@@ -12,6 +12,7 @@ import { bytesToHex } from '@noble/hashes/utils.js';
 
 import { SphereError } from '../../core/errors';
 import { logger } from '../../core/logger';
+import { timeoutSignal } from '../../core/timeout';
 
 /** Default Market API URL (intent bulletin board) */
 export const DEFAULT_MARKET_API_URL = 'https://market-api.unicity.network';
@@ -222,7 +223,7 @@ export class MarketModule {
   /** Fetch the most recent listings via REST (public — no auth required) */
   async getRecentListings(): Promise<FeedListing[]> {
     const res = await fetch(`${this.apiUrl}/api/feed/recent`, {
-      signal: AbortSignal.timeout(this.timeout),
+      signal: timeoutSignal(this.timeout),
     });
     const data = await this.parseResponse(res);
     return (data.listings ?? []).map(mapFeedListing);
@@ -325,7 +326,7 @@ export class MarketModule {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeout),
+      signal: timeoutSignal(this.timeout),
     });
 
     // 201 = created, 409 = already registered — both are fine
@@ -360,7 +361,7 @@ export class MarketModule {
       method: 'POST',
       headers: signed.headers,
       body: signed.body,
-      signal: AbortSignal.timeout(this.timeout),
+      signal: timeoutSignal(this.timeout),
     });
     return this.parseResponse(res);
   }
@@ -372,7 +373,7 @@ export class MarketModule {
     const res = await fetch(`${this.apiUrl}${path}`, {
       method: 'GET',
       headers: signed.headers,
-      signal: AbortSignal.timeout(this.timeout),
+      signal: timeoutSignal(this.timeout),
     });
     return this.parseResponse(res);
   }
@@ -384,7 +385,7 @@ export class MarketModule {
     const res = await fetch(`${this.apiUrl}${path}`, {
       method: 'DELETE',
       headers: signed.headers,
-      signal: AbortSignal.timeout(this.timeout),
+      signal: timeoutSignal(this.timeout),
     });
     return this.parseResponse(res);
   }
@@ -394,7 +395,7 @@ export class MarketModule {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeout),
+      signal: timeoutSignal(this.timeout),
     });
     return this.parseResponse(res);
   }
