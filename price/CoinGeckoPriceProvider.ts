@@ -8,7 +8,7 @@
 
 import { logger } from '../core/logger';
 import { SphereError } from '../core/errors';
-import { timeoutSignal } from '../core/utils';
+import { timeoutSignal } from '../core/timeout';
 import { STORAGE_KEYS_GLOBAL } from '../constants';
 import type { StorageProvider } from '../storage';
 import type { PriceProvider, PricePlatform, TokenPrice, PriceProviderConfig } from './price-provider';

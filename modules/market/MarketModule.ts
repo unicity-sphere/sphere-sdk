@@ -12,7 +12,7 @@ import { bytesToHex } from '@noble/hashes/utils.js';
 
 import { SphereError } from '../../core/errors';
 import { logger } from '../../core/logger';
-import { timeoutSignal } from '../../core/utils';
+import { timeoutSignal } from '../../core/timeout';
 
 /** Default Market API URL (intent bulletin board) */
 export const DEFAULT_MARKET_API_URL = 'https://market-api.unicity.network';

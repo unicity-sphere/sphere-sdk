@@ -75,7 +75,8 @@ import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
-import { sleep, timeoutSignal } from '../../core/utils';
+import { sleep } from '../../core/utils';
+import { timeoutSignal } from '../../core/timeout';
 import { decodeTokenBlob, encodeTokenBlob, unwrapTokenBlobBytes, TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
