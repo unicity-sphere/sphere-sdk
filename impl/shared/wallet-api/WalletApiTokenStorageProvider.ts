@@ -30,6 +30,8 @@
  */
 
 import { sha256 } from '@noble/hashes/sha2.js';
+
+import { randomUUID } from '../../../core/uuid';
 import type {
   ApplyDeltaAdded,
   ApplyDeltaOptions,
@@ -77,7 +79,7 @@ function hexToBytes(hex: string): Uint8Array {
 }
 
 function newTransferId(): string {
-  return (globalThis as { crypto: { randomUUID(): string } }).crypto.randomUUID();
+  return randomUUID();
 }
 
 /** A stored v2 token entry (the UI token record with a hex CBOR blob). */

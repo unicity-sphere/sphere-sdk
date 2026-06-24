@@ -13,6 +13,7 @@
  */
 
 import { SphereError, type SphereErrorCode } from '../core/errors';
+import { randomUUID } from '../core/uuid';
 import { TransferConflictError } from './errors';
 import { deriveDirectAddress, UNICITY_TOKEN_TYPE_HEX } from './identity';
 import { deriveDeliveryKeys } from './blob-keys';
@@ -380,7 +381,7 @@ export class SphereTokenEngine implements ITokenEngine {
   }
 
   private resolveTransferId(options?: EngineOpOptions): string {
-    const transferId = options?.transferId ?? crypto.randomUUID();
+    const transferId = options?.transferId ?? randomUUID();
     if (!TRANSFER_ID_RE.test(transferId)) {
       throw new SphereError(
         `transferId must be a canonical lowercase UUID string, got "${transferId}"`,

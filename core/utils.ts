@@ -191,14 +191,8 @@ export function randomHex(byteLength: number): string {
 }
 
 /**
- * Generate random UUID v4
+ * Generate a v4 UUID. Re-exported from {@link ./uuid} — a browser-safe,
+ * dependency-free implementation (native `crypto.randomUUID` with a
+ * `crypto.getRandomValues` fallback; no node:crypto require). See sphere-sdk#619.
  */
-export function randomUUID(): string {
-  if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.randomUUID) {
-    return globalThis.crypto.randomUUID();
-  }
-  // Fallback
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const nodeCrypto = require('crypto');
-  return nodeCrypto.randomUUID();
-}
+export { randomUUID } from './uuid';

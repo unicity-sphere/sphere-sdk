@@ -5,6 +5,7 @@
 
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { randomUUID } from '../../core/uuid';
 import { createTransportAddressResolver, type TransportAddressResolver } from '../../core/transport-resolver';
 import type {
   DirectMessage,
@@ -482,7 +483,7 @@ export class CommunicationsModule {
     const eventId = await this.deps!.transport.publishBroadcast?.(content, tags);
 
     const message: BroadcastMessage = {
-      id: eventId ?? crypto.randomUUID(),
+      id: eventId ?? randomUUID(),
       authorPubkey: this.deps!.identity.chainPubkey,
       authorNametag: this.deps!.identity.nametag,
       content,

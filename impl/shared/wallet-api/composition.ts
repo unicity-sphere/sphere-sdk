@@ -34,6 +34,7 @@ import type { DeliveryProvider } from '../../../transport/delivery-provider';
 import type { OracleProvider } from '../../../oracle';
 import type { TokenBlob } from '../../../token-engine/types';
 import { WalletApiClient } from '../../../wallet-api';
+import { randomUUID } from '../../../core/uuid';
 import type { FetchLike, KeyValueStore, WebSocketFactoryLike } from '../../../wallet-api';
 import { WalletApiTokenStorageProvider } from './WalletApiTokenStorageProvider';
 import { WalletApiMailboxProvider } from './WalletApiMailboxProvider';
@@ -130,7 +131,7 @@ function buildClient(base: SphereBaseProviders, config: WalletApiCompositionConf
     new WalletApiClient({
       baseUrl: config.baseUrl,
       network: config.network,
-      deviceId: config.deviceId ?? `sphere-${crypto.randomUUID()}`,
+      deviceId: config.deviceId ?? `sphere-${randomUUID()}`,
       storage: stateStore,
       fetchFn: config.fetchFn,
       webSocketFactory: config.webSocketFactory,

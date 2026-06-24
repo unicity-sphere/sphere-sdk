@@ -77,6 +77,7 @@ import { SphereError } from '../../core/errors';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
 import { sleep } from '../../core/utils';
 import { timeoutSignal } from '../../core/timeout';
+import { randomUUID } from '../../core/uuid';
 import { decodeTokenBlob, encodeTokenBlob, unwrapTokenBlobBytes, TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
@@ -99,7 +100,7 @@ export type TransactionHistoryEntry = import('../../storage').HistoryRecord;
 function computeHistoryDedupKey(type: string, tokenId?: string, transferId?: string): string {
   if (type === 'SENT' && transferId) return `${type}_transfer_${transferId}`;
   if (tokenId) return `${type}_${tokenId}`;
-  return `${type}_${crypto.randomUUID()}`;
+  return `${type}_${randomUUID()}`;
 }
 
 /** Maximum number of history entries to include in IPFS-synced TXF data */
@@ -1511,7 +1512,7 @@ export class PaymentsModule {
 
     // Use mutable result for building the transfer
     const result: { -readonly [K in keyof TransferResult]: TransferResult[K] } = {
-      id: internal?.existingReservationId ?? crypto.randomUUID(),
+      id: internal?.existingReservationId ?? randomUUID(),
       status: 'pending',
       tokens: [],
       tokenTransfers: [],
@@ -2210,7 +2211,7 @@ export class PaymentsModule {
 
       // Send via transport
       const eventId = await this.deps!.transport.sendPaymentRequest(recipientPubkey, payload);
-      const requestId = crypto.randomUUID();
+      const requestId = randomUUID();
 
       // Track outgoing request
       const outgoingRequest: OutgoingPaymentRequest = {
@@ -3586,7 +3587,7 @@ export class PaymentsModule {
 
     const dedupKey = computeHistoryDedupKey(entry.type, entry.tokenId, entry.transferId);
     const historyEntry: TransactionHistoryEntry = {
-      id: crypto.randomUUID(),
+      id: randomUUID(),
       dedupKey,
       ...entry,
     };
@@ -3626,7 +3627,7 @@ export class PaymentsModule {
         await walletApi.postHistoryRecords([
           {
             dedupKey: historyEntry.dedupKey,
-            id: crypto.randomUUID(),
+            id: randomUUID(),
             type: historyEntry.type,
             ts: new Date(historyEntry.timestamp).toISOString(),
             assets: [{ coinId: historyEntry.coinId, amount: historyEntry.amount }],
