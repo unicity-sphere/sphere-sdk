@@ -31,6 +31,7 @@ import type {
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
 import type { ITokenEngine, SphereToken, TokenBlob } from '../../token-engine';
 import { TransferConflictError } from '../../token-engine';
+import { WalletApiError } from '../../wallet-api';
 import { isV2TransferPayload, type V2TransferPayload } from '../../types/v2-transfer';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
@@ -150,6 +151,8 @@ const DELIVERY_POLL_INTERVAL_MS = 30_000;
  */
 const DELIVERY_REPLAY_RETRIES = 2;
 const MAX_DELIVERY_REPLAY_ATTEMPTS = 6;
+/** §3.1 (#621): how long a recipient-quota (429) delivery is deferred before the next replay attempt. */
+const DELIVERY_DEFERRAL_MS = 60 * 60 * 1000; // 1h
 const DELIVERY_REPLAY_BASE_DELAY_MS = 1_000;
 const DELIVERY_REPLAY_MAX_DELAY_MS = 8_000;
 
@@ -174,6 +177,20 @@ interface PendingV2Delivery {
   attempts?: number;
   /** Set once the entry is surfaced as poison; it stays journaled but is no longer auto-retried. */
   undeliverable?: boolean;
+  /**
+   * (transferId, opIndex) pairing (§8.1) — the op's position in the intent's persisted order.
+   * Lets resume RE-DELIVER this already-certified blob instead of re-running the engine op
+   * (which would raise TransferConflictError on the spent source). Absent on legacy entries.
+   */
+  opIndex?: number;
+  /**
+   * §3.1 (#621): a recipient-side 429 (full mailbox / never-claimer) is NOT poison — it self-heals
+   * when the recipient drains. Such entries are deferred (kept journaled, never auto-poisoned) and
+   * retried no sooner than this epoch-ms; the count does not consume the case-A poison budget.
+   */
+  deferredUntil?: number;
+  /** Why the entry is deferred (observability) — e.g. 'recipient-quota'. */
+  deferredReason?: string;
 }
 
 /** Running per-coin totals folded by {@link PaymentsModule.aggregateTokens}. */
@@ -1022,6 +1039,8 @@ export class PaymentsModule {
    * waiting real time — never mutated in production.
    */
   private replayBackoffBaseMs = DELIVERY_REPLAY_BASE_DELAY_MS;
+  /** Deferral window for recipient-quota (429) deliveries (#621). Overridable in tests. */
+  private deliveryDeferralMs = DELIVERY_DEFERRAL_MS;
   /**
    * #517: serializes {@link replayPendingV2Deliveries}. `load()` kicks replay
    * off fire-and-forget and `receive()` calls `load()`, so two passes can
@@ -1522,6 +1541,9 @@ export class PaymentsModule {
     // this send. The failure handler must never restore these as 'confirmed' —
     // their state is consumed; the finished output blob is journaled separately.
     const committedOnChainTokenIds = new Set<string>();
+    // §3.1 (#621): set when any leg's post-certification delivery is deferred (kept journaled).
+    // Scoped to the whole send so the resolve path below can mark the result delivery-pending.
+    let deliveryPending = false;
 
     try {
       // Resolve recipient
@@ -1717,10 +1739,11 @@ export class PaymentsModule {
             recipientPubkey: recipientChainPubkeyHex,
             tokenBlob,
             memo: request.memo,
+            opIndex,
             createdAt: Date.now(),
           });
-          await deliverBlob(tokenBlob);
-          await this.removePendingV2Delivery(tokenBlob);
+          // §3.1 (#621): a delivery failure after certification must NOT fail the sender.
+          if (!(await this.tryDeliver(() => deliverBlob(tokenBlob), tokenBlob))) deliveryPending = true;
           result.tokenTransfers.push({ sourceTokenId: tw.uiToken.id, method: 'direct' });
           consumedSources.push({
             uiTokenId: tw.uiToken.id,
@@ -1763,6 +1786,7 @@ export class PaymentsModule {
             recipientPubkey: recipientChainPubkeyHex,
             tokenBlob: recipientBlob,
             memo: request.memo,
+            opIndex: splitPlan.tokensToTransferDirectly.length,
             createdAt: Date.now(),
           });
           changeOutput = outputs[1];
@@ -1779,8 +1803,8 @@ export class PaymentsModule {
             await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
           }
 
-          await deliverBlob(recipientBlob);
-          await this.removePendingV2Delivery(recipientBlob);
+          // §3.1 (#621): a delivery failure after certification must NOT fail the sender.
+          if (!(await this.tryDeliver(() => deliverBlob(recipientBlob), recipientBlob))) deliveryPending = true;
 
           result.tokenTransfers.push({ sourceTokenId: splitPlan.tokenToSplit.uiToken.id, method: 'split' });
           consumedSources.push({
@@ -1870,7 +1894,17 @@ export class PaymentsModule {
       // Commit reservation — all tokens have been sent on-chain and removed.
       this.reservationLedger.commit(result.id);
 
-      this.deps!.emitEvent('transfer:confirmed', result);
+      // §3.1 (#621): the spend is final regardless of delivery. If any leg's delivery was
+      // deferred (recipient-side 429 / transient outage), resolve as delivery-pending — the
+      // blob stays journaled for (re-)delivery — rather than failing the sender.
+      if (deliveryPending) {
+        result.deliveryPending = true;
+        result.deliveryState = 'pending-delivery';
+      } else {
+        result.deliveryState = 'landed';
+      }
+
+      this.deps!.emitEvent(deliveryPending ? 'transfer:delivery_pending' : 'transfer:confirmed', result);
       return result;
     } catch (error) {
       // Cancel reservation — free reserved amounts for other sends
@@ -5174,66 +5208,110 @@ export class PaymentsModule {
       parseInvoiceMemoForOnChain(payload.memo, payload.invoiceRefundAddress, payload.invoiceContact) ??
       undefined;
 
-    const deliverBlob = async (tokenBlobHex: string): Promise<void> => {
+    const deliverBlob = async (tokenBlobHex: string, opIndex: number): Promise<void> => {
       await this.savePendingV2Delivery({
         transferId,
         recipientPubkey: payload.recipient,
         tokenBlob: tokenBlobHex,
         memo: payload.memo,
+        opIndex,
         createdAt: Date.now(),
       });
       const nm = this.currentNametagName();
-      await delivery.deliver(payload.recipient, hexToBytes(tokenBlobHex), {
-        transferId,
-        memo: payload.memo,
-        ...(nm !== undefined ? { senderNametag: nm } : {}),
-      });
-      await this.removePendingV2Delivery(tokenBlobHex);
+      // §3.1 (#621): non-fatal — a recipient-side/transient delivery failure must NOT throw out of
+      // resume (applyDelta below must still reconcile the server); the blob stays journaled for replay.
+      await this.tryDeliver(
+        () => delivery.deliver(payload.recipient, hexToBytes(tokenBlobHex), {
+          transferId,
+          memo: payload.memo,
+          ...(nm !== undefined ? { senderNametag: nm } : {}),
+        }),
+        tokenBlobHex,
+      );
     };
 
+    // #621: re-deliver, never re-certify. A journaled blob for (transferId, opIndex) means the op
+    // already certified in the original send (the intent stayed open on a LATER failure, e.g. applyDelta).
+    // Re-running engine.transfer on the now-spent source would raise TransferConflictError — re-deliver
+    // the stored blob instead (idempotent). Only run the engine op when nothing was journaled for it.
+    const journaled = await this.journaledByOp(transferId);
     const spent: string[] = [];
     for (const [opIndex, genesisId] of payload.direct.entries()) {
-      const blob = await provider.getToken(genesisId);
-      const source = await engine.decodeToken(blob);
-      const finished = await engine.transfer(
-        { token: source, recipientPubkey: recipientChainPubkey, data: memoData },
-        // (transferId, opIndex) pairing replayed from the intent's persisted order (§8.1)
-        { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex }
-      );
-      await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(finished))));
+      const existing = journaled.get(opIndex);
+      if (existing) {
+        await deliverBlob(existing.tokenBlob, opIndex);
+      } else {
+        try {
+          const blob = await provider.getToken(genesisId);
+          const source = await engine.decodeToken(blob);
+          const finished = await engine.transfer(
+            { token: source, recipientPubkey: recipientChainPubkey, data: memoData },
+            // (transferId, opIndex) pairing replayed from the intent's persisted order (§8.1)
+            { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex }
+          );
+          await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(finished))), opIndex);
+        } catch (err) {
+          // #621: no journaled blob, but the source is already spent on-chain — the original send
+          // certified (and delivered) this op and only failed to close on a LATER step. Record the
+          // spend (applyDelta below) instead of wedging on a re-certification TransferConflictError.
+          if (!(err instanceof TransferConflictError)) throw err;
+          logger.warn('Payments', `Resume op ${opIndex} already certified (source spent) — recording the spend, not re-certifying (§3.1):`, err);
+        }
+      }
       spent.push(genesisId);
     }
 
     let changeOutput: SphereToken | null = null;
     if (payload.split) {
-      const blob = await provider.getToken(payload.split.tokenId);
-      const source = await engine.decodeToken(blob);
-      const selfChainPubkey = hexToBytes(this.deps!.identity.chainPubkey);
-      const { outputs } = await engine.split(
-        {
-          token: source,
-          outputs: [
+      // Split opIndex follows the direct ops — replayed from the intent's order (§8.1).
+      const splitOpIndex = payload.direct.length;
+      const existingSplit = journaled.get(splitOpIndex);
+      if (existingSplit) {
+        // #621/#622-review: the split already certified in the original send — re-deliver the journaled
+        // recipient blob, never re-run engine.split on the spent source (it would TransferConflictError
+        // and wedge). The change output is handled by the conflict path below / a resync.
+        await deliverBlob(existingSplit.tokenBlob, splitOpIndex);
+      } else {
+        try {
+          const blob = await provider.getToken(payload.split.tokenId);
+          const source = await engine.decodeToken(blob);
+          const selfChainPubkey = hexToBytes(this.deps!.identity.chainPubkey);
+          const { outputs } = await engine.split(
             {
-              recipientPubkey: recipientChainPubkey,
-              coinId: payload.coinId,
-              amount: BigInt(payload.split.splitAmount),
-              data: memoData,
+              token: source,
+              outputs: [
+                {
+                  recipientPubkey: recipientChainPubkey,
+                  coinId: payload.coinId,
+                  amount: BigInt(payload.split.splitAmount),
+                  data: memoData,
+                },
+                {
+                  recipientPubkey: selfChainPubkey,
+                  coinId: payload.coinId,
+                  amount: BigInt(payload.split.remainderAmount),
+                },
+              ],
             },
-            {
-              recipientPubkey: selfChainPubkey,
-              coinId: payload.coinId,
-              amount: BigInt(payload.split.remainderAmount),
-            },
-          ],
-        },
-        // Split opIndex follows the direct ops — replayed from the intent's order (§8.1).
-        { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex: payload.direct.length }
-      );
-      changeOutput = outputs[1];
-      // critical (#515 F2): own-storage custody — persist-or-stay-open; a
-      // throw keeps the intent open and the next sign-in re-runs it.
-      if (!serverApply) await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
-      await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(outputs[0]))));
+            { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex: splitOpIndex }
+          );
+          changeOutput = outputs[1];
+          // critical (#515 F2): own-storage custody — persist-or-stay-open; a
+          // throw keeps the intent open and the next sign-in re-runs it.
+          if (!serverApply) await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
+          await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(outputs[0]))), splitOpIndex);
+        } catch (err) {
+          // #622-review: mirror the direct-op path for split. The split source is already spent on-chain
+          // (a crash certified it before this resume) — record the spend instead of wedging on the
+          // re-certification conflict. KNOWN LIMITATION: the change output is NOT journaled and cannot be
+          // re-derived here (re-running engine.split conflicts), so a split that crashed between
+          // certification and applyDelta recovers its change token via a full inventory resync. Surfaced
+          // (inventory:conflict prompts that refresh) — never silently lost.
+          if (!(err instanceof TransferConflictError)) throw err;
+          logger.warn('Payments', `Resume split op already certified — recording the spend; change token (if any) recovers on the next inventory resync (§3.1):`, err);
+          this.deps!.emitEvent('inventory:conflict', { transferId, coinId: payload.coinId, error: err.message });
+        }
+      }
       spent.push(payload.split.tokenId);
     }
 
@@ -5381,6 +5459,18 @@ export class PaymentsModule {
     return data ? (JSON.parse(data) as PendingV2Delivery[]) : [];
   }
 
+  /**
+   * #621: journaled finished blobs for an intent, keyed by op position. opIndex when present,
+   * else positional among the intent's entries (legacy entries journaled in op order). Resume
+   * uses this to re-deliver an already-certified op instead of re-running the engine on its spent source.
+   */
+  private async journaledByOp(transferId: string): Promise<Map<number, PendingV2Delivery>> {
+    const mine = (await this.loadPendingV2Deliveries()).filter((e) => e.transferId === transferId);
+    const byOp = new Map<number, PendingV2Delivery>();
+    mine.forEach((e, i) => byOp.set(e.opIndex ?? i, e));
+    return byOp;
+  }
+
   /** #517: run a journal read-modify-write atomically against all other journal mutations. */
   private withJournalLock<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.journalMutation.then(fn, fn);
@@ -5409,6 +5499,31 @@ export class PaymentsModule {
   }
 
   /**
+   * Covenant §3.1 (#621): once the source is certified on-chain, a delivery failure must NEVER
+   * fail the sender. Recipient-side conditions (a full mailbox / 429 from a never-claiming recipient)
+   * and transient delivery-infra failures (5xx/network) both leave the finished blob JOURNALED for
+   * (re-)delivery — the send resolves as delivery-pending and the sender moves on. The blob is already
+   * journaled (savePendingV2Delivery ran before this); on success we clear the journal, on any failure
+   * we keep it. Returns true if delivered, false if deferred. Never throws.
+   */
+  private async tryDeliver(deliver: () => Promise<unknown>, tokenBlob: string): Promise<boolean> {
+    try {
+      await deliver();
+    } catch (err) {
+      logger.warn('Payments', 'Delivery deferred (kept journaled); sender not failed (§3.1):', err);
+      return false;
+    }
+    // Delivered. Clearing the journal is best-effort — a failure here is harmless (the idempotent
+    // replay re-removes it) and must NOT flip the result to delivery-pending (#622 review).
+    try {
+      await this.removePendingV2Delivery(tokenBlob);
+    } catch (err) {
+      logger.warn('Payments', 'Delivered, but journal cleanup failed (replay will re-remove):', err);
+    }
+    return true;
+  }
+
+  /**
    * Replay journaled finished-but-undelivered v2 blobs (kicked from load())
    * through the delivery port (sdk-changes S3). Idempotent end to end: the
    * mailbox deposit is idempotent by the content-derived entry_id — it succeeds
@@ -5430,7 +5545,11 @@ export class PaymentsModule {
     if (this.replayInFlight) return;
     this.replayInFlight = true;
     try {
-      const entries = (await this.loadPendingV2Deliveries()).filter((e) => !e.undeliverable);
+      // #621: skip poison and recipient-quota entries still inside their deferral window.
+      const now = Date.now();
+      const entries = (await this.loadPendingV2Deliveries()).filter(
+        (e) => !e.undeliverable && (e.deferredUntil === undefined || e.deferredUntil <= now),
+      );
       if (entries.length === 0) return;
       logger.warn('Payments', `${entries.length} undelivered v2 transfer(s) journaled from a previous session — replaying`);
       for (const e of entries) {
@@ -5449,6 +5568,13 @@ export class PaymentsModule {
       await this.removePendingV2Delivery(entry.tokenBlob);
       logger.debug('Payments', `Replayed undelivered v2 transfer ${tag}...`);
     } catch (err) {
+      // §3.1 (#621): a recipient-side 429 (full mailbox / never-claimer) is NOT poison — it
+      // self-heals when the recipient drains. Defer it (kept journaled, never consumes the case-A
+      // poison budget, retried after the deferral window), distinct from a genuine delivery failure.
+      if (err instanceof WalletApiError && err.status === 429) {
+        await this.deferDelivery(entry, err.message);
+        return;
+      }
       const attempts = (entry.attempts ?? 0) + 1;
       const message = err instanceof Error ? err.message : String(err);
       if (attempts >= MAX_DELIVERY_REPLAY_ATTEMPTS) {
@@ -5458,6 +5584,26 @@ export class PaymentsModule {
       await this.bumpDeliveryAttempts(entry.tokenBlob, attempts);
       logger.warn('Payments', `Replay of undelivered v2 transfer ${tag}... failed (attempt ${attempts}/${MAX_DELIVERY_REPLAY_ATTEMPTS}, kept for next load):`, err);
     }
+  }
+
+  /**
+   * §3.1 (#621): defer a recipient-quota (429) delivery — keep it journaled, never poison it (it
+   * self-heals when the recipient claims), and retry no sooner than the deferral window. Surfaced
+   * distinctly (delivery:deferred) so a UI can show "recipient's mailbox is full — will retry".
+   */
+  private async deferDelivery(entry: PendingV2Delivery, error: string): Promise<void> {
+    const deferredUntil = Date.now() + this.deliveryDeferralMs;
+    await this.updatePendingV2Delivery(entry.tokenBlob, (e) => {
+      e.deferredUntil = deferredUntil;
+      e.deferredReason = 'recipient-quota';
+    });
+    logger.warn('Payments', `Undelivered v2 transfer ${entry.transferId.slice(0, 8)}... deferred — recipient mailbox full (429); kept journaled, retried after the deferral window (§3.1):`, error);
+    this.deps!.emitEvent('delivery:deferred', {
+      transferId: entry.transferId,
+      recipientPubkey: entry.recipientPubkey,
+      reason: 'recipient-quota',
+      deferredUntil,
+    });
   }
 
   /** One delivery with in-pass exponential backoff; throws the last error if all attempts fail. */

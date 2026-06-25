@@ -172,6 +172,15 @@ export interface TransferResult {
   /** Per-token transfer details — one entry per source token consumed */
   readonly tokenTransfers: TokenTransferDetail[];
   error?: string;
+  /**
+   * True when the send certified on-chain but the recipient-side delivery did not land
+   * (covenant §3.1 — issue #621): the source is terminally spent, the finished blob is
+   * journaled, and the sender is NOT failed. Distinguishes "sent, delivery deferred" from
+   * a real send failure. See {@link deliveryState}.
+   */
+  deliveryPending?: boolean;
+  /** 'landed' = delivered to the recipient's mailbox; 'pending-delivery' = certified, journaled, awaiting (re-)delivery. */
+  deliveryState?: 'landed' | 'pending-delivery';
 }
 
 export interface IncomingTransfer {
@@ -386,6 +395,7 @@ export type SphereEventType =
   | 'transfer:incoming'
   | 'transfer:confirmed'
   | 'transfer:failed'
+  | 'transfer:delivery_pending'
   | 'transfer:invalid'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
@@ -405,6 +415,7 @@ export type SphereEventType =
   | 'storage:degraded'
   | 'inventory:conflict'
   | 'delivery:undeliverable'
+  | 'delivery:deferred'
   | 'walletapi:session'
   | 'realtime:status'
   | 'connection:changed'
@@ -467,6 +478,12 @@ export interface SphereEventMap {
   'transfer:confirmed': TransferResult;
   'transfer:failed': TransferResult;
   /**
+   * Covenant §3.1 (#621): the send certified on-chain but recipient-side delivery did not land
+   * (a full mailbox / 429, or a transient outage). The source is spent, the finished blob is
+   * journaled for (re-)delivery, and the sender is NOT failed. UI renders "sent — delivery pending".
+   */
+  'transfer:delivery_pending': TransferResult;
+  /**
    * An incoming delivery failed LOCAL verification and was rejected back to
    * the delivery rail (sdk-changes S3): terminal for discovery only — the
    * entry stays claimable server-side and may be retried after an app update
@@ -514,6 +531,12 @@ export interface SphereEventMap {
    * is higher. Surfacing trips once `attempts` reaches the bounded budget.
    */
   'delivery:undeliverable': { transferId: string; recipientPubkey: string; attempts: number; error: string };
+  /**
+   * §3.1 (#621): a delivery was deferred because the recipient's mailbox is full (429 — a never-claimer
+   * or quota). NOT poison: kept journaled and retried after `deferredUntil`. UI: "recipient can't receive
+   * yet — will retry". The sender is NOT failed; the token is the recipient's on-chain.
+   */
+  'delivery:deferred': { transferId: string; recipientPubkey: string; reason: string; deferredUntil: number };
   /**
    * wallet-api session state change (#515 F3): 'offline' = sign-in failed and
    * the wallet runs degraded (no intents barrier, no server custody writes);

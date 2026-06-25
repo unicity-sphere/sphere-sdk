@@ -145,17 +145,18 @@ function journal(storage: { map: Map<string, string> }): Array<{ transferId: str
 }
 
 describe('send() — failure recovery (v2)', () => {
-  it('transport failure AFTER engine.transfer: source is spent (never confirmed), blob journaled, restore persisted', async () => {
-    const { module, engine, transport, storage, tokenStorage } = setup();
+  it('transport failure AFTER engine.transfer (§3.1 #621): send resolves delivery-pending, source consumed, blob journaled', async () => {
+    const { module, engine, transport, storage } = setup();
     await deliver(module, await v2Payload(engine, 100n));
     (transport.sendTokenTransfer as any).mockRejectedValueOnce(new Error('relay down'));
 
-    await expect(module.send({ recipient: '@bob', amount: '100', coinId: UCT })).rejects.toThrow('relay down');
+    // Covenant: a post-certification delivery failure must NOT fail the sender.
+    const result = await module.send({ recipient: '@bob', amount: '100', coinId: UCT });
+    expect(result.status).not.toBe('failed');
+    expect(result.deliveryPending).toBe(true);
 
-    // Source token was certified on-chain — terminal 'spent', NOT confirmed.
-    const tokens = module.getTokens();
-    expect(tokens).toHaveLength(1);
-    expect(tokens[0].status).toBe('spent');
+    // Source was certified on-chain — consumed, never left spendable.
+    expect(module.getTokens().some((t) => t.status === 'confirmed')).toBe(false);
 
     // The finished blob is journaled for replay. Since S3 the journal records
     // the recipient's CHAIN pubkey — the delivery port's canonical addressing
@@ -163,18 +164,14 @@ describe('send() — failure recovery (v2)', () => {
     const entries = journal(storage);
     expect(entries).toHaveLength(1);
     expect(entries[0].recipientPubkey).toBe(BOB_CHAIN_PUBKEY);
-
-    // The restore was persisted (a crash now must not resurrect 'transferring').
-    expect(tokenStorage.save).toHaveBeenCalled();
-    const persisted = tokenStorage.savedData();
-    expect(JSON.stringify(persisted)).toContain('"spent"');
   });
 
   it('replayPendingV2Deliveries delivers the journaled blob and clears the journal', async () => {
     const { module, engine, transport, storage } = setup();
     await deliver(module, await v2Payload(engine, 100n));
     (transport.sendTokenTransfer as any).mockRejectedValueOnce(new Error('relay down'));
-    await expect(module.send({ recipient: '@bob', amount: '100', coinId: UCT })).rejects.toThrow();
+    const result = await module.send({ recipient: '@bob', amount: '100', coinId: UCT });
+    expect(result.deliveryPending).toBe(true);
     expect(journal(storage)).toHaveLength(1);
     const journaledBlob = journal(storage)[0].tokenBlob;
 
@@ -192,14 +189,15 @@ describe('send() — failure recovery (v2)', () => {
     await deliver(module, await v2Payload(engine, 1000n));
     (transport.sendTokenTransfer as any).mockRejectedValueOnce(new Error('relay down'));
 
-    await expect(module.send({ recipient: '@bob', amount: '300', coinId: UCT })).rejects.toThrow('relay down');
+    // Covenant §3.1 (#621): delivery failure must not fail the sender.
+    const result = await module.send({ recipient: '@bob', amount: '300', coinId: UCT });
+    expect(result.deliveryPending).toBe(true);
 
     const tokens = module.getTokens();
-    // Change token (700) survived as confirmed; the split source is terminal 'spent'.
+    // Change token (700) survived as confirmed; the split source was consumed on-chain.
     const change = tokens.find((t) => t.amount === '700');
     expect(change?.status).toBe('confirmed');
-    const source = tokens.find((t) => t.amount === '1000');
-    expect(source?.status).toBe('spent');
+    expect(tokens.some((t) => t.amount === '1000' && t.status === 'confirmed')).toBe(false);
     // Recipient's 300 blob is journaled for replay.
     expect(journal(storage)).toHaveLength(1);
   });

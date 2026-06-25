@@ -27,7 +27,7 @@ import { FakeTokenEngine, decodeFakeTokenAssets, decodeFakeTokenId } from '../to
 import { TransferConflictError } from '../../../token-engine';
 import { FakeWalletApi } from '../../support/fake-wallet-api';
 import { MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
-import { WalletApiClient } from '../../../wallet-api';
+import { WalletApiClient, WalletApiError } from '../../../wallet-api';
 import { WalletApiMailboxProvider, WalletApiTokenStorageProvider } from '../../../impl/shared/wallet-api';
 import { encodeTokenBlob } from '../../../token-engine/token-blob';
 import { bytesToHex, hexToBytes } from '../../../core/crypto';
@@ -399,14 +399,18 @@ describe('interrupted deposit — journal replay on next load (S3 AC)', () => {
     await seedServerToken(fake, sender, SENDER, 1000n);
     await sender.module.load();
 
-    // Deliver fails once (mailbox outage) AFTER the engine certified.
+    // Deliver fails once (mailbox outage) AFTER the engine certified. Covenant §3.1 (#621):
+    // a post-certification delivery failure must NOT fail the sender — the send resolves
+    // delivery-pending and the journaled blob lands on the next load's replay.
     const realDeliver = sender.delivery.deliver.bind(sender.delivery);
     let failures = 1;
     vi.spyOn(sender.delivery, 'deliver').mockImplementation((a, b, c) =>
       failures-- > 0 ? Promise.reject(new Error('mailbox down')) : realDeliver(a, b, c)
     );
 
-    await expect(sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT })).rejects.toThrow('mailbox down');
+    const result = await sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT });
+    expect(result.status).not.toBe('failed');
+    expect(result.deliveryPending).toBe(true);
 
     // The finished blob is journaled; nothing reached the mailbox yet; the
     // source is terminal 'spent' locally (certified on-chain).
@@ -466,6 +470,60 @@ describe('interrupted deposit — journal replay on next load (S3 AC)', () => {
     expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
     expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(1);
     expect(fake.getMailboxEntry(RECIPIENT.chainPubkey, entry.entryId)).toMatchObject({ status: 'claimed' });
+  });
+});
+
+describe('recipient-side 429 must NOT fail the sender (covenant §3.1 — issue #621)', () => {
+  it('a recipient unclaimed-cap 429 after certification RESOLVES the send (deliveryPending), source spent, blob journaled', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-quota-1');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // The recipient's mailbox is FULL (§5.5 unclaimed cap). The deposit 429s AFTER the
+    // engine certified — exactly the recipient-side condition that must never fail the sender.
+    vi.spyOn(sender.delivery, 'deliver').mockRejectedValue(
+      new WalletApiError('per-recipient unclaimed+rejected entries exceed (§5.5)', 'RATE_LIMITED', 429),
+    );
+
+    // Covenant: the sender certified, the token is the recipient's on-chain — the send RESOLVES.
+    const result = await sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT });
+    expect(result.status).not.toBe('failed');
+    expect(result.deliveryPending).toBe(true);
+
+    // Source is terminally spent (never re-spendable); the finished blob stays journaled for re-delivery;
+    // nothing reached the recipient's mailbox yet.
+    const lazy = sender.module.getTokens();
+    expect(lazy.some((t) => t.status === 'confirmed')).toBe(false);
+    expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(1);
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(0);
+  });
+
+  it('after the recipient drains, a journal replay deposits the blob and clears the journal', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-quota-2');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    const realDeliver = sender.delivery.deliver.bind(sender.delivery);
+    let quotaFull = true;
+    vi.spyOn(sender.delivery, 'deliver').mockImplementation((a, b, c) =>
+      quotaFull
+        ? Promise.reject(new WalletApiError('quota (§5.5)', 'RATE_LIMITED', 429))
+        : realDeliver(a, b, c),
+    );
+
+    const result = await sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT });
+    expect(result.deliveryPending).toBe(true);
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(0);
+
+    // Recipient drains → the deferred blob lands on the next replay; journal clears.
+    quotaFull = false;
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    await (sender.module as any).replayPendingV2Deliveries();
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(1);
+    expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
   });
 });
 
@@ -693,6 +751,107 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
     const sent = fake.getHistoryRecords(SENDER.chainPubkey).find((r) => r.dedupKey === `SENT_transfer_${transferId}`);
     expect(sent).toBeDefined();
+  });
+
+  it('resume of an already-certified source records the spend instead of wedging on a conflict (§3.1 #621)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-rs-621');
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    const transferId = crypto.randomUUID();
+    const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
+    sender.client.setIdentity(SENDER);
+    await sender.client.putIntent(
+      transferId,
+      encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)),
+    );
+
+    // The original send already certified (and delivered) this source — the intent only failed to
+    // close on a later step. Re-running the engine on the spent source raises TransferConflictError.
+    // Old behavior wedged (conflicted + re-certify forever); the fix records the spend and completes.
+    vi.spyOn(sender.engine, 'transfer').mockRejectedValue(
+      new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent'),
+    );
+
+    const outcome = await sender.module.resumeOpenIntents();
+    expect(outcome.resumed).toEqual([transferId]);
+    expect(outcome.conflicted).toEqual([]);
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'removed' });
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
+  });
+
+  it('resume of an already-certified SPLIT source records the spend instead of wedging (#622 review)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-rs-split-621');
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    const transferId = crypto.randomUUID();
+    const payload = {
+      v: 1,
+      recipient: RECIPIENT.chainPubkey,
+      coinId: UCT,
+      amount: '300',
+      direct: [],
+      split: { tokenId: sourceTokenId, splitAmount: '300', remainderAmount: '700' },
+    };
+    sender.client.setIdentity(SENDER);
+    await sender.client.putIntent(
+      transferId,
+      encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)),
+    );
+
+    // The original send already certified the split — re-running engine.split conflicts. Without the
+    // #622-review fix this bubbles up, aborts, and wedges; the fix records the spend and completes.
+    vi.spyOn(sender.engine, 'split').mockRejectedValue(
+      new TransferConflictError('TRANSACTION_HASH_MISMATCH: split source already spent'),
+    );
+
+    const outcome = await sender.module.resumeOpenIntents();
+    expect(outcome.resumed).toEqual([transferId]);
+    expect(outcome.conflicted).toEqual([]);
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'removed' });
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
+    // The change-token limitation is surfaced (prompts a resync) — never silently lost.
+    expect(sender.emitEvent.mock.calls.some((c) => c[0] === 'inventory:conflict')).toBe(true);
+  });
+});
+
+describe('replay classifies recipient-quota (429) as deferred, never poison (§3.1 #621)', () => {
+  it('a recipient-full 429 blob is deferred (kept journaled, never poison) and lands once the recipient drains', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-defer-621');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    (sender.module as any).deliveryDeferralMs = 0; // re-eligible immediately — no real wait
+    (sender.module as any).replayBackoffBaseMs = 0;
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    const realDeliver = sender.delivery.deliver.bind(sender.delivery);
+    let recipientFull = true;
+    vi.spyOn(sender.delivery, 'deliver').mockImplementation((a, b, c) =>
+      recipientFull ? Promise.reject(new WalletApiError('quota (§5.5)', 'RATE_LIMITED', 429)) : realDeliver(a, b, c),
+    );
+
+    const result = await sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT });
+    expect(result.deliveryPending).toBe(true);
+
+    // Drive far past the case-A poison budget (6) while the recipient stays full — never poison.
+    for (let i = 0; i < 8; i++) await (sender.module as any).replayPendingV2Deliveries();
+    const journaled = JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]');
+    expect(journaled).toHaveLength(1);
+    expect(journaled[0].undeliverable).toBeUndefined();
+    expect(journaled[0].deferredReason).toBe('recipient-quota');
+    expect(sender.emitEvent.mock.calls.some((c) => c[0] === 'delivery:deferred')).toBe(true);
+    expect(sender.emitEvent.mock.calls.some((c) => c[0] === 'delivery:undeliverable')).toBe(false);
+
+    // Recipient drains → next replay lands and clears the journal.
+    recipientFull = false;
+    await (sender.module as any).replayPendingV2Deliveries();
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(1);
+    expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
   });
 });
 
