@@ -301,6 +301,63 @@ describe('send — full wallet-api preset (S2 consumer + S3 + §7 pipeline)', ()
   });
 });
 
+describe('incoming — claim/reject batched per page (#623)', () => {
+  it('receive() of N entries issues ONE claimMailbox call carrying all ids, not N', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-batch-1');
+    const N = 5;
+    for (let i = 0; i < N; i += 1) await seedServerToken(fake, sender, SENDER, 100n);
+    await sender.module.load();
+    for (let i = 0; i < N; i += 1) await sender.module.send({ recipient: '@bob', amount: '100', coinId: UCT });
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(N);
+
+    const recipient = makeFullPresetWallet(baseUrl, fake.network, RECIPIENT, 'd-batch-2');
+    await recipient.module.load();
+    const claimSpy = vi.spyOn(recipient.client, 'claimMailbox');
+
+    const { transfers } = await recipient.module.receive();
+    expect(transfers).toHaveLength(N);
+
+    // The whole page is claimed in ONE request carrying all N ids (was N requests of 1 before #623).
+    expect(claimSpy).toHaveBeenCalledTimes(1);
+    expect(claimSpy.mock.calls[0][0]).toHaveLength(N);
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey).every((e) => e.status === 'claimed')).toBe(true);
+  });
+
+  it('a mixed page batches valid claims and invalid rejects into one request each', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-mix-1');
+    await seedServerToken(fake, sender, SENDER, 100n);
+    await seedServerToken(fake, sender, SENDER, 100n);
+    await sender.module.load();
+    await sender.module.send({ recipient: '@bob', amount: '100', coinId: UCT });
+    await sender.module.send({ recipient: '@bob', amount: '100', coinId: UCT });
+    // A stranger deposits a token locked to ITSELF → the recipient can't verify ownership → rejected.
+    const stranger = makeFullPresetWallet(baseUrl, fake.network, STRANGER, 'd-mix-str');
+    const strangerToken = await stranger.engine.mint({
+      recipientPubkey: stranger.engine.getIdentity().chainPubkey,
+      value: { assets: [{ coinId: UCT, amount: 100n }] },
+    });
+    const badBytes = encodeTokenBlob(stranger.engine.encodeToken(strangerToken));
+    stranger.delivery.setIdentity(STRANGER);
+    await stranger.delivery.deliver(RECIPIENT.chainPubkey, badBytes, { transferId: crypto.randomUUID() });
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(3);
+
+    const recipient = makeFullPresetWallet(baseUrl, fake.network, RECIPIENT, 'd-mix-2');
+    await recipient.module.load();
+    const claimSpy = vi.spyOn(recipient.client, 'claimMailbox');
+    const rejectSpy = vi.spyOn(recipient.client, 'rejectMailbox');
+
+    await recipient.module.receive();
+
+    expect(claimSpy).toHaveBeenCalledTimes(1);
+    expect(claimSpy.mock.calls[0][0]).toHaveLength(2); // two valid
+    expect(rejectSpy).toHaveBeenCalledTimes(1);
+    expect(rejectSpy.mock.calls[0][0]).toHaveLength(1); // one invalid
+    expect(recipient.emitEvent.mock.calls.some((c) => c[0] === 'transfer:invalid')).toBe(true);
+  });
+});
+
 describe('incoming — mailbox pull feeds handleV2Transfer (S3)', () => {
   it('receive(): fetch → local verify → store → ack claimed (handoff) → RECEIVED history POST carrying the sender nametag + memo', async () => {
     const { fake, baseUrl } = await startFake();

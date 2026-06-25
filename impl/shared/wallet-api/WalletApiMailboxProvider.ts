@@ -428,6 +428,31 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
     await this.addSeen([deliveryId]); // the persistent (tokenId, stateHash) seen-set (S7)
   }
 
+  /**
+   * Batch ack (#623): one `claimMailbox` + one `rejectMailbox` request for a whole page, instead of
+   * one per entry. Only entries that were acked successfully enter the seen-set, so a defensive-bucket
+   * claim failure leaves that entry un-seen for a later pump to retry (never throws on the batch for a
+   * single bad entry — the §16 defensive lineage bucket is unreachable in normal flows). Claim is
+   * idempotent (§6), so re-listing an un-seen entry re-claims safely.
+   */
+  async ackBatch(claimed: string[], rejected: string[]): Promise<void> {
+    const acked: string[] = [];
+    if (claimed.length > 0) {
+      const intoInventory = this.custody === 'inventory';
+      const result = await this.client.claimMailbox(claimed, intoInventory);
+      const failedIds = new Set(result.failed.map((f) => f.entryId));
+      for (const id of claimed) if (!failedIds.has(id)) acked.push(id);
+      if (failedIds.size > 0) {
+        logger.warn(TAG, `mailbox batch claim: ${String(failedIds.size)} entr(ies) in the defensive bucket — left un-seen for retry`);
+      }
+    }
+    if (rejected.length > 0) {
+      await this.client.rejectMailbox(rejected);
+      acked.push(...rejected);
+    }
+    if (acked.length > 0) await this.addSeen(acked);
+  }
+
   // ── wake (optional hook — §9: a nudge, never a correctness dependency) ──────
 
   // The wallet-api wake socket multiplexes all three owner streams; forward

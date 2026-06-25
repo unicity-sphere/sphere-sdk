@@ -151,6 +151,9 @@ const DELIVERY_POLL_INTERVAL_MS = 30_000;
  */
 const DELIVERY_REPLAY_RETRIES = 2;
 const MAX_DELIVERY_REPLAY_ATTEMPTS = 6;
+/** #623: incoming claim/reject are submitted in batches of this size (one request each) so a large
+ * inbox drain doesn't fire one write per entry and trip the per-owner rate limit. */
+const INCOMING_ACK_BATCH_SIZE = 200;
 /** §3.1 (#621): how long a recipient-quota (429) delivery is deferred before the next replay attempt. */
 const DELIVERY_DEFERRAL_MS = 60 * 60 * 1000; // 1h
 const DELIVERY_REPLAY_BASE_DELAY_MS = 1_000;
@@ -4765,67 +4768,105 @@ export class PaymentsModule {
       await this.loadedPromise;
     }
     let stored = 0;
+    // #623: verify+store per entry (§8.2 — the recipient verifies locally), but ACCUMULATE the
+    // claim/reject and submit them in batches (one request each) so a large inbox drain doesn't fire
+    // one write per entry and trip the per-owner rate limit. Crash-safe: the seen-set (added only on a
+    // successful batch ack) is the replay guard and the cursor is the conservative §6 read pointer, so
+    // an un-flushed batch is simply re-listed and re-processed (idempotent claim, §6).
+    const claimed: string[] = [];
+    const rejected: string[] = [];
+    const flush = async (): Promise<void> => {
+      if (claimed.length === 0 && rejected.length === 0) return;
+      await this.flushIncomingAcks(delivery, claimed.splice(0), rejected.splice(0));
+    };
     for await (const incoming of delivery.incoming()) {
       try {
-        const accepted = await this.processIncomingDelivery(delivery, incoming);
-        if (accepted) stored++;
+        const verdict = await this.classifyIncomingDelivery(incoming);
+        if (verdict.disposition === 'claimed') {
+          claimed.push(incoming.deliveryId);
+          if (verdict.stored) stored++;
+        } else {
+          rejected.push(incoming.deliveryId);
+          // Surface as an invalid incoming payment (the actual reject is submitted in the flush).
+          this.deps!.emitEvent('transfer:invalid', {
+            deliveryId: incoming.deliveryId,
+            senderPubkey: incoming.senderPubkey,
+            reason: verdict.reason,
+          });
+        }
+        if (claimed.length + rejected.length >= INCOMING_ACK_BATCH_SIZE) await flush();
       } catch (err) {
-        // Transient (network, blob fetch): leave unacked — the next poll
-        // retries; discovery of LATER entries continues regardless.
+        // Transient (network, blob fetch / no-engine on THIS entry, or a threshold batch-flush
+        // failure): leave the affected entr(ies) unacked — they are not in the seen-set, so the next
+        // poll re-lists and re-processes them. Discovery of LATER entries continues.
         logger.warn(
           'Payments',
-          `Incoming delivery ${incoming.deliveryId.slice(0, 12)}… failed transiently (will retry):`,
+          `Incoming delivery ${incoming.deliveryId.slice(0, 12)}… (or its batch flush) failed transiently — left unacked, retried next poll:`,
           err
         );
       }
     }
+    // A final-flush failure (transient claim/reject) is safe-by-replay — the entries are not in the
+    // seen-set, so the next pump re-lists and re-processes them. Degrade gracefully rather than
+    // propagating a pump crash (a 30s poll-restart).
+    try {
+      await flush();
+    } catch (err) {
+      logger.warn('Payments', 'Incoming ack flush failed — entries kept for the next pump (replay-safe):', err);
+    }
     return stored;
   }
 
-  /** Returns true when the delivery stored a new token. */
-  private async processIncomingDelivery(
-    delivery: DeliveryProvider,
+  /**
+   * Verify + store an incoming delivery (§8.2 — local), returning the ack disposition WITHOUT acking
+   * — the pump batches the claim/reject (#623). A `duplicate` still claims (idempotent §6, advances
+   * the read pointer); `no-engine` throws so the entry is left unacked for a later pump.
+   */
+  private async classifyIncomingDelivery(
     incoming: IncomingDelivery
-  ): Promise<boolean> {
+  ): Promise<{ disposition: 'claimed'; stored: boolean } | { disposition: 'rejected'; reason: string }> {
     const bytes = await incoming.fetchBlob();
     const payload: V2TransferPayload = {
       type: 'V2_TRANSFER',
       version: '2.0',
       tokenBlob: bytesToHex(bytes),
-      // memo + senderNametag both ride the recipient-addressed delivery
-      // envelope (S6) the provider already decrypted — the nametag is the
-      // PRIMARY counterparty identity (no Nostr lookup; fixes "Someone").
+      // memo + senderNametag both ride the recipient-addressed delivery envelope (S6) the provider
+      // already decrypted — the nametag is the PRIMARY counterparty identity (no Nostr lookup).
       memo: incoming.memo,
       ...(incoming.senderNametag !== undefined ? { senderNametag: incoming.senderNametag } : {}),
     };
     const verdict = await this.handleV2Transfer(payload, incoming.senderPubkey ?? '');
     switch (verdict) {
       case 'stored':
-        await delivery.ack(incoming.deliveryId, 'claimed');
-        return true;
+        return { disposition: 'claimed', stored: true };
       case 'duplicate':
-        // Idempotent re-delivery (e.g. claimed race with another device) —
-        // claim so the read pointer advances (claim is idempotent, §6).
-        await delivery.ack(incoming.deliveryId, 'claimed');
-        return false;
+        return { disposition: 'claimed', stored: false };
       case 'invalid':
       case 'not-owned':
       case 'storage-rejected':
-        // Local verification failed (or the state is stale/tombstoned here):
-        // reject — terminal for DISCOVERY only; the entry stays claimable and
-        // its blob retained (§6), retryable after an app update (e.g. a
-        // trustbase fix). Surface as an invalid incoming payment.
-        await delivery.ack(incoming.deliveryId, 'rejected');
-        this.deps!.emitEvent('transfer:invalid', {
-          deliveryId: incoming.deliveryId,
-          senderPubkey: incoming.senderPubkey,
-          reason: verdict,
-        });
-        return false;
+        // Local verification failed (or the state is stale/tombstoned here): reject — terminal for
+        // DISCOVERY only; the entry stays claimable and its blob retained (§6).
+        return { disposition: 'rejected', reason: verdict };
       case 'no-engine':
-        // Not a verdict on the token at all — leave unacked for a later pump.
         throw new SphereError('Token engine unavailable for incoming delivery', 'AGGREGATOR_ERROR');
     }
+  }
+
+  /**
+   * Submit a batch of claims/rejects via the provider's batch ack (#623), falling back to per-entry
+   * ack for a provider without it (e.g. the relay no-op).
+   */
+  private async flushIncomingAcks(
+    delivery: DeliveryProvider,
+    claimed: string[],
+    rejected: string[]
+  ): Promise<void> {
+    if (delivery.ackBatch) {
+      await delivery.ackBatch(claimed, rejected);
+      return;
+    }
+    for (const id of claimed) await delivery.ack(id, 'claimed');
+    for (const id of rejected) await delivery.ack(id, 'rejected');
   }
 
   // ===========================================================================

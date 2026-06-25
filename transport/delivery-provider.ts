@@ -175,6 +175,16 @@ export interface DeliveryProvider {
   ack(deliveryId: string, disposition: DeliveryDisposition): Promise<void>;
 
   /**
+   * Optional batch acknowledge (#623): claim and reject whole pages of incoming deliveries in a
+   * single request each, instead of one per entry — so draining a large inbox (a long-offline or
+   * service wallet) doesn't fire thousands of writes and trip the per-owner rate limit. Same
+   * semantics as {@link ack}: the seen-set records only entries that were acked successfully, so a
+   * partial/failed batch is re-listed and re-processed (idempotent claim, §6). A provider that does
+   * not implement it (e.g. the relay no-op) is driven via per-entry {@link ack}.
+   */
+  ackBatch?(claimed: string[], rejected: string[]): Promise<void>;
+
+  /**
    * Optional wake hook: `callback` fires with the {@link WakeStream} that was
    * nudged when new data may be available on it (e.g. a WS nudge — never a
    * correctness dependency, ARCHITECTURE §9). The wallet-api wake socket
