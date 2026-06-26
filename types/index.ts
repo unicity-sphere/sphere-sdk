@@ -52,7 +52,7 @@ export interface IdentityConfig {
 
 export type TokenStatus =
   | 'pending'      // Initial creation
-  | 'submitted'    // Commitment sent, waiting for proof (NOSTR-FIRST)
+  | 'submitted'    // Commitment sent, awaiting on-chain certification
   | 'confirmed'    // Has inclusion proof
   | 'transferring' // Being transferred
   | 'spent'        // Transferred away
@@ -147,7 +147,7 @@ export interface TransferRequest {
   readonly memo?: string;
   /** Address mode: 'auto' (default) and 'direct' both resolve to the recipient's key-based DirectAddress (D5 — no PROXY). */
   readonly addressMode?: AddressMode;
-  /** Transfer mode: 'instant' (default) sends via Nostr immediately, 'conservative' collects all proofs first */
+  /** @deprecated v2 has a single engine-driven send path; this field is accepted for backwards-compat but IGNORED. */
   readonly transferMode?: TransferMode;
   /** Invoice refund address (DIRECT://) — embedded in on-chain message for return routing */
   readonly invoiceRefundAddress?: string;

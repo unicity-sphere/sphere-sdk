@@ -4,15 +4,15 @@ A modular TypeScript SDK for Unicity wallet operations on Layer 3 (Unicity state
 
 ## Features
 
-- **Wallet Management** - BIP39/BIP32 key derivation, AES-256 encryption
-- **L3 Payments** - Token transfers via the v2 state-transition token engine, concurrent-send safety (SpendQueue)
+- **Wallet Management** - BIP39/BIP32 key derivation; optional password encryption (PBKDF2)
+- **L3 Payments** - Engine-certified token transfers, delivered via the **wallet-api mailbox** (`DeliveryProvider` port); concurrent-send safety (SpendQueue); self-healing coin selection
 - **Invoicing / Accounting** *(experimental — not production-ready, not enabled in the Sphere wallet)* - On-chain invoice lifecycle with payment attribution, auto-return, privacy-preserving hashed invoice IDs; invoices travel as v2 data-token blobs (hex strings) — `createInvoice()` returns the blob, `importInvoice()` accepts it
 - **Token Swaps** - P2P atomic swaps via escrow with DM-based negotiation protocol
 - **Payment Requests** - Request payments with async response tracking
 - **Market (Intents)** - Signed intent bulletin board with semantic search and live feed
 - **Group Chat** - NIP-29 relay-based group messaging with moderation
-- **Nostr Transport** - Resilient P2P messaging with verified publish, health checks, NIP-17 gift-wrap
-- **IPFS Storage** - Decentralized token backup via HTTP API (browser + Node.js)
+- **Messaging (Nostr)** - NIP-17 DMs + NIP-29 group chat and nametag publishing — **messaging only; not the v2 payment rail**
+- **IPFS Sync** *(optional)* - Decentralized token **backup/recovery** — not used for delivery
 - **Multi-Address** - HD address derivation (BIP32/BIP44)
 - **Token Validation** - Engine-based token verification (trust base + spent check via the v2 gateway)
 - **Connect Protocol** - dApp ↔ wallet communication via `ConnectClient` / `ConnectHost` (browser extension + popup)
@@ -48,51 +48,90 @@ See [docs/QUICKSTART-CLI.md](docs/QUICKSTART-CLI.md) for the full command refere
 
 ## Quick Start
 
+> **v2 setup is two provider layers, not one.** `createBrowserProviders` / `createNodeProviders`
+> build only the **base** (storage + transport + oracle). You **must** then add the wallet-api rails
+> with `createWalletApiProviders` — that is what gives the wallet its **delivery** (mailbox) and
+> **token-storage** ports. Skipping it does **not** error; you silently get a wallet that cannot send
+> or receive v2 transfers. This single step is what trips most integrators up.
+
 ```typescript
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
 
-// Create providers (browser) — `network` is required (no default).
-// 'testnet' is the v2 testnet2 gateway; pass the gateway API key for
-// send/mint/invoice operations (see "API Key" below).
-const providers = createBrowserProviders({
-  network: 'testnet',
-  oracle: { apiKey: 'sk_...' },  // testnet2 key is not a secret — see .env.example
+// 1. Base providers: storage + transport + oracle. `network` is REQUIRED here (no default).
+//    The testnet2 gateway key is PUBLIC (not a secret); it is required at runtime for send/mint.
+const base = createBrowserProviders({
+  network: 'testnet',                                          // alias of testnet2 (networkId 4)
+  oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' },   // public testnet2 key
 });
 
-// Initialize (auto-creates wallet if needed)
+// 2. Add the v2 wallet-api rails: mailbox delivery + server token storage + client.
+//    Returns { ...base, delivery, walletApi, tokenStorage }. THIS is the step v1 docs omitted.
+const providers = createWalletApiProviders(base, {
+  baseUrl: 'https://wallet-api.unicity.network',   // your wallet-api deployment (testnet2)
+  network: 'testnet2',
+  deviceId: 'my-stable-device-id',                 // persist this to avoid re-auth each launch
+});
+
+// 3. Init the wallet (auto-creates one if none exists).
 const { sphere, created, generatedMnemonic } = await Sphere.init({
   ...providers,
-  autoGenerate: true,  // Generate mnemonic if wallet doesn't exist
+  autoGenerate: true,
 });
-
 if (created && generatedMnemonic) {
-  console.log('Save this mnemonic:', generatedMnemonic);
+  console.log('SAVE THIS RECOVERY PHRASE:', generatedMnemonic);
 }
 
-// Get identity (L3 DIRECT address is primary)
-console.log('Address:', sphere.identity?.directAddress);
-
-// Get assets with price data
-const assets = await sphere.payments.getAssets();
-console.log('Assets:', assets);
-
-// Get total portfolio value in USD (requires PriceProvider)
-const totalUsd = await sphere.payments.getFiatBalance();
-console.log('Total USD:', totalUsd); // number | null
-
-// Send tokens — the recipient must have a published identity (chain pubkey),
-// e.g. a registered Unicity ID; otherwise send fails with INVALID_RECIPIENT
+// 4. Send — engine-driven, certified on-chain. The recipient needs a published identity
+//    (chain pubkey), e.g. a registered Unicity ID; otherwise send fails with INVALID_RECIPIENT.
 const result = await sphere.payments.send({
   recipient: '@alice',
-  amount: '1000000',
-  coinId: 'UCT',
+  amount: '1000000',     // decimal STRING — never a JS number
+  coinId: 'UCT',         // a symbol auto-resolves to its hex coinId
+  memo: 'hello',
+});
+console.log(result.status);   // 'completed'
+// result.deliveryPending === true is NORMAL, not a failure: the token is certified on-chain but
+// the recipient's mailbox delivery was deferred and will land on retry (see "Send result" below).
+
+// 5. Receive — incoming transfers arrive automatically via the delivery port (background poll +
+//    wake). To drain explicitly (e.g. a CLI/batch app), call receive():
+const { transfers } = await sphere.payments.receive(undefined, (t) => {
+  console.log('received', t.amount, t.coinId);
 });
 
-// Derive additional addresses
-const addr1 = sphere.deriveAddress(1);
-console.log('Address 1:', addr1.address);
+console.log(await sphere.payments.getAssets());
 ```
+
+### What just happened (the provider model)
+
+A v2 wallet is composed from **swappable ports**, layered in two steps:
+
+| Layer | Built by | Ports it supplies |
+|-------|----------|-------------------|
+| **Base** | `createBrowserProviders` / `createNodeProviders` | `storage` (wallet state), `transport` (Nostr — **messaging/nametags only**), `oracle` (gateway/trust base) |
+| **wallet-api rails** | `createWalletApiProviders(base, …)` | `delivery` (mailbox), `walletApi` (REST client), `tokenStorage` (server inventory) |
+
+- **Delivery is a port, not Nostr.** In v2, transfers are certified on-chain by the token engine and the finished token is delivered through the **wallet-api mailbox** (`WalletApiMailboxProvider`). Nostr carries messaging/nametags; IPFS (optional) is token-sync backup only — **neither moves payments.**
+- **Custody.** `createWalletApiProviders` uses server custody (`'inventory'`): the wallet-api holds your token inventory. For **own-custody** (your app keeps token storage, wallet-api is delivery-only), swap in `createOwnStorageWalletApiProviders` (custody `'external'`).
+- **`network` placement.** Required on `createBrowserProviders`/`createNodeProviders` (throws `INVALID_CONFIG` if absent); optional/informational on `Sphere.init`.
+
+For manual/advanced provider wiring, see [Custom Providers Configuration](#custom-providers-configuration). For the deeper integration guide, see [docs/INTEGRATION.md](docs/INTEGRATION.md).
+
+### Send result (`TransferResult`)
+
+`send()` resolves with a `TransferResult`:
+
+| Field | Meaning |
+|-------|---------|
+| `status` | `'completed'` on success. (`'pending' \| 'submitted' \| 'confirmed' \| 'delivered' \| 'failed'` also exist for in-flight/terminal states.) |
+| `deliveryPending` | `true` when the spend is **certified on-chain** but the recipient's **mailbox delivery was deferred** (a full inbox / transient outage). **This is success, not failure** — the token is finalized and the finished blob is journaled and re-delivered automatically. |
+| `deliveryState` | `'landed'` (delivered) or `'pending-delivery'` (deferred, as above). |
+
+Treat `status === 'completed'` as sent. Use `deliveryPending` only to show a "delivery pending" hint — never as an error. `send()` throws only for genuine failures (e.g. `INVALID_RECIPIENT`, insufficient balance); a stale-but-spent source is self-healed (the next live coin is selected automatically).
+
+> `transferMode` on `TransferRequest` is **deprecated** — accepted for backwards-compat but ignored (v2 has a single engine-driven path).
 
 ## Network Configuration
 
@@ -762,26 +801,20 @@ Token Engine (token-engine/)
     (trust base JSON + gateway URL + API key); no state-transition SDK
     objects cross this boundary.
 
-Providers (injectable dependencies)
-├── StorageProvider      - Key-value persistence
-├── TransportProvider    - P2P messaging (Nostr)
-├── OracleProvider       - Network config for the token engine (trust base
-│                          JSON + gateway URL + API key) + legacy v1 RPC
-│                          validateToken (display-only)
-└── TokenStorageProvider - Token backup (IPFS)
+Providers (injectable ports)
+├── StorageProvider      - Wallet-state key-value persistence
+├── TransportProvider    - Messaging (Nostr) — NOT the payment rail
+├── OracleProvider       - Token-engine config (trust base JSON + gateway URL + API key)
+├── DeliveryProvider     - v2 transfer delivery (wallet-api mailbox — WalletApiMailboxProvider)
+└── TokenStorageProvider - Token inventory (wallet-api server custody, or own/local storage)
 
 Implementation (platform-specific)
-├── impl/shared/         - Common interfaces & resolvers
-│   ├── config.ts        - Base configuration types
-│   └── resolvers.ts     - Extend/override pattern utilities
-├── impl/browser/        - Browser implementations
-│   ├── LocalStorageProvider
-│   ├── IndexedDBTokenStorageProvider
-│   └── createBrowserProviders()
-└── impl/nodejs/         - Node.js implementations
-    ├── FileStorageProvider
-    ├── FileTokenStorageProvider
-    └── createNodeProviders()
+├── impl/shared/            - Common interfaces & resolvers
+├── impl/shared/wallet-api/ - the v2 rails (REQUIRED for delivery):
+│   ├── WalletApiMailboxProvider / WalletApiTokenStorageProvider
+│   └── createWalletApiProviders() / createOwnStorageWalletApiProviders()
+├── impl/browser/        - Browser base: LocalStorage/IndexedDB + createBrowserProviders()
+└── impl/nodejs/         - Node.js base: File storage + createNodeProviders()
 
 Core Utilities
 ├── crypto     - Key derivation, hashing, signatures
@@ -1356,20 +1389,25 @@ const bobTag = sphere.getNametagForAddress(1);    // 'bob'
 
 ---
 
-## Known Limitations / TODO
+## Wallet Security & Encryption
 
-### Wallet Encryption
+The wallet seed can be encrypted with a **user password** — PBKDF2-derived key, 100k iterations
+(`core/encryption.ts`). Pass `password` to `Sphere.init` / `Sphere.create` / `Sphere.load`:
 
-Currently, wallet mnemonics are encrypted using a default key (`DEFAULT_ENCRYPTION_KEY` in constants.ts). This provides basic protection but is not secure for production use.
+```typescript
+// Init/create with a password — the seed is encrypted at rest under a PBKDF2-derived key.
+const { sphere } = await Sphere.init({ ...providers, autoGenerate: true, password: userPassword });
 
-**Future implementation needed:**
-- Add user password parameter to `Sphere.create()`, `Sphere.load()`, and `Sphere.init()`
-- Derive encryption key from user password using PBKDF2/Argon2
-- Migration strategy for existing wallets:
-  1. Try decrypting with user-provided password first
-  2. If decryption fails, fallback to `DEFAULT_ENCRYPTION_KEY`
-  3. If fallback succeeds, re-encrypt with new user password
-  4. This ensures backwards compatibility with wallets created before password support
+// Loading later requires the same password.
+const { sphere } = await Sphere.load({ ...providers, password: userPassword });
+
+// Encrypted JSON export/import use the same scheme.
+const encrypted = sphere.exportToJSON({ password: userPassword });
+```
+
+If no `password` is supplied, the seed is stored under a built-in default key
+(`DEFAULT_ENCRYPTION_KEY`) — that is obfuscation at rest, **not** a substitute for a user password.
+Supply a password for any wallet holding real value.
 
 ## License
 
