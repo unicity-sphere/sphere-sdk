@@ -170,6 +170,23 @@ const providers = createBrowserProviders({
 
 The **testnet2 key is not a secret** — it is published in [.env.example](.env.example) and safe to keep in docs and client code. A **mainnet** key, by contrast, IS a secret: keep it in your deploy environment only.
 
+### Testnet2 endpoints (the values we build with)
+
+The `testnet` preset wires most of these automatically — you only pass `network`, `oracle.apiKey`, and the wallet-api `baseUrl`. The full set, for reference and manual wiring:
+
+| What | Value |
+|------|-------|
+| Network | `testnet` (alias `testnet2`), networkId **4** |
+| **Aggregator / gateway** (token engine) | `https://gateway.testnet2.unicity.network` |
+| **Aggregator API key** (public — **not** a secret) | `sk_ddc3cfcc001e4a28ac3fad7407f99590` |
+| **wallet-api** (delivery + token storage) | `https://wallet-api.unicity.network` |
+| **Nostr relay** (messaging / nametags) | `wss://nostr-relay.testnet.unicity.network` |
+| **Group-chat relay** (NIP-29) | `wss://sphere-relay.unicity.network` |
+| **IPFS gateway** (optional token backup) | `https://unicity-ipfs1.dyndns.org` |
+| **Token registry** | `https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json` |
+
+The aggregator key above is the **testnet2** key only and is safe in client code; a **mainnet** key is a real secret. `mainnet`/`dev` still point at v1-era aggregators and cannot serve the v2 engine yet (`AGGREGATOR_ERROR`).
+
 ## Price Provider (Optional)
 
 Enable fiat price display by adding a `price` config. Currently supports CoinGecko API (free and pro tiers).

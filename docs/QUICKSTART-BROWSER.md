@@ -12,7 +12,7 @@ npm install @unicitylabs/sphere-sdk
 |---------|----------|-------------|
 | `@unicitylabs/sphere-sdk` | Yes | The SDK |
 
-**That's it!** No additional dependencies for basic usage. Browser uses native WebSocket. IPFS sync is built-in — no extra packages needed.
+**That's it!** No additional dependencies for basic usage. Browser uses native WebSocket.
 
 > **Note:** No API key is bundled with the SDK. The `testnet` gateway (testnet2, see below) requires one — inject it via `oracle: { apiKey: '...' }`. The testnet2 key is **not a secret** (see `.env.example`): `sk_ddc3cfcc001e4a28ac3fad7407f99590`. A mainnet key, by contrast, IS a secret — keep it in your deploy environment only.
 >
@@ -25,16 +25,25 @@ npm install @unicitylabs/sphere-sdk
 ```typescript
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
 
 async function initWallet() {
-  const providers = createBrowserProviders({
+  // Step 1: Create base providers (storage + transport + oracle)
+  const base = createBrowserProviders({
     network: 'testnet',
     oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' }, // public testnet2 key
   });
 
+  // Step 2: Wrap with wallet-api for v2 mailbox delivery and token storage
+  const providers = createWalletApiProviders(base, {
+    baseUrl: 'https://wallet-api.unicity.network',
+    network: 'testnet2',
+    deviceId: 'my-stable-device-id', // Must be stable across sessions
+  });
+
+  // Step 3: Initialize wallet
   const { sphere, created, generatedMnemonic } = await Sphere.init({
     ...providers,
-    network: 'testnet', // required — Sphere.init throws without it
     autoGenerate: true,
   });
 
@@ -53,6 +62,7 @@ async function initWallet() {
 import { useState, useEffect } from 'react';
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
 
 function useWallet() {
   const [sphere, setSphere] = useState<Sphere | null>(null);
@@ -61,11 +71,22 @@ function useWallet() {
 
   useEffect(() => {
     const init = async () => {
-      const providers = createBrowserProviders({ network: 'testnet' });
+      // Step 1: Create base providers
+      const base = createBrowserProviders({
+        network: 'testnet',
+        oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' }, // public testnet2 key
+      });
 
+      // Step 2: Wrap with wallet-api for v2 delivery
+      const providers = createWalletApiProviders(base, {
+        baseUrl: 'https://wallet-api.unicity.network',
+        network: 'testnet2',
+        deviceId: 'my-stable-device-id',
+      });
+
+      // Step 3: Initialize wallet
       const { sphere, created, generatedMnemonic } = await Sphere.init({
         ...providers,
-        network: 'testnet',
         autoGenerate: true,
       });
 
@@ -120,17 +141,29 @@ function App() {
 import { ref, onMounted, onUnmounted } from 'vue';
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
 
 const sphere = ref<Sphere | null>(null);
 const loading = ref(true);
 const mnemonic = ref<string | null>(null);
 
 onMounted(async () => {
-  const providers = createBrowserProviders({ network: 'testnet' });
+  // Step 1: Create base providers
+  const base = createBrowserProviders({
+    network: 'testnet',
+    oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' }, // public testnet2 key
+  });
 
+  // Step 2: Wrap with wallet-api for v2 delivery
+  const providers = createWalletApiProviders(base, {
+    baseUrl: 'https://wallet-api.unicity.network',
+    network: 'testnet2',
+    deviceId: 'my-stable-device-id',
+  });
+
+  // Step 3: Initialize wallet
   const result = await Sphere.init({
     ...providers,
-    network: 'testnet',
     autoGenerate: true,
   });
 
@@ -172,12 +205,26 @@ async function initWallet() {
   const { createBrowserProviders } = await import(
     '@unicitylabs/sphere-sdk/impl/browser'
   );
+  const { createWalletApiProviders } = await import(
+    '@unicitylabs/sphere-sdk/impl/shared/wallet-api'
+  );
 
-  const providers = createBrowserProviders({ network: 'testnet' });
+  // Step 1: Create base providers
+  const base = createBrowserProviders({
+    network: 'testnet',
+    oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' }, // public testnet2 key
+  });
 
+  // Step 2: Wrap with wallet-api for v2 delivery
+  const providers = createWalletApiProviders(base, {
+    baseUrl: 'https://wallet-api.unicity.network',
+    network: 'testnet2',
+    deviceId: 'my-stable-device-id',
+  });
+
+  // Step 3: Initialize wallet
   return Sphere.init({
     ...providers,
-    network: 'testnet',
     autoGenerate: true,
   });
 }
@@ -196,21 +243,28 @@ export default function WalletPage() {
 }
 ```
 
-## Storage
+## Storage & Delivery
 
-Browser SDK uses two storage mechanisms automatically:
+The v2 SDK combines three storage mechanisms:
 
-| Data | Storage | Persistence |
-|------|---------|-------------|
-| Wallet (mnemonic, nametag) | `localStorage` | Per-domain, survives refresh |
-| Tokens | `IndexedDB` | Per-domain, larger capacity |
+| Data | Storage | Persistence | Role |
+|------|---------|-------------|------|
+| Wallet (mnemonic, nametag) | `localStorage` | Per-domain, survives refresh | Local secret key |
+| Tokens (confirmed transfers) | `IndexedDB` | Per-domain, larger capacity | Token ledger |
+| Mailbox (recipient delivery) | Wallet API | Server-backed, cross-device | v2 certified transfer inbox |
 
 **SSR Note:** If `localStorage` is unavailable (SSR), an in-memory fallback is used.
+
+**Wallet-API Delivery:** The WalletApiMailboxProvider polls the wallet-api server for incoming certified transfers (on behalf of recipient nametags). This is the reference implementation of v2 token delivery — Nostr and IPFS are messaging/backup only, not the payment rail.
 
 ## Configuration Options
 
 ```typescript
-const providers = createBrowserProviders({
+import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
+
+// Step 1: Base providers (required for network, oracle, transport)
+const base = createBrowserProviders({
   // Network: 'mainnet' | 'testnet' | 'testnet2' | 'dev'
   // ('testnet' IS testnet2 — the v2 gateway; mainnet/dev are still v1-era and
   //  cannot serve the v2 engine yet)
@@ -225,7 +279,7 @@ const providers = createBrowserProviders({
     debug: false,
   },
 
-  // Oracle (v2 gateway) options
+  // Oracle (v2 gateway) options — REQUIRED AT RUNTIME for send/mint
   oracle: {
     url: 'https://gateway.testnet2.unicity.network',   // Replace default gateway URL
     apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590',     // Gateway API key (public testnet2 key)
@@ -241,13 +295,26 @@ const providers = createBrowserProviders({
     cacheTtlMs: 60000,        // Cache TTL in ms (default: 60s)
   },
 
-  // Token sync (optional IPFS)
+  // Token sync (optional IPFS backup)
   tokenSync: {
     ipfs: {
       enabled: true,
       additionalGateways: ['https://my-ipfs-gateway.com'],
     },
   },
+});
+
+// Step 2: Wrap with wallet-api for v2 mailbox delivery (REQUIRED for v2)
+const providers = createWalletApiProviders(base, {
+  baseUrl: 'https://wallet-api.unicity.network', // Canonical testnet2 host
+  network: 'testnet2',
+  deviceId: 'my-stable-device-id',               // Must be stable across sessions
+});
+
+// Step 3: Initialize wallet with the composed providers
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
 });
 ```
 
@@ -312,8 +379,8 @@ const registry = TokenRegistry.getInstance();
 
 // List all registered assets
 const allAssets = registry.getAllDefinitions();
-const coins = registry.getFungibleDefinitions();
-const nfts = registry.getNonFungibleDefinitions();
+const coins = registry.getFungibleTokens();
+const nfts = registry.getNonFungibleTokens();
 
 // Look up a specific asset
 const uct = registry.getDefinitionBySymbol('UCT');
@@ -332,11 +399,20 @@ import { isSphereError } from '@unicitylabs/sphere-sdk';
 
 async function sendTokens(recipient: string, amount: string) {
   try {
-    await sphere.payments.send({
+    const result = await sphere.payments.send({
       coinId: 'UCT',
       amount: '1000000',
       recipient: '@alice',
     });
+    
+    // Transfer is certified on-chain, now awaiting recipient mailbox delivery
+    console.log('Status:', result.status);  // 'pending', 'submitted', 'confirmed', 'delivered', 'completed', etc.
+    
+    // deliveryPending=true means certified but recipient delivery deferred (NORMAL, not a failure)
+    if (result.deliveryPending) {
+      console.log('Transfer certified; recipient mailbox delivery in progress...');
+    }
+    
     showToast('Sent!');
   } catch (error) {
     if (isSphereError(error)) {
@@ -378,7 +454,6 @@ async function registerNametag(username: string) {
 // Alternative: register during init
 const { sphere } = await Sphere.init({
   ...providers,
-  network: 'testnet',
   autoGenerate: true,
   nametag: 'alice',
 });
@@ -421,7 +496,6 @@ Enable the accounting module when initializing the wallet:
 ```typescript
 const { sphere } = await Sphere.init({
   ...providers,
-  network: 'testnet',
   autoGenerate: true,
   accounting: true,  // Enable with defaults
 });
@@ -499,7 +573,6 @@ The swap module enables trustless two-party token exchanges via an escrow servic
 ```typescript
 const { sphere } = await Sphere.init({
   ...providers,
-  network: 'testnet',
   autoGenerate: true,
   accounting: true,  // Required (swap uses invoices internally)
   swap: true,        // Enable swap module
@@ -580,14 +653,12 @@ console.log('Progress:', status.progress, 'Escrow state:', status.escrowState);
 // From mnemonic (recovery, plaintext storage — default)
 const { sphere } = await Sphere.init({
   ...providers,
-  network: 'testnet',
   mnemonic: 'word1 word2 word3 ... word12',
 });
 
 // From mnemonic with password encryption
 const { sphere } = await Sphere.init({
   ...providers,
-  network: 'testnet',
   mnemonic: 'word1 word2 word3 ... word12',
   password: 'my-secret-password',
 });
@@ -595,7 +666,6 @@ const { sphere } = await Sphere.init({
 // Load existing wallet with password
 const { sphere } = await Sphere.init({
   ...providers,
-  network: 'testnet',
   password: 'my-secret-password',
 });
 
@@ -611,6 +681,7 @@ sphere.on('nametag:recovered', (data) => {
 import { useState, useEffect, useCallback } from 'react';
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
 
 function WalletApp() {
   const [sphere, setSphere] = useState<Sphere | null>(null);
@@ -622,10 +693,22 @@ function WalletApp() {
   // Initialize wallet
   useEffect(() => {
     const init = async () => {
-      const providers = createBrowserProviders({ network: 'testnet' });
+      // Step 1: Create base providers
+      const base = createBrowserProviders({
+        network: 'testnet',
+        oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' },
+      });
+
+      // Step 2: Wrap with wallet-api for v2 delivery
+      const providers = createWalletApiProviders(base, {
+        baseUrl: 'https://wallet-api.unicity.network',
+        network: 'testnet2',
+        deviceId: 'my-stable-device-id',
+      });
+
+      // Step 3: Initialize wallet
       const { sphere, created, generatedMnemonic } = await Sphere.init({
         ...providers,
-        network: 'testnet',
         autoGenerate: true,
       });
 
@@ -659,12 +742,13 @@ function WalletApp() {
 
     setStatus('Sending...');
     try {
-      await sphere.payments.send({
+      const result = await sphere.payments.send({
         recipient,
         amount,
         coinId: 'UCT',
       });
-      setStatus('Sent!');
+      
+      setStatus(result.deliveryPending ? 'Sent (delivery in progress)' : 'Sent!');
       setRecipient('');
       setAmount('');
 
@@ -810,6 +894,9 @@ Use dynamic import:
 const { createBrowserProviders } = await import(
   '@unicitylabs/sphere-sdk/impl/browser'
 );
+const { createWalletApiProviders } = await import(
+  '@unicitylabs/sphere-sdk/impl/shared/wallet-api'
+);
 ```
 
 ### "Buffer is not defined"
@@ -844,8 +931,9 @@ if (!window.indexedDB) {
 ### WebSocket Connection Failed
 
 ```typescript
-const providers = createBrowserProviders({
+const base = createBrowserProviders({
   network: 'testnet',
+  oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' },
   transport: {
     debug: true,           // Enable logging
     timeout: 10000,        // Increase timeout
