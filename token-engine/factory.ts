@@ -46,6 +46,12 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
   mintJustificationVerifier.register(
     new SplitMintJustificationVerifier(trustBase, predicateVerifier, decodeSpherePaymentData),
   );
+  // Per-asset bridged-token verifiers (e.g. Tron USDT) are supplied by the
+  // consumer and registered here so engine.verify() re-checks bridge lock proofs
+  // on every receive. Each owns a unique CBOR tag (register throws on collision).
+  for (const verifier of config.bridgeJustificationVerifiers ?? []) {
+    mintJustificationVerifier.register(verifier);
+  }
 
   const deps: EngineDeps = {
     client: new StateTransitionClient(new AggregatorClient(config.aggregatorUrl, config.apiKey ?? null)),

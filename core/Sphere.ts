@@ -116,7 +116,7 @@ import {
   isSQLiteDatabase,
   isWalletDatEncrypted,
 } from '../serialization/wallet-dat';
-import { createSphereTokenEngine, createUnicityIdMinter, deriveDirectAddress, type ITokenEngine } from '../token-engine';
+import { createSphereTokenEngine, createUnicityIdMinter, deriveDirectAddress, type EngineConfig, type ITokenEngine } from '../token-engine';
 import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
 
 export function isValidNametag(nametag: string): boolean {
@@ -176,7 +176,19 @@ export interface SphereWalletApiSession extends PaymentsWalletApiPort {
 }
 
 /** Options for creating a new wallet */
-export interface SphereCreateOptions {
+/**
+ * Bridge wiring shared by every init path (06 §W0). The app resolves a
+ * {BridgeManifest} via the plugin façade and passes the built verifiers + the
+ * read-only metadata here; Sphere forwards the verifiers into the token engine.
+ */
+export interface BridgeInitOptions {
+  /** Per-asset bridged-token mint-reason verifiers (forwarded to the engine). */
+  bridgeJustificationVerifiers?: EngineConfig['bridgeJustificationVerifiers'];
+  /** Read-only bridged-asset metadata for the UI (badge + Bridge in/out). */
+  bridges?: readonly SphereBridgeInfo[];
+}
+
+export interface SphereCreateOptions extends BridgeInitOptions {
   /** BIP39 mnemonic (12 or 24 words) */
   mnemonic: string;
   /** Custom derivation path (default: m/44'/0'/0') */
@@ -237,7 +249,7 @@ export interface SphereCreateOptions {
 }
 
 /** Options for loading existing wallet */
-export interface SphereLoadOptions {
+export interface SphereLoadOptions extends BridgeInitOptions {
   /** Storage provider instance */
   storage: StorageProvider;
   /** Optional token storage provider (for IPFS sync) */
@@ -292,7 +304,7 @@ export interface SphereLoadOptions {
 }
 
 /** Options for importing a wallet */
-export interface SphereImportOptions {
+export interface SphereImportOptions extends BridgeInitOptions {
   /** BIP39 mnemonic to import */
   mnemonic?: string;
   /** Or master private key (hex) */
@@ -431,6 +443,43 @@ export interface SphereInitOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Per-asset bridged-token mint-reason verifiers (06 §W0). Forwarded into the
+   * token engine so `verify()` re-checks each bridge's source-chain lock proof on
+   * every receive. Built by `createBrowserProviders({ bridges })` from a
+   * {BridgeManifest} via the plugin façade — Sphere holds zero bridge logic.
+   */
+  bridgeJustificationVerifiers?: EngineConfig['bridgeJustificationVerifiers'];
+  /**
+   * Read-only metadata for the bridged assets above (06 §W1): which coins are
+   * bridged, their labels/decimals/finality + return-service URL. Drives the
+   * "bridged" badge + the Bridge in/out UI. Resolved alongside the verifiers.
+   */
+  bridges?: readonly SphereBridgeInfo[];
+}
+
+/**
+ * UI-facing descriptor of one bridged asset (06 §W1). A flat projection of a
+ * {BridgeManifest}/LoadedBridge so the wallet view never imports the plugin.
+ */
+export interface SphereBridgeInfo {
+  /** 32-byte coinId (hex) — the Sphere asset this bridge backs. */
+  readonly coinIdHex: string;
+  /** 32-byte Unicity TokenType (hex) of the bridged asset. */
+  readonly tokenTypeHex: string;
+  /** Human label, e.g. "USDT (bridged · Tron)". */
+  readonly label: string;
+  readonly decimals: number;
+  /** Source-finality threshold an independent receiver enforces. */
+  readonly confirmations: number;
+  /** Source chain id (e.g. Nile = 3448148188). */
+  readonly chainId: number;
+  /** Part-B return-service base URL (bridge-back). */
+  readonly returnServiceUrl: string;
+  /** Deployed vault (base58). */
+  readonly vault: string;
+  /** Source asset contract (base58). */
+  readonly asset: string;
 }
 
 /** Result of init operation */
@@ -528,6 +577,10 @@ export class Sphere {
   private _masterKey: MasterKey | null = null;
   private _mnemonic: string | null = null;
   private _password: string | null = null;
+  /** Bridge mint-reason verifiers forwarded into the token engine (06 §W0). */
+  private _bridgeJustificationVerifiers: EngineConfig['bridgeJustificationVerifiers'] = undefined;
+  /** Read-only bridged-asset metadata for the UI (06 §W1). */
+  private _bridges: readonly SphereBridgeInfo[] = [];
   private _source: WalletSource = 'unknown';
   private _derivationMode: DerivationMode = 'bip32';
   private _basePath: string = DEFAULT_BASE_PATH;
@@ -941,6 +994,8 @@ export class Sphere {
       options.walletApi,
     );
     sphere._password = options.password ?? null;
+    sphere._bridgeJustificationVerifiers = options.bridgeJustificationVerifiers;
+    sphere._bridges = options.bridges ?? [];
 
     // Store mnemonic (encrypted if password provided, plaintext otherwise)
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
@@ -1043,6 +1098,8 @@ export class Sphere {
       options.walletApi,
     );
     sphere._password = options.password ?? null;
+    sphere._bridgeJustificationVerifiers = options.bridgeJustificationVerifiers;
+    sphere._bridges = options.bridges ?? [];
 
     // exists() restores original (disconnected) state — reconnect for reads
     if (!options.storage.isConnected()) {
@@ -1148,6 +1205,8 @@ export class Sphere {
       options.walletApi,
     );
     sphere._password = options.password ?? null;
+    sphere._bridgeJustificationVerifiers = options.bridgeJustificationVerifiers;
+    sphere._bridges = options.bridges ?? [];
 
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
 
@@ -1423,6 +1482,21 @@ export class Sphere {
       ipnsName: this._identity.ipnsName,
       nametag: this._identity.nametag,
     };
+  }
+
+  /**
+   * Read-only metadata for the configured bridged assets (06 §W1). Empty unless
+   * the app passed `bridges` to `Sphere.init` (via `createBrowserProviders`). The
+   * wallet UI uses this to badge bridged balances + drive the Bridge in/out flow.
+   */
+  get bridges(): readonly SphereBridgeInfo[] {
+    return this._bridges;
+  }
+
+  /** Lookup the bridge backing a coin (by 64-hex coinId), or undefined. */
+  bridgeForCoin(coinIdHex: string): SphereBridgeInfo | undefined {
+    const key = coinIdHex.toLowerCase();
+    return this._bridges.find((b) => b.coinIdHex.toLowerCase() === key);
   }
 
   /** Is ready */
@@ -4446,6 +4520,7 @@ export class Sphere {
         apiKey: oracle.getApiKey?.(),
         privateKey: hexToBytes(privateKey),
         trustBaseJson,
+        bridgeJustificationVerifiers: this._bridgeJustificationVerifiers,
       });
     } catch (err) {
       logger.warn(

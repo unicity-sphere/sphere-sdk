@@ -7,6 +7,7 @@
  * intentionally NOT part of this public interface.
  */
 
+import type { IMintJustificationVerifier } from './sdk';
 import type {
   EngineIdentity,
   CoinId,
@@ -16,6 +17,8 @@ import type {
   MintParams,
   MintDataTokenParams,
   TransferParams,
+  BridgeBurnParams,
+  BridgeBurnResult,
   SplitParams,
   SplitResult,
   EngineVerifyResult,
@@ -111,6 +114,13 @@ export interface ITokenEngine {
   transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken>;
   /** Split a token into N value-conserving outputs (burn source + internally mint each output). */
   split(params: SplitParams, options?: EngineOpOptions): Promise<SplitResult>;
+  /**
+   * Bridge-back burn (06 §A1.2): spend a token to `BurnPredicate(reasonHash)` with
+   * `reasonBytes` in the aux data, certify it, and return the burned blob + the
+   * certified state id / tx hash (for nullifier/leaf derivation). The burn is
+   * terminal — the token can never move again.
+   */
+  bridgeBurn(params: BridgeBurnParams, options?: EngineOpOptions): Promise<BridgeBurnResult>;
 
   // ── verification ──────────────────────────────────────────────────────────
   /** Fully verify a token against the trust base. */
@@ -168,6 +178,15 @@ export interface EngineConfig {
   readonly proofPollIntervalMs?: number;
   /** Inclusion-proof overall timeout in ms (0/undefined = no engine-side cap). */
   readonly proofTimeoutMs?: number;
+  /**
+   * Per-asset bridged-token mint-reason verifiers (one per bridged asset, e.g.
+   * `@unicitylabs/bridge-plugin-tron-usdt`). Registered into the engine's
+   * mint-justification verifier so `verify()` re-checks bridge lock proofs on
+   * every receive. Each is dispatched by its CBOR tag (must be unique). The
+   * consumer constructs these — typically with `spherePaymentAmountExtractor`
+   * so the token's declared value is checked against the locked amount.
+   */
+  readonly bridgeJustificationVerifiers?: readonly IMintJustificationVerifier[];
 }
 
 /** Factory signature for the real adapter (implemented in Track A). */

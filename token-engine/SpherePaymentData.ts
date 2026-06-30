@@ -48,7 +48,7 @@ export function sphereAssetToSdk(coinId: CoinId, amount: bigint): Asset {
 
 export class SpherePaymentData implements IPaymentData {
   /** Sphere-private CBOR tag (verified free in the v2 SDK tag space). */
-  public static readonly CBOR_TAG = 39050n;
+  public static readonly CBOR_TAG = 39048n;
   /** Envelope version; bump when the structure changes. */
   public static readonly VERSION = 1n;
 
@@ -90,7 +90,7 @@ export class SpherePaymentData implements IPaymentData {
     return new SpherePaymentData(PaymentAssetCollection.fromCBOR(fields[1]), memo);
   }
 
-  /** Deterministic, versioned, tagged CBOR: `tag(39050)[ version, assets, memo? ]`. */
+  /** Deterministic, versioned, tagged CBOR: `tag(39048)[ version, assets, memo? ]`. */
   public encode(): Promise<Uint8Array> {
     return Promise.resolve(
       CborSerializer.encodeTag(
@@ -130,4 +130,27 @@ export class SpherePaymentData implements IPaymentData {
  */
 export function decodeSpherePaymentData(bytes: Uint8Array): Promise<IPaymentData> {
   return Promise.resolve(SpherePaymentData.fromCBOR(bytes));
+}
+
+/**
+ * Reads the amount a Sphere token declares for `coinId` (32 raw bytes), or null
+ * if it declares none. Shaped as a bridge plugin's value extractor so a bridged
+ * mint-reason verifier can confirm the token's declared value equals the amount
+ * locked on the source chain.
+ *
+ * Example:
+ * ```ts
+ * createTronUsdtBridgePlugin(config, { extractAmount: spherePaymentAmountExtractor });
+ * ```
+ */
+export function spherePaymentAmountExtractor(data: Uint8Array | null, coinId: Uint8Array): bigint | null {
+  if (!data) {
+    return null;
+  }
+  try {
+    const amount = SpherePaymentData.fromCBOR(data).balanceOf(HexConverter.encode(coinId).toLowerCase());
+    return amount > 0n ? amount : null;
+  } catch {
+    return null;
+  }
 }

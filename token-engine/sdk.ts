@@ -35,6 +35,7 @@ export { TokenType } from '@unicitylabs/state-transition-sdk/lib/transaction/Tok
 export { TokenSalt } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenSalt.js';
 export type { ITransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/ITransaction.js';
 export { MintJustificationVerifierService } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/MintJustificationVerifierService.js';
+export type { IMintJustificationVerifier } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/IMintJustificationVerifier.js';
 
 // ── predicates / unlock scripts ─────────────────────────────────────────────
 export type { IPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/IPredicate.js';

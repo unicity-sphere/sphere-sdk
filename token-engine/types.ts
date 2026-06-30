@@ -87,6 +87,24 @@ export interface MintParams {
   readonly recipientPubkey: Uint8Array;
   /** Value to embed in the mint; null mints a value-less token. */
   readonly value?: SphereValue | null;
+  /**
+   * Custom 32-byte token type (e.g. a bridged asset's TokenType). Random when
+   * omitted. Bridge-in (06 §A1.1) passes the asset's TokenType so the minted
+   * token is the bridged asset, not an ad-hoc one.
+   */
+  readonly tokenType?: Uint8Array;
+  /**
+   * Deterministic salt → a stable, committed `tokenId` (`TokenId.fromSalt`).
+   * Bridge-in passes the salt the Tron lock committed to, so the mint produces
+   * exactly the token the lock funds.
+   */
+  readonly salt?: Uint8Array;
+  /**
+   * Genesis mint reason (06 §A1.1) — e.g. a `TronUsdtLockJustification` CBOR. When
+   * present, `Token.mint` runs the matching bridged-asset verifier (registered via
+   * `bridgeJustificationVerifiers`), which re-checks the source-chain lock proof.
+   */
+  readonly genesisReason?: Uint8Array;
 }
 
 /**
@@ -112,6 +130,31 @@ export interface TransferParams {
   readonly recipientPubkey: Uint8Array;
   /** Optional opaque on-chain memo carried on the transfer (read back via `readMemo`). */
   readonly data?: Uint8Array;
+}
+
+/**
+ * Bridge-back burn (06 §A1.2): spend a token to a terminal `BurnPredicate(reasonHash)`
+ * carrying `reasonBytes` in the transfer aux data — the self-contained release
+ * authorization the prover/vault decode. The caller (the app's bridge flow) computes
+ * `reasonHash`/`reasonBytes` via the plugin's pure derivations; the engine certifies.
+ */
+export interface BridgeBurnParams {
+  /** The (whole) token to burn — for a partial return, split first and pass the child. */
+  readonly token: SphereToken;
+  /** `H(reasonBytes)` — the `BurnPredicate` payload (00 §4). */
+  readonly reasonHash: Uint8Array;
+  /** Canonical `BridgeBackReason` CBOR — rides in the burn's aux data. */
+  readonly reasonBytes: Uint8Array;
+}
+
+/** The certified burn artifacts the wallet persists + hands to the return service. */
+export interface BridgeBurnResult {
+  /** The burned-token blob (CBOR) — recovery-critical; resubmittable by anyone. */
+  readonly burnedTokenCbor: Uint8Array;
+  /** The certified burn's state id (00 §5 — into `burnTransitionId`). */
+  readonly burnStateId: Uint8Array;
+  /** The certified burn's transaction hash (00 §5 — into `burnTransitionId`). */
+  readonly burnTxHash: Uint8Array;
 }
 
 /**

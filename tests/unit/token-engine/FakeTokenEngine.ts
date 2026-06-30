@@ -153,6 +153,19 @@ export class FakeTokenEngine implements ITokenEngine {
     });
   }
 
+  public async bridgeBurn(
+    params: import('../../../token-engine/types').BridgeBurnParams,
+    _options?: EngineOpOptions,
+  ): Promise<import('../../../token-engine/types').BridgeBurnResult> {
+    this.consume(params.token);
+    // Deterministic fakes so tests can assert on stable bytes.
+    return {
+      burnedTokenCbor: params.token.blob.token,
+      burnStateId: this.nextId(),
+      burnTxHash: this.nextId(),
+    };
+  }
+
   public async split(params: SplitParams, _options?: EngineOpOptions): Promise<SplitResult> {
     assertConserved(params.token.value ?? { assets: [] }, params.outputs);
     this.consume(params.token);

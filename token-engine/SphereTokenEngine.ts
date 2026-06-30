@@ -27,6 +27,7 @@ import {
   type InclusionProof,
   InclusionProofVerificationStatus,
   type ITransaction,
+  BurnPredicate,
   type MintJustificationVerifierService,
   MintTransaction,
   type NetworkId,
@@ -56,6 +57,8 @@ import type {
   EngineIdentity,
   EngineVerifyResult,
   MintDataTokenParams,
+  BridgeBurnParams,
+  BridgeBurnResult,
   MintParams,
   SphereToken,
   SphereValue,
@@ -146,7 +149,20 @@ export class SphereTokenEngine implements ITokenEngine {
     const recipient = SignaturePredicate.create(params.recipientPubkey);
     const data = params.value ? await SpherePaymentData.fromValue(params.value).encode() : null;
 
-    const mintTx = await MintTransaction.create(this.deps.networkId, recipient, data);
+    // Bridged / custom mints specify a token type, committed salt, and/or a genesis
+    // reason (a bridge lock justification). `Token.mint` runs the registered bridge
+    // verifier on that reason. Plain self-mints keep the original 3-arg path.
+    const isCustom = !!(params.tokenType || params.salt || params.genesisReason);
+    const mintTx = isCustom
+      ? await MintTransaction.create(
+          this.deps.networkId,
+          recipient,
+          data,
+          params.tokenType ? new TokenType(params.tokenType) : TokenType.generate(),
+          params.salt ? TokenSalt.fromBytes(params.salt) : TokenSalt.generate(),
+          params.genesisReason,
+        )
+      : await MintTransaction.create(this.deps.networkId, recipient, data);
     const certificationData = await CertificationData.fromMintTransaction(mintTx);
 
     const response = await this.deps.client.submitCertificationRequest(certificationData);
@@ -224,6 +240,38 @@ export class SphereTokenEngine implements ITokenEngine {
     const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
     const transferred = await params.token.sdkToken.transfer(this.deps.trustBase, this.deps.predicateVerifier, certified);
     return this.wrapToken(transferred);
+  }
+
+  public async bridgeBurn(params: BridgeBurnParams, options?: EngineOpOptions): Promise<BridgeBurnResult> {
+    this.assertOwned(params.token);
+    const transferId = this.resolveTransferId(options);
+    const stateMask = deriveRealization(this.privateKeyHex, transferId, this.resolveOpIndex(options), 'stateMask');
+
+    // Terminal burn: recipient is BurnPredicate(reasonHash); reasonBytes ride in aux.
+    const burnPredicate = BurnPredicate.create(params.reasonHash);
+    const burnTx = await TransferTransaction.create(
+      params.token.sdkToken,
+      burnPredicate as unknown as Parameters<typeof TransferTransaction.create>[1],
+      stateMask,
+      params.reasonBytes,
+    );
+    const unlockScript = await SignaturePredicateUnlockScript.create(burnTx, this.deps.signingService);
+    const certificationData = await CertificationData.fromTransaction(burnTx, unlockScript);
+
+    const proof = await this.submitAndAwaitProof(
+      certificationData,
+      burnTx,
+      'Bridge burn certification failed',
+      'TRANSFER_FAILED',
+      options,
+    );
+    const certified = await burnTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
+    const burned = await params.token.sdkToken.transfer(this.deps.trustBase, this.deps.predicateVerifier, certified);
+
+    // The certified burn's state id + tx hash feed the nullifier/leaf (00 §5/§7).
+    const burnStateId = (await StateId.fromTransaction(burnTx)).data;
+    const burnTxHash = (await burnTx.calculateTransactionHash()).data;
+    return { burnedTokenCbor: burned.toCBOR(), burnStateId, burnTxHash };
   }
 
   public async split(params: SplitParams, options?: EngineOpOptions): Promise<SplitResult> {
