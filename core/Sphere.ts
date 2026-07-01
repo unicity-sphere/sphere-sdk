@@ -3553,8 +3553,9 @@ export class Sphere {
 
     // Register the nametag by publishing the Nostr identity binding (name ↔ chainPubkey).
     // D5: nametags are Nostr bindings only — there is no on-chain nametag token. Receive is
-    // always SignaturePredicate(chainPubkey); the binding is the sole registration act, and its
-    // first-seen-wins failure path below is the uniqueness guard.
+    // always SignaturePredicate(chainPubkey); the binding is the sole registration act. The
+    // binding carries the UNIP-01 marker, so the relay enforces single ownership — a publish
+    // for a name already owned by another key is rejected (the failure path below).
     if (this._transport.publishIdentityBinding) {
       const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
@@ -3673,7 +3674,7 @@ export class Sphere {
    * Check whether a nametag is available to register.
    *
    * D5: nametags are Nostr bindings (name ↔ chainPubkey), not on-chain tokens. Availability is
-   * first-seen-wins — a name is available iff no binding resolves for it.
+   * determined by UNIP-01 resolution — a name is available iff no binding resolves for it.
    *
    * @param nametag - The nametag to check (e.g., "alice" or "@alice")
    * @returns true if available, false if already taken

@@ -850,14 +850,16 @@ export class NostrTransportProvider implements TransportProvider {
 
   async resolveNametag(nametag: string): Promise<string | null> {
     await this.ensureConnectedForResolve();
-    // Delegate to nostr-js-sdk which implements first-seen-wins anti-hijacking
+    // Delegate to nostr-js-sdk, which resolves via UNIP-01 (prefers the
+    // relay-vetted single-owner binding; see unicity-tokens-relay/docs/UNIP-01.md)
     return this.nostrClient!.queryPubkeyByNametag(nametag);
   }
 
   async resolveNametagInfo(nametag: string): Promise<PeerInfo | null> {
     await this.ensureConnectedForResolve();
 
-    // Delegate to nostr-js-sdk which implements first-seen-wins anti-hijacking
+    // Delegate to nostr-js-sdk, which resolves via UNIP-01 (prefers the
+    // relay-vetted single-owner binding; see unicity-tokens-relay/docs/UNIP-01.md)
     const binding = await this.nostrClient!.queryBindingByNametag(nametag);
     if (!binding) {
       logger.debug('Nostr', `resolveNametagInfo: no binding events found for Unicity ID "${nametag}"`);
@@ -869,7 +871,7 @@ export class NostrTransportProvider implements TransportProvider {
 
   /**
    * Resolve a DIRECT:// or PROXY:// address to full peer info.
-   * Performs reverse lookup via nostr-js-sdk with first-seen-wins anti-hijacking.
+   * Performs reverse lookup via nostr-js-sdk (UNIP-01 marker-preferring resolution).
    */
   async resolveAddressInfo(address: string): Promise<PeerInfo | null> {
     await this.ensureConnectedForResolve();
@@ -1039,7 +1041,7 @@ export class NostrTransportProvider implements TransportProvider {
    * Without nametag: publishes base binding (chainPubkey, directAddress)
    * using a per-identity d-tag for address discovery.
    * With nametag: delegates to nostr-js-sdk's publishNametagBinding which handles
-   * conflict detection (first-seen-wins), encryption, and indexed tags.
+   * conflict detection (UNIP-01 single-owner), encryption, and indexed tags.
    *
    * @returns true if successful, false if nametag is taken by another pubkey
    */
