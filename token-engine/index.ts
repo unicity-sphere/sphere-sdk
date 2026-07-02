@@ -17,6 +17,10 @@ export type {
   CreateTokenEngine,
 } from './engine';
 
+// Re-exported so callers can build a `mintJustificationVerifierOverride`
+// (06 §A1.1 bridge self-mint) without importing the SDK directly.
+export type { MintJustificationVerifierService } from './sdk';
+
 export type {
   EngineIdentity,
   SphereNetwork,

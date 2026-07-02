@@ -7,7 +7,7 @@
  * intentionally NOT part of this public interface.
  */
 
-import type { IMintJustificationVerifier } from './sdk';
+import type { IMintJustificationVerifier, MintJustificationVerifierService } from './sdk';
 import type {
   EngineIdentity,
   CoinId,
@@ -52,6 +52,14 @@ export interface EngineOpOptions {
    * opIndex) pairing per source.
    */
   readonly opIndex?: number;
+  /**
+   * Per-call override for genesis verification (06 §A1.1: bridge-in self-mint
+   * trusts its own just-broadcast lock at `confirmations: 0`, rather than the
+   * K-confirmation threshold the shared `bridgeJustificationVerifiers` service
+   * enforces for every other verification). Only `mint()` reads this; absent
+   * everywhere else, the engine's shared service applies as usual.
+   */
+  readonly mintJustificationVerifierOverride?: MintJustificationVerifierService;
 }
 
 /**

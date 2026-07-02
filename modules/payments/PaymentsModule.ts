@@ -29,7 +29,7 @@ import type {
   NametagData,
 } from '../../types/txf';
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
-import type { ITokenEngine, SphereToken, TokenBlob } from '../../token-engine';
+import type { ITokenEngine, MintJustificationVerifierService, SphereToken, TokenBlob } from '../../token-engine';
 import { TransferConflictError } from '../../token-engine';
 import { WalletApiError } from '../../wallet-api';
 import { isV2TransferPayload, type V2TransferPayload } from '../../types/v2-transfer';
@@ -4074,6 +4074,11 @@ export class PaymentsModule {
     tokenType: Uint8Array;
     salt: Uint8Array;
     genesisReason: Uint8Array;
+    /** 06 §A1.1: pass a confirmations:0 self-mint verifier service (the caller
+     * builds it via the bridge plugin's `buildSelfMintVerifierService`) so this
+     * mint trusts the lock it just broadcast, instead of the K-confirmation
+     * threshold `bridgeJustificationVerifiers` enforces everywhere else. */
+    mintJustificationVerifierOverride?: MintJustificationVerifierService;
   }): Promise<{ success: true; token: Token; tokenId: string } | { success: false; error: string }> {
     this.ensureInitialized();
     const engine = this.deps?.tokenEngine;
@@ -4084,13 +4089,16 @@ export class PaymentsModule {
       return { success: false, error: 'Mint amount must be greater than zero' };
     }
     try {
-      const minted = await engine.mint({
-        recipientPubkey: engine.getIdentity().chainPubkey,
-        value: { assets: [{ coinId: params.coinIdHex, amount: params.amount }] },
-        tokenType: params.tokenType,
-        salt: params.salt,
-        genesisReason: params.genesisReason,
-      });
+      const minted = await engine.mint(
+        {
+          recipientPubkey: engine.getIdentity().chainPubkey,
+          value: { assets: [{ coinId: params.coinIdHex, amount: params.amount }] },
+          tokenType: params.tokenType,
+          salt: params.salt,
+          genesisReason: params.genesisReason,
+        },
+        { mintJustificationVerifierOverride: params.mintJustificationVerifierOverride },
+      );
       const { uiToken } = await this.storeEngineToken(engine, minted, { criticalSave: true });
       return { success: true, token: uiToken, tokenId: engine.tokenId(minted) };
     } catch (err) {

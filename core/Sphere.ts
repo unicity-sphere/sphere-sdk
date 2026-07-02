@@ -469,6 +469,9 @@ export interface SphereBridgeInfo {
   readonly tokenTypeHex: string;
   /** Human label, e.g. "USDT (bridged · Tron)". */
   readonly label: string;
+  /** Short ticker for the primary balance display, e.g. "USDT" — the
+   * bridge-derived coinId is never in the token registry. */
+  readonly symbol: string;
   readonly decimals: number;
   /** Source-finality threshold an independent receiver enforces. */
   readonly confirmations: number;
@@ -800,6 +803,10 @@ export class Sphere {
         password: options.password,
         discoverAddresses: options.discoverAddresses,
         onProgress: options.onProgress,
+        // 06 §W0: dropping these silently disabled the bridge UI/verifiers on
+        // every *load* (existing-wallet) path — forward them always.
+        bridgeJustificationVerifiers: options.bridgeJustificationVerifiers,
+        bridges: options.bridges,
       });
       // Store dmSince for forwarding to transport/mux when subscriptions are set up
       if (options.dmSince != null) {
@@ -847,6 +854,10 @@ export class Sphere {
       password: options.password,
       discoverAddresses: options.discoverAddresses,
       onProgress: options.onProgress,
+      // 06 §W0: dropping these silently disabled the bridge UI/verifiers on
+      // every *create* (new-wallet) path — forward them always.
+      bridgeJustificationVerifiers: options.bridgeJustificationVerifiers,
+      bridges: options.bridges,
     });
 
     if (options.dmSince != null) {

@@ -181,7 +181,7 @@ export class SphereTokenEngine implements ITokenEngine {
     const token = await Token.mint(
       this.deps.trustBase,
       this.deps.predicateVerifier,
-      this.deps.mintJustificationVerifier,
+      options?.mintJustificationVerifierOverride ?? this.deps.mintJustificationVerifier,
       certified,
     );
     return this.wrapToken(token);
