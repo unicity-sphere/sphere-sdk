@@ -44,7 +44,7 @@ export { createSphereTokenEngine } from './factory';
 // Typed conflict surface of the recoverable engine (Part E.2): the source state
 // was consumed by a DIFFERENT transaction — a lost race, not a resume. Callers
 // abort the intent and re-plan under a new transferId.
-export { TransferConflictError } from './errors';
+export { TransferConflictError, ProofUnconfirmedError } from './errors';
 
 // Self-issued Unicity ID (nametag) token mint — the v2 analog of the v1
 // nametag mint, stored at registration but unused at runtime (D5 + user

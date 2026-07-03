@@ -24,7 +24,7 @@ import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
 import { FakeTokenEngine, decodeFakeTokenAssets, decodeFakeTokenId } from '../token-engine/FakeTokenEngine';
-import { TransferConflictError } from '../../../token-engine';
+import { TransferConflictError, ProofUnconfirmedError } from '../../../token-engine';
 import { FakeWalletApi } from '../../support/fake-wallet-api';
 import { MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
 import { WalletApiClient, WalletApiError } from '../../../wallet-api';
@@ -836,6 +836,65 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(outcome.conflicted).toEqual([]);
     expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'removed' });
     expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
+  });
+
+  it('#631: a proof-fetch failure AFTER certification keeps the intent OPEN (resume seed survives; no double-spend)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-631-open');
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // The #631 window: the aggregator certifies (the source is consumed on-chain) but the
+    // inclusion-proof fetch THEN throws — modeled by running the REAL op (which marks the source
+    // spent → engine.isSpent(source) === true) and then throwing ProofUnconfirmedError.
+    const realTransfer = sender.engine.transfer.bind(sender.engine);
+    let transferId: string | undefined;
+    vi.spyOn(sender.engine, 'transfer').mockImplementationOnce(async (p, o) => {
+      transferId = o?.transferId;
+      const finished = await realTransfer(p, o); // consumes the source (certifies)
+      void finished;
+      throw new ProofUnconfirmedError('inclusion-proof fetch failed after certification');
+    });
+
+    await expect(
+      sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT, memo: 'lunch' }),
+    ).rejects.toBeInstanceOf(ProofUnconfirmedError);
+
+    // THE FIX: the intent is kept OPEN (was 'aborted' before #631) — the resume seed survives so
+    // resumeOpenIntents can replay the same transferId to recover the proof + delivery. (Resume
+    // convergence of an open intent is covered by the §3.1/#621 resume tests above.)
+    expect(fake.getIntent(SENDER.chainPubkey, transferId!)).toMatchObject({ status: 'open' });
+
+    // Money-safe: the source is terminal 'spent' locally (never restored to 'confirmed' — no
+    // phantom balance), via the restore loop's on-chain isSpent probe.
+    expect(sender.module.getTokens()[0].status).toBe('spent');
+
+    // Nothing committed server-side, nothing delivered: the throw beat applyDelta AND the
+    // blob-journal, so the source row is not removed and the recipient mailbox is empty. Only the
+    // resume SEED was ever at risk — and it now survives instead of being aborted.
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)?.status).not.toBe('removed');
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(0);
+  });
+
+  it('#631 regression: a clean pre-certification failure (plain error, source untouched) still aborts + restores', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-631-clean');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // A plain Error (NOT ProofUnconfirmedError) with NOTHING consumed — a proven clean
+    // pre-certification failure. The fix must leave this on the abort + restore path.
+    let transferId: string | undefined;
+    vi.spyOn(sender.engine, 'transfer').mockImplementationOnce((_p, o) => {
+      transferId = o?.transferId;
+      return Promise.reject(new Error('aggregator rejected — clean, nothing certified'));
+    });
+
+    await expect(sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT })).rejects.toThrow();
+
+    // Unchanged: the untouched source is restored to 'confirmed' and the intent is aborted.
+    expect(sender.module.getTokens()[0].status).toBe('confirmed');
+    expect(fake.getIntent(SENDER.chainPubkey, transferId!)).toMatchObject({ status: 'aborted' });
   });
 
   it('resume of an already-certified SPLIT source records the spend instead of wedging (#622 review)', async () => {

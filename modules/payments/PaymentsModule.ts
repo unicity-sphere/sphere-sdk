@@ -30,7 +30,7 @@ import type {
 } from '../../types/txf';
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
 import type { ITokenEngine, SphereToken, TokenBlob } from '../../token-engine';
-import { TransferConflictError } from '../../token-engine';
+import { TransferConflictError, ProofUnconfirmedError } from '../../token-engine';
 import { WalletApiError } from '../../wallet-api';
 import { isV2TransferPayload, type V2TransferPayload } from '../../types/v2-transfer';
 import { TokenReservationLedger } from './TokenReservationLedger';
@@ -2011,13 +2011,22 @@ export class PaymentsModule {
       //    caller re-plans under a NEW transferId; soft abort keeps the row);
       //    any already-certified legs stay journaled for delivery replay and
       //    converge via the recipient's claim handoff (§6);
-      //  - a failure with NOTHING certified also aborts — an open intent would
-      //    silently re-execute the transfer at the next sign-in after the user
-      //    already saw it fail (and possibly retried it manually);
+      //  - a PROVEN clean pre-certification failure (nothing certified) also
+      //    aborts — an open intent would silently re-execute the transfer at the
+      //    next sign-in after the user already saw it fail (and possibly retried
+      //    it manually);
       //  - a partially-certified non-conflict failure keeps the intent OPEN:
-      //    forward completion via resume is the only exit (§7).
+      //    forward completion via resume is the only exit (§7);
+      //  - #631: a ProofUnconfirmedError (submit accepted / proof fetch
+      //    inconclusive) is NOT "nothing certified" — the source spend may be
+      //    on-chain under result.id, and the intent is the only resume seed. Keep
+      //    it OPEN even when committedOnChainTokenIds is still empty (the throw
+      //    beat the .add()). Resume re-derives the identical tx: it recovers the
+      //    proof + delivery, or records the spend if a foreign tx won — never a
+      //    second on-chain spend.
+      const mayHaveCertified = error instanceof ProofUnconfirmedError;
       if (this.deps?.walletApi) {
-        if (error instanceof TransferConflictError || committedOnChainTokenIds.size === 0) {
+        if (error instanceof TransferConflictError || (committedOnChainTokenIds.size === 0 && !mayHaveCertified)) {
           try {
             await this.deps.walletApi.abortIntent(result.id);
           } catch (abortErr) {
