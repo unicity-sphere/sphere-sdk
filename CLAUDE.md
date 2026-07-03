@@ -550,6 +550,16 @@ authoritative for build success.
   on-chain during a failed send become terminal `'spent'` — never restored to
   `'confirmed'`. Tokens stuck `'transferring'` after a crash are reconciled
   against the network on `load()`.
+- **Possibly-certified failure (`ProofUnconfirmedError`, code
+  `CERTIFICATION_UNCONFIRMED`, `mayHaveCertified`, #631):** when a submit is
+  accepted (or thrown) but the proof fetch is inconclusive, `send()` rejects
+  with this typed error and the intent is kept **OPEN** — the spend may be
+  on-chain. Callers **MUST NOT re-issue `send()`** (a fresh `transferId` on a
+  different source double-pays the recipient); `resumeOpenIntents()` (runs at
+  session start via `startWalletApiSession`; also public/callable) replays the
+  **same `transferId`** to recover the proof + delivery, or records the spend if
+  a foreign tx won — never a second spend. A **proven** clean reject (a known
+  validation-reject submit status) and a `TransferConflictError` still abort.
 
 ### Receive & Verification (v2)
 - v2 transfers arrive as finished tokens: decode + verify + store, no

@@ -129,7 +129,30 @@ For manual/advanced provider wiring, see [Custom Providers Configuration](#custo
 | `deliveryPending` | `true` when the spend is **certified on-chain** but the recipient's **mailbox delivery was deferred** (a full inbox / transient outage). **This is success, not failure** — the token is finalized and the finished blob is journaled and re-delivered automatically. |
 | `deliveryState` | `'landed'` (delivered) or `'pending-delivery'` (deferred, as above). |
 
-Treat `status === 'completed'` as sent. Use `deliveryPending` only to show a "delivery pending" hint — never as an error. `send()` throws only for genuine failures (e.g. `INVALID_RECIPIENT`, insufficient balance); a stale-but-spent source is self-healed (the next live coin is selected automatically).
+Treat `status === 'completed'` as sent. Use `deliveryPending` only to show a "delivery pending" hint — never as an error. A stale-but-spent source is self-healed (the next live coin is selected automatically).
+
+#### Handling `send()` rejections — `CERTIFICATION_UNCONFIRMED` is NOT re-sendable (money-safety)
+
+`send()` throws for genuine failures (`INVALID_RECIPIENT`, insufficient balance, a `TransferConflictError` lost race) **and** for one *indeterminate* case you must handle specially: a **`ProofUnconfirmedError`** (`code: 'CERTIFICATION_UNCONFIRMED'`, `mayHaveCertified: true`). It means the spend **may already be on-chain** but the proof fetch was inconclusive — the SDK keeps the intent **open** and completes it later under the **same `transferId`**.
+
+- ⚠️ **Never re-issue `send()` on `CERTIFICATION_UNCONFIRMED`.** A fresh `send()` mints a new `transferId` on a *different* source, so the original resumes **and** the retry sends → **the recipient is double-paid.** Treat it as *"sent, pending confirmation."*
+- **Recovery is `resumeOpenIntents()`** — it replays the open intent under the same `transferId` (recovers the proof + delivery, or records the spend if a rival tx won; **never a second spend**). It runs automatically at **session start** (`Sphere.init` / `Sphere.load` / re-sign-in). A **long-running bot** that doesn't re-init should call `sphere.payments.resumeOpenIntents()` on startup and periodically — it returns `{ resumed, conflicted, failed }`.
+
+```ts
+import { isSphereError } from '@unicitylabs/sphere-sdk';
+
+try {
+  const result = await sphere.payments.send({ recipient: '@bob', amount, coinId });
+  // result.status === 'completed' (or result.deliveryPending === true) → sent
+} catch (err) {
+  if (isSphereError(err) && err.code === 'CERTIFICATION_UNCONFIRMED') {
+    // Possibly already sent on-chain — DO NOT re-send. Resume finishes it
+    // (auto at next sign-in, or: await sphere.payments.resumeOpenIntents()).
+  } else {
+    // genuine failure — safe to surface to the user / retry
+  }
+}
+```
 
 > `transferMode` on `TransferRequest` is **deprecated** — accepted for backwards-compat but ignored (v2 has a single engine-driven path).
 
