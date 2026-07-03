@@ -77,6 +77,7 @@ import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
 import { sleep } from '../../core/utils';
+import { PumpHealth } from './pump-health';
 import { timeoutSignal } from '../../core/timeout';
 import { randomUUID } from '../../core/uuid';
 import { decodeTokenBlob, encodeTokenBlob, unwrapTokenBlobBytes, TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
@@ -1026,6 +1027,8 @@ export class PaymentsModule {
   private storageEventUnsubscribers: (() => void)[] = [];
   private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly SYNC_DEBOUNCE_MS = 500;
+  /** Quiet-then-escalate logging for the background wallet-api pumps (#630). */
+  private readonly pumpHealth = new PumpHealth();
 
   /** Sync coalescing: concurrent sync() calls share the same operation */
   private _syncInProgress: Promise<{ added: number; removed: number }> | null = null;
@@ -1225,16 +1228,12 @@ export class PaymentsModule {
         ) ?? null;
       // Poll is the correctness path; the wake is just a nudge (§9).
       this.deliveryPollTimer = setInterval(() => {
-        void this.pumpIncomingDeliveries().catch((err) =>
-          logger.warn('Payments', 'Incoming delivery pump (poll) failed:', err)
-        );
+        this.pumpHealth.run('delivery', () => this.pumpIncomingDeliveries());
       }, DELIVERY_POLL_INTERVAL_MS);
       // Inventory poll backstop (§9): converges the owned-token set even if an
       // `inventory` wake is missed, mirroring the delivery/PR pumps' interval.
       this.inventoryPollTimer = setInterval(() => {
-        void this.resyncInventory().catch((err) =>
-          logger.warn('Payments', 'Inventory resync (poll) failed:', err)
-        );
+        this.pumpHealth.run('inventory', () => this.resyncInventory());
       }, DELIVERY_POLL_INTERVAL_MS);
     } else {
       // Subscribe to incoming transfers
@@ -1252,9 +1251,7 @@ export class PaymentsModule {
     this.prBootstrapped = false;
     if (this.paymentRequestsApi()) {
       this.prPollTimer = setInterval(() => {
-        void this.pumpPaymentRequests().catch((err) =>
-          logger.warn('Payments', 'Payment-request pump (poll) failed:', err)
-        );
+        this.pumpHealth.run('payment-requests', () => this.pumpPaymentRequests());
       }, DELIVERY_POLL_INTERVAL_MS);
     } else {
       // Subscribe to incoming payment requests (if supported)
@@ -1463,15 +1460,13 @@ export class PaymentsModule {
     // S3: drain the delivery port's incoming feed once at load (poll + wake
     // keep it drained afterwards).
     if (this.injectedDelivery) {
-      void this.pumpIncomingDeliveries().catch((err) =>
-        logger.warn('Payments', 'Incoming delivery pump (load) failed:', err));
+      this.pumpHealth.run('delivery', () => this.pumpIncomingDeliveries());
     }
 
     // S4: drain the payment-request `?since=` stream once at load (the poll
     // keeps it drained afterwards).
     if (this.paymentRequestsApi()) {
-      void this.pumpPaymentRequests().catch((err) =>
-        logger.warn('Payments', 'Payment-request pump (load) failed:', err));
+      this.pumpHealth.run('payment-requests', () => this.pumpPaymentRequests());
     }
   }
 
@@ -4744,17 +4739,13 @@ export class PaymentsModule {
   private handleWake(stream: WakeStream): void {
     switch (stream) {
       case 'mailbox':
-        void this.pumpIncomingDeliveries().catch((err) =>
-          logger.warn('Payments', 'Incoming delivery pump (wake) failed:', err)
-        );
+        this.pumpHealth.run('delivery', () => this.pumpIncomingDeliveries());
         return;
       case 'inventory':
         this.debouncedInventorySyncFromWake();
         return;
       case 'payment_requests':
-        void this.pumpPaymentRequests().catch((err) =>
-          logger.warn('Payments', 'Payment-request pump (wake) failed:', err)
-        );
+        this.pumpHealth.run('payment-requests', () => this.pumpPaymentRequests());
         return;
     }
   }
@@ -4770,9 +4761,7 @@ export class PaymentsModule {
     }
     this.syncDebounceTimer = setTimeout(() => {
       this.syncDebounceTimer = null;
-      void this.resyncInventory().catch((err) =>
-        logger.debug('Payments', 'Inventory resync (wake) failed:', err)
-      );
+      this.pumpHealth.run('inventory', () => this.resyncInventory());
     }, PaymentsModule.SYNC_DEBOUNCE_MS);
   }
 

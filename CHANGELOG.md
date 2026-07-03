@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **wallet-api client resilience (#630):** the §16 REST client now rides out transient failures
+  instead of surfacing them raw. Idempotent GETs retry a dropped/reset connection (a DNS /
+  `ENOTFOUND` blip) with bounded exponential backoff **+ full jitter**; a `429` retries on any
+  method and a `503` on GETs, both honoring the server `Retry-After` (capped). Tunable via
+  `WalletApiClientConfig.retry` / `WalletApiCompositionConfig.retry` (default-on; `false` disables).
+  The three background pumps (mailbox, payment-requests, inventory) no longer dump a full
+  `WalletApiError` stack every 30 s tick during an outage — a transient network failure is a single
+  `debug` line, escalating to one `warn` only after several consecutive failures, with a recovery
+  line when it clears; non-network faults stay loud and immediate. Adds `WalletApiRetryConfig` and
+  `HeadersLike`; extends `FetchResponseLike` with an optional `headers` accessor. `payments.send`
+  transient-failure safety is unchanged — a wallet-api NETWORK error never re-mints a `transferId`;
+  same-`transferId` E.2 resume already covers it.
 - `parseTokenAmount(value, decimals)` / `safeParseTokenAmount(value, decimals)` — strict
   human-readable → smallest-units parsing with ethers `parseUnits` semantics. `parseTokenAmount`
   throws `SphereError('INVALID_AMOUNT')` on empty/non-string input, non-decimal strings (sign,

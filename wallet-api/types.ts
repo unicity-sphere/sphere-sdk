@@ -30,9 +30,20 @@ export type FetchLike = (url: string, init?: {
   body?: string | Uint8Array;
 }) => Promise<FetchResponseLike>;
 
+/** Minimal response-header accessor — native `fetch` `Response.headers` satisfies it. */
+export interface HeadersLike {
+  get(name: string): string | null;
+}
+
 export interface FetchResponseLike {
   status: number;
   ok: boolean;
+  /**
+   * Optional response headers. Native `fetch` supplies them; test doubles may
+   * omit. Read to honor `Retry-After` on a `429`/`503` (ARCHITECTURE §16) — when
+   * absent, the client falls back to its own computed backoff.
+   */
+  headers?: HeadersLike;
   text(): Promise<string>;
   arrayBuffer(): Promise<ArrayBuffer>;
 }
@@ -78,6 +89,37 @@ export interface WalletApiClientConfig {
   webSocketFactory?: WebSocketFactoryLike;
   /** Injectable clock (ms since epoch) for challenge plausibility checks. */
   now?: () => number;
+  /**
+   * Transient-failure retry policy for the §16 REST path (default-on). Pass
+   * `false` to disable (a single attempt). See {@link WalletApiRetryConfig}.
+   */
+  retry?: WalletApiRetryConfig | false;
+}
+
+/**
+ * Retry policy for transient REST failures (S1). Every field defaults when
+ * omitted; the classes of retry differ by safety:
+ * - a transient `NETWORK` failure (dropped/reset connection, DNS blip) is
+ *   retried on **idempotent GETs only** — a lost-response retry of a write could
+ *   double-apply;
+ * - an HTTP **429** is retried on **any** method — a 429 is rejected *before*
+ *   execution (the write never ran), so re-issuing is safe — honoring the
+ *   server's `Retry-After`;
+ * - an HTTP **503** is retried on **GETs only** (a write may have started).
+ */
+export interface WalletApiRetryConfig {
+  /** Total attempts including the first (default 3). */
+  maxAttempts?: number;
+  /** Base delay in ms for the exponential schedule (default 200). */
+  baseMs?: number;
+  /** Backoff ceiling in ms (default 10_000). */
+  capMs?: number;
+  /** Full jitter (default) spreads retries across clients; `'none'` is deterministic. */
+  jitter?: 'full' | 'none';
+  /** Honor a server `Retry-After` on 429/503 (default true). */
+  honorRetryAfter?: boolean;
+  /** Ceiling in ms for an honored `Retry-After` (default 60_000). */
+  maxRetryAfterMs?: number;
 }
 
 /** The wallet identity the client authenticates as. */
