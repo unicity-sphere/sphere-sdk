@@ -140,6 +140,21 @@ describe('WalletApiClient — 429/503 Retry-After + retry config (#630)', () => 
     expect(countOf('PUT', '/v1/intents/')).toBe(1); // write 503 NOT retried
   });
 
+  it('sanitizes a malformed retry config — a NaN maxAttempts stays bounded, never unbounded', async () => {
+    const client = makeClient((u, init) => {
+      const method = init?.method ?? 'GET';
+      const path = String(u);
+      calls.push({ method, path });
+      if (method === 'GET' && path.includes('/v1/inventory')) return Promise.reject(new TypeError('fetch failed'));
+      return realFetch(u, init);
+    }, { maxAttempts: Number.NaN, baseMs: -1, capMs: -1 } as WalletApiRetryConfig);
+
+    await expect(client.listInventory()).rejects.toBeInstanceOf(WalletApiError);
+    const gets = countOf('GET', '/v1/inventory');
+    expect(gets).toBeGreaterThanOrEqual(1);
+    expect(gets).toBeLessThanOrEqual(3); // NaN → sanitized to the default bound (never an infinite loop)
+  });
+
   it('retry:false disables retry — a transient NETWORK GET is attempted exactly once', async () => {
     const client = makeClient((u, init) => {
       const method = init?.method ?? 'GET';

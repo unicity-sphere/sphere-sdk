@@ -169,17 +169,27 @@ const DEFAULT_RETRY: ResolvedRetryConfig = {
   maxRetryAfterMs: 60_000,
 };
 
-/** Fill defaults; `false` disables retry (a single attempt). */
+/** A finite number ≥ `min`, else `fallback` — sanitizes the public retry config. */
+function finiteAtLeast(value: number | undefined, fallback: number, min: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= min ? value : fallback;
+}
+
+/**
+ * Fill defaults and SANITIZE (retry is public API): `false` disables retry; a
+ * non-finite/negative `maxAttempts` (e.g. `NaN`, which would never satisfy
+ * `attempt >= maxAttempts` and loop forever) falls back to the default, and
+ * negative/NaN delays fall back too. Always returns a fresh object.
+ */
 function resolveRetry(cfg: WalletApiRetryConfig | false | undefined): ResolvedRetryConfig {
   if (cfg === false) return { ...DEFAULT_RETRY, maxAttempts: 1 };
-  if (!cfg) return DEFAULT_RETRY;
+  if (!cfg) return { ...DEFAULT_RETRY };
   return {
-    maxAttempts: cfg.maxAttempts ?? DEFAULT_RETRY.maxAttempts,
-    baseMs: cfg.baseMs ?? DEFAULT_RETRY.baseMs,
-    capMs: cfg.capMs ?? DEFAULT_RETRY.capMs,
-    jitter: cfg.jitter ?? DEFAULT_RETRY.jitter,
+    maxAttempts: Math.max(1, Math.floor(finiteAtLeast(cfg.maxAttempts, DEFAULT_RETRY.maxAttempts, 1))),
+    baseMs: finiteAtLeast(cfg.baseMs, DEFAULT_RETRY.baseMs, 0),
+    capMs: finiteAtLeast(cfg.capMs, DEFAULT_RETRY.capMs, 0),
+    jitter: cfg.jitter === 'none' ? 'none' : 'full',
     honorRetryAfter: cfg.honorRetryAfter ?? DEFAULT_RETRY.honorRetryAfter,
-    maxRetryAfterMs: cfg.maxRetryAfterMs ?? DEFAULT_RETRY.maxRetryAfterMs,
+    maxRetryAfterMs: finiteAtLeast(cfg.maxRetryAfterMs, DEFAULT_RETRY.maxRetryAfterMs, 0),
   };
 }
 
