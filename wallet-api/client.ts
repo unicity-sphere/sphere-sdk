@@ -496,7 +496,11 @@ export class WalletApiClient {
     const retryable = res.status === 429 || (res.status === 503 && idempotent);
     if (!retryable) return null;
     const hinted = this.retry.honorRetryAfter ? this.parseRetryAfter(res) : null;
-    return Math.min(hinted ?? this.backoffMs(attempt), this.retry.maxRetryAfterMs);
+    // A server `Retry-After` is capped at `maxRetryAfterMs`. The fallback backoff
+    // is already bounded by `capMs`, so it is NOT re-clamped here — otherwise a
+    // small `maxRetryAfterMs` would shrink every backoff too (contradicting its
+    // documented "ceiling for an honored Retry-After" contract).
+    return hinted === null ? this.backoffMs(attempt) : Math.min(hinted, this.retry.maxRetryAfterMs);
   }
 
   /** Parse `Retry-After` (delta-seconds or an HTTP-date) to ms, or `null` if absent/unparseable. */

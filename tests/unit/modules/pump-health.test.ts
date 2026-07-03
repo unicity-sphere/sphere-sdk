@@ -89,6 +89,25 @@ describe('PumpHealth — quiet-then-escalate pump logging (#630)', () => {
     expect(warns().filter((w) => /degraded/.test(w.message))).toHaveLength(0); // never escalates
   });
 
+  it('run() classifies a SYNCHRONOUS throw as a failure (never an unhandled rejection)', async () => {
+    const h = new PumpHealth(1);
+    h.run('delivery', () => {
+      throw network(); // throws before returning a Promise
+    });
+    await new Promise((r) => setTimeout(r, 0)); // flush the microtask chain
+    expect(warns()).toHaveLength(1); // degradeAfter=1 → the single failure escalates
+    expect(warns()[0].message).toMatch(/degraded/);
+  });
+
+  it('run() resets the counter on a successful run', async () => {
+    const h = new PumpHealth(2);
+    h.failure('inventory', network()); // #1
+    h.run('inventory', async () => undefined); // success → reset
+    await new Promise((r) => setTimeout(r, 0));
+    h.failure('inventory', network()); // #1 again (not #2) — so no escalation yet
+    expect(warns()).toHaveLength(0);
+  });
+
   it('tracks each pump stream independently', () => {
     const h = new PumpHealth(2);
     h.failure('delivery', network());

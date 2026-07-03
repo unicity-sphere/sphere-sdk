@@ -30,7 +30,12 @@ export type FetchLike = (url: string, init?: {
   body?: string | Uint8Array;
 }) => Promise<FetchResponseLike>;
 
-/** Minimal response-header accessor — native `fetch` `Response.headers` satisfies it. */
+/**
+ * Minimal response-header accessor — native `fetch` `Response.headers` satisfies
+ * it. `get` MUST be case-insensitive, as native `Headers` is: the client looks
+ * `Retry-After` up in lowercase, so a case-sensitive test double would silently
+ * miss it.
+ */
 export interface HeadersLike {
   get(name: string): string | null;
 }

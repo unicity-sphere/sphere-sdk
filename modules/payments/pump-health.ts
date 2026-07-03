@@ -38,10 +38,14 @@ export class PumpHealth {
 
   /** Run a pump and record its outcome (success resets; failure classifies + counts). */
   run(key: PumpKey, run: () => Promise<unknown>): void {
-    void run().then(
-      () => this.success(key),
-      (err) => this.failure(key, err),
-    );
+    // `Promise.resolve().then(run)` so a SYNCHRONOUS throw in `run` is classified
+    // too, not left as an unhandled rejection.
+    void Promise.resolve()
+      .then(run)
+      .then(
+        () => this.success(key),
+        (err) => this.failure(key, err),
+      );
   }
 
   failure(key: PumpKey, err: unknown): void {
