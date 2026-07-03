@@ -14,7 +14,7 @@
 
 import { SphereError, type SphereErrorCode } from '../core/errors';
 import { randomUUID } from '../core/uuid';
-import { TransferConflictError } from './errors';
+import { TransferConflictError, ProofUnconfirmedError } from './errors';
 import { deriveDirectAddress, UNICITY_TOKEN_TYPE_HEX } from './identity';
 import { deriveDeliveryKeys } from './blob-keys';
 import { deriveRealization } from './realization';
@@ -83,6 +83,26 @@ export interface EngineDeps {
 
 /** Canonical lowercase UUID — the spec's `transferId` wire form (sdk-changes E.1). */
 const TRANSFER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * The KNOWN validation-reject submit statuses: a well-formed rejection that PROVES the
+ * state was never certified (a byte-identical resume of a *valid* tx never later returns
+ * a format/signature/state/shard-mismatch failure). E.2 is status-AGNOSTIC for everything
+ * else: an UNKNOWN or transitional non-SUCCESS status (e.g. the gateway's transitional
+ * `STATE_ID_EXISTS`) means "a certification for this state MAY already exist" — it must be
+ * treated as possibly-certified (keep the intent OPEN — #631), NEVER a clean abort. Any
+ * status outside this set therefore falls through to `ProofUnconfirmedError`.
+ */
+const CLEAN_REJECT_STATUSES: ReadonlySet<string> = new Set([
+  CertificationStatus.STATE_ID_MISMATCH,
+  CertificationStatus.SIGNATURE_VERIFICATION_FAILED,
+  CertificationStatus.INVALID_SIGNATURE_FORMAT,
+  CertificationStatus.INVALID_PUBLIC_KEY_FORMAT,
+  CertificationStatus.INVALID_SOURCE_STATE_HASH_FORMAT,
+  CertificationStatus.INVALID_TRANSACTION_HASH_FORMAT,
+  CertificationStatus.UNSUPPORTED_ALGORITHM,
+  CertificationStatus.INVALID_SHARD,
+]);
 
 export class SphereTokenEngine implements ITokenEngine {
   /** Hex form of the wallet key — deriveRealization's ikm input (Part E.1). */
@@ -418,10 +438,16 @@ export class SphereTokenEngine implements ITokenEngine {
     options?: EngineOpOptions,
   ): Promise<InclusionProof> {
     let submitError: unknown = null;
+    // true ONLY for a KNOWN validation-reject status — a PROVEN clean pre-certification
+    // reject (nothing on-chain). Status-agnostic otherwise (E.2): an UNKNOWN/transitional
+    // non-SUCCESS status may have certified, and a THROWN submit POST may have been
+    // processed server-side — both stay INDETERMINATE (keep-open, #631).
+    let submitRejectedCleanly = false;
     try {
       const response = await this.deps.client.submitCertificationRequest(certificationData);
       if (response.status !== CertificationStatus.SUCCESS) {
         submitError = new SphereError(`${failLabel}: ${response.status}`, failCode);
+        submitRejectedCleanly = CLEAN_REJECT_STATUSES.has(response.status);
       }
     } catch (err) {
       submitError = err ?? new SphereError(`${failLabel}: submit failed`, failCode);
@@ -450,9 +476,20 @@ export class SphereTokenEngine implements ITokenEngine {
           err,
         );
       }
-      // No certification materialized and the submit itself had failed.
-      if (submitError !== null) throw submitError;
-      throw err;
+      // A PROVEN clean pre-certification reject (well-formed non-SUCCESS status)
+      // → the state was genuinely never certified; surface the original error so
+      // the caller aborts + restores the untouched source.
+      if (submitRejectedCleanly) throw submitError;
+      // Otherwise INDETERMINATE (#631): the submit returned SUCCESS (submitError
+      // === null) and the proof fetch threw, OR the submit POST itself threw (may
+      // have been processed server-side). The source spend MAY be on-chain under
+      // THIS transferId — surface a typed keep-open signal so the caller keeps the
+      // intent OPEN and resumes under the same transferId instead of aborting.
+      throw new ProofUnconfirmedError(
+        `${failLabel}: certification unconfirmed — the source spend may be on-chain; ` +
+          'keep the intent open and resume under the same transferId',
+        submitError ?? err,
+      );
     }
   }
 

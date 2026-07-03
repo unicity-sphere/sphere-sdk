@@ -35,6 +35,9 @@ export type SphereErrorCode =
   // The source state was consumed by a DIFFERENT transaction (lost race, not a
   // resume) — raised as TransferConflictError (token-engine/errors.ts, Part E.2).
   | 'TRANSFER_CONFLICT'
+  // The op's certification is INDETERMINATE (submit accepted / proof fetch
+  // inconclusive) — raised as ProofUnconfirmedError; keep the intent OPEN (#631).
+  | 'CERTIFICATION_UNCONFIRMED'
   | 'STORAGE_ERROR'
   | 'TRANSPORT_ERROR'
   | 'AGGREGATOR_ERROR'

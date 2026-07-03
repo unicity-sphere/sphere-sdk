@@ -18,7 +18,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { TransferConflictError } from '../../../token-engine/errors';
+import { TransferConflictError, ProofUnconfirmedError } from '../../../token-engine/errors';
 import { deriveRealization } from '../../../token-engine/realization';
 import {
   type CertificationData,
@@ -76,7 +76,8 @@ class CrashAfterBurnClient implements IAggregatorClient {
   }
 }
 
-/** Submit never reaches the aggregator — a genuine submit failure (no proof will exist). */
+/** Submit THROWS (unreachable / lost response) — INDETERMINATE: the POST may have been
+ * processed server-side, so this is not a proven clean reject (#631). */
 class SubmitUnreachableClient implements IAggregatorClient {
   public constructor(private readonly inner: TestAggregatorClient) {}
 
@@ -86,6 +87,50 @@ class SubmitUnreachableClient implements IAggregatorClient {
 
   public submitCertificationRequest(): Promise<CertificationResponse> {
     return Promise.reject(new Error('aggregator unreachable (simulated)'));
+  }
+}
+
+/** Submit LANDS (SUCCESS — the certification exists) but the PROOF FETCH throws: the
+ * canonical #631 window — the source is consumed on-chain, yet no verdict is available. */
+class GetInclusionProofThrowsClient implements IAggregatorClient {
+  public constructor(private readonly inner: TestAggregatorClient) {}
+
+  public submitCertificationRequest(certificationData: CertificationData): Promise<CertificationResponse> {
+    return this.inner.submitCertificationRequest(certificationData); // SUCCESS → certifies
+  }
+
+  public getInclusionProof(): Promise<InclusionProofResponse> {
+    return Promise.reject(new Error('inclusion-proof fetch failed: 503 unavailable'));
+  }
+}
+
+/** Submit resolves with a NON-VALIDATION status UNKNOWN to this SDK's enum (the transitional
+ * `STATE_ID_EXISTS` — "a certification may already exist"), then the proof fetch throws. E.2 is
+ * status-AGNOSTIC: this must be treated as possibly-certified (ProofUnconfirmedError), never a
+ * clean reject — #631. `status` is a plain string, so unknown values parse fine (per the SDK). */
+class UnknownStatusThenProofThrowsClient implements IAggregatorClient {
+  public constructor(private readonly inner: TestAggregatorClient) {}
+
+  public submitCertificationRequest(): Promise<CertificationResponse> {
+    return Promise.resolve({ status: 'STATE_ID_EXISTS' } as unknown as CertificationResponse);
+  }
+
+  public getInclusionProof(): Promise<InclusionProofResponse> {
+    return Promise.reject(new Error('proof fetch failed (transient)'));
+  }
+}
+
+/** Submit resolves with a KNOWN validation-reject status (nothing certified), then the proof fetch
+ * throws. E.2 must surface the clean submit error (→ abort + restore), NOT ProofUnconfirmedError. */
+class ValidationRejectThenProofThrowsClient implements IAggregatorClient {
+  public constructor(private readonly inner: TestAggregatorClient) {}
+
+  public submitCertificationRequest(): Promise<CertificationResponse> {
+    return Promise.resolve({ status: 'STATE_ID_MISMATCH' } as unknown as CertificationResponse);
+  }
+
+  public getInclusionProof(): Promise<InclusionProofResponse> {
+    return Promise.reject(new Error('proof fetch failed (transient)'));
   }
 }
 
@@ -237,10 +282,15 @@ describe('recoverable engine (Part E) — real adapter over in-memory aggregator
       { recipientPubkey: self, coinId: COIN, amount: 40n },
     ];
 
-    await expect(
+    const err = await crashing
       // Short proof-poll budget: the crashed mint submits leave no proof to find.
-      crashing.split({ token: src, outputs }, { transferId, signal: AbortSignal.timeout(2000) }),
-    ).rejects.toThrow('wallet crashed mid-split (simulated)');
+      .split({ token: src, outputs }, { transferId, signal: AbortSignal.timeout(2000) })
+      .then(() => null, (caught: unknown) => caught);
+    // #631: the mint submit crashed AFTER the burn certified — INDETERMINATE (the mint may have
+    // been processed server-side). The engine raises ProofUnconfirmedError (keep-open), preserving
+    // the crash as the cause; resume under the same transferId then completes (below).
+    expect(err).toBeInstanceOf(ProofUnconfirmedError);
+    expect(String((err as { cause?: unknown }).cause)).toContain('wallet crashed mid-split (simulated)');
 
     const resumed = await plain.split({ token: src, outputs }, { transferId });
     expect(resumed.outputs).toHaveLength(2);
@@ -305,9 +355,11 @@ describe('recoverable engine (Part E) — real adapter over in-memory aggregator
     expect((await plain.verify(finished)).ok).toBe(true);
   }, 20000);
 
-  // E.2 third arm: no certification ever landed AND the submit failed — the
-  // ORIGINAL submit error surfaces (a genuine failure, not a resume case).
-  it('E.2: a failed submit with no existing proof rethrows the original submit error', async () => {
+  // E.2 fourth arm (#631): a submit that THROWS (unreachable / lost response) is
+  // INDETERMINATE — it may have been processed server-side — so the engine raises a typed
+  // ProofUnconfirmedError (keep the intent OPEN + resume), preserving the submit error as
+  // the cause. Only a well-formed non-SUCCESS status is a PROVEN clean reject.
+  it('E.2 #631: a throwing/unreachable submit with no proof raises ProofUnconfirmedError (keep-open)', async () => {
     const aggregator = TestAggregatorClient.create();
     const walletKey = SigningService.generatePrivateKey();
     const plain = createTestEngine({ aggregator, privateKey: walletKey });
@@ -321,13 +373,93 @@ describe('recoverable engine (Part E) — real adapter over in-memory aggregator
       recipientPubkey: plain.getIdentity().chainPubkey,
       value: { assets: [{ coinId: COIN, amount: 1n }] },
     });
-    await expect(
-      dead.transfer(
+    const err = await dead
+      .transfer(
         { token: src, recipientPubkey: freshPubkey() },
         // Short proof-poll budget: with no certification the probe can only time out.
         { transferId: crypto.randomUUID(), signal: AbortSignal.timeout(500) },
-      ),
-    ).rejects.toThrow('aggregator unreachable (simulated)');
+      )
+      .then(() => null, (caught: unknown) => caught);
+    expect(err).toBeInstanceOf(ProofUnconfirmedError);
+    expect((err as ProofUnconfirmedError).code).toBe('CERTIFICATION_UNCONFIRMED');
+    expect((err as ProofUnconfirmedError).mayHaveCertified).toBe(true);
+    expect(String((err as { cause?: unknown }).cause)).toContain('aggregator unreachable');
+  }, 20000);
+
+  // #631 canonical window: submit SUCCESS (the certification lands — the source is consumed
+  // on-chain) but the proof FETCH throws. The engine must raise the typed keep-open signal
+  // (ProofUnconfirmedError) — NOT a raw error, NOT TransferConflictError — so the caller keeps
+  // the intent open and recovers via resume instead of orphaning a certified send.
+  it('E.2 #631: submit SUCCESS then a throwing proof fetch raises ProofUnconfirmedError (source is spent)', async () => {
+    const aggregator = TestAggregatorClient.create();
+    const walletKey = SigningService.generatePrivateKey();
+    const plain = createTestEngine({ aggregator, privateKey: walletKey });
+    const flaky = createTestEngine({
+      aggregator,
+      privateKey: walletKey,
+      wireClient: new GetInclusionProofThrowsClient(aggregator),
+    });
+
+    const src = await plain.mint({
+      recipientPubkey: plain.getIdentity().chainPubkey,
+      value: { assets: [{ coinId: COIN, amount: 7n }] },
+    });
+    const err = await flaky
+      .transfer({ token: src, recipientPubkey: freshPubkey() }, { transferId: crypto.randomUUID() })
+      .then(() => null, (caught: unknown) => caught);
+    expect(err).toBeInstanceOf(ProofUnconfirmedError);
+    expect((err as ProofUnconfirmedError).mayHaveCertified).toBe(true);
+    expect(err).not.toBeInstanceOf(TransferConflictError);
+    // the submit landed on the shared aggregator — the source IS spent on-chain, so a resume
+    // under the same transferId can recover the proof (this is exactly why we keep the intent open).
+    expect(await plain.isSpent(src)).toBe(true);
+  }, 20000);
+
+  // #631 status-agnostic classifier: an UNKNOWN/transitional non-SUCCESS status (e.g. STATE_ID_EXISTS
+  // — "a certification may already exist") + a throwing proof fetch is INDETERMINATE and MUST raise
+  // ProofUnconfirmedError (keep-open), NOT a clean abort. Guards against re-arming the #631 orphan on
+  // the submit-status classifier: `!== SUCCESS` is not "proven clean reject".
+  it('E.2 #631: an unknown non-SUCCESS submit status + throwing proof fetch → ProofUnconfirmedError (keep-open)', async () => {
+    const aggregator = TestAggregatorClient.create();
+    const walletKey = SigningService.generatePrivateKey();
+    const plain = createTestEngine({ aggregator, privateKey: walletKey });
+    const flaky = createTestEngine({
+      aggregator,
+      privateKey: walletKey,
+      wireClient: new UnknownStatusThenProofThrowsClient(aggregator),
+    });
+    const src = await plain.mint({
+      recipientPubkey: plain.getIdentity().chainPubkey,
+      value: { assets: [{ coinId: COIN, amount: 3n }] },
+    });
+    const err = await flaky
+      .transfer({ token: src, recipientPubkey: freshPubkey() }, { transferId: crypto.randomUUID(), signal: AbortSignal.timeout(500) })
+      .then(() => null, (caught: unknown) => caught);
+    expect(err).toBeInstanceOf(ProofUnconfirmedError);
+    expect((err as ProofUnconfirmedError).mayHaveCertified).toBe(true);
+  }, 20000);
+
+  // The other side of the classifier: a KNOWN validation-reject status PROVES nothing certified — it
+  // must surface the clean submit error (→ abort + restore), NEVER ProofUnconfirmedError.
+  it('E.2: a known validation-reject status + throwing proof fetch surfaces the clean submit error (abort)', async () => {
+    const aggregator = TestAggregatorClient.create();
+    const walletKey = SigningService.generatePrivateKey();
+    const plain = createTestEngine({ aggregator, privateKey: walletKey });
+    const rejecting = createTestEngine({
+      aggregator,
+      privateKey: walletKey,
+      wireClient: new ValidationRejectThenProofThrowsClient(aggregator),
+    });
+    const src = await plain.mint({
+      recipientPubkey: plain.getIdentity().chainPubkey,
+      value: { assets: [{ coinId: COIN, amount: 3n }] },
+    });
+    const err = await rejecting
+      .transfer({ token: src, recipientPubkey: freshPubkey() }, { transferId: crypto.randomUUID(), signal: AbortSignal.timeout(500) })
+      .then(() => null, (caught: unknown) => caught);
+    expect(err).not.toBeInstanceOf(ProofUnconfirmedError);
+    expect(err).not.toBeInstanceOf(TransferConflictError);
+    expect(String((err as Error).message)).toContain('STATE_ID_MISMATCH');
   }, 20000);
 
   // Pins the EXACT SDK error surface the engine maps to TransferConflictError:
