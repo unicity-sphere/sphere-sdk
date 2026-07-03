@@ -83,6 +83,7 @@ import type {
   WakeSocketHandle,
   WalletApiClientConfig,
   WalletApiIdentity,
+  WalletApiRetryConfig,
   WebSocketFactoryLike,
   WebSocketLike,
 } from './types';
@@ -145,10 +146,52 @@ function defaultWebSocketFactory(url: string): import('./types').WebSocketLike {
   return new Ctor(url);
 }
 
-/** GET-only retry on a transient NETWORK failure (a dropped/reset connection — e.g. a backend under
- * load resetting mid-read). Total attempts and exponential-backoff base. */
-const GET_RETRY_ATTEMPTS = 3;
-const GET_RETRY_BASE_MS = 200;
+/**
+ * Resolved (all-fields-present) form of {@link WalletApiRetryConfig}. Transient
+ * NETWORK failures retry on idempotent GETs; a 429 retries on any method
+ * (rejected before execution); a 503 retries on GETs. See the config type.
+ */
+interface ResolvedRetryConfig {
+  maxAttempts: number;
+  baseMs: number;
+  capMs: number;
+  jitter: 'full' | 'none';
+  honorRetryAfter: boolean;
+  maxRetryAfterMs: number;
+}
+
+const DEFAULT_RETRY: ResolvedRetryConfig = {
+  maxAttempts: 3,
+  baseMs: 200,
+  capMs: 10_000,
+  jitter: 'full',
+  honorRetryAfter: true,
+  maxRetryAfterMs: 60_000,
+};
+
+/** A finite number ≥ `min`, else `fallback` — sanitizes the public retry config. */
+function finiteAtLeast(value: number | undefined, fallback: number, min: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= min ? value : fallback;
+}
+
+/**
+ * Fill defaults and SANITIZE (retry is public API): `false` disables retry; a
+ * non-finite/negative `maxAttempts` (e.g. `NaN`, which would never satisfy
+ * `attempt >= maxAttempts` and loop forever) falls back to the default, and
+ * negative/NaN delays fall back too. Always returns a fresh object.
+ */
+function resolveRetry(cfg: WalletApiRetryConfig | false | undefined): ResolvedRetryConfig {
+  if (cfg === false) return { ...DEFAULT_RETRY, maxAttempts: 1 };
+  if (!cfg) return { ...DEFAULT_RETRY };
+  return {
+    maxAttempts: Math.max(1, Math.floor(finiteAtLeast(cfg.maxAttempts, DEFAULT_RETRY.maxAttempts, 1))),
+    baseMs: finiteAtLeast(cfg.baseMs, DEFAULT_RETRY.baseMs, 0),
+    capMs: finiteAtLeast(cfg.capMs, DEFAULT_RETRY.capMs, 0),
+    jitter: cfg.jitter === 'none' ? 'none' : 'full',
+    honorRetryAfter: cfg.honorRetryAfter ?? DEFAULT_RETRY.honorRetryAfter,
+    maxRetryAfterMs: finiteAtLeast(cfg.maxRetryAfterMs, DEFAULT_RETRY.maxRetryAfterMs, 0),
+  };
+}
 
 export class WalletApiClient {
   /** Network name (also the blob-key prefix `<network>/t/<sha256>` — §5.2). */
@@ -160,6 +203,7 @@ export class WalletApiClient {
   private readonly fetchFn: FetchLike;
   private readonly wsFactory: WebSocketFactoryLike;
   private readonly now: () => number;
+  private readonly retry: ResolvedRetryConfig;
 
   private identity: WalletApiIdentity | null = null;
   private jwt: string | null = null;
@@ -195,6 +239,7 @@ export class WalletApiClient {
       config.fetchFn ?? ((u, init) => (globalThis as unknown as { fetch: FetchLike }).fetch(u, init));
     this.wsFactory = config.webSocketFactory ?? defaultWebSocketFactory;
     this.now = config.now ?? (() => Date.now());
+    this.retry = resolveRetry(config.retry);
     this.config = config;
   }
 
@@ -413,41 +458,89 @@ export class WalletApiClient {
   }
 
   /**
-   * GET-only retry on a transient NETWORK failure (a dropped/reset connection — e.g. a backend under
-   * load resetting mid-read). GETs are idempotent, so re-issuing is safe; non-GET methods are NEVER
-   * retried here because a lost-response retry could double-apply a write. Non-NETWORK outcomes (any
-   * HTTP status) come back as a response and are handled by the caller. Bounded exponential backoff.
+   * Retry transient REST failures with bounded exponential backoff + jitter:
+   * - a thrown transient `NETWORK` failure (dropped/reset connection, DNS blip)
+   *   retries on **idempotent GETs only** — a lost-response retry of a write
+   *   could double-apply;
+   * - a `429` response retries on **any** method (a 429 is rejected before the
+   *   handler runs — the write never executed), honoring the server `Retry-After`;
+   * - a `503` response retries on **GETs only** (a write may have started).
+   * Every other outcome (2xx, or a non-retryable status) is returned to the
+   * caller, which maps a non-2xx to a typed {@link WalletApiError}.
    */
-  private async rawFetchWithReadRetry(
+  private async rawFetchWithRetry(
     method: string,
     path: string,
     body: unknown,
     jwt: string
   ): Promise<FetchResponseLike> {
-    const attempts = method === 'GET' ? GET_RETRY_ATTEMPTS : 1;
+    const idempotent = method === 'GET';
     for (let attempt = 1; ; attempt += 1) {
+      let res: FetchResponseLike;
       try {
-        return await this.rawFetch(method, path, body, jwt);
+        res = await this.rawFetch(method, path, body, jwt);
       } catch (err) {
         const transient = err instanceof WalletApiError && err.code === 'NETWORK';
-        if (!transient || attempt >= attempts) throw err;
-        await new Promise((resolve) => setTimeout(resolve, GET_RETRY_BASE_MS * 2 ** (attempt - 1)));
+        if (!transient || !idempotent || attempt >= this.retry.maxAttempts) throw err;
+        await this.sleep(this.backoffMs(attempt));
+        continue;
       }
+      const waitMs = this.retryDelayForStatus(res, idempotent, attempt);
+      if (waitMs === null || attempt >= this.retry.maxAttempts) return res;
+      await this.sleep(waitMs);
     }
+  }
+
+  /** Bounded full-jitter exponential backoff (mirrors the wake supervisor). */
+  private backoffMs(attempt: number): number {
+    const capped = Math.min(this.retry.capMs, this.retry.baseMs * 2 ** (attempt - 1));
+    return this.retry.jitter === 'none' ? capped : Math.floor(Math.random() * capped);
+  }
+
+  /**
+   * Delay before retrying a non-2xx response, or `null` to not retry. `429`
+   * retries on any method (rejected before execution); `503` on idempotent GETs.
+   * Honors a capped `Retry-After` when present, else falls back to backoff.
+   */
+  private retryDelayForStatus(res: FetchResponseLike, idempotent: boolean, attempt: number): number | null {
+    const retryable = res.status === 429 || (res.status === 503 && idempotent);
+    if (!retryable) return null;
+    const hinted = this.retry.honorRetryAfter ? this.parseRetryAfter(res) : null;
+    // A server `Retry-After` is capped at `maxRetryAfterMs`. The fallback backoff
+    // is already bounded by `capMs`, so it is NOT re-clamped here — otherwise a
+    // small `maxRetryAfterMs` would shrink every backoff too (contradicting its
+    // documented "ceiling for an honored Retry-After" contract).
+    return hinted === null ? this.backoffMs(attempt) : Math.min(hinted, this.retry.maxRetryAfterMs);
+  }
+
+  /** Parse `Retry-After` (delta-seconds or an HTTP-date) to ms, or `null` if absent/unparseable. */
+  private parseRetryAfter(res: FetchResponseLike): number | null {
+    const raw = res.headers?.get('retry-after');
+    if (!raw) return null;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+    const when = Date.parse(raw);
+    return Number.isNaN(when) ? null : Math.max(0, when - this.now());
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
    * Authenticated JSON request. A 401 triggers one silent re-auth
-   * (refresh → challenge fallback) and one retry; idempotent GETs additionally retry a transient
-   * NETWORK failure (rawFetchWithReadRetry) so a single dropped connection doesn't fail the call.
+   * (refresh → challenge fallback) and one retry; {@link rawFetchWithRetry}
+   * additionally rides out transient failures — a dropped connection on an
+   * idempotent GET, or a `429`/`503` with `Retry-After` — so a single blip or a
+   * brief rate-limit window doesn't fail the call.
    */
   private async requestJson(method: string, path: string, body?: unknown): Promise<unknown> {
     if (!this.jwt) await this.signIn();
-    let res = await this.rawFetchWithReadRetry(method, path, body, this.jwt!);
+    let res = await this.rawFetchWithRetry(method, path, body, this.jwt!);
     if (res.status === 401) {
       this.jwt = null;
       await this.signIn();
-      res = await this.rawFetchWithReadRetry(method, path, body, this.jwt!);
+      res = await this.rawFetchWithRetry(method, path, body, this.jwt!);
     }
     if (res.status === 204) return null;
     if (!res.ok) throw await this.toError(res, `${method} ${path}`);

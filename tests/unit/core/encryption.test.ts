@@ -26,6 +26,24 @@ const TEST_PASSWORD = 'test-password-123';
 const TEST_PLAINTEXT = 'Hello, World! This is a secret message.';
 const TEST_MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 
+/**
+ * A wrong password must NEVER recover the original value — assert exactly that,
+ * NOT that decryption throws. CryptoJS AES-CBC is unauthenticated, so a wrong
+ * password yields garbage that only *probabilistically* fails to parse; a bare
+ * `.toThrow()` was therefore flaky. Throwing OR yielding anything ≠ the original
+ * both satisfy the real security invariant (and a wrong key recovering the
+ * plaintext — the one true regression — still fails this).
+ */
+function expectWrongPasswordDoesNotRecover<T>(attempt: () => T, original: T): void {
+  let recovered: T;
+  try {
+    recovered = attempt();
+  } catch {
+    return; // threw → definitely not recovered
+  }
+  expect(recovered).not.toEqual(original);
+}
+
 // =============================================================================
 // encrypt/decrypt Tests
 // =============================================================================
@@ -155,11 +173,10 @@ describe('decryptJson()', () => {
     expect(() => decryptJson(encrypted, TEST_PASSWORD)).toThrow('invalid JSON');
   });
 
-  it('should throw with wrong password', () => {
+  it('does not recover the data with a wrong password', () => {
     const encrypted = encrypt({ test: true }, TEST_PASSWORD);
 
-    // Wrong password can cause either decryption failure or malformed data
-    expect(() => decryptJson(encrypted, 'wrong')).toThrow();
+    expectWrongPasswordDoesNotRecover(() => decryptJson(encrypted, 'wrong'), { test: true });
   });
 });
 
@@ -191,10 +208,10 @@ describe('decryptSimple()', () => {
     expect(decrypted).toBe(TEST_PLAINTEXT);
   });
 
-  it('should throw with wrong password', () => {
+  it('does not recover the plaintext with a wrong password', () => {
     const encrypted = encryptSimple(TEST_PLAINTEXT, TEST_PASSWORD);
 
-    expect(() => decryptSimple(encrypted, 'wrong')).toThrow();
+    expectWrongPasswordDoesNotRecover(() => decryptSimple(encrypted, 'wrong'), TEST_PLAINTEXT);
   });
 
   it('should handle special characters', () => {
@@ -227,11 +244,10 @@ describe('decryptMnemonic()', () => {
     expect(decrypted).toBe(TEST_MNEMONIC);
   });
 
-  it('should throw with wrong password', () => {
+  it('does not recover the mnemonic with a wrong password', () => {
     const encrypted = encryptMnemonic(TEST_MNEMONIC, TEST_PASSWORD);
 
-    // CryptoJS may throw "Malformed UTF-8 data" or our wrapper throws "Decryption failed"
-    expect(() => decryptMnemonic(encrypted, 'wrong')).toThrow();
+    expectWrongPasswordDoesNotRecover(() => decryptMnemonic(encrypted, 'wrong'), TEST_MNEMONIC);
   });
 });
 

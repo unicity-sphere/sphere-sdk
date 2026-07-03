@@ -35,7 +35,7 @@ import type { OracleProvider } from '../../../oracle';
 import type { TokenBlob } from '../../../token-engine/types';
 import { WalletApiClient } from '../../../wallet-api';
 import { randomUUID } from '../../../core/uuid';
-import type { FetchLike, KeyValueStore, WebSocketFactoryLike } from '../../../wallet-api';
+import type { FetchLike, KeyValueStore, WalletApiRetryConfig, WebSocketFactoryLike } from '../../../wallet-api';
 import { WalletApiTokenStorageProvider } from './WalletApiTokenStorageProvider';
 import { WalletApiMailboxProvider } from './WalletApiMailboxProvider';
 
@@ -103,6 +103,8 @@ export interface WalletApiCompositionConfig {
   webSocketFactory?: WebSocketFactoryLike;
   /** Local token verification for `recoverRemoved()` (wire the engine here). */
   verifyToken?: (blob: TokenBlob) => Promise<boolean>;
+  /** Transient-failure retry policy for the §16 REST path (default-on; `false` disables). */
+  retry?: WalletApiRetryConfig | false;
 }
 
 /** What the wallet-api presets add to the base bundle. */
@@ -135,6 +137,7 @@ function buildClient(base: SphereBaseProviders, config: WalletApiCompositionConf
       storage: stateStore,
       fetchFn: config.fetchFn,
       webSocketFactory: config.webSocketFactory,
+      ...(config.retry !== undefined ? { retry: config.retry } : {}),
     });
   return { client, stateStore };
 }
