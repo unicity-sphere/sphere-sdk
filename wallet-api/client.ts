@@ -862,18 +862,21 @@ export class WalletApiClient {
    */
   async postIntentProgress(transferId: string, opIndex: number, payloadEnvelope: string): Promise<string> {
     await this.backstopProgress(transferId, opIndex, payloadEnvelope);
-    const signature = this.signProgress(transferId, opIndex, payloadEnvelope);
-    const body = await this.requestJson('POST', `/v1/intents/${transferId}/progress`, {
-      opIndex,
-      payload: payloadEnvelope,
-      signature,
-    });
-    // Insert-once first-write-wins: a 200 returns the WINNER's envelope, which may differ from ours
-    // if a racing device wrote first. Reconcile the local backstop to the AUTHORITATIVE bytes so a
-    // later syncEpoch re-seed re-POSTs the winner's proof — never our stale losing bytes (which
-    // would make our proof authoritative and mismatch the leg the winner already certified).
+    return this.postProgressEnvelope(transferId, opIndex, payloadEnvelope);
+  }
+
+  /**
+   * POST one checkpoint envelope (signed) and RECONCILE the local backstop to the AUTHORITATIVE
+   * returned envelope. Insert-once first-write-wins: a 200 returns the WINNER's envelope, which may
+   * differ from ours if a racing device wrote first — so re-seeding (or a retry) must carry the
+   * winner's proof, never our stale losing bytes (which would make our proof authoritative and
+   * mismatch the leg the winner already certified). Shared by the append and the syncEpoch re-seed.
+   */
+  private async postProgressEnvelope(transferId: string, opIndex: number, envelope: string): Promise<string> {
+    const signature = this.signProgress(transferId, opIndex, envelope);
+    const body = await this.requestJson('POST', `/v1/intents/${transferId}/progress`, { opIndex, payload: envelope, signature });
     const authoritative = parseProgressRecord(body).payload;
-    if (authoritative !== payloadEnvelope) await this.backstopProgress(transferId, opIndex, authoritative);
+    if (authoritative !== envelope) await this.backstopProgress(transferId, opIndex, authoritative);
     return authoritative;
   }
 
@@ -967,11 +970,9 @@ export class WalletApiClient {
           this.intentPutBody(intent.payload, intent.requiresSeedClose === true)
         );
         for (const [opIndex, envelope] of Object.entries(intent.progress ?? {})) {
-          await this.requestJson('POST', `/v1/intents/${transferId}/progress`, {
-            opIndex: Number(opIndex),
-            payload: envelope,
-            signature: this.signProgress(transferId, Number(opIndex), envelope),
-          });
+          // Reconcile to the authoritative record (a concurrent writer may have won the slot) so a
+          // later re-seed never re-POSTs stale losing bytes — the wedge Copilot flagged on #638.
+          await this.postProgressEnvelope(transferId, Number(opIndex), envelope);
         }
       } else if (intent.status === 'aborted' && intent.abortPending === true) {
         await this.requestJson(
