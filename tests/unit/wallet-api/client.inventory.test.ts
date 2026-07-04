@@ -196,6 +196,41 @@ describe('WalletApiClient — intents (E.3, §16)', () => {
     );
   });
 
+  it('intent progress (E.4): append is insert-once, readable, and gated on requiresSeedClose', async () => {
+    const ckpt = envelope('{"checkpoint":"burn-proof"}');
+    // A checkpoint append requires the intent to be requiresSeedClose (§16/#87).
+    await client.putIntent(tid, envelope('unguarded'));
+    await expect(client.postIntentProgress(tid, 0, ckpt)).rejects.toMatchObject({ code: 'CONFLICT' });
+
+    // A seed-close split intent accepts the signed append; the response is the AUTHORITATIVE stored
+    // envelope, insert-once (a re-POST of the same slot returns the first record byte-identically).
+    const splitTid = 'cccccccc-0000-4000-8000-000000000001';
+    await client.putIntent(splitTid, envelope('split'), { requiresSeedClose: true });
+    expect(await client.postIntentProgress(splitTid, 0, ckpt)).toBe(ckpt); // 201 → our bytes
+    expect(await client.postIntentProgress(splitTid, 0, envelope('other'))).toBe(ckpt); // 200 → first wins
+    const records = await client.getIntentProgress(splitTid);
+    expect(records).toMatchObject([{ opIndex: 0, payload: ckpt }]);
+
+    // The signed uniform close succeeds for the checkpoint-bearing intent (the fake requires a sig).
+    await client.completeIntent(splitTid);
+    expect(fake.getIntent(identity.chainPubkey, splitTid)?.status).toBe('completed');
+  });
+
+  it('progress records ride the E.3 re-seed: resync re-POSTs the local backstop after a restore', async () => {
+    const splitTid = 'cccccccc-0000-4000-8000-000000000002';
+    const ckpt = envelope('{"checkpoint":"x"}');
+    await client.putIntent(splitTid, envelope('split'), { requiresSeedClose: true });
+    await client.postIntentProgress(splitTid, 0, ckpt);
+
+    // Simulate a server restore that dropped the rows; the client re-seeds from its local backstop.
+    fake.dropIntent(identity.chainPubkey, splitTid);
+    expect(fake.getIntent(identity.chainPubkey, splitTid)).toBeNull();
+    await client.resyncOpenIntents();
+
+    expect(fake.getIntent(identity.chainPubkey, splitTid)?.status).toBe('open');
+    expect(await client.getIntentProgress(splitTid)).toMatchObject([{ opIndex: 0, payload: ckpt }]);
+  });
+
   it('PUT is write-once while open: a different payload is a no-op (§16)', async () => {
     const p1 = envelope('one');
     const p2 = envelope('two');

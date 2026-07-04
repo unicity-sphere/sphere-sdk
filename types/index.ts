@@ -421,6 +421,7 @@ export type SphereEventType =
   | 'sync:error'
   | 'storage:degraded'
   | 'inventory:conflict'
+  | 'split:checkpoint-stuck'
   | 'delivery:undeliverable'
   | 'delivery:deferred'
   | 'walletapi:session'
@@ -528,6 +529,14 @@ export interface SphereEventMap {
    * "refresh and retry". `transferId` is the aborted send's id.
    */
   'inventory:conflict': { transferId: string; coinId: string; error: string };
+  /**
+   * E.4 (sphere-sdk#501): a burn-certified split is stuck on a keep-open checkpoint error — the
+   * stored checkpoint is lost/unreadable (`SPLIT_CHECKPOINT_LOST`) or no longer verifies against the
+   * current trust base (`CHECKPOINT_TRUSTBASE_MISMATCH`, a validator rotation). The intent stays
+   * OPEN (never aborted — funds are in-flight, not lost), but this needs operator attention (the
+   * drain remedy), NOT a silent retry. Distinct from a transient resume failure.
+   */
+  'split:checkpoint-stuck': { transferId: string; code: string; error: string };
   /**
    * A journaled finished-but-undelivered v2 transfer blob (#517) has exhausted
    * its bounded replay budget and is now POISON: it stays journaled (the deposit

@@ -30,6 +30,7 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 
 import { signMessage } from '../core/crypto';
+import { completeSignMessage, progressSignMessage } from './intent-signing';
 import { WalletApiError } from './errors';
 import { verifyChallengeTemplate } from './challenge';
 import {
@@ -47,6 +48,8 @@ import {
   parseDepositResult,
   parseHistoryPage,
   parseIntents,
+  parseProgressRecord,
+  parseProgressRecords,
   parseInventoryPage,
   parseMailboxPage,
   parsePaymentRequestRecord,
@@ -74,6 +77,7 @@ import type {
   MailboxPage,
   PaymentRequestRecord,
   PaymentRequestsPage,
+  ProgressRecord,
   RespondPaymentRequestInput,
   SupervisedWakeSocketHandle,
   SuperviseWakeOptions,
@@ -99,6 +103,17 @@ interface LocalIntent {
    * resume re-executing a send the user watched fail.
    */
   abortPending?: boolean;
+  /**
+   * E.4/#87: a split intent whose terminal close needs a seed-holder signature. Set at PUT (before
+   * the burn); re-PUT with the same flag on a syncEpoch re-seed; the close is signed when it is set.
+   */
+  requiresSeedClose?: boolean;
+  /**
+   * E.4 burn-checkpoint backstop: the exact enc1. envelope(s) POSTed to
+   * `/v1/intents/{id}/progress`, keyed by opIndex. Persisted BEFORE the first POST and re-POSTed
+   * byte-identically on retry / syncEpoch re-seed (content-idempotent; re-encryption is forbidden).
+   */
+  progress?: Record<number, string>;
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -813,13 +828,74 @@ export class WalletApiClient {
    * the local copy stays as the restore backstop and is re-PUT by
    * {@link resyncOpenIntents}.
    */
-  async putIntent(transferId: string, payloadEnvelope: string): Promise<void> {
+  async putIntent(
+    transferId: string,
+    payloadEnvelope: string,
+    opts: { requiresSeedClose?: boolean } = {}
+  ): Promise<void> {
+    const requiresSeedClose = opts.requiresSeedClose === true;
     const intents = await this.readLocalIntents();
     if (!intents[transferId]) {
-      intents[transferId] = { payload: payloadEnvelope, status: 'open', createdAt: this.now() };
+      intents[transferId] = {
+        payload: payloadEnvelope,
+        status: 'open',
+        createdAt: this.now(),
+        ...(requiresSeedClose ? { requiresSeedClose: true } : {}),
+      };
       await this.writeLocalIntents(intents);
     }
-    await this.requestJson('PUT', `/v1/intents/${transferId}`, { payload: payloadEnvelope });
+    await this.requestJson('PUT', `/v1/intents/${transferId}`, this.intentPutBody(payloadEnvelope, requiresSeedClose));
+  }
+
+  /** §16/#87: requiresSeedClose is honored only on first insert (write-once); omit it when false. */
+  private intentPutBody(payloadEnvelope: string, requiresSeedClose: boolean): Record<string, unknown> {
+    return requiresSeedClose ? { payload: payloadEnvelope, requiresSeedClose: true } : { payload: payloadEnvelope };
+  }
+
+  // ── intent progress: the E.4 burn checkpoint (sphere-sdk#501) ────────────────
+
+  /**
+   * `POST /v1/intents/{id}/progress` — append the split burn checkpoint envelope for `opIndex`,
+   * signed with the wallet chain key (§16/#87). Returns the AUTHORITATIVE stored envelope
+   * (insert-once first-write-wins: our bytes on 201, the winner's on 200 — the caller adopts it).
+   * The envelope is backed up locally BEFORE the POST and re-POSTed byte-identically on retry.
+   */
+  async postIntentProgress(transferId: string, opIndex: number, payloadEnvelope: string): Promise<string> {
+    await this.backstopProgress(transferId, opIndex, payloadEnvelope);
+    const signature = this.signProgress(transferId, opIndex, payloadEnvelope);
+    const body = await this.requestJson('POST', `/v1/intents/${transferId}/progress`, {
+      opIndex,
+      payload: payloadEnvelope,
+      signature,
+    });
+    // Insert-once first-write-wins: a 200 returns the WINNER's envelope, which may differ from ours
+    // if a racing device wrote first. Reconcile the local backstop to the AUTHORITATIVE bytes so a
+    // later syncEpoch re-seed re-POSTs the winner's proof — never our stale losing bytes (which
+    // would make our proof authoritative and mismatch the leg the winner already certified).
+    const authoritative = parseProgressRecord(body).payload;
+    if (authoritative !== payloadEnvelope) await this.backstopProgress(transferId, opIndex, authoritative);
+    return authoritative;
+  }
+
+  /** `GET /v1/intents/{id}/progress` → the stored checkpoint records (ascending opIndex). */
+  async getIntentProgress(transferId: string): Promise<ProgressRecord[]> {
+    return parseProgressRecords(await this.requestJson('GET', `/v1/intents/${transferId}/progress`));
+  }
+
+  /** The E.4 seed-holder append signature over the exact stored-envelope bytes. */
+  private signProgress(transferId: string, opIndex: number, payloadEnvelope: string): string {
+    return signMessage(this.requireIdentity().privateKey, progressSignMessage(transferId, opIndex, payloadEnvelope));
+  }
+
+  /** Persist the exact envelope locally before the first POST (dual persistence — E.3/E.4). */
+  private async backstopProgress(transferId: string, opIndex: number, payloadEnvelope: string): Promise<void> {
+    const intents = await this.readLocalIntents();
+    const intent = intents[transferId];
+    if (!intent) return; // no local intent (fresh-device append) — the server row is the seed
+    const progress = intent.progress ?? {};
+    if (progress[opIndex] === payloadEnvelope) return;
+    intent.progress = { ...progress, [opIndex]: payloadEnvelope };
+    await this.writeLocalIntents(intents);
   }
 
   /** `GET /v1/intents?status=` — server-side intent list. */
@@ -847,9 +923,15 @@ export class WalletApiClient {
     await this.setLocalIntentStatus(transferId, 'aborted');
   }
 
-  /** `POST /v1/intents/{id}/complete` — the uniform client-side close (E.3). */
+  /**
+   * `POST /v1/intents/{id}/complete` — the uniform client-side close (E.3). Always carries the
+   * seed-holder signature over `wallet-api.complete.v1:{transferId}` (§16/#87): a checkpoint-bearing
+   * intent REQUIRES it, and a valid own-key signature is harmlessly accepted for any other intent —
+   * so a fresh-device close (no local flag) still works.
+   */
   async completeIntent(transferId: string): Promise<void> {
-    await this.requestJson('POST', `/v1/intents/${transferId}/complete`);
+    const signature = signMessage(this.requireIdentity().privateKey, completeSignMessage(transferId));
+    await this.requestJson('POST', `/v1/intents/${transferId}/complete`, { signature });
     await this.setLocalIntentStatus(transferId, 'completed');
   }
 
@@ -877,9 +959,26 @@ export class WalletApiClient {
     const intents = await this.readLocalIntents();
     for (const [transferId, intent] of Object.entries(intents)) {
       if (intent.status === 'open') {
-        await this.requestJson('PUT', `/v1/intents/${transferId}`, { payload: intent.payload });
+        // Re-PUT with the SAME requiresSeedClose (the restore dropped the row), then re-POST every
+        // locally-held checkpoint byte-identically (E.4 — the two tables not blob-derivable).
+        await this.requestJson(
+          'PUT',
+          `/v1/intents/${transferId}`,
+          this.intentPutBody(intent.payload, intent.requiresSeedClose === true)
+        );
+        for (const [opIndex, envelope] of Object.entries(intent.progress ?? {})) {
+          await this.requestJson('POST', `/v1/intents/${transferId}/progress`, {
+            opIndex: Number(opIndex),
+            payload: envelope,
+            signature: this.signProgress(transferId, Number(opIndex), envelope),
+          });
+        }
       } else if (intent.status === 'aborted' && intent.abortPending === true) {
-        await this.requestJson('PUT', `/v1/intents/${transferId}`, { payload: intent.payload });
+        await this.requestJson(
+          'PUT',
+          `/v1/intents/${transferId}`,
+          this.intentPutBody(intent.payload, intent.requiresSeedClose === true)
+        );
         await this.requestJson('POST', `/v1/intents/${transferId}/abort`);
         await this.setLocalIntentStatus(transferId, 'aborted'); // clears abortPending
       }

@@ -14,6 +14,9 @@ export {
 } from './WalletApiMailboxProvider';
 export type { WalletApiMailboxProviderConfig } from './WalletApiMailboxProvider';
 
+export { WalletApiCheckpointStore } from './WalletApiCheckpointStore';
+export type { CheckpointProgressPort } from './WalletApiCheckpointStore';
+
 export {
   createSphereProviders,
   createWalletApiProviders,

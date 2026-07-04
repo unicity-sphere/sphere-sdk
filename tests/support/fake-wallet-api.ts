@@ -43,6 +43,7 @@ import { randomBytes } from '@noble/hashes/utils.js';
 import { recoverPubkeyFromSignature } from '../../core/crypto';
 import { decodeTokenBlob } from '../../token-engine/token-blob';
 import { AUTH_CHALLENGE_PREFIX } from '../../wallet-api/challenge';
+import { completeSignMessage, progressSignMessage } from '../../wallet-api/intent-signing';
 import { assertFieldEnvelopeShape } from '../../core/field-encryption';
 
 // =============================================================================
@@ -113,7 +114,17 @@ interface OwnerState {
   cursor: bigint; // gap-free, commit-ordered per-owner counter (§9)
   rows: Map<string, InventoryRow>; // one row per (owner, token) (§5.1)
   appliedTransfers: Map<string, bigint>; // §5.3 step 1 idempotency record
-  intents: Map<string, { payload: string; status: 'open' | 'completed' | 'aborted'; createdAt: string }>;
+  intents: Map<
+    string,
+    {
+      payload: string;
+      status: 'open' | 'completed' | 'aborted';
+      createdAt: string;
+      requiresSeedClose?: boolean;
+      // §16/E.4 intent progress: insert-once per opIndex (the split burn checkpoint).
+      progress?: Map<number, { payload: string; createdAt: string }>;
+    }
+  >;
   /** Mailbox entries ADDRESSED TO this owner (§6), keyed by entry_id. */
   mailbox: Map<string, MailboxEntryRow>;
   /** Per-recipient monotonic mailbox seq counter (§6) — separate from `cursor`. */
@@ -250,6 +261,7 @@ export class FakeWalletApi {
   private readonly wsTicketTtlMs: number;
   private readonly maxBlobBytes: number;
   private readonly intentMaxBytes: number;
+  private readonly progressMaxBytes = 65536; // §5.5 PROGRESS_PAYLOAD_MAX_BYTES (E.4 checkpoint)
   private readonly mailboxUnclaimedCap: number;
   private readonly mailboxPerPairCap: number;
   private readonly maxPayerOpenRequests: number;
@@ -339,6 +351,11 @@ export class FakeWalletApi {
     if (opts.dropIntents) {
       for (const owner of this.owners.values()) owner.intents.clear();
     }
+  }
+
+  /** Drop a single intent (+ its progress) — a targeted PITR loss for the E.4 re-seed test. */
+  dropIntent(pubkey: string, transferId: string): void {
+    this.owner(pubkey).intents.delete(transferId);
   }
 
   /** Make the next auth challenge malformed — the client MUST refuse to sign it. */
@@ -670,7 +687,7 @@ export class FakeWalletApi {
     const respondMatch = path.match(/^\/v1\/payment-requests\/([^/]+)\/respond$/);
     if (method === 'POST' && respondMatch) return this.handlePaymentRequestRespond(req, res, respondMatch[1]);
 
-    const intentMatch = path.match(/^\/v1\/intents\/([^/]+)(\/(abort|complete))?$/);
+    const intentMatch = path.match(/^\/v1\/intents\/([^/]+)(\/(abort|complete|progress))?$/);
     if (intentMatch) return this.handleIntent(req, res, intentMatch[1], intentMatch[3]);
     if (method === 'GET' && path === '/v1/intents') return this.handleListIntents(req, res, url);
 
@@ -1981,9 +1998,15 @@ export class FakeWalletApi {
         throw new HttpError(422, 'VALIDATION', err instanceof Error ? err.message : 'bad intent payload');
       }
       const payload = body.payload as string;
+      const requiresSeedClose = body.requiresSeedClose === true; // §16/#87, honored on first insert
       const existing = owner.intents.get(transferId);
       if (!existing) {
-        owner.intents.set(transferId, { payload, status: 'open', createdAt: new Date().toISOString() });
+        owner.intents.set(transferId, {
+          payload,
+          status: 'open',
+          createdAt: new Date().toISOString(),
+          ...(requiresSeedClose ? { requiresSeedClose: true } : {}),
+        });
         this.json(res, 204, null);
         return;
       }
@@ -2017,15 +2040,86 @@ export class FakeWalletApi {
     if (method === 'POST' && action === 'complete') {
       const intent = owner.intents.get(transferId);
       if (!intent) throw new HttpError(404, 'NOT_FOUND', 'unknown intent');
-      // §16: idempotent; aborted → completed is legal (completion wins);
-      // completed never reverts. This is the uniform client-side close —
-      // storage-opt-out senders depend on it.
+      // §16/#87: a checkpoint-bearing (requires_seed_close) intent's terminal close needs a
+      // seed-holder signature. The fake does not verify secp256k1 — it only asserts one is present
+      // (the real backend recovers + checks the pubkey; cryptographic verification is covered by
+      // the wallet-api integration suite, M2.12).
+      if (intent.requiresSeedClose === true) {
+        const body = (await this.readJsonBody(req).catch(() => ({}))) as { signature?: unknown };
+        // §16/#87: recover the pubkey over the canonical close message and require the owner's — a
+        // faithful gate (the real backend does this) so a wrong-key/wrong-message signature fails.
+        this.assertSeedHolder(session.pubkey, completeSignMessage(transferId), body.signature, 403);
+      }
       intent.status = 'completed';
       this.json(res, 204, null);
       return;
     }
 
+    if (action === 'progress') return this.handleIntentProgress(req, res, owner, session.pubkey, transferId, method);
+
     throw new HttpError(404, 'NOT_FOUND', 'no such intent route');
+  }
+
+  /** §16/#87 seed-holder gate: the signature must recover to the intent owner over `message`. */
+  private assertSeedHolder(pubkey: string, message: string, signature: unknown, foreignStatus: number): void {
+    if (typeof signature !== 'string' || signature.length === 0) {
+      throw new HttpError(foreignStatus, 'FORBIDDEN', 'seed-holder signature required');
+    }
+    let recovered: string;
+    try {
+      recovered = recoverPubkeyFromSignature(message, signature);
+    } catch {
+      throw new HttpError(422, 'VALIDATION', 'seed-holder signature does not parse');
+    }
+    if (recovered.toLowerCase() !== pubkey.toLowerCase()) {
+      throw new HttpError(foreignStatus, 'FORBIDDEN', 'seed-holder signature is not the intent owner');
+    }
+  }
+
+  /** §16/E.4 intent progress — insert-once first-write-wins per (transferId, opIndex). */
+  private async handleIntentProgress(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    owner: OwnerState,
+    pubkey: string,
+    transferId: string,
+    method: string
+  ): Promise<void> {
+    const intent = owner.intents.get(transferId);
+    if (method === 'GET') {
+      if (!intent) throw new HttpError(404, 'NOT_FOUND', 'unknown intent');
+      const records = [...(intent.progress ?? new Map()).entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([opIndex, r]) => ({ opIndex, payload: r.payload, createdAt: r.createdAt }));
+      this.json(res, 200, { records });
+      return;
+    }
+    if (method !== 'POST') throw new HttpError(404, 'NOT_FOUND', 'no such intent route');
+    if (!intent) throw new HttpError(404, 'NOT_FOUND', 'unknown intent');
+    if (intent.status !== 'open') throw new HttpError(409, 'CONFLICT', 'intent is not open');
+    if (intent.requiresSeedClose !== true) throw new HttpError(409, 'CONFLICT', 'intent is not requires_seed_close (§16/#87)');
+    const body = (await this.readJsonBody(req)) as { opIndex?: unknown; payload?: unknown; signature?: unknown };
+    try {
+      assertFieldEnvelopeShape(body.payload, this.progressMaxBytes);
+    } catch (err) {
+      throw new HttpError(422, 'VALIDATION', err instanceof Error ? err.message : 'bad progress payload');
+    }
+    const opIndex = Number(body.opIndex);
+    if (!Number.isInteger(opIndex) || opIndex < 0) throw new HttpError(422, 'VALIDATION', 'bad opIndex');
+    // §16/#87 seed-holder gate: recover the pubkey over the canonical progress message (bound to the
+    // EXACT envelope bytes) and require the owner's — the faithful gate the real backend runs.
+    this.assertSeedHolder(pubkey, progressSignMessage(transferId, opIndex, body.payload as string), body.signature, 403);
+    const progress = intent.progress ?? new Map<number, { payload: string; createdAt: string }>();
+    intent.progress = progress;
+    const existing = progress.get(opIndex);
+    if (existing) {
+      // insert-once: return the FIRST writer's record (adopt), 200.
+      this.json(res, 200, { record: { opIndex, payload: existing.payload, createdAt: existing.createdAt } });
+      return;
+    }
+    const record = { payload: body.payload as string, createdAt: new Date().toISOString() };
+    progress.set(opIndex, record);
+    this.json(res, 201, { record: { opIndex, payload: record.payload, createdAt: record.createdAt } });
   }
 
   private handleListIntents(req: http.IncomingMessage, res: http.ServerResponse, url: URL): void {

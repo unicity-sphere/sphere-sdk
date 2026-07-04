@@ -10,6 +10,7 @@ export { WalletApiClient } from './client';
 export { WalletApiError, ChallengeTemplateError } from './errors';
 export type { WalletApiErrorCode } from './errors';
 export { AUTH_CHALLENGE_PREFIX, verifyChallengeTemplate } from './challenge';
+export { completeSignMessage, progressSignMessage } from './intent-signing';
 export type { ChallengeExpectation } from './challenge';
 
 export type {
