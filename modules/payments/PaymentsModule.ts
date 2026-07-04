@@ -30,7 +30,15 @@ import type {
 } from '../../types/txf';
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
 import type { ITokenEngine, SphereToken, TokenBlob } from '../../token-engine';
-import { TransferConflictError, ProofUnconfirmedError } from '../../token-engine';
+import {
+  CheckpointPersistFailedError,
+  CheckpointTrustbaseMismatchError,
+  ProofUnconfirmedError,
+  type SplitCheckpointStore,
+  SplitCheckpointLostError,
+  TransferConflictError,
+} from '../../token-engine';
+import { WalletApiCheckpointStore } from '../../impl/shared/wallet-api/WalletApiCheckpointStore';
 import { WalletApiError } from '../../wallet-api';
 import { isV2TransferPayload, type V2TransferPayload } from '../../types/v2-transfer';
 import { TokenReservationLedger } from './TokenReservationLedger';
@@ -763,12 +771,23 @@ export interface WalletApiHistoryRecord {
  * module's responsibility: sdk-changes E.3 + S2 consumer update).
  */
 export interface PaymentsWalletApiPort {
-  /** E.3: persist the client-encrypted intent; MUST be awaited before the engine. */
-  putIntent(transferId: string, payloadEnvelope: string): Promise<void>;
-  /** E.3 uniform close — every finished send ends with this (idempotent). */
+  /**
+   * E.3: persist the client-encrypted intent; MUST be awaited before the engine. `requiresSeedClose`
+   * (E.4/#87) marks a split intent whose terminal close is seed-gated — set BEFORE the burn.
+   */
+  putIntent(transferId: string, payloadEnvelope: string, opts?: { requiresSeedClose?: boolean }): Promise<void>;
+  /** E.3 uniform close — every finished send ends with this (idempotent; signs the §87 close). */
   completeIntent(transferId: string): Promise<void>;
   /** E.2 lost-race cleanup (soft, recoverable). */
   abortIntent(transferId: string): Promise<void>;
+  /**
+   * E.4 burn checkpoint (sphere-sdk#501) — OPTIONAL capability. When present (the WalletApiClient
+   * provides them), a split's resume is checkpoint-protected via {@link WalletApiCheckpointStore};
+   * a composed port without them keeps today's residual (a split resumed after a certified mint
+   * cannot recover its change — surfaced via inventory resync).
+   */
+  postIntentProgress?(transferId: string, opIndex: number, payloadEnvelope: string): Promise<string>;
+  getIntentProgress?(transferId: string): Promise<readonly { opIndex: number; payload: string }[]>;
   /** E.3 resume: list open intents at sign-in (any device). */
   listIntents(status: 'open' | 'aborted'): Promise<
     { transferId: string; payload: string; status: 'open' | 'completed' | 'aborted'; createdAt: number }[]
@@ -833,9 +852,14 @@ type PaymentRequestsApi = Pick<PaymentsWalletApiPort, 'network'> &
     Pick<PaymentsWalletApiPort, 'createPaymentRequest' | 'listPaymentRequests' | 'respondPaymentRequest'>
   >;
 
-/** The decrypted E.3 intent payload (`{ sources, recipient, amounts }` concretized). */
+/**
+ * The decrypted E.3 intent payload (`{ sources, recipient, amounts }` concretized). `v:2` is the
+ * E.4 (sphere-sdk#501) variant: its split resumes from the durable burn checkpoint. `v:1` is the
+ * pre-E.4 legacy shape — resumed via the change-blind journaled shortcut, sunsetting one release
+ * after E.4 (a v:1 split that crashed mid-flight recovers its change via a full inventory resync).
+ */
 interface IntentPayloadV1 {
-  v: 1;
+  v: 1 | 2;
   /** Recipient chain pubkey (33-byte compressed, hex). */
   recipient: string;
   coinId: string;
@@ -1003,6 +1027,7 @@ export class PaymentsModule {
   private pumpInFlight: Promise<number> | null = null;
   /** S6 field-encryption key (intent payloads, history memos) — per identity. */
   private fieldEncryptionKey: Uint8Array | null = null;
+  private checkpointStore: SplitCheckpointStore | null = null;
 
   // wallet-api payment requests (sdk-changes S4 — §10/§16)
   private prPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -1189,6 +1214,7 @@ export class PaymentsModule {
     this.deps = deps;
     this.priceProvider = deps.price ?? null;
     this.fieldEncryptionKey = null; // re-derived lazily per identity (S6)
+    this.checkpointStore = null; // rebuilt lazily — it captures the per-identity field key (E.4)
     // Path B: wire the engine into the planner (value reads use it when present).
     this.spendPlanner.setEngine(deps.tokenEngine);
 
@@ -1738,12 +1764,16 @@ export class PaymentsModule {
         // for a possibly-already-certified transfer; local-only persistence is
         // forbidden for the live path.
         if (walletApi) {
+          // E.4/#87: a split's terminal close is seed-gated — set requiresSeedClose here, BEFORE
+          // the burn, so the funds-critical window is guarded from intent creation (not only once
+          // the first checkpoint is appended).
           await walletApi.putIntent(
             result.id,
             encryptField(
               this.getFieldEncryptionKey(),
               JSON.stringify(this.buildIntentPayload(request, peerInfo.chainPubkey, splitPlan))
-            )
+            ),
+            splitPlan.requiresSplit ? { requiresSeedClose: true } : {}
           );
         }
 
@@ -1836,10 +1866,12 @@ export class PaymentsModule {
               },
               // Same per-send seed; the split's opIndex follows the direct ops
               // (stable across resume — it is derived from the intent's order).
+              // E.4: persist the burn checkpoint before the first mint (durable-ack gated).
               {
                 signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS),
                 transferId: result.id,
                 opIndex: splitPlan.tokensToTransferDirectly.length,
+                ...(this.getCheckpointStore() ? { checkpointStore: this.getCheckpointStore() } : {}),
               },
             ));
           } catch (err) {
@@ -2005,6 +2037,11 @@ export class PaymentsModule {
           error: error.message,
         });
       }
+      // E.4: a stuck checkpoint on the SEND path (lost/withheld record, or a trust-base rotation) —
+      // kept open, but surface the distinct loud signal (never a silent retry — needs the drain).
+      if (error instanceof SplitCheckpointLostError || error instanceof CheckpointTrustbaseMismatchError) {
+        this.deps!.emitEvent('split:checkpoint-stuck', { transferId: result.id, code: error.code, error: error.message });
+      }
 
       // Intent disposition on failure (E.2/E.3):
       //  - a TransferConflictError aborts (the prescribed recovery — the
@@ -2024,9 +2061,18 @@ export class PaymentsModule {
       //    beat the .add()). Resume re-derives the identical tx: it recovers the
       //    proof + delivery, or records the spend if a foreign tx won — never a
       //    second on-chain spend.
-      const mayHaveCertified = error instanceof ProofUnconfirmedError;
+      //  - E.4 (sphere-sdk#501): the split burn-checkpoint errors are ALL keep-open. The burn is
+      //    certified (or the source is untouched, for a leg-0 strand); a split-mint stateId is
+      //    HKDF-derived, so a mismatch is never a foreign spend. Aborting would orphan a
+      //    burn-certified split — resume under the same transferId (rebuilding from the stored
+      //    checkpoint) is the only exit. So keep-open even when committedOnChainTokenIds is empty.
+      const keepOpen =
+        error instanceof ProofUnconfirmedError ||
+        error instanceof CheckpointPersistFailedError ||
+        error instanceof SplitCheckpointLostError ||
+        error instanceof CheckpointTrustbaseMismatchError;
       if (this.deps?.walletApi) {
-        if (error instanceof TransferConflictError || (committedOnChainTokenIds.size === 0 && !mayHaveCertified)) {
+        if (error instanceof TransferConflictError || (committedOnChainTokenIds.size === 0 && !keepOpen)) {
           try {
             await this.deps.walletApi.abortIntent(result.id);
           } catch (abortErr) {
@@ -2152,6 +2198,28 @@ export class PaymentsModule {
   }
 
   /**
+   * The E.4 split burn checkpoint store (sphere-sdk#501), or undefined when the composed wallet-api
+   * port lacks the progress capability (own-storage / legacy compositions — the documented
+   * residual). Memoized. Passed into engine.split() so a split resumed after a certified mint
+   * rebuilds its outputs from the durable checkpoint instead of stranding them.
+   */
+  private getCheckpointStore(): SplitCheckpointStore | undefined {
+    const walletApi = this.deps?.walletApi;
+    if (!walletApi || typeof walletApi.postIntentProgress !== 'function' || typeof walletApi.getIntentProgress !== 'function') {
+      return undefined;
+    }
+    if (!this.checkpointStore) {
+      const post = walletApi.postIntentProgress.bind(walletApi);
+      const get = walletApi.getIntentProgress.bind(walletApi);
+      this.checkpointStore = new WalletApiCheckpointStore(
+        { postIntentProgress: post, getIntentProgress: get },
+        this.getFieldEncryptionKey(),
+      );
+    }
+    return this.checkpointStore;
+  }
+
+  /**
    * S2: materialize the SELECTED lazy sources — fetch each blob on demand via
    * the storage port's `getToken()` and decode it through the engine. Only
    * tokens the plan actually consumes are downloaded; coin-selection itself
@@ -2198,7 +2266,7 @@ export class PaymentsModule {
     const genesisIdOf = (tw: TokenWithAmount): string =>
       extractTokenIdFromSdkData(tw.uiToken.sdkData) ?? tw.uiToken.id.replace(/^v2_/, '');
     return {
-      v: 1,
+      v: 2, // E.4: new sends carry the checkpoint-aware resume contract (sphere-sdk#501)
       recipient: recipientChainPubkey,
       coinId: request.coinId,
       amount: request.amount,
@@ -5274,7 +5342,7 @@ export class PaymentsModule {
       try {
         const plain = decryptField(this.getFieldEncryptionKey(), intent.payload);
         payload = JSON.parse(plain) as IntentPayloadV1;
-        if (payload.v !== 1 || !Array.isArray(payload.direct)) {
+        if ((payload.v !== 1 && payload.v !== 2) || !Array.isArray(payload.direct)) {
           throw new SphereError('Unknown intent payload shape', 'VALIDATION_ERROR');
         }
       } catch (err) {
@@ -5296,6 +5364,18 @@ export class PaymentsModule {
             logger.warn('Payments', 'abortIntent during resume failed:', abortErr);
           }
           outcome.conflicted.push(intent.transferId);
+        } else if (err instanceof SplitCheckpointLostError || err instanceof CheckpointTrustbaseMismatchError) {
+          // E.4: a burn-certified split is STUCK on an unrecoverable-for-now checkpoint error (lost
+          // checkpoint, or a trust-base rotation). The intent stays OPEN (funds in-flight, never
+          // lost), but this is NOT a transient blip — emit a distinct LOUD signal so the operator
+          // can act (the drain remedy) rather than wait on a silent retry.
+          logger.warn('Payments', `Intent ${intent.transferId.slice(0, 8)}… split checkpoint STUCK (${err.code}) — kept open, needs attention:`, err);
+          this.deps!.emitEvent('split:checkpoint-stuck', {
+            transferId: intent.transferId,
+            code: err.code,
+            error: err.message,
+          });
+          outcome.failed.push(intent.transferId);
         } else {
           // Transient — the intent stays open; the next sign-in retries.
           logger.warn('Payments', `Intent ${intent.transferId.slice(0, 8)}… resume failed (stays open):`, err);
@@ -5383,10 +5463,14 @@ export class PaymentsModule {
       // Split opIndex follows the direct ops — replayed from the intent's order (§8.1).
       const splitOpIndex = payload.direct.length;
       const existingSplit = journaled.get(splitOpIndex);
-      if (existingSplit) {
-        // #621/#622-review: the split already certified in the original send — re-deliver the journaled
-        // recipient blob, never re-run engine.split on the spent source (it would TransferConflictError
-        // and wedge). The change output is handled by the conflict path below / a resync.
+      // E.4 (sphere-sdk#501): a v:2 split resumes THROUGH its burn checkpoint — engine.split()
+      // rebuilds BOTH outputs from the stored proof (already-certified legs match-verify), so the
+      // change is recovered even when the split already certified. This subsumes AND fixes the
+      // legacy journaled shortcut (#634): that shortcut re-delivered the recipient blob but left the
+      // change unpersisted, so the following applyDelta recorded the spend with an empty `added`.
+      const checkpointStore = payload.v === 2 ? this.getCheckpointStore() : undefined;
+      if (checkpointStore === undefined && existingSplit) {
+        // Legacy residual (no checkpoint): re-deliver only; the change recovers via inventory resync.
         await deliverBlob(existingSplit.tokenBlob, splitOpIndex);
       } else {
         try {
@@ -5410,7 +5494,12 @@ export class PaymentsModule {
                 },
               ],
             },
-            { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex: splitOpIndex }
+            {
+              signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS),
+              transferId,
+              opIndex: splitOpIndex,
+              ...(checkpointStore ? { checkpointStore } : {}),
+            }
           );
           changeOutput = outputs[1];
           // critical (#515 F2): own-storage custody — persist-or-stay-open; a
@@ -5418,14 +5507,24 @@ export class PaymentsModule {
           if (!serverApply) await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
           await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(outputs[0]))), splitOpIndex);
         } catch (err) {
-          // #622-review: mirror the direct-op path for split. The split source is already spent on-chain
-          // (a crash certified it before this resume) — record the spend instead of wedging on the
-          // re-certification conflict. KNOWN LIMITATION: the change output is NOT journaled and cannot be
-          // re-derived here (re-running engine.split conflicts), so a split that crashed between
-          // certification and applyDelta recovers its change token via a full inventory resync. Surfaced
-          // (inventory:conflict prompts that refresh) — never silently lost.
-          if (!(err instanceof TransferConflictError)) throw err;
-          logger.warn('Payments', `Resume split op already certified — recording the spend; change token (if any) recovers on the next inventory resync (§3.1):`, err);
+          if (err instanceof ProofUnconfirmedError) throw err; // #631 keep-open (indeterminate)
+          // KEEP-OPEN with a checkpoint store (v:2): the burn is certified and a split-mint stateId is
+          // HKDF-derived (never a foreign spend), so resume — rebuilding from the checkpoint — is the
+          // only exit. NEVER record the spend or abort.
+          if (
+            checkpointStore !== undefined &&
+            (err instanceof CheckpointPersistFailedError ||
+              err instanceof SplitCheckpointLostError ||
+              err instanceof CheckpointTrustbaseMismatchError)
+          ) {
+            throw err;
+          }
+          // Record the spend for: a genuine burn-leg foreign spend (TransferConflictError, §7 race
+          // under a DIFFERENT transferId), OR a LEGACY no-checkpoint split whose already-certified
+          // mint leg the engine now surfaces as SplitCheckpointLostError (there is no checkpoint to
+          // recover from — the v:1 residual: the change recovers via a full inventory resync).
+          if (!(err instanceof TransferConflictError) && !(err instanceof SplitCheckpointLostError)) throw err;
+          logger.warn('Payments', `Resume split: source already spent — recording the spend; change (if any) recovers on the next inventory resync (§3.1):`, err);
           this.deps!.emitEvent('inventory:conflict', { transferId, coinId: payload.coinId, error: err.message });
         }
       }

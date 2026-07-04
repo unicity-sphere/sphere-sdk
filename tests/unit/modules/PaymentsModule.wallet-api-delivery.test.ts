@@ -24,7 +24,7 @@ import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
 import { FakeTokenEngine, decodeFakeTokenAssets, decodeFakeTokenId } from '../token-engine/FakeTokenEngine';
-import { TransferConflictError, ProofUnconfirmedError } from '../../../token-engine';
+import { TransferConflictError, ProofUnconfirmedError, SplitCheckpointLostError } from '../../../token-engine';
 import { FakeWalletApi } from '../../support/fake-wallet-api';
 import { MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
 import { WalletApiClient, WalletApiError } from '../../../wallet-api';
@@ -931,6 +931,114 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
     // The change-token limitation is surfaced (prompts a resync) — never silently lost.
     expect(sender.emitEvent.mock.calls.some((c) => c[0] === 'inventory:conflict')).toBe(true);
+  });
+
+  it('legacy (v:1, no store): a resume that hits SplitCheckpointLostError records the spend, never wedges', async () => {
+    // The engine now maps a split-mint-leg mismatch to the keep-open SplitCheckpointLostError. A v:1
+    // intent has NO checkpoint store, so there is nothing to recover from — resume must fall back to
+    // the legacy residual (record the spend + surface a resync), NOT rethrow and wedge the intent.
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-legacy-lost');
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    const transferId = crypto.randomUUID();
+    const payload = {
+      v: 1,
+      recipient: RECIPIENT.chainPubkey,
+      coinId: UCT,
+      amount: '300',
+      direct: [],
+      split: { tokenId: sourceTokenId, splitAmount: '300', remainderAmount: '700' },
+    };
+    sender.client.setIdentity(SENDER);
+    await sender.client.putIntent(
+      transferId,
+      encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload))
+    );
+    vi.spyOn(sender.engine, 'split').mockRejectedValue(
+      new SplitCheckpointLostError('a split mint leg no longer matches its certified leaf')
+    );
+
+    const outcome = await sender.module.resumeOpenIntents();
+    expect(outcome.resumed).toEqual([transferId]); // completed, not wedged
+    expect(outcome.failed).toEqual([]);
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'removed' });
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
+    expect(sender.emitEvent.mock.calls.some((c) => c[0] === 'inventory:conflict')).toBe(true);
+  });
+
+  it('#634: resume of a v:2 split re-runs the split THROUGH the checkpoint and recovers the change output', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-634-recover');
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // A checkpoint-bearing (requiresSeedClose) v:2 split intent whose original send crashed after
+    // the split certified but before the change was applied server-side (the #634 window).
+    const transferId = crypto.randomUUID();
+    const payload = {
+      v: 2,
+      recipient: RECIPIENT.chainPubkey,
+      coinId: UCT,
+      amount: '300',
+      direct: [],
+      split: { tokenId: sourceTokenId, splitAmount: '300', remainderAmount: '700' },
+    };
+    sender.client.setIdentity(SENDER);
+    await sender.client.putIntent(
+      transferId,
+      encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)),
+      { requiresSeedClose: true }
+    );
+    // CRUCIAL for #634: the original send JOURNALED the split's recipient blob (opIndex 0) before
+    // crashing. This is the exact state the old change-blind shortcut fired on — it re-delivered
+    // this blob and skipped re-deriving the change. The fix must re-run split() ANYWAY (via the
+    // checkpoint) so the change is recovered; without the fix the change row would be absent.
+    const splitOpIndex = 0; // direct.length
+    await (sender.module as unknown as {
+      savePendingV2Delivery(e: {
+        transferId: string;
+        recipientPubkey: string;
+        tokenBlob: string;
+        opIndex: number;
+        createdAt: number;
+      }): Promise<void>;
+    }).savePendingV2Delivery({
+      transferId,
+      recipientPubkey: RECIPIENT.chainPubkey,
+      tokenBlob: 'ab'.repeat(40),
+      opIndex: splitOpIndex,
+      createdAt: Date.now(),
+    });
+
+    // The engine recovers BOTH outputs from the stored checkpoint on resume (proven end-to-end by
+    // the engine's AC-E2). Here the FakeTokenEngine produces the outputs; we capture the options to
+    // assert the checkpoint store was threaded (the #634 fix re-runs split, not the change-blind
+    // shortcut) and the change output that resume must apply.
+    const realSplit = sender.engine.split.bind(sender.engine);
+    let splitOpts: Parameters<typeof sender.engine.split>[1];
+    let change: Awaited<ReturnType<typeof sender.engine.split>>['outputs'][1] | undefined;
+    vi.spyOn(sender.engine, 'split').mockImplementation(async (p, o) => {
+      splitOpts = o;
+      const result = await realSplit(p, o);
+      change = result.outputs[1];
+      return result;
+    });
+
+    const outcome = await sender.module.resumeOpenIntents();
+
+    expect(outcome.resumed).toEqual([transferId]);
+    expect(outcome.conflicted).toEqual([]);
+    // The #634 fix: engine.split WAS re-run WITH the checkpoint store (vs the old change-blind
+    // shortcut that never re-derived the change), and the source spend was applied.
+    expect(splitOpts?.checkpointStore).toBeDefined();
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'removed' });
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
+    // The change token (700) is now in the server inventory — RECOVERED, not lost, no resync prompt.
+    const changeId = sender.engine.tokenId(change!);
+    expect(fake.getRow(SENDER.chainPubkey, changeId)).toMatchObject({ status: 'active' });
+    expect(sender.emitEvent.mock.calls.some((c) => c[0] === 'inventory:conflict')).toBe(false);
   });
 });
 

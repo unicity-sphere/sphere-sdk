@@ -23,6 +23,7 @@ import type {
   MailboxPage,
   PaymentRequestRecord,
   PaymentRequestsPage,
+  ProgressRecord,
   UploadUrlEntry,
 } from './types';
 
@@ -165,6 +166,29 @@ export function parseIntents(body: unknown): IntentRecord[] {
       createdAt,
     };
   });
+}
+
+function parseProgressEntry(raw: unknown, where: string): ProgressRecord {
+  const it = asRecord(raw, where);
+  const opIndex = Number(it.opIndex);
+  if (!Number.isInteger(opIndex) || opIndex < 0) throw protocolError(`${where}.opIndex is not a non-negative integer`);
+  const createdAt = Date.parse(asString(it.createdAt, `${where}.createdAt`));
+  if (Number.isNaN(createdAt)) throw protocolError(`${where}.createdAt is not a timestamp`);
+  return { opIndex, payload: asString(it.payload, `${where}.payload`), createdAt };
+}
+
+/** `POST /v1/intents/{id}/progress` → the stored record (§16/E.4; 201 created or 200 first-write-wins). */
+export function parseProgressRecord(body: unknown): ProgressRecord {
+  const rec = asRecord(body, 'progress response');
+  return parseProgressEntry(rec.record, 'progress response .record');
+}
+
+/** `GET /v1/intents/{id}/progress` → the stored records, ascending opIndex (§16/E.4). */
+export function parseProgressRecords(body: unknown): ProgressRecord[] {
+  const rec = asRecord(body, 'progress list response');
+  return asArray(rec.records, 'progress list response .records').map((raw, i) =>
+    parseProgressEntry(raw, `progress records[${i}]`)
+  );
 }
 
 // ── mailbox (§6/§16) ──────────────────────────────────────────────────────────

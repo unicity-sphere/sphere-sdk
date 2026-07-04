@@ -189,6 +189,13 @@ export interface IntentRecord {
   createdAt: number;
 }
 
+/** One intent-progress record (§16/E.4): a split burn checkpoint. `payload` is the enc1. envelope. */
+export interface ProgressRecord {
+  opIndex: number;
+  payload: string;
+  createdAt: number;
+}
+
 // ── mailbox (§6/§16) ──────────────────────────────────────────────────────────
 
 /** `POST /v1/mailbox` request (§16). `memo` is the S6 `enc1.` envelope, verbatim. */

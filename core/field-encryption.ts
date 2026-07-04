@@ -131,12 +131,15 @@ export function deriveFieldEncryptionKey(privKeyHex: string): Uint8Array {
 // =============================================================================
 
 /**
- * Encrypt a plaintext field into the S6 wire envelope:
- * `"enc1." + base64(nonce ‖ ciphertext)` (XChaCha20-Poly1305, random 24-byte nonce).
+ * Encrypt BINARY plaintext into the S6 wire envelope, optionally bound to associated data (AAD):
+ * `"enc1." + base64(nonce ‖ ciphertext)` (XChaCha20-Poly1305, random 24-byte nonce). The AAD is
+ * authenticated but NOT stored in the envelope — the reader re-derives it from context, so a
+ * record decrypted against a different AAD fails the poly1305 tag (E.4: AAD = `transferId:opIndex`
+ * binds a checkpoint to its slot, defeating a mis-served / cross-intent replay at the crypto layer).
  */
-export function encryptField(key: Uint8Array, plaintext: string): string {
+export function encryptFieldBytes(key: Uint8Array, plaintext: Uint8Array, aad?: Uint8Array): string {
   const nonce = randomBytes(FIELD_ENVELOPE_NONCE_BYTES);
-  const ciphertext = xchacha20poly1305(key, nonce).encrypt(new TextEncoder().encode(plaintext));
+  const ciphertext = xchacha20poly1305(key, nonce, aad).encrypt(plaintext);
   const packed = new Uint8Array(nonce.length + ciphertext.length);
   packed.set(nonce, 0);
   packed.set(ciphertext, nonce.length);
@@ -144,11 +147,10 @@ export function encryptField(key: Uint8Array, plaintext: string): string {
 }
 
 /**
- * Decrypt an S6 wire envelope. Validates the prefix and shape, then opens the
- * XChaCha20-Poly1305 box; any tampering (nonce, ciphertext, or tag) throws a
- * `SphereError('DECRYPTION_ERROR')`.
+ * Decrypt an S6 wire envelope to BINARY bytes, requiring the same `aad` used at encrypt time.
+ * Any tampering, wrong key, OR wrong AAD throws `SphereError('DECRYPTION_ERROR')`.
  */
-export function decryptField(key: Uint8Array, envelope: string): string {
+export function decryptFieldBytes(key: Uint8Array, envelope: string, aad?: Uint8Array): Uint8Array {
   if (typeof envelope !== 'string' || !envelope.startsWith(FIELD_ENVELOPE_PREFIX)) {
     throw new SphereError('Invalid field envelope: missing "enc1." prefix', 'DECRYPTION_ERROR');
   }
@@ -159,11 +161,26 @@ export function decryptField(key: Uint8Array, envelope: string): string {
   const nonce = packed.slice(0, FIELD_ENVELOPE_NONCE_BYTES);
   const ciphertext = packed.slice(FIELD_ENVELOPE_NONCE_BYTES);
   try {
-    const plain = xchacha20poly1305(key, nonce).decrypt(ciphertext);
-    return new TextDecoder().decode(plain);
+    return xchacha20poly1305(key, nonce, aad).decrypt(ciphertext);
   } catch (err) {
-    throw new SphereError('Field envelope authentication failed (tampered or wrong key)', 'DECRYPTION_ERROR', err);
+    throw new SphereError('Field envelope authentication failed (tampered, wrong key, or wrong AAD)', 'DECRYPTION_ERROR', err);
   }
+}
+
+/**
+ * Encrypt a UTF-8 string field into the S6 wire envelope (AAD-less). Thin wrapper over
+ * {@link encryptFieldBytes} — the memo/nametag/intent-payload path.
+ */
+export function encryptField(key: Uint8Array, plaintext: string): string {
+  return encryptFieldBytes(key, new TextEncoder().encode(plaintext));
+}
+
+/**
+ * Decrypt an AAD-less S6 wire envelope to a UTF-8 string (memo/nametag/intent payload). Any
+ * tampering throws `SphereError('DECRYPTION_ERROR')`.
+ */
+export function decryptField(key: Uint8Array, envelope: string): string {
+  return new TextDecoder().decode(decryptFieldBytes(key, envelope));
 }
 
 /**

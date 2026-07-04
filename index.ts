@@ -198,6 +198,8 @@ export {
   deriveFieldEncryptionKey,
   encryptField,
   decryptField,
+  encryptFieldBytes,
+  decryptFieldBytes,
   assertFieldEnvelopeShape,
   FIELD_ENCRYPTION_HKDF_INFO,
   FIELD_ENVELOPE_PREFIX,

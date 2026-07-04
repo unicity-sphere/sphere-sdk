@@ -7,8 +7,10 @@ import { describe, it, expect } from 'vitest';
 import {
   assertFieldEnvelopeShape,
   decryptField,
+  decryptFieldBytes,
   deriveFieldEncryptionKey,
   encryptField,
+  encryptFieldBytes,
   FIELD_ENVELOPE_MAX_BYTES,
   FIELD_ENVELOPE_PREFIX,
 } from '../../../core/field-encryption';
@@ -104,6 +106,45 @@ describe('field-encryption (S6)', () => {
       const big = encryptField(key, 'x'.repeat(FIELD_ENVELOPE_MAX_BYTES));
       expect(() => assertFieldEnvelopeShape(big)).toThrowError(/size cap/);
       expect(() => assertFieldEnvelopeShape(big, big.length)).not.toThrow();
+    });
+  });
+
+  describe('binary + AAD (E.4 checkpoint envelope)', () => {
+    const AAD_A = new TextEncoder().encode('transfer-a:0');
+    const AAD_B = new TextEncoder().encode('transfer-b:0');
+
+    it('round-trips arbitrary (non-UTF-8) binary bytes under matching AAD', () => {
+      const key = deriveFieldEncryptionKey(PRIV_A);
+      // 0xff 0xfe … is not valid UTF-8 — a string codec would corrupt it.
+      const plaintext = new Uint8Array([0xff, 0xfe, 0x00, 0x80, 0x13, 0x37, 0xc0]);
+      const envelope = encryptFieldBytes(key, plaintext, AAD_A);
+      expect(Array.from(decryptFieldBytes(key, envelope, AAD_A))).toEqual(Array.from(plaintext));
+    });
+
+    it('a wrong AAD fails the tag at decrypt (cross-slot replay is rejected)', () => {
+      const key = deriveFieldEncryptionKey(PRIV_A);
+      const envelope = encryptFieldBytes(key, new Uint8Array([1, 2, 3]), AAD_A);
+      // The SAME key + envelope, but a different slot's AAD — must not decrypt.
+      expect(() => decryptFieldBytes(key, envelope, AAD_B)).toThrowError(SphereError);
+      expect(() => decryptFieldBytes(key, envelope, AAD_B)).toThrowError(/authentication failed/);
+      // …and the correct AAD still opens it.
+      expect(Array.from(decryptFieldBytes(key, envelope, AAD_A))).toEqual([1, 2, 3]);
+    });
+
+    it('AAD is authenticated but NOT stored — omitting it entirely is a different context', () => {
+      const key = deriveFieldEncryptionKey(PRIV_A);
+      const withAad = encryptFieldBytes(key, new Uint8Array([9]), AAD_A);
+      expect(() => decryptFieldBytes(key, withAad)).toThrowError(/authentication failed/); // no AAD ≠ AAD_A
+      const noAad = encryptFieldBytes(key, new Uint8Array([9]));
+      expect(Array.from(decryptFieldBytes(key, noAad))).toEqual([9]); // AAD-less round-trips
+    });
+
+    it('the string wrappers are the AAD-less binary path (interop with encryptFieldBytes)', () => {
+      const key = deriveFieldEncryptionKey(PRIV_A);
+      const viaString = encryptField(key, 'hello');
+      expect(new TextDecoder().decode(decryptFieldBytes(key, viaString))).toBe('hello');
+      const viaBytes = encryptFieldBytes(key, new TextEncoder().encode('hello'));
+      expect(decryptField(key, viaBytes)).toBe('hello');
     });
   });
 });
