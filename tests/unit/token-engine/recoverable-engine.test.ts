@@ -18,9 +18,16 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { TransferConflictError, ProofUnconfirmedError } from '../../../token-engine/errors';
+import type { SplitCheckpointStore } from '../../../token-engine/engine';
+import {
+  CheckpointPersistFailedError,
+  ProofUnconfirmedError,
+  SplitCheckpointLostError,
+  TransferConflictError,
+} from '../../../token-engine/errors';
 import { deriveRealization } from '../../../token-engine/realization';
 import {
+  CborSerializer,
   type CertificationData,
   type CertificationResponse,
   HexConverter,
@@ -133,6 +140,116 @@ class ValidationRejectThenProofThrowsClient implements IAggregatorClient {
     return Promise.reject(new Error('proof fetch failed (transient)'));
   }
 }
+
+/** In-memory SplitCheckpointStore (E.4): insert-once, first-write-wins — the wallet-api §16
+ * intent-progress contract the engine builds against. `raw`/`putCalls` are test observers. */
+class InMemoryCheckpointStore implements SplitCheckpointStore {
+  public putCalls = 0;
+  private readonly slots = new Map<string, Uint8Array>();
+
+  private key(transferId: string, opIndex: number): string {
+    return `${transferId}:${String(opIndex)}`;
+  }
+
+  public put(transferId: string, opIndex: number, bytes: Uint8Array): Promise<Uint8Array> {
+    this.putCalls++;
+    const k = this.key(transferId, opIndex);
+    const existing = this.slots.get(k);
+    if (existing !== undefined) return Promise.resolve(existing); // first-write-wins
+    this.slots.set(k, bytes);
+    return Promise.resolve(bytes);
+  }
+
+  public get(transferId: string, opIndex: number): Promise<Uint8Array | null> {
+    return Promise.resolve(this.slots.get(this.key(transferId, opIndex)) ?? null);
+  }
+
+  public raw(transferId: string, opIndex: number): Uint8Array | undefined {
+    return this.slots.get(this.key(transferId, opIndex));
+  }
+}
+
+/** `put` always rejects — the durable-ack gate must fail BEFORE any mint submit (E.4). */
+class PersistFailingStore implements SplitCheckpointStore {
+  public get(): Promise<Uint8Array | null> {
+    return Promise.resolve(null);
+  }
+
+  public put(): Promise<Uint8Array> {
+    return Promise.reject(new Error('checkpoint store 503 (simulated)'));
+  }
+}
+
+/** `get` serves corrupt bytes — a store may serve a non-array blob OR a well-framed 5-array whose
+ * inner fields are wrong-typed (a bit-flip / tolerant re-encode that still parses as an array). */
+class PoisonedStore implements SplitCheckpointStore {
+  public constructor(private readonly poison: Uint8Array) {}
+
+  public get(): Promise<Uint8Array | null> {
+    return Promise.resolve(this.poison);
+  }
+
+  public put(_transferId: string, _opIndex: number, bytes: Uint8Array): Promise<Uint8Array> {
+    return Promise.resolve(bytes);
+  }
+}
+
+/** `get` null, but `put` returns a DIFFERENT authoritative record (a racing resumer won the slot). */
+class AdoptStore implements SplitCheckpointStore {
+  public constructor(private readonly winner: Uint8Array) {}
+
+  public get(): Promise<Uint8Array | null> {
+    return Promise.resolve(null);
+  }
+
+  public put(): Promise<Uint8Array> {
+    return Promise.resolve(this.winner); // first-write-wins: the caller MUST adopt these bytes
+  }
+}
+
+/** `get` always returns the same fixed record (a device resuming from a server-stored checkpoint). */
+class FixedGetStore implements SplitCheckpointStore {
+  public constructor(private readonly record: Uint8Array) {}
+
+  public get(): Promise<Uint8Array | null> {
+    return Promise.resolve(this.record);
+  }
+
+  public put(_transferId: string, _opIndex: number, bytes: Uint8Array): Promise<Uint8Array> {
+    return Promise.resolve(bytes);
+  }
+}
+
+/** A non-4-byte, structurally-valid 5-element CBOR array whose version field is a TEXT string
+ * (wrong major type) — parses as array(5) but the per-field decode throws a raw CborError. */
+const WRONG_TYPED_CHECKPOINT = CborSerializer.encodeArray(
+  CborSerializer.encodeTextString('not-an-int'), // field[0] should be a uint version
+  CborSerializer.encodeTextString('sdk'),
+  CborSerializer.encodeByteString(new Uint8Array([1])),
+  CborSerializer.encodeByteString(new Uint8Array([2])),
+  CborSerializer.encodeByteString(new Uint8Array([3])),
+);
+
+/** Counts submits so a test can prove ZERO mint legs were submitted (only the burn). */
+class SubmitCountingClient implements IAggregatorClient {
+  public submits = 0;
+
+  public constructor(private readonly inner: IAggregatorClient) {}
+
+  public getInclusionProof(stateId: StateId): Promise<InclusionProofResponse> {
+    return this.inner.getInclusionProof(stateId);
+  }
+
+  public submitCertificationRequest(certificationData: CertificationData): Promise<CertificationResponse> {
+    this.submits++;
+    return this.inner.submitCertificationRequest(certificationData);
+  }
+}
+
+const SPLIT_OUTPUTS = (self: Uint8Array) => [
+  { recipientPubkey: freshPubkey(), coinId: COIN, amount: 70n },
+  { recipientPubkey: self, coinId: COIN, amount: 30n },
+];
 
 describe('recoverable engine (Part E) — real adapter over in-memory aggregator', () => {
   // AC-E1 (transfer leg) + the AC-E2 mock-resume shape: the duplicate submit is
@@ -300,24 +417,59 @@ describe('recoverable engine (Part E) — real adapter over in-memory aggregator
     }
   }, 40000);
 
-  // KNOWN GAP sphere-sdk#501, pinned: a FULL re-run after the mint legs
-  // certified cannot recover. The aggregator rebuilds inclusion proofs from
-  // the live tree per request (st-sdk#126 — only CertificationData is
-  // stable), so the rebuilt mint transactions embed a byte-different burn
-  // proof; their transactionHashes mismatch the certified leaves and E.2's
-  // match-verify throws TransferConflictError. FLIP this test to assert
-  // recovery once the #501 persistence design (durable burn-certified split
-  // progress) lands.
-  it('split full re-run after certified mints throws TransferConflictError (#501 known gap)', async () => {
+  // AC-E2 (split leg, sphere-sdk#501 FIXED via E.4): a FULL re-run after the
+  // mint legs certified RECOVERS when a checkpoint store is supplied. The
+  // aggregator rebuilds inclusion proofs from the live tree per request
+  // (st-sdk#126 — only CertificationData is stable), so a refetched burn proof
+  // is byte-different; recovery therefore CANNOT come from a refetch — it comes
+  // from the stored burn checkpoint. The control below (no store → still
+  // conflicts, same aggregator) proves the checkpoint is what flips the outcome.
+  it('AC-E2: split full re-run after certified mints RECOVERS from the checkpoint (no funds lost)', async () => {
+    const aggregator = TestAggregatorClient.create();
+    const store = new InMemoryCheckpointStore();
+    const engine = createTestEngine({ aggregator });
+    const self = engine.getIdentity().chainPubkey;
+    const src = await engine.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 100n }] } });
+    const transferId = crypto.randomUUID();
+    const outputs = SPLIT_OUTPUTS(self);
+
+    const first = await engine.split({ token: src, outputs }, { transferId, checkpointStore: store });
+    expect(first.outputs).toHaveLength(2);
+    // The checkpoint was persisted exactly once (before the first mint), and holds real bytes.
+    expect(store.putCalls).toBe(1);
+    const stored = store.raw(transferId, 0);
+    expect(stored).toBeInstanceOf(Uint8Array);
+    const storedHex = HexConverter.encode(stored as Uint8Array);
+
+    // Full re-run with the same transferId + the same store: the mint justification is rebuilt
+    // from the STORED burn proof, so the already-certified legs match-verify and every output is
+    // recovered — decimal-exact, fully verifying — NOT a TransferConflictError.
+    const resumed = await engine.split({ token: src, outputs }, { transferId, checkpointStore: store });
+    expect(resumed.outputs).toHaveLength(2);
+    expect(resumed.outputs.map((o) => engine.balanceOf(o, COIN))).toEqual([70n, 30n]);
+    expect(resumed.outputs.map((o) => engine.tokenId(o))).toEqual(first.outputs.map((o) => engine.tokenId(o)));
+    for (const o of resumed.outputs) {
+      expect((await engine.verify(o)).ok).toBe(true);
+    }
+    // Insert-once: the resume read the checkpoint, never re-persisted it (still one put, same bytes).
+    expect(store.putCalls).toBe(1);
+    expect(HexConverter.encode(store.raw(transferId, 0) as Uint8Array)).toBe(storedHex);
+  }, 40000);
+
+  // The residual for fully-local compositions (no checkpoint store), pinned: a FULL re-run after
+  // the mint legs certified does NOT recover — the refetched burn proof is byte-different (the
+  // aggregator regenerates per request), so the rebuilt mint transactions mismatch the certified
+  // leaves. It surfaces as the keep-open SplitCheckpointLostError (a mint-leg mismatch is NEVER a
+  // foreign spend — its stateId is HKDF-derived — so never the abort-y TransferConflictError). This
+  // is the SAME aggregator as the recovery test above; the ONLY difference is the presence of the
+  // checkpoint — the proof that recovery came from stored bytes, not accidental refetch stability.
+  it('residual: split full re-run WITHOUT a checkpoint store cannot recover (SplitCheckpointLostError)', async () => {
     const aggregator = TestAggregatorClient.create();
     const engine = createTestEngine({ aggregator });
     const self = engine.getIdentity().chainPubkey;
     const src = await engine.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 100n }] } });
     const transferId = crypto.randomUUID();
-    const outputs = [
-      { recipientPubkey: freshPubkey(), coinId: COIN, amount: 70n },
-      { recipientPubkey: self, coinId: COIN, amount: 30n },
-    ];
+    const outputs = SPLIT_OUTPUTS(self);
 
     const first = await engine.split({ token: src, outputs }, { transferId });
     expect(first.outputs).toHaveLength(2);
@@ -326,8 +478,145 @@ describe('recoverable engine (Part E) — real adapter over in-memory aggregator
       () => null,
       (caught: unknown) => caught,
     );
-    expect(err).toBeInstanceOf(TransferConflictError);
-    expect((err as TransferConflictError).code).toBe('TRANSFER_CONFLICT');
+    expect(err).toBeInstanceOf(SplitCheckpointLostError);
+    expect((err as SplitCheckpointLostError).code).toBe('SPLIT_CHECKPOINT_LOST');
+    expect(err).not.toBeInstanceOf(TransferConflictError);
+  }, 40000);
+
+  // AC-E6(a) — the durable-ack ordering gate: if the checkpoint cannot be persisted after the
+  // burn certifies, the engine raises CheckpointPersistFailedError (keep-open) and submits ZERO
+  // mint legs (only the burn reached the aggregator). Funds are in-flight, not lost.
+  it('AC-E6: a checkpoint persist failure raises CheckpointPersistFailedError and submits no mint leg', async () => {
+    const aggregator = TestAggregatorClient.create();
+    const counting = new SubmitCountingClient(aggregator);
+    const engine = createTestEngine({ aggregator, wireClient: counting });
+    const self = engine.getIdentity().chainPubkey;
+    const src = await engine.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 100n }] } });
+    const submitsAfterMint = counting.submits; // the source mint
+
+    const err = await engine
+      .split({ token: src, outputs: SPLIT_OUTPUTS(self) }, { transferId: crypto.randomUUID(), checkpointStore: new PersistFailingStore() })
+      .then(() => null, (caught: unknown) => caught);
+
+    expect(err).toBeInstanceOf(CheckpointPersistFailedError);
+    expect((err as CheckpointPersistFailedError).code).toBe('CHECKPOINT_PERSIST_FAILED');
+    expect((err as CheckpointPersistFailedError).mayHaveCertified).toBe(true);
+    expect(String((err as { cause?: unknown }).cause)).toContain('checkpoint store 503');
+    // exactly one submit after the source mint — the burn — and NO mint leg.
+    expect(counting.submits).toBe(submitsAfterMint + 1);
+  }, 40000);
+
+  // AC-E6(b) — leg-0 pre-flight: a certified mint leaf with NO checkpoint (server data loss /
+  // withholding) is genuinely unrecoverable. Resume with an empty store probes leg-0 (certified
+  // on the shared aggregator) and raises SplitCheckpointLostError BEFORE any re-burn — never a
+  // foreign-conflict, never a silent re-mint.
+  it('AC-E6: a certified leg with a missing checkpoint raises SplitCheckpointLostError (leg-0 probe)', async () => {
+    const aggregator = TestAggregatorClient.create();
+    const engine = createTestEngine({ aggregator });
+    const self = engine.getIdentity().chainPubkey;
+    const src = await engine.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 100n }] } });
+    const transferId = crypto.randomUUID();
+    const outputs = SPLIT_OUTPUTS(self);
+
+    await engine.split({ token: src, outputs }, { transferId, checkpointStore: new InMemoryCheckpointStore() });
+
+    // Resume under the same transferId but with a FRESH (empty) store — the checkpoint is gone.
+    const err = await engine
+      .split({ token: src, outputs }, { transferId, checkpointStore: new InMemoryCheckpointStore() })
+      .then(() => null, (caught: unknown) => caught);
+    expect(err).toBeInstanceOf(SplitCheckpointLostError);
+    expect((err as SplitCheckpointLostError).code).toBe('SPLIT_CHECKPOINT_LOST');
+  }, 40000);
+
+  // AC-E6(c) — a corrupt / mis-served checkpoint record must never be minted from: decoding fails
+  // and the engine raises SplitCheckpointLostError (keep-open), never a wrong-bytes mint. BOTH
+  // corruption shapes are covered: a non-array blob, AND a well-framed 5-array with a wrong-typed
+  // inner field (the field decoders throw a raw CborError that must still surface as the typed
+  // keep-open error — a bit-flip / tolerant re-encode that this plaintext layer cannot pre-reject).
+  it.each([
+    ['non-array blob', new Uint8Array([0xff, 0x00, 0x13, 0x37])],
+    ['5-array, wrong-typed version field', WRONG_TYPED_CHECKPOINT],
+  ])('AC-E6: a poisoned checkpoint record (%s) raises SplitCheckpointLostError, never mints', async (_label, poison) => {
+    const aggregator = TestAggregatorClient.create();
+    const counting = new SubmitCountingClient(aggregator);
+    const engine = createTestEngine({ aggregator, wireClient: counting });
+    const self = engine.getIdentity().chainPubkey;
+    const src = await engine.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 100n }] } });
+    const submitsAfterMint = counting.submits;
+
+    const err = await engine
+      .split({ token: src, outputs: SPLIT_OUTPUTS(self) }, { transferId: crypto.randomUUID(), checkpointStore: new PoisonedStore(poison) })
+      .then(() => null, (caught: unknown) => caught);
+    expect(err).toBeInstanceOf(SplitCheckpointLostError);
+    // get() returned poison up front — nothing was submitted (no burn, no mint).
+    expect(counting.submits).toBe(submitsAfterMint);
+  }, 40000);
+
+  // AC-E6(e) — insert-once ADOPT: two devices race the no-checkpoint path; the loser's put() gets
+  // the WINNER's authoritative bytes back and MUST mint from those (decode-from-stored), not its
+  // own pre-store burnt token — else the two devices would embed byte-different burn proofs and
+  // diverge. Construction: engine A burns + checkpoints but crashes before minting (no leg
+  // certified, checkpoint C captured); the tree is advanced so a fresh burn refetch is
+  // byte-different; the loser adopts C via put() and mints; a reference device resuming from C
+  // (get-path) mints the same legs — the outputs are byte-identical, proving the loser used C.
+  it('AC-E6: a resumer that loses the put race adopts the winner checkpoint and converges', async () => {
+    const aggregator = TestAggregatorClient.create();
+    const walletKey = SigningService.generatePrivateKey();
+    const capture = new InMemoryCheckpointStore();
+    const crashing = createTestEngine({ aggregator, privateKey: walletKey, wireClient: new CrashAfterBurnClient(aggregator) });
+    const plain = createTestEngine({ aggregator, privateKey: walletKey });
+
+    const self = plain.getIdentity().chainPubkey;
+    const src = await plain.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 100n }] } });
+    const transferId = crypto.randomUUID();
+    const outputs = SPLIT_OUTPUTS(self);
+
+    // A: burn certifies + checkpoint persists, then the mint submit crashes — no leg certified.
+    await crashing
+      .split({ token: src, outputs }, { transferId, checkpointStore: capture, signal: AbortSignal.timeout(2000) })
+      .then(() => null, () => null);
+    const winner = capture.raw(transferId, 0);
+    expect(winner).toBeInstanceOf(Uint8Array);
+    // Advance the tree so a fresh burn-proof refetch is byte-different from the captured one.
+    await plain.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 1n }] } });
+
+    // The LOSER: get() sees nothing, but put() returns the winner's bytes — it must mint from those.
+    // It mints FIRST here, certifying the legs with whichever burn proof it used.
+    const loser = await plain.split({ token: src, outputs }, { transferId, checkpointStore: new AdoptStore(winner as Uint8Array) });
+    expect(loser.outputs.map((o) => plain.balanceOf(o, COIN))).toEqual([70n, 30n]);
+    for (const o of loser.outputs) {
+      expect((await plain.verify(o)).ok).toBe(true);
+    }
+
+    // The discriminator: a reference device resuming DIRECTLY from the winner checkpoint rebuilds
+    // the winner's mint justification and re-submits the legs. It match-verifies (dup-OK) ONLY if
+    // the loser certified them with the winner's burn proof — i.e. adopted it. Had the loser minted
+    // from its OWN (byte-different, tree-advanced) burn proof, this resume would hit a mint-leg hash
+    // mismatch and throw SplitCheckpointLostError. That it recovers is the proof of adoption.
+    const reference = await plain.split({ token: src, outputs }, { transferId, checkpointStore: new FixedGetStore(winner as Uint8Array) });
+    expect(reference.outputs.map((o) => plain.tokenId(o))).toEqual(loser.outputs.map((o) => plain.tokenId(o)));
+    for (const o of reference.outputs) {
+      expect((await plain.verify(o)).ok).toBe(true);
+    }
+  }, 40000);
+
+  // AC-E6(d) — the happy path with a store: a first-time split persists the checkpoint (before the
+  // first mint) and completes; every output verifies. Proves the store is written on the fresh
+  // path, not only on resume.
+  it('AC-E6: a first-time split with a checkpoint store completes and persists the checkpoint', async () => {
+    const aggregator = TestAggregatorClient.create();
+    const store = new InMemoryCheckpointStore();
+    const engine = createTestEngine({ aggregator });
+    const self = engine.getIdentity().chainPubkey;
+    const src = await engine.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 100n }] } });
+    const transferId = crypto.randomUUID();
+
+    const { outputs } = await engine.split({ token: src, outputs: SPLIT_OUTPUTS(self) }, { transferId, checkpointStore: store });
+    expect(outputs.map((o) => engine.balanceOf(o, COIN))).toEqual([70n, 30n]);
+    for (const o of outputs) {
+      expect((await engine.verify(o)).ok).toBe(true);
+    }
+    expect(store.raw(transferId, 0)).toBeInstanceOf(Uint8Array);
   }, 40000);
 
   // E.2 status-agnostic submit: a submit that THROWS (response-parse failure)

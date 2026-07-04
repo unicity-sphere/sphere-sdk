@@ -14,10 +14,16 @@
 
 import { SphereError, type SphereErrorCode } from '../core/errors';
 import { randomUUID } from '../core/uuid';
-import { TransferConflictError, ProofUnconfirmedError } from './errors';
+import {
+  CheckpointPersistFailedError,
+  ProofUnconfirmedError,
+  SplitCheckpointLostError,
+  TransferConflictError,
+} from './errors';
 import { deriveDirectAddress, UNICITY_TOKEN_TYPE_HEX } from './identity';
 import { deriveDeliveryKeys } from './blob-keys';
 import { deriveRealization } from './realization';
+import { burntTokenFromCheckpoint, encodeCheckpoint } from './split-checkpoint';
 import {
   CborDeserializer,
   CertificationData,
@@ -37,6 +43,7 @@ import {
   SignaturePredicateUnlockScript,
   type SigningService,
   SplitMintJustification,
+  type SplitToken,
   SplitTokenRequest,
   StateId,
   type StateTransitionClient,
@@ -103,6 +110,17 @@ const CLEAN_REJECT_STATUSES: ReadonlySet<string> = new Set([
   CertificationStatus.UNSUPPORTED_ALGORITHM,
   CertificationStatus.INVALID_SHARD,
 ]);
+
+/** The deterministic split plan (burn leg + per-output mint requests) — `TokenSplit.split`'s result. */
+type SplitPlan = Awaited<ReturnType<typeof TokenSplit.split>>;
+
+/** Threaded through the E.4 burnt-token resolution so its helpers stay within the max-params bound. */
+interface SplitContext {
+  readonly params: SplitParams;
+  readonly split: SplitPlan;
+  readonly transferId: string;
+  readonly options?: EngineOpOptions | undefined;
+}
 
 export class SphereTokenEngine implements ITokenEngine {
   /** Hex form of the wallet key — deriveRealization's ikm input (Part E.1). */
@@ -276,55 +294,133 @@ export class SphereTokenEngine implements ITokenEngine {
       deriveRealization(this.privateKeyHex, transferId, this.resolveOpIndex(options), 'burn'),
     );
 
-    // 1. Burn the source: certify the burn transfer and append it -> burntToken.
-    const burnUnlock = await SignaturePredicateUnlockScript.create(split.burn.transaction, this.deps.signingService);
-    const burnCert = await CertificationData.fromTransaction(split.burn.transaction, burnUnlock);
-    const burnProof = await this.submitAndAwaitProof(
-      burnCert,
-      split.burn.transaction,
-      'Split burn failed',
-      'TRANSFER_FAILED',
-      options,
-    );
-    const burnCertified = await split.burn.transaction.toCertifiedTransaction(
-      this.deps.trustBase,
-      this.deps.predicateVerifier,
-      burnProof,
-    );
-    const burntToken = await params.token.sdkToken.transfer(
-      this.deps.trustBase,
-      this.deps.predicateVerifier,
-      burnCertified,
-    );
+    // 1. Resolve the burnt token: from a durable checkpoint on resume, else burn now and persist
+    //    the checkpoint BEFORE any mint submit (E.4 — the burn proof is the one non-re-derivable
+    //    split input; a mint certified against proof bytes that were never stored strands #501).
+    const burntToken = await this.resolveBurntToken({ params, split, transferId, options });
 
     // 2. Mint each output, justified by the burnt token + its split proofs.
     const outputs: SphereToken[] = [];
     for (let i = 0; i < split.tokens.length; i++) {
-      const splitToken = split.tokens[i];
-      // split.tokens preserves requests order, so the per-output memo maps by index.
-      const data = await SpherePaymentData.create(splitToken.assets, params.outputs[i].data ?? null).encode();
-      const justification = SplitMintJustification.create(burntToken, splitToken.proofs).toCBOR();
-      const mintTx = await MintTransaction.create(
-        splitToken.networkId,
-        splitToken.recipient,
-        data,
-        splitToken.tokenType,
-        splitToken.salt,
-        justification,
-      );
-      const certData = await CertificationData.fromMintTransaction(mintTx);
-      const proof = await this.submitAndAwaitProof(certData, mintTx, 'Split mint failed', 'AGGREGATOR_ERROR', options);
-      const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
-      const token = await Token.mint(
-        this.deps.trustBase,
-        this.deps.predicateVerifier,
-        this.deps.mintJustificationVerifier,
-        certified,
-      );
-      outputs.push(this.wrapToken(token));
+      outputs.push(await this.mintSplitOutput(split.tokens[i], burntToken, params.outputs[i].data ?? null, options));
     }
-
     return { outputs };
+  }
+
+  /**
+   * E.4 burnt-token resolution. With a checkpoint store: `get` → rebuild from the STORED proof on
+   * resume; else a leg-0 pre-flight probe (a certified leaf with no checkpoint is unrecoverable),
+   * then burn, persist the checkpoint (durable-ack gated), and adopt the authoritative stored
+   * bytes. Without a store: burn as before (a documented residual for fully-local compositions).
+   */
+  private async resolveBurntToken(ctx: SplitContext): Promise<Token> {
+    const store = ctx.options?.checkpointStore;
+    const opIndex = this.resolveOpIndex(ctx.options);
+    const source = ctx.params.token.sdkToken;
+    if (store === undefined) {
+      return (await this.burnSource(ctx)).burntToken;
+    }
+    const stored = await store.get(ctx.transferId, opIndex);
+    if (stored !== null) {
+      return burntTokenFromCheckpoint(this.deps, stored, ctx.split.burn.transaction, source);
+    }
+    await this.assertNoLegStranded(ctx);
+    const { burntToken, burnProof } = await this.burnSource(ctx);
+    const envelope = await encodeCheckpoint(ctx.split.burn.transaction, burnProof, burntToken);
+    // The durable-ack gate: `put` resolving IS the ack, and NO mint has been submitted yet.
+    let authoritative: Uint8Array;
+    try {
+      authoritative = await store.put(ctx.transferId, opIndex, envelope);
+    } catch (err) {
+      throw new CheckpointPersistFailedError(
+        'split burn certified but its checkpoint could not be persisted — keep the intent open and resume',
+        err,
+      );
+    }
+    // Decode-from-stored discipline: mint from the AUTHORITATIVE bytes (ours, or a racing resumer's
+    // that won the slot), never the pre-store in-memory burnt token — so concurrent resumers agree.
+    return burntTokenFromCheckpoint(this.deps, authoritative, ctx.split.burn.transaction, source);
+  }
+
+  /** Burn the source: certify the burn transfer and append it -> burntToken (+ its proof). */
+  private async burnSource(ctx: SplitContext): Promise<{ burntToken: Token; burnProof: InclusionProof }> {
+    const burnTx = ctx.split.burn.transaction;
+    const burnUnlock = await SignaturePredicateUnlockScript.create(burnTx, this.deps.signingService);
+    const burnCert = await CertificationData.fromTransaction(burnTx, burnUnlock);
+    const burnProof = await this.submitAndAwaitProof(burnCert, burnTx, 'Split burn failed', 'TRANSFER_FAILED', ctx.options);
+    const burnCertified = await burnTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, burnProof);
+    const burntToken = await ctx.params.token.sdkToken.transfer(this.deps.trustBase, this.deps.predicateVerifier, burnCertified);
+    return { burntToken, burnProof };
+  }
+
+  /**
+   * Pre-flight (no-checkpoint path): if ANY mint leaf is already certified on-chain while the
+   * checkpoint is missing, the burn proof is genuinely unrecoverable — fail BEFORE any re-burn. A
+   * mint's stateId is justification-INDEPENDENT (only the source state hash + salt-derived mask),
+   * so a probe mint with a null justification derives the true on-chain key. Every leg is probed,
+   * so correctness does NOT depend on the mint loop certifying leg 0 first (E.4 step 3).
+   */
+  private async assertNoLegStranded(ctx: SplitContext): Promise<void> {
+    for (let i = 0; i < ctx.split.tokens.length; i++) {
+      const leg = ctx.split.tokens[i];
+      const data = await SpherePaymentData.create(leg.assets, ctx.params.outputs[i].data ?? null).encode();
+      const probe = await MintTransaction.create(leg.networkId, leg.recipient, data, leg.tokenType, leg.salt, null);
+      const response = await this.deps.client.getInclusionProof(await StateId.fromTransaction(probe));
+      if (response.inclusionProof.inclusionCertificate !== null) {
+        throw new SplitCheckpointLostError(
+          'a split mint leaf is certified on-chain but no burn checkpoint exists — outputs are unrecoverable',
+        );
+      }
+    }
+  }
+
+  /** One split output: build the justification from the burnt token, submit, certify, wrap. */
+  private async mintSplitOutput(
+    splitToken: SplitToken,
+    burntToken: Token,
+    memo: Uint8Array | null,
+    options?: EngineOpOptions,
+  ): Promise<SphereToken> {
+    const data = await SpherePaymentData.create(splitToken.assets, memo).encode();
+    const justification = SplitMintJustification.create(burntToken, splitToken.proofs).toCBOR();
+    const mintTx = await MintTransaction.create(
+      splitToken.networkId,
+      splitToken.recipient,
+      data,
+      splitToken.tokenType,
+      splitToken.salt,
+      justification,
+    );
+    const certData = await CertificationData.fromMintTransaction(mintTx);
+    const proof = await this.submitSplitMintLeg(certData, mintTx, options);
+    const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
+    const token = await Token.mint(this.deps.trustBase, this.deps.predicateVerifier, this.deps.mintJustificationVerifier, certified);
+    return this.wrapToken(token);
+  }
+
+  /**
+   * Submit one split-mint leg. A `TRANSACTION_HASH_MISMATCH` on a mint leg is NOT a foreign spend
+   * (its stateId is HKDF-derived from `(seed, transferId)`, so only a seed-holder under THIS
+   * transferId could have certified a different leaf): the stored checkpoint no longer reproduces
+   * the certified leaf → keep-open `SplitCheckpointLostError`, never the abort-and-re-plan
+   * `TransferConflictError` (E.2/E.4 split-mint arm).
+   */
+  private async submitSplitMintLeg(
+    certData: CertificationData,
+    mintTx: MintTransaction,
+    options?: EngineOpOptions,
+  ): Promise<InclusionProof> {
+    try {
+      return await this.submitAndAwaitProof(certData, mintTx, 'Split mint failed', 'AGGREGATOR_ERROR', options);
+    } catch (err) {
+      if (err instanceof TransferConflictError) {
+        throw new SplitCheckpointLostError(
+          'a split mint leg no longer matches its certified leaf — the burn checkpoint is stale or lost',
+          err,
+        );
+      }
+      throw err;
+    }
   }
 
   // ── verification ─────────────────────────────────────────────────────────────

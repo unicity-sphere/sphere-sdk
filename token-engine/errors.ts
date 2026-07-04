@@ -50,3 +50,58 @@ export class ProofUnconfirmedError extends SphereError {
     this.name = 'ProofUnconfirmedError';
   }
 }
+
+/**
+ * A split's burn certified but its checkpoint (sdk-changes E.4, sphere-sdk#501) could NOT be
+ * durably persisted — the `SplitCheckpointStore.put` rejected (network / 5xx / timeout / quota) —
+ * so NO mint leg was submitted. The burn is on-chain (funds in-flight, not lost); the outputs are
+ * fully recoverable on resume.
+ *
+ * Keep-open family (like {@link ProofUnconfirmedError}): the caller MUST keep the intent OPEN and
+ * resume under the SAME `transferId` — the next attempt re-derives the byte-identical burn,
+ * re-persists the checkpoint (content-idempotent), and mints. NEVER abort.
+ */
+export class CheckpointPersistFailedError extends SphereError {
+  readonly mayHaveCertified = true as const;
+
+  constructor(message: string, cause?: unknown) {
+    super(message, 'CHECKPOINT_PERSIST_FAILED', cause);
+    this.name = 'CheckpointPersistFailedError';
+  }
+}
+
+/**
+ * A split cannot be rebuilt from its checkpoint, in a way that is NOT a lost race: either a mint
+ * leaf is already certified on-chain but no stored bytes reproduce its certified transactionHash
+ * (server data loss / withholding, or a pre-E.4 legacy intent), or a stored checkpoint fails its
+ * byte-binding checks (the re-derived burn tx ≠ the stored bytes — cross-version derivation drift
+ * — or a corrupt stored proof, or a burnt-token re-encode mismatch).
+ *
+ * Distinct from {@link TransferConflictError}: a split-mint stateId is HKDF-derived from
+ * `(seed, transferId)`, so only a seed-holder under THIS `transferId` can have certified it — this
+ * is never a foreign spend. Keep-open, alert loudly: the caller MUST NOT abort, NOT complete, and
+ * NOT record the source as foreign-spent (sdk-changes E.4).
+ */
+export class SplitCheckpointLostError extends SphereError {
+  constructor(message: string, cause?: unknown) {
+    super(message, 'SPLIT_CHECKPOINT_LOST', cause);
+    this.name = 'SplitCheckpointLostError';
+  }
+}
+
+/**
+ * A stored split checkpoint (sdk-changes E.4) is authentic and byte-bound to the re-derived burn
+ * transaction, but its inclusion proof no longer verifies against the CURRENT trust base
+ * (`INVALID_TRUSTBASE`) — a validator-set / quorum rotation while the intent was open. The bytes
+ * are NOT wrong; re-burning would strand the certified split, so the engine never falls through to
+ * a re-burn.
+ *
+ * Keep-open, distinct signal: the operational remedy is to drain open split intents BEFORE a
+ * validator rotation (the SDK has no epoch map — single-epoch trust base, ARCHITECTURE §8.2/§19).
+ */
+export class CheckpointTrustbaseMismatchError extends SphereError {
+  constructor(message: string, cause?: unknown) {
+    super(message, 'CHECKPOINT_TRUSTBASE_MISMATCH', cause);
+    this.name = 'CheckpointTrustbaseMismatchError';
+  }
+}

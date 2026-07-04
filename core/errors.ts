@@ -38,6 +38,13 @@ export type SphereErrorCode =
   // The op's certification is INDETERMINATE (submit accepted / proof fetch
   // inconclusive) — raised as ProofUnconfirmedError; keep the intent OPEN (#631).
   | 'CERTIFICATION_UNCONFIRMED'
+  // Split burn checkpoint (sdk-changes E.4, sphere-sdk#501) — all keep-open (token-engine/errors.ts):
+  // burn certified but the checkpoint could not be persisted (no mint submitted);
+  | 'CHECKPOINT_PERSIST_FAILED'
+  // a certified mint leaf has no reproducing stored bytes, or a stored checkpoint fails byte-binding;
+  | 'SPLIT_CHECKPOINT_LOST'
+  // a byte-bound checkpoint proof no longer verifies against the current trust base (validator rotation).
+  | 'CHECKPOINT_TRUSTBASE_MISMATCH'
   | 'STORAGE_ERROR'
   | 'TRANSPORT_ERROR'
   | 'AGGREGATOR_ERROR'

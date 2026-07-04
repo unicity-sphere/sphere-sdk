@@ -33,8 +33,8 @@ ref_materials/
 # CLI wallet profiles and test wallets
 .sphere-cli*/
 
-# Integration test data
-tests/integration/.test-*/
+# Test-run data dirs (any suite that writes a wallet/token fixture under tests/)
+tests/**/.test-*/
 .claude/
 
 # Superpowers specs/plans — local only, never committed

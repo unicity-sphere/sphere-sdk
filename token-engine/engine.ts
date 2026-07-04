@@ -21,10 +21,42 @@ import type {
   EngineVerifyResult,
 } from './types';
 
+/**
+ * Durable, any-device store for a split's burn checkpoint (sdk-changes E.4, sphere-sdk#501
+ * option b). The engine passes opaque PLAINTEXT bytes; a transport adapter (the wallet-api
+ * provider) is responsible for AAD-encryption and the wallet-api §16 intent-progress round-trip.
+ *
+ * The store is the resume seed for the one split input the engine cannot re-derive — the burn's
+ * aggregator-issued inclusion proof — so the mint justification is rebuilt from stored bytes, not
+ * a refetch (the aggregator regenerates proofs per request).
+ */
+export interface SplitCheckpointStore {
+  /**
+   * Insert-once, first-write-wins. MUST resolve only AFTER the store acked durability, and MUST
+   * resolve with the AUTHORITATIVE stored bytes — the caller's own on a fresh write, or the FIRST
+   * writer's when the slot `(transferId, opIndex)` was already taken (the caller adopts those and
+   * mints from them, so concurrent resumers converge on one burn proof).
+   */
+  put(transferId: string, opIndex: number, bytes: Uint8Array): Promise<Uint8Array>;
+  /** The stored bytes for the slot, or `null` when none exists. */
+  get(transferId: string, opIndex: number): Promise<Uint8Array | null>;
+}
+
 /** Options common to the long-running, network-bound operations. */
 export interface EngineOpOptions {
   /** Cancels the operation (including inclusion-proof polling). */
   readonly signal?: AbortSignal;
+  /**
+   * Durable burn-checkpoint store for a resumable split (sdk-changes E.4, sphere-sdk#501). When
+   * present, `split()` persists the burn's certified proof AND awaits its durable ack BEFORE
+   * submitting any mint leg, and rebuilds the mint justification from the stored bytes on resume —
+   * so a split resumed after any mint leg certified recovers instead of stranding its outputs.
+   *
+   * Absent keeps today's behavior (a fresh burn proof per attempt): fine for a mid-split resume
+   * with no mint yet certified, but a split resumed AFTER a mint certified cannot recover — a
+   * documented residual for fully-local compositions; the live path MUST supply the store.
+   */
+  readonly checkpointStore?: SplitCheckpointStore;
   /**
    * Realization seed for deterministic transfer/split (Part E, sdk-changes E.1/E.3):
    * a client-generated UUIDv4 in canonical lowercase string form. Every value the
