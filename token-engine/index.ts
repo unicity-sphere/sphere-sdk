@@ -14,6 +14,7 @@ export type {
   ITokenEngine,
   EngineConfig,
   EngineOpOptions,
+  SplitCheckpointStore,
   CreateTokenEngine,
 } from './engine';
 
@@ -41,10 +42,18 @@ export { deriveDirectAddress } from './identity';
 // The concrete adapter factory (A4) — the public way to obtain an ITokenEngine.
 export { createSphereTokenEngine } from './factory';
 
-// Typed conflict surface of the recoverable engine (Part E.2): the source state
-// was consumed by a DIFFERENT transaction — a lost race, not a resume. Callers
-// abort the intent and re-plan under a new transferId.
-export { TransferConflictError, ProofUnconfirmedError } from './errors';
+// Typed error surface of the recoverable engine (Part E.2/E.4). TransferConflictError = the source
+// was consumed by a DIFFERENT transaction (lost race — abort + re-plan). The rest are KEEP-OPEN
+// (never abort): ProofUnconfirmedError (#631 indeterminate certification), and the split burn
+// checkpoint family (sphere-sdk#501/E.4) that the wallet-api adapter + PaymentsModule must catch
+// and dispose — CheckpointPersistFailedError, SplitCheckpointLostError, CheckpointTrustbaseMismatchError.
+export {
+  CheckpointPersistFailedError,
+  CheckpointTrustbaseMismatchError,
+  ProofUnconfirmedError,
+  SplitCheckpointLostError,
+  TransferConflictError,
+} from './errors';
 
 // Self-issued Unicity ID (nametag) token mint — the v2 analog of the v1
 // nametag mint, stored at registration but unused at runtime (D5 + user
