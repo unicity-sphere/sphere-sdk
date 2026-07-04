@@ -16,9 +16,15 @@
  * STATE_ID_EXISTS), the proof is re-fetched, MATCH-VERIFIED and applied —
  * no funds lost, delivered exactly once.
  *
- * Deliberately a WHOLE-TOKEN send: split full-rerun-after-certified-mints
- * remains the #501 known gap (burn-certified resume only) — this drill does
- * not touch that path and must not be extended to until #501 is decided.
+ * A SPLIT send (sphere-sdk#501 FIXED via E.4): 600 of a 1000-token source goes
+ * to the recipient, 400 change stays. The SIGKILL lands AFTER the split's burn
+ * + both mint legs certified on the real chain AND the burn checkpoint was
+ * durably persisted (§16 intent progress) AND the recipient deposit acked, but
+ * BEFORE the apply that records the change. The fresh-device resume rebuilds the
+ * mint justification from the STORED burn proof (the aggregator regenerates
+ * proofs per request, so a refetch would mismatch — recovery MUST come from the
+ * checkpoint), recovers BOTH outputs, and applies the change — closing the #501
+ * money-loss window AND the #634 change-blind loss on the live gateway.
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
@@ -41,8 +47,8 @@ function totalOf(balances: CoinBalance[]): bigint {
   return balances.find((b) => b.coinId === HARNESS_COIN)?.total ?? 0n;
 }
 
-describe('S5/AC-E5 — SIGKILL after REAL certification → fresh-device resume', () => {
-  it('recovers the certified transfer on a new device, delivers exactly once, loses nothing', async () => {
+describe('S5/AC-E5 — SIGKILL after REAL split certification → fresh-device checkpoint resume', () => {
+  it('recovers a certified SPLIT (recipient + change) on a new device from the burn checkpoint, loses nothing', async () => {
     const aId = randomIdentity();
     const bId = randomIdentity();
 
@@ -63,7 +69,7 @@ describe('S5/AC-E5 — SIGKILL after REAL certification → fresh-device resume'
       HARNESS_PRIVKEY: aId.privateKey,
       HARNESS_PUBKEY: aId.chainPubkey,
       HARNESS_RECIPIENT: bId.chainPubkey,
-      HARNESS_AMOUNT: '1000', // whole token — the split-rerun path stays out (#501)
+      HARNESS_AMOUNT: '600', // < the 1000-token source ⇒ send() plans a SPLIT (600 out, 400 change)
     };
 
     // Phase 1: the child certifies the transfer ON THE REAL CHAIN and reaches
@@ -109,11 +115,12 @@ describe('S5/AC-E5 — SIGKILL after REAL certification → fresh-device resume'
     await b.module.load();
     const { transfers } = await b.module.receive();
     expect(transfers).toHaveLength(1);
-    expect(transfers[0].tokens[0]).toMatchObject({ amount: '1000', status: 'confirmed' });
+    expect(transfers[0].tokens[0]).toMatchObject({ amount: '600', status: 'confirmed' });
 
-    // No funds lost; both sides converge through the real backend.
-    expect(totalOf(await aClient.getBalances())).toBe(0n);
-    expect(totalOf(await bClient.getBalances())).toBe(1000n);
+    // No funds lost; both sides converge through the real backend. The 400 change was RECOVERED
+    // from the burn checkpoint on the fresh device (the #501/#634 fix) — not stranded.
+    expect(totalOf(await aClient.getBalances())).toBe(400n);
+    expect(totalOf(await bClient.getBalances())).toBe(600n);
 
     // Exactly ONE dedupKey'd SENT row under the original transferId (§10).
     const history = await aClient.listHistory();
