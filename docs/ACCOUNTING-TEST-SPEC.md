@@ -68,7 +68,6 @@ Each mock implements the full interface of its target to avoid partial stub issu
 // - on(event, handler): () => void (unsubscribe)
 // --- Test helpers (not part of PaymentsModule interface) ---
 // - emit(event, data): void (for triggering test events)
-// - l1: null (or MockL1PaymentsModule if needed)
 ```
 
 #### MockOracleProvider

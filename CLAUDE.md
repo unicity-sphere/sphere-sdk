@@ -45,7 +45,6 @@ if (created && generatedMnemonic) {
 // 3. Identity is ready
 const identity = sphere.identity!;
 console.log('L3 address:', identity.directAddress);  // DIRECT://... (primary)
-console.log('L1 address:', identity.l1Address);      // alpha1...
 console.log('Nametag:', identity.nametag);            // alice
 
 // 4. Check tokens and balance
@@ -117,15 +116,7 @@ sphere.on('transfer:incoming', (transfer) => {
   console.log(`From: ${transfer.senderNametag}, Tokens: ${transfer.tokens.length}`);
 });
 
-// 7. L1 operations (enabled by default, lazy Fulcrum connection)
-const l1Balance = await sphere.payments.l1!.getBalance();
-// { confirmed, unconfirmed, vested, unvested, total } — all strings in satoshis
-
-const l1Result = await sphere.payments.l1!.send({
-  to: 'alpha1...', amount: '100000', feeRate: 5,
-});
-
-// 8. Sync with remote storage (IPFS etc.)
+// 7. Sync with remote storage (IPFS etc.)
 const syncResult = await sphere.payments.sync(); // { added, removed }
 
 // 9. Transaction history
@@ -134,7 +125,7 @@ const history = sphere.payments.getHistory();
 
 // 10. Peer resolution (nametag → addresses)
 const peer = await sphere.resolve('@bob');
-// { chainPubkey, directAddress, l1Address, nametag, transportPubkey }
+// { chainPubkey, directAddress, nametag, transportPubkey }
 
 // 11. Multi-address
 await sphere.switchToAddress(1);
@@ -181,11 +172,11 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 
 **Transports:** `PostMessageTransport` (iframe/popup), `ExtensionTransport` (browser extension), `WebSocketTransport` (Node.js).
 
-**Queries:** `sphere_getIdentity`, `sphere_getBalance`, `sphere_getFiatBalance`, `sphere_l1GetBalance`, `sphere_getAssets`, `sphere_getTokens`, `sphere_getHistory`, `sphere_l1GetHistory`, `sphere_resolve`.
+**Queries:** `sphere_getIdentity`, `sphere_getBalance`, `sphere_getFiatBalance`, `sphere_getAssets`, `sphere_getTokens`, `sphere_getHistory`, `sphere_resolve`.
 
-**Intents:** `send`, `l1_send`, `dm`, `payment_request`, `receive`, `sign_message`.
+**Intents:** `send`, `dm`, `payment_request`, `receive`, `sign_message`.
 
-**Permissions:** `identity:read`, `balance:read`, `history:read`, `assets:read`, `intent:send`, `intent:l1_send`, `intent:dm`, `intent:payment_request`, `intent:receive`, `intent:sign_message`.
+**Permissions:** `identity:read`, `balance:read`, `history:read`, `assets:read`, `intent:send`, `intent:dm`, `intent:payment_request`, `intent:receive`, `intent:sign_message`.
 
 **Silent mode:** `new ConnectClient({ ..., silent: true })` — fast-check approved list without UI popup.
 
@@ -199,8 +190,6 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | Token Storage | IndexedDB per-address | File-based per-address |
 | Transport (Nostr) | Native WebSocket | `ws` package (install separately) |
 | Oracle (Aggregator) | Included with API key | Included with API key |
-| L1 (ALPHA blockchain) | Enabled, lazy Fulcrum connect | Enabled, lazy Fulcrum connect |
-| L1 Vesting Cache | IndexedDB (`SphereVestingCacheV5`) | Memory-only (no persistence) |
 | Price (CoinGecko) | Optional (`price` config) | Optional (`price` config) |
 | Token Registry | Remote fetch + localStorage cache | Remote fetch + file cache |
 | IPFS sync | Built-in (HTTP) | Built-in (HTTP) |
@@ -220,9 +209,6 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `sphere.payments.sync()` | `{ added, removed }` | Sync with remote storage |
 | `sphere.payments.validate()` | `{ valid, invalid }` | Validate against aggregator |
 | `sphere.payments.getHistory()` | `TransactionHistoryEntry[]` | Transaction history |
-| `sphere.payments.l1.getBalance()` | `L1Balance` | L1 balance (strings in sats) |
-| `sphere.payments.l1.send(request)` | `L1SendResult` | Send L1 transaction |
-| `sphere.payments.l1.getHistory(limit?)` | `L1Transaction[]` | L1 tx history |
 | `sphere.resolve(identifier)` | `PeerInfo \| null` | Resolve @nametag/address/pubkey |
 | `sphere.communications.resolvePeerNametag(pubkey)` | `string \| undefined` | Resolve peer nametag via transport |
 | `sphere.registerNametag(name)` | `void` | Register nametag (mints on-chain) |
@@ -247,7 +233,7 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `transfer:incoming` | `{ senderPubkey, senderNametag?, tokens, receivedAt }` | Received tokens via Nostr |
 | `transfer:confirmed` | `TransferResult` | Outgoing transfer confirmed |
 | `transfer:failed` | `TransferResult` | Outgoing transfer failed |
-| `identity:changed` | `{ l1Address, directAddress, chainPubkey, nametag, addressIndex }` | Address switch |
+| `identity:changed` | `{ directAddress, chainPubkey, nametag, addressIndex }` | Address switch |
 | `nametag:registered` | `{ nametag, addressIndex }` | Nametag registered |
 | `nametag:recovered` | `{ nametag }` | Nametag recovered from Nostr on import |
 | `address:activated` | `{ address: TrackedAddress }` | New address tracked |
@@ -307,7 +293,6 @@ sphere-sdk/
 ├── modules/                 # Feature modules
 │   ├── payments/
 │   │   ├── PaymentsModule.ts      # L3 token operations (88KB)
-│   │   ├── L1PaymentsModule.ts    # ALPHA blockchain operations
 │   │   ├── TokenSplitCalculator.ts
 │   │   ├── TokenSplitExecutor.ts
 │   │   └── NametagMinter.ts       # On-chain nametag minting
@@ -392,7 +377,6 @@ mnemonic → master key → BIP32 derivation → identity
                                               ↓
                         ┌─────────────────────┴─────────────────────┐
                         │  chainPubkey:   33-byte compressed pubkey │
-                        │  l1Address:     alpha1... (bech32)        │
                         │  directAddress: DIRECT://... (L3)         │
                         │  transportPubkey: derived for Nostr       │
                         └─────────────────────────────────────────────┘
@@ -403,7 +387,6 @@ mnemonic → master key → BIP32 derivation → identity
 ```typescript
 interface Identity {
   chainPubkey: string;      // 33-byte compressed secp256k1 (for L3)
-  l1Address: string;        // L1 bech32 address (alpha1...)
   directAddress?: string;   // L3 DIRECT address
   ipnsName?: string;        // IPFS/IPNS identifier
   nametag?: string;         // Human-readable alias (@username)
@@ -457,7 +440,6 @@ interface TransferResult {
 interface TrackedAddress {
   index: number;            // HD derivation index
   addressId: string;        // "DIRECT_abc123_xyz789"
-  l1Address: string;        // alpha1...
   directAddress: string;    // DIRECT://...
   chainPubkey: string;      // 33-byte compressed pubkey
   nametag?: string;         // primary nametag (without @)
@@ -507,12 +489,6 @@ npm run typecheck
 
 ## Key Concepts
 
-### L1 Payments (Enabled by Default)
-- L1 module (`sphere.payments.l1`) is created automatically
-- Fulcrum WebSocket connection is **lazy** — deferred until first L1 operation
-- Set `l1: null` in `PaymentsModuleConfig` to explicitly disable
-- `importFromJSON()` and `importFromLegacyFile()` accept `l1` config option
-- **Vesting cache**: `VestingClassifier` uses IndexedDB (`SphereVestingCacheV5`) in browser for persistent UTXO→coinbase tracing cache. In Node.js, falls back to memory-only cache (re-fetched from network each session)
 
 ### Nametags
 - Human-readable aliases (e.g., `@alice`) for receiving payments
@@ -603,10 +579,8 @@ The SDK manages multiple IndexedDB databases:
 |----------|----------|---------|
 | `sphere-storage` | `IndexedDBStorageProvider` | Wallet keys, per-address data (messages, etc.) |
 | `sphere-token-storage-{addressId}` | `IndexedDBTokenStorageProvider` | Token data per address (TXF format) |
-| `SphereVestingCacheV5` | `VestingClassifier` | L1 UTXO→coinbase tracing cache |
 
 `Sphere.clear()` deletes all three via:
-1. `vestingClassifier.destroy()` → deletes `SphereVestingCacheV5`
 2. Bulk `indexedDB.databases()` → deletes all `sphere*` databases
 3. `tokenStorage.clear()` → deletes per-address token databases
 4. `storage.clear()` → deletes `sphere-storage`

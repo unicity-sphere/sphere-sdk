@@ -40,7 +40,6 @@ A second key system appears in exactly one place: the optional IPFS/IPNS token b
 interface Identity {
   chainPubkey: string;     // 33-byte compressed secp256k1 (token network)
   directAddress?: string;  // DIRECT://…  — primary wallet address
-  l1Address: string;       // alpha1…     — ALPHA base-chain coin only
   ipnsName?: string;       // identifier for IPFS token backup
   nametag?: string;        // the Unicity ID (human-readable handle, e.g. @alice)
 }
@@ -66,8 +65,6 @@ The service that batches commitments into rounds and issues the signed proofs is
 
 ### 2b. The ALPHA blockchain ("L1")
 
-A conventional UTXO chain, Bitcoin‑style (SegWit / P2WPKH, bech32 `alpha1…` addresses). The SDK builds and signs transactions by hand (BIP‑143 signature hashing, low‑S canonical signatures, a fixed fee, 546‑sat dust threshold) and talks to a **Fulcrum** Electrum server over a WebSocket. The connection is *lazy* — it isn't opened until the first ALPHA operation.
-
 It also includes a **vesting classifier**: it traces each coin back to the coinbase that created it to label it vested or unvested, caching results in IndexedDB (browser) or memory (Node).
 
 ### Network presets
@@ -78,7 +75,6 @@ It also includes a **vesting classifier**: it traces each coin back to the coinb
 |---|---|---|---|
 | Aggregator | `aggregator.unicity.network/rpc` | `goggregator-test.unicity.network` | `dev-aggregator.dyndns.org/rpc` |
 | Messaging relay | `relay.unicity.network` | `nostr-relay.testnet.unicity.network` | `nostr-relay.testnet.unicity.network` |
-| Fulcrum (ALPHA) | `fulcrum.unicity.network:50004` | `fulcrum.unicity.network:50004` | `fulcrum.unicity.network:50004` |
 | Group‑chat relay | `sphere-relay.unicity.network` | `sphere-relay.unicity.network` | `sphere-relay.unicity.network` |
 
 Token metadata (symbols, decimals, icons) is fetched from a remote registry and cached; prices are optional via a CoinGecko provider.
@@ -172,7 +168,6 @@ The transport persists a per‑wallet "last seen" timestamp so reconnects resume
 ```
 Sphere (entry point: init / create / load / import / clear)
 ├── payments          — token transfers, balances, history
-│   └── l1            — ALPHA blockchain operations (lazy Fulcrum connection)
 ├── accounting        — invoices (an invoice IS a token), payment attribution, auto-return
 ├── swap              — peer-to-peer token swaps via an escrow service
 ├── communications    — direct messages and broadcasts

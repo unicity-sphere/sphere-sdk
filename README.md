@@ -129,7 +129,6 @@ sphere.communications.onDirectMessage((m) => console.log(m.senderNametag, m.cont
 
 **Send the ALPHA coin** (Unicity's base‑chain coin)
 ```typescript
-const r = await sphere.payments.l1!.send({ to: 'alpha1...', amount: '100000' /* in satoshis */ });
 ```
 
 ## Going further
@@ -163,7 +162,6 @@ There is also a command‑line tool in a separate package, [`@unicity-sphere/cli
 - **Token** — a unit of digital value held in a wallet (e.g. `UCT`).
 - **Unicity ID** — a human‑readable handle for a wallet (e.g. `@alice`). Lowercase letters/digits with `-` or `_`, 3–20 characters. Called `nametag` in the SDK's API.
 - **Wallet address** — the machine‑readable address behind a Unicity ID. People rarely type it; they use the handle (e.g. `@alice`).
-- **ALPHA coin** — the coin of Unicity's base blockchain. Sent through `sphere.payments.l1`.
 - **Smallest unit** — token amounts are integers in the token's smallest denomination, passed as strings (so `"1000000"`, not `1.0`).
 - **Provider** — a pluggable backend (storage, messaging, etc.). `createBrowserProviders()` / `createNodeProviders()` set these up for you.
 - **Network** — `testnet` (free, for building) or `mainnet` (real value).

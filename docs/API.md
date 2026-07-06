@@ -18,7 +18,6 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
   mnemonic: 'words...',      // Or provide mnemonic to create/import
   password: 'secret',        // Optional: encrypt mnemonic (plaintext if omitted)
   nametag: 'alice',          // Optional: register @alice on create
-  l1: { electrumUrl: '...' }, // Optional L1 config (enabled by default)
   price: priceProvider,      // Optional PriceProvider
   accounting: true,          // Optional: enable invoicing module
   swap: true,                // Optional: enable swap module (requires accounting)
@@ -66,7 +65,6 @@ await Sphere.clear(storage);
 |----------|------|-------------|
 | `identity` | `FullIdentity \| null` | Current wallet identity (after init/load) |
 | `payments` | `PaymentsModule` | L3 token operations + L1 via `.l1` |
-| `payments.l1` | `L1PaymentsModule` | L1 ALPHA operations |
 | `communications` | `CommunicationsModule` | Messaging operations |
 | `accounting` | `AccountingModule \| null` | Invoice lifecycle and payment attribution |
 | `swap` | `SwapModule \| null` | P2P token swap orchestration |
@@ -150,7 +148,6 @@ Switch the active identity to a different HD-derived address. Automatically trac
 ```typescript
 await sphere.switchToAddress(1);
 console.log(sphere.getCurrentAddressIndex()); // 1
-console.log(sphere.identity!.l1Address);      // alpha1... (address at index 1)
 ```
 
 #### `getActiveAddresses(): TrackedAddress[]`
@@ -160,7 +157,6 @@ Get all non-hidden tracked addresses, sorted by index.
 ```typescript
 const addresses = sphere.getActiveAddresses();
 for (const addr of addresses) {
-  console.log(`#${addr.index}: ${addr.l1Address} (${addr.nametag ?? 'no nametag'})`);
 }
 ```
 
@@ -193,7 +189,6 @@ const peer = await sphere.resolve('@alice');
 const peer = await sphere.resolve('DIRECT://000059756bc9c2e4c...');
 
 // By L1 address
-const peer = await sphere.resolve('alpha1qptag...');
 
 // By chain pubkey (33-byte compressed, 02/03 prefix)
 const peer = await sphere.resolve('025412bda2c5b5a15a891c6...');
@@ -209,7 +204,6 @@ interface PeerInfo {
   nametag?: string;        // Unicity ID (e.g. @alice) if registered
   transportPubkey: string; // 32-byte transport key
   chainPubkey: string;     // 33-byte compressed secp256k1
-  l1Address: string;       // alpha1... L1 address
   directAddress: string;   // DIRECT://... L3 address
   proxyAddress?: string;   // PROXY://... (only if nametag registered)
   timestamp: number;       // Binding event timestamp
@@ -1052,102 +1046,6 @@ Clear all completed, rejected, or expired outgoing requests.
 
 ---
 
-## L1PaymentsModule
-
-L1 (ALPHA blockchain) payments are accessed via `sphere.payments.l1`.
-
-L1 is **enabled by default** with lazy WebSocket connection (connects on first use). Set `l1: null` to disable.
-
-### Configuration
-
-L1 is configured through `Sphere.init()`:
-
-```typescript
-const { sphere } = await Sphere.init({
-  ...providers,
-  autoGenerate: true,
-  l1: {
-    electrumUrl: 'wss://fulcrum.alpha.unicity.network:50004',  // default
-    defaultFeeRate: 10,    // sat/byte, default
-    enableVesting: true,   // classify coins as vested/unvested, default
-  },
-});
-
-// Access L1 via payments module
-const balance = await sphere.payments.l1.getBalance();
-
-// Disable L1 entirely
-const { sphere } = await Sphere.init({ ...providers, autoGenerate: true, l1: null });
-```
-
-### L1Config
-
-```typescript
-interface L1Config {
-  /** Fulcrum WebSocket URL (default: wss://fulcrum.alpha.unicity.network:50004) */
-  electrumUrl?: string;
-  /** Default fee rate in sat/byte (default: 10) */
-  defaultFeeRate?: number;
-  /** Enable vesting classification (default: true) */
-  enableVesting?: boolean;
-}
-```
-
-### Methods
-
-#### `getBalance(): Promise<L1Balance>`
-
-```typescript
-interface L1Balance {
-  confirmed: string;
-  unconfirmed: string;
-  vested: string;
-  unvested: string;
-  total: string;
-}
-```
-
-#### `getUtxos(): Promise<L1Utxo[]>`
-
-```typescript
-interface L1Utxo {
-  txid: string;
-  vout: number;
-  amount: string;
-  address: string;
-  isVested: boolean;
-  confirmations: number;
-}
-```
-
-#### `send(request: L1SendRequest): Promise<L1SendResult>`
-
-```typescript
-interface L1SendRequest {
-  to: string;
-  amount: string;      // in satoshis
-  feeRate?: number;
-  useVested?: boolean;  // Send only vested coins
-  memo?: string;
-}
-
-interface L1SendResult {
-  success: boolean;
-  txHash?: string;
-  fee?: string;
-  error?: string;
-}
-```
-
-#### `getHistory(limit?: number): Promise<L1Transaction[]>`
-
-#### `getTransaction(txid: string): Promise<L1Transaction | null>`
-
-Get a single transaction by txid.
-
-#### `estimateFee(to: string, amount: string): Promise<{ fee: string; feeRate: number }>`
-
----
 
 ## CommunicationsModule
 
@@ -1315,7 +1213,6 @@ interface GroupData {
 ### FullIdentity
 
 **Single Identity Model**: L1 and L3 share the same secp256k1 key pair. The same `privateKey`/`chainPubkey` is used for:
-- L1 blockchain transactions (via `l1Address`)
 - L3 token ownership and transfers (via `chainPubkey` and `directAddress`)
 - Nostr P2P messaging (derived transport key)
 
@@ -1324,7 +1221,6 @@ interface Identity {
   /** 33-byte compressed secp256k1 public key (for L3 chain) */
   chainPubkey: string;
   /** L1 bech32 address = alpha1... (hash160 of chainPubkey) */
-  l1Address: string;
   /** L3 DIRECT address (DIRECT://...) */
   directAddress?: string;
   /** IPNS identifier for storage */
@@ -1372,7 +1268,6 @@ Full tracked address with derived fields (available in memory via `getActiveAddr
 ```typescript
 interface TrackedAddress extends TrackedAddressEntry {
   readonly addressId: string;      // Short ID (e.g., "DIRECT_abc123_xyz789")
-  readonly l1Address: string;      // L1 bech32 address (alpha1...)
   readonly directAddress: string;  // L3 DIRECT address (DIRECT://...)
   readonly chainPubkey: string;    // 33-byte compressed secp256k1
   readonly nametag?: string;       // Primary nametag (without @ prefix)
@@ -1434,8 +1329,7 @@ interface SphereEventMap {
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
   'identity:changed': {
-    l1Address: string;
-    directAddress?: string;
+      directAddress?: string;
     chainPubkey: string;
     nametag?: string;
     addressIndex: number;
@@ -1499,7 +1393,6 @@ interface PaymentsModuleDependencies {
   oracle: OracleProvider;
   emitEvent: (type: SphereEventType, data: SphereEventMap[type]) => void;
   chainCode?: string;
-  l1Addresses?: string[];
 }
 ```
 
@@ -1652,8 +1545,6 @@ createUnicityAggregatorProvider(config?: UnicityAggregatorProviderConfig): Unici
 
 // Payments
 createPaymentsModule(config?: PaymentsModuleConfig): PaymentsModule
-// PaymentsModuleConfig includes optional l1?: L1PaymentsModuleConfig
-createL1PaymentsModule(config?: L1PaymentsModuleConfig): L1PaymentsModule
 
 // Communications
 createCommunicationsModule(config?: CommunicationsModuleConfig): CommunicationsModule
