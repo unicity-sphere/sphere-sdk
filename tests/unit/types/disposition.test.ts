@@ -28,13 +28,13 @@ import type {
   DispositionReason,
   InvalidEntry,
   ManifestEntry,
-} from '../../../types/disposition';
+} from '../../../extensions/uxf/types/disposition';
 import {
   AUDIT_STATUSES,
   DISPOSITION_REASONS,
   isAuditStatus,
   isDispositionReason,
-} from '../../../types/disposition';
+} from '../../../extensions/uxf/types/disposition';
 
 // =============================================================================
 // 1. Stability snapshot — DispositionReason

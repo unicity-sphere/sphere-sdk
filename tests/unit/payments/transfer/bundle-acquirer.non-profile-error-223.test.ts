@@ -41,7 +41,7 @@ import {
   __clearInflightForTests,
 } from '../../../../extensions/uxf/pipeline/bundle-acquirer';
 import { ReplayLRU } from '../../../../extensions/uxf/pipeline/replay-lru';
-import type { UxfTransferPayloadCid } from '../../../../types/uxf-transfer';
+import type { UxfTransferPayloadCid } from '../../../../extensions/uxf/types/uxf-transfer';
 
 const SENDER = 'a'.repeat(64);
 const BUNDLE_CID = 'bafyreigoqei7imlyllzngjgun4yu2mkbmufgkbfxabafh552vyhm2z5lby';

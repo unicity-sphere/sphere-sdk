@@ -55,7 +55,7 @@ import {
   isUxfTransferOutboxEntry,
   type LegacyOutboxEntry,
   type UxfTransferOutboxEntry,
-} from '../../../types/uxf-outbox.js';
+} from '../types/uxf-outbox.js';
 import { decryptProfileValue, encryptProfileValue } from './encryption.js';
 import { Lamport } from './lamport.js';
 import {
@@ -65,7 +65,7 @@ import {
 } from './oplog-envelope-io.js';
 import { assertTransition } from './outbox-state-machine.js';
 import type { ProfileDatabase, TombstoneGcResult } from './types.js';
-import { MAX_ENTRY_BYTES_RAW } from '../../../types/uxf-bounds.js';
+import { MAX_ENTRY_BYTES_RAW } from '../types/uxf-bounds.js';
 import {
   runJoinSnapshot,
   validateLamport,

@@ -76,7 +76,7 @@ import {
   isUxfOutboxStatus,
   partitionStatus,
   type UxfOutboxStatus,
-} from '../../../types/uxf-outbox.js';
+} from '../types/uxf-outbox.js';
 
 // =============================================================================
 // 1. Public types — transition table rows + validator I/O

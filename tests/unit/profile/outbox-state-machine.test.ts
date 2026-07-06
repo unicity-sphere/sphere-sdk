@@ -32,7 +32,7 @@ import { SphereError } from '../../../core/errors.js';
 import {
   UXF_OUTBOX_STATUSES,
   type UxfOutboxStatus,
-} from '../../../types/uxf-outbox.js';
+} from '../../../extensions/uxf/types/uxf-outbox.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,

@@ -126,7 +126,7 @@ import {
   isLegacyOutboxEntry,
   type LegacyOutboxEntry,
   type UxfOutboxStatus,
-} from '../../../types/uxf-outbox.js';
+} from '../types/uxf-outbox.js';
 import { decryptProfileValue, encryptProfileValue } from './encryption.js';
 import { OutboxWriter, type OutboxWriteInput } from './outbox-writer.js';
 import type { ProfileDatabase } from './types.js';

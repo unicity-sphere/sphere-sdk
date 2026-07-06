@@ -45,7 +45,7 @@ import { SphereError } from '../../../core/errors.js';
 import {
   isUxfSentLedgerEntry,
   type UxfSentLedgerEntry,
-} from '../../../types/uxf-sent.js';
+} from '../types/uxf-sent.js';
 import { decryptProfileValue, encryptProfileValue } from './encryption.js';
 import { Lamport } from './lamport.js';
 import {
@@ -54,7 +54,7 @@ import {
   unwrapEnvelopeBytes,
 } from './oplog-envelope-io.js';
 import type { ProfileDatabase, TombstoneGcResult } from './types.js';
-import { MAX_ENTRY_BYTES_RAW } from '../../../types/uxf-bounds.js';
+import { MAX_ENTRY_BYTES_RAW } from '../types/uxf-bounds.js';
 import {
   runJoinSnapshot,
   validateLamport,

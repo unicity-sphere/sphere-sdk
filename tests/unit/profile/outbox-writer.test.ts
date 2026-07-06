@@ -32,7 +32,7 @@ import {
   type LegacyOutboxEntry,
   type UxfOutboxStatus,
   type UxfTransferOutboxEntry,
-} from '../../../types/uxf-outbox.js';
+} from '../../../extensions/uxf/types/uxf-outbox.js';
 import type { OrbitDbConfig, ProfileDatabase } from '../../../extensions/uxf/profile/types.js';
 
 // ---------------------------------------------------------------------------

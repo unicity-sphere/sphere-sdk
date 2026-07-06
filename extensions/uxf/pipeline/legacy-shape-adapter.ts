@@ -152,8 +152,8 @@ import { SphereError } from '../../../core/errors';
 import {
   isLegacyTokenTransferPayload,
   type LegacyTokenTransferPayload,
-} from '../../../types/uxf-transfer';
-import type { DispositionRecord } from '../../../types/disposition';
+} from '../types/uxf-transfer';
+import type { DispositionRecord } from '../types/disposition';
 import type { ContentHash, UxfElement } from '../bundle/types';
 import {
   processDisposition,
@@ -1051,8 +1051,8 @@ function defaultNow(): number {
 // 9. Re-exports — convenience for callers
 // =============================================================================
 
-export type { DispositionRecord } from '../../../types/disposition';
+export type { DispositionRecord } from '../types/disposition';
 export type {
   LegacyTokenTransferPayload,
-} from '../../../types/uxf-transfer';
+} from '../types/uxf-transfer';
 export type { FinalizationQueueEntry } from './finalization-queue';

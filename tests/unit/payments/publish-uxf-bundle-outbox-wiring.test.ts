@@ -38,7 +38,7 @@ import { PaymentsModule } from '../../../modules/payments/PaymentsModule';
 import type { OutboxWriter } from '../../../extensions/uxf/profile/outbox-writer';
 import type { SentLedgerWriter } from '../../../extensions/uxf/profile/sent-ledger-writer';
 import type { FullIdentity } from '../../../types';
-import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../../../extensions/uxf/types/uxf-outbox';
 
 // =============================================================================
 // Helpers

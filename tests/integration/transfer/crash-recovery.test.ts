@@ -96,7 +96,7 @@ import type {
 import type {
   UxfTransferOutboxEntry,
   UxfOutboxStatus,
-} from '../../../types/uxf-outbox';
+} from '../../../extensions/uxf/types/uxf-outbox';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 
 // =============================================================================

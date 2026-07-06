@@ -32,7 +32,7 @@ import type {
   UxfTransferPayload,
   UxfTransferPayloadCar,
   UxfTransferPayloadCid,
-} from '../../../../types/uxf-transfer';
+} from '../../../../extensions/uxf/types/uxf-transfer';
 import { UxfPackage } from '../../../../extensions/uxf/bundle/UxfPackage';
 import {
   carBytesToBase64,

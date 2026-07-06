@@ -29,7 +29,7 @@ import {
   MAX_CHAIN_DEPTH,
   MAX_UNCLAIMED_ROOTS,
 } from '../../../../extensions/uxf/pipeline/limits';
-import type { UxfTransferPayloadCar } from '../../../../types/uxf-transfer';
+import type { UxfTransferPayloadCar } from '../../../../extensions/uxf/types/uxf-transfer';
 import { UxfPackage } from '../../../../extensions/uxf/bundle/UxfPackage';
 import {
   ELEMENT_TYPE_TOKEN_ROOT,

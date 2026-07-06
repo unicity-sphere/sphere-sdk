@@ -121,7 +121,7 @@ import type { SphereEventMap, SphereEventType } from '../../../types/index.js';
 import type {
   UxfTransferPayloadCar,
   UxfTransferPayloadCid,
-} from '../../../types/uxf-transfer.js';
+} from '../types/uxf-transfer.js';
 import type { PerTokenMutex, PerTokenMutexStrategy } from '../profile/per-token-mutex.js';
 
 /**

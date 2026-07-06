@@ -28,8 +28,8 @@ import {
 import type { OutboxWriter } from '../../../../extensions/uxf/profile/outbox-writer';
 import type { SentLedgerWriter } from '../../../../extensions/uxf/profile/sent-ledger-writer';
 import type { SphereEventMap, SphereEventType } from '../../../../types';
-import type { UxfSentLedgerEntry } from '../../../../types/uxf-sent';
-import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
+import type { UxfSentLedgerEntry } from '../../../../extensions/uxf/types/uxf-sent';
+import type { UxfTransferOutboxEntry } from '../../../../extensions/uxf/types/uxf-outbox';
 import { SphereError } from '../../../../core/errors';
 
 // =============================================================================

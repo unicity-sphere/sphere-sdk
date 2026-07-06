@@ -4,7 +4,7 @@
  */
 
 import type { BaseProvider, FullIdentity, ComposingIndicator } from '../types';
-import type { UxfTransferPayload } from '../types/uxf-transfer';
+import type { UxfTransferPayload } from '../extensions/uxf/types/uxf-transfer';
 
 // =============================================================================
 // Transport Provider Interface

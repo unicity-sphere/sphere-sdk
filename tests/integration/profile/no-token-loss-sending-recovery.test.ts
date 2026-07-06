@@ -36,7 +36,7 @@ import {
   SendingRecoveryWorker,
   type SendingRecoveryWorkerDeps,
 } from '../../../extensions/uxf/pipeline/sending-recovery-worker.js';
-import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox.js';
+import type { UxfTransferOutboxEntry } from '../../../extensions/uxf/types/uxf-outbox.js';
 
 describe('G6 — SendingRecoveryWorker wiring', () => {
   it('SendingRecoveryWorker.runScanCycle invokes outbox.readAllNew()', async () => {

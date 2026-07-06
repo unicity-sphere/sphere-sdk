@@ -40,7 +40,7 @@ import {
   type UxfTransferPayload,
   type UxfTransferPayloadCar,
   type UxfTransferPayloadCid,
-} from '../../../types/uxf-transfer.js';
+} from '../types/uxf-transfer.js';
 import { EXTRACT_CAR_ROOT_HEADER_PROBE_BYTES } from './limits.js';
 
 // =============================================================================

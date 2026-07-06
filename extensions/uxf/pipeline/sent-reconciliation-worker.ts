@@ -68,7 +68,7 @@
  */
 
 import type { SphereEventMap, SphereEventType } from '../../../types';
-import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../types/uxf-outbox';
 import type { OutboxWriter } from '../profile/outbox-writer';
 import type { SentLedgerWriter } from '../profile/sent-ledger-writer';
 import { redactCause } from '../../../core/errors';

@@ -141,7 +141,7 @@ import { SphereError } from '../../../core/errors.js';
 import type {
   DispositionRecord,
   ManifestEntryDelta,
-} from '../../../types/disposition.js';
+} from '../types/disposition.js';
 import type { ContentHash, UxfElement } from '../bundle/types.js';
 
 import type { ContinuityResult, TxLike } from './continuity-walker.js';
@@ -1182,4 +1182,4 @@ export type { ContentHash, UxfElement } from '../bundle/types.js';
 export type {
   DispositionRecord,
   ManifestEntryDelta,
-} from '../../../types/disposition.js';
+} from '../types/disposition.js';

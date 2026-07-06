@@ -4,7 +4,7 @@
  */
 
 import type { AdditionalAsset } from './asset-target';
-import type { DeliveryStrategy } from './uxf-transfer';
+import type { DeliveryStrategy } from '../extensions/uxf/types/uxf-transfer';
 
 // =============================================================================
 // Provider Base Types
@@ -820,7 +820,7 @@ export interface SphereEventMap {
    * §5.4 / `DispositionReason` enum.
    */
   'transfer:operator-alert': {
-    readonly code: import('./disposition').DispositionReason;
+    readonly code: import('../extensions/uxf/types/disposition').DispositionReason;
     readonly tokenId?: string;
     readonly bundleCid?: string;
     readonly observedTokenContentHash?: import('../extensions/uxf/bundle/types').ContentHash;
@@ -927,7 +927,7 @@ export interface SphereEventMap {
     readonly tokenId: string;
     readonly bundleCid: string;
     readonly recipientTransportPubkey: string;
-    readonly reason: import('./disposition').DispositionReason;
+    readonly reason: import('../extensions/uxf/types/disposition').DispositionReason;
     /**
      * Outbox entry's transfer mode at cascade time.
      *
@@ -1085,7 +1085,7 @@ export interface SphereEventMap {
     readonly tokenId: string;
     readonly overrideAppliedAt: number;
     readonly overrideAppliedBy?: string;
-    readonly previousReason: import('./disposition').DispositionReason;
+    readonly previousReason: import('../extensions/uxf/types/disposition').DispositionReason;
     readonly transition: 'invalid→valid' | 'invalid→pending';
   };
   /**
@@ -1804,13 +1804,13 @@ export * from './instant-split';
 export * from './payment-session';
 
 // Re-export UXF transfer wire-format types (T.1.A)
-export * from './uxf-transfer';
+export * from '../extensions/uxf/types/uxf-transfer';
 
 // Re-export Asset Target / Additional Asset types (T.1.B.1)
 export * from './asset-target';
 
 // Re-export DispositionReason / AuditStatus enums + record schemas (T.1.C)
-export * from './disposition';
+export * from '../extensions/uxf/types/disposition';
 
 // =============================================================================
 // Network Health Types

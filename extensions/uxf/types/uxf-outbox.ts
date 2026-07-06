@@ -38,7 +38,7 @@
  * @module types/uxf-outbox
  */
 
-import type { OutboxEntry } from './txf.js';
+import type { OutboxEntry } from '../../../types/txf.js';
 import {
   MAX_TOKEN_IDS_PER_ENTRY,
   MAX_TOKEN_ID_LENGTH,

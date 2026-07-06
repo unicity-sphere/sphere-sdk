@@ -39,7 +39,7 @@ import type {
   WaitOptions,
 } from '../../../../oracle/oracle-provider';
 import type { Token } from '../../../../types';
-import type { DispositionReason } from '../../../../types/disposition';
+import type { DispositionReason } from '../../../../extensions/uxf/types/disposition';
 
 // =============================================================================
 // 1. Tiny test fixtures

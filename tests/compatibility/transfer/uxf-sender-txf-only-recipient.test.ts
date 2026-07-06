@@ -80,7 +80,7 @@ import {
   type UxfTransferPayloadCar,
   type UxfTransferPayloadCid,
   type LegacyTokenTransferPayload,
-} from '../../../types/uxf-transfer';
+} from '../../../extensions/uxf/types/uxf-transfer';
 import {
   carBytesToBase64,
   extractCarRootCid,

@@ -48,7 +48,7 @@ import type { OutboxWriter } from '../../../../extensions/uxf/profile/outbox-wri
 import type { SentLedgerWriter } from '../../../../extensions/uxf/profile/sent-ledger-writer';
 import type { SendingRecoveryWorker } from '../../../../extensions/uxf/pipeline/sending-recovery-worker';
 import type { TransportProvider } from '../../../../transport';
-import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../../../../extensions/uxf/types/uxf-outbox';
 
 // ---------------------------------------------------------------------------
 // SDK mocks

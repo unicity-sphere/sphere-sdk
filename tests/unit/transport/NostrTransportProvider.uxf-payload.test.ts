@@ -41,7 +41,7 @@ import type {
   LegacySphereTxfPayload,
   UxfTransferPayloadCar,
   UxfTransferPayloadCid,
-} from '../../../types/uxf-transfer';
+} from '../../../extensions/uxf/types/uxf-transfer';
 import type {
   IncomingTokenTransfer,
   TokenTransferPayload,

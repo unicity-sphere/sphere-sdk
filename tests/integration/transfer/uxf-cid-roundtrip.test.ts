@@ -40,7 +40,7 @@ import {
   isReplayOutcome,
 } from '../../../extensions/uxf/pipeline/bundle-acquirer';
 import { ReplayLRU } from '../../../extensions/uxf/pipeline/replay-lru';
-import type { UxfTransferPayloadCid } from '../../../types/uxf-transfer';
+import type { UxfTransferPayloadCid } from '../../../extensions/uxf/types/uxf-transfer';
 import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
 import {
   carBytesToBase64,

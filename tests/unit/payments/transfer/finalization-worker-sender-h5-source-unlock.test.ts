@@ -29,7 +29,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type {
   UxfTransferOutboxEntry,
   UxfOutboxStatus,
-} from '../../../../types/uxf-outbox';
+} from '../../../../extensions/uxf/types/uxf-outbox';
 import {
   FinalizationWorkerSender,
   type FinalizationOutboxWriter,

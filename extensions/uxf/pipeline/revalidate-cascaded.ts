@@ -61,7 +61,7 @@ import { MAX_CHAIN_DEPTH } from './limits';
 import type { CascadeManifestScanner } from './cascade-walker';
 import type { TokenManifestEntry } from '../profile/token-manifest';
 import type { ManifestStore } from '../profile/manifest-store';
-import type { DispositionReason } from '../../../types/disposition';
+import type { DispositionReason } from '../types/disposition';
 
 // =============================================================================
 // 1. Public types — child-revalidator contract

@@ -34,7 +34,7 @@ import {
   tk,
 } from '../../unit/payments/transfer/import-inclusion-proof-fixtures';
 import type { SphereEventMap } from '../../../types';
-import type { DispositionReason } from '../../../types/disposition';
+import type { DispositionReason } from '../../../extensions/uxf/types/disposition';
 
 // =============================================================================
 // 1. Audit listener — mirrors what an operator console would do.

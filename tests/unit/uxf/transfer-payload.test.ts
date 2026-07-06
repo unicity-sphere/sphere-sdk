@@ -39,7 +39,7 @@ import type {
   UxfTransferPayload,
   UxfTransferPayloadCar,
   UxfTransferPayloadCid,
-} from '../../../types/uxf-transfer';
+} from '../../../extensions/uxf/types/uxf-transfer';
 import { SphereError } from '../../../core/errors';
 
 // =============================================================================

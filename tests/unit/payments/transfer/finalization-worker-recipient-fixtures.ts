@@ -43,7 +43,7 @@ import { ManifestCas, type MinimalManifestStorage } from '../../../../extensions
 import { PerTokenMutex } from '../../../../extensions/uxf/profile/per-token-mutex';
 import { contentHash } from '../../../../extensions/uxf/bundle/types';
 import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
-import type { DispositionRecord } from '../../../../types/disposition';
+import type { DispositionRecord } from '../../../../extensions/uxf/types/disposition';
 import type {
   DispositionRevaluateInput,
 } from '../../../../extensions/uxf/pipeline/disposition-engine';

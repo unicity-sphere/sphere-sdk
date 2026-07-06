@@ -78,7 +78,7 @@ import {
 } from './manifest-cid-rewrite';
 import { ManifestCas } from '../profile/manifest-cas';
 import type { PerTokenMutex } from '../profile/per-token-mutex';
-import type { DispositionReason } from '../../../types/disposition';
+import type { DispositionReason } from '../types/disposition';
 import type {
   SphereEventMap,
   SphereEventType,
@@ -87,7 +87,7 @@ import type {
 import type {
   UxfTransferOutboxEntry,
   UxfOutboxStatus,
-} from '../../../types/uxf-outbox';
+} from '../types/uxf-outbox';
 import { SphereError } from '../../../core/errors';
 import { sanitizeReasonString, safeErrorMessage } from '../../../core/error-sanitize';
 import type { TrustBaseStaleness } from './trustbase-staleness';

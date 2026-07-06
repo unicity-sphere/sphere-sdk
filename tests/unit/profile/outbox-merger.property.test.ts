@@ -32,7 +32,7 @@
 
 import { describe, it, expect } from 'vitest';
 import fc from 'fast-check';
-import type { UxfTransferOutboxEntry, UxfOutboxStatus } from '../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry, UxfOutboxStatus } from '../../../extensions/uxf/types/uxf-outbox';
 import {
   mergeOutboxEntries,
   mergeStatus,

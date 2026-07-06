@@ -30,7 +30,7 @@ import { ManifestCas, type MinimalManifestStorage } from '../../../../extensions
 import { PerTokenMutex } from '../../../../extensions/uxf/profile/per-token-mutex';
 import { contentHash } from '../../../../extensions/uxf/bundle/types';
 import type { SphereEventMap, SphereEventType } from '../../../../types';
-import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../../../../extensions/uxf/types/uxf-outbox';
 import type { TokenManifestEntry } from '../../../../extensions/uxf/profile/token-manifest';
 
 export const ADDR = 'DIRECT://addr-A';

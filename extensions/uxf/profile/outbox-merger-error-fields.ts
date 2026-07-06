@@ -35,7 +35,7 @@
  * @see docs/uxf/UXF-TRANSFER-PROTOCOL.md §7.1 — canonical rules.
  */
 
-import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../types/uxf-outbox';
 import type { StatusMergeResult } from './outbox-merger-status';
 
 // =============================================================================

@@ -31,7 +31,7 @@
  * @module types/disposition
  */
 
-import type { ContentHash } from '../extensions/uxf/bundle/types.js';
+import type { ContentHash } from '../bundle/types.js';
 // Canonical ManifestEntry source: `profile/token-manifest.ts` exports
 // `TokenManifestEntry`. Per UXF-TRANSFER-IMPL-PLAN T.1.C, we re-export it
 // under the spec-aligned alias `ManifestEntry`. Future waves (T.1.F, T.5.B,
@@ -39,7 +39,7 @@ import type { ContentHash } from '../extensions/uxf/bundle/types.js';
 // (`splitParent`, `audit_promoted_from`, `lamport`, `lastProofRefreshAt`)
 // per PA §10.11; the alias keeps the import path stable across that
 // augmentation.
-import type { TokenManifestEntry } from '../extensions/uxf/profile/token-manifest.js';
+import type { TokenManifestEntry } from '../profile/token-manifest.js';
 
 // =============================================================================
 // 1. DispositionReason — on-wire string union (14 values, §5.4)

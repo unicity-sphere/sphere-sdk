@@ -28,7 +28,7 @@ import type {
 } from '../../../extensions/uxf/profile/types.js';
 import type {
   LegacyOutboxEntry,
-} from '../../../types/uxf-outbox.js';
+} from '../../../extensions/uxf/types/uxf-outbox.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures (mirror outbox-writer.test.ts to keep the suites side-by-side)

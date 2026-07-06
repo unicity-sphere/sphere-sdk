@@ -40,8 +40,8 @@ import {
 } from './__fixtures__/payments-module-fixture';
 import { Lamport } from '../../../../extensions/uxf/profile/lamport';
 import { SentLedgerWriter } from '../../../../extensions/uxf/profile/sent-ledger-writer';
-import type { UxfSentLedgerEntry } from '../../../../types/uxf-sent';
-import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
+import type { UxfSentLedgerEntry } from '../../../../extensions/uxf/types/uxf-sent';
+import type { UxfTransferOutboxEntry } from '../../../../extensions/uxf/types/uxf-outbox';
 
 // ---------------------------------------------------------------------------
 // SDK mocks (same shape as PaymentsModule.dual-mode.test.ts)

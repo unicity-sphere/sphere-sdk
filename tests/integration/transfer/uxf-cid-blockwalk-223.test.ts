@@ -50,7 +50,7 @@ import {
 } from '../../../extensions/uxf/pipeline/bundle-acquirer';
 import { ReplayLRU } from '../../../extensions/uxf/pipeline/replay-lru';
 import { isSphereError } from '../../../core/errors';
-import type { UxfTransferPayloadCid } from '../../../types/uxf-transfer';
+import type { UxfTransferPayloadCid } from '../../../extensions/uxf/types/uxf-transfer';
 import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
 import { extractCarRootCid } from '../../../extensions/uxf/bundle/transfer-payload';
 

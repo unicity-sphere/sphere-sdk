@@ -34,7 +34,7 @@ import {
 import type { TokenLike } from '../../../extensions/uxf/pipeline/classify-token';
 import type { PreflightFinalizeOptions } from '../../../extensions/uxf/pipeline/preflight-finalize';
 import type { Token, TransferRequest } from '../../../types';
-import type { UxfTransferPayloadCar } from '../../../types/uxf-transfer';
+import type { UxfTransferPayloadCar } from '../../../extensions/uxf/types/uxf-transfer';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 
 import {

@@ -212,7 +212,7 @@ import { ManifestCas, type MinimalManifestStorage } from '../../extensions/uxf/p
 // inject OrbitDB-backed dispositionStorage + manifestStore (see
 // {@link OrbitDbDispositionStorageAdapter}).
 import { DispositionWriter } from '../../extensions/uxf/profile/disposition-writer';
-import type { DispositionRecord } from '../../types/disposition';
+import type { DispositionRecord } from '../../extensions/uxf/types/disposition';
 import {
   InMemoryDispositionStorageAdapter,
 } from '../../extensions/uxf/profile/disposition-storage-adapters';
@@ -222,10 +222,10 @@ import type { TokenManifestEntry } from '../../extensions/uxf/profile/token-mani
 import type { CascadeManifestScanner as CascadeManifestScannerForRevalidate } from '../../extensions/uxf/pipeline/cascade-walker';
 import type { ProofVerifyStatus } from '../../extensions/uxf/pipeline/proof-verifier';
 import { contentHash, type ContentHash } from '../../extensions/uxf/bundle/types';
-import { isLegacyTokenTransferPayload, type UxfTransferPayload } from '../../types/uxf-transfer';
+import { isLegacyTokenTransferPayload, type UxfTransferPayload } from '../../extensions/uxf/types/uxf-transfer';
 import { carBytesToBase64 } from '../../extensions/uxf/bundle/transfer-payload';
-import type { UxfTransferOutboxEntry } from '../../types/uxf-outbox';
-import type { UxfSentLedgerEntry } from '../../types/uxf-sent';
+import type { UxfTransferOutboxEntry } from '../../extensions/uxf/types/uxf-outbox';
+import type { UxfSentLedgerEntry } from '../../extensions/uxf/types/uxf-sent';
 import type { OutboxWriter } from '../../extensions/uxf/profile/outbox-writer';
 import type { SentLedgerWriter } from '../../extensions/uxf/profile/sent-ledger-writer';
 import {

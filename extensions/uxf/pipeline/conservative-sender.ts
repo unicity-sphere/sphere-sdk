@@ -94,12 +94,12 @@ import type {
   TransferRequest,
   TransferResult,
 } from '../../../types';
-import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../types/uxf-outbox';
 import type {
   DeliveryStrategy,
   UxfTransferPayloadCar,
   UxfTransferPayloadCid,
-} from '../../../types/uxf-transfer';
+} from '../types/uxf-transfer';
 import { UxfPackage } from '../bundle/UxfPackage';
 import { extractCarRootCid } from '../bundle/transfer-payload';
 

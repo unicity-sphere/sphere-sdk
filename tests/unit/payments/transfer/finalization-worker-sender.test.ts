@@ -51,7 +51,7 @@ import type {
   SphereEventMap,
   SphereEventType,
 } from '../../../../types';
-import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../../../../extensions/uxf/types/uxf-outbox';
 import type { TokenManifestEntry } from '../../../../extensions/uxf/profile/token-manifest';
 
 // =============================================================================

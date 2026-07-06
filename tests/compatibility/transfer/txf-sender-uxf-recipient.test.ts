@@ -72,7 +72,7 @@ import type { OracleProvider } from '../../../oracle/oracle-provider';
 import type { TransportProvider } from '../../../transport';
 import type { PeerInfo } from '../../../transport/transport-provider';
 import type { ContentHash } from '../../../extensions/uxf/bundle/types';
-import type { LegacyTokenTransferPayload } from '../../../types/uxf-transfer';
+import type { LegacyTokenTransferPayload } from '../../../extensions/uxf/types/uxf-transfer';
 import type {
   FullIdentity,
   SphereEventMap,

@@ -41,7 +41,7 @@
  */
 
 import { SphereError } from '../../../core/errors';
-import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../types/uxf-outbox';
 import { mergeStatus } from './outbox-merger-status';
 import { mergeRequestIds } from './outbox-merger-requestids';
 import { mergeErrorFields, mergeAuditPromotedFrom } from './outbox-merger-error-fields';

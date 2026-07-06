@@ -42,8 +42,8 @@
  * @see docs/uxf/UXF-TRANSFER-PROTOCOL.md §7.1 — canonical rules.
  */
 
-import type { UxfTransferOutboxEntry, UxfOutboxStatus } from '../../../types/uxf-outbox';
-import { partitionStatus } from '../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry, UxfOutboxStatus } from '../types/uxf-outbox';
+import { partitionStatus } from '../types/uxf-outbox';
 
 // =============================================================================
 // 1. Lattice helpers (active-tier)

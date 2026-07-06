@@ -81,8 +81,8 @@ import type {
   DeliveryStrategy,
   UxfTransferPayloadCar,
   UxfTransferPayloadCid,
-} from '../../../types/uxf-transfer';
-import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
+} from '../types/uxf-transfer';
+import type { UxfTransferOutboxEntry } from '../types/uxf-outbox';
 import { UxfPackage } from '../bundle/UxfPackage';
 import { extractCarRootCid } from '../bundle/transfer-payload';
 

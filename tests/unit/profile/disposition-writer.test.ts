@@ -44,7 +44,7 @@ import type {
   AuditEntry,
   DispositionRecord,
   InvalidEntry,
-} from '../../../types/disposition.js';
+} from '../../../extensions/uxf/types/disposition.js';
 import type {
   SphereEventMap,
   SphereEventType,

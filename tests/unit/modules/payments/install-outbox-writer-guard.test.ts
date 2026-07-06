@@ -37,7 +37,7 @@ import {
   makeOutboxEntry,
 } from './__fixtures__/payments-module-fixture';
 import type { OutboxWriter } from '../../../../extensions/uxf/profile/outbox-writer';
-import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../../../../extensions/uxf/types/uxf-outbox';
 
 // ---------------------------------------------------------------------------
 // SDK mocks

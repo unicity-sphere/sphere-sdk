@@ -74,12 +74,12 @@ import {
   type ManifestCasResult,
 } from '../profile/manifest-cas';
 import type { TokenManifestEntry } from '../profile/token-manifest';
-import type { DispositionReason } from '../../../types/disposition';
+import type { DispositionReason } from '../types/disposition';
 import type {
   SphereEventMap,
   SphereEventType,
 } from '../../../types';
-import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../types/uxf-outbox';
 
 // =============================================================================
 // 1. Injected dependency contracts

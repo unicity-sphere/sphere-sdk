@@ -70,7 +70,7 @@
  */
 
 import { SphereError } from '../../../core/errors.js';
-import type { UxfTransferPayload } from '../../../types/uxf-transfer.js';
+import type { UxfTransferPayload } from '../types/uxf-transfer.js';
 import type { UxfPackage } from '../bundle/UxfPackage.js';
 import {
   ELEMENT_TYPE_TOKEN_ROOT,

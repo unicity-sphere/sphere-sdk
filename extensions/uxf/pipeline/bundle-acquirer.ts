@@ -83,11 +83,11 @@
 
 import { SphereError } from '../../../core/errors.js';
 import { sanitizeReasonString } from '../../../core/error-sanitize.js';
-import type { UxfTransferPayload } from '../../../types/uxf-transfer.js';
+import type { UxfTransferPayload } from '../types/uxf-transfer.js';
 import {
   isUxfTransferPayloadCar,
   isUxfTransferPayloadCid,
-} from '../../../types/uxf-transfer.js';
+} from '../types/uxf-transfer.js';
 import { UxfPackage } from '../bundle/UxfPackage.js';
 import { UxfError } from '../bundle/errors.js';
 import {

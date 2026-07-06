@@ -43,7 +43,7 @@ import {
   seedQueue,
 } from './finalization-worker-recipient-fixtures';
 import type { TokenManifestEntry } from '../../../../extensions/uxf/profile/token-manifest';
-import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../../../../extensions/uxf/types/uxf-outbox';
 
 const CHILD_A = 'child-token-A';
 const CHILD_B = 'child-token-B';

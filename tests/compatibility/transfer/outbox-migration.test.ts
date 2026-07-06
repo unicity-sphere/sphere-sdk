@@ -64,7 +64,7 @@ import {
   sentinelKey,
 } from '../../../extensions/uxf/profile/migration-outbox.js';
 import { restoreLegacyOutbox } from '../../../tools/restore-legacy-outbox.js';
-import { isLegacyOutboxEntry, type LegacyOutboxEntry } from '../../../types/uxf-outbox.js';
+import { isLegacyOutboxEntry, type LegacyOutboxEntry } from '../../../extensions/uxf/types/uxf-outbox.js';
 import type { OrbitDbConfig, ProfileDatabase } from '../../../extensions/uxf/profile/types.js';
 
 // =============================================================================

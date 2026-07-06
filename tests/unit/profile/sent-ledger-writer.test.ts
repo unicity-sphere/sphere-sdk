@@ -575,7 +575,7 @@ describe('SentLedgerWriter (Issue #97)', () => {
     // pollute the existing top-of-file imports.
     let isUxfSentLedgerEntry: (v: unknown) => boolean;
     beforeEach(async () => {
-      const mod = await import('../../../types/uxf-sent.js');
+      const mod = await import('../../../extensions/uxf/types/uxf-sent.js');
       isUxfSentLedgerEntry = mod.isUxfSentLedgerEntry;
     });
 
@@ -642,7 +642,7 @@ describe('SentLedgerWriter (Issue #97)', () => {
 
     let isUxfSentLedgerEntry: (v: unknown) => boolean;
     beforeEach(async () => {
-      const mod = await import('../../../types/uxf-sent.js');
+      const mod = await import('../../../extensions/uxf/types/uxf-sent.js');
       isUxfSentLedgerEntry = mod.isUxfSentLedgerEntry;
     });
 

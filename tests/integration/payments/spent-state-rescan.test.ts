@@ -52,8 +52,8 @@ import type {
   SphereEventType,
   Token,
 } from '../../../types';
-import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
-import type { UxfSentLedgerEntry } from '../../../types/uxf-sent';
+import type { UxfTransferOutboxEntry } from '../../../extensions/uxf/types/uxf-outbox';
+import type { UxfSentLedgerEntry } from '../../../extensions/uxf/types/uxf-sent';
 
 // =============================================================================
 // Fixture — shared addressId, mock ProfileDatabase.

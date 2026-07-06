@@ -22,7 +22,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { SphereError } from '../../../core/errors';
-import type { UxfTransferOutboxEntry, UxfOutboxStatus } from '../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry, UxfOutboxStatus } from '../../../extensions/uxf/types/uxf-outbox';
 import {
   mergeOutboxEntries,
   mergeOutboxEntriesPair,

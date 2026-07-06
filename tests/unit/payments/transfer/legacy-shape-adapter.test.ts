@@ -40,7 +40,7 @@ import type { EvaluatePredicateResult } from '../../../../extensions/uxf/pipelin
 import type { ProofVerifyStatus } from '../../../../extensions/uxf/pipeline/proof-verifier';
 import type { VerifyAuthenticatorResult } from '../../../../extensions/uxf/pipeline/authenticator-verifier';
 import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
-import type { LegacyTokenTransferPayload } from '../../../../types/uxf-transfer';
+import type { LegacyTokenTransferPayload } from '../../../../extensions/uxf/types/uxf-transfer';
 import type { FinalizationQueueEntry } from '../../../../extensions/uxf/pipeline/finalization-queue';
 
 // =============================================================================

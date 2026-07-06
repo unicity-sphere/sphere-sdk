@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../../../extensions/uxf/types/uxf-outbox';
 import { mergeOutboxEntries, mergeErrorFields, mergeStatus } from '../../../extensions/uxf/profile/outbox-merger';
 
 function makeEntry(overrides: Partial<UxfTransferOutboxEntry> = {}): UxfTransferOutboxEntry {

@@ -53,11 +53,11 @@ import type {
 import type {
   UxfTransferOutboxEntry,
   UxfOutboxStatus,
-} from '../../../../types/uxf-outbox';
+} from '../../../../extensions/uxf/types/uxf-outbox';
 import type {
   UxfTransferPayloadCar,
   UxfTransferPayloadCid,
-} from '../../../../types/uxf-transfer';
+} from '../../../../extensions/uxf/types/uxf-transfer';
 import { TOKEN_A } from '../../../fixtures/uxf-mock-tokens';
 
 // =============================================================================

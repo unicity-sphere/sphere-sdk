@@ -60,7 +60,7 @@ import {
   type SnapshotEntry,
 } from './profile-snapshot-merge.js';
 import type { ProfileDatabase } from './types.js';
-import { MAX_ENTRY_BYTES_RAW } from '../../../types/uxf-bounds.js';
+import { MAX_ENTRY_BYTES_RAW } from '../types/uxf-bounds.js';
 
 // =============================================================================
 // 1. Options + value-validator type

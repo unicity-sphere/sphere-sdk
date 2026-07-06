@@ -46,7 +46,7 @@ import {
 } from '../../../extensions/uxf/profile/migration-outbox.js';
 import { encryptProfileValue } from '../../../extensions/uxf/profile/encryption.js';
 import { restoreLegacyOutbox } from '../../../tools/restore-legacy-outbox.js';
-import type { LegacyOutboxEntry } from '../../../types/uxf-outbox.js';
+import type { LegacyOutboxEntry } from '../../../extensions/uxf/types/uxf-outbox.js';
 import type { OrbitDbConfig, ProfileDatabase } from '../../../extensions/uxf/profile/types.js';
 
 // ---------------------------------------------------------------------------

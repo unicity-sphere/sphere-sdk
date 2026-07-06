@@ -37,7 +37,7 @@
  */
 
 import { SphereError } from '../../../core/errors.js';
-import type { DeliveryStrategy } from '../../../types/uxf-transfer.js';
+import type { DeliveryStrategy } from '../types/uxf-transfer.js';
 import { carBytesToBase64 } from '../bundle/transfer-payload.js';
 
 import {

@@ -93,7 +93,7 @@ import type {
   TransferRequest,
   TransferResult,
 } from '../../../types';
-import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../types/uxf-outbox';
 
 import { classifyToken, type TokenLike } from './classify-token';
 import type { FaultInjectionHooks } from './conservative-sender';

@@ -55,7 +55,7 @@ import type {
   SubmitResult,
 } from '../../../oracle/oracle-provider';
 import type { Token } from '../../../types';
-import type { DispositionReason } from '../../../types/disposition';
+import type { DispositionReason } from '../types/disposition';
 
 // =============================================================================
 // 1. Public types — events, options, results, hard-fail cause

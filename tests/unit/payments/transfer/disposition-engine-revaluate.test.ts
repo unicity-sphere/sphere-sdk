@@ -26,7 +26,7 @@ import {
   type HydratedChain,
   type HydratedTx,
 } from '../../../../extensions/uxf/pipeline/disposition-engine';
-import type { ManifestEntryDelta } from '../../../../types/disposition';
+import type { ManifestEntryDelta } from '../../../../extensions/uxf/types/disposition';
 import type { ContentHash, UxfElement } from '../../../../extensions/uxf/bundle/types';
 
 const TOKEN_ID =

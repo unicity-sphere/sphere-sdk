@@ -45,7 +45,7 @@ import type {
   AuditEntry,
   DispositionReason,
   InvalidEntry,
-} from '../../../../types/disposition';
+} from '../../../../extensions/uxf/types/disposition';
 import type { DispositionPerEntryStorage } from '../../../../extensions/uxf/profile/disposition-writer';
 import type {
   SphereEventMap,

@@ -43,7 +43,7 @@ import type {
   TxfStorageDataBase,
 } from '../../../../../storage';
 import type { TransportProvider } from '../../../../../transport';
-import type { UxfTransferOutboxEntry } from '../../../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../../../../../extensions/uxf/types/uxf-outbox';
 import type { SentLedgerWriteInput } from '../../../../../extensions/uxf/profile/sent-ledger-writer';
 
 /** Canonical valid addressId used by every fixture. Matches the shape

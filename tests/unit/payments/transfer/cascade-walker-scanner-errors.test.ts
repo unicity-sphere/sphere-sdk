@@ -34,7 +34,7 @@ import type {
   CascadeManifestScanner,
   CascadeOutboxScanner,
 } from '../../../../extensions/uxf/pipeline/cascade-walker';
-import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../../../../extensions/uxf/types/uxf-outbox';
 
 describe('§6.1.1 cascade — scanner-error surfacing', () => {
   it('findChildren throw → scannerErrors increments + onScannerError fires', async () => {

@@ -41,7 +41,7 @@ import {
 import { createUxfCarPublisher } from '../../../extensions/uxf/pipeline/ipfs-publisher';
 import type { PreflightFinalizeOptions } from '../../../extensions/uxf/pipeline/preflight-finalize';
 import type { TransferRequest } from '../../../types';
-import type { UxfTransferPayloadCid } from '../../../types/uxf-transfer';
+import type { UxfTransferPayloadCid } from '../../../extensions/uxf/types/uxf-transfer';
 import { extractCarRootCid } from '../../../extensions/uxf/bundle/transfer-payload';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 

@@ -42,7 +42,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { SphereEventMap, SphereEventType } from '../../../types';
-import type { DispositionReason } from '../../../types/disposition';
+import type { DispositionReason } from '../../../extensions/uxf/types/disposition';
 
 // =============================================================================
 // 1. Compile-time existence check — every UXF transfer:* key MUST be

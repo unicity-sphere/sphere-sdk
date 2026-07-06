@@ -62,7 +62,7 @@ import type { ContinuityResult, TxLike } from '../../../../extensions/uxf/pipeli
 import type { EvaluatePredicateResult } from '../../../../extensions/uxf/pipeline/predicate-evaluator';
 import type { ProofVerifyStatus } from '../../../../extensions/uxf/pipeline/proof-verifier';
 import type { VerifyAuthenticatorResult } from '../../../../extensions/uxf/pipeline/authenticator-verifier';
-import type { ManifestEntryDelta } from '../../../../types/disposition';
+import type { ManifestEntryDelta } from '../../../../extensions/uxf/types/disposition';
 import type { ContentHash, UxfElement } from '../../../../extensions/uxf/bundle/types';
 
 // =============================================================================

@@ -66,10 +66,10 @@
 
 import type {
   DispositionReason,
-} from '../../../types/disposition';
+} from '../types/disposition';
 import type {
   InvalidEntry,
-} from '../../../types/disposition';
+} from '../types/disposition';
 import type {
   SphereEventMap,
   SphereEventType,

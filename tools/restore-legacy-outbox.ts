@@ -127,7 +127,7 @@ import {
   sentinelKey,
   type LegacyOutboxBackup,
 } from '../extensions/uxf/profile/migration-outbox.js';
-import { isLegacyOutboxEntry, type LegacyOutboxEntry } from '../types/uxf-outbox.js';
+import { isLegacyOutboxEntry, type LegacyOutboxEntry } from '../extensions/uxf/types/uxf-outbox.js';
 import type { ProfileDatabase } from '../extensions/uxf/profile/types.js';
 
 // =============================================================================

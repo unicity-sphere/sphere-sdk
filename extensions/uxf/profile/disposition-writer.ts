@@ -57,7 +57,7 @@ import type {
   DispositionRecord,
   InvalidEntry,
   ManifestEntryDelta,
-} from '../../../types/disposition.js';
+} from '../types/disposition.js';
 import type { SphereEventMap, SphereEventType } from '../../../types/index.js';
 import type { ContentHash } from '../bundle/types.js';
 import { ManifestStore } from './manifest-store.js';

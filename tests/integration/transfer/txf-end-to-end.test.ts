@@ -31,7 +31,7 @@ import {
   type TxfOutboxHooks,
 } from '../../../extensions/uxf/pipeline/txf-sender';
 import type { TransferRequest } from '../../../types';
-import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
+import type { UxfTransferOutboxEntry } from '../../../extensions/uxf/types/uxf-outbox';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 
 import {

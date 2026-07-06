@@ -29,7 +29,7 @@ import { ReplayLRU } from '../../../extensions/uxf/pipeline/replay-lru';
 import type {
   UxfTransferPayload,
   UxfTransferPayloadCar,
-} from '../../../types/uxf-transfer';
+} from '../../../extensions/uxf/types/uxf-transfer';
 import type { TransferRequest } from '../../../types';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 

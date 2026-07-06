@@ -49,7 +49,7 @@ import {
   extractCarRootCid,
 } from '../../../extensions/uxf/bundle/transfer-payload';
 import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
-import type { UxfTransferPayloadCid } from '../../../types/uxf-transfer';
+import type { UxfTransferPayloadCid } from '../../../extensions/uxf/types/uxf-transfer';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 
 import { ALICE_CHAIN_PUBKEY } from './_harness';

@@ -70,7 +70,7 @@ import {
   STORAGE_KEYS_GLOBAL,
   TIMEOUTS,
 } from '../constants';
-import { isUxfTransferPayload } from '../types/uxf-transfer';
+import { isUxfTransferPayload } from '../extensions/uxf/types/uxf-transfer';
 import { encodeTransferPayload, decodeTransferPayload } from '../extensions/uxf/bundle/transfer-payload';
 
 // =============================================================================

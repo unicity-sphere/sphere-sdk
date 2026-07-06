@@ -34,7 +34,7 @@ import type { TransferRequest } from '../../../types';
 import type {
   UxfTransferPayloadCar,
   UxfTransferPayloadCid,
-} from '../../../types/uxf-transfer';
+} from '../../../extensions/uxf/types/uxf-transfer';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 
 import {

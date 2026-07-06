@@ -23,13 +23,13 @@ import type {
   UxfTransferPayload,
   UxfTransferPayloadCar,
   UxfTransferPayloadCid,
-} from '../../../types/uxf-transfer';
+} from '../../../extensions/uxf/types/uxf-transfer';
 import {
   isLegacyTokenTransferPayload,
   isUxfTransferPayload,
   isUxfTransferPayloadCar,
   isUxfTransferPayloadCid,
-} from '../../../types/uxf-transfer';
+} from '../../../extensions/uxf/types/uxf-transfer';
 
 // =============================================================================
 // Runtime guard — `isUxfTransferPayload`
