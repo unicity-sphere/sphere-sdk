@@ -20,7 +20,7 @@ import { CID } from 'multiformats/cid';
 import * as raw from 'multiformats/codecs/raw';
 import { create as createDigest } from 'multiformats/hashes/digest';
 
-import { pinToIpfs, pinCarBlocksToIpfs, fetchFromIpfs } from '../../../profile/ipfs-client';
+import { pinToIpfs, pinCarBlocksToIpfs, fetchFromIpfs } from '../../../extensions/uxf/profile/ipfs-client';
 
 // ---------------------------------------------------------------------------
 // Helpers

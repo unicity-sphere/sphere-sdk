@@ -15,8 +15,8 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { OrbitDbAdapter } from '../../profile/orbitdb-adapter.js';
-import { buildLocalEntry, decodeEntry, encodeEntry } from '../../profile/oplog-entry.js';
+import { OrbitDbAdapter } from '../../extensions/uxf/profile/orbitdb-adapter.js';
+import { buildLocalEntry, decodeEntry, encodeEntry } from '../../extensions/uxf/profile/oplog-entry.js';
 import { randomBytes } from 'crypto';
 import * as os from 'os';
 import * as path from 'path';

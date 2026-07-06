@@ -24,12 +24,12 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   runProfileSnapshotApply,
   type ProfileSnapshotApplyDeps,
-} from '../../../profile/factory.js';
+} from '../../../extensions/uxf/profile/factory.js';
 import type {
   JoinResult,
   ProfileSyncWriter,
-} from '../../../profile/profile-snapshot-merge.js';
-import type { LeanProfileSnapshot } from '../../../profile/profile-lean-snapshot.js';
+} from '../../../extensions/uxf/profile/profile-snapshot-merge.js';
+import type { LeanProfileSnapshot } from '../../../extensions/uxf/profile/profile-lean-snapshot.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures

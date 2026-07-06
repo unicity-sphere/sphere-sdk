@@ -19,7 +19,7 @@ import { describe, it, expect, vi } from 'vitest';
 // Mock the IPFS client so fetchAndJoin tests don't hit the network.
 // The mock is per-test via `mockImplementation` to keep each scenario
 // independent.
-vi.mock('../../../profile/ipfs-client', () => ({
+vi.mock('../../../extensions/uxf/profile/ipfs-client', () => ({
   fetchFromIpfs: vi.fn(),
   pinToIpfs: vi.fn(),
   verifyCidAccessible: vi.fn(),
@@ -32,8 +32,8 @@ import type { OracleProvider } from '../../../oracle';
 import {
   DURABLE_STORAGE,
   ProfilePointerLayer,
-} from '../../../profile/aggregator-pointer';
-import { buildProfilePointerLayer } from '../../../profile/pointer-wiring';
+} from '../../../extensions/uxf/profile/aggregator-pointer';
+import { buildProfilePointerLayer } from '../../../extensions/uxf/profile/pointer-wiring';
 import { createFileStorageProvider } from '../../../impl/nodejs/storage/FileStorageProvider';
 
 /**
@@ -335,7 +335,7 @@ describe('fetchAndJoin pre-flight (Item #15 Phase E)', () => {
   const TEST_CID_STRING = 'bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku';
 
   it('throws CAR_UNAVAILABLE when the IPFS fetch fails', async () => {
-    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
+    const { fetchFromIpfs } = await import('../../../extensions/uxf/profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
     fetchMock.mockImplementation(async () => {
@@ -343,7 +343,7 @@ describe('fetchAndJoin pre-flight (Item #15 Phase E)', () => {
     });
 
     const applySnapshot = vi.fn();
-    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { __internal } = await import('../../../extensions/uxf/profile/pointer-wiring');
     const { CID } = await import('multiformats/cid');
     const callback = __internal.buildFetchAndJoin({
       gateways: ['https://ipfs.example'],
@@ -362,7 +362,7 @@ describe('fetchAndJoin pre-flight (Item #15 Phase E)', () => {
 
   it('throws CAR_UNAVAILABLE when no gateways are configured', async () => {
     const applySnapshot = vi.fn();
-    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { __internal } = await import('../../../extensions/uxf/profile/pointer-wiring');
     const { CID } = await import('multiformats/cid');
     const callback = __internal.buildFetchAndJoin({
       gateways: [],
@@ -379,7 +379,7 @@ describe('fetchAndJoin pre-flight (Item #15 Phase E)', () => {
 
   it('throws PROTOCOL_ERROR on malformed CID bytes', async () => {
     const applySnapshot = vi.fn();
-    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { __internal } = await import('../../../extensions/uxf/profile/pointer-wiring');
     const callback = __internal.buildFetchAndJoin({
       gateways: ['https://ipfs.example'],
       persistLocalVersion: async () => {},
@@ -424,7 +424,7 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
      */
     blockMap: Map<string, Uint8Array>;
   }> {
-    const { buildLeanProfileSnapshot } = await import('../../../profile/profile-lean-snapshot');
+    const { buildLeanProfileSnapshot } = await import('../../../extensions/uxf/profile/profile-lean-snapshot');
     // Stub storage with one KV entry under an addressId.
     const tokenStorageStub = {
       listBundles: async () => new Map(),
@@ -474,7 +474,7 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
   it('parses the snapshot root block, calls applySnapshot, and persists the version', async () => {
     const { rootCid, blockMap } = await buildSnapshotCar();
 
-    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
+    const { fetchFromIpfs } = await import('../../../extensions/uxf/profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
     fetchMock.mockImplementation(async (_gateways: string[], cid: string) => {
@@ -504,7 +504,7 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
       };
     });
 
-    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { __internal } = await import('../../../extensions/uxf/profile/pointer-wiring');
     const { CID } = await import('multiformats/cid');
     const callback = __internal.buildFetchAndJoin({
       gateways: ['https://ipfs.example'],
@@ -529,7 +529,7 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
     // re-fetches + re-applies idempotently. Reversing the order would
     // strand the cursor past unapplied snapshot state.
     const { rootCid, blockMap } = await buildSnapshotCar();
-    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
+    const { fetchFromIpfs } = await import('../../../extensions/uxf/profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
     fetchMock.mockImplementation(async (_gateways: string[], cid: string) => {
@@ -555,7 +555,7 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
       };
     });
 
-    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { __internal } = await import('../../../extensions/uxf/profile/pointer-wiring');
     const { CID } = await import('multiformats/cid');
     const callback = __internal.buildFetchAndJoin({
       gateways: ['https://ipfs.example'],
@@ -572,7 +572,7 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
   it('does NOT advance the version when applySnapshot throws', async () => {
     const { rootCid, blockMap } = await buildSnapshotCar();
 
-    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
+    const { fetchFromIpfs } = await import('../../../extensions/uxf/profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
     fetchMock.mockImplementation(async (_gateways: string[], cid: string) => {
@@ -586,7 +586,7 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
       throw new Error('dispatcher exploded');
     });
 
-    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { __internal } = await import('../../../extensions/uxf/profile/pointer-wiring');
     const { CID } = await import('multiformats/cid');
     const callback = __internal.buildFetchAndJoin({
       gateways: ['https://ipfs.example'],
@@ -606,7 +606,7 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
   });
 
   it('throws PROTOCOL_ERROR when the snapshot root block is not a valid lean snapshot', async () => {
-    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
+    const { fetchFromIpfs } = await import('../../../extensions/uxf/profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
     // Return bytes that are not a parseable dag-cbor block — definitely
@@ -619,7 +619,7 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
     let persistCalled = false;
     const applySnapshot = vi.fn();
 
-    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { __internal } = await import('../../../extensions/uxf/profile/pointer-wiring');
     const { CID } = await import('multiformats/cid');
     const callback = __internal.buildFetchAndJoin({
       gateways: ['https://ipfs.example'],

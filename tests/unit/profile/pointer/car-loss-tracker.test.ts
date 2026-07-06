@@ -25,7 +25,7 @@ import {
   AggregatorPointerErrorCode,
   CAR_FETCH_PERSISTENT_RETRY_ATTEMPTS,
   CAR_FETCH_PERSISTENT_TOTAL_DURATION_MS,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 const PUBKEY = 'ab'.repeat(33);
 

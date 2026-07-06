@@ -35,7 +35,7 @@ import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
 import { NametagMinter, type MintNametagResult } from './NametagMinter';
-import { CidRefStore, type CidRef } from '../../profile/cid-ref-store';
+import { CidRefStore, type CidRef } from '../../extensions/uxf/profile/cid-ref-store';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../storage';
 import type {
   TransportProvider,
@@ -109,7 +109,7 @@ import {
 } from '../../extensions/uxf/pipeline/ingest-worker-pool';
 import type { AcquireBundleCidOptions } from '../../extensions/uxf/pipeline/bundle-acquirer';
 import { ReplayLRU } from '../../extensions/uxf/pipeline/replay-lru';
-import { PerTokenMutex } from '../../profile/per-token-mutex';
+import { PerTokenMutex } from '../../extensions/uxf/profile/per-token-mutex';
 // T.5.D — operator escape hatch (`importInclusionProof` +
 // `revalidateCascadedChildren`). Class types only; the wiring layer
 // (Sphere bootstrap) constructs the runtime instances and installs them
@@ -204,21 +204,21 @@ import {
   type CascadeOutboxScanner,
   type ClassifyTokenLookup,
 } from '../../extensions/uxf/pipeline/cascade-walker';
-import { ManifestCas, type MinimalManifestStorage } from '../../profile/manifest-cas';
+import { ManifestCas, type MinimalManifestStorage } from '../../extensions/uxf/profile/manifest-cas';
 // Round 5 (FIX 1) — production-wired default importer/runner for the
 // operator escape hatch. Uses lightweight in-memory adapters mirroring
 // the auto-install pattern of `buildDefaultFinalizationWorkerSender`.
 // Sphere bootstrap MAY override via the existing `install*` methods to
 // inject OrbitDB-backed dispositionStorage + manifestStore (see
 // {@link OrbitDbDispositionStorageAdapter}).
-import { DispositionWriter } from '../../profile/disposition-writer';
+import { DispositionWriter } from '../../extensions/uxf/profile/disposition-writer';
 import type { DispositionRecord } from '../../types/disposition';
 import {
   InMemoryDispositionStorageAdapter,
-} from '../../profile/disposition-storage-adapters';
-import { ManifestStore } from '../../profile/manifest-store';
-import { Lamport } from '../../profile/lamport';
-import type { TokenManifestEntry } from '../../profile/token-manifest';
+} from '../../extensions/uxf/profile/disposition-storage-adapters';
+import { ManifestStore } from '../../extensions/uxf/profile/manifest-store';
+import { Lamport } from '../../extensions/uxf/profile/lamport';
+import type { TokenManifestEntry } from '../../extensions/uxf/profile/token-manifest';
 import type { CascadeManifestScanner as CascadeManifestScannerForRevalidate } from '../../extensions/uxf/pipeline/cascade-walker';
 import type { ProofVerifyStatus } from '../../extensions/uxf/pipeline/proof-verifier';
 import { contentHash, type ContentHash } from '../../extensions/uxf/bundle/types';
@@ -226,8 +226,8 @@ import { isLegacyTokenTransferPayload, type UxfTransferPayload } from '../../typ
 import { carBytesToBase64 } from '../../extensions/uxf/bundle/transfer-payload';
 import type { UxfTransferOutboxEntry } from '../../types/uxf-outbox';
 import type { UxfSentLedgerEntry } from '../../types/uxf-sent';
-import type { OutboxWriter } from '../../profile/outbox-writer';
-import type { SentLedgerWriter } from '../../profile/sent-ledger-writer';
+import type { OutboxWriter } from '../../extensions/uxf/profile/outbox-writer';
+import type { SentLedgerWriter } from '../../extensions/uxf/profile/sent-ledger-writer';
 import {
   sweepOrphanSpendingTokens,
   type OrphanSweepResult,
@@ -256,7 +256,7 @@ import { hexToBytes as fromHex, bytesToHex } from '../../core/hex';
 // dynamic import was motivated by a bundle-size concern that didn't apply
 // here; it silently swallowed import errors in consumer builds lacking
 // matching bundler rules and made Profile-mode data load paths fragile.
-import { computeAddressId } from '../../profile/types.js';
+import { computeAddressId } from '../../extensions/uxf/profile/types.js';
 
 // Instant split imports
 import { InstantSplitExecutor } from './InstantSplitExecutor';
@@ -4907,8 +4907,8 @@ export class PaymentsModule {
    * @internal
    */
   private _recipientContextStorage:
-    | import('../../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
-    | import('../../profile/finalization-queue-storage-adapter').InMemoryRecipientContextStorageAdapter
+    | import('../../extensions/uxf/profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+    | import('../../extensions/uxf/profile/finalization-queue-storage-adapter').InMemoryRecipientContextStorageAdapter
     | null = null;
 
   /**
@@ -4952,8 +4952,8 @@ export class PaymentsModule {
   configureRecipientPersistedStorage(opts: {
     readonly finalizationQueueStorage?: import('../../extensions/uxf/pipeline/finalization-queue').FinalizationQueueStorage;
     readonly recipientContextStorage?:
-      | import('../../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
-      | import('../../profile/finalization-queue-storage-adapter').InMemoryRecipientContextStorageAdapter;
+      | import('../../extensions/uxf/profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+      | import('../../extensions/uxf/profile/finalization-queue-storage-adapter').InMemoryRecipientContextStorageAdapter;
   }): void {
     if (opts.finalizationQueueStorage !== undefined) {
       this._recipientFinalizationQueueStorage = opts.finalizationQueueStorage;
@@ -5006,7 +5006,7 @@ export class PaymentsModule {
    * remaining case 3 / 5 / 6 gap).
    */
   configureOperatorEscapeHatchStorage(
-    dispositionStorage: import('../../profile/disposition-writer').DispositionPerEntryStorage,
+    dispositionStorage: import('../../extensions/uxf/profile/disposition-writer').DispositionPerEntryStorage,
     options?: {
       readonly verifyProof?: import('../../extensions/uxf/pipeline/import-inclusion-proof').ProofVerifier;
       readonly graftCallback?: import('../../extensions/uxf/pipeline/import-inclusion-proof').ImportProofGraftCallback;
@@ -10879,7 +10879,7 @@ export class PaymentsModule {
         // doesn't have the store needed to resolve them. Throw typed error
         // so the caller can surface to the user rather than silently
         // dropping pending transfers.
-        const { ProfileError } = await import('../../profile/errors.js');
+        const { ProfileError } = await import('../../extensions/uxf/profile/errors.js');
         throw new ProfileError(
           'CID_REF_UNREADABLE',
           `PaymentsModule.loadPendingV5Tokens: KV at ${STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS} ` +
@@ -16993,7 +16993,7 @@ export class PaymentsModule {
     const ref = CidRefStore.tryParseRef(data);
     if (ref) {
       if (!this.deps!.cidRefStore) {
-        const { ProfileError } = await import('../../profile/errors.js');
+        const { ProfileError } = await import('../../extensions/uxf/profile/errors.js');
         throw new ProfileError(
           'CID_REF_UNREADABLE',
           `PaymentsModule.loadOutbox: KV at ${STORAGE_KEYS_ADDRESS.OUTBOX} ` +
@@ -18193,12 +18193,12 @@ export function buildDefaultFinalizationWorkerSender(opts: {
   };
 
   // In-memory manifest storage — needed by ManifestCas.
-  const manifestEntries = new Map<string, import('../../profile/token-manifest').TokenManifestEntry>();
+  const manifestEntries = new Map<string, import('../../extensions/uxf/profile/token-manifest').TokenManifestEntry>();
   const manifestStorage: MinimalManifestStorage = {
     async readEntry(addr: string, tokenId: string) {
       return manifestEntries.get(`${addr}:${tokenId}`);
     },
-    async writeEntry(addr: string, tokenId: string, entry: import('../../profile/token-manifest').TokenManifestEntry) {
+    async writeEntry(addr: string, tokenId: string, entry: import('../../extensions/uxf/profile/token-manifest').TokenManifestEntry) {
       manifestEntries.set(`${addr}:${tokenId}`, entry);
     },
   };
@@ -18533,7 +18533,7 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
   // ---- ManifestCas + tombstones — in-memory ---------------------------
   const manifestEntries = new Map<
     string,
-    import('../../profile/token-manifest').TokenManifestEntry
+    import('../../extensions/uxf/profile/token-manifest').TokenManifestEntry
   >();
   const manifestStorage: MinimalManifestStorage = {
     async readEntry(addr, tokenId) {
@@ -19071,7 +19071,7 @@ export function buildDefaultInclusionProofImporter(opts: {
    * default — preserves backward compatibility for tests + dev-mode
    * wallets without a profile stack).
    */
-  readonly dispositionStorage?: import('../../profile/disposition-writer').DispositionPerEntryStorage;
+  readonly dispositionStorage?: import('../../extensions/uxf/profile/disposition-writer').DispositionPerEntryStorage;
   /**
    * Round 8 (FIX 1) — Optional production-grade
    * {@link ProofVerifier}. When passed (the Sphere bootstrap layer

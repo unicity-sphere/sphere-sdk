@@ -77,36 +77,36 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 
-import { Lamport } from '../../../profile/lamport.js';
+import { Lamport } from '../../../extensions/uxf/profile/lamport.js';
 import {
   OutboxWriter,
   type OutboxWriteInput,
-} from '../../../profile/outbox-writer.js';
+} from '../../../extensions/uxf/profile/outbox-writer.js';
 import {
   SentLedgerWriter,
-} from '../../../profile/sent-ledger-writer.js';
+} from '../../../extensions/uxf/profile/sent-ledger-writer.js';
 import {
   buildLeanProfileSnapshot,
   parseLeanProfileSnapshot,
   type LeanProfileSnapshot,
-} from '../../../profile/profile-lean-snapshot.js';
+} from '../../../extensions/uxf/profile/profile-lean-snapshot.js';
 import {
   runProfileSnapshotJoin,
   type SnapshotJoinWriterEntry,
-} from '../../../profile/profile-snapshot-dispatcher.js';
-import type { ProfileSyncWriter } from '../../../profile/profile-snapshot-merge.js';
+} from '../../../extensions/uxf/profile/profile-snapshot-dispatcher.js';
+import type { ProfileSyncWriter } from '../../../extensions/uxf/profile/profile-snapshot-merge.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
   UxfBundleRef,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 import type { StorageProvider } from '../../../storage/storage-provider.js';
 import type {
   ProviderStatus,
   TrackedAddressEntry,
   FullIdentity,
 } from '../../../types/index.js';
-import type { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider.js';
+import type { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider.js';
 
 // =============================================================================
 // Fixtures

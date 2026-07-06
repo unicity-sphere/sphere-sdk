@@ -24,11 +24,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
+import type { ProfileDatabase, OrbitDbConfig } from '../../../extensions/uxf/profile/types';
 import type { FullIdentity } from '../../../types';
 import type { TxfStorageDataBase } from '../../../storage/storage-provider';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
-import { PROFILE_KEY_MAPPING } from '../../../profile/types';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
+import { PROFILE_KEY_MAPPING } from '../../../extensions/uxf/profile/types';
 import { waitForFlushSettled } from '../../helpers/profile/waitForFlushSettled';
 
 // ---------------------------------------------------------------------------

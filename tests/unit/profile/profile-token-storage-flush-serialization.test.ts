@@ -42,13 +42,13 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type {
   ProfileDatabase,
   OrbitDbConfig,
-} from '../../../profile/types';
+} from '../../../extensions/uxf/profile/types';
 import type { FullIdentity } from '../../../types';
 import type { TxfStorageDataBase } from '../../../storage/storage-provider';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 import {
   deriveProfileEncryptionKey,
-} from '../../../profile/encryption';
+} from '../../../extensions/uxf/profile/encryption';
 import { waitForFlushSettled } from '../../helpers/profile/waitForFlushSettled';
 
 // =============================================================================

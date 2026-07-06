@@ -17,9 +17,9 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { ProfileStorageProvider } from '../../../profile/profile-storage-provider';
-import { CidRefStore } from '../../../profile/cid-ref-store';
-import type { ProfileDatabase } from '../../../profile/types';
+import { ProfileStorageProvider } from '../../../extensions/uxf/profile/profile-storage-provider';
+import { CidRefStore } from '../../../extensions/uxf/profile/cid-ref-store';
+import type { ProfileDatabase } from '../../../extensions/uxf/profile/types';
 import type { StorageProvider } from '../../../storage';
 import type { FullIdentity } from '../../../types';
 

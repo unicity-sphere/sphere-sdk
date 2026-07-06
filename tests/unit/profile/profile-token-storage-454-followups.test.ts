@@ -38,8 +38,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ProfileTokenStorageProvider,
   type ProfileTokenStorageProviderOptions,
-} from '../../../profile/profile-token-storage-provider.js';
-import type { OrbitDbConfig, ProfileDatabase } from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/profile-token-storage-provider.js';
+import type { OrbitDbConfig, ProfileDatabase } from '../../../extensions/uxf/profile/types.js';
 import type { StorageProvider, StorageEvent } from '../../../storage/storage-provider.js';
 import type { FullIdentity, TrackedAddressEntry } from '../../../types/index.js';
 import { STORAGE_KEYS_GLOBAL } from '../../../constants.js';

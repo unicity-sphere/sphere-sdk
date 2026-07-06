@@ -33,7 +33,7 @@ import {
   LEGACY_IPNS_SEQUENCE_KEY,
   MIGRATION_DONE_KEY,
   type ProfileSnapshot,
-} from '../../../../profile/migration/ipns-reader';
+} from '../../../../extensions/uxf/profile/migration/ipns-reader';
 
 // A stable CIDv1 raw-codec string we can parse via multiformats.
 const VALID_CID_A = 'bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku';

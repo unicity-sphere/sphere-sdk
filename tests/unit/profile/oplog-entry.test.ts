@@ -30,8 +30,8 @@ import {
   MAX_PAYLOAD_BYTES,
   OpLogEntryCorrupt,
   type OpLogEntryEnvelope,
-} from '../../../profile/oplog-entry.js';
-import { AggregatorPointerErrorCode } from '../../../profile/aggregator-pointer/index.js';
+} from '../../../extensions/uxf/profile/oplog-entry.js';
+import { AggregatorPointerErrorCode } from '../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 

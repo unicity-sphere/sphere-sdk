@@ -19,18 +19,18 @@ import { describe, it, expect } from 'vitest';
 import {
   BundleIndex,
   BUNDLE_KEY_PREFIX,
-} from '../../../profile/profile-token-storage/bundle-index.js';
+} from '../../../extensions/uxf/profile/profile-token-storage/bundle-index.js';
 import {
   encryptProfileValue,
   deriveProfileEncryptionKey,
-} from '../../../profile/encryption.js';
-import { buildLocalEntry } from '../../../profile/oplog-entry.js';
+} from '../../../extensions/uxf/profile/encryption.js';
+import { buildLocalEntry } from '../../../extensions/uxf/profile/oplog-entry.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
-} from '../../../profile/types.js';
-import type { ProfileTokenStorageHost } from '../../../profile/profile-token-storage/host.js';
-import type { UxfBundleRef } from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
+import type { ProfileTokenStorageHost } from '../../../extensions/uxf/profile/profile-token-storage/host.js';
+import type { UxfBundleRef } from '../../../extensions/uxf/profile/types.js';
 
 // ---------------------------------------------------------------------------
 // Test doubles

@@ -24,28 +24,28 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { Lamport } from '../../../profile/lamport.js';
-import { OutboxWriter, type OutboxWriteInput } from '../../../profile/outbox-writer.js';
+import { Lamport } from '../../../extensions/uxf/profile/lamport.js';
+import { OutboxWriter, type OutboxWriteInput } from '../../../extensions/uxf/profile/outbox-writer.js';
 import {
   SentLedgerWriter,
   type SentLedgerWriteInput,
-} from '../../../profile/sent-ledger-writer.js';
-import { PrefixSyncWriter } from '../../../profile/prefix-sync-writer.js';
+} from '../../../extensions/uxf/profile/sent-ledger-writer.js';
+import { PrefixSyncWriter } from '../../../extensions/uxf/profile/prefix-sync-writer.js';
 import {
   OrbitDbFinalizationQueueStorageAdapter,
   OrbitDbRecipientContextStorageAdapter,
-} from '../../../profile/finalization-queue-storage-adapter.js';
-import { BundleIndex } from '../../../profile/profile-token-storage/bundle-index.js';
+} from '../../../extensions/uxf/profile/finalization-queue-storage-adapter.js';
+import { BundleIndex } from '../../../extensions/uxf/profile/profile-token-storage/bundle-index.js';
 import {
   deriveProfileEncryptionKey,
   encryptProfileValue,
-} from '../../../profile/encryption.js';
+} from '../../../extensions/uxf/profile/encryption.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
   UxfBundleRef,
-} from '../../../profile/types.js';
-import type { ProfileTokenStorageHost } from '../../../profile/profile-token-storage/host.js';
+} from '../../../extensions/uxf/profile/types.js';
+import type { ProfileTokenStorageHost } from '../../../extensions/uxf/profile/profile-token-storage/host.js';
 
 // ---------------------------------------------------------------------------
 // Test fixtures

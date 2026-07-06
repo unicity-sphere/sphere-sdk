@@ -6,7 +6,7 @@
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { createTransportAddressResolver, type TransportAddressResolver } from '../../core/transport-resolver';
-import { CidRefStore, type CidRef } from '../../profile/cid-ref-store';
+import { CidRefStore, type CidRef } from '../../extensions/uxf/profile/cid-ref-store';
 import type {
   DirectMessage,
   BroadcastMessage,

@@ -17,11 +17,11 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { attachIdentityToProfileProviders } from '../../../profile/attach-identity';
+import { attachIdentityToProfileProviders } from '../../../extensions/uxf/profile/attach-identity';
 import type { Sphere } from '../../../core/Sphere';
 import type { FullIdentity } from '../../../types';
-import type { ProfileStorageProvider } from '../../../profile/profile-storage-provider';
-import type { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import type { ProfileStorageProvider } from '../../../extensions/uxf/profile/profile-storage-provider';
+import type { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 
 // ---------------------------------------------------------------------------
 // Fixtures — minimal Sphere + provider stubs that exercise the helper's

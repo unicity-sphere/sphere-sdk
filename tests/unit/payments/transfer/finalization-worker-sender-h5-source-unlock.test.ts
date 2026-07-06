@@ -41,8 +41,8 @@ import {
   type FinalizationQueueAdapter,
   type Semaphore,
 } from '../../../../extensions/uxf/pipeline/finalization-worker-sender';
-import { ManifestCas } from '../../../../profile/manifest-cas';
-import { PerTokenMutex } from '../../../../profile/per-token-mutex';
+import { ManifestCas } from '../../../../extensions/uxf/profile/manifest-cas';
+import { PerTokenMutex } from '../../../../extensions/uxf/profile/per-token-mutex';
 import type {
   SphereEventMap,
   SphereEventType,

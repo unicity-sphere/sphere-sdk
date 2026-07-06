@@ -33,19 +33,19 @@ import {
   encodeEntry,
   OPLOG_ENTRY_LEGACY_VERSION,
   OPLOG_ENTRY_SCHEMA_VERSION,
-} from '../../../profile/oplog-entry';
+} from '../../../extensions/uxf/profile/oplog-entry';
 import {
   getEnvelopePayload,
   putEnvelopePayload,
   unwrapEnvelopeBytes,
-} from '../../../profile/oplog-envelope-io';
+} from '../../../extensions/uxf/profile/oplog-envelope-io';
 import {
   deriveProfileEncryptionKey,
   encryptString,
   decryptString,
   encryptProfileValue,
-} from '../../../profile/encryption';
-import type { ProfileDatabase } from '../../../profile/types';
+} from '../../../extensions/uxf/profile/encryption';
+import type { ProfileDatabase } from '../../../extensions/uxf/profile/types';
 
 // =============================================================================
 // Mock ProfileDatabase variants
@@ -405,8 +405,8 @@ describe('Issue #247 — lean snapshot reads new envelope entries', () => {
 import {
   OrbitDbFinalizationQueueStorageAdapter,
   OrbitDbRecipientContextStorageAdapter,
-} from '../../../profile/finalization-queue-storage-adapter';
-import { OrbitDbDispositionStorageAdapter } from '../../../profile/disposition-storage-adapters';
+} from '../../../extensions/uxf/profile/finalization-queue-storage-adapter';
+import { OrbitDbDispositionStorageAdapter } from '../../../extensions/uxf/profile/disposition-storage-adapters';
 
 describe('Issue #247 — OrbitDbFinalizationQueueStorageAdapter envelope round-trip', () => {
   it('writes via envelope, reads back the same value', async () => {

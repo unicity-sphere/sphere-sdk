@@ -18,18 +18,18 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { publishOnceAtVersion } from '../../../../profile/aggregator-pointer/publish-algorithm';
+import { publishOnceAtVersion } from '../../../../extensions/uxf/profile/aggregator-pointer/publish-algorithm';
 import {
   AggregatorPointerError,
   AggregatorPointerErrorCode,
   createMasterPrivateKey,
   derivePointerKeyMaterial,
-} from '../../../../profile/aggregator-pointer';
-import { buildPointerSigner } from '../../../../profile/aggregator-pointer/signing';
-import { FlagStore, DURABLE_STORAGE } from '../../../../profile/aggregator-pointer/flag-store';
+} from '../../../../extensions/uxf/profile/aggregator-pointer';
+import { buildPointerSigner } from '../../../../extensions/uxf/profile/aggregator-pointer/signing';
+import { FlagStore, DURABLE_STORAGE } from '../../../../extensions/uxf/profile/aggregator-pointer/flag-store';
 import type { StorageProvider } from '../../../../storage/storage-provider';
-import type { MutexHandle } from '../../../../profile/aggregator-pointer/mutex-lock';
-import type { PointerVersion } from '../../../../profile/aggregator-pointer/types';
+import type { MutexHandle } from '../../../../extensions/uxf/profile/aggregator-pointer/mutex-lock';
+import type { PointerVersion } from '../../../../extensions/uxf/profile/aggregator-pointer/types';
 
 // ---------------------------------------------------------------------------
 // In-memory durable StorageProvider for tests
@@ -160,7 +160,7 @@ describe('Commit B + E — state machine steelman² remediations', () => {
       // Here we exercise the discrimination path directly via the
       // exported combineOutcomes helper.
        
-      const submit = await import('../../../../profile/aggregator-pointer/aggregator-submit');
+      const submit = await import('../../../../extensions/uxf/profile/aggregator-pointer/aggregator-submit');
       const combine = (submit.__internal as { combineOutcomes?: unknown }).combineOutcomes as
         | ((outA: unknown, outB: unknown, v: number, cidBytes: Uint8Array, marker: unknown, hint?: boolean) => { kind: string; committedSideKind?: string })
         | undefined;

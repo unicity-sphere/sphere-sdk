@@ -36,8 +36,8 @@ import {
   createWriterPair,
   makeOutboxEntry,
 } from './__fixtures__/payments-module-fixture';
-import type { OutboxWriter } from '../../../../profile/outbox-writer';
-import type { SentLedgerWriter } from '../../../../profile/sent-ledger-writer';
+import type { OutboxWriter } from '../../../../extensions/uxf/profile/outbox-writer';
+import type { SentLedgerWriter } from '../../../../extensions/uxf/profile/sent-ledger-writer';
 import { isSphereError } from '../../../../core/errors';
 
 // ---------------------------------------------------------------------------

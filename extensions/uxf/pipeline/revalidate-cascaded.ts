@@ -59,8 +59,8 @@
 import { safeErrorMessage } from '../../../core/error-sanitize';
 import { MAX_CHAIN_DEPTH } from './limits';
 import type { CascadeManifestScanner } from './cascade-walker';
-import type { TokenManifestEntry } from '../../../profile/token-manifest';
-import type { ManifestStore } from '../../../profile/manifest-store';
+import type { TokenManifestEntry } from '../profile/token-manifest';
+import type { ManifestStore } from '../profile/manifest-store';
 import type { DispositionReason } from '../../../types/disposition';
 
 // =============================================================================

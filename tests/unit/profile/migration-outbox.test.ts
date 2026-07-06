@@ -19,22 +19,22 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Lamport } from '../../../profile/lamport.js';
+import { Lamport } from '../../../extensions/uxf/profile/lamport.js';
 import {
   OutboxWriter,
-} from '../../../profile/outbox-writer.js';
+} from '../../../extensions/uxf/profile/outbox-writer.js';
 import {
   backupKey,
   migrateLegacyOutbox,
   sentinelKey,
   type LegacyOutboxBackup,
-} from '../../../profile/migration-outbox.js';
+} from '../../../extensions/uxf/profile/migration-outbox.js';
 import {
   isUxfTransferOutboxEntry,
   type LegacyOutboxEntry,
   type UxfTransferOutboxEntry,
 } from '../../../types/uxf-outbox.js';
-import type { OrbitDbConfig, ProfileDatabase } from '../../../profile/types.js';
+import type { OrbitDbConfig, ProfileDatabase } from '../../../extensions/uxf/profile/types.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures

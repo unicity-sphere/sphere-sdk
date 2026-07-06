@@ -37,14 +37,14 @@ import {
   type UxfV1Payload,
 } from '../../../extensions/uxf/pipeline/ingest-worker-pool';
 import { ReplayLRU } from '../../../extensions/uxf/pipeline/replay-lru';
-import { PerTokenMutex } from '../../../profile/per-token-mutex';
+import { PerTokenMutex } from '../../../extensions/uxf/profile/per-token-mutex';
 import type {
   DispositionPerEntryStorage,
   DispositionEventEmitter,
-} from '../../../profile/disposition-writer';
-import { DispositionWriter } from '../../../profile/disposition-writer';
-import { ManifestStore } from '../../../profile/manifest-store';
-import { Lamport } from '../../../profile/lamport';
+} from '../../../extensions/uxf/profile/disposition-writer';
+import { DispositionWriter } from '../../../extensions/uxf/profile/disposition-writer';
+import { ManifestStore } from '../../../extensions/uxf/profile/manifest-store';
+import { Lamport } from '../../../extensions/uxf/profile/lamport';
 
 // =============================================================================
 // 1. Mock IPFS Trustless Gateway — always 503

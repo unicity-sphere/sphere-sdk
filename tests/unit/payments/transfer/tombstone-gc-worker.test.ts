@@ -19,9 +19,9 @@ import {
   TombstoneGcWorker,
   type TombstoneGcWorkerDeps,
 } from '../../../../extensions/uxf/pipeline/tombstone-gc-worker';
-import type { OutboxWriter } from '../../../../profile/outbox-writer';
-import type { SentLedgerWriter } from '../../../../profile/sent-ledger-writer';
-import type { TombstoneGcResult } from '../../../../profile/types';
+import type { OutboxWriter } from '../../../../extensions/uxf/profile/outbox-writer';
+import type { SentLedgerWriter } from '../../../../extensions/uxf/profile/sent-ledger-writer';
+import type { TombstoneGcResult } from '../../../../extensions/uxf/profile/types';
 
 // =============================================================================
 // 1. Fixtures

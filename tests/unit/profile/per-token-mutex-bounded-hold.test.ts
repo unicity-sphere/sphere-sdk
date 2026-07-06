@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import {
   PerTokenMutex,
   MAX_LOCK_HOLD_MS,
-} from '../../../profile/per-token-mutex';
+} from '../../../extensions/uxf/profile/per-token-mutex';
 import { SphereError } from '../../../core/errors';
 
 const sleep = (ms: number): Promise<void> =>

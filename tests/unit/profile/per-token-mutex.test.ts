@@ -11,7 +11,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { PerTokenMutex } from '../../../profile/per-token-mutex';
+import { PerTokenMutex } from '../../../extensions/uxf/profile/per-token-mutex';
 
 /** Defer to the next microtask (does not yield to setTimeout). */
 const microtask = (): Promise<void> => Promise.resolve();

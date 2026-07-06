@@ -16,7 +16,7 @@ import {
   installHeliaBlockstorePinShim,
   requestPersistentStorage,
   type HeliaWithPinsLike,
-} from '../../../profile/helia-blockstore-pin-shim';
+} from '../../../extensions/uxf/profile/helia-blockstore-pin-shim';
 import { logger } from '../../../core/logger';
 
 // ---------------------------------------------------------------------------

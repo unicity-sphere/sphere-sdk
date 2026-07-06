@@ -27,7 +27,7 @@ import {
   pinToIpfs,
   fetchFromIpfs,
   _resetSidecarColdState,
-} from '../../../profile/ipfs-client';
+} from '../../../extensions/uxf/profile/ipfs-client';
 
 // ---------------------------------------------------------------------------
 // Helpers

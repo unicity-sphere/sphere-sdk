@@ -49,7 +49,7 @@ import {
   createMasterPrivateKey,
   type CidDecoder,
   type CarFetcher,
-} from '../../../profile/aggregator-pointer/index.js';
+} from '../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 // ── Fixtures (mirror aggregator-probe.test.ts shape intentionally) ─────────
 

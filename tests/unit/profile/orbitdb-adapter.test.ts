@@ -7,8 +7,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
-import { OrbitDbAdapter } from '../../../profile/orbitdb-adapter';
+import type { ProfileDatabase, OrbitDbConfig } from '../../../extensions/uxf/profile/types';
+import { OrbitDbAdapter } from '../../../extensions/uxf/profile/orbitdb-adapter';
 
 // ---------------------------------------------------------------------------
 // Mock ProfileDatabase (in-memory Map-based implementation)
@@ -332,7 +332,7 @@ describe('OrbitDbAdapter.connect() — Issue #245 #2 retry on transient init fai
   }
 
   it('retries up to 2 times on transient ORBITDB_CONNECTION_FAILED, then succeeds', async () => {
-    const { ProfileError } = await import('../../../profile/errors.js');
+    const { ProfileError } = await import('../../../extensions/uxf/profile/errors.js');
     let attempt = 0;
     const { adapter, spy } = withStubbedConnectInner(async () => {
       attempt += 1;
@@ -353,7 +353,7 @@ describe('OrbitDbAdapter.connect() — Issue #245 #2 retry on transient init fai
   });
 
   it('does NOT retry ORBITDB_NOT_INSTALLED (sticky dep error)', async () => {
-    const { ProfileError } = await import('../../../profile/errors.js');
+    const { ProfileError } = await import('../../../extensions/uxf/profile/errors.js');
     const { adapter, spy } = withStubbedConnectInner(async () => {
       throw new ProfileError(
         'ORBITDB_NOT_INSTALLED',
@@ -376,7 +376,7 @@ describe('OrbitDbAdapter.connect() — Issue #245 #2 retry on transient init fai
   });
 
   it('augments the error with multi-process diagnostic hint when retries exhaust', async () => {
-    const { ProfileError } = await import('../../../profile/errors.js');
+    const { ProfileError } = await import('../../../extensions/uxf/profile/errors.js');
     const { adapter, spy } = withStubbedConnectInner(async () => {
       throw new ProfileError(
         'ORBITDB_CONNECTION_FAILED',
@@ -402,7 +402,7 @@ describe('OrbitDbAdapter.connect() — Issue #245 #2 retry on transient init fai
   });
 
   it('non-matching error message is NOT augmented (preserves original text)', async () => {
-    const { ProfileError } = await import('../../../profile/errors.js');
+    const { ProfileError } = await import('../../../extensions/uxf/profile/errors.js');
     const ORIGINAL = 'Failed to connect to OrbitDB: peer dependency missing';
     const { adapter, spy } = withStubbedConnectInner(async () => {
       throw new ProfileError('ORBITDB_CONNECTION_FAILED', ORIGINAL);

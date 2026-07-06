@@ -36,7 +36,7 @@ import {
   type UxfV1Payload,
 } from '../../../../extensions/uxf/pipeline/ingest-worker-pool';
 import { ReplayLRU } from '../../../../extensions/uxf/pipeline/replay-lru';
-import { PerTokenMutex } from '../../../../profile/per-token-mutex';
+import { PerTokenMutex } from '../../../../extensions/uxf/profile/per-token-mutex';
 import type {
   RootRef,
   VerifiedBundle,

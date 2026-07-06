@@ -17,7 +17,7 @@ import {
   buildPointerSigner,
   derivePointerKeyMaterial,
   createMasterPrivateKey,
-} from '../../../profile/aggregator-pointer/index.js';
+} from '../../../extensions/uxf/profile/aggregator-pointer/index.js';
 import {
   buildWinBroadcastHash,
   buildWinBroadcastTag,
@@ -29,7 +29,7 @@ import {
   WIN_BROADCAST_TAG_PREFIX,
   type SignedWinBroadcastPayload,
   type UnsignedWinBroadcastPayload,
-} from '../../../profile/aggregator-pointer/win-broadcast.js';
+} from '../../../extensions/uxf/profile/aggregator-pointer/win-broadcast.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 

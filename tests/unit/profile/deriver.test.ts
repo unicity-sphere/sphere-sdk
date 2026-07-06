@@ -12,7 +12,7 @@ import {
   deriveTombstonesFromArchived,
   deriveSentFromArchived,
   deriveHistoryFromArchived,
-} from '../../../profile/deriver';
+} from '../../../extensions/uxf/profile/deriver';
 
 const META = {
   _meta: {

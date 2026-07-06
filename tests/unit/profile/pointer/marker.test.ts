@@ -16,7 +16,7 @@ import {
   AggregatorPointerErrorCode,
   MARKER_MAX_JUMP,
   VERSION_MAX,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 

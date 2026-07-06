@@ -122,7 +122,7 @@ import type {
   UxfTransferPayloadCar,
   UxfTransferPayloadCid,
 } from '../../../types/uxf-transfer.js';
-import type { PerTokenMutex, PerTokenMutexStrategy } from '../../../profile/per-token-mutex.js';
+import type { PerTokenMutex, PerTokenMutexStrategy } from '../profile/per-token-mutex.js';
 
 /**
  * Local alias: the UXF v1.0 payload subset accepted by the pool.

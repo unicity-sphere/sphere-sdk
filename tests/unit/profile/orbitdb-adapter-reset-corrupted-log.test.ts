@@ -13,7 +13,7 @@ import {
   OrbitDbAdapter,
   ProfileError,
   extractLostHeadCid,
-} from '../../../profile/orbitdb-adapter';
+} from '../../../extensions/uxf/profile/orbitdb-adapter';
 
 // ---------------------------------------------------------------------------
 // resetCorruptedLog

@@ -17,12 +17,12 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { PrefixSyncWriter } from '../../../profile/prefix-sync-writer.js';
-import { encryptProfileValue } from '../../../profile/encryption.js';
+import { PrefixSyncWriter } from '../../../extensions/uxf/profile/prefix-sync-writer.js';
+import { encryptProfileValue } from '../../../extensions/uxf/profile/encryption.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 
 const ADDR_A = 'DIRECT_aabbcc_ddeeff';
 const ADDR_B = 'DIRECT_112233_445566';

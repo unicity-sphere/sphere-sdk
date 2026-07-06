@@ -32,14 +32,14 @@ import {
   BundleIndex,
   FlushScheduler,
   type ProfileTokenStorageHost,
-} from '../../../profile/profile-token-storage';
+} from '../../../extensions/uxf/profile/profile-token-storage';
 import type { StorageEvent } from '../../../storage/storage-provider';
-import type { UxfBundleRef } from '../../../profile/types';
+import type { UxfBundleRef } from '../../../extensions/uxf/profile/types';
 
 // Mock the gateway-probe helper so tests control the probe outcome
 // without spinning up real HTTP. The mock is keyed on the CID to
 // distinguish "served" vs "unreachable" across calls.
-vi.mock('../../../profile/ipfs-client', async (importOriginal) => {
+vi.mock('../../../extensions/uxf/profile/ipfs-client', async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
   return {
     ...actual,
@@ -389,7 +389,7 @@ describe('Audit #333 C3 — oplog auto-reset probe gate', () => {
       // Make verifyCidAccessibleWithRetry mock throw for this test by
       // returning a special sentinel that triggers a throw inside the
       // mock body. Simpler: spy on the mock and have it reject.
-      const ipfsClient = await import('../../../profile/ipfs-client');
+      const ipfsClient = await import('../../../extensions/uxf/profile/ipfs-client');
       const spy = vi.spyOn(ipfsClient, 'verifyCidAccessibleWithRetry')
         .mockRejectedValueOnce(new Error('gateway URL validation threw'));
 

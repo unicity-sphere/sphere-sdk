@@ -6,7 +6,7 @@ import { describe, it, expect } from 'vitest';
 import {
   AggregatorPointerError,
   AggregatorPointerErrorCode,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 describe('AggregatorPointerError taxonomy (T-A2)', () => {
   it('exposes exactly 27 codes (SPEC §12 v3.5)', () => {

@@ -16,13 +16,13 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { Lamport } from '../../../profile/lamport.js';
+import { Lamport } from '../../../extensions/uxf/profile/lamport.js';
 import {
   SentLedgerWriter,
   type SentLedgerWriteInput,
-} from '../../../profile/sent-ledger-writer.js';
+} from '../../../extensions/uxf/profile/sent-ledger-writer.js';
 import { SphereError } from '../../../core/errors.js';
-import type { OrbitDbConfig, ProfileDatabase } from '../../../profile/types.js';
+import type { OrbitDbConfig, ProfileDatabase } from '../../../extensions/uxf/profile/types.js';
 
 const ADDR = 'DIRECT_aabbcc_ddeeff';
 const KEY_PREFIX = `${ADDR}.sent.`;

@@ -9,7 +9,7 @@ import {
   assertAuthorizedMasterKey,
   derivePointerKeyMaterial,
   type MasterPrivateKey,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 describe('MasterPrivateKey (T-A5b)', () => {
   const bytes = new Uint8Array(32).fill(0x01);

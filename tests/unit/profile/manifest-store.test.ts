@@ -33,18 +33,18 @@ import {
   CAS_MAX_RETRIES,
   ManifestStore,
   mergeManifestEntry,
-} from '../../../profile/manifest-store.js';
+} from '../../../extensions/uxf/profile/manifest-store.js';
 import {
   ManifestCas,
   ManifestCasConcurrentModificationError,
   type MinimalManifestStorage,
-} from '../../../profile/manifest-cas.js';
-import { Lamport } from '../../../profile/lamport.js';
+} from '../../../extensions/uxf/profile/manifest-cas.js';
+import { Lamport } from '../../../extensions/uxf/profile/lamport.js';
 import { SphereError } from '../../../core/errors.js';
 import type {
   TokenManifestEntry,
   TokenManifestStatus,
-} from '../../../profile/token-manifest.js';
+} from '../../../extensions/uxf/profile/token-manifest.js';
 import type { ContentHash } from '../../../extensions/uxf/bundle/types.js';
 
 // =============================================================================

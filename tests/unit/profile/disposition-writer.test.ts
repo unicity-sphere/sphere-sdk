@@ -30,16 +30,16 @@ import {
   mergeAuditEntry,
   type DispositionEventEmitter,
   type DispositionPerEntryStorage,
-} from '../../../profile/disposition-writer.js';
-import { ManifestStore } from '../../../profile/manifest-store.js';
+} from '../../../extensions/uxf/profile/disposition-writer.js';
+import { ManifestStore } from '../../../extensions/uxf/profile/manifest-store.js';
 import {
   type MinimalManifestStorage,
-} from '../../../profile/manifest-cas.js';
-import { Lamport } from '../../../profile/lamport.js';
+} from '../../../extensions/uxf/profile/manifest-cas.js';
+import { Lamport } from '../../../extensions/uxf/profile/lamport.js';
 import { SphereError } from '../../../core/errors.js';
 import type {
   TokenManifestEntry,
-} from '../../../profile/token-manifest.js';
+} from '../../../extensions/uxf/profile/token-manifest.js';
 import type {
   AuditEntry,
   DispositionRecord,

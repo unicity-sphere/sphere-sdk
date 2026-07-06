@@ -20,10 +20,10 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
+import type { ProfileDatabase, OrbitDbConfig } from '../../../extensions/uxf/profile/types';
 import type { FullIdentity } from '../../../types';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
-import type { ProfilePointerLayer } from '../../../profile/aggregator-pointer';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
+import type { ProfilePointerLayer } from '../../../extensions/uxf/profile/aggregator-pointer';
 import {
   AggregatorPointerError,
   AggregatorPointerErrorCode,
@@ -31,12 +31,12 @@ import {
   derivePointerKeyMaterial,
   createMasterPrivateKey,
   type PointerSigner,
-} from '../../../profile/aggregator-pointer';
+} from '../../../extensions/uxf/profile/aggregator-pointer';
 import {
   buildWinBroadcastTag,
   verifyWinBroadcastPayload,
   type SignedWinBroadcastPayload,
-} from '../../../profile/aggregator-pointer/win-broadcast';
+} from '../../../extensions/uxf/profile/aggregator-pointer/win-broadcast';
 import type { StorageEvent } from '../../../storage/storage-provider';
 
 const TEST_PRIVATE_KEY =

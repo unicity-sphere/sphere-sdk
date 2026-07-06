@@ -245,7 +245,7 @@ describe('§6.3 importInclusionProof — override audit trail (W30 / W31 / N4)',
     // here we directly verify the set-OR / max-merge / lex-min semantics
     // for the audit-trail fields by importing the helper.
     const { mergeManifestEntry } = await import(
-      '../../../../profile/manifest-store'
+      '../../../../extensions/uxf/profile/manifest-store'
     );
     const base = manifestEntryFor({
       status: 'valid',

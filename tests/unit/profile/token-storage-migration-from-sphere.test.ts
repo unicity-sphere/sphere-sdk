@@ -23,7 +23,7 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { migrateLegacyToProfile } from '../../../profile/token-storage-migration';
+import { migrateLegacyToProfile } from '../../../extensions/uxf/profile/token-storage-migration';
 import type {
   TokenStorageProvider,
   TxfStorageDataBase,

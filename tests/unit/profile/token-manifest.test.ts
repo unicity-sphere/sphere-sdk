@@ -13,7 +13,7 @@ import {
   isConflictingStatus,
   type TokenManifest,
   type TokenManifestEntry,
-} from '../../../profile/token-manifest';
+} from '../../../extensions/uxf/profile/token-manifest';
 import type { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
 import type {
   ContentHash,

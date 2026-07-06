@@ -19,13 +19,13 @@ import {
   runProfileSnapshotJoin,
   __internal,
   type SnapshotJoinWriterEntry,
-} from '../../../profile/profile-snapshot-dispatcher';
+} from '../../../extensions/uxf/profile/profile-snapshot-dispatcher';
 import type {
   JoinResult,
   ProfileSyncWriter,
   SnapshotEntry,
-} from '../../../profile/profile-snapshot-merge';
-import type { LeanProfileSnapshot } from '../../../profile/profile-lean-snapshot';
+} from '../../../extensions/uxf/profile/profile-snapshot-merge';
+import type { LeanProfileSnapshot } from '../../../extensions/uxf/profile/profile-lean-snapshot';
 
 // =============================================================================
 // Helpers

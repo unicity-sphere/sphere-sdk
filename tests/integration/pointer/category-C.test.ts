@@ -102,8 +102,8 @@ import {
   type CarFetcher,
   type CidDecoder,
   type FetchAndJoinCallback,
-} from '../../../profile/aggregator-pointer/index.js';
-import { decodeVersionCid } from '../../../profile/aggregator-pointer/aggregator-probe.js';
+} from '../../../extensions/uxf/profile/aggregator-pointer/index.js';
+import { decodeVersionCid } from '../../../extensions/uxf/profile/aggregator-pointer/aggregator-probe.js';
 
 // ---------------------------------------------------------------------------
 // Shared fixtures

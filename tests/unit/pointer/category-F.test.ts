@@ -47,7 +47,7 @@ import {
   AggregatorPointerErrorCode,
   AggregatorPointerError,
   MAX_PLAUSIBLE_EPOCH_GAP,
-} from '../../../profile/aggregator-pointer/index.js';
+} from '../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 // ── Fake shapes ────────────────────────────────────────────────────────────
 

@@ -23,7 +23,7 @@ import { describe, it, expect, afterAll } from 'vitest';
 
 import { createIndexedDBStorageProvider } from '../../impl/browser/storage/IndexedDBStorageProvider';
 import { createFileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
-import { isDurableProvider } from '../../profile/aggregator-pointer';
+import { isDurableProvider } from '../../extensions/uxf/profile/aggregator-pointer';
 
 describe('production local-cache provider durability markers', () => {
   it('IndexedDBStorageProvider advertises DURABLE_STORAGE', () => {

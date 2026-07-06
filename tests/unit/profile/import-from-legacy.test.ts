@@ -27,7 +27,7 @@ import type {
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { TxfToken } from '../../../types/txf';
-import { importLegacyTokens } from '../../../profile/import-from-legacy';
+import { importLegacyTokens } from '../../../extensions/uxf/profile/import-from-legacy';
 
 // ---------------------------------------------------------------------------
 // SDK mocks (same pattern as PaymentsModule.dual-mode.test.ts)

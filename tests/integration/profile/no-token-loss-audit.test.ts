@@ -33,19 +33,19 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import type {
   ProfileDatabase,
   OrbitDbConfig,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 import type { FullIdentity } from '../../../types/index.js';
 import type {
   TxfStorageDataBase,
 } from '../../../storage/storage-provider.js';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider.js';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider.js';
 import {
   deriveProfileEncryptionKey,
-} from '../../../profile/encryption.js';
-import { OrbitDbDispositionStorageAdapter } from '../../../profile/disposition-storage-adapters.js';
-import { DispositionWriter } from '../../../profile/disposition-writer.js';
-import { ManifestStore } from '../../../profile/manifest-store.js';
-import { Lamport } from '../../../profile/lamport.js';
+} from '../../../extensions/uxf/profile/encryption.js';
+import { OrbitDbDispositionStorageAdapter } from '../../../extensions/uxf/profile/disposition-storage-adapters.js';
+import { DispositionWriter } from '../../../extensions/uxf/profile/disposition-writer.js';
+import { ManifestStore } from '../../../extensions/uxf/profile/manifest-store.js';
+import { Lamport } from '../../../extensions/uxf/profile/lamport.js';
 
 // ---------------------------------------------------------------------------
 // Constants & helpers (mirrors patterns from

@@ -14,8 +14,8 @@ import {
   decryptProfileValue,
   encryptString,
   decryptString,
-} from '../../../profile/encryption';
-import { ProfileError } from '../../../profile/errors';
+} from '../../../extensions/uxf/profile/encryption';
+import { ProfileError } from '../../../extensions/uxf/profile/errors';
 
 // ---------------------------------------------------------------------------
 // Helpers

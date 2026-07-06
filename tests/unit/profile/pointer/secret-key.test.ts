@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { SecretKey } from '../../../../profile/aggregator-pointer/index.js';
+import { SecretKey } from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 import { inspect } from 'node:util';
 
 describe('SecretKey (T-A7)', () => {

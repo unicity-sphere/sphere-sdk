@@ -15,9 +15,9 @@ import {
   InMemoryDispositionStorageAdapter,
   OrbitDbDispositionStorageAdapter,
   DEFAULT_LIST_KEYS_MAX_RESULTS,
-} from '../../../profile/disposition-storage-adapters';
-import { deriveProfileEncryptionKey, encryptString } from '../../../profile/encryption';
-import type { ProfileDatabase } from '../../../profile/types';
+} from '../../../extensions/uxf/profile/disposition-storage-adapters';
+import { deriveProfileEncryptionKey, encryptString } from '../../../extensions/uxf/profile/encryption';
+import type { ProfileDatabase } from '../../../extensions/uxf/profile/types';
 
 // =============================================================================
 // Mock ProfileDatabase backed by an in-memory Map<string, Uint8Array>.

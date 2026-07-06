@@ -8,7 +8,7 @@ import * as path from 'path';
 import type { StorageProvider } from '../../../storage';
 import type { FullIdentity, ProviderStatus, TrackedAddressEntry } from '../../../types';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, getAddressId } from '../../../constants';
-import { DURABLE_STORAGE } from '../../../profile/aggregator-pointer';
+import { DURABLE_STORAGE } from '../../../extensions/uxf/profile/aggregator-pointer';
 
 export interface FileStorageProviderConfig {
   /** Directory to store wallet data */

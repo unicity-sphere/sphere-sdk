@@ -29,7 +29,7 @@ import {
   assertDualWriteArc,
   validateDualWriteArc,
   type OutboxSchemaMode,
-} from '../../../profile/outbox-state-machine.js';
+} from '../../../extensions/uxf/profile/outbox-state-machine.js';
 import { SphereError } from '../../../core/errors.js';
 
 // ---------------------------------------------------------------------------

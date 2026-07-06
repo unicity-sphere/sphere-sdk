@@ -14,7 +14,7 @@ import {
   SIDE_A_NUM,
   SIDE_B_NUM,
   CID_MAX_BYTES,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 describe('derivePointerKeyMaterial (T-A4 / T-A5 / T-A6)', () => {
   const bytes = new Uint8Array(32).fill(0x01);
@@ -159,7 +159,7 @@ describe('be32', () => {
   });
 
   it('encodes VERSION_MAX (2^31 - 1) correctly', async () => {
-    const { VERSION_MAX } = await import('../../../../profile/aggregator-pointer/index.js');
+    const { VERSION_MAX } = await import('../../../../extensions/uxf/profile/aggregator-pointer/index.js');
     const out = be32(VERSION_MAX);
     expect(Array.from(out)).toEqual([0x7f, 0xff, 0xff, 0xff]);
   });

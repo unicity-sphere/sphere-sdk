@@ -21,8 +21,8 @@ import {
   type ImportableInclusionProof,
   type ProofVerifier,
 } from '../../../../extensions/uxf/pipeline/import-inclusion-proof';
-import { PerTokenMutex } from '../../../../profile/per-token-mutex';
-import type { PerTokenMutexStrategy } from '../../../../profile/per-token-mutex';
+import { PerTokenMutex } from '../../../../extensions/uxf/profile/per-token-mutex';
+import type { PerTokenMutexStrategy } from '../../../../extensions/uxf/profile/per-token-mutex';
 import {
   RevalidateCascadedRunner,
   type ChildRevalidationVerdict,
@@ -31,12 +31,12 @@ import {
   type RevalidationCycleWarning,
   type RevalidationScannerError,
 } from '../../../../extensions/uxf/pipeline/revalidate-cascaded';
-import { ManifestStore } from '../../../../profile/manifest-store';
-import { ManifestCas } from '../../../../profile/manifest-cas';
-import { Lamport } from '../../../../profile/lamport';
+import { ManifestStore } from '../../../../extensions/uxf/profile/manifest-store';
+import { ManifestCas } from '../../../../extensions/uxf/profile/manifest-cas';
+import { Lamport } from '../../../../extensions/uxf/profile/lamport';
 import { contentHash } from '../../../../extensions/uxf/bundle/types';
 import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
-import type { TokenManifestEntry } from '../../../../profile/token-manifest';
+import type { TokenManifestEntry } from '../../../../extensions/uxf/profile/token-manifest';
 import type {
   CascadeManifestScanner,
 } from '../../../../extensions/uxf/pipeline/cascade-walker';
@@ -46,7 +46,7 @@ import type {
   DispositionReason,
   InvalidEntry,
 } from '../../../../types/disposition';
-import type { DispositionPerEntryStorage } from '../../../../profile/disposition-writer';
+import type { DispositionPerEntryStorage } from '../../../../extensions/uxf/profile/disposition-writer';
 import type {
   SphereEventMap,
   SphereEventType,

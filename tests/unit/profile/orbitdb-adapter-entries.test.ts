@@ -8,15 +8,15 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { OrbitDbAdapter } from '../../../profile/orbitdb-adapter';
+import { OrbitDbAdapter } from '../../../extensions/uxf/profile/orbitdb-adapter';
 import {
   buildLocalEntry,
   encodeEntry,
   OPLOG_ENTRY_SCHEMA_VERSION,
   OpLogEntryCorrupt,
   type OpLogEntryEnvelope,
-} from '../../../profile/oplog-entry';
-import { AggregatorPointerErrorCode } from '../../../profile/aggregator-pointer';
+} from '../../../extensions/uxf/profile/oplog-entry';
+import { AggregatorPointerErrorCode } from '../../../extensions/uxf/profile/aggregator-pointer';
 
 /**
  * Patch a fresh OrbitDbAdapter with a fake in-memory `db` so we can test
@@ -192,7 +192,7 @@ describe('OrbitDbAdapter.getEntry — downgradeAsReplicated (§5.2)', () => {
   it('trustLocalClaim:true does NOT trust keys not locally-authored', async () => {
     const { adapter, store } = makeAdapterWithFakeDb();
     // Simulate a peer-authored write directly into the store (bypass putEntry).
-    const { encodeEntry } = await import('../../../profile/oplog-entry');
+    const { encodeEntry } = await import('../../../extensions/uxf/profile/oplog-entry');
     const peerEnvelope: OpLogEntryEnvelope = {
       v: OPLOG_ENTRY_SCHEMA_VERSION,
       type: 'token_send',

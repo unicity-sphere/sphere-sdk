@@ -29,11 +29,11 @@ import {
   mergeStatus,
   mergeRequestIds,
   mergeErrorFields,
-} from '../../../profile/outbox-merger';
+} from '../../../extensions/uxf/profile/outbox-merger';
 import {
   activeLatticeRank,
   hardTerminalRank,
-} from '../../../profile/outbox-merger-status';
+} from '../../../extensions/uxf/profile/outbox-merger-status';
 
 // -----------------------------------------------------------------------------
 // Test fixture helpers

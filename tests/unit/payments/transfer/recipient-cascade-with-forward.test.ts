@@ -30,7 +30,7 @@ import {
   type CascadeManifestScanner,
   type CascadeOutboxScanner,
 } from '../../../../extensions/uxf/pipeline/cascade-walker';
-import { ManifestCas } from '../../../../profile/manifest-cas';
+import { ManifestCas } from '../../../../extensions/uxf/profile/manifest-cas';
 import {
   ADDR,
   PREVIOUS_CID,
@@ -42,7 +42,7 @@ import {
   makeQueueEntry,
   seedQueue,
 } from './finalization-worker-recipient-fixtures';
-import type { TokenManifestEntry } from '../../../../profile/token-manifest';
+import type { TokenManifestEntry } from '../../../../extensions/uxf/profile/token-manifest';
 import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
 
 const CHILD_A = 'child-token-A';

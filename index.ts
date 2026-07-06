@@ -531,7 +531,7 @@ export type {
   ProfileEncryptionConfig,
   ConsolidationPendingState,
   ProfileErrorCode,
-} from './profile';
+} from './extensions/uxf/profile';
 
 // =============================================================================
 // Exports added for @unicity-sphere/cli consumption (phase 2 extraction).

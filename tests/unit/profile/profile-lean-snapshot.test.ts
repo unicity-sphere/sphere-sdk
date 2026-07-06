@@ -19,15 +19,15 @@ import {
   buildLeanProfileSnapshot,
   parseLeanProfileSnapshot,
   LEAN_PROFILE_SNAPSHOT_VERSION,
-} from '../../../profile/profile-lean-snapshot';
+} from '../../../extensions/uxf/profile/profile-lean-snapshot';
 import type { StorageProvider } from '../../../storage/storage-provider';
-import type { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import type { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 import type {
   ProviderStatus,
   TrackedAddressEntry,
   FullIdentity,
 } from '../../../types';
-import type { UxfBundleRef } from '../../../profile/types';
+import type { UxfBundleRef } from '../../../extensions/uxf/profile/types';
 
 // =============================================================================
 // Test doubles
@@ -689,7 +689,7 @@ describe('parseLeanProfileSnapshot — validation', () => {
 
 describe('profile-lean-snapshot — cross-version isolation', () => {
   it('v1 reader (parseProfileSnapshot) rejects lean v3 CARs', async () => {
-    const { parseProfileSnapshot } = await import('../../../profile/profile-export');
+    const { parseProfileSnapshot } = await import('../../../extensions/uxf/profile/profile-export');
 
     const storage = new InMemoryStorageProvider();
     await storage.connect();

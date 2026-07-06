@@ -32,9 +32,9 @@ import {
   createTestIdentity,
   createWriterPair,
 } from '../modules/payments/__fixtures__/payments-module-fixture';
-import { Lamport } from '../../../profile/lamport';
-import { OutboxWriter } from '../../../profile/outbox-writer';
-import { SentLedgerWriter } from '../../../profile/sent-ledger-writer';
+import { Lamport } from '../../../extensions/uxf/profile/lamport';
+import { OutboxWriter } from '../../../extensions/uxf/profile/outbox-writer';
+import { SentLedgerWriter } from '../../../extensions/uxf/profile/sent-ledger-writer';
 import type { FullIdentity } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 

@@ -25,14 +25,14 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 import {
   writeSnapshot,
   getSnapshotBlobKey,
   PROFILE_SNAPSHOT_SCHEMA_VERSION,
   type ProfileSnapshotBlob,
-} from '../../../profile/profile-snapshot-cache';
-import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
+} from '../../../extensions/uxf/profile/profile-snapshot-cache';
+import type { ProfileDatabase, OrbitDbConfig } from '../../../extensions/uxf/profile/types';
 import type { FullIdentity } from '../../../types';
 import type {
   StorageEvent,

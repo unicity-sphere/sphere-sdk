@@ -80,9 +80,9 @@ import {
 import type { TokenLike } from '../../../extensions/uxf/pipeline/classify-token';
 import type { PreflightFinalizeOptions } from '../../../extensions/uxf/pipeline/preflight-finalize';
 import { isSphereError } from '../../../core/errors';
-import { Lamport } from '../../../profile/lamport';
-import { OutboxWriter } from '../../../profile/outbox-writer';
-import type { ProfileDatabase } from '../../../profile/types';
+import { Lamport } from '../../../extensions/uxf/profile/lamport';
+import { OutboxWriter } from '../../../extensions/uxf/profile/outbox-writer';
+import type { ProfileDatabase } from '../../../extensions/uxf/profile/types';
 import type { OracleProvider } from '../../../oracle/oracle-provider';
 import type { TransportProvider } from '../../../transport';
 import type { PeerInfo } from '../../../transport/transport-provider';

@@ -17,7 +17,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { CID } from 'multiformats/cid';
 import * as Digest from 'multiformats/hashes/digest';
 
-import { verifyCarAndExtractFile } from '../../../../profile/migration/unixfs-verify.js';
+import { verifyCarAndExtractFile } from '../../../../extensions/uxf/profile/migration/unixfs-verify.js';
 
 const CODEC_RAW = 0x55;
 const CODEC_DAGPB = 0x70;

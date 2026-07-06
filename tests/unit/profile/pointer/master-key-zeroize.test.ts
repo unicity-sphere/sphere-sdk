@@ -18,7 +18,7 @@ import {
   assertAuthorizedMasterKey,
   derivePointerKeyMaterial,
   AggregatorPointerErrorCode,
-} from '../../../../profile/aggregator-pointer';
+} from '../../../../extensions/uxf/profile/aggregator-pointer';
 
 const SEED = new Uint8Array(32).fill(0x77);
 const ALT_SEED = new Uint8Array(32).fill(0x33);

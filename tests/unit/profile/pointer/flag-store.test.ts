@@ -3,8 +3,8 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { FlagStore, DURABLE_STORAGE, isDurableProvider } from '../../../../profile/aggregator-pointer/index.js';
-import { AggregatorPointerErrorCode } from '../../../../profile/aggregator-pointer/index.js';
+import { FlagStore, DURABLE_STORAGE, isDurableProvider } from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
+import { AggregatorPointerErrorCode } from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 // ── In-memory test storage providers ──────────────────────────────────────
 

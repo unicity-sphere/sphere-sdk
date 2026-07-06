@@ -29,9 +29,9 @@ import {
   SIDE_B_NUM,
   MAX_CT_RESIDENT_MS,
   VERSION_MAX,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 // Test-only access to internal helpers.
-import { __internal } from '../../../../profile/aggregator-pointer/aggregator-submit.js';
+import { __internal } from '../../../../extensions/uxf/profile/aggregator-pointer/aggregator-submit.js';
 
 // ── Test fixtures ──────────────────────────────────────────────────────────
 

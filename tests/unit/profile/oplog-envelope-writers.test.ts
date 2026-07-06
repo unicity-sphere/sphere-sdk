@@ -13,19 +13,19 @@
 
 import { describe, it, expect } from 'vitest';
 
-import { Lamport } from '../../../profile/lamport.js';
-import { OutboxWriter, type OutboxWriteInput } from '../../../profile/outbox-writer.js';
-import { SentLedgerWriter, type SentLedgerWriteInput } from '../../../profile/sent-ledger-writer.js';
+import { Lamport } from '../../../extensions/uxf/profile/lamport.js';
+import { OutboxWriter, type OutboxWriteInput } from '../../../extensions/uxf/profile/outbox-writer.js';
+import { SentLedgerWriter, type SentLedgerWriteInput } from '../../../extensions/uxf/profile/sent-ledger-writer.js';
 import {
   encryptProfileValue,
-} from '../../../profile/encryption.js';
-import { deriveProfileEncryptionKey } from '../../../profile/encryption.js';
+} from '../../../extensions/uxf/profile/encryption.js';
+import { deriveProfileEncryptionKey } from '../../../extensions/uxf/profile/encryption.js';
 import {
   decodeEntry,
   encodeEntry,
   OPLOG_ENTRY_SCHEMA_VERSION,
-} from '../../../profile/oplog-entry.js';
-import type { ProfileDatabase } from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/oplog-entry.js';
+import type { ProfileDatabase } from '../../../extensions/uxf/profile/types.js';
 
 const ADDR = 'DIRECT_aabbcc_ddeeff';
 const KEY = deriveProfileEncryptionKey(new Uint8Array(32).fill(11));

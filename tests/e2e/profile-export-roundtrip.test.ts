@@ -41,9 +41,9 @@ import { preflightSkip } from './lib/preflight';
 import {
   exportProfile,
   parseProfileSnapshot,
-} from '../../profile/profile-export';
-import { importProfile } from '../../profile/profile-import';
-import type { ProfileTokenStorageProvider } from '../../profile/profile-token-storage-provider';
+} from '../../extensions/uxf/profile/profile-export';
+import { importProfile } from '../../extensions/uxf/profile/profile-import';
+import type { ProfileTokenStorageProvider } from '../../extensions/uxf/profile/profile-token-storage-provider';
 
 // =============================================================================
 // Test gate

@@ -32,7 +32,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from
 // the project drops Node 20 (see #105 follow-up) this guard can go.
 const nodeVersion = parseInt(process.versions.node.split('.')[0], 10);
 const describeOrSkip = nodeVersion >= 22 ? describe : describe.skip;
-import { OrbitDbAdapter } from '../../profile/orbitdb-adapter.js';
+import { OrbitDbAdapter } from '../../extensions/uxf/profile/orbitdb-adapter.js';
 import { randomBytes } from 'crypto';
 import * as os from 'os';
 import * as path from 'path';

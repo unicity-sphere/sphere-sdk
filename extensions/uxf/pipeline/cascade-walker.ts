@@ -72,8 +72,8 @@ import { safeErrorMessage } from '../../../core/error-sanitize';
 import {
   ManifestCas,
   type ManifestCasResult,
-} from '../../../profile/manifest-cas';
-import type { TokenManifestEntry } from '../../../profile/token-manifest';
+} from '../profile/manifest-cas';
+import type { TokenManifestEntry } from '../profile/token-manifest';
 import type { DispositionReason } from '../../../types/disposition';
 import type {
   SphereEventMap,

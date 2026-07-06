@@ -78,8 +78,8 @@ let mockFetchCarFromIpfs: (
 ) => Promise<Uint8Array> = async () => {
   throw new Error('mockFetchCarFromIpfs not initialized');
 };
-vi.mock('../../../profile/ipfs-client', async (importOriginal) => {
-  const original = await importOriginal<typeof import('../../../profile/ipfs-client')>();
+vi.mock('../../../extensions/uxf/profile/ipfs-client', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../../extensions/uxf/profile/ipfs-client')>();
   return {
     ...original,
     fetchCarFromIpfs: (...args: Parameters<typeof original.fetchCarFromIpfs>) =>

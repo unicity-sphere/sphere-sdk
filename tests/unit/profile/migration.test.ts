@@ -5,10 +5,10 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ProfileMigration } from '../../../profile/migration';
+import { ProfileMigration } from '../../../extensions/uxf/profile/migration';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../storage/storage-provider';
-import type { ProfileStorageProvider } from '../../../profile/profile-storage-provider';
-import type { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import type { ProfileStorageProvider } from '../../../extensions/uxf/profile/profile-storage-provider';
+import type { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 
 // =============================================================================
 // Mock Factories
@@ -753,8 +753,8 @@ describe('ProfileMigration', () => {
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { migrateInvalidTokensToPerEntryKey } from '../../../profile/migration';
-import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
+import { migrateInvalidTokensToPerEntryKey } from '../../../extensions/uxf/profile/migration';
+import type { ProfileDatabase, OrbitDbConfig } from '../../../extensions/uxf/profile/types';
 
 interface FixtureSnapshot {
   readonly address_id: string;

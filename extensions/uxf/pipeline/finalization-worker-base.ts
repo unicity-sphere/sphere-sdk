@@ -66,8 +66,8 @@ import {
   type PoolWriteAdapter,
   type TombstoneWriteAdapter,
 } from './manifest-cid-rewrite';
-import { ManifestCas } from '../../../profile/manifest-cas';
-import type { PerTokenMutex } from '../../../profile/per-token-mutex';
+import { ManifestCas } from '../profile/manifest-cas';
+import type { PerTokenMutex } from '../profile/per-token-mutex';
 import type { ContentHash } from '../bundle/types';
 import type { DispositionReason } from '../../../types/disposition';
 import type {

@@ -27,7 +27,7 @@ import {
 } from '../../../../extensions/uxf/pipeline/bundle-acquirer';
 import { ReplayLRU } from '../../../../extensions/uxf/pipeline/replay-lru';
 import { RELAY_SAFE_CAP_BYTES } from '../../../../extensions/uxf/pipeline/limits';
-import { _resetGatewayCapabilityCache } from '../../../../profile/ipfs-client';
+import { _resetGatewayCapabilityCache } from '../../../../extensions/uxf/profile/ipfs-client';
 import type {
   UxfTransferPayload,
   UxfTransferPayloadCar,

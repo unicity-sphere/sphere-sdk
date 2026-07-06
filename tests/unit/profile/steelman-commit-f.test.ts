@@ -12,8 +12,8 @@ import { describe, it, expect } from 'vitest';
 import {
   createMasterPrivateKey,
   AggregatorPointerErrorCode,
-} from '../../../profile/aggregator-pointer';
-import { ProfilePointerLayer } from '../../../profile/aggregator-pointer/ProfilePointerLayer';
+} from '../../../extensions/uxf/profile/aggregator-pointer';
+import { ProfilePointerLayer } from '../../../extensions/uxf/profile/aggregator-pointer/ProfilePointerLayer';
 
 describe('Commit F — steelman² hardening regressions', () => {
   describe('1) byte-compare denylist (no hex-string heap residue)', () => {

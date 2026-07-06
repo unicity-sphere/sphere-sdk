@@ -14,7 +14,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { createProfileProviders } from '../../../profile/factory.js';
+import { createProfileProviders } from '../../../extensions/uxf/profile/factory.js';
 import type { StorageProvider, StorageEvent } from '../../../storage/storage-provider';
 import type { FullIdentity, TrackedAddressEntry } from '../../../types';
 

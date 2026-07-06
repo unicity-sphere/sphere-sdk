@@ -34,17 +34,17 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   type OpStateArrays,
   unionOpStateWithSentWins,
-} from '../../../profile/profile-token-storage/flush-scheduler';
-import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
+} from '../../../extensions/uxf/profile/profile-token-storage/flush-scheduler';
+import type { ProfileDatabase, OrbitDbConfig } from '../../../extensions/uxf/profile/types';
 import type { FullIdentity } from '../../../types';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 import {
   buildPointerSigner,
   createMasterPrivateKey,
   derivePointerKeyMaterial,
   ProfilePointerLayer,
   type PointerSigner,
-} from '../../../profile/aggregator-pointer';
+} from '../../../extensions/uxf/profile/aggregator-pointer';
 import type { StorageEvent } from '../../../storage/storage-provider';
 
 // ---------------------------------------------------------------------------

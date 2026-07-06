@@ -35,7 +35,7 @@ import {
   isTokenStorageMigrationComplete,
   clearTokenStorageMigrationMarker,
   TOKEN_STORAGE_MIGRATION_MARKER_VERSION,
-} from '../../../profile/token-storage-migration';
+} from '../../../extensions/uxf/profile/token-storage-migration';
 import type {
   TokenStorageProvider,
   TxfStorageDataBase,

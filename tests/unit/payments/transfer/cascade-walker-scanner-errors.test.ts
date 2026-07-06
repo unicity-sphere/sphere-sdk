@@ -294,7 +294,7 @@ describe('§6.1.1 cascade — scanner-error surfacing', () => {
       '../../../../extensions/uxf/pipeline/cascade-walker'
     );
     const { ManifestCas } = await import(
-      '../../../../profile/manifest-cas'
+      '../../../../extensions/uxf/profile/manifest-cas'
     );
     const walker = new CascadeWalker({
       manifestScanner: makeFakeManifestScanner(storage),

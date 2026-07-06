@@ -36,7 +36,7 @@ import {
   createWriterPair,
   makeOutboxEntry,
 } from './__fixtures__/payments-module-fixture';
-import type { OutboxWriter } from '../../../../profile/outbox-writer';
+import type { OutboxWriter } from '../../../../extensions/uxf/profile/outbox-writer';
 import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
 
 // ---------------------------------------------------------------------------

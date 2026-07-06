@@ -17,8 +17,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as os from 'node:os';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { createPointerMutex, AggregatorPointerErrorCode } from '../../../../profile/aggregator-pointer/index.js';
-import type { NodeLockPrimitives } from '../../../../profile/aggregator-pointer/index.js';
+import { createPointerMutex, AggregatorPointerErrorCode } from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
+import type { NodeLockPrimitives } from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 // ── Node.js mutex tests ────────────────────────────────────────────────────
 

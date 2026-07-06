@@ -44,8 +44,8 @@ import {
   createTestIdentity,
   createWriterPair,
 } from './__fixtures__/payments-module-fixture';
-import type { OutboxWriter } from '../../../../profile/outbox-writer';
-import type { SentLedgerWriter } from '../../../../profile/sent-ledger-writer';
+import type { OutboxWriter } from '../../../../extensions/uxf/profile/outbox-writer';
+import type { SentLedgerWriter } from '../../../../extensions/uxf/profile/sent-ledger-writer';
 import type { SendingRecoveryWorker } from '../../../../extensions/uxf/pipeline/sending-recovery-worker';
 import type { TransportProvider } from '../../../../transport';
 import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';

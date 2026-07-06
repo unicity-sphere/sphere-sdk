@@ -27,15 +27,15 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
+import type { ProfileDatabase, OrbitDbConfig } from '../../../extensions/uxf/profile/types';
 import {
   IDENTITY_KEYS,
   CACHE_ONLY_KEYS,
   PROFILE_KEY_MAPPING,
-} from '../../../profile/types';
+} from '../../../extensions/uxf/profile/types';
 import type { StorageProvider } from '../../../storage/storage-provider';
 import type { FullIdentity, TrackedAddressEntry } from '../../../types';
-import { ProfileStorageProvider } from '../../../profile/profile-storage-provider';
+import { ProfileStorageProvider } from '../../../extensions/uxf/profile/profile-storage-provider';
 
 // ---------------------------------------------------------------------------
 // Mocks (self-contained — independent of the broader test file so any

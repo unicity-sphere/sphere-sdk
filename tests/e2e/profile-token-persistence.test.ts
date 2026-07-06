@@ -39,7 +39,7 @@ import {
 } from './helpers';
 import { makeProfileProviders, unwrapProfileProviders } from './profile-helpers';
 import { preflightSkip } from './lib/preflight';
-import type { ProfileTokenStorageProvider } from '../../profile/profile-token-storage-provider';
+import type { ProfileTokenStorageProvider } from '../../extensions/uxf/profile/profile-token-storage-provider';
 
 // =============================================================================
 // Test Suite

@@ -7,11 +7,11 @@ import {
   ManifestCas,
   ManifestCasConcurrentModificationError,
   type MinimalManifestStorage,
-} from '../../../profile/manifest-cas';
+} from '../../../extensions/uxf/profile/manifest-cas';
 import type {
   TokenManifestEntry,
   TokenManifestStatus,
-} from '../../../profile/token-manifest';
+} from '../../../extensions/uxf/profile/token-manifest';
 import type { ContentHash } from '../../../extensions/uxf/bundle/types';
 
 /** In-memory MinimalManifestStorage backed by a Map keyed `${addr}|${tokenId}`. */

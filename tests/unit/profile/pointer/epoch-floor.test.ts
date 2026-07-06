@@ -13,7 +13,7 @@ import {
   pickEpochFloor,
   shouldSkipForEpochFloor,
   computeEpochFloor,
-} from '../../../../profile/aggregator-pointer/epoch-floor.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/epoch-floor.js';
 
 describe('normalizeEpoch', () => {
   it('treats undefined as epoch=0 (backwards-compat)', () => {

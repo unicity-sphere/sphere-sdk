@@ -10,7 +10,7 @@ import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage.js';
 import {
   deriveStructuralManifest,
   conflictingTokenIds,
-} from '../../../profile/token-manifest';
+} from '../../../extensions/uxf/profile/token-manifest';
 import { TOKEN_A, TOKEN_B } from '../../fixtures/uxf-mock-tokens.js';
 
 function tokenId(token: Record<string, unknown>): string {

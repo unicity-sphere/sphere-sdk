@@ -78,7 +78,7 @@ import {
   AggregatorPointerErrorCode,
   type CarFetcher,
   type CidDecoder,
-} from '../../../profile/aggregator-pointer/index.js';
+} from '../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 // ── Repo root resolution ───────────────────────────────────────────────────
 

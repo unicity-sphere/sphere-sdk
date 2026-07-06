@@ -468,7 +468,7 @@ describe('PaymentsModule.installSpentStateAuditWriter — durable AUDIT record (
   }
 
   function makeFakeDispositionWriter(options?: { readonly shouldThrow?: Error }): {
-    readonly writer: import('../../../profile/disposition-writer').DispositionWriter;
+    readonly writer: import('../../../extensions/uxf/profile/disposition-writer').DispositionWriter;
     readonly writes: ReadonlyArray<RecordedWrite>;
   } {
     const writes: RecordedWrite[] = [];
@@ -477,7 +477,7 @@ describe('PaymentsModule.installSpentStateAuditWriter — durable AUDIT record (
         writes.push({ addr, record });
         if (options?.shouldThrow) throw options.shouldThrow;
       },
-    } as unknown as import('../../../profile/disposition-writer').DispositionWriter;
+    } as unknown as import('../../../extensions/uxf/profile/disposition-writer').DispositionWriter;
     return { writer: fake, writes };
   }
 

@@ -29,8 +29,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ProfileTokenStorageProvider,
   type ProfileTokenStorageProviderOptions,
-} from '../../../profile/profile-token-storage-provider.js';
-import type { OrbitDbConfig, ProfileDatabase } from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/profile-token-storage-provider.js';
+import type { OrbitDbConfig, ProfileDatabase } from '../../../extensions/uxf/profile/types.js';
 
 function createMockDb(): ProfileDatabase {
   const store = new Map<string, Uint8Array>();

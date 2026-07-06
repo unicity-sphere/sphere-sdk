@@ -24,8 +24,8 @@ import {
   CidRefStore,
   FETCH_SIZE_TOLERANCE_BYTES,
   type CidRef,
-} from '../../../profile/cid-ref-store';
-import { ProfileError } from '../../../profile/errors';
+} from '../../../extensions/uxf/profile/cid-ref-store';
+import { ProfileError } from '../../../extensions/uxf/profile/errors';
 
 // ── Test fixtures ─────────────────────────────────────────────────────────
 

@@ -35,7 +35,7 @@ import {
   readSnapshot,
   writeSnapshot,
   type ProfileSnapshotBlob,
-} from '../../../profile/profile-snapshot-cache.js';
+} from '../../../extensions/uxf/profile/profile-snapshot-cache.js';
 import type {
   StorageProvider,
   TxfStorageDataBase,

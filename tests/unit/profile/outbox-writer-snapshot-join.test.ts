@@ -15,17 +15,17 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { Lamport } from '../../../profile/lamport.js';
+import { Lamport } from '../../../extensions/uxf/profile/lamport.js';
 import {
   OutboxWriter,
   type OutboxWriteInput,
-} from '../../../profile/outbox-writer.js';
-import { encryptProfileValue } from '../../../profile/encryption.js';
-import { MAX_SAFE_LAMPORT } from '../../../profile/profile-snapshot-merge.js';
+} from '../../../extensions/uxf/profile/outbox-writer.js';
+import { encryptProfileValue } from '../../../extensions/uxf/profile/encryption.js';
+import { MAX_SAFE_LAMPORT } from '../../../extensions/uxf/profile/profile-snapshot-merge.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 import type {
   LegacyOutboxEntry,
 } from '../../../types/uxf-outbox.js';

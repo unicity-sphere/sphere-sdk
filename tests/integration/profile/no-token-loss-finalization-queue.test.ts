@@ -32,15 +32,15 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import type {
   ProfileDatabase,
   OrbitDbConfig,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 import type { FullIdentity } from '../../../types/index.js';
-import { OrbitDbFinalizationQueueStorageAdapter } from '../../../profile/finalization-queue-storage-adapter.js';
+import { OrbitDbFinalizationQueueStorageAdapter } from '../../../extensions/uxf/profile/finalization-queue-storage-adapter.js';
 import {
   FinalizationQueue,
   type FinalizationQueueEntry,
   entryIdFor,
 } from '../../../extensions/uxf/pipeline/finalization-queue.js';
-import { deriveProfileEncryptionKey } from '../../../profile/encryption.js';
+import { deriveProfileEncryptionKey } from '../../../extensions/uxf/profile/encryption.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -188,7 +188,7 @@ describe('G3 — FinalizationQueue entries survive Sphere process restart', () =
     // Read the raw ciphertext, decrypt, and parse.
     const raw = db._store.get(`${ADDR}.finalizationQueue.${entry.entryId}`);
     expect(raw).toBeDefined();
-    const { decryptString } = await import('../../../profile/encryption.js');
+    const { decryptString } = await import('../../../extensions/uxf/profile/encryption.js');
     const json = await decryptString(getEncryptionKey(), raw!);
     const parsed = JSON.parse(json);
     expect(parsed._schemaVersion).toBe('uxf-1');
@@ -230,7 +230,7 @@ describe('G7 — recipient context records survive Sphere process restart', () =
 
   it('OrbitDbRecipientContextStorageAdapter persists request-context records across rebuild', async () => {
     const { OrbitDbRecipientContextStorageAdapter } = await import(
-      '../../../profile/finalization-queue-storage-adapter.js'
+      '../../../extensions/uxf/profile/finalization-queue-storage-adapter.js'
     );
 
     const adapter1 = new OrbitDbRecipientContextStorageAdapter({
@@ -257,7 +257,7 @@ describe('G7 — recipient context records survive Sphere process restart', () =
 
   it('OrbitDbRecipientContextStorageAdapter persists finalization-context records and lists them', async () => {
     const { OrbitDbRecipientContextStorageAdapter } = await import(
-      '../../../profile/finalization-queue-storage-adapter.js'
+      '../../../extensions/uxf/profile/finalization-queue-storage-adapter.js'
     );
 
     const adapter1 = new OrbitDbRecipientContextStorageAdapter({
@@ -290,7 +290,7 @@ describe('G7 — recipient context records survive Sphere process restart', () =
 
   it('persisted recipient-context records carry `_schemaVersion: "uxf-1"`', async () => {
     const { OrbitDbRecipientContextStorageAdapter } = await import(
-      '../../../profile/finalization-queue-storage-adapter.js'
+      '../../../extensions/uxf/profile/finalization-queue-storage-adapter.js'
     );
 
     const adapter = new OrbitDbRecipientContextStorageAdapter({
@@ -309,7 +309,7 @@ describe('G7 — recipient context records survive Sphere process restart', () =
       `${ADDR}.recipientContext.finalization.${tokenId}`,
     );
     expect(raw).toBeDefined();
-    const { decryptString } = await import('../../../profile/encryption.js');
+    const { decryptString } = await import('../../../extensions/uxf/profile/encryption.js');
     const parsed = JSON.parse(await decryptString(getEncryptionKey(), raw!));
     expect(parsed._schemaVersion).toBe('uxf-1');
   });

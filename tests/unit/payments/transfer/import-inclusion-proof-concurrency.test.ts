@@ -22,7 +22,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { PerTokenMutex } from '../../../../profile/per-token-mutex';
+import { PerTokenMutex } from '../../../../extensions/uxf/profile/per-token-mutex';
 import {
   ADDR,
   buildImporterHarness,

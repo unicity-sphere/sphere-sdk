@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Mock the orbitdb-adapter to avoid transitive @noble/curves resolution issues
-vi.mock('../../../profile/orbitdb-adapter', () => {
+vi.mock('../../../extensions/uxf/profile/orbitdb-adapter', () => {
   class OrbitDbAdapter {
     async connect() {}
     async put() {}
@@ -21,12 +21,12 @@ vi.mock('../../../profile/orbitdb-adapter', () => {
   return { OrbitDbAdapter, ProfileError: Error };
 });
 
-import { ProfileMigration } from '../../../profile/migration';
-import { createProfileProviders } from '../../../profile/factory';
-import { ProfileStorageProvider } from '../../../profile/profile-storage-provider';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
-import type { ProfileDatabase } from '../../../profile/types';
-import type { ProfileConfig } from '../../../profile/types';
+import { ProfileMigration } from '../../../extensions/uxf/profile/migration';
+import { createProfileProviders } from '../../../extensions/uxf/profile/factory';
+import { ProfileStorageProvider } from '../../../extensions/uxf/profile/profile-storage-provider';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
+import type { ProfileDatabase } from '../../../extensions/uxf/profile/types';
+import type { ProfileConfig } from '../../../extensions/uxf/profile/types';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../storage/storage-provider';
 import type { FullIdentity } from '../../../types/index';
 

@@ -68,14 +68,14 @@ import type {
   SphereProfileHandle,
   ResetEpochParams,
   ResetEpochResult,
-} from '../profile/profile-handle';
+} from '../extensions/uxf/profile/profile-handle';
 import {
   LOCAL_EPOCH_FLOOR_KEY,
   LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY,
   LOCAL_EPOCH_RESET_REASON_KEY,
-} from '../profile/pointer-wiring';
-import { EPOCH_RESET_REASON_MAX_BYTES } from '../profile/profile-lean-snapshot';
-import { beginGlobalClear, endGlobalClear } from '../profile/global-clear-gate';
+} from '../extensions/uxf/profile/pointer-wiring';
+import { EPOCH_RESET_REASON_MAX_BYTES } from '../extensions/uxf/profile/profile-lean-snapshot';
+import { beginGlobalClear, endGlobalClear } from '../extensions/uxf/profile/global-clear-gate';
 import type {
   ShutdownOptions,
   StorageProvider,
@@ -625,16 +625,16 @@ async function deriveL3PredicateAddress(privateKey: string): Promise<string> {
  * construction time.
  */
 async function buildSpentStateAuditWriter(
-  adapter: import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter,
+  adapter: import('../extensions/uxf/profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter,
   emitEvent: <T extends import('../types').SphereEventType>(
     type: T,
     data: import('../types').SphereEventMap[T],
   ) => void,
-): Promise<import('../profile/disposition-writer').DispositionWriter> {
-  const { DispositionWriter } = await import('../profile/disposition-writer');
-  const { ManifestStore } = await import('../profile/manifest-store');
-  const { Lamport } = await import('../profile/lamport');
-  const stubManifestStorage: import('../profile/manifest-cas').MinimalManifestStorage = {
+): Promise<import('../extensions/uxf/profile/disposition-writer').DispositionWriter> {
+  const { DispositionWriter } = await import('../extensions/uxf/profile/disposition-writer');
+  const { ManifestStore } = await import('../extensions/uxf/profile/manifest-store');
+  const { Lamport } = await import('../extensions/uxf/profile/lamport');
+  const stubManifestStorage: import('../extensions/uxf/profile/manifest-cas').MinimalManifestStorage = {
     async readEntry(): Promise<never> {
       throw new SphereError(
         'spent-state-rescan AUDIT-only DispositionWriter: manifestStore.readEntry called — ' +
@@ -3852,10 +3852,10 @@ export class Sphere {
     try {
       const storageWithBuilders = this._storage as unknown as {
         buildFinalizationQueueStorageAdapter?: () =>
-          | import('../profile/finalization-queue-storage-adapter').OrbitDbFinalizationQueueStorageAdapter
+          | import('../extensions/uxf/profile/finalization-queue-storage-adapter').OrbitDbFinalizationQueueStorageAdapter
           | null;
         buildRecipientContextStorageAdapter?: () =>
-          | import('../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+          | import('../extensions/uxf/profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
           | null;
       };
       const queueAdapter =
@@ -4020,7 +4020,7 @@ export class Sphere {
     try {
       const storageWithBuilder = this._storage as unknown as {
         buildDispositionStorageAdapter?: () =>
-          | import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter
+          | import('../extensions/uxf/profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter
           | null;
       };
       const builderAvailable =
@@ -4093,7 +4093,7 @@ export class Sphere {
         // upgrade just the verifier so multi-address wallets also
         // benefit from the Round 8 verifier wiring.
         const { InMemoryDispositionStorageAdapter } = await import(
-          '../profile/disposition-storage-adapters'
+          '../extensions/uxf/profile/disposition-storage-adapters'
         );
         payments.configureOperatorEscapeHatchStorage(
           new InMemoryDispositionStorageAdapter(),
@@ -4205,10 +4205,10 @@ export class Sphere {
       const storageForOutbox = this._storage as unknown as {
         buildOutboxWriter?: (
           addressId: string,
-        ) => import('../profile/outbox-writer').OutboxWriter | null;
+        ) => import('../extensions/uxf/profile/outbox-writer').OutboxWriter | null;
         buildSentLedgerWriter?: (
           addressId: string,
-        ) => import('../profile/sent-ledger-writer').SentLedgerWriter | null;
+        ) => import('../extensions/uxf/profile/sent-ledger-writer').SentLedgerWriter | null;
       };
       if (
         typeof storageForOutbox.buildOutboxWriter !== 'function' ||
@@ -4280,10 +4280,10 @@ export class Sphere {
    * `_cidRefStore = null` to force a rebuild — the captured
    * encryption key is the one at construction time.
    */
-  private buildCidRefStoreOrNull(): import('../profile/cid-ref-store').CidRefStore | null {
+  private buildCidRefStoreOrNull(): import('../extensions/uxf/profile/cid-ref-store').CidRefStore | null {
     try {
       const storageWithBuilder = this._storage as unknown as {
-        buildCidRefStore?: () => import('../profile/cid-ref-store').CidRefStore | null;
+        buildCidRefStore?: () => import('../extensions/uxf/profile/cid-ref-store').CidRefStore | null;
       };
       if (typeof storageWithBuilder.buildCidRefStore !== 'function') {
         return null;
@@ -6878,7 +6878,7 @@ export class Sphere {
     try {
       const storageWithPointer = this._storage as unknown as {
         getPointerLayer?: () =>
-          | import('../profile/aggregator-pointer/ProfilePointerLayer').ProfilePointerLayer
+          | import('../extensions/uxf/profile/aggregator-pointer/ProfilePointerLayer').ProfilePointerLayer
           | null;
       };
       const pointer = storageWithPointer.getPointerLayer?.() ?? null;
@@ -6956,7 +6956,7 @@ export class Sphere {
       const {
         buildWinBroadcastTag,
         verifyWinBroadcastPayload,
-      } = await import('../profile/aggregator-pointer/win-broadcast');
+      } = await import('../extensions/uxf/profile/aggregator-pointer/win-broadcast');
       const tag = buildWinBroadcastTag(signingPubKeyHex);
 
       const unsub = this._transport.subscribeToBroadcast(
@@ -7000,9 +7000,9 @@ export class Sphere {
   private async handleIncomingPointerWinBroadcast(
     contentJson: string,
     ownSigningPubKeyHex: string,
-    pointer: import('../profile/aggregator-pointer/ProfilePointerLayer').ProfilePointerLayer,
+    pointer: import('../extensions/uxf/profile/aggregator-pointer/ProfilePointerLayer').ProfilePointerLayer,
     verify: (
-      payload: import('../profile/aggregator-pointer/win-broadcast').SignedWinBroadcastPayload,
+      payload: import('../extensions/uxf/profile/aggregator-pointer/win-broadcast').SignedWinBroadcastPayload,
       expectedSigningPubKeyHex: string,
     ) => Promise<boolean>,
   ): Promise<void> {
@@ -7015,7 +7015,7 @@ export class Sphere {
         // defensive). Drop.
         return;
       }
-      const payload = parsed as import('../profile/aggregator-pointer/win-broadcast').SignedWinBroadcastPayload;
+      const payload = parsed as import('../extensions/uxf/profile/aggregator-pointer/win-broadcast').SignedWinBroadcastPayload;
       const ok = await verify(payload, ownSigningPubKeyHex);
       if (!ok) {
         logger.debug(
@@ -7135,10 +7135,10 @@ export class Sphere {
     try {
       const storageWithBuilders = this._storage as unknown as {
         buildFinalizationQueueStorageAdapter?: () =>
-          | import('../profile/finalization-queue-storage-adapter').OrbitDbFinalizationQueueStorageAdapter
+          | import('../extensions/uxf/profile/finalization-queue-storage-adapter').OrbitDbFinalizationQueueStorageAdapter
           | null;
         buildRecipientContextStorageAdapter?: () =>
-          | import('../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+          | import('../extensions/uxf/profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
           | null;
       };
       const queueAdapter =
@@ -7333,7 +7333,7 @@ price: this._priceProvider ?? undefined,
       // `buildDispositionStorageAdapter`. Other providers don't.
       const storageWithBuilder = this._storage as unknown as {
         buildDispositionStorageAdapter?: () =>
-          | import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter
+          | import('../extensions/uxf/profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter
           | null;
       };
       const builderAvailable =
@@ -7434,7 +7434,7 @@ price: this._priceProvider ?? undefined,
         // verifyProof wiring is strictly better than the stub.
         const paymentsForVerify = this._payments as unknown as {
           configureOperatorEscapeHatchStorage?: (
-            ds: import('../profile/disposition-writer').DispositionPerEntryStorage,
+            ds: import('../extensions/uxf/profile/disposition-writer').DispositionPerEntryStorage,
             options?: {
               readonly verifyProof?: import('../extensions/uxf/pipeline/import-inclusion-proof').ProofVerifier;
             },
@@ -7445,7 +7445,7 @@ price: this._priceProvider ?? undefined,
         // dispositionStorage instance, but rebuilding fresh keeps the
         // public surface narrow — the cost is one extra empty Map.
         const { InMemoryDispositionStorageAdapter } = await import(
-          '../profile/disposition-storage-adapters'
+          '../extensions/uxf/profile/disposition-storage-adapters'
         );
         if (typeof paymentsForVerify.configureOperatorEscapeHatchStorage === 'function') {
           paymentsForVerify.configureOperatorEscapeHatchStorage(

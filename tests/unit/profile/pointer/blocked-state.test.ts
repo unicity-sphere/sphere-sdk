@@ -16,7 +16,7 @@ import {
   FlagStore,
   AggregatorPointerError,
   AggregatorPointerErrorCode,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 function makeDurableStore() {
   const kv = new Map<string, string>();

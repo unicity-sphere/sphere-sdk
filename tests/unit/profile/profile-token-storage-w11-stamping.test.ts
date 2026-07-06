@@ -18,16 +18,16 @@ import type {
   ProfileDatabase,
   OrbitDbConfig,
   UxfBundleRef,
-} from '../../../profile/types';
+} from '../../../extensions/uxf/profile/types';
 import type { FullIdentity } from '../../../types';
-import type { OpLogEntryEnvelope } from '../../../profile/oplog-entry';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import type { OpLogEntryEnvelope } from '../../../extensions/uxf/profile/oplog-entry';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 import {
   deriveProfileEncryptionKey,
   encryptProfileValue,
-} from '../../../profile/encryption';
-import { encodeEntry, decodeEntry } from '../../../profile/oplog-entry';
-import { ConsolidationEngine } from '../../../profile/consolidation';
+} from '../../../extensions/uxf/profile/encryption';
+import { encodeEntry, decodeEntry } from '../../../extensions/uxf/profile/oplog-entry';
+import { ConsolidationEngine } from '../../../extensions/uxf/profile/consolidation';
 
 // ---------------------------------------------------------------------------
 // Fixtures

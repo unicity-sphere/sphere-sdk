@@ -18,7 +18,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { __coerceToUint8ArrayForTest as coerce } from '../../../profile/orbitdb-adapter';
+import { __coerceToUint8ArrayForTest as coerce } from '../../../extensions/uxf/profile/orbitdb-adapter';
 
 describe('coerceToUint8Array — passthrough', () => {
   it('returns Uint8Array unchanged (same instance)', () => {

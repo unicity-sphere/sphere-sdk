@@ -22,18 +22,18 @@ import {
   buildInvalidatedNametagsSyncWriter,
   buildTombstonesSyncWriter,
   SingleBlobSyncWriter,
-} from '../../../profile/single-blob-sync-writer.js';
+} from '../../../extensions/uxf/profile/single-blob-sync-writer.js';
 import {
   encryptProfileValue,
   decryptProfileValue,
-} from '../../../profile/encryption.js';
-import { runProfileSnapshotJoin } from '../../../profile/profile-snapshot-dispatcher.js';
-import { putEnvelopePayload } from '../../../profile/oplog-envelope-io.js';
+} from '../../../extensions/uxf/profile/encryption.js';
+import { runProfileSnapshotJoin } from '../../../extensions/uxf/profile/profile-snapshot-dispatcher.js';
+import { putEnvelopePayload } from '../../../extensions/uxf/profile/oplog-envelope-io.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
-} from '../../../profile/types.js';
-import type { LeanProfileSnapshot } from '../../../profile/profile-lean-snapshot.js';
+} from '../../../extensions/uxf/profile/types.js';
+import type { LeanProfileSnapshot } from '../../../extensions/uxf/profile/profile-lean-snapshot.js';
 
 // =============================================================================
 // Fixtures

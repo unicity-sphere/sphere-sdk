@@ -18,16 +18,16 @@
  */
 
 import { beforeEach, describe, expect, it } from 'vitest';
-import { Lamport } from '../../../profile/lamport.js';
+import { Lamport } from '../../../extensions/uxf/profile/lamport.js';
 import {
   ALLOWED_TRANSITIONS,
   assertTransition,
   validateTransition,
-} from '../../../profile/outbox-state-machine.js';
+} from '../../../extensions/uxf/profile/outbox-state-machine.js';
 import {
   OutboxWriter,
   type OutboxWriteInput,
-} from '../../../profile/outbox-writer.js';
+} from '../../../extensions/uxf/profile/outbox-writer.js';
 import { SphereError } from '../../../core/errors.js';
 import {
   UXF_OUTBOX_STATUSES,
@@ -36,7 +36,7 @@ import {
 import type {
   OrbitDbConfig,
   ProfileDatabase,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 
 // ---------------------------------------------------------------------------
 // 1. Table-size lockdown — spec drift guard

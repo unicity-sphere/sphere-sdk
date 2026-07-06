@@ -37,14 +37,14 @@ import type {
   ProfileDatabase,
   OrbitDbConfig,
   UxfBundleRef,
-} from '../../../profile/types';
+} from '../../../extensions/uxf/profile/types';
 import type { FullIdentity } from '../../../types';
 import type { OracleProvider } from '../../../oracle';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 import {
   deriveProfileEncryptionKey,
   encryptProfileValue,
-} from '../../../profile/encryption';
+} from '../../../extensions/uxf/profile/encryption';
 import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
 
 const TEST_PRIVATE_KEY =

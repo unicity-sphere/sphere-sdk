@@ -26,7 +26,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { mergeAuditPromotedFrom } from '../../../profile/outbox-merger';
+import { mergeAuditPromotedFrom } from '../../../extensions/uxf/profile/outbox-merger';
 
 describe('§5.4 / W45: mergeAuditPromotedFrom — set-OR with dedupe', () => {
   it('canonical: [a, b] ∪ [b, c] = [a, b, c]', () => {

@@ -31,10 +31,10 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   runProfileDirtyFlush,
   type ProfileDirtyFlushDeps,
-} from '../../../profile/factory.js';
-import type { ProfileSnapshotPublishResult } from '../../../profile/types.js';
-import type { BuildLeanProfileSnapshotResult } from '../../../profile/profile-lean-snapshot.js';
-import type { ProfilePointerLayer } from '../../../profile/aggregator-pointer/index.js';
+} from '../../../extensions/uxf/profile/factory.js';
+import type { ProfileSnapshotPublishResult } from '../../../extensions/uxf/profile/types.js';
+import type { BuildLeanProfileSnapshotResult } from '../../../extensions/uxf/profile/profile-lean-snapshot.js';
+import type { ProfilePointerLayer } from '../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 // ---------------------------------------------------------------------------
 // Test fixtures

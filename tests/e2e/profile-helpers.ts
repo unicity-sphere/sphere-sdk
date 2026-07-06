@@ -17,9 +17,9 @@
 
 import type { NodeProviders } from '../../impl/nodejs';
 import { createNodeProviders } from '../../impl/nodejs';
-import { createNodeProfileProviders } from '../../profile/node';
-import type { ProfileStorageProvider } from '../../profile/profile-storage-provider';
-import type { ProfileTokenStorageProvider } from '../../profile/profile-token-storage-provider';
+import { createNodeProfileProviders } from '../../extensions/uxf/profile/node';
+import type { ProfileStorageProvider } from '../../extensions/uxf/profile/profile-storage-provider';
+import type { ProfileTokenStorageProvider } from '../../extensions/uxf/profile/profile-token-storage-provider';
 import { DEFAULT_IPFS_BOOTSTRAP_PEERS } from '../../constants';
 import { join } from 'node:path';
 import { NETWORK } from './helpers';

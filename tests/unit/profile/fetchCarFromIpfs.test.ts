@@ -26,7 +26,7 @@ import * as raw from 'multiformats/codecs/raw';
 import { create as createMultihash } from 'multiformats/hashes/digest';
 import { encode as dagCborEncode } from '@ipld/dag-cbor';
 import { CarReader } from '@ipld/car';
-import { fetchCarFromIpfs } from '../../../profile/ipfs-client';
+import { fetchCarFromIpfs } from '../../../extensions/uxf/profile/ipfs-client';
 import { makeFakeUxfCar } from './_helpers/fake-uxf-car.js';
 
 const originalFetch = globalThis.fetch;

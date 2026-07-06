@@ -40,15 +40,15 @@ import {
   LEAN_PROFILE_SNAPSHOT_VERSION,
   LEAN_PROFILE_SNAPSHOT_GLOBAL_GROUP_KEY,
   type LeanProfileSnapshotBlockFetcher,
-} from '../../../profile/profile-lean-snapshot';
+} from '../../../extensions/uxf/profile/profile-lean-snapshot';
 import type { StorageProvider } from '../../../storage/storage-provider';
-import type { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import type { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 import type {
   ProviderStatus,
   TrackedAddressEntry,
   FullIdentity,
 } from '../../../types';
-import type { UxfBundleRef } from '../../../profile/types';
+import type { UxfBundleRef } from '../../../extensions/uxf/profile/types';
 import { CarReader } from '@ipld/car';
 
 // =============================================================================

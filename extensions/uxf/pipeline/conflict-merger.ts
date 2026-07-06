@@ -119,7 +119,7 @@ import type { ContentHash, UxfElement } from '../bundle/types.js';
 import type {
   TokenManifestEntry,
   TokenManifestStatus,
-} from '../../../profile/token-manifest.js';
+} from '../profile/token-manifest.js';
 
 import { compareCidV1Binary } from './limits.js';
 

@@ -30,7 +30,7 @@ import {
   type CidDecoder,
   type CarFetcher,
   type PointerVersion,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 const WALLET_SEED = new Uint8Array(32).fill(0x42);
 const VALID_CID = new Uint8Array([0x12, 0x20, ...new Array(32).fill(0xab)]);

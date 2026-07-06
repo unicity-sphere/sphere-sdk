@@ -6,15 +6,15 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
+import type { ProfileDatabase, OrbitDbConfig } from '../../../extensions/uxf/profile/types';
 import type { StorageProvider } from '../../../storage/storage-provider';
 import type { FullIdentity, TrackedAddressEntry } from '../../../types';
-import { ProfileStorageProvider } from '../../../profile/profile-storage-provider';
+import { ProfileStorageProvider } from '../../../extensions/uxf/profile/profile-storage-provider';
 import {
   deriveProfileEncryptionKey,
   encryptString,
   decryptString,
-} from '../../../profile/encryption';
+} from '../../../extensions/uxf/profile/encryption';
 
 // ---------------------------------------------------------------------------
 // Mock ProfileDatabase (in-memory)
@@ -901,7 +901,7 @@ describe('ProfileStorageProvider', () => {
       // (missing dependency) should not be retried forever. Transient
       // failures are retried; fatal ones stop the loop until the
       // caller explicitly disconnect()s.
-      const { ProfileError } = await import('../../../profile/errors');
+      const { ProfileError } = await import('../../../extensions/uxf/profile/errors');
       let attempts = 0;
       const fatalDb: any = {
         async connect() {
@@ -1001,13 +1001,13 @@ describe('ProfileStorageProvider', () => {
         onReplication() { return () => {}; },
         isConnected() { return connected; },
         async putEntry(key: string, entry: unknown) {
-          const { encodeEntry } = await import('../../../profile/oplog-entry');
+          const { encodeEntry } = await import('../../../extensions/uxf/profile/oplog-entry');
           const envelope = entry as { type: string; originated: string };
           entryWrites.push({ key, type: envelope.type, originated: envelope.originated });
           store.set(key, encodeEntry(entry as never));
         },
         async getEntry(key: string) {
-          const { decodeEntry } = await import('../../../profile/oplog-entry');
+          const { decodeEntry } = await import('../../../extensions/uxf/profile/oplog-entry');
           const raw = store.get(key);
           return raw ? decodeEntry(raw) : null;
         },
@@ -1098,7 +1098,7 @@ describe('ProfileStorageProvider', () => {
       const bytes = store.get('wallet_exists');
       expect(bytes).toBeDefined();
 
-      const { decodeEntry, OPLOG_ENTRY_SCHEMA_VERSION } = await import('../../../profile/oplog-entry');
+      const { decodeEntry, OPLOG_ENTRY_SCHEMA_VERSION } = await import('../../../extensions/uxf/profile/oplog-entry');
       const env = decodeEntry(bytes!);
       expect(env.v).toBe(OPLOG_ENTRY_SCHEMA_VERSION);
       expect(env.type).toBe('cache_index');
@@ -1337,7 +1337,7 @@ describe('ProfileStorageProvider', () => {
         markLocallyAuthored: (k: string) => void;
       };
       const localKeys = new Set<string>();
-      const { encodeEntry, decodeEntry } = await import('../../../profile/oplog-entry');
+      const { encodeEntry, decodeEntry } = await import('../../../extensions/uxf/profile/oplog-entry');
       db.putEntry = async (key: string, entry: unknown): Promise<void> => {
         const bytes = encodeEntry(entry as Parameters<typeof encodeEntry>[0]);
         db._store.set(key, bytes);
@@ -1551,7 +1551,7 @@ describe('ProfileStorageProvider', () => {
         deriveProfileEncryptionKey(hexToBytes(TEST_PRIVATE_KEY)),
         'fake SENT entry plaintext',
       );
-      const { buildLocalEntry } = await import('../../../profile/oplog-entry');
+      const { buildLocalEntry } = await import('../../../extensions/uxf/profile/oplog-entry');
       const envelope = buildLocalEntry({
         type: 'cache_index',
         originated: 'system',

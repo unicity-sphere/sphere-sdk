@@ -36,7 +36,7 @@ import type {
 } from '../../../storage';
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
-import { computeAddressId } from '../../../profile/types';
+import { computeAddressId } from '../../../extensions/uxf/profile/types';
 import { logger } from '../../../core/logger';
 
 // ---------------------------------------------------------------------------

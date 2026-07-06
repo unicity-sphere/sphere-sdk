@@ -8,7 +8,7 @@ import { SphereError } from '../../../core/errors';
 import type { ProviderStatus, FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, getAddressId } from '../../../constants';
-import { DURABLE_STORAGE } from '../../../profile/aggregator-pointer';
+import { DURABLE_STORAGE } from '../../../extensions/uxf/profile/aggregator-pointer';
 
 // =============================================================================
 // Configuration

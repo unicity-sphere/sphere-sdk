@@ -16,7 +16,7 @@ import {
   hexToBytesAllowEmpty as strictHexToBytesAllowEmpty,
 } from '../../core/hex.js';
 import { AsyncGateMap } from '../../core/async-gate.js';
-import { CidRefStore, type CidRef } from '../../profile/cid-ref-store.js';
+import { CidRefStore, type CidRef } from '../../extensions/uxf/profile/cid-ref-store.js';
 import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey, getAddressId } from '../../constants.js';
 import type {
   IncomingTransfer,
@@ -7497,7 +7497,7 @@ export class AccountingModule {
     const ref = CidRefStore.tryParseRef(raw);
     if (ref) {
       if (!this.deps!.cidRefStore) {
-        const { ProfileError } = await import('../../profile/errors.js');
+        const { ProfileError } = await import('../../extensions/uxf/profile/errors.js');
         throw new ProfileError(
           'CID_REF_UNREADABLE',
           `AccountingModule._parseLedgerPayload: ledger for invoice ${invoiceId} ` +

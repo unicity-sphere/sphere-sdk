@@ -88,8 +88,8 @@
  */
 
 import type { SphereEventMap, SphereEventType, Token } from '../../../types';
-import type { OutboxWriter } from '../../../profile/outbox-writer';
-import type { SentLedgerWriter } from '../../../profile/sent-ledger-writer';
+import type { OutboxWriter } from '../profile/outbox-writer';
+import type { SentLedgerWriter } from '../profile/sent-ledger-writer';
 import { redactCause } from '../../../core/errors';
 
 // =============================================================================

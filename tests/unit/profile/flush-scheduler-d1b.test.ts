@@ -40,12 +40,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ProfileTokenStorageProvider,
   type ProfileTokenStorageProviderOptions,
-} from '../../../profile/profile-token-storage-provider.js';
+} from '../../../extensions/uxf/profile/profile-token-storage-provider.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
   ProfileSnapshotPublishResult,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 import type { StorageEvent } from '../../../storage/storage-provider.js';
 
 // ---------------------------------------------------------------------------

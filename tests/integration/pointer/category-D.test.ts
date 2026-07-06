@@ -61,8 +61,8 @@ import {
   MAX_CAR_FETCH_INITIAL_RESPONSE_MS as _MAX_CAR_FETCH_INITIAL_RESPONSE_MS,
   MAX_CAR_FETCH_STALL_MS as _MAX_CAR_FETCH_STALL_MS,
   MAX_CAR_FETCH_TOTAL_MS as _MAX_CAR_FETCH_TOTAL_MS,
-} from '../../../profile/aggregator-pointer';
-import { __internal } from '../../../profile/pointer-wiring';
+} from '../../../extensions/uxf/profile/aggregator-pointer';
+import { __internal } from '../../../extensions/uxf/profile/pointer-wiring';
 
 // ---------------------------------------------------------------------------
 // Helpers

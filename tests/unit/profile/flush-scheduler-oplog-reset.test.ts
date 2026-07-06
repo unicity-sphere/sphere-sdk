@@ -15,9 +15,9 @@ import {
   BundleIndex,
   FlushScheduler,
   type ProfileTokenStorageHost,
-} from '../../../profile/profile-token-storage';
+} from '../../../extensions/uxf/profile/profile-token-storage';
 import type { StorageEvent } from '../../../storage/storage-provider';
-import type { UxfBundleRef } from '../../../profile/types';
+import type { UxfBundleRef } from '../../../extensions/uxf/profile/types';
 
 // ---------------------------------------------------------------------------
 // Test harness

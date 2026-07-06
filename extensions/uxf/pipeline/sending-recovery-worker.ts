@@ -54,7 +54,7 @@ import type {
 import type {
   UxfTransferOutboxEntry,
 } from '../../../types/uxf-outbox';
-import type { OutboxWriter } from '../../../profile/outbox-writer';
+import type { OutboxWriter } from '../profile/outbox-writer';
 import { redactCause } from '../../../core/errors';
 
 // =============================================================================

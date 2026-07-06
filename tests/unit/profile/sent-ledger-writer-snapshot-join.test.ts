@@ -12,16 +12,16 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { Lamport } from '../../../profile/lamport.js';
+import { Lamport } from '../../../extensions/uxf/profile/lamport.js';
 import {
   SentLedgerWriter,
   type SentLedgerWriteInput,
-} from '../../../profile/sent-ledger-writer.js';
-import { MAX_SAFE_LAMPORT } from '../../../profile/profile-snapshot-merge.js';
+} from '../../../extensions/uxf/profile/sent-ledger-writer.js';
+import { MAX_SAFE_LAMPORT } from '../../../extensions/uxf/profile/profile-snapshot-merge.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures (mirror sent-ledger-writer.test.ts)

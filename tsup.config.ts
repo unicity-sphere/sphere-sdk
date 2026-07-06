@@ -163,7 +163,7 @@ export default defineConfig([
   },
   // Profile - core (types, providers, shared factory)
   {
-    entry: { 'profile/index': 'profile/index.ts' },
+    entry: { 'profile/index': 'extensions/uxf/profile/index.ts' },
     format: ['esm', 'cjs'],
     dts: true,
     clean: false,
@@ -183,7 +183,7 @@ export default defineConfig([
   },
   // Profile - Browser factory
   {
-    entry: { 'profile/browser': 'profile/browser.ts' },
+    entry: { 'profile/browser': 'extensions/uxf/profile/browser.ts' },
     format: ['esm', 'cjs'],
     dts: true,
     clean: false,
@@ -203,7 +203,7 @@ export default defineConfig([
   },
   // Profile - Node.js factory
   {
-    entry: { 'profile/node': 'profile/node.ts' },
+    entry: { 'profile/node': 'extensions/uxf/profile/node.ts' },
     format: ['esm', 'cjs'],
     dts: true,
     clean: false,

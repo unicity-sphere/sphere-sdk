@@ -56,10 +56,10 @@ import {
 import {
   ManifestCas,
   type MinimalManifestStorage,
-} from '../../../../profile/manifest-cas';
-import type { TokenManifestEntry } from '../../../../profile/token-manifest';
+} from '../../../../extensions/uxf/profile/manifest-cas';
+import type { TokenManifestEntry } from '../../../../extensions/uxf/profile/token-manifest';
 import type { InclusionProof } from '../../../../oracle/oracle-provider';
-import { PerTokenMutex } from '../../../../profile/per-token-mutex';
+import { PerTokenMutex } from '../../../../extensions/uxf/profile/per-token-mutex';
 import { logger } from '../../../../core/logger';
 
 // =============================================================================

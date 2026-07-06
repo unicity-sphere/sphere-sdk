@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { Lamport } from '../../../profile/lamport';
+import { Lamport } from '../../../extensions/uxf/profile/lamport';
 import { SphereError } from '../../../core/errors';
 
 describe('Lamport', () => {

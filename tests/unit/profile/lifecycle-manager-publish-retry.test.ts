@@ -33,14 +33,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type {
   ProfileDatabase,
   OrbitDbConfig,
-} from '../../../profile/types';
+} from '../../../extensions/uxf/profile/types';
 import type { FullIdentity } from '../../../types';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
-import type { ProfilePointerLayer } from '../../../profile/aggregator-pointer';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
+import type { ProfilePointerLayer } from '../../../extensions/uxf/profile/aggregator-pointer';
 import {
   AggregatorPointerError,
   AggregatorPointerErrorCode,
-} from '../../../profile/aggregator-pointer/errors';
+} from '../../../extensions/uxf/profile/aggregator-pointer/errors';
 import { STORAGE_KEYS_GLOBAL } from '../../../constants';
 
 const TEST_PRIVATE_KEY =

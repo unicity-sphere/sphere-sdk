@@ -7,7 +7,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import {
   deriveHealthCheckRequestId,
   bytesToHex,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 describe('deriveHealthCheckRequestId (T-A6c)', () => {
   it('output is 32 bytes', () => {

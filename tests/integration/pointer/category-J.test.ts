@@ -52,7 +52,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { create as createDigest } from 'multiformats/hashes/digest';
 import { CarWriter } from '@ipld/car/writer';
 
-import { __internal } from '../../../profile/pointer-wiring.js';
+import { __internal } from '../../../extensions/uxf/profile/pointer-wiring.js';
 
 // ─── Fixture helpers ───────────────────────────────────────────────────────
 

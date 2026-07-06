@@ -27,9 +27,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   AggregatorPointerError,
   AggregatorPointerErrorCode,
-} from '../../../../profile/aggregator-pointer/errors';
-import { __internal as reconcileInternal } from '../../../../profile/aggregator-pointer/reconcile-algorithm';
-import * as discoverModule from '../../../../profile/aggregator-pointer/discover-algorithm';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/errors';
+import { __internal as reconcileInternal } from '../../../../extensions/uxf/profile/aggregator-pointer/reconcile-algorithm';
+import * as discoverModule from '../../../../extensions/uxf/profile/aggregator-pointer/discover-algorithm';
 
 const SUCCESS_RESULT = {
   validV: 5 as const,

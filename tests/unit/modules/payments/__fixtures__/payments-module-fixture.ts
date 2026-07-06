@@ -23,13 +23,13 @@
 
 import { vi } from 'vitest';
 
-import { Lamport } from '../../../../../profile/lamport';
-import { OutboxWriter } from '../../../../../profile/outbox-writer';
-import { SentLedgerWriter } from '../../../../../profile/sent-ledger-writer';
+import { Lamport } from '../../../../../extensions/uxf/profile/lamport';
+import { OutboxWriter } from '../../../../../extensions/uxf/profile/outbox-writer';
+import { SentLedgerWriter } from '../../../../../extensions/uxf/profile/sent-ledger-writer';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
-} from '../../../../../profile/types';
+} from '../../../../../extensions/uxf/profile/types';
 import type {
   FullIdentity,
   SphereEventMap,
@@ -44,7 +44,7 @@ import type {
 } from '../../../../../storage';
 import type { TransportProvider } from '../../../../../transport';
 import type { UxfTransferOutboxEntry } from '../../../../../types/uxf-outbox';
-import type { SentLedgerWriteInput } from '../../../../../profile/sent-ledger-writer';
+import type { SentLedgerWriteInput } from '../../../../../extensions/uxf/profile/sent-ledger-writer';
 
 /** Canonical valid addressId used by every fixture. Matches the shape
  *  produced by `getAddressId()` (`constants.ts`). */

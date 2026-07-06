@@ -15,7 +15,7 @@ import {
   assertOperatorOverridesAllowed,
   operatorOverridesAllowed,
   AggregatorPointerErrorCode,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 // Save and restore env vars across tests.
 const originalNodeEnv = process.env.NODE_ENV;

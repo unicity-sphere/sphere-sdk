@@ -14,7 +14,7 @@ import {
   downgradeForReplication,
   ALL_ENTRY_TYPES,
   AggregatorPointerErrorCode,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 const USER_TYPES = [
   'token_send',

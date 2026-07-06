@@ -26,17 +26,17 @@ import type {
   ProfileDatabase,
   OrbitDbConfig,
   UxfBundleRef,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 import type { FullIdentity } from '../../../types/index.js';
 import type {
   TxfStorageDataBase,
   TxfTombstone,
 } from '../../../storage/storage-provider.js';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider.js';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider.js';
 import {
   deriveProfileEncryptionKey,
   encryptProfileValue,
-} from '../../../profile/encryption.js';
+} from '../../../extensions/uxf/profile/encryption.js';
 import { waitForFlushSettled } from '../../helpers/profile/waitForFlushSettled.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { CID } from 'multiformats/cid';

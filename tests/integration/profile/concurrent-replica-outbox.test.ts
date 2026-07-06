@@ -74,17 +74,17 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 
-import { Lamport } from '../../../profile/lamport.js';
+import { Lamport } from '../../../extensions/uxf/profile/lamport.js';
 import {
   OutboxWriter,
   type OutboxWriteInput,
-} from '../../../profile/outbox-writer.js';
-import { SentLedgerWriter } from '../../../profile/sent-ledger-writer.js';
+} from '../../../extensions/uxf/profile/outbox-writer.js';
+import { SentLedgerWriter } from '../../../extensions/uxf/profile/sent-ledger-writer.js';
 import { SphereError } from '../../../core/errors.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 
 // ---------------------------------------------------------------------------
 // Shared in-memory ProfileDatabase fixture

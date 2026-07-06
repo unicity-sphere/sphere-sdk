@@ -121,14 +121,14 @@
  * @see docs/uxf/UXF-TRANSFER-PROTOCOL.md    §7.2 paragraph 5, §7.C back-out
  */
 
-import { decryptProfileValue, encryptProfileValue } from '../profile/encryption.js';
+import { decryptProfileValue, encryptProfileValue } from '../extensions/uxf/profile/encryption.js';
 import {
   backupKey,
   sentinelKey,
   type LegacyOutboxBackup,
-} from '../profile/migration-outbox.js';
+} from '../extensions/uxf/profile/migration-outbox.js';
 import { isLegacyOutboxEntry, type LegacyOutboxEntry } from '../types/uxf-outbox.js';
-import type { ProfileDatabase } from '../profile/types.js';
+import type { ProfileDatabase } from '../extensions/uxf/profile/types.js';
 
 // =============================================================================
 // 1. Public API types
@@ -618,7 +618,7 @@ async function openProductionDatabase(profilePath: string): Promise<ProfileDatab
   // important because (a) those modules are heavy and (b) the unit test
   // suite stubs the function to inject a mock db. The narrow type assertion
   // is safe: `OrbitDbAdapter` implements `ProfileDatabase`.
-  const mod = (await import('../profile/orbitdb-adapter.js')) as {
+  const mod = (await import('../extensions/uxf/profile/orbitdb-adapter.js')) as {
     OrbitDbAdapter: new () => ProfileDatabase;
   };
   const db = new mod.OrbitDbAdapter();

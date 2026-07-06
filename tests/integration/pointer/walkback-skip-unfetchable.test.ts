@@ -49,8 +49,8 @@ import {
   type PointerKeyMaterial,
   type PointerSigner,
   type PointerVersion,
-} from '../../../profile/aggregator-pointer/index.js';
-import { __internal as probeInternal } from '../../../profile/aggregator-pointer/aggregator-probe.js';
+} from '../../../extensions/uxf/profile/aggregator-pointer/index.js';
+import { __internal as probeInternal } from '../../../extensions/uxf/profile/aggregator-pointer/aggregator-probe.js';
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 

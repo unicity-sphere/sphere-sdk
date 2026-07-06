@@ -24,7 +24,7 @@ import {
   type ClassifiedSlot,
   type SnapshotEntry,
   type JoinDeps,
-} from '../../../profile/profile-snapshot-merge';
+} from '../../../extensions/uxf/profile/profile-snapshot-merge';
 
 // =============================================================================
 // 1. mergeSlots — every cell of the 6-row table + tie-breaks

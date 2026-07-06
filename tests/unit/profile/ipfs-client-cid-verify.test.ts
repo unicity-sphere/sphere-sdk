@@ -12,8 +12,8 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { CID } from 'multiformats/cid';
 import * as raw from 'multiformats/codecs/raw';
 import { create as createDigest } from 'multiformats/hashes/digest';
-import { verifyCidMatchesBytes, fetchFromIpfs } from '../../../profile/ipfs-client';
-import { ProfileError } from '../../../profile/errors';
+import { verifyCidMatchesBytes, fetchFromIpfs } from '../../../extensions/uxf/profile/ipfs-client';
+import { ProfileError } from '../../../extensions/uxf/profile/errors';
 
 function cidForBytes(bytes: Uint8Array): string {
   const digest = createDigest(0x12, sha256(bytes));

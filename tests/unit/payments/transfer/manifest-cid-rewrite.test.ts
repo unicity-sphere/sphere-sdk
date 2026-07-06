@@ -32,8 +32,8 @@ import {
 import {
   ManifestCas,
   type MinimalManifestStorage,
-} from '../../../../profile/manifest-cas';
-import type { TokenManifestEntry } from '../../../../profile/token-manifest';
+} from '../../../../extensions/uxf/profile/manifest-cas';
+import type { TokenManifestEntry } from '../../../../extensions/uxf/profile/token-manifest';
 import type { InclusionProof } from '../../../../oracle/oracle-provider';
 import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 

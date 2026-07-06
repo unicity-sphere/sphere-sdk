@@ -26,7 +26,7 @@ import {
   migrateLegacyToProfile,
   migrateProfileToLegacy,
   isTokenStorageMigrationComplete,
-} from '../../../profile/token-storage-migration';
+} from '../../../extensions/uxf/profile/token-storage-migration';
 import type { FullIdentity } from '../../../types';
 import type { TxfToken } from '../../../types/txf';
 import type { TxfStorageDataBase } from '../../../storage';

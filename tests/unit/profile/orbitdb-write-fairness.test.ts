@@ -9,7 +9,7 @@
 
 import { describe, it, expect } from 'vitest';
 
-import { OrbitDbWriteFairness } from '../../../profile/orbitdb-write-fairness';
+import { OrbitDbWriteFairness } from '../../../extensions/uxf/profile/orbitdb-write-fairness';
 import { MAX_CONCURRENT_ORBITDB_WRITES } from '../../../extensions/uxf/pipeline/limits';
 
 /**

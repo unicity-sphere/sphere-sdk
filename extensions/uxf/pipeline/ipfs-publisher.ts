@@ -38,7 +38,7 @@
  * @module modules/payments/transfer/ipfs-publisher
  */
 
-import { pinCarBlocksToIpfs } from '../../../profile/ipfs-client.js';
+import { pinCarBlocksToIpfs } from '../profile/ipfs-client.js';
 import { extractCarRootCid } from '../bundle/transfer-payload.js';
 
 import type {

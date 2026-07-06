@@ -29,8 +29,8 @@ import {
   LOCAL_EPOCH_FLOOR_KEY,
   LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY,
   LOCAL_EPOCH_RESET_REASON_KEY,
-} from '../../../profile/pointer-wiring';
-import { EPOCH_RESET_REASON_MAX_BYTES } from '../../../profile/profile-lean-snapshot';
+} from '../../../extensions/uxf/profile/pointer-wiring';
+import { EPOCH_RESET_REASON_MAX_BYTES } from '../../../extensions/uxf/profile/profile-lean-snapshot';
 import type { SphereEventMap } from '../../../types';
 
 // =============================================================================

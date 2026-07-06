@@ -57,7 +57,7 @@ import {
 import type {
   TokenManifestEntry,
   TokenManifestStatus,
-} from '../../../../profile/token-manifest';
+} from '../../../../extensions/uxf/profile/token-manifest';
 import type { ContentHash, UxfElement } from '../../../../extensions/uxf/bundle/types';
 
 // =============================================================================

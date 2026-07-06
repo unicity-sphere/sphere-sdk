@@ -41,10 +41,10 @@ const discoverMockState: {
   nextResult: { validV: 0, includedV: 0, probeVersions: [] },
 };
 
-vi.mock('../../../profile/aggregator-pointer/discover-algorithm.js', async () => {
+vi.mock('../../../extensions/uxf/profile/aggregator-pointer/discover-algorithm.js', async () => {
   const actual = await vi.importActual<
-    typeof import('../../../profile/aggregator-pointer/discover-algorithm.js')
-  >('../../../profile/aggregator-pointer/discover-algorithm.js');
+    typeof import('../../../extensions/uxf/profile/aggregator-pointer/discover-algorithm.js')
+  >('../../../extensions/uxf/profile/aggregator-pointer/discover-algorithm.js');
   return {
     ...actual,
     findLatestValidVersion: vi.fn(async () => {
@@ -67,11 +67,11 @@ import {
   createMasterPrivateKey,
   derivePointerKeyMaterial,
   type PointerSigner,
-} from '../../../profile/aggregator-pointer';
+} from '../../../extensions/uxf/profile/aggregator-pointer';
 import { Sphere } from '../../../core/Sphere';
-import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
+import type { ProfileDatabase, OrbitDbConfig } from '../../../extensions/uxf/profile/types';
 import type { StorageProvider, TokenStorageProvider } from '../../../types';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 
 async function buildRealSigner(): Promise<PointerSigner> {
   const seed = new Uint8Array(32).fill(0x42);

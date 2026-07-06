@@ -13,7 +13,7 @@ import type { StorageProvider, TokenStorageProvider } from '../../storage/storag
 import type { OracleProvider } from '../../oracle/oracle-provider';
 import type { PaymentsModule } from '../payments/PaymentsModule';
 import type { CommunicationsModule } from '../communications/CommunicationsModule';
-import type { CidRefStore } from '../../profile/cid-ref-store';
+import type { CidRefStore } from '../../extensions/uxf/profile/cid-ref-store';
 
 // =============================================================================
 // §1.1 Shared Asset Types (reused from TXF genesis coinData format)

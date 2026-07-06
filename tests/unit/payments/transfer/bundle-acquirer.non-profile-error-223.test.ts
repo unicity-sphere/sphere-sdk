@@ -35,7 +35,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 import { isSphereError, SphereError } from '../../../../core/errors';
-import { ProfileError } from '../../../../profile/errors';
+import { ProfileError } from '../../../../extensions/uxf/profile/errors';
 import {
   acquireBundle,
   __clearInflightForTests,
@@ -55,8 +55,8 @@ const mockFetchCarFromIpfs = vi.fn<
   (gateways: readonly string[], rootCid: string) => Promise<Uint8Array>
 >();
 
-vi.mock('../../../../profile/ipfs-client', async (importOriginal) => {
-  const original = await importOriginal<typeof import('../../../../profile/ipfs-client')>();
+vi.mock('../../../../extensions/uxf/profile/ipfs-client', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../../../extensions/uxf/profile/ipfs-client')>();
   return {
     ...original,
     fetchCarFromIpfs: (...args: Parameters<typeof original.fetchCarFromIpfs>) =>

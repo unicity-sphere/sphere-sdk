@@ -29,9 +29,9 @@
  */
 
 import type { ContentHash } from '../bundle/types';
-import type { ManifestCas } from '../../../profile/manifest-cas';
-import { PerTokenMutex } from '../../../profile/per-token-mutex';
-import type { TokenManifestEntry } from '../../../profile/token-manifest';
+import type { ManifestCas } from '../profile/manifest-cas';
+import { PerTokenMutex } from '../profile/per-token-mutex';
+import type { TokenManifestEntry } from '../profile/token-manifest';
 import type { InclusionProof } from '../../../oracle/oracle-provider';
 
 // =============================================================================

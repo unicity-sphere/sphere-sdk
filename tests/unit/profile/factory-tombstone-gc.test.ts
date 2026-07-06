@@ -31,7 +31,7 @@ import {
   DEFAULT_PROFILE_TOMBSTONE_RETENTION_MS,
   runProfileTombstoneGc,
   type ProfileTombstoneGcDeps,
-} from '../../../profile/factory.js';
+} from '../../../extensions/uxf/profile/factory.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures

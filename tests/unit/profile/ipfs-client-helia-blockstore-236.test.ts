@@ -33,7 +33,7 @@ import {
   pinCarBlocksToIpfs,
   fetchFromIpfs,
   fetchCarFromIpfs,
-} from '../../../profile/ipfs-client';
+} from '../../../extensions/uxf/profile/ipfs-client';
 import { makeFakeUxfCar } from './_helpers/fake-uxf-car.js';
 import { CarReader } from '@ipld/car';
 

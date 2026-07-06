@@ -34,7 +34,7 @@ import * as path from 'node:path';
 import {
   createPointerMutex,
   AggregatorPointerErrorCode,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 const OWNER_SUFFIX = '.owner.json';
 

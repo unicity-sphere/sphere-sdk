@@ -10,7 +10,7 @@ import {
   derivePointerKeyMaterial,
   buildPointerSigner,
   bytesToHex,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 import { DataHash } from '@unicitylabs/state-transition-sdk/lib/hash/DataHash.js';
 import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm.js';
 import { sha256 } from '@noble/hashes/sha2.js';

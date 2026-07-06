@@ -20,12 +20,12 @@ import {
   OrbitDbRecipientContextStorageAdapter,
   type PersistedFinalizationContext,
   type PersistedRequestContext,
-} from '../../../profile/finalization-queue-storage-adapter.js';
-import { deriveProfileEncryptionKey } from '../../../profile/encryption.js';
+} from '../../../extensions/uxf/profile/finalization-queue-storage-adapter.js';
+import { deriveProfileEncryptionKey } from '../../../extensions/uxf/profile/encryption.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 
 const ADDR_A = 'DIRECT_aabbcc_ddeeff';
 const ADDR_B = 'DIRECT_112233_445566';
@@ -140,7 +140,7 @@ describe('OrbitDbFinalizationQueueStorageAdapter.syncWriterFor', () => {
     });
     // Plant a legacy-shape entry directly via db.put (bypassing the
     // adapter's writeKey which would stamp _schemaVersion).
-    const { encryptString } = await import('../../../profile/encryption.js');
+    const { encryptString } = await import('../../../extensions/uxf/profile/encryption.js');
     const ct = await encryptString(
       key,
       JSON.stringify({ tokenId: '0xt-legacy', noSchema: true }),

@@ -38,8 +38,8 @@ import {
   makeOutboxEntry,
   TEST_ADDRESS_ID,
 } from './__fixtures__/payments-module-fixture';
-import { Lamport } from '../../../../profile/lamport';
-import { SentLedgerWriter } from '../../../../profile/sent-ledger-writer';
+import { Lamport } from '../../../../extensions/uxf/profile/lamport';
+import { SentLedgerWriter } from '../../../../extensions/uxf/profile/sent-ledger-writer';
 import type { UxfSentLedgerEntry } from '../../../../types/uxf-sent';
 import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
 

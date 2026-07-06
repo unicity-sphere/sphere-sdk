@@ -40,13 +40,13 @@ import {
   type SpentStateRescanWorkerDeps,
   type TransitionToAuditFn,
 } from '../../../extensions/uxf/pipeline/spent-state-rescan-worker';
-import { OutboxWriter } from '../../../profile/outbox-writer';
-import { SentLedgerWriter } from '../../../profile/sent-ledger-writer';
-import { Lamport } from '../../../profile/lamport';
+import { OutboxWriter } from '../../../extensions/uxf/profile/outbox-writer';
+import { SentLedgerWriter } from '../../../extensions/uxf/profile/sent-ledger-writer';
+import { Lamport } from '../../../extensions/uxf/profile/lamport';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
-} from '../../../profile/types';
+} from '../../../extensions/uxf/profile/types';
 import type {
   SphereEventMap,
   SphereEventType,

@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { NostrReplicationBridge, __testInternal } from '../../../profile/nostr-replication';
+import { NostrReplicationBridge, __testInternal } from '../../../extensions/uxf/profile/nostr-replication';
 
 // ---------------------------------------------------------------------------
 // Minimal fake WebSocket implementation

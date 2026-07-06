@@ -74,15 +74,15 @@ import type {
   SphereEventMap,
   SphereEventType,
 } from '../../../types';
-import type { TokenManifestEntry } from '../../../profile/token-manifest';
-import type { ManifestStore } from '../../../profile/manifest-store';
+import type { TokenManifestEntry } from '../profile/token-manifest';
+import type { ManifestStore } from '../profile/manifest-store';
 import {
   type DispositionPerEntryStorage,
-} from '../../../profile/disposition-writer';
+} from '../profile/disposition-writer';
 import {
   PerTokenMutex,
   type PerTokenMutexStrategy,
-} from '../../../profile/per-token-mutex';
+} from '../profile/per-token-mutex';
 import type { ProofVerifyStatus } from './proof-verifier';
 import { safeErrorMessage } from '../../../core/error-sanitize';
 

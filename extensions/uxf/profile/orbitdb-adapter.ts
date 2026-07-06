@@ -1,0 +1,1807 @@
+/**
+ * OrbitDB Wrapper/Adapter for the UXF Profile system.
+ *
+ * Provides a typed, promise-based API around `@orbitdb/core` for the Profile's
+ * key-value database. The rest of the Profile system never imports `@orbitdb/core`
+ * directly -- all OrbitDB interaction flows through this adapter.
+ *
+ * `@orbitdb/core` is loaded via dynamic `import()` in `connect()`. If the package
+ * is not installed, a `ProfileError` with code `ORBITDB_NOT_INSTALLED` is thrown.
+ *
+ * @module profile/orbitdb-adapter
+ */
+
+import { logger } from '../../../core/logger.js';
+import { hexToBytes } from '../../../core/hex.js';
+import { incr, observeMs } from '../../../core/perf-counters.js';
+import { ProfileError } from './errors.js';
+import { installHeliaBlockstoreGetShim } from './helia-blockstore-shim.js';
+import {
+  installHeliaBlockstorePinShim,
+  requestPersistentStorage,
+  type PinShimHandle,
+} from './helia-blockstore-pin-shim.js';
+import {
+  decodeAndDowngradeReplicated,
+  decodeEntry,
+  encodeEntry,
+  type OpLogEntryEnvelope,
+} from './oplog-entry.js';
+import type { OrbitDbConfig, ProfileDatabase } from './types.js';
+
+// Re-export types so existing consumers that import from this module still work
+export type { OrbitDbConfig, ProfileDatabase };
+export { ProfileError };
+export type { OpLogEntryEnvelope };
+
+// ---------------------------------------------------------------------------
+// Implementation
+// ---------------------------------------------------------------------------
+
+/**
+ * Concrete `ProfileDatabase` backed by `@orbitdb/core`.
+ *
+ * All OrbitDB / Helia / libp2p instances are created inside `connect()` via
+ * dynamic `import()`, so the rest of the SDK tree-shakes cleanly when OrbitDB
+ * is not used.
+ */
+export class OrbitDbAdapter implements ProfileDatabase {
+  // ---- private fields (typed as `any` because @orbitdb/core may not be installed) ----
+  /** The Helia IPFS node. */
+  private helia: any = null;
+  /** The OrbitDB instance. */
+  private orbitdb: any = null;
+  /** The opened `keyvalue` database handle. */
+  private db: any = null;
+  /** Tracks connection state. */
+  private connected = false;
+  /** Registered replication listeners for cleanup. */
+  private replicationListeners: Set<() => void> = new Set();
+  /**
+   * Keys written by LOCAL `putEntry` calls during this session. Used by
+   * `getEntry` to decide whether to trust the stored `originated` tag
+   * (local write → trust) or force-downgrade to 'replicated' (peer write).
+   *
+   * Security invariant: `getEntry(key)` without `trustLocalClaim:true`
+   * returns `originated:'replicated'` UNLESS the key is in this set AND
+   * no replication event has fired for the key since we wrote it. This
+   * closes the "peer forges 'user' tag in envelope, plain getEntry
+   * returns it verbatim" attack surface.
+   *
+   * Set is session-scoped — cleared on `close()` / re-connect. That's
+   * correct: a key we wrote in session N cannot be trusted across
+   * sessions because a remote peer may have overwritten it (LWW) while
+   * we were offline. Local writes are always re-stamped on next write.
+   */
+  private localAuthoredKeys: Set<string> = new Set();
+
+  /**
+   * Steelman⁴⁸ WARNING: dedup concurrent connect() calls.
+   * Two callers racing on init both saw connected=false, both
+   * proceeded to create Helia + OrbitDB + open db. The second
+   * overwrote helia/orbitdb/db, leaking the first instance's
+   * resources (no future close() could find them). Now both callers
+   * await the same connect promise.
+   */
+  private connectInFlight: Promise<void> | null = null;
+  private closeInFlight: Promise<void> | null = null;
+
+  /**
+   * Last `OrbitDbConfig` passed to a successful `connect()`. Captured at
+   * the end of `connectInner` and retained across `close()` so
+   * `resetCorruptedLog()` can rebuild a fresh OrbitDB instance without
+   * the caller having to re-supply config. Cleared only by `cleanupOnError`
+   * (a config that produced a failure is suspect and should not be
+   * silently reused) — note `close()` intentionally does NOT clear it,
+   * the recovered Profile re-uses the same dbNameOverride / directory.
+   */
+  private currentConfig: OrbitDbConfig | null = null;
+
+  /**
+   * Steelman remediation for issue #236 — set TRUE at the entry of
+   * `closeInner()` (BEFORE the bounded teardown begins), cleared after
+   * the close completes (or at the start of the next successful
+   * `connect()`). Read by `getHelia()` to deny new fast-path callers
+   * during the teardown window; pre-#236 the read was guarded only by
+   * `this.connected`, which is cleared at the END of close — wide open
+   * to a concurrent flush capturing a half-stopped Helia between the
+   * `helia.stop()` race and the `onSettle` null-out.
+   */
+  private shuttingDown = false;
+
+  /**
+   * Issue #311 — handle to the pin shim installed over
+   * `helia.blockstore.put`. Exposed via `getPinShimCounters()` for
+   * tests and operator diagnostics. Null until `connectInner()` has
+   * installed the shim; cleared on `cleanupOnError()` and `closeInner()`.
+   */
+  private pinShim: PinShimHandle | null = null;
+
+  /**
+   * Issue #311 — listener invoked exactly once during `connectInner()`
+   * AFTER the `navigator.storage.persist()` outcome is known. Tests
+   * subscribe to assert the boot path fired the event; production
+   * wiring (the factory) plumbs it into `tokenStorage.emitEvent` so
+   * it surfaces on the public `onEvent` surface as
+   * `profile:storage-persistence`.
+   *
+   * `null` (default) means the adapter still calls `requestPersistentStorage`
+   * but does not surface the result — useful for tests that don't care.
+   */
+  private storagePersistenceListener:
+    | ((info: { readonly granted: boolean; readonly supported: boolean }) => void)
+    | null = null;
+
+  // ---------- ProfileDatabase implementation ----------
+
+  async connect(config: OrbitDbConfig): Promise<void> {
+    // Steelman⁴⁹ WARNING: if a close() is currently tearing down,
+    // we must wait for it to complete before we can connect again.
+    // Otherwise a fresh connect() observing connected=true (close
+    // hasn't reached connected=false yet) returns success while
+    // close is still mid-teardown, leaving caller with db=null.
+    if (this.closeInFlight) {
+      try {
+        await this.closeInFlight;
+      } catch {
+        /* close errors are best-effort; caller's connect should still proceed */
+      }
+    }
+    if (this.connected) {
+      return; // idempotent
+    }
+    if (this.connectInFlight) {
+      return this.connectInFlight;
+    }
+    this.connectInFlight = this.connectWithRetry(config).finally(() => {
+      this.connectInFlight = null;
+    });
+    return this.connectInFlight;
+  }
+
+  /**
+   * Issue #245 #2 — bounded retry wrapper around `connectInner`.
+   *
+   * **Why:** the manual-test-full-recovery.sh §C.4 step reliably
+   * surfaced
+   *   `Failed to attach OrbitDB: ORBITDB_CONNECTION_FAILED: ...
+   *    Failed to connect to OrbitDB: Database is not open`
+   * on the FIRST CLI invocation following a daemon-driven sync
+   * (where the daemon's prior `closeInner()` had hit the
+   * `helia.stop exceeded 10000ms — dropping reference and continuing`
+   * budget timeout, leaving on-disk state in a transient
+   * lock/teardown limbo). The next process couldn't open the same
+   * directory cleanly until ~seconds had passed.
+   *
+   * `cleanupOnError()` (run inside `connectInner` on throw) wipes
+   * adapter-local helia/orbitdb/db handles before re-throwing — so
+   * a retry creates a fresh helia + orbitdb pair from scratch. That
+   * makes the retry both safe (no stale state carry-over) and
+   * meaningful (we get a fresh attempt at acquiring the on-disk
+   * locks / pubsub init / DB open).
+   *
+   * **Retry budget:** 2 attempts × 1.5s linear backoff = ~3-4.5s
+   * worst-case extra latency. Acceptable given the failure mode
+   * (test-script reliability + UX after a daemon restart). We do
+   * NOT retry `ORBITDB_NOT_INSTALLED` — that's a sticky dep error.
+   *
+   * **Multi-process diagnosis:** if all retries exhaust and the
+   * final message matches a lock-contention pattern, we augment the
+   * error with an actionable hint pointing at the most likely cause
+   * (a sphere daemon holding the lock). The base ProfileErrorCode
+   * is preserved so callers' code-based routing keeps working.
+   */
+  private async connectWithRetry(config: OrbitDbConfig): Promise<void> {
+    const RETRY_ATTEMPTS = 2; // 1 initial + 2 retries = 3 total
+    const RETRY_BACKOFF_MS = 1500;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= RETRY_ATTEMPTS; attempt++) {
+      try {
+        await this.connectInner(config);
+        return;
+      } catch (err) {
+        lastErr = err;
+        // Sticky errors: no retry. ORBITDB_NOT_INSTALLED is a dep
+        // problem that won't fix itself; retrying just delays the
+        // operator-visible failure.
+        if (
+          err instanceof ProfileError &&
+          err.code === 'ORBITDB_NOT_INSTALLED'
+        ) {
+          throw err;
+        }
+        if (attempt >= RETRY_ATTEMPTS) break;
+        // Linear backoff (≥1s) — absorbs a few seconds of teardown
+        // / file-lock release without overshooting.
+        await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS));
+      }
+    }
+    // Augment the final error with multi-process diagnostic hint
+    // when the message matches a likely lock-contention or
+    // teardown-race pattern. Keep the original code so any caller
+    // that branches on `err.code === 'ORBITDB_CONNECTION_FAILED'`
+    // keeps working.
+    if (
+      lastErr instanceof ProfileError &&
+      lastErr.code === 'ORBITDB_CONNECTION_FAILED' &&
+      /Database is not open|LOCK|Resource temporarily unavailable|lockfile|EBUSY/i.test(
+        lastErr.message,
+      )
+    ) {
+      throw new ProfileError(
+        'ORBITDB_CONNECTION_FAILED',
+        `${lastErr.message} (after ${RETRY_ATTEMPTS + 1} attempts). ` +
+          `This is typically caused by another process (e.g. a ` +
+          `\`sphere daemon\`) still holding the OrbitDB / Helia ` +
+          `directory lock. Stop the daemon (\`sphere daemon stop\`) ` +
+          `or wait for its teardown to complete, then retry.`,
+        lastErr,
+      );
+    }
+    throw lastErr;
+  }
+
+  private async connectInner(config: OrbitDbConfig): Promise<void> {
+    // Steelman remediation for issue #236 — clear the shutdown gate
+    // defensively. `closeInner()` clears it on its own success path,
+    // but a previous `close()` that threw mid-teardown could leave
+    // `shuttingDown = true` and silently disable the local-helia
+    // fast-path for the lifetime of the next session.
+    this.shuttingDown = false;
+
+    // Issue #311 — request persistent storage from the browser as the
+    // FIRST step so any subsequent IndexedDB writes (Helia FsBlockstore /
+    // IDBBlockstore, OrbitDB level state, libp2p keychain) land in
+    // storage that is NOT eligible for opportunistic browser eviction.
+    // Browser-only — Node returns
+    // `{ granted: false, supported: false }` synchronously without
+    // touching globals. Fire-and-forget so a slow `persist()` does
+    // NOT block OrbitDB attach. The result is surfaced via the
+    // optional `storagePersistenceListener` (wired by the factory).
+    void requestPersistentStorage()
+      .then((result) => {
+        const listener = this.storagePersistenceListener;
+        if (listener !== null) {
+          try {
+            listener(result);
+          } catch {
+            // Best-effort signal; never break attach on a misbehaving listener.
+          }
+        }
+      })
+      .catch(() => {
+        // Defense-in-depth — `requestPersistentStorage` already
+        // swallows its own errors.
+      });
+
+    // --- Dynamic import of @orbitdb/core ---
+    let orbitdbModule: any;
+    try {
+      orbitdbModule = await import('@orbitdb/core' as string);
+    } catch {
+      throw new ProfileError(
+        'ORBITDB_NOT_INSTALLED',
+        '@orbitdb/core is not installed. Install it with: npm install @orbitdb/core',
+      );
+    }
+
+    // --- Dynamic import of Helia ---
+    let heliaModule: any;
+    try {
+      heliaModule = await import('helia' as string);
+    } catch {
+      throw new ProfileError(
+        'ORBITDB_NOT_INSTALLED',
+        'helia is not installed. Install it with: npm install helia',
+      );
+    }
+
+    try {
+      // 1. Create Helia IPFS node with gossipsub (required by OrbitDB v3 Sync)
+      const createHelia = heliaModule.createHelia ?? heliaModule.default?.createHelia;
+      const libp2pDefaults = heliaModule.libp2pDefaults ?? heliaModule.default?.libp2pDefaults;
+      if (typeof createHelia !== 'function') {
+        throw new Error('Could not resolve createHelia from helia module');
+      }
+
+      // OrbitDB v3 requires pubsub (gossipsub) in Helia's libp2p services.
+      // Helia v6 does not include gossipsub by default, so we must inject it.
+      let gossipsubFactory: any = null;
+      try {
+        const gossipsubModule: any = await import('@chainsafe/libp2p-gossipsub' as string);
+        gossipsubFactory = gossipsubModule.gossipsub ?? gossipsubModule.default?.gossipsub ?? gossipsubModule.default;
+      } catch {
+        // gossipsub not installed -- OrbitDB Sync will fail if it tries to use pubsub
+      }
+
+      // Issue #266 — HTTP-only IPFS mode for wallet/CLI clients.
+      //
+      // What we strip:
+      //   - libp2p networking (DHT, bootstrap peers, peer discovery,
+      //     autoNAT, dcutr, delegatedRouting, ipnsFetch, ipnsPublish).
+      //     This is the actual cost driver — 80+ TCP connections to
+      //     port 4001, ~3 min wall-clock per CLI invocation.
+      //   - Helia's default block brokers (bitswap hangs without peers;
+      //     trustlessGateway walks public gateways with 30s timeouts).
+      //
+      // What we KEEP:
+      //   - Helia's `FsBlockstore` under `<directory>/blocks/`. The
+      //     on-disk blockstore is essential for cross-process recovery
+      //     on the same `dataDir`: a freshly-initted wallet writes
+      //     OpLog blocks to disk before exit, the next CLI invocation
+      //     reads them back, OrbitDB decodes its OpLog. Disk-resident
+      //     blocks are MB-scale — negligible vs the libp2p costs we
+      //     stripped above. The user accepted this tradeoff:
+      //     "preserving local helia storage (but no libp2p
+      //     bootstraping)" ensures full functionality without a
+      //     separate fix for the flush-on-init timing window.
+      //
+      // What we ADD (cross-device / fresh-`dataDir` recovery):
+      //   - A single HTTP `BlockBroker` (profile/http-block-broker.ts)
+      //     installed when `ipfsGateways` is supplied. On a local
+      //     blockstore miss, the broker fetches via
+      //     `POST /api/v0/block/get?arg=<cid>` against the operator-
+      //     controlled Kubo gateways. Helia's `NetworkedStorage`
+      //     consults brokers only on miss, so FsBlockstore hits stay
+      //     fast.
+      //
+      // The non-httpOnly path is unchanged: `FsBlockstore` on disk,
+      // full libp2pDefaults, public trustless gateways available.
+      // That path is for operator-side bridges / e2e tests with real
+      // peer discovery.
+      const httpOnlyIpfs = config.httpOnlyIpfs === true;
+
+      const heliaOptions: Record<string, unknown> = {};
+      if (config.directory) {
+        heliaOptions.directory = config.directory;
+
+        // Issue #234 follow-up — Helia v6 defaults to MemoryBlockstore
+        // (see `helia/dist/src/utils/helia-defaults.js`: `blockstore =
+        // init.blockstore ?? new MemoryBlockstore()`). The `directory`
+        // option ONLY configures the libp2p datastore (peer ID, keychain),
+        // NOT the blockstore. Without an explicit `blockstore` config
+        // every OpLog entry and CAR block is kept in-process memory and
+        // lost on `destroy()`. Phase 2 then reads heads from level (which
+        // IS persisted) but their referenced entry blocks are gone →
+        // `IPFSBlockStorage.get` returns an empty/throwing generator and
+        // OrbitDB fails to decode the OpLog. Use FsBlockstore so blocks
+        // persist across destroys for cross-process / cross-device
+        // recovery on the same dataDir.
+        //
+        // Issue #266 kept this path even in lightweight mode (the
+        // user-approved tradeoff is "preserve local helia storage
+        // but no libp2p bootstrapping"). FsBlockstore handles
+        // cross-process recovery on the same dataDir without
+        // requiring the flush to have completed before process exit.
+        // Cross-device recovery still uses the HTTP block broker.
+        try {
+          const blockstoreFsModule: any = await import('blockstore-fs' as string);
+          const FsBlockstoreCtor =
+            blockstoreFsModule.FsBlockstore ?? blockstoreFsModule.default?.FsBlockstore;
+          if (typeof FsBlockstoreCtor === 'function') {
+            heliaOptions.blockstore = new FsBlockstoreCtor(`${config.directory}/blocks`);
+          }
+        } catch {
+          // blockstore-fs not installed — fall back to in-memory blockstore
+          // (cross-process recovery will not work). Logged via the host's
+          // event surface elsewhere.
+        }
+      } else if (isBrowserEnvironment()) {
+        // Issue #330 — install an IndexedDB-backed Helia blockstore in
+        // the browser. Without this, Helia v6 falls back to its default
+        // `MemoryBlockstore` and EVERY OpLog block (`helia.blockstore.put`
+        // from OrbitDB) and CAR block (`pinSingleBlock` write-back fast-
+        // path) lives only in tab memory. OrbitDB's level state IS
+        // persisted to IndexedDB, so after a page reload the head CID
+        // pointer survives but the block bytes it references are gone —
+        // every subsequent append fails with the same error, forever
+        // (the symptom described in #330 and called out verbatim in the
+        // JSDoc of `resetAndReconnect` below).
+        //
+        // The `helia-blockstore-pin-shim` (installed below) auto-pins
+        // every written block via `helia.pins.add(cid)` so the new
+        // IDBBlockstore retains them across reloads. The pin shim's
+        // defence against eviction is meaningful only against a
+        // persistent backing store; pinning a MemoryBlockstore is a
+        // no-op against reload.
+        //
+        // We use the same major as `blockstore-fs` (`^4.0.1`) so the
+        // `interface-blockstore` contract aligns with Helia v6's
+        // expectation. The DB name defaults to `'sphere-helia-blocks'`
+        // and is overridable via `config.browserBlockstorePath` for
+        // callers who want per-wallet isolation.
+        // Use a STATIC-string dynamic import (no `as string` cast). The
+        // `as string` form in the Node `blockstore-fs` branch above
+        // tells tsup / consumer bundlers to leave the import alone as
+        // a runtime expression — which is fine for Node where the
+        // package is on the filesystem. For browser bundling we want
+        // tsup AND consumer bundlers (Vite / Webpack / esbuild) to
+        // statically discover `blockstore-idb` and include it in the
+        // output bundle. The string-literal form gives the bundler
+        // a deterministic target.
+        try {
+          const blockstoreIdbModule: any = await import('blockstore-idb');
+          const IDBBlockstoreCtor =
+            blockstoreIdbModule.IDBBlockstore ?? blockstoreIdbModule.default?.IDBBlockstore;
+          if (typeof IDBBlockstoreCtor === 'function') {
+            const dbName =
+              typeof config.browserBlockstorePath === 'string' &&
+              config.browserBlockstorePath.length > 0
+                ? config.browserBlockstorePath
+                : 'sphere-helia-blocks';
+            const idbBlockstore = new IDBBlockstoreCtor(dbName);
+            // blockstore-idb requires `open()` to be awaited before the
+            // store can serve get/put. Wrap with a generous deadline so
+            // a stuck IDB upgrade (sibling tab holding an older version)
+            // does not hang the entire wallet init. On timeout we fall
+            // through to MemoryBlockstore — same as if the dependency
+            // had been missing.
+            if (typeof idbBlockstore.open === 'function') {
+              await Promise.race([
+                idbBlockstore.open(),
+                new Promise<never>((_, reject) =>
+                  setTimeout(
+                    () => reject(new Error('blockstore-idb open() timed out after 5_000ms')),
+                    5_000,
+                  ),
+                ),
+              ]);
+            }
+            heliaOptions.blockstore = idbBlockstore;
+          }
+        } catch (err) {
+          // blockstore-idb not installed, open() rejected, or open()
+          // exceeded the 5s deadline — fall back to Helia's
+          // MemoryBlockstore default. The wallet still functions for
+          // the lifetime of this tab but loses durability across
+          // reloads (the pre-#330 behaviour). Log loudly so the
+          // operator can investigate; the pin shim that follows will
+          // still attempt pin, but pinning memory is a no-op.
+          //
+          // Suppress logger import to keep the failure path small; the
+          // caller's outer connect()/init() telemetry will reflect the
+          // degraded mode via subsequent `storage:error` events.
+          if (typeof console !== 'undefined' && console.warn) {
+            console.warn(
+              '[OrbitDB] IDBBlockstore install failed; falling back to Helia MemoryBlockstore. ' +
+                'Browser wallet durability across reloads is degraded. ' +
+                `cause=${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+      }
+
+      // Build libp2p config with gossipsub if available
+      if (gossipsubFactory && typeof libp2pDefaults === 'function') {
+        const libp2pConfig = libp2pDefaults();
+
+        // Strip WebRTC transports in Node. `@libp2p/webrtc` relies on
+        // `node-datachannel` which is browser-first; on Node it emits
+        // `DataChannel is closed` errors during shutdown and isn't
+        // actually reachable from peers without signalling. TCP +
+        // WebSocket + circuit-relay cover every peer-to-peer path we
+        // actually use (Helia gateway dials, OrbitDB OpLog replication
+        // via gossipsub, NAT traversal via dcutr on a relay).
+        //
+        // Each transport in `libp2pDefaults()` is a factory function
+        // whose `.toString()` reveals its constructor (e.g.
+        // `new WebRTCTransport(...)`). Matching on the source string
+        // is the only portable identifier across libp2p versions that
+        // don't set `[Symbol.toStringTag]` on the factory.
+        if (!isBrowserEnvironment() && Array.isArray(libp2pConfig.transports)) {
+          libp2pConfig.transports = libp2pConfig.transports.filter((factory: any) => {
+            try {
+              const src = typeof factory === 'function' ? factory.toString() : '';
+              return !src.includes('WebRTC');
+            } catch {
+              return true; // keep on inspection failure
+            }
+          });
+        }
+        if (!isBrowserEnvironment() && libp2pConfig.addresses?.listen) {
+          libp2pConfig.addresses.listen = libp2pConfig.addresses.listen.filter(
+            (addr: string) => !addr.includes('webrtc'),
+          );
+        }
+
+        // **Isolated / test mode** — explicit empty `bootstrapPeers`
+        // array OR `httpOnlyIpfs: true` signals "do not attempt peer
+        // discovery."
+        //
+        // Why: `libp2pDefaults()` unconditionally includes
+        // `peerDiscovery: [bootstrap(bootstrapConfig)]` pointing at the
+        // canonical IPFS bootstrap list. On a CI runner with no
+        // outbound IPFS connectivity, bootstrap retries indefinitely
+        // and the OrbitDB integration test hangs past its 12-minute
+        // suite timeout (originally tracked in sphere-sdk#105, which
+        // led to the test being skipped in CI wholesale).
+        //
+        // The same heavyweight bootstrap path also burns wallet CPU and
+        // file descriptors during every CLI invocation (issue #266):
+        // 80+ libp2p TCP connections to port 4001, ~3 min wall-clock
+        // for `sphere wallet use alice`. Wallet clients should never
+        // join the global IPFS DHT — they HTTP-only against operator
+        // Kubo gateways.
+        //
+        // With isolation, we keep gossipsub (so OrbitDB v3 doesn't
+        // fail on missing pubsub) and the local-only services
+        // (keychain, identify, ping) but drop every outbound-discovery
+        // surface: peerDiscovery, DHT, autoNAT, dcutr, delegated
+        // routing. The adapter remains fully functional for single-
+        // process OrbitDB operations.
+        //
+        // Production callers who want real peer discovery either omit
+        // `bootstrapPeers` AND `httpOnlyIpfs` (getting libp2pDefaults
+        // behaviour) or pass a non-empty list (wired here). When
+        // `httpOnlyIpfs: true` is set, any non-empty bootstrap list is
+        // ignored — the isolation contract takes precedence.
+        const isIsolated = httpOnlyIpfs ||
+          (Array.isArray(config.bootstrapPeers) &&
+            config.bootstrapPeers.length === 0);
+        if (isIsolated) {
+          libp2pConfig.peerDiscovery = [];
+          if (libp2pConfig.services) {
+            const isolatedServices: Record<string, unknown> = {};
+            // Allow-list of services that do NOT perform outbound
+            // discovery on startup. Every other service in
+            // libp2pDefaults (autoNAT, dcutr, dht, delegatedRouting,
+            // http, ipnsFetch, ipnsPublish) issues network requests.
+            const allowed = new Set(['identify', 'identifyPush', 'keychain', 'ping']);
+            for (const [k, v] of Object.entries(libp2pConfig.services)) {
+              if (allowed.has(k)) isolatedServices[k] = v;
+            }
+            libp2pConfig.services = isolatedServices;
+          }
+          libp2pConfig.addresses = { listen: [] };
+        } else if (config.bootstrapPeers && config.bootstrapPeers.length > 0) {
+          // Non-empty bootstrap list — replace the default peers with
+          // the caller's. Keeps peerDiscovery active but uses the
+          // caller-supplied peer set.
+          try {
+            const bootstrapModule: any = await import('@libp2p/bootstrap' as string);
+            const bootstrapFactory = bootstrapModule.bootstrap ?? bootstrapModule.default?.bootstrap ?? bootstrapModule.default;
+            if (typeof bootstrapFactory === 'function') {
+              libp2pConfig.peerDiscovery = [bootstrapFactory({ list: [...config.bootstrapPeers] })];
+            }
+          } catch {
+            // @libp2p/bootstrap unavailable — leave the defaults in place.
+          }
+        }
+
+        libp2pConfig.services = {
+          ...libp2pConfig.services,
+          pubsub: gossipsubFactory({ allowPublishToZeroTopicPeers: true }),
+        };
+        heliaOptions.libp2p = libp2pConfig;
+
+        // Issue #266 — replace Helia's default block brokers in HTTP-only
+        // mode. The defaults are:
+        //   - `bitswap()` — peer-to-peer via libp2p; useless without
+        //     peers and hangs waiting for them.
+        //   - `trustlessGateway()` — HTTP gateway client that discovers
+        //     gateway URLs via routing. The default routing
+        //     (delegatedRouting) returns PUBLIC gateways like
+        //     `trustless-gateway.link` and `4everland.io`. These do
+        //     not host our wallet data and produce 504s + 30-second
+        //     waits before failing.
+        //
+        // When the caller passes `ipfsGateways: [...]`, we install a
+        // single broker that HTTP-fetches missing blocks via
+        // `POST /api/v0/block/get?arg=<cid>` against the operator
+        // Kubo. Cross-process recovery works because the previous
+        // process pushed blocks to operator Kubo via the flush-
+        // scheduler (`profile/ipfs-client.ts`) before exit.
+        //
+        // When no gateways are supplied (raw isolated mode, e.g. CI
+        // tests with `bootstrapPeers: []`), we still drop all default
+        // brokers so a local-blockstore miss fails FAST instead of
+        // walking public gateways. The monkey-patched blockstore.get
+        // swallows the resulting InvalidConfigurationError and
+        // returns `undefined` for the missing block.
+        if (isIsolated) {
+          const gateways = Array.isArray(config.ipfsGateways)
+            ? config.ipfsGateways.filter((g): g is string => typeof g === 'string' && g.length > 0)
+            : [];
+          if (gateways.length > 0) {
+            const { createHttpBlockBroker } = await import('./http-block-broker.js');
+            heliaOptions.blockBrokers = [createHttpBlockBroker({ gateways })];
+          } else {
+            heliaOptions.blockBrokers = [];
+          }
+        }
+      } else if (gossipsubFactory) {
+        // libp2pDefaults not available -- pass minimal libp2p with gossipsub
+        heliaOptions.libp2p = {
+          services: {
+            pubsub: gossipsubFactory({ allowPublishToZeroTopicPeers: true }),
+          },
+        };
+      }
+
+      this.helia = await createHelia(heliaOptions);
+
+      // Issues #234, #266, #278 — install the blockstore shim that
+      // (1) drains Helia-v6 async-generator `get` into a single Uint8Array
+      //     so OrbitDB-v3's `await ipfs.blockstore.get(cid)` keeps working,
+      // (2) swallows `NotFoundError` / `InvalidConfigurationError` so the
+      //     caller sees `undefined` on a miss (matching the v5 contract),
+      // (3) bounds repeated reads of the SAME CID via a 64-entry LRU +
+      //     in-flight Promise dedup — eliminates the FD-exhaustion wedge
+      //     observed in #278 where 900+ FDs accumulated against TWO
+      //     OpLog blocks under a hot read loop.
+      //
+      // Implementation + rationale: see `profile/helia-blockstore-shim.ts`.
+      const heliaInstance: any = this.helia;
+      if (heliaInstance?.blockstore && typeof heliaInstance.blockstore.get === 'function') {
+        installHeliaBlockstoreGetShim(heliaInstance.blockstore);
+      }
+
+      // Issue #311 — install the pin shim over `helia.blockstore.put`
+      // so every block OrbitDB writes is pinned via `helia.pins.add`.
+      // Pinned blocks survive Helia GC; the unpinned default is the
+      // root cause of the `sphere-telco-test.dyndns.org` lockout
+      // (block `bafyreihx3oa...` evicted from the IDBBlockstore
+      // between sessions). Best-effort: a missing `pins` API or a
+      // pin rejection does NOT break the put. The companion
+      // `requestPersistentStorage()` call fires earlier in
+      // `connectInner` (before any await) so the browser persistence
+      // request is initiated as soon as possible.
+      //
+      // Implementation: see `profile/helia-blockstore-pin-shim.ts`.
+      this.pinShim = installHeliaBlockstorePinShim(heliaInstance);
+
+      // 2. Create OrbitDB instance
+      const createOrbitDB =
+        orbitdbModule.createOrbitDB ?? orbitdbModule.default?.createOrbitDB;
+      if (typeof createOrbitDB !== 'function') {
+        throw new Error('Could not resolve createOrbitDB from @orbitdb/core');
+      }
+
+      // Derive deterministic key material from the wallet privateKey (or
+      // caller-supplied dbNameOverride). Both the OrbitDB identity `id`
+      // and the database `name` are bound to these inputs so two
+      // processes / devices with the same wallet open the SAME database
+      // address.
+      //
+      // Steelman²⁸/²⁹ critical: prefer caller-supplied dbNameOverride
+      // (derived from a wipeable Uint8Array). Falling back to
+      // derivePublicKeyShort(config.privateKey) is a memory-safety
+      // hazard documented on OrbitDbConfig. Now: require one or the
+      // other, fail closed if neither.
+      let dbName: string;
+      let identityIdSource: string;
+      if (config.dbNameOverride) {
+        dbName = config.dbNameOverride;
+        identityIdSource = config.dbNameOverride;
+      } else if (config.privateKey && config.privateKey.length > 0) {
+        const publicKeyShort = await derivePublicKeyShort(config.privateKey);
+        dbName = `sphere-profile-${publicKeyShort}`;
+        identityIdSource = publicKeyShort;
+      } else {
+        throw new ProfileError(
+          'ORBITDB_CONNECTION_FAILED',
+          'OrbitDbConfig requires either dbNameOverride (preferred) or privateKey (deprecated).',
+        );
+      }
+
+      // Issue #234 root cause — `createOrbitDB({ipfs, directory})` without
+      // `id` invokes OrbitDB's `createId()` which is `Math.random()` over a
+      // 32-char alphabet (`@orbitdb/core/src/utils/create-id.js`). Each
+      // connect() generates a NEW random identity → new
+      // `accessController.write[0]` → new manifest CID → new database
+      // address. Phase 2 of a destroy/reopen cycle (and every cross-device
+      // peer with the same mnemonic) therefore opens a DIFFERENT empty
+      // OrbitDB database than Phase 1 wrote to, with NO gossipsub
+      // replication possible because the gossipsub topic differs.
+      //
+      // Passing a deterministic `id` derived from the same inputs as the
+      // dbName closes the bug: two processes with the same wallet → same
+      // id → same identity → same database address → same gossipsub topic
+      // → OrbitDB replication actually works.
+      const derivedId = `sphere-orbit-${identityIdSource}`;
+
+      const orbitDbOptions: Record<string, unknown> = {
+        ipfs: this.helia,
+        id: derivedId,
+      };
+      if (config.directory) {
+        orbitDbOptions.directory = config.directory;
+      }
+
+      this.orbitdb = await createOrbitDB(orbitDbOptions);
+
+      // 4. Open (or create) the keyvalue database with access control
+      //    Only the wallet identity can write.
+      const OrbitDBAccessController =
+        orbitdbModule.OrbitDBAccessController ??
+        orbitdbModule.default?.OrbitDBAccessController;
+
+      const openOptions: Record<string, unknown> = {
+        type: 'keyvalue',
+      };
+
+      // Apply access controller if available
+      if (OrbitDBAccessController) {
+        openOptions.AccessController = OrbitDBAccessController({
+          write: [this.orbitdb.identity.id],
+        });
+      }
+
+      this.db = await this.orbitdb.open(dbName, openOptions);
+
+      this.connected = true;
+      // Capture config for resetCorruptedLog (issue #310 / OpLog auto-reset).
+      // Retained across close() so a flush-time auto-reset can rebuild a
+      // fresh OrbitDB+Helia pair without the caller re-supplying config.
+      this.currentConfig = config;
+    } catch (err) {
+      // Clean up partial state on failure
+      await this.cleanupOnError();
+
+      if (err instanceof ProfileError) {
+        throw err;
+      }
+      throw new ProfileError(
+        'ORBITDB_CONNECTION_FAILED',
+        `Failed to connect to OrbitDB: ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    }
+  }
+
+  async put(key: string, value: Uint8Array): Promise<void> {
+    this.ensureConnected();
+    const __t0 = performance.now();
+    const isBundleKey = key.startsWith('tokens.bundle.');
+    try {
+      await this.db.put(key, value);
+    } catch (err) {
+      incr('orbitdb.put.error');
+      throw new ProfileError(
+        'ORBITDB_WRITE_FAILED',
+        `Failed to write key "${key}": ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    } finally {
+      observeMs(
+        isBundleKey ? 'orbitdb.put.bundle' : 'orbitdb.put.other',
+        performance.now() - __t0,
+      );
+    }
+  }
+
+  async get(key: string): Promise<Uint8Array | null> {
+    this.ensureConnected();
+    const __t0 = performance.now();
+    try {
+      const value = await this.db.get(key);
+      if (value === undefined || value === null) {
+        observeMs('orbitdb.get.missMs', performance.now() - __t0);
+        return null;
+      }
+      // Steelman² remediation: shape validation now lives inside
+      // `coerceToUint8Array` (single source of truth shared with
+      // getEntry() and all()). A peer-crafted LWW write that puts a
+      // pathological object in the value slot is rejected uniformly
+      // across all three entry points.
+      const result = coerceToUint8Array(value);
+      observeMs('orbitdb.get.hitMs', performance.now() - __t0);
+      return result;
+    } catch (err) {
+      incr('orbitdb.get.error');
+      observeMs('orbitdb.get.errorMs', performance.now() - __t0);
+      if (err instanceof ProfileError) throw err;
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Failed to read key "${key}": ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    }
+  }
+
+  async del(key: string): Promise<void> {
+    this.ensureConnected();
+    const __t0 = performance.now();
+    try {
+      await this.db.del(key);
+    } catch (err) {
+      incr('orbitdb.del.error');
+      throw new ProfileError(
+        'ORBITDB_WRITE_FAILED',
+        `Failed to delete key "${key}": ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    } finally {
+      observeMs('orbitdb.del.totalMs', performance.now() - __t0);
+    }
+  }
+
+  // ---------- Structured-entry API (PROFILE-OPLOG-SCHEMA.md §5) ----------
+
+  /**
+   * Write a structured OpLog entry envelope at `key`.
+   *
+   * Encodes via deterministic CBOR (@ipld/dag-cbor) and stores the bytes
+   * in the underlying OrbitDB keyvalue database. OrbitDB signs the
+   * (key, cborBytes) pair, binding the envelope's originated tag to the
+   * author's identity.
+   *
+   * Callers SHOULD construct envelopes via `buildLocalEntry()` or the
+   * replication-downgrade helpers from `profile/oplog-entry.ts` rather
+   * than hand-rolling — those helpers enforce the (type, originated)
+   * coherence check.
+   */
+  async putEntry(key: string, entry: OpLogEntryEnvelope): Promise<void> {
+    this.ensureConnected();
+    // GH #363 — measure putEntry round-trip. Hypothesis under
+    // investigation: every logical operation produces many putEntry
+    // calls, each paying a full IPFS round-trip. Counter splits the
+    // bundle-ref keyspace from everything else so the batching
+    // question (issue #363) gets a direct signal.
+    const t0 = performance.now();
+    const isBundleKey = key.startsWith('tokens.bundle.');
+    try {
+      const cborBytes = encodeEntry(entry);
+      await this.db.put(key, cborBytes);
+      // Track this key as locally authored. `getEntry` uses this set to
+      // decide whether to trust the stored `originated` tag.
+      this.localAuthoredKeys.add(key);
+    } catch (err) {
+      incr('orbitdb.putEntry.error');
+      throw new ProfileError(
+        'ORBITDB_WRITE_FAILED',
+        `Failed to write structured entry at "${key}": ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    } finally {
+      observeMs(
+        isBundleKey ? 'orbitdb.putEntry.bundle' : 'orbitdb.putEntry.other',
+        performance.now() - t0,
+      );
+    }
+  }
+
+  /**
+   * Also track local authorship when code takes the legacy `put()` path.
+   * This is called by ProfileStorageProvider.writeEnvelope's fallback branch
+   * (for adapters without structured-entry support). We track it here so
+   * getEntry's trust decision is uniform regardless of which API wrote.
+   */
+  markLocallyAuthored(key: string): void {
+    this.localAuthoredKeys.add(key);
+  }
+
+  /**
+   * Read a structured OpLog entry envelope at `key`, or `null` if absent.
+   *
+   * SECURITY DEFAULT (post-steelman): the returned envelope's
+   * `originated` field is forced to `'replicated'` UNLESS the key was
+   * written by a local `putEntry` in THIS session AND no replication
+   * event has fired for this key since. Callers that specifically need
+   * the stored tag (e.g., debug tools) must pass `trustLocalClaim: true`.
+   *
+   * Legacy opaque-bytes entries (from pre-schema wallets) are wrapped
+   * in a synthetic envelope per §7.1 — callers can detect them via
+   * `isLegacyEntry(envelope)` from `profile/oplog-entry.ts`.
+   *
+   * @param opts.downgradeAsReplicated  — LEGACY: when true, forces
+   *   downgrade via `decodeAndDowngradeReplicated`. Kept for backward
+   *   compat but largely redundant since downgrade is now the DEFAULT.
+   * @param opts.trustLocalClaim  — EXPLICIT: when true, returns the
+   *   envelope's stored `originated` tag verbatim. Callers use this
+   *   when they've already authenticated the source (e.g., immediately
+   *   after putEntry). Legacy entries (v=0) always downgrade regardless.
+   */
+  async getEntry(
+    key: string,
+    opts: {
+      downgradeAsReplicated?: boolean;
+      trustLocalClaim?: boolean;
+    } = {},
+  ): Promise<OpLogEntryEnvelope | null> {
+    this.ensureConnected();
+    const __geStart = performance.now();
+    const isBundleKey = key.startsWith('tokens.bundle.');
+    try {
+      const raw = await this.db.get(key);
+      if (raw === undefined || raw === null) {
+        observeMs(
+          isBundleKey ? 'orbitdb.getEntry.bundleMissMs' : 'orbitdb.getEntry.missMs',
+          performance.now() - __geStart,
+        );
+        return null;
+      }
+      const bytes = coerceToUint8Array(raw);
+
+      // Explicit downgrade requested → route through the ingress path.
+      if (opts.downgradeAsReplicated === true) {
+        const result = decodeAndDowngradeReplicated(bytes);
+        observeMs(
+          isBundleKey ? 'orbitdb.getEntry.bundleHitMs' : 'orbitdb.getEntry.hitMs',
+          performance.now() - __geStart,
+        );
+        return result;
+      }
+
+      // Default: decode, then enforce the downgrade UNLESS the caller
+      // explicitly trusts the local claim AND the key is known locally.
+      const envelope = decodeEntry(bytes);
+
+      // Legacy entries (v=0) always carry the synthesized system tag —
+      // pass through unchanged; the v=0 sentinel tells the caller.
+      if (envelope.v === 0) {
+        observeMs(
+          isBundleKey ? 'orbitdb.getEntry.bundleHitMs' : 'orbitdb.getEntry.hitMs',
+          performance.now() - __geStart,
+        );
+        return envelope;
+      }
+
+      const trusted = opts.trustLocalClaim === true && this.localAuthoredKeys.has(key);
+      if (trusted) {
+        observeMs(
+          isBundleKey ? 'orbitdb.getEntry.bundleHitMs' : 'orbitdb.getEntry.hitMs',
+          performance.now() - __geStart,
+        );
+        return envelope;
+      }
+
+      // Non-trusted read → force downgrade to 'replicated'. Peer-claimed
+      // 'user'/'system' tags are overridden here.
+      //
+      // Steelman⁴³/⁴⁴ DESIGN NOTE: `localAuthoredKeys` is per-INSTANCE
+      // memory. Tab A's writes that replicate to Tab B (same identity)
+      // appear as 'replicated' to B even though both tabs share the
+      // wallet identity. This is FAIL-CLOSED behavior: B does NOT grant
+      // elevated privilege based on a forged tag, just refuses to grant
+      // it without local-authored proof. Cross-tab actions that depend
+      // on `trustLocalClaim` will be downgraded — that's the safe
+      // default. A future enhancement could verify the OpLog entry's
+      // identity field against the wallet's chainPubkey to recognize
+      // sibling-tab writes; deferred until a use case justifies it.
+      const downgraded = decodeAndDowngradeReplicated(bytes);
+      observeMs(
+        isBundleKey ? 'orbitdb.getEntry.bundleHitMs' : 'orbitdb.getEntry.hitMs',
+        performance.now() - __geStart,
+      );
+      return downgraded;
+    } catch (err) {
+      incr('orbitdb.getEntry.error');
+      observeMs('orbitdb.getEntry.errorMs', performance.now() - __geStart);
+      // Steelman³ remediation: pass ProfileError through unchanged.
+      // Re-wrapping double-prefixes the error code (`[PROFILE:ORBITDB_READ_FAILED]
+      // ... [PROFILE:ORBITDB_READ_FAILED]`) and obscures the original
+      // diagnostic — particularly for malformed-bytes errors thrown by
+      // coerceToUint8Array.
+      if (err instanceof ProfileError) throw err;
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Failed to read structured entry at "${key}": ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    }
+  }
+
+  async all(
+    prefix?: string,
+    opts?: { readonly maxResults?: number },
+  ): Promise<Map<string, Uint8Array>> {
+    this.ensureConnected();
+    incr('orbitdb.all.calls');
+    const __allStart = performance.now();
+    try {
+      const result = new Map<string, Uint8Array>();
+      // OrbitDB keyvalue databases expose an `all()` method that returns
+      // all entries as an object or iterable.
+      const __dbAllStart = performance.now();
+      const allEntries = await this.db.all();
+      observeMs('orbitdb.all.dbAllMs', performance.now() - __dbAllStart);
+      // Round 5 (FIX 3) — short-circuit iteration once the requested
+      // `maxResults` matching entries have been buffered. Defends
+      // against a hostile peer planting millions of crafted prefix
+      // matches — without the cap, the entire matching set is
+      // materialized regardless of the disposition adapter's own cap.
+      const maxResults =
+        opts?.maxResults !== undefined &&
+        Number.isFinite(opts.maxResults) &&
+        opts.maxResults >= 0
+          ? Math.floor(opts.maxResults)
+          : undefined;
+      const isCapped = maxResults !== undefined;
+
+      // Steelman³ remediation: skip malformed values rather than throwing.
+      // `keys()` and `clear()` use `all()` purely for key enumeration —
+      // a single peer-replicated bad value would otherwise DoS those
+      // operations entirely. Skipping with a logged-once warning keeps
+      // legitimate flows working while surfacing the corruption.
+      //
+      // Steelman²⁸ warning: enforce a per-call AGGREGATE memory budget so
+      // a malicious peer publishing thousands of near-cap values cannot
+      // sum into a multi-GB OOM. 256 MiB is far above any legitimate
+      // session payload total.
+      const ALL_AGGREGATE_BYTES_CAP = 256 * 1024 * 1024;
+      // Steelman²⁹ warning: distinguish the cap-exceeded fail-stop from
+      // per-entry coercion failures via a TYPED sentinel, not via brittle
+      // substring matching on err.message. A future error message reword
+      // would silently turn the hard-stop into a continue.
+      const AGGREGATE_CAP_SENTINEL = Symbol('orbitdb-aggregate-cap-exceeded');
+      let aggregateBytes = 0;
+      let skippedCount = 0;
+      const tryCoerce = (key: string, value: unknown): boolean => {
+        try {
+          const coerced = coerceToUint8Array(value);
+          aggregateBytes += coerced.byteLength;
+          if (aggregateBytes > ALL_AGGREGATE_BYTES_CAP) {
+            const err = new ProfileError(
+              'ORBITDB_READ_FAILED',
+              `all(): aggregate value bytes exceeded ${ALL_AGGREGATE_BYTES_CAP} ` +
+                `(at key="${key}"). Refusing to load further entries — possible ` +
+                `OOM attack from a malicious peer.`,
+            );
+            (err as unknown as { [s: symbol]: boolean })[AGGREGATE_CAP_SENTINEL] = true;
+            throw err;
+          }
+          result.set(key, coerced);
+          return true;
+        } catch (err) {
+          if (err && typeof err === 'object' && (err as { [s: symbol]: boolean })[AGGREGATE_CAP_SENTINEL]) {
+            // Hard fail-stop on aggregate cap.
+            throw err;
+          }
+          skippedCount += 1;
+          if (skippedCount <= 3) {
+            // Log first few; suppress thereafter to avoid log spam.
+            logger.warn(
+              'OrbitDbAdapter',
+              `all(): skipping malformed entry at key="${key}": ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          return false;
+        }
+      };
+
+      // Round 5 (FIX 3) — early-out helper. When `maxResults` is set,
+      // stop iterating as soon as the requested number of matching
+      // entries have been successfully buffered.
+      const reachedCap = (): boolean =>
+        isCapped && result.size >= (maxResults as number);
+
+      // allEntries may be an array of {key,value,hash}, an async iterable,
+      // a Map, or a plain object depending on the OrbitDB version.
+      if (Array.isArray(allEntries)) {
+        // OrbitDB v3 keyvalue `all()` returns Array<{key, value, hash}>
+        for (const entry of allEntries) {
+          if (reachedCap()) break;
+          const entryKey: string = entry.key ?? entry[0];
+          const entryValue = entry.value ?? entry[1];
+          if (prefix && !entryKey.startsWith(prefix)) {
+            continue;
+          }
+          tryCoerce(entryKey, entryValue);
+        }
+      } else if (allEntries && typeof allEntries[Symbol.asyncIterator] === 'function') {
+        for await (const entry of allEntries) {
+          if (reachedCap()) break;
+          const entryKey: string = entry.key ?? entry[0];
+          const entryValue = entry.value ?? entry[1];
+          if (prefix && !entryKey.startsWith(prefix)) {
+            continue;
+          }
+          tryCoerce(entryKey, entryValue);
+        }
+      } else if (allEntries instanceof Map) {
+        for (const [entryKey, entryValue] of allEntries) {
+          if (reachedCap()) break;
+          if (prefix && !entryKey.startsWith(prefix)) {
+            continue;
+          }
+          tryCoerce(entryKey, entryValue);
+        }
+      } else if (typeof allEntries === 'object' && allEntries !== null) {
+        for (const [entryKey, entryValue] of Object.entries(allEntries)) {
+          if (reachedCap()) break;
+          if (prefix && !entryKey.startsWith(prefix)) {
+            continue;
+          }
+          tryCoerce(entryKey, entryValue);
+        }
+      }
+
+      if (skippedCount > 3) {
+        logger.warn(
+          'OrbitDbAdapter',
+          `all(): skipped ${skippedCount} malformed entries total (further details suppressed).`,
+        );
+      }
+
+      incr('orbitdb.all.entries', result.size);
+      observeMs('orbitdb.all.totalMs', performance.now() - __allStart);
+      return result;
+    } catch (err) {
+      incr('orbitdb.all.error');
+      observeMs('orbitdb.all.totalMs', performance.now() - __allStart);
+      if (err instanceof ProfileError) throw err;
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Failed to read all entries${prefix ? ` with prefix "${prefix}"` : ''}: ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    }
+  }
+
+  async close(): Promise<void> {
+    // Steelman⁴⁹ WARNING: dedup concurrent close() calls and let
+    // connect() await us via closeInFlight. Without this, a new
+    // connect() racing the second half of close() could observe
+    // connected=true (close hasn't reset the flag yet) and return
+    // immediately, leaving caller with stale handles.
+    if (this.closeInFlight) return this.closeInFlight;
+    this.closeInFlight = this.closeInner().finally(() => {
+      this.closeInFlight = null;
+    });
+    return this.closeInFlight;
+  }
+
+  private async closeInner(): Promise<void> {
+    // Steelman⁴⁸ WARNING: if a connect() is currently in flight, await
+    // it before short-circuiting. Without this, close() observes
+    // connected=false (still mid-init), returns, and the eventual
+    // connect resolution leaves resources stranded with no cleanup
+    // path. Best-effort: wait for connectInFlight; if it succeeded
+    // we'll then clean up; if it failed (cleanupOnError already ran)
+    // we return idempotently.
+    if (this.connectInFlight) {
+      try {
+        await this.connectInFlight;
+      } catch {
+        /* already cleaned up via cleanupOnError */
+      }
+    }
+    if (!this.connected) {
+      return; // idempotent
+    }
+
+    // Steelman remediation for issue #236 — flip the shutdown gate
+    // BEFORE the bounded teardown begins. From this point forward,
+    // `getHelia()` returns `null` so any concurrent `pinCarBlocksToIpfs`
+    // call falls back to HTTP-only. Without this gate, the next-process
+    // recovery is unaffected (gateways still have the block) but the
+    // current process avoids dispatching `blockstore.put` against a
+    // helia whose libp2p / blockstore is mid-stop.
+    this.shuttingDown = true;
+
+    // Unsubscribe all replication listeners before closing the database
+    if (this.db?.events?.off) {
+      for (const handler of this.replicationListeners) {
+        try {
+          this.db.events.off('update', handler);
+        } catch {
+          // best-effort cleanup
+        }
+      }
+    }
+    this.replicationListeners.clear();
+    // Clear session-scoped locally-authored key set so a reconnect doesn't
+    // trust keys from the prior session (post-session peer writes may have
+    // overwritten them).
+    this.localAuthoredKeys.clear();
+
+    // Bounded teardown (#137). Each step gets a budget — a hung
+    // libp2p / pubsub / DAG-sync layer must not pin `Sphere.destroy()`
+    // for minutes. Best-effort: on timeout we log, drop the reference,
+    // and proceed; any leaked resources are reclaimed at process exit.
+    await closeWithBudget('db.close', () => this.db?.close(), () => {
+      this.db = null;
+    });
+    await closeWithBudget('orbitdb.stop', () => this.orbitdb?.stop(), () => {
+      this.orbitdb = null;
+    });
+    await closeWithBudget('helia.stop', () => this.helia?.stop(), () => {
+      this.helia = null;
+    });
+
+    // Issue #311 — drop the pin-shim handle. The wrapped `blockstore.put`
+    // is held by Helia's now-stopped blockstore; we just release our
+    // observability reference. Next connect() installs a fresh shim.
+    this.pinShim = null;
+
+    this.connected = false;
+    // Clear the shutdown gate AFTER `this.connected` flips. A
+    // subsequent connect() resets it again defensively below.
+    this.shuttingDown = false;
+  }
+
+  onReplication(callback: () => void): () => void {
+    this.ensureConnected();
+
+    // OrbitDB databases emit 'update' events when remote entries are merged.
+    // Invalidate the locally-authored set: a replication event means a peer
+    // may have overwritten any of our keys (LWW per-key), so we can no
+    // longer trust the stored `originated` tag for ANY key without
+    // re-authoring. This is conservative (over-invalidates) but safe.
+    //
+    // GH #363 measurement: count BOTH the raw 'update' fires AND the
+    // callback-side wall-clock. Issue #360 Finding #1 claimed every
+    // local write triggers this handler — but never measured the rate
+    // or the callback cost. Confirm or refute with real data.
+    const handler = () => {
+      incr('orbitdb.onReplication.fired');
+      const t0 = performance.now();
+      this.localAuthoredKeys.clear();
+      try {
+        callback();
+      } finally {
+        observeMs('orbitdb.onReplication.callbackMs', performance.now() - t0);
+      }
+    };
+
+    this.db.events.on('update', handler);
+    this.replicationListeners.add(handler);
+
+    // Return unsubscribe function
+    return () => {
+      this.db?.events?.off?.('update', handler);
+      this.replicationListeners.delete(handler);
+    };
+  }
+
+  isConnected(): boolean {
+    return this.connected;
+  }
+
+  /**
+   * Issue #236 — Expose the underlying Helia node so the Profile token-
+   * storage pin/fetch paths can use the local on-disk blockstore as the
+   * primary CAR store. Returns `null` when disconnected, pre-`connect()`,
+   * or DURING `close()` teardown (steelman remediation).
+   *
+   * Why this is safe to expose:
+   *   - The accessor is READ-ONLY (no `setHelia`) — callers cannot swap
+   *     out our IPFS substrate.
+   *   - The returned handle is the SAME instance the adapter uses for
+   *     OrbitDB's own blockstore, so writes via `blockstore.put` share
+   *     the on-disk persistence directory configured at `connect()` time.
+   *   - Typed as `unknown` to keep helia types out of the public Profile
+   *     interface (the rest of the SDK still tree-shakes cleanly when
+   *     helia is absent — the adapter is the single point of contact).
+   *
+   * **Shutdown gating (steelman remediation).** A concurrent flush
+   * firing during `closeInner()` could otherwise capture the helia
+   * handle and call `blockstore.put` on a draining Helia — the
+   * underlying libp2p / blockstore is already mid-teardown and the put
+   * may hang indefinitely (or write to a half-stopped store). We
+   * surface `null` from the moment `closeInner()` begins its teardown
+   * budget so in-flight callers immediately fall back to the HTTP-only
+   * pin path. The destroy-ordering invariant from PR #235 already
+   * ensures the token-storage layer is drained before the adapter
+   * closes; this gate is a defense-in-depth backstop against a future
+   * caller that bypasses the scheduler.
+   */
+  getHelia(): unknown | null {
+    if (this.shuttingDown) return null;
+    return this.helia ?? null;
+  }
+
+  /**
+   * Issue #311 — register a listener fired exactly once per `connect()`
+   * call with the result of `navigator.storage.persist()`. Must be set
+   * BEFORE `connect()` to be observed (the listener fires from inside
+   * `connectInner`). Pass `null` to disable.
+   *
+   * Production wiring routes this into the token-storage provider's
+   * `emitEvent` so it surfaces as a `profile:storage-persistence`
+   * StorageEvent. Tests use it directly to assert the call fired.
+   */
+  setStoragePersistenceListener(
+    listener:
+      | ((info: { readonly granted: boolean; readonly supported: boolean }) => void)
+      | null,
+  ): void {
+    this.storagePersistenceListener = listener;
+  }
+
+  /**
+   * Issue #311 — snapshot of the pin-shim counters. Null when the
+   * adapter has not yet connected (or has been closed). Test-observable.
+   */
+  getPinShimCounters(): {
+    readonly pinAttempted: number;
+    readonly pinSucceeded: number;
+    readonly pinFailed: number;
+    readonly pinSkipped: number;
+  } | null {
+    if (this.pinShim === null) return null;
+    return this.pinShim.getCounters();
+  }
+
+  /**
+   * Issue #311 — snapshot of pinned CIDs known to the shim. Null when
+   * not yet connected. Test-observable; production callers should not
+   * rely on this for correctness (the source of truth is
+   * `helia.pins.ls()`).
+   */
+  getPinnedCids(): ReadonlyArray<string> | null {
+    if (this.pinShim === null) return null;
+    return this.pinShim.getPinnedCids();
+  }
+
+  // ---------- Private helpers ----------
+
+  /**
+   * Throws `ProfileError` if the adapter is not connected.
+   */
+  private ensureConnected(): void {
+    if (!this.connected || !this.db) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        'OrbitDB adapter is not connected. Call connect() first.',
+      );
+    }
+  }
+
+  /**
+   * Clean up partially initialized state after a failed `connect()`.
+   */
+  private async cleanupOnError(): Promise<void> {
+    try {
+      if (this.db) {
+        await this.db.close();
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      if (this.orbitdb) {
+        await this.orbitdb.stop();
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      if (this.helia) {
+        await this.helia.stop();
+      }
+    } catch {
+      // ignore
+    }
+    this.db = null;
+    this.orbitdb = null;
+    this.helia = null;
+    // Issue #311 — drop the pin-shim handle alongside helia (the
+    // wrapped blockstore.put is dead with helia stopped).
+    this.pinShim = null;
+    this.connected = false;
+    // A config that produced a failed connect is suspect — wipe it so
+    // resetCorruptedLog() cannot silently reuse a known-bad input.
+    // close() (the success path) intentionally keeps the config.
+    this.currentConfig = null;
+  }
+
+  /**
+   * Recover from an unreachable-block OpLog corruption by tearing down
+   * the current OrbitDB DB and reconnecting from scratch.
+   *
+   * # When to call
+   *
+   * Invoked by callers (today: `FlushScheduler.flushToIpfs` →
+   * `BundleIndex.addBundle`) that catch a `PROFILE:ORBITDB_WRITE_FAILED`
+   * whose underlying error matches the "Failed to load block for <CID>"
+   * pattern emitted by Helia when the OpLog head block is unreachable.
+   * This happens reliably in browser deployments where Helia uses
+   * MemoryBlockstore (no persistence) while OrbitDB's level state (which
+   * holds the head CID pointer) IS persisted to IndexedDB. After a page
+   * reload, the level state survives but the head block bytes are gone —
+   * every subsequent append fails with the same error, forever.
+   *
+   * # Behaviour
+   *
+   *   1. Best-effort `db.drop()` — wipes the underlying level state so
+   *      the next `connect()` opens an empty OpLog. Some adapter shapes
+   *      (test stubs, future @orbitdb/core versions) may not expose
+   *      `drop`; we log the situation and proceed with close+reconnect.
+   *      In the no-drop case the corrupt level state may persist and
+   *      re-trigger failure on the next flush — the caller's error
+   *      handling should retry once and then bubble.
+   *   2. Full `close()` — releases helia + orbitdb + db handles so the
+   *      reconnect starts from a clean slate.
+   *   3. `connect()` against the captured `currentConfig` — rebuilds
+   *      the OrbitDB + Helia + libp2p stack.
+   *
+   * # Blast radius
+   *
+   * **Per-DB only.** The helia blockstore (FsBlockstore on Node;
+   * MemoryBlockstore in browser without a custom blockstore) is
+   * recreated by connect(); previously-cached UXF bundle bytes
+   * (in-session) are lost. Token data on IndexedDB token storage
+   * (`sphere-token-storage-<addressId>`) is UNTOUCHED — this method
+   * only operates on the OrbitDB profile layer.
+   *
+   * **Walk-back closed.** Prior OpLog entries become permanently
+   * inaccessible. The caller MUST write a recovery marker (via
+   * `ProfileTokenStorageHost.writeRecoveryMarker`) so the Profile is
+   * observably "Recovered" and downstream consumers know walk-back
+   * past `recoveredAt` is impossible.
+   *
+   * # Idempotency
+   *
+   * NOT idempotent if `connect()` fails: the second call will throw
+   * "currently not connected" if the failed connect cleaned up state.
+   * Callers should treat a failed reset as terminal for this session
+   * and surface the original error.
+   *
+   * @param reason  Diagnostics — the lost head CID (when captured by
+   *                the error pattern) and the call site ("flush-scheduler.bundle-write"
+   *                / etc.) for telemetry & operator triage.
+   * @returns       `{ recovered: true, lostHeadCid, recoveredAt }` on
+   *                success. Throws on failure.
+   */
+  async resetCorruptedLog(reason: {
+    lostHeadCid?: string;
+    context: string;
+  }): Promise<{ recovered: true; lostHeadCid?: string; recoveredAt: number }> {
+    // Pre-check: need a captured config so we can rebuild. The only
+    // path that produces a null `currentConfig` is "never connected" or
+    // "last connect failed and cleanupOnError wiped it" — either way
+    // there is nothing to reset back to. Fail loud rather than throwing
+    // an opaque NPE from inside connect().
+    if (this.currentConfig === null) {
+      throw new ProfileError(
+        'ORBITDB_CONNECTION_FAILED',
+        'resetCorruptedLog: no captured OrbitDbConfig — call connect() first.',
+      );
+    }
+
+    const lostCidLabel = reason.lostHeadCid ?? '(unknown)';
+    logger.debug(
+      'profile:orbitdb',
+      `resetCorruptedLog: starting (context=${reason.context}, lostHeadCid=${lostCidLabel}); ` +
+        `prior OpLog history will become permanently inaccessible.`,
+    );
+
+    // 1. Best-effort drop. `db.drop()` is provided by @orbitdb/core but
+    //    not by all test stubs. Wrap in try/catch so a missing or
+    //    throwing drop still lets us proceed to close+reconnect.
+    const dropFn = this.db && typeof (this.db as { drop?: unknown }).drop === 'function'
+      ? (this.db as { drop: () => Promise<void> }).drop.bind(this.db)
+      : null;
+    if (dropFn !== null) {
+      try {
+        await dropFn();
+        logger.debug('profile:orbitdb', 'resetCorruptedLog: db.drop() succeeded');
+      } catch (err) {
+        logger.debug(
+          'profile:orbitdb',
+          `resetCorruptedLog: db.drop() threw (${err instanceof Error ? err.message : String(err)}); proceeding`,
+        );
+      }
+    } else {
+      logger.debug(
+        'profile:orbitdb',
+        'resetCorruptedLog: OrbitDB drop unavailable; performing close+reconnect; ' +
+          'corrupt level state may persist and re-trigger failure.',
+      );
+    }
+
+    // 2. Full close — releases helia + orbitdb + db handles. `close()`
+    //    sets `connected = false` and nulls the handle fields.
+    //    `currentConfig` is intentionally retained by `close()`.
+    await this.close();
+
+    // 3. Reconnect against the captured config. This re-enters
+    //    `connectWithRetry` → `connectInner`, which rebuilds the entire
+    //    helia + orbitdb + db stack. On a connect failure the inner
+    //    `cleanupOnError` wipes `currentConfig`, so a follow-up
+    //    `resetCorruptedLog` call from the same caller will throw the
+    //    pre-check above rather than loop.
+    //
+    //    `currentConfig` is non-null per the pre-check above; close()
+    //    does not clear it. The non-null assertion is therefore safe.
+    await this.connect(this.currentConfig);
+
+    return {
+      recovered: true,
+      lostHeadCid: reason.lostHeadCid,
+      recoveredAt: Date.now(),
+    };
+  }
+}
+
+/**
+ * Inspect an error from put / putEntry / get / del paths and return the
+ * lost block CID iff the error's message chain matches the
+ * "Failed to load block for <CID>" pattern emitted by Helia when an
+ * OpLog head block is unreachable. Returns null otherwise.
+ *
+ * The matcher walks the `.cause` chain up to 4 levels deep — the
+ * pattern is sometimes wrapped by ProfileError / OrbitDB / IPFSBlockStorage
+ * before reaching the caller.
+ *
+ * Intentionally permissive on the CID shape — matches any `bafy[a-z0-9]+`
+ * (CIDv1 with multibase prefix `b`). Older OrbitDB releases may format
+ * the error differently; treat null as "not the auto-reset signature".
+ *
+ * @internal — Exported for FlushScheduler's auto-reset path and tests.
+ */
+export function extractLostHeadCid(err: unknown): string | null {
+  const pattern = /Failed to load block for (bafy[a-z0-9]+)/i;
+  let current: unknown = err;
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth++) {
+    let message: string | null = null;
+    if (current instanceof Error) {
+      message = current.message;
+    } else if (typeof current === 'string') {
+      message = current;
+    } else if (typeof current === 'object' && 'message' in (current as object)) {
+      const raw = (current as { message?: unknown }).message;
+      if (typeof raw === 'string') message = raw;
+    }
+    if (message !== null) {
+      const match = pattern.exec(message);
+      if (match !== null) {
+        return match[1];
+      }
+    }
+    // Descend the cause chain. ProfileError, Node's standard Error
+    // (`cause` option), and OrbitDB errors all expose `.cause`.
+    const next = (current as { cause?: unknown }).cause;
+    if (next === undefined || next === current) break;
+    current = next;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive the first 16 hex characters of the compressed public key from a
+ * private key hex string. Used to build the deterministic database name:
+ * `sphere-profile-<publicKeyShort>`.
+ *
+ * Uses `@noble/curves/secp256k1` (a mandatory sphere-sdk dependency) to
+ * derive the compressed public key. Falls back to SHA-256 hashing of the
+ * private key via `@noble/hashes` if curves is unavailable for any reason.
+ * Both packages are required sphere-sdk dependencies -- if neither is
+ * present the function throws rather than leaking private key material.
+ */
+async function derivePublicKeyShort(privateKeyHex: string): Promise<string> {
+  // Primary: derive the actual compressed public key via @noble/curves
+  try {
+    // Dynamic import with type suppression -- @noble/curves is a mandatory
+    // sphere-sdk dependency but may not have type declarations in this context
+    const secp256k1Module: any = await import('@noble/curves/secp256k1.js' as string);
+    const pubKeyBytes: Uint8Array = secp256k1Module.secp256k1.getPublicKey(privateKeyHex, true);
+    return bytesToHex(pubKeyBytes).slice(0, 16);
+  } catch {
+    // Fallback: use SHA-256 hash of private key to avoid leaking raw key material
+  }
+
+  try {
+    const hashModule: any = await import('@noble/hashes/sha2.js' as string);
+    const hash: Uint8Array = hashModule.sha256(hexToBytes(privateKeyHex));
+    return bytesToHex(hash).slice(0, 16);
+  } catch {
+    // Both mandatory dependencies are missing
+  }
+
+  throw new ProfileError(
+    'ORBITDB_CONNECTION_FAILED',
+    'Cannot derive public key: @noble/curves and @noble/hashes are required',
+  );
+}
+
+/**
+ * Per-step budget for graceful teardown of OrbitDB / Helia layers (#137).
+ * On timeout we DROP the reference instead of awaiting forever — `destroy()`
+ * is a terminal call and the process or test runner will reclaim the rest.
+ */
+const TEARDOWN_STEP_TIMEOUT_MS = 10_000;
+
+async function closeWithBudget(
+  label: string,
+  invoke: () => Promise<void> | undefined,
+  onSettle: () => void,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const op = invoke();
+    if (!op) return; // ref was null
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), TEARDOWN_STEP_TIMEOUT_MS);
+    });
+    const outcome = await Promise.race([op.then(() => 'ok' as const), timeout]);
+    if (outcome === 'timeout') {
+      logger.warn(
+        'OrbitDB',
+        `${label} exceeded ${TEARDOWN_STEP_TIMEOUT_MS}ms — dropping reference and continuing`,
+      );
+    }
+  } catch {
+    // Best-effort close; swallow underlying errors.
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    onSettle();
+  }
+}
+
+/**
+ * Convert a Uint8Array to a lowercase hex string.
+ */
+function bytesToHex(bytes: Uint8Array): string {
+  const hex: string[] = [];
+  for (let i = 0; i < bytes.length; i++) {
+    hex.push(bytes[i].toString(16).padStart(2, '0'));
+  }
+  return hex.join('');
+}
+
+// Steelman³⁵: hexToBytes consolidated to core/hex.ts (top-of-file import).
+
+/**
+ * Steelman² remediation: hard cap on the object-coercion fallback. A
+ * peer-replicated LWW write can put a pathological object in the value
+ * slot — without a cap, `new Uint8Array(Object.values(...))` would
+ * allocate proportional to attacker-chosen `length`. 1 MiB is well
+ * above any legitimate envelope (CIDs + metadata) and well below an
+ * OOM-inducing allocation.
+ */
+const COERCE_OBJECT_VALUE_CAP = 1 << 20;
+
+/**
+ * Canonical decimal form of a non-negative integer: "0", "1", "12", but
+ * NOT "00", "01", "-1", "1.0", "length", "type", "data", etc. Used to
+ * gate `coerceToUint8Array`'s dense-byte-map shape contract — see
+ * Issue #251 Problem 3.
+ */
+const CANONICAL_INDEX_KEY = /^(?:0|[1-9]\d*)$/;
+
+/**
+ * Coerce a value returned by OrbitDB into a Uint8Array.
+ *
+ * The contract: input MUST be either a Uint8Array/ArrayBuffer (trivial
+ * passthrough) OR a dense byte map keyed by the canonical decimal form
+ * of 0..N-1 with each value an integer in [0, 255]. Anything else is
+ * rejected with `ProfileError('ORBITDB_READ_FAILED')`.
+ *
+ * Why the strict contract — Issue #251 Problem 3:
+ *
+ *   Pre-fix the function tolerated any object with byte-valued entries,
+ *   relying on Object.values() to materialise bytes in insertion order.
+ *   That misbehaved silently for two realistic shapes that OrbitDB
+ *   replication and JSON round-tripping can produce:
+ *
+ *     • SPARSE OBJECTS — `{0:1, 2:3}` collapses to `[1, 3]` (length 2
+ *       instead of 3 with the middle index lost). The downstream
+ *       AES-GCM auth tag check then fails with the opaque "invalid key
+ *       or tampered data" message, masking the upstream byte-shape
+ *       corruption. Surfaced as the §C.4 finalization-queue read storm
+ *       in manual-test-full-recovery.sh.
+ *
+ *     • TRAILING NON-NUMERIC KEYS — `{0:1, 1:2, length:2}` or
+ *       `{0:1, 1:2, type:1}` slip a phantom trailing byte into the
+ *       Uint8Array (V8 iterates integer-string keys first, then string
+ *       keys in insertion order). If the trailing value happens to land
+ *       in [0, 255] the per-byte validator passes, then AES-GCM auth
+ *       fails — same opaque downstream symptom.
+ *
+ *   Failing loud here turns those into a clearly-labelled
+ *   ORBITDB_READ_FAILED that names the offending shape, so future
+ *   sightings of this bug surface as triage-able errors instead of
+ *   silent profile corruption.
+ *
+ * Steelman² (still active) — hard cap on key count guards against a
+ * peer-replicated LWW write with a pathological object in the value
+ * slot. The cap fires inside the for-in loop BEFORE any
+ * Object.values()/Object.keys() materialisation so an attacker can't
+ * trigger a 10M-key prepass allocation.
+ *
+ * Single source of truth shared across `get()`, `getEntry()`, and
+ * `all()` so no entry point bypasses the validation.
+ */
+function coerceToUint8Array(value: unknown): Uint8Array {
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
+  }
+  if (typeof value !== 'object' || value === null) {
+    // Primitive or null — preserve historical "empty result" path so
+    // callers checking for `bytes.length === 0` (e.g., absent key
+    // sentinel) still see the same value. Real reads of a missing key
+    // go through `db.get` returning null/undefined upstream of this
+    // function; landing here is the unexpected-primitive fallback.
+    return new Uint8Array(0);
+  }
+  const obj = value as Record<string, unknown>;
+
+  // Walk own enumerable keys ONCE with the cap. Validate each key's
+  // canonical-numeric form, reject accessor descriptors (getters can
+  // run arbitrary code during read; the contract is plain data), and
+  // track the maximum index to gate the sparse-shape check that
+  // follows.
+  let maxIdx = -1;
+  let keyCount = 0;
+  for (const k in obj) {
+    if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+    keyCount += 1;
+    if (keyCount > COERCE_OBJECT_VALUE_CAP) {
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Refusing to coerce object with > ${COERCE_OBJECT_VALUE_CAP} entries to Uint8Array (key-count cap exceeded)`,
+      );
+    }
+    if (!CANONICAL_INDEX_KEY.test(k)) {
+      // Trailing string-keyed property ("type", "data", "length",
+      // "_$serialised", etc.) — see header docblock for why this
+      // matters. Reject explicitly with the offending key name so the
+      // log line tells operators what to look for in their data path.
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Refusing to coerce object: non-canonical key "${k}" — expected a dense numeric-keyed byte map (Issue #251)`,
+      );
+    }
+    // PR #253 review: `hasOwnProperty` accepts accessor descriptors
+    // (own getters). The byte-fetch loop below uses plain property
+    // access `obj[String(i)]` which fires the getter — letting an
+    // attacker-controlled object run arbitrary code at read time
+    // while passing the byte-range check by returning a number in
+    // [0, 255]. OrbitDB returns plain CBOR-deserialized data
+    // (data descriptors only) so this is not a production exposure
+    // today, but the contract is "plain byte map" not "any object
+    // that happens to enumerate byte-valued properties." Reject
+    // accessor descriptors explicitly so the contract is enforced.
+    const descriptor = Object.getOwnPropertyDescriptor(obj, k);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Refusing to coerce object: key "${k}" has an accessor descriptor — expected a plain data property (Issue #251)`,
+      );
+    }
+    const idx = Number(k);
+    if (idx > maxIdx) maxIdx = idx;
+  }
+
+  // Sparse-map detection — see header docblock.
+  if (keyCount > 0 && keyCount !== maxIdx + 1) {
+    throw new ProfileError(
+      'ORBITDB_READ_FAILED',
+      `Refusing to coerce sparse object: ${keyCount} keys but maxIdx=${maxIdx} (expected dense 0..${keyCount - 1}, Issue #251)`,
+    );
+  }
+
+  const bytes = new Uint8Array(keyCount);
+  for (let i = 0; i < keyCount; i++) {
+    const v = obj[String(i)];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 255) {
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Invalid byte value at index ${i}: ${typeof v} (expected integer 0-255)`,
+      );
+    }
+    bytes[i] = v;
+  }
+  return bytes;
+}
+
+/**
+ * Test-only export of {@link coerceToUint8Array} — kept at the bottom
+ * of the file so production code uses the unprefixed internal name.
+ * Vitest specs import via this name to drive every shape branch
+ * directly without spinning up an OrbitDbAdapter.
+ *
+ * @internal
+ */
+export const __coerceToUint8ArrayForTest = coerceToUint8Array;
+
+/**
+ * True when running in a browser-like environment (Window present).
+ * In browsers we keep WebRTC because it's the only viable direct
+ * peer-to-peer transport from a page — TCP/WebSocket-only browser
+ * nodes can't initiate inbound connections. In Node we strip it
+ * because `node-datachannel` is a workaround rather than real support.
+ */
+function isBrowserEnvironment(): boolean {
+  return typeof (globalThis as { window?: unknown }).window !== 'undefined';
+}

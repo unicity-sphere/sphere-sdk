@@ -37,7 +37,7 @@ import {
   mergeOutboxEntries,
   mergeStatus,
   mergeAuditPromotedFrom,
-} from '../../../profile/outbox-merger';
+} from '../../../extensions/uxf/profile/outbox-merger';
 
 // -----------------------------------------------------------------------------
 // fast-check arbitraries

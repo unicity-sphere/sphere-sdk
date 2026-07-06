@@ -18,8 +18,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { PROFILE_CACHE_PURPOSE } from '../../../profile/cryptographer';
-import { PROFILE_HKDF_INFO } from '../../../profile/encryption';
+import { PROFILE_CACHE_PURPOSE } from '../../../extensions/uxf/profile/cryptographer';
+import { PROFILE_HKDF_INFO } from '../../../extensions/uxf/profile/encryption';
 
 describe('profile/cryptographer', () => {
   it('PROFILE_CACHE_PURPOSE has a stable string value', () => {

@@ -29,7 +29,7 @@ import {
   bytesToHex,
   SIDE_A_NUM,
   SIDE_B_NUM,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 describe('log-scrub (T-A7b)', () => {
   it('derived secret bytes never appear in console / JSON / util.inspect output', async () => {

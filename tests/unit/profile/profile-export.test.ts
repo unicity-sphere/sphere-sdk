@@ -28,16 +28,16 @@ import {
   parseProfileSnapshot,
   PROFILE_SNAPSHOT_VERSION,
   type ProfileSnapshot,
-} from '../../../profile/profile-export';
-import { importProfile } from '../../../profile/profile-import';
+} from '../../../extensions/uxf/profile/profile-export';
+import { importProfile } from '../../../extensions/uxf/profile/profile-import';
 import type { StorageProvider } from '../../../storage/storage-provider';
-import type { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import type { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 import type {
   ProviderStatus,
   TrackedAddressEntry,
   FullIdentity,
 } from '../../../types';
-import type { UxfBundleRef } from '../../../profile/types';
+import type { UxfBundleRef } from '../../../extensions/uxf/profile/types';
 import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
 
 // =============================================================================
@@ -164,8 +164,8 @@ class FakeTokenStorage {
 // the production code path uses it inside `parseProfileSnapshot` and
 // `pinCarBlocksToIpfs` to reject blocks whose CIDs don't bind to their
 // bytes. Mocking it as a no-op would silently mask CID-binding regressions.
-vi.mock('../../../profile/ipfs-client', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../../profile/ipfs-client')>();
+vi.mock('../../../extensions/uxf/profile/ipfs-client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../extensions/uxf/profile/ipfs-client')>();
   const carCache = new Map<string, Uint8Array>();
   // Issue #200 Phase 2: production now uses `fetchCarFromIpfs` and
   // `pinCarBlocksToIpfs`. The fixtures here pre-populate real CARs into
@@ -234,7 +234,7 @@ async function buildSampleBundleCar(description = 'unit-test fixture bundle'): P
 
 describe('profile-export — round-trip', () => {
   it('preserves all KV entries through export → parse', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const storage = new InMemoryStorageProvider();
@@ -275,7 +275,7 @@ describe('profile-export — round-trip', () => {
   });
 
   it('embeds and recovers a bundle CAR end-to-end', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
     const setCar = (ipfs as unknown as {
       __setBundleCar: (cid: string, bytes: Uint8Array) => void;
@@ -319,7 +319,7 @@ describe('profile-export — round-trip', () => {
   });
 
   it('counts bundles whose CAR fetch fails as `bundlesMissing`', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const storage = new InMemoryStorageProvider();
@@ -357,7 +357,7 @@ describe('profile-export — round-trip', () => {
 
 describe('profile-export — encrypted-form export (Wave 9 critical #1)', () => {
   it('embeds ENCRYPTED ciphertext for every KV value, never plaintext', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const storage = new InMemoryStorageProvider();
@@ -402,7 +402,7 @@ describe('profile-export — encrypted-form export (Wave 9 critical #1)', () => 
   });
 
   it('throws when the storage provider does not implement getEncryptedRaw', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const tokenStorage = new FakeTokenStorage();
@@ -435,7 +435,7 @@ describe('profile-export — encrypted-form export (Wave 9 critical #1)', () => 
 
 describe('profile-export — operational-key filtering (Wave 9 fix #7)', () => {
   it('filters tokens.bundle.*, consolidation.pending, and per-device timestamps', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const storage = new InMemoryStorageProvider();
@@ -476,7 +476,7 @@ describe('profile-export — operational-key filtering (Wave 9 fix #7)', () => {
 
 describe('profile-export — determinism (Wave 9 fix #8)', () => {
   it('produces byte-identical roots for two exports of the same Profile', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const storage = new InMemoryStorageProvider();
@@ -511,7 +511,7 @@ describe('profile-export — determinism (Wave 9 fix #8)', () => {
   });
 
   it('produces a DIFFERENT root after the Profile is mutated', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const storage = new InMemoryStorageProvider();
@@ -860,7 +860,7 @@ describe('parseProfileSnapshot — bundle authentication (Wave 9 critical #2)', 
 
 describe('importProfile — safety gates', () => {
   it('refuses to clobber a non-empty Profile without `force`', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     // A snapshot we want to import. The mnemonic value is the toy
@@ -911,7 +911,7 @@ describe('importProfile — safety gates', () => {
   });
 
   it('refuses to import when chainPubkey differs without override', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const snapshot: ProfileSnapshot = {
@@ -950,7 +950,7 @@ describe('importProfile — safety gates', () => {
   });
 
   it('replays embedded bundle CARs into the destination bundle index', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const fixture = await buildSampleBundleCar();
@@ -992,7 +992,7 @@ describe('importProfile — safety gates', () => {
   });
 
   it('rejects missing expectedChainPubkey (Wave 9 fix #6)', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const snapshot: ProfileSnapshot = {
@@ -1020,7 +1020,7 @@ describe('importProfile — safety gates', () => {
   });
 
   it('rejects force + allowDifferentIdentity without acknowledgement (Wave 9 fix #6)', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const snapshot: ProfileSnapshot = {
@@ -1064,7 +1064,7 @@ describe('importProfile — safety gates', () => {
   });
 
   it('rejects import without IPFS gateway when bundles are present (Wave 9 fix #5)', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const fixture = await buildSampleBundleCar();
@@ -1101,7 +1101,7 @@ describe('importProfile — safety gates', () => {
   });
 
   it('allows import without IPFS gateway when no bundles are present', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const snapshot: ProfileSnapshot = {
@@ -1135,7 +1135,7 @@ describe('importProfile — safety gates', () => {
 
 describe('exportProfile — scale', () => {
   it('handles a large number of bundles without truncation', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     const setCar = (ipfs as unknown as {
       __setBundleCar: (cid: string, bytes: Uint8Array) => void;
       __clearBundleCars: () => void;
@@ -1194,7 +1194,7 @@ describe('exportProfile — hierarchical CAR dedup (Issue #200 Phase 5)', () => 
    * to the union.
    */
   it('dedups bundle sub-blocks shared across multiple bundles', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     const setCar = (ipfs as unknown as {
       __setBundleCar: (cid: string, bytes: Uint8Array) => void;
       __clearBundleCars: () => void;
@@ -1257,7 +1257,7 @@ describe('exportProfile — hierarchical CAR dedup (Issue #200 Phase 5)', () => 
   });
 
   it('reports `uniqueBundleBlocks` count for callers / CLI diagnostics', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     const setCar = (ipfs as unknown as {
       __setBundleCar: (cid: string, bytes: Uint8Array) => void;
       __clearBundleCars: () => void;
@@ -1297,7 +1297,7 @@ describe('exportProfile — hierarchical CAR dedup (Issue #200 Phase 5)', () => 
    * codecs as expectedRootCid).
    */
   it('round-trips a legacy raw-codec bundle through export → import', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     const setCar = (ipfs as unknown as {
       __setBundleCar: (cid: string, bytes: Uint8Array) => void;
       __clearBundleCars: () => void;
@@ -1385,7 +1385,7 @@ describe('exportProfile — hierarchical CAR dedup (Issue #200 Phase 5)', () => 
    * confirm zero new pins on the second import.
    */
   it('is idempotent under re-import: second pass succeeds with force=true', async () => {
-    const ipfs = await import('../../../profile/ipfs-client');
+    const ipfs = await import('../../../extensions/uxf/profile/ipfs-client');
     const setCar = (ipfs as unknown as {
       __setBundleCar: (cid: string, bytes: Uint8Array) => void;
       __clearBundleCars: () => void;

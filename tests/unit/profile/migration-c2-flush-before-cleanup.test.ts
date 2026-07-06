@@ -36,8 +36,8 @@ import type {
   TxfStorageDataBase,
   TokenStorageProvider,
 } from '../../../types';
-import type { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
-import { ProfileMigration } from '../../../profile/migration';
+import type { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
+import { ProfileMigration } from '../../../extensions/uxf/profile/migration';
 
 // ---------------------------------------------------------------------------
 // Minimal mocks (kept self-contained — independent of the broader

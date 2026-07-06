@@ -13,12 +13,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   ProfileTokenStorageProvider,
-} from '../../../profile/profile-token-storage-provider.js';
+} from '../../../extensions/uxf/profile/profile-token-storage-provider.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
   ProfileRecoveryMarker,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 
 function createMockDb(): ProfileDatabase {
   const store = new Map<string, Uint8Array>();

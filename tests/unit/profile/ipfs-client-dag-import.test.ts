@@ -31,7 +31,7 @@ import { create as createDigest } from 'multiformats/hashes/digest';
 import {
   pinCarBlocksToIpfs,
   _resetGatewayCapabilityCache,
-} from '../../../profile/ipfs-client';
+} from '../../../extensions/uxf/profile/ipfs-client';
 
 // ---------------------------------------------------------------------------
 // Fixtures

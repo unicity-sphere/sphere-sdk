@@ -109,8 +109,8 @@ import type {
 // streaming-CAR consumer; UXF transfer bundles route through
 // `fetchCarFromIpfs` instead because the gateway's `?format=car`
 // endpoint cannot traverse Option-C raw-bstr child references.
-import { fetchCarFromIpfs } from '../../../profile/ipfs-client.js';
-import { ProfileError } from '../../../profile/errors.js';
+import { fetchCarFromIpfs } from '../profile/ipfs-client.js';
+import { ProfileError } from '../profile/errors.js';
 import { RELAY_SAFE_CAP_BYTES } from './limits.js';
 import type { ReplayLRU } from './replay-lru.js';
 

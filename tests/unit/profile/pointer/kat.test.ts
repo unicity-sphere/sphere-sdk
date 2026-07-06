@@ -20,7 +20,7 @@ import {
   bytesToHex,
   SIDE_A_NUM,
   SIDE_B_NUM,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 
 interface KatVectors {

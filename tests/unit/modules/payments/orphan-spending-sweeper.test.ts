@@ -17,13 +17,13 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { sweepOrphanSpendingTokens } from '../../../../extensions/uxf/pipeline/orphan-spending-sweeper.js';
-import { OutboxWriter } from '../../../../profile/outbox-writer.js';
-import { SentLedgerWriter } from '../../../../profile/sent-ledger-writer.js';
-import { Lamport } from '../../../../profile/lamport.js';
+import { OutboxWriter } from '../../../../extensions/uxf/profile/outbox-writer.js';
+import { SentLedgerWriter } from '../../../../extensions/uxf/profile/sent-ledger-writer.js';
+import { Lamport } from '../../../../extensions/uxf/profile/lamport.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
-} from '../../../../profile/types.js';
+} from '../../../../extensions/uxf/profile/types.js';
 import type { Token, SphereEventType, SphereEventMap } from '../../../../types';
 
 const ADDR = 'DIRECT_aabbcc_ddeeff';

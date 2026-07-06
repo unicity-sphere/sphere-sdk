@@ -53,8 +53,8 @@ import {
   MARKER_MAX_JUMP,
   createPointerMutex,
   type NodeLockPrimitives,
-} from '../../../profile/aggregator-pointer/index.js';
-import { mutexKey } from '../../../profile/aggregator-pointer/constants.js';
+} from '../../../extensions/uxf/profile/aggregator-pointer/index.js';
+import { mutexKey } from '../../../extensions/uxf/profile/aggregator-pointer/constants.js';
 
 // ── Durable storage harness with crash simulation ─────────────────────────
 //

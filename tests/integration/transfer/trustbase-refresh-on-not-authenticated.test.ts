@@ -42,8 +42,8 @@ import {
 import {
   FinalizationWorkerRecipient,
 } from '../../../extensions/uxf/pipeline/finalization-worker-recipient';
-import { ManifestCas } from '../../../profile/manifest-cas';
-import { PerTokenMutex } from '../../../profile/per-token-mutex';
+import { ManifestCas } from '../../../extensions/uxf/profile/manifest-cas';
+import { PerTokenMutex } from '../../../extensions/uxf/profile/per-token-mutex';
 import {
   ADDR as ADDR_S,
   REQUEST_ID,

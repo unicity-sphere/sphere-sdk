@@ -27,12 +27,12 @@ import {
   dispositionAuditPrefix,
   dispositionInvalidOrphanPrefix,
   dispositionInvalidPrefix,
-} from '../../../profile/disposition-storage-adapters.js';
-import { deriveProfileEncryptionKey } from '../../../profile/encryption.js';
+} from '../../../extensions/uxf/profile/disposition-storage-adapters.js';
+import { deriveProfileEncryptionKey } from '../../../extensions/uxf/profile/encryption.js';
 import type {
   OrbitDbConfig,
   ProfileDatabase,
-} from '../../../profile/types.js';
+} from '../../../extensions/uxf/profile/types.js';
 
 const ADDR_A = 'DIRECT_aabbcc_ddeeff';
 const ADDR_B = 'DIRECT_112233_445566';

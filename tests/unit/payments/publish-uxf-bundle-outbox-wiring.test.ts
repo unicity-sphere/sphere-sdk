@@ -35,8 +35,8 @@
 import { describe, it, expect, vi } from 'vitest';
 
 import { PaymentsModule } from '../../../modules/payments/PaymentsModule';
-import type { OutboxWriter } from '../../../profile/outbox-writer';
-import type { SentLedgerWriter } from '../../../profile/sent-ledger-writer';
+import type { OutboxWriter } from '../../../extensions/uxf/profile/outbox-writer';
+import type { SentLedgerWriter } from '../../../extensions/uxf/profile/sent-ledger-writer';
 import type { FullIdentity } from '../../../types';
 import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
 

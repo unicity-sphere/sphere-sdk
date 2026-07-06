@@ -23,11 +23,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type {
   ProfileDatabase,
   OrbitDbConfig,
-} from '../../../profile/types';
+} from '../../../extensions/uxf/profile/types';
 import type { FullIdentity } from '../../../types';
 import type { LoadResult, TokenStorageProvider } from '../../../storage';
 import type { TxfStorageDataBase } from '../../../types';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 
 const TEST_PRIVATE_KEY =
   'aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd';

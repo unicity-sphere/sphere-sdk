@@ -24,15 +24,15 @@ import {
   parseLeanProfileSnapshotFromRootBlock,
   EPOCH_RESET_REASON_MAX_BYTES,
   EPOCH_MAX,
-} from '../../../profile/profile-lean-snapshot';
+} from '../../../extensions/uxf/profile/profile-lean-snapshot';
 import type { StorageProvider } from '../../../storage/storage-provider';
-import type { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import type { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 import type {
   ProviderStatus,
   TrackedAddressEntry,
   FullIdentity,
 } from '../../../types';
-import type { UxfBundleRef } from '../../../profile/types';
+import type { UxfBundleRef } from '../../../extensions/uxf/profile/types';
 
 // =============================================================================
 // Test doubles

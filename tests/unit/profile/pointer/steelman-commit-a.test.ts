@@ -15,8 +15,8 @@ import {
   createMasterPrivateKey,
   derivePointerKeyMaterial,
   AggregatorPointerErrorCode,
-} from '../../../../profile/aggregator-pointer';
-import { ProfilePointerLayer } from '../../../../profile/aggregator-pointer/ProfilePointerLayer';
+} from '../../../../extensions/uxf/profile/aggregator-pointer';
+import { ProfilePointerLayer } from '../../../../extensions/uxf/profile/aggregator-pointer/ProfilePointerLayer';
 
 describe('Commit A — crypto steelman remediations', () => {
   describe('1) MasterPrivateKey.bytes — defensive copy prevents WeakSet bypass', () => {

@@ -39,15 +39,15 @@ import type {
   ProfileDatabase,
   OrbitDbConfig,
   UxfBundleRef,
-} from '../../../profile/types';
+} from '../../../extensions/uxf/profile/types';
 import type { FullIdentity } from '../../../types';
 import type { TxfStorageDataBase } from '../../../storage/storage-provider';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
 import {
   deriveProfileEncryptionKey,
   encryptProfileValue,
-} from '../../../profile/encryption';
-import { POINTER_MONOTONICITY_VIOLATION } from '../../../profile/profile-token-storage/flush-scheduler';
+} from '../../../extensions/uxf/profile/encryption';
+import { POINTER_MONOTONICITY_VIOLATION } from '../../../extensions/uxf/profile/profile-token-storage/flush-scheduler';
 import { waitForFlushSettled } from '../../helpers/profile/waitForFlushSettled';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { CID } from 'multiformats/cid';
@@ -675,7 +675,7 @@ describe('pointer monotonicity invariant', () => {
     // payload's array length equals the count → no information lost →
     // truncated MUST be false.
     const { MONOTONICITY_RECOVERY_PAYLOAD_CAP } = await import(
-      '../../../profile/profile-token-storage/flush-scheduler'
+      '../../../extensions/uxf/profile/profile-token-storage/flush-scheduler'
     );
     const data = await runRecoveryWithMissingCount(MONOTONICITY_RECOVERY_PAYLOAD_CAP);
     expect(data.recoveredTokenCount).toBe(MONOTONICITY_RECOVERY_PAYLOAD_CAP);
@@ -688,7 +688,7 @@ describe('pointer monotonicity invariant', () => {
     // array slice can carry. Operators see 100 ids + count 101 +
     // truncated=true so they know to query the full set elsewhere.
     const { MONOTONICITY_RECOVERY_PAYLOAD_CAP } = await import(
-      '../../../profile/profile-token-storage/flush-scheduler'
+      '../../../extensions/uxf/profile/profile-token-storage/flush-scheduler'
     );
     const data = await runRecoveryWithMissingCount(MONOTONICITY_RECOVERY_PAYLOAD_CAP + 1);
     expect(data.recoveredTokenCount).toBe(MONOTONICITY_RECOVERY_PAYLOAD_CAP + 1);
@@ -700,7 +700,7 @@ describe('pointer monotonicity invariant', () => {
     // Original test: stresses well above the cap to verify the count
     // field surfaces the FULL total even when the array is truncated.
     const { MONOTONICITY_RECOVERY_PAYLOAD_CAP } = await import(
-      '../../../profile/profile-token-storage/flush-scheduler'
+      '../../../extensions/uxf/profile/profile-token-storage/flush-scheduler'
     );
     const data = await runRecoveryWithMissingCount(150);
     expect(data.recoveredTokenCount).toBe(150);

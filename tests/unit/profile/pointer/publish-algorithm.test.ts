@@ -28,7 +28,7 @@ import {
   createPointerMutex,
   type PointerMutex,
   readMarker,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 const WALLET_SEED = new Uint8Array(32).fill(0x42);
 const VALID_CID = new Uint8Array([0x12, 0x20, ...new Array(32).fill(0xab)]);
@@ -212,7 +212,7 @@ describe('publishOnceAtVersion (T-D1)', () => {
     expect(await readMarker(flagStore)).toBeNull();
 
     // BLOCKED must be SET (recursive steelman: classifier now maps REJECTED → 'rejected').
-    const { isBlocked } = await import('../../../../profile/aggregator-pointer/index.js');
+    const { isBlocked } = await import('../../../../extensions/uxf/profile/aggregator-pointer/index.js');
     const state = await isBlocked(flagStore);
     expect(state.blocked).toBe(true);
     expect(state.reason).toBe('rejected');

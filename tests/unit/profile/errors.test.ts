@@ -4,8 +4,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { ProfileError } from '../../../profile/errors';
-import type { ProfileErrorCode } from '../../../profile/errors';
+import { ProfileError } from '../../../extensions/uxf/profile/errors';
+import type { ProfileErrorCode } from '../../../extensions/uxf/profile/errors';
 
 describe('ProfileError', () => {
   it('constructs with code and message', () => {

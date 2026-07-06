@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { pinToIpfs } from '../../../profile/ipfs-client.js';
+import { pinToIpfs } from '../../../extensions/uxf/profile/ipfs-client.js';
 
 describe('Commit C — external IO steelman remediations', () => {
   describe('pinToIpfs — gateway CID verification', () => {

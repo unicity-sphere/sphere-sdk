@@ -20,7 +20,7 @@ import * as raw from 'multiformats/codecs/raw';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { FsBlockstore } from 'blockstore-fs';
 import { createHelia } from 'helia';
-import { installHeliaBlockstoreGetShim } from '../../profile/helia-blockstore-shim';
+import { installHeliaBlockstoreGetShim } from '../../extensions/uxf/profile/helia-blockstore-shim';
 
 const FD_DIR = '/proc/self/fd';
 const FD_AVAILABLE = existsSync(FD_DIR);

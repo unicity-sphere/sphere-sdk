@@ -26,12 +26,12 @@ import {
   type PoolWriteAdapter,
   type TombstoneWriteAdapter,
 } from '../../../../extensions/uxf/pipeline/manifest-cid-rewrite';
-import { ManifestCas, type MinimalManifestStorage } from '../../../../profile/manifest-cas';
-import { PerTokenMutex } from '../../../../profile/per-token-mutex';
+import { ManifestCas, type MinimalManifestStorage } from '../../../../extensions/uxf/profile/manifest-cas';
+import { PerTokenMutex } from '../../../../extensions/uxf/profile/per-token-mutex';
 import { contentHash } from '../../../../extensions/uxf/bundle/types';
 import type { SphereEventMap, SphereEventType } from '../../../../types';
 import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
-import type { TokenManifestEntry } from '../../../../profile/token-manifest';
+import type { TokenManifestEntry } from '../../../../extensions/uxf/profile/token-manifest';
 
 export const ADDR = 'DIRECT://addr-A';
 export const TOKEN_ID = 'token-1';

@@ -35,9 +35,9 @@ import { describe, it, expect, vi } from 'vitest';
 
 import {
   AggregatorPointerErrorCode,
-} from '../../../../profile/aggregator-pointer/errors';
-import { ProfilePointerLayer, type RecoverResult } from '../../../../profile/aggregator-pointer/ProfilePointerLayer';
-import type { PointerVersion } from '../../../../profile/aggregator-pointer/types';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/errors';
+import { ProfilePointerLayer, type RecoverResult } from '../../../../extensions/uxf/profile/aggregator-pointer/ProfilePointerLayer';
+import type { PointerVersion } from '../../../../extensions/uxf/profile/aggregator-pointer/types';
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 

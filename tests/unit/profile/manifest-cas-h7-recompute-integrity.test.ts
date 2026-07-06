@@ -33,8 +33,8 @@ import {
   ManifestCas,
   type MinimalManifestStorage,
   type VerifyEntryRootFn,
-} from '../../../profile/manifest-cas';
-import type { TokenManifestEntry } from '../../../profile/token-manifest';
+} from '../../../extensions/uxf/profile/manifest-cas';
+import type { TokenManifestEntry } from '../../../extensions/uxf/profile/token-manifest';
 
 // ---------------------------------------------------------------------------
 // Minimal in-memory storage adapter (same shape as the existing tests

@@ -24,13 +24,13 @@ import {
   downgradeForReplication,
   ALL_ENTRY_TYPES,
   AggregatorPointerErrorCode,
-} from '../../../profile/aggregator-pointer/index.js';
+} from '../../../extensions/uxf/profile/aggregator-pointer/index.js';
 import type {
   OpLogEntryType,
   UserActionType,
   SystemActionType,
-} from '../../../profile/aggregator-pointer/originated-tag.js';
-import { buildLocalEntry } from '../../../profile/oplog-entry.js';
+} from '../../../extensions/uxf/profile/aggregator-pointer/originated-tag.js';
+import { buildLocalEntry } from '../../../extensions/uxf/profile/oplog-entry.js';
 
 // ── Enum fixtures (mirror of originated-tag.ts, re-declared here on purpose:
 //    if upstream drift changes the enum, K1 fails loudly.) ───────────────────

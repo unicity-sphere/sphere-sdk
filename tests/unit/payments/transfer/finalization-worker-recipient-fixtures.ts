@@ -39,8 +39,8 @@ import {
   type PoolWriteAdapter,
   type TombstoneWriteAdapter,
 } from '../../../../extensions/uxf/pipeline/manifest-cid-rewrite';
-import { ManifestCas, type MinimalManifestStorage } from '../../../../profile/manifest-cas';
-import { PerTokenMutex } from '../../../../profile/per-token-mutex';
+import { ManifestCas, type MinimalManifestStorage } from '../../../../extensions/uxf/profile/manifest-cas';
+import { PerTokenMutex } from '../../../../extensions/uxf/profile/per-token-mutex';
 import { contentHash } from '../../../../extensions/uxf/bundle/types';
 import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 import type { DispositionRecord } from '../../../../types/disposition';
@@ -48,7 +48,7 @@ import type {
   DispositionRevaluateInput,
 } from '../../../../extensions/uxf/pipeline/disposition-engine';
 import type { SphereEventMap, SphereEventType } from '../../../../types';
-import type { TokenManifestEntry } from '../../../../profile/token-manifest';
+import type { TokenManifestEntry } from '../../../../extensions/uxf/profile/token-manifest';
 
 // =============================================================================
 // 1. Constants

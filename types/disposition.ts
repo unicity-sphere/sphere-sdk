@@ -39,7 +39,7 @@ import type { ContentHash } from '../extensions/uxf/bundle/types.js';
 // (`splitParent`, `audit_promoted_from`, `lamport`, `lastProofRefreshAt`)
 // per PA §10.11; the alias keeps the import path stable across that
 // augmentation.
-import type { TokenManifestEntry } from '../profile/token-manifest.js';
+import type { TokenManifestEntry } from '../extensions/uxf/profile/token-manifest.js';
 
 // =============================================================================
 // 1. DispositionReason — on-wire string union (14 values, §5.4)

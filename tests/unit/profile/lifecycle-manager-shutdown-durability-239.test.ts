@@ -34,13 +34,13 @@ import {
 import type {
   ProfileDatabase,
   OrbitDbConfig,
-} from '../../../profile/types';
+} from '../../../extensions/uxf/profile/types';
 import type { FullIdentity } from '../../../types';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
-import type { ProfilePointerLayer } from '../../../profile/aggregator-pointer';
+import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
+import type { ProfilePointerLayer } from '../../../extensions/uxf/profile/aggregator-pointer';
 import {
   verifyCidAccessibleWithRetry,
-} from '../../../profile/ipfs-client';
+} from '../../../extensions/uxf/profile/ipfs-client';
 import { CID } from 'multiformats/cid';
 import * as raw from 'multiformats/codecs/raw';
 import { create as createMultihash } from 'multiformats/hashes/digest';

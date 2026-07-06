@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import {
   installHeliaBlockstoreGetShim,
   BLOCKSTORE_GET_LRU_MAX_DEFAULT,
-} from '../../../profile/helia-blockstore-shim';
+} from '../../../extensions/uxf/profile/helia-blockstore-shim';
 
 // ---------------------------------------------------------------------------
 // Mock blockstore — captures every get call so tests can assert dedup.

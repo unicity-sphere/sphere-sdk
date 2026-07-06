@@ -25,7 +25,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { isTransientPinError, withPinRetry, pinToIpfs } from '../../../profile/ipfs-client';
+import { isTransientPinError, withPinRetry, pinToIpfs } from '../../../extensions/uxf/profile/ipfs-client';
 import {
   __setPerfEnabledForTest,
   __stopAutoDumpForTest,

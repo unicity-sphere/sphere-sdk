@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { fetchCarFromGateway } from '../../../../profile/aggregator-pointer/index.js';
+import { fetchCarFromGateway } from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 function textEncode(s: string): Uint8Array {
   return new TextEncoder().encode(s);

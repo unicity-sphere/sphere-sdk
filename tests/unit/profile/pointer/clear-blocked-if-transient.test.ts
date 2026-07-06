@@ -18,9 +18,9 @@ import {
   FlagStore,
   AggregatorPointerError,
   AggregatorPointerErrorCode,
-} from '../../../../profile/aggregator-pointer/index.js';
-import { ProfilePointerLayer } from '../../../../profile/aggregator-pointer/ProfilePointerLayer.js';
-import type { BlockedReason } from '../../../../profile/aggregator-pointer/blocked-state.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
+import { ProfilePointerLayer } from '../../../../extensions/uxf/profile/aggregator-pointer/ProfilePointerLayer.js';
+import type { BlockedReason } from '../../../../extensions/uxf/profile/aggregator-pointer/blocked-state.js';
 
 function makeDurableStore() {
   const kv = new Map<string, string>();

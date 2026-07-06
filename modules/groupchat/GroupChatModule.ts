@@ -23,7 +23,7 @@ import type {
 } from '../../types';
 import type { StorageProvider } from '../../storage';
 import { STORAGE_KEYS_GLOBAL, STORAGE_KEYS_ADDRESS, NIP29_KINDS } from '../../constants';
-import { CidRefStore, type CidRef } from '../../profile/cid-ref-store';
+import { CidRefStore, type CidRef } from '../../extensions/uxf/profile/cid-ref-store';
 
 /**
  * Prefixes for per-groupId storage keys (PROFILE-CID-REFERENCES.md §8.5).

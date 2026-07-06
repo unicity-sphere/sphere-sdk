@@ -33,7 +33,7 @@ import {
   pendingVersionKey,
   blockedFlagKey,
   SPHERE_ALLOW_OVERRIDES_VALUE,
-} from '../../../../profile/aggregator-pointer/index.js';
+} from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
 
 describe('SPEC §3 constants (T-A1)', () => {
   it('PROFILE_POINTER_HKDF_INFO is exactly 33 bytes (H12)', () => {

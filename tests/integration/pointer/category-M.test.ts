@@ -63,8 +63,8 @@ import {
   type CarFetcher,
   type CidDecoder,
   type FetchAndJoinCallback,
-} from '../../../profile/aggregator-pointer';
-import { decodeVersionCid } from '../../../profile/aggregator-pointer/aggregator-probe';
+} from '../../../extensions/uxf/profile/aggregator-pointer';
+import { decodeVersionCid } from '../../../extensions/uxf/profile/aggregator-pointer/aggregator-probe';
 import {
   assertTokenConservation,
   captureSnapshot,
