@@ -553,7 +553,7 @@ export {
 } from './core/encryption';
 export type { EncryptedData } from './core/encryption';
 
-export { generateAddressFromMasterKey } from './core/crypto';
+export { generateAddressFromMasterKey, hexToWIF, generatePrivateKey } from './core/crypto';
 
 // Accounting module types
 export type {
@@ -569,3 +569,36 @@ export type { TxfToken } from './types/txf';
 
 // Master-key provider status re-export (already re-exported via ./types barrel,
 // but keeping explicit here for consumers that want to import direct types).
+
+// =============================================================================
+// L1 legacy namespace — CLI compatibility shim
+// =============================================================================
+//
+// The pre-Phase-2 sphere-sdk exposed L1 (ALPHA blockchain) helpers under an
+// `L1` namespace, and sphere-cli's `src/legacy/legacy-cli.ts` does a
+// module-load top-level destructure against it:
+//
+//     import { L1 } from '@unicitylabs/sphere-sdk';
+//     const { encrypt, decrypt, hexToWIF, generatePrivateKey,
+//             generateAddressFromMasterKey } = L1;
+//
+// Without an `L1` export the destructure throws at import time and the CLI
+// won't even parse. Under uxf-v2 the L1 subsystem is removed, but the CRYPTO
+// helpers the legacy-cli destructures happen to still exist (relocated to
+// core/crypto.ts and core/encryption.ts). Ship them as an `L1` namespace
+// object so the destructure resolves cleanly. The `hexToWIF` stub throws
+// when actually called (see core/crypto.ts) so legacy WIF import commands
+// fail loudly rather than silently mis-behaving.
+//
+// This is a temporary compat shim; the plan's Phase 5+ sphere-cli work
+// rewrites legacy-cli.ts to use the new import paths directly, at which
+// point this export can be removed.
+import * as _cryptoNs from './core/crypto';
+import * as _encNs from './core/encryption';
+export const L1 = {
+  encrypt: _encNs.encrypt,
+  decrypt: _encNs.decrypt,
+  hexToWIF: _cryptoNs.hexToWIF,
+  generatePrivateKey: _cryptoNs.generatePrivateKey,
+  generateAddressFromMasterKey: _cryptoNs.generateAddressFromMasterKey,
+};

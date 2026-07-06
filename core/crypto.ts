@@ -666,5 +666,33 @@ export function generateAddressFromMasterKey(
   return generateAddressInfo(childPrivateKey, index, derivationPath);
 }
 
+/**
+ * Legacy `hexToWIF` — WIF (Wallet Import Format) is a Bitcoin/L1-specific
+ * encoding. Under uxf-v2 the L1 subsystem is removed; this stub throws to
+ * make legacy CLI code fail loudly when the WIF path is actually
+ * exercised (rather than silently import-succeeding and later mis-behaving).
+ *
+ * Preserved as an export because the sphere-cli legacy import path
+ * (`src/legacy/legacy-cli.ts`) top-level-destructures it — removing the
+ * export would break CLI startup even for commands that never touch WIF.
+ *
+ * @deprecated — L1 removed in Phase 2; WIF has no v2 counterpart.
+ */
+export function hexToWIF(_privateKeyHex: string, _compressed: boolean = true): string {
+  throw new Error('hexToWIF: WIF encoding is L1-only and was removed in Phase 2 of uxf-v2. Use hex private keys directly.');
+}
+
+/**
+ * Legacy `generatePrivateKey` — creates a 32-byte hex private key.
+ * Kept as an export so the sphere-cli legacy import path continues to
+ * resolve; internally forwards to `randomBytes(32)` which is the same
+ * cryptographic operation the L1-era implementation used.
+ *
+ * @deprecated — L1 removed in Phase 2; use `randomBytes(32)` directly.
+ */
+export function generatePrivateKey(): string {
+  return randomBytes(32);
+}
+
 // Re-export elliptic instance for advanced use cases
 export { ec };
