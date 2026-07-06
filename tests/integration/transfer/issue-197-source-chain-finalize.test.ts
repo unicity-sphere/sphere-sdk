@@ -41,7 +41,7 @@ import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType
 import { TransferTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransactionData';
 import { UnmaskedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate';
 
-import { finalizeSourceTokenChain } from '../../../modules/payments/transfer/conservative-source-finalize';
+import { finalizeSourceTokenChain } from '../../../extensions/uxf/pipeline/conservative-source-finalize';
 import type { InclusionProof, OracleProvider } from '../../../oracle/oracle-provider';
 import type { Token } from '../../../types';
 

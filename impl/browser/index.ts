@@ -40,8 +40,8 @@ import type { MarketModuleConfig } from '../../modules/market';
 import type { PriceProvider } from '../../price';
 import { createPriceProvider } from '../../price';
 import { TokenRegistry } from '../../registry';
-import { createUxfCarPublisher } from '../../modules/payments/transfer/ipfs-publisher';
-import type { PublishToIpfsCallback } from '../../modules/payments/transfer/delivery-resolver';
+import { createUxfCarPublisher } from '../../extensions/uxf/pipeline/ipfs-publisher';
+import type { PublishToIpfsCallback } from '../../extensions/uxf/pipeline/delivery-resolver';
 import {
   type BaseTransportConfig,
   type BaseOracleConfig,

@@ -37,7 +37,7 @@ import {
   type AssertRequestIdBindingFn,
   type DispositionEngineInput,
   type HydratedChain,
-} from '../../../../modules/payments/transfer/disposition-engine';
+} from '../../../../extensions/uxf/pipeline/disposition-engine';
 import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 
 // ---------------------------------------------------------------------------

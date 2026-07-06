@@ -19,7 +19,7 @@
  * @packageDocumentation
  */
 
-import { MAX_CONCURRENT_ORBITDB_WRITES } from '../modules/payments/transfer/limits';
+import { MAX_CONCURRENT_ORBITDB_WRITES } from '../extensions/uxf/pipeline/limits';
 
 /**
  * Snapshot of fairness-queue activity for telemetry / load-test gates.

@@ -523,7 +523,7 @@ describe('§6.1.1 revalidateCascadedChildren', () => {
     it('findChildren throws → counter increments + onScannerError fires + console.warn', async () => {
       const PARENT = 'p-scanner-err';
       // Build a scanner whose findChildren throws deterministically.
-      const throwingScanner: import('../../../../modules/payments/transfer/cascade-walker').CascadeManifestScanner = {
+      const throwingScanner: import('../../../../extensions/uxf/pipeline/cascade-walker').CascadeManifestScanner = {
         async readEntry() {
           // The runner calls readEntry only inside the per-child loop;
           // findChildren is what we want to fail. Return undefined for
@@ -567,7 +567,7 @@ describe('§6.1.1 revalidateCascadedChildren', () => {
       const PARENT = 'p-scanner-err-leak';
       const SECRET_HEX = 'deadbeefcafebabe1337b00b1eb000b5';
       // Hostile scanner: throws an Error decorated with sensitive bytes.
-      const hostileScanner: import('../../../../modules/payments/transfer/cascade-walker').CascadeManifestScanner = {
+      const hostileScanner: import('../../../../extensions/uxf/pipeline/cascade-walker').CascadeManifestScanner = {
         async readEntry() {
           return undefined;
         },

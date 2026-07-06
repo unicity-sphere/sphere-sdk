@@ -29,7 +29,7 @@ import {
   type TxfFinalization,
   type TxfSenderDeps,
   type TxfOutboxHooks,
-} from '../../../modules/payments/transfer/txf-sender';
+} from '../../../extensions/uxf/pipeline/txf-sender';
 import type { TransferRequest } from '../../../types';
 import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';

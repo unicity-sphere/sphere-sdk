@@ -30,13 +30,13 @@ import { AddressInfo } from 'node:net';
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { acquireBundle as acquireBundleProd } from '../../../modules/payments/transfer/bundle-acquirer';
+import { acquireBundle as acquireBundleProd } from '../../../extensions/uxf/pipeline/bundle-acquirer';
 import {
   IngestWorkerPool,
   type ProcessTokenFn,
   type UxfV1Payload,
-} from '../../../modules/payments/transfer/ingest-worker-pool';
-import { ReplayLRU } from '../../../modules/payments/transfer/replay-lru';
+} from '../../../extensions/uxf/pipeline/ingest-worker-pool';
+import { ReplayLRU } from '../../../extensions/uxf/pipeline/replay-lru';
 import { PerTokenMutex } from '../../../profile/per-token-mutex';
 import type {
   DispositionPerEntryStorage,

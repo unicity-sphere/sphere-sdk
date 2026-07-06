@@ -25,7 +25,7 @@ import {
   type DispositionRevaluateInput,
   type HydratedChain,
   type HydratedTx,
-} from '../../../../modules/payments/transfer/disposition-engine';
+} from '../../../../extensions/uxf/pipeline/disposition-engine';
 import type { ManifestEntryDelta } from '../../../../types/disposition';
 import type { ContentHash, UxfElement } from '../../../../extensions/uxf/bundle/types';
 

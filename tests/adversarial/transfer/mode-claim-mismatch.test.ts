@@ -50,11 +50,11 @@ import {
   type DispositionEngineInput,
   type HydratedChain,
   type HydratedTx,
-} from '../../../modules/payments/transfer/disposition-engine';
+} from '../../../extensions/uxf/pipeline/disposition-engine';
 import type {
   ContinuityResult,
   TxLike,
-} from '../../../modules/payments/transfer/continuity-walker';
+} from '../../../extensions/uxf/pipeline/continuity-walker';
 import type { ContentHash, UxfElement } from '../../../extensions/uxf/bundle/types';
 
 // =============================================================================

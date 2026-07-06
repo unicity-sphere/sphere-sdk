@@ -16,7 +16,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { sweepOrphanSpendingTokens } from '../../../../modules/payments/transfer/orphan-spending-sweeper.js';
+import { sweepOrphanSpendingTokens } from '../../../../extensions/uxf/pipeline/orphan-spending-sweeper.js';
 import { OutboxWriter } from '../../../../profile/outbox-writer.js';
 import { SentLedgerWriter } from '../../../../profile/sent-ledger-writer.js';
 import { Lamport } from '../../../../profile/lamport.js';

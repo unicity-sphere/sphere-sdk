@@ -28,7 +28,7 @@ import { isSphereError } from '../../../../core/errors';
 import {
   fetchCarByCid,
   type CidFetcherFetch,
-} from '../../../../modules/payments/transfer/cid-fetcher';
+} from '../../../../extensions/uxf/pipeline/cid-fetcher';
 import type { SphereEventMap } from '../../../../types/index';
 import { UxfPackage } from '../../../../extensions/uxf/bundle/UxfPackage';
 import {

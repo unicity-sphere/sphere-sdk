@@ -12,7 +12,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { PaymentsModule } from '../../../modules/payments/PaymentsModule';
-import { InclusionProofImporter } from '../../../modules/payments/transfer/import-inclusion-proof';
+import { InclusionProofImporter } from '../../../extensions/uxf/pipeline/import-inclusion-proof';
 import type { PaymentsModuleConfig } from '../../../modules/payments/PaymentsModule';
 
 // =============================================================================
@@ -174,7 +174,7 @@ describe('Round 3: PaymentsModule.importInclusionProof normalizes tokenId case',
 // Round 5 (FIX 5) — revalidateCascadedChildren tokenId case-normalization
 // =============================================================================
 
-import { RevalidateCascadedRunner } from '../../../modules/payments/transfer/revalidate-cascaded';
+import { RevalidateCascadedRunner } from '../../../extensions/uxf/pipeline/revalidate-cascaded';
 
 describe('Round 5 (FIX 5): PaymentsModule.revalidateCascadedChildren normalizes tokenId case', () => {
   it('uppercase parentTokenId → lowercased before reaching runner (no zero-children false positive)', async () => {

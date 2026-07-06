@@ -70,15 +70,15 @@ import {
   type OutboxCreateInput,
   type OutboxIntegrationHooks,
   type OutboxTransitionPatch,
-} from '../../../modules/payments/transfer/conservative-sender';
+} from '../../../extensions/uxf/pipeline/conservative-sender';
 import {
   sendInstantUxf,
   type InstantCommitResult,
   type InstantOutboxHooks,
   type InstantSenderDeps,
-} from '../../../modules/payments/transfer/instant-sender';
-import type { TokenLike } from '../../../modules/payments/transfer/classify-token';
-import type { PreflightFinalizeOptions } from '../../../modules/payments/transfer/preflight-finalize';
+} from '../../../extensions/uxf/pipeline/instant-sender';
+import type { TokenLike } from '../../../extensions/uxf/pipeline/classify-token';
+import type { PreflightFinalizeOptions } from '../../../extensions/uxf/pipeline/preflight-finalize';
 import { isSphereError } from '../../../core/errors';
 import { Lamport } from '../../../profile/lamport';
 import { OutboxWriter } from '../../../profile/outbox-writer';

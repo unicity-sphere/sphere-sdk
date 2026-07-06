@@ -59,7 +59,7 @@ import {
   mergeConflictingHeads,
   type CidComparator,
   type MergeConflictingHeadsResult,
-} from '../../../../modules/payments/transfer/conflict-merger';
+} from '../../../../extensions/uxf/pipeline/conflict-merger';
 import type {
   TokenManifestEntry,
   TokenManifestStatus,

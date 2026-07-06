@@ -88,7 +88,7 @@ import type { OracleProvider } from '../oracle';
 import type { PriceProvider } from '../price';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
 import type { SyncOptions, SyncResult } from '../modules/payments';
-import type { PublishToIpfsCallback } from '../modules/payments/transfer/delivery-resolver';
+import type { PublishToIpfsCallback } from '../extensions/uxf/pipeline/delivery-resolver';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
 import type { CommunicationsModuleConfig } from '../modules/communications';
 import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
@@ -4041,11 +4041,11 @@ export class Sphere {
       const oracleHasVerify =
         typeof oracleForVerify.verifyInclusionProof === 'function';
       const verifyProofAdapter:
-        | import('../modules/payments/transfer/import-inclusion-proof').ProofVerifier
+        | import('../extensions/uxf/pipeline/import-inclusion-proof').ProofVerifier
         | undefined = oracleHasVerify
         ? async (
-            proof: import('../modules/payments/transfer/import-inclusion-proof').ImportableInclusionProof,
-          ): Promise<import('../modules/payments/transfer/proof-verifier').ProofVerifyStatus> => {
+            proof: import('../extensions/uxf/pipeline/import-inclusion-proof').ImportableInclusionProof,
+          ): Promise<import('../extensions/uxf/pipeline/proof-verifier').ProofVerifyStatus> => {
             try {
               const ok = await oracleForVerify.verifyInclusionProof!({
                 proofJson: proof.proof,
@@ -7371,11 +7371,11 @@ price: this._priceProvider ?? undefined,
       const oracleHasVerify =
         typeof oracleForVerify.verifyInclusionProof === 'function';
       const verifyProofAdapter:
-        | import('../modules/payments/transfer/import-inclusion-proof').ProofVerifier
+        | import('../extensions/uxf/pipeline/import-inclusion-proof').ProofVerifier
         | undefined = oracleHasVerify
         ? async (
-            proof: import('../modules/payments/transfer/import-inclusion-proof').ImportableInclusionProof,
-          ): Promise<import('../modules/payments/transfer/proof-verifier').ProofVerifyStatus> => {
+            proof: import('../extensions/uxf/pipeline/import-inclusion-proof').ImportableInclusionProof,
+          ): Promise<import('../extensions/uxf/pipeline/proof-verifier').ProofVerifyStatus> => {
             try {
               const ok = await oracleForVerify.verifyInclusionProof!({
                 proofJson: proof.proof,
@@ -7436,7 +7436,7 @@ price: this._priceProvider ?? undefined,
           configureOperatorEscapeHatchStorage?: (
             ds: import('../profile/disposition-writer').DispositionPerEntryStorage,
             options?: {
-              readonly verifyProof?: import('../modules/payments/transfer/import-inclusion-proof').ProofVerifier;
+              readonly verifyProof?: import('../extensions/uxf/pipeline/import-inclusion-proof').ProofVerifier;
             },
           ) => void;
         };

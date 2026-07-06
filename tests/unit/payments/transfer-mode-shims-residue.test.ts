@@ -22,12 +22,12 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import * as shims from '../../../modules/payments/transfer/transfer-mode-shims';
+import * as shims from '../../../extensions/uxf/pipeline/transfer-mode-shims';
 
 const __dirname_ = dirname(fileURLToPath(import.meta.url));
 const SHIM_PATH = resolve(
   __dirname_,
-  '../../../modules/payments/transfer/transfer-mode-shims.ts',
+  '../../../extensions/uxf/pipeline/transfer-mode-shims.ts',
 );
 const SHIM_SRC = readFileSync(SHIM_PATH, 'utf8');
 

@@ -12,7 +12,7 @@ import type { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/trans
 import type { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
 
-import { verifyProof } from '../../../../modules/payments/transfer/proof-verifier';
+import { verifyProof } from '../../../../extensions/uxf/pipeline/proof-verifier';
 
 // =============================================================================
 // Test doubles

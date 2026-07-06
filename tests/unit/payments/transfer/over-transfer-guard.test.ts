@@ -10,7 +10,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { enforceOverTransferGuard, type GuardCommitResult } from '../../../../modules/payments/transfer/over-transfer-guard';
+import { enforceOverTransferGuard, type GuardCommitResult } from '../../../../extensions/uxf/pipeline/over-transfer-guard';
 import { isSphereError } from '../../../../core/errors';
 import type { TransferRequest } from '../../../../types';
 

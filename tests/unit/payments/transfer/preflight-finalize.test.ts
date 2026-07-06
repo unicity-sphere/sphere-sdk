@@ -30,7 +30,7 @@ import {
   mapAggregatorRejection,
   type PendingTxDescriptor,
   type PreflightProgressEvent,
-} from '../../../../modules/payments/transfer/preflight-finalize';
+} from '../../../../extensions/uxf/pipeline/preflight-finalize';
 import { SphereError, isSphereError } from '../../../../core/errors';
 import type {
   InclusionProof,

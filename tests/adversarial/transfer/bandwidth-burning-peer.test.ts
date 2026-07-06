@@ -44,7 +44,7 @@ import {
   MAX_TRUSTED_SENDERS,
   MAX_UNTRUSTED_SENDERS,
   ReplayLRU,
-} from '../../../modules/payments/transfer/replay-lru';
+} from '../../../extensions/uxf/pipeline/replay-lru';
 
 const HONEST_ALICE = 'a'.repeat(64);
 const HONEST_BOB = 'b'.repeat(64);

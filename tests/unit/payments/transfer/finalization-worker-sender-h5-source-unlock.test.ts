@@ -40,7 +40,7 @@ import {
   type TombstoneWriteAdapter,
   type FinalizationQueueAdapter,
   type Semaphore,
-} from '../../../../modules/payments/transfer/finalization-worker-sender';
+} from '../../../../extensions/uxf/pipeline/finalization-worker-sender';
 import { ManifestCas } from '../../../../profile/manifest-cas';
 import { PerTokenMutex } from '../../../../profile/per-token-mutex';
 import type {

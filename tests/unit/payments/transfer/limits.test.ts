@@ -24,7 +24,7 @@ import {
   INGEST_QUEUE_PER_TOKEN_CAP,
   clampInlineCap,
   compareCidV1Binary,
-} from '../../../../modules/payments/transfer/limits';
+} from '../../../../extensions/uxf/pipeline/limits';
 
 // =============================================================================
 // 1. Constants — pin exact spec values
@@ -95,7 +95,7 @@ describe('UXF transfer limits — side-effect freedom', () => {
     const here = path.dirname(url.fileURLToPath(import.meta.url));
     const limitsPath = path.resolve(
       here,
-      '../../../../modules/payments/transfer/limits.ts',
+      '../../../../extensions/uxf/pipeline/limits.ts',
     );
     const source = await fs.readFile(limitsPath, 'utf8');
     // Strip block comments and line comments so they don't false-positive.

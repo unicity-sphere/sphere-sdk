@@ -201,7 +201,7 @@ export interface TxfCommitResult {
  * components (sourceToken JSON + transferTx JSON).
  *
  * Production wiring inside {@link
- * import('../PaymentsModule').PaymentsModule}'s TXF dispatcher derives
+ * import('../../../modules/payments/PaymentsModule').PaymentsModule}'s TXF dispatcher derives
  * commitments via the SDK's `TransferCommitment.create` /
  * `submitTransferCommitment`. Conservative awaits the inclusion proof
  * inline; instant returns immediately with `inclusionProof: null`.
@@ -295,7 +295,7 @@ export interface TxfOutboxHooks {
  * Mirrors {@link import('./instant-sender').InstantSenderDeps} field by
  * field — every surface is callback-shaped so unit tests exercise the
  * full pipeline without the surrounding {@link
- * import('../PaymentsModule').PaymentsModule}.
+ * import('../../../modules/payments/PaymentsModule').PaymentsModule}.
  */
 export interface TxfSenderDeps {
   /** Aggregator client. Forwarded to {@link TxfCommitSourcesFn} via

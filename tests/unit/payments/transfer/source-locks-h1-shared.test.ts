@@ -28,10 +28,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   acquireSourceLocks,
   __resetSourceLocksForTesting,
-} from '../../../../modules/payments/transfer/source-locks';
+} from '../../../../extensions/uxf/pipeline/source-locks';
 import {
   __resetSourceLocksForTesting as __resetFromInstantSender,
-} from '../../../../modules/payments/transfer/instant-sender';
+} from '../../../../extensions/uxf/pipeline/instant-sender';
 
 describe('Audit #333 H1 — shared source-lock module', () => {
   beforeEach(() => __resetSourceLocksForTesting());

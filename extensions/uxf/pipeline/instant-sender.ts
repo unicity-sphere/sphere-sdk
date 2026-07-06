@@ -83,8 +83,8 @@ import type {
   UxfTransferPayloadCid,
 } from '../../../types/uxf-transfer';
 import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
-import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
-import { extractCarRootCid } from '../../../extensions/uxf/bundle/transfer-payload';
+import { UxfPackage } from '../bundle/UxfPackage';
+import { extractCarRootCid } from '../bundle/transfer-payload';
 
 import { classifyToken, type TokenLike } from './classify-token';
 import type { FaultInjectionHooks } from './conservative-sender';
@@ -206,7 +206,7 @@ export interface InstantSourceSelection {
  * transition) for ingestion into the UXF bundle.
  *
  * Production wiring inside {@link
- * import('../PaymentsModule').PaymentsModule}'s instant dispatcher
+ * import('../../../modules/payments/PaymentsModule').PaymentsModule}'s instant dispatcher
  * derives commitments via the SDK's `TransferCommitment.create` /
  * `submitTransferCommitment` and STOPS THERE — no
  * `waitInclusionProof()`. Tests inject inline mocks.
@@ -328,7 +328,7 @@ export interface InstantOutboxHooks {
  * import('./conservative-sender').ConservativeSenderDeps} — every
  * surface is callback-shaped so unit tests can exercise the full
  * pipeline without the surrounding {@link
- * import('../PaymentsModule').PaymentsModule}.
+ * import('../../../modules/payments/PaymentsModule').PaymentsModule}.
  */
 export interface InstantSenderDeps {
   /** Aggregator client. Forwarded to {@link InstantCommitSourcesFn} via

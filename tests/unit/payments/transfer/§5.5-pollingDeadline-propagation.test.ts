@@ -29,7 +29,7 @@ import {
   makeFakeAggregator,
   makeOutboxEntry,
 } from './finalization-worker-sender-fixtures';
-import { POLLING_WINDOW_MS, MIN_POLL_ATTEMPTS } from '../../../../modules/payments/transfer/limits';
+import { POLLING_WINDOW_MS, MIN_POLL_ATTEMPTS } from '../../../../extensions/uxf/pipeline/limits';
 
 describe('§5.5 step 6 pollingDeadline propagation (W17)', () => {
   it('terminates with oracle-rejected after window+MIN_POLL_ATTEMPTS satisfied', async () => {

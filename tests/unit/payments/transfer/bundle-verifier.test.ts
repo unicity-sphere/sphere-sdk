@@ -24,11 +24,11 @@ import { isSphereError } from '../../../../core/errors';
 import {
   verifyBundleStructure,
   type RootRef,
-} from '../../../../modules/payments/transfer/bundle-verifier';
+} from '../../../../extensions/uxf/pipeline/bundle-verifier';
 import {
   MAX_CHAIN_DEPTH,
   MAX_UNCLAIMED_ROOTS,
-} from '../../../../modules/payments/transfer/limits';
+} from '../../../../extensions/uxf/pipeline/limits';
 import type { UxfTransferPayloadCar } from '../../../../types/uxf-transfer';
 import { UxfPackage } from '../../../../extensions/uxf/bundle/UxfPackage';
 import {

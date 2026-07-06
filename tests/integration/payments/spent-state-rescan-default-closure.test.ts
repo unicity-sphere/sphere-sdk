@@ -27,7 +27,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PaymentsModule } from '../../../modules/payments/PaymentsModule';
-import { SpentStateRescanWorker } from '../../../modules/payments/transfer/spent-state-rescan-worker';
+import { SpentStateRescanWorker } from '../../../extensions/uxf/pipeline/spent-state-rescan-worker';
 import type { FullIdentity, SphereEventMap, SphereEventType, Token } from '../../../types';
 import type { OracleProvider } from '../../../oracle';
 import type { StorageProvider } from '../../../storage';

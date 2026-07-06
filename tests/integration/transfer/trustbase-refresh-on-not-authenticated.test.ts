@@ -34,14 +34,14 @@ import {
   TrustBaseStaleness,
   type RefreshOutcome,
   type TrustBaseRefresher,
-} from '../../../modules/payments/transfer/trustbase-staleness';
+} from '../../../extensions/uxf/pipeline/trustbase-staleness';
 import {
   FinalizationWorkerSender,
   CountingSemaphore,
-} from '../../../modules/payments/transfer/finalization-worker-sender';
+} from '../../../extensions/uxf/pipeline/finalization-worker-sender';
 import {
   FinalizationWorkerRecipient,
-} from '../../../modules/payments/transfer/finalization-worker-recipient';
+} from '../../../extensions/uxf/pipeline/finalization-worker-recipient';
 import { ManifestCas } from '../../../profile/manifest-cas';
 import { PerTokenMutex } from '../../../profile/per-token-mutex';
 import {
@@ -75,7 +75,7 @@ import {
   seedQueue,
   type WorkerHarness as RecipientWorkerHarness,
 } from '../../unit/payments/transfer/finalization-worker-recipient-fixtures';
-import { FinalizationQueue } from '../../../modules/payments/transfer/finalization-queue';
+import { FinalizationQueue } from '../../../extensions/uxf/pipeline/finalization-queue';
 import { contentHash } from '../../../extensions/uxf/bundle/types';
 import type { SphereEventMap, SphereEventType } from '../../../types';
 

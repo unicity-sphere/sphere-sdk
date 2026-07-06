@@ -47,7 +47,7 @@ import {
   reresolveNametag,
   resolveSenderInfoViaBinding,
   type NametagResolver,
-} from '../../../modules/payments/transfer/nametag-reresolver';
+} from '../../../extensions/uxf/pipeline/nametag-reresolver';
 import type { PeerInfo } from '../../../transport/transport-provider';
 
 // =============================================================================

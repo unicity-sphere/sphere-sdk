@@ -33,7 +33,7 @@ import {
 import type {
   CascadeManifestScanner,
   CascadeOutboxScanner,
-} from '../../../../modules/payments/transfer/cascade-walker';
+} from '../../../../extensions/uxf/pipeline/cascade-walker';
 import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
 
 describe('§6.1.1 cascade — scanner-error surfacing', () => {
@@ -291,7 +291,7 @@ describe('§6.1.1 cascade — scanner-error surfacing', () => {
 
     // Replace the walker with one whose onScannerError throws.
     const { CascadeWalker } = await import(
-      '../../../../modules/payments/transfer/cascade-walker'
+      '../../../../extensions/uxf/pipeline/cascade-walker'
     );
     const { ManifestCas } = await import(
       '../../../../profile/manifest-cas'

@@ -35,7 +35,7 @@ import {
   makeQueueEntry,
   seedQueue,
 } from './finalization-worker-recipient-fixtures';
-import { entryIdFor } from '../../../../modules/payments/transfer/finalization-queue';
+import { entryIdFor } from '../../../../extensions/uxf/pipeline/finalization-queue';
 
 describe('§5.6 idempotency — replay convergence', () => {
   it('replay with same transactionHash converges (no double-write)', async () => {

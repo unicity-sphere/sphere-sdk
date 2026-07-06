@@ -18,7 +18,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   TombstoneGcWorker,
   type TombstoneGcWorkerDeps,
-} from '../../../../modules/payments/transfer/tombstone-gc-worker';
+} from '../../../../extensions/uxf/pipeline/tombstone-gc-worker';
 import type { OutboxWriter } from '../../../../profile/outbox-writer';
 import type { SentLedgerWriter } from '../../../../profile/sent-ledger-writer';
 import type { TombstoneGcResult } from '../../../../profile/types';

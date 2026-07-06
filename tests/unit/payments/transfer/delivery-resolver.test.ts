@@ -26,12 +26,12 @@ import {
   type EmitTelemetryCallback,
   type PublishToIpfsCallback,
   type PublishToIpfsResult,
-} from '../../../../modules/payments/transfer/delivery-resolver';
+} from '../../../../extensions/uxf/pipeline/delivery-resolver';
 import {
   AUTOMATED_CID_DELIVERY_ENABLED,
   MAX_INLINE_CAR_BYTES,
   RELAY_SAFE_CAP_BYTES,
-} from '../../../../modules/payments/transfer/limits';
+} from '../../../../extensions/uxf/pipeline/limits';
 
 // Issue #393 — five tests below exercise the `auto → CID` promotion
 // path. They are gated on the {@link AUTOMATED_CID_DELIVERY_ENABLED}
@@ -563,7 +563,7 @@ describe('resolveDelivery — forward-compat extension points', () => {
     const here = url.fileURLToPath(import.meta.url);
     const resolverPath = path.resolve(
       path.dirname(here),
-      '../../../../modules/payments/transfer/delivery-resolver.ts',
+      '../../../../extensions/uxf/pipeline/delivery-resolver.ts',
     );
     const source = await fs.readFile(resolverPath, 'utf8');
     expect(source).toContain('TODO(T.future-NIP11)');

@@ -57,11 +57,11 @@ import {
   type DispositionEngineInput,
   type HydratedChain,
   type HydratedTx,
-} from '../../../../modules/payments/transfer/disposition-engine';
-import type { ContinuityResult, TxLike } from '../../../../modules/payments/transfer/continuity-walker';
-import type { EvaluatePredicateResult } from '../../../../modules/payments/transfer/predicate-evaluator';
-import type { ProofVerifyStatus } from '../../../../modules/payments/transfer/proof-verifier';
-import type { VerifyAuthenticatorResult } from '../../../../modules/payments/transfer/authenticator-verifier';
+} from '../../../../extensions/uxf/pipeline/disposition-engine';
+import type { ContinuityResult, TxLike } from '../../../../extensions/uxf/pipeline/continuity-walker';
+import type { EvaluatePredicateResult } from '../../../../extensions/uxf/pipeline/predicate-evaluator';
+import type { ProofVerifyStatus } from '../../../../extensions/uxf/pipeline/proof-verifier';
+import type { VerifyAuthenticatorResult } from '../../../../extensions/uxf/pipeline/authenticator-verifier';
 import type { ManifestEntryDelta } from '../../../../types/disposition';
 import type { ContentHash, UxfElement } from '../../../../extensions/uxf/bundle/types';
 

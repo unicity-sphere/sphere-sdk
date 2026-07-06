@@ -14,7 +14,7 @@ import {
   noopRefresher,
   type RefreshOutcome,
   type TrustBaseRefresher,
-} from '../../../../modules/payments/transfer/trustbase-staleness';
+} from '../../../../extensions/uxf/pipeline/trustbase-staleness';
 
 // =============================================================================
 // 1. Test refresher fakes
@@ -498,7 +498,7 @@ describe('TrustBaseStaleness — isTrustBaseStale is ADVISORY-ONLY (Wave 3)', ()
     const src = await fs.readFile(
       path.resolve(
         __dirname,
-        '../../../../modules/payments/transfer/trustbase-staleness.ts',
+        '../../../../extensions/uxf/pipeline/trustbase-staleness.ts',
       ),
       'utf8',
     );

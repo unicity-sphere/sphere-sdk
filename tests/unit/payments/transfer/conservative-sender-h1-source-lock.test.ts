@@ -34,10 +34,10 @@ import {
   sendConservativeUxf,
   type ConservativeCommitResult,
   type ConservativeSenderDeps,
-} from '../../../../modules/payments/transfer/conservative-sender';
-import { __resetSourceLocksForTesting } from '../../../../modules/payments/transfer/source-locks';
-import type { TokenLike } from '../../../../modules/payments/transfer/classify-token';
-import type { PreflightFinalizeOptions } from '../../../../modules/payments/transfer/preflight-finalize';
+} from '../../../../extensions/uxf/pipeline/conservative-sender';
+import { __resetSourceLocksForTesting } from '../../../../extensions/uxf/pipeline/source-locks';
+import type { TokenLike } from '../../../../extensions/uxf/pipeline/classify-token';
+import type { PreflightFinalizeOptions } from '../../../../extensions/uxf/pipeline/preflight-finalize';
 import type { OracleProvider } from '../../../../oracle/oracle-provider';
 import type { TransportProvider } from '../../../../transport';
 import type { PeerInfo } from '../../../../transport/transport-provider';

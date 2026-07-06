@@ -37,13 +37,13 @@ import {
   type RequestContextResolver,
   type SubmitOutcome,
   type PollOutcome,
-} from '../../../../modules/payments/transfer/finalization-worker-sender';
-import { hashAuthenticatorForLog } from '../../../../modules/payments/transfer/finalization-worker-base';
+} from '../../../../extensions/uxf/pipeline/finalization-worker-sender';
+import { hashAuthenticatorForLog } from '../../../../extensions/uxf/pipeline/finalization-worker-base';
 import {
   type FinalizationQueueAdapter,
   type PoolWriteAdapter,
   type TombstoneWriteAdapter,
-} from '../../../../modules/payments/transfer/manifest-cid-rewrite';
+} from '../../../../extensions/uxf/pipeline/manifest-cid-rewrite';
 import { ManifestCas, type MinimalManifestStorage } from '../../../../profile/manifest-cas';
 import { PerTokenMutex } from '../../../../profile/per-token-mutex';
 import { contentHash } from '../../../../extensions/uxf/bundle/types';

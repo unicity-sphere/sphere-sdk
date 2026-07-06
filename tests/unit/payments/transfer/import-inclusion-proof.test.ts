@@ -15,7 +15,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { InclusionProofImporter } from '../../../../modules/payments/transfer/import-inclusion-proof';
+import { InclusionProofImporter } from '../../../../extensions/uxf/pipeline/import-inclusion-proof';
 import {
   ADDR,
   ADDR_ALT,

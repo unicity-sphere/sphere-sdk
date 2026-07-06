@@ -24,7 +24,7 @@
 import { describe, it, expect, expectTypeOf } from 'vitest';
 import {
   narrowTransferMode,
-} from '../../../modules/payments/transfer/transfer-mode-shims';
+} from '../../../extensions/uxf/pipeline/transfer-mode-shims';
 import { isSphereError } from '../../../core/errors';
 import type {
   AdditionalAsset,

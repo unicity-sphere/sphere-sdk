@@ -22,8 +22,8 @@ import {
   __resetAggregatorSemaphoresForTesting,
   canonicalizeAggregatorId,
   getAggregatorSemaphore,
-} from '../../../../modules/payments/transfer/aggregator-semaphores';
-import { MAX_CONCURRENT_POLLS_PER_AGGREGATOR } from '../../../../modules/payments/transfer/limits';
+} from '../../../../extensions/uxf/pipeline/aggregator-semaphores';
+import { MAX_CONCURRENT_POLLS_PER_AGGREGATOR } from '../../../../extensions/uxf/pipeline/limits';
 
 describe('aggregator-semaphores — process-global registry (W14)', () => {
   beforeEach(() => {

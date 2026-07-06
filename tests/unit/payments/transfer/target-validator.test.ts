@@ -23,12 +23,12 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { validateTargets } from '../../../../modules/payments/transfer/target-validator';
-import type { TokenLike } from '../../../../modules/payments/transfer/classify-token';
+import { validateTargets } from '../../../../extensions/uxf/pipeline/target-validator';
+import type { TokenLike } from '../../../../extensions/uxf/pipeline/classify-token';
 import {
   classifyToken,
   normalizeCoinData,
-} from '../../../../modules/payments/transfer/classify-token';
+} from '../../../../extensions/uxf/pipeline/classify-token';
 import { isSphereError } from '../../../../core/errors';
 import type { TransferRequest } from '../../../../types';
 

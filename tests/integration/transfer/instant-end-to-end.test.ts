@@ -19,13 +19,13 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { acquireBundle, isReplayOutcome } from '../../../modules/payments/transfer/bundle-acquirer';
+import { acquireBundle, isReplayOutcome } from '../../../extensions/uxf/pipeline/bundle-acquirer';
 import {
   sendInstantUxf,
   type InstantCommitResult,
   type InstantSenderDeps,
-} from '../../../modules/payments/transfer/instant-sender';
-import { ReplayLRU } from '../../../modules/payments/transfer/replay-lru';
+} from '../../../extensions/uxf/pipeline/instant-sender';
+import { ReplayLRU } from '../../../extensions/uxf/pipeline/replay-lru';
 import type {
   UxfTransferPayload,
   UxfTransferPayloadCar,

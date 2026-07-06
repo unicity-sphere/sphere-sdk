@@ -26,8 +26,8 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createPaymentsModule } from '../../../modules/payments/PaymentsModule';
-import { InclusionProofImporter } from '../../../modules/payments/transfer/import-inclusion-proof';
-import { RevalidateCascadedRunner } from '../../../modules/payments/transfer/revalidate-cascaded';
+import { InclusionProofImporter } from '../../../extensions/uxf/pipeline/import-inclusion-proof';
+import { RevalidateCascadedRunner } from '../../../extensions/uxf/pipeline/revalidate-cascaded';
 import type { FullIdentity } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import type { TransportProvider } from '../../../transport';

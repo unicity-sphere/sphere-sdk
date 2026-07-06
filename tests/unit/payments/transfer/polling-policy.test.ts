@@ -19,7 +19,7 @@ import {
   getSubmitRetryBackoffMs,
   getMonotonicNowMs,
   isPollingTimedOut,
-} from '../../../../modules/payments/transfer/polling-policy';
+} from '../../../../extensions/uxf/pipeline/polling-policy';
 
 // =============================================================================
 // 1. Re-exported constants — pin spec defaults
@@ -471,10 +471,10 @@ describe('polling-policy — module side-effect freedom', () => {
     // statement) would surface as an unawaited promise rejection or
     // hung timer.
     const mod1 = await import(
-      '../../../../modules/payments/transfer/polling-policy'
+      '../../../../extensions/uxf/pipeline/polling-policy'
     );
     const mod2 = await import(
-      '../../../../modules/payments/transfer/polling-policy'
+      '../../../../extensions/uxf/pipeline/polling-policy'
     );
     // Same module identity (Node ESM cache).
     expect(mod1.POLLING_WINDOW_MS).toBe(mod2.POLLING_WINDOW_MS);

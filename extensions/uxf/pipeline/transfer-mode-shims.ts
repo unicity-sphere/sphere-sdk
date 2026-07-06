@@ -92,7 +92,7 @@ const DEFAULT_TRANSFER_MODE: TransferMode = 'instant';
  * - `undefined`        → `'instant'` — post T.7.E this means "instant over
  *   UXF" per §2.5 (semantic flip; literal value unchanged). Routing is
  *   chosen by the dispatcher in
- *   {@link import('../PaymentsModule').PaymentsModule.send}: when
+ *   {@link import('../../../modules/payments/PaymentsModule').PaymentsModule.send}: when
  *   `features.senderUxf === true`, the value lands in
  *   {@link import('./instant-sender').sendInstantUxf}. When the flag is
  *   `false` (staged-rollout state, removed by T.8.D), the value still

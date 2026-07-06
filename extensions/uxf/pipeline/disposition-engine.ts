@@ -142,7 +142,7 @@ import type {
   DispositionRecord,
   ManifestEntryDelta,
 } from '../../../types/disposition.js';
-import type { ContentHash, UxfElement } from '../../../extensions/uxf/bundle/types.js';
+import type { ContentHash, UxfElement } from '../bundle/types.js';
 
 import type { ContinuityResult, TxLike } from './continuity-walker.js';
 import type { EvaluatePredicateResult } from './predicate-evaluator.js';
@@ -1178,7 +1178,7 @@ export async function revaluate(
 // 5. Re-exports (for caller convenience)
 // =============================================================================
 
-export type { ContentHash, UxfElement } from '../../../extensions/uxf/bundle/types.js';
+export type { ContentHash, UxfElement } from '../bundle/types.js';
 export type {
   DispositionRecord,
   ManifestEntryDelta,

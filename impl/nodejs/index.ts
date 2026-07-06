@@ -38,8 +38,8 @@ import type { NetworkType } from '../../constants';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
 import type { MarketModuleConfig } from '../../modules/market';
 import type { IpfsStorageConfig } from '../shared/ipfs';
-import { createUxfCarPublisher } from '../../modules/payments/transfer/ipfs-publisher';
-import type { PublishToIpfsCallback } from '../../modules/payments/transfer/delivery-resolver';
+import { createUxfCarPublisher } from '../../extensions/uxf/pipeline/ipfs-publisher';
+import type { PublishToIpfsCallback } from '../../extensions/uxf/pipeline/delivery-resolver';
 import { DEFAULT_IPFS_GATEWAYS } from '../../constants';
 
 // Issue #394 — re-export the canonical UXF publisher factory + default
@@ -48,8 +48,8 @@ import { DEFAULT_IPFS_GATEWAYS } from '../../constants';
 // the deprecated `tokenSync.ipfs.enabled` flag (which couples publisher
 // construction with the `IpfsStorageProvider` wallet-storage path
 // Profile has replaced).
-export { createUxfCarPublisher } from '../../modules/payments/transfer/ipfs-publisher';
-export type { PublishToIpfsCallback } from '../../modules/payments/transfer/delivery-resolver';
+export { createUxfCarPublisher } from '../../extensions/uxf/pipeline/ipfs-publisher';
+export type { PublishToIpfsCallback } from '../../extensions/uxf/pipeline/delivery-resolver';
 export { DEFAULT_IPFS_GATEWAYS } from '../../constants';
 import {
   type BaseTransportConfig,

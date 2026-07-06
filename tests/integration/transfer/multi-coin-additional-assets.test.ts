@@ -30,9 +30,9 @@ import {
   sendConservativeUxf,
   type ConservativeCommitResult,
   type ConservativeSenderDeps,
-} from '../../../modules/payments/transfer/conservative-sender';
-import type { TokenLike } from '../../../modules/payments/transfer/classify-token';
-import type { PreflightFinalizeOptions } from '../../../modules/payments/transfer/preflight-finalize';
+} from '../../../extensions/uxf/pipeline/conservative-sender';
+import type { TokenLike } from '../../../extensions/uxf/pipeline/classify-token';
+import type { PreflightFinalizeOptions } from '../../../extensions/uxf/pipeline/preflight-finalize';
 import type { Token, TransferRequest } from '../../../types';
 import type { UxfTransferPayloadCar } from '../../../types/uxf-transfer';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';

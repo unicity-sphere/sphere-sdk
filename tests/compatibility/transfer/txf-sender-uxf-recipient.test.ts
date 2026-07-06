@@ -57,17 +57,17 @@ import {
   sendTxfUxf,
   type TxfCommitResult,
   type TxfSenderDeps,
-} from '../../../modules/payments/transfer/txf-sender';
+} from '../../../extensions/uxf/pipeline/txf-sender';
 import {
   adaptLegacyShape,
   classifyLegacyShape,
   type FinalizationQueueEnqueuer,
   type LegacyTokenEntry,
-} from '../../../modules/payments/transfer/legacy-shape-adapter';
-import type { ContinuityResult, TxLike } from '../../../modules/payments/transfer/continuity-walker';
-import type { EvaluatePredicateResult } from '../../../modules/payments/transfer/predicate-evaluator';
-import type { ProofVerifyStatus } from '../../../modules/payments/transfer/proof-verifier';
-import type { VerifyAuthenticatorResult } from '../../../modules/payments/transfer/authenticator-verifier';
+} from '../../../extensions/uxf/pipeline/legacy-shape-adapter';
+import type { ContinuityResult, TxLike } from '../../../extensions/uxf/pipeline/continuity-walker';
+import type { EvaluatePredicateResult } from '../../../extensions/uxf/pipeline/predicate-evaluator';
+import type { ProofVerifyStatus } from '../../../extensions/uxf/pipeline/proof-verifier';
+import type { VerifyAuthenticatorResult } from '../../../extensions/uxf/pipeline/authenticator-verifier';
 import type { OracleProvider } from '../../../oracle/oracle-provider';
 import type { TransportProvider } from '../../../transport';
 import type { PeerInfo } from '../../../transport/transport-provider';
@@ -79,7 +79,7 @@ import type {
   SphereEventType,
   Token,
 } from '../../../types';
-import type { FinalizationQueueEntry } from '../../../modules/payments/transfer/finalization-queue';
+import type { FinalizationQueueEntry } from '../../../extensions/uxf/pipeline/finalization-queue';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 
 // =============================================================================

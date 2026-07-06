@@ -32,13 +32,13 @@ import {
   type AcquireBundleFn,
   type ProcessTokenFn,
   type UxfV1Payload,
-} from '../../../../modules/payments/transfer/ingest-worker-pool';
-import { ReplayLRU } from '../../../../modules/payments/transfer/replay-lru';
+} from '../../../../extensions/uxf/pipeline/ingest-worker-pool';
+import { ReplayLRU } from '../../../../extensions/uxf/pipeline/replay-lru';
 import { PerTokenMutex } from '../../../../profile/per-token-mutex';
 import type {
   RootRef,
   VerifiedBundle,
-} from '../../../../modules/payments/transfer/bundle-verifier';
+} from '../../../../extensions/uxf/pipeline/bundle-verifier';
 import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 
 // =============================================================================

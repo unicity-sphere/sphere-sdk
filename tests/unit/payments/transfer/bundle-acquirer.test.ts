@@ -24,9 +24,9 @@ import {
   acquireBundle,
   isReplayOutcome,
   RECIPIENT_MAX_INLINE_CARBASE64_LENGTH,
-} from '../../../../modules/payments/transfer/bundle-acquirer';
-import { ReplayLRU } from '../../../../modules/payments/transfer/replay-lru';
-import { RELAY_SAFE_CAP_BYTES } from '../../../../modules/payments/transfer/limits';
+} from '../../../../extensions/uxf/pipeline/bundle-acquirer';
+import { ReplayLRU } from '../../../../extensions/uxf/pipeline/replay-lru';
+import { RELAY_SAFE_CAP_BYTES } from '../../../../extensions/uxf/pipeline/limits';
 import { _resetGatewayCapabilityCache } from '../../../../profile/ipfs-client';
 import type {
   UxfTransferPayload,
@@ -570,7 +570,7 @@ describe('acquireBundle — defense-in-depth CID re-extract (steelman #170)', ()
     const here = url.fileURLToPath(import.meta.url);
     const acquirerPath = path.resolve(
       path.dirname(here),
-      '../../../../modules/payments/transfer/bundle-acquirer.ts',
+      '../../../../extensions/uxf/pipeline/bundle-acquirer.ts',
     );
     const source = await fs.readFile(acquirerPath, 'utf8');
 

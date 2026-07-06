@@ -39,7 +39,7 @@ import {
   FinalizationQueue,
   type FinalizationQueueEntry,
   entryIdFor,
-} from '../../../modules/payments/transfer/finalization-queue.js';
+} from '../../../extensions/uxf/pipeline/finalization-queue.js';
 import { deriveProfileEncryptionKey } from '../../../profile/encryption.js';
 
 // ---------------------------------------------------------------------------

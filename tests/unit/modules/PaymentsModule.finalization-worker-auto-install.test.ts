@@ -17,10 +17,10 @@ import {
 } from '../../../modules/payments/PaymentsModule';
 import {
   FinalizationWorkerSender,
-} from '../../../modules/payments/transfer/finalization-worker-sender';
+} from '../../../extensions/uxf/pipeline/finalization-worker-sender';
 import {
   FinalizationWorkerRecipient,
-} from '../../../modules/payments/transfer/finalization-worker-recipient';
+} from '../../../extensions/uxf/pipeline/finalization-worker-recipient';
 import type { FullIdentity } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import type { TransportProvider } from '../../../transport';

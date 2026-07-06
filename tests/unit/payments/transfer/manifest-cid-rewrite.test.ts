@@ -28,7 +28,7 @@ import {
   type PoolWriteAdapter,
   type TombstoneWriteAdapter,
   type FinalizationQueueAdapter,
-} from '../../../../modules/payments/transfer/manifest-cid-rewrite';
+} from '../../../../extensions/uxf/pipeline/manifest-cid-rewrite';
 import {
   ManifestCas,
   type MinimalManifestStorage,

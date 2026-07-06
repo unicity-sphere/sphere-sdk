@@ -115,7 +115,7 @@ describe('N4 — operator override audit-trail listener', () => {
     const {
       InclusionProofImporter,
     } = await import(
-      '../../../modules/payments/transfer/import-inclusion-proof'
+      '../../../extensions/uxf/pipeline/import-inclusion-proof'
     );
     const wiredImporter = new InclusionProofImporter({
       manifestStore: h2.manifestStore,
@@ -194,7 +194,7 @@ describe('N4 — operator override audit-trail listener', () => {
     const {
       InclusionProofImporter,
     } = await import(
-      '../../../modules/payments/transfer/import-inclusion-proof'
+      '../../../extensions/uxf/pipeline/import-inclusion-proof'
     );
 
     // Two distinct tokens: one case-5 (invalid→valid), one case-6

@@ -33,7 +33,7 @@
 import { describe, it, expect, vi } from 'vitest';
 
 import { PaymentsModule } from '../../../modules/payments/PaymentsModule';
-import type { PublishToIpfsCallback } from '../../../modules/payments/transfer/delivery-resolver';
+import type { PublishToIpfsCallback } from '../../../extensions/uxf/pipeline/delivery-resolver';
 import type { FullIdentity } from '../../../types';
 
 // =============================================================================

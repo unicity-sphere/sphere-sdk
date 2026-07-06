@@ -71,7 +71,7 @@
 
 import { SphereError } from '../../../core/errors.js';
 import type { UxfTransferPayload } from '../../../types/uxf-transfer.js';
-import type { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage.js';
+import type { UxfPackage } from '../bundle/UxfPackage.js';
 import {
   ELEMENT_TYPE_TOKEN_ROOT,
   type ContentHash,
@@ -79,7 +79,7 @@ import {
   type TokenRootChildren,
   type UxfElement,
   type UxfElementType,
-} from '../../../extensions/uxf/bundle/types.js';
+} from '../bundle/types.js';
 
 import { MAX_CHAIN_DEPTH, MAX_UNCLAIMED_ROOTS } from './limits.js';
 

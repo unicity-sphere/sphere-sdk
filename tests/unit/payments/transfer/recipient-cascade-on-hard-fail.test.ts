@@ -29,7 +29,7 @@ import {
   makeQueueEntry,
   seedQueue,
 } from './finalization-worker-recipient-fixtures';
-import { entryIdFor } from '../../../../modules/payments/transfer/finalization-queue';
+import { entryIdFor } from '../../../../extensions/uxf/pipeline/finalization-queue';
 
 describe('recipient cascade — invoked on hard-fail', () => {
   it('belief-divergence triggers cascade walker', async () => {

@@ -75,40 +75,40 @@ import {
   narrowTransferMode,
   requireLegacyCoinSlot,
   type LegacyCoinTransferRequest,
-} from './transfer/transfer-mode-shims';
+} from '../../extensions/uxf/pipeline/transfer-mode-shims';
 import {
   sendConservativeUxf,
   type ConservativeCommitResult,
   type ConservativeSenderDeps,
   type ConservativeSourceSelection,
   type OutboxCreateInput,
-} from './transfer/conservative-sender';
+} from '../../extensions/uxf/pipeline/conservative-sender';
 import {
   extractPendingChainFromSdkData,
   finalizeSourceTokenChain,
-} from './transfer/conservative-source-finalize';
+} from '../../extensions/uxf/pipeline/conservative-source-finalize';
 import {
   sendInstantUxf,
   type InstantCommitResult,
   type InstantSenderDeps,
   type InstantSourceSelection,
-} from './transfer/instant-sender';
-import type { PublishToIpfsCallback } from './transfer/delivery-resolver';
+} from '../../extensions/uxf/pipeline/instant-sender';
+import type { PublishToIpfsCallback } from '../../extensions/uxf/pipeline/delivery-resolver';
 import {
   sendTxfUxf,
   type TxfCommitResult,
   type TxfFinalization,
   type TxfSenderDeps,
-} from './transfer/txf-sender';
-import { classifyToken as classifyTokenLike } from './transfer/classify-token';
+} from '../../extensions/uxf/pipeline/txf-sender';
+import { classifyToken as classifyTokenLike } from '../../extensions/uxf/pipeline/classify-token';
 import {
   IngestWorkerPool,
   type IngestWorkerPoolOptions,
   type UxfV1Payload,
   type ProcessTokenFn,
-} from './transfer/ingest-worker-pool';
-import type { AcquireBundleCidOptions } from './transfer/bundle-acquirer';
-import { ReplayLRU } from './transfer/replay-lru';
+} from '../../extensions/uxf/pipeline/ingest-worker-pool';
+import type { AcquireBundleCidOptions } from '../../extensions/uxf/pipeline/bundle-acquirer';
+import { ReplayLRU } from '../../extensions/uxf/pipeline/replay-lru';
 import { PerTokenMutex } from '../../profile/per-token-mutex';
 // T.5.D — operator escape hatch (`importInclusionProof` +
 // `revalidateCascadedChildren`). Class types only; the wiring layer
@@ -119,15 +119,15 @@ import {
   type ImportInclusionProofCallOptions,
   type ImportProofResult,
   type ImportableInclusionProof,
-} from './transfer/import-inclusion-proof';
+} from '../../extensions/uxf/pipeline/import-inclusion-proof';
 import {
   RevalidateCascadedRunner,
   type RevalidationResult,
-} from './transfer/revalidate-cascaded';
+} from '../../extensions/uxf/pipeline/revalidate-cascaded';
 // Phase 8 steelman post-cutover — sending-recovery worker. The bootstrap
 // layer (Sphere) wires an instance via `installSendingRecoveryWorker()`;
 // the module starts/stops it gated on `features.recoveryWorker`.
-import { SendingRecoveryWorker } from './transfer/sending-recovery-worker';
+import { SendingRecoveryWorker } from '../../extensions/uxf/pipeline/sending-recovery-worker';
 // Issue #166 P2 #4 — SENT-write reconciliation worker. Auto-installed in
 // `initialize()` when `features.sentReconciliationWorker` is true
 // (default-ON). Retries SENT-ledger writes that failed at the
@@ -137,7 +137,7 @@ import { SendingRecoveryWorker } from './transfer/sending-recovery-worker';
 import {
   SentReconciliationWorker,
   type SentReconciliationWorkerDeps,
-} from './transfer/sent-reconciliation-worker';
+} from '../../extensions/uxf/pipeline/sent-reconciliation-worker';
 // Issue #166 P2 #3 — Nostr persistence verification worker. Auto-installed
 // in `initialize()` when `features.nostrPersistenceVerifier` is true
 // (default-OFF — adds relay query traffic; opt-in until soak-tested).
@@ -147,7 +147,7 @@ import {
   NostrPersistenceVerifier,
   type NostrPersistenceVerifierDeps,
   type VerifyOutcome,
-} from './transfer/nostr-persistence-verifier';
+} from '../../extensions/uxf/pipeline/nostr-persistence-verifier';
 // Issue #174 — per-token spent-state rescan worker
 // (UXF-TRANSFER-PROTOCOL §12.3.2). Auto-installed in `initialize()` when
 // `features.spentStateRescan` is true (default-OFF). Proactively probes
@@ -159,7 +159,7 @@ import {
   SpentStateRescanWorker,
   type SpentStateRescanWorkerDeps,
   type TransitionToAuditFn,
-} from './transfer/spent-state-rescan-worker';
+} from '../../extensions/uxf/pipeline/spent-state-rescan-worker';
 // OUTBOX-SEND-FOLLOWUPS item #4 — tombstone GC worker. Auto-installed in
 // `initialize()` when `features.tombstoneGcWorker` is true. Periodically
 // replaces expired tombstones (older than the configured retention
@@ -167,7 +167,7 @@ import {
 import {
   TombstoneGcWorker,
   type TombstoneGcWorkerDeps,
-} from './transfer/tombstone-gc-worker';
+} from '../../extensions/uxf/pipeline/tombstone-gc-worker';
 // Phase 9.6.D — sender-side §6.1 finalization worker. Auto-installed in
 // `initialize()` when `features.finalizationWorker` is true (default-ON
 // when `senderUxf` is true). Consumer-installed workers (via
@@ -181,7 +181,7 @@ import {
   type RequestContext,
   type SubmitOutcome,
   type PollOutcome,
-} from './transfer/finalization-worker-sender';
+} from '../../extensions/uxf/pipeline/finalization-worker-sender';
 // Task #151 — wired. The recipient worker is auto-instantiated in
 // initialize() with lightweight in-memory adapters (see
 // `buildDefaultFinalizationWorkerRecipient` at the bottom of this file).
@@ -192,18 +192,18 @@ import {
   FinalizationWorkerRecipient,
   type FinalizationDispositionWriter,
   type RevaluateHooksProvider,
-} from './transfer/finalization-worker-recipient';
+} from '../../extensions/uxf/pipeline/finalization-worker-recipient';
 import {
   FinalizationQueue,
   entryIdFor,
   type FinalizationQueueEntry,
-} from './transfer/finalization-queue';
+} from '../../extensions/uxf/pipeline/finalization-queue';
 import {
   CascadeWalker,
   type CascadeManifestScanner,
   type CascadeOutboxScanner,
   type ClassifyTokenLookup,
-} from './transfer/cascade-walker';
+} from '../../extensions/uxf/pipeline/cascade-walker';
 import { ManifestCas, type MinimalManifestStorage } from '../../profile/manifest-cas';
 // Round 5 (FIX 1) — production-wired default importer/runner for the
 // operator escape hatch. Uses lightweight in-memory adapters mirroring
@@ -219,8 +219,8 @@ import {
 import { ManifestStore } from '../../profile/manifest-store';
 import { Lamport } from '../../profile/lamport';
 import type { TokenManifestEntry } from '../../profile/token-manifest';
-import type { CascadeManifestScanner as CascadeManifestScannerForRevalidate } from './transfer/cascade-walker';
-import type { ProofVerifyStatus } from './transfer/proof-verifier';
+import type { CascadeManifestScanner as CascadeManifestScannerForRevalidate } from '../../extensions/uxf/pipeline/cascade-walker';
+import type { ProofVerifyStatus } from '../../extensions/uxf/pipeline/proof-verifier';
 import { contentHash, type ContentHash } from '../../extensions/uxf/bundle/types';
 import { isLegacyTokenTransferPayload, type UxfTransferPayload } from '../../types/uxf-transfer';
 import { carBytesToBase64 } from '../../extensions/uxf/bundle/transfer-payload';
@@ -232,11 +232,11 @@ import {
   sweepOrphanSpendingTokens,
   type OrphanSweepResult,
   type OrphanSpendingFinding,
-} from './transfer/orphan-spending-sweeper';
+} from '../../extensions/uxf/pipeline/orphan-spending-sweeper';
 import {
   resolveSenderInfoViaBinding,
   type ReresolvedNametagSource,
-} from './transfer/nametag-reresolver';
+} from '../../extensions/uxf/pipeline/nametag-reresolver';
 
 /**
  * Narrow guard for the UXF v1.0 wire shapes accepted by the
@@ -2041,7 +2041,7 @@ export class PaymentsModule {
       // surface itself, so we can't reach `this.writeSentEntryFromOutbox`
       // from there. Pre-bind at closure construction time.
       const writeSentEntryFromOutbox = this.writeSentEntryFromOutbox.bind(this);
-      const recoveryDeps: import('./transfer/sending-recovery-worker').SendingRecoveryWorkerDeps = {
+      const recoveryDeps: import('../../extensions/uxf/pipeline/sending-recovery-worker').SendingRecoveryWorkerDeps = {
         outbox: {
           async readAllNew(): Promise<ReadonlyArray<UxfTransferOutboxEntry>> {
             const writer = getOutboxWriter();
@@ -4893,7 +4893,7 @@ export class PaymentsModule {
    * @internal
    */
   private _recipientFinalizationQueueStorage:
-    | import('./transfer/finalization-queue').FinalizationQueueStorage
+    | import('../../extensions/uxf/pipeline/finalization-queue').FinalizationQueueStorage
     | null = null;
 
   /**
@@ -4950,7 +4950,7 @@ export class PaymentsModule {
    * ProfileDatabase.
    */
   configureRecipientPersistedStorage(opts: {
-    readonly finalizationQueueStorage?: import('./transfer/finalization-queue').FinalizationQueueStorage;
+    readonly finalizationQueueStorage?: import('../../extensions/uxf/pipeline/finalization-queue').FinalizationQueueStorage;
     readonly recipientContextStorage?:
       | import('../../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
       | import('../../profile/finalization-queue-storage-adapter').InMemoryRecipientContextStorageAdapter;
@@ -5008,9 +5008,9 @@ export class PaymentsModule {
   configureOperatorEscapeHatchStorage(
     dispositionStorage: import('../../profile/disposition-writer').DispositionPerEntryStorage,
     options?: {
-      readonly verifyProof?: import('./transfer/import-inclusion-proof').ProofVerifier;
-      readonly graftCallback?: import('./transfer/import-inclusion-proof').ImportProofGraftCallback;
-      readonly overrideCallback?: import('./transfer/import-inclusion-proof').ImportProofOverrideCallback;
+      readonly verifyProof?: import('../../extensions/uxf/pipeline/import-inclusion-proof').ProofVerifier;
+      readonly graftCallback?: import('../../extensions/uxf/pipeline/import-inclusion-proof').ImportProofGraftCallback;
+      readonly overrideCallback?: import('../../extensions/uxf/pipeline/import-inclusion-proof').ImportProofOverrideCallback;
     },
   ): void {
     this.ensureInitialized();
@@ -18182,12 +18182,12 @@ export function buildDefaultFinalizationWorkerSender(opts: {
   };
 
   // In-memory pool read adapter.
-  const poolProofs = new Map<string, import('./transfer/finalization-worker-base').AnchoredProofDescriptor>();
+  const poolProofs = new Map<string, import('../../extensions/uxf/pipeline/finalization-worker-base').AnchoredProofDescriptor>();
   const poolRead = {
     async getAttachedProof(
       tokenId: string,
       reqId: string,
-    ): Promise<import('./transfer/finalization-worker-base').AnchoredProofDescriptor | null> {
+    ): Promise<import('../../extensions/uxf/pipeline/finalization-worker-base').AnchoredProofDescriptor | null> {
       return poolProofs.get(`${tokenId}:${reqId}`) ?? null;
     },
   };
@@ -18287,7 +18287,7 @@ export function buildDefaultFinalizationWorkerSender(opts: {
         // degenerate case where proofJson is null/undefined entirely
         // (which should not happen given the upstream shape validation,
         // but keeps the descriptor a valid string for type safety).
-        const descriptor: import('./transfer/finalization-worker-base').AnchoredProofDescriptor = {
+        const descriptor: import('../../extensions/uxf/pipeline/finalization-worker-base').AnchoredProofDescriptor = {
           transactionHash: proofTxHash ?? proof.requestId,
           authenticator: proofAuthenticator,
           roundNumber: proof.roundNumber,
@@ -18428,7 +18428,7 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
    * here when a Profile-backed storage stack is detected, closing the
    * cross-restart safety net for the recipient worker.
    */
-  readonly finalizationQueueStorage?: import('./transfer/finalization-queue').FinalizationQueueStorage;
+  readonly finalizationQueueStorage?: import('../../extensions/uxf/pipeline/finalization-queue').FinalizationQueueStorage;
 }): {
   worker: FinalizationWorkerRecipient;
   queue: FinalizationQueue;
@@ -18463,7 +18463,7 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
   // backed) over the in-memory shim. Sphere wires the persisted form
   // when a ProfileStorageProvider is present; legacy callers fall back
   // to the in-memory map (loss-prone across Sphere.destroy()/restart).
-  let queueStorage: import('./transfer/finalization-queue').FinalizationQueueStorage;
+  let queueStorage: import('../../extensions/uxf/pipeline/finalization-queue').FinalizationQueueStorage;
   if (finalizationQueueStorage !== undefined) {
     queueStorage = finalizationQueueStorage;
   } else {
@@ -18509,7 +18509,7 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
   const proofAttached = new Set<string>();
   const poolProofs = new Map<
     string,
-    import('./transfer/finalization-worker-base').AnchoredProofDescriptor
+    import('../../extensions/uxf/pipeline/finalization-worker-base').AnchoredProofDescriptor
   >();
   const pool = {
     async isProofAttached(tokenId: string, reqId: string): Promise<boolean> {
@@ -18524,7 +18524,7 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
       tokenId: string,
       reqId: string,
     ): Promise<
-      import('./transfer/finalization-worker-base').AnchoredProofDescriptor | null
+      import('../../extensions/uxf/pipeline/finalization-worker-base').AnchoredProofDescriptor | null
     > {
       return poolProofs.get(`${tokenId}:${reqId}`) ?? null;
     },
@@ -18603,7 +18603,7 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
           proofJson !== null && proofJson !== undefined && proofJson.authenticator !== undefined && proofJson.authenticator !== null
             ? JSON.stringify(proofJson.authenticator)
             : '';
-        const descriptor: import('./transfer/finalization-worker-base').AnchoredProofDescriptor = {
+        const descriptor: import('../../extensions/uxf/pipeline/finalization-worker-base').AnchoredProofDescriptor = {
           transactionHash: proofTxHash ?? proof.requestId,
           authenticator: proofAuthenticator,
           roundNumber: proof.roundNumber,
@@ -19083,7 +19083,7 @@ export function buildDefaultInclusionProofImporter(opts: {
    * (preserves the Round 7 default-safe semantics for callers without
    * a wired oracle).
    */
-  readonly verifyProof?: import('./transfer/import-inclusion-proof').ProofVerifier;
+  readonly verifyProof?: import('../../extensions/uxf/pipeline/import-inclusion-proof').ProofVerifier;
   /**
    * Round 8 (FIX 1) — Optional production-grade graft callback. When
    * passed, case 3 (pending-graft) drives the §5.5 step 5 4-step write
@@ -19093,7 +19093,7 @@ export function buildDefaultInclusionProofImporter(opts: {
    * in the auto-installed default; bootstrap layers that wire a real
    * `queueScanner` (alongside this callback) close the production gap.
    */
-  readonly graftCallback?: import('./transfer/import-inclusion-proof').ImportProofGraftCallback;
+  readonly graftCallback?: import('../../extensions/uxf/pipeline/import-inclusion-proof').ImportProofGraftCallback;
   /**
    * Round 8 (FIX 1) — Optional production-grade override callback.
    * When passed, cases 5 / 6 (operator override of `_invalid`) drive
@@ -19101,7 +19101,7 @@ export function buildDefaultInclusionProofImporter(opts: {
    * no-op stub stays in place — same reachability caveat as
    * `graftCallback` above.
    */
-  readonly overrideCallback?: import('./transfer/import-inclusion-proof').ImportProofOverrideCallback;
+  readonly overrideCallback?: import('../../extensions/uxf/pipeline/import-inclusion-proof').ImportProofOverrideCallback;
 }): InclusionProofImporter {
   const { emit } = opts;
 

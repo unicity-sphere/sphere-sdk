@@ -39,7 +39,7 @@
  */
 
 import { pinCarBlocksToIpfs } from '../../../profile/ipfs-client.js';
-import { extractCarRootCid } from '../../../extensions/uxf/bundle/transfer-payload.js';
+import { extractCarRootCid } from '../bundle/transfer-payload.js';
 
 import type {
   PublishToIpfsCallback,

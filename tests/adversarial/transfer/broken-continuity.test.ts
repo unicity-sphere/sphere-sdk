@@ -36,7 +36,7 @@ import { describe, it, expect } from 'vitest';
 import {
   walkContinuity,
   type TxLike,
-} from '../../../modules/payments/transfer/continuity-walker';
+} from '../../../extensions/uxf/pipeline/continuity-walker';
 
 // =============================================================================
 // Adversarial chain construction

@@ -30,7 +30,7 @@ import {
   SentReconciliationWorker,
   type SentReconciliationWorkerDeps,
   type WriteSentEntryFn,
-} from '../../../../modules/payments/transfer/sent-reconciliation-worker';
+} from '../../../../extensions/uxf/pipeline/sent-reconciliation-worker';
 import type { OutboxWriter } from '../../../../profile/outbox-writer';
 import type { SentLedgerWriter } from '../../../../profile/sent-ledger-writer';
 import type { SphereEventMap, SphereEventType } from '../../../../types';

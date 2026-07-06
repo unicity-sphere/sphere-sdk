@@ -39,8 +39,8 @@ import { ProfileError } from '../../../../profile/errors';
 import {
   acquireBundle,
   __clearInflightForTests,
-} from '../../../../modules/payments/transfer/bundle-acquirer';
-import { ReplayLRU } from '../../../../modules/payments/transfer/replay-lru';
+} from '../../../../extensions/uxf/pipeline/bundle-acquirer';
+import { ReplayLRU } from '../../../../extensions/uxf/pipeline/replay-lru';
 import type { UxfTransferPayloadCid } from '../../../../types/uxf-transfer';
 
 const SENDER = 'a'.repeat(64);

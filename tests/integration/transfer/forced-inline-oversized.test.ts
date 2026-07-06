@@ -25,9 +25,9 @@ import {
   sendConservativeUxf,
   type ConservativeCommitResult,
   type ConservativeSenderDeps,
-} from '../../../modules/payments/transfer/conservative-sender';
-import { RELAY_SAFE_CAP_BYTES } from '../../../modules/payments/transfer/limits';
-import type { PreflightFinalizeOptions } from '../../../modules/payments/transfer/preflight-finalize';
+} from '../../../extensions/uxf/pipeline/conservative-sender';
+import { RELAY_SAFE_CAP_BYTES } from '../../../extensions/uxf/pipeline/limits';
+import type { PreflightFinalizeOptions } from '../../../extensions/uxf/pipeline/preflight-finalize';
 import type { TransferRequest } from '../../../types';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 

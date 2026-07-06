@@ -29,8 +29,8 @@ import {
   sendInstantUxf,
   type InstantCommitResult,
   type InstantSenderDeps,
-} from '../../../../modules/payments/transfer/instant-sender';
-import type { TokenLike } from '../../../../modules/payments/transfer/classify-token';
+} from '../../../../extensions/uxf/pipeline/instant-sender';
+import type { TokenLike } from '../../../../extensions/uxf/pipeline/classify-token';
 import { isSphereError } from '../../../../core/errors';
 import type { OracleProvider } from '../../../../oracle/oracle-provider';
 import type { TransportProvider } from '../../../../transport';

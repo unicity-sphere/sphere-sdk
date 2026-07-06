@@ -15,7 +15,7 @@ import {
   type CascadeCycleWarning,
   type CascadeScannerError,
   type ClassifyTokenLookup,
-} from '../../../../modules/payments/transfer/cascade-walker';
+} from '../../../../extensions/uxf/pipeline/cascade-walker';
 import {
   ManifestCas,
   type MinimalManifestStorage,

@@ -26,7 +26,7 @@ import {
   extractPendingChainFromSdkData,
   extractPendingSourceChain,
   finalizeSourceTokenChain,
-} from '../../../../modules/payments/transfer/conservative-source-finalize';
+} from '../../../../extensions/uxf/pipeline/conservative-source-finalize';
 import type { OracleProvider } from '../../../../oracle/oracle-provider';
 import type { Token } from '../../../../types';
 

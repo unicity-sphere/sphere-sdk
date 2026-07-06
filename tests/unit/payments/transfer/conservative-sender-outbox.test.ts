@@ -31,7 +31,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
-import { AUTOMATED_CID_DELIVERY_ENABLED } from '../../../../modules/payments/transfer/limits';
+import { AUTOMATED_CID_DELIVERY_ENABLED } from '../../../../extensions/uxf/pipeline/limits';
 // Issue #393 — gate auto-CID-promotion tests on the kill-switch.
 const ifAutoCid = AUTOMATED_CID_DELIVERY_ENABLED ? it : it.skip;
 
@@ -42,10 +42,10 @@ import {
   type OutboxCreateInput,
   type OutboxIntegrationHooks,
   type OutboxTransitionPatch,
-} from '../../../../modules/payments/transfer/conservative-sender';
-import type { PreflightFinalizeOptions } from '../../../../modules/payments/transfer/preflight-finalize';
-import type { TokenLike } from '../../../../modules/payments/transfer/classify-token';
-import type { PublishToIpfsCallback } from '../../../../modules/payments/transfer/delivery-resolver';
+} from '../../../../extensions/uxf/pipeline/conservative-sender';
+import type { PreflightFinalizeOptions } from '../../../../extensions/uxf/pipeline/preflight-finalize';
+import type { TokenLike } from '../../../../extensions/uxf/pipeline/classify-token';
+import type { PublishToIpfsCallback } from '../../../../extensions/uxf/pipeline/delivery-resolver';
 import { isSphereError } from '../../../../core/errors';
 import { Lamport } from '../../../../profile/lamport';
 import { OutboxWriter } from '../../../../profile/outbox-writer';

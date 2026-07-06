@@ -25,7 +25,7 @@ import {
   SendingRecoveryWorker,
   type RepublishFn,
   type SendingRecoveryWorkerDeps,
-} from '../../../../modules/payments/transfer/sending-recovery-worker';
+} from '../../../../extensions/uxf/pipeline/sending-recovery-worker';
 import type { OutboxWriter } from '../../../../profile/outbox-writer';
 import type {
   SphereEventMap,

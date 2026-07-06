@@ -31,7 +31,7 @@ import { describe, it, expect } from 'vitest';
 import type { Authenticator } from '@unicitylabs/state-transition-sdk/lib/api/Authenticator';
 import type { DataHash } from '@unicitylabs/state-transition-sdk/lib/hash/DataHash';
 
-import { verifyAuthenticator } from '../../../modules/payments/transfer/authenticator-verifier';
+import { verifyAuthenticator } from '../../../extensions/uxf/pipeline/authenticator-verifier';
 
 // =============================================================================
 // Adversarial chain construction

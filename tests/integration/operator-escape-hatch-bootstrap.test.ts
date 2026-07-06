@@ -43,7 +43,7 @@ import { vi } from 'vitest';
 import { Sphere } from '../../core/Sphere';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenStorageProvider';
-import { InclusionProofImporter } from '../../modules/payments/transfer/import-inclusion-proof';
+import { InclusionProofImporter } from '../../extensions/uxf/pipeline/import-inclusion-proof';
 import type { TransportProvider, OracleProvider } from '../../index';
 import type { ProviderStatus } from '../../types';
 

@@ -42,8 +42,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   acquireBundle,
   isReplayOutcome,
-} from '../../../modules/payments/transfer/bundle-acquirer';
-import { ReplayLRU } from '../../../modules/payments/transfer/replay-lru';
+} from '../../../extensions/uxf/pipeline/bundle-acquirer';
+import { ReplayLRU } from '../../../extensions/uxf/pipeline/replay-lru';
 import {
   carBytesToBase64,
   extractCarRootCid,

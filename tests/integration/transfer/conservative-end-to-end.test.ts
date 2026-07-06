@@ -22,14 +22,14 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { isReplayOutcome, acquireBundle } from '../../../modules/payments/transfer/bundle-acquirer';
+import { isReplayOutcome, acquireBundle } from '../../../extensions/uxf/pipeline/bundle-acquirer';
 import {
   sendConservativeUxf,
   type ConservativeCommitResult,
   type ConservativeSenderDeps,
-} from '../../../modules/payments/transfer/conservative-sender';
-import type { PreflightFinalizeOptions } from '../../../modules/payments/transfer/preflight-finalize';
-import { ReplayLRU } from '../../../modules/payments/transfer/replay-lru';
+} from '../../../extensions/uxf/pipeline/conservative-sender';
+import type { PreflightFinalizeOptions } from '../../../extensions/uxf/pipeline/preflight-finalize';
+import { ReplayLRU } from '../../../extensions/uxf/pipeline/replay-lru';
 import type {
   UxfTransferPayload,
   UxfTransferPayloadCar,

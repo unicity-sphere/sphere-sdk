@@ -34,14 +34,14 @@ import {
   type FinalizationQueueEnqueuer,
   type LegacyShapeAdapterInput,
   type LegacyTokenEntry,
-} from '../../../../modules/payments/transfer/legacy-shape-adapter';
-import type { ContinuityResult, TxLike } from '../../../../modules/payments/transfer/continuity-walker';
-import type { EvaluatePredicateResult } from '../../../../modules/payments/transfer/predicate-evaluator';
-import type { ProofVerifyStatus } from '../../../../modules/payments/transfer/proof-verifier';
-import type { VerifyAuthenticatorResult } from '../../../../modules/payments/transfer/authenticator-verifier';
+} from '../../../../extensions/uxf/pipeline/legacy-shape-adapter';
+import type { ContinuityResult, TxLike } from '../../../../extensions/uxf/pipeline/continuity-walker';
+import type { EvaluatePredicateResult } from '../../../../extensions/uxf/pipeline/predicate-evaluator';
+import type { ProofVerifyStatus } from '../../../../extensions/uxf/pipeline/proof-verifier';
+import type { VerifyAuthenticatorResult } from '../../../../extensions/uxf/pipeline/authenticator-verifier';
 import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 import type { LegacyTokenTransferPayload } from '../../../../types/uxf-transfer';
-import type { FinalizationQueueEntry } from '../../../../modules/payments/transfer/finalization-queue';
+import type { FinalizationQueueEntry } from '../../../../extensions/uxf/pipeline/finalization-queue';
 
 // =============================================================================
 // 1. Common fixtures

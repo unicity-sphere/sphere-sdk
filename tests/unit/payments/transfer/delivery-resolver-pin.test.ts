@@ -24,12 +24,12 @@ import {
   resolveDelivery,
   type PublishToIpfsCallback,
   type PublishToIpfsResult,
-} from '../../../../modules/payments/transfer/delivery-resolver';
+} from '../../../../extensions/uxf/pipeline/delivery-resolver';
 import {
   AUTOMATED_CID_DELIVERY_ENABLED,
   MAX_INLINE_CAR_BYTES,
   RELAY_SAFE_CAP_BYTES,
-} from '../../../../modules/payments/transfer/limits';
+} from '../../../../extensions/uxf/pipeline/limits';
 // Issue #393 — gate auto-CID-promotion tests on the kill-switch.
 const ifAutoCid = AUTOMATED_CID_DELIVERY_ENABLED ? it : it.skip;
 

@@ -1397,7 +1397,7 @@ describe('Wave 6 — REAL UXF round-trip: pkg.ingestAll → toCar → fromCar �
     // The importer must succeed via transactionHash-only binding.
     const {
       InclusionProofImporter,
-    } = await import('../../../modules/payments/transfer/import-inclusion-proof');
+    } = await import('../../../extensions/uxf/pipeline/import-inclusion-proof');
 
     const TOKEN_HEX = 'aa'.repeat(32);
     const REQ_ID = 'rq-wave6';
@@ -1473,7 +1473,7 @@ describe('Wave 6 — REAL UXF round-trip: pkg.ingestAll → toCar → fromCar �
     // MUST fail the binding.
     const {
       InclusionProofImporter,
-    } = await import('../../../modules/payments/transfer/import-inclusion-proof');
+    } = await import('../../../extensions/uxf/pipeline/import-inclusion-proof');
 
     const TOKEN_HEX = 'bb'.repeat(32);
     const REQ_ID = 'rq-wave6-tx-mm';

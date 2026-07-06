@@ -39,7 +39,7 @@ import {
   SpentStateRescanWorker,
   type SpentStateRescanWorkerDeps,
   type TransitionToAuditFn,
-} from '../../../modules/payments/transfer/spent-state-rescan-worker';
+} from '../../../extensions/uxf/pipeline/spent-state-rescan-worker';
 import { OutboxWriter } from '../../../profile/outbox-writer';
 import { SentLedgerWriter } from '../../../profile/sent-ledger-writer';
 import { Lamport } from '../../../profile/lamport';

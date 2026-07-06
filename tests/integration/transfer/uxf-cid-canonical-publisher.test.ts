@@ -29,7 +29,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AUTOMATED_CID_DELIVERY_ENABLED } from '../../../modules/payments/transfer/limits';
+import { AUTOMATED_CID_DELIVERY_ENABLED } from '../../../extensions/uxf/pipeline/limits';
 // Issue #393 — gate auto-CID-promotion tests on the kill-switch.
 const ifAutoCid = AUTOMATED_CID_DELIVERY_ENABLED ? it : it.skip;
 
@@ -37,9 +37,9 @@ import {
   sendConservativeUxf,
   type ConservativeCommitResult,
   type ConservativeSenderDeps,
-} from '../../../modules/payments/transfer/conservative-sender';
-import { createUxfCarPublisher } from '../../../modules/payments/transfer/ipfs-publisher';
-import type { PreflightFinalizeOptions } from '../../../modules/payments/transfer/preflight-finalize';
+} from '../../../extensions/uxf/pipeline/conservative-sender';
+import { createUxfCarPublisher } from '../../../extensions/uxf/pipeline/ipfs-publisher';
+import type { PreflightFinalizeOptions } from '../../../extensions/uxf/pipeline/preflight-finalize';
 import type { TransferRequest } from '../../../types';
 import type { UxfTransferPayloadCid } from '../../../types/uxf-transfer';
 import { extractCarRootCid } from '../../../extensions/uxf/bundle/transfer-payload';

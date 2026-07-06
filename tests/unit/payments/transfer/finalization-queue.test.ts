@@ -19,7 +19,7 @@ import {
   prefixFor,
   type FinalizationQueueEntry,
   type FinalizationQueueStorage,
-} from '../../../../modules/payments/transfer/finalization-queue';
+} from '../../../../extensions/uxf/pipeline/finalization-queue';
 
 const ADDR = 'DIRECT://addr-A';
 const TOKEN_A = 'token-aaaa';

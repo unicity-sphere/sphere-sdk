@@ -32,7 +32,7 @@ import {
   makeQueueEntry,
   seedQueue,
 } from './finalization-worker-recipient-fixtures';
-import { entryIdFor } from '../../../../modules/payments/transfer/finalization-queue';
+import { entryIdFor } from '../../../../extensions/uxf/pipeline/finalization-queue';
 
 describe('FinalizationWorkerRecipient — single queue entry success path', () => {
   it('K=1: submit + poll OK + attach proof + queue drained → VALID', async () => {
@@ -709,7 +709,7 @@ describe('FinalizationWorkerRecipient — RECIPIENT_SCAN_LIST_HARD_GUARD truncat
     // synthetic entries every cycle. We use the recipient's exposed
     // constant via a probe import below.
     const { RECIPIENT_SCAN_LIST_HARD_GUARD } = await import(
-      '../../../../modules/payments/transfer/finalization-worker-recipient'
+      '../../../../extensions/uxf/pipeline/finalization-worker-recipient'
     );
     const stubEntries = Array.from(
       { length: RECIPIENT_SCAN_LIST_HARD_GUARD + 1 },
@@ -773,7 +773,7 @@ describe('FinalizationWorkerRecipient — Wave 7 emit-if-emitted recovery semant
   it('Wave 7: single-cycle flap (streak=1) emits paired alert AND recovery', async () => {
     const harness = buildWorker({ sleepFn: yieldingSleep });
     const { RECIPIENT_SCAN_LIST_HARD_GUARD } = await import(
-      '../../../../modules/payments/transfer/finalization-worker-recipient'
+      '../../../../extensions/uxf/pipeline/finalization-worker-recipient'
     );
     const oversizeBatch = Array.from(
       { length: RECIPIENT_SCAN_LIST_HARD_GUARD + 1 },
@@ -827,7 +827,7 @@ describe('FinalizationWorkerRecipient — Wave 7 emit-if-emitted recovery semant
   it('Wave 7: oversize recovery alert fires for sustained streak (>= 4)', async () => {
     const harness = buildWorker({ sleepFn: yieldingSleep });
     const { RECIPIENT_SCAN_LIST_HARD_GUARD } = await import(
-      '../../../../modules/payments/transfer/finalization-worker-recipient'
+      '../../../../extensions/uxf/pipeline/finalization-worker-recipient'
     );
     const oversizeBatch = Array.from(
       { length: RECIPIENT_SCAN_LIST_HARD_GUARD + 1 },

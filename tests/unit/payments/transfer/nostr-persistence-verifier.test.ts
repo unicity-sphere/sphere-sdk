@@ -24,7 +24,7 @@ import {
   type OutboxWriterProvider,
   type VerifyOutcome,
   type VerifySentEntryFn,
-} from '../../../../modules/payments/transfer/nostr-persistence-verifier';
+} from '../../../../extensions/uxf/pipeline/nostr-persistence-verifier';
 import type { OutboxWriter } from '../../../../profile/outbox-writer';
 import type { SentLedgerWriter } from '../../../../profile/sent-ledger-writer';
 import type { SphereEventMap, SphereEventType } from '../../../../types';

@@ -21,11 +21,11 @@
 
 import { describe, it, expect } from 'vitest';
 
-import { resolveDelivery } from '../../../../modules/payments/transfer/delivery-resolver';
+import { resolveDelivery } from '../../../../extensions/uxf/pipeline/delivery-resolver';
 import {
   AUTOMATED_CID_DELIVERY_ENABLED,
   RELAY_SAFE_CAP_BYTES,
-} from '../../../../modules/payments/transfer/limits';
+} from '../../../../extensions/uxf/pipeline/limits';
 import { SphereError } from '../../../../core/errors';
 
 // =============================================================================

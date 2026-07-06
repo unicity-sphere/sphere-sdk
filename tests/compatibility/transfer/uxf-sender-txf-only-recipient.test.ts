@@ -70,7 +70,7 @@ import { describe, expect, it } from 'vitest';
 import {
   adaptLegacyShape,
   classifyLegacyShape,
-} from '../../../modules/payments/transfer/legacy-shape-adapter';
+} from '../../../extensions/uxf/pipeline/legacy-shape-adapter';
 import { isSphereError } from '../../../core/errors';
 import {
   isLegacyTokenTransferPayload,
@@ -86,10 +86,10 @@ import {
   extractCarRootCid,
 } from '../../../extensions/uxf/bundle/transfer-payload';
 import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
-import type { ContinuityResult, TxLike } from '../../../modules/payments/transfer/continuity-walker';
-import type { EvaluatePredicateResult } from '../../../modules/payments/transfer/predicate-evaluator';
-import type { ProofVerifyStatus } from '../../../modules/payments/transfer/proof-verifier';
-import type { VerifyAuthenticatorResult } from '../../../modules/payments/transfer/authenticator-verifier';
+import type { ContinuityResult, TxLike } from '../../../extensions/uxf/pipeline/continuity-walker';
+import type { EvaluatePredicateResult } from '../../../extensions/uxf/pipeline/predicate-evaluator';
+import type { ProofVerifyStatus } from '../../../extensions/uxf/pipeline/proof-verifier';
+import type { VerifyAuthenticatorResult } from '../../../extensions/uxf/pipeline/authenticator-verifier';
 
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 

@@ -9,7 +9,7 @@
  * `features.senderUxf === true` AND `request.transferMode` is
  * `undefined`, the dispatcher in
  * {@link PaymentsModule#send} routes the call to
- * {@link import('../../../modules/payments/transfer/instant-sender').sendInstantUxf}
+ * {@link import('../../../extensions/uxf/pipeline/instant-sender').sendInstantUxf}
  * which emits a UXF bundle (`uxf-cid` wire shape per §3.1).
  *
  * The actual flip happens inside two existing dispatcher arms (T.5.A
@@ -55,7 +55,7 @@
 import { describe, it, expect, vi } from 'vitest';
 
 import { PaymentsModule } from '../../../modules/payments/PaymentsModule';
-import { narrowTransferMode } from '../../../modules/payments/transfer/transfer-mode-shims';
+import { narrowTransferMode } from '../../../extensions/uxf/pipeline/transfer-mode-shims';
 import type { TransferMode, TransferRequest, TransferResult } from '../../../types';
 
 // =============================================================================

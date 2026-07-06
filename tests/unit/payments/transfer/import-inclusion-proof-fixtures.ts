@@ -20,7 +20,7 @@ import {
   type ImportProofQueueScanner,
   type ImportableInclusionProof,
   type ProofVerifier,
-} from '../../../../modules/payments/transfer/import-inclusion-proof';
+} from '../../../../extensions/uxf/pipeline/import-inclusion-proof';
 import { PerTokenMutex } from '../../../../profile/per-token-mutex';
 import type { PerTokenMutexStrategy } from '../../../../profile/per-token-mutex';
 import {
@@ -30,7 +30,7 @@ import {
   type RevalidateCascadedOptions,
   type RevalidationCycleWarning,
   type RevalidationScannerError,
-} from '../../../../modules/payments/transfer/revalidate-cascaded';
+} from '../../../../extensions/uxf/pipeline/revalidate-cascaded';
 import { ManifestStore } from '../../../../profile/manifest-store';
 import { ManifestCas } from '../../../../profile/manifest-cas';
 import { Lamport } from '../../../../profile/lamport';
@@ -39,8 +39,8 @@ import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 import type { TokenManifestEntry } from '../../../../profile/token-manifest';
 import type {
   CascadeManifestScanner,
-} from '../../../../modules/payments/transfer/cascade-walker';
-import type { ProofVerifyStatus } from '../../../../modules/payments/transfer/proof-verifier';
+} from '../../../../extensions/uxf/pipeline/cascade-walker';
+import type { ProofVerifyStatus } from '../../../../extensions/uxf/pipeline/proof-verifier';
 import type {
   AuditEntry,
   DispositionReason,
@@ -394,7 +394,7 @@ export function buildRevalidatorHarness(args: {
    * need `findChildren` to throw deterministically.
    */
   readonly manifestScannerOverride?: import(
-    '../../../../modules/payments/transfer/cascade-walker'
+    '../../../../extensions/uxf/pipeline/cascade-walker'
   ).CascadeManifestScanner;
 } = {}): RevalidatorHarness {
   const manifest = makeFakeManifestStorage();

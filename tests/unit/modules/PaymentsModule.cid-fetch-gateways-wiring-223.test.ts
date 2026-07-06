@@ -21,8 +21,8 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createPaymentsModule } from '../../../modules/payments/PaymentsModule';
-import type { IngestWorkerPool } from '../../../modules/payments/transfer/ingest-worker-pool';
-import type { AcquireBundleCidOptions } from '../../../modules/payments/transfer/bundle-acquirer';
+import type { IngestWorkerPool } from '../../../extensions/uxf/pipeline/ingest-worker-pool';
+import type { AcquireBundleCidOptions } from '../../../extensions/uxf/pipeline/bundle-acquirer';
 import type { FullIdentity } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import type { TransportProvider } from '../../../transport';

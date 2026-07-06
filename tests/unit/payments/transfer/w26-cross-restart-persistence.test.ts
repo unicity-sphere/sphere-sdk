@@ -24,7 +24,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { POLLING_WINDOW_MS } from '../../../../modules/payments/transfer/limits';
+import { POLLING_WINDOW_MS } from '../../../../extensions/uxf/pipeline/limits';
 import {
   buildWorker,
   makeFakeAggregator,

@@ -29,7 +29,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { verifyBundleStructure } from '../../../../modules/payments/transfer/bundle-verifier';
+import { verifyBundleStructure } from '../../../../extensions/uxf/pipeline/bundle-verifier';
 import type { UxfTransferPayloadCar } from '../../../../types/uxf-transfer';
 import { UxfPackage } from '../../../../extensions/uxf/bundle/UxfPackage';
 import {

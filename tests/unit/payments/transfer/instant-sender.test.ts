@@ -36,9 +36,9 @@ import {
   type InstantCommitResult,
   type InstantSenderDeps,
   type InstantOutboxHooks,
-} from '../../../../modules/payments/transfer/instant-sender';
-import type { TokenLike } from '../../../../modules/payments/transfer/classify-token';
-import type { PublishToIpfsCallback } from '../../../../modules/payments/transfer/delivery-resolver';
+} from '../../../../extensions/uxf/pipeline/instant-sender';
+import type { TokenLike } from '../../../../extensions/uxf/pipeline/classify-token';
+import type { PublishToIpfsCallback } from '../../../../extensions/uxf/pipeline/delivery-resolver';
 import { isSphereError } from '../../../../core/errors';
 import type { OracleProvider } from '../../../../oracle/oracle-provider';
 import type { TransportProvider } from '../../../../transport';

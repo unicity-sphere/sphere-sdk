@@ -46,7 +46,7 @@ import {
   POLLING_WINDOW_MS,
   MIN_POLL_ATTEMPTS,
   isPollingTimedOut,
-} from '../../../modules/payments/transfer/polling-policy';
+} from '../../../extensions/uxf/pipeline/polling-policy';
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 

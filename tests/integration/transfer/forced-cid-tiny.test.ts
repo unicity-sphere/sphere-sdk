@@ -24,12 +24,12 @@ import {
   sendConservativeUxf,
   type ConservativeCommitResult,
   type ConservativeSenderDeps,
-} from '../../../modules/payments/transfer/conservative-sender';
+} from '../../../extensions/uxf/pipeline/conservative-sender';
 import type {
   PublishToIpfsCallback,
   PublishToIpfsResult,
-} from '../../../modules/payments/transfer/delivery-resolver';
-import type { PreflightFinalizeOptions } from '../../../modules/payments/transfer/preflight-finalize';
+} from '../../../extensions/uxf/pipeline/delivery-resolver';
+import type { PreflightFinalizeOptions } from '../../../extensions/uxf/pipeline/preflight-finalize';
 import type { TransferRequest } from '../../../types';
 import type {
   UxfTransferPayloadCar,

@@ -27,7 +27,7 @@ import {
   makeFakeAggregator,
   makeOutboxEntry,
 } from './finalization-worker-sender-fixtures';
-import { POLLING_WINDOW_MS, MIN_POLL_ATTEMPTS } from '../../../../modules/payments/transfer/limits';
+import { POLLING_WINDOW_MS, MIN_POLL_ATTEMPTS } from '../../../../extensions/uxf/pipeline/limits';
 
 describe('§5.5 step 6 — 2× POLLING_WINDOW hard safety net (W26)', () => {
   it('terminates with oracle-rejected after 2× window even when MIN_POLL_ATTEMPTS is starved', async () => {

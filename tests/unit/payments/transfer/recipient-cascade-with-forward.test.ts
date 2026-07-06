@@ -29,7 +29,7 @@ import {
   CascadeWalker,
   type CascadeManifestScanner,
   type CascadeOutboxScanner,
-} from '../../../../modules/payments/transfer/cascade-walker';
+} from '../../../../extensions/uxf/pipeline/cascade-walker';
 import { ManifestCas } from '../../../../profile/manifest-cas';
 import {
   ADDR,

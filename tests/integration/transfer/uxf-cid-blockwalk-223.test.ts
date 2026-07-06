@@ -47,8 +47,8 @@ import { CarReader } from '@ipld/car';
 import {
   acquireBundle,
   isReplayOutcome,
-} from '../../../modules/payments/transfer/bundle-acquirer';
-import { ReplayLRU } from '../../../modules/payments/transfer/replay-lru';
+} from '../../../extensions/uxf/pipeline/bundle-acquirer';
+import { ReplayLRU } from '../../../extensions/uxf/pipeline/replay-lru';
 import { isSphereError } from '../../../core/errors';
 import type { UxfTransferPayloadCid } from '../../../types/uxf-transfer';
 import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';

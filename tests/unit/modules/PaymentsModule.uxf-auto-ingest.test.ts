@@ -24,10 +24,10 @@ import {
 import {
   IngestWorkerPool,
   type UxfV1Payload,
-} from '../../../modules/payments/transfer/ingest-worker-pool';
-import { ReplayLRU } from '../../../modules/payments/transfer/replay-lru';
+} from '../../../extensions/uxf/pipeline/ingest-worker-pool';
+import { ReplayLRU } from '../../../extensions/uxf/pipeline/replay-lru';
 import { PerTokenMutex } from '../../../profile/per-token-mutex';
-import type { RootRef, VerifiedBundle } from '../../../modules/payments/transfer/bundle-verifier';
+import type { RootRef, VerifiedBundle } from '../../../extensions/uxf/pipeline/bundle-verifier';
 import type { FullIdentity } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import type { TransportProvider } from '../../../transport';
@@ -160,7 +160,7 @@ vi.mock('../../../serialization/txf-serializer', () => ({
 // that export, every enqueue() throws a "No export defined" error and
 // the bundle is rejected before the worker runs.
 const mockAcquireBundle = vi.fn();
-vi.mock('../../../modules/payments/transfer/bundle-acquirer', () => ({
+vi.mock('../../../extensions/uxf/pipeline/bundle-acquirer', () => ({
   acquireBundle: (...args: unknown[]) => mockAcquireBundle(...args),
   isReplayOutcome: () => false,
   // 8 MiB — well above any synthetic carBase64 used in this test file

@@ -30,7 +30,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { hashAuthenticatorForLog } from '../../../modules/payments/transfer/finalization-worker-base';
+import { hashAuthenticatorForLog } from '../../../extensions/uxf/pipeline/finalization-worker-base';
 import {
   buildWorker,
   makeFakeAggregator,

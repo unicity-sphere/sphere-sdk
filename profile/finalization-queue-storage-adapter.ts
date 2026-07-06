@@ -50,7 +50,7 @@
 
 import { logger } from '../core/logger.js';
 import { decryptString, encryptString } from './encryption.js';
-import type { FinalizationQueueStorage } from '../modules/payments/transfer/finalization-queue.js';
+import type { FinalizationQueueStorage } from '../extensions/uxf/pipeline/finalization-queue.js';
 import type { ProfileDatabase } from './types.js';
 import { PrefixSyncWriter } from './prefix-sync-writer.js';
 import type { ProfileSyncWriter } from './profile-snapshot-merge.js';

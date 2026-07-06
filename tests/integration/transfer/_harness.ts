@@ -24,7 +24,7 @@
 
 import { vi } from 'vitest';
 
-import type { TokenLike } from '../../../modules/payments/transfer/classify-token';
+import type { TokenLike } from '../../../extensions/uxf/pipeline/classify-token';
 import type { OracleProvider } from '../../../oracle/oracle-provider';
 import type { TransportProvider } from '../../../transport';
 import type { PeerInfo } from '../../../transport/transport-provider';

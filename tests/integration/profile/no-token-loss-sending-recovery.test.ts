@@ -35,7 +35,7 @@ import { describe, it, expect } from 'vitest';
 import {
   SendingRecoveryWorker,
   type SendingRecoveryWorkerDeps,
-} from '../../../modules/payments/transfer/sending-recovery-worker.js';
+} from '../../../extensions/uxf/pipeline/sending-recovery-worker.js';
 import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox.js';
 
 describe('G6 — SendingRecoveryWorker wiring', () => {

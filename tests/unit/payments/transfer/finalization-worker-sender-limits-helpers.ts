@@ -7,11 +7,11 @@
 import {
   MAX_CONCURRENT_POLLS_PER_AGGREGATOR,
   MAX_CONCURRENT_POLLS_PER_TOKEN,
-} from '../../../../modules/payments/transfer/limits';
+} from '../../../../extensions/uxf/pipeline/limits';
 
 export const MAX_CONCURRENT_POLLS_PER_AGGREGATOR_DEFAULT =
   MAX_CONCURRENT_POLLS_PER_AGGREGATOR;
 export const MAX_CONCURRENT_POLLS_PER_TOKEN_DEFAULT =
   MAX_CONCURRENT_POLLS_PER_TOKEN;
 
-export { CountingSemaphore } from '../../../../modules/payments/transfer/finalization-worker-sender';
+export { CountingSemaphore } from '../../../../extensions/uxf/pipeline/finalization-worker-sender';

@@ -53,7 +53,7 @@ import {
   NostrPersistenceVerifier,
   type NostrPersistenceVerifierDeps,
   type VerifySentEntryFn,
-} from '../../../modules/payments/transfer/nostr-persistence-verifier.js';
+} from '../../../extensions/uxf/pipeline/nostr-persistence-verifier.js';
 import { OutboxWriter } from '../../../profile/outbox-writer.js';
 import { SentLedgerWriter } from '../../../profile/sent-ledger-writer.js';
 import { Lamport } from '../../../profile/lamport.js';

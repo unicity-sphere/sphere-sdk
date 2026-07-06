@@ -88,12 +88,12 @@ import {
   isUxfTransferPayloadCar,
   isUxfTransferPayloadCid,
 } from '../../../types/uxf-transfer.js';
-import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage.js';
-import { UxfError } from '../../../extensions/uxf/bundle/errors.js';
+import { UxfPackage } from '../bundle/UxfPackage.js';
+import { UxfError } from '../bundle/errors.js';
 import {
   carBase64ToBytes,
   extractCarRootCid,
-} from '../../../extensions/uxf/bundle/transfer-payload.js';
+} from '../bundle/transfer-payload.js';
 
 import {
   verifyBundleStructure,

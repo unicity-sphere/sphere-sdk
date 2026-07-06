@@ -28,7 +28,7 @@ import {
   SpentStateRescanWorker,
   type SpentStateRescanWorkerDeps,
   type TransitionToAuditFn,
-} from '../../../../modules/payments/transfer/spent-state-rescan-worker';
+} from '../../../../extensions/uxf/pipeline/spent-state-rescan-worker';
 import type { OutboxWriter } from '../../../../profile/outbox-writer';
 import type { SentLedgerWriter } from '../../../../profile/sent-ledger-writer';
 import type { SphereEventMap, SphereEventType, Token } from '../../../../types';

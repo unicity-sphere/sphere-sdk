@@ -121,7 +121,7 @@ import { revaluate, type DispositionRevaluateInput } from './disposition-engine'
 import type { DispositionRecord } from '../../../types/disposition';
 import { ManifestCas } from '../../../profile/manifest-cas';
 import type { PerTokenMutex } from '../../../profile/per-token-mutex';
-import type { ContentHash } from '../../../extensions/uxf/bundle/types';
+import type { ContentHash } from '../bundle/types';
 import type { DispositionReason } from '../../../types/disposition';
 import type {
   IncomingTransfer,

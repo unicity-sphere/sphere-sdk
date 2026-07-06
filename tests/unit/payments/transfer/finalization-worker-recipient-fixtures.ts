@@ -14,13 +14,13 @@ import {
   type CascadeManifestScanner,
   type CascadeOutboxScanner,
   type ClassifyTokenLookup,
-} from '../../../../modules/payments/transfer/cascade-walker';
+} from '../../../../extensions/uxf/pipeline/cascade-walker';
 import {
   FinalizationQueue,
   entryIdFor,
   type FinalizationQueueEntry,
   type FinalizationQueueStorage,
-} from '../../../../modules/payments/transfer/finalization-queue';
+} from '../../../../extensions/uxf/pipeline/finalization-queue';
 import {
   FinalizationWorkerRecipient,
   type AnchoredProofDescriptor,
@@ -32,13 +32,13 @@ import {
   type RevaluateHooksProvider,
   type SubmitOutcome,
   type PollOutcome,
-} from '../../../../modules/payments/transfer/finalization-worker-recipient';
-import { CountingSemaphore } from '../../../../modules/payments/transfer/finalization-worker-sender';
+} from '../../../../extensions/uxf/pipeline/finalization-worker-recipient';
+import { CountingSemaphore } from '../../../../extensions/uxf/pipeline/finalization-worker-sender';
 import {
   type FinalizationQueueAdapter,
   type PoolWriteAdapter,
   type TombstoneWriteAdapter,
-} from '../../../../modules/payments/transfer/manifest-cid-rewrite';
+} from '../../../../extensions/uxf/pipeline/manifest-cid-rewrite';
 import { ManifestCas, type MinimalManifestStorage } from '../../../../profile/manifest-cas';
 import { PerTokenMutex } from '../../../../profile/per-token-mutex';
 import { contentHash } from '../../../../extensions/uxf/bundle/types';
@@ -46,7 +46,7 @@ import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 import type { DispositionRecord } from '../../../../types/disposition';
 import type {
   DispositionRevaluateInput,
-} from '../../../../modules/payments/transfer/disposition-engine';
+} from '../../../../extensions/uxf/pipeline/disposition-engine';
 import type { SphereEventMap, SphereEventType } from '../../../../types';
 import type { TokenManifestEntry } from '../../../../profile/token-manifest';
 

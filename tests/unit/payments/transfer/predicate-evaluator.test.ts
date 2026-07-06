@@ -8,7 +8,7 @@
 import { describe, it, expect } from 'vitest';
 import type { IPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/IPredicate';
 
-import { evaluatePredicateBindsToUs } from '../../../../modules/payments/transfer/predicate-evaluator';
+import { evaluatePredicateBindsToUs } from '../../../../extensions/uxf/pipeline/predicate-evaluator';
 
 // =============================================================================
 // Test doubles — minimal IPredicate stubs
