@@ -41,6 +41,7 @@ export interface UxfHandle extends ExtensionHandle {
 }
 
 /** Ports the composition root exposes to an extension's `install()`. */
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
 export interface ExtensionHost {
   /**
    * Wave-1: shape is intentionally minimal so no core module has to change
