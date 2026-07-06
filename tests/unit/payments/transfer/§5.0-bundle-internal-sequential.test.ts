@@ -39,7 +39,7 @@ import type {
   RootRef,
   VerifiedBundle,
 } from '../../../../modules/payments/transfer/bundle-verifier';
-import type { ContentHash } from '../../../../uxf/types';
+import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 
 // =============================================================================
 // 1. Fixtures

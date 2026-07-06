@@ -30,7 +30,7 @@ import type {
   TokenRootChildren,
   GenesisChildren,
 } from './types.js';
-import { incr, observeMs } from '../core/perf-counters.js';
+import { incr, observeMs } from '../../../core/perf-counters.js';
 import { STRATEGY_LATEST } from './types.js';
 import { UxfError } from './errors.js';
 import { computeElementHash } from './hash.js';
@@ -50,7 +50,7 @@ import { diff as diffImpl, applyDelta as applyDeltaImpl } from './diff.js';
 import { packageToJson, packageFromJson } from './json.js';
 import { exportToCar, importFromCar } from './ipld.js';
 import { resolveTokenRoot } from './token-join.js';
-import { logger } from '../core/logger.js';
+import { logger } from '../../../core/logger.js';
 
 // ---------------------------------------------------------------------------
 // UxfPackage Class

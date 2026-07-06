@@ -6,11 +6,11 @@ import {
   elementToIpldBlock,
   exportToCar,
   importFromCar,
-} from '../../../uxf/ipld.js';
-import { verify } from '../../../uxf/verify.js';
-import { ElementPool } from '../../../uxf/element-pool.js';
-import { deconstructToken } from '../../../uxf/deconstruct.js';
-import { computeElementHash } from '../../../uxf/hash.js';
+} from '../../../extensions/uxf/bundle/ipld.js';
+import { verify } from '../../../extensions/uxf/bundle/verify.js';
+import { ElementPool } from '../../../extensions/uxf/bundle/element-pool.js';
+import { deconstructToken } from '../../../extensions/uxf/bundle/deconstruct.js';
+import { computeElementHash } from '../../../extensions/uxf/bundle/hash.js';
 import { CID } from 'multiformats';
 import { encode as dagCborEncode, decode as dagCborDecode } from '@ipld/dag-cbor';
 import { CarWriter } from '@ipld/car/writer';
@@ -20,8 +20,8 @@ import type {
   UxfElement,
   UxfPackageData,
   InstanceChainEntry,
-} from '../../../uxf/types.js';
-import { contentHash } from '../../../uxf/types.js';
+} from '../../../extensions/uxf/bundle/types.js';
+import { contentHash } from '../../../extensions/uxf/bundle/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -536,7 +536,7 @@ describe('importFromCar — multi-root rejection (FIX 1, spec §5.2 #1)', () => 
   });
 
   it('UxfPackage.fromCar rejects multi-root CAR with INVALID_PACKAGE', async () => {
-    const { UxfPackage } = await import('../../../uxf/UxfPackage.js');
+    const { UxfPackage } = await import('../../../extensions/uxf/bundle/UxfPackage.js');
     const bytesA = dagCborEncode({ a: 1 });
     const bytesB = dagCborEncode({ b: 2 });
     const cidA = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(bytesA)));
@@ -1033,7 +1033,7 @@ describe('rebuildInstanceChains — predecessor cycle rejection (FIX 5, Round 3)
     // Specifically: A has predecessor=B, B has predecessor=C, C has
     // predecessor=B → walking from A: A→B→C→B (cycle). A is the head
     // (no successors), so the walk starts.
-    const { rebuildInstanceChains: rebuild } = await import('../../../uxf/ipld.js');
+    const { rebuildInstanceChains: rebuild } = await import('../../../extensions/uxf/bundle/ipld.js');
     const elA: UxfElement = {
       header: { representation: 1, semantics: 1, kind: 'default', predecessor: 'bb'.repeat(32) as ContentHash },
       type: 'token-state',
@@ -1084,7 +1084,7 @@ describe('rebuildInstanceChains — predecessor cycle rejection (FIX 5, Round 3)
     // added as head there either. In this corner case the walk simply
     // never starts, and rebuild returns an empty chains map. That's
     // still safe (no infinite loop). Verify behaviour.
-    const { rebuildInstanceChains: rebuild } = await import('../../../uxf/ipld.js');
+    const { rebuildInstanceChains: rebuild } = await import('../../../extensions/uxf/bundle/ipld.js');
     const hX = 'aa'.repeat(32) as ContentHash;
     const elX: UxfElement = {
       header: { representation: 1, semantics: 1, kind: 'default', predecessor: hX },

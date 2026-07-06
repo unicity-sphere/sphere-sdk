@@ -43,7 +43,7 @@
 
 import { SphereError } from '../core/errors.js';
 import { compareCidV1Binary } from '../modules/payments/transfer/limits.js';
-import type { ContentHash } from '../uxf/types.js';
+import type { ContentHash } from '../extensions/uxf/bundle/types.js';
 import { Lamport } from './lamport.js';
 import {
   ManifestCas,

@@ -42,7 +42,7 @@ import { createUxfCarPublisher } from '../../../modules/payments/transfer/ipfs-p
 import type { PreflightFinalizeOptions } from '../../../modules/payments/transfer/preflight-finalize';
 import type { TransferRequest } from '../../../types';
 import type { UxfTransferPayloadCid } from '../../../types/uxf-transfer';
-import { extractCarRootCid } from '../../../uxf/transfer-payload';
+import { extractCarRootCid } from '../../../extensions/uxf/bundle/transfer-payload';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 
 import {

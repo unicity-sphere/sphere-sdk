@@ -7,10 +7,10 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { UxfPackage } from '../../../uxf/UxfPackage.js';
-import { UxfError } from '../../../uxf/errors.js';
-import { STRATEGY_LATEST, STRATEGY_ORIGINAL } from '../../../uxf/types.js';
-import type { UxfElement, ContentHash, TokenRootChildren } from '../../../uxf/types.js';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage.js';
+import { UxfError } from '../../../extensions/uxf/bundle/errors.js';
+import { STRATEGY_LATEST, STRATEGY_ORIGINAL } from '../../../extensions/uxf/bundle/types.js';
+import type { UxfElement, ContentHash, TokenRootChildren } from '../../../extensions/uxf/bundle/types.js';
 import {
   TOKEN_A,
   TOKEN_B,

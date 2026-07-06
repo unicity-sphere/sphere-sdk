@@ -34,10 +34,10 @@ import { encode as dagCborEncode } from '@ipld/dag-cbor';
 
 import { SparseMerkleTreePath } from '@unicitylabs/state-transition-sdk/lib/mtree/plain/SparseMerkleTreePath.js';
 
-import { prepareContentForHashing } from '../../../uxf/hash.js';
-import { deconstructSmtPath } from '../../../uxf/deconstruct.js';
-import { ElementPool } from '../../../uxf/element-pool.js';
-import type { SmtPathContent } from '../../../uxf/types.js';
+import { prepareContentForHashing } from '../../../extensions/uxf/bundle/hash.js';
+import { deconstructSmtPath } from '../../../extensions/uxf/bundle/deconstruct.js';
+import { ElementPool } from '../../../extensions/uxf/bundle/element-pool.js';
+import type { SmtPathContent } from '../../../extensions/uxf/bundle/types.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = resolve(

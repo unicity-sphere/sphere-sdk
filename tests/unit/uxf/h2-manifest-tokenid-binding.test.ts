@@ -25,18 +25,18 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { packageToJson, packageFromJson } from '../../../uxf/json.js';
-import { exportToCar, importFromCar } from '../../../uxf/ipld.js';
-import { verify } from '../../../uxf/verify.js';
-import { ElementPool } from '../../../uxf/element-pool.js';
-import { deconstructToken } from '../../../uxf/deconstruct.js';
-import { UxfError } from '../../../uxf/errors.js';
+import { packageToJson, packageFromJson } from '../../../extensions/uxf/bundle/json.js';
+import { exportToCar, importFromCar } from '../../../extensions/uxf/bundle/ipld.js';
+import { verify } from '../../../extensions/uxf/bundle/verify.js';
+import { ElementPool } from '../../../extensions/uxf/bundle/element-pool.js';
+import { deconstructToken } from '../../../extensions/uxf/bundle/deconstruct.js';
+import { UxfError } from '../../../extensions/uxf/bundle/errors.js';
 import type {
   ContentHash,
   UxfElement,
   UxfPackageData,
   InstanceChainEntry,
-} from '../../../uxf/types.js';
+} from '../../../extensions/uxf/bundle/types.js';
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers (adapted from tests/unit/uxf/json.test.ts)

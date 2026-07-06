@@ -6,10 +6,10 @@ import {
   prepareContentForHashing,
   prepareChildrenForHashing,
   computeElementHash,
-} from '../../../uxf/hash.js';
-import { UxfError } from '../../../uxf/errors.js';
-import type { ContentHash, UxfElement } from '../../../uxf/types.js';
-import { contentHash } from '../../../uxf/types.js';
+} from '../../../extensions/uxf/bundle/hash.js';
+import { UxfError } from '../../../extensions/uxf/bundle/errors.js';
+import type { ContentHash, UxfElement } from '../../../extensions/uxf/bundle/types.js';
+import { contentHash } from '../../../extensions/uxf/bundle/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers

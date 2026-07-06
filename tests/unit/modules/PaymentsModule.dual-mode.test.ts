@@ -227,7 +227,7 @@ function createProfileInMemoryTokenStorage(): TokenStorageProvider<TxfStorageDat
     },
     async shutdown() {},
     async save(data) {
-      const { UxfPackage } = await import('../../../uxf/UxfPackage.js');
+      const { UxfPackage } = await import('../../../extensions/uxf/bundle/UxfPackage.js');
       const pkg = UxfPackage.create();
       // Ingest tokens (keys starting with `_` that aren't operational)
       const operational = new Set([
@@ -268,7 +268,7 @@ function createProfileInMemoryTokenStorage(): TokenStorageProvider<TxfStorageDat
       if (!store.carBytes) {
         return { success: false, source: 'local', timestamp: Date.now() };
       }
-      const { UxfPackage } = await import('../../../uxf/UxfPackage.js');
+      const { UxfPackage } = await import('../../../extensions/uxf/bundle/UxfPackage.js');
       const pkg = await UxfPackage.fromCar(store.carBytes);
       const assembled = pkg.assembleAll();
 

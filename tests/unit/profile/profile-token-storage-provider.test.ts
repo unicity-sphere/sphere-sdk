@@ -161,7 +161,7 @@ function createMockDb(): MockProfileDb {
 // Mock UxfPackage
 // ---------------------------------------------------------------------------
 
-vi.mock('../../../uxf/UxfPackage.js', async () => {
+vi.mock('../../../extensions/uxf/bundle/UxfPackage.js', async () => {
   // Issue #200 Phase 2: production now calls `extractCarRootCid` +
   // `pinCarBlocksToIpfs` against `toCar()` output, so the mock must
   // produce a real CAR (not raw JSON bytes). `makeFakeUxfCar` wraps

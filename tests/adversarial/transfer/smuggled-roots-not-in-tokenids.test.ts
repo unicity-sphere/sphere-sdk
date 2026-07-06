@@ -53,7 +53,7 @@ import {
   MAX_UNCLAIMED_ROOTS,
 } from '../../../modules/payments/transfer/limits';
 import type { UxfTransferPayloadCar } from '../../../types/uxf-transfer';
-import { UxfPackage } from '../../../uxf/UxfPackage';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
 
 import { TOKEN_A, TOKEN_B } from '../../fixtures/uxf-mock-tokens';
 

@@ -83,8 +83,8 @@ import type {
   UxfTransferPayloadCid,
 } from '../../../types/uxf-transfer';
 import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
-import { UxfPackage } from '../../../uxf/UxfPackage';
-import { extractCarRootCid } from '../../../uxf/transfer-payload';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
+import { extractCarRootCid } from '../../../extensions/uxf/bundle/transfer-payload';
 
 import { classifyToken, type TokenLike } from './classify-token';
 import type { FaultInjectionHooks } from './conservative-sender';

@@ -100,8 +100,8 @@ import type {
   UxfTransferPayloadCar,
   UxfTransferPayloadCid,
 } from '../../../types/uxf-transfer';
-import { UxfPackage } from '../../../uxf/UxfPackage';
-import { extractCarRootCid } from '../../../uxf/transfer-payload';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
+import { extractCarRootCid } from '../../../extensions/uxf/bundle/transfer-payload';
 
 import type { TokenLike } from './classify-token';
 import type { PublishToIpfsCallback } from './delivery-resolver';

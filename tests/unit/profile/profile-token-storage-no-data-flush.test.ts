@@ -91,7 +91,7 @@ function getEncryptionKey(): Uint8Array {
  */
 async function projectedFlushCid(tokens: unknown[]): Promise<string> {
   const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
-  const { extractCarRootCid } = await import('../../../uxf/transfer-payload.js');
+  const { extractCarRootCid } = await import('../../../extensions/uxf/bundle/transfer-payload.js');
   const carBytes = await makeFakeUxfCar({ tokens });
   return extractCarRootCid(carBytes);
 }
@@ -172,7 +172,7 @@ function createMockDb(): MockProfileDb {
 // UxfPackage mock — produces deterministic, content-addressable bytes
 // =============================================================================
 
-vi.mock('../../../uxf/UxfPackage.js', async () => {
+vi.mock('../../../extensions/uxf/bundle/UxfPackage.js', async () => {
   // Issue #200 Phase 2: `toCar()` must return a real CAR (not JSON bytes)
   // because the flush scheduler now calls `extractCarRootCid` +
   // `pinCarBlocksToIpfs`. `makeFakeUxfCar` wraps the payload in a

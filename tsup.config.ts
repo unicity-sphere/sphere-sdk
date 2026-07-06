@@ -145,7 +145,7 @@ export default defineConfig([
   },
   // UXF (Universal eXchange Format) - platform-agnostic
   {
-    entry: { 'uxf/index': 'uxf/index.ts' },
+    entry: { 'uxf/index': 'extensions/uxf/bundle/index.ts' },
     format: ['esm', 'cjs'],
     dts: true,
     clean: false,

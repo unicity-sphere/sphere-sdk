@@ -29,9 +29,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { UxfPackage } from '../../../uxf/UxfPackage';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
-import { extractCarRootCid } from '../../../uxf/transfer-payload';
+import { extractCarRootCid } from '../../../extensions/uxf/bundle/transfer-payload';
 
 describe('UxfPackage.create — bundleCid determinism (post-#362)', () => {
   describe('locked createdAt', () => {

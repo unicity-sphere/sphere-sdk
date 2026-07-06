@@ -39,7 +39,7 @@ import type { ContinuityResult, TxLike } from '../../../../modules/payments/tran
 import type { EvaluatePredicateResult } from '../../../../modules/payments/transfer/predicate-evaluator';
 import type { ProofVerifyStatus } from '../../../../modules/payments/transfer/proof-verifier';
 import type { VerifyAuthenticatorResult } from '../../../../modules/payments/transfer/authenticator-verifier';
-import type { ContentHash } from '../../../../uxf/types';
+import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 import type { LegacyTokenTransferPayload } from '../../../../types/uxf-transfer';
 import type { FinalizationQueueEntry } from '../../../../modules/payments/transfer/finalization-queue';
 

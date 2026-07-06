@@ -1476,14 +1476,14 @@ export class AccountingModule {
     let carBytes: Uint8Array;
     let bundleCid: string;
     try {
-      const { UxfPackage } = await import('../../uxf/UxfPackage.js');
+      const { UxfPackage } = await import('../../extensions/uxf/bundle/UxfPackage.js');
       const pkg = UxfPackage.create({
         description: 'invoice-delivery',
         creator: deps.identity.chainPubkey,
       });
       pkg.ingest(tokenJson);
       carBytes = await pkg.toCar();
-      const { extractCarRootCid } = await import('../../uxf/transfer-payload.js');
+      const { extractCarRootCid } = await import('../../extensions/uxf/bundle/transfer-payload.js');
       bundleCid = await extractCarRootCid(carBytes);
     } catch (err) {
       throw new SphereError(

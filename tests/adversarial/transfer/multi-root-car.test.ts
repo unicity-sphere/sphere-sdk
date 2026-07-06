@@ -47,9 +47,9 @@ import * as raw from 'multiformats/codecs/raw';
 import { create as createDigest } from 'multiformats/hashes/digest';
 
 import { SphereError } from '../../../core/errors';
-import { extractCarRootCid } from '../../../uxf/transfer-payload';
-import { UxfPackage } from '../../../uxf/UxfPackage';
-import { importFromCar } from '../../../uxf/ipld';
+import { extractCarRootCid } from '../../../extensions/uxf/bundle/transfer-payload';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
+import { importFromCar } from '../../../extensions/uxf/bundle/ipld';
 
 // =============================================================================
 // Adversarial CAR construction

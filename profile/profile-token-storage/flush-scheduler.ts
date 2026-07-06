@@ -67,7 +67,7 @@ import {
   pinCarBlocksToIpfs,
   verifyCidAccessibleWithRetry,
 } from '../ipfs-client.js';
-import { extractCarRootCid } from '../../uxf/transfer-payload.js';
+import { extractCarRootCid } from '../../extensions/uxf/bundle/transfer-payload.js';
 import { incr, observeMs } from '../../core/perf-counters.js';
 import { extractLostHeadCid } from '../orbitdb-adapter.js';
 import type { OrbitDbAdapter } from '../orbitdb-adapter.js';
@@ -717,7 +717,7 @@ export class FlushScheduler {
       let opState = this.host.extractOperationalState(data);
 
       // 2. Build UXF package
-      const { UxfPackage } = await import('../../uxf/UxfPackage.js');
+      const { UxfPackage } = await import('../../extensions/uxf/bundle/UxfPackage.js');
       const pkg = UxfPackage.create();
 
       // Ingest all token objects

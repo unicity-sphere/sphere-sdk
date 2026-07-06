@@ -39,14 +39,14 @@ import {
   contentHashToCid,
   cidToContentHash,
   exportToCar,
-} from '../../../uxf/ipld.js';
-import { ElementPool } from '../../../uxf/element-pool.js';
-import { deconstructToken } from '../../../uxf/deconstruct.js';
+} from '../../../extensions/uxf/bundle/ipld.js';
+import { ElementPool } from '../../../extensions/uxf/bundle/element-pool.js';
+import { deconstructToken } from '../../../extensions/uxf/bundle/deconstruct.js';
 import type {
   ContentHash,
   UxfElement,
   UxfPackageData,
-} from '../../../uxf/types.js';
+} from '../../../extensions/uxf/bundle/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers

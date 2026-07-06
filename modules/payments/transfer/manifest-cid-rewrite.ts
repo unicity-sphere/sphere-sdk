@@ -28,7 +28,7 @@
  * @packageDocumentation
  */
 
-import type { ContentHash } from '../../../uxf/types';
+import type { ContentHash } from '../../../extensions/uxf/bundle/types';
 import type { ManifestCas } from '../../../profile/manifest-cas';
 import { PerTokenMutex } from '../../../profile/per-token-mutex';
 import type { TokenManifestEntry } from '../../../profile/token-manifest';

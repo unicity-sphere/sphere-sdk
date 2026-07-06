@@ -34,8 +34,8 @@ import {
 import { ManifestStore } from '../../../../profile/manifest-store';
 import { ManifestCas } from '../../../../profile/manifest-cas';
 import { Lamport } from '../../../../profile/lamport';
-import { contentHash } from '../../../../uxf/types';
-import type { ContentHash } from '../../../../uxf/types';
+import { contentHash } from '../../../../extensions/uxf/bundle/types';
+import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 import type { TokenManifestEntry } from '../../../../profile/token-manifest';
 import type {
   CascadeManifestScanner,

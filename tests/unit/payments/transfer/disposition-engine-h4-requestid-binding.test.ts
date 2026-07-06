@@ -38,7 +38,7 @@ import {
   type DispositionEngineInput,
   type HydratedChain,
 } from '../../../../modules/payments/transfer/disposition-engine';
-import type { ContentHash } from '../../../../uxf/types';
+import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 
 // ---------------------------------------------------------------------------
 // Minimal fixture — focused on the proof-verify branch so we can drive

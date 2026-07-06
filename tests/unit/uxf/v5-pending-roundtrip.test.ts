@@ -28,7 +28,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { UxfPackage } from '../../../uxf/UxfPackage.js';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage.js';
 import {
   TOKEN_TYPE_FUNGIBLE,
   PUBKEY_ALICE,

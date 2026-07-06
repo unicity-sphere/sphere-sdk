@@ -1,14 +1,14 @@
 import { describe, it, expect } from 'vitest';
-import { ElementPool, collectGarbage, walkReachable } from '../../../uxf/element-pool.js';
-import { computeElementHash } from '../../../uxf/hash.js';
+import { ElementPool, collectGarbage, walkReachable } from '../../../extensions/uxf/bundle/element-pool.js';
+import { computeElementHash } from '../../../extensions/uxf/bundle/hash.js';
 import type {
   ContentHash,
   UxfElement,
   UxfPackageData,
   InstanceChainIndex,
   InstanceChainEntry,
-} from '../../../uxf/types.js';
-import { contentHash } from '../../../uxf/types.js';
+} from '../../../extensions/uxf/bundle/types.js';
+import { contentHash } from '../../../extensions/uxf/bundle/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers

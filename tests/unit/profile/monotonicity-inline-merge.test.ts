@@ -120,7 +120,7 @@ function buildTxfData(
 // CAR-derived CID, so the fake-CAR helper preserves that contract.
 // ---------------------------------------------------------------------------
 
-vi.mock('../../../uxf/UxfPackage.js', async () => {
+vi.mock('../../../extensions/uxf/bundle/UxfPackage.js', async () => {
   const { makeFakeUxfCar, decodeFakeUxfCar } = await import(
     './_helpers/fake-uxf-car.js'
   );
@@ -316,7 +316,7 @@ describe('FlushScheduler — in-place monotonicity recovery (#255)', () => {
     // Use the SAME fake-CAR helper the mocked UxfPackage uses so the
     // CID we plant matches what `pkg.toCar()` would produce.
     const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
-    const { extractCarRootCid } = await import('../../../uxf/transfer-payload.js');
+    const { extractCarRootCid } = await import('../../../extensions/uxf/bundle/transfer-payload.js');
 
     const tokenLocal = { id: '_TL', genesis: { tokenId: 'TL' } };
     const localCarBytes = await makeFakeUxfCar({ tokens: [tokenLocal] });
@@ -402,7 +402,7 @@ describe('FlushScheduler — in-place monotonicity recovery (#255)', () => {
     await provider.initialize();
 
     const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
-    const { extractCarRootCid } = await import('../../../uxf/transfer-payload.js');
+    const { extractCarRootCid } = await import('../../../extensions/uxf/bundle/transfer-payload.js');
 
     const tokenLocal = { id: '_TL', genesis: { tokenId: 'TL' } };
     const localCarBytes = await makeFakeUxfCar({ tokens: [tokenLocal] });
@@ -501,7 +501,7 @@ describe('FlushScheduler — in-place monotonicity recovery (#255)', () => {
     await provider.initialize();
 
     const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
-    const { extractCarRootCid } = await import('../../../uxf/transfer-payload.js');
+    const { extractCarRootCid } = await import('../../../extensions/uxf/bundle/transfer-payload.js');
 
     const tokenLocal = { id: '_TL', genesis: { tokenId: 'TL' } };
     const localCarBytes = await makeFakeUxfCar({ tokens: [tokenLocal] });

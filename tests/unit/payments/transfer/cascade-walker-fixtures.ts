@@ -20,8 +20,8 @@ import {
   ManifestCas,
   type MinimalManifestStorage,
 } from '../../../../profile/manifest-cas';
-import { contentHash } from '../../../../uxf/types';
-import type { ContentHash } from '../../../../uxf/types';
+import { contentHash } from '../../../../extensions/uxf/bundle/types';
+import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 import type { TokenManifestEntry } from '../../../../profile/token-manifest';
 import type { SphereEventMap, SphereEventType } from '../../../../types';
 import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';

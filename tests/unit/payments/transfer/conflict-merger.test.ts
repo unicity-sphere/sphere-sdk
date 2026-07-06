@@ -58,7 +58,7 @@ import type {
   TokenManifestEntry,
   TokenManifestStatus,
 } from '../../../../profile/token-manifest';
-import type { ContentHash, UxfElement } from '../../../../uxf/types';
+import type { ContentHash, UxfElement } from '../../../../extensions/uxf/bundle/types';
 
 // =============================================================================
 // 1. Fixture helpers — minimal token-root + tx pool entries.

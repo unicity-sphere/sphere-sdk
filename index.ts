@@ -515,9 +515,9 @@ export type {
   UxfVerificationResult,
   UxfVerificationIssue,
   UxfDelta,
-} from './uxf';
+} from './extensions/uxf/bundle';
 
-export type { UxfErrorCode } from './uxf';
+export type { UxfErrorCode } from './extensions/uxf/bundle';
 
 // =============================================================================
 // Profile Types (type-only -- runtime available via @unicitylabs/sphere-sdk/profile)

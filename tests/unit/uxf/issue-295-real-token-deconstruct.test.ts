@@ -24,9 +24,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
-import { deconstructToken } from '../../../uxf/deconstruct.js';
-import { ElementPool } from '../../../uxf/element-pool.js';
-import type { SmtPathContent } from '../../../uxf/types.js';
+import { deconstructToken } from '../../../extensions/uxf/bundle/deconstruct.js';
+import { ElementPool } from '../../../extensions/uxf/bundle/element-pool.js';
+import type { SmtPathContent } from '../../../extensions/uxf/bundle/types.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = resolve(

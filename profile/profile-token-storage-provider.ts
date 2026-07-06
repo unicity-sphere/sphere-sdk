@@ -1739,7 +1739,7 @@ export class ProfileTokenStorageProvider
       }
 
       // 2. Dynamically import UxfPackage
-      const { UxfPackage } = await import('../uxf/UxfPackage.js');
+      const { UxfPackage } = await import('../extensions/uxf/bundle/UxfPackage.js');
       // Local type alias for the imported class instance — UxfPackage's
       // constructor is private, so `InstanceType<typeof UxfPackage>`
       // fails. Snapshotting via ReturnType<create> sidesteps the

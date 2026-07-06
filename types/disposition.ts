@@ -31,7 +31,7 @@
  * @module types/disposition
  */
 
-import type { ContentHash } from '../uxf/types.js';
+import type { ContentHash } from '../extensions/uxf/bundle/types.js';
 // Canonical ManifestEntry source: `profile/token-manifest.ts` exports
 // `TokenManifestEntry`. Per UXF-TRANSFER-IMPL-PLAN T.1.C, we re-export it
 // under the spec-aligned alias `ManifestEntry`. Future waves (T.1.F, T.5.B,

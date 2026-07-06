@@ -1,16 +1,16 @@
 import { describe, it, expect } from 'vitest';
-import { diff, applyDelta } from '../../../uxf/diff.js';
-import { verify } from '../../../uxf/verify.js';
-import { ElementPool } from '../../../uxf/element-pool.js';
-import { deconstructToken } from '../../../uxf/deconstruct.js';
+import { diff, applyDelta } from '../../../extensions/uxf/bundle/diff.js';
+import { verify } from '../../../extensions/uxf/bundle/verify.js';
+import { ElementPool } from '../../../extensions/uxf/bundle/element-pool.js';
+import { deconstructToken } from '../../../extensions/uxf/bundle/deconstruct.js';
 import type {
   ContentHash,
   UxfElement,
   UxfPackageData,
   UxfDelta,
   InstanceChainEntry,
-} from '../../../uxf/types.js';
-import { contentHash } from '../../../uxf/types.js';
+} from '../../../extensions/uxf/bundle/types.js';
+import { contentHash } from '../../../extensions/uxf/bundle/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers

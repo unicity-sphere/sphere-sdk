@@ -49,7 +49,7 @@ import type {
   SphereEventMap,
   SphereEventType,
 } from '../../../types/index.js';
-import type { ContentHash } from '../../../uxf/types.js';
+import type { ContentHash } from '../../../extensions/uxf/bundle/types.js';
 
 // =============================================================================
 // Fixtures

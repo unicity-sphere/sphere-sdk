@@ -45,7 +45,7 @@ import {
   deriveProfileEncryptionKey,
   encryptProfileValue,
 } from '../../../profile/encryption';
-import { UxfPackage } from '../../../uxf/UxfPackage';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
 
 const TEST_PRIVATE_KEY =
   'aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd';

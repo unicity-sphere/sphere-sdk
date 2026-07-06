@@ -4,8 +4,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { UxfError } from '../../../uxf/errors';
-import type { UxfErrorCode } from '../../../uxf/errors';
+import { UxfError } from '../../../extensions/uxf/bundle/errors';
+import type { UxfErrorCode } from '../../../extensions/uxf/bundle/errors';
 
 describe('UxfError', () => {
   it('constructs with code and message', () => {

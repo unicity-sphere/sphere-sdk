@@ -31,7 +31,7 @@ import { bytesReader, readHeader } from '@ipld/car/decoder';
 import { CID } from 'multiformats/cid';
 import { Buffer } from 'buffer';
 
-import { SphereError } from '../core/errors.js';
+import { SphereError } from '../../../core/errors.js';
 import {
   isUxfTransferPayload,
   isUxfTransferPayloadCar,
@@ -40,7 +40,7 @@ import {
   type UxfTransferPayload,
   type UxfTransferPayloadCar,
   type UxfTransferPayloadCid,
-} from '../types/uxf-transfer.js';
+} from '../../../types/uxf-transfer.js';
 import { EXTRACT_CAR_ROOT_HEADER_PROBE_BYTES } from './limits.js';
 
 // =============================================================================

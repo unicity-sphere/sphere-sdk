@@ -442,7 +442,7 @@ export interface SendMessageOptions {
  *    V5/V4 `INSTANT_SPLIT`, SDK `{token, proof}`).
  *
  * The transport layer SERIALIZES whichever shape it is handed (UXF via
- * the canonical encoder from {@link "../uxf/transfer-payload"}, legacy via
+ * the canonical encoder from {@link "../extensions/uxf/bundle/transfer-payload"}, legacy via
  * pass-through `JSON.stringify`), and DELIVERS whichever shape arrives over
  * the wire to {@link TokenTransferHandler}. Shape discrimination is the
  * receiver/handler's responsibility — see `PaymentsModule` (T.7.A).

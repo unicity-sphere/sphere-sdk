@@ -823,7 +823,7 @@ export interface SphereEventMap {
     readonly code: import('./disposition').DispositionReason;
     readonly tokenId?: string;
     readonly bundleCid?: string;
-    readonly observedTokenContentHash?: import('../uxf/types').ContentHash;
+    readonly observedTokenContentHash?: import('../extensions/uxf/bundle/types').ContentHash;
     readonly senderTransportPubkey?: string;
     /**
      * Human-readable diagnostic. **Round 5 contract:** emit sites MUST

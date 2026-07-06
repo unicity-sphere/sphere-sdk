@@ -71,7 +71,7 @@ import type { VerifyAuthenticatorResult } from '../../../modules/payments/transf
 import type { OracleProvider } from '../../../oracle/oracle-provider';
 import type { TransportProvider } from '../../../transport';
 import type { PeerInfo } from '../../../transport/transport-provider';
-import type { ContentHash } from '../../../uxf/types';
+import type { ContentHash } from '../../../extensions/uxf/bundle/types';
 import type { LegacyTokenTransferPayload } from '../../../types/uxf-transfer';
 import type {
   FullIdentity,

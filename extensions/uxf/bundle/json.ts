@@ -37,7 +37,7 @@ import { contentHash, ELEMENT_TYPE_IDS, ELEMENT_TYPE_TOKEN_ROOT } from './types.
 import { ENRICHED_SYNTHETIC_KIND } from './token-join.js';
 import { UxfError } from './errors.js';
 import { computeElementHash } from './hash.js';
-import { hexToBytesAllowEmpty } from '../core/hex.js';
+import { hexToBytesAllowEmpty } from '../../../core/hex.js';
 import { assertHeaderKindField, assertHeaderVersionField } from './header-validation.js';
 import {
   ELEMENTS_MAX_SIZE,

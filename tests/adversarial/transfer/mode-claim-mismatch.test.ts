@@ -55,7 +55,7 @@ import type {
   ContinuityResult,
   TxLike,
 } from '../../../modules/payments/transfer/continuity-walker';
-import type { ContentHash, UxfElement } from '../../../uxf/types';
+import type { ContentHash, UxfElement } from '../../../extensions/uxf/bundle/types';
 
 // =============================================================================
 // Common fixtures

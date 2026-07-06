@@ -12,11 +12,11 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { exportToCar } from '../../../uxf/ipld';
-import { UxfError } from '../../../uxf/errors';
-import type { UxfPackageData, UxfElement, ContentHash } from '../../../uxf/types';
-import { contentHash } from '../../../uxf/types';
-import { resolveTokenRoot } from '../../../uxf/token-join';
+import { exportToCar } from '../../../extensions/uxf/bundle/ipld';
+import { UxfError } from '../../../extensions/uxf/bundle/errors';
+import type { UxfPackageData, UxfElement, ContentHash } from '../../../extensions/uxf/bundle/types';
+import { contentHash } from '../../../extensions/uxf/bundle/types';
+import { resolveTokenRoot } from '../../../extensions/uxf/bundle/token-join';
 
 function hexTag(tag: string): ContentHash {
   let out = '';

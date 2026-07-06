@@ -12,11 +12,11 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { packageFromJson } from '../../../uxf/json';
-import { UxfError } from '../../../uxf/errors';
-import type { UxfElement, ContentHash } from '../../../uxf/types';
-import { ENRICHED_SYNTHETIC_KIND } from '../../../uxf/token-join';
-import { computeElementHash } from '../../../uxf/hash';
+import { packageFromJson } from '../../../extensions/uxf/bundle/json';
+import { UxfError } from '../../../extensions/uxf/bundle/errors';
+import type { UxfElement, ContentHash } from '../../../extensions/uxf/bundle/types';
+import { ENRICHED_SYNTHETIC_KIND } from '../../../extensions/uxf/bundle/token-join';
+import { computeElementHash } from '../../../extensions/uxf/bundle/hash';
 
 function hexTag(tag: string): ContentHash {
   let out = '';

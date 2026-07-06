@@ -2,15 +2,15 @@ import { describe, it, expect } from 'vitest';
 import {
   InMemoryUxfStorage,
   KvUxfStorageAdapter,
-} from '../../../uxf/storage-adapters.js';
-import { ElementPool } from '../../../uxf/element-pool.js';
-import { deconstructToken } from '../../../uxf/deconstruct.js';
+} from '../../../extensions/uxf/bundle/storage-adapters.js';
+import { ElementPool } from '../../../extensions/uxf/bundle/element-pool.js';
+import { deconstructToken } from '../../../extensions/uxf/bundle/deconstruct.js';
 import type {
   ContentHash,
   UxfElement,
   UxfPackageData,
   InstanceChainEntry,
-} from '../../../uxf/types.js';
+} from '../../../extensions/uxf/bundle/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers

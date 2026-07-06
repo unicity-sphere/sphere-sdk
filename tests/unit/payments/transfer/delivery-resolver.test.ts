@@ -42,7 +42,7 @@ import {
 // comment for the full re-enable checklist.
 const ifAutoCid = AUTOMATED_CID_DELIVERY_ENABLED ? it : it.skip;
 import { SphereError } from '../../../../core/errors';
-import { carBytesToBase64 } from '../../../../uxf/transfer-payload';
+import { carBytesToBase64 } from '../../../../extensions/uxf/bundle/transfer-payload';
 
 // =============================================================================
 // 1. Test helpers

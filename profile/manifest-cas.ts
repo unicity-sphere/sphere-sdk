@@ -22,7 +22,7 @@
  * storage. Destroy-recreate is safe.
  */
 
-import type { ContentHash } from '../uxf/types';
+import type { ContentHash } from '../extensions/uxf/bundle/types';
 import type { TokenManifestEntry } from './token-manifest';
 
 /**

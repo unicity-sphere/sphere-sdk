@@ -27,7 +27,7 @@ import {
   type HydratedTx,
 } from '../../../../modules/payments/transfer/disposition-engine';
 import type { ManifestEntryDelta } from '../../../../types/disposition';
-import type { ContentHash, UxfElement } from '../../../../uxf/types';
+import type { ContentHash, UxfElement } from '../../../../extensions/uxf/bundle/types';
 
 const TOKEN_ID =
   'aa00000000000000000000000000000000000000000000000000000000000001';

@@ -45,7 +45,7 @@ import type {
   TokenManifestEntry,
   TokenManifestStatus,
 } from '../../../profile/token-manifest.js';
-import type { ContentHash } from '../../../uxf/types.js';
+import type { ContentHash } from '../../../extensions/uxf/bundle/types.js';
 
 // =============================================================================
 // Fixtures

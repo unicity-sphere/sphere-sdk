@@ -84,8 +84,8 @@ import {
 import {
   carBytesToBase64,
   extractCarRootCid,
-} from '../../../uxf/transfer-payload';
-import { UxfPackage } from '../../../uxf/UxfPackage';
+} from '../../../extensions/uxf/bundle/transfer-payload';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
 import type { ContinuityResult, TxLike } from '../../../modules/payments/transfer/continuity-walker';
 import type { EvaluatePredicateResult } from '../../../modules/payments/transfer/predicate-evaluator';
 import type { ProofVerifyStatus } from '../../../modules/payments/transfer/proof-verifier';

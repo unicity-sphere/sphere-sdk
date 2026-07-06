@@ -29,12 +29,12 @@
  * @module profile/token-manifest
  */
 
-import type { UxfPackage } from '../uxf/UxfPackage.js';
+import type { UxfPackage } from '../extensions/uxf/bundle/UxfPackage.js';
 import type {
   ContentHash,
   InstanceChainEntry,
   UxfPackageData,
-} from '../uxf/types.js';
+} from '../extensions/uxf/bundle/types.js';
 
 // =============================================================================
 // Public types

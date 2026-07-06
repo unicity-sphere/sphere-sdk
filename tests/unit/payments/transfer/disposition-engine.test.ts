@@ -63,7 +63,7 @@ import type { EvaluatePredicateResult } from '../../../../modules/payments/trans
 import type { ProofVerifyStatus } from '../../../../modules/payments/transfer/proof-verifier';
 import type { VerifyAuthenticatorResult } from '../../../../modules/payments/transfer/authenticator-verifier';
 import type { ManifestEntryDelta } from '../../../../types/disposition';
-import type { ContentHash, UxfElement } from '../../../../uxf/types';
+import type { ContentHash, UxfElement } from '../../../../extensions/uxf/bundle/types';
 
 // =============================================================================
 // 1. Common fixtures

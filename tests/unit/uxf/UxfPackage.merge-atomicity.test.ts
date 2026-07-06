@@ -27,7 +27,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import type { ResolveInput, ResolveOutcome } from '../../../uxf/token-join.js';
+import type { ResolveInput, ResolveOutcome } from '../../../extensions/uxf/bundle/token-join.js';
 import { logger, type LogLevel } from '../../../core/logger.js';
 import { TOKEN_A, TOKEN_B, TOKEN_C } from '../../fixtures/uxf-mock-tokens.js';
 
@@ -62,9 +62,9 @@ function getRealResolver(): ResolveBehavior {
   ] as ResolveBehavior;
 }
 
-vi.mock('../../../uxf/token-join.js', async () => {
-  const actual = await vi.importActual<typeof import('../../../uxf/token-join.js')>(
-    '../../../uxf/token-join.js',
+vi.mock('../../../extensions/uxf/bundle/token-join.js', async () => {
+  const actual = await vi.importActual<typeof import('../../../extensions/uxf/bundle/token-join.js')>(
+    '../../../extensions/uxf/bundle/token-join.js',
   );
   // Stash the real resolver on globalThis so test bodies reach it
   // without re-importing (which would hit the mock again and recurse).
@@ -85,9 +85,9 @@ vi.mock('../../../uxf/token-join.js', async () => {
 
 // UxfPackage must be imported AFTER vi.mock so its internal
 // `resolveTokenRoot` reference points at the mocked module.
-import { UxfPackage } from '../../../uxf/UxfPackage.js';
-import type { UxfPackageData, UxfElement, ContentHash } from '../../../uxf/types.js';
-import { UxfError } from '../../../uxf/errors.js';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage.js';
+import type { UxfPackageData, UxfElement, ContentHash } from '../../../extensions/uxf/bundle/types.js';
+import { UxfError } from '../../../extensions/uxf/bundle/errors.js';
 
 // ---------------------------------------------------------------------------
 // Helpers

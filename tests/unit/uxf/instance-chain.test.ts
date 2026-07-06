@@ -13,8 +13,8 @@ import type {
   UxfInstanceKind,
   InstanceChainEntry,
   InstanceSelectionStrategy,
-} from '../../../uxf/types.js';
-import { ElementPool } from '../../../uxf/element-pool.js';
+} from '../../../extensions/uxf/bundle/types.js';
+import { ElementPool } from '../../../extensions/uxf/bundle/element-pool.js';
 import {
   addInstance,
   selectInstance,
@@ -24,9 +24,9 @@ import {
   rebuildInstanceChainIndex,
   createInstanceChainIndex,
   type MutableInstanceChainIndex,
-} from '../../../uxf/instance-chain.js';
-import { UxfError } from '../../../uxf/errors.js';
-import { computeElementHash } from '../../../uxf/hash.js';
+} from '../../../extensions/uxf/bundle/instance-chain.js';
+import { UxfError } from '../../../extensions/uxf/bundle/errors.js';
+import { computeElementHash } from '../../../extensions/uxf/bundle/hash.js';
 
 // ---------------------------------------------------------------------------
 // Helpers

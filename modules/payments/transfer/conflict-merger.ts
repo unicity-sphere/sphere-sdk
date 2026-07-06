@@ -114,8 +114,8 @@
 import {
   resolveTokenRoot,
   type ResolveOutcome,
-} from '../../../uxf/token-join.js';
-import type { ContentHash, UxfElement } from '../../../uxf/types.js';
+} from '../../../extensions/uxf/bundle/token-join.js';
+import type { ContentHash, UxfElement } from '../../../extensions/uxf/bundle/types.js';
 import type {
   TokenManifestEntry,
   TokenManifestStatus,
@@ -979,4 +979,4 @@ function stripUndefined<T extends object>(value: T): T {
 // =============================================================================
 
 export { compareCidV1Binary } from './limits.js';
-export type { ResolveOutcome } from '../../../uxf/token-join.js';
+export type { ResolveOutcome } from '../../../extensions/uxf/bundle/token-join.js';

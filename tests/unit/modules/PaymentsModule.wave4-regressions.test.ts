@@ -1303,7 +1303,7 @@ describe('Wave 6 — REAL UXF round-trip: pkg.ingestAll → toCar → fromCar �
     };
 
     // Round-trip via ingestAll → toCar → fromCar → assemble.
-    const { UxfPackage } = await import('../../../uxf/UxfPackage');
+    const { UxfPackage } = await import('../../../extensions/uxf/bundle/UxfPackage');
     const pkg = UxfPackage.create();
     pkg.ingestAll([tokenJson]);
     const carBytes = await pkg.toCar();
@@ -1350,7 +1350,7 @@ describe('Wave 6 — REAL UXF round-trip: pkg.ingestAll → toCar → fromCar �
       inclusionProof: null,
     };
 
-    const { UxfPackage } = await import('../../../uxf/UxfPackage');
+    const { UxfPackage } = await import('../../../extensions/uxf/bundle/UxfPackage');
     const pkg = UxfPackage.create();
     pkg.ingestAll([tokenJson]);
     const carBytes = await pkg.toCar();

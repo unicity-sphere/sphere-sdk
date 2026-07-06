@@ -156,7 +156,7 @@ function createMockDb(): MockProfileDb {
 // UxfPackage mock — produces deterministic, content-addressable bytes
 // =============================================================================
 
-vi.mock('../../../uxf/UxfPackage.js', async () => {
+vi.mock('../../../extensions/uxf/bundle/UxfPackage.js', async () => {
   // Issue #200 Phase 2: `toCar()` must return a real CAR (not JSON bytes)
   // because the flush scheduler now calls `extractCarRootCid` +
   // `pinCarBlocksToIpfs`. `makeFakeUxfCar` wraps the JSON-shaped
@@ -723,7 +723,7 @@ describe('pointer monotonicity invariant', () => {
     // extractCarRootCid(carBytes))`. Mirror that projection here so
     // the short-circuit comparison fires.
     const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
-    const { extractCarRootCid } = await import('../../../uxf/transfer-payload.js');
+    const { extractCarRootCid } = await import('../../../extensions/uxf/bundle/transfer-payload.js');
     const projectedCarBytes = await makeFakeUxfCar({ tokens: [tokenA] });
     const projectedCid = await extractCarRootCid(projectedCarBytes);
 

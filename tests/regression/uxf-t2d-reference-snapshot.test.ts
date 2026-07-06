@@ -73,7 +73,7 @@ import type {
   TransferRequest,
 } from '../../types';
 import type { UxfTransferPayloadCar } from '../../types/uxf-transfer';
-import { carBase64ToBytes } from '../../uxf/transfer-payload';
+import { carBase64ToBytes } from '../../extensions/uxf/bundle/transfer-payload';
 import { TOKEN_A } from '../fixtures/uxf-mock-tokens';
 
 // =============================================================================

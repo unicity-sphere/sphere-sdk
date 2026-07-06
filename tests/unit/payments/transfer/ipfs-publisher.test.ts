@@ -22,8 +22,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createUxfCarPublisher } from '../../../../modules/payments/transfer/ipfs-publisher.js';
-import { UxfPackage } from '../../../../uxf/UxfPackage.js';
-import { extractCarRootCid } from '../../../../uxf/transfer-payload.js';
+import { UxfPackage } from '../../../../extensions/uxf/bundle/UxfPackage.js';
+import { extractCarRootCid } from '../../../../extensions/uxf/bundle/transfer-payload.js';
 
 // ---------------------------------------------------------------------------
 // Test fixtures

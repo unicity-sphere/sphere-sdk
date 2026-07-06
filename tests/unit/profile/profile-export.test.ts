@@ -38,7 +38,7 @@ import type {
   FullIdentity,
 } from '../../../types';
 import type { UxfBundleRef } from '../../../profile/types';
-import { UxfPackage } from '../../../uxf/UxfPackage';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
 
 // =============================================================================
 // Test doubles

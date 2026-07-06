@@ -211,9 +211,9 @@ describe('fetchCarFromIpfs (Issue #200 Phase 2)', () => {
     // both UXF and non-UXF dag-cbor blocks — otherwise the BFS
     // terminates early and `UxfPackage.fromCar` rejects the
     // incomplete CAR with a missing-block error.
-    const { exportToCar } = await import('../../../uxf/ipld.js');
-    const { ElementPool } = await import('../../../uxf/element-pool.js');
-    const { deconstructToken } = await import('../../../uxf/deconstruct.js');
+    const { exportToCar } = await import('../../../extensions/uxf/bundle/ipld.js');
+    const { ElementPool } = await import('../../../extensions/uxf/bundle/element-pool.js');
+    const { deconstructToken } = await import('../../../extensions/uxf/bundle/deconstruct.js');
 
     function hexFill(pattern: string, totalChars: number): string {
       return pattern
@@ -322,7 +322,7 @@ describe('fetchCarFromIpfs (Issue #200 Phase 2)', () => {
     // Final check: the reassembled CAR is itself importable through the
     // UXF receiver, verifying the per-block sha256(bytes) === cid check
     // in `importFromCar` is satisfied for every walked sub-block.
-    const { importFromCar } = await import('../../../uxf/ipld.js');
+    const { importFromCar } = await import('../../../extensions/uxf/bundle/ipld.js');
     const restored = await importFromCar(reassembled);
     expect(restored.manifest.tokens.size).toBe(1);
     expect(restored.pool.size).toBe(pkg.pool.size);

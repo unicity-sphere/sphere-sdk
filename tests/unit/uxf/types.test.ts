@@ -9,8 +9,8 @@ import {
   ELEMENT_TYPE_IDS,
   STRATEGY_LATEST,
   STRATEGY_ORIGINAL,
-} from '../../../uxf/types';
-import { UxfError } from '../../../uxf/errors';
+} from '../../../extensions/uxf/bundle/types';
+import { UxfError } from '../../../extensions/uxf/bundle/errors';
 
 // =============================================================================
 // contentHash

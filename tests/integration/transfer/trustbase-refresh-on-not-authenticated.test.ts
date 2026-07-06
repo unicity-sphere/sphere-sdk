@@ -76,7 +76,7 @@ import {
   type WorkerHarness as RecipientWorkerHarness,
 } from '../../unit/payments/transfer/finalization-worker-recipient-fixtures';
 import { FinalizationQueue } from '../../../modules/payments/transfer/finalization-queue';
-import { contentHash } from '../../../uxf/types';
+import { contentHash } from '../../../extensions/uxf/bundle/types';
 import type { SphereEventMap, SphereEventType } from '../../../types';
 
 // =============================================================================

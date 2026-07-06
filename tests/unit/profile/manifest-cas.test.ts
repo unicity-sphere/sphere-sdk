@@ -12,7 +12,7 @@ import type {
   TokenManifestEntry,
   TokenManifestStatus,
 } from '../../../profile/token-manifest';
-import type { ContentHash } from '../../../uxf/types';
+import type { ContentHash } from '../../../extensions/uxf/bundle/types';
 
 /** In-memory MinimalManifestStorage backed by a Map keyed `${addr}|${tokenId}`. */
 class FakeManifestStorage implements MinimalManifestStorage {

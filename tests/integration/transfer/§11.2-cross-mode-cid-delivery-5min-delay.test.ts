@@ -47,8 +47,8 @@ import { ReplayLRU } from '../../../modules/payments/transfer/replay-lru';
 import {
   carBytesToBase64,
   extractCarRootCid,
-} from '../../../uxf/transfer-payload';
-import { UxfPackage } from '../../../uxf/UxfPackage';
+} from '../../../extensions/uxf/bundle/transfer-payload';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
 import type { UxfTransferPayloadCid } from '../../../types/uxf-transfer';
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 

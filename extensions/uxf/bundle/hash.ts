@@ -13,7 +13,7 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { encode } from '@ipld/dag-cbor';
 import type { CID } from 'multiformats';
-import { bytesToHex } from '../core/crypto.js';
+import { bytesToHex } from '../../../core/crypto.js';
 import {
   type ContentHash,
   contentHash,

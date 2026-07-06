@@ -154,7 +154,7 @@ import {
   type LegacyTokenTransferPayload,
 } from '../../../types/uxf-transfer';
 import type { DispositionRecord } from '../../../types/disposition';
-import type { ContentHash, UxfElement } from '../../../uxf/types';
+import type { ContentHash, UxfElement } from '../../../extensions/uxf/bundle/types';
 import {
   processDisposition,
   type AssertRequestIdBindingFn,

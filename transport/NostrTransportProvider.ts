@@ -71,7 +71,7 @@ import {
   TIMEOUTS,
 } from '../constants';
 import { isUxfTransferPayload } from '../types/uxf-transfer';
-import { encodeTransferPayload, decodeTransferPayload } from '../uxf/transfer-payload';
+import { encodeTransferPayload, decodeTransferPayload } from '../extensions/uxf/bundle/transfer-payload';
 
 // =============================================================================
 // Configuration

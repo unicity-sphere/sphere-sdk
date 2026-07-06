@@ -30,11 +30,11 @@ import {
   type CidFetcherFetch,
 } from '../../../../modules/payments/transfer/cid-fetcher';
 import type { SphereEventMap } from '../../../../types/index';
-import { UxfPackage } from '../../../../uxf/UxfPackage';
+import { UxfPackage } from '../../../../extensions/uxf/bundle/UxfPackage';
 import {
   carBytesToBase64,
   extractCarRootCid,
-} from '../../../../uxf/transfer-payload';
+} from '../../../../extensions/uxf/bundle/transfer-payload';
 
 import { TOKEN_A, TOKEN_B } from '../../../fixtures/uxf-mock-tokens';
 

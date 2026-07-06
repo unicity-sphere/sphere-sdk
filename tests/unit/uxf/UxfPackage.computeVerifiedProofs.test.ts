@@ -18,9 +18,9 @@ import { describe, it, expect, vi } from 'vitest';
 // Mock assemble.ts so assembleInclusionProofForVerification returns
 // a stub proofJson without actually walking the pool. This lets us
 // exercise the verifier-call branch deterministically.
-vi.mock('../../../uxf/assemble.js', async () => {
-  const actual = await vi.importActual<typeof import('../../../uxf/assemble.js')>(
-    '../../../uxf/assemble.js',
+vi.mock('../../../extensions/uxf/bundle/assemble.js', async () => {
+  const actual = await vi.importActual<typeof import('../../../extensions/uxf/bundle/assemble.js')>(
+    '../../../extensions/uxf/bundle/assemble.js',
   );
   return {
     ...actual,
@@ -32,8 +32,8 @@ vi.mock('../../../uxf/assemble.js', async () => {
   };
 });
 
-import { UxfPackage } from '../../../uxf/UxfPackage.js';
-import type { UxfPackageData, UxfElement, ContentHash } from '../../../uxf/types.js';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage.js';
+import type { UxfPackageData, UxfElement, ContentHash } from '../../../extensions/uxf/bundle/types.js';
 
 const ELEMENT_TYPE_INCLUSION_PROOF = 'inclusion-proof' as const;
 

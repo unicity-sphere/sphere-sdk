@@ -67,7 +67,7 @@
 import { SphereError, redactCause } from '../../../core/errors.js';
 import { sanitizeReasonString as sharedSanitizeReason } from '../../../core/error-sanitize.js';
 import type { SphereEventMap } from '../../../types/index.js';
-import { extractCarRootCid } from '../../../uxf/transfer-payload.js';
+import { extractCarRootCid } from '../../../extensions/uxf/bundle/transfer-payload.js';
 
 import { MAX_FETCHED_CAR_BYTES, MAX_TOTAL_FETCH_MS } from './limits.js';
 

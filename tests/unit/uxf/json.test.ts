@@ -1,15 +1,15 @@
 import { describe, it, expect } from 'vitest';
-import { packageToJson, packageFromJson } from '../../../uxf/json.js';
-import { verify } from '../../../uxf/verify.js';
-import { ElementPool } from '../../../uxf/element-pool.js';
-import { deconstructToken } from '../../../uxf/deconstruct.js';
-import { ELEMENT_TYPE_IDS } from '../../../uxf/types.js';
+import { packageToJson, packageFromJson } from '../../../extensions/uxf/bundle/json.js';
+import { verify } from '../../../extensions/uxf/bundle/verify.js';
+import { ElementPool } from '../../../extensions/uxf/bundle/element-pool.js';
+import { deconstructToken } from '../../../extensions/uxf/bundle/deconstruct.js';
+import { ELEMENT_TYPE_IDS } from '../../../extensions/uxf/bundle/types.js';
 import type {
   ContentHash,
   UxfElement,
   UxfPackageData,
   InstanceChainEntry,
-} from '../../../uxf/types.js';
+} from '../../../extensions/uxf/bundle/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -399,7 +399,7 @@ describe('packageToJson / packageFromJson', () => {
       // Forge a manifest entry that points at a hash NOT in the pool.
       const ghostHash = '00'.repeat(32) as ContentHash;
       (pkg.manifest.tokens as Map<string, ContentHash>).set('ghost-token-id', ghostHash);
-      const { UxfError } = await import('../../../uxf/errors.js');
+      const { UxfError } = await import('../../../extensions/uxf/bundle/errors.js');
       try {
         packageToJson(pkg);
         throw new Error('expected packageToJson to throw');

@@ -100,7 +100,7 @@ function createMockDb(): MockProfileDb {
 // `pinCarBlocksToIpfs` against the result. `makeFakeUxfCar` produces a
 // minimal valid single-block CAR — enough for the pin path while still
 // allowing this test to bypass the real UxfPackage encoder.
-vi.mock('../../../uxf/UxfPackage.js', async () => {
+vi.mock('../../../extensions/uxf/bundle/UxfPackage.js', async () => {
   const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
   return {
     UxfPackage: {

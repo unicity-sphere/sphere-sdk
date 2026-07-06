@@ -47,7 +47,7 @@ import type {
 } from './accounting-test-helpers.js';
 import type { Token } from '../../../types/index.js';
 import { INVOICE_TOKEN_TYPE_HEX } from '../../../constants.js';
-import { UxfPackage } from '../../../uxf/UxfPackage.js';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage.js';
 
 // =============================================================================
 // SDK dynamic-import mocks (mirror createInvoice.test.ts so createInvoice

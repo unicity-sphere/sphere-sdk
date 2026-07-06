@@ -32,7 +32,7 @@ import {
   decryptProfileValue,
 } from './encryption.js';
 import { pinCarBlocksToIpfs, fetchCarFromIpfs } from './ipfs-client.js';
-import { extractCarRootCid } from '../uxf/transfer-payload.js';
+import { extractCarRootCid } from '../extensions/uxf/bundle/transfer-payload.js';
 
 // =============================================================================
 // Constants
@@ -249,7 +249,7 @@ export class ConsolidationEngine {
 
     try {
       // Step 4-5: fetch, merge (CARs are unencrypted on IPFS)
-      const { UxfPackage } = await import('../uxf/UxfPackage.js');
+      const { UxfPackage } = await import('../extensions/uxf/bundle/UxfPackage.js');
       const mergedPkg = UxfPackage.create({ description: 'consolidated' });
       const successfullyMergedCids: string[] = [];
 

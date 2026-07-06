@@ -9,11 +9,11 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { UxfPackage } from '../../../uxf/UxfPackage.js';
-import { InMemoryUxfStorage } from '../../../uxf/storage-adapters.js';
-import { UxfError } from '../../../uxf/errors.js';
-import { STRATEGY_ORIGINAL } from '../../../uxf/types.js';
-import type { UxfElement, ContentHash } from '../../../uxf/types.js';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage.js';
+import { InMemoryUxfStorage } from '../../../extensions/uxf/bundle/storage-adapters.js';
+import { UxfError } from '../../../extensions/uxf/bundle/errors.js';
+import { STRATEGY_ORIGINAL } from '../../../extensions/uxf/bundle/types.js';
+import type { UxfElement, ContentHash } from '../../../extensions/uxf/bundle/types.js';
 import {
   TOKEN_A,
   TOKEN_B,
@@ -607,7 +607,7 @@ describe('UxfPackage', () => {
         // non-malformed. Without this the loop body would throw
         // SERIALIZATION_ERROR on the first garbage block long before
         // reaching the count cap.
-        const { elementToIpldBlock } = await import('../../../uxf/ipld.js');
+        const { elementToIpldBlock } = await import('../../../extensions/uxf/bundle/ipld.js');
         for (let i = 0; i < N; i++) {
           // Unique 64-char hex per element so each maps to a distinct CID.
           const counter = i.toString(16).padStart(8, '0');

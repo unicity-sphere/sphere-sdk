@@ -10,8 +10,8 @@
 
 import { describe, it, expect } from 'vitest';
 
-import type { ContentHash, UxfElement } from '../../../uxf/types';
-import { resolveTokenRoot } from '../../../uxf/token-join';
+import type { ContentHash, UxfElement } from '../../../extensions/uxf/bundle/types';
+import { resolveTokenRoot } from '../../../extensions/uxf/bundle/token-join';
 
 // ---------------------------------------------------------------------------
 // Element factories — minimal enough to satisfy the resolver's reads.
@@ -659,7 +659,7 @@ describe('resolveTokenRoot', () => {
     // tag kind='enriched-synthetic' so downstream consumers can
     // distinguish and filter.
     const { ENRICHED_SYNTHETIC_KIND, isEnrichedSyntheticRoot } = await import(
-      '../../../uxf/token-join'
+      '../../../extensions/uxf/bundle/token-join'
     );
 
     const t0 = makeTransaction('0', { committed: true });

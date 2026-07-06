@@ -19,7 +19,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { UxfPackage } from '../../../uxf/UxfPackage.js';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage.js';
 import { TOKEN_A, TOKEN_B, TOKEN_C, NAMETAG_ALICE } from '../../fixtures/uxf-mock-tokens.js';
 
 function tokenId(t: Record<string, unknown>): string {

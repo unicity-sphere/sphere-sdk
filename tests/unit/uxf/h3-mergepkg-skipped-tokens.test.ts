@@ -34,14 +34,14 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { UxfPackage } from '../../../uxf/UxfPackage.js';
-import { UxfError } from '../../../uxf/errors.js';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage.js';
+import { UxfError } from '../../../extensions/uxf/bundle/errors.js';
 import {
   TOKEN_A,
   TOKEN_B,
   TOKEN_C,
 } from '../../fixtures/uxf-mock-tokens.js';
-import * as tokenJoin from '../../../uxf/token-join.js';
+import * as tokenJoin from '../../../extensions/uxf/bundle/token-join.js';
 
 // ---------------------------------------------------------------------------
 // Helpers

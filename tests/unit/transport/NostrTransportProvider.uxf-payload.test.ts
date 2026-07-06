@@ -36,7 +36,7 @@ import type { WebSocketFactory } from '../../../transport/websocket';
 import {
   encodeTransferPayload,
   decodeTransferPayload,
-} from '../../../uxf/transfer-payload';
+} from '../../../extensions/uxf/bundle/transfer-payload';
 import type {
   LegacySphereTxfPayload,
   UxfTransferPayloadCar,

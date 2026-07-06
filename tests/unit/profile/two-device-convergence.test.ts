@@ -108,7 +108,7 @@ function cidForBytes(bytes: Uint8Array): string {
 // Mock UxfPackage — pass-through that preserves token IDs.
 // ---------------------------------------------------------------------------
 
-vi.mock('../../../uxf/UxfPackage.js', async () => {
+vi.mock('../../../extensions/uxf/bundle/UxfPackage.js', async () => {
   // Issue #200 Phase 2: `toCar()` must return a real CAR (not JSON bytes)
   // because the flush scheduler now calls `extractCarRootCid` +
   // `pinCarBlocksToIpfs`. `makeFakeUxfCar` wraps the payload in a

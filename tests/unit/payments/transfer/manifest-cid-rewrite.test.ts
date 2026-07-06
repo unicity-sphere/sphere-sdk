@@ -35,7 +35,7 @@ import {
 } from '../../../../profile/manifest-cas';
 import type { TokenManifestEntry } from '../../../../profile/token-manifest';
 import type { InclusionProof } from '../../../../oracle/oracle-provider';
-import type { ContentHash } from '../../../../uxf/types';
+import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 
 // =============================================================================
 // 1. Fake adapters

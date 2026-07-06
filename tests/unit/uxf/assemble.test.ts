@@ -6,16 +6,16 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { ElementPool } from '../../../uxf/element-pool.js';
-import { deconstructToken } from '../../../uxf/deconstruct.js';
+import { ElementPool } from '../../../extensions/uxf/bundle/element-pool.js';
+import { deconstructToken } from '../../../extensions/uxf/bundle/deconstruct.js';
 import {
   assembleToken,
   assembleTokenFromRoot,
   assembleTokenAtState,
-} from '../../../uxf/assemble.js';
-import { computeElementHash } from '../../../uxf/hash.js';
-import { addInstance, createInstanceChainIndex } from '../../../uxf/instance-chain.js';
-import { UxfError } from '../../../uxf/errors.js';
+} from '../../../extensions/uxf/bundle/assemble.js';
+import { computeElementHash } from '../../../extensions/uxf/bundle/hash.js';
+import { addInstance, createInstanceChainIndex } from '../../../extensions/uxf/bundle/instance-chain.js';
+import { UxfError } from '../../../extensions/uxf/bundle/errors.js';
 import type {
   ContentHash,
   UxfElement,
@@ -24,8 +24,8 @@ import type {
   TokenRootChildren,
   GenesisChildren,
   TransactionChildren,
-} from '../../../uxf/types.js';
-import { STRATEGY_LATEST, STRATEGY_ORIGINAL } from '../../../uxf/types.js';
+} from '../../../extensions/uxf/bundle/types.js';
+import { STRATEGY_LATEST, STRATEGY_ORIGINAL } from '../../../extensions/uxf/bundle/types.js';
 import {
   TOKEN_A,
   TOKEN_B,

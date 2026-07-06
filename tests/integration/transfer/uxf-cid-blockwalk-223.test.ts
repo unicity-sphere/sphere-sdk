@@ -51,8 +51,8 @@ import {
 import { ReplayLRU } from '../../../modules/payments/transfer/replay-lru';
 import { isSphereError } from '../../../core/errors';
 import type { UxfTransferPayloadCid } from '../../../types/uxf-transfer';
-import { UxfPackage } from '../../../uxf/UxfPackage';
-import { extractCarRootCid } from '../../../uxf/transfer-payload';
+import { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
+import { extractCarRootCid } from '../../../extensions/uxf/bundle/transfer-payload';
 
 import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 import { rewriteFixtureTokenId } from './_harness';

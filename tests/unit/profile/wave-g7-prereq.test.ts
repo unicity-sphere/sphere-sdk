@@ -89,7 +89,7 @@ function createMockDb(): MockProfileDb {
 // Issue #200 Phase 2: `toCar()` must return a real CAR (not JSON bytes)
 // because the flush scheduler now calls `extractCarRootCid` +
 // `pinCarBlocksToIpfs`. `makeFakeUxfCar` produces a minimal valid CAR.
-vi.mock('../../../uxf/UxfPackage.js', async () => {
+vi.mock('../../../extensions/uxf/bundle/UxfPackage.js', async () => {
   const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
   return {
     UxfPackage: {

@@ -42,7 +42,7 @@ import type {
   VerifiedBundle,
 } from '../../../../modules/payments/transfer/bundle-verifier';
 import { RECIPIENT_MAX_INLINE_CARBASE64_LENGTH } from '../../../../modules/payments/transfer/bundle-acquirer';
-import type { ContentHash } from '../../../../uxf/types';
+import type { ContentHash } from '../../../../extensions/uxf/bundle/types';
 import type { SphereEventMap, SphereEventType } from '../../../../types';
 
 // =============================================================================

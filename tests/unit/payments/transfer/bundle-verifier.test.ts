@@ -30,14 +30,14 @@ import {
   MAX_UNCLAIMED_ROOTS,
 } from '../../../../modules/payments/transfer/limits';
 import type { UxfTransferPayloadCar } from '../../../../types/uxf-transfer';
-import { UxfPackage } from '../../../../uxf/UxfPackage';
+import { UxfPackage } from '../../../../extensions/uxf/bundle/UxfPackage';
 import {
   ELEMENT_TYPE_TOKEN_ROOT,
   type ContentHash,
   type UxfElement,
   type UxfPackageData,
   type UxfVerificationResult,
-} from '../../../../uxf/types';
+} from '../../../../extensions/uxf/bundle/types';
 
 import { TOKEN_A, TOKEN_B, TOKEN_C } from '../../../fixtures/uxf-mock-tokens';
 

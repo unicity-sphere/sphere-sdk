@@ -31,11 +31,11 @@ import { describe, expect, it } from 'vitest';
 
 import { verifyBundleStructure } from '../../../../modules/payments/transfer/bundle-verifier';
 import type { UxfTransferPayloadCar } from '../../../../types/uxf-transfer';
-import { UxfPackage } from '../../../../uxf/UxfPackage';
+import { UxfPackage } from '../../../../extensions/uxf/bundle/UxfPackage';
 import {
   carBytesToBase64,
   extractCarRootCid,
-} from '../../../../uxf/transfer-payload';
+} from '../../../../extensions/uxf/bundle/transfer-payload';
 
 import { TOKEN_A, TOKEN_B } from '../../../fixtures/uxf-mock-tokens';
 

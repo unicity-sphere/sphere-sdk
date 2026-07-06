@@ -46,7 +46,7 @@ import {
 } from '../../../../modules/payments/transfer/manifest-cid-rewrite';
 import { ManifestCas, type MinimalManifestStorage } from '../../../../profile/manifest-cas';
 import { PerTokenMutex } from '../../../../profile/per-token-mutex';
-import { contentHash } from '../../../../uxf/types';
+import { contentHash } from '../../../../extensions/uxf/bundle/types';
 import type {
   SphereEventMap,
   SphereEventType,

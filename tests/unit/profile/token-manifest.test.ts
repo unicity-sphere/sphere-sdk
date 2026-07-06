@@ -14,13 +14,13 @@ import {
   type TokenManifest,
   type TokenManifestEntry,
 } from '../../../profile/token-manifest';
-import type { UxfPackage } from '../../../uxf/UxfPackage';
+import type { UxfPackage } from '../../../extensions/uxf/bundle/UxfPackage';
 import type {
   ContentHash,
   InstanceChainEntry,
   UxfManifest,
   UxfPackageData,
-} from '../../../uxf/types';
+} from '../../../extensions/uxf/bundle/types';
 
 // ---------------------------------------------------------------------------
 // Fixture helpers (build minimal UxfPackageData + UxfPackage shapes)

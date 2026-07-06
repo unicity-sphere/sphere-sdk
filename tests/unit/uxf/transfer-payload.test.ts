@@ -30,7 +30,7 @@ import {
   extractCarRootCid,
   carBytesToBase64,
   carBase64ToBytes,
-} from '../../../uxf/transfer-payload';
+} from '../../../extensions/uxf/bundle/transfer-payload';
 import type {
   LegacyCombinedTransferPayload,
   LegacyInstantSplitPayload,

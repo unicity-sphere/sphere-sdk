@@ -7,10 +7,10 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { ElementPool } from '../../../uxf/element-pool.js';
-import { deconstructToken } from '../../../uxf/deconstruct.js';
-import { UxfError } from '../../../uxf/errors.js';
-import type { ContentHash, UxfElement, TokenRootChildren, GenesisChildren, TransactionChildren } from '../../../uxf/types.js';
+import { ElementPool } from '../../../extensions/uxf/bundle/element-pool.js';
+import { deconstructToken } from '../../../extensions/uxf/bundle/deconstruct.js';
+import { UxfError } from '../../../extensions/uxf/bundle/errors.js';
+import type { ContentHash, UxfElement, TokenRootChildren, GenesisChildren, TransactionChildren } from '../../../extensions/uxf/bundle/types.js';
 import {
   TOKEN_A,
   TOKEN_B,
