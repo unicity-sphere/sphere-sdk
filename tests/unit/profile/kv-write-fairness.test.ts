@@ -1,21 +1,21 @@
 /**
- * Unit tests for `profile/orbitdb-write-fairness.ts` (T.5.B.0.5).
+ * Unit tests for `profile/kv-write-fairness.ts` (T.5.B.0.5).
  *
  * Covers: bounded concurrency, FIFO/round-robin ordering, `run`
  * try/finally semantics, metrics, and per-instance independence.
  *
- * Spec / ADR: `docs/uxf/ADR-005-orbitdb-write-fairness.md`.
+ * Spec / ADR: `docs/uxf/ADR-005-kv-write-fairness.md`.
  */
 
 import { describe, it, expect } from 'vitest';
 
-import { OrbitDbWriteFairness } from '../../../extensions/uxf/profile/orbitdb-write-fairness';
-import { MAX_CONCURRENT_ORBITDB_WRITES } from '../../../extensions/uxf/pipeline/limits';
+import { KvWriteFairness } from '../../../extensions/uxf/profile/kv-write-fairness';
+import { MAX_CONCURRENT_KV_WRITES } from '../../../extensions/uxf/pipeline/limits';
 
 /**
  * Yield to the microtask queue enough times for queued promise
  * resolutions and `then` chains to flush. Vitest's fake timers are not
- * needed here — `OrbitDbWriteFairness` only uses microtasks.
+ * needed here — `KvWriteFairness` only uses microtasks.
  */
 async function flushMicrotasks(): Promise<void> {
   // 4 awaits is sufficient for the chains in these tests; bumps higher
@@ -25,30 +25,30 @@ async function flushMicrotasks(): Promise<void> {
   }
 }
 
-describe('OrbitDbWriteFairness — defaults & construction', () => {
-  it('uses MAX_CONCURRENT_ORBITDB_WRITES as the default cap', async () => {
-    const queue = new OrbitDbWriteFairness();
+describe('KvWriteFairness — defaults & construction', () => {
+  it('uses MAX_CONCURRENT_KV_WRITES as the default cap', async () => {
+    const queue = new KvWriteFairness();
     // Acquire up to the cap — all should resolve immediately.
-    for (let i = 0; i < MAX_CONCURRENT_ORBITDB_WRITES; i++) {
+    for (let i = 0; i < MAX_CONCURRENT_KV_WRITES; i++) {
       await queue.acquire();
     }
     expect(queue.getMetrics()).toEqual({
-      inflightCount: MAX_CONCURRENT_ORBITDB_WRITES,
+      inflightCount: MAX_CONCURRENT_KV_WRITES,
       waitQueueDepth: 0,
     });
   });
 
   it('rejects non-finite or sub-1 maxConcurrent', () => {
-    expect(() => new OrbitDbWriteFairness(0)).toThrow(/maxConcurrent/);
-    expect(() => new OrbitDbWriteFairness(-1)).toThrow(/maxConcurrent/);
-    expect(() => new OrbitDbWriteFairness(Number.NaN)).toThrow(/maxConcurrent/);
-    expect(() => new OrbitDbWriteFairness(Number.POSITIVE_INFINITY)).toThrow(
+    expect(() => new KvWriteFairness(0)).toThrow(/maxConcurrent/);
+    expect(() => new KvWriteFairness(-1)).toThrow(/maxConcurrent/);
+    expect(() => new KvWriteFairness(Number.NaN)).toThrow(/maxConcurrent/);
+    expect(() => new KvWriteFairness(Number.POSITIVE_INFINITY)).toThrow(
       /maxConcurrent/,
     );
   });
 
   it('floors fractional maxConcurrent', async () => {
-    const queue = new OrbitDbWriteFairness(2.9);
+    const queue = new KvWriteFairness(2.9);
     // Cap is 2 → 3rd acquire must queue.
     await queue.acquire();
     await queue.acquire();
@@ -65,9 +65,9 @@ describe('OrbitDbWriteFairness — defaults & construction', () => {
   });
 });
 
-describe('OrbitDbWriteFairness — bounded concurrency', () => {
+describe('KvWriteFairness — bounded concurrency', () => {
   it('first N acquires resolve immediately when under cap=N', async () => {
-    const queue = new OrbitDbWriteFairness(2);
+    const queue = new KvWriteFairness(2);
     let firstResolved = false;
     let secondResolved = false;
     void queue.acquire().then(() => {
@@ -82,7 +82,7 @@ describe('OrbitDbWriteFairness — bounded concurrency', () => {
   });
 
   it('the (N+1)-th acquire queues until a slot is released', async () => {
-    const queue = new OrbitDbWriteFairness(2);
+    const queue = new KvWriteFairness(2);
     await queue.acquire();
     await queue.acquire();
 
@@ -109,9 +109,9 @@ describe('OrbitDbWriteFairness — bounded concurrency', () => {
   });
 });
 
-describe('OrbitDbWriteFairness — FIFO / round-robin ordering', () => {
+describe('KvWriteFairness — FIFO / round-robin ordering', () => {
   it('5 queued acquires release in insertion order under cap=1', async () => {
-    const queue = new OrbitDbWriteFairness(1);
+    const queue = new KvWriteFairness(1);
     await queue.acquire(); // saturates the cap
 
     const order: number[] = [];
@@ -152,7 +152,7 @@ describe('OrbitDbWriteFairness — FIFO / round-robin ordering', () => {
     // resolving, the queued waiter gets the slot. The implementation
     // achieves this by handing the slot directly to the next waiter
     // without ever transiently dropping inflightCount.
-    const queue = new OrbitDbWriteFairness(1);
+    const queue = new KvWriteFairness(1);
     await queue.acquire(); // cap-saturating holder
 
     const order: string[] = [];
@@ -192,9 +192,9 @@ describe('OrbitDbWriteFairness — FIFO / round-robin ordering', () => {
   });
 });
 
-describe('OrbitDbWriteFairness — run() try/finally semantics', () => {
+describe('KvWriteFairness — run() try/finally semantics', () => {
   it('releases the slot on resolve', async () => {
-    const queue = new OrbitDbWriteFairness(1);
+    const queue = new KvWriteFairness(1);
     const result = await queue.run(async () => {
       expect(queue.getMetrics().inflightCount).toBe(1);
       return 42;
@@ -207,7 +207,7 @@ describe('OrbitDbWriteFairness — run() try/finally semantics', () => {
   });
 
   it('releases the slot on reject', async () => {
-    const queue = new OrbitDbWriteFairness(1);
+    const queue = new KvWriteFairness(1);
     await expect(
       queue.run(async () => {
         expect(queue.getMetrics().inflightCount).toBe(1);
@@ -222,7 +222,7 @@ describe('OrbitDbWriteFairness — run() try/finally semantics', () => {
   });
 
   it('serializes work under cap=1 (round-robin via run)', async () => {
-    const queue = new OrbitDbWriteFairness(1);
+    const queue = new KvWriteFairness(1);
     const order: number[] = [];
     const tasks = Array.from({ length: 5 }, (_, i) =>
       queue.run(async () => {
@@ -237,9 +237,9 @@ describe('OrbitDbWriteFairness — run() try/finally semantics', () => {
   });
 });
 
-describe('OrbitDbWriteFairness — metrics & instance isolation', () => {
+describe('KvWriteFairness — metrics & instance isolation', () => {
   it('metrics reflect caller observations', async () => {
-    const queue = new OrbitDbWriteFairness(3);
+    const queue = new KvWriteFairness(3);
     expect(queue.getMetrics()).toEqual({
       inflightCount: 0,
       waitQueueDepth: 0,
@@ -266,8 +266,8 @@ describe('OrbitDbWriteFairness — metrics & instance isolation', () => {
   });
 
   it('two instances are fully independent (no shared state)', async () => {
-    const a = new OrbitDbWriteFairness(1);
-    const b = new OrbitDbWriteFairness(1);
+    const a = new KvWriteFairness(1);
+    const b = new KvWriteFairness(1);
     await a.acquire();
     // a is saturated; b should still be free.
     expect(a.getMetrics()).toEqual({
@@ -297,8 +297,8 @@ describe('OrbitDbWriteFairness — metrics & instance isolation', () => {
   });
 });
 
-describe('OrbitDbWriteFairness — cap value defaults to limits.ts', () => {
-  it('MAX_CONCURRENT_ORBITDB_WRITES is exported and equals 8', () => {
-    expect(MAX_CONCURRENT_ORBITDB_WRITES).toBe(8);
+describe('KvWriteFairness — cap value defaults to limits.ts', () => {
+  it('MAX_CONCURRENT_KV_WRITES is exported and equals 8', () => {
+    expect(MAX_CONCURRENT_KV_WRITES).toBe(8);
   });
 });

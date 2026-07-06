@@ -41,10 +41,10 @@ need is **bounded concurrency**.
 ## Decision
 
 1. Cap concurrent in-flight OrbitDB writes at
-   `MAX_CONCURRENT_ORBITDB_WRITES = 8` (declared in
+   `MAX_CONCURRENT_KV_WRITES = 8` (declared in
    `modules/payments/transfer/limits.ts`).
 2. Implement the cap as a per-instance fairness queue in
-   `profile/orbitdb-write-fairness.ts` (`class OrbitDbWriteFairness`)
+   `profile/kv-write-fairness.ts` (`class KvWriteFairness`)
    exposing `acquire / release / run / getMetrics`.
 3. Fairness policy: **FIFO across pending writers** (round-robin). No
    priority lanes, no per-token-id buckets — the simplest discipline
@@ -70,7 +70,7 @@ T.8.D cutover.
 ## Consequences
 
 - Writers may queue. Queue depth is observable via
-  `OrbitDbWriteFairness.getMetrics()` (`inflightCount + waitQueueDepth`).
+  `KvWriteFairness.getMetrics()` (`inflightCount + waitQueueDepth`).
 - Worst-case end-to-end latency of a §5.5 step-5 sequence grows by at
   most one queued write's wait time (queues are bounded by the worker
   pool size, not the offered request rate, because workers can only

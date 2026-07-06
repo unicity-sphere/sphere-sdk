@@ -176,7 +176,7 @@ import { INGEST_QUEUE_PER_TOKEN_CAP, INGEST_QUEUE_SIZE } from './limits.js';
  * processed by a pool of parallel workers (default
  * MAX_INGEST_WORKERS = 16, configurable)."
  *
- * The cap is shared with `MAX_CONCURRENT_ORBITDB_WRITES = 8` (50%
+ * The cap is shared with `MAX_CONCURRENT_KV_WRITES = 8` (50%
  * headroom) — see `limits.ts` and ADR-005.
  */
 export const MAX_INGEST_WORKERS = 16;

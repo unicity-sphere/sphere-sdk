@@ -9,17 +9,17 @@
  * waiter, so no writer is starved by a steady stream of fresh acquires.
  *
  * **Per-instance scoping**: the queue holds NO module-level state. Each
- * `Sphere` instance constructs its own `OrbitDbWriteFairness`, so destroy-
+ * `Sphere` instance constructs its own `KvWriteFairness`, so destroy-
  * recreate cycles do not bleed slot accounting across wallet incarnations,
  * and unit tests can compose multiple independent instances without
  * cross-contamination.
  *
- * **Spec / ADR**: `docs/uxf/ADR-005-orbitdb-write-fairness.md`.
+ * **Spec / ADR**: `docs/uxf/ADR-005-kv-write-fairness.md`.
  *
  * @packageDocumentation
  */
 
-import { MAX_CONCURRENT_ORBITDB_WRITES } from '../pipeline/limits';
+import { MAX_CONCURRENT_KV_WRITES } from '../pipeline/limits';
 
 /**
  * Snapshot of fairness-queue activity for telemetry / load-test gates.
@@ -28,7 +28,7 @@ import { MAX_CONCURRENT_ORBITDB_WRITES } from '../pipeline/limits';
  * `waitQueueDepth / maxConcurrent > 0.5` is sustained, ADR-005's revisit
  * criteria fires.
  */
-export interface OrbitDbWriteFairnessMetrics {
+export interface KvWriteFairnessMetrics {
   /** Number of writers currently holding a slot. `0..maxConcurrent`. */
   readonly inflightCount: number;
   /** Number of writers parked in the FIFO wait queue. */
@@ -42,19 +42,19 @@ export interface OrbitDbWriteFairnessMetrics {
  * lifetime control, plus a `run` convenience that releases on both
  * resolve and reject paths via try/finally.
  */
-export class OrbitDbWriteFairness {
+export class KvWriteFairness {
   private readonly maxConcurrent: number;
   private inflightCount = 0;
   private readonly waitQueue: Array<() => void> = [];
 
   /**
    * @param maxConcurrent Maximum concurrent in-flight writes. Defaults
-   *   to {@link MAX_CONCURRENT_ORBITDB_WRITES}. Must be `>= 1`.
+   *   to {@link MAX_CONCURRENT_KV_WRITES}. Must be `>= 1`.
    */
-  constructor(maxConcurrent: number = MAX_CONCURRENT_ORBITDB_WRITES) {
+  constructor(maxConcurrent: number = MAX_CONCURRENT_KV_WRITES) {
     if (!Number.isFinite(maxConcurrent) || maxConcurrent < 1) {
       throw new Error(
-        `OrbitDbWriteFairness: maxConcurrent must be >= 1, got ${maxConcurrent}`,
+        `KvWriteFairness: maxConcurrent must be >= 1, got ${maxConcurrent}`,
       );
     }
     this.maxConcurrent = Math.floor(maxConcurrent);
@@ -121,7 +121,7 @@ export class OrbitDbWriteFairness {
    * a single synchronous tick; concurrent acquires/releases between
    * sampling and reaction are inherent to a non-locked observer.
    */
-  getMetrics(): OrbitDbWriteFairnessMetrics {
+  getMetrics(): KvWriteFairnessMetrics {
     return {
       inflightCount: this.inflightCount,
       waitQueueDepth: this.waitQueue.length,

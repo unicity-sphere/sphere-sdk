@@ -69,7 +69,7 @@ Walk the commit log — each title maps to a plan task.
 - `docs/uxf/UXF-TRANSFER-IMPL-PLAN.md` (52-task plan)
 - `docs/uxf/UXF-TRANSFER-CUTOVER-RUNBOOK.md` (operator runbook)
 - `docs/uxf/CONNECT-HOST-MIGRATION-NOTE.md` (cross-repo migration)
-- `docs/uxf/ADR-005-orbitdb-write-fairness.md`
+- `docs/uxf/ADR-005-kv-write-fairness.md`
 - `docs/INTEGRATION.md` (operator API + 13 events table)
 ```
 

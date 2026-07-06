@@ -29,8 +29,8 @@
  *          `MIN_POLL_ATTEMPTS`, `BACKOFF_SCHEDULE_MS` — consumed by the
  *          shared `polling-policy.ts` module (T.5.B.0).
  * - PROFILE-ARCHITECTURE.md §10 / ADR-005:
- *          `MAX_CONCURRENT_ORBITDB_WRITES` — fairness-queue cap consumed
- *          by `profile/orbitdb-write-fairness.ts` (T.5.B.0.5).
+ *          `MAX_CONCURRENT_KV_WRITES` — fairness-queue cap consumed
+ *          by `profile/kv-write-fairness.ts` (T.5.B.0.5).
  *
  * @packageDocumentation
  */
@@ -232,7 +232,7 @@ export const INGEST_QUEUE_PER_TOKEN_CAP = 16;
  * OrbitDB writes contend with replication merges under load. Uncapped
  * worker-pool concurrency causes head-of-line blocking and merge thrashing,
  * so the sender (T.5.B) and recipient (T.5.C) finalization workers
- * acquire from a fairness queue (`profile/orbitdb-write-fairness.ts`)
+ * acquire from a fairness queue (`profile/kv-write-fairness.ts`)
  * before issuing each write.
  *
  * **Default value: 8** — half of `MAX_INGEST_WORKERS = 16` (defined in
@@ -241,7 +241,7 @@ export const INGEST_QUEUE_PER_TOKEN_CAP = 16;
  * writes; setting the cap equal to the worker pool would starve the
  * merge path.
  *
- * **Revisit criteria** — see `docs/uxf/ADR-005-orbitdb-write-fairness.md`.
+ * **Revisit criteria** — see `docs/uxf/ADR-005-kv-write-fairness.md`.
  * Re-evaluate if T.8.E.1 load test shows:
  *   (a) sustained queue depth > 50% of cap,
  *   (b) p99 write latency > 5s, or
@@ -251,7 +251,7 @@ export const INGEST_QUEUE_PER_TOKEN_CAP = 16;
  * T.6.A's outbox writer is intentionally NOT wrapped — see ADR-005 "Out
  * of scope" section.
  */
-export const MAX_CONCURRENT_ORBITDB_WRITES = 8;
+export const MAX_CONCURRENT_KV_WRITES = 8;
 
 /**
  * Polling-window for finalization queue entries (§5.5 step 6). The

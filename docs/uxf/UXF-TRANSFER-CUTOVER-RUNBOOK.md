@@ -289,7 +289,7 @@ events are documented in `UXF-TRANSFER-IMPL-PLAN.md` §7.E.
 | --- | --- | --- | --- |
 | Ingest queue depth | `transfer:ingest-queue-full` count | low | sustained > 5/min → recipient pool overloaded; consider raising `MAX_INGEST_WORKERS` |
 | Per-token ingest backpressure | `transfer:ingest-queue-full-per-token` count | rare bursts | sustained → adversarial peer or hot tokenId; investigate sender |
-| OrbitDB write fairness queue | `OrbitDbWriteFairness.getMetrics()` (`waitQueueDepth / inflightCount`) | `waitQueueDepth / 8 < 0.5` | sustained > 0.5 for 30s → ADR-005 revisit criteria triggered (cap may need tuning) |
+| OrbitDB write fairness queue | `KvWriteFairness.getMetrics()` (`waitQueueDepth / inflightCount`) | `waitQueueDepth / 8 < 0.5` | sustained > 0.5 for 30s → ADR-005 revisit criteria triggered (cap may need tuning) |
 | Sending-recovery worker | `INGEST_QUEUE_FULL` counter (recovery-side) + per-entry retry count | retries < 3/entry typical | repeated `failed-transient` transitions → investigate stuck entries |
 
 ---
@@ -521,7 +521,7 @@ relevant commit SHA above.
 - `docs/uxf/UXF-TRANSFER-PROTOCOL.md` — canonical protocol spec.
 - `docs/uxf/UXF-TRANSFER-IMPL-PLAN.md` — 12-wave implementation plan (T.1–T.8).
 - `docs/uxf/CONNECT-HOST-MIGRATION-NOTE.md` — `schemaVersion` widening migration note.
-- `docs/uxf/ADR-005-orbitdb-write-fairness.md` — write-fairness cap and queue ADR.
+- `docs/uxf/ADR-005-kv-write-fairness.md` — write-fairness cap and queue ADR.
 - `tools/restore-legacy-outbox.ts` — back-out script (T.6.D.2).
 - `.github/workflows/external-acks-gate.yml` — CI gate enforcing the three external acks.
 - `tests/integration/profile/legacy-outbox-restore-roundtrip.test.ts` — C7 round-trip gate.

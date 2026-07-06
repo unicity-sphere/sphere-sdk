@@ -743,15 +743,15 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
 
 - **wave**: T.5 (lands BEFORE T.5.C's design is frozen)
 - **files_touched**:
-  - NEW: `docs/uxf/ADR-005-orbitdb-write-fairness.md` (~50 LOC) — decision record on `MAX_CONCURRENT_ORBITDB_WRITES` cap value + fairness-queue strategy. Default proposed: 8 (half of MAX_INGEST_WORKERS to leave OrbitDB headroom for replication merges); revisit-criteria section requires re-eval if T.8.E.1 load test shows >50% queue depth at the cap.
-  - MODIFIED: `modules/payments/transfer/limits.ts` — add `MAX_CONCURRENT_ORBITDB_WRITES = 8` constant.
-  - NEW: `profile/orbitdb-write-fairness.ts` (~30 LOC) — fairness-queue stub (round-robin across pending writers; bounded concurrent in-flight count). **T.5.B and T.5.C consume this primitive** (added explicitly to their depends_on); T.6.A landed earlier in the chain and uses unmediated OrbitDB writes. A follow-up T.6.A-fairness-wrap task is OPTIONAL and not on the critical path — exists only if T.8.E.1 load test shows T.6.A's outbox writes contending with T.5.B/T.5.C's worker writes.
+  - NEW: `docs/uxf/ADR-005-kv-write-fairness.md` (~50 LOC) — decision record on `MAX_CONCURRENT_KV_WRITES` cap value + fairness-queue strategy. Default proposed: 8 (half of MAX_INGEST_WORKERS to leave OrbitDB headroom for replication merges); revisit-criteria section requires re-eval if T.8.E.1 load test shows >50% queue depth at the cap.
+  - MODIFIED: `modules/payments/transfer/limits.ts` — add `MAX_CONCURRENT_KV_WRITES = 8` constant.
+  - NEW: `profile/kv-write-fairness.ts` (~30 LOC) — fairness-queue stub (round-robin across pending writers; bounded concurrent in-flight count). **T.5.B and T.5.C consume this primitive** (added explicitly to their depends_on); T.6.A landed earlier in the chain and uses unmediated OrbitDB writes. A follow-up T.6.A-fairness-wrap task is OPTIONAL and not on the critical path — exists only if T.8.E.1 load test shows T.6.A's outbox writes contending with T.5.B/T.5.C's worker writes.
 - **depends_on**: T.5.B.0 (manifest-cid-rewrite needs the fairness queue available to call into).
 - **parallel_with**: T.5.B (after T.5.B.0 lands).
 - **skill_tag**: `crdt`
 - **acceptance**:
   - ADR documents the choice + revisit criteria.
-  - `MAX_CONCURRENT_ORBITDB_WRITES` is exported from `limits.ts`.
+  - `MAX_CONCURRENT_KV_WRITES` is exported from `limits.ts`.
   - Fairness-queue stub passes basic round-robin unit tests.
   - T.8.E.1 load test gates verify the cap is appropriate; if wrong, ADR revisit triggered.
 - **est_loc**: 80
@@ -1731,7 +1731,7 @@ These do not block T.1–T.8 but should be resolved before merge of the correspo
 9. **[NEW]** T.5.F — trustBase refresh storm — debounce + cool-down for refresh; confirm rate limit on aggregator side; coordinate with aggregator team.
 10. **[NEW]** T.7.C.5 — external-repo coordination — proactive notification to agentsphere + sphere app maintainers about the `schemaVersion` field. Track ack from each downstream maintainer before T.8.D. **Steelman round 1 #10**: T.7.C.5 itself is documentation + a schemaVersion field; the actual external migration is unsolved and must NOT block T.8.D's coordination gate.
 11. **[RESOLVED]** ~~T.5.B / T.5.C test-LoC ratios~~ — round-2 W7: T.5.B est_loc bumped 1180 → 1580 (+400); T.5.C bumped 1240 → 1740 (+500). 1:1.5 impl:test ratio restored for both critical-path tasks.
-12. **[NEW — actionable, not punted]** Cross-tokenId disk-I/O contention (round-1 #8 / round-2 W8). Add a NEW pre-T.5.C task: `T.5.B.0.5 — OrbitDB-write-fairness ADR + cap` (~80 LOC: 1 ADR doc + `MAX_CONCURRENT_ORBITDB_WRITES` constant in `limits.ts` + a fairness-queue stub). Lands BEFORE T.5.C's design is frozen. T.8.E.1 load test then verifies the cap value; if cap is wrong, revisit per ADR's revisit-criteria section.
+12. **[NEW — actionable, not punted]** Cross-tokenId disk-I/O contention (round-1 #8 / round-2 W8). Add a NEW pre-T.5.C task: `T.5.B.0.5 — OrbitDB-write-fairness ADR + cap` (~80 LOC: 1 ADR doc + `MAX_CONCURRENT_KV_WRITES` constant in `limits.ts` + a fairness-queue stub). Lands BEFORE T.5.C's design is frozen. T.8.E.1 load test then verifies the cap value; if cap is wrong, revisit per ADR's revisit-criteria section.
 13. **[NEW]** Per-feature flag invalid-combination matrix is now enumerated in §7.A (round-1 #5 / #7); `validateFeatures(features)` is a T.1.B.1 deliverable. Steelman should verify each combo's effect on a stale wallet (e.g., V3 → V2 rollback during dual-write).
 14. **[NEW]** T.6.D.2 byte-identity definition (round-1 #13): "byte-identical" excludes `lamport`, `observedAt` timestamps, `_schemaVersion`, sentinel keys. Implementers test against the explicit field-list, not raw byte equality.
 15. **[NEW]** Spec-citation prefix on test filenames (round-1 #12): mandatory for spec-defined behavior tests (cite the §section), optional for adversarial-only tests where no normative requirement applies. Implementers follow the convention; reviewers enforce it on PRs that introduce tests.
