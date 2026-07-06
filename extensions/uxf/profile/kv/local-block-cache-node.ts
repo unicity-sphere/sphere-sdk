@@ -22,6 +22,38 @@ export interface LocalBlockCacheNodeOptions {
   readonly directory: string;
 }
 
+/**
+ * Materialize a blockstore-fs / blockstore-idb v4 `get()` return value
+ * (Generator | AsyncGenerator of Uint8Array chunks) into a single
+ * `Uint8Array`. Falls through unchanged if the underlying store already
+ * returns a plain `Uint8Array` (older versions / mocks).
+ */
+export async function concatChunks(
+  input:
+    | Uint8Array
+    | Generator<Uint8Array>
+    | AsyncGenerator<Uint8Array>
+    | Iterable<Uint8Array>
+    | AsyncIterable<Uint8Array>,
+): Promise<Uint8Array> {
+  if (input instanceof Uint8Array) return input;
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for await (const chunk of input as AsyncIterable<Uint8Array>) {
+    const view = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+    chunks.push(view);
+    total += view.byteLength;
+  }
+  if (chunks.length === 1) return chunks[0];
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 /** Minimal blockstore facade — matches `ipfs-client.ts`'s `HeliaLike`. */
 export interface LocalBlockCacheFacade {
   readonly blockstore: {
@@ -71,7 +103,10 @@ export class LocalBlockCacheNode implements LocalBlockCacheFacade {
     return {
       get: async (cid: CID) => {
         const bs = await this.ensureOpen();
-        return bs.get(cid);
+        const chunks = bs.get(cid);
+        // blockstore v4 returns Generator|AsyncGenerator<Uint8Array>; the
+        // HeliaLike consumers expect a single Uint8Array, so materialize.
+        return concatChunks(chunks);
       },
       put: async (cid: CID, bytes: Uint8Array) => {
         const bs = await this.ensureOpen();

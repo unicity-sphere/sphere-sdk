@@ -39,6 +39,11 @@ import { createProfileProviders } from './factory';
 import { createFileStorageProvider } from '../../../impl/nodejs/storage/FileStorageProvider';
 import { getNetworkConfig } from '../../../impl/shared';
 import { DEFAULT_IPFS_GATEWAYS } from '../../../constants';
+import {
+  ProfileKvAdapter,
+  ProfileKvNode,
+  LocalBlockCacheNode,
+} from './kv';
 import type { NetworkType } from '../../../constants';
 import { attachIdentityToProfileProviders } from './attach-identity';
 import { migrateLegacyToProfile } from './token-storage-migration';
@@ -103,6 +108,7 @@ export function createNodeProfileProviders(
 
   // Build the full ProfileConfig from network defaults + overrides
   const profileConfig: ProfileConfig = {
+    substrate: config.profileConfig?.substrate,
     orbitDb: {
       privateKey: '', // Set later via setIdentity()
       directory: config.profileConfig?.orbitDb?.directory ?? `${config.dataDir}/orbitdb`,
@@ -131,10 +137,33 @@ export function createNodeProfileProviders(
     debug: config.profileConfig?.debug,
   };
 
+  // Phase 4 (uxf-v2) — when the caller opts into the KV substrate,
+  // pre-build a ProfileKvAdapter here so `createProfileProviders`
+  // uses it instead of constructing an OrbitDbAdapter. The KV
+  // backend / block cache directories nest under the same dataDir
+  // as OrbitDB used to, so nothing else in the factory chain
+  // (dataDir cleanup, `Sphere.clear`, etc.) needs to change.
+  let substrateOverride: ProfileKvAdapter | undefined;
+  if (profileConfig.substrate === 'kv') {
+    const kvBaseDir =
+      profileConfig.orbitDb.directory ?? `${config.dataDir}/orbitdb`;
+    substrateOverride = new ProfileKvAdapter({
+      backendFactory: (shortName) =>
+        new ProfileKvNode({
+          directory: `${kvBaseDir}/kv-${shortName}`,
+        }),
+      blockCacheFactory: (shortName) =>
+        new LocalBlockCacheNode({
+          directory: `${kvBaseDir}/kv-${shortName}/blocks`,
+        }),
+    });
+  }
+
   const { storage, tokenStorage } = createProfileProviders(
     profileConfig,
     localCache,
     config.oracle,
+    substrateOverride,
   );
 
   return { storage, tokenStorage };

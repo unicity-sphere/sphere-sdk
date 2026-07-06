@@ -16,6 +16,7 @@ import type { StorageProvider } from '../../../storage/storage-provider';
 import type { OracleProvider } from '../../../oracle';
 import type {
   ProfileConfig,
+  ProfileDatabase,
   ProfileSnapshotPublishResult,
   ProfileTokenStorageProviderOptions,
 } from './types';
@@ -414,6 +415,14 @@ export function createProfileProviders(
   config: ProfileConfig,
   cacheStorage: StorageProvider,
   oracle?: OracleProvider,
+  /**
+   * Optional pre-constructed `ProfileDatabase` — when set, the factory
+   * uses it instead of building an `OrbitDbAdapter`. Node / browser
+   * factories inject a `ProfileKvAdapter` here when the caller opts in
+   * via `substrate: 'kv'`. Passing `undefined` (the default) keeps the
+   * legacy OrbitDB path.
+   */
+  substrateOverride?: ProfileDatabase,
 ): ProfileProviders {
   // Merge custom bootstrap peers from the convenience alias
   const resolvedConfig: ProfileConfig = config.profileOrbitDbPeers
@@ -429,8 +438,11 @@ export function createProfileProviders(
       }
     : config;
 
-  // Create OrbitDB adapter (connection deferred to connect())
-  const db = new OrbitDbAdapter();
+  // Substrate selection — the OrbitDB path is the default; the KV path
+  // is opt-in via `substrate: 'kv'` in ProfileConfig and requires the
+  // platform factory to pre-construct the ProfileKvAdapter. See
+  // docs/uxf/uxfv2-substrate-alternatives.md §3.7.
+  const db: ProfileDatabase = substrateOverride ?? new OrbitDbAdapter();
 
   // Create ProfileStorageProvider wrapping the local cache and OrbitDB
   const storage = new ProfileStorageProvider(cacheStorage, db, {

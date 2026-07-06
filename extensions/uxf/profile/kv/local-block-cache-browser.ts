@@ -14,7 +14,7 @@ import type { CID } from 'multiformats/cid';
 import { IDBBlockstore } from 'blockstore-idb';
 
 import { logger } from '../../../../core/logger.js';
-import type { LocalBlockCacheFacade } from './local-block-cache-node.js';
+import { concatChunks, type LocalBlockCacheFacade } from './local-block-cache-node.js';
 
 export interface LocalBlockCacheBrowserOptions {
   /** IndexedDB database name for the blockstore. */
@@ -56,7 +56,8 @@ export class LocalBlockCacheBrowser implements LocalBlockCacheFacade {
     return {
       get: async (cid: CID) => {
         const bs = await this.ensureOpen();
-        return bs.get(cid);
+        const chunks = bs.get(cid);
+        return concatChunks(chunks);
       },
       put: async (cid: CID, bytes: Uint8Array) => {
         const bs = await this.ensureOpen();

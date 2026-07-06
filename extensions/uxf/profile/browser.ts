@@ -37,6 +37,11 @@ import type { Sphere } from '../../../core/Sphere';
 import type { TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
 import { createProfileProviders } from './factory';
 import {
+  ProfileKvAdapter,
+  ProfileKvBrowser,
+  LocalBlockCacheBrowser,
+} from './kv';
+import {
   createIndexedDBStorageProvider,
   createIndexedDBTokenStorageProvider,
 } from '../../../impl/browser/storage';
@@ -118,6 +123,7 @@ export function createBrowserProfileProviders(
 
   // Build the full ProfileConfig from network defaults + overrides
   const profileConfig: ProfileConfig = {
+    substrate: config.profileConfig?.substrate,
     orbitDb: {
       privateKey: '', // Set later via setIdentity()
       // Issue #266 — browser wallets default to HTTP-only IPFS:
@@ -139,10 +145,28 @@ export function createBrowserProfileProviders(
     debug: config.profileConfig?.debug,
   };
 
+  // Phase 4 (uxf-v2) — opt-in KV substrate. Nests under an
+  // IndexedDB name derived from the wallet shortname so multiple
+  // wallets on the same origin don't collide.
+  let substrateOverride: ProfileKvAdapter | undefined;
+  if (profileConfig.substrate === 'kv') {
+    substrateOverride = new ProfileKvAdapter({
+      backendFactory: (shortName) =>
+        new ProfileKvBrowser({
+          dbName: `sphere-profile-kv-${shortName}`,
+        }),
+      blockCacheFactory: (shortName) =>
+        new LocalBlockCacheBrowser({
+          dbName: `sphere-profile-kv-blocks-${shortName}`,
+        }),
+    });
+  }
+
   const { storage, tokenStorage } = createProfileProviders(
     profileConfig,
     localCache,
     config.oracle,
+    substrateOverride,
   );
 
   return { storage, tokenStorage };

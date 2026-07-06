@@ -57,7 +57,19 @@ import type { ProfileKvBackend } from './profile-kv-node.js';
 export type { OpLogEntryEnvelope };
 
 export interface ProfileKvAdapterOptions {
-  readonly backend: ProfileKvBackend;
+  /**
+   * Directly-injected KV backend. Preferred for tests / stubs / callers
+   * that already know the DB shortname. When set, the shortname derived
+   * at `connect()` is ignored for backend selection.
+   */
+  readonly backend?: ProfileKvBackend;
+  /**
+   * Lazy backend factory invoked at `connect()` time with the derived
+   * `sphere-profile-<shortname>` label so the factory can pick a
+   * per-wallet directory / IndexedDB name. Used by the production node
+   * / browser factories.
+   */
+  readonly backendFactory?: (dbShortName: string) => ProfileKvBackend;
   /**
    * Optional local block cache exposed via `getHelia()` so
    * `ipfs-client.ts` can use it as the first-class store for CAR
@@ -65,6 +77,12 @@ export interface ProfileKvAdapterOptions {
    * pin/fetch path.
    */
   readonly blockCache?: LocalBlockCacheFacade | null;
+  /**
+   * Lazy block-cache factory invoked at `connect()` time. When both
+   * `blockCache` and `blockCacheFactory` are omitted, `getHelia()`
+   * returns `null` and the pin/fetch path falls through to HTTP.
+   */
+  readonly blockCacheFactory?: (dbShortName: string) => LocalBlockCacheFacade | null;
 }
 
 /**
@@ -72,8 +90,12 @@ export interface ProfileKvAdapterOptions {
  * `ProfileDatabase` consumers.
  */
 export class ProfileKvAdapter {
-  private readonly backend: ProfileKvBackend;
-  private readonly blockCache: LocalBlockCacheFacade | null;
+  private readonly backendFactory: (dbShortName: string) => ProfileKvBackend;
+  private readonly blockCacheFactory: (
+    dbShortName: string,
+  ) => LocalBlockCacheFacade | null;
+  private backend: ProfileKvBackend | null = null;
+  private blockCache: LocalBlockCacheFacade | null = null;
   private connected = false;
   private connectInFlight: Promise<void> | null = null;
   private shuttingDown = false;
@@ -84,8 +106,25 @@ export class ProfileKvAdapter {
     | null = null;
 
   constructor(opts: ProfileKvAdapterOptions) {
-    this.backend = opts.backend;
-    this.blockCache = opts.blockCache ?? null;
+    if (opts.backend) {
+      const injectedBackend = opts.backend;
+      this.backendFactory = () => injectedBackend;
+    } else if (opts.backendFactory) {
+      this.backendFactory = opts.backendFactory;
+    } else {
+      throw new ProfileError(
+        'PROFILE_KV_INIT_FAILED',
+        'ProfileKvAdapter requires `backend` or `backendFactory`',
+      );
+    }
+    if (opts.blockCache !== undefined) {
+      const injectedCache = opts.blockCache;
+      this.blockCacheFactory = () => injectedCache;
+    } else if (opts.blockCacheFactory) {
+      this.blockCacheFactory = opts.blockCacheFactory;
+    } else {
+      this.blockCacheFactory = () => null;
+    }
   }
 
   async connect(config: OrbitDbConfig): Promise<void> {
@@ -97,22 +136,19 @@ export class ProfileKvAdapter {
         // Byte-stable identity derivation with OrbitDbAdapter — same
         // `sphere-profile-<16-hex>` shape so cross-device opens on
         // the same seed land on the same KV directory.
+        let dbShortName: string;
         if (config.dbNameOverride) {
-          // pre-derived name — nothing to do here, the backend already
-          // has its directory / dbName from the factory.
+          dbShortName = normalizeShortName(config.dbNameOverride);
         } else if (config.privateKey && config.privateKey.length > 0) {
-          // Legacy path — the factory should have derived and passed
-          // `dbNameOverride` already; keeping this branch alive means
-          // adapter callers that skip the factory still work.
-          // We don't actually re-derive here because the backend is
-          // already bound to its directory / dbName; log for parity.
-          await derivePublicKeyShort(config.privateKey);
+          dbShortName = await deriveProfileDbNameShort(config.privateKey);
         } else {
           throw new ProfileError(
             'PROFILE_KV_CONNECTION_FAILED',
             'ProfileKvConfig requires either dbNameOverride (preferred) or privateKey (deprecated).',
           );
         }
+        this.backend = this.backendFactory(dbShortName);
+        this.blockCache = this.blockCacheFactory(dbShortName);
         await this.backend.open();
         this.connected = true;
         observeMs('profile-kv.connect.totalMs', performance.now() - t0);
@@ -143,7 +179,9 @@ export class ProfileKvAdapter {
           /* connect errors are terminal; keep tearing down */
         }
       }
-      await this.backend.close();
+      if (this.backend) {
+        await this.backend.close();
+      }
       const cache = this.blockCache as
         | (LocalBlockCacheFacade & { close?: () => Promise<void> })
         | null;
@@ -169,29 +207,30 @@ export class ProfileKvAdapter {
     return this.connected;
   }
 
-  private ensureConnected(): void {
-    if (!this.connected) {
+  private ensureConnected(): ProfileKvBackend {
+    if (!this.connected || !this.backend) {
       throw new ProfileError(
         'PROFILE_KV_NOT_OPEN',
         'ProfileKvAdapter: operation before connect()',
       );
     }
+    return this.backend;
   }
 
   async put(key: string, value: Uint8Array): Promise<void> {
-    this.ensureConnected();
-    await this.backend.put(key, value);
+    const backend = this.ensureConnected();
+    await backend.put(key, value);
     this.dispatchReplicationSignal();
   }
 
   async get(key: string): Promise<Uint8Array | null> {
-    this.ensureConnected();
-    return this.backend.get(key);
+    const backend = this.ensureConnected();
+    return backend.get(key);
   }
 
   async del(key: string): Promise<void> {
-    this.ensureConnected();
-    await this.backend.del(key);
+    const backend = this.ensureConnected();
+    await backend.del(key);
     this.dispatchReplicationSignal();
   }
 
@@ -199,8 +238,8 @@ export class ProfileKvAdapter {
     prefix?: string,
     opts?: { readonly maxResults?: number },
   ): Promise<Map<string, Uint8Array>> {
-    this.ensureConnected();
-    return this.backend.all(prefix, opts);
+    const backend = this.ensureConnected();
+    return backend.all(prefix, opts);
   }
 
   onReplication(callback: () => void): () => void {
@@ -248,12 +287,12 @@ export class ProfileKvAdapter {
   }
 
   async putEntry(key: string, entry: OpLogEntryEnvelope): Promise<void> {
-    this.ensureConnected();
+    const backend = this.ensureConnected();
     const t0 = performance.now();
     const isBundleKey = key.startsWith('tokens.bundle.');
     try {
       const cborBytes = encodeEntry(entry);
-      await this.backend.put(key, cborBytes);
+      await backend.put(key, cborBytes);
       this.localAuthoredKeys.add(key);
       this.dispatchReplicationSignal();
     } catch (err) {
@@ -282,11 +321,11 @@ export class ProfileKvAdapter {
       trustLocalClaim?: boolean;
     } = {},
   ): Promise<OpLogEntryEnvelope | null> {
-    this.ensureConnected();
+    const backend = this.ensureConnected();
     const t0 = performance.now();
     const isBundleKey = key.startsWith('tokens.bundle.');
     try {
-      const bytes = await this.backend.get(key);
+      const bytes = await backend.get(key);
       if (bytes === null) {
         observeMs(
           isBundleKey ? 'profile-kv.getEntry.bundleMissMs' : 'profile-kv.getEntry.missMs',
@@ -408,8 +447,16 @@ export async function deriveProfileDbNameShort(
   );
 }
 
-// Internal helper mirroring OrbitDbAdapter's derivePublicKeyShort so the
-// deprecated-path branch above has a place to touch the key when the
-// factory hasn't pre-derived a dbNameOverride. Unused by production
-// flows (factory always pre-derives), kept for CLI/test parity.
-const derivePublicKeyShort = deriveProfileDbNameShort;
+/**
+ * Extract a canonical 16-hex shortname from a `dbNameOverride`. If the
+ * caller passed the full `sphere-profile-<xxx>` label, strip the prefix
+ * so the backend factory receives a bare shortname. Any other input is
+ * accepted verbatim (byte-stable with OrbitDbAdapter's dbName usage).
+ */
+function normalizeShortName(dbNameOverride: string): string {
+  const prefix = 'sphere-profile-';
+  if (dbNameOverride.startsWith(prefix)) {
+    return dbNameOverride.slice(prefix.length);
+  }
+  return dbNameOverride;
+}
