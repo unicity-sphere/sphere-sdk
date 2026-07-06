@@ -95,7 +95,7 @@ describe.skipIf(SKIP_INFRA)(
       expect(initResult.generatedMnemonic).toBeTruthy();
       const mnemonic = initResult.generatedMnemonic!;
       const directAddress = sphereA.identity!.directAddress!;
-      console.log(`  Wallet A: ${sphereA.identity!.l1Address}`);
+      console.log(`  Wallet A: ${sphereA.identity!.chainPubkey}`);
 
       console.log('  Minting invoice for 11000000 UCT to self...');
       const invResult = await sphereA.accounting!.createInvoice({
@@ -148,7 +148,7 @@ describe.skipIf(SKIP_INFRA)(
         reInitResult.created,
         'second init should LOAD (wallet exists on disk), not CREATE',
       ).toBe(false);
-      console.log(`  Wallet B (re-loaded): ${sphereB.identity!.l1Address}`);
+      console.log(`  Wallet B (re-loaded): ${sphereB.identity!.chainPubkey}`);
 
       const tokensAfterReload = sphereB.payments.getTokens();
       const invoicesAfterReload = await sphereB.accounting!.getInvoices();

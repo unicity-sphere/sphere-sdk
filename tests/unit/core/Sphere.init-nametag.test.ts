@@ -169,7 +169,8 @@ describe('Sphere.init({ nametag }) on existing wallet (Bug A)', () => {
     // requested nametag.
     expect(mintSpy).toHaveBeenCalledWith('alice-t1');
     const publishCalls = (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mock.calls;
-    const publishedNames = publishCalls.map((args) => args[3]);
+    // publishIdentityBinding is 3-arg: (chainPubkey, directAddress, nametag)
+    const publishedNames = publishCalls.map((args) => args[2]);
     expect(publishedNames).toContain('alice-t1');
 
     await sphere.destroy();

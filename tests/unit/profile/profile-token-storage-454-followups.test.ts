@@ -542,6 +542,8 @@ describe('Issue #454 finding #4 — background HEAD-verify gates on !skipPublish
       '..',
       '..',
       '..',
+      'extensions',
+      'uxf',
       'profile',
       'profile-token-storage',
       'flush-scheduler.ts',

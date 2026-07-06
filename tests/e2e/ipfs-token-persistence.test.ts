@@ -110,7 +110,7 @@ describe.skip('IPFS Active Token Persistence E2E (legacy IpfsStorageProvider —
     expect(created).toBe(true);
     expect(generatedMnemonic).toBeTruthy();
     savedMnemonicA = generatedMnemonic!;
-    console.log(`  Wallet A created: ${sphereA.identity!.l1Address}`);
+    console.log(`  Wallet A created: ${sphereA.identity!.chainPubkey}`);
 
     // Request faucet for all coins
     console.log(`  Requesting multi-coin faucet for @${savedNametagA}...`);
@@ -193,7 +193,7 @@ describe.skip('IPFS Active Token Persistence E2E (legacy IpfsStorageProvider —
       mnemonic: savedMnemonicA,
     });
     spheres.push(sphereA);
-    console.log(`  Wallet A imported: ${sphereA.identity!.l1Address}`);
+    console.log(`  Wallet A imported: ${sphereA.identity!.chainPubkey}`);
 
     // Add IPFS provider
     if (providersA.ipfsTokenStorage) {
@@ -301,7 +301,7 @@ describe.skip('IPFS Active Token Persistence E2E (legacy IpfsStorageProvider —
       nametag: nametagB,
     });
     spheres.push(sphereB);
-    console.log(`  Wallet B created: ${sphereB.identity!.l1Address}`);
+    console.log(`  Wallet B created: ${sphereB.identity!.chainPubkey}`);
 
     // Finalize recovered tokens so they are spendable
     console.log('  Resolving unconfirmed tokens on wallet A...');
@@ -361,7 +361,7 @@ describe.skip('IPFS Active Token Persistence E2E (legacy IpfsStorageProvider —
     });
     spheres.push(sphereC1);
     expect(mnemonicC).toBeTruthy();
-    console.log(`  Wallet C created: ${sphereC1.identity!.l1Address}`);
+    console.log(`  Wallet C created: ${sphereC1.identity!.chainPubkey}`);
 
     // Request batch 1 (all coins)
     console.log('  Requesting batch 1 (all coins)...');

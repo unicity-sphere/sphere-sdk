@@ -437,7 +437,6 @@ function createParty(
   const trackedAddress: TrackedAddress = {
     index: 0,
     addressId: identity.directAddress!.replace('DIRECT://', 'DIRECT_'),
-    l1Address: identity.l1Address,
     directAddress: identity.directAddress!,
     chainPubkey: identity.chainPubkey,
     nametag: identity.nametag,

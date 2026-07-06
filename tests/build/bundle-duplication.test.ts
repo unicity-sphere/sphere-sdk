@@ -42,9 +42,9 @@ const ROOT = path.resolve(__dirname, '../..');
 /** Top-level tsup entry points that MUST NOT re-export ProfilePointerLayer. */
 const TOP_LEVEL_BARRELS: readonly string[] = [
   'index.ts',
-  'profile/index.ts',
-  'profile/browser.ts',
-  'profile/node.ts',
+  'extensions/uxf/profile/index.ts',
+  'extensions/uxf/profile/browser.ts',
+  'extensions/uxf/profile/node.ts',
   'impl/browser/index.ts',
   'impl/nodejs/index.ts',
 ];
@@ -114,7 +114,7 @@ describe('T-D12b — ProfilePointerLayer bundle-duplication invariant', () => {
 
   it('ProfilePointerLayer is exported from exactly one canonical module', () => {
     // Canonical: profile/aggregator-pointer/index.ts
-    const canonical = path.join(ROOT, 'profile/aggregator-pointer/index.ts');
+    const canonical = path.join(ROOT, 'extensions/uxf/profile/aggregator-pointer/index.ts');
     expect(fs.existsSync(canonical)).toBe(true);
     const content = fs.readFileSync(canonical, 'utf8');
     expect(grepExportsNaming(content, 'ProfilePointerLayer')).not.toEqual([]);

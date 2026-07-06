@@ -219,7 +219,7 @@ describe.skip('IPFS Multi-Device Sync E2E (legacy IpfsStorageProvider — deprec
       });
       spheres.push(sphereRecovery);
       console.log(
-        `  Wallet imported: ${sphereRecovery.identity!.l1Address}`,
+        `  Wallet imported: ${sphereRecovery.identity!.chainPubkey}`,
       );
 
       // Add IPFS provider

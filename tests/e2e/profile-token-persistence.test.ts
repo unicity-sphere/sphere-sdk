@@ -100,7 +100,7 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB) Active Token Persistence E2E', ()
     expect(created).toBe(true);
     expect(generatedMnemonic).toBeTruthy();
     savedMnemonicA = generatedMnemonic!;
-    console.log(`  Wallet A: ${sphereA.identity!.l1Address}`);
+    console.log(`  Wallet A: ${sphereA.identity!.chainPubkey}`);
 
     // Faucet: request every test coin
     console.log(`  Requesting faucet for @${savedNametagA}...`);
@@ -199,7 +199,7 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB) Active Token Persistence E2E', ()
       mnemonic: savedMnemonicA,
     });
     spheres.push(sphereA);
-    console.log(`  Wallet A imported: ${sphereA.identity!.l1Address}`);
+    console.log(`  Wallet A imported: ${sphereA.identity!.chainPubkey}`);
 
     // Profile recovery happens during Sphere.import() itself: the import
     // path runs `payments.load()` which calls each token-storage
@@ -282,7 +282,7 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB) Active Token Persistence E2E', ()
       nametag: nametagB,
     });
     spheres.push(sphereB);
-    console.log(`  Wallet B: ${sphereB.identity!.l1Address}`);
+    console.log(`  Wallet B: ${sphereB.identity!.chainPubkey}`);
 
     // Re-import wallet A with REAL transport so it can actually send
     // messages over Nostr (Test 2 used a noop transport).

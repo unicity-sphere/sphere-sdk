@@ -157,7 +157,7 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       // Should publish binding since not found
       if (!existingPubkey) {
-        await transport.publishIdentityBinding!(identity.chainPubkey, identity.l1Address, identity.directAddress || '', TEST_NAMETAG);
+        await transport.publishIdentityBinding!(identity.chainPubkey, identity.chainPubkey, identity.directAddress || '', TEST_NAMETAG);
       }
 
       expect(transport._resolveCalls).toContain(TEST_NAMETAG);
@@ -183,7 +183,7 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       // Should not publish since already registered to same pubkey
       if (existingPubkey !== identity.chainPubkey) {
-        await transport.publishIdentityBinding!(identity.chainPubkey, identity.l1Address, identity.directAddress || '', TEST_NAMETAG);
+        await transport.publishIdentityBinding!(identity.chainPubkey, identity.chainPubkey, identity.directAddress || '', TEST_NAMETAG);
       }
 
       expect(transport._resolveCalls).toContain(TEST_NAMETAG);
@@ -213,7 +213,7 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       // Simulate: do not publish on conflict
       if (!isConflict) {
-        await transport.publishIdentityBinding!(identity.chainPubkey, identity.l1Address, identity.directAddress || '', TEST_NAMETAG);
+        await transport.publishIdentityBinding!(identity.chainPubkey, identity.chainPubkey, identity.directAddress || '', TEST_NAMETAG);
       }
 
       expect(transport.publishIdentityBinding).not.toHaveBeenCalled();
@@ -384,7 +384,6 @@ describe('Sphere.recoverNametagFromNostr (simulated)', () => {
           if (transport.publishIdentityBinding) {
             await transport.publishIdentityBinding(
               identity.chainPubkey,
-              identity.l1Address,
               identity.directAddress || '',
               recovered,
             );

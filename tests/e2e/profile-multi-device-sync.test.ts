@@ -179,7 +179,7 @@ describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
         mnemonic: savedMnemonic,
       });
       spheres.push(sphereB);
-      console.log(`  Device B imported: ${sphereB.identity!.l1Address}`);
+      console.log(`  Device B imported: ${sphereB.identity!.chainPubkey}`);
 
       // Profile recovery happens during Sphere.import() itself: the
       // import path runs `payments.load()` which calls each token-storage

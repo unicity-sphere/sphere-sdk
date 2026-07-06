@@ -129,7 +129,7 @@ describe('checkNetworkHealth', () => {
 
   describe('parallel checks', () => {
     it('should check all services in parallel', async () => {
-      // Mock WebSocket for relay + l1
+      // Mock WebSocket for relay
       (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
         onopen: (() => void) | null = null;
         onerror: (() => void) | null = null;
@@ -146,15 +146,13 @@ describe('checkNetworkHealth', () => {
       );
 
       const result = await checkNetworkHealth('testnet', {
-        services: ['relay', 'oracle', 'l1'],
+        services: ['relay', 'oracle'],
       });
 
       expect(result.services.relay).toBeDefined();
       expect(result.services.oracle).toBeDefined();
-      expect(result.services.l1).toBeDefined();
       expect(result.services.relay!.healthy).toBe(true);
       expect(result.services.oracle!.healthy).toBe(true);
-      expect(result.services.l1!.healthy).toBe(true);
       expect(result.healthy).toBe(true);
     });
 
@@ -435,8 +433,6 @@ describe('checkNetworkHealth', () => {
     });
   });
 
-  describe('default behavior', () => {
-  });
 });
 
 // =============================================================================

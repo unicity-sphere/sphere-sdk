@@ -275,7 +275,7 @@ function buildSourceData(opts: {
   const data: Record<string, unknown> = {
     _meta: {
       version: 1,
-      address: IDENTITY.l1Address,
+      address: IDENTITY.chainPubkey,
       formatVersion: '2.0',
       updatedAt: 1000,
     },
@@ -949,7 +949,7 @@ describe('migrateTokenStorage — steelman fixes (PR #289 review)', () => {
     const source = createMockProvider({
       _meta: {
         version: 1,
-        address: IDENTITY.l1Address,
+        address: IDENTITY.chainPubkey,
         formatVersion: '2.0',
         updatedAt: 1,
       },
@@ -1093,7 +1093,7 @@ describe('migrateTokenStorage — steelman fixes (PR #289 review)', () => {
     const targetData = target._lastSavedData!;
     expect(targetData._meta).toBeDefined();
     expect(targetData._meta.version).toBe(1);
-    expect(targetData._meta.address).toBe(IDENTITY.l1Address);
+    expect(targetData._meta.address).toBe(IDENTITY.chainPubkey);
     expect(targetData._meta.formatVersion).toBe('2.0');
     expect(typeof targetData._meta.updatedAt).toBe('number');
   });

@@ -104,7 +104,6 @@ function setupIdentity(provider: InstanceType<typeof NostrTransportProvider>) {
   provider.setIdentity({
     privateKey: TEST_PRIVATE_KEY,
     chainPubkey: TEST_COMPRESSED_PUBKEY,
-    l1Address: TEST_L1_ADDRESS,
     directAddress: TEST_DIRECT_ADDRESS,
   });
 }

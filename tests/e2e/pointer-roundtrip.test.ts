@@ -511,7 +511,7 @@ describe.skipIf(SKIP)('ProfilePointerLayer round-trip (Unicity testnet)', () => 
       cleanupDirs.push(a.baseDir);
       spheres.push(a.sphere);
       console.log(`[pointer-roundtrip] Sphere.init took ${tInit.toFixed(0)}ms`);
-      console.log(`[pointer-roundtrip] identity=${a.sphere.identity!.l1Address}`);
+      console.log(`[pointer-roundtrip] identity=${a.sphere.identity!.chainPubkey}`);
 
       // See ORDERING NOTE at the top of this file. Force a Phase-C
       // retry now that the oracle is initialized — without this, the

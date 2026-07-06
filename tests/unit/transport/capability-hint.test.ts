@@ -110,7 +110,6 @@ function setupIdentity(provider: InstanceType<typeof NostrTransportProvider>) {
   provider.setIdentity({
     privateKey: TEST_PRIVATE_KEY,
     chainPubkey: TEST_COMPRESSED_PUBKEY,
-    l1Address: TEST_L1_ADDRESS,
     directAddress: TEST_DIRECT_ADDRESS,
   });
 }
@@ -168,7 +167,7 @@ describe('T.8.B — capability hint surfacing in identity binding events', () =>
       await provider.connect();
 
       const success = await provider.publishIdentityBinding(
-        TEST_COMPRESSED_PUBKEY, TEST_L1_ADDRESS, TEST_DIRECT_ADDRESS,
+        TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS,
       );
 
       expect(success).toBe(true);
@@ -181,9 +180,8 @@ describe('T.8.B — capability hint surfacing in identity binding events', () =>
       const content = JSON.parse(event.content) as Record<string, unknown>;
       expect(content.wire_protocols).toEqual(['uxf-car', 'uxf-cid', 'txf']);
       expect(content.asset_kinds).toEqual(['coin', 'nft']);
-      // And the canonical address fields stay alongside.
+      // Phase-2 emitters do NOT include `l1_address` on wire.
       expect(content.public_key).toBe(TEST_COMPRESSED_PUBKEY);
-      expect(content.l1_address).toBe(TEST_L1_ADDRESS);
       expect(content.direct_address).toBe(TEST_DIRECT_ADDRESS);
     });
 
@@ -193,7 +191,7 @@ describe('T.8.B — capability hint surfacing in identity binding events', () =>
       // The nametag path delegates to nostr-js-sdk for the nametag-specific
       // event AND additionally publishes the no-nametag capability binding.
       const success = await provider.publishIdentityBinding(
-        TEST_COMPRESSED_PUBKEY, TEST_L1_ADDRESS, TEST_DIRECT_ADDRESS, 'alice',
+        TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS, 'alice',
       );
       expect(success).toBe(true);
 
@@ -213,7 +211,7 @@ describe('T.8.B — capability hint surfacing in identity binding events', () =>
       // same author.
       await provider.connect();
       await provider.publishIdentityBinding(
-        TEST_COMPRESSED_PUBKEY, TEST_L1_ADDRESS, TEST_DIRECT_ADDRESS, 'alice',
+        TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS, 'alice',
       );
 
       expect(publishedEvents.length).toBe(1);

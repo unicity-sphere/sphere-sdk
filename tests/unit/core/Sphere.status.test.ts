@@ -9,13 +9,6 @@ import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { ProviderStatus, SphereEventMap } from '../../../types';
 
-// Mock L1 network module before importing Sphere
-vi.mock('../../../l1/network', () => ({
-  connect: vi.fn().mockResolvedValue(undefined),
-  disconnect: vi.fn(),
-  isWebSocketConnected: vi.fn().mockReturnValue(false),
-}));
-
 import { Sphere } from '../../../core/Sphere';
 
 // =============================================================================
@@ -163,7 +156,6 @@ describe('Sphere Status & Provider Management', () => {
   });
 
   async function initSphere(options?: {
-    l1?: { electrumUrl?: string };
     price?: { platform: string };
   }) {
     const initOpts: Record<string, unknown> = {
@@ -173,9 +165,6 @@ describe('Sphere Status & Provider Management', () => {
       tokenStorage,
       autoGenerate: true,
     };
-    if (options?.l1) {
-      initOpts.l1 = options.l1;
-    }
     if (options?.price) {
       initOpts.price = {
         platform: options.price.platform,
@@ -201,7 +190,6 @@ describe('Sphere Status & Provider Management', () => {
       expect(status.tokenStorage).toBeInstanceOf(Array);
       expect(status.transport).toBeInstanceOf(Array);
       expect(status.oracle).toBeInstanceOf(Array);
-      expect(status.l1).toBeInstanceOf(Array);
       expect(status.price).toBeInstanceOf(Array);
     });
 

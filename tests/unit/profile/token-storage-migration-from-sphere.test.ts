@@ -84,7 +84,7 @@ function makeMockTokenProvider(): TokenStorageProvider<TxfStorageDataBase> & {
         data: {
           _meta: {
             version: 1,
-            address: PUBLIC_IDENTITY.l1Address,
+            address: PUBLIC_IDENTITY.chainPubkey,
             formatVersion: '2.0',
             updatedAt: 0,
           },

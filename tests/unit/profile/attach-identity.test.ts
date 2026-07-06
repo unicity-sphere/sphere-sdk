@@ -56,7 +56,6 @@ function buildSphereStub(identity: FullIdentity | null): Sphere {
         }
         const snapshot: FullIdentity = {
           chainPubkey: identity.chainPubkey,
-          l1Address: identity.l1Address,
           directAddress: identity.directAddress,
           ipnsName: identity.ipnsName,
           nametag: identity.nametag,
@@ -107,7 +106,6 @@ describe('attachIdentityToProfileProviders', () => {
     expect(tokenStorageSetId).toHaveBeenCalledOnce();
     expect(storageSetId.mock.calls[0][0]).toMatchObject({
       chainPubkey: REAL_IDENTITY.chainPubkey,
-      l1Address: REAL_IDENTITY.l1Address,
       directAddress: REAL_IDENTITY.directAddress,
       privateKey: REAL_IDENTITY.privateKey,
     });

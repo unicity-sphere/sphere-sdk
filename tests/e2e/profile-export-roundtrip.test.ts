@@ -115,7 +115,7 @@ describe.skipIf(SKIP_SUITE)('Profile whole-snapshot export/import — real testn
     expect(created).toBe(true);
     expect(generatedMnemonic).toBeTruthy();
     savedMnemonicA = generatedMnemonic!;
-    console.log(`  Wallet A: ${sphereA.identity!.l1Address}`);
+    console.log(`  Wallet A: ${sphereA.identity!.chainPubkey}`);
 
     console.log(`  Requesting faucet for @${savedNametagA}...`);
     await requestMultiCoinFaucet(savedNametagA);

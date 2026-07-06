@@ -151,7 +151,6 @@ const mockQueryBindingByNametag = vi.fn().mockImplementation(async (nametagId: s
   return {
     transportPubkey: event.pubkey,
     publicKey: content.public_key || undefined,
-    l1Address: content.l1_address || undefined,
     directAddress: content.direct_address || undefined,
     proxyAddress: content.proxy_address || undefined,
     nametag: content.nametag || undefined,
@@ -351,7 +350,6 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
     provider.setIdentity({
       privateKey: TEST_PRIVATE_KEY,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
     });
   });
 
@@ -376,7 +374,6 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
     expect(info!.nametag).toBe(TEST_NAMETAG);
     expect(info!.transportPubkey).toBe(nostrPubkey);
     expect(info!.chainPubkey).toBe(TEST_COMPRESSED_PUBKEY);
-    expect(info!.l1Address).toBe(TEST_L1_ADDRESS);
     expect(info!.directAddress).toBe(TEST_DIRECT_ADDRESS);
     const expectedProxy = (await ProxyAddress.fromNameTag(TEST_NAMETAG)).toString();
     expect(info!.proxyAddress).toBe(expectedProxy);
@@ -412,7 +409,6 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
     expect(info!.nametag).toBe('legacy');
     expect(info!.transportPubkey).toBe(nostrPubkey);
     expect(info!.chainPubkey).toBe('');
-    expect(info!.l1Address).toBe('');
     const expectedProxy = (await ProxyAddress.fromNameTag('legacy')).toString();
     expect(info!.proxyAddress).toBe(expectedProxy);
   });
@@ -443,7 +439,6 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
 
     expect(info).not.toBeNull();
     expect(info!.chainPubkey).toBe(TEST_COMPRESSED_PUBKEY);
-    expect(info!.l1Address).toBe(TEST_L1_ADDRESS);
   });
 });
 
@@ -466,7 +461,6 @@ describe('NostrTransportProvider.recoverNametag()', () => {
     provider.setIdentity({
       privateKey: TEST_PRIVATE_KEY,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
     });
 
     nostrPubkey = provider.getNostrPubkey();
@@ -487,7 +481,6 @@ describe('NostrTransportProvider.recoverNametag()', () => {
       nametag: TEST_NAMETAG,
       nostrPubkey,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
       encryptedNametag,
     });
 
@@ -510,7 +503,6 @@ describe('NostrTransportProvider.recoverNametag()', () => {
       nametag: TEST_NAMETAG,
       nostrPubkey,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
     });
 
     storedQueryEvents.set(`author:${nostrPubkey}`, [event]);
@@ -528,7 +520,6 @@ describe('NostrTransportProvider.recoverNametag()', () => {
       nametag: TEST_NAMETAG,
       nostrPubkey,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
       encryptedNametag: encryptedWithDifferentKey,
     });
 
@@ -598,7 +589,6 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
     provider.setIdentity({
       privateKey: TEST_PRIVATE_KEY,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
       directAddress: TEST_DIRECT_ADDRESS,
     });
   });
@@ -607,7 +597,7 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
     await provider.connect();
 
     const success = await provider.publishIdentityBinding(
-      TEST_COMPRESSED_PUBKEY, TEST_L1_ADDRESS, TEST_DIRECT_ADDRESS, TEST_NAMETAG,
+      TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS, TEST_NAMETAG,
     );
 
     expect(success).toBe(true);
@@ -619,7 +609,6 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
       expect.any(String),
       expect.objectContaining({
         publicKey: TEST_COMPRESSED_PUBKEY,
-        l1Address: TEST_L1_ADDRESS,
         directAddress: TEST_DIRECT_ADDRESS,
       }),
     );
@@ -635,7 +624,7 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
     await provider.connect();
 
     const success = await provider.publishIdentityBinding(
-      TEST_COMPRESSED_PUBKEY, TEST_L1_ADDRESS, TEST_DIRECT_ADDRESS,
+      TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS,
     );
 
     expect(success).toBe(true);
@@ -647,7 +636,6 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
 
     const content = JSON.parse(event.content);
     expect(content.public_key).toBe(TEST_COMPRESSED_PUBKEY);
-    expect(content.l1_address).toBe(TEST_L1_ADDRESS);
     expect(content.direct_address).toBe(TEST_DIRECT_ADDRESS);
     // T.8.B — capability hints must be present.
     expect(content.wire_protocols).toEqual(['uxf-car', 'uxf-cid', 'txf']);

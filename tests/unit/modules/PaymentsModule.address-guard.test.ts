@@ -245,7 +245,6 @@ function createDeps(
 
 const IDENTITY: FullIdentity = {
   chainPubkey: CHAIN_PUBKEY,
-  l1Address: L1_ADDRESS,
   directAddress: DIRECT_ADDRESS,
   privateKey: '00' + '11'.repeat(31),
 };
@@ -309,9 +308,8 @@ describe('PaymentsModule address guard', () => {
     const foreign = 'DIRECT_ffffff_eeeeee';
     const { warned, warnMessage } = await loadWithMeta(foreign);
     expect(warned).toBe(true);
-    // Warning should show all three accepted forms, not just L1.
+    // Warning should list the two accepted forms (chain, profile).
     expect(warnMessage).toContain('profile=');
-    expect(warnMessage).toContain('L1=');
     expect(warnMessage).toContain('chain=');
   });
 
@@ -379,10 +377,9 @@ describe('PaymentsModule sync address guard', () => {
     const foreign = 'DIRECT_ffffff_eeeeee';
     const { warned, warnMessage } = await syncWithMergedMeta(foreign);
     expect(warned).toBe(true);
-    // Warning should advertise all three accepted forms so operators can
+    // Warning should advertise the two accepted forms so operators can
     // diagnose which writer produced the mismatched address.
     expect(warnMessage).toContain('profile=');
-    expect(warnMessage).toContain('L1=');
     expect(warnMessage).toContain('chain=');
   });
 

@@ -144,7 +144,6 @@ function makeTracked(
     createdAt: 1700000000000,
     updatedAt: 1700000000000,
     addressId: `DIRECT_idx${index}`,
-    l1Address: `alpha1real-sdk-${index}`,
     directAddress,
     chainPubkey,
   };

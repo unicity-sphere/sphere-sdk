@@ -243,7 +243,6 @@ describe('Nametag roundtrip integration', () => {
 
     const result = await provider.publishIdentityBinding(
       TEST_IDENTITY.chainPubkey,
-      TEST_IDENTITY.l1Address,
       TEST_IDENTITY.directAddress!,
       nametag,
     );
@@ -255,7 +254,6 @@ describe('Nametag roundtrip integration', () => {
       expect.any(String),
       expect.objectContaining({
         publicKey: TEST_IDENTITY.chainPubkey,
-        l1Address: TEST_IDENTITY.l1Address,
         directAddress: TEST_IDENTITY.directAddress,
       }),
     );
@@ -271,7 +269,6 @@ describe('Nametag roundtrip integration', () => {
     // Publish first
     await provider.publishIdentityBinding(
       TEST_IDENTITY.chainPubkey,
-      TEST_IDENTITY.l1Address,
       TEST_IDENTITY.directAddress!,
       nametag,
     );
@@ -299,7 +296,6 @@ describe('Nametag roundtrip integration', () => {
     // Publish first time
     const result1 = await provider.publishIdentityBinding(
       TEST_IDENTITY.chainPubkey,
-      TEST_IDENTITY.l1Address,
       TEST_IDENTITY.directAddress!,
       nametag,
     );
@@ -308,7 +304,6 @@ describe('Nametag roundtrip integration', () => {
     // Publish second time — should succeed (same pubkey)
     const result2 = await provider.publishIdentityBinding(
       TEST_IDENTITY.chainPubkey,
-      TEST_IDENTITY.l1Address,
       TEST_IDENTITY.directAddress!,
       nametag,
     );
@@ -346,7 +341,6 @@ describe('Nametag roundtrip integration', () => {
     // Try to publish with our identity — should fail
     const result = await provider.publishIdentityBinding(
       TEST_IDENTITY.chainPubkey,
-      TEST_IDENTITY.l1Address,
       TEST_IDENTITY.directAddress!,
       nametag,
     );
@@ -362,7 +356,6 @@ describe('Nametag roundtrip integration', () => {
 
     await provider.publishIdentityBinding(
       TEST_IDENTITY.chainPubkey,
-      TEST_IDENTITY.l1Address,
       TEST_IDENTITY.directAddress!,
       nametag,
     );

@@ -730,7 +730,8 @@ describe('Sphere.registerNametag() mint/Nostr-binding consistency guard', () => 
     // Nostr publish for the same name DID happen
     expect(transport.publishIdentityBinding).toHaveBeenCalled();
     const args = (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(args[3]).toBe('alice');
+    // publishIdentityBinding is 3-arg: (chainPubkey, directAddress, nametag)
+    expect(args[2]).toBe('alice');
 
     // Local state reflects the registration
     expect(sphere.identity!.nametag).toBe('alice');

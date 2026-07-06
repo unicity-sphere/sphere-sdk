@@ -276,7 +276,7 @@ describe('Sphere.clear() integration', () => {
       await tokenStorage.save({
         _meta: {
           version: 1,
-          address: identity.l1Address!,
+          address: identity.chainPubkey,
           formatVersion: '2.0',
           updatedAt: Date.now(),
         },
@@ -340,7 +340,7 @@ describe('Sphere.clear() integration', () => {
         nametag: 'firstwallet',
       });
 
-      const firstAddress = sphere1.identity!.l1Address;
+      const firstAddress = sphere1.identity!.chainPubkey;
       await sphere1.destroy();
 
       // Clear
@@ -365,7 +365,7 @@ describe('Sphere.clear() integration', () => {
       expect(created).toBe(true);
       expect(sphere2.identity!.nametag).toBe('secondwallet');
       // Different mnemonic = different address
-      expect(sphere2.identity!.l1Address).not.toBe(firstAddress);
+      expect(sphere2.identity!.chainPubkey).not.toBe(firstAddress);
 
       await sphere2.destroy();
     });
@@ -437,7 +437,7 @@ describe('Sphere.clear() integration', () => {
       await tokenStorage.save({
         _meta: {
           version: 1,
-          address: identity.l1Address!,
+          address: identity.chainPubkey,
           formatVersion: '2.0',
           updatedAt: Date.now(),
         },

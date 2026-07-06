@@ -180,7 +180,7 @@ describe('Tracked addresses integration', () => {
       expect(active).toHaveLength(1);
       expect(active[0].index).toBe(0);
       expect(active[0].hidden).toBe(false);
-      expect(active[0].l1Address).toBeDefined();
+      expect(active[0].chainPubkey).toBeDefined();
       expect(active[0].directAddress).toBeDefined();
       expect(active[0].chainPubkey).toBeDefined();
       expect(active[0].addressId).toBeDefined();
@@ -244,8 +244,8 @@ describe('Tracked addresses integration', () => {
       const addressIds = all.map(a => a.addressId);
       expect(new Set(addressIds).size).toBe(3);
 
-      const l1Addresses = all.map(a => a.l1Address);
-      expect(new Set(l1Addresses).size).toBe(3);
+      const chainPubkeys = all.map(a => a.chainPubkey);
+      expect(new Set(chainPubkeys).size).toBe(3);
 
       // Nametag checks
       expect(all[0].nametag).toBe('alice');
@@ -404,8 +404,8 @@ describe('Tracked addresses integration', () => {
 
       // Verify derived fields are computed
       for (const addr of allAfter) {
-        expect(addr.l1Address).toBeDefined();
-        expect(addr.l1Address.startsWith('alpha1')).toBe(true);
+        expect(addr.chainPubkey).toBeDefined();
+        expect(addr.chainPubkey.startsWith('02') || addr.chainPubkey.startsWith('03')).toBe(true);
         expect(addr.directAddress).toBeDefined();
         expect(addr.directAddress.startsWith('DIRECT://')).toBe(true);
         expect(addr.chainPubkey).toBeDefined();
@@ -428,7 +428,7 @@ describe('Tracked addresses integration', () => {
       // Verify addressIds match between sessions
       for (let i = 0; i < 3; i++) {
         expect(allAfter[i].addressId).toBe(allBefore[i].addressId);
-        expect(allAfter[i].l1Address).toBe(allBefore[i].l1Address);
+        expect(allAfter[i].chainPubkey).toBe(allBefore[i].chainPubkey);
       }
 
       await reloaded.destroy();
@@ -462,7 +462,7 @@ describe('Tracked addresses integration', () => {
         expect(entry).toHaveProperty('hidden');
         expect(entry).toHaveProperty('createdAt');
         expect(entry).toHaveProperty('updatedAt');
-        expect(entry).not.toHaveProperty('l1Address');
+        expect(entry).not.toHaveProperty("chainPubkey");
         expect(entry).not.toHaveProperty('directAddress');
         expect(entry).not.toHaveProperty('chainPubkey');
         expect(entry).not.toHaveProperty('addressId');
@@ -598,7 +598,7 @@ describe('Tracked addresses integration', () => {
       expect(secondAddresses[0].hidden).toBe(false);
 
       // Different identity from first wallet
-      expect(secondAddresses[0].l1Address).not.toBe(firstAddresses[0].l1Address);
+      expect(secondAddresses[0].chainPubkey).not.toBe(firstAddresses[0].chainPubkey);
 
       await second.destroy();
     });

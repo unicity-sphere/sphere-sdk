@@ -474,7 +474,6 @@ export function createTestSwapModule(configOverrides?: Partial<SwapModuleConfig>
   const defaultTrackedAddress: TrackedAddress = {
     index: 0,
     addressId: 'DIRECT_party_a_aaa111',
-    l1Address: identity.l1Address,
     directAddress: identity.directAddress!,
     chainPubkey: identity.chainPubkey,
     nametag: identity.nametag,

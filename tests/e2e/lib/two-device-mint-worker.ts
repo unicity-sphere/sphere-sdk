@@ -169,7 +169,6 @@ async function handleInit(
       type: 'init_ok',
       requestId,
       mnemonic,
-      l1Address: identity.l1Address,
       chainPubkey: identity.chainPubkey,
       directAddress: identity.directAddress,
     });
@@ -181,7 +180,6 @@ async function handleInit(
     type: 'init_ok',
     requestId,
     mnemonic: config.mnemonic!,
-    l1Address: identity.l1Address,
     chainPubkey: identity.chainPubkey,
     directAddress: identity.directAddress,
   });

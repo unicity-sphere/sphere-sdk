@@ -380,7 +380,7 @@ describe('Category P — Conformance & Security Invariants (TEST-SPEC §P)', () 
      * Any new occurrence outside this allowlist MUST fail P4.
      */
     const P4_IGNORELIST: ReadonlySet<string> = new Set<string>([
-      'profile/aggregator-pointer/signing.ts',
+      'extensions/uxf/profile/aggregator-pointer/signing.ts',
       'tests/unit/profile/pointer/signing.test.ts',
       // This test file itself references the patterns as STRINGS inside
       // regex definitions and ignorelist entries — those don't count as
@@ -590,7 +590,7 @@ describe('Category P — Conformance & Security Invariants (TEST-SPEC §P)', () 
      * header in the same PR — which is exactly the conformance trip-wire
      * P7 is designed to be.
      */
-    const ERRORS_PATH = resolve(REPO_ROOT, 'profile/aggregator-pointer/errors.ts');
+    const ERRORS_PATH = resolve(REPO_ROOT, 'extensions/uxf/profile/aggregator-pointer/errors.ts');
 
     it('errors.ts has exactly 26 AGGREGATOR_POINTER_* values + 1 SECURITY_ORIGIN_MISMATCH (27 total)', () => {
       const contents = readFileSync(ERRORS_PATH, 'utf8');

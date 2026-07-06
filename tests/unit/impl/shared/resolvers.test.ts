@@ -8,7 +8,6 @@ import {
   getNetworkConfig,
   resolveTransportConfig,
   resolveOracleConfig,
-  resolveL1Config,
   resolveArrayConfig,
   resolveMarketConfig,
 } from '../../../../impl/shared/resolvers';
@@ -305,10 +304,6 @@ describe('resolver integration', () => {
       apiKey: 'test-key',
     });
 
-    const l1 = resolveL1Config(network, {
-      enableVesting: true,
-    });
-
     // Transport should have defaults + extra relay
     expect(transport.relays.length).toBeGreaterThan(1);
     expect(transport.relays).toContain('wss://extra.relay');
@@ -318,9 +313,6 @@ describe('resolver integration', () => {
     expect(oracle.url).toBe(NETWORKS.testnet.aggregatorUrl);
     expect(oracle.apiKey).toBe('test-key');
 
-    // L1 should have testnet electrum URL
-    expect(l1?.electrumUrl).toBe(NETWORKS.testnet.electrumUrl);
-    expect(l1?.enableVesting).toBe(true);
   });
 
   it('should handle minimal config (just network)', () => {
@@ -328,10 +320,7 @@ describe('resolver integration', () => {
 
     const transport = resolveTransportConfig(network);
     const oracle = resolveOracleConfig(network);
-    const l1 = resolveL1Config(network, undefined);
-
     expect(transport.relays).toEqual([...NETWORKS.mainnet.nostrRelays]);
     expect(oracle.url).toBe(NETWORKS.mainnet.aggregatorUrl);
-    expect(l1).toBeUndefined();
   });
 });

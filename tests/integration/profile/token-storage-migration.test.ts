@@ -105,7 +105,7 @@ describe('migrateTokenStorage — file-storage integration', () => {
     const seedData: TxfStorageDataBase = {
       _meta: {
         version: 1,
-        address: IDENTITY.l1Address,
+        address: IDENTITY.chainPubkey,
         formatVersion: '2.0',
         updatedAt: Date.now(),
       },
@@ -205,7 +205,7 @@ describe('migrateTokenStorage — file-storage integration', () => {
     const seed: TxfStorageDataBase = {
       _meta: {
         version: 1,
-        address: IDENTITY.l1Address,
+        address: IDENTITY.chainPubkey,
         formatVersion: '2.0',
         updatedAt: 1000,
       },
@@ -274,7 +274,7 @@ describe('migrateTokenStorage — file-storage integration', () => {
     await source.save({
       _meta: {
         version: 1,
-        address: IDENTITY.l1Address,
+        address: IDENTITY.chainPubkey,
         formatVersion: '2.0',
         updatedAt: 1,
       },

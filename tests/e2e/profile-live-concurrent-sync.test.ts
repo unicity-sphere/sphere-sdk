@@ -501,7 +501,7 @@ describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
       });
       testSpheres.push(sphereA);
       const mnemonic = generatedMnemonic!;
-      console.log(`  A: identity=${sphereA.identity!.l1Address}`);
+      console.log(`  A: identity=${sphereA.identity!.chainPubkey}`);
 
       // Sphere singleton dance — see Test 1 for rationale.
       (Sphere as unknown as { instance: null }).instance = null;
@@ -514,8 +514,8 @@ describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
         mnemonic,
       });
       testSpheres.push(sphereB);
-      console.log(`  B: identity=${sphereB.identity!.l1Address}`);
-      expect(sphereB.identity!.l1Address).toBe(sphereA.identity!.l1Address);
+      console.log(`  B: identity=${sphereB.identity!.chainPubkey}`);
+      expect(sphereB.identity!.chainPubkey).toBe(sphereA.identity!.chainPubkey);
 
       // Both pre-conditions: zero balance.
       expect(getBalance(sphereA, TEST_COIN.symbol).total).toBe(0n);
