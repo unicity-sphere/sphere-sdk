@@ -143,9 +143,13 @@ export default defineConfig([
       'ws',
     ],
   },
-  // UXF (Universal eXchange Format) - platform-agnostic
+  // UXF extension entry — the public `@unicitylabs/sphere-sdk/uxf`
+  // subpath. Wave-1 (Phase 3) surfaces the extension factory + types;
+  // Phases 6/9 wire real bundle/pipeline/profile behavior. The internal
+  // bundle format lives at `extensions/uxf/bundle/` and is re-exported
+  // through this entry.
   {
-    entry: { 'uxf/index': 'extensions/uxf/bundle/index.ts' },
+    entry: { 'extensions/uxf/index': 'extensions/uxf/index.ts' },
     format: ['esm', 'cjs'],
     dts: true,
     clean: false,

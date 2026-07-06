@@ -503,6 +503,20 @@ export interface SphereInitOptions {
    * propagate it here.
    */
   cidFetchGateways?: ReadonlyArray<string>;
+  /**
+   * Phase-3 wave-1 extension attach point.
+   *
+   * Optional array of extensions activated during `Sphere.init()`.
+   * When omitted (or empty), the returned `Sphere` behaves identically
+   * to running against upstream sphere-sdk main — the whole `extensions/`
+   * subtree is inert. When populated, each extension's `install(host)`
+   * runs during composition; the resulting handle is exposed on
+   * `sphere.<id>` (e.g. `sphere.uxf` for the UXF extension).
+   *
+   * eslint-disable-next-line no-restricted-imports (allowlisted attach point)
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  extensions?: ReadonlyArray<{ readonly id: string; install(host: any): Promise<any> }>;
 }
 
 /** Result of init operation */
@@ -759,6 +773,18 @@ export interface DestroyOptions extends ShutdownOptions {
 export class Sphere {
   // Singleton
   private static instance: Sphere | null = null;
+
+  // Phase-3 wave-1 extension handles — see SphereInitOptions.extensions.
+  // The UXF handle is `undefined` unless `uxfExtension()` was passed to
+  // `Sphere.init({ extensions: [...] })`. Structural shape mirrors
+  // `extensions/uxf/types.ts::UxfHandle` — declared inline here so
+  // `core/` does not cross the extension boundary at compile time
+  // (the ESLint boundary rule enforces this).
+  public readonly uxf?: {
+    readonly id: 'uxf';
+    readonly stability: 'stable' | 'beta' | 'experimental';
+    destroy(): Promise<void>;
+  };
 
   // State
   private _initialized = false;

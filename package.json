@@ -77,12 +77,12 @@
     },
     "./uxf": {
       "import": {
-        "types": "./dist/uxf/index.d.ts",
-        "default": "./dist/uxf/index.js"
+        "types": "./dist/extensions/uxf/index.d.ts",
+        "default": "./dist/extensions/uxf/index.js"
       },
       "require": {
-        "types": "./dist/uxf/index.d.cts",
-        "default": "./dist/uxf/index.cjs"
+        "types": "./dist/extensions/uxf/index.d.cts",
+        "default": "./dist/extensions/uxf/index.cjs"
       }
     },
     "./profile": {
