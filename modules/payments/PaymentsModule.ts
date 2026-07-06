@@ -3568,17 +3568,15 @@ export class PaymentsModule {
       // Load metadata from TokenStorageProviders (archived, tombstones, forked)
       // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
       //
-      // Address guard: reject data whose `_meta.address` doesn't match the
-      // current identity. Accept three representations (one per writer):
-      //   - L1 bech32 (legacy file storage writes this)
-      //   - chain pubkey (some providers record the pubkey)
-      //   - Profile short ID (`DIRECT_{first6}_{last6}` — written by
-      //     ProfileTokenStorageProvider, derived via `computeAddressId`)
+      // Address guard: reject data persisted under a different address.
+      // _meta.address holds chainPubkey for current writes; legacy records hold an
+      // alpha1 value (pre-L1-removal) and are tolerated — the token store is
+      // partitioned by chainPubkey, and the record is rewritten to chainPubkey on
+      // the next save. Profile short ID also accepted (ProfileTokenStorageProvider).
       //
       // NOTE: This guard is an integrity check (catch misrouted or
       // corrupted data), not a security boundary. A writer with storage
       // access can forge `_meta.address` trivially.
-      const currentL1 = this.deps!.identity.l1Address;
       const currentChain = this.deps!.identity.chainPubkey;
       const currentDirect = this.deps!.identity.directAddress;
       const currentProfileShortId = currentDirect ? computeAddressId(currentDirect) : null;
@@ -3589,16 +3587,17 @@ export class PaymentsModule {
           const result = await provider.load();
           if (result.success && result.data) {
             const loadedMeta = (result.data as TxfStorageDataBase)?._meta;
+            const isLegacyAlpha = loadedMeta?.address?.startsWith('alpha1') ?? false;
             if (
               loadedMeta?.address &&
-              loadedMeta.address !== currentL1 &&
+              !isLegacyAlpha &&
               loadedMeta.address !== currentChain &&
               loadedMeta.address !== currentProfileShortId
             ) {
               const accepted = [
-                currentL1 ? `L1=${currentL1.slice(0, 16)}…` : null,
                 currentChain ? `chain=${currentChain.slice(0, 16)}…` : null,
                 currentProfileShortId ? `profile=${currentProfileShortId}` : null,
+                `legacy alpha1 (migration tolerance)`,
               ].filter(Boolean).join(', ');
               logger.warn(
                 'Payments',
@@ -17071,7 +17070,7 @@ export class PaymentsModule {
       Array.from(this.tokens.values()),
       {
         version: 1,
-        address: this.deps!.identity.l1Address,
+        address: this.deps!.identity.chainPubkey,
         ipnsName: this.deps!.identity.ipnsName ?? '',
       },
       {
