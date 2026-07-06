@@ -29,7 +29,6 @@ function buildStubModule(): PaymentsModule {
   (module as any).deps = {
     identity: {
       chainPubkey: '02' + '00'.repeat(32),
-      l1Address: 'alpha1test',
       privateKey: '00'.repeat(32),
     },
     storage: { get: () => null, set: () => undefined },

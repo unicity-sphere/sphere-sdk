@@ -118,7 +118,6 @@ describe('NostrTransportProvider — pre-Mux TOKEN_TRANSFER buffer drain (#247)'
     } as unknown;
     priv.identity = {
       chainPubkey: '02' + 'a'.repeat(64),
-      l1Address: 'alpha1mock',
       privateKey: 'b'.repeat(64),
     } as unknown;
   });

@@ -237,7 +237,6 @@ function createDeps(getReturns?: Record<string, string | null>): {
 
   const identity: FullIdentity = {
     chainPubkey: OUR_PUBKEY,
-    l1Address: 'alpha1ourtestaddress',
     directAddress: OUR_DIRECT,
     // 64-hex (no 0x prefix) — `createSigningService` calls `hexToBytes`
     // which rejects non-hex inputs.

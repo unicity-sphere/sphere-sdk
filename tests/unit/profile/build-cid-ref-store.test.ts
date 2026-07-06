@@ -31,7 +31,6 @@ const TEST_PUBKEY = '02' + 'bb'.repeat(32);
 const TEST_IDENTITY: FullIdentity = {
   chainPubkey: TEST_PUBKEY,
   privateKey: TEST_PRIVKEY,
-  l1Address: 'alpha1test',
   directAddress: 'DIRECT://testaddr',
 };
 

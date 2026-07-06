@@ -111,7 +111,6 @@ export interface TransportProvider extends BaseProvider {
    */
   publishIdentityBinding?(
     chainPubkey: string,
-    l1Address: string,
     directAddress: string,
     nametag?: string,
   ): Promise<boolean>;

@@ -166,7 +166,6 @@ describe('G6 — SendingRecoveryWorker wiring', () => {
     payments.initialize({
       identity: {
         chainPubkey: '02' + 'aa'.repeat(32),
-        l1Address: 'alpha1stub',
         directAddress: 'DIRECT://STUB',
         privateKey: 'aa'.repeat(32),
       } as Parameters<typeof payments.initialize>[0]['identity'],

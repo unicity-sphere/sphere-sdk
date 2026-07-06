@@ -114,7 +114,7 @@ function createMockTransport(options: {
       return Promise.resolve(options.resolveResult ?? null);
     }),
 
-    publishIdentityBinding: vi.fn((_chainPubkey: string, _l1Address: string, _directAddress: string, nametag?: string) => {
+    publishIdentityBinding: vi.fn((_chainPubkey: string, _directAddress: string, nametag?: string) => {
       if (nametag) {
         registerCalls.push({ nametag, chainPubkey: _chainPubkey, directAddress: _directAddress });
       }
@@ -146,7 +146,6 @@ describe('Sphere.syncNametagWithNostr', () => {
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
         chainPubkey: TEST_PUBKEY,
-        l1Address: 'alpha1test',
         directAddress: 'DIRECT://test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
@@ -173,7 +172,6 @@ describe('Sphere.syncNametagWithNostr', () => {
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
         chainPubkey: TEST_PUBKEY,
-        l1Address: 'alpha1test',
         directAddress: 'DIRECT://test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
@@ -200,7 +198,6 @@ describe('Sphere.syncNametagWithNostr', () => {
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
         chainPubkey: TEST_PUBKEY,
-        l1Address: 'alpha1test',
         directAddress: 'DIRECT://test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
@@ -230,7 +227,6 @@ describe('Sphere.syncNametagWithNostr', () => {
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
         chainPubkey: TEST_PUBKEY,
-        l1Address: 'alpha1test',
         ipnsName: '12D3KooWtest',
         // no nametag
       };
@@ -258,7 +254,6 @@ describe('Sphere.syncNametagWithNostr', () => {
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
         chainPubkey: TEST_PUBKEY,
-        l1Address: 'alpha1test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
       };
@@ -282,7 +277,6 @@ describe('Sphere.syncNametagWithNostr', () => {
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
         chainPubkey: TEST_PUBKEY,
-        l1Address: 'alpha1test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
       };
@@ -351,7 +345,7 @@ describe('Sphere.recoverNametagFromNostr (simulated)', () => {
         return Promise.resolve(options.recoverResult ?? null);
       }),
 
-      publishIdentityBinding: vi.fn((chainPubkey: string, l1Address: string, directAddress: string, nametag?: string) => {
+      publishIdentityBinding: vi.fn((chainPubkey: string, directAddress: string, nametag?: string) => {
         if (nametag) {
           registerCalls.push({ nametag, chainPubkey, directAddress });
         }
@@ -374,7 +368,6 @@ describe('Sphere.recoverNametagFromNostr (simulated)', () => {
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
         chainPubkey: TEST_PUBKEY,
-        l1Address: 'alpha1test',
         directAddress: 'DIRECT://test',
         // No nametag initially
       };
@@ -414,7 +407,6 @@ describe('Sphere.recoverNametagFromNostr (simulated)', () => {
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
         chainPubkey: TEST_PUBKEY,
-        l1Address: 'alpha1test',
         nametag: 'existing-nametag', // Already has nametag
       };
 
@@ -439,7 +431,6 @@ describe('Sphere.recoverNametagFromNostr (simulated)', () => {
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
         chainPubkey: TEST_PUBKEY,
-        l1Address: 'alpha1test',
       };
 
       if (!identity.nametag && transport.recoverNametag) {
@@ -463,7 +454,6 @@ describe('Sphere.recoverNametagFromNostr (simulated)', () => {
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
         chainPubkey: TEST_PUBKEY,
-        l1Address: 'alpha1test',
       };
 
       // Check if method exists before calling
@@ -492,7 +482,6 @@ describe('Sphere.recoverNametagFromNostr (simulated)', () => {
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
         chainPubkey: TEST_PUBKEY,
-        l1Address: 'alpha1test',
       };
 
       if (!identity.nametag && transport.recoverNametag) {
@@ -519,7 +508,6 @@ describe('Sphere.recoverNametagFromNostr (simulated)', () => {
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
         chainPubkey: TEST_PUBKEY,
-        l1Address: 'alpha1test',
       };
 
       if (!identity.nametag && transport.recoverNametag) {

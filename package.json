@@ -45,16 +45,6 @@
         "default": "./dist/core/index.cjs"
       }
     },
-    "./l1": {
-      "import": {
-        "types": "./dist/l1/index.d.ts",
-        "default": "./dist/l1/index.js"
-      },
-      "require": {
-        "types": "./dist/l1/index.d.cts",
-        "default": "./dist/l1/index.cjs"
-      }
-    },
     "./connect": {
       "import": {
         "types": "./dist/connect/index.d.ts",

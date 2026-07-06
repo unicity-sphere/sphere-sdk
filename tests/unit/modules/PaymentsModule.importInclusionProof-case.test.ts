@@ -55,7 +55,6 @@ function makeMinimalPayments(): PaymentsModule {
     addressId: 'DIRECT://test',
     identity: {
       chainPubkey: 'aa'.repeat(33),
-      l1Address: 'alpha1test',
       directAddress: 'DIRECT://test',
       privateKey: 'aa'.repeat(32),
     } as never,

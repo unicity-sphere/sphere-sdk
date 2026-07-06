@@ -1508,7 +1508,6 @@ export class NostrTransportProvider implements TransportProvider {
    */
   async publishIdentityBinding(
     chainPubkey: string,
-    l1Address: string,
     directAddress: string,
     nametag?: string,
   ): Promise<boolean> {
@@ -1531,7 +1530,6 @@ export class NostrTransportProvider implements TransportProvider {
           nostrPubkey,
           {
             publicKey: chainPubkey,
-            l1Address,
             directAddress,
             proxyAddress: proxyAddr.toString(),
           },
@@ -1551,7 +1549,7 @@ export class NostrTransportProvider implements TransportProvider {
           // `resolveTransportPubkeyInfo` (most-recent-author wins) would
           // return `nametag: undefined` after this event lands.
           await this.publishIdentityBindingWithCapabilities(
-            chainPubkey, l1Address, directAddress, nametag, proxyAddr.toString(),
+            chainPubkey, directAddress, nametag, proxyAddr.toString(),
           );
         }
         return success;
@@ -1571,7 +1569,7 @@ export class NostrTransportProvider implements TransportProvider {
     // ourselves; the d-tag formula is identical so this is wire-compatible
     // with older consumers that ignore the extra fields).
     const success = await this.publishIdentityBindingWithCapabilities(
-      chainPubkey, l1Address, directAddress,
+      chainPubkey, directAddress,
     );
 
     if (success) {
@@ -1596,7 +1594,6 @@ export class NostrTransportProvider implements TransportProvider {
    */
   private async publishIdentityBindingWithCapabilities(
     chainPubkey: string,
-    l1Address: string,
     directAddress: string,
     nametag?: string,
     proxyAddress?: string,
@@ -1608,7 +1605,6 @@ export class NostrTransportProvider implements TransportProvider {
 
     const content: Record<string, unknown> = {
       public_key: chainPubkey,
-      l1_address: l1Address,
       direct_address: directAddress,
       // T.8.B — capability hints (§10.4). Snake_case to match the upstream
       // content schema convention.
@@ -1630,9 +1626,6 @@ export class NostrTransportProvider implements TransportProvider {
     const tags: string[][] = [['d', dTag]];
     if (chainPubkey) {
       tags.push(['t', NametagUtils.hashAddressForTag(chainPubkey)]);
-    }
-    if (l1Address) {
-      tags.push(['t', NametagUtils.hashAddressForTag(l1Address)]);
     }
     if (directAddress) {
       tags.push(['t', NametagUtils.hashAddressForTag(directAddress)]);

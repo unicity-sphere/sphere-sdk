@@ -35,7 +35,6 @@ function createIdentity(directAddress = 'DIRECT://abcdef1234567890'): FullIdenti
   return {
     privateKey: '0'.repeat(64),
     chainPubkey: '02' + 'a'.repeat(64),
-    l1Address: 'alpha1testaddr',
     directAddress,
     nametag: 'testuser',
   };

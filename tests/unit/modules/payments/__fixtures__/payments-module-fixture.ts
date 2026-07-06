@@ -225,7 +225,6 @@ export function makeEventRecorder(): EventRecorder {
 export function createTestIdentity(): FullIdentity {
   return {
     chainPubkey: '02' + 'aa'.repeat(32),
-    l1Address: 'alpha1test',
     directAddress: 'DIRECT://test',
     privateKey: '00' + '11'.repeat(31),
   };

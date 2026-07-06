@@ -48,7 +48,6 @@ import type { FullIdentity } from '../../../types';
 function stubIdentity(): FullIdentity {
   return {
     chainPubkey: '02' + 'aa'.repeat(32),
-    l1Address: 'alpha1test',
     directAddress: 'DIRECT://test',
     privateKey: 'bb'.repeat(32),
   };

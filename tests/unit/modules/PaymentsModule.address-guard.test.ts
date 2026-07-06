@@ -292,11 +292,6 @@ describe('PaymentsModule address guard', () => {
     };
   }
 
-  it('accepts data whose _meta.address is the L1 bech32 (legacy writer)', async () => {
-    const { warned } = await loadWithMeta(L1_ADDRESS);
-    expect(warned).toBe(false);
-  });
-
   it('accepts data whose _meta.address is the chain pubkey', async () => {
     const { warned } = await loadWithMeta(CHAIN_PUBKEY);
     expect(warned).toBe(false);
@@ -318,12 +313,6 @@ describe('PaymentsModule address guard', () => {
     expect(warnMessage).toContain('profile=');
     expect(warnMessage).toContain('L1=');
     expect(warnMessage).toContain('chain=');
-  });
-
-  it('rejects data whose _meta.address is an unrelated L1 bech32', async () => {
-    const foreignL1 = 'alpha1qother';
-    const { warned } = await loadWithMeta(foreignL1);
-    expect(warned).toBe(true);
   });
 
   it('does not warn when _meta is absent', async () => {
@@ -373,11 +362,6 @@ describe('PaymentsModule sync address guard', () => {
     };
   }
 
-  it('accepts merged data whose _meta.address is the L1 bech32 (legacy writer)', async () => {
-    const { warned } = await syncWithMergedMeta(L1_ADDRESS);
-    expect(warned).toBe(false);
-  });
-
   it('accepts merged data whose _meta.address is the chain pubkey', async () => {
     const { warned } = await syncWithMergedMeta(CHAIN_PUBKEY);
     expect(warned).toBe(false);
@@ -400,12 +384,6 @@ describe('PaymentsModule sync address guard', () => {
     expect(warnMessage).toContain('profile=');
     expect(warnMessage).toContain('L1=');
     expect(warnMessage).toContain('chain=');
-  });
-
-  it('rejects merged data whose _meta.address is an unrelated L1 bech32', async () => {
-    const foreignL1 = 'alpha1qother';
-    const { warned } = await syncWithMergedMeta(foreignL1);
-    expect(warned).toBe(true);
   });
 
   it('does not warn when merged _meta is absent', async () => {

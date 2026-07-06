@@ -35,7 +35,6 @@ import type { FullIdentity } from '../../../types';
 
 const STUB_IDENTITY: FullIdentity = {
   chainPubkey: '02' + 'ab'.repeat(32),
-  l1Address: 'alpha1stub',
   directAddress: 'DIRECT://stub',
   transportPubkey: 'cc'.repeat(32),
   privateKey: 'dd'.repeat(32),

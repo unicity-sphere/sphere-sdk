@@ -68,7 +68,6 @@ const { MultiAddressTransportMux } = await import('../../../transport/MultiAddre
 
 const TEST_IDENTITY_0 = {
   chainPubkey: '02' + 'ab'.repeat(32),
-  l1Address: 'alpha1testaddr0',
   directAddress: 'DIRECT://test0',
   transportPubkey: 'cc'.repeat(32),
   privateKey: 'dd'.repeat(32),
@@ -76,7 +75,6 @@ const TEST_IDENTITY_0 = {
 
 const TEST_IDENTITY_1 = {
   chainPubkey: '02' + 'cd'.repeat(32),
-  l1Address: 'alpha1testaddr1',
   directAddress: 'DIRECT://test1',
   transportPubkey: '11'.repeat(32),
   // secp256k1 private keys must be in [1..N-1]; 'ff'.repeat(32) is above N.

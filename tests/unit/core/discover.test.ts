@@ -150,7 +150,6 @@ describe('discoverAddressesImpl', () => {
       return [{
         transportPubkey: pubkeys[0],
         chainPubkey: '', // missing
-        l1Address: '', // missing
         directAddress: '', // missing
         timestamp: Date.now(),
       }];

@@ -73,7 +73,6 @@ const UCT_COIN_ID = '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d
 function makeIdentity(): FullIdentity {
   return {
     chainPubkey: '02' + 'a'.repeat(64),
-    l1Address: 'alpha1test',
     directAddress: 'DIRECT://test',
     privateKey: 'a'.repeat(64),
   };

@@ -194,48 +194,6 @@ describe('resolveOracleConfig', () => {
 // resolveL1Config
 // =============================================================================
 
-describe('resolveL1Config', () => {
-  it('should return undefined when config is undefined', () => {
-    const result = resolveL1Config('testnet', undefined);
-    expect(result).toBeUndefined();
-  });
-
-  it('should return config with network defaults when empty config provided', () => {
-    const result = resolveL1Config('testnet', {});
-    expect(result).toBeDefined();
-    expect(result?.electrumUrl).toBe(NETWORKS.testnet.electrumUrl);
-  });
-
-  it('should override electrumUrl when specified', () => {
-    const customUrl = 'wss://custom.fulcrum:50004';
-    const result = resolveL1Config('testnet', { electrumUrl: customUrl });
-    expect(result?.electrumUrl).toBe(customUrl);
-  });
-
-  it('should use network default electrumUrl when not specified', () => {
-    const result = resolveL1Config('testnet', { defaultFeeRate: 5 });
-    expect(result?.electrumUrl).toBe(NETWORKS.testnet.electrumUrl);
-  });
-
-  it('should pass through defaultFeeRate', () => {
-    const result = resolveL1Config('testnet', { defaultFeeRate: 20 });
-    expect(result?.defaultFeeRate).toBe(20);
-  });
-
-  it('should pass through enableVesting', () => {
-    const result = resolveL1Config('testnet', { enableVesting: true });
-    expect(result?.enableVesting).toBe(true);
-  });
-
-  it('should use different defaults for different networks', () => {
-    const mainnet = resolveL1Config('mainnet', {});
-    const testnet = resolveL1Config('testnet', {});
-
-    expect(mainnet?.electrumUrl).toBe(NETWORKS.mainnet.electrumUrl);
-    expect(testnet?.electrumUrl).toBe(NETWORKS.testnet.electrumUrl);
-  });
-});
-
 // =============================================================================
 // resolveArrayConfig
 // =============================================================================

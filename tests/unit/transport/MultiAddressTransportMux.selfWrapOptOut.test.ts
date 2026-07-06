@@ -72,7 +72,6 @@ const RECIPIENT_COMPRESSED_PUBKEY = '02' + RECIPIENT_X_PUBKEY;
 
 const SENDER_IDENTITY = {
   chainPubkey: '02' + senderKm.getPublicKeyHex(),
-  l1Address: 'alpha1sender',
   directAddress: 'DIRECT://sender',
   transportPubkey: senderKm.getPublicKeyHex(),
   privateKey: SENDER_SK_HEX,

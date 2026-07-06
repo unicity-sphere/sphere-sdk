@@ -543,7 +543,7 @@ export async function migrateTokenStorage(
   const sourceMeta = targetData._meta ?? ({} as Partial<TxfStorageDataBase['_meta']>);
   targetData._meta = {
     version: sourceMeta.version ?? 1,
-    address: sourceMeta.address ?? (opts.identity.l1Address ?? ''),
+    address: sourceMeta.address ?? (opts.identity.chainPubkey ?? ''),
     formatVersion: sourceMeta.formatVersion ?? '2.0',
     ipnsName: sourceMeta.ipnsName,
     updatedAt: Date.now(),
@@ -952,7 +952,6 @@ function identityForMigrationFromSphere(sphere: Sphere): FullIdentity {
   }
   return {
     chainPubkey: publicIdentity.chainPubkey,
-    l1Address: publicIdentity.l1Address,
     directAddress: publicIdentity.directAddress,
     ipnsName: publicIdentity.ipnsName,
     nametag: publicIdentity.nametag,

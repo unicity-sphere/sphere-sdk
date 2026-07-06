@@ -147,7 +147,6 @@ function createDeps(): { deps: PaymentsModuleDependencies; identity: MutableFull
 
   const identity: MutableFullIdentity = {
     chainPubkey: '02' + 'a'.repeat(64),
-    l1Address: 'alpha1testaddress',
     directAddress: 'DIRECT://testaddress',
     privateKey: '0x' + 'b'.repeat(64),
   };

@@ -83,7 +83,7 @@ function createMockTransport(): TransportProvider {
     resolveNametag: vi.fn((nametag: string) => {
       return Promise.resolve(nostrRelayNametags.get(nametag) ?? null);
     }),
-    publishIdentityBinding: vi.fn((chainPubkey: string, _l1Address: string, _directAddress: string, nametag?: string) => {
+    publishIdentityBinding: vi.fn((chainPubkey: string, _directAddress: string, nametag?: string) => {
       if (nametag) {
         const existing = nostrRelayNametags.get(nametag);
         if (existing && existing !== chainPubkey) {

@@ -94,7 +94,6 @@ function createDeps(storage: StorageProvider, cidRefStore?: unknown): GroupChatM
   const identity: FullIdentity = {
     privateKey: '01'.padStart(64, '0'),
     chainPubkey: MY_PUBKEY,
-    l1Address: 'alpha1testaddr',
     directAddress: 'DIRECT://testaddr',
     nametag: 'testuser',
   };

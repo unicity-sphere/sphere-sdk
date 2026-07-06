@@ -30,7 +30,6 @@ import type {
   TombstoneEntry,
   NametagData,
 } from '../../types/txf';
-import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
 import { TokenSplitCalculator, type SplitPlan, type TokenWithAmount } from './TokenSplitCalculator';
 import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
@@ -1328,8 +1327,6 @@ export interface PaymentsModuleConfig {
   maxRetries?: number;
   /** Enable debug logging */
   debug?: boolean;
-  /** L1 (ALPHA blockchain) configuration. Set to null to explicitly disable L1. */
-  l1?: L1PaymentsModuleConfig | null;
   /** UXF Inter-Wallet Transfer feature flags. Default: all ON
    *  (T.8.D part 1 of 2). Pass explicit `false` per-flag to fall back
    *  to the legacy code path for that surface. */
@@ -1409,10 +1406,6 @@ export interface PaymentsModuleDependencies {
   transport: TransportProvider;
   oracle: OracleProvider;
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
-  /** Chain code for BIP32 HD derivation (for L1 multi-address support) */
-  chainCode?: string;
-  /** Additional L1 addresses to watch */
-  l1Addresses?: string[];
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
   /** Set of disabled provider IDs — disabled providers are skipped during sync/save */
@@ -1580,9 +1573,6 @@ export class PaymentsModule {
    * degradation: the pre-existing legacy storage path still runs).
    */
   private legacyShapeAdapterRunner: LegacyShapeAdapterRunner | null = null;
-
-  /** L1 (ALPHA blockchain) payments sub-module (null if disabled) */
-  readonly l1: L1PaymentsModule | null;
 
   // Token State
   private tokens: Map<string, Token> = new Map();
@@ -1850,11 +1840,6 @@ export class PaymentsModule {
       finalizationWorker: config?.features?.finalizationWorker ?? true,
     });
 
-    // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
-    // Only skip if l1 is explicitly set to null. The module is lazy — it won't
-    // open a WebSocket until the first L1 operation is performed.
-    this.l1 = config?.l1 === null ? null : new L1PaymentsModule(config?.l1);
-
     // Initialize spend queue (requires ledger, planner, and access to this.tokens)
     this.spendQueue = new SpendQueue(
       this.reservationLedger,
@@ -2003,16 +1988,6 @@ export class PaymentsModule {
 
     this.deps = deps;
     this.priceProvider = deps.price ?? null;
-
-    // Initialize L1 sub-module with chain code, addresses, and transport (if enabled)
-    if (this.l1) {
-      this.l1.initialize({
-        identity: deps.identity,
-        chainCode: deps.chainCode,
-        addresses: deps.l1Addresses,
-        transport: deps.transport,
-      });
-    }
 
     // Subscribe to incoming transfers
     this.unsubscribeTransfers = deps.transport.onTokenTransfer((transfer) =>
@@ -5460,10 +5435,6 @@ export class PaymentsModule {
 
     // Clean up storage event subscriptions
     this.unsubscribeStorageEvents();
-
-    if (this.l1) {
-      this.l1.destroy();
-    }
 
     // T.3.E — destroy the ingest worker pool. Fire-and-forget per the
     // module's destroy() contract (synchronous return). Workers drain
@@ -12274,31 +12245,26 @@ export class PaymentsModule {
             // Stale IPFS records may contain tokens from a previously active
             // address if a write-behind flush raced with an address switch.
             //
-            // Accept three representations (one per writer):
-            //   - L1 bech32 (`alpha1...`) — legacy file storage writes this
-            //   - chain pubkey — some providers record the pubkey
+            // Accept two representations (one per writer):
+            //   - chain pubkey — canonical post-L1-removal `_meta.address`
+            //     shape (see storage rekey in c09dfd9d)
             //   - Profile short ID (`DIRECT_{first6}_{last6}`) — written by
             //     ProfileTokenStorageProvider via `computeAddressId`
             //
-            // The third format was added to `load()`'s guard but missed
-            // here, causing sync() to silently discard Profile-provider
-            // data on cross-device recovery — Device B reads Device A's
-            // CAR via the aggregator pointer, the parsed `_meta.address`
-            // is the DIRECT_* short-id, and `currentL1` is the bech32
-            // form. Mismatch → reject → recovery returns empty.
+            // Legacy `alpha1...` bech32 addresses in `_meta.address` are
+            // tolerated on READ by the storage layer's alpha1 guard added
+            // in the L1-removal wave; they never re-appear here because
+            // any resave rewrites the field to the chainPubkey form.
             const mergedMeta = (result.merged as TxfStorageDataBase)?._meta;
-            const currentL1 = this.deps!.identity.l1Address;
             const currentChain = this.deps!.identity.chainPubkey;
             const currentDirect = this.deps!.identity.directAddress;
             const currentProfileShortId = currentDirect ? computeAddressId(currentDirect) : null;
             if (
               mergedMeta?.address &&
-              mergedMeta.address !== currentL1 &&
               mergedMeta.address !== currentChain &&
               mergedMeta.address !== currentProfileShortId
             ) {
               const accepted = [
-                currentL1 ? `L1=${currentL1.slice(0, 16)}…` : null,
                 currentChain ? `chain=${currentChain.slice(0, 16)}…` : null,
                 currentProfileShortId ? `profile=${currentProfileShortId}` : null,
               ].filter(Boolean).join(', ');

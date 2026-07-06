@@ -242,7 +242,6 @@ function createMockDeps(storageData?: Map<string, string>): PaymentsModuleDepend
 
   const mockIdentity: FullIdentity = {
     chainPubkey: '02' + 'ab'.repeat(32),
-    l1Address: 'alpha1test',
     directAddress: 'DIRECT://test',
     privateKey: 'aa'.repeat(32),
   };

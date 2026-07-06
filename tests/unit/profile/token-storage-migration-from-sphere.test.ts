@@ -39,7 +39,6 @@ import { getAddressId } from '../../../constants';
 
 const PUBLIC_IDENTITY: Identity = {
   chainPubkey: '02' + 'aa'.repeat(32),
-  l1Address: 'alpha1test',
   directAddress: 'DIRECT://test',
 };
 

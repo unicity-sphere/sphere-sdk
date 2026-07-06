@@ -30,7 +30,6 @@ const TEST_PRIVATE_KEY = 'a'.repeat(64);
 function mockIdentity(): FullIdentity {
   return {
     chainPubkey: '02' + 'ab'.repeat(32),
-    l1Address: 'alpha1test',
     directAddress: 'DIRECT://test',
     privateKey: TEST_PRIVATE_KEY,
   };

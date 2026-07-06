@@ -48,7 +48,6 @@ const TEST_PRIVATE_KEY =
 const EXPECTED_ADDRESS_ID = 'DIRECT_aabbcc_ddeeff';
 const TEST_IDENTITY: FullIdentity = {
   chainPubkey: '02' + 'aa'.repeat(32),
-  l1Address: 'alpha1testaddress',
   directAddress: 'DIRECT://AABBCCDDEEFF112233445566778899AABBCCDDEEFF',
   privateKey: TEST_PRIVATE_KEY,
 };

@@ -70,7 +70,6 @@ function createMockIdentity(): FullIdentity {
   return {
     privateKey: '0'.repeat(64),
     chainPubkey: MY_PUBKEY,
-    l1Address: 'alpha1testaddr',
     directAddress: 'DIRECT://testaddr',
     nametag: 'testuser',
   };
@@ -90,7 +89,6 @@ function makePeerInfo(nametag?: string): PeerInfo {
   return {
     transportPubkey: PEER_PUBKEY,
     chainPubkey: PEER_PUBKEY,
-    l1Address: 'alpha1peer',
     directAddress: 'DIRECT://peer',
     timestamp: Date.now(),
     ...(nametag ? { nametag } : {}),

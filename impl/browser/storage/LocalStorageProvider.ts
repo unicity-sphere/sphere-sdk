@@ -91,7 +91,7 @@ export class LocalStorageProvider implements StorageProvider {
 
   setIdentity(identity: FullIdentity): void {
     this.identity = identity;
-    this.log('Identity set:', identity.l1Address);
+    this.log('Identity set:', identity.directAddress);
   }
 
   async get(key: string): Promise<string | null> {

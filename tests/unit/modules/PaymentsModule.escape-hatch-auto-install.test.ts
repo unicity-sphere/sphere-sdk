@@ -70,7 +70,6 @@ vi.mock('../../../serialization/txf-serializer', () => ({
 function makeIdentity(): FullIdentity {
   return {
     chainPubkey: '02' + 'a'.repeat(64),
-    l1Address: 'alpha1test',
     directAddress: 'DIRECT://test',
     privateKey: 'a'.repeat(64),
   };

@@ -2334,11 +2334,10 @@ export class AddressTransportAdapter implements TransportProvider {
 
   async publishIdentityBinding(
     chainPubkey: string,
-    l1Address: string,
     directAddress: string,
     nametag?: string,
   ): Promise<boolean> {
-    return this.resolveDelegate?.publishIdentityBinding?.(chainPubkey, l1Address, directAddress, nametag) ?? false;
+    return this.resolveDelegate?.publishIdentityBinding?.(chainPubkey, directAddress, nametag) ?? false;
   }
 
   // ===========================================================================

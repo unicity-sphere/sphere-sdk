@@ -33,8 +33,6 @@ export interface BaseProvider extends ProviderMetadata {
 export interface Identity {
   /** 33-byte compressed secp256k1 public key (for L3 chain) */
   readonly chainPubkey: string;
-  /** L1 address (alpha1...) */
-  readonly l1Address: string;
   /** L3 DIRECT address (DIRECT://...) */
   readonly directAddress?: string;
   readonly ipnsName?: string;
@@ -541,8 +539,6 @@ export interface TrackedAddressEntry {
 export interface TrackedAddress extends TrackedAddressEntry {
   /** Short address identifier (e.g., "DIRECT_abc123_xyz789") */
   readonly addressId: string;
-  /** L1 bech32 address (alpha1...) */
-  readonly l1Address: string;
   /** L3 DIRECT address (DIRECT://...) */
   readonly directAddress: string;
   /** 33-byte compressed secp256k1 public key */
@@ -1517,7 +1513,7 @@ export interface SphereEventMap {
     error?: string;
     rolledBack: boolean;
   };
-  'identity:changed': { l1Address: string; directAddress?: string; chainPubkey: string; nametag?: string; addressIndex: number };
+  'identity:changed': { directAddress?: string; chainPubkey: string; nametag?: string; addressIndex: number };
   'address:activated': { address: TrackedAddress };
   'address:hidden': { index: number; addressId: string };
   'address:unhidden': { index: number; addressId: string };
@@ -1927,6 +1923,5 @@ export interface SphereStatus {
   tokenStorage: ProviderStatusInfo[];
   transport: ProviderStatusInfo[];
   oracle: ProviderStatusInfo[];
-  l1: ProviderStatusInfo[];
   price: ProviderStatusInfo[];
 }

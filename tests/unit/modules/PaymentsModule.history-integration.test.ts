@@ -204,7 +204,6 @@ const SENDER_TRANSPORT_PUBKEY = 'cc'.repeat(32);
 function createMockIdentity(): FullIdentity {
   return {
     chainPubkey: FAKE_PUBKEY,
-    l1Address: 'alpha1testaddr',
     directAddress: 'DIRECT://testaddr',
     privateKey: FAKE_PRIVATE_KEY,
     transportPubkey: 'dd'.repeat(32),

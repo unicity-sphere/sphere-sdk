@@ -67,7 +67,6 @@ function createMinimalSphere() {
   return {
     identity: {
       chainPubkey: '02abc',
-      l1Address: 'alpha1test',
       directAddress: 'DIRECT://test',
       nametag: 'alice',
     },

@@ -485,21 +485,9 @@ export const DEFAULT_DERIVATION_PATH = `${DEFAULT_BASE_PATH}/0/0` as const;
 
 /** Coin types */
 export const COIN_TYPES = {
-  /** ALPHA token (L1 blockchain) */
-  ALPHA: 'ALPHA',
   /** Test token */
   TEST: 'TEST',
 } as const;
-
-// =============================================================================
-// L1 (ALPHA Blockchain) Defaults
-// =============================================================================
-
-/** Default Fulcrum electrum server for mainnet */
-export const DEFAULT_ELECTRUM_URL = 'wss://fulcrum.unicity.network:50004' as const;
-
-/** Testnet Fulcrum electrum server */
-export const TEST_ELECTRUM_URL = 'wss://fulcrum.unicity.network:50004' as const;
 
 // =============================================================================
 // Token Registry Defaults
@@ -533,7 +521,6 @@ export const NETWORKS = {
     aggregatorUrl: DEFAULT_AGGREGATOR_URL,
     nostrRelays: DEFAULT_NOSTR_RELAYS,
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
-    electrumUrl: DEFAULT_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
@@ -542,7 +529,6 @@ export const NETWORKS = {
     aggregatorUrl: TEST_AGGREGATOR_URL,
     nostrRelays: TEST_NOSTR_RELAYS,
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
-    electrumUrl: TEST_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
@@ -551,7 +537,6 @@ export const NETWORKS = {
     aggregatorUrl: DEV_AGGREGATOR_URL,
     nostrRelays: TEST_NOSTR_RELAYS,
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
-    electrumUrl: TEST_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },

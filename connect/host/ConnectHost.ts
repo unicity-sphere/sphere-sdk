@@ -35,17 +35,13 @@ import type { PermissionScope } from '../permissions';
 // Use a minimal interface for the Sphere dependency to avoid circular imports.
 // ConnectHost only needs these public methods from Sphere.
 interface SphereInstance {
-  readonly identity: { chainPubkey: string; l1Address: string; directAddress?: string; nametag?: string } | null;
+  readonly identity: { chainPubkey: string; directAddress?: string; nametag?: string } | null;
   readonly payments: {
     getBalance(coinId?: string): unknown[];
     getAssets(coinId?: string): Promise<unknown[]>;
     getFiatBalance(): Promise<number | null>;
     getTokens(filter?: { coinId?: string }): unknown[];
     getHistory(): unknown[];
-    readonly l1?: {
-      getBalance(): Promise<unknown>;
-      getHistory(limit?: number): Promise<unknown[]>;
-    };
   };
   signMessage(message: string): string;
   resolve(identifier: string): Promise<unknown>;
@@ -463,18 +459,6 @@ export class ConnectHost {
       case RPC_METHODS.GET_HISTORY:
         return this.sphere.payments.getHistory();
 
-      case RPC_METHODS.L1_GET_BALANCE:
-        if (!this.sphere.payments.l1) {
-          throw new SphereError('L1 module not available', 'MODULE_NOT_AVAILABLE');
-        }
-        return this.sphere.payments.l1.getBalance();
-
-      case RPC_METHODS.L1_GET_HISTORY:
-        if (!this.sphere.payments.l1) {
-          throw new SphereError('L1 module not available', 'MODULE_NOT_AVAILABLE');
-        }
-        return this.sphere.payments.l1.getHistory(params.limit as number | undefined);
-
       case RPC_METHODS.RESOLVE:
         if (!params.identifier) {
           throw new SphereError('Missing required parameter: identifier', 'VALIDATION_ERROR');
@@ -664,7 +648,6 @@ export class ConnectHost {
     if (!id) return undefined;
     return {
       chainPubkey: id.chainPubkey,
-      l1Address: id.l1Address,
       directAddress: id.directAddress,
       nametag: id.nametag,
     };

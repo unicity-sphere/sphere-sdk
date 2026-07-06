@@ -290,7 +290,6 @@ describe('V6-RECOVER — real-SDK HD-index recovery integration', () => {
 
       const identity: FullIdentity = {
         chainPubkey: keyZero.chainPubkeyHex,
-        l1Address: 'alpha1active',
         directAddress: trackedZero.directAddress,
         privateKey: hexFromBytes(keyZero.privateKey),
       };
@@ -371,7 +370,6 @@ describe('V6-RECOVER — real-SDK HD-index recovery integration', () => {
 
       const identity: FullIdentity = {
         chainPubkey: keyZero.chainPubkeyHex,
-        l1Address: 'alpha1active',
         directAddress: trackedZero.directAddress,
         privateKey: hexFromBytes(keyZero.privateKey),
       };
@@ -459,7 +457,6 @@ describe('V6-RECOVER — real-SDK HD-index recovery integration', () => {
       ));
       const identity: FullIdentity = {
         chainPubkey: keyZero.chainPubkeyHex,
-        l1Address: 'alpha1active',
         directAddress: primaryDerived,
         privateKey: hexFromBytes(keyZero.privateKey),
       };
@@ -536,7 +533,6 @@ describe('V6-RECOVER — real-SDK HD-index recovery integration', () => {
 
       const identity: FullIdentity = {
         chainPubkey: keyZero.chainPubkeyHex,
-        l1Address: 'alpha1active',
         directAddress: trackedZero.directAddress,
         privateKey: hexFromBytes(keyZero.privateKey),
       };

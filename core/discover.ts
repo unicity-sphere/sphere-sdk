@@ -21,26 +21,22 @@ export interface DiscoverAddressProgress {
   discoveredCount: number;
   /** Current gap count (consecutive empty indices) */
   currentGap: number;
-  /** Phase: 'transport' or 'l1' */
-  phase: 'transport' | 'l1';
+  /** Phase: 'transport' */
+  phase: 'transport';
 }
 
 /** Single discovered address result */
 export interface DiscoveredAddress {
   /** HD derivation index */
   index: number;
-  /** L1 bech32 address (alpha1...) */
-  l1Address: string;
   /** L3 DIRECT address */
   directAddress: string;
   /** 33-byte compressed chain pubkey */
   chainPubkey: string;
   /** Nametag (from binding event) */
   nametag?: string;
-  /** L1 balance in ALPHA (0 if only discovered via transport) */
-  l1Balance: number;
   /** Discovery source */
-  source: 'transport' | 'l1' | 'both';
+  source: 'transport';
 }
 
 /** Options for address discovery */
@@ -51,8 +47,6 @@ export interface DiscoverAddressesOptions {
   gapLimit?: number;
   /** Batch size for transport queries (default: 20) */
   batchSize?: number;
-  /** Also run L1 balance scan (default: true when L1 is configured, false otherwise) */
-  includeL1Scan?: boolean;
   /** Progress callback */
   onProgress?: (progress: DiscoverAddressProgress) => void;
   /** Abort signal */
@@ -79,7 +73,6 @@ export interface DiscoverAddressesResult {
 interface DerivedAddressInfo {
   transportPubkey: string;
   chainPubkey: string;
-  l1Address: string;
   directAddress: string;
 }
 
@@ -146,11 +139,9 @@ export async function discoverAddressesImpl(
         const derived = pubkeyToInfo.get(peer.transportPubkey)!;
         discovered.set(index, {
           index,
-          l1Address: peer.l1Address || derived.l1Address,
           directAddress: peer.directAddress || derived.directAddress,
           chainPubkey: peer.chainPubkey || derived.chainPubkey,
           nametag: peer.nametag,
-          l1Balance: 0,
           source: 'transport',
         });
       }

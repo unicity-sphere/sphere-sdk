@@ -189,7 +189,6 @@ const RECEIVER_IDENTITY = {
   // chainPubkey is fed verbatim — the format isn't validated at this
   // layer.
   chainPubkey: '02' + 'cd'.repeat(32),
-  l1Address: 'alpha1receiver',
   directAddress: 'DIRECT://receiver',
 };
 
@@ -290,7 +289,6 @@ describe('NostrTransportProvider — UXF payload routing (T.2.E)', () => {
       await provider.setIdentity({
         privateKey: SENDER_SK_HEX,
         chainPubkey: '02' + 'aa'.repeat(32),
-        l1Address: 'alpha1sender',
       });
       await provider.connect();
 
@@ -331,7 +329,6 @@ describe('NostrTransportProvider — UXF payload routing (T.2.E)', () => {
       await provider.setIdentity({
         privateKey: SENDER_SK_HEX,
         chainPubkey: '02' + 'aa'.repeat(32),
-        l1Address: 'alpha1sender',
       });
       await provider.connect();
 
@@ -360,7 +357,6 @@ describe('NostrTransportProvider — UXF payload routing (T.2.E)', () => {
       await provider.setIdentity({
         privateKey: SENDER_SK_HEX,
         chainPubkey: '02' + 'aa'.repeat(32),
-        l1Address: 'alpha1sender',
       });
       await provider.connect();
 
@@ -392,7 +388,6 @@ describe('NostrTransportProvider — UXF payload routing (T.2.E)', () => {
       await provider.setIdentity({
         privateKey: SENDER_SK_HEX,
         chainPubkey: '02' + 'aa'.repeat(32),
-        l1Address: 'alpha1sender',
       });
       await provider.connect();
 

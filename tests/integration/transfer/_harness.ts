@@ -123,7 +123,6 @@ export const BOB_CHAIN_PUBKEY =
 export function makeIdentity(): FullIdentity {
   return {
     chainPubkey: ALICE_CHAIN_PUBKEY,
-    l1Address: 'alpha1mock',
     directAddress: 'DIRECT://alice-direct',
     privateKey: '01'.repeat(32),
   };
@@ -133,7 +132,6 @@ export function makePeerInfo(overrides: Partial<PeerInfo> = {}): PeerInfo {
   return {
     transportPubkey: BOB_TRANSPORT_PUBKEY,
     chainPubkey: BOB_CHAIN_PUBKEY,
-    l1Address: 'alpha1bob',
     directAddress: 'DIRECT://bob-direct',
     timestamp: 0,
     nametag: 'bob',

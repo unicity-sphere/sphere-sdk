@@ -52,7 +52,6 @@ function buildPeerInfo(over: Partial<PeerInfo>): PeerInfo {
   return {
     transportPubkey: 'a'.repeat(64),
     chainPubkey: '02' + 'b'.repeat(64),
-    l1Address: 'alpha1peer',
     directAddress: 'DIRECT://peer',
     timestamp: 1700000000000,
     ...over,

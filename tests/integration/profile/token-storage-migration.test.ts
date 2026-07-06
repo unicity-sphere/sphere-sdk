@@ -38,7 +38,6 @@ import type { TxfStorageDataBase } from '../../../storage';
 const IDENTITY: FullIdentity = {
   privateKey: '00' + '11'.repeat(31),
   chainPubkey: '02' + 'aa'.repeat(32),
-  l1Address: 'alpha1testaddr',
   directAddress: 'DIRECT://test',
   nametag: 'testuser',
 };

@@ -78,10 +78,6 @@ export type {
   InitProgressStep,
   InitProgress,
   InitProgressCallback,
-  ScanAddressProgress,
-  ScannedAddressResult,
-  ScanAddressesOptions,
-  ScanAddressesResult,
   DiscoverAddressProgress,
   DiscoveredAddress,
   DiscoverAddressesOptions,
@@ -303,9 +299,6 @@ export {
   DEFAULT_IPFS_GATEWAYS,
   BUILTIN_IPFS_GATEWAYS,
   DEFAULT_IPFS_BOOTSTRAP_PEERS,
-  // L1 (ALPHA Blockchain)
-  DEFAULT_ELECTRUM_URL,
-  TEST_ELECTRUM_URL,
   // Wallet
   DEFAULT_DERIVATION_PATH,
   COIN_TYPES,
@@ -407,27 +400,6 @@ export type {
 
 // =============================================================================
 // L1 SDK (ALPHA Blockchain)
-// =============================================================================
-
-export {
-  // L1 Payments Module
-  L1PaymentsModule,
-  createL1PaymentsModule,
-} from './modules/payments';
-
-export type {
-  L1PaymentsModuleConfig,
-  L1PaymentsModuleDependencies,
-  L1SendRequest,
-  L1SendResult,
-  L1Balance,
-  L1Utxo,
-  L1Transaction,
-} from './modules/payments';
-
-// L1 Low-level SDK
-export * as L1 from './l1';
-
 // =============================================================================
 // Token Registry
 // =============================================================================
@@ -581,15 +553,7 @@ export {
 } from './core/encryption';
 export type { EncryptedData } from './core/encryption';
 
-// L1 low-level crypto + address utilities (in addition to L1.* namespace export)
-export {
-  generatePrivateKey,
-  hexToWIF,
-  encryptWallet,
-  decryptWallet,
-} from './l1/crypto';
-
-export { generateAddressFromMasterKey } from './l1/address';
+export { generateAddressFromMasterKey } from './core/crypto';
 
 // Accounting module types
 export type {

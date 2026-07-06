@@ -382,7 +382,6 @@ function createPeerMap(): Map<string, PeerInfo> {
     chainPubkey: PARTY_A_PUBKEY,
     directAddress: PARTY_A_ADDRESS,
     transportPubkey: 'a'.repeat(64),
-    l1Address: 'alpha1partyaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     nametag: 'alice',
     timestamp: Date.now(),
   };
@@ -394,7 +393,6 @@ function createPeerMap(): Map<string, PeerInfo> {
     chainPubkey: PARTY_B_PUBKEY,
     directAddress: PARTY_B_ADDRESS,
     transportPubkey: 'b'.repeat(64),
-    l1Address: 'alpha1partybbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
     nametag: 'bob',
     timestamp: Date.now(),
   };
@@ -406,7 +404,6 @@ function createPeerMap(): Map<string, PeerInfo> {
     chainPubkey: ESCROW_PUBKEY,
     directAddress: ESCROW_ADDRESS,
     transportPubkey: 'e'.repeat(64),
-    l1Address: 'alpha1escroweeeeeeeeeeeeeeeeeeeeeeeeeeee',
     nametag: 'escrow',
     timestamp: Date.now(),
   };
@@ -505,7 +502,6 @@ function createSwapTestPair(): SwapTestContext {
   const identityA: FullIdentity = {
     chainPubkey: PARTY_A_PUBKEY,
     directAddress: PARTY_A_ADDRESS,
-    l1Address: 'alpha1partyaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     nametag: 'alice',
     privateKey: PARTY_A_PRIVATE_KEY,
   };
@@ -513,7 +509,6 @@ function createSwapTestPair(): SwapTestContext {
   const identityB: FullIdentity = {
     chainPubkey: PARTY_B_PUBKEY,
     directAddress: PARTY_B_ADDRESS,
-    l1Address: 'alpha1partybbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
     nametag: 'bob',
     privateKey: PARTY_B_PRIVATE_KEY,
   };

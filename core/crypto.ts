@@ -649,5 +649,22 @@ export function recoverPubkeyFromSignature(message: string, signature: string): 
   return recovered.encode('hex', true);
 }
 
+/**
+ * Legacy address derivation from master key using HMAC-SHA512.
+ * Used for wallet import/loading from pre-L1-removal backups.
+ * @deprecated — kept only for legacy wallet compatibility
+ */
+export function generateAddressFromMasterKey(
+  masterPrivateKey: string,
+  index: number
+): AddressInfo {
+  const derivationPath = `m/44'/0'/${index}'`;
+  const hmacInput = CryptoJS.enc.Hex.parse(masterPrivateKey);
+  const hmacKey = CryptoJS.enc.Utf8.parse(derivationPath);
+  const hmacOutput = CryptoJS.HmacSHA512(hmacInput, hmacKey).toString();
+  const childPrivateKey = hmacOutput.substring(0, 64);
+  return generateAddressInfo(childPrivateKey, index, derivationPath);
+}
+
 // Re-export elliptic instance for advanced use cases
 export { ec };

@@ -62,7 +62,6 @@ describe('SwapModule — Issue #457 fail-fast on missing transportPubkey', () =>
       chainPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
       directAddress: DEFAULT_TEST_PARTY_B_ADDRESS,
       transportPubkey: undefined as unknown as string, // partially propagated binding
-      l1Address: 'alpha1partybbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
       nametag: 'bob-demo06',
       timestamp: Date.now(),
     };
@@ -106,7 +105,6 @@ describe('SwapModule — Issue #457 fail-fast on missing transportPubkey', () =>
       chainPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
       directAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       transportPubkey: undefined as unknown as string,
-      l1Address: 'alpha1escroweeeeeeeeeeeeeeeeeeeeeeeeeeee',
       nametag: 'escrow',
       timestamp: Date.now(),
     };
@@ -154,7 +152,6 @@ describe('SwapModule — Issue #457 fail-fast on missing transportPubkey', () =>
       chainPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
       directAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       transportPubkey: undefined as unknown as string,
-      l1Address: 'alpha1escroweeeeeeeeeeeeeeeeeeeeeeeeeeee',
       nametag: 'escrow',
       timestamp: Date.now(),
     };

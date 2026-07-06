@@ -46,7 +46,6 @@ function peerInfo(opts: { nametag?: string; directAddress?: string }): PeerInfo 
   return {
     transportPubkey: SENDER_PUBKEY,
     chainPubkey: '02'.padEnd(66, 'c'),
-    l1Address: 'alpha1example',
     directAddress: opts.directAddress ?? 'DIRECT://example',
     timestamp: 1700000000,
     ...(opts.nametag !== undefined ? { nametag: opts.nametag } : {}),

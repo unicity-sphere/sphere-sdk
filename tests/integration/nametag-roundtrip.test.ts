@@ -206,7 +206,6 @@ const TEST_IDENTITY = {
   publicKey: 'b'.repeat(64), // This is NOT used by publishIdentityBinding
   address: 'alpha1testaddress',
   chainPubkey: '02' + 'b'.repeat(64),
-  l1Address: 'alpha1testaddress',
   directAddress: 'DIRECT://testdirectaddress',
   ipnsName: '12D3KooWtest',
   nametag: undefined,

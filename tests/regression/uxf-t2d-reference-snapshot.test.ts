@@ -204,7 +204,6 @@ function makeTransportStub(): MockTransport {
 function makeIdentity(manifest: FixtureManifest): FullIdentity {
   return {
     chainPubkey: manifest.inputs.senderChainPubkey,
-    l1Address: 'alpha1regression',
     directAddress: 'DIRECT://regression-sender',
     privateKey: '01'.repeat(32),
   };
@@ -214,7 +213,6 @@ function makePeerInfo(manifest: FixtureManifest): PeerInfo {
   return {
     transportPubkey: manifest.inputs.recipientTransportPubkey,
     chainPubkey: manifest.inputs.recipientChainPubkey,
-    l1Address: 'alpha1regression-recipient',
     directAddress: manifest.inputs.recipientDirectAddress,
     timestamp: 0,
   };

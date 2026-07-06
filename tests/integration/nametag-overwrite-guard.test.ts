@@ -109,7 +109,7 @@ function createMockTransport(options: {
           return Promise.resolve(null);
         }),
 
-    publishIdentityBinding: vi.fn((chainPubkey: string, l1Address: string, directAddress: string, nametag?: string) => {
+    publishIdentityBinding: vi.fn((chainPubkey: string, directAddress: string, nametag?: string) => {
       // Store on relay (simulates what the real relay does)
       relayBindings.set(directAddress, {
         chainPubkey,

@@ -309,7 +309,6 @@ describe('Sphere.wireProfilePersistedSendStorage (Issue #166 — P3 #4)', () => 
 
     const noDirect: FullIdentity = {
       chainPubkey: '02' + 'aa'.repeat(32),
-      l1Address: 'alpha1test',
       privateKey: '00' + '11'.repeat(31),
       // no directAddress
     };

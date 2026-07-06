@@ -162,7 +162,6 @@ function makeTrackedAddress(
     createdAt: 1700000000000,
     updatedAt: 1700000000000,
     addressId: `DIRECT_idx${index}`,
-    l1Address: `alpha1mock${index}`,
     directAddress,
     chainPubkey,
   };
@@ -290,7 +289,6 @@ describe('#255 Problem A — HD-index recovery in finalizeTransferToken helpers'
       module.initialize(makeDeps({
         identity: {
           chainPubkey: CHAINPUB_INDEX_0,
-          l1Address: 'alpha1ourtestaddress',
           directAddress: ADDR_INDEX_0,
           privateKey: PK_INDEX_0,
         },
@@ -329,7 +327,6 @@ describe('#255 Problem A — HD-index recovery in finalizeTransferToken helpers'
       module.initialize(makeDeps({
         identity: {
           chainPubkey: CHAINPUB_INDEX_0,
-          l1Address: 'alpha1ourtestaddress',
           directAddress: ADDR_INDEX_0,
           privateKey: PK_INDEX_0,
         },
@@ -360,7 +357,6 @@ describe('#255 Problem A — HD-index recovery in finalizeTransferToken helpers'
       module.initialize(makeDeps({
         identity: {
           chainPubkey: CHAINPUB_INDEX_0,
-          l1Address: 'alpha1ourtestaddress',
           directAddress: ADDR_INDEX_0,
           privateKey: PK_INDEX_0,
         },
@@ -390,7 +386,6 @@ describe('#255 Problem A — HD-index recovery in finalizeTransferToken helpers'
       module.initialize(makeDeps({
         identity: {
           chainPubkey: CHAINPUB_INDEX_0,
-          l1Address: 'alpha1mock0',
           directAddress: ADDR_INDEX_0,
           privateKey: PK_INDEX_0,
         },
@@ -422,7 +417,6 @@ describe('#255 Problem A — HD-index recovery in finalizeTransferToken helpers'
       module.initialize(makeDeps({
         identity: {
           chainPubkey: CHAINPUB_INDEX_0,
-          l1Address: 'alpha1mock0',
           directAddress: ADDR_INDEX_0,
           privateKey: PK_INDEX_0,
         },
@@ -456,7 +450,6 @@ describe('#255 Problem A — HD-index recovery in finalizeTransferToken helpers'
       module.initialize(makeDeps({
         identity: {
           chainPubkey: CHAINPUB_INDEX_0,
-          l1Address: 'alpha1mock0',
           directAddress: ADDR_INDEX_0,
           privateKey: PK_INDEX_0,
         },
@@ -489,7 +482,6 @@ describe('#255 Problem A — HD-index recovery in finalizeTransferToken helpers'
       module.initialize(makeDeps({
         identity: {
           chainPubkey: CHAINPUB_INDEX_0,
-          l1Address: 'alpha1mock0',
           directAddress: ADDR_INDEX_0,
           privateKey: PK_INDEX_0,
         },
@@ -515,7 +507,6 @@ describe('#255 Problem A — HD-index recovery in finalizeTransferToken helpers'
       module.initialize(makeDeps({
         identity: {
           chainPubkey: CHAINPUB_INDEX_0,
-          l1Address: 'alpha1ourtestaddress',
           directAddress: ADDR_INDEX_0,
           privateKey: PK_INDEX_0,
         },

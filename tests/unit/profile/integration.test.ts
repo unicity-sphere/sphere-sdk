@@ -179,7 +179,6 @@ function createMockLegacyTokenStorage(
 
 const TEST_IDENTITY: FullIdentity = {
   chainPubkey: '02' + 'ab'.repeat(32),
-  l1Address: 'alpha1testaddress',
   directAddress: 'DIRECT://AABBCC112233DDEEFF445566',
   privateKey: 'ff'.repeat(32),
 };

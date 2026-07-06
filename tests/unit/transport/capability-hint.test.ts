@@ -240,7 +240,6 @@ describe('T.8.B — capability hint surfacing in identity binding events', () =>
       const event = buildBindingEvent({
         pubkey: PEER_NOSTR_PUBKEY,
         publicKey: '02' + 'd'.repeat(64),
-        l1Address: 'alpha1peeraddr',
         directAddress: 'DIRECT://peer',
         wireProtocols: ['uxf-car', 'uxf-cid', 'txf'],
         assetKinds: ['coin', 'nft'],

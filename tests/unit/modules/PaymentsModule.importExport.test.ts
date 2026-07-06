@@ -215,7 +215,6 @@ function createMockDeps(): PaymentsModuleDependencies {
 
   const mockIdentity: FullIdentity = {
     chainPubkey: '02' + 'aa'.repeat(32),
-    l1Address: 'alpha1test',
     directAddress: 'DIRECT://test',
     privateKey: '00' + '11'.repeat(31),
   };

@@ -51,7 +51,6 @@ function createMockSphere() {
   return {
     identity: {
       chainPubkey: '02abc123',
-      l1Address: 'alpha1test',
       directAddress: 'DIRECT://test',
       nametag: 'alice',
     },
@@ -73,7 +72,6 @@ function createMockSphere() {
     resolve: vi.fn().mockResolvedValue({
       nametag: 'bob',
       chainPubkey: '03def456',
-      l1Address: 'alpha1bob',
       directAddress: 'DIRECT://bob',
       transportPubkey: 'ff00ff',
     }),
@@ -195,7 +193,6 @@ describe('Sphere Connect Integration', () => {
       const identity = await client.query(RPC_METHODS.GET_IDENTITY);
       expect(identity).toEqual({
         chainPubkey: '02abc123',
-        l1Address: 'alpha1test',
         directAddress: 'DIRECT://test',
         nametag: 'alice',
       });
@@ -227,11 +224,6 @@ describe('Sphere Connect Integration', () => {
     it('gets history', async () => {
       const history = await client.query(RPC_METHODS.GET_HISTORY);
       expect(history).toHaveLength(1);
-    });
-
-    it('gets L1 balance', async () => {
-      const balance = await client.query(RPC_METHODS.L1_GET_BALANCE);
-      expect(balance).toEqual({ confirmed: '100000', total: '100000' });
     });
 
     it('resolves nametag', async () => {

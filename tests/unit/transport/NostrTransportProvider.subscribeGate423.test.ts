@@ -81,7 +81,6 @@ const { NostrTransportProvider } = await import(
 // the call count and the fact that subscribe() WAS called.
 const STUB_IDENTITY: FullIdentity = {
   chainPubkey: '02' + 'ab'.repeat(32),
-  l1Address: 'alpha1stub',
   directAddress: 'DIRECT://stub',
   privateKey: 'cd'.repeat(32),
 };

@@ -163,7 +163,6 @@ const FAKE_PUBKEY = '02' + 'b'.repeat(64);
 function createMockIdentity(): FullIdentity {
   return {
     chainPubkey: FAKE_PUBKEY,
-    l1Address: 'alpha1testaddr',
     directAddress: 'DIRECT://testaddr',
     privateKey: FAKE_PRIVATE_KEY,
   };

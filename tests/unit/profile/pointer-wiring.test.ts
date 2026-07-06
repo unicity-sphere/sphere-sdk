@@ -65,7 +65,6 @@ const TEST_PRIVATE_KEY_HEX =
 
 const TEST_IDENTITY: FullIdentity = {
   chainPubkey: '02' + 'bb'.repeat(32),
-  l1Address: 'alpha1test',
   directAddress: 'DIRECT://test',
   privateKey: TEST_PRIVATE_KEY_HEX,
 };

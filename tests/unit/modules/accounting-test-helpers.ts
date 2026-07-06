@@ -803,7 +803,6 @@ export function resolveTerminalState(state: string): 'CLOSED' | 'CANCELLED' {
 /** Default FullIdentity used by createTestAccountingModule(). */
 export const DEFAULT_TEST_IDENTITY: FullIdentity = {
   chainPubkey: '02' + 'a'.repeat(64),
-  l1Address: 'alpha1testaddr',
   directAddress: 'DIRECT://test_target_address_abc123',
   privateKey: 'deadbeef'.repeat(8),
 };
@@ -812,7 +811,6 @@ export const DEFAULT_TEST_IDENTITY: FullIdentity = {
 export const DEFAULT_TEST_TRACKED_ADDRESS: TrackedAddress = {
   index: 0,
   addressId: getAddressId('DIRECT://test_target_address_abc123'),
-  l1Address: 'alpha1testaddr',
   directAddress: 'DIRECT://test_target_address_abc123',
   chainPubkey: '02' + 'a'.repeat(64),
   hidden: false,

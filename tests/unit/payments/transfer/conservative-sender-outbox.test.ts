@@ -170,7 +170,6 @@ function makeTransportStub(): MockTransport {
 function makeIdentity(): FullIdentity {
   return {
     chainPubkey: '02aaaa'.padEnd(66, 'a'),
-    l1Address: 'alpha1mock',
     directAddress: 'DIRECT://mock-direct',
     privateKey: '01'.repeat(32),
   };
@@ -180,7 +179,6 @@ function makePeerInfo(overrides: Partial<PeerInfo> = {}): PeerInfo {
   return {
     transportPubkey: '02bbbb'.padEnd(64, 'b'),
     chainPubkey: '02cccc'.padEnd(66, 'c'),
-    l1Address: 'alpha1bob',
     directAddress: 'DIRECT://bob-direct',
     timestamp: 0,
     nametag: 'bob',

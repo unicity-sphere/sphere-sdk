@@ -1476,7 +1476,7 @@ export class ProfileStorageProvider implements StorageProvider {
     // Forward identity to local cache
     this.localCache.setIdentity(identity);
 
-    this.log('Identity set:', identity.l1Address);
+    this.log('Identity set:', identity.directAddress);
 
     // If OrbitDB attached BEFORE setIdentity (the common Sphere.init/import
     // ordering: storage.connect() runs while identity is still null, then

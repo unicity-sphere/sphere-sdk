@@ -81,7 +81,6 @@ function bindingFor(pubkey: string, nametag: string | undefined): PeerInfo {
   return {
     transportPubkey: pubkey,
     chainPubkey: '02'.padEnd(66, 'd'),
-    l1Address: 'alpha1example',
     directAddress: `DIRECT://${pubkey.slice(0, 8)}`,
     timestamp: 1700000000,
     ...(nametag !== undefined ? { nametag } : {}),

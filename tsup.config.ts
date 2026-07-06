@@ -45,24 +45,6 @@ export default defineConfig([
       'ws',
     ],
   },
-  // L1 module (for direct crypto operations)
-  {
-    entry: { 'l1/index': 'l1/index.ts' },
-    format: ['esm', 'cjs'],
-    dts: true,
-    clean: false,
-    splitting: false,
-    sourcemap: true,
-    platform: 'node',
-    target: 'es2022',
-    noExternal: [/^@noble\//],
-    external: [
-      'bip39',
-      'buffer',
-      'crypto-js',
-      'elliptic',
-    ],
-  },
   // Browser implementation (without IPFS - no helia dependency)
   {
     entry: { 'impl/browser/index': 'impl/browser/index.ts' },

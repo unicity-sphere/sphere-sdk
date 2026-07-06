@@ -10,7 +10,7 @@ import type { NetworkHealthResult, ServiceHealthResult, HealthCheckFn } from '..
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
-type ServiceName = 'relay' | 'oracle' | 'l1';
+type ServiceName = 'relay' | 'oracle';
 
 export interface CheckNetworkHealthOptions {
   /** Timeout per service check in ms (default: 5000) */
@@ -23,8 +23,6 @@ export interface CheckNetworkHealthOptions {
     relay?: string;
     /** Custom aggregator HTTP URL (e.g. 'https://my-aggregator.example.com') */
     oracle?: string;
-    /** Custom Electrum WebSocket URL (e.g. 'wss://my-fulcrum.example.com:50004') */
-    l1?: string;
   };
   /**
    * Custom health checks — run in parallel alongside built-in checks.
@@ -79,8 +77,7 @@ export interface CheckNetworkHealthOptions {
  *   urls: {
  *     relay: 'wss://my-relay.example.com',
  *     oracle: 'https://my-aggregator.example.com',
- *     l1: 'wss://my-fulcrum.example.com:50004',
- *   },
+ *  *   },
  * });
  *
  * // Add custom health checks for your own providers
@@ -105,7 +102,7 @@ export async function checkNetworkHealth(
   options?: CheckNetworkHealthOptions,
 ): Promise<NetworkHealthResult> {
   const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const servicesToCheck = options?.services ?? (['relay', 'oracle', 'l1'] as ServiceName[]);
+  const servicesToCheck = options?.services ?? (['relay', 'oracle'] as ServiceName[]);
   const networkConfig = NETWORKS[network];
   const customUrls = options?.urls;
 
@@ -122,11 +119,6 @@ export async function checkNetworkHealth(
   if (servicesToCheck.includes('oracle')) {
     const oracleUrl = customUrls?.oracle ?? networkConfig.aggregatorUrl;
     allChecks.push(checkOracle(oracleUrl, timeoutMs).then((r) => ['oracle', r]));
-  }
-
-  if (servicesToCheck.includes('l1')) {
-    const l1Url = customUrls?.l1 ?? networkConfig.electrumUrl;
-    allChecks.push(checkWebSocket(l1Url, timeoutMs).then((r) => ['l1', r]));
   }
 
   // Custom checks — run in parallel with built-in ones

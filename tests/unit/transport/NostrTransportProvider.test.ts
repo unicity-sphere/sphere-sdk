@@ -309,7 +309,6 @@ describe('Reconnect re-subscription', () => {
     provider.setIdentity({
       privateKey: 'a'.repeat(64),
       chainPubkey: '02' + 'b'.repeat(64),
-      l1Address: 'alpha1test',
       directAddress: 'DIRECT://test',
     });
 
@@ -441,7 +440,6 @@ describe('Event subscription pubkey format', () => {
     provider.setIdentity({
       privateKey: 'b'.repeat(64),
       chainPubkey: compressedPubkey, // 33-byte compressed
-      l1Address: 'alpha1test',
     });
 
     await provider.connect();
@@ -483,7 +481,6 @@ describe('Event subscription pubkey format', () => {
     provider.setIdentity({
       privateKey: 'b'.repeat(64),
       chainPubkey: '02' + 'a'.repeat(64),
-      l1Address: 'alpha1test',
     });
 
     await provider.connect();
@@ -520,7 +517,6 @@ describe('Event subscription pubkey format', () => {
     provider.setIdentity({
       privateKey: 'd'.repeat(64),
       chainPubkey: compressedPubkey,
-      l1Address: 'alpha1test',
     });
 
     const nostrPubkey = provider.getNostrPubkey();
@@ -634,7 +630,6 @@ describe('Last event timestamp persistence', () => {
     provider.setIdentity({
       privateKey: 'b'.repeat(64),
       chainPubkey: '02' + 'a'.repeat(64),
-      l1Address: 'alpha1test',
     });
   }
 
@@ -1098,7 +1093,6 @@ describe('Issue #275 — persistent dedup', () => {
     provider.setIdentity({
       privateKey: 'b'.repeat(64),
       chainPubkey: '02' + 'a'.repeat(64),
-      l1Address: 'alpha1test',
     });
   }
 
@@ -1496,7 +1490,6 @@ describe('Issue #275 — persistent dedup', () => {
       await provider.setIdentity({
         privateKey: 'c'.repeat(64),
         chainPubkey: '02' + 'd'.repeat(64),
-        l1Address: 'alpha1other',
       });
 
       // Wait past the original 200ms debounce window. If the timer was

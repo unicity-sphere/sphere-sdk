@@ -25,7 +25,6 @@ import type { FullIdentity } from '../../../types';
 
 const REAL_IDENTITY: FullIdentity = {
   chainPubkey: '02' + 'aa'.repeat(32),
-  l1Address: 'alpha1test',
   directAddress: 'DIRECT://test',
   privateKey: '00' + '11'.repeat(31),
 };
