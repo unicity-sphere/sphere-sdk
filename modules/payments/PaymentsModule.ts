@@ -12252,21 +12252,25 @@ export class PaymentsModule {
             //     ProfileTokenStorageProvider via `computeAddressId`
             //
             // Legacy `alpha1...` bech32 addresses in `_meta.address` are
-            // tolerated on READ by the storage layer's alpha1 guard added
-            // in the L1-removal wave; they never re-appear here because
-            // any resave rewrites the field to the chainPubkey form.
+            // tolerated on READ — mirrors the tolerance in `load()` above.
+            // A resave from this Phase-2 code rewrites the field to
+            // chainPubkey. Rejecting alpha1 here would silently drop merged
+            // payloads from cross-version peers still writing the legacy form.
             const mergedMeta = (result.merged as TxfStorageDataBase)?._meta;
             const currentChain = this.deps!.identity.chainPubkey;
             const currentDirect = this.deps!.identity.directAddress;
             const currentProfileShortId = currentDirect ? computeAddressId(currentDirect) : null;
+            const isLegacyAlpha = mergedMeta?.address?.startsWith('alpha1') ?? false;
             if (
               mergedMeta?.address &&
+              !isLegacyAlpha &&
               mergedMeta.address !== currentChain &&
               mergedMeta.address !== currentProfileShortId
             ) {
               const accepted = [
                 currentChain ? `chain=${currentChain.slice(0, 16)}…` : null,
                 currentProfileShortId ? `profile=${currentProfileShortId}` : null,
+                `legacy alpha1 (migration tolerance)`,
               ].filter(Boolean).join(', ');
               logger.warn(
                 'Payments',
@@ -12975,7 +12979,6 @@ export class PaymentsModule {
     const recipient: PeerInfo = peerInfo ?? {
       transportPubkey: recipientPubkey,
       chainPubkey: '',
-      l1Address: '',
       directAddress: '',
       timestamp: Date.now(),
     };
@@ -13802,7 +13805,6 @@ export class PaymentsModule {
     const recipient: PeerInfo = peerInfo ?? {
       transportPubkey: recipientPubkey,
       chainPubkey: '',
-      l1Address: '',
       directAddress: '',
       timestamp: Date.now(),
     };
@@ -14831,7 +14833,6 @@ export class PaymentsModule {
     const recipient: PeerInfo = peerInfo ?? {
       transportPubkey: recipientPubkey,
       chainPubkey: '',
-      l1Address: '',
       directAddress: '',
       timestamp: Date.now(),
     };

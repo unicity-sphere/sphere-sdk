@@ -622,8 +622,15 @@ export interface PeerInfo {
   transportPubkey: string;
   /** 33-byte compressed secp256k1 public key (for L3 chain) */
   chainPubkey: string;
-  /** L1 address (alpha1...) */
-  l1Address: string;
+  /**
+   * Legacy L1 bech32 address (`alpha1…`) — RETAINED as an optional wire-
+   * tolerance field. Pre-Phase-2 binding events on relay still carry
+   * `l1_address` in JSON content; nostr-js-sdk parses it into
+   * `BindingInfo.l1Address`, and we surface it here so downstream code
+   * can inspect it without a runtime-vs-type mismatch. Phase-2 emitters
+   * no longer populate this field.
+   */
+  l1Address?: string;
   /** L3 DIRECT address (DIRECT://...) */
   directAddress: string;
   /** L3 PROXY address derived from nametag hash (PROXY:...), only if nametag registered */

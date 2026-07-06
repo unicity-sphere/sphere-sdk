@@ -2807,7 +2807,13 @@ export class Sphere {
       if (this._masterKey) {
         address0 = this.deriveAddress(0).address;
       } else if (this._identity) {
-        address0 = this._identity.directAddress ?? null;
+        // Consistency with the masterKey branch (which returns the alpha1-form
+        // bech32 encoding of the pubkey hash) — encode the identity's
+        // chainPubkey the same way so `address0` has a stable shape across
+        // both wallet-load paths. The `alpha` prefix is a historical label
+        // for the SDK's canonical HD-address bech32 encoding; it is no
+        // longer an L1 concept post-Phase-2.
+        address0 = publicKeyToAddress(this._identity.chainPubkey, 'alpha');
       }
     } catch {
       // Ignore errors
@@ -2867,7 +2873,7 @@ export class Sphere {
         // Stop if we can't derive more addresses (e.g., no masterKey)
         if (i === 0 && this._identity) {
           addresses.push({
-            address: this._identity.directAddress ?? '',
+            address: publicKeyToAddress(this._identity.chainPubkey, 'alpha'),
             publicKey: this._identity.chainPubkey,
             path: this.getDefaultAddressPath(),
             index: 0,
@@ -2967,7 +2973,7 @@ export class Sphere {
         // Stop if we can't derive more addresses
         if (i === 0 && this._identity) {
           addresses.push({
-            address: this._identity.directAddress ?? '',
+            address: publicKeyToAddress(this._identity.chainPubkey, 'alpha'),
             path: this.getDefaultAddressPath(),
             index: 0,
             isChange: false,
