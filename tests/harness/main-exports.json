@@ -1,0 +1,6376 @@
+{
+ "index.ts": [
+  {
+   "name": "addressesMatch",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/address.ts",
+   "line": 155,
+   "sig": "(a: string, b: string) => boolean"
+  },
+  {
+   "name": "AddressInfo",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/crypto.ts",
+   "line": 46,
+   "sig": "extends KeyPair { path, index }"
+  },
+  {
+   "name": "AddressMode",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 139,
+   "sig": "export type AddressMode = 'auto' | 'direct';"
+  },
+  {
+   "name": "AddressType",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "core/address.ts",
+   "line": 35,
+   "sig": "export type AddressType = 'DIRECT' | 'PROXY' | 'NAMETAG';"
+  },
+  {
+   "name": "AggregatorEvent",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "oracle/oracle-provider.ts",
+   "line": 114,
+   "sig": "export type AggregatorEvent = OracleEvent;"
+  },
+  {
+   "name": "AggregatorEventCallback",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "oracle/oracle-provider.ts",
+   "line": 116,
+   "sig": "export type AggregatorEventCallback = OracleEventCallback;"
+  },
+  {
+   "name": "AggregatorEventType",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "oracle/oracle-provider.ts",
+   "line": 112,
+   "sig": "export type AggregatorEventType = OracleEventType;"
+  },
+  {
+   "name": "AggregatorProvider",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "oracle/oracle-provider.ts",
+   "line": 110,
+   "sig": "export type AggregatorProvider = OracleProvider;"
+  },
+  {
+   "name": "AggregatorProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 687,
+   "sig": "{ url, timeout, skipVerification }"
+  },
+  {
+   "name": "ApplyDeltaAdded",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 140,
+   "sig": "{ tokenId, key }"
+  },
+  {
+   "name": "ApplyDeltaOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 146,
+   "sig": "{ externalDelivery }"
+  },
+  {
+   "name": "ApplyDeltaRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 177,
+   "sig": "{ transferId, spent, added, externalDelivery }"
+  },
+  {
+   "name": "archivedKeyFromTokenId",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "types/txf.ts",
+   "line": 304,
+   "sig": "(tokenId: string) => string"
+  },
+  {
+   "name": "areSameNametag",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/nametag/NametagUtils.d.ts",
+   "line": 38,
+   "sig": "(tag1: string, tag2: string, defaultCountry?: string) => boolean"
+  },
+  {
+   "name": "assertFieldEnvelopeShape",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 194,
+   "sig": "(value: unknown, maxBytes?: number) => void"
+  },
+  {
+   "name": "Asset",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 89,
+   "sig": "{ coinId, symbol, name, decimals, iconUrl, totalAmount, tokenCount, confirmedAmount, unconfirmedAmount, confirmedTokenCount, unconfirmedTokenCount, transferringTokenCount, transferringAmount, priceUsd, priceEur, change24h, fiatValueUsd, fiatValueEur }"
+  },
+  {
+   "name": "AUTH_CHALLENGE_PREFIX",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "wallet-api/challenge.ts",
+   "line": 24,
+   "sig": "\"unicity:wallet-api:auth:v1\\n\""
+  },
+  {
+   "name": "base58Decode",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 78,
+   "sig": "(str: string) => Uint8Array"
+  },
+  {
+   "name": "base58Encode",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 51,
+   "sig": "(hex: string) => string"
+  },
+  {
+   "name": "BaseProvider",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 19,
+   "sig": "extends ProviderMetadata { connect, disconnect, isConnected, getStatus }"
+  },
+  {
+   "name": "BindingInfo",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/nametag/NametagBinding.d.ts",
+   "line": 26,
+   "sig": "{ transportPubkey, publicKey, l1Address, directAddress, proxyAddress, nametag, timestamp }"
+  },
+  {
+   "name": "BlobUrlEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 156,
+   "sig": "{ tokenId, getUrl }"
+  },
+  {
+   "name": "BroadcastHandler",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "transport/transport-provider.ts",
+   "line": 415,
+   "sig": "export type BroadcastHandler = (broadcast: IncomingBroadcast) => void;"
+  },
+  {
+   "name": "BroadcastMessage",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 348,
+   "sig": "{ id, authorPubkey, authorNametag, content, timestamp, tags }"
+  },
+  {
+   "name": "buildManifest",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/swap/manifest.ts",
+   "line": 87,
+   "sig": "(resolvedPartyA: string, resolvedPartyB: string, deal: SwapDeal, timeout: number, escrowAddress?: string) => SwapManifest"
+  },
+  {
+   "name": "buildTxfStorageData",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/txf-serializer.ts",
+   "line": 278,
+   "sig": "(tokens: Token[], meta: Omit<TxfMeta, \"formatVersion\">, options?: { nametags?: NametagData[]; tombstones?: TombstoneEntry[]; archivedTokens?: Map<string, TxfToken>; forkedTokens?: Map<string, TxfToken>; outboxEntries?: OutboxEntry[]; mintOutboxEntries?: MintOutboxEntry[]; invalidatedNametags?: InvalidatedNametagEntry[]; historyEntries?: HistoryRecord[]; }) => Promise<TxfStorageData>"
+  },
+  {
+   "name": "bytesToHex",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 316,
+   "sig": "(bytes: Uint8Array) => string"
+  },
+  {
+   "name": "ChallengeTemplateError",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "wallet-api/errors.ts",
+   "line": 68,
+   "sig": "extends WalletApiError { constructor }"
+  },
+  {
+   "name": "checkNetworkHealth",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/network-health.ts",
+   "line": 100,
+   "sig": "(network?: NetworkType, options?: CheckNetworkHealthOptions) => Promise<NetworkHealthResult>"
+  },
+  {
+   "name": "CheckNetworkHealthOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/network-health.ts",
+   "line": 15,
+   "sig": "{ timeoutMs, services, urls, checks }"
+  },
+  {
+   "name": "CMasterKeyData",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "serialization/wallet-dat.ts",
+   "line": 27,
+   "sig": "{ encryptedKey, salt, derivationMethod, iterations, position }"
+  },
+  {
+   "name": "COIN_TYPES",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 345,
+   "sig": "{ readonly TEST: \"TEST\"; }"
+  },
+  {
+   "name": "CoinBalance",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 149,
+   "sig": "{ coinId, total, tokenCount }"
+  },
+  {
+   "name": "CoinGeckoPriceProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "price/CoinGeckoPriceProvider.ts",
+   "line": 52,
+   "sig": "implements PriceProvider { platform, cache, apiKey, cacheTtlMs, timeout, debug, baseUrl, storage, fetchPromise, fetchNames, persistentCacheLoaded, loadCachePromise, constructor, getPrices, doFetch, loadFromStorage, doLoadFromStorage, saveToStorage, extendCacheOnRateLimit, getPrice, clearCache }"
+  },
+  {
+   "name": "coinIdsMatch",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "registry/TokenRegistry.ts",
+   "line": 726,
+   "sig": "(a: string, b: string) => boolean"
+  },
+  {
+   "name": "CommunicationsModule",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "modules/communications/CommunicationsModule.ts",
+   "line": 75,
+   "sig": "{ config, deps, messages, broadcasts, unsubscribeMessages, unsubscribeComposing, broadcastSubscriptions, dmHandlers, replayedHandlers, composingHandlers, broadcastHandlers, initializedAt, transportResolver, constructor, initialize, load, destroy, sendDM, getConversation, getConversations, markAsRead, getUnreadCount, getConversationPage, deleteConversation, sendTypingIndicator, sendComposingIndicator, onComposingIndicator, onDirectMessage, broadcast, subscribeToBroadcasts, getBroadcasts, onBroadcast, resolvePeerNametag, handleIncomingMessage, handleComposingIndicator, handleIncomingBroadcast, s…"
+  },
+  {
+   "name": "CommunicationsModuleConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/communications/CommunicationsModule.ts",
+   "line": 26,
+   "sig": "{ autoSave, maxMessages, maxPerConversation, readReceipts, cacheMessages }"
+  },
+  {
+   "name": "CommunicationsModuleDependencies",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/communications/CommunicationsModule.ts",
+   "line": 64,
+   "sig": "{ identity, storage, transport, emitEvent }"
+  },
+  {
+   "name": "composeDeliveryKeys",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "transport/delivery-provider.ts",
+   "line": 270,
+   "sig": "(keys: { tokenId: string; stateHash: string; }) => DeliveryBlobKeys"
+  },
+  {
+   "name": "ComposingIndicator",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 357,
+   "sig": "{ senderPubkey, senderNametag, expiresIn }"
+  },
+  {
+   "name": "computeDeliveryId",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "transport/delivery-provider.ts",
+   "line": 242,
+   "sig": "(tokenIdHex: string, stateHashHex: string) => string"
+  },
+  {
+   "name": "computeSwapId",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/swap/manifest.ts",
+   "line": 63,
+   "sig": "(fields: ManifestFields) => string"
+  },
+  {
+   "name": "ConnectionEventListener",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/client/NostrClient.d.ts",
+   "line": 29,
+   "sig": "{ onConnect, onDisconnect, onReconnecting, onReconnected }"
+  },
+  {
+   "name": "ConversationPage",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/communications/CommunicationsModule.ts",
+   "line": 47,
+   "sig": "{ messages, hasMore, oldestTimestamp }"
+  },
+  {
+   "name": "countCommittedTransactions",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/txf-serializer.ts",
+   "line": 665,
+   "sig": "(token: Token) => number"
+  },
+  {
+   "name": "createAddress",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/bech32.ts",
+   "line": 196,
+   "sig": "(hrp: string, pubkeyHash: Uint8Array | string) => string"
+  },
+  {
+   "name": "createCommunicationsModule",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/communications/CommunicationsModule.ts",
+   "line": 813,
+   "sig": "(config?: CommunicationsModuleConfig) => CommunicationsModule"
+  },
+  {
+   "name": "createGroupChatModule",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/groupchat/GroupChatModule.ts",
+   "line": 1847,
+   "sig": "(config?: GroupChatModuleConfig) => GroupChatModule"
+  },
+  {
+   "name": "CreateGroupOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/groupchat/types.ts",
+   "line": 105,
+   "sig": "{ name, description, picture, visibility, writeRestricted }"
+  },
+  {
+   "name": "CreateInvoiceRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/accounting/types.ts",
+   "line": 110,
+   "sig": "{ targets, dueDate, memo, deliveryMethods, anonymous }"
+  },
+  {
+   "name": "createKeyPair",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 249,
+   "sig": "(privateKey: string) => KeyPair"
+  },
+  {
+   "name": "createMarketModule",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/market/MarketModule.ts",
+   "line": 409,
+   "sig": "(config?: MarketModuleConfig) => MarketModule"
+  },
+  {
+   "name": "createNametagBinding",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/swap/manifest.ts",
+   "line": 327,
+   "sig": "(privateKey: string, nametag: string, directAddress: string, swapId: string, chainPubkey: string) => NametagBindingProof"
+  },
+  {
+   "name": "createPaymentsModule",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/payments/PaymentsModule.ts",
+   "line": 5952,
+   "sig": "(config?: PaymentsModuleConfig) => PaymentsModule"
+  },
+  {
+   "name": "createPriceProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "price/index.ts",
+   "line": 32,
+   "sig": "(config: PriceProviderConfig) => PriceProvider"
+  },
+  {
+   "name": "createSphere",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 4709,
+   "sig": "any"
+  },
+  {
+   "name": "createSwapModule",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/swap/SwapModule.ts",
+   "line": 3731,
+   "sig": "(config?: SwapModuleConfig) => SwapModule"
+  },
+  {
+   "name": "createTokenValidator",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "validation/token-validator.ts",
+   "line": 187,
+   "sig": "(engine: ITokenEngine) => TokenValidator"
+  },
+  {
+   "name": "decodeBech32",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/bech32.ts",
+   "line": 150,
+   "sig": "(addr: string) => { hrp: string; witnessVersion: number; data: Uint8Array; } | null"
+  },
+  {
+   "name": "decrypt",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 123,
+   "sig": "(encryptedData: EncryptedData, password: string) => string"
+  },
+  {
+   "name": "decryptCMasterKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/wallet-dat.ts",
+   "line": 294,
+   "sig": "(cmk: CMasterKeyData, password: string, onProgress?: DecryptionProgressCallback) => Promise<string>"
+  },
+  {
+   "name": "decryptField",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 182,
+   "sig": "(key: Uint8Array, envelope: string) => string"
+  },
+  {
+   "name": "decryptFieldBytes",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 153,
+   "sig": "(key: Uint8Array, envelope: string, aad?: Uint8Array) => Uint8Array"
+  },
+  {
+   "name": "DecryptionProgressCallback",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "serialization/types.ts",
+   "line": 64,
+   "sig": "export type DecryptionProgressCallback = (iteration: number, total: number) => Promise<void> | void;"
+  },
+  {
+   "name": "decryptJson",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 160,
+   "sig": "<T = unknown>(encryptedData: EncryptedData, password: string) => T"
+  },
+  {
+   "name": "decryptMnemonic",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 238,
+   "sig": "(encryptedMnemonic: string, password: string) => string"
+  },
+  {
+   "name": "decryptNametag",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/nametag/NametagUtils.d.ts",
+   "line": 84,
+   "sig": "(encryptedBase64: string, privateKeyHex: string) => Promise<string | null>"
+  },
+  {
+   "name": "decryptPrivateKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/wallet-dat.ts",
+   "line": 338,
+   "sig": "(encryptedKey: Uint8Array, pubkey: Uint8Array, masterKeyHex: string) => string"
+  },
+  {
+   "name": "decryptSimple",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 188,
+   "sig": "(ciphertext: string, password: string) => string"
+  },
+  {
+   "name": "decryptTextFormatKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/wallet-text.ts",
+   "line": 39,
+   "sig": "(encryptedKey: string, password: string) => string | null"
+  },
+  {
+   "name": "decryptWithSalt",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 203,
+   "sig": "(ciphertext: string, password: string, salt: string) => string | null"
+  },
+  {
+   "name": "DEFAULT_AGGREGATOR_TIMEOUT",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 292,
+   "sig": "30000"
+  },
+  {
+   "name": "DEFAULT_AGGREGATOR_URL",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 283,
+   "sig": "\"https://aggregator.unicity.network/rpc\""
+  },
+  {
+   "name": "DEFAULT_DERIVATION_PATH",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 342,
+   "sig": "\"m/44'/0'/0'/0/0\""
+  },
+  {
+   "name": "DEFAULT_GROUP_RELAYS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 371,
+   "sig": "readonly [\"wss://sphere-relay.unicity.network\"]"
+  },
+  {
+   "name": "DEFAULT_IPFS_BOOTSTRAP_PEERS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 305,
+   "sig": "readonly [\"/dns4/unicity-ipfs2.dyndns.org/tcp/4001/p2p/12D3KooWLNi5NDPPHbrfJakAQqwBqymYTTwMQXQKEWuCrJNDdmfh\", \"/dns4/unicity-ipfs3.dyndns.org/tcp/4001/p2p/12D3KooWQ4aujVE4ShLjdusNZBdffq3TbzrwT2DuWZY9H1Gxhwn6\", \"/dns4/unicity-ipfs4.dyndns.org/tcp/4001/p2p/12D3KooWJ1ByPfUzUrpYvgxKU8NZrR8i6PU1tUgMEbQX9Hh2DEn1\", \"/dns4/unicity-ipfs5.dyndns.org/tcp/4001/p2p/12D3KooWB1MdZZGHN5B8TvWXntbycfe7Cjcz7n6eZ9eyk…"
+  },
+  {
+   "name": "DEFAULT_IPFS_GATEWAYS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 300,
+   "sig": "readonly [\"https://unicity-ipfs1.dyndns.org\"]"
+  },
+  {
+   "name": "DEFAULT_MARKET_API_URL",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "modules/market/MarketModule.ts",
+   "line": 18,
+   "sig": "\"https://market-api.unicity.network\""
+  },
+  {
+   "name": "DEFAULT_NOSTR_RELAYS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 212,
+   "sig": "readonly [\"wss://relay.unicity.network\", \"wss://relay.damus.io\", \"wss://nos.lol\", \"wss://relay.nostr.band\"]"
+  },
+  {
+   "name": "DeliverOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/delivery-provider.ts",
+   "line": 47,
+   "sig": "{ transferId, memo, senderNametag }"
+  },
+  {
+   "name": "DeliveryBlobKeys",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/delivery-provider.ts",
+   "line": 252,
+   "sig": "{ tokenId, stateHash, deliveryId }"
+  },
+  {
+   "name": "DeliveryCustody",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "transport/delivery-provider.ts",
+   "line": 118,
+   "sig": "export type DeliveryCustody = 'inventory' | 'external';"
+  },
+  {
+   "name": "DeliveryDisposition",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "transport/delivery-provider.ts",
+   "line": 90,
+   "sig": "export type DeliveryDisposition = 'claimed' | 'rejected';"
+  },
+  {
+   "name": "DeliveryProvider",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/delivery-provider.ts",
+   "line": 124,
+   "sig": "{ custody, setIdentity, createForAddress, deliver, incoming, ack, ackBatch, onWake, bindDeliveryKeys }"
+  },
+  {
+   "name": "DeliveryReceipt",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/delivery-provider.ts",
+   "line": 42,
+   "sig": "{ deliveryId }"
+  },
+  {
+   "name": "DerivationMode",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 718,
+   "sig": "export type DerivationMode = 'bip32' | 'legacy_hmac' | 'wif_hmac';"
+  },
+  {
+   "name": "deriveAddressInfo",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 370,
+   "sig": "(masterKey: MasterKey, basePath: string, index: number, isChange?: boolean) => AddressInfo"
+  },
+  {
+   "name": "deriveChildKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 143,
+   "sig": "(parentPrivKey: string, parentChainCode: string, index: number) => DerivedKey"
+  },
+  {
+   "name": "deriveFieldEncryptionKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 123,
+   "sig": "(privKeyHex: string) => Uint8Array"
+  },
+  {
+   "name": "deriveKeyAtPath",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 202,
+   "sig": "(masterPrivKey: string, masterChainCode: string, path: string) => DerivedKey"
+  },
+  {
+   "name": "DEV_AGGREGATOR_URL",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 286,
+   "sig": "\"https://dev-aggregator.dyndns.org/rpc\""
+  },
+  {
+   "name": "DirectMessage",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 337,
+   "sig": "{ id, senderPubkey, senderNametag, recipientPubkey, recipientNametag, content, timestamp, isRead }"
+  },
+  {
+   "name": "DiscoverAddressesOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/discover.ts",
+   "line": 42,
+   "sig": "{ maxAddresses, gapLimit, batchSize, onProgress, signal, autoTrack }"
+  },
+  {
+   "name": "DiscoverAddressesResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/discover.ts",
+   "line": 58,
+   "sig": "{ addresses, scannedCount, aborted }"
+  },
+  {
+   "name": "DiscoverAddressProgress",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/discover.ts",
+   "line": 14,
+   "sig": "{ currentBatch, totalBatches, discoveredCount, currentGap, phase }"
+  },
+  {
+   "name": "DiscoveredAddress",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/discover.ts",
+   "line": 28,
+   "sig": "{ index, directAddress, chainPubkey, nametag, source }"
+  },
+  {
+   "name": "doubleSha256",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 293,
+   "sig": "(data: string, inputEncoding?: \"hex\" | \"utf8\") => string"
+  },
+  {
+   "name": "encodeBech32",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/bech32.ts",
+   "line": 115,
+   "sig": "(hrp: string, version: number, program: Uint8Array) => string"
+  },
+  {
+   "name": "encrypt",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 84,
+   "sig": "(plaintext: string | object, password: string, options?: EncryptionOptions) => EncryptedData"
+  },
+  {
+   "name": "EncryptedData",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/encryption.ts",
+   "line": 16,
+   "sig": "{ ciphertext, iv, salt, algorithm, kdf, iterations }"
+  },
+  {
+   "name": "encryptField",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 174,
+   "sig": "(key: Uint8Array, plaintext: string) => string"
+  },
+  {
+   "name": "encryptFieldBytes",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 140,
+   "sig": "(key: Uint8Array, plaintext: Uint8Array, aad?: Uint8Array) => string"
+  },
+  {
+   "name": "encryptMnemonic",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 229,
+   "sig": "(mnemonic: string, password: string) => string"
+  },
+  {
+   "name": "encryptNametag",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/nametag/NametagUtils.d.ts",
+   "line": 77,
+   "sig": "(nametag: string, privateKeyHex: string) => Promise<string>"
+  },
+  {
+   "name": "encryptSimple",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 179,
+   "sig": "(plaintext: string, password: string) => string"
+  },
+  {
+   "name": "ExtendedValidationResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "validation/token-validator.ts",
+   "line": 25,
+   "sig": "extends TokenValidationResult { action }"
+  },
+  {
+   "name": "extractFromText",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 156,
+   "sig": "(text: string, pattern: RegExp) => string | null"
+  },
+  {
+   "name": "FIELD_ENCRYPTION_HKDF_INFO",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 29,
+   "sig": "\"sphere-fieldenc-v1\""
+  },
+  {
+   "name": "FIELD_ENVELOPE_MAX_BYTES",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 44,
+   "sig": "4096"
+  },
+  {
+   "name": "FIELD_ENVELOPE_NONCE_BYTES",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 35,
+   "sig": "24"
+  },
+  {
+   "name": "FIELD_ENVELOPE_PREFIX",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 32,
+   "sig": "\"enc1.\""
+  },
+  {
+   "name": "findPattern",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 127,
+   "sig": "(data: Uint8Array, pattern: Uint8Array, startIndex?: number) => number"
+  },
+  {
+   "name": "forkedKeyFromTokenIdAndState",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "types/txf.ts",
+   "line": 311,
+   "sig": "(tokenId: string, stateHash: string) => string"
+  },
+  {
+   "name": "formatAmount",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/currency.ts",
+   "line": 100,
+   "sig": "(amount: bigint | string, options?: { decimals?: number; symbol?: string; maxFractionDigits?: number; }) => string"
+  },
+  {
+   "name": "FullIdentity",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 39,
+   "sig": "extends Identity { privateKey }"
+  },
+  {
+   "name": "generateAddressFromMasterKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 418,
+   "sig": "(masterPrivateKey: string, index: number) => AddressInfo"
+  },
+  {
+   "name": "generateMasterKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 116,
+   "sig": "(seedHex: string) => MasterKey"
+  },
+  {
+   "name": "generateMnemonic",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 59,
+   "sig": "(strength?: 128 | 256) => string"
+  },
+  {
+   "name": "getAddressHrp",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/bech32.ts",
+   "line": 214,
+   "sig": "(addr: string) => string | null"
+  },
+  {
+   "name": "getAddressId",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 193,
+   "sig": "(directAddress: string) => string"
+  },
+  {
+   "name": "getAddressStorageKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 183,
+   "sig": "(addressId: string, key: string) => string"
+  },
+  {
+   "name": "getCoinIdByName",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "registry/TokenRegistry.ts",
+   "line": 670,
+   "sig": "(name: string) => string | undefined"
+  },
+  {
+   "name": "getCoinIdBySymbol",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "registry/TokenRegistry.ts",
+   "line": 661,
+   "sig": "(symbol: string) => string | undefined"
+  },
+  {
+   "name": "GetConversationPageOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/communications/CommunicationsModule.ts",
+   "line": 53,
+   "sig": "{ limit, before }"
+  },
+  {
+   "name": "getCurrentStateHash",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/txf-serializer.ts",
+   "line": 588,
+   "sig": "(txf: TxfToken) => string | undefined"
+  },
+  {
+   "name": "GetInvoicesOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/accounting/types.ts",
+   "line": 408,
+   "sig": "{ state, createdByMe, targetingMe, limit, offset, sortBy, sortOrder }"
+  },
+  {
+   "name": "getPublicKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 241,
+   "sig": "(privateKey: string, compressed?: boolean) => string"
+  },
+  {
+   "name": "getSphere",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 4713,
+   "sig": "any"
+  },
+  {
+   "name": "GetSwapsFilter",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/swap/types.ts",
+   "line": 482,
+   "sig": "{ progress, role, excludeTerminal }"
+  },
+  {
+   "name": "getTokenDecimals",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "registry/TokenRegistry.ts",
+   "line": 633,
+   "sig": "(coinId: string) => number"
+  },
+  {
+   "name": "getTokenDefinition",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "registry/TokenRegistry.ts",
+   "line": 606,
+   "sig": "(coinId: string) => TokenDefinition | undefined"
+  },
+  {
+   "name": "getTokenIconUrl",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "registry/TokenRegistry.ts",
+   "line": 643,
+   "sig": "(coinId: string, preferPng?: boolean) => string | null"
+  },
+  {
+   "name": "getTokenId",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/txf-serializer.ts",
+   "line": 566,
+   "sig": "(token: Token) => string"
+  },
+  {
+   "name": "getTokenName",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "registry/TokenRegistry.ts",
+   "line": 624,
+   "sig": "(coinId: string) => string"
+  },
+  {
+   "name": "getTokenSymbol",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "registry/TokenRegistry.ts",
+   "line": 615,
+   "sig": "(coinId: string) => string"
+  },
+  {
+   "name": "GroupChatModule",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "modules/groupchat/GroupChatModule.ts",
+   "line": 78,
+   "sig": "{ config, deps, client, keyManager, connected, connecting, connectPromise, reconnectAttempts, reconnectTimer, subscriptionIds, groups, messages, members, processedEventIds, pendingLeaves, persistTimer, persistPromise, relayAdminPubkeys, relayAdminFetchPromise, messageHandlers, constructor, initialize, load, destroy, destroyConnection, connect, getConnectionStatus, refreshSubscriptions, doConnect, scheduleReconnect, subscribeToJoinedGroups, subscribeToGroup, handleGroupEvent, handleMetadataEvent, handleModerationEvent, updateAdminsFromEvent, restoreJoinedGroups, fetchAvailableGroups, joinGroup,…"
+  },
+  {
+   "name": "GroupChatModuleConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/groupchat/types.ts",
+   "line": 71,
+   "sig": "{ relays, defaultMessageLimit, maxPreviousTags, reconnectDelayMs, maxReconnectAttempts }"
+  },
+  {
+   "name": "GroupChatModuleDependencies",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/groupchat/GroupChatModule.ts",
+   "line": 42,
+   "sig": "{ identity, storage, emitEvent }"
+  },
+  {
+   "name": "GroupData",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/groupchat/types.ts",
+   "line": 29,
+   "sig": "{ id, relayUrl, name, description, picture, visibility, createdAt, updatedAt, memberCount, unreadCount, lastMessageTime, lastMessageText, writeRestricted, localJoinedAt }"
+  },
+  {
+   "name": "GroupMemberData",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/groupchat/types.ts",
+   "line": 59,
+   "sig": "{ pubkey, groupId, role, nametag, joinedAt }"
+  },
+  {
+   "name": "GroupMessageData",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/groupchat/types.ts",
+   "line": 48,
+   "sig": "{ id, groupId, content, timestamp, senderPubkey, senderNametag, replyToId, previousIds }"
+  },
+  {
+   "name": "GroupRole",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "modules/groupchat/types.ts",
+   "line": 10,
+   "sig": "{ readonly ADMIN: \"ADMIN\"; readonly MODERATOR: \"MODERATOR\"; readonly MEMBER: \"MEMBER\"; }"
+  },
+  {
+   "name": "GroupVisibility",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "modules/groupchat/types.ts",
+   "line": 18,
+   "sig": "{ readonly PUBLIC: \"PUBLIC\"; readonly PRIVATE: \"PRIVATE\"; }"
+  },
+  {
+   "name": "hash160",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 285,
+   "sig": "(data: string) => string"
+  },
+  {
+   "name": "hashAddressForTag",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/nametag/NametagUtils.d.ts",
+   "line": 69,
+   "sig": "(address: string) => string"
+  },
+  {
+   "name": "hashNametag",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/nametag/NametagUtils.d.ts",
+   "line": 30,
+   "sig": "(nametag: string, defaultCountry?: string) => string"
+  },
+  {
+   "name": "hashSignMessage",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 458,
+   "sig": "(message: string) => string"
+  },
+  {
+   "name": "hasMissingNewStateHash",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/txf-serializer.ts",
+   "line": 655,
+   "sig": "(txf: TxfToken) => boolean"
+  },
+  {
+   "name": "hasUncommittedTransactions",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/txf-serializer.ts",
+   "line": 637,
+   "sig": "(token: Token) => boolean"
+  },
+  {
+   "name": "hasValidTxfData",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/txf-serializer.ts",
+   "line": 617,
+   "sig": "(token: Token) => boolean"
+  },
+  {
+   "name": "HealthCheckFn",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 807,
+   "sig": "export type HealthCheckFn = (timeoutMs: number) => Promise<ServiceHealthResult>;"
+  },
+  {
+   "name": "hexToBytes",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 305,
+   "sig": "(hex: string) => Uint8Array"
+  },
+  {
+   "name": "Identity",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 30,
+   "sig": "{ chainPubkey, directAddress, ipnsName, nametag }"
+  },
+  {
+   "name": "IdentityBindingParams",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/nametag/NametagBinding.d.ts",
+   "line": 13,
+   "sig": "{ publicKey, l1Address, directAddress, proxyAddress }"
+  },
+  {
+   "name": "IdentityConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 43,
+   "sig": "{ mnemonic, privateKey, derivationPath }"
+  },
+  {
+   "name": "identityFromMnemonicSync",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 352,
+   "sig": "(mnemonic: string, passphrase?: string) => MasterKey"
+  },
+  {
+   "name": "IncomingBroadcast",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/transport-provider.ts",
+   "line": 406,
+   "sig": "{ id, authorTransportPubkey, content, tags, timestamp }"
+  },
+  {
+   "name": "IncomingDelivery",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/delivery-provider.ts",
+   "line": 67,
+   "sig": "{ deliveryId, transferId, senderPubkey, memo, senderNametag, fetchBlob, cursor }"
+  },
+  {
+   "name": "IncomingMessage",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/transport-provider.ts",
+   "line": 282,
+   "sig": "{ id, senderTransportPubkey, senderNametag, content, timestamp, encrypted, isSelfWrap, recipientTransportPubkey }"
+  },
+  {
+   "name": "IncomingPaymentRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 233,
+   "sig": "{ id, senderPubkey, senderNametag, amount, coinId, symbol, message, recipientNametag, requestId, timestamp, status, metadata }"
+  },
+  {
+   "name": "IncomingTokenTransfer",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/transport-provider.ts",
+   "line": 318,
+   "sig": "{ id, senderTransportPubkey, payload, timestamp }"
+  },
+  {
+   "name": "IncomingTransfer",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 193,
+   "sig": "{ id, senderPubkey, senderNametag, tokens, memo, receivedAt }"
+  },
+  {
+   "name": "InitProgress",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 150,
+   "sig": "{ step, message }"
+  },
+  {
+   "name": "InitProgressCallback",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 158,
+   "sig": "export type InitProgressCallback = (progress: InitProgress) => void;"
+  },
+  {
+   "name": "InitProgressStep",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 137,
+   "sig": "export type InitProgressStep = | 'clearing' | 'storing_keys' | 'initializing' | 'recovering_nametag' | 'registering_nametag' | 'syncing_identity' | 'syncing_tokens' | 'discovering_addresses' | 'finalizing' | 'complete';"
+  },
+  {
+   "name": "initSphere",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 4712,
+   "sig": "any"
+  },
+  {
+   "name": "IntentRecord",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 185,
+   "sig": "{ transferId, payload, status, createdAt }"
+  },
+  {
+   "name": "IntentStatus",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "modules/market/types.ts",
+   "line": 12,
+   "sig": "export type IntentStatus = 'active' | 'closed' | 'expired';"
+  },
+  {
+   "name": "IntentType",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "modules/market/types.ts",
+   "line": 11,
+   "sig": "export type IntentType = 'buy' | 'sell' | 'service' | 'announcement' | 'other' | (string & {});"
+  },
+  {
+   "name": "InvalidatedNametagEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 143,
+   "sig": "{ name, token, timestamp, format, version, invalidatedAt, invalidationReason }"
+  },
+  {
+   "name": "InventoryAsset",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 101,
+   "sig": "{ coinId, amount }"
+  },
+  {
+   "name": "InventoryItem",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 112,
+   "sig": "{ tokenId, status, assets, seq }"
+  },
+  {
+   "name": "InventoryPage",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 141,
+   "sig": "{ cursor, syncEpoch, more, items }"
+  },
+  {
+   "name": "InventoryView",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 123,
+   "sig": "{ cursor, syncEpoch, more, items }"
+  },
+  {
+   "name": "InvoiceRequestedAsset",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/accounting/types.ts",
+   "line": 50,
+   "sig": "{ coin, nft }"
+  },
+  {
+   "name": "isArchivedKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "types/txf.ts",
+   "line": 269,
+   "sig": "(key: string) => boolean"
+  },
+  {
+   "name": "isForkedKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "types/txf.ts",
+   "line": 276,
+   "sig": "(key: string) => boolean"
+  },
+  {
+   "name": "isKnownToken",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "registry/TokenRegistry.ts",
+   "line": 652,
+   "sig": "(coinId: string) => boolean"
+  },
+  {
+   "name": "isPhoneNumber",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/nametag/NametagUtils.d.ts",
+   "line": 53,
+   "sig": "(str: string, defaultCountry?: string) => boolean"
+  },
+  {
+   "name": "isSphereError",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/errors.ts",
+   "line": 138,
+   "sig": "(err: unknown) => err is SphereError"
+  },
+  {
+   "name": "isSQLiteDatabase",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/wallet-dat.ts",
+   "line": 56,
+   "sig": "(data: Uint8Array) => boolean"
+  },
+  {
+   "name": "isTextWalletEncrypted",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/wallet-text.ts",
+   "line": 225,
+   "sig": "(content: string) => boolean"
+  },
+  {
+   "name": "isTokenKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "types/txf.ts",
+   "line": 259,
+   "sig": "(key: string) => boolean"
+  },
+  {
+   "name": "isValidAddress",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/address.ts",
+   "line": 99,
+   "sig": "(address: string) => boolean"
+  },
+  {
+   "name": "isValidBech32",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/bech32.ts",
+   "line": 207,
+   "sig": "(addr: string) => boolean"
+  },
+  {
+   "name": "isValidDirectAddress",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/address.ts",
+   "line": 106,
+   "sig": "(address: string) => boolean"
+  },
+  {
+   "name": "isValidNametag",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 122,
+   "sig": "(nametag: string) => boolean"
+  },
+  {
+   "name": "isValidPrivateKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 26,
+   "sig": "(hex: string) => boolean"
+  },
+  {
+   "name": "isValidTokenId",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "types/txf.ts",
+   "line": 332,
+   "sig": "(tokenId: string) => boolean"
+  },
+  {
+   "name": "isWalletDatEncrypted",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/wallet-dat.ts",
+   "line": 65,
+   "sig": "(data: Uint8Array) => boolean"
+  },
+  {
+   "name": "isWalletTextFormat",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/wallet-text.ts",
+   "line": 215,
+   "sig": "(content: string) => boolean"
+  },
+  {
+   "name": "keyFromTokenId",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "types/txf.ts",
+   "line": 290,
+   "sig": "(tokenId: string) => string"
+  },
+  {
+   "name": "KeyValueStore",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 20,
+   "sig": "{ get, set, remove }"
+  },
+  {
+   "name": "LegacyFileImportOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "serialization/types.ts",
+   "line": 69,
+   "sig": "{ fileContent, fileName, password, onDecryptProgress }"
+  },
+  {
+   "name": "LegacyFileInfo",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "serialization/types.ts",
+   "line": 13,
+   "sig": "{ fileType, isEncrypted, isBIP32, hasMnemonic }"
+  },
+  {
+   "name": "LegacyFileParsedData",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "serialization/types.ts",
+   "line": 27,
+   "sig": "{ masterKey, chainCode, descriptorPath, mnemonic, derivationMode }"
+  },
+  {
+   "name": "LegacyFileParseResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "serialization/types.ts",
+   "line": 43,
+   "sig": "{ success, data, needsPassword, encryptionInfo, error }"
+  },
+  {
+   "name": "LegacyFileType",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "serialization/types.ts",
+   "line": 11,
+   "sig": "export type LegacyFileType = 'dat' | 'txt' | 'json' | 'mnemonic' | 'unknown';"
+  },
+  {
+   "name": "LIMITS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 495,
+   "sig": "{ readonly NAMETAG_MIN_LENGTH: 3; readonly NAMETAG_MAX_LENGTH: 20; readonly MEMO_MAX_LENGTH: 500; readonly MESSAGE_MAX_LENGTH: 10000; }"
+  },
+  {
+   "name": "LoadResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 179,
+   "sig": "{ success, data, error, source, timestamp }"
+  },
+  {
+   "name": "loadSphere",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 4710,
+   "sig": "any"
+  },
+  {
+   "name": "logger",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/logger.ts",
+   "line": 66,
+   "sig": "{ configure(config: LoggerConfig): void; setTagDebug(tag: string, enabled: boolean): void; clearTagDebug(tag: string): void; isDebugEnabled(tag?: string): boolean; debug(tag: string, message: string, ...args: unknown[]): void; warn(tag: string, message: string, ...args: unknown[]): void; error(tag: string, message: string, ...args: unknown[]): void; reset(): void; }"
+  },
+  {
+   "name": "LoggerConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/logger.ts",
+   "line": 34,
+   "sig": "{ debug, handler }"
+  },
+  {
+   "name": "LoggingConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 696,
+   "sig": "{ level, logger }"
+  },
+  {
+   "name": "LogHandler",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "core/logger.ts",
+   "line": 32,
+   "sig": "export type LogHandler = (level: LogLevel, tag: string, message: string, ...args: unknown[]) => void;"
+  },
+  {
+   "name": "LogLevel",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "core/logger.ts",
+   "line": 30,
+   "sig": "export type LogLevel = 'debug' | 'warn' | 'error';"
+  },
+  {
+   "name": "ManifestAuxiliary",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/swap/types.ts",
+   "line": 120,
+   "sig": "{ party_a_binding, party_b_binding }"
+  },
+  {
+   "name": "ManifestFields",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/swap/types.ts",
+   "line": 64,
+   "sig": "{ party_a_address, party_b_address, party_a_currency_to_change, party_a_value_to_change, party_b_currency_to_change, party_b_value_to_change, timeout, salt, escrow_address, protocol_version }"
+  },
+  {
+   "name": "ManifestSignatures",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/swap/types.ts",
+   "line": 92,
+   "sig": "{ party_a, party_b }"
+  },
+  {
+   "name": "MarketIntent",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/market/types.ts",
+   "line": 51,
+   "sig": "{ id, intentType, category, price, currency, location, status, createdAt, expiresAt }"
+  },
+  {
+   "name": "MarketModule",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "modules/market/MarketModule.ts",
+   "line": 160,
+   "sig": "{ apiUrl, timeout, identity, registered, constructor, initialize, load, destroy, postIntent, search, getMyIntents, closeIntent, getRecentListings, subscribeFeed, ensureIdentity, ensureRegistered, parseResponse, apiPost, apiGet, apiDelete, apiPublicPost }"
+  },
+  {
+   "name": "MarketModuleConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/market/types.ts",
+   "line": 18,
+   "sig": "{ apiUrl, timeout }"
+  },
+  {
+   "name": "MarketModuleDependencies",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/market/types.ts",
+   "line": 25,
+   "sig": "{ identity, emitEvent }"
+  },
+  {
+   "name": "MessageHandler",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "transport/transport-provider.ts",
+   "line": 297,
+   "sig": "export type MessageHandler = (message: IncomingMessage) => void;"
+  },
+  {
+   "name": "MintOutboxEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 174,
+   "sig": "{ id, status, type, salt, requestIdHex, mintDataJson, createdAt, updatedAt, error }"
+  },
+  {
+   "name": "mnemonicToSeedSync",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 86,
+   "sig": "(mnemonic: string, passphrase?: string) => string"
+  },
+  {
+   "name": "NametagBindingProof",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/swap/types.ts",
+   "line": 104,
+   "sig": "{ nametag, direct_address, chain_pubkey, signature }"
+  },
+  {
+   "name": "NametagData",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 123,
+   "sig": "{ name, token, timestamp, format, version }"
+  },
+  {
+   "name": "NetworkHealthResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 812,
+   "sig": "{ healthy, services, totalTimeMs }"
+  },
+  {
+   "name": "NETWORKS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 394,
+   "sig": "{ readonly mainnet: { readonly name: \"Mainnet\"; readonly aggregatorUrl: \"https://aggregator.unicity.network/rpc\"; readonly nostrRelays: readonly [\"wss://relay.unicity.network\", \"wss://relay.damus.io\", \"wss://nos.lol\", \"wss://relay.nostr.band\"]; readonly ipfsGateways: readonly [\"https://unicity-ipfs1.dyndns.org\"]; readonly groupRelays: readonly [\"wss://sphere-relay.unicity.network\"]; readonly token…"
+  },
+  {
+   "name": "NetworkType",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "constants.ts",
+   "line": 441,
+   "sig": "export type NetworkType = keyof typeof NETWORKS;"
+  },
+  {
+   "name": "NIP29_KINDS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 239,
+   "sig": "{ readonly CHAT_MESSAGE: 9; readonly THREAD_ROOT: 11; readonly THREAD_REPLY: 12; readonly JOIN_REQUEST: 9021; readonly LEAVE_REQUEST: 9022; readonly PUT_USER: 9000; readonly REMOVE_USER: 9001; readonly EDIT_METADATA: 9002; readonly DELETE_EVENT: 9005; readonly CREATE_GROUP: 9007; readonly DELETE_GROUP: 9008; readonly CREATE_INVITE: 9009; readonly GROUP_METADATA: 39000; readonly GROUP_ADMINS: 39001…"
+  },
+  {
+   "name": "normalizeAddress",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/address.ts",
+   "line": 134,
+   "sig": "(address: string) => string"
+  },
+  {
+   "name": "normalizeCoinId",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "registry/TokenRegistry.ts",
+   "line": 698,
+   "sig": "(coinId: string) => string"
+  },
+  {
+   "name": "normalizeNametag",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/nametag/NametagUtils.d.ts",
+   "line": 23,
+   "sig": "(nametag: string, defaultCountry?: string) => string"
+  },
+  {
+   "name": "normalizeSdkTokenToStorage",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/txf-serializer.ts",
+   "line": 71,
+   "sig": "(sdkTokenJson: unknown) => TxfToken"
+  },
+  {
+   "name": "NOSTR_EVENT_KINDS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 220,
+   "sig": "{ readonly DIRECT_MESSAGE: 4; readonly TOKEN_TRANSFER: 31113; readonly PAYMENT_REQUEST: 31115; readonly PAYMENT_REQUEST_RESPONSE: 31116; readonly NAMETAG_BINDING: 30078; readonly BROADCAST: 1; }"
+  },
+  {
+   "name": "NostrClient",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/client/NostrClient.d.ts",
+   "line": 42,
+   "sig": "{ keyManager, relays, subscriptions, eventQueue, pendingOks, subscriptionCounter, closed, queryTimeoutMs, autoReconnect, reconnectIntervalMs, maxReconnectIntervalMs, pingIntervalMs, connectionListeners, constructor, setKeyManager, getKeyManager, addConnectionListener, removeConnectionListener, emitConnectionEvent, getQueryTimeout, setQueryTimeout, connect, connectToRelay, scheduleReconnect, startPingTimer, stopPingTimer, resubscribeAll, flushEventQueue, handleRelayMessage, handleEventMessage, handleOkMessage, handleEOSEMessage, handleNoticeMessage, handleClosedMessage, handleAuthMessage, disco…"
+  },
+  {
+   "name": "NostrClientOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/client/NostrClient.d.ts",
+   "line": 14,
+   "sig": "{ queryTimeoutMs, autoReconnect, reconnectIntervalMs, maxReconnectIntervalMs, pingIntervalMs }"
+  },
+  {
+   "name": "NostrKeyManager",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "../../../../../../home/vrogojin/sphere-sdk/node_modules/@unicitylabs/nostr-js-sdk/dist/types/NostrKeyManager.d.ts",
+   "line": 10,
+   "sig": "{ privateKey, publicKey, cleared, constructor, fromPrivateKey, fromPrivateKeyHex, fromNsec, generate, ensureNotCleared, getPrivateKey, getPrivateKeyHex, getNsec, getPublicKey, getPublicKeyHex, getNpub, sign, signHex, verify, verifyHex, encrypt, encryptHex, decrypt, decryptHex, deriveSharedSecret, encryptNip44, encryptNip44Hex, decryptNip44, decryptNip44Hex, deriveConversationKey, isMyPublicKey, clear }"
+  },
+  {
+   "name": "objectToTxf",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/txf-serializer.ts",
+   "line": 173,
+   "sig": "(obj: TokenLike) => TxfToken | null"
+  },
+  {
+   "name": "OracleEvent",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "oracle/oracle-provider.ts",
+   "line": 71,
+   "sig": "{ type, timestamp, data, error }"
+  },
+  {
+   "name": "OracleEventCallback",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "oracle/oracle-provider.ts",
+   "line": 78,
+   "sig": "export type OracleEventCallback = (event: OracleEvent) => void;"
+  },
+  {
+   "name": "OracleEventType",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "oracle/oracle-provider.ts",
+   "line": 65,
+   "sig": "export type OracleEventType = | 'oracle:connected' | 'oracle:disconnected' | 'oracle:error' | 'validation:completed';"
+  },
+  {
+   "name": "OracleProvider",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "oracle/oracle-provider.ts",
+   "line": 21,
+   "sig": "extends BaseProvider { initialize, validateToken, getTrustBaseJson, getAggregatorUrl, getApiKey }"
+  },
+  {
+   "name": "OutboxEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 156,
+   "sig": "{ id, status, sourceTokenId, salt, commitmentJson, recipientPubkey, recipientNametag, amount, createdAt, updatedAt, error, retryCount }"
+  },
+  {
+   "name": "OutgoingPaymentRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 283,
+   "sig": "{ id, eventId, recipientPubkey, recipientNametag, amount, coinId, message, createdAt, status, response }"
+  },
+  {
+   "name": "parseAddress",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/address.ts",
+   "line": 63,
+   "sig": "(address: string) => ParsedAddress | null"
+  },
+  {
+   "name": "parseAndDecryptWalletDat",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/wallet-dat.ts",
+   "line": 450,
+   "sig": "(data: Uint8Array, password: string, onProgress?: DecryptionProgressCallback) => Promise<LegacyFileParseResult>"
+  },
+  {
+   "name": "parseAndDecryptWalletText",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/wallet-text.ts",
+   "line": 316,
+   "sig": "(content: string, password: string) => LegacyFileParseResult"
+  },
+  {
+   "name": "ParsedAddress",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/address.ts",
+   "line": 38,
+   "sig": "{ type, raw, value }"
+  },
+  {
+   "name": "ParsedStorageData",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "serialization/txf-serializer.ts",
+   "line": 362,
+   "sig": "{ tokens, meta, nametags, tombstones, archivedTokens, forkedTokens, outboxEntries, mintOutboxEntries, invalidatedNametags, historyEntries, validationErrors }"
+  },
+  {
+   "name": "parseForkedKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "types/txf.ts",
+   "line": 318,
+   "sig": "(key: string) => { tokenId: string; stateHash: string; } | null"
+  },
+  {
+   "name": "parseTokenAmount",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/currency.ts",
+   "line": 38,
+   "sig": "(value: string, decimals?: number) => bigint"
+  },
+  {
+   "name": "parseTxfStorageData",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/txf-serializer.ts",
+   "line": 379,
+   "sig": "(data: unknown) => ParsedStorageData"
+  },
+  {
+   "name": "parseWalletDat",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/wallet-dat.ts",
+   "line": 367,
+   "sig": "(data: Uint8Array) => LegacyFileParseResult"
+  },
+  {
+   "name": "parseWalletText",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/wallet-text.ts",
+   "line": 236,
+   "sig": "(content: string) => LegacyFileParseResult"
+  },
+  {
+   "name": "PayInvoiceParams",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/accounting/types.ts",
+   "line": 701,
+   "sig": "{ targetIndex, assetIndex, amount, freeText, refundAddress, contact }"
+  },
+  {
+   "name": "PaymentRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 211,
+   "sig": "{ id, amount, coinId, message, recipientNametag, metadata, expiresAt, createdAt }"
+  },
+  {
+   "name": "PaymentRequestHandler",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 273,
+   "sig": "export type PaymentRequestHandler = (request: IncomingPaymentRequest) => void;"
+  },
+  {
+   "name": "PaymentRequestResponse",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 309,
+   "sig": "{ id, responderPubkey, responderNametag, requestId, responseType, message, transferId, timestamp }"
+  },
+  {
+   "name": "PaymentRequestResponseHandler",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 331,
+   "sig": "export type PaymentRequestResponseHandler = (response: PaymentRequestResponse) => void;"
+  },
+  {
+   "name": "PaymentRequestResponseType",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 278,
+   "sig": "export type PaymentRequestResponseType = 'accepted' | 'rejected' | 'paid';"
+  },
+  {
+   "name": "PaymentRequestResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 263,
+   "sig": "{ success, requestId, eventId, error }"
+  },
+  {
+   "name": "PaymentRequestStatus",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 206,
+   "sig": "export type PaymentRequestStatus = 'pending' | 'accepted' | 'rejected' | 'paid' | 'expired';"
+  },
+  {
+   "name": "PaymentsModule",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "modules/payments/PaymentsModule.ts",
+   "line": 977,
+   "sig": "{ moduleConfig, deps, tokens, pendingTransfers, pendingBackgroundTasks, tombstones, tombstoneKeySet, archivedTokens, forkedTokens, _historyCache, nametags, paymentRequests, paymentRequestHandlers, outgoingPaymentRequests, paymentRequestResponseHandlers, pendingResponseResolvers, unsubscribeTransfers, unsubscribePaymentRequests, unsubscribePaymentRequestResponses, delivery, injectedDelivery, deliveryWakeUnsub, deliveryPollTimer, inventoryPollTimer, pumpInFlight, fieldEncryptionKey, checkpointStore, prPollTimer, prPumpInFlight, prBootstrapped, loadedPromise, loaded, storageEventUnsubscribers, sy…"
+  },
+  {
+   "name": "PaymentsModuleConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/payments/PaymentsModule.ts",
+   "line": 672,
+   "sig": "{ autoSync, autoValidate, retryFailed, maxRetries, debug }"
+  },
+  {
+   "name": "PaymentsModuleDependencies",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/payments/PaymentsModule.ts",
+   "line": 881,
+   "sig": "{ identity, storage, tokenStorage, tokenStorageProviders, transport, oracle, tokenEngine, emitEvent, price, disabledProviderIds, delivery, walletApi, getCurrentNametag }"
+  },
+  {
+   "name": "PaymentsWalletApiPort",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/payments/PaymentsModule.ts",
+   "line": 773,
+   "sig": "{ putIntent, completeIntent, abortIntent, postIntentProgress, getIntentProgress, listIntents, getUploadUrls, uploadBlob, postHistoryRecords, listHistory, network, createPaymentRequest, listPaymentRequests, respondPaymentRequest }"
+  },
+  {
+   "name": "PeerInfo",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/transport-provider.ts",
+   "line": 459,
+   "sig": "{ nametag, transportPubkey, chainPubkey, directAddress, timestamp }"
+  },
+  {
+   "name": "PostIntentRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/market/types.ts",
+   "line": 34,
+   "sig": "{ description, intentType, category, price, currency, location, contactHandle, expiresInDays }"
+  },
+  {
+   "name": "PostIntentResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/market/types.ts",
+   "line": 45,
+   "sig": "{ intentId, message, expiresAt }"
+  },
+  {
+   "name": "PricePlatform",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "price/price-provider.ts",
+   "line": 17,
+   "sig": "export type PricePlatform = 'coingecko';"
+  },
+  {
+   "name": "PriceProvider",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "price/price-provider.ts",
+   "line": 72,
+   "sig": "{ platform, getPrices, getPrice, clearCache }"
+  },
+  {
+   "name": "PriceProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "price/price-provider.ts",
+   "line": 38,
+   "sig": "{ platform, apiKey, baseUrl, cacheTtlMs, timeout, debug, storage }"
+  },
+  {
+   "name": "ProviderMetadata",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 12,
+   "sig": "{ id, name, type, description }"
+  },
+  {
+   "name": "ProviderRole",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 831,
+   "sig": "export type ProviderRole = 'storage' | 'token-storage' | 'transport' | 'oracle' | 'price';"
+  },
+  {
+   "name": "ProviderStatus",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 10,
+   "sig": "export type ProviderStatus = 'disconnected' | 'connecting' | 'connected' | 'error';"
+  },
+  {
+   "name": "ProviderStatusInfo",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 836,
+   "sig": "{ id, name, role, status, connected, enabled, metadata }"
+  },
+  {
+   "name": "randomBytes",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 325,
+   "sig": "(length: number) => string"
+  },
+  {
+   "name": "randomHex",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 179,
+   "sig": "(byteLength: number) => string"
+  },
+  {
+   "name": "randomUUID",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/uuid.ts",
+   "line": 19,
+   "sig": "() => string"
+  },
+  {
+   "name": "ReceiveOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/payments/PaymentsModule.ts",
+   "line": 234,
+   "sig": "{ finalize, timeout, pollInterval }"
+  },
+  {
+   "name": "ReceiveResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/payments/PaymentsModule.ts",
+   "line": 243,
+   "sig": "{ transfers }"
+  },
+  {
+   "name": "recoverPubkeyFromSignature",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 556,
+   "sig": "(message: string, signature: string) => string"
+  },
+  {
+   "name": "RecoverRemovedResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 156,
+   "sig": "{ recovered, spent, skipped }"
+  },
+  {
+   "name": "RegistryNetwork",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "registry/TokenRegistry.ts",
+   "line": 48,
+   "sig": "export type RegistryNetwork = 'testnet' | 'mainnet' | 'dev';"
+  },
+  {
+   "name": "ReturnPaymentParams",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/accounting/types.ts",
+   "line": 758,
+   "sig": "{ recipient, amount, coinId, freeText }"
+  },
+  {
+   "name": "ripemd160",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 274,
+   "sig": "(data: string, inputEncoding?: \"hex\" | \"utf8\") => string"
+  },
+  {
+   "name": "safeParseTokenAmount",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/currency.ts",
+   "line": 62,
+   "sig": "(value: string, decimals?: number) => bigint | null"
+  },
+  {
+   "name": "SaveResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 172,
+   "sig": "{ success, cid, error, timestamp }"
+  },
+  {
+   "name": "SearchFilters",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/market/types.ts",
+   "line": 80,
+   "sig": "{ intentType, category, minPrice, maxPrice, location, minScore }"
+  },
+  {
+   "name": "SearchIntentResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/market/types.ts",
+   "line": 63,
+   "sig": "{ id, score, agentNametag, agentPublicKey, description, intentType, category, price, currency, location, contactMethod, contactHandle, createdAt, expiresAt }"
+  },
+  {
+   "name": "SearchOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/market/types.ts",
+   "line": 90,
+   "sig": "{ filters, limit }"
+  },
+  {
+   "name": "SearchResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/market/types.ts",
+   "line": 95,
+   "sig": "{ intents, count }"
+  },
+  {
+   "name": "ServiceHealthResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 792,
+   "sig": "{ healthy, url, responseTimeMs, error }"
+  },
+  {
+   "name": "sha256",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 263,
+   "sig": "(data: string, inputEncoding?: \"hex\" | \"utf8\") => string"
+  },
+  {
+   "name": "SIGN_MESSAGE_PREFIX",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 440,
+   "sig": "\"Sphere Signed Message:\\n\""
+  },
+  {
+   "name": "signMessage",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 483,
+   "sig": "(privateKeyHex: string, message: string) => string"
+  },
+  {
+   "name": "signSwapManifest",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/swap/manifest.ts",
+   "line": 250,
+   "sig": "(privateKey: string, swapId: string, escrowAddress: string) => string"
+  },
+  {
+   "name": "sleep",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 168,
+   "sig": "(ms: number) => Promise<void>"
+  },
+  {
+   "name": "SpentTokenInfo",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "validation/token-validator.ts",
+   "line": 30,
+   "sig": "{ stateId }"
+  },
+  {
+   "name": "SpentTokenResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "validation/token-validator.ts",
+   "line": 34,
+   "sig": "{ spentTokens, errors }"
+  },
+  {
+   "name": "Sphere",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 517,
+   "sig": "{ instance, _orphanCacheCleaned, _initialized, _trackedAddressesLoaded, _identity, _masterKey, _mnemonic, _password, _source, _derivationMode, _basePath, _currentAddressIndex, _trackedAddresses, _addressIdToIndex, _addressNametags, _storage, _tokenStorageProviders, _transport, _oracle, _priceProvider, _delivery, _walletApi, _deliveryTemplate, _walletApiTemplate, _walletApiSessionStatus, _tokenEngine, _payments, _communications, _groupChat, _market, _accounting, _swap, _addressModules, _transportMux, _dmSince, _groupChatConfig, _marketConfig, _communicationsConfig, eventHandlers, _disabledProvi…"
+  },
+  {
+   "name": "SphereConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 659,
+   "sig": "{ identity, storage, transport, aggregator, logging }"
+  },
+  {
+   "name": "SphereCreateOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 179,
+   "sig": "{ mnemonic, derivationPath, nametag, storage, tokenStorage, transport, oracle, delivery, walletApi, price, network, groupChat, market, accounting, swap, communications, password, discoverAddresses, debug, onProgress }"
+  },
+  {
+   "name": "SphereError",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "core/errors.ts",
+   "line": 123,
+   "sig": "extends Error { code, cause, constructor }"
+  },
+  {
+   "name": "SphereErrorCode",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "core/errors.ts",
+   "line": 27,
+   "sig": "export type SphereErrorCode = | 'NOT_INITIALIZED' | 'ALREADY_INITIALIZED' | 'INVALID_CONFIG' | 'INVALID_IDENTITY' | 'INSUFFICIENT_BALANCE' | 'INVALID_RECIPIENT' | 'TRANSFER_FAILED' // The source state was consumed by a DIFFERENT transaction (lost race, not a // resume) — raised as TransferConflictError (token-engine/errors.ts, Part E.2). | 'TRANSFER_CONFLICT' // The op's certification is INDETERMI…"
+  },
+  {
+   "name": "SphereEventHandler",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 651,
+   "sig": "export type SphereEventHandler<T extends SphereEventType> = ( data: SphereEventMap[T] ) => void;"
+  },
+  {
+   "name": "SphereEventMap",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 484,
+   "sig": "{ 'transfer:incoming', 'transfer:confirmed', 'transfer:failed', 'transfer:delivery_pending', 'transfer:invalid', 'payment_request:incoming', 'payment_request:accepted', 'payment_request:rejected', 'payment_request:paid', 'payment_request:expired', 'payment_request:response', 'message:dm', 'message:read', 'message:typing', 'composing:started', 'message:broadcast', 'sync:started', 'sync:completed', 'sync:provider', 'sync:error', 'storage:degraded', 'inventory:conflict', 'split:checkpoint-stuck', 'delivery:undeliverable', 'delivery:deferred', 'walletapi:session', 'realtime:status', 'connection:ch…"
+  },
+  {
+   "name": "SphereEventType",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 401,
+   "sig": "export type SphereEventType = | 'transfer:incoming' | 'transfer:confirmed' | 'transfer:failed' | 'transfer:delivery_pending' | 'transfer:invalid' | 'payment_request:incoming' | 'payment_request:accepted' | 'payment_request:rejected' | 'payment_request:paid' | 'payment_request:expired' | 'payment_request:response' | 'message:dm' | 'message:read' | 'message:typing' | 'composing:started' | 'message:b…"
+  },
+  {
+   "name": "sphereExists",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 4714,
+   "sig": "any"
+  },
+  {
+   "name": "SphereImportOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 295,
+   "sig": "{ mnemonic, masterKey, chainCode, derivationPath, basePath, derivationMode, nametag, network, storage, tokenStorage, transport, oracle, delivery, walletApi, price, groupChat, market, accounting, swap, communications, password, discoverAddresses, debug, onProgress }"
+  },
+  {
+   "name": "SphereInitOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 362,
+   "sig": "{ storage, transport, oracle, delivery, walletApi, tokenStorage, mnemonic, autoGenerate, derivationPath, nametag, price, network, groupChat, market, accounting, swap, password, discoverAddresses, dmSince, communications, debug, onProgress }"
+  },
+  {
+   "name": "SphereInitResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 437,
+   "sig": "{ sphere, created, generatedMnemonic }"
+  },
+  {
+   "name": "SphereLoadOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 240,
+   "sig": "{ storage, tokenStorage, transport, oracle, delivery, walletApi, price, network, groupChat, market, accounting, swap, communications, password, discoverAddresses, debug, onProgress }"
+  },
+  {
+   "name": "SphereStatus",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 856,
+   "sig": "{ storage, tokenStorage, transport, oracle, price }"
+  },
+  {
+   "name": "SphereWalletApiSession",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 169,
+   "sig": "extends PaymentsWalletApiPort { setIdentity, signIn, logout }"
+  },
+  {
+   "name": "STORAGE_KEYS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 172,
+   "sig": "{ readonly PENDING_TRANSFERS: \"pending_transfers\"; readonly OUTBOX: \"outbox\"; readonly CONVERSATIONS: \"conversations\"; readonly MESSAGES: \"messages\"; readonly TRANSACTION_HISTORY: \"transaction_history\"; readonly PENDING_V5_TOKENS: \"pending_v5_tokens\"; readonly PENDING_V2_DELIVERIES: \"pending_v2_deliveries\"; readonly GROUP_CHAT_GROUPS: \"group_chat_groups\"; readonly GROUP_CHAT_MESSAGES: \"group_chat_…"
+  },
+  {
+   "name": "STORAGE_KEYS_ADDRESS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 71,
+   "sig": "{ readonly PENDING_TRANSFERS: \"pending_transfers\"; readonly OUTBOX: \"outbox\"; readonly CONVERSATIONS: \"conversations\"; readonly MESSAGES: \"messages\"; readonly TRANSACTION_HISTORY: \"transaction_history\"; readonly PENDING_V5_TOKENS: \"pending_v5_tokens\"; readonly PENDING_V2_DELIVERIES: \"pending_v2_deliveries\"; readonly GROUP_CHAT_GROUPS: \"group_chat_groups\"; readonly GROUP_CHAT_MESSAGES: \"group_chat_…"
+  },
+  {
+   "name": "STORAGE_KEYS_GLOBAL",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 24,
+   "sig": "{ readonly MNEMONIC: \"mnemonic\"; readonly MASTER_KEY: \"master_key\"; readonly CHAIN_CODE: \"chain_code\"; readonly DERIVATION_PATH: \"derivation_path\"; readonly BASE_PATH: \"base_path\"; readonly DERIVATION_MODE: \"derivation_mode\"; readonly WALLET_SOURCE: \"wallet_source\"; readonly WALLET_EXISTS: \"wallet_exists\"; readonly CURRENT_ADDRESS_INDEX: \"current_address_index\"; readonly ADDRESS_NAMETAGS: \"address…"
+  },
+  {
+   "name": "STORAGE_PREFIX",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 11,
+   "sig": "\"sphere_\""
+  },
+  {
+   "name": "StorageEvent",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 367,
+   "sig": "{ type, timestamp, data, error }"
+  },
+  {
+   "name": "StorageEventCallback",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 374,
+   "sig": "export type StorageEventCallback = (event: StorageEvent) => void;"
+  },
+  {
+   "name": "StorageEventType",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 355,
+   "sig": "export type StorageEventType = | 'storage:saving' | 'storage:saved' | 'storage:loading' | 'storage:loaded' | 'storage:error' | 'storage:remote-updated' | 'sync:started' | 'sync:completed' | 'sync:conflict' | 'sync:error';"
+  },
+  {
+   "name": "StorageProvider",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 17,
+   "sig": "extends BaseProvider { setIdentity, get, set, remove, has, keys, clear, saveTrackedAddresses, loadTrackedAddresses }"
+  },
+  {
+   "name": "StorageProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 667,
+   "sig": "{ type, prefix, gateways, bootstrapPeers, enableIpns }"
+  },
+  {
+   "name": "SwapDeal",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/swap/types.ts",
+   "line": 31,
+   "sig": "{ partyA, partyB, partyACurrency, partyAAmount, partyBCurrency, partyBAmount, timeout, escrowAddress }"
+  },
+  {
+   "name": "SwapManifest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/swap/types.ts",
+   "line": 135,
+   "sig": "{ swap_id, party_a_address, party_b_address, party_a_currency_to_change, party_a_value_to_change, party_b_currency_to_change, party_b_value_to_change, timeout, salt, escrow_address, protocol_version }"
+  },
+  {
+   "name": "SwapModule",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "modules/swap/SwapModule.ts",
+   "line": 92,
+   "sig": "{ config, deps, swaps, terminalSwapIds, _storedTerminalEntries, _gateMap, localTimers, announceAbortControllers, _completedEventEmittedUnverified, invoiceToSwapIndex, destroyed, loaded, _loading, _loadingDeferred, loadPromise, dmUnsubscribe, invoiceEventUnsubs, constructor, initialize, load, _createDeferred, _doLoad, destroy, withSwapGate, persistSwap, persistIndex, loadFromStorage, removeSwapFromStorage, transitionProgress, ensureInitialized, ensureReady, ensureNotDestroyed, pingEscrow, proposeSwap, acceptSwap, rejectSwap, deposit, verifyPayout, getSwapStatus, getSwaps, cancelSwap, resolveSwa…"
+  },
+  {
+   "name": "SwapModuleConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/swap/types.ts",
+   "line": 692,
+   "sig": "{ debug, defaultEscrowAddress, proposalTimeoutMs, maxPendingSwaps, announceTimeoutMs, terminalPurgeTtlMs }"
+  },
+  {
+   "name": "SwapProgress",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "modules/swap/types.ts",
+   "line": 180,
+   "sig": "export type SwapProgress = | 'proposed' // Proposal sent (proposer) or received (acceptor). No escrow contact yet. | 'accepted' // Counterparty accepted. About to announce to escrow. | 'announced' // Escrow acknowledged. Deposit invoice available. | 'depositing' // Local deposit sent, awaiting confirmation or counterparty deposit. | 'awaiting_counter' // Local deposit confirmed. Waiting for counte…"
+  },
+  {
+   "name": "SwapProposalResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/swap/types.ts",
+   "line": 451,
+   "sig": "{ swapId, manifest, swap }"
+  },
+  {
+   "name": "SwapRef",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "modules/swap/types.ts",
+   "line": 212,
+   "sig": "{ swapId, deal, manifest, role, progress, depositInvoiceId, payoutInvoiceId, escrowState, counterpartyPubkey, counterpartyNametag, localDepositTransferId, escrowPubkey, escrowDirectAddress, payoutVerified, createdAt, announcedAt, updatedAt, error, proposerChainPubkey, proposerSignature, acceptorSignature, auxiliary, protocolVersion }"
+  },
+  {
+   "name": "SwapRole",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "modules/swap/types.ts",
+   "line": 195,
+   "sig": "export type SwapRole = 'proposer' | 'acceptor';"
+  },
+  {
+   "name": "SyncResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 187,
+   "sig": "{ success, merged, added, removed, conflicts, error }"
+  },
+  {
+   "name": "TEST_AGGREGATOR_URL",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 289,
+   "sig": "\"https://goggregator-test.unicity.network\""
+  },
+  {
+   "name": "TEST_NOSTR_RELAYS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 366,
+   "sig": "readonly [\"wss://nostr-relay.testnet.unicity.network\"]"
+  },
+  {
+   "name": "TIMEOUTS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 469,
+   "sig": "{ readonly WEBSOCKET_CONNECT: 10000; readonly NOSTR_RECONNECT_DELAY: 3000; readonly MAX_RECONNECT_ATTEMPTS: 5; readonly PROOF_POLL_INTERVAL: 1000; readonly SYNC_INTERVAL: 60000; }"
+  },
+  {
+   "name": "toHumanReadable",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/currency.ts",
+   "line": 82,
+   "sig": "(amount: bigint | string, decimals?: number) => string"
+  },
+  {
+   "name": "Token",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 61,
+   "sig": "{ id, coinId, symbol, name, decimals, iconUrl, amount, status, createdAt, updatedAt, sdkData, lazy, suspectedSpent }"
+  },
+  {
+   "name": "TokenDefinition",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "registry/TokenRegistry.ts",
+   "line": 26,
+   "sig": "{ network, assetKind, name, symbol, decimals, description, icons, id }"
+  },
+  {
+   "name": "TokenIcon",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "registry/TokenRegistry.ts",
+   "line": 19,
+   "sig": "{ url }"
+  },
+  {
+   "name": "tokenIdFromArchivedKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "types/txf.ts",
+   "line": 297,
+   "sig": "(key: string) => string"
+  },
+  {
+   "name": "tokenIdFromKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "types/txf.ts",
+   "line": 283,
+   "sig": "(key: string) => string"
+  },
+  {
+   "name": "TokenPrice",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "price/price-provider.ts",
+   "line": 22,
+   "sig": "{ tokenName, priceUsd, priceEur, change24h, timestamp }"
+  },
+  {
+   "name": "TokenRegistry",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "registry/TokenRegistry.ts",
+   "line": 103,
+   "sig": "{ instance, definitionsById, definitionsBySymbol, definitionsByName, remoteUrl, storage, refreshIntervalMs, refreshTimer, lastRefreshAt, refreshPromise, initialLoadPromise, constructor, getInstance, configure, resetInstance, destroy, waitForReady, performInitialLoad, cacheKeys, loadFromCache, saveToCache, applyDefinitions, isValidDefinitionsArray, refreshFromRemote, doRefresh, startAutoRefresh, stopAutoRefresh, getLastRefreshAt, getDefinition, getDefinitionBySymbol, getDefinitionByName, getSymbol, getName, getDecimals, getIconUrl, isKnown, getAllDefinitions, getFungibleTokens, getNonFungibleTo…"
+  },
+  {
+   "name": "TokenStatus",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 53,
+   "sig": "export type TokenStatus = | 'pending' // Initial creation | 'submitted' // Commitment sent, awaiting on-chain certification | 'confirmed' // Has inclusion proof | 'transferring' // Being transferred | 'spent' // Transferred away | 'invalid';"
+  },
+  {
+   "name": "TokenStorageProvider",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 200,
+   "sig": "extends BaseProvider { requiresWalletApi, setIdentity, initialize, shutdown, save, load, sync, listInventory, getToken, applyDelta, recoverRemoved, exists, clear, createForAddress, onEvent, addHistoryEntry, getHistoryEntries, hasHistoryEntry, clearHistory, importHistoryEntries }"
+  },
+  {
+   "name": "tokenToTxf",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/txf-serializer.ts",
+   "line": 127,
+   "sig": "(token: Token) => TxfToken | null"
+  },
+  {
+   "name": "TokenTransferDetail",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 162,
+   "sig": "{ sourceTokenId, method, requestIdHex, splitGroupId, nostrEventId }"
+  },
+  {
+   "name": "TokenTransferHandler",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "transport/transport-provider.ts",
+   "line": 326,
+   "sig": "export type TokenTransferHandler = (transfer: IncomingTokenTransfer) => void | Promise<void>;"
+  },
+  {
+   "name": "TokenTransferPayload",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/transport-provider.ts",
+   "line": 303,
+   "sig": "{ token, proof, memo, sender }"
+  },
+  {
+   "name": "TokenValidationResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "validation/token-validator.ts",
+   "line": 39,
+   "sig": "{ validTokens, issues }"
+  },
+  {
+   "name": "TokenValidator",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "validation/token-validator.ts",
+   "line": 57,
+   "sig": "{ engine, spentStateCache, UNSPENT_CACHE_TTL_MS, constructor, validateAllTokens, validateToken, isSpent, checkSpentTokens, clearSpentStateCache }"
+  },
+  {
+   "name": "TombstoneEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 134,
+   "sig": "{ tokenId, stateHash, timestamp }"
+  },
+  {
+   "name": "TrackedAddress",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 386,
+   "sig": "extends TrackedAddressEntry { addressId, directAddress, chainPubkey, nametag }"
+  },
+  {
+   "name": "TrackedAddressEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 371,
+   "sig": "{ index, hidden, createdAt, updatedAt }"
+  },
+  {
+   "name": "TransactionHistoryEntry",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "modules/payments/PaymentsModule.ts",
+   "line": 102,
+   "sig": "export type TransactionHistoryEntry = import('../../storage').HistoryRecord;"
+  },
+  {
+   "name": "TransferMode",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 141,
+   "sig": "export type TransferMode = 'instant' | 'conservative';"
+  },
+  {
+   "name": "TransferRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 143,
+   "sig": "{ coinId, amount, recipient, memo, addressMode, transferMode, invoiceRefundAddress, invoiceContact }"
+  },
+  {
+   "name": "TransferResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 175,
+   "sig": "{ id, status, tokens, tokenTransfers, error, deliveryPending, deliveryState }"
+  },
+  {
+   "name": "TransferStatus",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 131,
+   "sig": "export type TransferStatus = | 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed';"
+  },
+  {
+   "name": "TransportEvent",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/transport-provider.ts",
+   "line": 433,
+   "sig": "{ type, timestamp, data, error }"
+  },
+  {
+   "name": "TransportEventCallback",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "transport/transport-provider.ts",
+   "line": 440,
+   "sig": "export type TransportEventCallback = (event: TransportEvent) => void;"
+  },
+  {
+   "name": "TransportEventType",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "transport/transport-provider.ts",
+   "line": 421,
+   "sig": "export type TransportEventType = | 'transport:connected' | 'transport:disconnected' | 'transport:reconnecting' | 'transport:error' | 'transport:relay_added' | 'transport:relay_removed' | 'message:received' | 'message:sent' | 'transfer:received' | 'transfer:sent';"
+  },
+  {
+   "name": "TransportProvider",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/transport-provider.ts",
+   "line": 15,
+   "sig": "extends BaseProvider { setIdentity, sendMessage, onMessage, sendTokenTransfer, onTokenTransfer, resolve, resolveNametag, resolveNametagInfo, resolveAddressInfo, resolveTransportPubkeyInfo, discoverAddresses, recoverNametag, publishIdentityBinding, subscribeToBroadcast, publishBroadcast, sendPaymentRequest, onPaymentRequest, sendPaymentRequestResponse, onPaymentRequestResponse, sendReadReceipt, onReadReceipt, sendTypingIndicator, onTypingIndicator, sendComposingIndicator, onComposing, getRelays, getConnectedRelays, addRelay, removeRelay, hasRelay, isRelayConnected, setFallbackSince, setFallback…"
+  },
+  {
+   "name": "TransportProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 676,
+   "sig": "{ type, relays, timeout, autoReconnect }"
+  },
+  {
+   "name": "TxfAuthenticator",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 79,
+   "sig": "{ algorithm, publicKey, signature, stateHash }"
+  },
+  {
+   "name": "TxfGenesis",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 28,
+   "sig": "{ data, inclusionProof }"
+  },
+  {
+   "name": "TxfGenesisData",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 36,
+   "sig": "{ tokenId, tokenType, coinData, tokenData, salt, recipient, recipientDataHash, reason }"
+  },
+  {
+   "name": "TxfInclusionProof",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 69,
+   "sig": "{ authenticator, merkleTreePath, transactionHash, unicityCertificate }"
+  },
+  {
+   "name": "TxfIntegrity",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 105,
+   "sig": "{ genesisDataJSONHash, currentStateHash }"
+  },
+  {
+   "name": "TxfInvalidEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 421,
+   "sig": "{ tokenId, reason, detectedAt }"
+  },
+  {
+   "name": "TxfMerkleStep",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 97,
+   "sig": "{ data, path }"
+  },
+  {
+   "name": "TxfMerkleTreePath",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 89,
+   "sig": "{ root, steps }"
+  },
+  {
+   "name": "TxfMeta",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 391,
+   "sig": "{ version, address, ipnsName, formatVersion, updatedAt }"
+  },
+  {
+   "name": "TxfOutboxEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 405,
+   "sig": "{ id, status, tokenId, recipient, createdAt, data }"
+  },
+  {
+   "name": "TxfSentEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 414,
+   "sig": "{ tokenId, recipient, txHash, sentAt }"
+  },
+  {
+   "name": "TxfState",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 50,
+   "sig": "{ data, predicate }"
+  },
+  {
+   "name": "TxfStorageData",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 201,
+   "sig": "{ _meta, _nametag, _nametags, _tombstones, _invalidatedNametags, _outbox, _mintOutbox, ? }"
+  },
+  {
+   "name": "TxfStorageDataBase",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 380,
+   "sig": "{ _meta, _tombstones, _outbox, _sent, _invalid, _history, ? }"
+  },
+  {
+   "name": "TxfToken",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 16,
+   "sig": "{ version, genesis, state, transactions, nametags, _integrity }"
+  },
+  {
+   "name": "TxfTombstone",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 399,
+   "sig": "{ tokenId, stateHash, timestamp }"
+  },
+  {
+   "name": "txfToToken",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "serialization/txf-serializer.ts",
+   "line": 204,
+   "sig": "(tokenId: string, txf: TxfToken) => Token"
+  },
+  {
+   "name": "TxfTransaction",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 58,
+   "sig": "{ previousStateHash, newStateHash, predicate, inclusionProof, data }"
+  },
+  {
+   "name": "UploadUrlEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 169,
+   "sig": "{ sha256, key, putUrl }"
+  },
+  {
+   "name": "UploadUrlRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 162,
+   "sig": "{ sha256, size }"
+  },
+  {
+   "name": "validateManifest",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/swap/manifest.ts",
+   "line": 124,
+   "sig": "(manifest: SwapManifest) => { valid: boolean; errors: string[]; }"
+  },
+  {
+   "name": "validateMnemonic",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 66,
+   "sig": "(mnemonic: string) => boolean"
+  },
+  {
+   "name": "ValidationAction",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "validation/token-validator.ts",
+   "line": 23,
+   "sig": "export type ValidationAction = 'ACCEPT' | 'RETRY_LATER' | 'DISCARD_FORK';"
+  },
+  {
+   "name": "ValidationIssue",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/txf.ts",
+   "line": 236,
+   "sig": "{ tokenId, reason, recoverable }"
+  },
+  {
+   "name": "ValidationResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "oracle/oracle-provider.ts",
+   "line": 54,
+   "sig": "{ valid, spent, error, stateHash }"
+  },
+  {
+   "name": "verifyChallengeTemplate",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "wallet-api/challenge.ts",
+   "line": 84,
+   "sig": "(challenge: string, expect: ChallengeExpectation) => void"
+  },
+  {
+   "name": "verifyManifestIntegrity",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/swap/manifest.ts",
+   "line": 221,
+   "sig": "(manifest: SwapManifest) => boolean"
+  },
+  {
+   "name": "verifyNametagBinding",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/swap/manifest.ts",
+   "line": 361,
+   "sig": "(proof: NametagBindingProof, swapId: string) => boolean"
+  },
+  {
+   "name": "verifySignedMessage",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 518,
+   "sig": "(message: string, signature: string, expectedPubkey: string) => boolean"
+  },
+  {
+   "name": "verifySwapSignature",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "modules/swap/manifest.ts",
+   "line": 274,
+   "sig": "(swapId: string, escrowAddress: string, signature: string, chainPubkey: string) => boolean"
+  },
+  {
+   "name": "WakeCallback",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 376,
+   "sig": "export type WakeCallback = (wake: WakeEvent) => void;"
+  },
+  {
+   "name": "WakeEvent",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 371,
+   "sig": "{ stream, syncEpoch }"
+  },
+  {
+   "name": "WakeSocketHandle",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 379,
+   "sig": "{ close }"
+  },
+  {
+   "name": "WalletApiClient",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "wallet-api/client.ts",
+   "line": 211,
+   "sig": "{ network, baseUrl, deviceId, storage, fetchFn, wsFactory, now, retry, identity, jwt, authInFlight, authGeneration, config, constructor, clone, setIdentity, requireIdentity, scopedKey, refreshTokenKey, isStale, signIn, signInInner, tryRefresh, challengeSignIn, logout, rawFetch, readJson, toError, rawFetchWithRetry, backoffMs, retryDelayForStatus, parseRetryAfter, sleep, requestJson, listInventory, getBalances, getBlobUrls, getUploadUrls, applyInventoryDelta, fetchBlob, uploadBlob, depositMailbox, listMailbox, claimMailbox, rejectMailbox, postHistoryRecords, listHistory, createPaymentRequest, l…"
+  },
+  {
+   "name": "WalletApiClientConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 78,
+   "sig": "{ baseUrl, network, deviceId, storage, fetchFn, webSocketFactory, now, retry }"
+  },
+  {
+   "name": "WalletApiError",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "wallet-api/errors.ts",
+   "line": 45,
+   "sig": "extends Error { code, status, constructor, fromStatus }"
+  },
+  {
+   "name": "WalletApiErrorCode",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "wallet-api/errors.ts",
+   "line": 9,
+   "sig": "export type WalletApiErrorCode = /** Construction/config problems (bad base URL, missing identity). */ | 'CONFIG' /** The server challenge failed template verification — never signed. */ | 'CHALLENGE_TEMPLATE' /** 401 — session invalid and re-auth also failed. */ | 'UNAUTHORIZED' /** 403 — ownership/addressee check failed. */ | 'FORBIDDEN' /** 404 — unknown resource. */ | 'NOT_FOUND' /** 409 — lin…"
+  },
+  {
+   "name": "WalletApiIdentity",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 131,
+   "sig": "{ privateKey, chainPubkey }"
+  },
+  {
+   "name": "WalletDatInfo",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "serialization/wallet-dat.ts",
+   "line": 35,
+   "sig": "{ isSQLite, isEncrypted, isDescriptorWallet, hasHDChain, descriptorKeys, legacyKeys, chainCode, descriptorPath, cmasterKeys, descriptorId, xpubString }"
+  },
+  {
+   "name": "WalletInfo",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 728,
+   "sig": "{ source, hasMnemonic, hasChainCode, derivationMode, basePath, address0 }"
+  },
+  {
+   "name": "WalletJSON",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 741,
+   "sig": "{ version, type, createdAt, wallet, mnemonic, encrypted, source, derivationMode }"
+  },
+  {
+   "name": "WalletJSONExportOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 767,
+   "sig": "{ includeMnemonic, password, addressCount }"
+  },
+  {
+   "name": "WalletSource",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "types/index.ts",
+   "line": 723,
+   "sig": "export type WalletSource = 'mnemonic' | 'file' | 'unknown';"
+  },
+  {
+   "name": "WholeBlobInventoryAdapter",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "storage/whole-blob-inventory-adapter.ts",
+   "line": 109,
+   "sig": "{ constructor, loadData, listInventory, getToken, applyDelta }"
+  },
+  {
+   "name": "WholeBlobStore",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/whole-blob-inventory-adapter.ts",
+   "line": 41,
+   "sig": "{ load, save }"
+  }
+ ],
+ "core/index.ts": [
+  {
+   "name": "AddressInfo",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/crypto.ts",
+   "line": 46,
+   "sig": "extends KeyPair { path, index }"
+  },
+  {
+   "name": "AddressModuleSet",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 485,
+   "sig": "{ index, identity, payments, communications, groupChat, market, transportAdapter, tokenStorageProviders, tokenEngine, delivery, walletApi, initialized }"
+  },
+  {
+   "name": "assertFieldEnvelopeShape",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 194,
+   "sig": "(value: unknown, maxBytes?: number) => void"
+  },
+  {
+   "name": "base58Decode",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 78,
+   "sig": "(str: string) => Uint8Array"
+  },
+  {
+   "name": "base58Encode",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 51,
+   "sig": "(hex: string) => string"
+  },
+  {
+   "name": "bytesToHex",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 316,
+   "sig": "(bytes: Uint8Array) => string"
+  },
+  {
+   "name": "CHARSET",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/bech32.ts",
+   "line": 13,
+   "sig": "\"qpzry9x8gf2tvdw0s3jn54khce6mua7l\""
+  },
+  {
+   "name": "checkNetworkHealth",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/network-health.ts",
+   "line": 100,
+   "sig": "(network?: NetworkType, options?: CheckNetworkHealthOptions) => Promise<NetworkHealthResult>"
+  },
+  {
+   "name": "CheckNetworkHealthOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/network-health.ts",
+   "line": 15,
+   "sig": "{ timeoutMs, services, urls, checks }"
+  },
+  {
+   "name": "convertBits",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/bech32.ts",
+   "line": 25,
+   "sig": "(data: number[], fromBits: number, toBits: number, pad: boolean) => number[] | null"
+  },
+  {
+   "name": "createAddress",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/bech32.ts",
+   "line": 196,
+   "sig": "(hrp: string, pubkeyHash: Uint8Array | string) => string"
+  },
+  {
+   "name": "createKeyPair",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 249,
+   "sig": "(privateKey: string) => KeyPair"
+  },
+  {
+   "name": "createSphere",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 4709,
+   "sig": "any"
+  },
+  {
+   "name": "CurrencyUtils",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/currency.ts",
+   "line": 127,
+   "sig": "{ parseTokenAmount: (value: string, decimals?: number) => bigint; safeParseTokenAmount: (value: string, decimals?: number) => bigint | null; toHumanReadable: (amount: bigint | string, decimals?: number) => string; format: (amount: bigint | string, options?: { decimals?: number; symbol?: string; maxFractionDigits?: number; }) => string; }"
+  },
+  {
+   "name": "decodeBech32",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/bech32.ts",
+   "line": 150,
+   "sig": "(addr: string) => { hrp: string; witnessVersion: number; data: Uint8Array; } | null"
+  },
+  {
+   "name": "decrypt",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 123,
+   "sig": "(encryptedData: EncryptedData, password: string) => string"
+  },
+  {
+   "name": "decryptDeliveryBundle",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/delivery-envelope.ts",
+   "line": 97,
+   "sig": "(key: Uint8Array, envelope: string) => DeliveryBundle"
+  },
+  {
+   "name": "decryptField",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 182,
+   "sig": "(key: Uint8Array, envelope: string) => string"
+  },
+  {
+   "name": "decryptFieldBytes",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 153,
+   "sig": "(key: Uint8Array, envelope: string, aad?: Uint8Array) => Uint8Array"
+  },
+  {
+   "name": "decryptJson",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 160,
+   "sig": "<T = unknown>(encryptedData: EncryptedData, password: string) => T"
+  },
+  {
+   "name": "decryptMnemonic",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 238,
+   "sig": "(encryptedMnemonic: string, password: string) => string"
+  },
+  {
+   "name": "decryptSimple",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 188,
+   "sig": "(ciphertext: string, password: string) => string"
+  },
+  {
+   "name": "decryptWithSalt",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 203,
+   "sig": "(ciphertext: string, password: string, salt: string) => string | null"
+  },
+  {
+   "name": "DEFAULT_DERIVATION_PATH",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 25,
+   "sig": "\"m/44'/0'/0'\""
+  },
+  {
+   "name": "DEFAULT_TOKEN_DECIMALS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/currency.ts",
+   "line": 13,
+   "sig": "18"
+  },
+  {
+   "name": "DELIVERY_ENCRYPTION_HKDF_INFO",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/delivery-envelope.ts",
+   "line": 39,
+   "sig": "\"sphere-deliveryenc-v1\""
+  },
+  {
+   "name": "DeliveryBundle",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/delivery-envelope.ts",
+   "line": 42,
+   "sig": "{ senderNametag, memo }"
+  },
+  {
+   "name": "deriveAddressInfo",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 370,
+   "sig": "(masterKey: MasterKey, basePath: string, index: number, isChange?: boolean) => AddressInfo"
+  },
+  {
+   "name": "deriveChildKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 143,
+   "sig": "(parentPrivKey: string, parentChainCode: string, index: number) => DerivedKey"
+  },
+  {
+   "name": "deriveDeliveryEncryptionKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/delivery-envelope.ts",
+   "line": 67,
+   "sig": "(privKeyHex: string, peerPubkeyHex: string) => Uint8Array"
+  },
+  {
+   "name": "DerivedKey",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/crypto.ts",
+   "line": 36,
+   "sig": "{ privateKey, chainCode }"
+  },
+  {
+   "name": "deriveFieldEncryptionKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 123,
+   "sig": "(privKeyHex: string) => Uint8Array"
+  },
+  {
+   "name": "deriveKeyAtPath",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 202,
+   "sig": "(masterPrivKey: string, masterChainCode: string, path: string) => DerivedKey"
+  },
+  {
+   "name": "deserializeEncrypted",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 274,
+   "sig": "(serialized: string) => EncryptedData"
+  },
+  {
+   "name": "discoverAddressesImpl",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/discover.ts",
+   "line": 88,
+   "sig": "(deriveTransportPubkey: (index: number) => DerivedAddressInfo, batchResolve: (transportPubkeys: string[]) => Promise<PeerInfo[]>, options?: DiscoverAddressesOptions) => Promise<DiscoverAddressesResult>"
+  },
+  {
+   "name": "DiscoverAddressesOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/discover.ts",
+   "line": 42,
+   "sig": "{ maxAddresses, gapLimit, batchSize, onProgress, signal, autoTrack }"
+  },
+  {
+   "name": "DiscoverAddressesResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/discover.ts",
+   "line": 58,
+   "sig": "{ addresses, scannedCount, aborted }"
+  },
+  {
+   "name": "DiscoverAddressProgress",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/discover.ts",
+   "line": 14,
+   "sig": "{ currentBatch, totalBatches, discoveredCount, currentGap, phase }"
+  },
+  {
+   "name": "DiscoveredAddress",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/discover.ts",
+   "line": 28,
+   "sig": "{ index, directAddress, chainPubkey, nametag, source }"
+  },
+  {
+   "name": "doubleSha256",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 293,
+   "sig": "(data: string, inputEncoding?: \"hex\" | \"utf8\") => string"
+  },
+  {
+   "name": "ec",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 17,
+   "sig": "elliptic.ec"
+  },
+  {
+   "name": "encodeBech32",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/bech32.ts",
+   "line": 115,
+   "sig": "(hrp: string, version: number, program: Uint8Array) => string"
+  },
+  {
+   "name": "encrypt",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 84,
+   "sig": "(plaintext: string | object, password: string, options?: EncryptionOptions) => EncryptedData"
+  },
+  {
+   "name": "encryptDeliveryBundle",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/delivery-envelope.ts",
+   "line": 83,
+   "sig": "(key: Uint8Array, bundle: DeliveryBundle) => string | undefined"
+  },
+  {
+   "name": "EncryptedData",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/encryption.ts",
+   "line": 16,
+   "sig": "{ ciphertext, iv, salt, algorithm, kdf, iterations }"
+  },
+  {
+   "name": "encryptField",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 174,
+   "sig": "(key: Uint8Array, plaintext: string) => string"
+  },
+  {
+   "name": "encryptFieldBytes",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 140,
+   "sig": "(key: Uint8Array, plaintext: Uint8Array, aad?: Uint8Array) => string"
+  },
+  {
+   "name": "EncryptionOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/encryption.ts",
+   "line": 31,
+   "sig": "{ iterations }"
+  },
+  {
+   "name": "encryptMnemonic",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 229,
+   "sig": "(mnemonic: string, password: string) => string"
+  },
+  {
+   "name": "encryptSimple",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 179,
+   "sig": "(plaintext: string, password: string) => string"
+  },
+  {
+   "name": "entropyToMnemonic",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 104,
+   "sig": "(entropy: string) => string"
+  },
+  {
+   "name": "extractFromText",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 156,
+   "sig": "(text: string, pattern: RegExp) => string | null"
+  },
+  {
+   "name": "FIELD_ENCRYPTION_HKDF_INFO",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 29,
+   "sig": "\"sphere-fieldenc-v1\""
+  },
+  {
+   "name": "FIELD_ENVELOPE_MAX_BYTES",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 44,
+   "sig": "4096"
+  },
+  {
+   "name": "FIELD_ENVELOPE_NONCE_BYTES",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 35,
+   "sig": "24"
+  },
+  {
+   "name": "FIELD_ENVELOPE_PREFIX",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/field-encryption.ts",
+   "line": 32,
+   "sig": "\"enc1.\""
+  },
+  {
+   "name": "findPattern",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 127,
+   "sig": "(data: Uint8Array, pattern: Uint8Array, startIndex?: number) => number"
+  },
+  {
+   "name": "formatAmount",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/currency.ts",
+   "line": 100,
+   "sig": "(amount: bigint | string, options?: { decimals?: number; symbol?: string; maxFractionDigits?: number; }) => string"
+  },
+  {
+   "name": "generateAddressFromMasterKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 418,
+   "sig": "(masterPrivateKey: string, index: number) => AddressInfo"
+  },
+  {
+   "name": "generateAddressInfo",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 393,
+   "sig": "(privateKey: string, index: number, path: string) => AddressInfo"
+  },
+  {
+   "name": "generateMasterKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 116,
+   "sig": "(seedHex: string) => MasterKey"
+  },
+  {
+   "name": "generateMnemonic",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 59,
+   "sig": "(strength?: 128 | 256) => string"
+  },
+  {
+   "name": "generateRandomKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 286,
+   "sig": "(bytes?: number) => string"
+  },
+  {
+   "name": "getAddressHrp",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/bech32.ts",
+   "line": 214,
+   "sig": "(addr: string) => string | null"
+  },
+  {
+   "name": "getPublicKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 241,
+   "sig": "(privateKey: string, compressed?: boolean) => string"
+  },
+  {
+   "name": "getSphere",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 4713,
+   "sig": "any"
+  },
+  {
+   "name": "hash160",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 285,
+   "sig": "(data: string) => string"
+  },
+  {
+   "name": "hashSignMessage",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 458,
+   "sig": "(message: string) => string"
+  },
+  {
+   "name": "hexToBytes",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 305,
+   "sig": "(hex: string) => Uint8Array"
+  },
+  {
+   "name": "identityFromMnemonic",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 338,
+   "sig": "(mnemonic: string, passphrase?: string) => Promise<MasterKey>"
+  },
+  {
+   "name": "identityFromMnemonicSync",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 352,
+   "sig": "(mnemonic: string, passphrase?: string) => MasterKey"
+  },
+  {
+   "name": "importSphere",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 4711,
+   "sig": "any"
+  },
+  {
+   "name": "InitProgress",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 150,
+   "sig": "{ step, message }"
+  },
+  {
+   "name": "InitProgressCallback",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 158,
+   "sig": "export type InitProgressCallback = (progress: InitProgress) => void;"
+  },
+  {
+   "name": "InitProgressStep",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 137,
+   "sig": "export type InitProgressStep = | 'clearing' | 'storing_keys' | 'initializing' | 'recovering_nametag' | 'registering_nametag' | 'syncing_identity' | 'syncing_tokens' | 'discovering_addresses' | 'finalizing' | 'complete';"
+  },
+  {
+   "name": "initSphere",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 4712,
+   "sig": "any"
+  },
+  {
+   "name": "isEncryptedData",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 249,
+   "sig": "(data: unknown) => data is EncryptedData"
+  },
+  {
+   "name": "isSphereError",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/errors.ts",
+   "line": 138,
+   "sig": "(err: unknown) => err is SphereError"
+  },
+  {
+   "name": "isValidBech32",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/bech32.ts",
+   "line": 207,
+   "sig": "(addr: string) => boolean"
+  },
+  {
+   "name": "isValidNametag",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 122,
+   "sig": "(nametag: string) => boolean"
+  },
+  {
+   "name": "isValidPrivateKey",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 26,
+   "sig": "(hex: string) => boolean"
+  },
+  {
+   "name": "KeyPair",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/crypto.ts",
+   "line": 41,
+   "sig": "{ privateKey, publicKey }"
+  },
+  {
+   "name": "loadSphere",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 4710,
+   "sig": "any"
+  },
+  {
+   "name": "logger",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/logger.ts",
+   "line": 66,
+   "sig": "{ configure(config: LoggerConfig): void; setTagDebug(tag: string, enabled: boolean): void; clearTagDebug(tag: string): void; isDebugEnabled(tag?: string): boolean; debug(tag: string, message: string, ...args: unknown[]): void; warn(tag: string, message: string, ...args: unknown[]): void; error(tag: string, message: string, ...args: unknown[]): void; reset(): void; }"
+  },
+  {
+   "name": "LoggerConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/logger.ts",
+   "line": 34,
+   "sig": "{ debug, handler }"
+  },
+  {
+   "name": "LogHandler",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "core/logger.ts",
+   "line": 32,
+   "sig": "export type LogHandler = (level: LogLevel, tag: string, message: string, ...args: unknown[]) => void;"
+  },
+  {
+   "name": "LogLevel",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "core/logger.ts",
+   "line": 30,
+   "sig": "export type LogLevel = 'debug' | 'warn' | 'error';"
+  },
+  {
+   "name": "MasterKey",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/crypto.ts",
+   "line": 31,
+   "sig": "{ privateKey, chainCode }"
+  },
+  {
+   "name": "mnemonicToEntropy",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 97,
+   "sig": "(mnemonic: string) => string"
+  },
+  {
+   "name": "mnemonicToSeed",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 75,
+   "sig": "(mnemonic: string, passphrase?: string) => Promise<string>"
+  },
+  {
+   "name": "mnemonicToSeedSync",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 86,
+   "sig": "(mnemonic: string, passphrase?: string) => string"
+  },
+  {
+   "name": "parseTokenAmount",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/currency.ts",
+   "line": 38,
+   "sig": "(value: string, decimals?: number) => bigint"
+  },
+  {
+   "name": "randomBytes",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 325,
+   "sig": "(length: number) => string"
+  },
+  {
+   "name": "randomHex",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 179,
+   "sig": "(byteLength: number) => string"
+  },
+  {
+   "name": "randomUUID",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/uuid.ts",
+   "line": 19,
+   "sig": "() => string"
+  },
+  {
+   "name": "recoverPubkeyFromSignature",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 556,
+   "sig": "(message: string, signature: string) => string"
+  },
+  {
+   "name": "ripemd160",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 274,
+   "sig": "(data: string, inputEncoding?: \"hex\" | \"utf8\") => string"
+  },
+  {
+   "name": "safeParseTokenAmount",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/currency.ts",
+   "line": 62,
+   "sig": "(value: string, decimals?: number) => bigint | null"
+  },
+  {
+   "name": "serializeEncrypted",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/encryption.ts",
+   "line": 267,
+   "sig": "(data: EncryptedData) => string"
+  },
+  {
+   "name": "sha256",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 263,
+   "sig": "(data: string, inputEncoding?: \"hex\" | \"utf8\") => string"
+  },
+  {
+   "name": "SIGN_MESSAGE_PREFIX",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 440,
+   "sig": "\"Sphere Signed Message:\\n\""
+  },
+  {
+   "name": "signMessage",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 483,
+   "sig": "(privateKeyHex: string, message: string) => string"
+  },
+  {
+   "name": "sleep",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/utils.ts",
+   "line": 168,
+   "sig": "(ms: number) => Promise<void>"
+  },
+  {
+   "name": "Sphere",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 517,
+   "sig": "{ instance, _orphanCacheCleaned, _initialized, _trackedAddressesLoaded, _identity, _masterKey, _mnemonic, _password, _source, _derivationMode, _basePath, _currentAddressIndex, _trackedAddresses, _addressIdToIndex, _addressNametags, _storage, _tokenStorageProviders, _transport, _oracle, _priceProvider, _delivery, _walletApi, _deliveryTemplate, _walletApiTemplate, _walletApiSessionStatus, _tokenEngine, _payments, _communications, _groupChat, _market, _accounting, _swap, _addressModules, _transportMux, _dmSince, _groupChatConfig, _marketConfig, _communicationsConfig, eventHandlers, _disabledProvi…"
+  },
+  {
+   "name": "SphereCreateOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 179,
+   "sig": "{ mnemonic, derivationPath, nametag, storage, tokenStorage, transport, oracle, delivery, walletApi, price, network, groupChat, market, accounting, swap, communications, password, discoverAddresses, debug, onProgress }"
+  },
+  {
+   "name": "SphereError",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "core/errors.ts",
+   "line": 123,
+   "sig": "extends Error { code, cause, constructor }"
+  },
+  {
+   "name": "SphereErrorCode",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "core/errors.ts",
+   "line": 27,
+   "sig": "export type SphereErrorCode = | 'NOT_INITIALIZED' | 'ALREADY_INITIALIZED' | 'INVALID_CONFIG' | 'INVALID_IDENTITY' | 'INSUFFICIENT_BALANCE' | 'INVALID_RECIPIENT' | 'TRANSFER_FAILED' // The source state was consumed by a DIFFERENT transaction (lost race, not a // resume) — raised as TransferConflictError (token-engine/errors.ts, Part E.2). | 'TRANSFER_CONFLICT' // The op's certification is INDETERMI…"
+  },
+  {
+   "name": "sphereExists",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "core/Sphere.ts",
+   "line": 4714,
+   "sig": "any"
+  },
+  {
+   "name": "SphereImportOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 295,
+   "sig": "{ mnemonic, masterKey, chainCode, derivationPath, basePath, derivationMode, nametag, network, storage, tokenStorage, transport, oracle, delivery, walletApi, price, groupChat, market, accounting, swap, communications, password, discoverAddresses, debug, onProgress }"
+  },
+  {
+   "name": "SphereInitOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 362,
+   "sig": "{ storage, transport, oracle, delivery, walletApi, tokenStorage, mnemonic, autoGenerate, derivationPath, nametag, price, network, groupChat, market, accounting, swap, password, discoverAddresses, dmSince, communications, debug, onProgress }"
+  },
+  {
+   "name": "SphereInitResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 437,
+   "sig": "{ sphere, created, generatedMnemonic }"
+  },
+  {
+   "name": "SphereLoadOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 240,
+   "sig": "{ storage, tokenStorage, transport, oracle, delivery, walletApi, price, network, groupChat, market, accounting, swap, communications, password, discoverAddresses, debug, onProgress }"
+  },
+  {
+   "name": "SphereWalletApiSession",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "core/Sphere.ts",
+   "line": 169,
+   "sig": "extends PaymentsWalletApiPort { setIdentity, signIn, logout }"
+  },
+  {
+   "name": "toHumanReadable",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/currency.ts",
+   "line": 82,
+   "sig": "(amount: bigint | string, decimals?: number) => string"
+  },
+  {
+   "name": "validateMnemonic",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 66,
+   "sig": "(mnemonic: string) => boolean"
+  },
+  {
+   "name": "verifySignedMessage",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "core/crypto.ts",
+   "line": 518,
+   "sig": "(message: string, signature: string, expectedPubkey: string) => boolean"
+  }
+ ],
+ "token-engine/index.ts": [
+  {
+   "name": "CheckpointPersistFailedError",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "token-engine/errors.ts",
+   "line": 64,
+   "sig": "extends SphereError { mayHaveCertified, constructor }"
+  },
+  {
+   "name": "CheckpointTrustbaseMismatchError",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "token-engine/errors.ts",
+   "line": 102,
+   "sig": "extends SphereError { constructor }"
+  },
+  {
+   "name": "CoinId",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 35,
+   "sig": "export type CoinId = string;"
+  },
+  {
+   "name": "createSphereTokenEngine",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "token-engine/factory.ts",
+   "line": 31,
+   "sig": "(config: EngineConfig) => Promise<ITokenEngine>"
+  },
+  {
+   "name": "CreateTokenEngine",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "token-engine/engine.ts",
+   "line": 206,
+   "sig": "export type CreateTokenEngine = (config: EngineConfig) => Promise<ITokenEngine>;"
+  },
+  {
+   "name": "createUnicityIdMinter",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "token-engine/unicity-id.ts",
+   "line": 144,
+   "sig": "(config: EngineConfig) => IUnicityIdMinter"
+  },
+  {
+   "name": "decodeSpherePaymentData",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "token-engine/SpherePaymentData.ts",
+   "line": 131,
+   "sig": "(bytes: Uint8Array) => Promise<IPaymentData>"
+  },
+  {
+   "name": "deriveDirectAddress",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "token-engine/identity.ts",
+   "line": 58,
+   "sig": "(publicKey: Uint8Array) => Promise<string>"
+  },
+  {
+   "name": "EngineConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/engine.ts",
+   "line": 185,
+   "sig": "{ aggregatorUrl, apiKey, privateKey, trustBaseJson, proofPollIntervalMs, proofTimeoutMs }"
+  },
+  {
+   "name": "EngineIdentity",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 21,
+   "sig": "{ chainPubkey }"
+  },
+  {
+   "name": "EngineOpOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/engine.ts",
+   "line": 46,
+   "sig": "{ signal, checkpointStore, transferId, opIndex }"
+  },
+  {
+   "name": "EngineVerifyResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 151,
+   "sig": "{ ok, reason }"
+  },
+  {
+   "name": "ITokenEngine",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/engine.ts",
+   "line": 91,
+   "sig": "{ getIdentity, deriveIdentityAddress, tokenId, readValue, balanceOf, readMemo, readTokenData, mint, mintDataToken, transfer, split, verify, isSpent, isOwnedBy, encodeToken, decodeToken, deliveryKeys }"
+  },
+  {
+   "name": "IUnicityIdMinter",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/unicity-id.ts",
+   "line": 55,
+   "sig": "{ mintUnicityIdToken }"
+  },
+  {
+   "name": "MintDataTokenParams",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 98,
+   "sig": "{ recipientPubkey, data, tokenType, salt }"
+  },
+  {
+   "name": "MintParams",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 85,
+   "sig": "{ recipientPubkey, value }"
+  },
+  {
+   "name": "ProofUnconfirmedError",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "token-engine/errors.ts",
+   "line": 45,
+   "sig": "extends SphereError { mayHaveCertified, constructor }"
+  },
+  {
+   "name": "SphereAsset",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 38,
+   "sig": "{ coinId, amount }"
+  },
+  {
+   "name": "sphereAssetToSdk",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "token-engine/SpherePaymentData.ts",
+   "line": 44,
+   "sig": "(coinId: CoinId, amount: bigint) => Asset"
+  },
+  {
+   "name": "SphereNetwork",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 27,
+   "sig": "export type SphereNetwork = 'mainnet' | 'testnet' | 'local';"
+  },
+  {
+   "name": "SpherePaymentData",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "token-engine/SpherePaymentData.ts",
+   "line": 49,
+   "sig": "implements IPaymentData { CBOR_TAG, VERSION, constructor, memo, create, fromValue, fromCBOR, encode, toValue, balanceOf }"
+  },
+  {
+   "name": "SphereToken",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 74,
+   "sig": "{ sdkToken, blob, value }"
+  },
+  {
+   "name": "SphereValue",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 44,
+   "sig": "{ assets }"
+  },
+  {
+   "name": "SplitCheckpointLostError",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "token-engine/errors.ts",
+   "line": 85,
+   "sig": "extends SphereError { constructor }"
+  },
+  {
+   "name": "SplitCheckpointStore",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/engine.ts",
+   "line": 33,
+   "sig": "{ put, get }"
+  },
+  {
+   "name": "SplitOutput",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 123,
+   "sig": "{ recipientPubkey, coinId, amount, data }"
+  },
+  {
+   "name": "SplitParams",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 131,
+   "sig": "{ token, outputs }"
+  },
+  {
+   "name": "SplitResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 140,
+   "sig": "{ outputs }"
+  },
+  {
+   "name": "TokenBlob",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 55,
+   "sig": "{ v, network, tokenId, token }"
+  },
+  {
+   "name": "TransferConflictError",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "token-engine/errors.ts",
+   "line": 18,
+   "sig": "extends SphereError { conflictedSourceId, constructor }"
+  },
+  {
+   "name": "TransferParams",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/types.ts",
+   "line": 108,
+   "sig": "{ token, recipientPubkey, data }"
+  },
+  {
+   "name": "UnicityIdMintResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "token-engine/unicity-id.ts",
+   "line": 47,
+   "sig": "{ tokenCborHex, tokenId }"
+  }
+ ],
+ "wallet-api/index.ts": [
+  {
+   "name": "ApplyDeltaRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 177,
+   "sig": "{ transferId, spent, added, externalDelivery }"
+  },
+  {
+   "name": "AUTH_CHALLENGE_PREFIX",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "wallet-api/challenge.ts",
+   "line": 24,
+   "sig": "\"unicity:wallet-api:auth:v1\\n\""
+  },
+  {
+   "name": "BlobUrlEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 156,
+   "sig": "{ tokenId, getUrl }"
+  },
+  {
+   "name": "ChallengeExpectation",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/challenge.ts",
+   "line": 32,
+   "sig": "{ pubkey, nonce, network, nowMs }"
+  },
+  {
+   "name": "ChallengeTemplateError",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "wallet-api/errors.ts",
+   "line": 68,
+   "sig": "extends WalletApiError { constructor }"
+  },
+  {
+   "name": "CoinBalance",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 149,
+   "sig": "{ coinId, total, tokenCount }"
+  },
+  {
+   "name": "completeSignMessage",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "wallet-api/intent-signing.ts",
+   "line": 18,
+   "sig": "(transferId: string) => string"
+  },
+  {
+   "name": "CreatePaymentRequestInput",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 322,
+   "sig": "{ toPubkey, assets, memo, expiresAt }"
+  },
+  {
+   "name": "FetchLike",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 27,
+   "sig": "export type FetchLike = (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string | Uint8Array; }) => Promise<FetchResponseLike>;"
+  },
+  {
+   "name": "FetchResponseLike",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 43,
+   "sig": "{ status, ok, headers, text, arrayBuffer }"
+  },
+  {
+   "name": "HeadersLike",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 39,
+   "sig": "{ get }"
+  },
+  {
+   "name": "HistoryPage",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 287,
+   "sig": "{ records, more, cursor, syncEpoch }"
+  },
+  {
+   "name": "HistoryWireRecord",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 264,
+   "sig": "{ dedupKey, id, type, ts, assets, transferId, tokenId, counterpartyPubkey, memo, counterpartyNametag }"
+  },
+  {
+   "name": "IntentRecord",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 185,
+   "sig": "{ transferId, payload, status, createdAt }"
+  },
+  {
+   "name": "InventoryPage",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 141,
+   "sig": "{ cursor, syncEpoch, more, items }"
+  },
+  {
+   "name": "KeyValueStore",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 20,
+   "sig": "{ get, set, remove }"
+  },
+  {
+   "name": "ListPaymentRequestsParams",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 338,
+   "sig": "export type ListPaymentRequestsParams = | { role: 'incoming'; status?: PaymentRequestWireStatus; since?: bigint } | { role: 'outgoing'; status?: PaymentRequestWireStatus; before?: string };"
+  },
+  {
+   "name": "MailboxClaimResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 250,
+   "sig": "{ claimed, alreadyClaimed, failed }"
+  },
+  {
+   "name": "MailboxDepositRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 202,
+   "sig": "{ recipientPubkey, key, transferId, stateHash, tokenId, memo }"
+  },
+  {
+   "name": "MailboxEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 220,
+   "sig": "{ entryId, seq, status, transferId, tokenId, assets, senderPubkey, memo, createdAt, getUrl, blobCollected }"
+  },
+  {
+   "name": "MailboxEntryStatus",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 217,
+   "sig": "export type MailboxEntryStatus = 'unclaimed' | 'claimed' | 'rejected';"
+  },
+  {
+   "name": "MailboxPage",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 241,
+   "sig": "{ readPointer, syncEpoch, more, entries }"
+  },
+  {
+   "name": "PaymentRequestRecord",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 304,
+   "sig": "{ id, seq, fromPubkey, toPubkey, assets, memo, status, transferId, createdAt, expiresAt }"
+  },
+  {
+   "name": "PaymentRequestsPage",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 343,
+   "sig": "export type PaymentRequestsPage = | { role: 'incoming'; requests: PaymentRequestRecord[]; more: boolean; /** The §16 `?since=` seq cursor (gap-free — §9). */ cursor: bigint; syncEpoch: bigint; } | { role: 'outgoing'; requests: PaymentRequestRecord[]; more: boolean; /** Opaque keyset for the next (older) page; null when drained (§16). */ cursor: string | null; syncEpoch: bigint; };"
+  },
+  {
+   "name": "PaymentRequestWireStatus",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 297,
+   "sig": "export type PaymentRequestWireStatus = 'open' | 'paid' | 'declined' | 'expired';"
+  },
+  {
+   "name": "progressSignMessage",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "wallet-api/intent-signing.ts",
+   "line": 13,
+   "sig": "(transferId: string, opIndex: number, payloadEnvelope: string) => string"
+  },
+  {
+   "name": "RespondPaymentRequestInput",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 366,
+   "sig": "export type RespondPaymentRequestInput = | { action: 'paid'; transferId: string } | { action: 'declined' };"
+  },
+  {
+   "name": "SupervisedWakeSocketHandle",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 417,
+   "sig": "{ close, status }"
+  },
+  {
+   "name": "SuperviseWakeOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 402,
+   "sig": "{ onWake, onReconnect, onStatus }"
+  },
+  {
+   "name": "UploadUrlEntry",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 169,
+   "sig": "{ sha256, key, putUrl }"
+  },
+  {
+   "name": "UploadUrlRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 162,
+   "sig": "{ sha256, size }"
+  },
+  {
+   "name": "verifyChallengeTemplate",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "wallet-api/challenge.ts",
+   "line": 84,
+   "sig": "(challenge: string, expect: ChallengeExpectation) => void"
+  },
+  {
+   "name": "WakeCallback",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 376,
+   "sig": "export type WakeCallback = (wake: WakeEvent) => void;"
+  },
+  {
+   "name": "WakeEvent",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 371,
+   "sig": "{ stream, syncEpoch }"
+  },
+  {
+   "name": "WakeSocketHandle",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 379,
+   "sig": "{ close }"
+  },
+  {
+   "name": "WakeSocketStatus",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 390,
+   "sig": "export type WakeSocketStatus = 'connecting' | 'connected' | 'reconnecting' | 'closed';"
+  },
+  {
+   "name": "WalletApiClient",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "wallet-api/client.ts",
+   "line": 211,
+   "sig": "{ network, baseUrl, deviceId, storage, fetchFn, wsFactory, now, retry, identity, jwt, authInFlight, authGeneration, config, constructor, clone, setIdentity, requireIdentity, scopedKey, refreshTokenKey, isStale, signIn, signInInner, tryRefresh, challengeSignIn, logout, rawFetch, readJson, toError, rawFetchWithRetry, backoffMs, retryDelayForStatus, parseRetryAfter, sleep, requestJson, listInventory, getBalances, getBlobUrls, getUploadUrls, applyInventoryDelta, fetchBlob, uploadBlob, depositMailbox, listMailbox, claimMailbox, rejectMailbox, postHistoryRecords, listHistory, createPaymentRequest, l…"
+  },
+  {
+   "name": "WalletApiClientConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 78,
+   "sig": "{ baseUrl, network, deviceId, storage, fetchFn, webSocketFactory, now, retry }"
+  },
+  {
+   "name": "WalletApiError",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "wallet-api/errors.ts",
+   "line": 45,
+   "sig": "extends Error { code, status, constructor, fromStatus }"
+  },
+  {
+   "name": "WalletApiErrorCode",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "wallet-api/errors.ts",
+   "line": 9,
+   "sig": "export type WalletApiErrorCode = /** Construction/config problems (bad base URL, missing identity). */ | 'CONFIG' /** The server challenge failed template verification — never signed. */ | 'CHALLENGE_TEMPLATE' /** 401 — session invalid and re-auth also failed. */ | 'UNAUTHORIZED' /** 403 — ownership/addressee check failed. */ | 'FORBIDDEN' /** 404 — unknown resource. */ | 'NOT_FOUND' /** 409 — lin…"
+  },
+  {
+   "name": "WalletApiIdentity",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 131,
+   "sig": "{ privateKey, chainPubkey }"
+  },
+  {
+   "name": "WalletApiRetryConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 115,
+   "sig": "{ maxAttempts, baseMs, capMs, jitter, honorRetryAfter, maxRetryAfterMs }"
+  },
+  {
+   "name": "WebSocketFactoryLike",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 74,
+   "sig": "export type WebSocketFactoryLike = (url: string) => WebSocketLike;"
+  },
+  {
+   "name": "WebSocketLike",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "wallet-api/types.ts",
+   "line": 57,
+   "sig": "{ onopen, onmessage, onerror, onclose, onPing, onPong, close }"
+  }
+ ],
+ "impl/browser/index.ts": [
+  {
+   "name": "BaseOracleConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/config.ts",
+   "line": 50,
+   "sig": "{ url, apiKey, timeout, skipVerification, debug }"
+  },
+  {
+   "name": "BaseProviders",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/config.ts",
+   "line": 136,
+   "sig": "{ storage, tokenStorage, transport, oracle, price }"
+  },
+  {
+   "name": "BaseTransportConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/config.ts",
+   "line": 20,
+   "sig": "{ relays, additionalRelays, timeout, autoReconnect, debug }"
+  },
+  {
+   "name": "BrowserProviders",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/index.ts",
+   "line": 192,
+   "sig": "{ storage, transport, oracle, tokenStorage, price, ipfsTokenStorage, groupChat, market, tokenSyncConfig }"
+  },
+  {
+   "name": "BrowserProvidersConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/index.ts",
+   "line": 167,
+   "sig": "{ network, debug, storage, transport, oracle, tokenSync, price, groupChat, market }"
+  },
+  {
+   "name": "BrowserTrustBaseLoader",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/browser/oracle/index.ts",
+   "line": 32,
+   "sig": "extends BaseTrustBaseLoader { url, constructor, loadFromExternal }"
+  },
+  {
+   "name": "CheckpointProgressPort",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/WalletApiCheckpointStore.ts",
+   "line": 18,
+   "sig": "{ postIntentProgress, getIntentProgress }"
+  },
+  {
+   "name": "CloudSyncConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/index.ts",
+   "line": 116,
+   "sig": "{ enabled, provider, bucket, endpoint, apiKey }"
+  },
+  {
+   "name": "createBrowserProviders",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/index.ts",
+   "line": 362,
+   "sig": "(config?: BrowserProvidersConfig) => BrowserProviders"
+  },
+  {
+   "name": "createBrowserTrustBaseLoader",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/oracle/index.ts",
+   "line": 77,
+   "sig": "(networkOrUrl?: NetworkType | string, fallbackNetwork?: NetworkType) => TrustBaseLoader"
+  },
+  {
+   "name": "createBrowserWebSocket",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/transport/index.ts",
+   "line": 35,
+   "sig": "(url: string) => IWebSocket"
+  },
+  {
+   "name": "createIndexedDBStorageProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/storage/IndexedDBStorageProvider.ts",
+   "line": 404,
+   "sig": "(config?: IndexedDBStorageProviderConfig) => IndexedDBStorageProvider"
+  },
+  {
+   "name": "createIndexedDBTokenStorageProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/storage/IndexedDBTokenStorageProvider.ts",
+   "line": 631,
+   "sig": "(config?: IndexedDBTokenStorageConfig) => IndexedDBTokenStorageProvider"
+  },
+  {
+   "name": "createLocalStorageProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/storage/LocalStorageProvider.ts",
+   "line": 267,
+   "sig": "(config?: LocalStorageProviderConfig) => LocalStorageProvider"
+  },
+  {
+   "name": "createNostrTransportProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/transport/index.ts",
+   "line": 43,
+   "sig": "(config?: Omit<NostrTransportProviderConfig, \"createWebSocket\">) => NostrTransportProvider"
+  },
+  {
+   "name": "createOwnStorageWalletApiProviders",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 175,
+   "sig": "<B extends SphereBaseProviders>(base: B, config: WalletApiCompositionConfig) => B & WalletApiProviderExtras"
+  },
+  {
+   "name": "createSphereProviders",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 68,
+   "sig": "<B extends SphereBaseProviders>(base: B, ports?: SphereProviderPorts) => B & { delivery?: DeliveryProvider; }"
+  },
+  {
+   "name": "createUnicityAggregatorProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/oracle/index.ts",
+   "line": 91,
+   "sig": "(config: Omit<UnicityAggregatorProviderConfig, \"trustBaseLoader\"> & { trustBaseUrl?: string; network?: NetworkType; }) => UnicityAggregatorProvider"
+  },
+  {
+   "name": "createUnicityOracleProvider",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "impl/browser/oracle/index.ts",
+   "line": 113,
+   "sig": "(config: Omit<UnicityAggregatorProviderConfig, \"trustBaseLoader\"> & { trustBaseUrl?: string; network?: NetworkType; }) => UnicityAggregatorProvider"
+  },
+  {
+   "name": "createWalletApiMailboxProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiMailboxProvider.ts",
+   "line": 489,
+   "sig": "(config: WalletApiMailboxProviderConfig) => WalletApiMailboxProvider"
+  },
+  {
+   "name": "createWalletApiProviders",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 150,
+   "sig": "<B extends SphereBaseProviders>(base: B, config: WalletApiCompositionConfig) => B & WalletApiProviderExtras"
+  },
+  {
+   "name": "createWalletApiTokenStorageProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiTokenStorageProvider.ts",
+   "line": 582,
+   "sig": "(config: WalletApiTokenStorageConfig) => WalletApiTokenStorageProvider"
+  },
+  {
+   "name": "defaultUUIDGenerator",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "transport/websocket.ts",
+   "line": 60,
+   "sig": "() => string"
+  },
+  {
+   "name": "downloadFile",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/download.ts",
+   "line": 36,
+   "sig": "(content: string | Blob, filename: string, mimeType?: string) => void"
+  },
+  {
+   "name": "downloadJSONFile",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/download.ts",
+   "line": 66,
+   "sig": "(content: object | string, filename: string) => void"
+  },
+  {
+   "name": "DownloadJSONOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/download.ts",
+   "line": 22,
+   "sig": "extends WalletJSONExportOptions { filename, pretty }"
+  },
+  {
+   "name": "downloadTextFile",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/download.ts",
+   "line": 59,
+   "sig": "(content: string, filename: string) => void"
+  },
+  {
+   "name": "DownloadTextOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/download.ts",
+   "line": 13,
+   "sig": "{ password, addressCount, filename }"
+  },
+  {
+   "name": "downloadWalletJSON",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/download.ts",
+   "line": 120,
+   "sig": "(sphere: Sphere, options?: DownloadJSONOptions) => void"
+  },
+  {
+   "name": "downloadWalletJSONData",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/download.ts",
+   "line": 141,
+   "sig": "(json: WalletJSON, filename?: string) => void"
+  },
+  {
+   "name": "downloadWalletText",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/download.ts",
+   "line": 92,
+   "sig": "(sphere: Sphere, options?: DownloadTextOptions) => void"
+  },
+  {
+   "name": "FileSyncConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/index.ts",
+   "line": 104,
+   "sig": "{ enabled, directory, format }"
+  },
+  {
+   "name": "HistoryRecord",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "storage/storage-provider.ts",
+   "line": 68,
+   "sig": "{ dedupKey, id, type, amount, coinId, symbol, timestamp, transferId, tokenId, senderPubkey, senderAddress, senderNametag, recipientPubkey, recipientAddress, recipientNametag, memo, tokenIds }"
+  },
+  {
+   "name": "IMessageEvent",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/websocket.ts",
+   "line": 25,
+   "sig": "{ data }"
+  },
+  {
+   "name": "IndexedDBStorageProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/browser/storage/IndexedDBStorageProvider.ts",
+   "line": 41,
+   "sig": "implements StorageProvider { id, name, type, description, prefix, dbName, network, debug, identity, status, db, connId, constructor, connect, disconnect, isConnected, getStatus, setIdentity, get, set, remove, has, keys, clear, saveTrackedAddresses, loadTrackedAddresses, getJSON, setJSON, getFullKey, ensureConnected, openDatabase, idbGet, idbPut, idbDelete, idbCount, idbGetAll, idbClear, log }"
+  },
+  {
+   "name": "IndexedDBStorageProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/storage/IndexedDBStorageProvider.ts",
+   "line": 20,
+   "sig": "{ prefix, dbName, network, debug }"
+  },
+  {
+   "name": "IndexedDBTokenStorageConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/storage/IndexedDBTokenStorageProvider.ts",
+   "line": 27,
+   "sig": "{ dbNamePrefix, network, debug }"
+  },
+  {
+   "name": "IndexedDBTokenStorageProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/browser/storage/IndexedDBTokenStorageProvider.ts",
+   "line": 46,
+   "sig": "implements TokenStorageProvider<TxfStorageDataBase> { id, name, type, dbNamePrefix, dbName, debug, db, status, identity, connId, constructor, setIdentity, initialize, shutdown, connect, disconnect, isConnected, getStatus, load, save, inventoryAdapter, listInventory, getToken, applyDelta, sync, exists, clear, openDatabase, getFromStore, getAllFromStore, putToStore, deleteFromStore, findPrefixedDatabases, addHistoryEntry, getHistoryEntries, hasHistoryEntry, clearHistory, importHistoryEntries, clearDatabaseStores, createForAddress }"
+  },
+  {
+   "name": "IpfsSyncConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/index.ts",
+   "line": 86,
+   "sig": "{ enabled, gateways, additionalGateways, bootstrapPeers, additionalBootstrapPeers, useDht }"
+  },
+  {
+   "name": "IWebSocket",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/websocket.ts",
+   "line": 13,
+   "sig": "{ readyState, send, close, onopen, onclose, onerror, onmessage }"
+  },
+  {
+   "name": "LocalStorageProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/browser/storage/LocalStorageProvider.ts",
+   "line": 34,
+   "sig": "implements StorageProvider { id, name, type, description, config, network, identity, status, constructor, connect, disconnect, isConnected, getStatus, setIdentity, get, set, remove, has, keys, clear, saveTrackedAddresses, loadTrackedAddresses, getJSON, setJSON, getFullKey, ensureConnected, getStorageSafe, log }"
+  },
+  {
+   "name": "LocalStorageProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/storage/LocalStorageProvider.ts",
+   "line": 16,
+   "sig": "{ prefix, storage, network, debug }"
+  },
+  {
+   "name": "MongoDbSyncConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/index.ts",
+   "line": 132,
+   "sig": "{ enabled, uri, database, collection, authEnabled, username, password }"
+  },
+  {
+   "name": "NostrTransportProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "transport/NostrTransportProvider.ts",
+   "line": 111,
+   "sig": "implements TransportProvider { id, name, type, description, config, storage, lastEventTs, lastDmEventTs, fallbackSince, fallbackDmSince, identity, keyManager, status, nostrClient, mainSubscriptionId, processedEventIds, messageHandlers, transferHandlers, paymentRequestHandlers, paymentRequestResponseHandlers, readReceiptHandlers, typingIndicatorHandlers, composingHandlers, pendingMessages, broadcastHandlers, eventCallbacks, constructor, getWebSocketFactory, getConfiguredRelays, getStorageAdapter, getNostrClient, suppressSubscriptions, _subscriptionsSuppressed, connect, disconnect, isConnected, …"
+  },
+  {
+   "name": "NostrTransportProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/NostrTransportProvider.ts",
+   "line": 80,
+   "sig": "{ relays, timeout, autoReconnect, reconnectDelay, maxReconnectAttempts, debug, createWebSocket, generateUUID, storage }"
+  },
+  {
+   "name": "OracleConfig",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "impl/browser/index.ts",
+   "line": 77,
+   "sig": "export type OracleConfig = BaseOracleConfig;"
+  },
+  {
+   "name": "readFileAsArrayBuffer",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/download.ts",
+   "line": 165,
+   "sig": "(file: File) => Promise<ArrayBuffer>"
+  },
+  {
+   "name": "readFileAsText",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/download.ts",
+   "line": 153,
+   "sig": "(file: File) => Promise<string>"
+  },
+  {
+   "name": "readFileAsUint8Array",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/download.ts",
+   "line": 177,
+   "sig": "(file: File) => Promise<Uint8Array>"
+  },
+  {
+   "name": "SphereBaseProviders",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 47,
+   "sig": "{ storage, transport, oracle, tokenStorage }"
+  },
+  {
+   "name": "SphereProviderPorts",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 55,
+   "sig": "{ storage, delivery, engine }"
+  },
+  {
+   "name": "TokenSyncConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/index.ts",
+   "line": 152,
+   "sig": "{ ipfs, file, cloud, mongodb }"
+  },
+  {
+   "name": "TransportConfig",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "impl/browser/index.ts",
+   "line": 71,
+   "sig": "export type TransportConfig = BaseTransportConfig & BrowserTransportExtensions;"
+  },
+  {
+   "name": "TrustBaseLoader",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "oracle/oracle-provider.ts",
+   "line": 89,
+   "sig": "{ load }"
+  },
+  {
+   "name": "UnicityAggregatorProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "oracle/UnicityAggregatorProvider.ts",
+   "line": 63,
+   "sig": "implements OracleProvider { id, name, type, description, config, status, eventCallbacks, trustBaseJson, spentCache, constructor, getTrustBaseJson, getAggregatorUrl, getApiKey, connect, disconnect, isConnected, getStatus, initialize, validateToken, onEvent, rpcCall, ensureConnected, emitEvent, log }"
+  },
+  {
+   "name": "UnicityAggregatorProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "oracle/UnicityAggregatorProvider.ts",
+   "line": 33,
+   "sig": "{ url, apiKey, timeout, skipVerification, debug, trustBaseLoader }"
+  },
+  {
+   "name": "UnicityOracleProvider",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "oracle/UnicityAggregatorProvider.ts",
+   "line": 279,
+   "sig": "typeof UnicityAggregatorProvider"
+  },
+  {
+   "name": "UnicityOracleProviderConfig",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "oracle/UnicityAggregatorProvider.ts",
+   "line": 281,
+   "sig": "export type UnicityOracleProviderConfig = UnicityAggregatorProviderConfig;"
+  },
+  {
+   "name": "UUIDGenerator",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "transport/websocket.ts",
+   "line": 54,
+   "sig": "export type UUIDGenerator = () => string;"
+  },
+  {
+   "name": "WalletApiCheckpointStore",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiCheckpointStore.ts",
+   "line": 25,
+   "sig": "implements SplitCheckpointStore { constructor, aad, put, get, open }"
+  },
+  {
+   "name": "WalletApiCompositionConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 84,
+   "sig": "{ baseUrl, network, deviceId, client, stateStore, fetchFn, webSocketFactory, verifyToken, retry }"
+  },
+  {
+   "name": "WalletApiMailboxProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiMailboxProvider.ts",
+   "line": 80,
+   "sig": "implements DeliveryProvider { custody, client, stateStore, deriveKeysFn, identity, constructor, walletApiClient, bindDeliveryKeys, deriveKeys, setIdentity, createForAddress, stateKey, readSeen, addSeen, readCursorState, persistCursorState, deliver, incoming, decryptDeliveryEnvelope, toIncomingDelivery, ack, ackBatch, onWake, catchUpAllStreams }"
+  },
+  {
+   "name": "WalletApiMailboxProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/WalletApiMailboxProvider.ts",
+   "line": 53,
+   "sig": "{ client, custody, stateStore, deliveryKeys }"
+  },
+  {
+   "name": "WalletApiProviderExtras",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 111,
+   "sig": "{ delivery, walletApi }"
+  },
+  {
+   "name": "WalletApiTokenStorageConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/WalletApiTokenStorageProvider.ts",
+   "line": 57,
+   "sig": "{ client, stateStore, verifyToken }"
+  },
+  {
+   "name": "WalletApiTokenStorageProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiTokenStorageProvider.ts",
+   "line": 97,
+   "sig": "implements TokenStorageProvider<TxfStorageDataBase> { id, name, type, requiresWalletApi, client, stateStore, verifyToken, status, identity, view, hadSuccessfulLoad, constructor, setIdentity, createForAddress, initialize, shutdown, connect, disconnect, isConnected, getStatus, stateKey, readCursor, readSyncEpoch, persistSyncState, readKnownSpends, addKnownSpends, applyItems, fullPull, deltaLoop, handleSyncEpochChange, syncInventory, listInventory, snapshotView, getToken, wrapWireBlob, applyDelta, recoverRemoved, fetchRemovedBlob, locallyValid, load, save, pushAdditions, pushRemovals, sync }"
+  },
+  {
+   "name": "WebSocketFactory",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "transport/websocket.ts",
+   "line": 43,
+   "sig": "export type WebSocketFactory = (url: string) => IWebSocket;"
+  },
+  {
+   "name": "WebSocketReadyState",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "transport/websocket.ts",
+   "line": 32,
+   "sig": "{ readonly CONNECTING: 0; readonly OPEN: 1; readonly CLOSING: 2; readonly CLOSED: 3; }"
+  }
+ ],
+ "impl/shared/wallet-api/index.ts": [
+  {
+   "name": "CheckpointProgressPort",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/WalletApiCheckpointStore.ts",
+   "line": 18,
+   "sig": "{ postIntentProgress, getIntentProgress }"
+  },
+  {
+   "name": "createOwnStorageWalletApiProviders",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 175,
+   "sig": "<B extends SphereBaseProviders>(base: B, config: WalletApiCompositionConfig) => B & WalletApiProviderExtras"
+  },
+  {
+   "name": "createSphereProviders",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 68,
+   "sig": "<B extends SphereBaseProviders>(base: B, ports?: SphereProviderPorts) => B & { delivery?: DeliveryProvider; }"
+  },
+  {
+   "name": "createWalletApiMailboxProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiMailboxProvider.ts",
+   "line": 489,
+   "sig": "(config: WalletApiMailboxProviderConfig) => WalletApiMailboxProvider"
+  },
+  {
+   "name": "createWalletApiProviders",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 150,
+   "sig": "<B extends SphereBaseProviders>(base: B, config: WalletApiCompositionConfig) => B & WalletApiProviderExtras"
+  },
+  {
+   "name": "createWalletApiTokenStorageProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiTokenStorageProvider.ts",
+   "line": 582,
+   "sig": "(config: WalletApiTokenStorageConfig) => WalletApiTokenStorageProvider"
+  },
+  {
+   "name": "SphereBaseProviders",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 47,
+   "sig": "{ storage, transport, oracle, tokenStorage }"
+  },
+  {
+   "name": "SphereProviderPorts",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 55,
+   "sig": "{ storage, delivery, engine }"
+  },
+  {
+   "name": "WalletApiCheckpointStore",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiCheckpointStore.ts",
+   "line": 25,
+   "sig": "implements SplitCheckpointStore { constructor, aad, put, get, open }"
+  },
+  {
+   "name": "WalletApiCompositionConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 84,
+   "sig": "{ baseUrl, network, deviceId, client, stateStore, fetchFn, webSocketFactory, verifyToken, retry }"
+  },
+  {
+   "name": "WalletApiMailboxProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiMailboxProvider.ts",
+   "line": 80,
+   "sig": "implements DeliveryProvider { custody, client, stateStore, deriveKeysFn, identity, constructor, walletApiClient, bindDeliveryKeys, deriveKeys, setIdentity, createForAddress, stateKey, readSeen, addSeen, readCursorState, persistCursorState, deliver, incoming, decryptDeliveryEnvelope, toIncomingDelivery, ack, ackBatch, onWake, catchUpAllStreams }"
+  },
+  {
+   "name": "WalletApiMailboxProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/WalletApiMailboxProvider.ts",
+   "line": 53,
+   "sig": "{ client, custody, stateStore, deliveryKeys }"
+  },
+  {
+   "name": "WalletApiProviderExtras",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 111,
+   "sig": "{ delivery, walletApi }"
+  },
+  {
+   "name": "WalletApiTokenStorageConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/WalletApiTokenStorageProvider.ts",
+   "line": 57,
+   "sig": "{ client, stateStore, verifyToken }"
+  },
+  {
+   "name": "WalletApiTokenStorageProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiTokenStorageProvider.ts",
+   "line": 97,
+   "sig": "implements TokenStorageProvider<TxfStorageDataBase> { id, name, type, requiresWalletApi, client, stateStore, verifyToken, status, identity, view, hadSuccessfulLoad, constructor, setIdentity, createForAddress, initialize, shutdown, connect, disconnect, isConnected, getStatus, stateKey, readCursor, readSyncEpoch, persistSyncState, readKnownSpends, addKnownSpends, applyItems, fullPull, deltaLoop, handleSyncEpochChange, syncInventory, listInventory, snapshotView, getToken, wrapWireBlob, applyDelta, recoverRemoved, fetchRemovedBlob, locallyValid, load, save, pushAdditions, pushRemovals, sync }"
+  }
+ ],
+ "impl/browser/ipfs.ts": [
+  {
+   "name": "BrowserIpfsStatePersistence",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/browser/ipfs/browser-ipfs-state-persistence.ts",
+   "line": 22,
+   "sig": "implements IpfsStatePersistence { load, save, clear }"
+  },
+  {
+   "name": "createBrowserIpfsStorageProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/ipfs/index.ts",
+   "line": 26,
+   "sig": "(config?: IpfsStorageConfig) => IpfsStorageProvider"
+  },
+  {
+   "name": "createIpfsStorageProvider",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "impl/browser/ipfs/index.ts",
+   "line": 34,
+   "sig": "(config?: IpfsStorageConfig) => IpfsStorageProvider"
+  },
+  {
+   "name": "IpfsStorageProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/shared/ipfs/ipfs-storage-provider.ts",
+   "line": 46,
+   "sig": "implements TokenStorageProvider<TData> { id, name, type, status, identity, ipnsKeyPair, ipnsName, ipnsSequenceNumber, lastCid, lastKnownRemoteSequence, dataVersion, remoteCid, cache, httpClient, statePersistence, eventCallbacks, debug, ipnsLifetimeMs, createWebSocket, wsUrl, fallbackPollIntervalMs, subscriptionClient, subscriptionUnsubscribe, flushQueue, pendingBuffer, flushTimer, flushDebounceMs, isShuttingDown, _config, _statePersistenceCtor, constructor, connect, disconnect, isConnected, getStatus, setIdentity, initialize, shutdown, save, _doSave, scheduleFlush, executeFlush, load, inventor…"
+  },
+  {
+   "name": "IpfsStorageProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/ipfs/ipfs-types.ts",
+   "line": 101,
+   "sig": "{ network, gateways, fetchTimeoutMs, resolveTimeoutMs, publishTimeoutMs, connectivityTimeoutMs, ipnsLifetimeMs, ipnsCacheTtlMs, circuitBreakerThreshold, circuitBreakerCooldownMs, knownFreshWindowMs, debug, createWebSocket, wsUrl, fallbackPollIntervalMs, syncDebounceMs, flushDebounceMs }"
+  }
+ ],
+ "impl/nodejs/index.ts": [
+  {
+   "name": "BaseOracleConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/config.ts",
+   "line": 50,
+   "sig": "{ url, apiKey, timeout, skipVerification, debug }"
+  },
+  {
+   "name": "BaseProviders",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/config.ts",
+   "line": 136,
+   "sig": "{ storage, tokenStorage, transport, oracle, price }"
+  },
+  {
+   "name": "BaseTransportConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/config.ts",
+   "line": 20,
+   "sig": "{ relays, additionalRelays, timeout, autoReconnect, debug }"
+  },
+  {
+   "name": "CheckpointProgressPort",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/WalletApiCheckpointStore.ts",
+   "line": 18,
+   "sig": "{ postIntentProgress, getIntentProgress }"
+  },
+  {
+   "name": "createFileStorageProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/nodejs/storage/FileStorageProvider.ts",
+   "line": 239,
+   "sig": "(config: FileStorageProviderConfig | string) => FileStorageProvider"
+  },
+  {
+   "name": "createFileTokenStorageProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/nodejs/storage/FileTokenStorageProvider.ts",
+   "line": 339,
+   "sig": "(config: FileTokenStorageConfig | string) => FileTokenStorageProvider"
+  },
+  {
+   "name": "createNodeProviders",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/nodejs/index.ts",
+   "line": 171,
+   "sig": "(config?: NodeProvidersConfig) => NodeProviders"
+  },
+  {
+   "name": "createNodeTrustBaseLoader",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/nodejs/oracle/index.ts",
+   "line": 77,
+   "sig": "(filePathOrNetwork?: string | NetworkType, fallbackNetwork?: NetworkType) => TrustBaseLoader"
+  },
+  {
+   "name": "createNodeWebSocketFactory",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/nodejs/transport/index.ts",
+   "line": 29,
+   "sig": "() => WebSocketFactory"
+  },
+  {
+   "name": "createNostrTransportProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/nodejs/transport/index.ts",
+   "line": 42,
+   "sig": "(config: Omit<NostrTransportProviderConfig, \"createWebSocket\">) => NostrTransportProvider"
+  },
+  {
+   "name": "createOwnStorageWalletApiProviders",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 175,
+   "sig": "<B extends SphereBaseProviders>(base: B, config: WalletApiCompositionConfig) => B & WalletApiProviderExtras"
+  },
+  {
+   "name": "createSphereProviders",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 68,
+   "sig": "<B extends SphereBaseProviders>(base: B, ports?: SphereProviderPorts) => B & { delivery?: DeliveryProvider; }"
+  },
+  {
+   "name": "createUnicityAggregatorProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/nodejs/oracle/index.ts",
+   "line": 91,
+   "sig": "(config: Omit<UnicityAggregatorProviderConfig, \"trustBaseLoader\"> & { trustBasePath?: string; network?: NetworkType; }) => UnicityAggregatorProvider"
+  },
+  {
+   "name": "createUnicityOracleProvider",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "impl/nodejs/oracle/index.ts",
+   "line": 113,
+   "sig": "(config: Omit<UnicityAggregatorProviderConfig, \"trustBaseLoader\"> & { trustBasePath?: string; network?: NetworkType; }) => UnicityAggregatorProvider"
+  },
+  {
+   "name": "createWalletApiMailboxProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiMailboxProvider.ts",
+   "line": 489,
+   "sig": "(config: WalletApiMailboxProviderConfig) => WalletApiMailboxProvider"
+  },
+  {
+   "name": "createWalletApiProviders",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 150,
+   "sig": "<B extends SphereBaseProviders>(base: B, config: WalletApiCompositionConfig) => B & WalletApiProviderExtras"
+  },
+  {
+   "name": "createWalletApiTokenStorageProvider",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiTokenStorageProvider.ts",
+   "line": 582,
+   "sig": "(config: WalletApiTokenStorageConfig) => WalletApiTokenStorageProvider"
+  },
+  {
+   "name": "FileStorageProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/nodejs/storage/FileStorageProvider.ts",
+   "line": 24,
+   "sig": "implements StorageProvider { id, name, type, dataDir, filePath, isTxtMode, network, data, status, _identity, constructor, setIdentity, getIdentity, connect, disconnect, isConnected, getStatus, get, set, remove, has, keys, clear, saveTrackedAddresses, loadTrackedAddresses, getFullKey, save }"
+  },
+  {
+   "name": "FileStorageProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/nodejs/storage/FileStorageProvider.ts",
+   "line": 12,
+   "sig": "{ dataDir, fileName, network }"
+  },
+  {
+   "name": "FileTokenStorageConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/nodejs/storage/FileTokenStorageProvider.ts",
+   "line": 18,
+   "sig": "{ tokensDir, network }"
+  },
+  {
+   "name": "FileTokenStorageProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/nodejs/storage/FileTokenStorageProvider.ts",
+   "line": 28,
+   "sig": "implements TokenStorageProvider<TxfStorageDataBase> { id, name, type, baseTokensDir, network, status, identity, inventoryAdapter, constructor, setIdentity, tokensDir, initialize, shutdown, connect, disconnect, isConnected, getStatus, load, save, sync, listInventory, getToken, applyDelta, clear, historyPath, readHistoryFile, writeHistoryFile, addHistoryEntry, getHistoryEntries, hasHistoryEntry, clearHistory, importHistoryEntries, createForAddress }"
+  },
+  {
+   "name": "IWebSocket",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/websocket.ts",
+   "line": 13,
+   "sig": "{ readyState, send, close, onopen, onclose, onerror, onmessage }"
+  },
+  {
+   "name": "NodeIpfsSyncConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/nodejs/index.ts",
+   "line": 81,
+   "sig": "{ enabled, config }"
+  },
+  {
+   "name": "NodeOracleConfig",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "impl/nodejs/index.ts",
+   "line": 74,
+   "sig": "export type NodeOracleConfig = BaseOracleConfig & NodeOracleExtensions;"
+  },
+  {
+   "name": "NodeProviders",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/nodejs/index.ts",
+   "line": 119,
+   "sig": "{ storage, tokenStorage, transport, oracle, price, ipfsTokenStorage, groupChat, market }"
+  },
+  {
+   "name": "NodeProvidersConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/nodejs/index.ts",
+   "line": 94,
+   "sig": "{ network, debug, dataDir, walletFileName, tokensDir, transport, oracle, price, tokenSync, groupChat, market }"
+  },
+  {
+   "name": "NodeTokenSyncConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/nodejs/index.ts",
+   "line": 89,
+   "sig": "{ ipfs }"
+  },
+  {
+   "name": "NodeTransportConfig",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "impl/nodejs/index.ts",
+   "line": 68,
+   "sig": "export type NodeTransportConfig = BaseTransportConfig;"
+  },
+  {
+   "name": "NodeTrustBaseLoader",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/nodejs/oracle/index.ts",
+   "line": 33,
+   "sig": "extends BaseTrustBaseLoader { filePath, constructor, loadFromExternal }"
+  },
+  {
+   "name": "NostrTransportProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "transport/NostrTransportProvider.ts",
+   "line": 111,
+   "sig": "implements TransportProvider { id, name, type, description, config, storage, lastEventTs, lastDmEventTs, fallbackSince, fallbackDmSince, identity, keyManager, status, nostrClient, mainSubscriptionId, processedEventIds, messageHandlers, transferHandlers, paymentRequestHandlers, paymentRequestResponseHandlers, readReceiptHandlers, typingIndicatorHandlers, composingHandlers, pendingMessages, broadcastHandlers, eventCallbacks, constructor, getWebSocketFactory, getConfiguredRelays, getStorageAdapter, getNostrClient, suppressSubscriptions, _subscriptionsSuppressed, connect, disconnect, isConnected, …"
+  },
+  {
+   "name": "NostrTransportProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "transport/NostrTransportProvider.ts",
+   "line": 80,
+   "sig": "{ relays, timeout, autoReconnect, reconnectDelay, maxReconnectAttempts, debug, createWebSocket, generateUUID, storage }"
+  },
+  {
+   "name": "SphereBaseProviders",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 47,
+   "sig": "{ storage, transport, oracle, tokenStorage }"
+  },
+  {
+   "name": "SphereProviderPorts",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 55,
+   "sig": "{ storage, delivery, engine }"
+  },
+  {
+   "name": "TrustBaseLoader",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "oracle/oracle-provider.ts",
+   "line": 89,
+   "sig": "{ load }"
+  },
+  {
+   "name": "UnicityAggregatorProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "oracle/UnicityAggregatorProvider.ts",
+   "line": 63,
+   "sig": "implements OracleProvider { id, name, type, description, config, status, eventCallbacks, trustBaseJson, spentCache, constructor, getTrustBaseJson, getAggregatorUrl, getApiKey, connect, disconnect, isConnected, getStatus, initialize, validateToken, onEvent, rpcCall, ensureConnected, emitEvent, log }"
+  },
+  {
+   "name": "UnicityAggregatorProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "oracle/UnicityAggregatorProvider.ts",
+   "line": 33,
+   "sig": "{ url, apiKey, timeout, skipVerification, debug, trustBaseLoader }"
+  },
+  {
+   "name": "UnicityOracleProvider",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "oracle/UnicityAggregatorProvider.ts",
+   "line": 279,
+   "sig": "typeof UnicityAggregatorProvider"
+  },
+  {
+   "name": "UnicityOracleProviderConfig",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "oracle/UnicityAggregatorProvider.ts",
+   "line": 281,
+   "sig": "export type UnicityOracleProviderConfig = UnicityAggregatorProviderConfig;"
+  },
+  {
+   "name": "WalletApiCheckpointStore",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiCheckpointStore.ts",
+   "line": 25,
+   "sig": "implements SplitCheckpointStore { constructor, aad, put, get, open }"
+  },
+  {
+   "name": "WalletApiCompositionConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 84,
+   "sig": "{ baseUrl, network, deviceId, client, stateStore, fetchFn, webSocketFactory, verifyToken, retry }"
+  },
+  {
+   "name": "WalletApiMailboxProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiMailboxProvider.ts",
+   "line": 80,
+   "sig": "implements DeliveryProvider { custody, client, stateStore, deriveKeysFn, identity, constructor, walletApiClient, bindDeliveryKeys, deriveKeys, setIdentity, createForAddress, stateKey, readSeen, addSeen, readCursorState, persistCursorState, deliver, incoming, decryptDeliveryEnvelope, toIncomingDelivery, ack, ackBatch, onWake, catchUpAllStreams }"
+  },
+  {
+   "name": "WalletApiMailboxProviderConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/WalletApiMailboxProvider.ts",
+   "line": 53,
+   "sig": "{ client, custody, stateStore, deliveryKeys }"
+  },
+  {
+   "name": "WalletApiProviderExtras",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/composition.ts",
+   "line": 111,
+   "sig": "{ delivery, walletApi }"
+  },
+  {
+   "name": "WalletApiTokenStorageConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/shared/wallet-api/WalletApiTokenStorageProvider.ts",
+   "line": 57,
+   "sig": "{ client, stateStore, verifyToken }"
+  },
+  {
+   "name": "WalletApiTokenStorageProvider",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/shared/wallet-api/WalletApiTokenStorageProvider.ts",
+   "line": 97,
+   "sig": "implements TokenStorageProvider<TxfStorageDataBase> { id, name, type, requiresWalletApi, client, stateStore, verifyToken, status, identity, view, hadSuccessfulLoad, constructor, setIdentity, createForAddress, initialize, shutdown, connect, disconnect, isConnected, getStatus, stateKey, readCursor, readSyncEpoch, persistSyncState, readKnownSpends, addKnownSpends, applyItems, fullPull, deltaLoop, handleSyncEpochChange, syncInventory, listInventory, snapshotView, getToken, wrapWireBlob, applyDelta, recoverRemoved, fetchRemovedBlob, locallyValid, load, save, pushAdditions, pushRemovals, sync }"
+  },
+  {
+   "name": "WebSocketFactory",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "transport/websocket.ts",
+   "line": 43,
+   "sig": "export type WebSocketFactory = (url: string) => IWebSocket;"
+  }
+ ],
+ "connect/index.ts": [
+  {
+   "name": "ALL_PERMISSIONS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "connect/permissions.ts",
+   "line": 33,
+   "sig": "readonly PermissionScope[]"
+  },
+  {
+   "name": "ConnectClient",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "connect/client/ConnectClient.ts",
+   "line": 49,
+   "sig": "{ transport, dapp, requestedPermissions, timeout, intentTimeout, resumeSessionId, silent, network, sessionId, grantedPermissions, identity, walletNet, connected, pendingRequests, eventHandlers, unsubscribeTransport, handshakeResolver, constructor, connect, disconnect, isConnected, permissions, session, walletIdentity, walletNetwork, query, intent, on, handleMessage, handleHandshakeResponse, handlePendingResponse, cleanup }"
+  },
+  {
+   "name": "ConnectClientConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/types.ts",
+   "line": 88,
+   "sig": "{ transport, dapp, permissions, timeout, intentTimeout, resumeSessionId, silent, network }"
+  },
+  {
+   "name": "ConnectError",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "connect/client/ConnectClient.ts",
+   "line": 33,
+   "sig": "extends Error { constructor }"
+  },
+  {
+   "name": "ConnectEventHandler",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "connect/types.ts",
+   "line": 131,
+   "sig": "export type ConnectEventHandler = (data: unknown) => void;"
+  },
+  {
+   "name": "ConnectHost",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "connect/host/ConnectHost.ts",
+   "line": 86,
+   "sig": "{ sphere, transport, config, session, grantedPermissions, eventSubscriptions, autoApprovedIntents, rateLimitCounter, rateLimitResetAt, unsubscribeTransport, constructor, getSession, setIntentAutoApprove, clearIntentAutoApprove, updateSphere, revokeSession, notifyWalletLocked, destroy, handleMessage, handleHandshake, sendHandshakeResponse, handleRpcRequest, handleIntentRequest, executeMethod, autoSubscribeIdentityChanged, handleSubscribe, handleUnsubscribe, cleanupEventSubscriptions, pushClientEvent, getPublicIdentity, stripTokenSdkData, sendResult, sendError, sendIntentResult, sendIntentError,…"
+  },
+  {
+   "name": "ConnectHostConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/types.ts",
+   "line": 41,
+   "sig": "{ sphere, transport, onConnectionRequest, onIntent, onDisconnect, onConnectionRejected, sessionTtlMs, minSdkVersion, minMinorVersion, maxRequestsPerSecond }"
+  },
+  {
+   "name": "ConnectResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/types.ts",
+   "line": 121,
+   "sig": "{ sessionId, permissions, identity }"
+  },
+  {
+   "name": "ConnectSession",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/types.ts",
+   "line": 28,
+   "sig": "{ id, dapp, permissions, createdAt, expiresAt, active }"
+  },
+  {
+   "name": "ConnectTransport",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/types.ts",
+   "line": 13,
+   "sig": "{ send, onMessage, destroy }"
+  },
+  {
+   "name": "createRequestId",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "connect/protocol.ts",
+   "line": 238,
+   "sig": "() => string"
+  },
+  {
+   "name": "DAppMetadata",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 186,
+   "sig": "{ name, description, icon, url }"
+  },
+  {
+   "name": "DEFAULT_PERMISSIONS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "connect/permissions.ts",
+   "line": 36,
+   "sig": "readonly PermissionScope[]"
+  },
+  {
+   "name": "ERROR_CODES",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "connect/protocol.ts",
+   "line": 75,
+   "sig": "{ readonly PARSE_ERROR: -32700; readonly INVALID_REQUEST: -32600; readonly METHOD_NOT_FOUND: -32601; readonly INVALID_PARAMS: -32602; readonly INTERNAL_ERROR: -32603; readonly NOT_CONNECTED: 4001; readonly PERMISSION_DENIED: 4002; readonly USER_REJECTED: 4003; readonly SESSION_EXPIRED: 4004; readonly ORIGIN_BLOCKED: 4005; readonly RATE_LIMITED: 4006; readonly UNSUPPORTED_PROTOCOL_VERSION: 4007; re…"
+  },
+  {
+   "name": "ErrorCode",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 98,
+   "sig": "export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];"
+  },
+  {
+   "name": "hasIntentPermission",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "connect/permissions.ts",
+   "line": 96,
+   "sig": "(granted: ReadonlySet<string>, action: string) => boolean"
+  },
+  {
+   "name": "hasMethodPermission",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "connect/permissions.ts",
+   "line": 89,
+   "sig": "(granted: ReadonlySet<string>, method: string) => boolean"
+  },
+  {
+   "name": "HOST_READY_TIMEOUT",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 490,
+   "sig": "30000"
+  },
+  {
+   "name": "HOST_READY_TYPE",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 487,
+   "sig": "\"sphere-connect:host-ready\""
+  },
+  {
+   "name": "INTENT_ACTIONS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "connect/protocol.ts",
+   "line": 51,
+   "sig": "{ readonly SEND: \"send\"; readonly DM: \"dm\"; readonly PAYMENT_REQUEST: \"payment_request\"; readonly RECEIVE: \"receive\"; readonly SIGN_MESSAGE: \"sign_message\"; readonly CREATE_INVOICE: \"create_invoice\"; readonly CLOSE_INVOICE: \"close_invoice\"; readonly CANCEL_INVOICE: \"cancel_invoice\"; readonly PAY_INVOICE: \"pay_invoice\"; readonly RETURN_INVOICE_PAYMENT: \"return_invoice_payment\"; readonly IMPORT_INVO…"
+  },
+  {
+   "name": "INTENT_PERMISSIONS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "connect/permissions.ts",
+   "line": 66,
+   "sig": "Record<string, PermissionScope>"
+  },
+  {
+   "name": "IntentAction",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 69,
+   "sig": "export type IntentAction = (typeof INTENT_ACTIONS)[keyof typeof INTENT_ACTIONS];"
+  },
+  {
+   "name": "isSphereConnectMessage",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "connect/protocol.ts",
+   "line": 228,
+   "sig": "(msg: unknown) => msg is SphereConnectMessage"
+  },
+  {
+   "name": "METHOD_PERMISSIONS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "connect/permissions.ts",
+   "line": 44,
+   "sig": "Record<string, PermissionScope>"
+  },
+  {
+   "name": "NetworkInfo",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "constants.ts",
+   "line": 449,
+   "sig": "{ id, name }"
+  },
+  {
+   "name": "PERMISSION_SCOPES",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "connect/permissions.ts",
+   "line": 12,
+   "sig": "{ readonly IDENTITY_READ: \"identity:read\"; readonly BALANCE_READ: \"balance:read\"; readonly TOKENS_READ: \"tokens:read\"; readonly HISTORY_READ: \"history:read\"; readonly EVENTS_SUBSCRIBE: \"events:subscribe\"; readonly RESOLVE_PEER: \"resolve:peer\"; readonly TRANSFER_REQUEST: \"transfer:request\"; readonly DM_REQUEST: \"dm:request\"; readonly DM_READ: \"dm:read\"; readonly DM_MANAGE: \"dm:manage\"; readonly PAY…"
+  },
+  {
+   "name": "PermissionScope",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "connect/permissions.ts",
+   "line": 30,
+   "sig": "export type PermissionScope = (typeof PERMISSION_SCOPES)[keyof typeof PERMISSION_SCOPES];"
+  },
+  {
+   "name": "PublicIdentity",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 193,
+   "sig": "{ chainPubkey, directAddress, nametag }"
+  },
+  {
+   "name": "RPC_METHODS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "connect/protocol.ts",
+   "line": 26,
+   "sig": "{ readonly GET_IDENTITY: \"sphere_getIdentity\"; readonly GET_BALANCE: \"sphere_getBalance\"; readonly GET_ASSETS: \"sphere_getAssets\"; readonly GET_FIAT_BALANCE: \"sphere_getFiatBalance\"; readonly GET_TOKENS: \"sphere_getTokens\"; readonly GET_HISTORY: \"sphere_getHistory\"; readonly RESOLVE: \"sphere_resolve\"; readonly SUBSCRIBE: \"sphere_subscribe\"; readonly UNSUBSCRIBE: \"sphere_unsubscribe\"; readonly DISC…"
+  },
+  {
+   "name": "RpcMethod",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 45,
+   "sig": "export type RpcMethod = (typeof RPC_METHODS)[keyof typeof RPC_METHODS];"
+  },
+  {
+   "name": "SPHERE_CONNECT_NAMESPACE",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "connect/protocol.ts",
+   "line": 12,
+   "sig": "\"sphere-connect\""
+  },
+  {
+   "name": "SPHERE_CONNECT_VERSION",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "connect/protocol.ts",
+   "line": 13,
+   "sig": "\"2.0\""
+  },
+  {
+   "name": "SPHERE_NETWORKS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "constants.ts",
+   "line": 460,
+   "sig": "{ readonly testnet2: { readonly id: number; readonly name: \"testnet2\"; }; }"
+  },
+  {
+   "name": "SphereConnectMessage",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 174,
+   "sig": "export type SphereConnectMessage = | SphereRpcRequest | SphereRpcResponse | SphereIntentRequest | SphereIntentResult | SphereEventMessage | SphereHandshake;"
+  },
+  {
+   "name": "SphereEventMessage",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 142,
+   "sig": "extends SphereMessageBase { type, event, data }"
+  },
+  {
+   "name": "SphereHandshake",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 149,
+   "sig": "extends SphereMessageBase { type, direction, permissions, dapp, sessionId, identity, silent, network, sdkVersion, error, warning }"
+  },
+  {
+   "name": "SphereIntentRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 126,
+   "sig": "extends SphereMessageBase { type, id, action, params }"
+  },
+  {
+   "name": "SphereIntentResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 134,
+   "sig": "extends SphereMessageBase { type, id, result, error }"
+  },
+  {
+   "name": "SphereRpcError",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 168,
+   "sig": "{ code, message, data }"
+  },
+  {
+   "name": "SphereRpcRequest",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 110,
+   "sig": "extends SphereMessageBase { type, id, method, params }"
+  },
+  {
+   "name": "SphereRpcResponse",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 118,
+   "sig": "extends SphereMessageBase { type, id, result, error }"
+  },
+  {
+   "name": "validatePermissions",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "connect/permissions.ts",
+   "line": 103,
+   "sig": "(permissions: string[]) => permissions is PermissionScope[]"
+  },
+  {
+   "name": "WALLET_EVENTS",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "connect/protocol.ts",
+   "line": 208,
+   "sig": "{ readonly LOCKED: \"wallet:locked\"; readonly IDENTITY_CHANGED: \"identity:changed\"; }"
+  },
+  {
+   "name": "WalletEvent",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "connect/protocol.ts",
+   "line": 217,
+   "sig": "export type WalletEvent = (typeof WALLET_EVENTS)[keyof typeof WALLET_EVENTS];"
+  }
+ ],
+ "impl/browser/connect/index.ts": [
+  {
+   "name": "autoConnect",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/connect/autoConnect.ts",
+   "line": 147,
+   "sig": "(config: AutoConnectConfig) => Promise<AutoConnectResult>"
+  },
+  {
+   "name": "AutoConnectConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/connect/autoConnect.ts",
+   "line": 72,
+   "sig": "{ dapp, walletUrl, permissions, silent, network, resumeSessionId, timeout, intentTimeout, popupFeatures, forceTransport }"
+  },
+  {
+   "name": "AutoConnectResult",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/connect/autoConnect.ts",
+   "line": 122,
+   "sig": "{ client, connection, transport, disconnect }"
+  },
+  {
+   "name": "ChromeMessagingApi",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/connect/ExtensionTransport.ts",
+   "line": 101,
+   "sig": "{ onMessage, tabs }"
+  },
+  {
+   "name": "DetectedTransport",
+   "kind": "type",
+   "typeOnly": true,
+   "file": "impl/browser/connect/autoConnect.ts",
+   "line": 59,
+   "sig": "export type DetectedTransport = 'iframe' | 'extension' | 'popup';"
+  },
+  {
+   "name": "detectTransport",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/connect/autoConnect.ts",
+   "line": 62,
+   "sig": "() => DetectedTransport"
+  },
+  {
+   "name": "EXT_MSG_TO_CLIENT",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "impl/browser/connect/ExtensionTransport.ts",
+   "line": 22,
+   "sig": "\"sphere-connect-ext:toclient\""
+  },
+  {
+   "name": "EXT_MSG_TO_HOST",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "impl/browser/connect/ExtensionTransport.ts",
+   "line": 21,
+   "sig": "\"sphere-connect-ext:tohost\""
+  },
+  {
+   "name": "ExtensionConnectEnvelope",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/connect/ExtensionTransport.ts",
+   "line": 25,
+   "sig": "{ type, payload }"
+  },
+  {
+   "name": "ExtensionTransport",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "impl/browser/connect/ExtensionTransport.ts",
+   "line": 182,
+   "sig": "{ forClient(): ConnectTransport; forHost(chromeApi: ChromeMessagingApi): ConnectTransport; }"
+  },
+  {
+   "name": "hasExtension",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/connect/autoConnect.ts",
+   "line": 46,
+   "sig": "() => boolean"
+  },
+  {
+   "name": "isExtensionConnectEnvelope",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/connect/ExtensionTransport.ts",
+   "line": 30,
+   "sig": "(data: unknown) => data is ExtensionConnectEnvelope"
+  },
+  {
+   "name": "isInIframe",
+   "kind": "function",
+   "typeOnly": false,
+   "file": "impl/browser/connect/autoConnect.ts",
+   "line": 36,
+   "sig": "() => boolean"
+  },
+  {
+   "name": "PostMessageClientOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/connect/PostMessageTransport.ts",
+   "line": 21,
+   "sig": "{ target, targetOrigin }"
+  },
+  {
+   "name": "PostMessageHostOptions",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/browser/connect/PostMessageTransport.ts",
+   "line": 16,
+   "sig": "{ allowedOrigins }"
+  },
+  {
+   "name": "PostMessageTransport",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/browser/connect/PostMessageTransport.ts",
+   "line": 34,
+   "sig": "implements ConnectTransport { targetWindow, targetOrigin, allowedOrigins, handlers, listener, popupCheckInterval, onPopupClosed, constructor, forHost, forClient, send, onMessage, destroy, onClose, startPopupCloseDetection }"
+  }
+ ],
+ "impl/nodejs/connect/index.ts": [
+  {
+   "name": "WebSocketClientConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/nodejs/connect/WebSocketTransport.ts",
+   "line": 28,
+   "sig": "{ url, createWebSocket, autoReconnect, reconnectDelayMs, maxReconnectDelayMs, maxReconnectAttempts }"
+  },
+  {
+   "name": "WebSocketClientTransport",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/nodejs/connect/WebSocketTransport.ts",
+   "line": 138,
+   "sig": "implements ConnectTransport { ws, handlers, config, reconnectAttempts, reconnectTimer, destroyed, constructor, connect, send, onMessage, destroy, doConnect, scheduleReconnect }"
+  },
+  {
+   "name": "WebSocketServerConfig",
+   "kind": "interface",
+   "typeOnly": true,
+   "file": "impl/nodejs/connect/WebSocketTransport.ts",
+   "line": 21,
+   "sig": "{ port, host }"
+  },
+  {
+   "name": "WebSocketServerTransport",
+   "kind": "class",
+   "typeOnly": false,
+   "file": "impl/nodejs/connect/WebSocketTransport.ts",
+   "line": 47,
+   "sig": "implements ConnectTransport { server, clientSocket, handlers, config, constructor, start, send, onMessage, destroy }"
+  },
+  {
+   "name": "WebSocketTransport",
+   "kind": "const",
+   "typeOnly": false,
+   "file": "impl/nodejs/connect/WebSocketTransport.ts",
+   "line": 257,
+   "sig": "{ createServer(config: WebSocketServerConfig): WebSocketServerTransport; createClient(config: WebSocketClientConfig): WebSocketClientTransport; }"
+  }
+ ]
+}

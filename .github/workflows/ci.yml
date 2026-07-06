@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, '@vrogojin/uxf-v2']
   pull_request:
-    branches: [main]
+    branches: [main, '@vrogojin/uxf-v2']
 
 jobs:
   build:
@@ -33,3 +33,27 @@ jobs:
 
       - name: Test
         run: npm run test:run
+
+  conformance-report:
+    runs-on: ubuntu-latest
+    # Report-only: never blocks the build. Diffs the exported API surface against a
+    # frozen upstream main v0.11.4 snapshot as a burn-down metric for the uxf-v2 refactor.
+    # See docs/uxf/uxfv2-phase-1-report.md.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          npm install --include=optional --ignore-scripts
+          npm rebuild
+
+      - name: API-conformance drift report
+        run: bash tests/harness/run-conformance.sh
