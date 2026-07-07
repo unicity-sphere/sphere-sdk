@@ -246,6 +246,11 @@ import {
   type CapabilityWarningHost,
 } from '../../extensions/uxf/pipeline/module-glue/capability-warning';
 import {
+  recordUxfBundleSentHistory as recordUxfBundleSentHistoryImpl,
+  type SentHistoryRecorderHost,
+  type RecordUxfBundleSentHistoryArgs,
+} from '../../extensions/uxf/pipeline/module-glue/sent-history-recorder';
+import {
   sweepOrphanSpendingTokens,
   type OrphanSweepResult,
   type OrphanSpendingFinding,
@@ -8870,96 +8875,18 @@ export class PaymentsModule {
    * into a thrown error. Each entry is wrapped in its own try/catch so
    * one bad write can't drop the rest.
    */
-  private async recordUxfBundleSentHistory(args: {
-    originalRequest: TransferRequest;
-    request: LegacyCoinTransferRequest;
-    result: TransferResult;
-    peerInfo: PeerInfo | null;
-    recipientPubkey: string;
-    recipientAddress: { toString(): string };
-    diagLabel: string;
-  }): Promise<void> {
-    const {
-      originalRequest,
-      request,
-      result,
-      peerInfo,
-      recipientPubkey,
-      recipientAddress,
-      diagLabel,
-    } = args;
+  private async recordUxfBundleSentHistory(
+    args: RecordUxfBundleSentHistoryArgs,
+  ): Promise<void> {
+    return recordUxfBundleSentHistoryImpl(this.sentHistoryRecorderHost(), args);
+  }
 
-    const recipientNametag =
-      peerInfo?.nametag ??
-      (originalRequest.recipient.startsWith('@')
-        ? originalRequest.recipient.slice(1)
-        : undefined);
-
-    // Pivot tokenTransfers by source coinId. result.tokens carries the
-    // consumed source tokens (post-removal from in-memory map, but still
-    // present on the result). For each source, look up its pre-burn
-    // coinId and amount.
-    const tokenMap = new Map(result.tokens.map((t) => [t.id, t]));
-    const perCoinTokenIds = new Map<
-      string,
-      Array<{ id: string; amount: string; source: 'split' | 'direct' }>
-    >();
-    for (const tt of result.tokenTransfers) {
-      const tok = tokenMap.get(tt.sourceTokenId);
-      if (!tok) continue;
-      const list = perCoinTokenIds.get(tok.coinId) ?? [];
-      list.push({
-        id: tt.sourceTokenId,
-        amount: tok.amount,
-        source: tt.method === 'split' ? 'split' : 'direct',
-      });
-      perCoinTokenIds.set(tok.coinId, list);
-    }
-
-    // Build the per-coin summary list. Primary slot first; then each
-    // additionalAssets coin entry preserving caller order. NFT
-    // additionals are excluded (whole-token, no amount slot).
-    type CoinSummary = { coinId: string; amount: string };
-    const summaries: CoinSummary[] = [
-      { coinId: request.coinId, amount: request.amount },
-    ];
-    for (const asset of originalRequest.additionalAssets ?? []) {
-      if (asset.kind !== 'coin') continue;
-      summaries.push({ coinId: asset.coinId, amount: asset.amount });
-    }
-
-    const recipientAddressStr =
-      peerInfo?.directAddress ?? recipientAddress.toString() ?? recipientPubkey;
-
-    const baseTimestamp = Date.now();
-    for (const summary of summaries) {
-      const tokenIds = perCoinTokenIds.get(summary.coinId) ?? [];
-      const firstTokenId = tokenIds[0]?.id;
-      try {
-        await this.addToHistory({
-          type: 'SENT',
-          amount: summary.amount,
-          coinId: summary.coinId,
-          symbol: this.getCoinSymbol(summary.coinId),
-          timestamp: baseTimestamp,
-          recipientPubkey,
-          ...(recipientNametag !== undefined ? { recipientNametag } : {}),
-          recipientAddress: recipientAddressStr,
-          ...(request.memo !== undefined ? { memo: request.memo } : {}),
-          transferId: result.id,
-          ...(firstTokenId !== undefined ? { tokenId: firstTokenId } : {}),
-          ...(tokenIds.length > 0 ? { tokenIds } : {}),
-        });
-      } catch (err) {
-        logger.warn(
-          'Payments',
-          `${diagLabel}: failed to record SENT history for coin=${summary.coinId.slice(
-            0,
-            16,
-          )} (send already succeeded): ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }
+  /** Host-shim builder for {@link recordUxfBundleSentHistoryImpl}. */
+  private sentHistoryRecorderHost(): SentHistoryRecorderHost {
+    return {
+      addToHistory: (entry) => this.addToHistory(entry),
+      getCoinSymbol: (coinId) => this.getCoinSymbol(coinId),
+    };
   }
 
   // ===========================================================================
