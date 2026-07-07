@@ -46,6 +46,7 @@
     "**/*.test.ts",
     "token-engine/**/*.ts",
     "modules/payments/legacy-v1/**/*.ts",
+    "modules/accounting/legacy-v1/**/*.ts",
     "validation/legacy-v1/**/*.ts"
   ]
 }

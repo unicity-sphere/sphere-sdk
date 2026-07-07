@@ -696,6 +696,15 @@ export interface AccountingModuleDependencies {
    * sends no hint; the receiver's own gateway list is authoritative.
    */
   cidFetchGateways?: ReadonlyArray<string>;
+  /**
+   * Wave 6-P2-4c: the anti-corruption `ITokenEngine` port used by the
+   * slim v2 `createInvoice()` for atomic invoice-token minting. Optional
+   * for consumer compat during the migration window — a call to
+   * `createInvoice()` without an engine wired returns an error result.
+   * Typed `unknown` to keep SDK types off the public surface (types.ts
+   * cannot import from `../../token-engine/`).
+   */
+  tokenEngine?: unknown;
 }
 
 // =============================================================================

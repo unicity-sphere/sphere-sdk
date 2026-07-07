@@ -72,7 +72,6 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
   // (or route through a `transport.resolveIncomingSenderInfo` port on
   // ExtensionHost), at which point this entry burns down.
   'modules/payments/read-model/history.ts',
-  'modules/accounting/AccountingModule.ts',
   'modules/accounting/types.ts',
   'modules/communications/CommunicationsModule.ts',
   'modules/groupchat/GroupChatModule.ts',
@@ -97,6 +96,11 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
   // Phase 6.C runs `git rm -r modules/payments/legacy-v1/` in a single
   // diff, at which point this entry retires.
   'modules/payments/legacy-v1/**/*.ts',
+  // Phase 6 wave-P2-4c quarantine — AccountingModule.ts was slim-rebuilt
+  // on ITokenEngine; the 7,747-LoC v1 impl was carved into legacy-v1/.
+  // Phase 7 runs `git rm -r modules/accounting/legacy-v1/` in a single
+  // diff, at which point this entry retires.
+  'modules/accounting/legacy-v1/**/*.ts',
 ];
 
 // Phase 6.C burn-down: core files that still import v1 STSDK directly.
@@ -105,11 +109,14 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
 // stops importing `@unicitylabs/state-transition-sdk`.
 const STSDK_CORE_BURNDOWN = [
   'core/Sphere.ts',
-  'modules/accounting/AccountingModule.ts',
   // Removed in wave 6-P2-4b: modules/payments/PaymentsModule.ts now routes
   // ALL v2 SDK access through `ITokenEngine` — no direct
   // `@unicitylabs/state-transition-sdk` imports remain (v1 impl quarantined
   // to legacy-v1/ where the STSDK ban is relaxed).
+  // Removed in wave 6-P2-4c: modules/accounting/AccountingModule.ts now
+  // routes ALL v2 SDK access through `ITokenEngine.mintDataToken` — no
+  // direct `@unicitylabs/state-transition-sdk` imports remain (v1 impl
+  // quarantined to legacy-v1/).
   // Removed in wave 6-P2-4a: oracle/UnicityAggregatorProvider.ts now routes
   // ALL v2 SDK access through `token-engine/sdk` (the anti-corruption layer)
   // — no direct `@unicitylabs/state-transition-sdk` imports remain.
@@ -124,6 +131,10 @@ const STSDK_CORE_BURNDOWN = [
   // files still do, so the glob stays until Phase 6.C runs
   // `git rm -r modules/payments/legacy-v1/` in a single diff.
   'modules/payments/legacy-v1/**/*.ts',
+  // Phase 6 wave-P2-4c quarantine — legacy AccountingModule kept its v1
+  // STSDK direct imports; the slim v2 rebuild replaces them with
+  // ITokenEngine calls in the new AccountingModule.ts.
+  'modules/accounting/legacy-v1/**/*.ts',
 ];
 
 // Pattern definitions kept as named constants so the overrides below can
