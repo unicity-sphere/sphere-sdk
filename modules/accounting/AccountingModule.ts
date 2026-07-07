@@ -1413,6 +1413,11 @@ export class AccountingModule {
 
     // Synthesize a lightweight InvoiceTransferRef for the event.
     const first = transfer.tokens?.[0];
+    // v2-6d: propagate `transfer.senderAddress` when the receive path
+    // could resolve the sender's DIRECT:// via transport binding lookup.
+    // Absent → null (per InvoiceTransferRef contract); the auto-return
+    // path then can't refund to sender, but coverage still counts (see
+    // _computeLatestSenderMap + IncomingTransfer.senderAddress docs).
     const syntheticRef: InvoiceTransferRef = {
       transferId: transfer.id,
       direction: 'inbound',
@@ -1422,7 +1427,7 @@ export class AccountingModule {
       destinationAddress: this.deps!.identity.directAddress ?? '',
       timestamp: transfer.receivedAt,
       confirmed: false,
-      senderAddress: null,
+      senderAddress: transfer.senderAddress ?? null,
       ...(transfer.senderNametag !== undefined
         ? { senderNametag: transfer.senderNametag }
         : {}),

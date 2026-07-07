@@ -347,6 +347,21 @@ export interface IncomingTransfer {
   readonly id: string;
   readonly senderPubkey: string;
   readonly senderNametag?: string;
+  /**
+   * Sender's L3 `DIRECT://` address, resolved from `senderPubkey` (the sender's
+   * transport/Nostr pubkey) via the transport binding lookup at receive time.
+   * Present when the sender's identity binding is discoverable on the relay;
+   * absent for peers that haven't published a binding yet.
+   *
+   * Consumed by `AccountingModule` for auto-return / refund routing:
+   * `returnAllInvoicePayments` refunds each covered payment to its original
+   * sender, and needs the DIRECT:// address to construct the refund send.
+   * A missing `senderAddress` degrades to "coverage counted but sender cannot
+   * be refunded" — the invoice still transitions COVERED/CLOSED, just the
+   * refund-to-sender path silently no-ops (documented in
+   * `_computeLatestSenderMap`).
+   */
+  readonly senderAddress?: string;
   readonly tokens: Token[];
   readonly memo?: string;
   readonly receivedAt: number;

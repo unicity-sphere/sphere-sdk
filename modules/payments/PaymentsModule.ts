@@ -1125,11 +1125,35 @@ export class PaymentsModule {
             ? payload.memo
             : undefined;
         const recipientDirectAddress = this.deps!.identity.directAddress;
+        // v2-6d: resolve sender's DIRECT:// address via transport binding
+        // so AccountingModule's auto-return / refund path can route back
+        // to the payer. Best-effort — a missing binding degrades to
+        // "coverage counted but sender cannot be refunded" (documented on
+        // `IncomingTransfer.senderAddress`).
+        let senderDirectAddress: string | undefined;
+        try {
+          const resolveInfo = this.deps!.transport.resolveTransportPubkeyInfo;
+          if (resolveInfo) {
+            const info = await resolveInfo(transfer.senderTransportPubkey);
+            if (info?.directAddress) {
+              senderDirectAddress = info.directAddress;
+            }
+          }
+        } catch (err) {
+          logger.debug(
+            'Payments',
+            'sender directAddress resolve failed (best-effort):',
+            err,
+          );
+        }
         const incomingTransfer: IncomingTransfer = {
           id: transfer.id,
           senderPubkey: transfer.senderTransportPubkey,
           ...(isUxfTransferPayloadCar(payload) || isUxfTransferPayloadCid(payload)
             ? { senderNametag: payload.sender?.nametag }
+            : {}),
+          ...(senderDirectAddress !== undefined
+            ? { senderAddress: senderDirectAddress }
             : {}),
           tokens: acceptedTokens,
           ...(payloadMemo !== undefined ? { memo: payloadMemo } : {}),
@@ -1143,6 +1167,9 @@ export class PaymentsModule {
           senderPubkey: transfer.senderTransportPubkey,
           ...(incomingTransfer.senderNametag !== undefined
             ? { senderNametag: incomingTransfer.senderNametag }
+            : {}),
+          ...(senderDirectAddress !== undefined
+            ? { senderAddress: senderDirectAddress }
             : {}),
           ...(payloadMemo !== undefined ? { memo: payloadMemo } : {}),
           ...(recipientDirectAddress !== undefined
