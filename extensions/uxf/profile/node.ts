@@ -137,30 +137,23 @@ export function createNodeProfileProviders(
     debug: config.profileConfig?.debug,
   };
 
-  // Phase 4 (uxf-v2) — KV substrate is the default. Pre-build a
-  // ProfileKvAdapter here so `createProfileProviders` uses it
-  // instead of constructing an OrbitDbAdapter. The KV backend /
-  // block cache directories nest under the same dataDir as OrbitDB
-  // used to, so nothing else in the factory chain (dataDir
-  // cleanup, `Sphere.clear`, etc.) needs to change. Legacy callers
-  // that explicitly pass `substrate: 'orbitdb'` fall through to
-  // the factory's OrbitDB fallback (removed in the next commit).
-  const substrateSelection = profileConfig.substrate ?? 'kv';
-  let substrateOverride: ProfileKvAdapter | undefined;
-  if (substrateSelection === 'kv') {
-    const kvBaseDir =
-      profileConfig.orbitDb.directory ?? `${config.dataDir}/orbitdb`;
-    substrateOverride = new ProfileKvAdapter({
-      backendFactory: (shortName) =>
-        new ProfileKvNode({
-          directory: `${kvBaseDir}/kv-${shortName}`,
-        }),
-      blockCacheFactory: (shortName) =>
-        new LocalBlockCacheNode({
-          directory: `${kvBaseDir}/kv-${shortName}/blocks`,
-        }),
-    });
-  }
+  // Phase 4 (uxf-v2) — KV substrate. Pre-build a ProfileKvAdapter
+  // and hand it to `createProfileProviders`. The KV backend / block
+  // cache directories nest under the same dataDir as OrbitDB used
+  // to, so nothing else in the factory chain (dataDir cleanup,
+  // `Sphere.clear`, etc.) needs to change.
+  const kvBaseDir =
+    profileConfig.orbitDb.directory ?? `${config.dataDir}/orbitdb`;
+  const substrateOverride = new ProfileKvAdapter({
+    backendFactory: (shortName) =>
+      new ProfileKvNode({
+        directory: `${kvBaseDir}/kv-${shortName}`,
+      }),
+    blockCacheFactory: (shortName) =>
+      new LocalBlockCacheNode({
+        directory: `${kvBaseDir}/kv-${shortName}/blocks`,
+      }),
+  });
 
   const { storage, tokenStorage } = createProfileProviders(
     profileConfig,

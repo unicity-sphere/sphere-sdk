@@ -145,25 +145,19 @@ export function createBrowserProfileProviders(
     debug: config.profileConfig?.debug,
   };
 
-  // Phase 4 (uxf-v2) — KV substrate is the default. Nests under an
-  // IndexedDB name derived from the wallet shortname so multiple
-  // wallets on the same origin don't collide. Legacy callers that
-  // explicitly pass `substrate: 'orbitdb'` fall through to the
-  // factory's OrbitDB fallback (removed in the next commit).
-  const substrateSelection = profileConfig.substrate ?? 'kv';
-  let substrateOverride: ProfileKvAdapter | undefined;
-  if (substrateSelection === 'kv') {
-    substrateOverride = new ProfileKvAdapter({
-      backendFactory: (shortName) =>
-        new ProfileKvBrowser({
-          dbName: `sphere-profile-kv-${shortName}`,
-        }),
-      blockCacheFactory: (shortName) =>
-        new LocalBlockCacheBrowser({
-          dbName: `sphere-profile-kv-blocks-${shortName}`,
-        }),
-    });
-  }
+  // Phase 4 (uxf-v2) — KV substrate. Nests under an IndexedDB name
+  // derived from the wallet shortname so multiple wallets on the
+  // same origin don't collide.
+  const substrateOverride = new ProfileKvAdapter({
+    backendFactory: (shortName) =>
+      new ProfileKvBrowser({
+        dbName: `sphere-profile-kv-${shortName}`,
+      }),
+    blockCacheFactory: (shortName) =>
+      new LocalBlockCacheBrowser({
+        dbName: `sphere-profile-kv-blocks-${shortName}`,
+      }),
+  });
 
   const { storage, tokenStorage } = createProfileProviders(
     profileConfig,

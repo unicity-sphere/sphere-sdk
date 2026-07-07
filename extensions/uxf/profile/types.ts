@@ -211,16 +211,12 @@ export interface OrbitDbConfig {
  */
 export interface ProfileConfig {
   /**
-   * Substrate selector — Phase 4 (uxf-v2) narrowed this to the KV
-   * path only. Retained for source-compatibility with the small
-   * number of call sites (soak playbooks, tests) that still pass
-   * `substrate: 'kv'` explicitly; ignore anything else.
-   *
-   * A follow-up sub-phase removes the field entirely.
-   *
-   * @default 'kv'
+   * Substrate selector — Phase 4 narrowed this to the KV path only.
+   * Retained for source-compatibility with the small number of call
+   * sites (soak playbooks, tests) that still pass `substrate: 'kv'`
+   * explicitly. The value is otherwise ignored.
    */
-  readonly substrate?: 'orbitdb' | 'kv';
+  readonly substrate?: 'kv';
   /** OrbitDB connection configuration */
   readonly orbitDb: OrbitDbConfig;
   /** Whether to encrypt values stored in OrbitDB (default: true) */
