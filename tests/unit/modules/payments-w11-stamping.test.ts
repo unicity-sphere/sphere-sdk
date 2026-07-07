@@ -37,11 +37,29 @@ const PAYMENTS_LEGACY_FINALIZATION_PATH = path.resolve(
   '../../../modules/payments/legacy-v1/finalization.ts',
 );
 
+// Phase 5 wave-3: the OUTBOX ops (which include four W11-stamped
+// `setStorageEntry` call sites for STORAGE_KEYS_ADDRESS.OUTBOX) moved
+// to `extensions/uxf/pipeline/module-glue/outbox-ops.ts` per
+// docs/uxf/uxfv2-phase-5-payments-disposition.md. The source-level
+// invariant survives — it just spans two files now.
+const OUTBOX_OPS_PATH = path.resolve(
+  __dirname,
+  '../../../extensions/uxf/pipeline/module-glue/outbox-ops.ts',
+);
+
 describe('T-D7 PaymentsModule W11 stamping — source-level invariant', () => {
   const source =
     fs.readFileSync(PAYMENTS_MODULE_PATH, 'utf8') +
     '\n' +
     fs.readFileSync(PAYMENTS_LEGACY_FINALIZATION_PATH, 'utf8');
+  const outboxOpsSource = fs.existsSync(OUTBOX_OPS_PATH)
+    ? fs.readFileSync(OUTBOX_OPS_PATH, 'utf8')
+    : '';
+  // Combined view for source-level greps that used to run on
+  // PaymentsModule.ts alone. Individual call-site guards below still
+  // check each file independently so the invariant is scoped, not
+  // laundered.
+  const combinedSource = source + '\n' + outboxOpsSource;
 
   // Grep for the canonical W11-stamped keys and assert no raw
   // `storage.set(<key>, …)` appears. These keys represent user
@@ -62,11 +80,18 @@ describe('T-D7 PaymentsModule W11 stamping — source-level invariant', () => {
       const offenderRe = new RegExp(
         `storage\\s*\\.\\s*set\\s*\\(\\s*${escapedKey}\\b`,
       );
-      const lines = source.split('\n');
+      // Check both PaymentsModule.ts and the module-glue outbox-ops.ts
+      // where the OUTBOX-key call sites moved in Phase 5 wave-3.
       const offenders: string[] = [];
-      for (let i = 0; i < lines.length; i++) {
-        if (offenderRe.test(lines[i])) {
-          offenders.push(`line ${i + 1}: ${lines[i].trim()}`);
+      for (const [name, src] of [
+        ['PaymentsModule.ts', source],
+        ['module-glue/outbox-ops.ts', outboxOpsSource],
+      ] as const) {
+        const lines = src.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          if (offenderRe.test(lines[i])) {
+            offenders.push(`${name}:${i + 1}: ${lines[i].trim()}`);
+          }
         }
       }
       expect(offenders).toEqual([]);
@@ -93,9 +118,13 @@ describe('T-D7 PaymentsModule W11 stamping — source-level invariant', () => {
     // | 'cache_index'`. Any call-site passing a raw string must match
     // one of those — TypeScript catches mismatches at compile time,
     // but a regression test anchors the narrow set explicitly.
-    const calls = [...source.matchAll(/setStorageEntry\s*\([^)]*,\s*['"]([^'"]+)['"]\s*\)/g)];
-    // Capture groups: [_, lastStringArg]. That captures the final
-    // string argument regardless of value-argument complexity.
+    //
+    // Post-wave-3: call sites span PaymentsModule.ts (PENDING_V5_TOKENS
+    // paths) + extensions/uxf/pipeline/module-glue/outbox-ops.ts
+    // (OUTBOX paths). Scan both.
+    const calls = [
+      ...combinedSource.matchAll(/setStorageEntry\s*\([^)]*,\s*['"]([^'"]+)['"]\s*\)/g),
+    ];
     const tags = calls.map((m) => m[1]);
     const allowed = new Set(['token_send', 'token_receive', 'cache_index']);
     for (const tag of tags) {

@@ -587,28 +587,53 @@ describe('Issue #454 finding #9 — typed optional flusher access prevents stub-
   // misshapen types compiled; the typed access means they don't.
 
   it('the source uses the typed optional access (?? fallback) and not the structural cast', async () => {
+    // Phase 5 wave-3: the durability gate body moved to
+    // `extensions/uxf/pipeline/module-glue/durability-gate.ts`
+    // per docs/uxf/uxfv2-phase-5-payments-disposition.md. Assert
+    // the pattern lives in either the module-glue file OR the
+    // legacy in-place location, whichever the current tree holds.
     const fs = await import('node:fs/promises');
-    const path = (
-      await import('node:path')
-    ).resolve(
-      __dirname,
-      '..',
-      '..',
-      '..',
-      'modules',
-      'payments',
-      'PaymentsModule.ts',
-    );
-    const src = await fs.readFile(path, 'utf8');
-    expect(src).toContain('provider.awaitNextLocalFlush ?? provider.awaitNextFlush');
-    // Negative-form check: the misshapen cast string should NOT be
-    // present in the awaitAllProvidersDurable body. Scope to the
-    // surrounding context so we don't false-positive on unrelated
-    // legitimate uses of `awaitNextLocalFlush?:` in the same file.
-    const durabilityBodyMatch = src.match(
-      /awaitAllProvidersDurable[\s\S]{0,4000}flusher = provider\.awaitNextLocalFlush \?\? provider\.awaitNextFlush/,
-    );
-    expect(durabilityBodyMatch).not.toBeNull();
+    const nodePath = await import('node:path');
+    const candidatePaths = [
+      nodePath.resolve(
+        __dirname,
+        '..',
+        '..',
+        '..',
+        'extensions',
+        'uxf',
+        'pipeline',
+        'module-glue',
+        'durability-gate.ts',
+      ),
+      nodePath.resolve(
+        __dirname,
+        '..',
+        '..',
+        '..',
+        'modules',
+        'payments',
+        'PaymentsModule.ts',
+      ),
+    ];
+    let matchedSrc: string | null = null;
+    for (const p of candidatePaths) {
+      try {
+        const src = await fs.readFile(p, 'utf8');
+        if (
+          src.includes('provider.awaitNextLocalFlush ?? provider.awaitNextFlush') &&
+          /awaitAllProvidersDurable[\s\S]{0,4000}flusher = provider\.awaitNextLocalFlush \?\? provider\.awaitNextFlush/.test(
+            src,
+          )
+        ) {
+          matchedSrc = src;
+          break;
+        }
+      } catch {
+        // file not present at this path — try next
+      }
+    }
+    expect(matchedSrc).not.toBeNull();
   });
 
   it('a stub provider with a no-op awaitNextLocalFlush returns durable=true (documents the contract gap)', async () => {
