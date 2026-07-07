@@ -381,7 +381,16 @@ describe('Wave 5 R1 — recipient `_recipientRequestContextMap` extraction (RUNT
 // =============================================================================
 
 describe('Wave 4 R2 — null transactionHash classified as PATH_NOT_INCLUDED in poll producers', () => {
-  const SRC_PATH = resolve(__dirname, '../../../modules/payments/PaymentsModule.ts');
+  // Phase 5 wave-4a [B] extraction — the recipient builder body followed
+  // the sibling composition factories out of PaymentsModule.ts into
+  // `extensions/uxf/pipeline/module-glue/composition.ts`. The source-
+  // invariant grep now scans the composition file where the function
+  // bodies live; PaymentsModule.ts re-exports the symbols but no longer
+  // owns the implementations.
+  const SRC_PATH = resolve(
+    __dirname,
+    '../../../extensions/uxf/pipeline/module-glue/composition.ts',
+  );
   const src = readFileSync(SRC_PATH, 'utf8');
 
   it('recipient poll producer returns PATH_NOT_INCLUDED when proof.transactionHash === null', () => {
@@ -401,7 +410,16 @@ describe('Wave 4 R2 — null transactionHash classified as PATH_NOT_INCLUDED in 
 // =============================================================================
 
 describe('Wave 4 R3 — dispositionWriter emits operator-alert on failure paths', () => {
-  const SRC_PATH = resolve(__dirname, '../../../modules/payments/PaymentsModule.ts');
+  // Phase 5 wave-4a [B] extraction — the recipient builder body followed
+  // the sibling composition factories out of PaymentsModule.ts into
+  // `extensions/uxf/pipeline/module-glue/composition.ts`. The source-
+  // invariant grep now scans the composition file where the function
+  // bodies live; PaymentsModule.ts re-exports the symbols but no longer
+  // owns the implementations.
+  const SRC_PATH = resolve(
+    __dirname,
+    '../../../extensions/uxf/pipeline/module-glue/composition.ts',
+  );
   const src = readFileSync(SRC_PATH, 'utf8');
 
   it('emits transfer:operator-alert when oracle.getProof returns null in dispositionWriter', () => {
@@ -501,7 +519,16 @@ describe('Wave 4 R2 — poll producer null-transactionHash classification (runti
 // ctx — consistent with the documented promise.
 
 describe('Wave 5 — dispositionWriter save-failure ctx retention coherence', () => {
-  const SRC_PATH = resolve(__dirname, '../../../modules/payments/PaymentsModule.ts');
+  // Phase 5 wave-4a [B] extraction — the recipient builder body followed
+  // the sibling composition factories out of PaymentsModule.ts into
+  // `extensions/uxf/pipeline/module-glue/composition.ts`. The source-
+  // invariant grep now scans the composition file where the function
+  // bodies live; PaymentsModule.ts re-exports the symbols but no longer
+  // owns the implementations.
+  const SRC_PATH = resolve(
+    __dirname,
+    '../../../extensions/uxf/pipeline/module-glue/composition.ts',
+  );
   const src = readFileSync(SRC_PATH, 'utf8');
 
   it('does NOT delete recipientFinalizationContext after the save() catch — the Wave 4 incoherence', () => {
