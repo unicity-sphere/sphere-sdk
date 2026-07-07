@@ -198,7 +198,16 @@ describe('Issue #195 — manifest-cid-rewrite genesis contract', () => {
 // =============================================================================
 
 describe('Issue #195 — buildDefaultFinalizationWorkerRecipient source guard', () => {
-  const SRC_PATH = resolve(__dirname, '../../../../modules/payments/PaymentsModule.ts');
+  // Phase 5 wave-4a [B] extraction — the recipient builder body followed
+  // the sibling composition factories out of PaymentsModule.ts into
+  // `extensions/uxf/pipeline/module-glue/composition.ts`. The source-
+  // invariant grep now scans the composition file where the function
+  // body lives; PaymentsModule.ts re-exports the symbol but no longer
+  // owns the implementation.
+  const SRC_PATH = resolve(
+    __dirname,
+    '../../../../extensions/uxf/pipeline/module-glue/composition.ts',
+  );
   const src = readFileSync(SRC_PATH, 'utf8');
 
   function extractRecipientBuilderBody(): string {
