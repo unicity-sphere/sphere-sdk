@@ -30,6 +30,8 @@
  * @module profile/node
  */
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type { ProfileConfig } from './types';
 import type { ProfileStorageProvider } from './profile-storage-provider';
 import type { ProfileTokenStorageProvider } from './profile-token-storage-provider';
@@ -144,6 +146,24 @@ export function createNodeProfileProviders(
   // `Sphere.clear`, etc.) needs to change.
   const kvBaseDir =
     profileConfig.orbitDb.directory ?? `${config.dataDir}/orbitdb`;
+
+  // Phase 4-Swap guard (steelman finding #2): detect pre-Phase-4-Swap
+  // OrbitDB dataDir contents and refuse to open silently.
+  //
+  // Old wallets carried operational state (OUTBOX/SENT/finalization/
+  // disposition) in `${kvBaseDir}/*` under OrbitDB's oplog format. The
+  // Phase-4-Swap KV substrate nests its own directories at
+  // `${kvBaseDir}/kv-<shortName>/*`. Booting KV against a directory that
+  // still holds only OrbitDB files leaves identity intact (kept in
+  // wallet.json via FileStorageProvider) while silently dropping every
+  // operational entry — the wallet appears to boot fresh with pending
+  // sends lost.
+  //
+  // Detect that state and fail loudly. Operators who *want* to accept the
+  // orphaned OrbitDB state (e.g., in dev, or after they've manually
+  // migrated) can set SPHERE_KV_ACCEPT_ORPHANED_ORBITDB=1.
+  detectOrphanedOrbitDbDataDir(kvBaseDir);
+
   const substrateOverride = new ProfileKvAdapter({
     backendFactory: (shortName) =>
       new ProfileKvNode({
@@ -243,4 +263,64 @@ export async function migrateLegacyToProfileNode(
         dataDir,
       }),
   });
+}
+
+// =============================================================================
+// Phase 4-Swap guard: pre-Phase-4-Swap OrbitDB dataDir detection
+// =============================================================================
+
+const ORBITDB_ORPHAN_ENV = 'SPHERE_KV_ACCEPT_ORPHANED_ORBITDB';
+
+/**
+ * Fail loudly if `kvBaseDir` still contains only OrbitDB-format files from
+ * before Phase 4-Swap.
+ *
+ * The KV substrate creates its own directories under `${kvBaseDir}/kv-<name>/*`.
+ * A dataDir that has `${kvBaseDir}/*` (files/dirs) but no `kv-*` children is
+ * a legacy OrbitDB wallet whose operational state is invisible to the KV
+ * substrate. Booting through it silently zeros out OUTBOX/SENT/finalization
+ * / disposition entries (identity survives via wallet.json / FileStorageProvider).
+ *
+ * Operators who *want* to accept the orphaned state can set
+ * `SPHERE_KV_ACCEPT_ORPHANED_ORBITDB=1`.
+ */
+function detectOrphanedOrbitDbDataDir(kvBaseDir: string): void {
+  if (process.env[ORBITDB_ORPHAN_ENV] === '1') return;
+
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(kvBaseDir);
+  } catch (err) {
+    // Directory doesn't exist yet — fresh wallet, nothing to detect.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw err;
+  }
+
+  if (entries.length === 0) return;
+
+  // Any `kv-*` child means the KV substrate has been used here — safe.
+  const hasKvChild = entries.some((entry) => entry.startsWith('kv-'));
+  if (hasKvChild) return;
+
+  // We have a non-empty dataDir with zero KV children → looks like a
+  // pre-Phase-4-Swap OrbitDB wallet.
+  const sample = entries.slice(0, 6).map((e) => path.join(kvBaseDir, e));
+  throw new Error(
+    `[uxf-v2 Phase 4-Swap] Refusing to open KV substrate against a dataDir ` +
+      `that appears to hold pre-Phase-4-Swap OrbitDB state.\n` +
+      `  Location: ${kvBaseDir}\n` +
+      `  Non-KV entries found: ${sample.join(', ')}${
+        entries.length > sample.length ? ` (and ${entries.length - sample.length} more)` : ''
+      }\n\n` +
+      `The Phase 4-Swap KV substrate stores wallet operational state under ` +
+      `${kvBaseDir}/kv-<shortName>/*. The entries above are not KV data. ` +
+      `Continuing would silently drop OUTBOX/SENT/finalization/disposition ` +
+      `entries (identity survives via FileStorageProvider's wallet.json).\n\n` +
+      `Choose one:\n` +
+      `  (a) Point dataDir at a fresh directory (recommended for new wallets).\n` +
+      `  (b) Move ${kvBaseDir} aside if you want the wallet to boot with ` +
+      `      no operational state.\n` +
+      `  (c) Set ${ORBITDB_ORPHAN_ENV}=1 to bypass this check and accept ` +
+      `      that the orphaned OrbitDB data will be inaccessible.`,
+  );
 }

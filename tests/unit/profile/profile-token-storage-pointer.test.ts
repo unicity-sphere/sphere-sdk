@@ -109,7 +109,6 @@ function createProvider(opts: {
     {
       config: {
         orbitDb: { privateKey: TEST_PRIVATE_KEY },
-        ipnsSnapshot: false, // disable IPNS fallback in these tests
       },
       addressId: 'test',
       encrypt: true,

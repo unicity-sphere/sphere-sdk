@@ -72,6 +72,22 @@ export interface ProfileKvBackend {
 
   /** Reset (delete) the entire KV directory. Used by wallet-clear paths. */
   reset(): Promise<void>;
+
+  /**
+   * Install a listener that fires whenever `get`/`all` sees an ENOENT
+   * for a key the in-memory index still tracks. The KV analog of
+   * OrbitDB's `LoadBlockFailedError`. Installing overrides any prior
+   * listener; pass `null` to clear. Optional so test stubs can skip it.
+   */
+  setOrphanedIndexEntryListener?(
+    listener:
+      | ((info: {
+          readonly key: string;
+          readonly filepath: string;
+          readonly attemptedAt: number;
+        }) => void)
+      | null,
+  ): void;
 }
 
 export interface ProfileKvNodeOptions {
@@ -82,6 +98,20 @@ export interface ProfileKvNodeOptions {
    * slower on Linux; default `true` because durability > perf here.
    */
   readonly fsyncDirs?: boolean;
+  /**
+   * Steelman-4b fix: notify the caller when a `get`/`all` observes an
+   * ENOENT for a file the in-memory index still tracks — the KV analog of
+   * OrbitDB's `LoadBlockFailedError` (which fired
+   * `profile:critical-block-evicted`). The adapter wires this into the
+   * `profile-token-storage-provider.emitExternalProfileEvent` bridge so
+   * consumers keep operator-visible alerting on silent data loss.
+   * `attemptedAt` is a UNIX ms timestamp.
+   */
+  readonly onOrphanedIndexEntry?: (info: {
+    readonly key: string;
+    readonly filepath: string;
+    readonly attemptedAt: number;
+  }) => void;
 }
 
 const MANIFEST_FILENAME = '.keys.json';
@@ -143,6 +173,9 @@ export class ProfileKvNode implements ProfileKvBackend {
   private readonly dataDir: string;
   private readonly manifestFile: string;
   private readonly fsyncDirs: boolean;
+  private onOrphanedIndexEntry:
+    | ((info: { readonly key: string; readonly filepath: string; readonly attemptedAt: number }) => void)
+    | null;
   private opened = false;
   /** In-memory map from logical key → hashed filename. */
   private index: Map<string, string> = new Map();
@@ -160,6 +193,7 @@ export class ProfileKvNode implements ProfileKvBackend {
     this.dataDir = path.join(opts.directory, DATA_SUBDIR);
     this.manifestFile = path.join(opts.directory, MANIFEST_FILENAME);
     this.fsyncDirs = opts.fsyncDirs !== false;
+    this.onOrphanedIndexEntry = opts.onOrphanedIndexEntry ?? null;
   }
 
   async open(): Promise<void> {
@@ -220,6 +254,42 @@ export class ProfileKvNode implements ProfileKvBackend {
     return this.manifestChain;
   }
 
+  /**
+   * Install/replace the orphaned-index-entry listener. Adapters call this
+   * after backend construction to wire the data-loss event bridge into
+   * `profile:critical-block-evicted`.
+   */
+  setOrphanedIndexEntryListener(
+    listener:
+      | ((info: { readonly key: string; readonly filepath: string; readonly attemptedAt: number }) => void)
+      | null,
+  ): void {
+    this.onOrphanedIndexEntry = listener;
+  }
+
+  /**
+   * Fire the caller-provided data-loss callback (best-effort). The KV
+   * analog of OrbitDB's `LoadBlockFailedError` — the manifest still
+   * lists a key but its backing file is gone. Adapters route this into
+   * `profile:critical-block-evicted` so operators keep visibility of
+   * silent data loss under the KV substrate.
+   */
+  private emitOrphanedIndexEntry(key: string, filepath: string): void {
+    if (this.onOrphanedIndexEntry === null) return;
+    try {
+      this.onOrphanedIndexEntry({
+        key,
+        filepath,
+        attemptedAt: Date.now(),
+      });
+    } catch (err) {
+      logger.warn(
+        'ProfileKvNode',
+        `onOrphanedIndexEntry callback threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   async put(key: string, value: Uint8Array): Promise<void> {
     this.ensureOpen();
     const t0 = performance.now();
@@ -248,13 +318,13 @@ export class ProfileKvNode implements ProfileKvBackend {
   async get(key: string): Promise<Uint8Array | null> {
     this.ensureOpen();
     const t0 = performance.now();
+    const filename = this.index.get(key);
+    if (filename === undefined) {
+      observeMs('profile-kv.get.missMs', performance.now() - t0);
+      return null;
+    }
+    const filepath = path.join(this.dataDir, filename);
     try {
-      const filename = this.index.get(key);
-      if (filename === undefined) {
-        observeMs('profile-kv.get.missMs', performance.now() - t0);
-        return null;
-      }
-      const filepath = path.join(this.dataDir, filename);
       const buf = await fs.readFile(filepath);
       observeMs('profile-kv.get.hitMs', performance.now() - t0);
       return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -265,6 +335,8 @@ export class ProfileKvNode implements ProfileKvBackend {
         await this.queueManifestWrite().catch(() => {
           /* best-effort */
         });
+        incr('profile-kv.get.orphaned-index-entry');
+        this.emitOrphanedIndexEntry(key, filepath);
         return null;
       }
       incr('profile-kv.get.error');
@@ -336,6 +408,8 @@ export class ProfileKvNode implements ProfileKvBackend {
           if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
             // Skew — drop the stale index entry.
             this.index.delete(key);
+            incr('profile-kv.all.orphaned-index-entry');
+            this.emitOrphanedIndexEntry(key, filepath);
             continue;
           }
           logger.warn(

@@ -348,7 +348,6 @@ function createProvider(db: MockProfileDb): ProfileTokenStorageProvider {
         orbitDb: { privateKey: TEST_PRIVATE_KEY },
         // Disable IPNS snapshot recovery — this test exercises the
         // bundle-ref JOIN path, not legacy snapshot recovery.
-        ipnsSnapshot: false,
       },
       addressId: EXPECTED_ADDRESS_ID,
       encrypt: true,

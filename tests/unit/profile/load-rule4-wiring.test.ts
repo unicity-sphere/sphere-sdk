@@ -168,7 +168,6 @@ function createProvider(
     {
       config: {
         orbitDb: { privateKey: TEST_PRIVATE_KEY },
-        ipnsSnapshot: false,
       },
       addressId: EXPECTED_ADDRESS_ID,
       encrypt: true,

@@ -160,7 +160,6 @@ async function createTestHandle(pointer: ProfilePointerLayer): Promise<TestHandl
     {
       config: {
         orbitDb: { privateKey: TEST_PRIVATE_KEY },
-        ipnsSnapshot: false,
       },
       addressId: 'test',
       encrypt: true,

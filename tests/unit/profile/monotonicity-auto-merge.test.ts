@@ -408,7 +408,7 @@ async function createHarness(pointer: ProfilePointerLayer): Promise<{
     new Uint8Array(32).fill(0x11),
     ['https://mock-ipfs.test'],
     {
-      config: { orbitDb: { privateKey: TEST_PRIVATE_KEY }, ipnsSnapshot: false },
+      config: { orbitDb: { privateKey: TEST_PRIVATE_KEY } },
       addressId: 'test',
       encrypt: true,
       getPointerLayer: () => pointer,

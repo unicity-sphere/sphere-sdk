@@ -172,7 +172,6 @@ function buildProvider(opts: {
       config: {
         orbitDb: { privateKey: TEST_PRIVATE_KEY },
         network: opts.network ?? 'testnet',
-        ipnsSnapshot: false,
       },
       addressId: 'test',
       encrypt: true,

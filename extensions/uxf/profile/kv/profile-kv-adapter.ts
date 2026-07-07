@@ -104,6 +104,9 @@ export class ProfileKvAdapter {
   private storagePersistenceListener:
     | ((info: { readonly granted: boolean; readonly supported: boolean }) => void)
     | null = null;
+  private orphanedIndexEntryListener:
+    | ((info: { readonly key: string; readonly filepath: string; readonly attemptedAt: number }) => void)
+    | null = null;
 
   constructor(opts: ProfileKvAdapterOptions) {
     if (opts.backend) {
@@ -149,6 +152,15 @@ export class ProfileKvAdapter {
         }
         this.backend = this.backendFactory(dbShortName);
         this.blockCache = this.blockCacheFactory(dbShortName);
+        // Wire any pre-installed orphaned-index-entry listener into the
+        // freshly-constructed backend (steelman-4b fix — keeps
+        // `profile:critical-block-evicted` alerting alive under KV).
+        if (
+          this.orphanedIndexEntryListener !== null &&
+          typeof this.backend.setOrphanedIndexEntryListener === 'function'
+        ) {
+          this.backend.setOrphanedIndexEntryListener(this.orphanedIndexEntryListener);
+        }
         await this.backend.open();
         this.connected = true;
         observeMs('profile-kv.connect.totalMs', performance.now() - t0);
@@ -387,6 +399,28 @@ export class ProfileKvAdapter {
       | null,
   ): void {
     this.storagePersistenceListener = listener;
+  }
+
+  /**
+   * Steelman-4b fix: install a listener for the KV analog of OrbitDB's
+   * `LoadBlockFailedError` — fires when `get`/`all` sees an ENOENT for a
+   * key the in-memory index still tracks. Wired by the factory into
+   * `profile:critical-block-evicted` so operators keep visibility of
+   * silent data loss under the KV substrate. Installation is deferred:
+   * if `connect()` has already run the listener is pushed into the
+   * backend immediately; otherwise it is stored and applied when
+   * `connect()` completes.
+   */
+  setOrphanedIndexEntryListener(
+    listener:
+      | ((info: { readonly key: string; readonly filepath: string; readonly attemptedAt: number }) => void)
+      | null,
+  ): void {
+    this.orphanedIndexEntryListener = listener;
+    const backend = this.backend;
+    if (backend && typeof backend.setOrphanedIndexEntryListener === 'function') {
+      backend.setOrphanedIndexEntryListener(listener);
+    }
   }
 
   /**

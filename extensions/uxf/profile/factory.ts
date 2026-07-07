@@ -640,6 +640,34 @@ export function createProfileProviders(
     });
   }
 
+  // Steelman-4b fix: install the orphaned-index-entry bridge on the KV
+  // substrate. Fires `profile:critical-block-evicted` when `get`/`all`
+  // observes an ENOENT for a key the in-memory index still tracks — the
+  // KV analog of the OrbitDB-era `LoadBlockFailedError`. Dedup is left to
+  // the token-storage provider (existing dedup for critical-block-evicted).
+  const dbWithOrphanHook = db as unknown as {
+    setOrphanedIndexEntryListener?: (
+      cb:
+        | ((info: { readonly key: string; readonly filepath: string; readonly attemptedAt: number }) => void)
+        | null,
+    ) => void;
+  };
+  if (typeof dbWithOrphanHook.setOrphanedIndexEntryListener === 'function') {
+    dbWithOrphanHook.setOrphanedIndexEntryListener((info) => {
+      tokenStorage.emitExternalProfileEvent({
+        type: 'profile:critical-block-evicted',
+        timestamp: Date.now(),
+        data: {
+          // Under KV there is no CID (the substrate is not content-addressed);
+          // the operator-relevant identifier is the file path that went missing.
+          cid: null,
+          key: info.key,
+          attemptedAt: info.attemptedAt,
+        },
+      });
+    });
+  }
+
   // Item #15 Phase C.3 — bridge writer-side dirty signals to the
   // token-storage debouncer. `setProfileDirtyNotifier(cb)` propagates
   // the callback into every per-writer instance produced by the

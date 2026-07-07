@@ -117,7 +117,6 @@ async function makeProvider(opts: {
     {
       config: {
         orbitDb: { privateKey: TEST_PRIVATE_KEY },
-        ipnsSnapshot: false,
       },
       addressId: 'test',
       encrypt: true,

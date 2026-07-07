@@ -140,7 +140,7 @@ function buildProvider(db: MockProfileDb): ProfileTokenStorageProvider {
     hexToBytes('11'.repeat(32)),
     ['https://mock-ipfs.test'],
     {
-      config: { orbitDb: { privateKey: TEST_PRIVATE_KEY }, ipnsSnapshot: false },
+      config: { orbitDb: { privateKey: TEST_PRIVATE_KEY } },
       addressId: ADDR,
       encrypt: true,
       flushDebounceMs: 20,

@@ -109,7 +109,6 @@ function createProvider(db: ProfileDatabase): ProfileTokenStorageProvider {
     {
       config: {
         orbitDb: { privateKey: TEST_PRIVATE_KEY },
-        ipnsSnapshot: false,
       },
       addressId: 'test',
       encrypt: true,

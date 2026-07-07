@@ -82,7 +82,6 @@ function createProvider(): ProfileTokenStorageProvider {
     {
       config: {
         orbitDb: { privateKey: TEST_PRIVATE_KEY },
-        ipnsSnapshot: false,
       },
       addressId: 'test',
       encrypt: true,
@@ -163,7 +162,6 @@ describe('ProfileTokenStorageProvider.applySnapshotIfWired (Item #15 Phase E fol
       {
         config: {
           orbitDb: { privateKey: TEST_PRIVATE_KEY },
-          ipnsSnapshot: false,
         },
         addressId: 'test',
         encrypt: true,
@@ -187,7 +185,6 @@ describe('ProfileTokenStorageProvider.applySnapshotIfWired (Item #15 Phase E fol
       {
         config: {
           orbitDb: { privateKey: TEST_PRIVATE_KEY },
-          ipnsSnapshot: false,
         },
         addressId: 'test',
         encrypt: true,

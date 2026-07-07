@@ -235,7 +235,6 @@ function createProvider(
     {
       config: {
         orbitDb: { privateKey: TEST_PRIVATE_KEY },
-        ipnsSnapshot: false,
       },
       addressId: ADDR,
       encrypt: true,

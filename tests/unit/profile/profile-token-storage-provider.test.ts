@@ -371,7 +371,6 @@ function createProvider(
         // suite against real infrastructure. Unit tests count
         // pinToIpfs invocations and would otherwise be perturbed
         // by the extra snapshot pin.
-        ipnsSnapshot: false,
       },
       addressId: EXPECTED_ADDRESS_ID,
       encrypt: true,

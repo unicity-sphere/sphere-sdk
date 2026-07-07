@@ -126,7 +126,7 @@ async function createHandle() {
     new Uint8Array(32).fill(0x11),
     [GATEWAY_A, GATEWAY_B],
     {
-      config: { orbitDb: { privateKey: TEST_PRIVATE_KEY }, ipnsSnapshot: false },
+      config: { orbitDb: { privateKey: TEST_PRIVATE_KEY } },
       addressId: 'test-272',
       encrypt: true,
       getPointerLayer: () => pointer,

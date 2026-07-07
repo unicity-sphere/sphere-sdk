@@ -300,19 +300,6 @@ export interface ProfileConfig {
   readonly tombstoneRetentionMs?: number;
   /** Custom bootstrap peers for OrbitDB (convenience alias for orbitDb.bootstrapPeers) */
   readonly profileOrbitDbPeers?: string[];
-  /**
-   * Publish a wallet-keyed IPNS snapshot of active bundle CIDs after
-   * every flush, and attempt to resolve it on cold-start when the
-   * local OrbitDB has no bundles. Default: true.
-   *
-   * This is an OrbitDB-layer parity assist — without it, a freshly
-   * re-imported wallet on a wiped device cannot discover its own
-   * bundles unless another live peer is replicating the OrbitDB
-   * OpLog. Publish is best-effort (never fails the flush).
-   *
-   * Tests and specialised deployments can opt out with `false`.
-   */
-  readonly ipnsSnapshot?: boolean;
   /** Enable debug logging (default: false) */
   readonly debug?: boolean;
 }
