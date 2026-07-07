@@ -321,81 +321,27 @@ export type TransactionHistoryEntry = import('../../storage').HistoryRecord;
 // =============================================================================
 // importTokens result types
 // =============================================================================
+//
+// The full taxonomy (`ImportAddedCode`, `ImportSkipCode`, `ImportRejectCode`,
+// `ImportAdded`, `ImportSkipped`, `ImportRejected`, `ImportTokensResult`) was
+// extracted to `./import-export/types.ts` during Phase 5. Re-exported here
+// so external consumers (`import { ImportTokensResult } from
+// '@unicitylabs/sphere-sdk'`) keep working unchanged.
 
-/**
- * Outcome of a single token in `importTokens`. Codes are stable enums
- * suitable for switch-on-code logic in callers (CLI, scripting, UI).
- */
-export type ImportAddedCode =
-  /** Token was new to the wallet — fresh acquisition. */
-  | 'added'
-  /**
-   * Lenient mode only: an active (confirmed or submitted) state of
-   * the same genesis tokenId existed in the wallet and has been
-   * archived by addToken's state-update path. The imported state is
-   * now authoritative. Distinct from `'stale-record-replaced'` below.
-   */
-  | 'state-replaced'
-  /**
-   * Lenient mode only: the wallet already held a record for the same
-   * genesis tokenId but its status was `'spent'` or `'invalid'` — the
-   * prior entry was a dead bookkeeping record, not an active state.
-   * Import simply resurrected the tokenId. UI should treat this as
-   * effectively fresh ('added'-like) with no warning.
-   */
-  | 'stale-record-replaced';
+export type {
+  ImportAddedCode,
+  ImportSkipCode,
+  ImportRejectCode,
+  ImportAdded,
+  ImportSkipped,
+  ImportRejected,
+  ImportTokensResult,
+} from './import-export';
 
-export type ImportSkipCode =
-  /** Exact (tokenId, stateHash) already in the wallet. */
-  | 'duplicate'
-  /** (tokenId, stateHash) was previously spent from this wallet. */
-  | 'tombstoned'
-  /**
-   * Strict-mode only: tokenId is in the wallet at a DIFFERENT state
-   * and we refuse to clobber that state from an import.
-   */
-  | 'genesis-exists'
-  /** addToken returned false despite the pre-checks (race or unknown). */
-  | 'unknown';
-
-export type ImportRejectCode =
-  /** TxfToken structure is invalid (missing fields, wrong types, etc.). */
-  | 'malformed'
-  /** addToken threw an unexpected error during the write path. */
-  | 'add-failed';
-
-/**
- * Discriminated union so `note` is structurally required on the
- * `'state-replaced'` and `'stale-record-replaced'` branches — consumers
- * don't need `!` assertions after switch-on-code.
- */
-export type ImportAdded =
-  | {
-      readonly localId: string;
-      readonly genesisTokenId: string;
-      readonly code: 'added';
-    }
-  | {
-      readonly localId: string;
-      readonly genesisTokenId: string;
-      readonly code: 'state-replaced' | 'stale-record-replaced';
-      readonly note: string;
-    };
-export interface ImportSkipped {
-  readonly genesisTokenId: string;
-  readonly code: ImportSkipCode;
-  readonly reason: string;
-}
-export interface ImportRejected {
-  readonly genesisTokenId: string | null;
-  readonly code: ImportRejectCode;
-  readonly reason: string;
-}
-export interface ImportTokensResult {
-  readonly added: ImportAdded[];
-  readonly skipped: ImportSkipped[];
-  readonly rejected: ImportRejected[];
-}
+// Local alias so the class body can reference these types by name
+// without a separate `import type` block. Kept as `import type` to
+// stay type-only at runtime.
+import type { ImportTokensResult } from './import-export';
 
 /**
  * Compute a dedup key for a history entry.
@@ -749,6 +695,11 @@ import {
 // lives in a small, single-purpose file. See modules/payments/mint/README.md
 // for the routing plan; Phase 6.C will rewire this onto `ITokenEngine`.
 import { mintFungibleTokenImpl } from './mint';
+
+// Phase 5 [A] survive extraction — importTokens / exportTokens are now
+// thin facade delegations to pure functions in `./import-export/`.
+// See modules/payments/import-export/README.md for the routing plan.
+import { exportTokensFromMap, importTokensInto } from './import-export';
 
 // Issue #245 #1 — `extractCurrentStatePublicKeyHexFromSdkData` was extracted
 // to `./extract-state-publickey.ts` (issue #535) so SwapModule.verifyPayout
@@ -8391,28 +8342,10 @@ export class PaymentsModule {
     includeUnconfirmed?: boolean;
   }): Array<{ localId: string; genesisTokenId: string; txf: TxfToken }> {
     this.ensureInitialized();
-
-    let candidates = Array.from(this.tokens.values());
-    if (options?.ids) {
-      const idSet = new Set(options.ids);
-      candidates = candidates.filter((t) => idSet.has(t.id));
-    }
-    if (options?.coinId) {
-      candidates = candidates.filter((t) => t.coinId === options.coinId);
-    }
-    if (!options?.includeUnconfirmed) {
-      candidates = candidates.filter((t) => t.status === 'confirmed');
-    }
-
-    const out: Array<{ localId: string; genesisTokenId: string; txf: TxfToken }> = [];
-    for (const token of candidates) {
-      const txf = tokenToTxf(token);
-      if (!txf) continue;
-      const genesisTokenId = txf.genesis?.data?.tokenId;
-      if (!genesisTokenId) continue;
-      out.push({ localId: token.id, genesisTokenId, txf });
-    }
-    return out;
+    // Delegates to `./import-export/export.ts` — pure function over the
+    // in-memory token map. Phase 5 extraction (uxfv2-phase-5-payments-
+    // disposition.md), behavior-preserving.
+    return exportTokensFromMap(this.tokens, options);
   }
 
   // (See ImportTokensResult and friends defined at module scope.)
@@ -8460,208 +8393,20 @@ export class PaymentsModule {
   ): Promise<ImportTokensResult> {
     this.ensureInitialized();
 
-    const added: ImportAdded[] = [];
-    const skipped: ImportSkipped[] = [];
-    const rejected: ImportRejected[] = [];
-
-    for (const txf of txfTokens) {
-      const genesisTokenId = txf?.genesis?.data?.tokenId ?? null;
-      if (!genesisTokenId) {
-        rejected.push({
-          genesisTokenId: null,
-          code: 'malformed',
-          reason: 'Missing genesis.data.tokenId',
-        });
-        continue;
-      }
-      if (!txf.state || !txf.genesis) {
-        rejected.push({
-          genesisTokenId,
-          code: 'malformed',
-          reason: 'Missing state or genesis section',
-        });
-        continue;
-      }
-
-      // Effective dedup key combines current-state hash (for
-      // finalized tokens) and a genesis-content hash (for pending-
-      // mint tokens). See `effectiveDedupKey`.
-      const incomingDedupKey = effectiveDedupKey(txf);
-
-      // Real stateHash for the tombstone check — via the canonical
-      // `parseSdkDataCached` path. Tombstones are only keyed on
-      // concrete post-spend hashes, so pending tokens can never
-      // match one (by definition their first state transition
-      // hasn't happened yet).
-      const incomingStateHash = extractStateHashFromSdkData(
-        JSON.stringify(txf),
-      );
-
-      // -- Pre-check 1: tombstoned (previously spent).
-      if (incomingStateHash && this.isStateTombstoned(genesisTokenId, incomingStateHash)) {
-        skipped.push({
-          genesisTokenId,
-          code: 'tombstoned',
-          reason: `(tokenId, stateHash) previously spent from this wallet`,
-        });
-        continue;
-      }
-
-      // Scan in-memory wallet for matching genesis / state. Track
-      // the matched token's status so we can distinguish a true
-      // "state replaced a live state" from "stale bookkeeping record
-      // (spent/invalid) was overwritten" downstream.
-      //
-      // For the dedup-key comparison we reuse `parseSdkDataCached`
-      // via extractStateHashFromSdkData rather than re-parsing each
-      // existing token's sdkData in the loop (was O(N×M) JSON.parse
-      // on large wallets). For pending existing tokens with empty
-      // stateHash, we fall through to the one-off JSON.parse — rare
-      // path.
-      let exactDuplicateLocalId: string | null = null;
-      let genesisMatchLocalId: string | null = null;
-      let genesisMatchStatus: TokenStatus | null = null;
-      let genesisMatchIsPending = false;
-      for (const [existingId, existing] of this.tokens) {
-        const existingTokenId = extractTokenIdFromSdkData(existing.sdkData);
-        if (existingTokenId !== genesisTokenId) continue;
-
-        const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
-        let existingDedupKey: string;
-        let existingIsPending = false;
-        if (existingStateHash) {
-          // Fast path: both via the cached parser — no re-parse.
-          existingDedupKey = existingStateHash;
-        } else if (existing.sdkData) {
-          // Pending existing (empty stateHash). Compute the fallback
-          // the same way we did for the incoming token.
-          try {
-            const existingTxf = JSON.parse(existing.sdkData) as Parameters<typeof effectiveDedupKey>[0];
-            existingDedupKey = effectiveDedupKey(existingTxf);
-            existingIsPending = true;
-          } catch {
-            // Malformed sdkData — treat as genesis-only match with
-            // no identifiable current state.
-            genesisMatchLocalId = existingId;
-            genesisMatchStatus = existing.status;
-            continue;
-          }
-        } else {
-          genesisMatchLocalId = existingId;
-          genesisMatchStatus = existing.status;
-          continue;
-        }
-
-        if (existingDedupKey === incomingDedupKey) {
-          exactDuplicateLocalId = existingId;
-          break;
-        }
-        genesisMatchLocalId = existingId;
-        genesisMatchStatus = existing.status;
-        genesisMatchIsPending = existingIsPending;
-      }
-
-      // -- Pre-check 2: exact duplicate.
-      if (exactDuplicateLocalId) {
-        skipped.push({
-          genesisTokenId,
-          code: 'duplicate',
-          reason: 'Exact (tokenId, stateHash) already owned',
-        });
-        continue;
-      }
-
-      // -- Pre-check 3: strict-mode genesis collision.
-      // Exception: if the wallet's existing copy is a pending-mint
-      // (empty current stateHash) and the incoming is finalized
-      // (has a real stateHash), allow the upgrade — the incoming
-      // carries strictly more information than what we already have,
-      // and refusing would leave the wallet stuck on the pending
-      // record. This is the common "migrated legacy while mint was
-      // in flight, now rerun after finalization" pattern.
-      if (options?.skipExistingGenesis && genesisMatchLocalId) {
-        const incomingIsPending = incomingDedupKey.startsWith('pending-');
-        const upgradingPendingToFinalized = genesisMatchIsPending && !incomingIsPending;
-        if (!upgradingPendingToFinalized) {
-          skipped.push({
-            genesisTokenId,
-            code: 'genesis-exists',
-            reason: 'Genesis tokenId owned at a different state; strict mode preserves current state',
-          });
-          continue;
-        }
-        // Fall through — the incoming finalized state will replace
-        // the prior pending record via addToken's state-update path.
-      }
-
-      // Build the UI token. Failures here are malformed-input
-      // rejections, not skips.
-      const localId = crypto.randomUUID();
-      let uiToken: Token;
-      try {
-        uiToken = txfToToken(localId, txf);
-      } catch (err) {
-        rejected.push({
-          genesisTokenId,
-          code: 'malformed',
-          reason: `txfToToken failed: ${err instanceof Error ? err.message : String(err)}`,
-        });
-        continue;
-      }
-
-      // Hand off to addToken. Pre-checks above mean addToken should
-      // not return false here — but defend against it just in case.
-      try {
-        const addedOk = await this.addToken(uiToken);
-        if (addedOk) {
-          if (genesisMatchLocalId) {
-            // Differentiate:
-            //   - Replacing a LIVE state (confirmed/submitted/...):
-            //     the user previously held this state of the token;
-            //     UI should highlight the overwrite.
-            //   - Replacing a DEAD record (spent/invalid): the prior
-            //     entry was bookkeeping for a token we no longer
-            //     controlled; no user-visible state was lost.
-            const isStaleRecord =
-              genesisMatchStatus === 'spent' || genesisMatchStatus === 'invalid';
-            added.push({
-              localId,
-              genesisTokenId,
-              code: isStaleRecord ? 'stale-record-replaced' : 'state-replaced',
-              note: isStaleRecord
-                ? 'Overwrote a stale spent/invalid record of the same tokenId'
-                : 'Replaced an existing state of the same tokenId (lenient mode)',
-            });
-          } else {
-            added.push({ localId, genesisTokenId, code: 'added' });
-          }
-        } else {
-          // Defensive — addToken returned false despite our pre-checks.
-          // This indicates a race (the wallet mutated between our
-          // pre-check scan and addToken's own guard) or a guard
-          // pattern we didn't enumerate. Log at warn level so field
-          // operators can correlate it with transport activity.
-          logger.warn(
-            'Payments',
-            `importTokens: addToken unexpectedly refused token ${genesisTokenId.slice(0, 16)}... ` +
-              `after pre-checks (possible race with incoming transfer). Marking as skipped/unknown.`,
-          );
-          skipped.push({
-            genesisTokenId,
-            code: 'unknown',
-            reason: 'addToken returned false after pre-checks (race or unrecognised guard)',
-          });
-        }
-      } catch (err) {
-        rejected.push({
-          genesisTokenId,
-          code: 'add-failed',
-          reason: `addToken failed: ${err instanceof Error ? err.message : String(err)}`,
-        });
-      }
-    }
-
-    return { added, skipped, rejected };
+    // Delegates to `./import-export/import.ts` — behavior-preserving
+    // per-token pre-check pipeline (Phase 5 extraction per
+    // uxfv2-phase-5-payments-disposition.md). The extracted function
+    // reads from `this.tokens` and calls back into `this.addToken` /
+    // `this.isStateTombstoned` via the `ImportHost` shim.
+    return importTokensInto(
+      {
+        tokens: this.tokens,
+        isStateTombstoned: (id, hash) => this.isStateTombstoned(id, hash),
+        addToken: (t) => this.addToken(t),
+      },
+      txfTokens,
+      options,
+    );
   }
 
   // ===========================================================================
