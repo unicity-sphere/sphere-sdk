@@ -602,7 +602,18 @@ export type SphereErrorCode =
    * cap), and a Nostr outage means delivery may be queued for retry —
    * neither is a hard offline condition.
    */
-  | 'OFFLINE';
+  | 'OFFLINE'
+  // ============================================================================
+  // Phase 6 — token-engine (v2 SDK) migration error codes.
+  // Emitted by `token-engine/errors.ts` (SHA-pinned) for the recoverable
+  // engine's typed error surface (Part E.2 / E.4). See that file's JSDoc
+  // for the semantic contract behind each code.
+  // ============================================================================
+  | 'TRANSFER_CONFLICT'
+  | 'CERTIFICATION_UNCONFIRMED'
+  | 'CHECKPOINT_PERSIST_FAILED'
+  | 'SPLIT_CHECKPOINT_LOST'
+  | 'CHECKPOINT_TRUSTBASE_MISMATCH';
 
 // ===========================================================================
 // W40 — SphereError redaction layer (T.8.C)
