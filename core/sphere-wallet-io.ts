@@ -68,8 +68,8 @@ export interface WalletIoInstanceHost {
  * create a circular import).
  */
 export interface WalletIoSphereRef<TSphere> {
-  import(options: any): Promise<TSphere>;
-  importFromJSON(options: any): Promise<{ success: boolean; mnemonic?: string; error?: string }>;
+  import(options: Record<string, unknown>): Promise<TSphere>;
+  importFromJSON(options: Record<string, unknown>): Promise<{ success: boolean; mnemonic?: string; error?: string }>;
   validateMnemonic(mnemonic: string): boolean;
   getInstance(): TSphere | null;
 }
