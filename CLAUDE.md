@@ -225,6 +225,11 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `sphere.swap.acceptSwap(swapId)` | `void` | Accept a swap proposal |
 | `sphere.swap.deposit(swapId)` | `TransferResult` | Deposit into a swap |
 | `sphere.swap.getSwaps(filter?)` | `SwapRef[]` | List swaps with filter |
+| `sphere.tokenEngine.mint(params, options?)` | `SphereToken` | v2 engine: mint a token (testnet2 only; `null` on v1 networks) |
+| `sphere.tokenEngine.transfer(params, options?)` | `SphereToken` | v2 engine: transfer a token to a new predicate |
+| `sphere.tokenEngine.split(params, options?)` | `SplitResult` | v2 engine: burn-then-mint split into outputs |
+| `sphere.tokenEngine.verify(token, options?)` | `EngineVerifyResult` | v2 engine: verify token state + proofs |
+| `sphere.tokenEngine.isSpent(token, options?)` | `boolean` | v2 engine: check if the token's current state is spent |
 
 ### Key Events
 
@@ -466,7 +471,14 @@ Abstract interfaces for platform independence:
 |---------|------------|-------------|----------|
 | mainnet | aggregator.unicity.network | relay.unicity.network | fulcrum.alpha.unicity.network |
 | testnet | goggregator-test.unicity.network | nostr-relay.testnet.unicity.network | fulcrum.alpha.testnet.unicity.network |
+| testnet2 | gateway.testnet2.unicity.network (v2) | nostr-relay.testnet.unicity.network | fulcrum.alpha.testnet.unicity.network |
 | dev | dev-aggregator.dyndns.org | nostr-relay.testnet.unicity.network | fulcrum.alpha.testnet.unicity.network |
+
+`testnet2` is Phase 6's v2 state-transition SDK network — it auto-fetches
+the root trust base from `NETWORKS.testnet2.trustBaseUrl` and exposes the
+new engine at `sphere.tokenEngine`. See `.env.example` at the repo root
+and [`docs/QUICKSTART-NODEJS.md`](docs/QUICKSTART-NODEJS.md#testnet2-v2-state-transition-sdk)
+for the config shape.
 
 ## Common Commands
 
