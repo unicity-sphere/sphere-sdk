@@ -122,25 +122,20 @@ import {
   type MasterKey,
   type AddressInfo,
 } from './crypto';
-import { encryptSimple, decryptSimple, decryptWithSalt } from './encryption';
+import { encryptSimple, decryptSimple } from './encryption';
 import { discoverAddressesImpl } from './discover';
 import type { DiscoverAddressesOptions, DiscoverAddressesResult } from './discover';
 import { generateAddressFromMasterKey } from './crypto';
 import {
-  parseWalletText,
-  parseAndDecryptWalletText,
-  isWalletTextFormat,
-  isTextWalletEncrypted,
-  serializeWalletToText,
-  serializeEncryptedWalletToText,
-  encryptForTextFormat,
-} from '../serialization/wallet-text';
-import {
-  parseWalletDat,
-  parseAndDecryptWalletDat,
-  isSQLiteDatabase,
-  isWalletDatEncrypted,
-} from '../serialization/wallet-dat';
+  exportToJSON as walletIoExportToJSON,
+  exportToTxt as walletIoExportToTxt,
+  importFromJSON as walletIoImportFromJSON,
+  importFromLegacyFile as walletIoImportFromLegacyFile,
+  detectLegacyFileType as walletIoDetectLegacyFileType,
+  isLegacyFileEncrypted as walletIoIsLegacyFileEncrypted,
+  type WalletIoInstanceHost,
+  type WalletIoSphereRef,
+} from './sphere-wallet-io';
 // Phase 6-P2-4d: SigningService import routed through token-engine anti-corruption
 // barrel; the v1 predicate primitives (`TokenType`, `HashAlgorithm`,
 // `UnmaskedPredicateReference`) that used to compose the DIRECT address by hand
@@ -3018,88 +3013,7 @@ export class Sphere {
    * ```
    */
   exportToJSON(options: WalletJSONExportOptions = {}): WalletJSON {
-    this.ensureReady();
-
-    if (!this._masterKey && !this._identity) {
-      throw new SphereError('Wallet not initialized', 'NOT_INITIALIZED');
-    }
-
-    // Build addresses array
-    const addressCount = options.addressCount || 1;
-    const addresses: Array<{
-      address: string;
-      publicKey: string;
-      path: string;
-      index: number;
-    }> = [];
-
-    for (let i = 0; i < addressCount; i++) {
-      try {
-        const addr = this.deriveAddress(i, false);
-        addresses.push({
-          address: addr.address,
-          publicKey: addr.publicKey,
-          path: addr.path,
-          index: addr.index,
-        });
-      } catch {
-        // Stop if we can't derive more addresses (e.g., no masterKey)
-        if (i === 0 && this._identity) {
-          addresses.push({
-            address: publicKeyToAddress(this._identity.chainPubkey, 'alpha'),
-            publicKey: this._identity.chainPubkey,
-            path: this.getDefaultAddressPath(),
-            index: 0,
-          });
-        }
-        break;
-      }
-    }
-
-    // Build wallet data
-    let masterPrivateKey: string | undefined;
-    let chainCode: string | undefined;
-
-    if (this._masterKey) {
-      masterPrivateKey = this._masterKey.privateKey;
-      chainCode = this._masterKey.chainCode || undefined;
-    }
-
-    // Prepare mnemonic (optionally encrypt)
-    let mnemonic: string | undefined;
-    let encrypted = false;
-
-    if (this._mnemonic && options.includeMnemonic !== false) {
-      if (options.password) {
-        mnemonic = encryptSimple(this._mnemonic, options.password);
-        encrypted = true;
-      } else {
-        mnemonic = this._mnemonic;
-      }
-    }
-
-    // Encrypt master key if password provided
-    if (masterPrivateKey && options.password) {
-      masterPrivateKey = encryptSimple(masterPrivateKey, options.password);
-      encrypted = true;
-    }
-
-    return {
-      version: '1.0',
-      type: 'sphere-wallet',
-      createdAt: new Date().toISOString(),
-      wallet: {
-        masterPrivateKey,
-        chainCode,
-        addresses,
-        isBIP32: this._derivationMode === 'bip32',
-        descriptorPath: this._basePath.replace(/^m\//, ''),
-      },
-      mnemonic,
-      encrypted,
-      source: this._source,
-      derivationMode: this._derivationMode,
-    };
+    return walletIoExportToJSON(this as unknown as WalletIoInstanceHost, options);
   }
 
   /**
@@ -3118,69 +3032,7 @@ export class Sphere {
    * ```
    */
   exportToTxt(options: { password?: string; addressCount?: number } = {}): string {
-    this.ensureReady();
-
-    if (!this._masterKey && !this._identity) {
-      throw new SphereError('Wallet not initialized', 'NOT_INITIALIZED');
-    }
-
-    // Build addresses array
-    const addressCount = options.addressCount || 1;
-    const addresses: Array<{
-      index: number;
-      address: string;
-      path: string;
-      isChange: boolean;
-    }> = [];
-
-    for (let i = 0; i < addressCount; i++) {
-      try {
-        const addr = this.deriveAddress(i, false);
-        addresses.push({
-          address: addr.address,
-          path: addr.path,
-          index: addr.index,
-          isChange: false,
-        });
-      } catch {
-        // Stop if we can't derive more addresses
-        if (i === 0 && this._identity) {
-          addresses.push({
-            address: publicKeyToAddress(this._identity.chainPubkey, 'alpha'),
-            path: this.getDefaultAddressPath(),
-            index: 0,
-            isChange: false,
-          });
-        }
-        break;
-      }
-    }
-
-    const masterPrivateKey = this._masterKey?.privateKey || '';
-    const chainCode = this._masterKey?.chainCode || undefined;
-    const isBIP32 = this._derivationMode === 'bip32';
-    const descriptorPath = this._basePath.replace(/^m\//, '');
-
-    // If password provided, encrypt
-    if (options.password) {
-      const encryptedMasterKey = encryptForTextFormat(masterPrivateKey, options.password);
-      return serializeEncryptedWalletToText({
-        encryptedMasterKey,
-        chainCode,
-        descriptorPath,
-        isBIP32,
-        addresses,
-      });
-    }
-
-    // Unencrypted export
-    return serializeWalletToText({
-      masterPrivateKey,
-      chainCode,
-      descriptorPath,
-      isBIP32,
-      addresses,
-    });
+    return walletIoExportToTxt(this as unknown as WalletIoInstanceHost, options);
   }
 
   /**
@@ -3202,68 +3054,7 @@ export class Sphere {
     jsonContent: string;
     password?: string;
   }): Promise<{ success: boolean; mnemonic?: string; error?: string }> {
-    const { jsonContent, password, ...baseOptions } = options;
-
-    try {
-      const data = JSON.parse(jsonContent) as WalletJSON;
-
-      if (data.version !== '1.0' || data.type !== 'sphere-wallet') {
-        return { success: false, error: 'Invalid wallet format' };
-      }
-
-      // Decrypt if needed
-      let mnemonic = data.mnemonic;
-      let masterKey = data.wallet.masterPrivateKey;
-
-      if (data.encrypted && password) {
-        if (mnemonic) {
-          const decrypted = decryptSimple(mnemonic, password);
-          if (!decrypted) {
-            return { success: false, error: 'Failed to decrypt mnemonic - wrong password?' };
-          }
-          mnemonic = decrypted;
-        }
-        if (masterKey) {
-          const decrypted = decryptSimple(masterKey, password);
-          if (!decrypted) {
-            return { success: false, error: 'Failed to decrypt master key - wrong password?' };
-          }
-          masterKey = decrypted;
-        }
-      } else if (data.encrypted && !password) {
-        return { success: false, error: 'Password required for encrypted wallet' };
-      }
-
-      // Determine base path
-      const basePath = data.wallet.descriptorPath
-        ? `m/${data.wallet.descriptorPath}`
-        : DEFAULT_BASE_PATH;
-
-      // Import using mnemonic if available (preferred)
-      if (mnemonic) {
-        await Sphere.import({ ...baseOptions, mnemonic, basePath });
-        return { success: true, mnemonic };
-      }
-
-      // Otherwise import using master key
-      if (masterKey) {
-        await Sphere.import({
-          ...baseOptions,
-          masterKey,
-          chainCode: data.wallet.chainCode,
-          basePath,
-          derivationMode: data.derivationMode || (data.wallet.isBIP32 ? 'bip32' : 'wif_hmac'),
-        });
-        return { success: true };
-      }
-
-      return { success: false, error: 'No mnemonic or master key in wallet data' };
-    } catch (e) {
-      return {
-        success: false,
-        error: e instanceof Error ? e.message : 'Failed to parse wallet JSON',
-      };
-    }
+    return walletIoImportFromJSON(Sphere as unknown as WalletIoSphereRef<Sphere>, options);
   }
 
   /**
@@ -3312,271 +3103,24 @@ export class Sphere {
     needsPassword?: boolean;
     error?: string;
   }> {
-    const { fileContent, fileName, password, onDecryptProgress, ...baseOptions } = options;
-
-    // Detect file type
-    const fileType = Sphere.detectLegacyFileType(fileName, fileContent);
-
-    if (fileType === 'unknown') {
-      return { success: false, error: 'Unknown file format' };
-    }
-
-    // Handle mnemonic text
-    if (fileType === 'mnemonic') {
-      const mnemonic = (fileContent as string).trim().toLowerCase().split(/\s+/).join(' ');
-      if (!Sphere.validateMnemonic(mnemonic)) {
-        return { success: false, error: 'Invalid mnemonic phrase' };
-      }
-
-      const sphere = await Sphere.import({ ...baseOptions, mnemonic });
-      return { success: true, sphere, mnemonic };
-    }
-
-    // Handle .dat file
-    if (fileType === 'dat') {
-      const data = fileContent instanceof Uint8Array
-        ? fileContent
-        : new TextEncoder().encode(fileContent);
-
-      let parseResult;
-
-      if (password) {
-        parseResult = await parseAndDecryptWalletDat(data, password, onDecryptProgress);
-      } else {
-        parseResult = parseWalletDat(data);
-      }
-
-      if (parseResult.needsPassword && !password) {
-        return { success: false, needsPassword: true, error: 'Password required for encrypted wallet' };
-      }
-
-      if (!parseResult.success || !parseResult.data) {
-        return { success: false, error: parseResult.error };
-      }
-
-      const { masterKey, chainCode, descriptorPath, derivationMode } = parseResult.data;
-      const basePath = descriptorPath ? `m/${descriptorPath}` : DEFAULT_BASE_PATH;
-
-      const sphere = await Sphere.import({
-        ...baseOptions,
-        masterKey,
-        chainCode,
-        basePath,
-        derivationMode: derivationMode || (chainCode ? 'bip32' : 'wif_hmac'),
-      });
-
-      return { success: true, sphere };
-    }
-
-    // Handle .txt file
-    if (fileType === 'txt') {
-      const content = typeof fileContent === 'string'
-        ? fileContent
-        : new TextDecoder().decode(fileContent);
-
-      let parseResult;
-
-      if (password) {
-        parseResult = parseAndDecryptWalletText(content, password);
-      } else if (isTextWalletEncrypted(content)) {
-        return { success: false, needsPassword: true, error: 'Password required for encrypted wallet' };
-      } else {
-        parseResult = parseWalletText(content);
-      }
-
-      if (parseResult.needsPassword && !password) {
-        return { success: false, needsPassword: true, error: 'Password required for encrypted wallet' };
-      }
-
-      if (!parseResult.success || !parseResult.data) {
-        return { success: false, error: parseResult.error };
-      }
-
-      const { masterKey, chainCode, descriptorPath, derivationMode } = parseResult.data;
-      const basePath = descriptorPath ? `m/${descriptorPath}` : DEFAULT_BASE_PATH;
-
-      const sphere = await Sphere.import({
-        ...baseOptions,
-        masterKey,
-        chainCode,
-        basePath,
-        derivationMode: derivationMode || (chainCode ? 'bip32' : 'wif_hmac'),
-      });
-
-      return { success: true, sphere };
-    }
-
-    // Handle JSON
-    if (fileType === 'json') {
-      const content = typeof fileContent === 'string'
-        ? fileContent
-        : new TextDecoder().decode(fileContent);
-
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = JSON.parse(content);
-      } catch {
-        return { success: false, error: 'Invalid JSON file' };
-      }
-
-      // sphere-wallet format — delegate to importFromJSON
-      if (parsed.type === 'sphere-wallet') {
-        const result = await Sphere.importFromJSON({
-          ...baseOptions,
-          jsonContent: content,
-          password,
-        });
-
-        if (result.success) {
-          const sphere = Sphere.getInstance();
-          return { success: true, sphere: sphere!, mnemonic: result.mnemonic };
-        }
-
-        if (!password && result.error?.includes('Password required')) {
-          return { success: false, needsPassword: true, error: result.error };
-        }
-
-        return { success: false, error: result.error };
-      }
-
-      // Legacy flat JSON format (webwallet export)
-      let masterKey: string | undefined;
-      let mnemonic: string | undefined;
-
-      if (parsed.encrypted && typeof parsed.encrypted === 'object') {
-        // Encrypted legacy JSON — needs password + salt-based PBKDF2 decryption
-        if (!password) {
-          return { success: false, needsPassword: true, error: 'Password required for encrypted wallet' };
-        }
-        const enc = parsed.encrypted as { masterPrivateKey?: string; mnemonic?: string; salt?: string };
-        if (!enc.salt || !enc.masterPrivateKey) {
-          return { success: false, error: 'Invalid encrypted wallet format' };
-        }
-        const decryptedKey = decryptWithSalt(enc.masterPrivateKey, password, enc.salt);
-        if (!decryptedKey) {
-          return { success: false, error: 'Failed to decrypt - incorrect password?' };
-        }
-        masterKey = decryptedKey;
-        if (enc.mnemonic) {
-          mnemonic = decryptWithSalt(enc.mnemonic, password, enc.salt) ?? undefined;
-        }
-      } else {
-        // Unencrypted legacy JSON
-        masterKey = parsed.masterPrivateKey as string | undefined;
-        mnemonic = parsed.mnemonic as string | undefined;
-      }
-
-      if (!masterKey) {
-        return { success: false, error: 'No master key found in wallet JSON' };
-      }
-
-      const chainCode = parsed.chainCode as string | undefined;
-      const descriptorPath = parsed.descriptorPath as string | undefined;
-      const derivationMode = (parsed.derivationMode as string | undefined);
-      const isBIP32 = derivationMode === 'bip32' || !!chainCode;
-      const basePath = descriptorPath
-        ? `m/${descriptorPath}`
-        : (isBIP32 ? "m/84'/1'/0'" : DEFAULT_BASE_PATH);
-
-      if (mnemonic) {
-        const sphere = await Sphere.import({ ...baseOptions, mnemonic, basePath });
-        return { success: true, sphere, mnemonic };
-      }
-
-      const sphere = await Sphere.import({
-        ...baseOptions,
-        masterKey,
-        chainCode,
-        basePath,
-        derivationMode: (derivationMode as DerivationMode) || (chainCode ? 'bip32' : 'wif_hmac'),
-      });
-      return { success: true, sphere };
-    }
-
-    return { success: false, error: 'Unsupported file type' };
+    return walletIoImportFromLegacyFile(
+      Sphere as unknown as WalletIoSphereRef<Sphere>,
+      options,
+    );
   }
 
   /**
    * Detect legacy file type from filename and content
    */
   static detectLegacyFileType(fileName: string, content: string | Uint8Array): LegacyFileType {
-    // .dat files are binary
-    if (fileName.endsWith('.dat')) {
-      return 'dat';
-    }
-
-    // Check content for type detection
-    const textContent = typeof content === 'string'
-      ? content
-      : (content.length < 1000 ? new TextDecoder().decode(content) : '');
-
-    // Check for JSON
-    if (fileName.endsWith('.json')) {
-      return 'json';
-    }
-
-    try {
-      const trimmed = textContent.trim();
-      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-        JSON.parse(trimmed);
-        return 'json';
-      }
-    } catch {
-      // Not JSON
-    }
-
-    // Check for mnemonic (12 or 24 words)
-    const words = textContent.trim().split(/\s+/);
-    if (
-      (words.length === 12 || words.length === 24) &&
-      words.every((w) => /^[a-z]+$/.test(w.toLowerCase()))
-    ) {
-      return 'mnemonic';
-    }
-
-    // Check for text wallet format
-    if (isWalletTextFormat(textContent)) {
-      return 'txt';
-    }
-
-    // Check for SQLite (binary .dat)
-    if (content instanceof Uint8Array && isSQLiteDatabase(content)) {
-      return 'dat';
-    }
-
-    return 'unknown';
+    return walletIoDetectLegacyFileType(fileName, content);
   }
 
   /**
    * Check if a legacy file is encrypted
    */
   static isLegacyFileEncrypted(fileName: string, content: string | Uint8Array): boolean {
-    const fileType = Sphere.detectLegacyFileType(fileName, content);
-
-    if (fileType === 'dat' && content instanceof Uint8Array) {
-      return isWalletDatEncrypted(content);
-    }
-
-    if (fileType === 'txt') {
-      const textContent = typeof content === 'string'
-        ? content
-        : new TextDecoder().decode(content);
-      return isTextWalletEncrypted(textContent);
-    }
-
-    if (fileType === 'json') {
-      try {
-        const textContent = typeof content === 'string'
-          ? content
-          : new TextDecoder().decode(content);
-        const data = JSON.parse(textContent);
-        return !!data.encrypted;
-      } catch {
-        return false;
-      }
-    }
-
-    return false;
+    return walletIoIsLegacyFileEncrypted(fileName, content);
   }
 
   /**
