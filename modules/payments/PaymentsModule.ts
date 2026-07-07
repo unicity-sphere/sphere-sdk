@@ -68,11 +68,8 @@ import type {
 } from '../../types';
 import { STORAGE_KEYS_ADDRESS } from '../../constants';
 import {
-  tokenToTxf,
   txfToToken,
   getCurrentStateHash,
-  buildTxfStorageData,
-  parseTxfStorageData,
 } from '../../serialization/txf-serializer';
 import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
@@ -324,7 +321,6 @@ export type { TransactionHistoryEntry } from './read-model';
 
 // Runtime imports for the class-body delegations below.
 import {
-  MAX_SYNCED_HISTORY_ENTRIES,
   getHistoryDescending,
   resolveSenderInfo as resolveSenderInfoImpl,
   addHistoryEntry as addHistoryEntryImpl,
@@ -671,6 +667,22 @@ import { mintFungibleTokenImpl } from './mint';
 // thin facade delegations to pure functions in `./import-export/`.
 // See modules/payments/import-export/README.md for the routing plan.
 import { exportTokensFromMap, importTokensInto } from './import-export';
+
+// Phase 5 [A] survive extraction — persistence codec + save + KV writer
+// helper + local-provider selector live under `./persistence/`. Facade
+// keeps its private method signatures (archiveToken, save, _doSave,
+// setStorageEntry, createStorageData, loadFromStorageData,
+// getLocalTokenStorageProvider) as one-line delegations to keep external
+// call graphs stable. See modules/payments/persistence/README.md.
+import {
+  archiveTokenImpl,
+  createStorageData as createStorageDataImpl,
+  loadFromStorageData as loadFromStorageDataImpl,
+  runDoSave,
+  getLocalTokenStorageProvider as pickLocalTokenStorageProvider,
+  writeKvEntry,
+  type EntryTag,
+} from './persistence';
 
 // Phase 5 [A] survive extraction — sync engine + storage-event helpers.
 // The facade retains its public method signatures and delegates to
@@ -10693,15 +10705,7 @@ export class PaymentsModule {
    * Get the first local token storage provider (for history operations).
    */
   private getLocalTokenStorageProvider(): TokenStorageProvider<TxfStorageDataBase> | null {
-    const providers = this.getTokenStorageProviders();
-    for (const [, provider] of providers) {
-      if (provider.type === 'local') return provider;
-    }
-    // Fallback: first provider
-    for (const [, provider] of providers) {
-      return provider;
-    }
-    return null;
+    return pickLocalTokenStorageProvider(this.getTokenStorageProviders());
   }
 
   // ===========================================================================
@@ -15328,28 +15332,14 @@ export class PaymentsModule {
   // ===========================================================================
 
   private async archiveToken(token: Token): Promise<void> {
-    const txf = tokenToTxf(token);
-    if (!txf) return;
-
-    const tokenId = txf.genesis?.data?.tokenId;
-    if (!tokenId) return;
-
-    const existingArchive = this.archivedTokens.get(tokenId);
-
-    if (existingArchive) {
-      if (isIncrementalUpdate(existingArchive, txf)) {
-        this.archivedTokens.set(tokenId, txf);
-        logger.debug('Payments', `Updated archived token ${tokenId.slice(0, 8)}...`);
-      } else {
-        // Fork
-        const stateHash = getCurrentStateHash(txf) || '';
-        await this.storeForkedToken(tokenId, stateHash, txf);
-        logger.debug('Payments', `Archived token ${tokenId.slice(0, 8)}... is a fork`);
-      }
-    } else {
-      this.archivedTokens.set(tokenId, txf);
-      logger.debug('Payments', `Archived token ${tokenId.slice(0, 8)}...`);
-    }
+    await archiveTokenImpl(
+      {
+        archivedTokens: this.archivedTokens,
+        storeForkedToken: (tokenId, stateHash, txf) =>
+          this.storeForkedToken(tokenId, stateHash, txf),
+      },
+      token,
+    );
   }
 
   // ===========================================================================
@@ -15399,33 +15389,10 @@ export class PaymentsModule {
   private async setStorageEntry(
     key: string,
     value: string,
-    entryType: 'token_send' | 'token_receive' | 'cache_index',
+    entryType: EntryTag,
   ): Promise<void> {
-    const storage = this.deps!.storage;
-    const setEntryFn = (storage as { setEntry?: (k: string, v: string, t: string) => Promise<void> })
-      .setEntry;
-    if (typeof setEntryFn === 'function') {
-      await setEntryFn.call(storage, key, value, entryType);
-      return;
-    }
-    // Fallback: provider has no envelope-storage layer (plain IndexedDB
-    // / file KV). Log once per provider-class so a silent loss of W11
-    // stamping during a migration is visible in ops. Subsequent calls
-    // from the same class are silent to avoid log spam.
-    const providerClass = storage.constructor?.name ?? 'UnknownStorage';
-    if (!PaymentsModule._w11FallbackLogged.has(providerClass)) {
-      PaymentsModule._w11FallbackLogged.add(providerClass);
-      logger.debug(
-        'Payments',
-        `[W11] storage.setEntry not available on ${providerClass}; originated tags will not be stamped ` +
-          `(this is expected for plain IndexedDB / file storage, unexpected when ProfileStorageProvider is in the chain).`,
-      );
-    }
-    await storage.set(key, value);
+    await writeKvEntry(this.deps!.storage, key, value, entryType);
   }
-
-  /** Per-class dedup set for the W11 fallback log (see setStorageEntry). */
-  private static _w11FallbackLogged: Set<string> = new Set();
 
   private async save(): Promise<void> {
     // Chain onto the previous save. Failure in prior save is isolated via
@@ -15442,34 +15409,12 @@ export class PaymentsModule {
   }
 
   private async _doSave(): Promise<void> {
-    // Save to TokenStorageProviders (IndexedDB/files)
-    const providers = this.getTokenStorageProviders();
-    // Debug: log token serialization status
-    const tokenStats = Array.from(this.tokens.values()).map(t => {
-      const txf = tokenToTxf(t);
-      return `${t.id.slice(0, 12)}(${t.status},txf=${!!txf})`;
+    await runDoSave({
+      tokens: this.tokens,
+      getTokenStorageProviders: () => this.getTokenStorageProviders(),
+      createStorageData: () => this.createStorageData(),
+      savePendingV5Tokens: () => this.savePendingV5Tokens(),
     });
-    logger.debug('Payments', `save(): providers=${providers.size}, tokens=[${tokenStats.join(', ')}]`);
-
-    if (providers.size > 0) {
-      const data = await this.createStorageData();
-      const dataKeys = Object.keys(data).filter(k => k.startsWith('token-'));
-      logger.debug('Payments', `save(): TXF keys=${dataKeys.length} (${dataKeys.join(', ')})`);
-      for (const [id, provider] of providers) {
-        try {
-          await provider.save(data);
-        } catch (err) {
-          logger.error('Payments', `Failed to save to provider ${id}:`, err);
-        }
-      }
-    } else {
-      logger.debug('Payments', 'save(): No token storage providers - TXF not persisted');
-    }
-
-    // Always save pending V5 tokens to KV storage (separate from TXF providers).
-    // V5 pending tokens can't be serialized to TXF, so they use KV regardless
-    // of whether TXF providers exist.
-    await this.savePendingV5Tokens();
   }
 
   /**
@@ -15633,371 +15578,50 @@ export class PaymentsModule {
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
-    const sorted = [...this._historyCache].sort((a, b) => b.timestamp - a.timestamp);
-    return await buildTxfStorageData(
-      Array.from(this.tokens.values()),
-      {
-        version: 1,
-        address: this.deps!.identity.chainPubkey,
-        ipnsName: this.deps!.identity.ipnsName ?? '',
-      },
-      {
-        nametags: this.nametags,
-        tombstones: this.tombstones,
-        archivedTokens: this.archivedTokens,
-        forkedTokens: this.forkedTokens,
-        historyEntries: sorted.slice(0, MAX_SYNCED_HISTORY_ENTRIES),
-      }
-    ) as unknown as TxfStorageDataBase;
+    return await createStorageDataImpl({
+      identity: this.deps!.identity,
+      tokens: this.tokens,
+      nametags: this.nametags,
+      tombstones: this.tombstones,
+      archivedTokens: this.archivedTokens,
+      forkedTokens: this.forkedTokens,
+      historyCache: this._historyCache,
+    });
   }
 
   private loadFromStorageData(data: TxfStorageDataBase): void {
-    const parsed = parseTxfStorageData(data);
-    logger.debug('Payments', `loadFromStorageData: parsed ${parsed.tokens.length} tokens, ${parsed.tombstones.length} tombstones, errors=[${parsed.validationErrors.join('; ')}]`);
-
-    // #143 FIX D — UNION-MERGE tombstones (do NOT replace).
-    //
-    // Wholesale replacement is unsafe: when a remote/sync snapshot is older
-    // than the local set (e.g. an in-flight send tombstoned a source AFTER
-    // the snapshot was captured), `this.tombstones = parsed.tombstones`
-    // drops the local tombstone. The just-spent source token then re-loads
-    // from the snapshot, status='confirmed', and the spend planner sees a
-    // phantom balance — the failure mode reported in #143.
-    //
-    // Union semantics mirror {@link mergeTombstones} (line ~6806). Local
-    // tombstones survive sync; remote tombstones are added if not already
-    // present. The keySet provides O(1) dedup.
-    //
-    // Loop1-S10 — build the merged ARRAY in a local first, then assign
-    // both `this.tombstones` AND `this.tombstoneKeySet` atomically at
-    // the end. The previous revision mutated `this.tombstones` in-place
-    // during the loop while reassigning the keySet only AFTER the loop
-    // exited; an exception mid-iteration (malformed snapshot, etc.)
-    // would leave the two stores divergent until the next
-    // `rebuildTombstoneKeySet`. Atomic assignment closes that hazard.
-    const mergedKeySet = new Set(this.tombstoneKeySet);
-    const mergedArray = [...this.tombstones];
-    for (const t of parsed.tombstones) {
-      // Defensive: skip malformed entries. A snapshot with a missing
-      // tokenId or stateHash would create a "undefined:undefined" key
-      // that matches any future token whose extract* returns undefined
-      // — silent over-tombstoning.
-      if (
-        t === null ||
-        typeof t !== 'object' ||
-        typeof (t as { tokenId?: unknown }).tokenId !== 'string' ||
-        typeof (t as { stateHash?: unknown }).stateHash !== 'string'
-      ) {
-        continue;
-      }
-      const k = `${t.tokenId}:${t.stateHash}`;
-      if (!mergedKeySet.has(k)) {
-        mergedArray.push(t);
-        mergedKeySet.add(k);
-      }
-    }
-    this.tombstones = mergedArray;
-    this.tombstoneKeySet = mergedKeySet;
-    // Load tokens, filtering out tombstoned ones.
-    //
-    // INVARIANT (2026-05-16): load() MUST NEVER drop tokens that exist
-    // only in memory. Storage can lag (debounced flush, transient
-    // pointer publish failures holding the at-least-once gate closed)
-    // while addToken has already committed to `this.tokens`. A
-    // wholesale `tokens.clear()` followed by "rebuild from storage"
-    // silently wipes any token whose flush hasn't durably completed —
-    // even though PaymentsModule originally accepted it. That is the
-    // exact failure mode that caused profile-multi-device-sync to lose
-    // 4 of 7 faucet drops when transient AGGREGATOR_POINTER_WALKBACK_FLOOR
-    // errors held the publish gate closed.
-    //
-    // Policy:
-    //   - Snapshot every in-memory token before clearing.
-    //   - Storage data wins for tokens whose (tokenId, stateHash)
-    //     identity matches a storage entry. The storage version is
-    //     the most-recently-loaded definitive shape (proofs, etc.).
-    //   - For every snapshot token that has NO matching storage
-    //     entry: re-insert it after the storage load. These are
-    //     tokens still in flight from in-memory to storage; dropping
-    //     them would lose user state.
-    //   - Tombstoned tokens (matching the tombstone set after the
-    //     UNION-MERGE above) are dropped from the snapshot —
-    //     consistent with the storage-side filter below.
-    //
-    // The pre-existing 'transferring' preservation guard is now
-    // redundant (covered by the broader policy) but kept for clarity
-    // at the call site. The newer `preservedFromMemory` map covers
-    // every other status — confirmed, unconfirmed, pending, etc.
-    const preservedFromMemory = new Map<string, Token>(this.tokens);
-
-    this.tokens.clear();
-
-    // Load other data EARLY so archive-move (below) can write into the
-    // up-to-date archive map. Note: `this.nametags` is set further down
-    // via the preservation guard so a sync provider that strips _nametags
-    // doesn't transiently empty the in-memory nametag set (#136 / PR #140).
-    this.archivedTokens = parsed.archivedTokens;
-    this.forkedTokens = parsed.forkedTokens;
-
-    let archiveMoved = 0;
-    for (const token of parsed.tokens) {
-      // Don't overwrite in-flight 'transferring' tokens from the
-      // pre-clear snapshot. The broader NEVER-WIPE restore loop
-      // below handles every OTHER status, but at the in-loop set
-      // stage we still skip storage entries that would clobber a
-      // 'transferring' in-flight send (the original guard).
-      const existingTransferring = preservedFromMemory.get(token.id);
-      if (existingTransferring?.status === 'transferring') continue;
-
-      const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
-      const stateHash = extractStateHashFromSdkData(token.sdkData);
-
-      // Only filter if we have exact state match
-      if (sdkTokenId && stateHash && this.isStateTombstoned(sdkTokenId, stateHash)) {
-        logger.debug('Payments', `Skipping tombstoned token ${sdkTokenId.slice(0, 8)}... during load (exact state match)`);
-        continue;
-      }
-
-      // #144 L3 — balance-model invariant: if the latest state's
-      // predicate isn't ours AND no finalization plan exists, the token
-      // has no place in the active map per #143's mutual-exclusivity
-      // refinement. Move it to archive. Bob's stranded V6-direct receive
-      // (the #144 reproduction case) is preserved because
-      // `isReceivedLegacyPending → hasFinalizationPlan: true`.
-      if (
-        !this.latestStatePredicateMatchesWallet(token) &&
-        !this.hasFinalizationPlan(token)
-      ) {
-        const txf = tokenToTxf(token);
-        if (txf?.genesis?.data?.tokenId) {
-          const archiveTokenId = txf.genesis.data.tokenId;
-          // Steelman FIX E (#144): the archive map can already contain a
-          // record for this tokenId — either from prior archiving (legit
-          // history) or from a FORK (different state of same tokenId).
-          // Pre-FIX-E we silently overwrote, destroying fork-detection
-          // evidence. Now: if archive already has it, skip — the prior
-          // record wins. The active-map removal still happens (we don't
-          // re-add the token to `this.tokens`). Fork resolution should
-          // happen via the explicit `archiveToken()`/`storeForkedToken`
-          // flow, not via load-time invariant enforcement.
-          if (this.archivedTokens.has(archiveTokenId)) {
-            logger.debug(
-              'Payments',
-              `[BALANCE-INVARIANT] Token ${token.id.slice(0, 12)} ` +
-                `already in archive — leaving existing record intact ` +
-                `(possible fork or prior archive). Dropping active copy.`,
-            );
-          } else {
-            this.archivedTokens.set(archiveTokenId, txf);
-            logger.debug(
-              'Payments',
-              `[BALANCE-INVARIANT] Moved token ${token.id.slice(0, 12)} to archive — ` +
-                `latest state predicate not ours, no finalization plan`,
-            );
-          }
-          archiveMoved++;
-          continue;
-        }
-        // Couldn't convert to TXF — keep in active to avoid data loss.
-      }
-
-      this.tokens.set(token.id, token);
-    }
-    if (archiveMoved > 0) {
-      logger.debug(
-        'Payments',
-        `[BALANCE-INVARIANT] loadFromStorageData moved ${archiveMoved} token(s) to archive`,
-      );
-    }
-
-    // NEVER-WIPE INVARIANT (2026-05-16): re-insert any token from the
-    // pre-clear snapshot that storage did NOT supersede. Storage wins
-    // when the same (tokenId, stateHash) identity already loaded —
-    // those tokens are NOT restored from the snapshot (the storage
-    // version is the canonical one). All other snapshot tokens (those
-    // still in flight to storage, or those whose flush failed for any
-    // reason) are restored. Tombstoned (tokenId, stateHash) pairs are
-    // dropped to stay consistent with the storage-side filter.
-    //
-    // Build a set of the (tokenId, stateHash) identities now in
-    // `this.tokens` from the storage load so the restore loop can
-    // dedup cheaply. `Token.id` is internal and can differ between
-    // a snapshot entry and a storage entry that represent the SAME
-    // logical state — so the comparison MUST go through the SDK-data
-    // extractors.
-    const loadedStateKeys = new Set<string>();
-    for (const t of this.tokens.values()) {
-      const tid = extractTokenIdFromSdkData(t.sdkData);
-      const sh = extractStateHashFromSdkData(t.sdkData);
-      if (tid && sh) loadedStateKeys.add(createTokenStateKey(tid, sh));
-    }
-
-    let restoredFromMemory = 0;
-    for (const [snapshotId, snapshotToken] of preservedFromMemory) {
-      // Skip if storage already loaded a token at this id slot.
-      if (this.tokens.has(snapshotId)) continue;
-
-      const snapTokenId = extractTokenIdFromSdkData(snapshotToken.sdkData);
-      const snapStateHash = extractStateHashFromSdkData(snapshotToken.sdkData);
-
-      // Tombstoned (tokenId, stateHash) pair → drop (storage tombstone wins).
-      if (
-        snapTokenId &&
-        snapStateHash &&
-        this.isStateTombstoned(snapTokenId, snapStateHash)
-      ) {
-        continue;
-      }
-
-      // Storage already has this exact state under a different id slot
-      // (rare — happens when storage's internal id differs from the
-      // in-memory id for the same logical token). Storage wins.
-      if (
-        snapTokenId &&
-        snapStateHash &&
-        loadedStateKeys.has(createTokenStateKey(snapTokenId, snapStateHash))
-      ) {
-        continue;
-      }
-
-      // Snapshot has a NEWER state than what storage loaded for the
-      // same tokenId. The newer state was added to memory after the
-      // last successful flush and storage hasn't caught up. Archive
-      // the older state in `this.tokens` (if present) and restore
-      // the newer snapshot — matches addToken's CASE 2 semantics.
-      if (snapTokenId) {
-        let supersededOlder = false;
-        // OUTBOX-SEND-FOLLOWUPS Item #14 Phase 2 work item 5 — JOIN-
-        // divergent loser detection. When the preserved-from-memory
-        // snapshot token is at status='transferring' (an in-flight
-        // send) AND the storage load surfaced a DIFFERENT chain head
-        // for the same genesisTokenId, the L3 aggregator has already
-        // arbitrated against the local in-flight send (multi-device
-        // double-spend race). The storage token is the winner; the
-        // snapshot is a stale loser. We drop it (don't restore) and
-        // emit `transfer:double-spend-detected` for operator visibility.
-        //
-        // For non-'transferring' snapshot statuses (e.g. 'confirmed')
-        // we preserve the legacy dual-state restore — the spent-state
-        // rescan worker (Item #16, default-ON post-soak) catches the
-        // off-record spend on its next 5-min probe via
-        // `oracle.isSpent` and routes through `defaultSpentStateTransition`.
-        let supersededByJoinDivergence = false;
-        let winnerStateHash: string | null = null;
-        for (const [existingId, existingToken] of this.tokens) {
-          if (!hasSameGenesisTokenId(existingToken, snapshotToken)) continue;
-          const existingStateHash = extractStateHashFromSdkData(existingToken.sdkData);
-          if (
-            snapStateHash &&
-            existingStateHash &&
-            snapStateHash === existingStateHash
-          ) {
-            // Same exact state — storage's record wins (it was just loaded).
-            supersededOlder = true;
-            break;
-          }
-          // Different state. Branch on the snapshot token's status:
-          if (snapshotToken.status === 'transferring') {
-            // JOIN-divergent loser — drop the snapshot.
-            supersededByJoinDivergence = true;
-            winnerStateHash = existingStateHash ?? null;
-            void existingId; // silence unused-var on the non-debug path
-          }
-          // Either branch ends the per-token loop — we've found the
-          // same-genesisTokenId match.
-          break;
-        }
-        if (supersededOlder) continue;
-        if (supersededByJoinDivergence) {
-          // Don't restore. The token's value is gone (aggregator
-          // anchored the winner's commit; our submit failed at
-          // `STATE_ALREADY_SPENT_BY_OTHER` per Item #14 Phase 1).
-          //
-          // Steelman H1 (PR #182 review): create a tombstone for the
-          // dropped loser's (tokenId, stateHash) BEFORE the event
-          // emit so a process restart between drop and event-consume
-          // leaves a durable audit trail. The tombstone also blocks
-          // a stale storage source from re-syncing the dead state
-          // back into the active pool on a future load. Same
-          // pattern as `removeToken` at line ~9512 — see
-          // `createTombstoneFromToken` (line 878).
-          const tombstone = createTombstoneFromToken(snapshotToken);
-          if (tombstone) {
-            const tombKey = `${tombstone.tokenId}:${tombstone.stateHash}`;
-            if (!this.tombstoneKeySet.has(tombKey)) {
-              this.tombstones.push(tombstone);
-              this.tombstoneKeySet.add(tombKey);
-            }
-          }
-
-          // The recipient field on the loser's bundle is the local
-          // intended recipient; we don't have authoritative info on
-          // the winning recipient. Emit with empty `ourIntendedRecipient`
-          // and `winnerStateHash` so an operator can correlate to
-          // the relevant SENT entry / OUTBOX archive if needed.
-          //
-          // The event matches the Item #14 Phase 1 reactive surface
-          // (`transfer:double-spend-detected`) — the reactive surface
-          // fires at submit-time, this surface fires at JOIN-time.
-          // Operators expect to see the event from EITHER source.
-          try {
-            this.deps?.emitEvent('transfer:double-spend-detected', {
-              tokenId: snapTokenId ?? '',
-              sourceStateHash: snapStateHash ?? '',
-              ourIntendedRecipient: '',
-              detectedAt: Date.now(),
-            });
-          } catch (emitErr) {
-            logger.warn(
-              'Payments',
-              `loadFromStorageData: emit transfer:double-spend-detected failed for token ${snapshotId.slice(0, 12)}…: ${emitErr instanceof Error ? emitErr.message : String(emitErr)}`,
-            );
-          }
-          logger.debug(
-            'Payments',
-            `loadFromStorageData: JOIN-divergent loser dropped (tokenId=${snapTokenId?.slice(0, 16)}…, ` +
-              `loser-stateHash=${snapStateHash?.slice(0, 16)}…, winner-stateHash=${winnerStateHash?.slice(0, 16) ?? '?'}…, ` +
-              `snapshotId=${snapshotId.slice(0, 12)}…, tombstoned=${tombstone !== null}). Item #14 Phase 2 work item 5 — multi-device double-spend race.`,
-          );
-          continue;
-        }
-      }
-
-      this.tokens.set(snapshotId, snapshotToken);
-      restoredFromMemory++;
-    }
-    if (restoredFromMemory > 0) {
-      logger.debug(
-        'Payments',
-        `[NEVER-WIPE] loadFromStorageData restored ${restoredFromMemory} in-memory ` +
-          `token(s) not present in storage (likely in-flight or flush-stalled)`,
-      );
-    }
-
-    // Nametag preservation guard (#136). Some sync providers strip
-    // `_nametags` from merged data — overriding would transiently empty
-    // `this.nametags` and any concurrent `finalizeTransferToken` would
-    // throw "no Unicity ID token". Only override when the incoming data
-    // actually carries nametag information. An explicit `_nametags: []`
-    // (or legacy `_nametag`) from a different device still clears, as
-    // expected.
-    const rawData = data as unknown as Record<string, unknown>;
-    const incomingHasNametags =
-      Array.isArray(rawData._nametags) || rawData._nametag != null;
-    if (incomingHasNametags || this.nametags.length === 0) {
-      this.nametags = parsed.nametags;
-    }
-
-    // Issue #387 — every TXF round-trip through `parseTxfStorageData →
-    // txfToToken → determineTokenStatus` rewrites token status from
-    // {transactions, inclusionProof} only; the application-level
-    // `'invalid'` verdict (set by `finalizeStrandedReceivedToken` after
-    // a V6-RECOVER permanent-fail) is lost. Re-apply the persistent
-    // `v6RecoverPermanent` ledger to the freshly-loaded tokens so the
-    // verdict survives initial load AND every subsequent `sync()`
-    // (which calls back into `loadFromStorageData`). No-op when the
-    // ledger is empty.
-    this.applyV6RecoverPermanentInvalidStatus();
+    const diff = loadFromStorageDataImpl(
+      {
+        tokens: this.tokens,
+        tombstones: this.tombstones,
+        tombstoneKeySet: this.tombstoneKeySet,
+        archivedTokens: this.archivedTokens,
+        forkedTokens: this.forkedTokens,
+        nametags: this.nametags,
+        emitEvent: (type, payload) => this.deps?.emitEvent(type, payload),
+        latestStatePredicateMatchesWallet: (token) =>
+          this.latestStatePredicateMatchesWallet(token),
+        hasFinalizationPlan: (token) => this.hasFinalizationPlan(token),
+        isStateTombstoned: (tokenId, stateHash) =>
+          this.isStateTombstoned(tokenId, stateHash),
+        applyV6RecoverPermanentInvalidStatus: () =>
+          this.applyV6RecoverPermanentInvalidStatus(),
+      },
+      data,
+    );
+    // Atomic re-assignment slots — the codec builds fresh containers
+    // for `tombstones` / `tombstoneKeySet` so a mid-load exception can
+    // never leave them divergent. `nametags` is preserved through the
+    // #136 guard inside the codec and returned back to the facade so
+    // the facade's field observes the guard's decision. `archivedTokens`
+    // / `forkedTokens` come from `parseTxfStorageData`'s output — the
+    // codec's archive-move branch writes into that Map (see #144 FIX E)
+    // so the facade must re-point at the same instance.
+    this.tombstones = diff.tombstones;
+    this.tombstoneKeySet = diff.tombstoneKeySet;
+    this.nametags = diff.nametags;
+    this.archivedTokens = diff.archivedTokens;
+    this.forkedTokens = diff.forkedTokens;
   }
 
   // ===========================================================================

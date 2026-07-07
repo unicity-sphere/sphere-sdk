@@ -67,7 +67,15 @@ describe('T-D7 PaymentsModule W11 stamping — source-level invariant', () => {
     // Anchor the helper to keep future refactors honest — a rename
     // or move should update this test alongside the call sites.
     expect(source).toMatch(/private\s+async\s+setStorageEntry\s*\(/);
-    expect(source).toMatch(/entryType:\s*['"]token_send['"]\s*\|/);
+    // Phase 5 persistence/ extraction: the `'token_send' | 'token_receive'
+    // | 'cache_index'` union was hoisted into
+    // `modules/payments/persistence/kv-writer-adapter.ts` as the
+    // exported `EntryTag` alias, and the facade now delegates through
+    // `writeKvEntry(...)`. The anchor tracks the alias name so a
+    // rename or drop of `EntryTag` from the persistence submodule
+    // trips this test.
+    expect(source).toMatch(/entryType:\s*EntryTag\b/);
+    expect(source).toMatch(/writeKvEntry\s*\(/);
   });
 
   it('every setStorageEntry call uses one of the declared entry types', () => {
