@@ -141,10 +141,13 @@ import {
   isSQLiteDatabase,
   isWalletDatEncrypted,
 } from '../serialization/wallet-dat';
-import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
-import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
-import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
-import { UnmaskedPredicateReference } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference';
+// Phase 6-P2-4d: SigningService import routed through token-engine anti-corruption
+// barrel; the v1 predicate primitives (`TokenType`, `HashAlgorithm`,
+// `UnmaskedPredicateReference`) that used to compose the DIRECT address by hand
+// are replaced by the vendored, byte-identical `deriveDirectAddress` helper
+// (token-engine/identity.ts). See `deriveL3PredicateAddress` below.
+import { SigningService } from '../token-engine/sdk';
+import { deriveDirectAddress } from '../token-engine';
 import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
 
 export function isValidNametag(nametag: string): boolean {
@@ -593,26 +596,20 @@ interface DetachedPublishContext {
 }
 
 /**
- * Derive L3 predicate address (DIRECT://...) from private key
- * Uses UnmaskedPredicateReference for stable wallet address
+ * Derive L3 predicate address (DIRECT://...) from private key.
+ *
+ * Phase 6-P2-4d: uses `token-engine/identity.deriveDirectAddress`, which
+ * reproduces the v1 `UnmaskedPredicateReference → DirectAddress` recipe
+ * byte-identically via v2 primitives (CborSerializer, DataHasher). Quest XP
+ * is keyed on this address, so the derivation MUST stay stable across the
+ * v1→v2 cut-over — token-engine's golden test locks the vector.
  */
 async function deriveL3PredicateAddress(privateKey: string): Promise<string> {
   // Steelman³³ warning: strict hex decode — Buffer.from(_, 'hex') silently
   // truncates odd-length and stops at first non-hex char.
   const secret = strictHexToBytes(privateKey);
-  const signingService = await SigningService.createFromSecret(secret);
-
-  const tokenTypeBytes = Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex');
-  const tokenType = new TokenType(tokenTypeBytes);
-
-  const predicateRef = UnmaskedPredicateReference.create(
-    tokenType,
-    signingService.algorithm,
-    signingService.publicKey,
-    HashAlgorithm.SHA256
-  );
-
-  return (await (await predicateRef).toAddress()).toString();
+  const signingService = new SigningService(secret);
+  return deriveDirectAddress(signingService.publicKey);
 }
 
 // =============================================================================
@@ -4904,16 +4901,17 @@ export class Sphere {
     }
   }
 
-  /** Compute and cache the PROXY address from the current nametag */
+  /**
+   * PROXY address caching — retired in Phase 6 (v2 is DIRECT-only).
+   *
+   * v2's state-transition SDK removed `ProxyAddress` entirely; the wallet
+   * exposes only `DIRECT://` addresses now, per token-engine's Path-A
+   * architecture. Callers of `getProxyAddress()` still get `undefined`,
+   * matching the pre-Phase-6 no-nametag path. Any callsite that WROTE to
+   * PROXY:// is broken and will surface in wave 6-P2-5's test migration.
+   */
   private async _updateCachedProxyAddress(): Promise<void> {
-    const nametag = this._identity?.nametag;
-    if (!nametag) {
-      this._cachedProxyAddress = undefined;
-      return;
-    }
-    const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-    const proxyAddr = await ProxyAddress.fromNameTag(nametag);
-    this._cachedProxyAddress = proxyAddr.toString();
+    this._cachedProxyAddress = undefined;
   }
 
   /**
