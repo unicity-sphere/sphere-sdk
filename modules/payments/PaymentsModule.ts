@@ -271,6 +271,10 @@ import {
   type PublishUxfBundleResult,
 } from '../../extensions/uxf/pipeline/module-glue/publish-uxf-bundle';
 import {
+  defaultSpentStateTransition as defaultSpentStateTransitionImpl,
+  type SpentStateTransitionHost,
+} from '../../extensions/uxf/pipeline/module-glue/spent-state-transition';
+import {
   sweepOrphanSpendingTokens,
   type OrphanSweepResult,
   type OrphanSpendingFinding,
@@ -4014,146 +4018,22 @@ export class PaymentsModule {
     readonly suspectedSiblingInstance: boolean;
     readonly detectedAt: number;
   }): Promise<void> {
-    const live = this.tokens.get(params.token.id);
-    if (live === undefined) {
-      logger.debug(
-        'Payments',
-        `defaultSpentStateTransition: token ${params.token.id.slice(0, 12)}… already removed; no-op`,
-      );
-      return;
-    }
-    if (live.status !== 'confirmed') {
-      logger.debug(
-        'Payments',
-        `defaultSpentStateTransition: token ${params.token.id.slice(0, 12)}… is now ${live.status} (not 'confirmed'); ` +
-          `deferring to whatever path owns that transition`,
-      );
-      return;
-    }
-    try {
-      // `removeToken` archives, tombstones, removes from the active map,
-      // and persists via `save()`. All four are required for a clean
-      // off-record-spend cleanup — partial application would either
-      // leak forensic context (no archive) or risk re-sync resurrection
-      // (no tombstone) or leave the in-memory map inconsistent.
-      await this.removeToken(params.token.id);
-      logger.debug(
-        'Payments',
-        `defaultSpentStateTransition: token ${params.token.id.slice(0, 12)}… ` +
-          `(coin=${params.token.coinId.slice(0, 12)}, amount=${params.token.amount}, ` +
-          `suspectedSibling=${params.suspectedSiblingInstance}) removed after off-record-spend ` +
-          `(stateHash=${params.currentStateHash.slice(0, 16)}…, detectedAt=${params.detectedAt})`,
-      );
-    } catch (removeErr) {
-      logger.warn(
-        'Payments',
-        `defaultSpentStateTransition: removeToken failed for ${params.token.id.slice(0, 12)}… ` +
-          `(transfer:off-record-spent event already fired; operator triage recommended): ` +
-          `${removeErr instanceof Error ? removeErr.message : String(removeErr)}`,
-      );
-      // Return early — without successful local cleanup, writing the
-      // durable AUDIT record below could leave the wallet in a hybrid
-      // state (active-pool token + `_audit` record for the same
-      // tokenId). The next rescan cycle will retry both paths once
-      // the underlying issue clears.
-      return;
-    }
-    // Issue #174 (PR #B) — durable AUDIT record. Best-effort: the
-    // writer is optional (`_spentStateAuditWriter === null` when the
-    // bootstrap layer hasn't installed it, e.g. legacy wallets, no
-    // OrbitDb backing). When wired, synthesize a `DispositionRecord`
-    // with `disposition='AUDIT'`, `reason='off-record-spend'`,
-    // `auditStatus='audit-off-record-spend'`, and route through
-    // `dispositionWriter.write()` — same code path the disposition
-    // engine uses for received off-record-spent bundles (§5.3 [E]).
-    //
-    // Synthesized fields:
-    //   - `tokenId`: SDK genesis tokenId from `sdkData`. Empty
-    //     string when unparseable → routes to the `_audit-orphan`
-    //     keyspace per `auditKeyFor`.
-    //   - `observedTokenContentHash`: SHA-256 of `sdkData` —
-    //     64-char hex, satisfies `assertCanonicalContentHash`.
-    //     Stable: two probes of the same token in the same state
-    //     produce the same hash, so `mergeAuditEntry` correctly
-    //     dedups.
-    //   - `bundleCid`: synthetic `local-rescan-{addr}-{detectedAt}`
-    //     marker since no incoming bundle drove this detection.
-    //     Stamped in `bundleCidsObserved`.
-    //   - `senderTransportPubkey`: our own `chainPubkey` (the entity
-    //     that observed the off-record spend is THIS device).
-    //   - `auditStatus`: `'audit-off-record-spend'` — the canonical
-    //     initial state for §5.3 [E].
-    //
-    // Never throws — defense-in-depth converts every error path
-    // (writer not wired, identity missing, write rejection) to a
-    // warn-log. The event already fired; the local cleanup
-    // succeeded; the durable record is observational forensics.
-    // Steelman H3 (PR #179 review): lazy field read — the writer is
-    // looked up AT PROBE TIME, not at closure-bind time. This means
-    // the bootstrap layer (Sphere) can install the writer BEFORE OR
-    // AFTER `payments.initialize()` (which starts the rescan worker);
-    // the closure observes whatever value is in the field when the
-    // probe actually fires. With the default `intervalMs = 5 min`,
-    // any reasonable bootstrap order completes well before the first
-    // probe. If the writer is null at probe time (e.g. legacy
-    // wallets without an OrbitDb adapter, or a race between bootstrap
-    // and an aggressively-tuned `intervalMs` in tests), we degrade
-    // gracefully: local cleanup already happened above; only the
-    // durable forensic record is skipped.
-    const writer = this._spentStateAuditWriter;
-    if (writer === null) return;
-    const identity = this.deps?.identity;
-    if (identity === undefined) {
-      logger.warn(
-        'Payments',
-        `defaultSpentStateTransition: identity missing — skipping AUDIT record for ${params.token.id.slice(0, 12)}…`,
-      );
-      return;
-    }
-    const directAddr =
-      typeof identity.directAddress === 'string' && identity.directAddress.length > 0
-        ? identity.directAddress
-        : null;
-    const addr = directAddr !== null ? computeAddressId(directAddr) : identity.chainPubkey;
-    try {
-      const sdkTokenId =
-        extractTokenIdFromSdkData(params.token.sdkData) ?? '';
-      const sdkDataBytes = new TextEncoder().encode(params.token.sdkData ?? '');
-      const digest = sha256(sdkDataBytes);
-      let observedTokenContentHash = '';
-      for (const b of digest) observedTokenContentHash += b.toString(16).padStart(2, '0');
-      const auditRecord: DispositionRecord = {
-        disposition: 'AUDIT',
-        tokenId: sdkTokenId,
-        observedTokenContentHash: observedTokenContentHash as DispositionRecord['observedTokenContentHash'],
-        // Steelman H1 (PR #179 review): include the local token id so
-        // two distinct tokens probed in the SAME millisecond produce
-        // distinct synthetic markers in their respective
-        // `bundleCidsObserved` lists. Storage key is keyed by
-        // (addr, tokenId, observedTokenContentHash) so distinct keys
-        // were guaranteed already; this fix is for forensic fidelity
-        // when an operator replays the bundleCidsObserved accumulator.
-        bundleCid: `local-rescan-${addr}-${params.token.id.slice(0, 12)}-${params.detectedAt}`,
-        senderTransportPubkey: identity.chainPubkey,
-        auditStatus: 'audit-off-record-spend',
-        reason: 'off-record-spend',
-      };
-      await writer.write(addr, auditRecord);
-      logger.debug(
-        'Payments',
-        `defaultSpentStateTransition: AUDIT record written for ${params.token.id.slice(0, 12)}… ` +
-          `(addr=${addr.slice(0, 16)}…, tokenId=${sdkTokenId.slice(0, 16)}…, ` +
-          `observedTokenContentHash=${observedTokenContentHash.slice(0, 16)}…)`,
-      );
-    } catch (writerErr) {
-      logger.warn(
-        'Payments',
-        `defaultSpentStateTransition: AUDIT record write failed for ${params.token.id.slice(0, 12)}… ` +
-          `(local cleanup already applied; durable record absent until next rescan or operator replay): ` +
-          `${writerErr instanceof Error ? writerErr.message : String(writerErr)}`,
-      );
-    }
+    return defaultSpentStateTransitionImpl(this.spentStateTransitionHost(), params);
   }
+
+  /** Host-shim builder for {@link defaultSpentStateTransitionImpl}. */
+  private spentStateTransitionHost(): SpentStateTransitionHost {
+    return {
+      tokens: this.tokens,
+      spentStateAuditWriter: this._spentStateAuditWriter,
+      identity: this.deps?.identity,
+      removeToken: (id) => this.removeToken(id),
+    };
+  }
+
+  // NOTE: prior inline implementation of defaultSpentStateTransition
+  // (~140 LoC) moved verbatim to
+  // extensions/uxf/pipeline/module-glue/spent-state-transition.ts.
 
   installOutboxWriter(writer: OutboxWriter | null): void {
     this._outboxWriter = writer;
