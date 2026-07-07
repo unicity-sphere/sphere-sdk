@@ -58,9 +58,6 @@ import type {
 import { SphereError } from './errors';
 import {
   ConnectivityManager,
-  AggregatorPinger,
-  IpfsPinger,
-  NostrPinger,
   type ConnectivityManagerHandle,
 } from './connectivity';
 import type {
@@ -200,6 +197,10 @@ import {
   ensureTransportMuxImpl as modulesInitEnsureTransportMux,
   type ModulesInitHost,
 } from './sphere-modules-init';
+import {
+  buildConnectivityManagerImpl,
+  type ConnectivityBuilderHost,
+} from './sphere-connectivity';
 // Phase 6-P2-4d: SigningService import routed through token-engine anti-corruption
 // barrel; the v1 predicate primitives (`TokenType`, `HashAlgorithm`,
 // `UnmaskedPredicateReference`) that used to compose the DIRECT address by hand
@@ -3789,51 +3790,11 @@ export class Sphere {
   /**
    * Issue #312 — build the per-wallet ConnectivityManager.
    *
-   * Pingers wired:
-   *   - `aggregator`: probes `oracle.getCurrentRound()` (cheap JSON-RPC).
-   *   - `ipfs`: HEAD-probes the configured gateways (skipped when no
-   *      gateways are wired — wallet stays "fully online" w.r.t. IPFS).
-   *   - `nostr`: reads `transport.isConnected()` (the transport owns its
-   *      reconnect loop; we don't open a parallel subscription).
-   *
-   * Returns a freshly-built manager; the caller is responsible for
-   * `.start()` and `.stop()`.
+   * Wave 6-P2-8e: body extracted to `sphere-connectivity.ts`; this delegator
+   * preserves the same public shape.
    */
   private buildConnectivityManager(): ConnectivityManager {
-    const emitEvent = this.emitEvent.bind(this);
-
-    const aggregatorPinger = new AggregatorPinger({
-      provider: {
-        getCurrentRound: () => this._oracle.getCurrentRound(),
-      },
-    });
-
-    // IPFS gateways are wired only when the host app's provider factory
-    // populated `_cidFetchGateways` (the wallet has IPFS sync configured).
-    // Without gateways we skip the IPFS pinger entirely so the
-    // "no-IPFS" wallet is not stuck in permanent offline-degraded.
-    const ipfsGateways = this._cidFetchGateways ?? [];
-    const pingers: import('./connectivity').Pinger[] = [aggregatorPinger];
-    if (ipfsGateways.length > 0) {
-      pingers.push(new IpfsPinger(ipfsGateways));
-    }
-    pingers.push(
-      new NostrPinger(() => {
-        try {
-          return this._transport.isConnected();
-        } catch {
-          return false;
-        }
-      }),
-    );
-
-    return new ConnectivityManager(pingers, {
-      emitEvent: (type, payload) => {
-        // Forward to the Sphere event bus — types narrow correctly via
-        // SphereEventMap.
-        emitEvent(type as SphereEventType, payload as SphereEventMap[SphereEventType]);
-      },
-    });
+    return buildConnectivityManagerImpl(this as unknown as ConnectivityBuilderHost);
   }
 
   // ===========================================================================
