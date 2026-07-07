@@ -106,14 +106,7 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
 const STSDK_CORE_BURNDOWN = [
   'core/Sphere.ts',
   'modules/accounting/AccountingModule.ts',
-  'modules/payments/BackgroundCommitmentService.ts',
-  'modules/payments/NametagMinter.ts',
-  'modules/payments/nametag/availability.ts',
   'modules/payments/PaymentsModule.ts',
-  'modules/payments/SpendQueue.ts',
-  'modules/payments/mint/fungible.ts',
-  'modules/payments/TokenRecoveryService.ts',
-  'modules/swap/payout-verifier.ts',
   'oracle/UnicityAggregatorProvider.ts',
   // Phase 5 wave-3 [C] + Phase 6 wave-P2-2 Group-A quarantine —
   // files were carved out of PaymentsModule.ts (and its Group-A

@@ -8,5 +8,4 @@ export { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool, 
 // Instant split exports
 export * from './legacy-v1/InstantSplitExecutor';
 export * from './legacy-v1/InstantSplitProcessor';
-export * from './BackgroundCommitmentService';
 export * from './TokenRecoveryService';

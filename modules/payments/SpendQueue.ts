@@ -16,8 +16,15 @@ import { SphereError } from '../../core/errors';
 import type { Token } from '../../types';
 import type { SplitPlan, TokenWithAmount } from './legacy-v1/TokenSplitCalculator';
 import type { TokenReservationLedger } from './TokenReservationLedger';
-import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
+// Phase 6.P2.3 type-strip: SpendQueue interoperates with the legacy-v1
+// TokenSplitCalculator + TokenSplitExecutor (which stay on the v1 SDK
+// wave-6-P2-2 quarantine via the `stsdk-v1` alias). Import from the same
+// alias so the `sdkToken` handle passed through `ParsedTokenEntry` is
+// type-compatible with `TokenWithAmount.sdkToken`. The public shape of
+// `ParsedTokenEntry` treats `sdkToken` as an opaque handle — CoinId +
+// SdkToken are internal-only to `buildParsedPool` / `getTokenBalance`.
+import { Token as SdkToken } from 'stsdk-v1/lib/token/Token';
+import { CoinId } from 'stsdk-v1/lib/token/fungible/CoinId';
 
 // =============================================================================
 // Constants

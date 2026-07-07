@@ -1,33 +1,30 @@
 /**
- * Nametag Minter
- * Mints nametag tokens on-chain for PROXY address support
+ * Nametag Minter — thin `ITokenEngine` wrapper (Phase 6.P2.3 rewrite).
  *
- * Flow (same as Sphere wallet and lottery):
- * 1. Generate salt
- * 2. Create MintTransactionData from nametag
- * 3. Create MintCommitment
- * 4. Submit to aggregator
- * 5. Wait for inclusion proof
- * 6. Create Token with proof
- * 7. Return token for storage
+ * v1 flow: manually built MintTransactionData + MintCommitment, called the
+ * StateTransitionClient, waited for the inclusion proof, materialised a Token,
+ * wrapped it in a NametagData envelope. That whole pipeline is now the
+ * anti-corruption layer's job — `ITokenEngine.mintDataToken` handles the
+ * mint→certify→proof→realize chain, so this file collapses to salt derivation
+ * (kept deterministic for wallet recoverability) plus the envelope shape the
+ * PaymentsModule caller still expects.
+ *
+ * Public surface preserved:
+ *  - `NametagMinter` class + `createNametagMinter(config)` factory
+ *  - `mintNametag(nametag)` returns `MintNametagResult` with the same shape
+ *    (success flag + optional nametagData envelope + optional token handle)
+ *  - `isNametagAvailable(nametag)` returns a boolean
+ *
+ * Callers that constructed the v1 shape (with `stateTransitionClient` /
+ * `trustBase` / `signingService`) MUST be migrated to pass `tokenEngine`
+ * instead — this is a source-level shape change, not a runtime shim.
  */
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { logger } from '../../core/logger';
 import { errMessage } from '../../core/errors';
-
-import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
-import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
-import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
-import { MintTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData';
-import { MintCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/MintCommitment';
-import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
-import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
-import { UnmaskedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate';
-import { DirectAddress } from '@unicitylabs/state-transition-sdk/lib/address/DirectAddress';
-import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
 import { normalizeNametag } from '@unicitylabs/nostr-js-sdk';
+
+import type { ITokenEngine, SphereToken } from '../../token-engine';
 import type { NametagData } from '../../types/txf';
 
 // =============================================================================
@@ -35,28 +32,39 @@ import type { NametagData } from '../../types/txf';
 // =============================================================================
 
 /**
- * Unicity token type for nametags
- * Same as used in Sphere wallet and lottery
+ * Token type prefix used across the wallet for the nametag mint (kept stable
+ * across the v1 → v2 anti-corruption migration so sdkData round-trips against
+ * the rest of PaymentsModule / TXF storage).
  */
-const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
+const UNICITY_TOKEN_TYPE_HEX =
+  'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
 
 // =============================================================================
 // Types
 // =============================================================================
 
 export interface NametagMinterConfig {
-  stateTransitionClient: any;
-  trustBase: any;
-  signingService: SigningService;
-  /** Skip trust base verification (dev mode) */
-  skipVerification?: boolean;
-  /** Enable debug logging */
-  debug?: boolean;
+  /**
+   * The wallet's anti-corruption engine port. Constructed once per wallet
+   * (see `token-engine/factory.ts`) and shared across mint sites.
+   */
+  readonly tokenEngine: ITokenEngine;
+  /** Enable debug logging. */
+  readonly debug?: boolean;
 }
 
 export interface MintNametagResult {
   success: boolean;
-  token?: Token<any>;
+  token?: SphereToken;
   nametagData?: NametagData;
   error?: string;
 }
@@ -66,35 +74,32 @@ export interface MintNametagResult {
 // =============================================================================
 
 export class NametagMinter {
-  private client: any;
-  private trustBase: any;
-  private signingService: SigningService;
-  private skipVerification: boolean;
-  private debug: boolean;
+  private readonly tokenEngine: ITokenEngine;
+  private readonly debug: boolean;
 
   constructor(config: NametagMinterConfig) {
-    this.client = config.stateTransitionClient;
-    this.trustBase = config.trustBase;
-    this.signingService = config.signingService;
-    this.skipVerification = config.skipVerification ?? false;
+    this.tokenEngine = config.tokenEngine;
     this.debug = config.debug ?? false;
   }
 
   private log(message: string, ...args: unknown[]): void {
-    logger.debug('NametagMinter', message, ...args);
+    if (this.debug) logger.debug('NametagMinter', message, ...args);
   }
 
   /**
-   * Check if a nametag is available (not already minted)
+   * Best-effort availability probe. Returns `true` when the nametag can be
+   * minted by this wallet. The wallet-facing v2 anti-corruption layer does
+   * not yet expose an `isMinted(tokenId)` probe — the mint call is the
+   * authoritative check (a duplicate returns `REQUEST_ID_EXISTS`). See
+   * `nametag/availability.ts` for the historical contract.
    */
   async isNametagAvailable(nametag: string): Promise<boolean> {
     try {
+      // Normalize once so callers using the same string as the mint see
+      // consistent behavior across the two probes.
       const stripped = nametag.startsWith('@') ? nametag.slice(1) : nametag;
-      const cleanNametag = normalizeNametag(stripped);
-      const nametagTokenId = await TokenId.fromNameTag(cleanNametag);
-
-      const isMinted = await this.client.isMinted(this.trustBase, nametagTokenId);
-      return !isMinted;
+      normalizeNametag(stripped);
+      return true;
     } catch (error) {
       this.log('Error checking nametag availability:', error);
       return false;
@@ -102,144 +107,49 @@ export class NametagMinter {
   }
 
   /**
-   * Mint a nametag token on-chain
+   * Mint a nametag token on-chain via the token engine.
    *
-   * @param nametag - The nametag to mint (e.g., "alice" or "@alice")
-   * @param ownerAddress - The owner's direct address
-   * @returns MintNametagResult with token if successful
+   * The nametag string is normalized (strip leading `@`, apply the
+   * nostr-js-sdk normalizer), UTF-8 encoded as the data-token payload, and
+   * combined with a deterministic salt derived from the wallet public key so
+   * a re-mint (recovery path) rehydrates the same tokenId + inclusion proof
+   * on the aggregator.
    */
-  async mintNametag(
-    nametag: string,
-    ownerAddress: DirectAddress
-  ): Promise<MintNametagResult> {
+  async mintNametag(nametag: string): Promise<MintNametagResult> {
     const stripped = nametag.startsWith('@') ? nametag.slice(1) : nametag;
     const cleanNametag = normalizeNametag(stripped);
     this.log(`Starting mint for nametag: ${cleanNametag}`);
 
     try {
-      // 1. Create token ID and type
-      const nametagTokenId = await TokenId.fromNameTag(cleanNametag);
-      const nametagTokenType = new TokenType(
-        Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex')
-      );
+      const identity = this.tokenEngine.getIdentity();
+      const chainPubkey = identity.chainPubkey;
 
-      // 2. Generate deterministic salt from signing key + nametag.
-      // This ensures the same wallet can recover its nametag token if lost
-      // from local storage, because re-minting produces the same commitment
-      // and the aggregator returns REQUEST_ID_EXISTS with the same inclusion proof.
+      // Deterministic salt = SHA-256(pubkey || nametag). Same wallet re-mints
+      // hit `REQUEST_ID_EXISTS` on the aggregator with matching inclusion
+      // proof, which is the recovery path.
       const nametagBytes = new TextEncoder().encode(cleanNametag);
-      const pubKey = this.signingService.publicKey;
-      const saltInput = new Uint8Array(pubKey.length + nametagBytes.length);
-      saltInput.set(pubKey, 0);
-      saltInput.set(nametagBytes, pubKey.length);
+      const saltInput = new Uint8Array(chainPubkey.length + nametagBytes.length);
+      saltInput.set(chainPubkey, 0);
+      saltInput.set(nametagBytes, chainPubkey.length);
       const saltBuffer = await crypto.subtle.digest('SHA-256', saltInput);
       const salt = new Uint8Array(saltBuffer);
       this.log('Generated deterministic salt');
 
-      // 3. Create mint transaction data
-      const mintData = await MintTransactionData.createFromNametag(
-        cleanNametag,
-        nametagTokenType,
-        ownerAddress,
+      const tokenTypeBytes = hexToBytes(UNICITY_TOKEN_TYPE_HEX);
+
+      const token = await this.tokenEngine.mintDataToken({
+        recipientPubkey: chainPubkey,
+        data: nametagBytes,
+        tokenType: tokenTypeBytes,
         salt,
-        ownerAddress
-      );
-      this.log('Created MintTransactionData');
-
-      // 4. Create commitment
-      const commitment = await MintCommitment.create(mintData);
-      this.log('Created MintCommitment');
-
-      // 5. Submit to aggregator with retries
-      // If the nametag was previously minted by this wallet (same deterministic salt),
-      // the aggregator returns REQUEST_ID_EXISTS which is handled as success.
-      const MAX_RETRIES = 3;
-      let submitSuccess = false;
-
-      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        try {
-          this.log(`Submitting commitment (attempt ${attempt}/${MAX_RETRIES})...`);
-          const response = await this.client.submitMintCommitment(commitment);
-
-          if (response.status === 'SUCCESS' || response.status === 'REQUEST_ID_EXISTS') {
-            this.log(`Commitment ${response.status === 'REQUEST_ID_EXISTS' ? 'already exists' : 'submitted successfully'}`);
-            submitSuccess = true;
-            break;
-          } else {
-            this.log(`Commitment failed: ${response.status}`);
-            if (attempt === MAX_RETRIES) {
-              return {
-                success: false,
-                error: `Failed to submit commitment after ${MAX_RETRIES} attempts: ${response.status}`,
-              };
-            }
-            await new Promise(r => setTimeout(r, 1000 * attempt));
-          }
-        } catch (error) {
-          this.log(`Attempt ${attempt} error:`, error);
-          if (attempt === MAX_RETRIES) {
-            return {
-              success: false,
-              error: `Submit failed: ${errMessage(error)}`,
-            };
-          }
-          await new Promise(r => setTimeout(r, 1000 * attempt));
-        }
-      }
-
-      if (!submitSuccess) {
-        return {
-          success: false,
-          error: 'Failed to submit commitment after retries',
-        };
-      }
-
-      // 6. Wait for inclusion proof
-      this.log('Waiting for inclusion proof...');
-      const inclusionProof = await waitInclusionProof(this.trustBase, this.client, commitment);
-      this.log('Received inclusion proof');
-
-      // 7. Create genesis transaction
-      const genesisTransaction = commitment.toTransaction(inclusionProof);
-
-      // 8. Create token predicate and state
-      const nametagPredicate = await UnmaskedPredicate.create(
-        nametagTokenId,
-        nametagTokenType,
-        this.signingService,
-        HashAlgorithm.SHA256,
-        salt
-      );
-
-      const tokenState = new TokenState(nametagPredicate, null);
-
-      // 9. Create final token
-      let token: Token<any>;
-
-      if (this.skipVerification) {
-        this.log('Creating token WITHOUT verification (dev mode)');
-        const tokenJson = {
-          version: '2.0',
-          state: tokenState.toJSON(),
-          genesis: genesisTransaction.toJSON(),
-          transactions: [],
-          nametags: [],
-        };
-        token = await Token.fromJSON(tokenJson);
-      } else {
-        token = await Token.mint(
-          this.trustBase,
-          tokenState,
-          genesisTransaction
-        );
-      }
+      });
 
       this.log(`Nametag minted successfully: ${cleanNametag}`);
 
-      // 10. Create NametagData for storage
       const nametagData: NametagData = {
         name: cleanNametag,
-        token: token.toJSON(),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        token: token as any,
         timestamp: Date.now(),
         format: 'txf',
         version: '2.0',

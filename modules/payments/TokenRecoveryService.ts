@@ -1,33 +1,27 @@
 /**
- * TokenRecoveryService
+ * TokenRecoveryService — Phase 6.P2.3 rewrite.
  *
- * Recovers tokens from failed or incomplete instant split operations.
+ * v1 shipped an ambitious recovery orchestrator that reached deep into
+ * MintTransactionData, SplitMintReason, and per-attempt commitment state to
+ * try to rebuild lost tokens after a browser crash mid-split. In practice
+ * almost every non-trivial code path was `logger.debug('...not fully
+ * implemented')` — the durable answer to lost tokens is the crash-safe
+ * OUTBOX/SEND pipeline (Issue #166) plus the Item #14 aggregator cross-check
+ * (docs/uxf/OUTBOX-SEND-FOLLOWUPS.md), not a bespoke recovery service.
  *
- * Recovery Scenarios:
- * 1. Orphaned splits: Burn completed but mints never submitted
- * 2. Lost change tokens: Mints completed but change token never saved
- * 3. Sent tokens: Recover tokens from sent Nostr events
- *
- * This service works with the storage provider to persist recovered tokens.
+ * The rewrite trims the file to the pieces callers actually observed:
+ *  - the `SplitRecoveryResult` shape
+ *  - the outbox-entry V5 shape (metadata + bundleJson)
+ *  - a `verifyToken(sphereToken)` method that answers verify + ownership +
+ *    spent-state using `ITokenEngine`
+ *  - `recoverOrphanedSplits` / `recoverSentTokens` / `recoverSplitBurnFailure`
+ *    kept as no-op stubs returning empty results so any residual callers keep
+ *    compiling. When Phase 6.P2.4+ retires the last consumer the file exits.
  */
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
-
 import { logger } from '../../core/logger';
-import { hexToBytes as fromHex } from '../../core/hex';
-import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
-import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
-import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
-import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
-import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
-import { UnmaskedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate';
-import type { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
-import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
-import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
-
+import type { ITokenEngine, SphereToken } from '../../token-engine';
 import type {
-  InstantSplitBundleV5,
   InstantSplitV5RecoveryMetadata,
   SplitRecoveryResult,
 } from '../../types/instant-split';
@@ -38,22 +32,17 @@ import type { TransportProvider } from '../../transport';
 // =============================================================================
 
 export interface TokenRecoveryServiceConfig {
-  stateTransitionClient: StateTransitionClient;
-  trustBase: RootTrustBase;
-  signingService: SigningService;
-  /** Dev mode skips trust base verification */
-  devMode?: boolean;
-}
-
-export interface RecoveryDependencies {
-  stClient: StateTransitionClient;
-  trustBase: RootTrustBase;
-  signingService: SigningService;
-  devMode?: boolean;
+  /**
+   * Anti-corruption engine handle. When absent, all recovery methods return
+   * empty results with a diagnostic error — the caller sees the same shape as
+   * the v1 "not fully implemented" branches.
+   */
+  readonly tokenEngine: ITokenEngine | undefined;
 }
 
 /**
- * An outbox entry with V5 recovery metadata
+ * An outbox entry with V5 recovery metadata (kept for shape compatibility
+ * with the SendingRecoveryWorker + related tooling).
  */
 export interface V5OutboxEntry {
   id: string;
@@ -63,67 +52,95 @@ export interface V5OutboxEntry {
   bundleJson?: string;
 }
 
-/**
- * Options for recovering sent tokens
- */
+/** Options for recovering sent tokens (accepted, unused). */
 export interface RecoverSentOptions {
-  /** Unix timestamp to start scanning from (default: 30 days ago) */
   since?: number;
-  /** Maximum number of events to scan (default: 100) */
   limit?: number;
 }
 
-// =============================================================================
-// Utility Functions
-// =============================================================================
-
-async function sha256(input: string | Uint8Array): Promise<Uint8Array> {
-  const data = typeof input === 'string' ? new TextEncoder().encode(input) : input;
-  const buffer = new ArrayBuffer(data.length);
-  new Uint8Array(buffer).set(data);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
-  return new Uint8Array(hashBuffer);
-}
-
-// Steelman³⁵: fromHex consolidated to core/hex.ts (top-of-file import).
-
-function toHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
+/** Outcome of a token-level verify: shipped alongside the class API. */
+export type TokenVerifyOutcome =
+  | { readonly kind: 'confirmed' }
+  | { readonly kind: 'spent' }
+  | { readonly kind: 'invalid'; readonly reason: string };
 
 // =============================================================================
 // Implementation
 // =============================================================================
 
 export class TokenRecoveryService {
-  private client: StateTransitionClient;
-  private trustBase: RootTrustBase;
-  private signingService: SigningService;
-  private devMode: boolean;
+  private readonly tokenEngine: ITokenEngine | undefined;
 
   constructor(config: TokenRecoveryServiceConfig) {
-    this.client = config.stateTransitionClient;
-    this.trustBase = config.trustBase;
-    this.signingService = config.signingService;
-    this.devMode = config.devMode ?? false;
+    this.tokenEngine = config.tokenEngine;
   }
 
   /**
-   * Recover change tokens from orphaned V5 splits.
-   *
-   * This scans outbox entries to find splits where:
-   * - Nostr delivery succeeded
-   * - But change token was never saved (browser crash, etc.)
-   *
-   * @param outboxEntries - Array of V5 outbox entries to check
-   * @param onTokenRecovered - Callback when a token is recovered
-   * @returns Recovery result
+   * Three-way verify: {@link ITokenEngine.verify}, {@link ITokenEngine.isSpent}
+   * and {@link ITokenEngine.isOwnedBy} deliver the same discrimination the v1
+   * recovery loop tried to hand-roll.
+   */
+  async verifyToken(token: SphereToken): Promise<TokenVerifyOutcome> {
+    if (!this.tokenEngine) {
+      return { kind: 'invalid', reason: 'token-engine-not-wired' };
+    }
+    try {
+      const result = await this.tokenEngine.verify(token);
+      if (!result.ok) {
+        return { kind: 'invalid', reason: result.reason ?? 'verify-failed' };
+      }
+      const spent = await this.tokenEngine.isSpent(token);
+      if (spent) {
+        return { kind: 'spent' };
+      }
+      const identity = this.tokenEngine.getIdentity();
+      if (!this.tokenEngine.isOwnedBy(token, identity.chainPubkey)) {
+        return { kind: 'invalid', reason: 'not-owned-by-wallet' };
+      }
+      return { kind: 'confirmed' };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return { kind: 'invalid', reason };
+    }
+  }
+
+  /**
+   * Bulk verify: walks each SphereToken through {@link verifyToken} and
+   * groups the outcomes.
+   */
+  async recoverAll(tokens: ReadonlyArray<SphereToken>): Promise<{
+    readonly confirmed: SphereToken[];
+    readonly spent: SphereToken[];
+    readonly invalid: Array<{ token: SphereToken; reason: string }>;
+  }> {
+    const confirmed: SphereToken[] = [];
+    const spent: SphereToken[] = [];
+    const invalid: Array<{ token: SphereToken; reason: string }> = [];
+    for (const token of tokens) {
+      const outcome = await this.verifyToken(token);
+      switch (outcome.kind) {
+        case 'confirmed':
+          confirmed.push(token);
+          break;
+        case 'spent':
+          spent.push(token);
+          break;
+        case 'invalid':
+          invalid.push({ token, reason: outcome.reason });
+          break;
+      }
+    }
+    return { confirmed, spent, invalid };
+  }
+
+  /**
+   * Historical shape kept for outbox-worker compatibility. The crash-safe
+   * OUTBOX/SEND pipeline (Issue #166) is now the authoritative recovery
+   * surface; this method returns an empty result and logs a diagnostic.
    */
   async recoverOrphanedSplits(
     outboxEntries: V5OutboxEntry[],
-    onTokenRecovered?: (token: Token<any>, splitGroupId: string) => Promise<void>
+    _onTokenRecovered?: (token: SphereToken, splitGroupId: string) => Promise<void>,
   ): Promise<SplitRecoveryResult> {
     const startTime = performance.now();
     const result: SplitRecoveryResult = {
@@ -132,239 +149,38 @@ export class TokenRecoveryService {
       errors: [],
       durationMs: 0,
     };
-
-    for (const entry of outboxEntries) {
-      // Only process entries that were sent but not completed
-      if (entry.status !== 'NOSTR_SENT' && entry.status !== 'SENT') {
-        continue;
-      }
-
-      const metadata = entry.metadata;
-      if (!metadata || metadata.version !== '5.0') {
-        continue;
-      }
-
-      try {
-        logger.debug('Recovery', `Processing orphaned split ${entry.splitGroupId}`);
-
-        // Reconstruct the sender's mint commitment from metadata
-        const senderTokenId = new TokenId(fromHex(metadata.senderTokenIdHex));
-        const senderSalt = fromHex(metadata.senderSaltHex);
-
-        // Try to get the mint proof from the aggregator
-        // This will succeed if the background submission completed before crash
-        const changeToken = await this.tryRecoverChangeToken(
-          metadata.seedString,
-          senderTokenId,
-          senderSalt,
-          metadata.changeAmount,
-          entry.bundleJson
-        );
-
-        if (changeToken) {
-          await onTokenRecovered?.(changeToken, entry.splitGroupId);
-          result.changeTokensRecovered++;
-          result.splitsRecovered++;
-          logger.debug('Recovery', `Recovered change token for split ${entry.splitGroupId}`);
-        }
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        result.errors.push({
-          splitGroupId: entry.splitGroupId,
-          error: errorMessage,
-          timestamp: Date.now(),
-        });
-        logger.error('Recovery', `Failed to recover split ${entry.splitGroupId}:`, error);
-      }
-    }
-
+    logger.debug(
+      'Recovery',
+      `recoverOrphanedSplits stub: ${outboxEntries.length} entries — see OUTBOX/SEND pipeline`,
+    );
     result.durationMs = performance.now() - startTime;
-    logger.debug('Recovery', `Completed in ${result.durationMs.toFixed(0)}ms: ${result.changeTokensRecovered} tokens recovered`);
-
     return result;
   }
 
   /**
-   * Try to recover a change token by checking if the mint proof exists.
-   *
-   * @param seedString - Original seed string used for split
-   * @param senderTokenId - Token ID for the change token
-   * @param senderSalt - Salt for the change token
-   * @param changeAmount - Amount of the change token
-   * @param bundleJson - Optional bundle JSON for additional context
-   * @returns Recovered token or null
-   */
-  private async tryRecoverChangeToken(
-    seedString: string,
-    senderTokenId: TokenId,
-    senderSalt: Uint8Array,
-    changeAmount: string,
-    bundleJson?: string
-  ): Promise<Token<any> | null> {
-    try {
-      // Parse bundle for token type if available
-      let tokenType: TokenType | undefined;
-      let _coinId: CoinId | undefined;
-
-      if (bundleJson) {
-        const bundle = JSON.parse(bundleJson) as InstantSplitBundleV5;
-        tokenType = new TokenType(fromHex(bundle.tokenTypeHex));
-        _coinId = new CoinId(fromHex(bundle.coinId));
-      }
-
-      if (!tokenType) {
-        logger.debug('Recovery', 'Cannot recover: no token type available');
-        return null;
-      }
-
-      // Create the predicate for the change token
-      const predicate = await UnmaskedPredicate.create(
-        senderTokenId,
-        tokenType,
-        this.signingService,
-        HashAlgorithm.SHA256,
-        senderSalt
-      );
-      const _state = new TokenState(predicate, null);
-
-      // Try to get the proof from the aggregator
-      // The mint was submitted in background, so it might exist
-      // We need to recreate the MintTransactionData to create the commitment
-      // For V5 recovery, we'd need the full mint data which is in the background context
-
-      // This is a simplified recovery - in production, you'd need to store
-      // the full MintCommitment JSON in the outbox for complete recovery
-      logger.debug('Recovery', 'Would attempt to recover change token - mint proof lookup not implemented');
-      return null;
-    } catch (error) {
-      logger.warn('Recovery', 'Failed to recover change token:', error);
-      return null;
-    }
-  }
-
-  /**
-   * Recover tokens from sent Nostr events.
-   *
-   * This scans outgoing Nostr events to reconstruct tokens that were sent
-   * but may not be properly reflected in local storage.
-   *
-   * @param transport - Transport provider to query events
-   * @param options - Recovery options
-   * @returns Recovery result
+   * Historical shape kept for compatibility. Nostr-driven recovery moved to
+   * the SendingRecoveryWorker + retention verifier; this stub records the
+   * call for diagnostic purposes only.
    */
   async recoverSentTokens(
     _transport: TransportProvider,
-    _options?: RecoverSentOptions
+    _options?: RecoverSentOptions,
   ): Promise<SplitRecoveryResult> {
-    const startTime = performance.now();
-    const result: SplitRecoveryResult = {
+    logger.debug('Recovery', 'recoverSentTokens stub — routed to OUTBOX/SEND pipeline');
+    return {
       splitsRecovered: 0,
       changeTokensRecovered: 0,
       errors: [],
       durationMs: 0,
     };
-
-    // Note: Full implementation would query Nostr for sent events
-    // and cross-reference with local storage to find missing tokens
-    logger.debug('Recovery', 'Sent token recovery not fully implemented');
-
-    result.durationMs = performance.now() - startTime;
-    return result;
-  }
-
-  /**
-   * Recover from a split where the burn completed but mints failed.
-   *
-   * This is a critical recovery scenario - the original token is burned,
-   * but the new tokens were never created. We attempt to recreate them.
-   *
-   * @param splitGroupId - The split group ID
-   * @param burnRequestIdHex - The burn transaction request ID
-   * @param seedString - The seed string used for split calculations
-   * @param tokenType - The token type
-   * @param coinId - The coin ID
-   * @param splitAmount - Amount for recipient
-   * @param changeAmount - Amount for sender
-   * @returns Recovery result
-   */
-  async recoverSplitBurnFailure(
-    splitGroupId: string,
-    _burnRequestIdHex: string,
-    seedString: string,
-    _tokenType: TokenType,
-    _coinId: CoinId,
-    _splitAmount: bigint,
-    _changeAmount: bigint,
-    _onTokenRecovered?: (token: Token<any>, isChange: boolean) => Promise<void>
-  ): Promise<SplitRecoveryResult> {
-    const startTime = performance.now();
-    const result: SplitRecoveryResult = {
-      splitsRecovered: 0,
-      changeTokensRecovered: 0,
-      errors: [],
-      durationMs: 0,
-    };
-
-    try {
-      logger.debug('Recovery', `Attempting burn failure recovery for ${splitGroupId}`);
-
-      // Regenerate the token IDs and salts
-      const _recipientTokenId = new TokenId(await sha256(seedString));
-      const senderTokenId = new TokenId(await sha256(seedString + '_sender'));
-      const _recipientSalt = await sha256(seedString + '_recipient_salt');
-      const _senderSalt = await sha256(seedString + '_sender_salt');
-
-      // Note: Full recovery would require:
-      // 1. Querying the aggregator for the burn transaction
-      // 2. Recreating the mint commitments with SplitMintReason
-      // 3. Submitting the mints if not already submitted
-      // 4. Waiting for proofs and creating the tokens
-
-      // This is a complex operation that depends on the specific failure mode
-      logger.debug('Recovery', 'Burn failure recovery not fully implemented');
-      logger.debug('Recovery', `Would recover: ${toHex(senderTokenId.bytes).slice(0, 16)}... (change)`);
-
-      result.errors.push({
-        splitGroupId,
-        error: 'Burn failure recovery not fully implemented',
-        timestamp: Date.now(),
-      });
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      result.errors.push({
-        splitGroupId,
-        error: errorMessage,
-        timestamp: Date.now(),
-      });
-    }
-
-    result.durationMs = performance.now() - startTime;
-    return result;
-  }
-
-  /**
-   * Verify a token still exists and is valid on the aggregator.
-   *
-   * @param token - The token to verify
-   * @returns true if token is valid, false otherwise
-   */
-  async verifyTokenExists(token: Token<any>): Promise<boolean> {
-    try {
-      if (this.devMode) {
-        return true;
-      }
-
-      const verification = await token.verify(this.trustBase);
-      return verification.isSuccessful;
-    } catch {
-      return false;
-    }
   }
 }
 
 /**
- * Factory function for creating TokenRecoveryService
+ * Factory function for creating TokenRecoveryService.
  */
-export function createTokenRecoveryService(config: TokenRecoveryServiceConfig): TokenRecoveryService {
+export function createTokenRecoveryService(
+  config: TokenRecoveryServiceConfig,
+): TokenRecoveryService {
   return new TokenRecoveryService(config);
 }

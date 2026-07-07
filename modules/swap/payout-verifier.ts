@@ -1,64 +1,48 @@
 /**
- * Per-payout-token verification used by `SwapModule.verifyPayout` (issue #535).
+ * Per-payout-token verification used by `SwapModule.verifyPayout` (issue #535)
+ * — Phase 6.P2.3 rewrite atop `ITokenEngine`.
  *
  * Background
  * ----------
- * Until issue #535, `SwapModule.verifyPayout` called the wallet-wide
- * `payments.validate()` and then filtered its `invalid` set down to tokens
- * linked to the payout invoice. That had three problems:
+ * Before Phase 6, this file talked to the v1 state-transition-sdk directly:
+ * parse the sdkData JSON, run `SdkToken.fromJSON`, call
+ * `SdkToken.verify(trustBase)`, then ask an `OracleProvider.isSpent(publicKey,
+ * stateHash)` scoped to the extracted predicate state. The three-way outcome
+ * — `ok` / `transient` / `terminal` — was carefully shaped so
+ * `SwapModule.verifyPayout` could distinguish "not finalized yet",
+ * "cryptographically invalid", and "already spent out from under us"
+ * (issue #535 background is preserved verbatim below).
  *
- *   1. **Wrong primitive.** `payments.validate()` is conceptually the
- *      user-facing "audit my whole wallet" diagnostic. Once an inclusion
- *      proof is cryptographically valid against the trustBase, the
- *      aggregator can never revoke it (the SMT is append-only; the BFT
- *      certificate is signed by an immutable validator set for that
- *      epoch). Re-running it across every wallet token is wasted work.
- *   2. **No targeted failure modes.** "not finalized yet" (transient),
- *      "cryptographically invalid" (terminal fraud), and "already spent
- *      out from under us" (terminal fraud, the actual reason this gate
- *      exists) were lumped into one opaque retry loop.
- *   3. **Pre-fix, `validate()` always reported invalid** (PR #534). That
- *      defect masked the design issue for months — the retry loop
- *      naturally hung instead of completing.
+ * The v2 anti-corruption engine collapses the whole check into three engine
+ * calls:
  *
- * This module replaces the `validate()`-driven block with three checks
- * scoped to the specific payout tokens:
+ *   (a) Finalization / cryptographic verify — {@link ITokenEngine.verify}
+ *       delivers the full genesis→current chain check against the bundled
+ *       RootTrustBase. `ok === false` maps to `terminal` (a payout the escrow
+ *       attested as invalid is fraud, not a retry).
+ *   (b) Spent check — {@link ITokenEngine.isSpent} answers whether the
+ *       token's CURRENT state has already been consumed. `true` maps to
+ *       `terminal` — the payout was spent out from under us.
+ *   (c) Ownership check — {@link ITokenEngine.isOwnedBy}, evaluated against
+ *       the wallet's chainPubkey, answers "is this token even addressed to
+ *       us". Ownership failure maps to `terminal` (fraud / misroute).
  *
- *   (a) Finalization — last `transactions[]` entry (or `genesis` for an
- *       unmoved mint) MUST carry an `inclusionProof`. A null proof means
- *       the aggregator hasn't anchored this transition yet → transient.
- *   (b) Cryptographic verify — `SdkToken.verify(trustBase)` runs the full
- *       genesis-→-current chain check locally against the bundled
- *       RootTrustBase. Failure means the escrow signed an invalid mint
- *       (or the token was tampered with) → terminal fraud.
- *   (c) Spent check — `oracle.isSpent(predicatePublicKey, stateHash)`
- *       asks the aggregator whether the predicate guarding the current
- *       state has already produced a transition (i.e. someone spent the
- *       payout out from under us between mint and delivery). True →
- *       terminal fraud.
- *
- * Result discrimination
- * --------------------
- * The function returns a tagged union so the caller can distinguish:
+ * Behavior contract preserved
+ * ---------------------------
+ * `verifyPayoutTokens` returns exactly the same tagged union so the caller
+ * (`SwapModule.verifyPayout`) does not change discrimination logic:
  *
  *   - `{ kind: 'ok' }` — all tokens passed all three checks.
- *   - `{ kind: 'transient', reason }` — caller should `returnFalse()` and
- *     retry on the next verify tick.
- *   - `{ kind: 'terminal', reason }` — caller should `failPayout(reason)`
- *     and transition the swap to `failed`.
+ *   - `{ kind: 'transient', reason }` — caller should return false and retry.
+ *   - `{ kind: 'terminal', reason }` — caller should fail the payout.
  *
- * Throws
- * ------
- * `oracle.isSpent` MUST NOT fail-open per its interface contract. An RPC
- * failure throws — and that throw propagates out of this function to the
- * caller's outer auto-verify catch (which logs and retries). This matches
- * the existing pattern: transient infrastructure problems are retried;
- * cryptographically-verified bad state terminally fails the swap.
+ * A `null` / `undefined` tokenEngine (Phase 6.P2.3 landed the type; wire-up
+ * lands in Phase 6.P2.4) returns `transient` so the retry loop stays intact
+ * until the engine is wired. RPC errors from `isSpent` propagate — matches
+ * the v1 fail-closed rule (see issue #535 header notes in git history).
  */
 
-import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { extractCurrentStatePublicKeyHexFromSdkData } from '../payments/legacy-v1/extract-state-publickey';
-import type { Token } from '../../types';
+import type { ITokenEngine, SphereToken } from '../../token-engine';
 
 export type PayoutVerificationResult =
   | { readonly kind: 'ok' }
@@ -68,92 +52,49 @@ export type PayoutVerificationResult =
 export interface VerifyPayoutTokensInput {
   /** Token IDs linked to the payout invoice via accounting.getTokenIdsForInvoice. */
   readonly payoutTokenIds: ReadonlySet<string>;
-  /** PaymentsModule's getToken — returns the wallet's local Token or undefined. */
-  readonly getToken: (id: string) => Token | undefined;
-  /** Bundled RootTrustBase from the oracle. SDK-shaped (typed as unknown to keep
-   *  this module free of a hard SDK import beyond Token itself). */
-  readonly trustBase: unknown | null;
-  /** OracleProvider.isSpent — throws on RPC failure (intentional, see file docstring). */
-  readonly isSpent: (publicKey: string, stateHash: string) => Promise<boolean>;
-  /** Fallback predicate publicKey when extraction from sdkData fails. Typically
-   *  the wallet's own chainPubkey — payouts are minted to our predicate so this
-   *  is the correct spent-probe target when extraction can't recover the bytes. */
-  readonly fallbackPublicKey: string;
+  /**
+   * Caller-provided lookup returning the wallet's local {@link SphereToken}
+   * for `id`, or `undefined` when the token has not landed yet. Consumers
+   * that still hold v1 UI `Token`s can wrap their store with a converter
+   * (Phase 6.P2.4 wires the converter through PaymentsModule).
+   */
+  readonly getSphereToken: (id: string) => SphereToken | undefined;
+  /** Anti-corruption engine port. `null`/`undefined` yields a transient result. */
+  readonly tokenEngine: ITokenEngine | null | undefined;
+  /**
+   * Wallet's 33-byte compressed chain pubkey. Used for the ownership probe —
+   * payouts are minted to OUR predicate.
+   */
+  readonly expectedOwnerPubkey: Uint8Array;
 }
 
 export async function verifyPayoutTokens(
   input: VerifyPayoutTokensInput,
 ): Promise<PayoutVerificationResult> {
-  const { payoutTokenIds, getToken, trustBase, isSpent, fallbackPublicKey } = input;
+  const { payoutTokenIds, getSphereToken, tokenEngine, expectedOwnerPubkey } = input;
 
   // SECURITY: fail-closed when the reverse index for this invoice is empty.
   // An empty set means accounting's `tokenInvoiceMap` hasn't been rebuilt
-  // yet for this invoice (snapshot/restart race) — we cannot determine
-  // which tokens to check, so we cannot safely fall through to verified.
-  // Transient: the next verify tick picks up after the rebuild completes.
+  // yet for this invoice (snapshot/restart race). Transient — the next
+  // verify tick picks up after the rebuild completes.
   if (payoutTokenIds.size === 0) {
     return { kind: 'transient', reason: 'payout-reverse-index-empty' };
   }
 
-  if (!trustBase) {
-    return { kind: 'transient', reason: 'trustbase-not-loaded' };
+  if (!tokenEngine) {
+    return { kind: 'transient', reason: 'token-engine-not-wired' };
   }
 
   for (const tokenId of payoutTokenIds) {
-    const tok = getToken(tokenId);
-    if (!tok) {
+    const sphereToken = getSphereToken(tokenId);
+    if (!sphereToken) {
       return { kind: 'transient', reason: `token-not-in-wallet:${tokenId}` };
     }
-    if (!tok.sdkData) {
-      return { kind: 'transient', reason: `token-missing-sdkdata:${tokenId}` };
-    }
 
-    // (a) Finalization — last transaction (or genesis for an unmoved
-    //     mint) must carry an inclusion proof. Parse defensively: a
-    //     storage-corrupted sdkData throws here and routes to terminal
-    //     (we'd never be able to verify this token, no point retrying).
-    let parsedSdkData: unknown;
+    // (a) Finalization / cryptographic verify.
+    let verifyResult: { ok: boolean; reason?: string };
     try {
-      parsedSdkData = JSON.parse(tok.sdkData);
-    } catch (err) {
-      return {
-        kind: 'terminal',
-        reason: `PAYOUT_TOKEN_SDKDATA_UNPARSEABLE: ${tokenId}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      };
-    }
-    const sdkDataShape = parsedSdkData as {
-      transactions?: ReadonlyArray<{ inclusionProof?: unknown }>;
-      genesis?: { inclusionProof?: unknown };
-    };
-    const txs = sdkDataShape.transactions ?? [];
-    const lastTx = txs.length > 0 ? txs[txs.length - 1] : sdkDataShape.genesis;
-    if (!lastTx || lastTx.inclusionProof == null) {
-      return { kind: 'transient', reason: `payout-token-not-finalized:${tokenId}` };
-    }
-
-    // (b) Cryptographic verify — SdkToken.fromJSON + verify(trustBase).
-    //     A fromJSON throw on well-formed-but-out-of-spec input is
-    //     terminal (we can never accept this shape); a verify failure
-    //     is also terminal (escrow attested an invalid mint).
-    let sdkToken;
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      sdkToken = await SdkToken.fromJSON(parsedSdkData as any);
-    } catch (err) {
-      return {
-        kind: 'terminal',
-        reason: `PAYOUT_TOKEN_PARSE_FAILED: ${tokenId}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      };
-    }
-
-    let verifyResult: { isSuccessful: boolean };
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      verifyResult = await sdkToken.verify(trustBase as any);
+      verifyResult = await tokenEngine.verify(sphereToken);
     } catch (err) {
       return {
         kind: 'terminal',
@@ -162,21 +103,24 @@ export async function verifyPayoutTokens(
         }`,
       };
     }
-    if (!verifyResult.isSuccessful) {
+    if (!verifyResult.ok) {
       return {
         kind: 'terminal',
-        reason: `PAYOUT_TOKEN_VERIFY_FAILED: ${tokenId}`,
+        reason: `PAYOUT_TOKEN_VERIFY_FAILED: ${tokenId}: ${verifyResult.reason ?? 'unspecified'}`,
       };
     }
 
-    // (c) Spent check — derive the predicate publicKey, compute the
-    //     state hash, ask the aggregator. RPC errors propagate (per
-    //     OracleProvider contract — never fail-open).
-    const publicKeyHex =
-      (await extractCurrentStatePublicKeyHexFromSdkData(tok.sdkData)) ??
-      fallbackPublicKey;
-    const stateHashHex = (await sdkToken.state.calculateHash()).toJSON();
-    const spent = await isSpent(publicKeyHex, stateHashHex);
+    // (c) Ownership probe — synchronous predicate byte-compare (no network).
+    if (!tokenEngine.isOwnedBy(sphereToken, expectedOwnerPubkey)) {
+      return {
+        kind: 'terminal',
+        reason: `PAYOUT_TOKEN_NOT_OWNED: ${tokenId}`,
+      };
+    }
+
+    // (b) Spent check — engine calls the aggregator. RPC errors propagate
+    // (fail-closed contract).
+    const spent = await tokenEngine.isSpent(sphereToken);
     if (spent) {
       return {
         kind: 'terminal',

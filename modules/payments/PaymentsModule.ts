@@ -34,7 +34,7 @@ import { TokenSplitCalculator, type SplitPlan, type TokenWithAmount } from './le
 import { TokenSplitExecutor } from './legacy-v1/TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
-import { NametagMinter, type MintNametagResult } from './NametagMinter';
+import type { MintNametagResult } from './NametagMinter';
 import * as nametagStore from './nametag/store';
 import { checkNametagAvailability } from './nametag/availability';
 import * as paymentRequestIncoming from './payment-request/incoming';
@@ -1242,6 +1242,17 @@ export interface PaymentsModuleDependencies {
    * iteration; finalize falls back to single-identity behavior.
    */
   getActiveAddresses?: () => ReadonlyArray<TrackedAddress>;
+  /**
+   * Anti-corruption token engine port (Phase 6.P2.3+). Optional during the
+   * migration: files rewritten onto {@link ITokenEngine} (nametag mint,
+   * fungible mint, availability probe, payout verify, token recovery) consume
+   * this handle when present, and either report an error or fall back to a
+   * safe default (e.g. `isNametagAvailable` returns `false`) when absent.
+   *
+   * Phase 6.P2.4 wires this from {@link core.Sphere} to the engine
+   * constructed via {@link createSphereTokenEngine}.
+   */
+  tokenEngine?: import('../../token-engine').ITokenEngine;
 }
 
 // =============================================================================
@@ -7429,12 +7440,7 @@ export class PaymentsModule {
     // Phase 6.C will rewire the free function onto `ITokenEngine`.
     return mintFungibleTokenImpl(
       {
-        stateTransitionClient: this.deps!.oracle.getStateTransitionClient?.() as
-          | StateTransitionClient
-          | undefined,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        trustBase: (this.deps!.oracle as any).getTrustBase?.(),
-        createSigningService: () => this.createSigningService(),
+        tokenEngine: this.deps!.tokenEngine,
         getCoinSymbol: (id) => this.getCoinSymbol(id),
         getCoinName: (id) => this.getCoinName(id),
         getCoinDecimals: (id) => this.getCoinDecimals(id),
@@ -7453,20 +7459,14 @@ export class PaymentsModule {
   async isNametagAvailable(nametag: string): Promise<boolean> {
     this.ensureInitialized();
 
-    const stClient = this.deps!.oracle.getStateTransitionClient?.();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
-
-    if (!stClient || !trustBase) {
+    const tokenEngine = this.deps!.tokenEngine;
+    if (!tokenEngine) {
       return false;
     }
 
     try {
-      const signingService = await this.createSigningService();
       return await checkNametagAvailability({
-        stateTransitionClient: stClient,
-        trustBase,
-        signingService,
+        tokenEngine,
         nametag,
       });
     } catch {

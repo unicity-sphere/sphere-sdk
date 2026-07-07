@@ -2247,16 +2247,18 @@ export class SwapModule {
     // "cryptographically invalid" from "already spent". See
     // `modules/swap/payout-verifier.ts` for the full rationale.
     const payoutTokenIds = deps.accounting.getTokenIdsForInvoice(swap.payoutInvoiceId);
+    // Phase 6.P2.3 rewrite: payout-verifier is now an ITokenEngine wrapper.
+    // The engine + SphereToken-lookup shim will be wired through the swap
+    // deps in Phase 6.P2.4; until then we pass `null` for the engine — the
+    // verifier returns `transient` and the retry loop stays intact.
+    const chainPubkeyBytes = new Uint8Array(
+      Buffer.from(deps.identity.chainPubkey, 'hex'),
+    );
     const verifyResult = await verifyPayoutTokens({
       payoutTokenIds,
-      getToken: (id: string) => deps.payments.getToken(id),
-      trustBase: deps.oracle.getRootTrustBase(),
-      isSpent: (pk: string, sh: string) => deps.oracle.isSpent(pk, sh),
-      // Payouts are minted to OUR predicate, so the wallet's chainPubkey is
-      // the correct spent-probe target when extraction can't recover the
-      // predicate bytes from sdkData. Matches the wallet-owned fallback
-      // pattern in PaymentsModule's spent-state rescan worker.
-      fallbackPublicKey: deps.identity.chainPubkey,
+      getSphereToken: () => undefined,
+      tokenEngine: null,
+      expectedOwnerPubkey: chainPubkeyBytes,
     });
     if (verifyResult.kind === 'transient') {
       logger.warn(
