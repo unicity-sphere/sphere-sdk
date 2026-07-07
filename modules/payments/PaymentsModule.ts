@@ -35,6 +35,8 @@ import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
 import { NametagMinter, type MintNametagResult } from './NametagMinter';
+import * as nametagStore from './nametag/store';
+import { checkNametagAvailability } from './nametag/availability';
 import { CidRefStore, type CidRef } from '../../extensions/uxf/profile/cid-ref-store';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../storage';
 import type {
@@ -11455,12 +11457,7 @@ export class PaymentsModule {
    */
   async setNametag(nametag: NametagData): Promise<void> {
     this.ensureInitialized();
-    const idx = this.nametags.findIndex(n => n.name === nametag.name);
-    if (idx >= 0) {
-      this.nametags[idx] = nametag;
-    } else {
-      this.nametags.push(nametag);
-    }
+    nametagStore.upsertNametag(this.nametags, nametag);
     await this.save();
     logger.debug('Payments', `Unicity ID set: ${nametag.name}`);
   }
@@ -11480,12 +11477,7 @@ export class PaymentsModule {
    * @returns The active nametag data, or `null` if no nametag is set.
    */
   getNametag(): NametagData | null {
-    const claimedName = this.deps?.identity.nametag;
-    if (claimedName) {
-      const match = this.nametags.find((n) => n.name === claimedName);
-      if (match) return match;
-    }
-    return this.nametags[0] ?? null;
+    return nametagStore.getActiveNametag(this.nametags, this.deps?.identity.nametag);
   }
 
   /**
@@ -11499,7 +11491,7 @@ export class PaymentsModule {
    * @param name - Normalized nametag name (e.g. result of `normalizeNametag`).
    */
   getNametagByName(name: string): NametagData | null {
-    return this.nametags.find((n) => n.name === name) ?? null;
+    return nametagStore.findNametagByName(this.nametags, name);
   }
 
   /**
@@ -11508,7 +11500,7 @@ export class PaymentsModule {
    * @returns A copy of the nametags array.
    */
   getNametags(): NametagData[] {
-    return [...this.nametags];
+    return nametagStore.copyNametagList(this.nametags);
   }
 
   /**
@@ -11523,7 +11515,7 @@ export class PaymentsModule {
    * @returns `true` if nametag data is present.
    */
   hasNametag(): boolean {
-    return this.nametags.length > 0;
+    return nametagStore.hasAnyNametag(this.nametags);
   }
 
   /**
@@ -11532,7 +11524,7 @@ export class PaymentsModule {
    * @param name - Normalized nametag name.
    */
   hasNametagNamed(name: string): boolean {
-    return this.nametags.some((n) => n.name === name);
+    return nametagStore.hasNametagWithName(this.nametags, name);
   }
 
   /**
@@ -11560,9 +11552,8 @@ export class PaymentsModule {
    */
   async clearNametagByName(name: string): Promise<boolean> {
     this.ensureInitialized();
-    const before = this.nametags.length;
-    this.nametags = this.nametags.filter((n) => n.name !== name);
-    const removed = this.nametags.length < before;
+    const { nextList, removed } = nametagStore.removeNametagByName(this.nametags, name);
+    this.nametags = nextList;
     if (removed) {
       await this.save();
     }
@@ -11577,20 +11568,9 @@ export class PaymentsModule {
    */
   private async reloadNametagsFromStorage(): Promise<void> {
     const providers = this.getTokenStorageProviders();
-    for (const [, provider] of providers) {
-      try {
-        const result = await provider.load();
-        if (result.success && result.data) {
-          const parsed = parseTxfStorageData(result.data);
-          if (parsed.nametags.length > 0) {
-            this.nametags = parsed.nametags;
-            logger.debug('Payments', `Reloaded ${parsed.nametags.length} Unicity ID(s) from storage`);
-            return;
-          }
-        }
-      } catch {
-        // Continue to next provider
-      }
+    const reloaded = await nametagStore.reloadNametagsFromProviders(providers);
+    if (reloaded !== null) {
+      this.nametags = reloaded;
     }
   }
 
@@ -11749,13 +11729,12 @@ export class PaymentsModule {
 
     try {
       const signingService = await this.createSigningService();
-      const minter = new NametagMinter({
+      return await checkNametagAvailability({
         stateTransitionClient: stClient,
         trustBase,
         signingService,
+        nametag,
       });
-
-      return await minter.isNametagAvailable(nametag);
     } catch {
       return false;
     }
