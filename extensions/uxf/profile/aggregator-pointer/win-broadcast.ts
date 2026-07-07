@@ -35,10 +35,10 @@
  * reject any `v !== 1`.
  */
 
-import { DataHasher } from '@unicitylabs/state-transition-sdk/lib/hash/DataHasher.js';
-import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm.js';
-import { Signature } from '@unicitylabs/state-transition-sdk/lib/sign/Signature.js';
-import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService.js';
+import { DataHasher } from 'stsdk-v1/lib/hash/DataHasher.js';
+import { HashAlgorithm } from 'stsdk-v1/lib/hash/HashAlgorithm.js';
+import { Signature } from 'stsdk-v1/lib/sign/Signature.js';
+import { SigningService } from 'stsdk-v1/lib/sign/SigningService.js';
 import type { PointerSigner } from './signing.js';
 
 /**

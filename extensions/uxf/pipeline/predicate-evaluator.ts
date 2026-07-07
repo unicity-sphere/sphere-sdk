@@ -41,7 +41,7 @@
  * @packageDocumentation
  */
 
-import type { IPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/IPredicate';
+import type { IPredicate } from 'stsdk-v1/lib/predicate/IPredicate';
 
 // =============================================================================
 // 1. Public types — discriminated outcome

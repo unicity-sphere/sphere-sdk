@@ -60,8 +60,8 @@ import type { OracleProvider } from '../../../oracle';
 import { logger } from '../../../core/logger';
 import { hexToBytes as strictHexToBytesCore } from '../../../core/hex';
 
-import type { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
-import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase.js';
+import type { AggregatorClient } from 'stsdk-v1/lib/api/AggregatorClient.js';
+import type { RootTrustBase } from 'stsdk-v1/lib/bft/RootTrustBase.js';
 
 import {
   ProfilePointerLayer,

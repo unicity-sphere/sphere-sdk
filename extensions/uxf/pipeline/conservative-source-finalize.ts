@@ -36,9 +36,9 @@
  * @internal
  */
 
-import { PredicateEngineService } from '@unicitylabs/state-transition-sdk/lib/predicate/PredicateEngineService';
-import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
-import { TransferTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransactionData';
+import { PredicateEngineService } from 'stsdk-v1/lib/predicate/PredicateEngineService';
+import { RequestId } from 'stsdk-v1/lib/api/RequestId';
+import { TransferTransactionData } from 'stsdk-v1/lib/transaction/TransferTransactionData';
 
 import type { OracleProvider } from '../../../oracle/oracle-provider';
 import type { Token } from '../../../types';

@@ -23,8 +23,8 @@
  * "something is wrong" alarm.
  */
 
-import type { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof.js';
-import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase.js';
+import type { InclusionProof } from 'stsdk-v1/lib/transaction/InclusionProof.js';
+import type { RootTrustBase } from 'stsdk-v1/lib/bft/RootTrustBase.js';
 
 import { MAX_PLAUSIBLE_EPOCH_GAP } from './constants.js';
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';

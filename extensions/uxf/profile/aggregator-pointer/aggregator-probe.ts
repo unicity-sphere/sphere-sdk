@@ -23,13 +23,13 @@
  * No side-channel leakage: timing does not depend on which side verified.
  */
 
-import type { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
-import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId.js';
-import { DataHash } from '@unicitylabs/state-transition-sdk/lib/hash/DataHash.js';
-import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm.js';
-import { InclusionProofVerificationStatus } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof.js';
-import type { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof.js';
-import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase.js';
+import type { AggregatorClient } from 'stsdk-v1/lib/api/AggregatorClient.js';
+import { RequestId } from 'stsdk-v1/lib/api/RequestId.js';
+import { DataHash } from 'stsdk-v1/lib/hash/DataHash.js';
+import { HashAlgorithm } from 'stsdk-v1/lib/hash/HashAlgorithm.js';
+import { InclusionProofVerificationStatus } from 'stsdk-v1/lib/transaction/InclusionProof.js';
+import type { InclusionProof } from 'stsdk-v1/lib/transaction/InclusionProof.js';
+import type { RootTrustBase } from 'stsdk-v1/lib/bft/RootTrustBase.js';
 
 import { PROBE_REQUEST_TIMEOUT_MS } from './constants.js';
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';

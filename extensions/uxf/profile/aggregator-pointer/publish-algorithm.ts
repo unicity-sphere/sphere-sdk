@@ -21,7 +21,7 @@
  * cross-version reconciliation — that is reconcile-algorithm.ts's job.
  */
 
-import type { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
+import type { AggregatorClient } from 'stsdk-v1/lib/api/AggregatorClient.js';
 
 import { submitPointer, type SubmitOutcome } from './aggregator-submit.js';
 import { isBlocked, maybeSetBlocked } from './blocked-state.js';

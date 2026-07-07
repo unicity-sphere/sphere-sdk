@@ -22,8 +22,8 @@
  * consume reconcile's budget.
  */
 
-import type { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
-import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase.js';
+import type { AggregatorClient } from 'stsdk-v1/lib/api/AggregatorClient.js';
+import type { RootTrustBase } from 'stsdk-v1/lib/bft/RootTrustBase.js';
 
 import { findLatestValidVersion, type DiscoverResult } from './discover-algorithm.js';
 import type { CarFetcher, CidDecoder } from './aggregator-probe.js';

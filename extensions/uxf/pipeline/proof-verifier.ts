@@ -78,10 +78,10 @@
  * @packageDocumentation
  */
 
-import type { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
-import { InclusionProofVerificationStatus } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
-import type { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
-import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
+import type { InclusionProof } from 'stsdk-v1/lib/transaction/InclusionProof';
+import { InclusionProofVerificationStatus } from 'stsdk-v1/lib/transaction/InclusionProof';
+import type { RequestId } from 'stsdk-v1/lib/api/RequestId';
+import type { RootTrustBase } from 'stsdk-v1/lib/bft/RootTrustBase';
 
 // =============================================================================
 // 1. Public types

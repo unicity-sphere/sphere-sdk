@@ -58,8 +58,8 @@
  * @packageDocumentation
  */
 
-import type { Authenticator } from '@unicitylabs/state-transition-sdk/lib/api/Authenticator';
-import type { DataHash } from '@unicitylabs/state-transition-sdk/lib/hash/DataHash';
+import type { Authenticator } from 'stsdk-v1/lib/api/Authenticator';
+import type { DataHash } from 'stsdk-v1/lib/hash/DataHash';
 
 // =============================================================================
 // 1. Public types — discriminated outcome

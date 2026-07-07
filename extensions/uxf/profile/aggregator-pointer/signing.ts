@@ -12,7 +12,7 @@
  * MUTEX_KEY / PENDING_VERSION_KEY / BLOCKED_FLAG_KEY templates.
  */
 
-import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService.js';
+import { SigningService } from 'stsdk-v1/lib/sign/SigningService.js';
 import type { SecretKey } from './secret-key.js';
 
 export interface PointerSigner {

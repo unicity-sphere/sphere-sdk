@@ -13,7 +13,7 @@
  */
 
 import { encode } from '@ipld/dag-cbor';
-import { SparseMerkleTreePath } from '@unicitylabs/state-transition-sdk/lib/mtree/plain/SparseMerkleTreePath.js';
+import { SparseMerkleTreePath } from 'stsdk-v1/lib/mtree/plain/SparseMerkleTreePath.js';
 
 import type {
   ContentHash,

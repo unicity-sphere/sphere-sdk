@@ -20,15 +20,15 @@
  *     residual risk per SPEC R-11.
  */
 
-import { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
-import { Authenticator } from '@unicitylabs/state-transition-sdk/lib/api/Authenticator.js';
-import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId.js';
+import { AggregatorClient } from 'stsdk-v1/lib/api/AggregatorClient.js';
+import { Authenticator } from 'stsdk-v1/lib/api/Authenticator.js';
+import { RequestId } from 'stsdk-v1/lib/api/RequestId.js';
 import {
   SubmitCommitmentResponse,
   SubmitCommitmentStatus,
-} from '@unicitylabs/state-transition-sdk/lib/api/SubmitCommitmentResponse.js';
-import { DataHash } from '@unicitylabs/state-transition-sdk/lib/hash/DataHash.js';
-import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm.js';
+} from 'stsdk-v1/lib/api/SubmitCommitmentResponse.js';
+import { DataHash } from 'stsdk-v1/lib/hash/DataHash.js';
+import { HashAlgorithm } from 'stsdk-v1/lib/hash/HashAlgorithm.js';
 
 import {
   CID_MAX_BYTES,

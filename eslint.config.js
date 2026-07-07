@@ -11,12 +11,24 @@ import tseslint from 'typescript-eslint';
 // makes the extension effectively mandatory and breaks the "invisible to
 // main-only consumers" invariant that anchors the whole extension design.
 //
-// This is enforced by the `no-restricted-imports` rule below, applied to
-// every core dir. Pre-existing crossings that predate Phase 3 are kept
-// working via a targeted allowlist — each entry is temporary and burns
-// down in a later phase (annotation next to each file).
-//
 // New crossings from unlisted files fail lint. That's the whole point.
+// =============================================================================
+//
+// Phase 6.A — STSDK anti-corruption layer
+// =============================================================================
+//
+// The v2 state-transition SDK is imported ONLY inside `token-engine/`
+// (the SHA-pinned anti-corruption layer). Every other subtree — core AND
+// extensions — routes v2 SDK usage through `ITokenEngine`.
+//
+// Extension code that still speaks v1 SDK (parked until Phase 9's port)
+// uses the `stsdk-v1` npm alias, which resolves to the pinned v1 version.
+// The direct package name `@unicitylabs/state-transition-sdk` outside
+// `token-engine/` is banned.
+//
+// Core files that legitimately still use v1 direct today are enumerated in
+// `STSDK_CORE_BURNDOWN` below. Each entry burns down as Phase 6.C
+// rewires the file onto `token-engine`.
 // =============================================================================
 
 const CORE_GLOBS = [
@@ -69,6 +81,42 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
   'tools/restore-legacy-outbox.ts',
 ];
 
+// Phase 6.C burn-down: core files that still import v1 STSDK directly.
+// Each will be rewired onto `token-engine` (via `ITokenEngine`) during
+// the sub-phase; the entry is deleted from this list when the file
+// stops importing `@unicitylabs/state-transition-sdk`.
+const STSDK_CORE_BURNDOWN = [
+  'core/Sphere.ts',
+  'modules/accounting/AccountingModule.ts',
+  'modules/payments/BackgroundCommitmentService.ts',
+  'modules/payments/InstantSplitExecutor.ts',
+  'modules/payments/InstantSplitProcessor.ts',
+  'modules/payments/NametagMinter.ts',
+  'modules/payments/PaymentsModule.ts',
+  'modules/payments/SpendQueue.ts',
+  'modules/payments/TokenRecoveryService.ts',
+  'modules/payments/TokenSplitCalculator.ts',
+  'modules/payments/TokenSplitExecutor.ts',
+  'modules/payments/extract-state-publickey.ts',
+  'modules/payments/v5-pending-shape.ts',
+  'modules/swap/payout-verifier.ts',
+  'oracle/UnicityAggregatorProvider.ts',
+];
+
+// Pattern definitions kept as named constants so the overrides below can
+// compose them cleanly.
+const EXT_PATTERN = {
+  group: ['**/extensions/**', 'extensions/**'],
+  message:
+    'core code MUST NOT import from `extensions/`. Route the callsite through a hook/port (see modules/payments/hooks.ts pattern, or add a raw-event tap on ExtensionHost.transport), or — if this is a temporary landing site — add the file to EXTENSION_BOUNDARY_ALLOWLIST in eslint.config.js with a burn-down phase annotation.',
+};
+
+const STSDK_PATTERN = {
+  group: ['@unicitylabs/state-transition-sdk', '@unicitylabs/state-transition-sdk/**'],
+  message:
+    'v2 state-transition SDK is only importable from `token-engine/` (the anti-corruption layer). Route the callsite through `ITokenEngine` — see modules/payments/PaymentsModule.ts on mainstream sphere-sdk main for the reference pattern. Extension code parked on v1 uses the `stsdk-v1` npm alias. For files still on v1 direct, add to STSDK_CORE_BURNDOWN in eslint.config.js and open a Phase 6.C burn-down issue.',
+};
+
 export default tseslint.config(
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
@@ -87,24 +135,55 @@ export default tseslint.config(
       '@typescript-eslint/no-non-null-assertion': 'off',
     },
   },
-  // Core files enforce the extensions/ boundary.
+  // Core files enforce BOTH boundaries: extensions/ ban AND STSDK ban.
   {
     files: CORE_GLOBS,
     rules: {
       'no-restricted-imports': ['error', {
-        patterns: [{
-          group: ['**/extensions/**', 'extensions/**'],
-          message:
-            'core code MUST NOT import from `extensions/`. Route the callsite through a hook/port (see modules/payments/hooks.ts pattern, or add a raw-event tap on ExtensionHost.transport), or — if this is a temporary landing site — add the file to the allowlist in eslint.config.js with a burn-down phase annotation.',
-        }],
+        patterns: [EXT_PATTERN, STSDK_PATTERN],
       }],
     },
   },
-  // Pre-existing crossings — burn-down enumerated above.
+  // Extension boundary burn-down — files listed here may import
+  // `extensions/*` but still cannot bypass the STSDK ban.
   {
     files: EXTENSION_BOUNDARY_ALLOWLIST,
     rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [STSDK_PATTERN],
+      }],
+    },
+  },
+  // STSDK burn-down — files listed here may import `@unicitylabs/state-transition-sdk`
+  // directly but still cannot bypass the extensions/ ban.
+  {
+    files: STSDK_CORE_BURNDOWN,
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [EXT_PATTERN],
+      }],
+    },
+  },
+  // Files that appear on BOTH burn-down lists (currently: core/Sphere.ts,
+  // modules/payments/PaymentsModule.ts, modules/accounting/AccountingModule.ts)
+  // need both bans relaxed until their respective burn-downs land.
+  {
+    files: STSDK_CORE_BURNDOWN.filter((f) => EXTENSION_BOUNDARY_ALLOWLIST.includes(f)),
+    rules: {
       'no-restricted-imports': 'off',
     },
-  }
+  },
+  // Extension code parked on v1 — `stsdk-v1` alias is the ONLY sanctioned
+  // way to reach v1 STSDK from here. Direct `@unicitylabs/state-transition-sdk`
+  // imports are banned (would resolve to v2 once package.json bumps in 6.B).
+  // Phase 9 ports the extension onto v2 through `token-engine`; the alias
+  // + this rule both retire at that point.
+  {
+    files: ['extensions/**/*.ts'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [STSDK_PATTERN],
+      }],
+    },
+  },
 );
