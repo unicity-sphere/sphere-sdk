@@ -147,7 +147,11 @@ import {
 // are replaced by the vendored, byte-identical `deriveDirectAddress` helper
 // (token-engine/identity.ts). See `deriveL3PredicateAddress` below.
 import { SigningService } from '../token-engine/sdk';
-import { deriveDirectAddress } from '../token-engine';
+import {
+  deriveDirectAddress,
+  createSphereTokenEngine,
+  type ITokenEngine,
+} from '../token-engine';
 import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
 
 export function isValidNametag(nametag: string): boolean {
@@ -260,6 +264,21 @@ export interface SphereCreateOptions {
    * propagate it here.
    */
   cidFetchGateways?: ReadonlyArray<string>;
+  /**
+   * Phase 6 — v2 token engine configuration. When the target `network` has
+   * a `trustBaseUrl` on `NETWORKS[network]` (currently: `testnet2`), Sphere
+   * fetches the trust base and constructs a {@link ITokenEngine} accessible
+   * via `sphere.tokenEngine`. Passes it into `PaymentsModule` /
+   * `AccountingModule` deps.
+   *
+   * Omit to fall back to `NETWORKS[network]` defaults (testnet2 embeds its
+   * non-secret gateway apiKey; mainnet requires explicit apiKey injection).
+   */
+  tokenEngine?: {
+    readonly apiKey?: string;
+    readonly trustBaseUrl?: string;
+    readonly aggregatorUrl?: string;
+  };
 }
 
 /** Options for loading existing wallet */
@@ -337,6 +356,21 @@ export interface SphereLoadOptions {
    * propagate it here.
    */
   cidFetchGateways?: ReadonlyArray<string>;
+  /**
+   * Phase 6 — v2 token engine configuration. When the target `network` has
+   * a `trustBaseUrl` on `NETWORKS[network]` (currently: `testnet2`), Sphere
+   * fetches the trust base and constructs a {@link ITokenEngine} accessible
+   * via `sphere.tokenEngine`. Passes it into `PaymentsModule` /
+   * `AccountingModule` deps.
+   *
+   * Omit to fall back to `NETWORKS[network]` defaults (testnet2 embeds its
+   * non-secret gateway apiKey; mainnet requires explicit apiKey injection).
+   */
+  tokenEngine?: {
+    readonly apiKey?: string;
+    readonly trustBaseUrl?: string;
+    readonly aggregatorUrl?: string;
+  };
 }
 
 /** Options for importing a wallet */
@@ -365,6 +399,12 @@ export interface SphereImportOptions {
   oracle: OracleProvider;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
+  /**
+   * Network type (mainnet, testnet, testnet2, dev) — informational only for
+   * lookups on {@link NETWORKS} (used by Phase-6 token engine construction).
+   * Actual network configuration comes from provider URLs.
+   */
+  network?: NetworkType;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
@@ -403,6 +443,21 @@ export interface SphereImportOptions {
    * propagate it here.
    */
   cidFetchGateways?: ReadonlyArray<string>;
+  /**
+   * Phase 6 — v2 token engine configuration. When the target `network` has
+   * a `trustBaseUrl` on `NETWORKS[network]` (currently: `testnet2`), Sphere
+   * fetches the trust base and constructs a {@link ITokenEngine} accessible
+   * via `sphere.tokenEngine`. Passes it into `PaymentsModule` /
+   * `AccountingModule` deps.
+   *
+   * Omit to fall back to `NETWORKS[network]` defaults (testnet2 embeds its
+   * non-secret gateway apiKey; mainnet requires explicit apiKey injection).
+   */
+  tokenEngine?: {
+    readonly apiKey?: string;
+    readonly trustBaseUrl?: string;
+    readonly aggregatorUrl?: string;
+  };
 }
 
 /** L1 (ALPHA blockchain) configuration */
@@ -836,6 +891,32 @@ export class Sphere {
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
   private _priceProvider: PriceProvider | null;
+  /**
+   * Phase 6 — v2 token engine (anti-corruption port). Constructed lazily by
+   * {@link Sphere.ensureTokenEngine} when the target network has a trust
+   * base URL AND the wallet identity is loaded. `null` when the network is
+   * v1-only (mainnet / testnet / dev today) OR before identity is available.
+   *
+   * The slim `PaymentsModule` / `AccountingModule` (waves 6-P2-4b/c) route
+   * ALL token operations through this — mint, transfer, split, verify,
+   * isSpent, isOwnedBy, encode/decode. Callers that need direct engine
+   * access (e.g. issuing tokens, running a smoke test) use `sphere.tokenEngine`.
+   */
+  private _tokenEngine: ITokenEngine | null = null;
+  /**
+   * Phase 6 — v2 token engine config overrides + network name. Filled from
+   * `SphereInitOptions.tokenEngine` (and Load/Create/Import equivalents) at
+   * construction time, then consulted by {@link Sphere.ensureTokenEngine}
+   * when the identity becomes available.
+   */
+  private _tokenEngineConfig: {
+    readonly network: NetworkType;
+    readonly apiKey?: string;
+    readonly trustBaseUrl?: string;
+    readonly aggregatorUrl?: string;
+  } | null = null;
+  /** Cached parsed trust base JSON; fetched once per engine construction. */
+  private _cachedTrustBaseJson: unknown | null = null;
   /**
    * Optional UXF bundle-CAR publisher for the `uxf-cid` delivery branch
    * (Issue #200 Phase 1 wiring). Forwarded into every PaymentsModule
@@ -1299,6 +1380,14 @@ export class Sphere {
     // primary PaymentsModule).
     sphere._publishToIpfs = options.publishToIpfs ?? null;
     sphere._cidFetchGateways = options.cidFetchGateways ?? null;
+    // Phase 6 — capture v2 token engine config so `ensureTokenEngine()`
+    // can materialize the engine once identity lands.
+    sphere._tokenEngineConfig = {
+      network: options.network ?? 'mainnet',
+      apiKey: options.tokenEngine?.apiKey,
+      trustBaseUrl: options.tokenEngine?.trustBaseUrl,
+      aggregatorUrl: options.tokenEngine?.aggregatorUrl,
+    };
 
     // Store mnemonic (encrypted if password provided, plaintext otherwise)
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
@@ -1400,6 +1489,14 @@ export class Sphere {
     // before `initializeModules()` threads it into PaymentsModule.
     sphere._publishToIpfs = options.publishToIpfs ?? null;
     sphere._cidFetchGateways = options.cidFetchGateways ?? null;
+    // Phase 6 — capture v2 token engine config so `ensureTokenEngine()`
+    // can materialize the engine once identity lands.
+    sphere._tokenEngineConfig = {
+      network: options.network ?? 'mainnet',
+      apiKey: options.tokenEngine?.apiKey,
+      trustBaseUrl: options.tokenEngine?.trustBaseUrl,
+      aggregatorUrl: options.tokenEngine?.aggregatorUrl,
+    };
     // Issue #309 — read-only fallback storage for identity-key reads.
     // Consulted by loadIdentityFromStorage() when the primary returns
     // null or throws a recoverable LoadBlockFailedError. Used in
@@ -1611,6 +1708,14 @@ export class Sphere {
     // before `initializeModules()` threads it into PaymentsModule.
     sphere._publishToIpfs = options.publishToIpfs ?? null;
     sphere._cidFetchGateways = options.cidFetchGateways ?? null;
+    // Phase 6 — capture v2 token engine config so `ensureTokenEngine()`
+    // can materialize the engine once identity lands.
+    sphere._tokenEngineConfig = {
+      network: options.network ?? 'mainnet',
+      apiKey: options.tokenEngine?.apiKey,
+      trustBaseUrl: options.tokenEngine?.trustBaseUrl,
+      aggregatorUrl: options.tokenEngine?.aggregatorUrl,
+    };
 
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
 
@@ -2514,6 +2619,79 @@ export class Sphere {
   /** Is ready */
   get isReady(): boolean {
     return this._initialized;
+  }
+
+  /**
+   * Phase 6 — v2 token engine (anti-corruption port).
+   *
+   * `null` until {@link ensureTokenEngine} has run — which happens
+   * automatically during {@link init}/{@link load}/{@link create}/{@link import}
+   * when the target network has a `trustBaseUrl` configured
+   * (currently: `testnet2`). For v1-only networks (`mainnet`, `testnet`,
+   * `dev`) this stays `null` — the slim PaymentsModule/AccountingModule then
+   * throw a clear "engine not configured" error on any call that requires it.
+   *
+   * Direct callers (test scripts, custom flows) can drive
+   * `sphere.tokenEngine.mint(...)` / `.transfer(...)` themselves without going
+   * through the facade.
+   */
+  get tokenEngine(): ITokenEngine | null {
+    return this._tokenEngine;
+  }
+
+  /**
+   * Phase 6 — construct the v2 SphereTokenEngine if the network + identity
+   * make it possible. Idempotent: subsequent calls short-circuit on the
+   * cached engine. Called at every place the identity becomes available
+   * (init, load, create, import, address switch, nametag registration).
+   *
+   * Silently returns `null` when the target network has no `trustBaseUrl`
+   * (v1-only networks: mainnet/testnet/dev). Throws if fetching the trust
+   * base or constructing the engine fails — a hard failure is preferable
+   * to running with a broken engine (subsequent send/receive would fail
+   * mysteriously downstream).
+   */
+  async ensureTokenEngine(): Promise<ITokenEngine | null> {
+    if (this._tokenEngine !== null) return this._tokenEngine;
+    if (!this._identity?.privateKey) return null;
+    const cfg = this._tokenEngineConfig;
+    if (cfg === null) return null;
+
+    const network = NETWORKS[cfg.network] as
+      | { aggregatorUrl?: string; trustBaseUrl?: string; aggregatorApiKey?: string }
+      | undefined;
+    const aggregatorUrl = cfg.aggregatorUrl ?? network?.aggregatorUrl;
+    const trustBaseUrl = cfg.trustBaseUrl ?? network?.trustBaseUrl;
+    const apiKey = cfg.apiKey ?? network?.aggregatorApiKey;
+    if (!aggregatorUrl || !trustBaseUrl) {
+      // Network doesn't declare a v2 trust base — engine intentionally left null.
+      return null;
+    }
+
+    if (this._cachedTrustBaseJson === null) {
+      logger.debug('Sphere', `Fetching trust base from ${trustBaseUrl}`);
+      const resp = await fetch(trustBaseUrl);
+      if (!resp.ok) {
+        throw new SphereError(
+          `Trust base fetch failed (${resp.status} ${resp.statusText}): ${trustBaseUrl}`,
+          'INVALID_CONFIG',
+        );
+      }
+      this._cachedTrustBaseJson = await resp.json();
+    }
+
+    const privateKey = strictHexToBytes(this._identity.privateKey);
+    this._tokenEngine = await createSphereTokenEngine({
+      aggregatorUrl,
+      apiKey,
+      privateKey,
+      trustBaseJson: this._cachedTrustBaseJson,
+    });
+    logger.debug(
+      'Sphere',
+      `SphereTokenEngine constructed for network=${cfg.network} gateway=${aggregatorUrl}`,
+    );
+    return this._tokenEngine;
   }
 
   // ===========================================================================
@@ -3623,6 +3801,8 @@ export class Sphere {
         moduleSet.identity = newIdentity;
         // Use per-address transport if available
         const addressTransport: TransportProvider = moduleSet.transportAdapter ?? this._transport;
+        // Phase 6 — ensure v2 token engine is available for the deps object.
+        await this.ensureTokenEngine();
         // Re-initialize with updated identity (nametag change)
         moduleSet.payments.initialize({
           identity: newIdentity,
@@ -3630,6 +3810,7 @@ export class Sphere {
           tokenStorageProviders: moduleSet.tokenStorageProviders,
           transport: addressTransport,
           oracle: this._oracle,
+          tokenEngine: this._tokenEngine ?? undefined,
           emitEvent: this.emitEvent.bind(this),
               price: this._priceProvider ?? undefined,
           // Issue #200 Phase 1 wiring — keep CID-by-reference publisher
@@ -3862,6 +4043,9 @@ export class Sphere {
     // sharing this storage provider use the same CidRefStore instance.
     const cidRefStore = this.buildCidRefStoreOrNull();
 
+    // Phase 6 — ensure v2 token engine before wiring into deps.
+    await this.ensureTokenEngine();
+
     // Initialize with address-specific identity and per-address transport
     payments.initialize({
       identity,
@@ -3869,6 +4053,7 @@ export class Sphere {
       tokenStorageProviders,
       transport: addressTransport,
       oracle: this._oracle,
+      tokenEngine: this._tokenEngine ?? undefined,
       emitEvent,
       price: this._priceProvider ?? undefined,
       // Issue #200 Phase 1 wiring — forward canonical UXF CAR publisher
@@ -3928,6 +4113,7 @@ export class Sphere {
           payments,
           tokenStorage: accountingTokenStorage,
           oracle: this._oracle,
+          tokenEngine: this._tokenEngine ?? undefined,
           trustBase,
           identity,
           getActiveAddresses: () => this._getActiveAddressesInternal(),
@@ -7147,12 +7333,16 @@ export class Sphere {
     // Pass it into every module that has a fat-data OpLog write site.
     const cidRefStore = this.buildCidRefStoreOrNull();
 
+    // Phase 6 — ensure v2 token engine before wiring into deps.
+    await this.ensureTokenEngine();
+
     this._payments.initialize({
       identity: this._identity!,
       storage: this._storage,
       tokenStorageProviders: this._tokenStorageProviders,
       transport: moduleTransport,
       oracle: this._oracle,
+      tokenEngine: this._tokenEngine ?? undefined,
       emitEvent,
 price: this._priceProvider ?? undefined,
       disabledProviderIds: this._disabledProviders,
@@ -7216,6 +7406,7 @@ price: this._priceProvider ?? undefined,
           payments: this._payments,
           tokenStorage: accountingTokenStorage,
           oracle: this._oracle,
+          tokenEngine: this._tokenEngine ?? undefined,
           trustBase,
           identity: this._identity!,
           getActiveAddresses: () => this._getActiveAddressesInternal(),

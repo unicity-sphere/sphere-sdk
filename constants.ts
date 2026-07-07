@@ -574,6 +574,13 @@ export const NETWORKS = {
   testnet2: {
     name: 'Testnet2 (v2 gateway)',
     aggregatorUrl: TESTNET2_GATEWAY_URL,
+    // testnet2 gateway API key (Phase 6). NOT a secret — testnet2 keys are safe
+    // to embed. A MAINNET key, by contrast, IS a secret and must be
+    // env-injected via SphereInitOptions.tokenEngine.apiKey.
+    aggregatorApiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590',
+    // Root-trust-base JSON URL (Phase 6). The v2 SphereTokenEngine takes its
+    // NetworkId from `RootTrustBase.networkId` in this JSON (testnet2 = 4).
+    trustBaseUrl: TESTNET2_TRUST_BASE_URL,
     nostrRelays: TEST_NOSTR_RELAYS,
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     groupRelays: DEFAULT_GROUP_RELAYS,
