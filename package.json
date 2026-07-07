@@ -21,10 +21,6 @@
       "import": "./dist/impl/browser/index.js",
       "require": "./dist/impl/browser/index.cjs"
     },
-    "./impl/browser/ipfs": {
-      "import": "./dist/impl/browser/ipfs.js",
-      "require": "./dist/impl/browser/ipfs.cjs"
-    },
     "./impl/nodejs": {
       "import": {
         "types": "./dist/impl/nodejs/index.d.ts",
@@ -149,15 +145,10 @@
     "url": "https://github.com/unicity-sphere/sphere-sdk.git"
   },
   "dependencies": {
-    "@chainsafe/libp2p-gossipsub": "^14.1.2",
     "@ipld/car": "^5.4.2",
     "@ipld/dag-cbor": "^9.2.5",
-    "@libp2p/bootstrap": "^12.0.11",
-    "@libp2p/crypto": "^5.1.13",
-    "@libp2p/peer-id": "^6.0.4",
     "@noble/curves": "^2.0.1",
     "@noble/hashes": "^2.0.1",
-    "@orbitdb/core": "^3.0.2",
     "@unicitylabs/nostr-js-sdk": "^0.5.0",
     "@unicitylabs/state-transition-sdk": "1.6.1-rc.f37cb85",
     "async-mutex": "^0.5.0",
@@ -168,8 +159,6 @@
     "canonicalize": "^3.0.0",
     "crypto-js": "^4.2.0",
     "elliptic": "^6.6.1",
-    "helia": "^6.1.1",
-    "ipns": "^10.0.0",
     "multiformats": "^13.4.2",
     "proper-lockfile": "^4.1.2"
   },

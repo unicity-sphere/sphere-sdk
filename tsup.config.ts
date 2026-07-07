@@ -14,13 +14,10 @@ export default defineConfig([
     noExternal: [/^@noble\//],
     external: [
       /^@unicitylabs\//,
-      /^@libp2p\//,
-      /^@helia\//,
       'bip39',
       'buffer',
       'crypto-js',
       'elliptic',
-      'helia',
       'multiformats',
       'ws',
     ],
@@ -60,26 +57,6 @@ export default defineConfig([
       /^@unicitylabs\//,
     ],
   },
-  // Browser IPFS implementation (requires helia)
-  // Separate entry point so users can opt-in to IPFS functionality
-  {
-    entry: { 'impl/browser/ipfs': 'impl/browser/ipfs.ts' },
-    format: ['esm', 'cjs'],
-    dts: false,
-    clean: false,
-    splitting: false,
-    sourcemap: true,
-    platform: 'browser',
-    target: 'es2022',
-    noExternal: [/^@noble\//],
-    external: [
-      /^@unicitylabs\//,
-      /^@libp2p\//,
-      /^@helia\//,
-      'helia',
-      'multiformats',
-    ],
-  },
   // Node.js implementation
   {
     entry: { 'impl/nodejs/index': 'impl/nodejs/index.ts' },
@@ -93,9 +70,6 @@ export default defineConfig([
     noExternal: [/^@noble\//],
     external: [
       /^@unicitylabs\//,
-      /^@libp2p\//,
-      /^@helia\//,
-      'helia',
       'multiformats',
       'ws',
     ],
@@ -178,11 +152,9 @@ export default defineConfig([
     noExternal: [/^@noble\//],
     external: [
       /^@unicitylabs\//,
-      '@orbitdb/core',
       '@ipld/dag-cbor',
       '@ipld/car',
       'multiformats',
-      'helia',
     ],
   },
   // Profile - Browser factory
@@ -198,11 +170,9 @@ export default defineConfig([
     noExternal: [/^@noble\//],
     external: [
       /^@unicitylabs\//,
-      '@orbitdb/core',
       '@ipld/dag-cbor',
       '@ipld/car',
       'multiformats',
-      'helia',
     ],
   },
   // Profile - Node.js factory
@@ -218,11 +188,9 @@ export default defineConfig([
     noExternal: [/^@noble\//],
     external: [
       /^@unicitylabs\//,
-      '@orbitdb/core',
       '@ipld/dag-cbor',
       '@ipld/car',
       'multiformats',
-      'helia',
     ],
   },
 ]);
