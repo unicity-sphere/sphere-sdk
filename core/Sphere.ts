@@ -137,6 +137,12 @@ import {
   resetEpochImpl as epochResetEpochImpl,
   type EpochOpsHost,
 } from './sphere-epoch';
+import {
+  syncIdentityWithTransport as nametagSyncSyncIdentity,
+  recoverNametagFromTransport as nametagSyncRecoverNametag,
+  cleanNametag as nametagSyncCleanNametag,
+  type NametagSyncHost,
+} from './sphere-nametag-sync';
 // Phase 6-P2-4d: SigningService import routed through token-engine anti-corruption
 // barrel; the v1 predicate primitives (`TokenType`, `HashAlgorithm`,
 // `UnmaskedPredicateReference`) that used to compose the DIRECT address by hand
@@ -4834,228 +4840,24 @@ export class Sphere {
   }
 
   /**
-   * Publish identity binding via transport.
-   * Always publishes base identity (chainPubkey, l1Address, directAddress).
-   * If nametag is set, also publishes nametag hash, proxy address, encrypted nametag.
+   * Publish identity binding via transport (Nostr).
+   * Extracted to `core/sphere-nametag-sync.ts` — see there for detail.
    */
   private async syncIdentityWithTransport(): Promise<void> {
-    if (!this._transport.publishIdentityBinding) {
-      return; // Transport doesn't support identity binding
-    }
-
-    try {
-      // Check if a binding already exists by querying the relay by transport pubkey
-      // (= x-only pubkey = chainPubkey without the 02/03 prefix).
-      // This finds events in ANY format (old d=hashedNametag and new d=hash(identity:pubkey))
-      // because resolve(64-hex) searches by event author, not by tag.
-      const transportPubkey = this._identity?.chainPubkey?.slice(2);
-      if (transportPubkey && this._transport.resolve) {
-        try {
-          const existing = await this._transport.resolve(transportPubkey);
-          if (existing) {
-            // If existing binding has nametag but local state doesn't — recover it
-            let recoveredNametag = existing.nametag;
-            let fromLegacy = false;
-
-            // Old-format events don't have content.nametag (only encrypted_nametag).
-            // Fall back to recoverNametag() which decrypts encrypted_nametag from any event.
-            if (!recoveredNametag && !this._identity?.nametag && this._transport.recoverNametag) {
-              try {
-                recoveredNametag = await this._transport.recoverNametag() ?? undefined;
-                if (recoveredNametag) fromLegacy = true;
-              } catch {
-                // Decryption failed — continue without nametag
-              }
-            }
-
-            if (recoveredNametag && !this._identity?.nametag) {
-              (this._identity as MutableFullIdentity).nametag = recoveredNametag;
-              await this._updateCachedProxyAddress();
-
-              const entry = await this.ensureAddressTracked(this._currentAddressIndex);
-              let nametags = this._addressNametags.get(entry.addressId);
-              if (!nametags) {
-                nametags = new Map();
-                this._addressNametags.set(entry.addressId, nametags);
-              }
-              if (!nametags.has(0)) {
-                nametags.set(0, recoveredNametag);
-                await this.persistAddressNametags();
-              }
-
-              this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
-
-              // Re-publish in new format only when migrating from legacy event
-              if (fromLegacy) {
-                await this._transport.publishIdentityBinding!(
-                  this._identity!.chainPubkey,
-                  this._identity!.directAddress || '',
-                  recoveredNametag,
-                );
-                logger.debug('Sphere', `Migrated legacy binding with Unicity ID @${recoveredNametag}`);
-                return;
-              }
-            }
-
-            // Check if existing binding is missing critical fields — re-publish if so
-            const needsUpdate =
-              !existing.directAddress ||
-              !existing.chainPubkey ||
-              (this._identity?.nametag && !existing.nametag);
-
-            if (needsUpdate) {
-              logger.debug('Sphere', 'Existing binding incomplete, re-publishing with full data');
-              await this._transport.publishIdentityBinding!(
-                this._identity!.chainPubkey,
-                this._identity!.directAddress || '',
-                this._identity?.nametag || existing.nametag || undefined,
-              );
-              return;
-            }
-
-            logger.debug('Sphere', 'Existing binding found, skipping re-publish');
-            return;
-          }
-        } catch (e) {
-          // resolve failed — do NOT fall through to publish, as it could
-          // overwrite an existing binding (with nametag) with one without.
-          // Next reload will retry.
-          logger.warn('Sphere', 'resolve() failed, skipping publish to avoid overwrite', e);
-          return;
-        }
-      }
-
-      // No existing binding — publish for the first time
-      const nametag = this._identity?.nametag;
-      const success = await this._transport.publishIdentityBinding(
-        this._identity!.chainPubkey,
-        this._identity!.directAddress || '',
-        nametag || undefined,
-      );
-      if (success) {
-        logger.debug('Sphere', `Identity binding published${nametag ? ` with Unicity ID @${nametag}` : ''}`);
-      } else if (nametag) {
-        logger.warn('Sphere', `Unicity ID @${nametag} is taken by another pubkey`);
-      }
-    } catch (error) {
-      // Don't fail wallet load on identity sync errors
-      logger.warn('Sphere', `Identity binding sync failed:`, error);
-    }
+    return nametagSyncSyncIdentity(this as unknown as NametagSyncHost);
   }
 
   /**
    * Recover nametag from transport after wallet import.
-   * Searches for encrypted nametag events authored by this wallet's pubkey
-   * and decrypts them to restore the nametag association.
+   * Extracted to `core/sphere-nametag-sync.ts` — see there for detail.
    */
   private async recoverNametagFromTransport(): Promise<void> {
-    // Skip if already has a nametag
-    if (this._identity?.nametag) {
-      return;
-    }
-
-    let recoveredNametag: string | null = null;
-
-    // Strategy 1: Decrypt nametag from own Nostr binding events (private-key based)
-    if (this._transport.recoverNametag) {
-      try {
-        recoveredNametag = await this._transport.recoverNametag();
-      } catch {
-        // Non-fatal — try fallback
-      }
-    }
-
-    if (!recoveredNametag) {
-      return;
-    }
-
-    try {
-      // Update identity with recovered nametag
-      if (this._identity) {
-        (this._identity as MutableFullIdentity).nametag = recoveredNametag;
-        await this._updateCachedProxyAddress();
-      }
-
-      // Update nametag cache
-      const entry = await this.ensureAddressTracked(this._currentAddressIndex);
-      let nametags = this._addressNametags.get(entry.addressId);
-      if (!nametags) {
-        nametags = new Map();
-        this._addressNametags.set(entry.addressId, nametags);
-      }
-      const nextIndex = nametags.size;
-      nametags.set(nextIndex, recoveredNametag);
-      await this.persistAddressNametags();
-
-      // Note: no need to re-publish here — callers follow up with
-      // syncIdentityWithTransport() which will publish WITH the recovered nametag.
-
-      // Re-mint the on-chain nametag TOKEN. Without this, the wallet's
-      // identity claim (set above) advertises @recoveredNametag on Nostr,
-      // but `_payments.nametags` is empty — so the wallet has no
-      // `nametagToken.id` to derive the expected PROXY against, and every
-      // inbound PROXY-mode transfer fails `finalizeTransferToken` with
-      // "Cannot finalize PROXY transfer - no Unicity ID token".
-      //
-      // Recovery is one deterministic-salt mint call. The aggregator
-      // returns `REQUEST_ID_EXISTS` with the original inclusion proof
-      // (because the salt is `SHA256(this.signingKey || name)` — same
-      // wallet, same name → same commitment ID), and the wallet
-      // reconstructs the token locally. No extra round-trip beyond what
-      // a fresh mint would cost.
-      //
-      // If the mint fails (network hiccup, aggregator down, or — in the
-      // hypothetical Nostr-binding-forged scenario — the salt doesn't
-      // match a prior commitment under this pubkey), we keep the
-      // identity claim but warn. PROXY-mode transfers will fail until a
-      // subsequent successful `sphere.mintNametag()` call; the operator
-      // can retry manually.
-      if (!this._payments.hasNametagNamed(recoveredNametag)) {
-        try {
-          // Call PaymentsModule.mintNametag directly, NOT this.mintNametag.
-          // The public Sphere.mintNametag wrapper invokes ensureReady() —
-          // which throws "Sphere not initialized" because Sphere.create
-          // calls recoverNametagFromTransport BEFORE setting
-          // `_initialized = true`. The PaymentsModule's own
-          // ensureInitialized() check is satisfied at this point
-          // (initializeModules ran earlier in the create flow).
-          const mintResult = await this._payments.mintNametag(recoveredNametag);
-          if (mintResult.success) {
-            logger.debug(
-              'Sphere',
-              `Re-minted on-chain nametag token for recovered "@${recoveredNametag}"`,
-            );
-          } else {
-            logger.warn(
-              'Sphere',
-              `Recovered Unicity ID "@${recoveredNametag}" from transport but ` +
-              `on-chain token mint-recovery failed: ${mintResult.error}. ` +
-              `PROXY-mode inbound transfers will fail until a subsequent ` +
-              `sphere.mintNametag("${recoveredNametag}") call succeeds.`,
-            );
-          }
-        } catch (mintErr) {
-          logger.warn(
-            'Sphere',
-            `Recovered Unicity ID "@${recoveredNametag}" from transport but ` +
-            `on-chain token mint-recovery threw (continuing without token):`,
-            mintErr,
-          );
-        }
-      }
-
-      this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
-    } catch {
-      // Don't fail wallet import on nametag recovery errors
-    }
+    return nametagSyncRecoverNametag(this as unknown as NametagSyncHost);
   }
 
-  /**
-   * Strip @ prefix and normalize a nametag (lowercase, phone E.164, strip @unicity suffix).
-   */
+  /** Strip @ prefix and normalize a nametag. */
   private cleanNametag(raw: string): string {
-    const stripped = raw.startsWith('@') ? raw.slice(1) : raw;
-    return normalizeNametag(stripped);
+    return nametagSyncCleanNametag(raw);
   }
 
   // ===========================================================================
