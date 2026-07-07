@@ -29,9 +29,19 @@ const PAYMENTS_MODULE_PATH = path.resolve(
   __dirname,
   '../../../modules/payments/PaymentsModule.ts',
 );
+// Phase 5 [C] quarantine — some historically-in-PaymentsModule bodies
+// were moved wholesale to `legacy-v1/finalization.ts` (Phase 6.C deletes
+// them). W11 stamping call-sites still need to be counted across both.
+const PAYMENTS_LEGACY_FINALIZATION_PATH = path.resolve(
+  __dirname,
+  '../../../modules/payments/legacy-v1/finalization.ts',
+);
 
 describe('T-D7 PaymentsModule W11 stamping — source-level invariant', () => {
-  const source = fs.readFileSync(PAYMENTS_MODULE_PATH, 'utf8');
+  const source =
+    fs.readFileSync(PAYMENTS_MODULE_PATH, 'utf8') +
+    '\n' +
+    fs.readFileSync(PAYMENTS_LEGACY_FINALIZATION_PATH, 'utf8');
 
   // Grep for the canonical W11-stamped keys and assert no raw
   // `storage.set(<key>, …)` appears. These keys represent user
