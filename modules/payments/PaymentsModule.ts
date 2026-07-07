@@ -663,6 +663,21 @@ import {
 // for the routing plan; Phase 6.C will rewire this onto `ITokenEngine`.
 import { mintFungibleTokenImpl } from './mint';
 
+// Phase 5 [C] quarantine — v1-STSDK-coupled machinery slated for Phase 6.C
+// wholesale deletion via `git rm -r modules/payments/legacy-v1/`.
+// See modules/payments/legacy-v1/README.md for the deletion plan.
+import {
+  sendInstantImpl,
+  saveUnconfirmedV5TokenImpl,
+  saveCommitmentOnlyTokenImpl,
+  processCombinedTransferBundleImpl,
+  saveProcessedCombinedTransferIdsImpl,
+  loadProcessedCombinedTransferIdsImpl,
+  processInstantSplitBundleImpl,
+  processInstantSplitBundleSyncImpl,
+  isInstantSplitBundleImpl,
+} from './legacy-v1';
+
 // Phase 5 [A] survive extraction — importTokens / exportTokens are now
 // thin facade delegations to pure functions in `./import-export/`.
 // See modules/payments/import-export/README.md for the routing plan.
@@ -6311,239 +6326,9 @@ export class PaymentsModule {
     originalRequest: TransferRequest,
     options?: InstantSplitOptions
   ): Promise<InstantSplitResult> {
-    this.ensureInitialized();
-
-    // T.1.B.1 — narrow the optional-on-public-API `coinId` / `amount` to a
-    // required-string `LegacyCoinTransferRequest`. NFT-only and
-    // multi-asset shapes are accepted by the public type but not yet
-    // routable on this entry point (awaits T.2.B). The narrow runs
-    // BEFORE any state mutation. Mode narrowing is skipped here because
-    // `sendInstant()` is itself a routing target of `'instant'` mode and
-    // the public-mode → internal-mode shim has run upstream.
-    let request: LegacyCoinTransferRequest = requireLegacyCoinSlot(originalRequest);
-
-    const startTime = performance.now();
-
-    let reservationId: string | undefined;
-    let tokenToSplitRef: Token | undefined;
-
-    try {
-      // Resolve recipient
-      const peerInfo: PeerInfo | null = await this.deps!.transport.resolve?.(request.recipient) ?? null;
-      const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
-      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
-
-      // Create signing service
-      const signingService = await this.createSigningService();
-
-      // Get state transition client and trust base
-      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
-      if (!stClient) {
-        throw new SphereError('State transition client not available', 'AGGREGATOR_ERROR');
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const trustBase = (this.deps!.oracle as any).getTrustBase?.();
-      if (!trustBase) {
-        throw new SphereError('Trust base not available', 'AGGREGATOR_ERROR');
-      }
-
-      // ── Spend Queue: reserve tokens (same path as send()) ──
-      reservationId = crypto.randomUUID();
-      // Symbol → coinId resolution — delegate to shared helper.
-      request = requireLegacyCoinSlot(this.resolveCoinIdSymbol(request));
-      const parsedPool = await this.spendPlanner.buildParsedPool(
-        Array.from(this.tokens.values()),
-        request.coinId
-      );
-
-      let pendingChangeAmount2 = 0n;
-      for (const [, t] of this.tokens) {
-        if (t.coinId === request.coinId && t.status === 'transferring') {
-          pendingChangeAmount2 += BigInt(t.amount || '0');
-        }
-      }
-      const planResult = this.spendPlanner.planSend(
-        request, parsedPool, this.reservationLedger, this.spendQueue, reservationId, pendingChangeAmount2
-      );
-
-      let splitPlan;
-      if (planResult === 'queued') {
-        const queueResult = await this.spendQueue.waitForEntry(reservationId);
-        splitPlan = queueResult.splitPlan;
-      } else {
-        splitPlan = planResult.splitPlan;
-      }
-
-      if (!splitPlan) {
-        throw new SphereError('Insufficient balance', 'SEND_INSUFFICIENT_BALANCE');
-      }
-
-      if (!splitPlan.requiresSplit || !splitPlan.tokenToSplit) {
-        // W23 fix: For direct transfers without split, fall back to standard send()
-        // but pass the existing reservation ID so send() can reuse it instead of
-        // creating a new one. This closes the race window where freed tokens could
-        // be grabbed by a concurrent queued entry between cancel and re-reserve.
-        logger.debug('Payments', 'No split required, falling back to standard send()');
-        try {
-          const result = await this.send(request, { existingReservationId: reservationId, existingSplitPlan: splitPlan });
-          return {
-            success: result.status === 'completed',
-            criticalPathDurationMs: performance.now() - startTime,
-            error: result.error,
-          };
-        } finally {
-          this.spendQueue.notifyChange(request.coinId);
-        }
-      }
-
-      logger.debug('Payments', `InstantSplit: amount=${splitPlan.splitAmount}, remainder=${splitPlan.remainderAmount}`);
-
-      // Mark token as transferring
-      const tokenToSplit = splitPlan.tokenToSplit.uiToken;
-      tokenToSplitRef = tokenToSplit;
-      tokenToSplit.status = 'transferring';
-      this.tokens.set(tokenToSplit.id, tokenToSplit);
-      this.parsedTokenCache.delete(tokenToSplit.id);
-
-      // Check if dev mode
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const devMode = options?.devMode ?? (this.deps!.oracle as any).isDevMode?.() ?? false;
-
-      const onChainMessage: Uint8Array | null = null;
-
-      // Create instant split executor
-      const executor = new InstantSplitExecutor({
-        stateTransitionClient: stClient,
-        trustBase,
-        signingService,
-        devMode,
-      });
-
-      // Execute instant split
-      const result = await executor.executeSplitInstant(
-        splitPlan.tokenToSplit.sdkToken,
-        splitPlan.splitAmount!,
-        splitPlan.remainderAmount!,
-        splitPlan.coinId,
-        recipientAddress,
-        this.deps!.transport,
-        recipientPubkey,
-        {
-          ...options,
-          memo: request.memo,
-          message: onChainMessage,
-          onChangeTokenCreated: async (changeToken) => {
-            // Save change token when background completes
-            const changeTokenData = changeToken.toJSON();
-            const uiToken: Token = {
-              id: crypto.randomUUID(),
-              coinId: request.coinId,
-              symbol: this.getCoinSymbol(request.coinId),
-              name: this.getCoinName(request.coinId),
-              decimals: this.getCoinDecimals(request.coinId),
-              iconUrl: this.getCoinIconUrl(request.coinId),
-              amount: splitPlan.remainderAmount!.toString(),
-              status: 'confirmed',
-              createdAt: Date.now(),
-              updatedAt: Date.now(),
-              sdkData: JSON.stringify(changeTokenData),
-            };
-            await this.addToken(uiToken);
-            logger.debug('Payments', `Change token saved via background: ${uiToken.id}`);
-          },
-          onStorageSync: async () => {
-            await this.save();
-            return true;
-          },
-        }
-      );
-
-      if (result.success) {
-        // Track background task for change token creation
-        if (result.backgroundPromise) {
-          this.pendingBackgroundTasks.push(result.backgroundPromise);
-        }
-
-        // Commit reservation AFTER transfer — removing token passes excludeReservationId
-        // to prevent cancelForToken() from cancelling our own in-flight reservation.
-        this.reservationLedger.commit(reservationId);
-
-        // Remove the original token
-        await this.removeToken(tokenToSplit.id, reservationId);
-
-        // Add to transaction history (single entry for the actual sent amount)
-        const recipientNametag = peerInfo?.nametag
-          || (request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined);
-        const splitTokenId = extractTokenIdFromSdkData(tokenToSplit.sdkData);
-        await this.addToHistory({
-          type: 'SENT',
-          amount: request.amount,
-          coinId: request.coinId,
-          symbol: this.getCoinSymbol(request.coinId),
-          timestamp: Date.now(),
-          recipientPubkey,
-          recipientNametag,
-          recipientAddress: peerInfo?.directAddress || recipientAddress?.toString() || recipientPubkey,
-          memo: request.memo,
-          tokenId: splitTokenId || undefined,
-        });
-
-        await this.save();
-      } else {
-        // Cancel reservation — free reserved amounts for other sends
-        this.reservationLedger.cancel(reservationId);
-        // Restore token on failure and re-add to cache
-        tokenToSplit.status = 'confirmed';
-        this.tokens.set(tokenToSplit.id, tokenToSplit);
-        if (tokenToSplit.sdkData) {
-          try {
-            const parsed = JSON.parse(tokenToSplit.sdkData);
-            const sdkToken = await SdkToken.fromJSON(parsed);
-            const amount = this.extractCoinAmountForCache(sdkToken, tokenToSplit.coinId);
-            if (amount > 0n) {
-              this.parsedTokenCache.set(tokenToSplit.id, { token: tokenToSplit, sdkToken, amount });
-            }
-          } catch { /* parse failure — skip */ }
-        }
-        this.spendQueue.notifyChange(request.coinId);
-      }
-
-      return result;
-    } catch (error) {
-      // Cancel reservation on exception (only if one was created)
-      if (reservationId) {
-        this.reservationLedger.cancel(reservationId);
-      }
-
-      // Restore token from 'transferring' back to 'confirmed' if it was marked
-      if (tokenToSplitRef && tokenToSplitRef.status === 'transferring') {
-        tokenToSplitRef.status = 'confirmed';
-        this.tokens.set(tokenToSplitRef.id, tokenToSplitRef);
-        if (tokenToSplitRef.sdkData) {
-          try {
-            const parsed = JSON.parse(tokenToSplitRef.sdkData);
-            const sdkToken = await SdkToken.fromJSON(parsed);
-            const amount = this.extractCoinAmountForCache(sdkToken, tokenToSplitRef.coinId);
-            if (amount > 0n) {
-              this.parsedTokenCache.set(tokenToSplitRef.id, { token: tokenToSplitRef, sdkToken, amount });
-            }
-          } catch { /* parse failure — skip */ }
-        }
-      }
-
-      // Notify queue after all restoration is complete
-      if (reservationId) {
-        this.spendQueue.notifyChange(request.coinId);
-      }
-
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        success: false,
-        criticalPathDurationMs: performance.now() - startTime,
-        error: errorMessage,
-      };
-    }
+    return sendInstantImpl.call(this, originalRequest, options);
   }
+
 
   // ===========================================================================
   // Shared Helpers for V5 and V6 Receiver Processing
@@ -6601,69 +6386,7 @@ export class PaymentsModule {
     senderPubkey: string,
     deferPersistence = false,
   ): Promise<Token | null> {
-    const deterministicId = `v5split_${bundle.splitGroupId}`;
-    if (this.tokens.has(deterministicId) || this.processedSplitGroupIds.has(bundle.splitGroupId)) {
-      logger.debug('Payments', `V5 bundle ${bundle.splitGroupId.slice(0, 12)}... already processed, skipping`);
-      return null;
-    }
-
-    const registry = TokenRegistry.getInstance();
-    const pendingData: PendingV5Finalization = {
-      type: 'v5_bundle',
-      stage: 'RECEIVED',
-      bundleJson: JSON.stringify(bundle),
-      senderPubkey,
-      savedAt: Date.now(),
-      attemptCount: 0,
-    };
-
-    // #202 — Build a UXF/TXF-valid synthetic sdkData. See doc-comment.
-    // On any parse failure, fall back to the legacy opaque
-    // `{_pendingFinalization: ...}` shape (single-device KV path still
-    // recovers the token; bundle CAR omits it as pre-#202).
-    //
-    // #207 PR-B — helper extracted to `v5-pending-shape.ts` for unit
-    // testability + clear separation of pure shape-construction from
-    // wallet-side bookkeeping. The helper returns a discriminated result
-    // so the fallback log carries the underlying error message — silent
-    // regressions in bundle shape are otherwise undiagnosable.
-    let sdkDataJson: string;
-    const syntheticResult = buildSyntheticV5PendingSdkData(bundle, pendingData);
-    if (syntheticResult.ok) {
-      sdkDataJson = syntheticResult.sdkData;
-    } else {
-      logger.warn(
-        'Payments',
-        `saveUnconfirmedV5Token: failed to synthesize UXF-compatible shape for bundle ${bundle.splitGroupId.slice(0, 12)} (${syntheticResult.error}), falling back to legacy opaque shape — token will be omitted from bundle CAR but recoverable via PENDING_V5_TOKENS KV`,
-      );
-      sdkDataJson = JSON.stringify({ _pendingFinalization: pendingData });
-    }
-
-    const uiToken: Token = {
-      id: deterministicId,
-      coinId: bundle.coinId,
-      symbol: registry.getSymbol(bundle.coinId) || bundle.coinId,
-      name: registry.getName(bundle.coinId) || bundle.coinId,
-      decimals: registry.getDecimals(bundle.coinId) ?? 8,
-      amount: bundle.amount,
-      status: 'submitted',  // UNCONFIRMED
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      sdkData: sdkDataJson,
-    };
-
-    // Record splitGroupId for persistent dedup across page reloads
-    this.processedSplitGroupIds.add(bundle.splitGroupId);
-
-    if (deferPersistence) {
-      // Only update in-memory map — caller will save() + saveProcessedSplitGroupIds()
-      this.tokens.set(uiToken.id, uiToken);
-    } else {
-      await this.addToken(uiToken);
-      await this.saveProcessedSplitGroupIds();
-    }
-
-    return uiToken;
+    return saveUnconfirmedV5TokenImpl.call(this, bundle, senderPubkey, deferPersistence);
   }
 
   /**
@@ -6683,238 +6406,7 @@ export class PaymentsModule {
     deferPersistence = false,
     skipGenesisDedup = false,
   ): Promise<Token | null> {
-    const tokenInfo = await parseTokenInfo(sourceTokenInput);
-
-    // V6-RECV / faucet-flow fix (post PR #146 regression).
-    //
-    // Pre-fix, this method persisted the raw source TXF as-is. The
-    // bundle's source token carries only the mint transaction (with its
-    // own inclusionProof). The transfer commitment that flips ownership
-    // to us is tracked separately as a proof-polling job in
-    // `this.proofPollingJobs`. After a CLI invocation exits and a new
-    // one runs:
-    //
-    //  - `determineTokenStatus` sees "1 tx with proof" → 'confirmed'
-    //    (the original in-memory 'submitted' status is lost).
-    //  - The proof-polling job persistence is fire-and-forget and may
-    //    not complete before process exit; even when it does,
-    //    `restoreProofPollingJobs` runs AFTER `loadFromStorageData`.
-    //  - PR #146's `#144 L3 balance-model invariant` then moves the
-    //    token to archive because the state.predicate is the sender's,
-    //    not ours, AND `hasFinalizationPlan()` returns false.
-    //
-    // Net effect: faucet (and any V6 direct) receives become invisible
-    // after the first CLI exit. The user sees "No tokens found" even
-    // though tokens are on disk and history records the inbound.
-    //
-    // Fix: synthesize a pending transfer transaction in the persisted
-    // sdkData using the commitment's transactionData with
-    // `inclusionProof: null`. After this, the on-disk shape correctly
-    // expresses "received but transfer not yet finalized" via the
-    // standard pending-tx convention that V5 splits and other paths
-    // already use:
-    //
-    //   - `determineTokenStatus` sees last tx with null proof → 'pending'.
-    //   - `isReceivedLegacyPending(token)` returns true (recipient is us).
-    //   - `hasFinalizationPlan(token)` returns true.
-    //   - The balance-model invariant correctly skips archive.
-    //   - `recoverStrandedReceivedTokens` recovers a fresh proof-polling
-    //     job on next load.
-    //
-    // When `finalizeReceivedToken` runs (now or after restart), it
-    // calls `finalizeTransferToken` which rebuilds the transactions
-    // array from the SDK — the synthetic pending tx is replaced by the
-    // proven one in finalizeTransferToken's output.
-    let sdkData: string;
-    {
-      const rawSource: unknown =
-        typeof sourceTokenInput === 'string'
-          ? JSON.parse(sourceTokenInput)
-          : sourceTokenInput;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const rawSourceObj = rawSource as any;
-      const existingTxs: unknown[] = Array.isArray(rawSourceObj?.transactions)
-        ? rawSourceObj.transactions
-        : [];
-
-      // Extract the commitment's transactionData AND authenticator. The
-      // commitment is either a parsed object or a JSON-ish object; the
-      // `transactionData` sub-object is what goes on-chain. We use it to
-      // synthesize a pending tx with `inclusionProof: null` so subsequent
-      // loads see a properly-shaped "transfer pending" token.
-      //
-      // Option B (token-local recovery state): we also embed the sender's
-      // `authenticator` under a wallet-internal `_wallet` field on the
-      // synthetic pending tx. The authenticator is the SENDER's signature
-      // over (transactionHash, sourceStateHash) — the aggregator verifies
-      // it without caring about the submitter's identity. Storing it
-      // alongside the transactionData lets the recipient re-submit the
-      // commitment after a wallet wipe + re-import-from-mnemonic, without
-      // any cooperation from the (possibly offline) sender. This closes
-      // the gap where proof-polling jobs (kept in a separate KV map, not
-      // in the IPFS-published TXF) get lost on profile recreation.
-      //
-      // `_wallet` is a non-SDK field; `normalizeSdkTokenToStorage` uses
-      // structuredClone, which preserves unknown fields. On finalize,
-      // `SdkToken.fromJSON` strips it (typed deserialization), and
-      // `finalizedSdkToken.toJSON()` writes the clean post-transition
-      // shape — so `_wallet` is naturally cleaned up.
-      let pendingTxData: unknown = null;
-      let pendingAuthenticator: unknown = null;
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const ci = commitmentInput as any;
-        if (ci && typeof ci === 'object') {
-          if (ci.transactionData !== undefined) {
-            pendingTxData = ci.transactionData;
-          } else if (ci.data !== undefined) {
-            pendingTxData = ci.data;
-          }
-          // Authenticator can come as plain JSON ({publicKey, signature,
-          // stateHash}) or as a class instance with toJSON(). Normalize to
-          // the JSON shape so the recovery path can pass it straight to
-          // `TransferCommitment.fromJSON({...})`.
-          if (ci.authenticator !== undefined && ci.authenticator !== null) {
-            const auth = ci.authenticator as { toJSON?: () => unknown };
-            pendingAuthenticator =
-              typeof auth.toJSON === 'function' ? auth.toJSON() : ci.authenticator;
-          }
-        }
-      } catch {
-        // Best-effort — fall through. The token will still be saved
-        // (without the synthetic pending tx) and finalization will
-        // recover the state when the proof arrives in this session.
-        pendingTxData = null;
-        pendingAuthenticator = null;
-      }
-
-      // Defensive: avoid double-appending. If the last existing tx already
-      // has `inclusionProof: null` (or missing — see the parser tweaks in
-      // `determineTokenStatus` / `isReceivedLegacyPending` which treat
-      // missing as null per the canonical V5/V6 protocol), the source TXF
-      // already encodes a pending transfer. Don't append a second one.
-      const lastExistingTx = existingTxs[existingTxs.length - 1] as
-        | { inclusionProof?: unknown }
-        | undefined;
-      const lastExistingHasNullProof =
-        lastExistingTx !== undefined &&
-        (lastExistingTx.inclusionProof === null ||
-          lastExistingTx.inclusionProof === undefined);
-
-      const syntheticPendingTx: Record<string, unknown> = {
-        data: pendingTxData,
-        inclusionProof: null,
-      };
-      if (pendingAuthenticator !== null) {
-        // Wallet-internal recovery state — Option B (token-local).
-        syntheticPendingTx._wallet = { authenticator: pendingAuthenticator };
-      }
-
-      const augmentedSource =
-        pendingTxData !== null && !lastExistingHasNullProof
-          ? {
-              ...rawSourceObj,
-              transactions: [...existingTxs, syntheticPendingTx],
-            }
-          : rawSourceObj;
-
-      sdkData = JSON.stringify(augmentedSource);
-    }
-
-    // Check tombstones BEFORE creating the token
-    const nostrTokenId = extractTokenIdFromSdkData(sdkData);
-    const nostrStateHash = extractStateHashFromSdkData(sdkData);
-    if (nostrTokenId && nostrStateHash && this.isStateTombstoned(nostrTokenId, nostrStateHash)) {
-      logger.debug('Payments', `NOSTR-FIRST: Rejecting tombstoned token ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`);
-      return null;
-    }
-
-    // Dedup: check existing tokens
-    if (nostrTokenId) {
-      for (const existing of this.tokens.values()) {
-        const existingTokenId = extractTokenIdFromSdkData(existing.sdkData);
-        if (existingTokenId !== nostrTokenId) continue;
-
-        // Exact state match — always reject (duplicate delivery)
-        const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
-        if (nostrStateHash && existingStateHash === nostrStateHash) {
-          logger.debug(
-            'Payments',
-            `NOSTR-FIRST: Skipping duplicate token state ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`
-          );
-          return null;
-        }
-
-        // Same genesis, different state — reject for standalone NOSTR-FIRST (replay after
-        // finalization changes stateHash), allow for V6 batches (split children share genesis)
-        if (!skipGenesisDedup) {
-          logger.debug(
-            'Payments',
-            `NOSTR-FIRST: Skipping replay of finalized token ${nostrTokenId.slice(0, 8)}...`
-          );
-          return null;
-        }
-      }
-    }
-
-    const token: Token = {
-      id: crypto.randomUUID(),
-      coinId: tokenInfo.coinId,
-      symbol: tokenInfo.symbol,
-      name: tokenInfo.name,
-      decimals: tokenInfo.decimals,
-      iconUrl: tokenInfo.iconUrl,
-      amount: tokenInfo.amount,
-      status: 'submitted',  // NOSTR-FIRST: unconfirmed until proof
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      sdkData,
-    };
-
-    // Add token to in-memory map
-    this.tokens.set(token.id, token);
-
-    if (!deferPersistence) {
-      await this.save();
-    }
-
-    // Start proof polling (commitment submission deferred when batching)
-    try {
-      const commitment = await TransferCommitment.fromJSON(commitmentInput);
-      const requestIdBytes = commitment.requestId;
-      const requestIdHex = requestIdBytes instanceof Uint8Array
-        ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
-        : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
-
-      if (!deferPersistence) {
-        // Submit commitment to aggregator immediately (standalone path)
-        const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
-        if (stClient) {
-          const response = await stClient.submitTransferCommitment(commitment);
-          logger.debug('Payments', `NOSTR-FIRST recipient commitment submit: ${response.status}`);
-        }
-      }
-
-      this.addProofPollingJob({
-        tokenId: token.id,
-        requestIdHex,
-        commitmentJson: JSON.stringify(commitmentInput),
-        // Persist the source token JSON so that on process restart we can
-        // restore the job (#144 layer 1). `sdkData` is the raw source TXF
-        // string — same value that was passed in as `sourceTokenInput`.
-        sourceTokenJson: sdkData,
-        startedAt: Date.now(),
-        attemptCount: 0,
-        lastAttemptAt: 0,
-        onProofReceived: async (tokenId) => {
-          await this.finalizeReceivedToken(tokenId, sourceTokenInput, commitmentInput);
-        },
-      });
-    } catch (err) {
-      logger.error('Payments', 'Failed to parse commitment for proof polling:', err);
-    }
-
-    return token;
+    return saveCommitmentOnlyTokenImpl.call(this, sourceTokenInput, commitmentInput, senderPubkey, deferPersistence, skipGenesisDedup);
   }
 
   // ===========================================================================
@@ -6934,156 +6426,21 @@ export class PaymentsModule {
     bundle: CombinedTransferBundleV6,
     senderPubkey: string,
   ): Promise<void> {
-    this.ensureInitialized();
-
-    // Ensure load() has completed so dedup checks see all persisted tokens
-    if (!this.loaded && this.loadedPromise) {
-      await this.loadedPromise;
-    }
-
-    // Dedup by transferId
-    if (this.processedCombinedTransferIds.has(bundle.transferId)) {
-      logger.debug('Payments', `V6 combined transfer ${bundle.transferId.slice(0, 12)}... already processed, skipping`);
-      return;
-    }
-
-    logger.debug(
-      'Payments',
-      `Processing V6 combined transfer ${bundle.transferId.slice(0, 12)}... ` +
-      `(split=${!!bundle.splitBundle}, direct=${bundle.directTokens.length})`
-    );
-
-    const allTokens: Token[] = [];
-    const tokenBreakdown: Array<{ id: string; amount: string; source: 'split' | 'direct' }> = [];
-
-    // Pre-parse direct token commitment data once (reused for saving + aggregator submit)
-    const parsedDirectEntries = bundle.directTokens.map(entry => ({
-      sourceToken: typeof entry.sourceToken === 'string' ? JSON.parse(entry.sourceToken) : entry.sourceToken,
-      commitment: typeof entry.commitmentData === 'string' ? JSON.parse(entry.commitmentData) : entry.commitmentData,
-    }));
-
-    // 1. Process split bundle (if present) — deferred persistence
-    if (bundle.splitBundle) {
-      const splitToken = await this.saveUnconfirmedV5Token(bundle.splitBundle, senderPubkey, true);
-      if (splitToken) {
-        allTokens.push(splitToken);
-        tokenBreakdown.push({ id: splitToken.id, amount: splitToken.amount, source: 'split' });
-      } else {
-        logger.warn('Payments', `V6: split token was deduped/failed — amount=${bundle.splitBundle.amount}`);
-      }
-    }
-
-    // 2. Process direct tokens in parallel — deferred persistence
-    const directResults = await Promise.all(
-      parsedDirectEntries.map(({ sourceToken, commitment }) =>
-        this.saveCommitmentOnlyToken(sourceToken, commitment, senderPubkey, true, true)
-      )
-    );
-    for (let i = 0; i < directResults.length; i++) {
-      const token = directResults[i];
-      if (token) {
-        allTokens.push(token);
-        tokenBreakdown.push({ id: token.id, amount: token.amount, source: 'direct' });
-      } else {
-        const entry = bundle.directTokens[i];
-        logger.warn(
-          'Payments',
-          `V6: direct token #${i} dropped (amount=${entry.amount}, ` +
-          `tokenId=${entry.tokenId?.slice(0, 12) ?? 'N/A'})`
-        );
-      }
-    }
-
-    if (allTokens.length === 0) {
-      logger.debug('Payments', 'V6 combined transfer: all tokens deduped, nothing to save');
-      return;
-    }
-
-    // 3. Batched persistence + sender info resolution in parallel
-    this.processedCombinedTransferIds.add(bundle.transferId);
-    const [senderInfo] = await Promise.all([
-      this.resolveSenderInfo(senderPubkey),
-      this.save(),
-      this.saveProcessedCombinedTransferIds(),
-      ...(bundle.splitBundle ? [this.saveProcessedSplitGroupIds()] : []),
-    ]);
-
-    // 4. Submit direct token commitments to aggregator (fire-and-forget, reuse parsed data)
-    const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
-    if (stClient) {
-      for (const { commitment } of parsedDirectEntries) {
-        TransferCommitment.fromJSON(commitment).then(c =>
-          stClient.submitTransferCommitment(c)
-        ).catch(err =>
-          logger.error('Payments', 'V6 background commitment submit failed:', err)
-        );
-      }
-    }
-
-    // 5. Emit event + history
-
-    this.deps!.emitEvent('transfer:incoming', {
-      id: bundle.transferId,
-      senderPubkey,
-      senderNametag: senderInfo.senderNametag,
-      tokens: allTokens,
-      memo: bundle.memo,
-      receivedAt: Date.now(),
-    });
-
-    // Compute actual received amount from saved tokens (not bundle.totalAmount which is sender's request)
-    const actualAmount = allTokens.reduce((sum, t) => sum + BigInt(t.amount || '0'), 0n).toString();
-
-    await this.addToHistory({
-      type: 'RECEIVED',
-      amount: actualAmount,
-      coinId: bundle.coinId,
-      symbol: allTokens[0]?.symbol || bundle.coinId,
-      timestamp: Date.now(),
-      senderPubkey,
-      ...senderInfo,
-      memo: bundle.memo,
-      transferId: bundle.transferId,
-      tokenId: allTokens[0]?.id,
-      tokenIds: tokenBreakdown,
-    });
-
-    // 6. Fire-and-forget: try to resolve V5 tokens immediately
-    if (bundle.splitBundle) {
-      this.resolveUnconfirmed().catch((err) => logger.debug('Payments', 'resolveUnconfirmed failed', err));
-      this.scheduleResolveUnconfirmed();
-    }
+    return processCombinedTransferBundleImpl.call(this, bundle, senderPubkey);
   }
 
   /**
    * Persist processed combined transfer IDs to KV storage.
    */
   private async saveProcessedCombinedTransferIds(): Promise<void> {
-    const ids = Array.from(this.processedCombinedTransferIds);
-    if (ids.length > 0) {
-      // Dedup ledger — pure operational state, not a user action.
-      await this.setStorageEntry(
-        STORAGE_KEYS_ADDRESS.PROCESSED_COMBINED_TRANSFER_IDS,
-        JSON.stringify(ids),
-        'cache_index',
-      );
-    }
+    return saveProcessedCombinedTransferIdsImpl.call(this);
   }
 
   /**
    * Load processed combined transfer IDs from KV storage.
    */
   private async loadProcessedCombinedTransferIds(): Promise<void> {
-    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PROCESSED_COMBINED_TRANSFER_IDS);
-    if (!data) return;
-    try {
-      const ids = JSON.parse(data) as string[];
-      for (const id of ids) {
-        this.processedCombinedTransferIds.add(id);
-      }
-    } catch {
-      // Ignore corrupt data
-    }
+    return loadProcessedCombinedTransferIdsImpl.call(this);
   }
 
   /**
@@ -7105,65 +6462,7 @@ export class PaymentsModule {
     senderPubkey: string,
     memo?: string,
   ): Promise<InstantSplitProcessResult> {
-    this.ensureInitialized();
-
-    // Ensure load() has completed so the dedup check below sees all
-    // persisted tokens.  Transport may deliver events before load finishes.
-    if (!this.loaded && this.loadedPromise) {
-      await this.loadedPromise;
-    }
-
-    if (!isInstantSplitBundleV5(bundle)) {
-      // V4 (dev mode) still processes synchronously
-      return this.processInstantSplitBundleSync(bundle, senderPubkey, memo);
-    }
-
-    // V5: save immediately as unconfirmed, resolve proofs lazily
-    try {
-      const uiToken = await this.saveUnconfirmedV5Token(bundle, senderPubkey);
-      if (!uiToken) {
-        return { success: true, durationMs: 0 };
-      }
-
-      // Record in history (once per token — resolveV5Token will NOT add another)
-      const senderInfo = await this.resolveSenderInfo(senderPubkey);
-      await this.addToHistory({
-        type: 'RECEIVED',
-        amount: bundle.amount,
-        coinId: bundle.coinId,
-        symbol: uiToken.symbol,
-        timestamp: Date.now(),
-        senderPubkey,
-        ...senderInfo,
-        memo,
-        tokenId: uiToken.id,
-      });
-
-      // Emit incoming transfer event
-      this.deps!.emitEvent('transfer:incoming', {
-        id: bundle.splitGroupId,
-        senderPubkey,
-        senderNametag: senderInfo.senderNametag,
-        tokens: [uiToken],
-        memo,
-        receivedAt: Date.now(),
-      });
-
-      await this.save();
-
-      // Fire-and-forget: try to resolve immediately, then start periodic retry
-      this.resolveUnconfirmed().catch((err) => logger.debug('Payments', 'resolveUnconfirmed failed', err));
-      this.scheduleResolveUnconfirmed();
-
-      return { success: true, durationMs: 0 };
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        success: false,
-        error: errorMessage,
-        durationMs: 0,
-      };
-    }
+    return processInstantSplitBundleImpl.call(this, bundle, senderPubkey, memo);
   }
 
   /**
@@ -7175,110 +6474,7 @@ export class PaymentsModule {
     senderPubkey: string,
     memo?: string,
   ): Promise<InstantSplitProcessResult> {
-    try {
-      const signingService = await this.createSigningService();
-
-      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
-      if (!stClient) {
-        throw new SphereError('State transition client not available', 'AGGREGATOR_ERROR');
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const trustBase = (this.deps!.oracle as any).getTrustBase?.();
-      if (!trustBase) {
-        throw new SphereError('Trust base not available', 'AGGREGATOR_ERROR');
-      }
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const devMode = (this.deps!.oracle as any).isDevMode?.() ?? false;
-
-      const processor = new InstantSplitProcessor({
-        stateTransitionClient: stClient,
-        trustBase,
-        devMode,
-      });
-
-      const result = await processor.processReceivedBundle(
-        bundle,
-        signingService,
-        senderPubkey,
-        {
-          findNametagToken: async (proxyAddress: string) => {
-            const currentNametag = this.getNametag();
-            if (currentNametag?.token) {
-              try {
-                const nametagToken = await SdkToken.fromJSON(currentNametag.token);
-                const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-                const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
-                if (proxy.address === proxyAddress) {
-                  return nametagToken;
-                }
-                logger.debug('Payments', `Unicity ID PROXY address mismatch: ${proxy.address} !== ${proxyAddress}`);
-                return null;
-              } catch (err) {
-                logger.debug('Payments', 'Failed to parse nametag token:', err);
-                return null;
-              }
-            }
-            return null;
-          },
-        }
-      );
-
-      if (result.success && result.token) {
-        const tokenData = result.token.toJSON();
-        const info = await parseTokenInfo(tokenData);
-
-        const uiToken: Token = {
-          id: crypto.randomUUID(),
-          coinId: info.coinId,
-          symbol: info.symbol,
-          name: info.name,
-          decimals: info.decimals,
-          iconUrl: info.iconUrl,
-          amount: bundle.amount,
-          status: 'confirmed',
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          sdkData: JSON.stringify(tokenData),
-        };
-
-        await this.addToken(uiToken);
-
-        const receivedTokenId = extractTokenIdFromSdkData(uiToken.sdkData);
-        const senderInfo = await this.resolveSenderInfo(senderPubkey);
-        await this.addToHistory({
-          type: 'RECEIVED',
-          amount: bundle.amount,
-          coinId: info.coinId,
-          symbol: info.symbol,
-          timestamp: Date.now(),
-          senderPubkey,
-          ...senderInfo,
-          memo,
-          tokenId: receivedTokenId || uiToken.id,
-        });
-
-        await this.save();
-
-        this.deps!.emitEvent('transfer:incoming', {
-          id: bundle.splitGroupId,
-          senderPubkey,
-          senderNametag: senderInfo.senderNametag,
-          tokens: [uiToken],
-          memo,
-          receivedAt: Date.now(),
-        });
-      }
-
-      return result;
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return {
-        success: false,
-        error: errorMessage,
-        durationMs: 0,
-      };
-    }
+    return processInstantSplitBundleSyncImpl.call(this, bundle, senderPubkey, memo);
   }
 
   /**
@@ -7288,7 +6484,17 @@ export class PaymentsModule {
    * @returns `true` if the payload matches the InstantSplitBundle shape.
    */
   private isInstantSplitBundle(payload: unknown): payload is InstantSplitBundle {
-    return isInstantSplitBundle(payload);
+    return isInstantSplitBundleImpl.call(this, payload);
+  }
+
+  /**
+   * @internal Phase 5 [C] shim — legacy-v1 quarantined helpers call this
+   * to reach the module-scope `parseTokenInfo` free function without
+   * needing to import it directly. Phase 6.C wipes this along with
+   * `legacy-v1/`.
+   */
+  private __parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
+    return parseTokenInfo(tokenData);
   }
 
   // ===========================================================================
