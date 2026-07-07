@@ -20,7 +20,6 @@ import type {
   ProfileSnapshotPublishResult,
   ProfileTokenStorageProviderOptions,
 } from './types';
-import { OrbitDbAdapter } from './orbitdb-adapter';
 import { ProfileStorageProvider } from './profile-storage-provider';
 import { ProfileTokenStorageProvider } from './profile-token-storage-provider';
 import { DEFAULT_IPFS_GATEWAYS } from '../../../constants';
@@ -395,54 +394,40 @@ export interface ProfileProviders {
  * Create Profile-backed storage and token storage providers.
  *
  * This is the shared factory core. It:
- * 1. Creates an OrbitDbAdapter instance (connection is deferred to connect())
- * 2. Wraps the provided local cache with ProfileStorageProvider
- * 3. Creates a ProfileTokenStorageProvider for token operations
+ * 1. Wraps the provided local cache with ProfileStorageProvider
+ * 2. Creates a ProfileTokenStorageProvider for token operations
  *
  * The returned providers are drop-in replacements for the existing
- * IndexedDB / file-based providers. When Profile providers are used,
- * IpfsStorageProvider is NOT needed — OrbitDB replication replaces IPNS sync.
+ * IndexedDB / file-based providers.
  *
- * @param config - Profile configuration (OrbitDB settings, encryption, gateways)
+ * @param config - Profile configuration (encryption, gateways)
  * @param cacheStorage - Local cache provider (IndexedDB or file-based)
  * @param oracle - Oracle provider used by the aggregator pointer layer (optional
  *   during rollout; required once T-D6 replaces IPNS recovery). Must be the
  *   same instance passed to L4 / `PaymentsModule` so the embedded
  *   `RootTrustBase` is shared (SPEC §8.4.2 H6).
+ * @param substrate - Pre-constructed `ProfileDatabase` (a `ProfileKvAdapter`).
+ *   Required — the OrbitDB substrate has been deleted in Phase 4-Swap and the
+ *   platform factories always pre-build the KV adapter.
  * @returns Profile-backed storage and token storage providers
  */
 export function createProfileProviders(
   config: ProfileConfig,
   cacheStorage: StorageProvider,
   oracle?: OracleProvider,
-  /**
-   * Optional pre-constructed `ProfileDatabase` — when set, the factory
-   * uses it instead of building an `OrbitDbAdapter`. Node / browser
-   * factories inject a `ProfileKvAdapter` here when the caller opts in
-   * via `substrate: 'kv'`. Passing `undefined` (the default) keeps the
-   * legacy OrbitDB path.
-   */
-  substrateOverride?: ProfileDatabase,
+  substrate?: ProfileDatabase,
 ): ProfileProviders {
-  // Merge custom bootstrap peers from the convenience alias
-  const resolvedConfig: ProfileConfig = config.profileOrbitDbPeers
-    ? {
-        ...config,
-        orbitDb: {
-          ...config.orbitDb,
-          bootstrapPeers: [
-            ...(config.orbitDb.bootstrapPeers ?? []),
-            ...config.profileOrbitDbPeers,
-          ],
-        },
-      }
-    : config;
+  const resolvedConfig: ProfileConfig = config;
 
-  // Substrate selection — the OrbitDB path is the default; the KV path
-  // is opt-in via `substrate: 'kv'` in ProfileConfig and requires the
-  // platform factory to pre-construct the ProfileKvAdapter. See
-  // docs/uxf/uxfv2-substrate-alternatives.md §3.7.
-  const db: ProfileDatabase = substrateOverride ?? new OrbitDbAdapter();
+  if (!substrate) {
+    throw new Error(
+      'createProfileProviders: substrate (ProfileKvAdapter) is required. ' +
+        'The OrbitDB substrate was deleted in Phase 4-Swap; use ' +
+        'createBrowserProfileProviders / createNodeProfileProviders which ' +
+        'construct the KV adapter automatically.',
+    );
+  }
+  const db: ProfileDatabase = substrate;
 
   // Create ProfileStorageProvider wrapping the local cache and OrbitDB
   const storage = new ProfileStorageProvider(cacheStorage, db, {
@@ -632,22 +617,12 @@ export function createProfileProviders(
   );
   tokenStorageHolder.current = tokenStorage;
 
-  // Issue #311 — bridge the OrbitDbAdapter / ProfileStorageProvider
-  // observability hooks for Helia browser blockstore durability into
-  // the token-storage event surface so consumers (sphere.telco, the
-  // Sphere wallet UI, operator monitors) have a single subscription
-  // point for these typed events. Each notifier is best-effort and
-  // dedup'd at its source — they never trigger more than once per
-  // unique signal per provider instance.
-  //
-  // Defensive feature-probing: legacy test stubs that mock
-  // `OrbitDbAdapter` with a minimal `ProfileDatabase`-shaped object
-  // do NOT expose `setStoragePersistenceListener`. The bridge skips
-  // wiring in that case — wallets running against a legitimate
-  // adapter still get the events; the test stub remains compatible.
-  // Same defense applies to `setCriticalBlockEvictedNotifier`, which
-  // is technically present on every ProfileStorageProvider we ship
-  // but a future minimal-stub seam may not expose it.
+  // Issue #311 — bridge the adapter's browser-storage-persistence
+  // hook into the token-storage event surface so consumers (sphere.
+  // telco, the Sphere wallet UI, operator monitors) have a single
+  // subscription point for the typed event. Best-effort and dedup'd
+  // at the source. The KV adapter exposes the hook natively; legacy
+  // test stubs that skipped it still work via feature-probing.
   const dbWithPersistenceHook = db as unknown as {
     setStoragePersistenceListener?: (
       cb:
@@ -661,32 +636,6 @@ export function createProfileProviders(
         type: 'profile:storage-persistence',
         timestamp: Date.now(),
         data: { granted: result.granted, supported: result.supported },
-      });
-    });
-  }
-  const storageWithCriticalHook = storage as unknown as {
-    setCriticalBlockEvictedNotifier?: (
-      cb:
-        | ((info: {
-            readonly cid: string | null;
-            readonly key: string;
-            readonly attemptedAt: number;
-          }) => void)
-        | null,
-    ) => void;
-  };
-  if (
-    typeof storageWithCriticalHook.setCriticalBlockEvictedNotifier === 'function'
-  ) {
-    storageWithCriticalHook.setCriticalBlockEvictedNotifier((info) => {
-      tokenStorage.emitExternalProfileEvent({
-        type: 'profile:critical-block-evicted',
-        timestamp: Date.now(),
-        data: {
-          cid: info.cid,
-          key: info.key,
-          attemptedAt: info.attemptedAt,
-        },
       });
     });
   }

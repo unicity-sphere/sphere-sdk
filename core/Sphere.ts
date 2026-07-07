@@ -2122,66 +2122,19 @@ export class Sphere {
       const baseEpoch = Math.max(currentEpoch, discoveredEpoch);
       const newEpoch = baseEpoch + 1;
 
-      // 2. Persist BEFORE the OpLog wipe so a crash between (2) and
-      //    (3) leaves the local wallet with the new floor in place —
-      //    the next Sphere.load() publishes the bumped epoch on its
-      //    first dirty-flush.
+      // 2. Persist the new epoch floor + reason. Once these keys
+      //    land, the wallet is committed to the bump — a crash
+      //    between here and the flush still publishes the new epoch
+      //    on the next `Sphere.load()`.
       await this._storage.set(LOCAL_EPOCH_FLOOR_KEY, String(newEpoch));
       await this._storage.set(LOCAL_EPOCH_RESET_REASON_KEY, params.reason);
 
-      // 3. Best-effort OpLog wipe via OrbitDbAdapter.resetCorruptedLog.
-      try {
-        const storageWithAdapter = this._storage as unknown as {
-          getOrbitDbAdapter?: () => {
-            resetCorruptedLog?: (reason: {
-              lostHeadCid?: string;
-              context: string;
-            }) => Promise<unknown>;
-          } | null;
-        };
-        const adapter = storageWithAdapter.getOrbitDbAdapter?.() ?? null;
-        if (
-          adapter !== null &&
-          typeof adapter.resetCorruptedLog === 'function'
-        ) {
-          await adapter.resetCorruptedLog({
-            context: `sphere.profile.resetEpoch: ${params.reason}`,
-          });
-        }
-      } catch (err) {
-        logger.warn(
-          'Sphere',
-          `resetEpoch: OpLog wipe threw (continuing with epoch bump): ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-
-      // 3b. PR #316 F3 fix — write a sentinel KV AFTER the OpLog wipe
-      //     so the snapshot builder has concrete OpLog state to flush
-      //     even when no other writers have mutated since the wipe.
-      //     The value is the post-reset epoch (decimal string); the
-      //     sentinel is overwritten on every subsequent reset and
-      //     never accumulates.
-      //
-      //     Ordering rationale: must run AFTER the OpLog wipe so the
-      //     sentinel lands in the FRESH OpLog (the wipe drops the
-      //     OrbitDB instance, so any pre-wipe write would be lost).
-      //     The local cache copy is also overwritten (via
-      //     ProfileStorageProvider.set's local-cache mirror) so the
-      //     wallet's next `Sphere.load()` reads the sentinel back
-      //     consistently.
-      //
-      //     Without this, a publish failure on the first post-reset
-      //     flush could leave the aggregator chain stuck at the
-      //     pre-reset version with no automatic retry surface — the
-      //     periodic poll's `retryPendingPublishIfAny` only fires
-      //     when `pendingPublishCid` is non-null, which in turn only
-      //     stamps when a publish actually attempted and transient-
-      //     failed. If the snapshot builder skipped the publish for
-      //     "no dirty state", no retry would ever run.
-      //
-      //     Best-effort: a write failure does NOT abort the bump.
-      //     The local floor IS already persisted; the wallet stays
-      //     consistent.
+      // 3. Write a flush-trigger sentinel so the snapshot builder has
+      //    concrete state to flush even when no other writers have
+      //    mutated since the epoch bump. Value = post-reset epoch;
+      //    overwritten on every subsequent reset and never accumulates.
+      //    Best-effort: a write failure does NOT abort the bump —
+      //    the local floor IS already persisted.
       try {
         await this._storage.set(
           LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY,

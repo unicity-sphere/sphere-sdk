@@ -6,21 +6,6 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock the orbitdb-adapter to avoid transitive @noble/curves resolution issues
-vi.mock('../../../extensions/uxf/profile/orbitdb-adapter', () => {
-  class OrbitDbAdapter {
-    async connect() {}
-    async put() {}
-    async get() { return null; }
-    async del() {}
-    async all() { return new Map(); }
-    async close() {}
-    onReplication() { return () => {}; }
-    isConnected() { return false; }
-  }
-  return { OrbitDbAdapter, ProfileError: Error };
-});
-
 import { ProfileMigration } from '../../../extensions/uxf/profile/migration';
 import { createProfileProviders } from '../../../extensions/uxf/profile/factory';
 import { ProfileStorageProvider } from '../../../extensions/uxf/profile/profile-storage-provider';
@@ -463,30 +448,15 @@ describe('Profile Integration', () => {
         orbitDb: { privateKey: 'ff'.repeat(32) },
       };
 
-      const providers = createProfileProviders(config, cacheStorage);
+      const providers = createProfileProviders(
+        config,
+        cacheStorage,
+        undefined,
+        createMockProfileDatabase(),
+      );
 
       expect(providers.storage).toBeInstanceOf(ProfileStorageProvider);
       expect(providers.tokenStorage).toBeInstanceOf(ProfileTokenStorageProvider);
-    });
-
-    it('bootstrap peers merge from profileOrbitDbPeers alias', () => {
-      const cacheStorage = createMockCacheStorage();
-      const config: ProfileConfig = {
-        orbitDb: {
-          privateKey: 'ff'.repeat(32),
-          bootstrapPeers: ['peer0'],
-        },
-        profileOrbitDbPeers: ['peer1'],
-      };
-
-      const providers = createProfileProviders(config, cacheStorage);
-
-      // Access the internal config to verify merge
-      // The resolved config is used to create the OrbitDbAdapter, but we can
-      // verify it through the options passed to ProfileStorageProvider
-      const storageOpts = (providers.storage as any).options;
-      expect(storageOpts.config.orbitDb.bootstrapPeers).toContain('peer0');
-      expect(storageOpts.config.orbitDb.bootstrapPeers).toContain('peer1');
     });
 
     it('default IPFS gateways used when none specified', () => {
@@ -496,7 +466,12 @@ describe('Profile Integration', () => {
         // ipfsGateways not specified
       };
 
-      const providers = createProfileProviders(config, cacheStorage);
+      const providers = createProfileProviders(
+        config,
+        cacheStorage,
+        undefined,
+        createMockProfileDatabase(),
+      );
 
       // The tokenStorage should have default gateways from constants.ts
       const gateways = (providers.tokenStorage as any)._ipfsGateways;
@@ -513,7 +488,12 @@ describe('Profile Integration', () => {
         encrypt: false,
       };
 
-      const providers = createProfileProviders(config, cacheStorage);
+      const providers = createProfileProviders(
+        config,
+        cacheStorage,
+        undefined,
+        createMockProfileDatabase(),
+      );
 
       // Verify the storage provider has encryption disabled
       const encEnabled = (providers.storage as any).encryptionEnabled;
@@ -536,7 +516,12 @@ describe('Profile Integration', () => {
         orbitDb: { privateKey: 'ff'.repeat(32) },
       };
 
-      const providers = createProfileProviders(config, cacheStorage);
+      const providers = createProfileProviders(
+        config,
+        cacheStorage,
+        undefined,
+        createMockProfileDatabase(),
+      );
 
       const opts = (providers.tokenStorage as any)._options;
       expect(opts).toBeDefined();
@@ -549,7 +534,12 @@ describe('Profile Integration', () => {
         orbitDb: { privateKey: 'ff'.repeat(32) },
       };
 
-      const providers = createProfileProviders(config, cacheStorage);
+      const providers = createProfileProviders(
+        config,
+        cacheStorage,
+        undefined,
+        createMockProfileDatabase(),
+      );
 
       const notifier = (providers.storage as any).profileDirtyNotifier;
       expect(typeof notifier).toBe('function');
@@ -578,7 +568,12 @@ describe('Profile Integration', () => {
         orbitDb: { privateKey: 'ff'.repeat(32) },
       };
 
-      const providers = createProfileProviders(config, cacheStorage);
+      const providers = createProfileProviders(
+        config,
+        cacheStorage,
+        undefined,
+        createMockProfileDatabase(),
+      );
 
       const applier = (providers.storage as any).snapshotApplier;
       expect(typeof applier).toBe('function');

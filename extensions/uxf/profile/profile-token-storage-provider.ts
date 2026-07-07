@@ -72,7 +72,7 @@ import {
   type ProfileSnapshotPublishResult,
   type ProfileTokenStorageProviderOptions,
 } from './types.js';
-import type { ProfileDatabase } from './orbitdb-adapter.js';
+import type { ProfileDatabase } from './types.js';
 import {
   isTokenKey,
   isArchivedKey,

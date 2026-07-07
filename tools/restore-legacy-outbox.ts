@@ -609,19 +609,26 @@ Exit codes:
  * is deferred to the runtime — production callers wire `OrbitDbAdapter`,
  * tests inject a mock.
  *
- * The CLI dynamically imports {@link OrbitDbAdapter} so the unit tests
- * (which never reach this branch) do not pull in the OrbitDB / Helia
+ * The CLI dynamically imports the ProfileKv modules so the unit tests
+ * (which never reach this branch) do not pull in the KV / blockstore
  * tree at test-collection time.
  */
 async function openProductionDatabase(profilePath: string): Promise<ProfileDatabase> {
-  // Dynamic import avoids loading Helia/libp2p at module-import time —
-  // important because (a) those modules are heavy and (b) the unit test
-  // suite stubs the function to inject a mock db. The narrow type assertion
-  // is safe: `OrbitDbAdapter` implements `ProfileDatabase`.
-  const mod = (await import('../extensions/uxf/profile/orbitdb-adapter.js')) as {
-    OrbitDbAdapter: new () => ProfileDatabase;
+  const adapterMod = (await import('../extensions/uxf/profile/kv/profile-kv-adapter.js')) as {
+    ProfileKvAdapter: new (opts: unknown) => ProfileDatabase;
   };
-  const db = new mod.OrbitDbAdapter();
+  const kvMod = (await import('../extensions/uxf/profile/kv/profile-kv-node.js')) as {
+    ProfileKvNode: new (opts: { directory: string }) => unknown;
+  };
+  const cacheMod = (await import('../extensions/uxf/profile/kv/local-block-cache-node.js')) as {
+    LocalBlockCacheNode: new (opts: { directory: string }) => unknown;
+  };
+  const db = new adapterMod.ProfileKvAdapter({
+    backendFactory: (shortName: string) =>
+      new kvMod.ProfileKvNode({ directory: `${profilePath}/kv-${shortName}` }),
+    blockCacheFactory: (shortName: string) =>
+      new cacheMod.LocalBlockCacheNode({ directory: `${profilePath}/kv-${shortName}/blocks` }),
+  });
   await db.connect({ directory: profilePath });
   return db;
 }

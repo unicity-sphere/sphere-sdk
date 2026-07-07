@@ -41,7 +41,7 @@ import type {
   ProfileSnapshotPublishResult,
   ProfileTokenStorageProviderOptions,
 } from '../types.js';
-import type { ProfileDatabase } from '../orbitdb-adapter.js';
+import type { ProfileDatabase } from '../types.js';
 import type { TokenManifest } from '../token-manifest.js';
 import type { ApplySnapshotResult } from '../profile-snapshot-dispatcher.js';
 

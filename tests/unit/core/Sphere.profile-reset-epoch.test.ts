@@ -17,8 +17,6 @@
  *   - `resetEpoch` writes the reason into local storage
  *   - `getEpochFloor()` returns the persisted floor
  *   - non-empty reason cap enforcement
- *   - OrbitDB adapter's `resetCorruptedLog` is invoked when available
- *   - OrbitDB adapter failure is non-fatal (epoch bump still happens)
  */
 
 import { describe, it, expect, vi } from 'vitest';
@@ -65,12 +63,6 @@ interface PointerStub {
 }
 interface ProfileStorageStub extends InMemoryKv {
   getPointerLayer(): PointerStub | null;
-  getOrbitDbAdapter?(): {
-    resetCorruptedLog?: (reason: {
-      lostHeadCid?: string;
-      context: string;
-    }) => Promise<void>;
-  } | null;
 }
 
 function makeLegacyStorage(): LegacyStorageStub {
@@ -78,9 +70,6 @@ function makeLegacyStorage(): LegacyStorageStub {
 }
 
 function makeProfileStorage(opts: {
-  withAdapter?: boolean;
-  resetThrows?: boolean;
-  resetCalls?: Array<{ context: string }>;
   /**
    * PR #316 F1 fix — stub the on-chain discovery result. When set,
    * the pointer-layer stub exposes `discoverLatestVersion()` that
@@ -107,21 +96,10 @@ function makeProfileStorage(opts: {
       pickedEpoch: opts.discoveredEpoch!,
     });
   }
-  const result: ProfileStorageStub = {
+  return {
     ...kv,
     getPointerLayer: () => pointer,
   };
-  if (opts.withAdapter) {
-    result.getOrbitDbAdapter = () => ({
-      resetCorruptedLog: async (reason) => {
-        opts.resetCalls?.push({ context: reason.context });
-        if (opts.resetThrows) {
-          throw new Error('synthetic adapter failure');
-        }
-      },
-    });
-  }
-  return result;
 }
 
 // =============================================================================
@@ -283,38 +261,6 @@ describe('Sphere.profile.resetEpoch()', () => {
 
     await sphere.profile!.resetEpoch({ reason: 'second' });
     expect(await sphere.profile!.getEpochFloor()).toBe(2);
-  });
-
-  it('invokes OrbitDbAdapter.resetCorruptedLog when available', async () => {
-    const resetCalls: Array<{ context: string }> = [];
-    const storage = makeProfileStorage({
-      withAdapter: true,
-      resetCalls,
-    });
-    const { sphere } = buildSphereLike(storage);
-
-    await sphere.profile!.resetEpoch({ reason: 'corrupt-block' });
-
-    expect(resetCalls).toHaveLength(1);
-    expect(resetCalls[0].context).toContain('corrupt-block');
-  });
-
-  it('continues with the epoch bump even when resetCorruptedLog throws', async () => {
-    const storage = makeProfileStorage({
-      withAdapter: true,
-      resetThrows: true,
-    });
-    const { sphere, events } = buildSphereLike(storage);
-
-    // Should NOT throw — the adapter failure is logged + swallowed.
-    const result = await sphere.profile!.resetEpoch({ reason: 'recovery' });
-    expect(result.newEpoch).toBe(1);
-
-    // Floor is still persisted.
-    expect(await storage.get(LOCAL_EPOCH_FLOOR_KEY)).toBe('1');
-
-    // Event still fired.
-    expect(events).toHaveLength(1);
   });
 
   it('treats a corrupted floor value as 0 (fail-closed)', async () => {
