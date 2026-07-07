@@ -64,6 +64,7 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
   'core/sphere-addresses.ts',
   'core/sphere-epoch.ts',
   'core/sphere-identity-storage.ts',
+  'core/sphere-modules-init.ts',
   'core/sphere-nametag.ts',
   'core/sphere-nametag-sync.ts',
   'core/sphere-providers.ts',
