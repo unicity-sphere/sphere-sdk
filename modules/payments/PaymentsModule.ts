@@ -289,6 +289,11 @@ import {
   buildDefaultRevalidateCascadedRunner,
   type RecipientFinalizationContext,
 } from '../../extensions/uxf/pipeline/module-glue/composition';
+import {
+  installUxfAuxiliaryWorkers,
+  installUxfFinalizationStack,
+  type UxfWorkerFleetHost,
+} from '../../extensions/uxf/pipeline/module-glue/worker-fleet';
 // Re-export the composition factories so external callers (tests,
 // consumer-installed variants) that dynamically import
 // `modules/payments/PaymentsModule` continue to see the same public
@@ -1753,426 +1758,7 @@ export class PaymentsModule {
     // Subscribe to storage provider events (push-based sync)
     this.subscribeToStorageEvents();
 
-    // G6 — auto-install a default SendingRecoveryWorker when the gate
-    // is on AND no consumer has already wired one. The auto-installed
-    // worker reads from the in-memory `_senderOutboxMap` (same shim
-    // FinalizationWorkerSender uses) and re-publishes via the injected
-    // transport, preserving `bundleCid` for recipient-side replay LRU
-    // (§6.3 / T.3.A idempotency contract).
-    //
-    // Bootstrap layers (Sphere) MAY override by installing a worker
-    // wired against a Profile-backed `OutboxWriter` BEFORE
-    // `initialize()` (the `!this.sendingRecoveryWorker` check preserves
-    // that contract).
-    if (
-      this.features.recoveryWorker &&
-      this.sendingRecoveryWorker === null
-    ) {
-      const senderOutboxMap = this._senderOutboxMap;
-      const transport = this.deps!.transport;
-      const sphereEmit = this.deps!.emitEvent;
-      // Issue #97 — capture by closure so reads route through the
-      // profile-resident writer when installed. The writer is the
-      // source of truth across restarts; falling back to the in-memory
-      // map preserves pre-#97 behaviour for callers that haven't wired
-      // the profile-backed path yet.
-      const getOutboxWriter = (): OutboxWriter | null => this._outboxWriter;
-      // Issue #97 (steelman C3) — bind the SENT-write helper for the
-      // recovery worker's `update` closure. The object-method-shorthand
-      // inside `recoveryDeps.outbox` rebinds `this` to the outbox
-      // surface itself, so we can't reach `this.writeSentEntryFromOutbox`
-      // from there. Pre-bind at closure construction time.
-      const writeSentEntryFromOutbox = this.writeSentEntryFromOutbox.bind(this);
-      const recoveryDeps: import('../../extensions/uxf/pipeline/sending-recovery-worker').SendingRecoveryWorkerDeps = {
-        outbox: {
-          async readAllNew(): Promise<ReadonlyArray<UxfTransferOutboxEntry>> {
-            const writer = getOutboxWriter();
-            if (writer !== null) {
-              // Durable source-of-truth read. Tombstoned ids are skipped
-              // by readAllNew per OutboxWriter contract.
-              return await writer.readAllNew();
-            }
-            return Array.from(senderOutboxMap.values());
-          },
-          async update(
-            id: string,
-            mutator: (prev: UxfTransferOutboxEntry) => UxfTransferOutboxEntry,
-          ): Promise<UxfTransferOutboxEntry> {
-            const writer = getOutboxWriter();
-            let prevStatus: UxfTransferOutboxEntry['status'] | null = null;
-            let updated: UxfTransferOutboxEntry;
-            if (writer !== null) {
-              // Route through the writer so the §7.0 state-machine
-              // validator fires AND the Lamport bump rule (§7.1) is
-              // honored. Mirror the result into the in-memory map so
-              // FinalizationOutboxWriter consumers stay coherent.
-              //
-              // Issue #97 (steelman C3 fix) — capture the pre-state so
-              // we can detect a `'sending' → 'delivered'/'delivered-
-              // instant'` arc and fire the SENT-write helper. The
-              // dispatcher's transition hook is not involved on the
-              // recovery-worker code path, so SENT must be written
-              // here or recovered sends silently bypass the ledger.
-              updated = await writer.update(id, (prev) => {
-                prevStatus = prev.status;
-                return mutator(prev);
-              });
-              senderOutboxMap.set(id, updated);
-            } else {
-              const existing = senderOutboxMap.get(id);
-              if (existing === undefined) {
-                throw new SphereError(
-                  `SendingRecoveryWorker.update: no entry at id "${id}"`,
-                  'VALIDATION_ERROR',
-                );
-              }
-              prevStatus = existing.status;
-              const next = mutator(existing);
-              const bumped: UxfTransferOutboxEntry = {
-                ...next,
-                lamport: (existing.lamport ?? 0) + 1,
-              };
-              senderOutboxMap.set(id, bumped);
-              updated = bumped;
-            }
-
-            // Issue #97 (C3) — detect terminal-success arc and write
-            // SENT inline. CAS guard: only fire when the status
-            // ACTUALLY transitioned (mutator may return prev unchanged
-            // for self-loop no-ops; see sending-recovery-worker.ts
-            // `transitionToDelivered`'s CAS pattern). Self-loop =
-            // updated.status === prevStatus → skip.
-            const terminalSuccess =
-              (updated.status === 'delivered' || updated.status === 'delivered-instant') &&
-              prevStatus !== updated.status;
-            if (terminalSuccess) {
-              // Use the pre-bound helper — the object-method-shorthand
-              // here doesn't expose PaymentsModule.this.
-              await writeSentEntryFromOutbox(
-                updated,
-                'sendingRecoveryWorker',
-              );
-            }
-
-            return updated;
-          },
-        },
-        republish: async (entry: UxfTransferOutboxEntry): Promise<void> => {
-          // Re-publish via the same transport surface the original
-          // send used. The recipient's replay-LRU short-circuits
-          // duplicates by `bundleCid` (§6.3 / T.3.A) so a wasted publish
-          // in the racing window is harmless.
-          //
-          // OUTBOX-SEND-FOLLOWUPS item #2 (final closure, PR #189) —
-          // ALWAYS produce a `'uxf-cid'` payload, even when the entry's
-          // original `deliveryMethod` was `'car-over-nostr'`. Item #6.a
-          // (PR #188) flipped inline-CAR sends to ALSO pin the CAR
-          // bytes to the sender's local IPFS node, so the recipient
-          // CAN fetch the CID. Without that pin (pre-#6.a entries or
-          // wallets without an IPFS publisher) the recipient's CID-
-          // fetch path surfaces an error; the entry remains discoverable
-          // via the verifier's next retention cycle and the operator
-          // can intervene. This is no worse than the pre-PR behavior
-          // (which throw → `'failed-transient'` → silent terminal),
-          // and it correctly recovers the common case where the pin
-          // exists.
-          //
-          // Custom workers that wire local CAR retention or per-entry
-          // pin tracking can install their own republish via
-          // `installSendingRecoveryWorker()` and refuse the downgrade
-          // when their richer signals indicate the CID is unfetchable.
-          switch (entry.deliveryMethod) {
-            case 'cid-over-nostr':
-            case 'car-over-nostr': {
-              // The CID is the durable handle in both cases:
-              //  - 'cid-over-nostr': original send pinned the CAR to
-              //    IPFS before publishing the CID-by-reference shape.
-              //  - 'car-over-nostr' (post-#6.a): inline send fired a
-              //    best-effort local pin via the orchestrator's Step
-              //    8.5 path; the CID is fetchable from the sender's
-              //    IPFS node.
-              //  - 'car-over-nostr' (pre-#6.a): NO local pin; the
-              //    recipient's CID fetch will fail. The verifier's
-              //    next cycle re-arms the entry (still at `'delivered'`
-              //    OR re-armed back to `'sending'`); operator triage
-              //    catches stuck cycles via tombstone GC.
-              //
-              // `mode === 'txf'` is a legacy outbox-mode discriminator
-              // that does NOT belong to UXF wire payloads — map it to
-              // `'instant'` for the advisory `mode` field; recipients
-              // ignore it (§5.6).
-              const payloadMode: 'conservative' | 'instant' =
-                entry.mode === 'txf' ? 'instant' : entry.mode;
-              await transport.sendTokenTransfer(
-                entry.recipientTransportPubkey,
-                {
-                  kind: 'uxf-cid',
-                  version: '1.0',
-                  mode: payloadMode,
-                  bundleCid: entry.bundleCid,
-                  tokenIds: entry.tokenIds,
-                  ...(typeof entry.memo === 'string'
-                    ? { memo: entry.memo }
-                    : {}),
-                },
-              );
-              return;
-            }
-            case 'txf-legacy': {
-              throw new SphereError(
-                `SendingRecoveryWorker default republish cannot recover entry ${entry.id}: ` +
-                  `deliveryMethod='txf-legacy' is a single-token legacy wire shape that does ` +
-                  `not round-trip through the UXF payload union. Operator triage required.`,
-                'VALIDATION_ERROR',
-              );
-            }
-            default: {
-              // Defense-in-depth: refuse to publish an unknown
-              // delivery method as `'uxf-cid'` blindly. This branch
-              // is unreachable today; if a new arm is added to
-              // `UxfTransferOutboxEntry.deliveryMethod` and lands in
-              // the outbox before this switch is updated, fail-closed.
-              const _exhaustive: never = entry.deliveryMethod;
-              throw new SphereError(
-                `SendingRecoveryWorker default republish: unsupported ` +
-                  `deliveryMethod=${String(_exhaustive)} on entry ${entry.id}`,
-                'VALIDATION_ERROR',
-              );
-            }
-          }
-        },
-        emit: sphereEmit,
-      };
-      this.sendingRecoveryWorker = new SendingRecoveryWorker(recoveryDeps);
-      this.sendingRecoveryWorker.start();
-      logger.debug(
-        'Payments',
-        'Default SendingRecoveryWorker auto-installed (recoveryWorker default-on)',
-      );
-    } else if (
-      this.features.recoveryWorker &&
-      this.sendingRecoveryWorker !== null
-    ) {
-      // Pre-installed by the bootstrap layer — start it.
-      this.sendingRecoveryWorker.start();
-    }
-
-    // Issue #166 P2 #4 — auto-install the SENT-write reconciliation
-    // worker. Mirrors the SendingRecoveryWorker pattern above but with
-    // closures over the OUTBOX/SENT writer providers so the worker
-    // observes hot-swaps and the writer-uninstall arc at destroy. The
-    // worker itself self-skips when either writer is null, so the
-    // start() call is safe even before the bootstrap layer (Sphere)
-    // installs the writers.
-    if (
-      this.features.sentReconciliationWorker &&
-      this.sentReconciliationWorker === null
-    ) {
-      // Pre-bind the SENT-write helper so the closure in
-      // `recDeps.writeSentEntry` doesn't lose `this` — same rationale
-      // as the SendingRecoveryWorker's C3 fix above.
-      const writeSentEntryFromOutbox =
-        this.writeSentEntryFromOutbox.bind(this);
-      const recDeps: SentReconciliationWorkerDeps = {
-        outboxProvider: (): Pick<OutboxWriter, 'readAllNew' | 'delete'> | null =>
-          this._outboxWriter,
-        sentProvider: (): Pick<SentLedgerWriter, 'readOne'> | null =>
-          this._sentLedgerWriter,
-        writeSentEntry: writeSentEntryFromOutbox,
-        emit: this.deps!.emitEvent,
-      };
-      this.sentReconciliationWorker = new SentReconciliationWorker(recDeps);
-      this.sentReconciliationWorker.start();
-      logger.debug(
-        'Payments',
-        'Default SentReconciliationWorker auto-installed (sentReconciliationWorker default-on)',
-      );
-    } else if (
-      this.features.sentReconciliationWorker &&
-      this.sentReconciliationWorker !== null
-    ) {
-      // Pre-installed by the bootstrap layer — start it.
-      this.sentReconciliationWorker.start();
-    }
-
-    // Issue #166 P2 #3 — auto-install the Nostr persistence
-    // verification worker. Mirrors the recovery / reconciliation
-    // worker patterns above. Default-ON after item #5 soak; the
-    // worker self-skips entries that lack `nostrEventId` (legacy
-    // SENT entries from before the dispatcher capture wiring), and
-    // routes verify() through transport.verifyTokenTransferRetained
-    // when the transport implements it (else 'unverifiable' which
-    // never produces a false-positive warning).
-    if (
-      this.features.nostrPersistenceVerifier &&
-      this.nostrPersistenceVerifier === null
-    ) {
-      const transport = this.deps!.transport;
-      const sphereEmit = this.deps!.emitEvent;
-      const verifierDeps: NostrPersistenceVerifierDeps = {
-        sentProvider: (): Pick<SentLedgerWriter, 'readAll'> | null =>
-          this._sentLedgerWriter,
-        // OUTBOX-SEND-FOLLOWUPS item #2 — thread the OUTBOX writer so
-        // the verifier can transition live `delivered`/`delivered-
-        // instant` entries back to `'sending'` on retention drops.
-        // The SendingRecoveryWorker then republishes via its existing
-        // scan loop (item #6's deliveryMethod-aware closure handles
-        // CAR/TXF entries safely).
-        outboxProvider: (): Pick<OutboxWriter, 'update'> | null =>
-          this._outboxWriter,
-        verify: async (entry: UxfSentLedgerEntry): Promise<VerifyOutcome> => {
-          if (
-            typeof entry.nostrEventId !== 'string' ||
-            entry.nostrEventId.length === 0
-          ) {
-            return 'unverifiable';
-          }
-          if (typeof transport.verifyTokenTransferRetained !== 'function') {
-            // Transport does not implement the optional verify
-            // method — the worker can't make progress here, but
-            // 'unverifiable' means "retry next cycle" so no false
-            // warnings are emitted.
-            return 'unverifiable';
-          }
-          try {
-            return await transport.verifyTokenTransferRetained(
-              entry.nostrEventId,
-            );
-          } catch {
-            // The transport contract says "never throw," but
-            // defense-in-depth: a throw here degrades to
-            // unverifiable rather than missing.
-            return 'unverifiable';
-          }
-        },
-        emit: sphereEmit,
-      };
-      this.nostrPersistenceVerifier = new NostrPersistenceVerifier(verifierDeps);
-      this.nostrPersistenceVerifier.start();
-      logger.debug(
-        'Payments',
-        'Default NostrPersistenceVerifier auto-installed (nostrPersistenceVerifier opt-in flag ON)',
-      );
-    } else if (
-      this.features.nostrPersistenceVerifier &&
-      this.nostrPersistenceVerifier !== null
-    ) {
-      this.nostrPersistenceVerifier.start();
-    }
-
-    // Issue #174 — auto-install the per-token spent-state rescan worker
-    // (UXF-TRANSFER-PROTOCOL §12.3.2). Default-OFF; when ON the worker
-    // probes oracle.isSpent for each `'confirmed'` token to detect
-    // off-record spends from sibling instances of the same wallet.
-    // `transitionToAudit` defaults to {@link defaultSpentStateTransition}
-    // (local Token.status flip + archive + tombstone via removeToken);
-    // callers that need to route through a production-wired
-    // `DispositionWriter.write()` (future, once that wiring lands in
-    // production) override via {@link setSpentStateRescanTransitionToAudit}.
-    // The `oracleProvider` closure reads `this.deps?.oracle` lazily so
-    // a future `deps` re-init (e.g. oracle swap on reconnect) is
-    // observed; same closure pattern as `sentProvider` / `outboxProvider`
-    // for consistency.
-    if (
-      this.features.spentStateRescan &&
-      this.spentStateRescanWorker === null
-    ) {
-      const sphereEmit = this.deps!.emitEvent;
-      const rescanDeps: SpentStateRescanWorkerDeps = {
-        tokensProvider: (): Iterable<Token> => this.tokens.values(),
-        oracleProvider: (): {
-          readonly isSpent: (token: Token, stateHash: string) => Promise<boolean>;
-        } | null => {
-          // Issue #243 / #245 #1 — wallet-scoped wrapper around
-          // oracle.isSpent. The underlying OracleProvider.isSpent
-          // requires `(publicKey, stateHash)` because the canonical
-          // aggregator indexes commitments by
-          // `RequestId.create(pubkey, hash)`.
-          //
-          // Per-token publicKey extraction: parse the token's CURRENT
-          // state predicate from `sdkData` and use ITS publicKey,
-          // falling back to `chainPubkey` on parse failure. Binding
-          // `chainPubkey` for every token misses spent states whose
-          // predicate was constructed under a different key (sync
-          // race / migration data / multi-address wallets where the
-          // worker scans address A's pool but a token's predicate
-          // was built under address B).
-          const oracle = this.deps?.oracle;
-          if (oracle === undefined || typeof oracle.isSpent !== 'function') {
-            return null;
-          }
-          const fallbackPubkey = this.deps?.identity?.chainPubkey;
-          if (!fallbackPubkey) return null;
-          return {
-            isSpent: async (token: Token, stateHash: string): Promise<boolean> => {
-              const ownerPubkey =
-                (await extractCurrentStatePublicKeyHexFromSdkData(token.sdkData)) ??
-                fallbackPubkey;
-              return oracle.isSpent(ownerPubkey, stateHash);
-            },
-          };
-        },
-        extractCurrentStateHash: (token: Token): string =>
-          extractStateHashFromSdkData(token.sdkData),
-        sentProvider: (): Pick<SentLedgerWriter, 'contains'> | null =>
-          this._sentLedgerWriter,
-        outboxProvider: (): Pick<OutboxWriter, 'readAll'> | null =>
-          this._outboxWriter,
-        transitionToAudit:
-          this._spentStateRescanTransitionToAudit ??
-          this.defaultSpentStateTransition.bind(this),
-        emit: sphereEmit,
-        logger: {
-          warn: (message: string, context?: Record<string, unknown>): void => {
-            logger.warn('Payments', `${message}`, context);
-          },
-        },
-      };
-      this.spentStateRescanWorker = new SpentStateRescanWorker(rescanDeps);
-      this.spentStateRescanWorker.start();
-      logger.debug(
-        'Payments',
-        'Default SpentStateRescanWorker auto-installed (spentStateRescan opt-in flag ON)',
-      );
-    } else if (
-      this.features.spentStateRescan &&
-      this.spentStateRescanWorker !== null
-    ) {
-      this.spentStateRescanWorker.start();
-    }
-
-    // OUTBOX-SEND-FOLLOWUPS item #4 — auto-install the tombstone GC
-    // worker. Default-ON after item #5 soak: the worker periodically
-    // reclaims storage occupied by tombstones whose retention window
-    // has elapsed. Both writers self-skip when no writer is installed,
-    // so the start() call is safe even before bootstrap installs them.
-    if (
-      this.features.tombstoneGcWorker &&
-      this.tombstoneGcWorker === null
-    ) {
-      const gcDeps: TombstoneGcWorkerDeps = {
-        outboxProvider: (): Pick<OutboxWriter, 'gcExpiredTombstones'> | null =>
-          this._outboxWriter,
-        sentProvider: (): Pick<SentLedgerWriter, 'gcExpiredTombstones'> | null =>
-          this._sentLedgerWriter,
-        logger: {
-          warn: (message: string, context?: Record<string, unknown>): void => {
-            logger.warn('Payments', `${message}`, context);
-          },
-        },
-      };
-      this.tombstoneGcWorker = new TombstoneGcWorker(gcDeps);
-      this.tombstoneGcWorker.start();
-      logger.debug(
-        'Payments',
-        'Default TombstoneGcWorker auto-installed (tombstoneGcWorker opt-in flag ON)',
-      );
-    } else if (
-      this.features.tombstoneGcWorker &&
-      this.tombstoneGcWorker !== null
-    ) {
-      this.tombstoneGcWorker.start();
-    }
+    installUxfAuxiliaryWorkers(this.workerFleetHost());
 
     // T.3.E — auto-install a default IngestWorkerPool when recipientUxf
     // is on AND the bootstrap layer has not already wired a custom pool.
@@ -2975,258 +2561,7 @@ export class PaymentsModule {
       );
     }
 
-    // Task #169 — Per-initialize AbortController. Aborted in destroy()
-    // BEFORE awaiting worker.stop() so in-flight runFinalizationCycle
-    // invocations + their pending sleep(...) timers terminate
-    // deterministically. Recreated each initialize() because aborted
-    // signals cannot be reset.
-    this._workerAbortController = new AbortController();
-
-    // Round 7 (FIX 3) — Shared per-tokenId mutex. Constructed once per
-    // initialize() and plumbed into the sender + recipient finalization
-    // workers AND the operator escape-hatch InclusionProofImporter so
-    // all three paths serialize against the same read-decide-write
-    // window when they touch the same tokenId. Without this, a
-    // concurrent `finalizeTransferToken(X)` and `importInclusionProof(X)`
-    // race in their respective per-tokenId guards (each builder
-    // previously created its own fresh PerTokenMutex), corrupting the
-    // manifest's audit trail or re-queuing duplicate K-1 entries.
-    this._sharedPerTokenMutex = new PerTokenMutex();
-
-    // Phase 9.6.D — auto-install the sender-side finalization worker when
-    // `senderUxf` is on AND `finalizationWorker` is on AND no consumer has
-    // already installed one via `installFinalizationWorkerSender()`.
-    //
-    // The auto-installed worker uses lightweight in-memory adapters for the
-    // pool/manifest/tombstone/queue 4-step write order (no OrbitDB required).
-    // These in-memory writes are sufficient to drive the §6.1 cycle to
-    // completion and emit `transfer:confirmed`. The full OrbitDB-backed
-    // adapters can be injected by the bootstrap layer (Sphere) via
-    // `installFinalizationWorkerSender()` when it has the full profile stack.
-    //
-    // Consumer-installed workers (installFinalizationWorkerSender()) win:
-    // the `!this.finalizationWorkerSender` check preserves that contract.
-    if (
-      this.features.senderUxf &&
-      this.features.finalizationWorker &&
-      !this.finalizationWorkerSender
-    ) {
-      const aggregatorClient = this.deps!.oracle.getAggregatorClient?.();
-      if (aggregatorClient === null || aggregatorClient === undefined) {
-        // Oracle stub does not expose an aggregator client; skip auto-install.
-        // Tests with mocked oracles (no getAggregatorClient) take this path.
-        logger.debug(
-          'Payments',
-          'FinalizationWorkerSender auto-install skipped: oracle has no getAggregatorClient()',
-        );
-      } else {
-        const directAddr = this.deps!.identity.directAddress;
-        const workerAddressId =
-          typeof directAddr === 'string' && directAddr.length > 0
-            ? computeAddressId(directAddr)
-            : this.deps!.identity.chainPubkey;
-        this.finalizationWorkerSender = buildDefaultFinalizationWorkerSender({
-          addressId: workerAddressId,
-          oracle: this.deps!.oracle,
-          senderOutboxMap: this._senderOutboxMap,
-          senderRequestContextMap: this._senderRequestContextMap,
-          emit: (type, data) => this.deps!.emitEvent(type, data),
-          // Task #169 — wire the per-initialize AbortController's signal
-          // through to the worker so destroy() can cancel in-flight
-          // submit/poll cycles + sleep timers.
-          signal: this._workerAbortController.signal,
-          // Round 7 (FIX 3) — share per-tokenId mutex with recipient
-          // worker + operator importer so all three paths serialize
-          // against the same read-decide-write window.
-          perTokenMutex: this._sharedPerTokenMutex,
-        });
-        this.finalizationWorkerSender.start();
-        logger.debug(
-          'Payments',
-          'Default FinalizationWorkerSender auto-installed (senderUxf default-on)',
-        );
-      }
-    }
-
-    // Task #151 — auto-install the recipient-side finalization worker
-    // when `recipientUxf` is on AND `finalizationWorker` is on AND no
-    // consumer has already installed one via
-    // `installFinalizationWorkerRecipient()`.
-    //
-    // The auto-installed worker uses lightweight in-memory adapters
-    // (FinalizationQueue + manifestCas + tombstones + pool + queue +
-    // stub revaluateHooks/cascadeWalker). Its dispositionWriter is
-    // wired back to PaymentsModule via the
-    // `_recipientFinalizationContext` map: when the worker writes a
-    // VALID disposition for a tokenId, PaymentsModule rebuilds the SDK
-    // Token via `finalizeTransferToken` and overwrites the locally-
-    // stored Token's sdkData + flips status to 'confirmed'.
-    //
-    // This is the minimum production-ready harness that closes the
-    // S2 e2e loop (Bob receives instant tokens → re-spends them).
-    // Bootstrap layers (Sphere) MAY override via
-    // `installFinalizationWorkerRecipient()` for a full §5.5 / §6.2
-    // implementation backed by Profile + OrbitDB.
-    //
-    // FIXME(#151): the in-memory queue + finalization context map are
-    // NOT persisted across `Sphere.destroy()` and process restart.
-    // Recovery on next launch requires either a manifest scan or an
-    // external re-trigger (operator escape-hatch). The Profile-backed
-    // FinalizationQueue (T.5.C / Wave G.7) deferred to a future wave
-    // closes this gap.
-    if (
-      this.features.recipientUxf &&
-      this.features.finalizationWorker &&
-      !this.finalizationWorkerRecipient
-    ) {
-      const aggregatorClient = this.deps!.oracle.getAggregatorClient?.();
-      if (aggregatorClient === null || aggregatorClient === undefined) {
-        logger.debug(
-          'Payments',
-          'FinalizationWorkerRecipient auto-install skipped: oracle has no getAggregatorClient()',
-        );
-      } else {
-        const directAddr = this.deps!.identity.directAddress;
-        const recipientAddressId =
-          typeof directAddr === 'string' && directAddr.length > 0
-            ? computeAddressId(directAddr)
-            : this.deps!.identity.chainPubkey;
-
-        // G7 — re-hydrate the recipient context Maps from persisted
-        // storage. Without this, a Sphere that crashed between enqueue
-        // and finalization could not surface the contexts the
-        // dispositionWriter VALID branch needs to flip local Tokens to
-        // `'confirmed'`.
-        //
-        // The hydration is fire-and-forget so initialize() stays
-        // synchronous; the recipient worker has its own retry loop and
-        // is tolerant of a context Map populated mid-cycle. The hydration
-        // promise is exposed via {@link awaitRecipientContextHydration}
-        // for tests that need a deterministic settle point.
-        if (this._recipientContextStorage !== null) {
-          const ctxStorage = this._recipientContextStorage;
-          this._recipientContextHydrationPromise = (async () => {
-            try {
-              const persistedFinalization =
-                await ctxStorage.listAllFinalizationContexts(recipientAddressId);
-              for (const [tokenId, ctx] of persistedFinalization) {
-                if (!this._recipientFinalizationContext.has(tokenId)) {
-                  this._recipientFinalizationContext.set(tokenId, ctx);
-                }
-              }
-              const persistedRequest =
-                await ctxStorage.listAllRequestContexts(recipientAddressId);
-              for (const [reqId, ctx] of persistedRequest) {
-                if (!this._recipientRequestContextMap.has(reqId)) {
-                  // Cast: PersistedRequestContext is the JSON-safe
-                  // mirror of RequestContext (`nextEntryRest` widens to
-                  // Record<string, unknown> at the storage layer).
-                  this._recipientRequestContextMap.set(
-                    reqId,
-                    ctx as unknown as RequestContext,
-                  );
-                }
-              }
-              logger.debug(
-                'Payments',
-                `G7: re-hydrated ${persistedFinalization.size} finalization + ${persistedRequest.size} request contexts from profile`,
-              );
-            } catch (err) {
-              logger.warn(
-                'Payments',
-                `G7: failed to re-hydrate recipient context Maps from profile (continuing with empty maps): ${err instanceof Error ? err.message : String(err)}`,
-              );
-            }
-          })();
-        }
-
-        const built = buildDefaultFinalizationWorkerRecipient({
-          addressId: recipientAddressId,
-          oracle: this.deps!.oracle,
-          recipientRequestContextMap: this._recipientRequestContextMap,
-          recipientFinalizationContext: this._recipientFinalizationContext,
-          tokens: this.tokens,
-          finalizeTransferToken: (sourceToken, lastTx, stClient, trustBase) =>
-            this.finalizeTransferToken(sourceToken, lastTx, stClient, trustBase),
-          getStateTransitionClient: () =>
-            this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          getTrustBase: () => (this.deps!.oracle as any).getTrustBase?.(),
-          save: () => this.save(),
-          emit: (type, data) => this.deps!.emitEvent(type, data),
-          signal: this._workerAbortController.signal,
-          // Round 7 (FIX 3) — share per-tokenId mutex with sender worker
-          // + operator importer so all three paths serialize against the
-          // same read-decide-write window.
-          perTokenMutex: this._sharedPerTokenMutex,
-          // G3 — pass the Profile-backed persisted FinalizationQueueStorage
-          // when configured. When null, the helper falls back to the
-          // in-memory shim (legacy behavior).
-          finalizationQueueStorage:
-            this._recipientFinalizationQueueStorage ?? undefined,
-        });
-        this._recipientFinalizationQueue = built.queue;
-        this.finalizationWorkerRecipient = built.worker;
-        // Wave 7 hygiene: retain the streak-cleanup callback so destroy()
-        // can wipe the closure-local `saveFailureStreak` Map alongside
-        // the other context maps.
-        this._recipientSaveFailureStreakClear = built.clearSaveFailureStreak;
-        this.finalizationWorkerRecipient.start();
-        logger.debug(
-          'Payments',
-          'Default FinalizationWorkerRecipient auto-installed (recipientUxf default-on)',
-        );
-      }
-    }
-
-    // Round 5 (FIX 1) — auto-install the operator escape-hatch importer
-    // and revalidate-cascaded runner (T.5.D). Before Round 5, no
-    // production code path called `installInclusionProofImporter()` /
-    // `installRevalidateCascadedRunner()`, so every wallet that
-    // bootstrapped through `Sphere.init()` threw
-    // `OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED` on the first
-    // `payments.importInclusionProof()` / `payments.revalidateCascadedChildren()`
-    // call.
-    //
-    // The auto-installed defaults use lightweight in-memory adapters
-    // (mirroring `buildDefaultFinalizationWorkerSender`'s pattern):
-    //  - `InMemoryDispositionStorageAdapter` for `_invalid` / `_audit`
-    //  - In-memory `MinimalManifestStorage` + a fresh `ManifestStore`
-    //    bound to a fresh `Lamport` clock
-    //  - Stub `queueScanner` (returns no entries) and stub
-    //    `verifyProof` (returns `'NOT_AUTHENTICATED'`) so the importer
-    //    fails closed on every operator-supplied proof until the
-    //    bootstrap layer overrides
-    //
-    // Bootstrap layers (Sphere) MAY override either by calling
-    // `installInclusionProofImporter()` / `installRevalidateCascadedRunner()`
-    // BEFORE `initialize()` (the `!this.inclusionProofImporter` checks
-    // preserve that contract) or AFTER `initialize()` (the install
-    // methods replace the auto-installed instance). Production
-    // override should construct an `OrbitDbDispositionStorageAdapter`
-    // bound to the wallet's ProfileDatabase and an OrbitDB-backed
-    // ManifestStore — see `OrbitDbDispositionStorageAdapter` JSDoc for
-    // the wiring sketch.
-    if (this.inclusionProofImporter === null) {
-      this.inclusionProofImporter = buildDefaultInclusionProofImporter({
-        emit: (type, data) => this.deps!.emitEvent(type, data),
-        // Round 7 (FIX 3) — share per-tokenId mutex with finalization
-        // workers so concurrent finalize + operator import on the same
-        // tokenId serialize against the read-decide-write window.
-        perTokenMutex: this._sharedPerTokenMutex ?? undefined,
-      });
-      logger.debug(
-        'Payments',
-        'Default InclusionProofImporter auto-installed (in-memory disposition storage)',
-      );
-    }
-    if (this.revalidateCascadedRunner === null) {
-      this.revalidateCascadedRunner = buildDefaultRevalidateCascadedRunner();
-      logger.debug(
-        'Payments',
-        'Default RevalidateCascadedRunner auto-installed (in-memory manifest scanner)',
-      );
-    }
+    installUxfFinalizationStack(this.workerFleetHost());
   }
 
   /**
@@ -4027,6 +3362,91 @@ export class PaymentsModule {
   // NOTE: prior inline implementation of defaultSpentStateTransition
   // (~140 LoC) moved verbatim to
   // extensions/uxf/pipeline/module-glue/spent-state-transition.ts.
+
+  /**
+   * Host-shim builder for {@link installUxfAuxiliaryWorkers} and
+   * {@link installUxfFinalizationStack}. Called twice per
+   * `initialize()`: once before the IngestWorkerPool block (auxiliary
+   * workers) and once after (finalization stack). The shim exposes
+   * every private facade slot the fleet installers need — matching the
+   * inline `this.X` access that was verbatim-moved into
+   * `extensions/uxf/pipeline/module-glue/worker-fleet.ts`.
+   */
+  private workerFleetHost(): UxfWorkerFleetHost {
+    return {
+      features: this.features,
+      deps: this.deps!,
+
+      // ---- SendingRecoveryWorker
+      getSendingRecoveryWorker: () => this.sendingRecoveryWorker,
+      setSendingRecoveryWorker: (w) => { this.sendingRecoveryWorker = w; },
+
+      // ---- SentReconciliationWorker
+      getSentReconciliationWorker: () => this.sentReconciliationWorker,
+      setSentReconciliationWorker: (w) => { this.sentReconciliationWorker = w; },
+
+      // ---- NostrPersistenceVerifier
+      getNostrPersistenceVerifier: () => this.nostrPersistenceVerifier,
+      setNostrPersistenceVerifier: (w) => { this.nostrPersistenceVerifier = w; },
+
+      // ---- SpentStateRescanWorker
+      getSpentStateRescanWorker: () => this.spentStateRescanWorker,
+      setSpentStateRescanWorker: (w) => { this.spentStateRescanWorker = w; },
+      getSpentStateRescanTransitionToAudit: () =>
+        this._spentStateRescanTransitionToAudit,
+      defaultSpentStateTransition: this.defaultSpentStateTransition.bind(this),
+      extractCurrentStateHash: (token) => extractStateHashFromSdkData(token.sdkData),
+      getTokensIterable: () => this.tokens.values(),
+      getFallbackChainPubkey: () => this.deps?.identity?.chainPubkey ?? null,
+      extractCurrentStatePublicKeyHexFromSdkData: (sdkData) =>
+        extractCurrentStatePublicKeyHexFromSdkData(sdkData),
+
+      // ---- TombstoneGcWorker
+      getTombstoneGcWorker: () => this.tombstoneGcWorker,
+      setTombstoneGcWorker: (w) => { this.tombstoneGcWorker = w; },
+
+      // ---- Profile-resident writers (closures re-fetch each call)
+      getOutboxWriter: () => this._outboxWriter,
+      getSentLedgerWriter: () => this._sentLedgerWriter,
+
+      // ---- Shared state Maps + writers
+      senderOutboxMap: this._senderOutboxMap,
+      senderRequestContextMap: this._senderRequestContextMap,
+      recipientRequestContextMap: this._recipientRequestContextMap,
+      recipientFinalizationContext: this._recipientFinalizationContext,
+      tokens: this.tokens,
+      writeSentEntryFromOutbox: this.writeSentEntryFromOutbox.bind(this),
+
+      // ---- Finalization stack slots
+      getRecipientFinalizationQueue: () => this._recipientFinalizationQueue,
+      setRecipientFinalizationQueue: (q) => { this._recipientFinalizationQueue = q; },
+      getRecipientSaveFailureStreakClear: () => this._recipientSaveFailureStreakClear,
+      setRecipientSaveFailureStreakClear: (cb) => { this._recipientSaveFailureStreakClear = cb; },
+      getSharedPerTokenMutex: () => this._sharedPerTokenMutex,
+      setSharedPerTokenMutex: (m) => { this._sharedPerTokenMutex = m; },
+      getWorkerAbortController: () => this._workerAbortController,
+      setWorkerAbortController: (c) => { this._workerAbortController = c; },
+      getFinalizationWorkerSender: () => this.finalizationWorkerSender,
+      setFinalizationWorkerSender: (w) => { this.finalizationWorkerSender = w; },
+      getFinalizationWorkerRecipient: () => this.finalizationWorkerRecipient,
+      setFinalizationWorkerRecipient: (w) => { this.finalizationWorkerRecipient = w; },
+      getInclusionProofImporter: () => this.inclusionProofImporter,
+      setInclusionProofImporter: (i) => { this.inclusionProofImporter = i; },
+      getRevalidateCascadedRunner: () => this.revalidateCascadedRunner,
+      setRevalidateCascadedRunner: (r) => { this.revalidateCascadedRunner = r; },
+      getRecipientFinalizationQueueStorage: () => this._recipientFinalizationQueueStorage,
+      getRecipientContextStorage: () => this._recipientContextStorage,
+      setRecipientContextHydrationPromise: (p) => {
+        this._recipientContextHydrationPromise = p;
+      },
+
+      // ---- Bound methods
+      finalizeTransferToken: (sourceToken, lastTx, stClient, trustBase) =>
+        this.finalizeTransferToken(sourceToken, lastTx, stClient, trustBase),
+      save: () => this.save(),
+      emit: (type, data) => this.deps!.emitEvent(type, data),
+    };
+  }
 
   installOutboxWriter(writer: OutboxWriter | null): void {
     this._outboxWriter = writer;
