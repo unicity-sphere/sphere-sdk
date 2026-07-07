@@ -106,7 +106,10 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
 const STSDK_CORE_BURNDOWN = [
   'core/Sphere.ts',
   'modules/accounting/AccountingModule.ts',
-  'modules/payments/PaymentsModule.ts',
+  // Removed in wave 6-P2-4b: modules/payments/PaymentsModule.ts now routes
+  // ALL v2 SDK access through `ITokenEngine` — no direct
+  // `@unicitylabs/state-transition-sdk` imports remain (v1 impl quarantined
+  // to legacy-v1/ where the STSDK ban is relaxed).
   // Removed in wave 6-P2-4a: oracle/UnicityAggregatorProvider.ts now routes
   // ALL v2 SDK access through `token-engine/sdk` (the anti-corruption layer)
   // — no direct `@unicitylabs/state-transition-sdk` imports remain.

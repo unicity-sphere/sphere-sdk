@@ -117,7 +117,7 @@ export function buildWinBroadcastTag(signingPubKeyHex: string): string {
  */
 export async function buildWinBroadcastHash(
   payload: UnsignedWinBroadcastPayload,
-): Promise<import('@unicitylabs/state-transition-sdk/lib/hash/DataHash.js').DataHash> {
+): Promise<import('stsdk-v1/lib/hash/DataHash.js').DataHash> {
   if (payload.v !== WIN_BROADCAST_SCHEMA_VERSION) {
     throw new Error(`buildWinBroadcastHash: unsupported schema version ${payload.v}`);
   }

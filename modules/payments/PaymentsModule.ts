@@ -1599,10 +1599,26 @@ export class PaymentsModule {
     return Array.from(this.tokens.values());
   }
 
-  async importTokens(_data: unknown): Promise<{
-    added: unknown[];
-    skipped: unknown[];
-    rejected: unknown[];
+  async importTokens(
+    _data: unknown,
+    _options?: unknown,
+  ): Promise<{
+    added: ReadonlyArray<{
+      readonly localId: string;
+      readonly genesisTokenId: string;
+      readonly code: 'added' | 'state-replaced' | 'stale-record-replaced';
+      readonly note?: string;
+    }>;
+    skipped: ReadonlyArray<{
+      readonly genesisTokenId: string;
+      readonly code: 'duplicate' | 'tombstoned' | 'genesis-exists' | 'unknown';
+      readonly reason: string;
+    }>;
+    rejected: ReadonlyArray<{
+      readonly genesisTokenId: string | null;
+      readonly code: 'malformed' | 'add-failed';
+      readonly reason: string;
+    }>;
   }> {
     return { added: [], skipped: [], rejected: [] };
   }
