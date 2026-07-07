@@ -256,6 +256,15 @@ import {
 } from '../../extensions/uxf/pipeline/module-glue/durability-gate';
 import { validateSourceOwnership as validateSourceOwnershipImpl } from '../../extensions/uxf/pipeline/module-glue/source-ownership';
 import {
+  writeSentEntryFromOutbox as writeSentEntryFromOutboxImpl,
+  assertNoDuplicateBundleMembership as assertNoDuplicateBundleMembershipImpl,
+  detectOrphanSpendingTokens as detectOrphanSpendingTokensImpl,
+  defaultOrphanRecovery as defaultOrphanRecoveryImpl,
+  type SentWriterHost,
+  type DuplicateBundleGuardHost,
+  type OrphanDetectionHost,
+} from '../../extensions/uxf/pipeline/module-glue/worker-helpers';
+import {
   sweepOrphanSpendingTokens,
   type OrphanSweepResult,
   type OrphanSpendingFinding,
@@ -3735,41 +3744,12 @@ export class PaymentsModule {
     entry: OutboxCreateInput,
     opLabel: string,
   ): Promise<'success' | 'failed' | 'skipped'> {
-    if (this._sentLedgerWriter === null) return 'skipped';
-    try {
-      await this._sentLedgerWriter.write({
-        id: entry.id,
-        tokenIds: entry.tokenIds,
-        bundleCid: entry.bundleCid,
-        recipientTransportPubkey: entry.recipientTransportPubkey,
-        recipient: entry.recipient,
-        ...(typeof entry.recipientNametag === 'string'
-          ? { recipientNametag: entry.recipientNametag }
-          : {}),
-        deliveryMethod: entry.deliveryMethod,
-        mode: entry.mode,
-        sentAt: Date.now(),
-        // Issue #166 P2 #3 — propagate nostrEventId from OUTBOX to
-        // SENT so the NostrPersistenceVerifier worker can re-query
-        // the relay by event id later. Omitted when the OUTBOX entry
-        // lacks the field (pre-P2 #3 entries or paths that haven't
-        // wired the capture yet) so the SENT type guard's
-        // "undefined OR non-empty string" rule holds.
-        ...(typeof entry.nostrEventId === 'string' && entry.nostrEventId.length > 0
-          ? { nostrEventId: entry.nostrEventId }
-          : {}),
-      });
-      return 'success';
-    } catch (sentErr) {
-      logger.error(
-        'Payments',
-        `${opLabel}: SENT ledger write failed for outbox id ${entry.id} ` +
-          `(bundle is already on the wire; OUTBOX entry kept live at status='delivered' as forensic record; ` +
-          `operator triage required): ` +
-          `${sentErr instanceof Error ? sentErr.message : String(sentErr)}`,
-      );
-      return 'failed';
-    }
+    return writeSentEntryFromOutboxImpl(this.sentWriterHost(), entry, opLabel);
+  }
+
+  /** Host-shim builder for {@link writeSentEntryFromOutboxImpl}. */
+  private sentWriterHost(): SentWriterHost {
+    return { sentLedgerWriter: this._sentLedgerWriter };
   }
 
   /**
@@ -3843,39 +3823,16 @@ export class PaymentsModule {
     candidateTokenIds: ReadonlyArray<string>,
     options: { readonly opLabel: string; readonly allowOverride: boolean },
   ): Promise<void> {
-    if (options.allowOverride) return;
-    if (this._outboxWriter === null) return;
-    if (candidateTokenIds.length === 0) return;
+    return assertNoDuplicateBundleMembershipImpl(
+      this.duplicateBundleGuardHost(),
+      candidateTokenIds,
+      options,
+    );
+  }
 
-    const candidates = new Set<string>(candidateTokenIds);
-
-    // ── OUTBOX check ────────────────────────────────────────────────────
-    // Compare candidates against each entry's SOURCE set
-    // (`sourceTokenIds`), which is the only field that can express the
-    // "don't burn the same source twice" invariant this guard defends.
-    // See issue #391 in the docstring above.
-    let outboxEntries: ReadonlyArray<UxfTransferOutboxEntry>;
-    try {
-      outboxEntries = await this._outboxWriter.readAllNew();
-    } catch (err) {
-      logger.warn(
-        'Payments',
-        `${options.opLabel}: duplicate-bundle guard could not read OUTBOX (proceeding without check): ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return;
-    }
-    for (const entry of outboxEntries) {
-      const sources = entry.sourceTokenIds;
-      if (sources === undefined) continue; // pre-H5 entry — silently skip
-      for (const tid of sources) {
-        if (candidates.has(tid)) {
-          throw new SphereError(
-            `${options.opLabel}: refusing to include token ${tid} in this bundle — it is already in flight as a source of OUTBOX entry ${entry.id} (status=${entry.status}). Set TransferRequest.allowDuplicateBundleMembership=true to bypass this guard if the re-include is intentional.`,
-            'DUPLICATE_BUNDLE_MEMBERSHIP',
-          );
-        }
-      }
-    }
+  /** Host-shim builder for {@link assertNoDuplicateBundleMembershipImpl}. */
+  private duplicateBundleGuardHost(): DuplicateBundleGuardHost {
+    return { outboxWriter: this._outboxWriter };
   }
 
   /**
@@ -3912,25 +3869,37 @@ export class PaymentsModule {
    * at boot).
    */
   async detectOrphanSpendingTokens(): Promise<OrphanSweepResult> {
-    return sweepOrphanSpendingTokens({
-      tokens: this.tokens.values(),
+    return detectOrphanSpendingTokensImpl(this.orphanDetectionHost());
+  }
+
+  /**
+   * Host-shim builder for {@link detectOrphanSpendingTokensImpl} +
+   * {@link defaultOrphanRecoveryImpl}. Built per-call so the
+   * dispatcher-in-flight counter and feature-flag reflect the
+   * live facade state at the moment the sweeper runs.
+   */
+  private orphanDetectionHost(): OrphanDetectionHost {
+    return {
+      tokens: this.tokens,
       outboxWriter: this._outboxWriter,
       sentLedgerWriter: this._sentLedgerWriter,
-      emit: this.deps!.emitEvent,
-      // Steelman item 2 — thread the dispatcher-in-flight counter so
-      // the sweeper self-skips during in-flight sends. The auto-
-      // invocation at load() tail is unaffected (count is 0 at boot);
-      // public-API callers and tests now see the gate.
+      oracle: this.deps!.oracle,
+      identityChainPubkey: this.deps!.identity.chainPubkey,
       dispatcherInFlightCount: this._dispatcherInFlightCount,
-      // Issue #166 P2 #1 — wire the default recovery closure only
-      // when the opt-in feature flag is ON. Without the flag, the
-      // sweeper preserves Phase-1 detection-only behavior (no
-      // `attemptRecovery` field → recovery branch in
-      // sweepOrphanSpendingTokens is never taken).
-      ...(this.features.orphanAutoRecovery
-        ? { attemptRecovery: this.defaultOrphanRecovery.bind(this) }
-        : {}),
-    });
+      orphanAutoRecoveryEnabled: this.features.orphanAutoRecovery,
+      emitEvent: (type, data) => this.deps!.emitEvent(type, data),
+      setTokenStatus: (id, next) => {
+        const t = this.tokens.get(id);
+        if (t === undefined) return;
+        t.status = next;
+        t.updatedAt = Date.now();
+        this.tokens.set(id, t);
+      },
+      clearParsedCache: (id) => {
+        this.parsedTokenCache.delete(id);
+      },
+      save: () => this.save(),
+    };
   }
 
   /**
@@ -3976,87 +3945,7 @@ export class PaymentsModule {
   private async defaultOrphanRecovery(
     finding: OrphanSpendingFinding,
   ): Promise<'recovered' | 'manual'> {
-    const token = this.tokens.get(finding.tokenId);
-    if (token === undefined) return 'manual';
-    if (token.status !== 'transferring') return 'manual';
-
-    // OUTBOX-SEND-FOLLOWUPS item #1: aggregator cross-check.
-    //
-    // The orphan's `sdkData` still holds the pre-commit serialization
-    // — `commitSources` does not mutate the source token's local
-    // data; the spent state shows up on-chain only. Extract the state
-    // hash and ask the aggregator whether that state is already
-    // recorded as spent. If yes, the spending commit DID land before
-    // the crash, and restoring locally would produce a token whose
-    // local state diverges from the aggregator's view.
-    const sourceStateHash = extractStateHashFromSdkData(token.sdkData);
-    if (sourceStateHash === '') {
-      logger.warn(
-        'Payments',
-        `defaultOrphanRecovery: token ${token.id} has no parseable stateHash on sdkData — ` +
-          `cannot cross-check aggregator; escalating to manual triage.`,
-      );
-      return 'manual';
-    }
-    let aggregatorRecordsSpent: boolean;
-    try {
-      // Issue #243 / #245 #1 — pass owner pubkey alongside stateHash.
-      // Prefer the publicKey embedded in the token's CURRENT state
-      // predicate (canonical aggregator requestId basis). Fall back
-      // to `chainPubkey` when the predicate cannot be parsed —
-      // matches the legacy assumption that orphan recovery only fires
-      // for our own locally-stranded tokens.
-      const ownerPubkey =
-        (await extractCurrentStatePublicKeyHexFromSdkData(token.sdkData)) ??
-        this.deps!.identity.chainPubkey;
-      aggregatorRecordsSpent = await this.deps!.oracle.isSpent(
-        ownerPubkey,
-        sourceStateHash,
-      );
-    } catch (oracleErr) {
-      // Per OracleProvider.isSpent contract, an RPC failure throws
-      // (never fail-open). Treat the throw as ambiguous: we cannot
-      // rule out the spent case, so escalate.
-      logger.warn(
-        'Payments',
-        `defaultOrphanRecovery: oracle.isSpent threw for token ${token.id} ` +
-          `(stateHash=${sourceStateHash}) — fail-closed to manual triage: ` +
-          `${oracleErr instanceof Error ? oracleErr.message : String(oracleErr)}`,
-      );
-      return 'manual';
-    }
-    if (aggregatorRecordsSpent) {
-      logger.error(
-        'Payments',
-        `defaultOrphanRecovery: aggregator records source state spent for token ${token.id} ` +
-          `(stateHash=${sourceStateHash}) — spending commit landed on-chain, local restore ` +
-          `would diverge; escalating to manual triage. Operator action: re-package the bundle ` +
-          `from the post-spend recipient context, or accept the value as already-sent.`,
-      );
-      return 'manual';
-    }
-
-    // Apply the in-memory restoration. The Token interface has
-    // `status` and `updatedAt` as mutable — same pattern used by
-    // dispatchUxfConservativeSend's Loop1-S9 path (~line 11122).
-    token.status = 'confirmed';
-    token.updatedAt = Date.now();
-    this.tokens.set(token.id, token);
-    this.parsedTokenCache.delete(token.id);
-
-    // Persist. If save() throws, the in-memory restoration sticks
-    // but durability is lost — degrade to 'manual' so the operator
-    // sees the detected event.
-    try {
-      await this.save();
-    } catch (saveErr) {
-      logger.warn(
-        'Payments',
-        `defaultOrphanRecovery: save() failed for token ${token.id} (in-memory restoration applied but not persisted): ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`,
-      );
-      return 'manual';
-    }
-    return 'recovered';
+    return defaultOrphanRecoveryImpl(this.orphanDetectionHost(), finding);
   }
 
   /**
