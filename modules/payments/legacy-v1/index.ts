@@ -12,3 +12,5 @@ export * from './combined-transfer';
 export * from './instant-split';
 export * from './finalization';
 export * from './commitment';
+export * from './dispatch-txf';
+export * from './proof-polling';
