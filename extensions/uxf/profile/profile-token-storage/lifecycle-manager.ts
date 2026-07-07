@@ -492,29 +492,15 @@ export class LifecycleManager {
         this.host.setKnownBundleCids(new Set());
       }
 
-      // COLD-START RECOVERY: if OrbitDB has no bundles locally, this
-      // is likely a fresh device (wallet re-imported from mnemonic
-      // after a wipe). Rebuild the active bundle set without waiting
-      // for a live peer.
-      //
-      // Priority (T-D6 / T-D6b):
-      //   (1) aggregator pointer layer — authoritative source of
-      //       truth. On a successful recoverLatest the CID is
-      //       trust-verified via inclusion proof + CAR content-
-      //       address verify. Lands as a new bundle ref that the
-      //       next JOIN pass assembles.
-      //   (2) one-shot legacy IPNS → pointer migration. Only fires
-      //       if the local cache carries a legacy `profile.ipns.
-      //       sequence` key and no `profile.pointer.migration.done`
-      //       marker. Reads the legacy IPNS snapshot ONE TIME,
-      //       hydrates the bundle set into OrbitDB, and stamps the
-      //       marker so subsequent loads go straight to the pointer
-      //       path. New wallets (no IPNS history) skip this entirely.
+      // COLD-START RECOVERY: if the KV substrate has no bundles
+      // locally, this is likely a fresh device (wallet re-imported
+      // from mnemonic after a wipe). Attempt the aggregator pointer
+      // layer — the authoritative source of truth. On a successful
+      // recoverLatest the CID is trust-verified via inclusion proof
+      // + CAR content-address verify. Lands as a new bundle ref
+      // that the next JOIN pass assembles.
       if (this.host.getKnownBundleCids().size === 0) {
-        const pointerRecovered = await this.recoverFromAggregatorPointerBestEffort();
-        if (!pointerRecovered) {
-          await this.runLegacyIpnsMigrationBestEffort();
-        }
+        await this.recoverFromAggregatorPointerBestEffort();
       }
 
       // Subscribe to OrbitDB replication events for real-time sync
@@ -2150,51 +2136,6 @@ export class LifecycleManager {
         `Pointer recover: applySnapshotIfWired failed (best-effort, will retry on next poll): ${msg}`,
       );
       return true;
-    }
-  }
-
-  /**
-   * Run the legacy IPNS → pointer migration if the wallet pre-dates
-   * the pointer layer. No-op for fresh wallets or wallets that have
-   * already migrated. Never throws — any failure logs and returns,
-   * leaving subsequent flushes to seed the anchor via the pointer
-   * layer directly.
-   */
-  private async runLegacyIpnsMigrationBestEffort(): Promise<void> {
-    const identity = this.host.getIdentity();
-    if (!identity || this.host.ipfsGateways.length === 0) return;
-    if (!this.host.localCache) return;
-
-    try {
-      const { runIpnsToPointerMigration } = await import(
-        '../migration/ipns-reader.js'
-      );
-      const localCache = this.host.localCache;
-      const result = await runIpnsToPointerMigration({
-        localCache: {
-          get: (k) => localCache.get(k),
-          set: (k, v) => localCache.set(k, v),
-        },
-        privateKeyHex: identity.privateKey,
-        gateways: this.host.ipfsGateways,
-        onBundle: async (cid, ref) => this.bundleIndex.addBundle(cid, ref),
-        log: (msg) => this.host.log(msg),
-      });
-      if (result.migrated) {
-        this.host.log(
-          `Legacy IPNS → pointer migration: imported ${result.bundlesImported} bundles`,
-        );
-      } else if (result.skipped === 'not-legacy') {
-        // Fresh install post-pointer — expected silent no-op.
-      } else {
-        this.host.log(
-          `Legacy migration skipped: ${result.skipped ?? 'transient-failure'}`,
-        );
-      }
-    } catch (err) {
-      this.host.log(
-        `Legacy IPNS migration threw: ${err instanceof Error ? err.message : String(err)}`,
-      );
     }
   }
 

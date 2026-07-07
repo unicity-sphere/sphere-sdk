@@ -30,7 +30,6 @@ import { logger as sdkLogger } from '../../core/logger';
 import { createIndexedDBStorageProvider, type IndexedDBStorageProviderConfig, createIndexedDBTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
-import { createBrowserIpfsStorageProvider } from './ipfs';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
@@ -51,7 +50,6 @@ import {
   resolveTransportConfig,
   resolveOracleConfig,
   resolvePriceConfig,
-  resolveArrayConfig,
   getNetworkConfig,
   resolveGroupChatConfig,
   resolveMarketConfig,
@@ -76,30 +74,6 @@ export type OracleConfig = BaseOracleConfig;
 // =============================================================================
 // Token Sync Backend Configurations
 // =============================================================================
-
-/**
- * IPFS sync backend configuration.
- *
- * @deprecated The IPNS-based mutable-pointer flow this config opts into
- * is superseded by the Profile token-storage path (OrbitDB + aggregator
- * pointer + IPFS CAR). See `createBrowserProfileProviders` and the
- * `IpfsStorageProvider` JSDoc. This config remains functional for
- * backward compatibility.
- */
-export interface IpfsSyncConfig {
-  /** Enable IPFS sync (default: false). @deprecated — see {@link IpfsSyncConfig}. */
-  enabled?: boolean;
-  /** Replace default gateways entirely */
-  gateways?: string[];
-  /** Add gateways to network defaults */
-  additionalGateways?: string[];
-  /** Replace default bootstrap peers */
-  bootstrapPeers?: string[];
-  /** Add bootstrap peers to defaults */
-  additionalBootstrapPeers?: string[];
-  /** Use browser DHT (Helia) vs HTTP-only mode */
-  useDht?: boolean;
-}
 
 /**
  * File sync backend configuration (future)
@@ -153,8 +127,6 @@ export interface MongoDbSyncConfig {
  * Token sync configuration - supports multiple backends
  */
 export interface TokenSyncConfig {
-  /** IPFS sync backend */
-  ipfs?: IpfsSyncConfig;
   /** File sync backend (future) */
   file?: FileSyncConfig;
   /** Cloud sync backend (future) */
@@ -200,14 +172,11 @@ export interface BrowserProviders {
   tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
-  /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
-  ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /**
    * UXF bundle-CAR publisher for the `uxf-cid` Nostr delivery branch
-   * (Issue #200 Phase 1 wiring). Built from the resolved IPFS gateway
-   * list when `tokenSync.ipfs.enabled` is true — same gateways used by
-   * the IPFS token-storage backend. Forward to `Sphere.init({...providers})`
-   * to enable production CID-by-reference token delivery.
+   * (Issue #200 Phase 1 wiring). Built from the default IPFS gateway
+   * list. Forward to `Sphere.init({...providers})` to enable production
+   * CID-by-reference token delivery.
    */
   publishToIpfs?: PublishToIpfsCallback;
   /**
@@ -230,12 +199,6 @@ export interface BrowserProviders {
    * use Sphere.addTokenStorageProvider() after initialization.
    */
   tokenSyncConfig?: {
-    ipfs?: {
-      enabled: boolean;
-      gateways: string[];
-      bootstrapPeers?: string[];
-      useDht?: boolean;
-    };
     file?: {
       enabled: boolean;
       directory?: string;
@@ -262,43 +225,15 @@ export interface BrowserProviders {
 // =============================================================================
 
 /**
- * Resolve IPFS sync configuration with extend/override pattern
- */
-function resolveIpfsSyncConfig(
-  network: NetworkType,
-  config?: IpfsSyncConfig
-): NonNullable<BrowserProviders['tokenSyncConfig']>['ipfs'] | undefined {
-  if (!config) return undefined;
-
-  const networkConfig = getNetworkConfig(network);
-  const gateways = resolveArrayConfig(
-    networkConfig.ipfsGateways,
-    config.gateways,
-    config.additionalGateways
-  );
-
-  return {
-    enabled: config.enabled ?? false,
-    gateways,
-    bootstrapPeers: config.bootstrapPeers ?? config.additionalBootstrapPeers,
-    useDht: config.useDht,
-  };
-}
-
-/**
  * Resolve all token sync backends
  */
 function resolveTokenSyncConfig(
-  network: NetworkType,
+  _network: NetworkType,
   config?: TokenSyncConfig
 ): BrowserProviders['tokenSyncConfig'] {
   if (!config) return undefined;
 
   const result: BrowserProviders['tokenSyncConfig'] = {};
-
-  // IPFS backend
-  const ipfs = resolveIpfsSyncConfig(network, config.ipfs);
-  if (ipfs) result.ipfs = ipfs;
 
   // File backend
   if (config.file) {
@@ -399,31 +334,20 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   const storage = createIndexedDBStorageProvider(config?.storage);
   const priceConfig = resolvePriceConfig(config?.price, storage);
 
-  // Create IPFS storage provider if enabled
-  const ipfsConfig = tokenSyncConfig?.ipfs;
-  const ipfsTokenStorage = ipfsConfig?.enabled
-    ? createBrowserIpfsStorageProvider({
-        gateways: ipfsConfig.gateways,
-        debug: config?.tokenSync?.ipfs?.useDht, // reuse debug-like flag
-      })
-    : undefined;
-
   // Issue #200 Phase 1 wiring — build the canonical UXF CAR publisher
-  // from the same gateway list when IPFS sync is enabled. Forwarded to
+  // from the network's default IPFS gateway list. Forwarded to
   // PaymentsModule via Sphere.init({...providers}) so the `uxf-cid`
-  // delivery branch becomes live in production. Reusing the gateway
-  // list keeps publish and storage targeting consistent.
+  // delivery branch becomes live in production.
   //
   // Issue #223 — surface the same gateway list as `cidFetchGateways`
   // so the recipient pipeline can stream-fetch incoming `uxf-cid`
   // bundles. Without this, every `uxf-cid` event is silently dropped
   // on receive.
-  const publishToIpfs: PublishToIpfsCallback | undefined = ipfsConfig?.enabled
-    ? createUxfCarPublisher(ipfsConfig.gateways)
-    : undefined;
-  const cidFetchGateways: ReadonlyArray<string> | undefined = ipfsConfig?.enabled
-    ? ipfsConfig.gateways
-    : undefined;
+  const _defaultGateways: string[] = [
+    ...(getNetworkConfig(network).ipfsGateways ?? []),
+  ];
+  const publishToIpfs: PublishToIpfsCallback = createUxfCarPublisher(_defaultGateways);
+  const cidFetchGateways: ReadonlyArray<string> = _defaultGateways;
 
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
@@ -458,7 +382,6 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
     }),
     tokenStorage: createIndexedDBTokenStorageProvider(),
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
-    ipfsTokenStorage,
     publishToIpfs,
     cidFetchGateways,
     tokenSyncConfig,

@@ -27,7 +27,6 @@ import { logger as sdkLogger } from '../../core/logger';
 import { createFileStorageProvider, createFileTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
-import { createNodeIpfsStorageProvider } from './ipfs';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
@@ -37,7 +36,6 @@ import { TokenRegistry } from '../../registry';
 import type { NetworkType } from '../../constants';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
 import type { MarketModuleConfig } from '../../modules/market';
-import type { IpfsStorageConfig } from '../shared/ipfs';
 import { createUxfCarPublisher } from '../../extensions/uxf/pipeline/ipfs-publisher';
 import type { PublishToIpfsCallback } from '../../extensions/uxf/pipeline/delivery-resolver';
 import { DEFAULT_IPFS_GATEWAYS } from '../../constants';
@@ -85,28 +83,6 @@ export type NodeOracleConfig = BaseOracleConfig & NodeOracleExtensions;
 // Node.js Providers Configuration
 // =============================================================================
 
-/**
- * Node.js IPFS sync configuration.
- *
- * @deprecated The IPNS-based mutable-pointer flow this config opts into
- * is superseded by the Profile token-storage path (OrbitDB + aggregator
- * pointer + IPFS CAR). See `createNodeProfileProviders` and the
- * `IpfsStorageProvider` JSDoc. This config remains functional for
- * backward compatibility.
- */
-export interface NodeIpfsSyncConfig {
-  /** Enable IPFS sync (default: false). @deprecated — see {@link NodeIpfsSyncConfig}. */
-  enabled?: boolean;
-  /** IPFS storage provider configuration */
-  config?: IpfsStorageConfig;
-}
-
-/** Node.js token sync configuration */
-export interface NodeTokenSyncConfig {
-  /** IPFS sync backend */
-  ipfs?: NodeIpfsSyncConfig;
-}
-
 export interface NodeProvidersConfig {
   /** Network preset: mainnet, testnet, or dev */
   network?: NetworkType;
@@ -124,8 +100,6 @@ export interface NodeProvidersConfig {
   oracle?: NodeOracleConfig;
   /** Price provider configuration (optional — enables fiat value display) */
   price?: BasePriceConfig;
-  /** Token sync backends configuration */
-  tokenSync?: NodeTokenSyncConfig;
   /** Group chat (NIP-29) configuration. true = enable with defaults, object = custom config */
   groupChat?: { enabled?: boolean; relays?: string[] } | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config */
@@ -139,14 +113,11 @@ export interface NodeProviders {
   oracle: OracleProvider;
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
-  /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
-  ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /**
    * UXF bundle-CAR publisher for the `uxf-cid` Nostr delivery branch
-   * (Issue #200 Phase 1 wiring). Built from the same IPFS gateway list
-   * used by `ipfsTokenStorage` when `tokenSync.ipfs.enabled` is true.
-   * Forward to `Sphere.init({...providers})` to enable production
-   * CID-by-reference token delivery.
+   * (Issue #200 Phase 1 wiring). Built from the default IPFS gateway
+   * list. Forward to `Sphere.init({...providers})` to enable
+   * production CID-by-reference token delivery.
    */
   publishToIpfs?: PublishToIpfsCallback;
   /**
@@ -270,30 +241,17 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   });
   const priceConfig = resolvePriceConfig(config?.price, storage);
 
-  // Create IPFS storage provider if enabled
-  const ipfsSync = config?.tokenSync?.ipfs;
-  const ipfsTokenStorage = ipfsSync?.enabled
-    ? createNodeIpfsStorageProvider(ipfsSync.config, storage)
-    : undefined;
-
   // Issue #200 Phase 1 wiring — build the canonical UXF CAR publisher
-  // from the same gateway list when IPFS sync is enabled. The Node
-  // IpfsStorageConfig only exposes a `gateways` field on the inner
-  // `config` block; fall back to DEFAULT_IPFS_GATEWAYS (which already
-  // honors the SPHERE_IPFS_GATEWAY env override) when unset.
+  // from the default gateway list (which already honors the
+  // SPHERE_IPFS_GATEWAY env override).
   //
   // Issue #223 — surface the same gateway list as `cidFetchGateways`
   // so the recipient pipeline can stream-fetch incoming `uxf-cid`
   // bundles. Without this, every `uxf-cid` event is silently dropped
   // on receive (see PaymentsModule.cidFetchGateways doc).
-  const resolvedIpfsGateways = ipfsSync?.enabled
-    ? ipfsSync.config?.gateways ?? [...DEFAULT_IPFS_GATEWAYS]
-    : undefined;
-  const publishToIpfs: PublishToIpfsCallback | undefined = resolvedIpfsGateways
-    ? createUxfCarPublisher(resolvedIpfsGateways)
-    : undefined;
-  const cidFetchGateways: ReadonlyArray<string> | undefined =
-    resolvedIpfsGateways;
+  const resolvedIpfsGateways: ReadonlyArray<string> = [...DEFAULT_IPFS_GATEWAYS];
+  const publishToIpfs: PublishToIpfsCallback = createUxfCarPublisher(resolvedIpfsGateways);
+  const cidFetchGateways: ReadonlyArray<string> = resolvedIpfsGateways;
 
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
@@ -329,7 +287,6 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
       network,
     }),
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
-    ipfsTokenStorage,
     publishToIpfs,
     cidFetchGateways,
   };
