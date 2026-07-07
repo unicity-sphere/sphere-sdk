@@ -62,6 +62,7 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
   // Wave 6-P2-8 splits — sphere-*.ts files carved out of Sphere.ts inherit
   // its extension crossings. Retire alongside `core/Sphere.ts` in Phase 7.
   'core/sphere-epoch.ts',
+  'core/sphere-nametag.ts',
   'core/sphere-nametag-sync.ts',
   'core/sphere-wallet-io.ts',
   'modules/payments/PaymentsModule.ts',
