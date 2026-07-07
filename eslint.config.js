@@ -108,7 +108,10 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
 // the sub-phase; the entry is deleted from this list when the file
 // stops importing `@unicitylabs/state-transition-sdk`.
 const STSDK_CORE_BURNDOWN = [
-  'core/Sphere.ts',
+  // Removed in wave 6-P2-4d: core/Sphere.ts now routes SigningService through
+  // the `token-engine/sdk` barrel and the DIRECT-address derivation through
+  // `token-engine.deriveDirectAddress` — no direct
+  // `@unicitylabs/state-transition-sdk` imports remain.
   // Removed in wave 6-P2-4b: modules/payments/PaymentsModule.ts now routes
   // ALL v2 SDK access through `ITokenEngine` — no direct
   // `@unicitylabs/state-transition-sdk` imports remain (v1 impl quarantined
