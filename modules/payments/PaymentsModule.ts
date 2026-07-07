@@ -37,16 +37,21 @@ import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool }
 import { NametagMinter, type MintNametagResult } from './NametagMinter';
 import * as nametagStore from './nametag/store';
 import { checkNametagAvailability } from './nametag/availability';
+import * as paymentRequestIncoming from './payment-request/incoming';
+import * as paymentRequestOutgoing from './payment-request/outgoing';
+import {
+  subscribeToTransportPaymentRequests,
+  type IncomingRequestHost,
+  type OutgoingRequestHost,
+  type PendingResponseResolver,
+  type SendPaymentRequestHost,
+} from './payment-request';
 import { CidRefStore, type CidRef } from '../../extensions/uxf/profile/cid-ref-store';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../storage';
 import type {
   TransportProvider,
   PeerInfo,
   IncomingTokenTransfer,
-  PaymentRequestPayload,
-  PaymentRequestResponsePayload,
-  IncomingPaymentRequest as TransportPaymentRequest,
-  IncomingPaymentRequestResponse as TransportPaymentRequestResponse,
 } from '../../transport';
 import { DEFAULT_ASSET_KINDS_WHEN_ABSENT } from '../../transport/transport-provider';
 import type { OracleProvider } from '../../oracle';
@@ -1290,11 +1295,7 @@ export class PaymentsModule {
   // Payment Requests State (Outgoing)
   private outgoingPaymentRequests: Map<string, OutgoingPaymentRequest> = new Map();
   private paymentRequestResponseHandlers: Set<PaymentRequestResponseHandler> = new Set();
-  private pendingResponseResolvers: Map<string, {
-    resolve: (response: PaymentRequestResponse) => void;
-    reject: (error: Error) => void;
-    timeout: ReturnType<typeof setTimeout>;
-  }> = new Map();
+  private pendingResponseResolvers: Map<string, PendingResponseResolver> = new Map();
 
   // Subscriptions
   private unsubscribeTransfers: (() => void) | null = null;
@@ -1689,19 +1690,20 @@ export class PaymentsModule {
       this.handleIncomingTransfer(transfer)
     );
 
-    // Subscribe to incoming payment requests (if supported)
-    if (deps.transport.onPaymentRequest) {
-      this.unsubscribePaymentRequests = deps.transport.onPaymentRequest((request) => {
-        this.handleIncomingPaymentRequest(request);
-      });
-    }
-
-    // Subscribe to payment request responses (if supported)
-    if (deps.transport.onPaymentRequestResponse) {
-      this.unsubscribePaymentRequestResponses = deps.transport.onPaymentRequestResponse((response) => {
-        this.handlePaymentRequestResponse(response);
-      });
-    }
+    // Subscribe to transport payment-request events (both are optional on
+    // the transport surface — helper preserves the null-slot contract).
+    const paymentRequestSubs = subscribeToTransportPaymentRequests(
+      deps.transport,
+      (request) =>
+        paymentRequestIncoming.handleIncomingPaymentRequest(
+          this.getIncomingRequestHost(),
+          request,
+        ),
+      (response) =>
+        paymentRequestOutgoing.handleResponse(this.getOutgoingRequestHost(), response),
+    );
+    this.unsubscribePaymentRequests = paymentRequestSubs.unsubscribeRequests;
+    this.unsubscribePaymentRequestResponses = paymentRequestSubs.unsubscribeResponses;
 
     // Subscribe to storage provider events (push-based sync)
     this.subscribeToStorageEvents();
@@ -7296,7 +7298,43 @@ export class PaymentsModule {
 
   // ===========================================================================
   // Public API - Payment Requests
+  //
+  // The bodies of these methods live in `./payment-request/{incoming,outgoing,
+  // init-subscription,types}.ts`. The facade retains public signatures + owns
+  // the underlying state (`paymentRequests`, `outgoingPaymentRequests`,
+  // handler sets, resolver map, unsubscribe slots) and delegates the logic
+  // via `getIncomingRequestHost()` / `getOutgoingRequestHost()` shim
+  // factories below. See uxfv2-phase-5-payments-disposition.md
+  // §"Payment requests" for the full method-to-file routing.
   // ===========================================================================
+
+  /**
+   * Build the incoming-side host shim for the current facade state. Cheap
+   * (bundles references, no allocations of the underlying stores) so it's
+   * safe to call per-invocation.
+   */
+  private getIncomingRequestHost(): IncomingRequestHost {
+    return {
+      requests: this.paymentRequests,
+      handlers: this.paymentRequestHandlers,
+      emitEvent: this.deps?.emitEvent,
+      transport: this.deps?.transport,
+    };
+  }
+
+  /**
+   * Build the outgoing-side host shim for the current facade state. Cheap
+   * (bundles references, no allocations of the underlying stores) so it's
+   * safe to call per-invocation.
+   */
+  private getOutgoingRequestHost(): OutgoingRequestHost {
+    return {
+      requests: this.outgoingPaymentRequests,
+      handlers: this.paymentRequestResponseHandlers,
+      resolvers: this.pendingResponseResolvers,
+      emitEvent: this.deps?.emitEvent,
+    };
+  }
 
   /**
    * Send a payment request to someone
@@ -7317,55 +7355,17 @@ export class PaymentsModule {
       };
     }
 
-    try {
-      // Resolve recipient
-      const peerInfo = await this.deps!.transport.resolve?.(recipientPubkeyOrNametag) ?? null;
-      const recipientPubkey = this.resolveTransportPubkey(recipientPubkeyOrNametag, peerInfo);
-
-      // Build payload
-      const payload: PaymentRequestPayload = {
-        amount: request.amount,
-        coinId: request.coinId,
-        message: request.message,
-        recipientNametag: request.recipientNametag,
-        metadata: request.metadata,
-      };
-
-      // Send via transport
-      const eventId = await this.deps!.transport.sendPaymentRequest(recipientPubkey, payload);
-      const requestId = crypto.randomUUID();
-
-      // Track outgoing request
-      const outgoingRequest: OutgoingPaymentRequest = {
-        id: requestId,
-        eventId,
-        recipientPubkey,
-        recipientNametag: recipientPubkeyOrNametag.startsWith('@')
-          ? recipientPubkeyOrNametag.slice(1)
-          : undefined,
-        amount: request.amount,
-        coinId: request.coinId,
-        message: request.message,
-        createdAt: Date.now(),
-        status: 'pending',
-      };
-      this.outgoingPaymentRequests.set(requestId, outgoingRequest);
-
-      logger.debug('Payments', `Payment request sent: ${eventId}`);
-
-      return {
-        success: true,
-        requestId,
-        eventId,
-      };
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      logger.debug('Payments', `Failed to send payment request: ${errorMsg}`);
-      return {
-        success: false,
-        error: errorMsg,
-      };
-    }
+    const host: SendPaymentRequestHost = {
+      transport: this.deps!.transport,
+      resolveTransportPubkey: (recipient, peerInfo) =>
+        this.resolveTransportPubkey(recipient, peerInfo ?? null),
+    };
+    return paymentRequestOutgoing.sendPaymentRequestImpl(
+      host,
+      this.outgoingPaymentRequests,
+      recipientPubkeyOrNametag,
+      request,
+    );
   }
 
   /**
@@ -7374,8 +7374,10 @@ export class PaymentsModule {
    * @returns Unsubscribe function
    */
   onPaymentRequest(handler: PaymentRequestHandler): () => void {
-    this.paymentRequestHandlers.add(handler);
-    return () => this.paymentRequestHandlers.delete(handler);
+    return paymentRequestIncoming.registerIncomingHandler(
+      this.paymentRequestHandlers,
+      handler,
+    );
   }
 
   /**
@@ -7383,10 +7385,7 @@ export class PaymentsModule {
    * @param filter - Optional status filter
    */
   getPaymentRequests(filter?: { status?: PaymentRequestStatus }): IncomingPaymentRequest[] {
-    if (filter?.status) {
-      return this.paymentRequests.filter((r) => r.status === filter.status);
-    }
-    return [...this.paymentRequests];
+    return paymentRequestIncoming.listIncomingRequests(this.paymentRequests, filter);
   }
 
   /**
@@ -7395,7 +7394,7 @@ export class PaymentsModule {
    * @returns Number of pending incoming payment requests.
    */
   getPendingPaymentRequestsCount(): number {
-    return this.paymentRequests.filter((r) => r.status === 'pending').length;
+    return paymentRequestIncoming.countPendingIncomingRequests(this.paymentRequests);
   }
 
   /**
@@ -7407,8 +7406,7 @@ export class PaymentsModule {
    * @param requestId - ID of the incoming payment request to accept.
    */
   async acceptPaymentRequest(requestId: string): Promise<void> {
-    this.updatePaymentRequestStatus(requestId, 'accepted');
-    await this.sendPaymentRequestResponse(requestId, 'accepted');
+    await paymentRequestIncoming.acceptRequest(this.getIncomingRequestHost(), requestId);
   }
 
   /**
@@ -7417,8 +7415,7 @@ export class PaymentsModule {
    * @param requestId - ID of the incoming payment request to reject.
    */
   async rejectPaymentRequest(requestId: string): Promise<void> {
-    this.updatePaymentRequestStatus(requestId, 'rejected');
-    await this.sendPaymentRequestResponse(requestId, 'rejected');
+    await paymentRequestIncoming.rejectRequest(this.getIncomingRequestHost(), requestId);
   }
 
   /**
@@ -7430,7 +7427,12 @@ export class PaymentsModule {
    * @param requestId - ID of the incoming payment request to mark as paid.
    */
   markPaymentRequestPaid(requestId: string): void {
-    this.updatePaymentRequestStatus(requestId, 'paid');
+    paymentRequestIncoming.updateRequestStatus(
+      this.paymentRequests,
+      requestId,
+      'paid',
+      this.deps?.emitEvent,
+    );
   }
 
   /**
@@ -7439,7 +7441,9 @@ export class PaymentsModule {
    * Keeps only requests with status `'pending'`.
    */
   clearProcessedPaymentRequests(): void {
-    this.paymentRequests = this.paymentRequests.filter((r) => r.status === 'pending');
+    this.paymentRequests = paymentRequestIncoming.filterProcessedIncomingRequests(
+      this.paymentRequests,
+    );
   }
 
   /**
@@ -7448,7 +7452,10 @@ export class PaymentsModule {
    * @param requestId - ID of the payment request to remove.
    */
   removePaymentRequest(requestId: string): void {
-    this.paymentRequests = this.paymentRequests.filter((r) => r.id !== requestId);
+    this.paymentRequests = paymentRequestIncoming.removeIncomingRequestById(
+      this.paymentRequests,
+      requestId,
+    );
   }
 
   /**
@@ -7456,105 +7463,12 @@ export class PaymentsModule {
    * Convenience method that accepts, sends, and marks as paid
    */
   async payPaymentRequest(requestId: string, memo?: string): Promise<TransferResult> {
-    const request = this.paymentRequests.find((r) => r.id === requestId);
-    if (!request) {
-      throw new SphereError(`Payment request not found: ${requestId}`, 'VALIDATION_ERROR');
-    }
-
-    if (request.status !== 'pending' && request.status !== 'accepted') {
-      throw new SphereError(`Payment request is not pending or accepted: ${request.status}`, 'VALIDATION_ERROR');
-    }
-
-    // Mark as accepted (don't send response yet, wait for payment)
-    this.updatePaymentRequestStatus(requestId, 'accepted');
-
-    try {
-      // Send the payment
-      // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site
-      // migration). This recursive call into `this.send()` is the
-      // PaymentsModule-internal recursion site listed in the T.7.C task spec
-      // (along with the AccountingModule + CLI sites). The outer
-      // `payPaymentRequest()` API does not currently expose a transferMode knob
-      // to callers, so the wire shape is fixed at `'instant'` (the default for
-      // unflagged production today). If `payPaymentRequest()` ever gains a
-      // mode parameter, plumb it through here.
-      const result = await this.send({
-        coinId: request.coinId,
-        amount: request.amount,
-        recipient: request.senderPubkey,
-        memo: memo || request.message,
-        transferMode: 'instant',
-      });
-
-      // Mark as paid and send response with transfer ID
-      this.updatePaymentRequestStatus(requestId, 'paid');
-      await this.sendPaymentRequestResponse(requestId, 'paid', result.id);
-
-      return result;
-    } catch (error) {
-      // Revert to pending on failure
-      this.updatePaymentRequestStatus(requestId, 'pending');
-      throw error;
-    }
-  }
-
-  private updatePaymentRequestStatus(requestId: string, status: PaymentRequestStatus): void {
-    const request = this.paymentRequests.find((r) => r.id === requestId);
-    if (request) {
-      request.status = status;
-
-      // Emit event
-      const eventType = `payment_request:${status}` as const;
-      if (eventType === 'payment_request:accepted' ||
-          eventType === 'payment_request:rejected' ||
-          eventType === 'payment_request:paid') {
-        this.deps?.emitEvent(eventType, request);
-      }
-    }
-  }
-
-  private handleIncomingPaymentRequest(transportRequest: TransportPaymentRequest): void {
-    // Check for duplicates
-    if (this.paymentRequests.find((r) => r.id === transportRequest.id)) {
-      return;
-    }
-
-    // Convert transport request to IncomingPaymentRequest
-    const coinId = transportRequest.request.coinId;
-    const registry = TokenRegistry.getInstance();
-    const coinDef = registry.getDefinition(coinId);
-
-    const request: IncomingPaymentRequest = {
-      id: transportRequest.id,
-      senderPubkey: transportRequest.senderTransportPubkey,
-      senderNametag: transportRequest.senderNametag,
-      amount: transportRequest.request.amount,
-      coinId,
-      symbol: coinDef?.symbol || coinId.slice(0, 8),
-      message: transportRequest.request.message,
-      recipientNametag: transportRequest.request.recipientNametag,
-      requestId: transportRequest.request.requestId,
-      timestamp: transportRequest.timestamp,
-      status: 'pending',
-      metadata: transportRequest.request.metadata,
-    };
-
-    // Add to list (newest first)
-    this.paymentRequests.unshift(request);
-
-    // Emit event
-    this.deps?.emitEvent('payment_request:incoming', request);
-
-    // Notify handlers
-    for (const handler of this.paymentRequestHandlers) {
-      try {
-        handler(request);
-      } catch (error) {
-        logger.debug('Payments', 'Payment request handler error:', error);
-      }
-    }
-
-    logger.debug('Payments', `Incoming payment request: ${request.id} for ${request.amount} ${request.symbol}`);
+    return paymentRequestIncoming.payRequest(
+      this.getIncomingRequestHost(),
+      requestId,
+      memo,
+      (req) => this.send(req),
+    );
   }
 
   // ===========================================================================
@@ -7566,11 +7480,7 @@ export class PaymentsModule {
    * @param filter - Optional status filter
    */
   getOutgoingPaymentRequests(filter?: { status?: PaymentRequestStatus }): OutgoingPaymentRequest[] {
-    const requests = Array.from(this.outgoingPaymentRequests.values());
-    if (filter?.status) {
-      return requests.filter((r) => r.status === filter.status);
-    }
-    return requests;
+    return paymentRequestOutgoing.listOutgoingRequests(this.outgoingPaymentRequests, filter);
   }
 
   /**
@@ -7579,8 +7489,10 @@ export class PaymentsModule {
    * @returns Unsubscribe function
    */
   onPaymentRequestResponse(handler: PaymentRequestResponseHandler): () => void {
-    this.paymentRequestResponseHandlers.add(handler);
-    return () => this.paymentRequestResponseHandlers.delete(handler);
+    return paymentRequestOutgoing.registerResponseHandler(
+      this.paymentRequestResponseHandlers,
+      handler,
+    );
   }
 
   /**
@@ -7590,30 +7502,11 @@ export class PaymentsModule {
    * @returns Promise that resolves with the response or rejects on timeout
    */
   waitForPaymentResponse(requestId: string, timeoutMs: number = 60000): Promise<PaymentRequestResponse> {
-    const outgoing = this.outgoingPaymentRequests.get(requestId);
-    if (!outgoing) {
-      return Promise.reject(new Error(`Outgoing payment request not found: ${requestId}`));
-    }
-
-    // If already has a response, return it
-    if (outgoing.response) {
-      return Promise.resolve(outgoing.response);
-    }
-
-    // Create a promise that resolves when response arrives or times out
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.pendingResponseResolvers.delete(requestId);
-        // Update status to expired
-        const request = this.outgoingPaymentRequests.get(requestId);
-        if (request && request.status === 'pending') {
-          request.status = 'expired';
-        }
-        reject(new Error(`Payment request response timeout: ${requestId}`));
-      }, timeoutMs);
-
-      this.pendingResponseResolvers.set(requestId, { resolve, reject, timeout });
-    });
+    return paymentRequestOutgoing.waitForResponse(
+      this.getOutgoingRequestHost(),
+      requestId,
+      timeoutMs,
+    );
   }
 
   /**
@@ -7624,12 +7517,7 @@ export class PaymentsModule {
    * @param requestId - The outgoing request ID whose wait should be cancelled.
    */
   cancelWaitForPaymentResponse(requestId: string): void {
-    const resolver = this.pendingResponseResolvers.get(requestId);
-    if (resolver) {
-      clearTimeout(resolver.timeout);
-      resolver.reject(new Error('Cancelled'));
-      this.pendingResponseResolvers.delete(requestId);
-    }
+    paymentRequestOutgoing.cancelWaitForResponse(this.pendingResponseResolvers, requestId);
   }
 
   /**
@@ -7638,106 +7526,14 @@ export class PaymentsModule {
    * @param requestId - ID of the outgoing request to remove.
    */
   removeOutgoingPaymentRequest(requestId: string): void {
-    this.outgoingPaymentRequests.delete(requestId);
-    this.cancelWaitForPaymentResponse(requestId);
+    paymentRequestOutgoing.removeOutgoingRequest(this.getOutgoingRequestHost(), requestId);
   }
 
   /**
    * Remove all outgoing payment requests that are `'paid'`, `'rejected'`, or `'expired'`.
    */
   clearCompletedOutgoingPaymentRequests(): void {
-    for (const [id, request] of this.outgoingPaymentRequests) {
-      if (request.status === 'paid' || request.status === 'rejected' || request.status === 'expired') {
-        this.outgoingPaymentRequests.delete(id);
-      }
-    }
-  }
-
-  private handlePaymentRequestResponse(transportResponse: TransportPaymentRequestResponse): void {
-    // Find the outgoing request by matching requestId
-    let outgoingRequest: OutgoingPaymentRequest | undefined;
-    let outgoingRequestId: string | undefined;
-
-    for (const [id, request] of this.outgoingPaymentRequests) {
-      // Match by eventId or requestId from the response
-      if (request.eventId === transportResponse.response.requestId ||
-          request.id === transportResponse.response.requestId) {
-        outgoingRequest = request;
-        outgoingRequestId = id;
-        break;
-      }
-    }
-
-    // Convert transport response to PaymentRequestResponse
-    const response: PaymentRequestResponse = {
-      id: transportResponse.id,
-      responderPubkey: transportResponse.responderTransportPubkey,
-      requestId: transportResponse.response.requestId,
-      responseType: transportResponse.response.responseType,
-      message: transportResponse.response.message,
-      transferId: transportResponse.response.transferId,
-      timestamp: transportResponse.timestamp,
-    };
-
-    // Update outgoing request if found
-    if (outgoingRequest && outgoingRequestId) {
-      outgoingRequest.status = response.responseType === 'paid' ? 'paid' :
-                               response.responseType === 'accepted' ? 'accepted' :
-                               'rejected';
-      outgoingRequest.response = response;
-
-      // Resolve pending promise if any
-      const resolver = this.pendingResponseResolvers.get(outgoingRequestId);
-      if (resolver) {
-        clearTimeout(resolver.timeout);
-        resolver.resolve(response);
-        this.pendingResponseResolvers.delete(outgoingRequestId);
-      }
-    }
-
-    // Emit event
-    this.deps?.emitEvent('payment_request:response', response);
-
-    // Notify handlers
-    for (const handler of this.paymentRequestResponseHandlers) {
-      try {
-        handler(response);
-      } catch (error) {
-        logger.debug('Payments', 'Payment request response handler error:', error);
-      }
-    }
-
-    logger.debug('Payments', `Received payment request response: ${response.id} type: ${response.responseType}`);
-  }
-
-  /**
-   * Send a response to a payment request (used internally by accept/reject/pay methods)
-   */
-  private async sendPaymentRequestResponse(
-    requestId: string,
-    responseType: 'accepted' | 'rejected' | 'paid',
-    transferId?: string
-  ): Promise<void> {
-    const request = this.paymentRequests.find((r) => r.id === requestId);
-    if (!request) return;
-
-    if (!this.deps?.transport.sendPaymentRequestResponse) {
-      logger.debug('Payments', 'Transport does not support sendPaymentRequestResponse');
-      return;
-    }
-
-    try {
-      const payload: PaymentRequestResponsePayload = {
-        requestId: request.requestId, // Original request ID from sender
-        responseType,
-        transferId,
-      };
-
-      await this.deps.transport.sendPaymentRequestResponse(request.senderPubkey, payload);
-      logger.debug('Payments', `Sent payment request response: ${responseType} for ${requestId}`);
-    } catch (error) {
-      logger.debug('Payments', 'Failed to send payment request response:', error);
-    }
+    paymentRequestOutgoing.clearCompletedOutgoingRequests(this.outgoingPaymentRequests);
   }
 
   // ===========================================================================
