@@ -37,7 +37,8 @@
     "registry/**/*.ts",
     "uxf/**/*.ts",
     "profile/**/*.ts",
-    "tools/**/*.ts"
+    "tools/**/*.ts",
+    "lib/**/*.ts"
   ],
   "exclude": [
     "node_modules",

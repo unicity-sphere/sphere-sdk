@@ -46,6 +46,7 @@ const CORE_GLOBS = [
   'connect/**/*.ts',
   'index.ts',
   'tools/**/*.ts',
+  'lib/**/*.ts',
 ];
 
 // Pre-existing core→extensions crossings — TEMPORARY allowlist.
