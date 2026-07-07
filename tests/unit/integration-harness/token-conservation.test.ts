@@ -16,7 +16,7 @@ import {
   diffSnapshots,
   TokenConservationViolation,
   type ConservationToken,
-} from '../../integration/pointer/token-conservation';
+} from '../../legacy-v1/integration/pointer/token-conservation';
 
 // ---------------------------------------------------------------------------
 // Helpers
