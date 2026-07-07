@@ -66,7 +66,7 @@ import type {
   PaymentRequestResponse,
   PaymentRequestResponseHandler,
 } from '../../types';
-import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX } from '../../constants';
+import { STORAGE_KEYS_ADDRESS } from '../../constants';
 import {
   tokenToTxf,
   txfToToken,
@@ -240,10 +240,7 @@ import {
   type OrphanSweepResult,
   type OrphanSpendingFinding,
 } from '../../extensions/uxf/pipeline/orphan-spending-sweeper';
-import {
-  resolveSenderInfoViaBinding,
-  type ReresolvedNametagSource,
-} from '../../extensions/uxf/pipeline/nametag-reresolver';
+import type { ReresolvedNametagSource } from '../../extensions/uxf/pipeline/nametag-reresolver';
 
 /**
  * Narrow guard for the UXF v1.0 wire shapes accepted by the
@@ -316,12 +313,41 @@ import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/Ro
 // =============================================================================
 // Transaction History Entry
 // =============================================================================
+//
+// `TransactionHistoryEntry` + `computeHistoryDedupKey` +
+// `MAX_SYNCED_HISTORY_ENTRIES` were extracted to `./read-model/history.ts`
+// during Phase 5. Re-exported here so external consumers
+// (`import { TransactionHistoryEntry } from '@unicitylabs/sphere-sdk'`)
+// keep working unchanged.
 
-/**
- * Public history entry type — re-exported from the shared storage layer.
- * Single source of truth: {@link HistoryRecord} in `storage/storage-provider.ts`.
- */
-export type TransactionHistoryEntry = import('../../storage').HistoryRecord;
+export type { TransactionHistoryEntry } from './read-model';
+
+// Runtime imports for the class-body delegations below.
+import {
+  MAX_SYNCED_HISTORY_ENTRIES,
+  getHistoryDescending,
+  resolveSenderInfo as resolveSenderInfoImpl,
+  addHistoryEntry as addHistoryEntryImpl,
+  loadHistoryEntries as loadHistoryEntriesImpl,
+  importRemoteHistoryEntriesInto,
+  aggregateTokens as aggregateTokensImpl,
+  getBalance as getBalanceImpl,
+  getAssets as getAssetsImpl,
+  getFiatBalance as getFiatBalanceImpl,
+  getTokens as getTokensImpl,
+  getToken as getTokenImpl,
+} from './read-model';
+
+// Local type alias so the class body can reference `TransactionHistoryEntry`
+// by name. `export type { ... } from` does not create a local binding.
+import type {
+  TransactionHistoryEntry,
+  AssetsHost,
+  TokensViewHost,
+  AddHistoryEntryHost,
+  LoadHistoryHost,
+  ImportRemoteHistoryEntriesHost,
+} from './read-model';
 
 // =============================================================================
 // importTokens result types
@@ -347,38 +373,6 @@ export type {
 // without a separate `import type` block. Kept as `import type` to
 // stay type-only at runtime.
 import type { ImportTokensResult } from './import-export';
-
-/**
- * Compute a dedup key for a history entry.
- * - SENT + transferId + coinId → one entry per coin per transfer (#149 multi-coin follow-up)
- * - SENT + transferId         → one entry per transfer (legacy / single-coin / coinId unknown)
- * - type + tokenId → one entry per token per direction
- * - fallback → UUID (no dedup possible)
- *
- * The coinId discriminator was added so multi-coin UXF sends produce one
- * SENT row per coin instead of clobbering all but the primary. Existing
- * single-coin entries in storage keep their legacy dedupKey; new entries
- * (post-fix) include the coinId suffix. The two formats are orthogonal
- * — they never collide for the same logical transfer because the
- * transferId is a fresh UUID per send.
- */
-function computeHistoryDedupKey(
-  type: string,
-  tokenId?: string,
-  transferId?: string,
-  coinId?: string,
-): string {
-  if (type === 'SENT' && transferId) {
-    return coinId
-      ? `${type}_transfer_${transferId}_${coinId}`
-      : `${type}_transfer_${transferId}`;
-  }
-  if (tokenId) return `${type}_${tokenId}`;
-  return `${type}_${crypto.randomUUID()}`;
-}
-
-/** Maximum number of history entries to include in IPFS-synced TXF data */
-const MAX_SYNCED_HISTORY_ENTRIES = 5000;
 
 // =============================================================================
 // Receive Options & Result
@@ -7804,25 +7798,12 @@ export class PaymentsModule {
   /**
    * Get total portfolio value in USD.
    * Returns null if PriceProvider is not configured.
+   *
+   * Delegates to `read-model/assets.ts` (see the Phase 5 disposition
+   * ledger). Behavior preserved verbatim.
    */
   async getFiatBalance(): Promise<number | null> {
-    const assets = await this.getAssets();
-
-    if (!this.priceProvider || this.isPriceDisabled()) {
-      return null;
-    }
-
-    let total = 0;
-    let hasAnyPrice = false;
-
-    for (const asset of assets) {
-      if (asset.fiatValueUsd != null) {
-        total += asset.fiatValueUsd;
-        hasAnyPrice = true;
-      }
-    }
-
-    return hasAnyPrice ? total : null;
+    return getFiatBalanceImpl(this.assetsHost());
   }
 
   /**
@@ -7835,212 +7816,60 @@ export class PaymentsModule {
    * This is synchronous — no price data is included. Use {@link getAssets}
    * for the async version with fiat pricing.
    *
+   * Delegates to `read-model/assets.ts` (see the Phase 5 disposition
+   * ledger). Behavior preserved verbatim.
+   *
    * @param coinId - Optional coin ID to filter by (e.g. hex string). When omitted, all coin types are returned.
    * @returns Array of balance summaries (synchronous — no await needed).
    */
   getBalance(coinId?: string): Asset[] {
-    return this.aggregateTokens(coinId);
+    return getBalanceImpl(this.assetsHost(), coinId);
   }
 
   /**
    * Get aggregated assets (tokens grouped by coinId) with price data.
    * Includes both confirmed and unconfirmed tokens with breakdown.
+   *
+   * Delegates to `read-model/assets.ts` (see the Phase 5 disposition
+   * ledger). Behavior preserved verbatim.
    */
   async getAssets(coinId?: string): Promise<Asset[]> {
-    const rawAssets = this.aggregateTokens(coinId);
-
-    // Fetch prices if provider is available
-    if (!this.priceProvider || this.isPriceDisabled() || rawAssets.length === 0) {
-      return rawAssets;
-    }
-
-    try {
-      const registry = TokenRegistry.getInstance();
-      const nameToCoins = new Map<string, string[]>(); // tokenName -> coinIds[]
-
-      for (const asset of rawAssets) {
-        const def = registry.getDefinition(asset.coinId);
-        if (def?.name) {
-          const existing = nameToCoins.get(def.name);
-          if (existing) {
-            existing.push(asset.coinId);
-          } else {
-            nameToCoins.set(def.name, [asset.coinId]);
-          }
-        }
-      }
-
-      if (nameToCoins.size > 0) {
-        const tokenNames = Array.from(nameToCoins.keys());
-        const prices = await this.priceProvider.getPrices(tokenNames);
-
-        return rawAssets.map((raw) => {
-          const def = registry.getDefinition(raw.coinId);
-          const price = def?.name ? prices.get(def.name) : undefined;
-          let fiatValueUsd: number | null = null;
-          let fiatValueEur: number | null = null;
-
-          if (price) {
-            const humanAmount = Number(raw.totalAmount) / Math.pow(10, raw.decimals);
-            fiatValueUsd = humanAmount * price.priceUsd;
-            if (price.priceEur != null) {
-              fiatValueEur = humanAmount * price.priceEur;
-            }
-          }
-
-          return {
-            ...raw,
-            priceUsd: price?.priceUsd ?? null,
-            priceEur: price?.priceEur ?? null,
-            change24h: price?.change24h ?? null,
-            fiatValueUsd,
-            fiatValueEur,
-          };
-        });
-      }
-    } catch (error) {
-      logger.warn('Payments', 'Failed to fetch prices, returning assets without price data:', error);
-    }
-
-    return rawAssets;
+    return getAssetsImpl(this.assetsHost(), coinId);
   }
 
   /**
    * Aggregate tokens by coinId with confirmed/unconfirmed breakdown.
    *
-   * Excludes:
-   *   - tokens with status `'spent'` or `'invalid'`;
-   *   - invoice tokens (`coinId === INVOICE_TOKEN_TYPE_HEX`) — they carry
-   *     no monetary value and only exist as ledger anchors; surfacing them
-   *     produced the phantom `: 0 (1 token)` entry in #282 on the
-   *     IPFS-recovery side, where `txfToToken` had no invoice branch and
-   *     left coinId/symbol empty;
-   *   - defensive: any residual token with empty `coinId` (catch-all for
-   *     future shapes that slip past `txfToToken`'s typed branches).
-   *
-   * Tokens with status `'transferring'` are counted as unconfirmed
-   * (visible in UI as "Sending").
-   *
-   * The returned array is sorted deterministically by symbol (ASCII
-   * case-insensitive) with coinId as the tie-breaker. Without this sort,
-   * multi-device wallets render the same asset set in different orders
-   * because the underlying `this.tokens` Map iterates in insertion order
-   * — which depends on snapshot replay sequence (#282 Residual #1).
+   * Retained as a private facade method for backwards compatibility with
+   * any internal call sites; the implementation lives in
+   * `read-model/assets.ts`.
    */
   private aggregateTokens(coinId?: string): Asset[] {
-    const assetsMap = new Map<string, {
-      coinId: string;
-      symbol: string;
-      name: string;
-      decimals: number;
-      iconUrl?: string;
-      confirmedAmount: bigint;
-      unconfirmedAmount: bigint;
-      confirmedTokenCount: number;
-      unconfirmedTokenCount: number;
-      transferringTokenCount: number;
-    }>();
+    return aggregateTokensImpl(this.assetsHost(), coinId);
+  }
 
-    for (const token of this.tokens.values()) {
-      // Skip spent and invalid tokens; transferring tokens remain visible
-      if (token.status === 'spent' || token.status === 'invalid') continue;
-      // Issue #387 — defense in depth: any token whose tokenId carries
-      // a permanent V6-RECOVER verdict is unspendable by this wallet
-      // (HD-index recovery exhausted / structural failure). Even if a
-      // TXF round-trip stripped its `'invalid'` status, the persistent
-      // ledger is the authoritative verdict source and must be honored
-      // here so balance NEVER includes unspendable tokens. The
-      // `applyV6RecoverPermanentInvalidStatus` patch from
-      // `loadFromStorageData` makes this filter normally redundant —
-      // belt-and-braces against any future caller mutating status
-      // independently or any code path that bypasses load (e.g. a
-      // direct `tokens.set()` in tests).
-      if (this.isV6RecoverPermanentToken(token)) continue;
-      // Issue #282 Residual #3 — skip invoice tokens and any residual
-      // empty-coinId entries. Invoices carry zero amount and have no
-      // place in a balance summary; an empty coinId is a defensive
-      // catch-all for token shapes that fall through `txfToToken`'s
-      // typed branches.
-      if (token.coinId === INVOICE_TOKEN_TYPE_HEX) continue;
-      if (token.coinId === '') continue;
-      if (coinId && token.coinId !== coinId) continue;
-
-      const key = token.coinId;
-      const amount = BigInt(token.amount);
-      const isConfirmed = token.status === 'confirmed';
-      const isTransferring = token.status === 'transferring';
-      const existing = assetsMap.get(key);
-
-      if (existing) {
-        if (isConfirmed) {
-          existing.confirmedAmount += amount;
-          existing.confirmedTokenCount++;
-        } else {
-          existing.unconfirmedAmount += amount;
-          existing.unconfirmedTokenCount++;
-        }
-        if (isTransferring) existing.transferringTokenCount++;
-      } else {
-        assetsMap.set(key, {
-          coinId: token.coinId,
-          symbol: token.symbol,
-          name: token.name,
-          decimals: token.decimals,
-          iconUrl: token.iconUrl,
-          confirmedAmount: isConfirmed ? amount : 0n,
-          unconfirmedAmount: isConfirmed ? 0n : amount,
-          confirmedTokenCount: isConfirmed ? 1 : 0,
-          unconfirmedTokenCount: isConfirmed ? 0 : 1,
-          transferringTokenCount: isTransferring ? 1 : 0,
-        });
-      }
-    }
-
-    const assets = Array.from(assetsMap.values()).map((raw) => {
-      const totalAmount = (raw.confirmedAmount + raw.unconfirmedAmount).toString();
-      return {
-        coinId: raw.coinId,
-        symbol: raw.symbol,
-        name: raw.name,
-        decimals: raw.decimals,
-        iconUrl: raw.iconUrl,
-        totalAmount,
-        tokenCount: raw.confirmedTokenCount + raw.unconfirmedTokenCount,
-        confirmedAmount: raw.confirmedAmount.toString(),
-        unconfirmedAmount: raw.unconfirmedAmount.toString(),
-        confirmedTokenCount: raw.confirmedTokenCount,
-        unconfirmedTokenCount: raw.unconfirmedTokenCount,
-        transferringTokenCount: raw.transferringTokenCount,
-        priceUsd: null as number | null,
-        priceEur: null as number | null,
-        change24h: null as number | null,
-        fiatValueUsd: null as number | null,
-        fiatValueEur: null as number | null,
-      };
-    });
-
-    // Issue #282 Residual #1 — deterministic asset order. Identical
-    // wallets on two devices MUST render the same `sphere balance` output
-    // regardless of token-insertion sequence.
-    assets.sort((a, b) => {
-      const sa = (a.symbol ?? '').toLocaleLowerCase('en-US');
-      const sb = (b.symbol ?? '').toLocaleLowerCase('en-US');
-      if (sa < sb) return -1;
-      if (sa > sb) return 1;
-      // Tie-break on coinId for cases where two assets share the same
-      // symbol (rare — registry-aliased coins, malformed metadata, etc.).
-      const ca = a.coinId ?? '';
-      const cb = b.coinId ?? '';
-      if (ca < cb) return -1;
-      if (ca > cb) return 1;
-      return 0;
-    });
-
-    return assets;
+  /**
+   * Build the {@link AssetsHost} shim over facade state. Cheap object
+   * literal — one allocation per read call. All fields / helpers are
+   * read-only from the read-model's perspective.
+   */
+  private assetsHost(): AssetsHost {
+    return {
+      tokens: this.tokens,
+      priceProvider: this.priceProvider,
+      isV6RecoverPermanentToken: (token, id) =>
+        this.isV6RecoverPermanentToken(token, id),
+      isPriceDisabled: () => this.isPriceDisabled(),
+    };
   }
 
   /**
    * Get all tokens, optionally filtered by coin type and/or status.
+   *
+   * Delegates to `read-model/tokens-view.ts` (see the Phase 5 disposition
+   * ledger). Behavior preserved verbatim — including the Issue #389
+   * finding #9 present-status overlay across the V6-RECOVER cold-start
+   * window.
    *
    * @param filter - Optional filter criteria.
    * @param filter.coinId - Return only tokens of this coin type.
@@ -8048,54 +7877,32 @@ export class PaymentsModule {
    * @returns Array of matching {@link Token} objects (synchronous).
    */
   getTokens(filter?: { coinId?: string; status?: TokenStatus }): Token[] {
-    // Issue #389 finding #9 — present-status accuracy across the
-    // cold-start window. `loadFromStorageData` calls
-    // `applyV6RecoverPermanentInvalidStatus` AT ITS END, but every
-    // sync() reload re-derives `Token.status` from TXF transactions
-    // (`determineTokenStatus` only emits `'pending'`/`'confirmed'`).
-    // Between the re-derive and the apply, the in-memory tokens map
-    // briefly holds ledgered tokens at `'pending'`. AccountingModule,
-    // SwapModule, and any direct API consumer reading `getTokens`
-    // during that window would observe an unspendable token as
-    // `'pending'` — the precise lie #387 closed. Patch on read,
-    // returning a synthesized view rather than mutating the map (which
-    // would race the next save). The hot path is unaffected: when the
-    // ledger is empty (the common case), `isV6RecoverPermanentToken`
-    // short-circuits before the array walk.
-    const ledgerActive = this.v6RecoverPermanent.size > 0;
-    let tokens: Token[] = ledgerActive
-      ? Array.from(this.tokens.entries(), ([id, t]) =>
-          t.status !== 'invalid' &&
-          t.status !== 'spent' &&
-          t.status !== 'transferring' &&
-          this.isV6RecoverPermanentToken(t, id)
-            ? { ...t, status: 'invalid' as TokenStatus }
-            : t,
-        )
-      : Array.from(this.tokens.values());
+    return getTokensImpl(this.tokensViewHost(), filter);
+  }
 
-    if (filter?.coinId) {
-      tokens = tokens.filter((t) => t.coinId === filter.coinId);
-    }
-    if (filter?.status) {
-      tokens = tokens.filter((t) => t.status === filter.status);
-    }
-
-    return tokens;
+  /**
+   * Build the {@link TokensViewHost} shim over facade state.
+   */
+  private tokensViewHost(): TokensViewHost {
+    return {
+      tokens: this.tokens,
+      isV6RecoverPermanentToken: (token, id) =>
+        this.isV6RecoverPermanentToken(token, id),
+      hasV6RecoverPermanentEntries: () => this.v6RecoverPermanent.size > 0,
+    };
   }
 
   /**
    * Get a single token by its local ID.
    *
+   * Delegates to `read-model/tokens-view.ts` (see the Phase 5 disposition
+   * ledger). Behavior preserved verbatim.
+   *
    * @param id - The local UUID assigned when the token was added.
    * @returns The token, or `undefined` if not found.
    */
   getToken(id: string): Token | undefined {
-    const token = this.tokens.get(id);
-    if (!token) {
-      logger.debug('Payments', `getToken: not found id=${id.slice(0, 16)}... mapSize=${this.tokens.size}`);
-    }
-    return token;
+    return getTokenImpl({ tokens: this.tokens }, id);
   }
 
   // ===========================================================================
@@ -10785,10 +10592,13 @@ export class PaymentsModule {
   /**
    * Get the transaction history sorted newest-first.
    *
+   * Delegates to `read-model/history.ts` (see the Phase 5 disposition
+   * ledger). Behavior preserved verbatim.
+   *
    * @returns Array of {@link TransactionHistoryEntry} objects in descending timestamp order.
    */
   getHistory(): TransactionHistoryEntry[] {
-    return [...this._historyCache].sort((a, b) => b.timestamp - a.timestamp);
+    return getHistoryDescending(this._historyCache);
   }
 
   /**
@@ -10805,25 +10615,8 @@ export class PaymentsModule {
    * but is NEVER trusted directly — it is logged for forensic correlation
    * with the binding-attested result.
    *
-   * Returns:
-   *   - `senderAddress` — the binding event's `directAddress`, or
-   *     `undefined` if no binding event exists.
-   *   - `senderNametag` — the BINDING-ATTESTED nametag, or `undefined`
-   *     if no binding event exists OR the binding event registers
-   *     pubkey-only (no nametag). NEVER returns the payload claim.
-   *   - `senderNametagSource` — `'binding-event'` when a binding was
-   *     found (regardless of whether it had a nametag),
-   *     `'untrusted-payload'` when the lookup failed. Used by callers
-   *     that want to differentiate "known peer (no nametag)" from
-   *     "unknown sender" in the UI.
-   *
-   * @param senderTransportPubkey - The AUTHENTICATED Nostr signing
-   *                                pubkey of the sender. Verified by
-   *                                the relay; safe to use as the
-   *                                lookup key.
-   * @param payloadSenderNametag - The unauthenticated nametag claim
-   *                               from `payload.sender.nametag` (if
-   *                               any). Accepted but never trusted.
+   * Delegates to `read-model/history.ts` (see the Phase 5 disposition
+   * ledger).
    */
   private async resolveSenderInfo(
     senderTransportPubkey: string,
@@ -10833,7 +10626,7 @@ export class PaymentsModule {
     senderNametag?: string;
     senderNametagSource: ReresolvedNametagSource;
   }> {
-    return resolveSenderInfoViaBinding(
+    return resolveSenderInfoImpl(
       senderTransportPubkey,
       payloadSenderNametag,
       this.deps?.transport,
@@ -10847,84 +10640,33 @@ export class PaymentsModule {
    * the local token storage provider's `history` store (IndexedDB / file).
    * Duplicate entries with the same `dedupKey` are silently ignored (upsert).
    *
+   * Delegates to `read-model/history.ts` (see the Phase 5 disposition
+   * ledger). Behavior preserved verbatim.
+   *
    * @param entry - History entry fields (without `id` and `dedupKey`).
    */
   async addToHistory(entry: Omit<TransactionHistoryEntry, 'id' | 'dedupKey'>): Promise<void> {
-    this.ensureInitialized();
-
-    const dedupKey = computeHistoryDedupKey(
-      entry.type,
-      entry.tokenId,
-      entry.transferId,
-      entry.coinId,
-    );
-    const historyEntry: TransactionHistoryEntry = {
-      id: crypto.randomUUID(),
-      dedupKey,
-      ...entry,
+    const host: AddHistoryEntryHost = {
+      ensureInitialized: () => this.ensureInitialized(),
+      getLocalTokenStorageProvider: () => this.getLocalTokenStorageProvider(),
+      emitHistoryUpdated: (updated) => this.deps!.emitEvent('history:updated', updated),
     };
-
-    // Persist to the local token storage provider's history store
-    const provider = this.getLocalTokenStorageProvider();
-    if (provider?.addHistoryEntry) {
-      await provider.addHistoryEntry(historyEntry);
-    }
-
-    // Update in-memory cache (replace if same dedupKey, else append)
-    const existingIdx = this._historyCache.findIndex(e => e.dedupKey === dedupKey);
-    if (existingIdx >= 0) {
-      this._historyCache[existingIdx] = historyEntry;
-    } else {
-      this._historyCache.push(historyEntry);
-    }
-
-    // Notify listeners that a history entry was saved
-    this.deps!.emitEvent('history:updated', historyEntry);
+    await addHistoryEntryImpl(host, this._historyCache, entry);
   }
 
   /**
    * Load history from the local token storage provider into the in-memory cache.
    * Also performs one-time migration from legacy KV storage.
+   *
+   * Delegates to `read-model/history.ts` (see the Phase 5 disposition
+   * ledger). Behavior preserved verbatim.
    */
   async loadHistory(): Promise<void> {
-    const provider = this.getLocalTokenStorageProvider();
-    if (provider?.getHistoryEntries) {
-      this._historyCache = await provider.getHistoryEntries();
-
-      // One-time migration from legacy KV storage
-      const legacyData = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
-      if (legacyData) {
-        try {
-          const legacyEntries = JSON.parse(legacyData) as TransactionHistoryEntry[];
-          // Ensure legacy entries have dedupKeys for import
-          const records = legacyEntries.map(e => ({
-            ...e,
-            dedupKey:
-              e.dedupKey ||
-              computeHistoryDedupKey(e.type, e.tokenId, e.transferId, e.coinId),
-          }));
-          const imported = await provider.importHistoryEntries?.(records) ?? 0;
-          if (imported > 0) {
-            this._historyCache = await provider.getHistoryEntries();
-            logger.debug('Payments', `Migrated ${imported} history entries from KV to history store`);
-          }
-          // Delete legacy key after successful migration
-          await this.deps!.storage.remove(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
-        } catch {
-          // Ignore corrupt legacy data
-        }
-      }
-    } else {
-      // Fallback: load from KV storage (no dedicated provider)
-      const historyData = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
-      if (historyData) {
-        try {
-          this._historyCache = JSON.parse(historyData);
-        } catch {
-          this._historyCache = [];
-        }
-      }
-    }
+    const host: LoadHistoryHost = {
+      getLocalTokenStorageProvider: () => this.getLocalTokenStorageProvider(),
+      storage: this.deps!.storage,
+    };
+    this._historyCache = await loadHistoryEntriesImpl(host);
   }
 
   /**
@@ -10932,31 +10674,19 @@ export class PaymentsModule {
    * Delegates to the local TokenStorageProvider's importHistoryEntries() for
    * persistent storage, with in-memory fallback.
    * Reused by both load() (initial IPFS fetch) and _doSync() (merge result).
+   *
+   * Delegates to `read-model/history.ts` (see the Phase 5 disposition
+   * ledger). Behavior preserved verbatim.
    */
   private async importRemoteHistoryEntries(entries: HistoryRecord[]): Promise<number> {
-    if (entries.length === 0) return 0;
-
-    const provider = this.getLocalTokenStorageProvider();
-    if (provider?.importHistoryEntries) {
-      const imported = await provider.importHistoryEntries(entries);
-      if (imported > 0) {
-        // Reload cache from provider to stay in sync
-        this._historyCache = await provider.getHistoryEntries!();
-      }
-      return imported;
+    const host: ImportRemoteHistoryEntriesHost = {
+      getLocalTokenStorageProvider: () => this.getLocalTokenStorageProvider(),
+    };
+    const result = await importRemoteHistoryEntriesInto(host, this._historyCache, entries);
+    if (result.newCache) {
+      this._historyCache = result.newCache;
     }
-
-    // Fallback: merge into in-memory cache by dedupKey
-    const existingKeys = new Set(this._historyCache.map(e => e.dedupKey));
-    let imported = 0;
-    for (const entry of entries) {
-      if (!existingKeys.has(entry.dedupKey)) {
-        this._historyCache.push(entry);
-        existingKeys.add(entry.dedupKey);
-        imported++;
-      }
-    }
-    return imported;
+    return result.imported;
   }
 
   /**

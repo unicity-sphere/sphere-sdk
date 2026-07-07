@@ -65,6 +65,13 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
   // Burns down alongside the parent facade in Phase 7 when the
   // extensions layer inverts control.
   'modules/payments/sync/engine.ts',
+  // Phase 5 read-model/ extraction — `history.ts` wraps
+  // `resolveSenderInfoViaBinding` from
+  // `extensions/uxf/pipeline/nametag-reresolver`. Phase 7 API-surface
+  // alignment will re-home the C9 nametag re-resolution helper into core
+  // (or route through a `transport.resolveIncomingSenderInfo` port on
+  // ExtensionHost), at which point this entry burns down.
+  'modules/payments/read-model/history.ts',
   'modules/accounting/AccountingModule.ts',
   'modules/accounting/types.ts',
   'modules/communications/CommunicationsModule.ts',
