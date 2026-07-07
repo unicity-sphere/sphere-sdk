@@ -487,7 +487,12 @@ async function submitAndAwaitProof(args: {
       break;
     }
     try {
-      const result = await aggregator.submitCommitment(
+      // TODO(wave 6-P2-4b/c/d/e): submitCommitment was removed from OracleProvider
+      // (v1-obsolete; v2 uses AggregatorClient.submitCertificationRequest). This
+      // extension caller is v1-legacy and gets ported in Phase 9. Cast to `any`
+      // until the rewrite.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = await (aggregator as any).submitCommitment(
         descriptor.commitment as never,
       );
       if (result.success) {

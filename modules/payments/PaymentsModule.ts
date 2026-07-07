@@ -8856,11 +8856,19 @@ export class PaymentsModule {
               return false;
             }
 
-            if (!this.deps!.oracle.waitForProofSdk) {
+            // TODO(wave 6-P2-4b/c/d/e): waitForProofSdk was removed from
+            // OracleProvider (v2 signature: waitInclusionProof(client,
+            // trustBase, predicateVerifier, transaction, signal) — takes an
+            // ITransaction, not a v1 commitment). This code path lives inside
+            // a legacy v1 commitment finalizer that's slated for a full engine
+            // rewrite. Cast to `any` in the interim so the file still compiles.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const oracleAny = this.deps!.oracle as any;
+            if (!oracleAny.waitForProofSdk) {
               logger.error('Payments', 'Cannot wait for proof - missing oracle method');
               return false;
             }
-            const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
+            const inclusionProof = await oracleAny.waitForProofSdk(commitment);
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             transferTx = commitment.toTransaction(inclusionProof as any);
           } else {
@@ -8871,11 +8879,15 @@ export class PaymentsModule {
               // Try commitment format as fallback
               const commitment = await TransferCommitment.fromJSON(transferTxInput);
               const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
-              if (!stClient || !this.deps!.oracle.waitForProofSdk) {
+              // TODO(wave 6-P2-4b/c/d/e): waitForProofSdk removed — see comment
+              // in the preceding branch. Same legacy-v1 finalize path.
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const oracleAny = this.deps!.oracle as any;
+              if (!stClient || !oracleAny.waitForProofSdk) {
                 throw new SphereError('Cannot submit commitment - missing oracle methods', 'AGGREGATOR_ERROR');
               }
               await stClient.submitTransferCommitment(commitment);
-              const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
+              const inclusionProof = await oracleAny.waitForProofSdk(commitment);
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               transferTx = commitment.toTransaction(inclusionProof as any);
             }

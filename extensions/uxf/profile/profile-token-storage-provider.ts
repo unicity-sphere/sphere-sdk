@@ -1846,7 +1846,14 @@ export class ProfileTokenStorageProvider
       // resolver only fires on per-token collisions which require ≥2
       // candidate roots; a single-bundle load has none.
       let verifiedProofs: ReadonlySet<string> | undefined = undefined;
-      const verifyInclusionProof = this.options?.oracle?.verifyInclusionProof;
+      // TODO(wave 6-P2-4b/c/d/e): verifyInclusionProof was removed from
+      // OracleProvider (v2's InclusionProofVerificationRule.verify requires
+      // the full transaction, not just a proof+txHash). The Rule-4 enrichment
+      // gate gets rehomed inside the token engine at proof-adoption time in a
+      // later wave. Until then, treat the verifier as unavailable so the load
+      // path degrades gracefully (skip Rule-4 enrichment).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const verifyInclusionProof = (this.options?.oracle as any)?.verifyInclusionProof;
       // GH #363 prototype — env-gated bypass for the Rule-4 pairwise
       // UXF-level verification loop. When set, load() skips the
       // O(N²) pairwise computeVerifiedProofs pass; structural JOIN

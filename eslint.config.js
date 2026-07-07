@@ -107,7 +107,9 @@ const STSDK_CORE_BURNDOWN = [
   'core/Sphere.ts',
   'modules/accounting/AccountingModule.ts',
   'modules/payments/PaymentsModule.ts',
-  'oracle/UnicityAggregatorProvider.ts',
+  // Removed in wave 6-P2-4a: oracle/UnicityAggregatorProvider.ts now routes
+  // ALL v2 SDK access through `token-engine/sdk` (the anti-corruption layer)
+  // — no direct `@unicitylabs/state-transition-sdk` imports remain.
   // Phase 5 wave-3 [C] + Phase 6 wave-P2-2 Group-A quarantine —
   // files were carved out of PaymentsModule.ts (and its Group-A
   // helpers TokenSplitCalculator / TokenSplitExecutor /

@@ -29,12 +29,11 @@ export interface OracleProvider extends BaseProvider {
   initialize(trustBase?: unknown): Promise<void>;
 
   /**
-   * Submit transfer commitment
-   */
-  submitCommitment(commitment: TransferCommitment): Promise<SubmitResult>;
-
-  /**
-   * Get inclusion proof for a request
+   * Get inclusion proof for a request.
+   *
+   * Now backed by v2 AggregatorClient — see implementation. Retains the v1
+   * `requestId` shape so callers still on v1-style polling loops keep working
+   * while the send/receive path moves onto `ITokenEngine`.
    */
   getProof(requestId: string): Promise<InclusionProof | null>;
 
@@ -44,7 +43,12 @@ export interface OracleProvider extends BaseProvider {
   waitForProof(requestId: string, options?: WaitOptions): Promise<InclusionProof>;
 
   /**
-   * Validate token against aggregator
+   * Validate token against aggregator.
+   *
+   * Now backed by v2 RPC — SDK-side crypto verification moved to
+   * `ITokenEngine.verify`. This method now performs only aggregator RPC
+   * validation; callers wanting full crypto verification MUST use
+   * `sphere.payments` / `ITokenEngine.verify` (wave 6-P2-4b routing).
    */
   validateToken(tokenData: unknown): Promise<ValidationResult>;
 
@@ -131,71 +135,22 @@ export interface OracleProvider extends BaseProvider {
    */
   getRootTrustBase?(): unknown;
 
-  /**
-   * Wait for inclusion proof using SDK commitment (if available)
-   * Used for transfer flows with SDK TransferCommitment
-   */
-  waitForProofSdk?(commitment: unknown, signal?: AbortSignal): Promise<unknown>;
-
-  /**
-   * Wave G.3: cryptographic verification of an inclusion proof.
-   *
-   * Used by `uxf/token-join.ts` Rule 4 enrichment to gate the
-   * `tryEnrichLongestWithProofs` path: an attacker-supplied proof
-   * element that's structurally well-formed but cryptographically
-   * invalid (forged authenticator signature, unknown SMT root)
-   * would otherwise be lifted into a synthetic token-root and
-   * propagated as if it were genuine. The gate calls this method
-   * once per candidate proof in the merge pool and only adopts a
-   * proof element whose `(authenticator, smtPath, transactionHash,
-   * unicityCertificate)` tuple verifies against the bundled
-   * `RootTrustBase`.
-   *
-   * Implementations construct the SDK `InclusionProof` from the
-   * supplied JSON shape via `InclusionProof.fromJSON()`, then call
-   * `proof.verify(trustBase, requestId)`. Returns true iff the
-   * status is `OK`. Returns false on PATH_NOT_INCLUDED, PATH_INVALID,
-   * NOT_AUTHENTICATED, or any thrown error during reconstruction —
-   * fail-closed so a buggy proof can never be accepted.
-   *
-   * `requestId` is the SHA-256(signingPubKey || stateHashImprint)
-   * tuple expected by the aggregator; for proof elements where the
-   * caller cannot reconstruct it (because state-hash isn't carried
-   * in the proof element itself), pass `null` and the implementation
-   * falls back to deriving it from the proof's authenticator if
-   * possible — or returns false if it can't be safely derived.
-   */
-  verifyInclusionProof?(input: {
-    /**
-     * The SDK-shaped JSON for the inclusion proof. Built via
-     * `assembleInclusionProof()` from the UXF pool, so the shape is
-     * already what `InclusionProof.fromJSON()` accepts.
-     */
-    proofJson: unknown;
-    /**
-     * Wave I.6: the SDK-encoded DataHash IMPRINT hex (68 chars =
-     * 2-byte algorithm prefix + 32-byte digest, as emitted by
-     * `DataHash.toJSON()` and stored verbatim in the UXF pool's
-     * `inclusion-proof.content.transactionHash`). NOT the bare 64-
-     * char content-hash digest. Implementations compare this byte-
-     * exactly against the inclusion-proof's own internal
-     * `transactionHash.imprint`; mismatch returns false (replay-
-     * grafting defense). Length must equal 68; values of other
-     * lengths are rejected as malformed input.
-     */
-    transactionHash: string;
-    /**
-     * Wave I.7: optional canonical proof identifier — typically the
-     * UXF pool ContentHash of the inclusion-proof element (64-char
-     * hex). When supplied, the implementation MAY include this in
-     * its result-cache key alongside `transactionHash` so two
-     * different proofs that happen to attest the same tx hash do
-     * not collide in the cache (forged-then-genuine denial-of-
-     * verification scenario). When omitted, callers accept the
-     * coarser cache keying.
-     */
-    proofHash?: string;
-  }): Promise<boolean>;
+  // Removed in wave 6-P2-4a (v1→v2 SDK migration):
+  //   - submitCommitment: v1 unified into `submitCertificationRequest` on the v2
+  //     `AggregatorClient`. Callers now route through `ITokenEngine.mint /
+  //     transfer / split` (see `token-engine/`). Extension code still on the
+  //     v1 alias may keep a local shim.
+  //   - waitForProofSdk: v1-shape SDK polling helper; v2 uses
+  //     `waitInclusionProof(client, trustBase, predicateVerifier, transaction,
+  //     signal)` which takes a full transaction (not an opaque commitment) and
+  //     is invoked internally by `ITokenEngine` operations. Callers no longer
+  //     need to reach for the SDK path directly.
+  //   - verifyInclusionProof: v2's `InclusionProofVerificationRule.verify(
+  //     trustBase, predicateVerifier, inclusionProof, transaction)` requires the
+  //     full `ITransaction`, which the UXF Rule-4 enrichment gate does not carry
+  //     at that call-site. Enrichment gating now happens inside the token
+  //     engine at proof-adoption time, not as a standalone probe. See
+  //     `token-engine/split-checkpoint.ts` for the pattern.
 }
 
 // =============================================================================
