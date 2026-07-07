@@ -161,9 +161,16 @@ async function main(): Promise<void> {
   await sleep(500);
   const postStatus = await sphereA.accounting.getInvoiceStatus(invoiceId);
   log(TAG, 'A: post-pay invoice status', { state: postStatus.state });
-  if (postStatus.state !== 'COVERED' && postStatus.state !== 'PARTIAL') {
+  // v2-6c: the slim rebuild's implicit-close path (AccountingModule.ts
+  // §getInvoiceStatus) auto-transitions COVERED+allConfirmed → CLOSED
+  // and fires `invoice:closed`, so CLOSED is a valid terminal here too.
+  if (
+    postStatus.state !== 'COVERED' &&
+    postStatus.state !== 'PARTIAL' &&
+    postStatus.state !== 'CLOSED'
+  ) {
     throw new Error(
-      `Post-pay state should be COVERED or PARTIAL, got ${postStatus.state}`,
+      `Post-pay state should be COVERED, PARTIAL, or CLOSED, got ${postStatus.state}`,
     );
   }
 

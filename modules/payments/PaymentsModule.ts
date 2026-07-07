@@ -798,6 +798,17 @@ export class PaymentsModule {
       this.pendingTransfers.delete(transferId);
 
       // History + events.
+      //
+      // v2-6c: SENT entries MUST carry the payment memo AND the resolved
+      // recipient's DIRECT address + chainPubkey (not the sender's own).
+      // AccountingModule's ledger scanner keys attribution on `memo`, and
+      // `payInvoice`'s remaining-amount computation reads back through
+      // history to detect prior coverage; recording the sender's own
+      // chainPubkey (as the pre-fix path did) broke both flows.
+      const resolvedRecipientChainPubkey =
+        peer?.chainPubkey ?? Buffer.from(recipientPubkey).toString('hex');
+      const resolvedRecipientDirectAddress =
+        peer?.directAddress ?? (await engine.deriveIdentityAddress(recipientPubkey));
       await this.recordHistory({
         type: 'SENT',
         amount: request.amount ?? '0',
@@ -805,7 +816,11 @@ export class PaymentsModule {
         symbol: '',
         transferId,
         ...(peer?.nametag !== undefined ? { recipientNametag: peer.nametag } : {}),
-        recipientPubkey: this.deps!.identity.chainPubkey,
+        recipientPubkey: resolvedRecipientChainPubkey,
+        ...(resolvedRecipientDirectAddress !== undefined
+          ? { recipientAddress: resolvedRecipientDirectAddress }
+          : {}),
+        ...(request.memo !== undefined ? { memo: request.memo } : {}),
         timestamp: Date.now(),
         tokenIds: deliveredUiTokens.map((t) => ({
           id: t.id,
@@ -1100,6 +1115,16 @@ export class PaymentsModule {
       }
 
       if (acceptedTokens.length > 0) {
+        // v2-6c: the RECEIVED history entry MUST carry the payment memo
+        // and the recipient's own directAddress so AccountingModule's
+        // ledger scanner can attribute payments to invoices. Both the
+        // `uxf-car` and `uxf-cid` payload shapes carry `memo?` at the
+        // envelope root (see extensions/uxf/types/uxf-transfer.ts).
+        const payloadMemo =
+          isUxfTransferPayloadCar(payload) || isUxfTransferPayloadCid(payload)
+            ? payload.memo
+            : undefined;
+        const recipientDirectAddress = this.deps!.identity.directAddress;
         const incomingTransfer: IncomingTransfer = {
           id: transfer.id,
           senderPubkey: transfer.senderTransportPubkey,
@@ -1107,6 +1132,7 @@ export class PaymentsModule {
             ? { senderNametag: payload.sender?.nametag }
             : {}),
           tokens: acceptedTokens,
+          ...(payloadMemo !== undefined ? { memo: payloadMemo } : {}),
           receivedAt: transfer.timestamp,
         };
         await this.recordHistory({
@@ -1117,6 +1143,10 @@ export class PaymentsModule {
           senderPubkey: transfer.senderTransportPubkey,
           ...(incomingTransfer.senderNametag !== undefined
             ? { senderNametag: incomingTransfer.senderNametag }
+            : {}),
+          ...(payloadMemo !== undefined ? { memo: payloadMemo } : {}),
+          ...(recipientDirectAddress !== undefined
+            ? { recipientAddress: recipientDirectAddress }
             : {}),
           timestamp: transfer.timestamp,
           tokenIds: acceptedTokens.map((t) => ({

@@ -452,7 +452,12 @@ export class AccountingModule {
       // Cache terms + build a lightweight TxfToken shape for callers that
       // still consume it via CreateInvoiceResult.token.
       this.invoiceTermsCache.set(invoiceId, terms);
-      const hash = await sha256(new TextEncoder().encode(invoiceId));
+      // v2-6c: hash the lowercased invoiceId to stay in sync with the
+      // memo-side `hashInvoiceId` (memo.ts:60), which lowercases before
+      // hashing. Currently consistent because `engine.tokenId()` returns
+      // lowercase hex, but this keeps the invariant robust to future
+      // refactors.
+      const hash = await sha256(new TextEncoder().encode(invoiceId.toLowerCase()));
       const hashHex = Array.from(hash)
         .map((b) => b.toString(16).padStart(2, '0'))
         .join('');
@@ -686,7 +691,9 @@ export class AccountingModule {
 
     // Step 5: cache + emit.
     this.invoiceTermsCache.set(tokenId, terms);
-    const hash = await sha256(new TextEncoder().encode(tokenId));
+    // v2-6c: hash the lowercased tokenId to match `hashInvoiceId`
+    // (memo.ts:60). See rationale in createInvoice above.
+    const hash = await sha256(new TextEncoder().encode(tokenId.toLowerCase()));
     const hashHex = Array.from(hash)
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
