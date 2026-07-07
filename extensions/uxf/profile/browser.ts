@@ -145,11 +145,14 @@ export function createBrowserProfileProviders(
     debug: config.profileConfig?.debug,
   };
 
-  // Phase 4 (uxf-v2) — opt-in KV substrate. Nests under an
+  // Phase 4 (uxf-v2) — KV substrate is the default. Nests under an
   // IndexedDB name derived from the wallet shortname so multiple
-  // wallets on the same origin don't collide.
+  // wallets on the same origin don't collide. Legacy callers that
+  // explicitly pass `substrate: 'orbitdb'` fall through to the
+  // factory's OrbitDB fallback (removed in the next commit).
+  const substrateSelection = profileConfig.substrate ?? 'kv';
   let substrateOverride: ProfileKvAdapter | undefined;
-  if (profileConfig.substrate === 'kv') {
+  if (substrateSelection === 'kv') {
     substrateOverride = new ProfileKvAdapter({
       backendFactory: (shortName) =>
         new ProfileKvBrowser({

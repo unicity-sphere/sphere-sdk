@@ -211,25 +211,14 @@ export interface OrbitDbConfig {
  */
 export interface ProfileConfig {
   /**
-   * Substrate selector — Phase 4 (uxf-v2) introduces an opt-in
-   * OrbitDB-free path.
+   * Substrate selector — Phase 4 (uxf-v2) narrowed this to the KV
+   * path only. Retained for source-compatibility with the small
+   * number of call sites (soak playbooks, tests) that still pass
+   * `substrate: 'kv'` explicitly; ignore anything else.
    *
-   * - `'orbitdb'` (default): the shipped OrbitDB adapter over Helia /
-   *   libp2p / OpLog. Keeps every existing consumer / test / soak
-   *   playbook byte-stable.
-   * - `'kv'`: the new `ProfileKvAdapter` over `ProfileKvBackend` (Node
-   *   file-per-key with fsync+atomic-rename, or browser IndexedDB) +
-   *   `LocalBlockCacheFacade` (`blockstore-fs` / `blockstore-idb`
-   *   directly, no Helia wrapper). Retires OrbitDB, Helia, libp2p,
-   *   gossipsub, IPNS. See docs/uxf/uxfv2-substrate-alternatives.md
-   *   §3.7 for the design.
+   * A follow-up sub-phase removes the field entirely.
    *
-   * The two paths coexist during the migration. Sub-phase 4-Swap
-   * flips the default to `'kv'` and deletes the OrbitDB stack; this
-   * flag exists so soak and testing can validate the KV path in
-   * production topologies before the flip.
-   *
-   * @default 'orbitdb'
+   * @default 'kv'
    */
   readonly substrate?: 'orbitdb' | 'kv';
   /** OrbitDB connection configuration */
