@@ -44,7 +44,16 @@ export interface MintFungibleTokenDeps {
   /** Registry lookup for the coin's icon URL (optional). */
   getCoinIconUrl(coinId: string): string | undefined;
   /** Persist the minted Token via the facade's repository layer. */
-  addToken(token: Token): Promise<boolean>;
+  /**
+   * Persist the minted token to storage AND register the opaque SphereToken
+   * handle in the facade's `engineTokens` map so `planCoinSpend` can source
+   * from it. Both args are required — bug uncovered by wave 6-P2-6's
+   * two-wallet send soak (2026-07-07): passing only the UI Token silently
+   * dropped the engine handle, and every subsequent `payments.send` failed
+   * with "Insufficient balance" because `planCoinSpend` couldn't find any
+   * candidate tokens.
+   */
+  addToken(token: Token, sphereToken: SphereToken): Promise<boolean>;
 }
 
 function encodeSdkDataFromSphereToken(sphereToken: SphereToken): string {
@@ -114,7 +123,7 @@ export async function mintFungibleTokenImpl(
       updatedAt: Date.now(),
       sdkData: encodeSdkDataFromSphereToken(sphereToken),
     };
-    await deps.addToken(uiToken);
+    await deps.addToken(uiToken, sphereToken);
 
     return { success: true, token: uiToken, tokenId: tokenIdHex };
   } catch (err) {

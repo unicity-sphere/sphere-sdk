@@ -1454,7 +1454,7 @@ export class PaymentsModule {
         getCoinName: (id) => registry.getDefinition(id)?.name ?? id.slice(0, 8),
         getCoinDecimals: (id) => registry.getDefinition(id)?.decimals ?? 0,
         getCoinIconUrl: (id) => registry.getDefinition(id)?.icons?.[0]?.url,
-        addToken: (t: Token) => this.addTokenInternal(t),
+        addToken: (t: Token, sphereToken) => this.addTokenInternal(t, sphereToken),
       },
       coinIdHex,
       amount,

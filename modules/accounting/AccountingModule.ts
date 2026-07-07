@@ -366,12 +366,19 @@ export class AccountingModule {
         }
         if (hasCoin) {
           const [coinId, amount] = asset.coin!;
-          if (
-            typeof coinId !== 'string' ||
-            coinId.length === 0 ||
-            coinId.length > 20 ||
-            !/^[A-Za-z0-9]+$/.test(coinId)
-          ) {
+          // v2 canonical coinIds are 64-char lowercase hex (v2 assetId scheme,
+          // see the testnet2 token registry). Legacy v1 shim also accepted
+          // short symbolic ids like "UCT" (up to 20 chars alphanumeric), so
+          // both are permitted here for backward compat during migration.
+          // Wave 6-P2-6 soak (2026-07-07) caught the v1-only reject on real
+          // testnet2 coinIds — this widening unblocks `createInvoice` for v2.
+          const isV2Hex = /^[0-9a-f]{64}$/.test(coinId);
+          const isLegacySymbol =
+            typeof coinId === 'string' &&
+            coinId.length > 0 &&
+            coinId.length <= 20 &&
+            /^[A-Za-z0-9]+$/.test(coinId);
+          if (typeof coinId !== 'string' || (!isV2Hex && !isLegacySymbol)) {
             return { success: false, error: `Invalid coinId: ${coinId}` };
           }
           if (seenCoins.has(coinId)) {
@@ -626,12 +633,16 @@ export class AccountingModule {
         }
         if (asset.coin !== undefined) {
           const [coinId, amount] = asset.coin;
-          if (
-            typeof coinId !== 'string' ||
-            coinId.length === 0 ||
-            coinId.length > 20 ||
-            !/^[A-Za-z0-9]+$/.test(coinId)
-          ) {
+          // v2 canonical coinIds are 64-char lowercase hex; legacy v1 shim
+          // used short symbolic ids ("UCT") — mirror the widened accept in
+          // `createInvoice` (see 6-P2-6 soak fix).
+          const isV2Hex = typeof coinId === 'string' && /^[0-9a-f]{64}$/.test(coinId);
+          const isLegacySymbol =
+            typeof coinId === 'string' &&
+            coinId.length > 0 &&
+            coinId.length <= 20 &&
+            /^[A-Za-z0-9]+$/.test(coinId);
+          if (typeof coinId !== 'string' || (!isV2Hex && !isLegacySymbol)) {
             throw new SphereError(
               `Invoice import failed: invalid coinId "${coinId}".`,
               'INVOICE_INVALID_DATA',
