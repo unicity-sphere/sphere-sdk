@@ -412,7 +412,12 @@ describe('PaymentsModule.receive (v2 slim)', () => {
     expect(h.module.getTokens()).toHaveLength(0);
   });
 
-  it('rejects a uxf-cid payload (slim receive does not fetch CARs by CID)', async () => {
+  it('rejects a uxf-cid payload when no cidFetchGateways are configured (retention)', async () => {
+    // Wave 6-P2-11 wired the uxf-cid receive path, but the harness here
+    // omits `deps.cidFetchGateways`. With no gateways to walk, the module
+    // still returns `false` so the transport retains the event for retry
+    // once gateways are configured. Full happy-path coverage lives in
+    // PaymentsModule.uxfCid.v2.test.ts.
     const h = await makeHarness();
     const cid: IncomingTokenTransfer = {
       id: 'nostr-cid',
@@ -428,8 +433,6 @@ describe('PaymentsModule.receive (v2 slim)', () => {
       timestamp: Date.now(),
     };
     const durable = await h.handler(cid);
-    // Slim rebuild returns false so the transport can keep the event and
-    // hand it to a fatter consumer later.
     expect(durable).toBe(false);
     expect(h.module.getTokens()).toHaveLength(0);
   });

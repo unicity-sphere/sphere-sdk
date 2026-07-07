@@ -1110,10 +1110,11 @@ export class PaymentsModule {
       });
       carBytes = result.carBytes;
     } catch (err) {
-      // Bound message to avoid accidentally leaking a gateway URL that
-      // slipped into a nested `cause`.
+      // Never surface gateway URLs to logs — strip any URL-looking
+      // token from the raw message and bound the length.
       const raw = err instanceof Error ? err.message : String(err);
-      const safe = raw.length > 200 ? raw.slice(0, 200) + '…' : raw;
+      const stripped = raw.replace(/https?:\/\/[^\s"',<>]+/gi, '[gateway-redacted]');
+      const safe = stripped.length > 200 ? stripped.slice(0, 200) + '…' : stripped;
       logger.warn(
         'Payments',
         `uxf-cid fetch failed for ${payload.bundleCid.slice(0, 16)}...: ${safe}`,
