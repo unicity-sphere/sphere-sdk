@@ -246,6 +246,52 @@ const providers = createNodeProviders({
 });
 ```
 
+## testnet2 (v2 state-transition SDK)
+
+Phase 6 migrates the L3 aggregator to v2 (`gateway.testnet2.unicity.network`).
+The `testnet2` network key wires the v2 gateway and root trust base for the
+new engine.
+
+```typescript
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+const providers = createNodeProviders({
+  network: 'testnet2',
+  // testnet2 API key — NOT a secret, safe to embed. Copy from .env.example.
+  oracle: { apiKey: process.env.TESTNET2_API_KEY! },
+  dataDir: './wallet-data',
+  tokensDir: './tokens-data',
+});
+
+const { sphere } = await Sphere.init({
+  ...providers,
+  network: 'testnet2',
+  tokenEngine: { apiKey: process.env.TESTNET2_API_KEY! },
+  autoGenerate: true,
+});
+
+// v2-only surface — the anti-corruption engine port:
+if (sphere.tokenEngine) {
+  const token = await sphere.tokenEngine.mint({ /* ... */ });
+  const moved = await sphere.tokenEngine.transfer({ /* ... */ });
+  const { outputs } = await sphere.tokenEngine.split({ /* ... */ });
+  const verified = await sphere.tokenEngine.verify(token);
+  const spent = await sphere.tokenEngine.isSpent(token);
+}
+```
+
+Notes:
+
+- The root trust base is fetched lazily on first engine construction from
+  the `trustBaseUrl` configured for the network (see `constants.ts` →
+  `NETWORKS.testnet2.trustBaseUrl`). No manual `trustBasePath` needed.
+- `sphere.tokenEngine` is `null` on v1-only networks (`mainnet`, `testnet`,
+  `dev`); the slim `PaymentsModule` / `AccountingModule` throw an
+  "engine not configured" error on any call that requires it.
+- The testnet2 API key is safe to commit — see `.env.example` at the repo
+  root for the current value and other testnet2 defaults.
+
 ## IPFS Token Sync (Optional)
 
 Enable decentralized token backup to IPFS/IPNS. No extra packages needed — uses built-in HTTP API.
