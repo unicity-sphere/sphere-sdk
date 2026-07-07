@@ -562,6 +562,21 @@ export interface SphereInitOptions {
    */
   cidFetchGateways?: ReadonlyArray<string>;
   /**
+   * Phase 6 — v2 token engine configuration. When the target `network` has
+   * a `trustBaseUrl` on `NETWORKS[network]` (currently: `testnet2`), Sphere
+   * fetches the trust base and constructs a {@link ITokenEngine} accessible
+   * via `sphere.tokenEngine`. Passes it into `PaymentsModule` /
+   * `AccountingModule` deps.
+   *
+   * Omit to fall back to `NETWORKS[network]` defaults (testnet2 embeds its
+   * non-secret gateway apiKey; mainnet requires explicit apiKey injection).
+   */
+  tokenEngine?: {
+    readonly apiKey?: string;
+    readonly trustBaseUrl?: string;
+    readonly aggregatorUrl?: string;
+  };
+  /**
    * Phase-3 wave-1 extension attach point.
    *
    * Optional array of extensions activated during `Sphere.init()`.
@@ -1142,6 +1157,7 @@ export class Sphere {
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
         price: options.price,
+        network: options.network,
         groupChat,
         market,
         accounting,
@@ -1151,6 +1167,7 @@ export class Sphere {
         onProgress: options.onProgress,
         publishToIpfs: options.publishToIpfs,
         cidFetchGateways: options.cidFetchGateways,
+        tokenEngine: options.tokenEngine,
       });
       // Store dmSince for forwarding to transport/mux when subscriptions are set up
       if (options.dmSince != null) {
@@ -1220,6 +1237,7 @@ export class Sphere {
       derivationPath: options.derivationPath,
       nametag: options.nametag,
       price: options.price,
+      network: options.network,
       groupChat,
       market,
       accounting,
@@ -1229,6 +1247,7 @@ export class Sphere {
       onProgress: options.onProgress,
       publishToIpfs: options.publishToIpfs,
       cidFetchGateways: options.cidFetchGateways,
+      tokenEngine: options.tokenEngine,
     });
 
     if (options.dmSince != null) {
