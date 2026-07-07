@@ -54,7 +54,6 @@ import type {
   WalletJSON,
   WalletJSONExportOptions,
   TrackedAddress,
-  TrackedAddressEntry,
 } from '../types';
 import { SphereError } from './errors';
 import {
@@ -107,19 +106,13 @@ import { TokenRegistry } from '../registry';
 import {
   generateMnemonic as generateBip39Mnemonic,
   validateMnemonic as validateBip39Mnemonic,
-  deriveKeyAtPath,
-  deriveAddressInfo,
-  getPublicKey,
-  sha256,
   publicKeyToAddress,
   signMessage as signMessageCrypto,
   type MasterKey,
   type AddressInfo,
 } from './crypto';
 import { encryptSimple, decryptSimple } from './encryption';
-import { discoverAddressesImpl } from './discover';
 import type { DiscoverAddressesOptions, DiscoverAddressesResult } from './discover';
-import { generateAddressFromMasterKey } from './crypto';
 import {
   exportToJSON as walletIoExportToJSON,
   exportToTxt as walletIoExportToTxt,
@@ -175,6 +168,31 @@ import {
   cleanupProviderEventSubscriptionsImpl as providersCleanupProviderEventSubscriptions,
   type ProvidersHost,
 } from './sphere-providers';
+import {
+  getCurrentAddressIndexImpl as addrGetCurrentAddressIndex,
+  getNametagForAddressImpl as addrGetNametagForAddress,
+  getNametagsForAddressImpl as addrGetNametagsForAddress,
+  getAllAddressNametagsImpl as addrGetAllAddressNametags,
+  getActiveAddressesImpl as addrGetActiveAddresses,
+  getAllTrackedAddressesImpl as addrGetAllTrackedAddresses,
+  getTrackedAddressImpl as addrGetTrackedAddress,
+  setAddressHiddenImpl as addrSetAddressHidden,
+  getAddressPaymentsImpl as addrGetAddressPayments,
+  switchToAddressImpl as addrSwitchToAddress,
+  deriveAddressPublicImpl as addrDeriveAddressPublic,
+  getActiveAddressesInternalImpl as addrGetActiveAddressesInternal,
+  deriveAddressInternalImpl as addrDeriveAddressInternal,
+  deriveAddressAtPathImpl as addrDeriveAddressAtPath,
+  deriveAddressesImpl as addrDeriveAddresses,
+  persistTrackedAddressesImpl as addrPersistTrackedAddresses,
+  loadTrackedAddressesImpl as addrLoadTrackedAddresses,
+  ensureAddressTrackedImpl as addrEnsureAddressTracked,
+  persistAddressNametagsImpl as addrPersistAddressNametags,
+  loadAddressNametagsImpl as addrLoadAddressNametags,
+  trackScannedAddressesImpl as addrTrackScannedAddresses,
+  discoverAddressesImplWrapped as addrDiscoverAddresses,
+  type AddressHost,
+} from './sphere-addresses';
 // Phase 6-P2-4d: SigningService import routed through token-engine anti-corruption
 // barrel; the v1 predicate primitives (`TokenType`, `HashAlgorithm`,
 // `UnmaskedPredicateReference`) that used to compose the DIRECT address by hand
@@ -2655,6 +2673,7 @@ export class Sphere {
 
   /**
    * Get the current active address index
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    *
    * @example
    * ```ts
@@ -2666,123 +2685,95 @@ export class Sphere {
    * ```
    */
   getCurrentAddressIndex(): number {
-    return this._currentAddressIndex;
+    return addrGetCurrentAddressIndex(this as unknown as AddressHost);
   }
 
   /**
    * Get primary nametag for a specific address
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    *
    * @param addressId - Address identifier (DIRECT://xxx), defaults to current address
    * @returns Primary nametag (index 0) or undefined if not registered
    */
   getNametagForAddress(addressId?: string): string | undefined {
-    const id = addressId ?? this._trackedAddresses.get(this._currentAddressIndex)?.addressId;
-    if (!id) return undefined;
-    return this._addressNametags.get(id)?.get(0);
+    return addrGetNametagForAddress(this as unknown as AddressHost, addressId);
   }
 
   /**
    * Get all nametags for a specific address
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    *
    * @param addressId - Address identifier (DIRECT://xxx), defaults to current address
    * @returns Map of nametagIndex to nametag, or undefined if no nametags
    */
   getNametagsForAddress(addressId?: string): Map<number, string> | undefined {
-    const id = addressId ?? this._trackedAddresses.get(this._currentAddressIndex)?.addressId;
-    if (!id) return undefined;
-    const nametags = this._addressNametags.get(id);
-    return nametags && nametags.size > 0 ? new Map(nametags) : undefined;
+    return addrGetNametagsForAddress(this as unknown as AddressHost, addressId);
   }
 
   /**
    * Get all registered address nametags
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    * @deprecated Use getActiveAddresses() or getAllTrackedAddresses() instead
    * @returns Map of addressId to (nametagIndex -> nametag)
    */
   getAllAddressNametags(): Map<string, Map<number, string>> {
-    const result = new Map<string, Map<number, string>>();
-    for (const [addressId, nametags] of this._addressNametags.entries()) {
-      if (nametags.size > 0) {
-        result.set(addressId, new Map(nametags));
-      }
-    }
-    return result;
+    return addrGetAllAddressNametags(this as unknown as AddressHost);
   }
 
   /**
    * Get all active (non-hidden) tracked addresses.
-   * Returns addresses that have been activated through create, switchToAddress,
-   * registerNametag, or nametag recovery.
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    *
    * @returns Array of TrackedAddress entries sorted by index, excluding hidden ones
    */
   getActiveAddresses(): TrackedAddress[] {
-    this.ensureReady();
-    const result: TrackedAddress[] = [];
-    for (const entry of this._trackedAddresses.values()) {
-      if (!entry.hidden) {
-        const nametag = this._addressNametags.get(entry.addressId)?.get(0);
-        result.push({ ...entry, nametag });
-      }
-    }
-    return result.sort((a, b) => a.index - b.index);
+    return addrGetActiveAddresses(this as unknown as AddressHost);
   }
 
   /**
    * Get all tracked addresses, including hidden ones.
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    *
    * @returns Array of all TrackedAddress entries sorted by index
    */
   getAllTrackedAddresses(): TrackedAddress[] {
-    this.ensureReady();
-    const result: TrackedAddress[] = [];
-    for (const entry of this._trackedAddresses.values()) {
-      const nametag = this._addressNametags.get(entry.addressId)?.get(0);
-      result.push({ ...entry, nametag });
-    }
-    return result.sort((a, b) => a.index - b.index);
+    return addrGetAllTrackedAddresses(this as unknown as AddressHost);
   }
 
   /**
    * Get tracked address info by index.
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    *
    * @param index - Address index
    * @returns TrackedAddress or undefined if not tracked
    */
   getTrackedAddress(index: number): TrackedAddress | undefined {
-    this.ensureReady();
-    const entry = this._trackedAddresses.get(index);
-    if (!entry) return undefined;
-    const nametag = this._addressNametags.get(entry.addressId)?.get(0);
-    return { ...entry, nametag };
+    return addrGetTrackedAddress(this as unknown as AddressHost, index);
   }
 
   /**
    * Set visibility of a tracked address.
-   * Hidden addresses are not returned by getActiveAddresses() but remain tracked.
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    *
    * @param index - Address index to hide/unhide
    * @param hidden - true to hide, false to show
    * @throws Error if address index is not tracked
    */
   async setAddressHidden(index: number, hidden: boolean): Promise<void> {
-    this.ensureReady();
-    const entry = this._trackedAddresses.get(index);
-    if (!entry) {
-      throw new SphereError(`Address at index ${index} is not tracked. Switch to it first.`, 'INVALID_CONFIG');
-    }
-    if (entry.hidden === hidden) return;
-
-    (entry as { hidden: boolean }).hidden = hidden;
-    await this.persistTrackedAddresses();
-
-    const eventType = hidden ? 'address:hidden' : 'address:unhidden';
-    this.emitEvent(eventType, { index, addressId: entry.addressId });
+    return addrSetAddressHidden(this as unknown as AddressHost, index, hidden);
   }
 
   /**
    * Switch to a different address by index
-   * This changes the active identity to the derived address at the specified index.
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
+   *
+   * Delegator is intentionally NOT `async`: `switchToAddress` schedules a
+   * detached `postSwitchSync` at the end of its body (via `.catch(...)`);
+   * wrapping the impl's returned promise in an extra `async` microtask
+   * would let that background work observe state that the caller expects
+   * to reflect the synchronous switch. Match the sibling extractions'
+   * pattern (see `registerNametag` — sphere-nametag.ts) and return the
+   * impl promise directly.
    *
    * @param index - Address index to switch to (0, 1, 2, ...)
    *
@@ -2799,236 +2790,8 @@ export class Sphere {
    * await sphere.switchToAddress(0);
    * ```
    */
-  async switchToAddress(index: number, options?: { nametag?: string }): Promise<void> {
-    this.ensureReady();
-
-    if (!this._masterKey) {
-      throw new SphereError('HD derivation requires master key with chain code. Cannot switch addresses.', 'INVALID_CONFIG');
-    }
-
-    if (index < 0) {
-      throw new SphereError('Address index must be non-negative', 'INVALID_CONFIG');
-    }
-
-    // If nametag requested, normalize and validate format early
-    const newNametag = options?.nametag ? this.cleanNametag(options.nametag) : undefined;
-    if (newNametag && !isValidNametag(newNametag)) {
-      throw new SphereError('Invalid Unicity ID format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.', 'VALIDATION_ERROR');
-    }
-
-    // Derive the address at the given index
-    const addressInfo = this.deriveAddress(index, false);
-
-    // Generate IPNS name from public key hash
-    const ipnsHash = sha256(addressInfo.publicKey, 'hex').slice(0, 40);
-
-    // Derive L3 predicate address (DIRECT://...)
-    const predicateAddress = await deriveL3PredicateAddress(addressInfo.privateKey);
-
-    // Ensure address is tracked in the registry
-    await this.ensureAddressTracked(index);
-    const addressId = getAddressId(predicateAddress);
-
-    // If nametag requested, check availability and store it BEFORE building identity
-    if (newNametag) {
-      const existing = await this._transport.resolveNametag?.(newNametag);
-      if (existing) {
-        throw new SphereError(`Unicity ID @${newNametag} is already taken`, 'VALIDATION_ERROR');
-      }
-
-      // Pre-populate nametag cache so identity is built WITH nametag
-      let nametags = this._addressNametags.get(addressId);
-      if (!nametags) {
-        nametags = new Map();
-        this._addressNametags.set(addressId, nametags);
-      }
-      nametags.set(0, newNametag);
-    }
-
-    const nametag = this._addressNametags.get(addressId)?.get(0);
-
-    // Build identity for new address
-    const newIdentity: MutableFullIdentity = {
-      privateKey: addressInfo.privateKey,
-      chainPubkey: addressInfo.publicKey,
-      directAddress: predicateAddress,
-      ipnsName: '12D3KooW' + ipnsHash,
-      nametag,
-    };
-
-    // =========================================================================
-    // Per-Address Module Architecture: Lazy Init + Pointer Switch
-    // No destroy, no waitForPendingOperations — old address keeps running.
-    // =========================================================================
-
-    if (!this._addressModules.has(index)) {
-      // First time switching to this address — create independent modules
-      logger.debug('Sphere', `switchToAddress(${index}): creating per-address modules (lazy init)`);
-
-      // CRITICAL: Update shared storage identity BEFORE loading per-address modules.
-      // IndexedDBStorageProvider.getFullKey() uses this.identity to build per-address
-      // storage keys.  Without this, modules would load the previous address's data.
-      this._storage.setIdentity(newIdentity);
-
-      // Create per-address token storage providers (each address needs its own instances)
-      const addressTokenProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
-      for (const [providerId, provider] of this._tokenStorageProviders.entries()) {
-        if (provider.createForAddress) {
-          const newProvider = provider.createForAddress();
-          newProvider.setIdentity(newIdentity);
-          await newProvider.initialize();
-          addressTokenProviders.set(providerId, newProvider);
-        } else {
-          // Fallback: reuse existing provider (legacy behavior for providers
-          // that don't support createForAddress)
-          logger.warn('Sphere', `Token storage provider ${providerId} does not support createForAddress, reusing shared instance`);
-          addressTokenProviders.set(providerId, provider);
-        }
-      }
-
-      await this.initializeAddressModules(index, newIdentity, addressTokenProviders);
-    } else {
-      // Modules already exist — update identity if nametag changed
-      const moduleSet = this._addressModules.get(index)!;
-      if (nametag !== moduleSet.identity.nametag) {
-        moduleSet.identity = newIdentity;
-        // Use per-address transport if available
-        const addressTransport: TransportProvider = moduleSet.transportAdapter ?? this._transport;
-        // Phase 6 — ensure v2 token engine is available for the deps object.
-        await this.ensureTokenEngine();
-        // Re-initialize with updated identity (nametag change)
-        moduleSet.payments.initialize({
-          identity: newIdentity,
-          storage: this._storage,
-          tokenStorageProviders: moduleSet.tokenStorageProviders,
-          transport: addressTransport,
-          oracle: this._oracle,
-          tokenEngine: this._tokenEngine ?? undefined,
-          emitEvent: this.emitEvent.bind(this),
-              price: this._priceProvider ?? undefined,
-          // Issue #200 Phase 1 wiring — keep CID-by-reference publisher
-          // wired across nametag-driven re-initialization.
-          publishToIpfs: this._publishToIpfs ?? undefined,
-          cidFetchGateways: this._cidFetchGateways ?? undefined,
-          // Issue #285 — preserve the CidRefStore across nametag re-init.
-          // The wallet's encryption key has not changed (only the nametag
-          // moved), so the cached store is still valid; we rebuild for
-          // safety because `Sphere.buildCidRefStoreOrNull()` is cheap
-          // (one constructor call). Without this line, the re-init would
-          // drop the deps.cidRefStore field back to undefined and the
-          // PaymentsModule would silently fall back to inline JSON for
-          // pending V5 token persistence.
-          cidRefStore: this.buildCidRefStoreOrNull() ?? undefined,
-          // Issue #255 Problem A — re-thread HD-index recovery hooks on
-          // nametag-driven re-init so per-address PaymentsModule
-          // instances keep the recovery surface alive after identity
-          // updates.
-          ...(this._masterKey
-            ? {
-                deriveAddressInfo: (idx: number) =>
-                  this._deriveAddressInternal(idx, false),
-                getActiveAddresses: () => this._getActiveAddressesInternal(),
-              }
-            : {}),
-        });
-      }
-    }
-
-    // Switch the active pointer — instant, no destroy
-    this._identity = newIdentity;
-    this._currentAddressIndex = index;
-    await this._updateCachedProxyAddress();
-
-    // Update active module references for backward compatibility
-    const activeModules = this._addressModules.get(index)!;
-    this._payments = activeModules.payments;
-    this._communications = activeModules.communications;
-    this._groupChat = activeModules.groupChat;
-    this._market = activeModules.market;
-
-    // Persist current index
-    await this._storage.set(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX, index.toString());
-
-    // Update storage identity for per-address key scoping
-    this._storage.setIdentity(this._identity);
-
-    // Provide fallback 'since' for first-time Nostr subscriptions
-    if (this._transport.setFallbackSince) {
-      const fallbackTs = Math.floor(Date.now() / 1000) - 86400;
-      this._transport.setFallbackSince(fallbackTs);
-    }
-
-    await this._transport.setIdentity(this._identity);
-
-    // The transport recreates its NostrClient on identity change (the
-    // SDK's client doesn't support runtime key swaps). When the Mux is
-    // sharing that client (#123), it must rebind to the new instance
-    // and re-establish its wallet/chat subscriptions on the new socket.
-    if (this._transportMux && typeof (this._transportMux as { rebindToSharedClient?: () => Promise<void> }).rebindToSharedClient === 'function') {
-      await (this._transportMux as { rebindToSharedClient: () => Promise<void> }).rebindToSharedClient();
-    }
-
-    this.emitEvent('identity:changed', {
-      directAddress: this._identity.directAddress,
-      chainPubkey: this._identity.chainPubkey,
-      nametag: this._identity.nametag,
-      addressIndex: index,
-    });
-
-    logger.debug('Sphere', `Switched to address ${index}:`, this._identity.directAddress);
-
-    // Run transport sync and nametag operations in background
-    this.postSwitchSync(index, newNametag).catch(err => {
-      logger.warn('Sphere', `Post-switch sync failed for address ${index}:`, err);
-    });
-  }
-
-  /**
-   * Background transport sync and nametag operations after address switch.
-   * Runs after switchToAddress returns so L1/L3 queries can start immediately.
-   */
-  private async postSwitchSync(index: number, newNametag?: string): Promise<void> {
-    // Sync identity with transport — recovers nametag from existing Nostr bindings
-    if (!newNametag) {
-      await this.syncIdentityWithTransport();
-    }
-
-    // If new nametag was registered, persist cache and mint token
-    if (newNametag) {
-      await this.persistAddressNametags();
-
-      if (!this._payments.hasNametag()) {
-        logger.debug('Sphere', `Minting nametag token for @${newNametag}...`);
-        try {
-          const result = await this.mintNametag(newNametag);
-          if (result.success) {
-            logger.debug('Sphere', `Nametag token minted successfully`);
-          } else {
-            logger.warn('Sphere', `Could not mint nametag token: ${result.error}`);
-          }
-        } catch (err) {
-          logger.warn('Sphere', `Nametag token mint failed:`, err);
-        }
-      }
-
-      this.emitEvent('nametag:registered', {
-        nametag: newNametag,
-        addressIndex: index,
-      });
-    } else if (this._identity?.nametag && !this._payments.hasNametag()) {
-      // Existing address with nametag but missing token — mint it
-      logger.debug('Sphere', `Unicity ID @${this._identity.nametag} has no token after switch, minting...`);
-      try {
-        const result = await this.mintNametag(this._identity.nametag);
-        if (result.success) {
-          logger.debug('Sphere', `Nametag token minted successfully after switch`);
-        } else {
-          logger.warn('Sphere', `Could not mint nametag token after switch: ${result.error}`);
-        }
-      } catch (err) {
-        logger.warn('Sphere', `Nametag token mint failed after switch:`, err);
-      }
-    }
+  switchToAddress(index: number, options?: { nametag?: string }): Promise<void> {
+    return addrSwitchToAddress(this as unknown as AddressHost, index, options);
   }
 
   /**
@@ -3621,14 +3384,15 @@ export class Sphere {
 
   /**
    * Get per-address modules for any address index (creates lazily if needed).
-   * This allows accessing any address's modules without switching.
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    */
   getAddressPayments(index: number): PaymentsModule | undefined {
-    return this._addressModules.get(index)?.payments;
+    return addrGetAddressPayments(this as unknown as AddressHost, index);
   }
 
   /**
    * Derive address at a specific index
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    *
    * @param index - Address index (0, 1, 2, ...)
    * @param isChange - Whether this is a change address (default: false)
@@ -3648,124 +3412,46 @@ export class Sphere {
    * ```
    */
   deriveAddress(index: number, isChange: boolean = false): AddressInfo {
-    this.ensureReady();
-    return this._deriveAddressInternal(index, isChange);
+    return addrDeriveAddressPublic(this as unknown as AddressHost, index, isChange);
   }
 
   /**
    * Internal getActiveAddresses without ensureReady() check.
-   * IMPORTANT: This method skips ensureReady() because it's called during initialization
-   * before _initialized is set. It REQUIRES that loadTrackedAddresses() has already completed.
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    */
   private _getActiveAddressesInternal(): TrackedAddress[] {
-    const result: TrackedAddress[] = [];
-    for (const entry of this._trackedAddresses.values()) {
-      if (!entry.hidden) {
-        const nametag = this._addressNametags.get(entry.addressId)?.get(0);
-        result.push({ ...entry, nametag });
-      }
-    }
-    return result.sort((a, b) => a.index - b.index);
+    return addrGetActiveAddressesInternal(this as unknown as AddressHost);
   }
 
   /**
    * Internal address derivation without ensureReady() check.
-   * Used during initialization (loadTrackedAddresses, ensureAddressTracked)
-   * when _initialized is still false.
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    */
   private _deriveAddressInternal(index: number, isChange: boolean = false): AddressInfo {
-    if (!this._masterKey) {
-      throw new SphereError('HD derivation requires master key with chain code', 'INVALID_CONFIG');
-    }
-
-    // WIF/HMAC mode: legacy HMAC-SHA512 derivation (no chain code, no change addresses)
-    if (this._derivationMode === 'wif_hmac') {
-      return generateAddressFromMasterKey(this._masterKey.privateKey, index);
-    }
-
-    const info = deriveAddressInfo(
-      this._masterKey,
-      this._basePath,
-      index,
-      isChange
-    );
-
-    // Convert to proper bech32 address format
-    return {
-      ...info,
-      address: publicKeyToAddress(info.publicKey, 'alpha'),
-    };
+    return addrDeriveAddressInternal(this as unknown as AddressHost, index, isChange);
   }
 
   /**
    * Derive address at a full BIP32 path
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    *
    * @param path - Full BIP32 path like "m/44'/0'/0'/0/5"
    * @returns Address info
-   *
-   * @example
-   * ```ts
-   * const addr = sphere.deriveAddressAtPath("m/44'/0'/0'/0/5");
-   * ```
    */
   deriveAddressAtPath(path: string): AddressInfo {
-    this.ensureReady();
-
-    if (!this._masterKey) {
-      throw new SphereError('HD derivation requires master key with chain code', 'INVALID_CONFIG');
-    }
-
-    // Parse path to extract index
-    const match = path.match(/\/(\d+)$/);
-    const index = match ? parseInt(match[1], 10) : 0;
-
-    const derived = deriveKeyAtPath(
-      this._masterKey.privateKey,
-      this._masterKey.chainCode,
-      path
-    );
-
-    const publicKey = getPublicKey(derived.privateKey);
-
-    return {
-      privateKey: derived.privateKey,
-      publicKey,
-      address: publicKeyToAddress(publicKey, 'alpha'),
-      path,
-      index,
-    };
+    return addrDeriveAddressAtPath(this as unknown as AddressHost, path);
   }
 
   /**
    * Derive multiple addresses starting from index 0
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    *
    * @param count - Number of addresses to derive
    * @param includeChange - Include change addresses (default: false)
    * @returns Array of address info
-   *
-   * @example
-   * ```ts
-   * // Get first 5 receiving addresses
-   * const addresses = sphere.deriveAddresses(5);
-   *
-   * // Get 5 receiving + 5 change addresses
-   * const allAddresses = sphere.deriveAddresses(5, true);
-   * ```
    */
   deriveAddresses(count: number, includeChange: boolean = false): AddressInfo[] {
-    const addresses: AddressInfo[] = [];
-
-    for (let i = 0; i < count; i++) {
-      addresses.push(this.deriveAddress(i, false));
-    }
-
-    if (includeChange) {
-      for (let i = 0; i < count; i++) {
-        addresses.push(this.deriveAddress(i, true));
-      }
-    }
-
-    return addresses;
+    return addrDeriveAddresses(this as unknown as AddressHost, count, includeChange);
   }
 
   /**
@@ -3788,40 +3474,17 @@ export class Sphere {
    */
   /**
    * Bulk-track scanned addresses with visibility and nametag data.
-   * Selected addresses get `hidden: false`, unselected get `hidden: true`.
-   * Performs only 2 storage writes total (tracked addresses + nametags).
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    */
   async trackScannedAddresses(
     entries: Array<{ index: number; hidden: boolean; nametag?: string }>,
   ): Promise<void> {
-    this.ensureReady();
-
-    for (const { index, hidden, nametag } of entries) {
-      const tracked = await this.ensureAddressTracked(index);
-
-      if (nametag) {
-        let nametags = this._addressNametags.get(tracked.addressId);
-        if (!nametags) {
-          nametags = new Map();
-          this._addressNametags.set(tracked.addressId, nametags);
-        }
-        if (!nametags.has(0)) nametags.set(0, nametag);
-      }
-
-      if (tracked.hidden !== hidden) {
-        (tracked as { hidden: boolean }).hidden = hidden;
-      }
-    }
-
-    await this.persistTrackedAddresses();
-    await this.persistAddressNametags();
+    return addrTrackScannedAddresses(this as unknown as AddressHost, entries);
   }
 
   /**
    * Discover previously used HD addresses.
-   *
-   * Primary: queries Nostr relay for identity binding events (fast, single batch query).
-   * Secondary: runs L1 balance scan to find legacy addresses with no binding event.
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    *
    * @example
    * ```ts
@@ -3835,43 +3498,7 @@ export class Sphere {
   async discoverAddresses(
     options: DiscoverAddressesOptions = {},
   ): Promise<DiscoverAddressesResult> {
-    this.ensureReady();
-
-    if (!this._masterKey) {
-      throw new SphereError('Address discovery requires HD master key', 'INVALID_CONFIG');
-    }
-
-    if (!this._transport.discoverAddresses) {
-      throw new SphereError('Transport provider does not support address discovery', 'INVALID_CONFIG');
-    }
-
-    // Phase 1: Transport (Nostr) binding event scan
-    const transportResult = await discoverAddressesImpl(
-      (index: number) => {
-        const addrInfo = this._deriveAddressInternal(index, false);
-        return {
-          transportPubkey: addrInfo.publicKey.slice(2), // x-only 32 bytes
-          chainPubkey: addrInfo.publicKey,
-          directAddress: '', // not needed for discovery query
-        };
-      },
-      (pubkeys: string[]) => this._transport.discoverAddresses!(pubkeys),
-      options,
-    );
-
-    // Auto-track if requested
-    if (options.autoTrack && transportResult.addresses.length > 0) {
-      await this.trackScannedAddresses(
-        transportResult.addresses.map(a => ({
-          index: a.index,
-          // Preserve existing hidden state; default to false for newly discovered
-          hidden: this._trackedAddresses.get(a.index)?.hidden ?? false,
-          nametag: a.nametag,
-        })),
-      );
-    }
-
-    return transportResult;
+    return addrDiscoverAddresses(this as unknown as AddressHost, options);
   }
 
   // ===========================================================================
@@ -4124,18 +3751,10 @@ export class Sphere {
 
   /**
    * Persist tracked addresses to storage (only minimal fields via StorageProvider)
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    */
   private async persistTrackedAddresses(): Promise<void> {
-    const entries: TrackedAddressEntry[] = [];
-    for (const entry of this._trackedAddresses.values()) {
-      entries.push({
-        index: entry.index,
-        hidden: entry.hidden,
-        createdAt: entry.createdAt,
-        updatedAt: entry.updatedAt,
-      });
-    }
-    await this._storage.saveTrackedAddresses(entries);
+    return addrPersistTrackedAddresses(this as unknown as AddressHost);
   }
 
   /**
@@ -4170,176 +3789,34 @@ export class Sphere {
 
   /**
    * Load tracked addresses from storage.
-   * Falls back to migrating from old ADDRESS_NAMETAGS format.
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    */
   private async loadTrackedAddresses(): Promise<void> {
-    this._trackedAddresses.clear();
-    this._addressIdToIndex.clear();
-
-    try {
-      // Load minimal entries from storage
-      const entries = await this._storage.loadTrackedAddresses();
-      if (entries.length > 0) {
-        for (const stored of entries) {
-          // Derive address fields from index (internal: no ensureReady check)
-          const addrInfo = this._deriveAddressInternal(stored.index, false);
-          const directAddress = await deriveL3PredicateAddress(addrInfo.privateKey);
-          const addressId = getAddressId(directAddress);
-
-          const entry: TrackedAddress = {
-            ...stored,
-            addressId,
-              directAddress,
-            chainPubkey: addrInfo.publicKey,
-          };
-          this._trackedAddresses.set(entry.index, entry);
-          this._addressIdToIndex.set(addressId, entry.index);
-        }
-        return;
-      }
-
-      // Fall back to old ADDRESS_NAMETAGS format and migrate
-      const oldData = await this._storage.get(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS);
-      if (oldData) {
-        const parsed = JSON.parse(oldData) as Record<string, unknown>;
-        await this.migrateFromOldNametagFormat(parsed);
-        await this.persistTrackedAddresses();
-      }
-    } catch {
-      // Ignore parse errors - start fresh
-    }
-  }
-
-  /**
-   * Migrate from old ADDRESS_NAMETAGS format to tracked addresses.
-   * Scans HD indices 0..19 to match addressIds from the old format.
-   * Populates both _trackedAddresses and _addressNametags.
-   */
-  private async migrateFromOldNametagFormat(
-    parsed: Record<string, unknown>
-  ): Promise<void> {
-    const addressIdToNametags = new Map<string, Record<string, string>>();
-    for (const [key, value] of Object.entries(parsed)) {
-      if (typeof value === 'object' && value !== null) {
-        addressIdToNametags.set(key, value as Record<string, string>);
-      }
-    }
-
-    if (addressIdToNametags.size === 0 || !this._masterKey) return;
-
-    const SCAN_LIMIT = 20;
-    for (let i = 0; i < SCAN_LIMIT && addressIdToNametags.size > 0; i++) {
-      try {
-        const addrInfo = this._deriveAddressInternal(i, false);
-        const directAddress = await deriveL3PredicateAddress(addrInfo.privateKey);
-        const addressId = getAddressId(directAddress);
-
-        if (addressIdToNametags.has(addressId)) {
-          const nametagsObj = addressIdToNametags.get(addressId)!;
-
-          // Populate nametag cache
-          const nametagMap = new Map<number, string>();
-          for (const [idx, tag] of Object.entries(nametagsObj)) {
-            nametagMap.set(parseInt(idx, 10), tag);
-          }
-          if (nametagMap.size > 0) {
-            this._addressNametags.set(addressId, nametagMap);
-          }
-
-          // Create tracked address entry
-          const now = Date.now();
-          const entry: TrackedAddress = {
-            index: i,
-            addressId,
-              directAddress,
-            chainPubkey: addrInfo.publicKey,
-            nametag: nametagMap.get(0),
-            hidden: false,
-            createdAt: now,
-            updatedAt: now,
-          };
-
-          this._trackedAddresses.set(i, entry);
-          this._addressIdToIndex.set(addressId, i);
-          addressIdToNametags.delete(addressId);
-        }
-      } catch {
-        // Skip indices that fail to derive
-      }
-    }
-
-    // Persist nametag cache separately
-    await this.persistAddressNametags();
+    return addrLoadTrackedAddresses(this as unknown as AddressHost);
   }
 
   /**
    * Ensure an address is tracked in the registry.
-   * If not yet tracked, derives full info and creates the entry.
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    */
   private async ensureAddressTracked(index: number): Promise<TrackedAddress> {
-    const existing = this._trackedAddresses.get(index);
-    if (existing) return existing;
-
-    const addrInfo = this._deriveAddressInternal(index, false);
-    const directAddress = await deriveL3PredicateAddress(addrInfo.privateKey);
-    const addressId = getAddressId(directAddress);
-
-    const now = Date.now();
-    const nametag = this._addressNametags.get(addressId)?.get(0);
-    const entry: TrackedAddress = {
-      index,
-      addressId,
-      directAddress,
-      chainPubkey: addrInfo.publicKey,
-      nametag,
-      hidden: false,
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    this._trackedAddresses.set(index, entry);
-    this._addressIdToIndex.set(addressId, index);
-    await this.persistTrackedAddresses();
-
-    this.emitEvent('address:activated', { address: { ...entry } });
-    return entry;
+    return addrEnsureAddressTracked(this as unknown as AddressHost, index);
   }
 
   /**
    * Persist nametag cache to storage.
-   * Format: { addressId: { "0": "alice", "1": "alice2" } }
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    */
   private async persistAddressNametags(): Promise<void> {
-    const result: Record<string, Record<string, string>> = {};
-    for (const [addressId, nametags] of this._addressNametags.entries()) {
-      const obj: Record<string, string> = {};
-      for (const [idx, tag] of nametags.entries()) {
-        obj[idx.toString()] = tag;
-      }
-      result[addressId] = obj;
-    }
-    await this._storage.set(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS, JSON.stringify(result));
+    return addrPersistAddressNametags(this as unknown as AddressHost);
   }
 
   /**
    * Load nametag cache from storage.
+   * Extracted to `core/sphere-addresses.ts` — see there for detail.
    */
   private async loadAddressNametags(): Promise<void> {
-    this._addressNametags.clear();
-    try {
-      const data = await this._storage.get(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS);
-      if (!data) return;
-      const parsed = JSON.parse(data) as Record<string, Record<string, string>>;
-      for (const [addressId, nametags] of Object.entries(parsed)) {
-        const map = new Map<number, string>();
-        for (const [idx, tag] of Object.entries(nametags)) {
-          map.set(parseInt(idx, 10), tag);
-        }
-        this._addressNametags.set(addressId, map);
-      }
-    } catch {
-      // Ignore parse errors
-    }
+    return addrLoadAddressNametags(this as unknown as AddressHost);
   }
 
   /**
