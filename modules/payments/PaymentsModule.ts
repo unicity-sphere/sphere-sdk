@@ -711,310 +711,46 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
 // =============================================================================
 // Repository Utility Functions
 // =============================================================================
+//
+// Phase 5 (uxfv2-refactor-design.md §2.1): the module-scope pure helpers
+// previously here (parseSdkDataCached, clearSdkDataCache, extract*, dedup
+// key helpers, tombstone helpers, findBestTokenVersion) moved into
+// per-concern submodule files under `./tokens/`. Imported below.
+//
+// The module-scope sdkDataCache singleton semantics are preserved: the
+// cache now lives inside `./tokens/parse-cache.ts` and there is still one
+// instance module-wide (ESM module-graph guarantee).
+//
+// See modules/payments/tokens/README.md for the full method routing.
 
-// Cache parsed sdkData fields to avoid repeated JSON.parse in hot loops.
-// Key = sdkData string reference, value = { tokenId, stateHash }.
-// Cleared on address switch via clearSdkDataCache().
-const sdkDataCache = new Map<string, { tokenId: string | null; stateHash: string }>();
-const SDK_DATA_CACHE_MAX = 2000;
-
-function parseSdkDataCached(sdkData: string): { tokenId: string | null; stateHash: string } {
-  const cached = sdkDataCache.get(sdkData);
-  if (cached) return cached;
-
-  let tokenId: string | null = null;
-  let stateHash = '';
-  try {
-    const txf = JSON.parse(sdkData);
-    tokenId = txf.genesis?.data?.tokenId || null;
-    stateHash = getCurrentStateHash(txf as TxfToken) || '';
-
-    // Try alternative locations if not found in standard place
-    if (!stateHash) {
-      /* eslint-disable @typescript-eslint/no-explicit-any */
-      if ((txf as any).state?.hash) {
-        stateHash = (txf as any).state.hash;
-      } else if ((txf as any).stateHash) {
-        stateHash = (txf as any).stateHash;
-      } else if ((txf as any).currentStateHash) {
-        stateHash = (txf as any).currentStateHash;
-      }
-      /* eslint-enable @typescript-eslint/no-explicit-any */
-    }
-  } catch {
-    // Invalid JSON — return defaults
-  }
-
-  const entry = { tokenId, stateHash };
-  // Evict cache if it grows too large (unlikely in normal usage)
-  if (sdkDataCache.size >= SDK_DATA_CACHE_MAX) {
-    sdkDataCache.clear();
-  }
-  sdkDataCache.set(sdkData, entry);
-  return entry;
-}
-
-function clearSdkDataCache(): void {
-  sdkDataCache.clear();
-}
-
-/**
- * Extract token ID (genesis tokenId) from sdkData/jsonData
- */
-function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
-  if (!sdkData) return null;
-  return parseSdkDataCached(sdkData).tokenId;
-}
-
-/**
- * Extract state hash from sdkData/jsonData
- */
-function extractStateHashFromSdkData(sdkData: string | undefined): string {
-  if (!sdkData) return '';
-  return parseSdkDataCached(sdkData).stateHash;
-}
+import {
+  parseSdkDataCached,
+  clearSdkDataCache,
+  extractTokenIdFromSdkData,
+  extractStateHashFromSdkData,
+  createTokenStateKey,
+  extractTokenStateKey,
+  pendingMintDedupKey,
+  effectiveDedupKey,
+  hasSameGenesisTokenId,
+  isSameTokenState,
+  isIncrementalUpdate,
+  countCommittedTxns,
+  createTombstoneFromToken,
+  pruneTombstonesByAge,
+  pruneMapByCount,
+  findBestTokenVersion,
+} from './tokens';
 
 // Issue #245 #1 — `extractCurrentStatePublicKeyHexFromSdkData` was extracted
 // to `./extract-state-publickey.ts` (issue #535) so SwapModule.verifyPayout
 // can reuse the same logic without re-implementing predicate parsing.
 // Rationale + fall-back guidance: see that file's docstring.
 
-/**
- * Create composite key from tokenId and stateHash
- * Format: {tokenId}_{stateHash}
- * This uniquely identifies a token at a specific state
- */
-function createTokenStateKey(tokenId: string, stateHash: string): string {
-  return `${tokenId}_${stateHash}`;
-}
-
-/**
- * Extract composite key (tokenId_stateHash) from token
- * Returns null if token doesn't have valid tokenId and stateHash
- */
-function extractTokenStateKey(token: Token): string | null {
-  const tokenId = extractTokenIdFromSdkData(token.sdkData);
-  const stateHash = extractStateHashFromSdkData(token.sdkData);
-  if (!tokenId || !stateHash) return null;
-  return createTokenStateKey(tokenId, stateHash);
-}
-
 // Steelman³⁵: fromHex consolidated to core/hex.ts (top-of-file import).
 
-/**
- * Compute a deterministic dedup key for a pending-mint (pre-finalization)
- * token, whose `getCurrentStateHash` is empty because the aggregator
- * hasn't returned an inclusion proof yet.
- *
- * We hash a canonical JSON encoding of the GENESIS DATA so the same
- * genesis always produces the same key. JSON.stringify (not pipe-
- * delimiting) ensures that any future field additions, `null` vs
- * `undefined` vs `''` distinctions, and field-values containing
- * special characters don't cause cross-genesis collisions.
- *
- * The returned key is prefixed `pending-` so it can never collide
- * with a real state hash (which is always a 64-hex SHA-256).
- *
- * @param txf - A TxfToken (typically the incoming import candidate).
- * @returns `pending-<64 hex>` — deterministic per genesis content.
- */
-function pendingMintDedupKey(txf: {
-  genesis?: {
-    data?: {
-      tokenId?: string;
-      tokenType?: string;
-      salt?: string;
-      recipient?: string | null;
-      tokenData?: string | null;
-      recipientDataHash?: string | null;
-    };
-  };
-}): string {
-  const d = txf.genesis?.data ?? {};
-  // Canonical JSON (fixed field order) preserves null-vs-undefined-vs-''
-  // distinctions and is robust against any special characters in field
-  // values. We explicitly list the fields rather than stringifying `d`
-  // to avoid unrelated keys on `d` (e.g., future SDK additions) changing
-  // the key for tokens already minted against the old schema.
-  const canonical = JSON.stringify([
-    d.tokenId ?? null,
-    d.tokenType ?? null,
-    d.salt ?? null,
-    d.recipient ?? null,
-    d.tokenData ?? null,
-    d.recipientDataHash ?? null,
-  ]);
-  const digest = sha256(new TextEncoder().encode(canonical));
-  let hex = '';
-  for (const b of digest) hex += b.toString(16).padStart(2, '0');
-  return 'pending-' + hex;
-}
-
-/**
- * Given an incoming TxfToken, return the dedup key to use for
- * duplicate detection in `importTokens`:
- *   - the token's CURRENT state hash when available (via
- *     `getCurrentStateHash`, which looks at the last transaction's
- *     `newStateHash` first, then authenticator, then genesis)
- *   - the pending-mint fallback otherwise
- *
- * Using `getCurrentStateHash` rather than reading only the genesis
- * path is load-bearing: a token that has been transferred has a
- * genesis hash that NEVER changes, but a current state hash that
- * tracks the latest transaction. If we keyed on genesis, two
- * different live states of the same token would collide as
- * "duplicate" and valid state updates would be silently dropped
- * on re-import.
- *
- * The return is a non-empty opaque string suitable for equality
- * comparison. Different shapes (real vs pending) never collide
- * because the pending variant is prefixed.
- */
-function effectiveDedupKey(
-  txf: Parameters<typeof pendingMintDedupKey>[0] & Parameters<typeof getCurrentStateHash>[0],
-): string {
-  const stateHash = getCurrentStateHash(txf as TxfToken) ?? '';
-  if (stateHash) return stateHash;
-  return pendingMintDedupKey(txf);
-}
-
-/**
- * Check if two tokens have the same genesis tokenId (same token, possibly different states)
- */
-function hasSameGenesisTokenId(t1: Token, t2: Token): boolean {
-  const id1 = extractTokenIdFromSdkData(t1.sdkData);
-  const id2 = extractTokenIdFromSdkData(t2.sdkData);
-  return !!(id1 && id2 && id1 === id2);
-}
-
-/**
- * Check if two tokens are exactly the same (same tokenId AND same stateHash)
- */
-function isSameTokenState(t1: Token, t2: Token): boolean {
-  const key1 = extractTokenStateKey(t1);
-  const key2 = extractTokenStateKey(t2);
-  return !!(key1 && key2 && key1 === key2);
-}
-
-/**
- * Create tombstone from token - requires valid tokenId and stateHash
- */
-function createTombstoneFromToken(token: Token): TombstoneEntry | null {
-  const tokenId = extractTokenIdFromSdkData(token.sdkData);
-  const stateHash = extractStateHashFromSdkData(token.sdkData);
-
-  // Both tokenId and stateHash are required for a valid tombstone
-  if (!tokenId || !stateHash) {
-    return null;
-  }
-
-  return {
-    tokenId,
-    stateHash,
-    timestamp: Date.now(),
-  };
-}
-
-/**
- * Check if incoming token is an incremental update
- */
-function isIncrementalUpdate(existing: TxfToken, incoming: TxfToken): boolean {
-  if (existing.genesis?.data?.tokenId !== incoming.genesis?.data?.tokenId) {
-    return false;
-  }
-
-  const existingTxns = existing.transactions || [];
-  const incomingTxns = incoming.transactions || [];
-
-  if (incomingTxns.length < existingTxns.length) {
-    return false;
-  }
-
-  for (let i = 0; i < existingTxns.length; i++) {
-    const existingTx = existingTxns[i];
-    const incomingTx = incomingTxns[i];
-
-    if (existingTx.previousStateHash !== incomingTx.previousStateHash ||
-        existingTx.newStateHash !== incomingTx.newStateHash) {
-      return false;
-    }
-  }
-
-  for (let i = existingTxns.length; i < incomingTxns.length; i++) {
-    const newTx = incomingTxns[i] as TxfTransaction;
-    if (newTx.inclusionProof === null) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-/**
- * Count committed transactions
- */
-function countCommittedTxns(txf: TxfToken): number {
-  return (txf.transactions || []).filter(
-    (tx: TxfTransaction) => tx.inclusionProof !== null
-  ).length;
-}
-
-/**
- * Prune tombstones by age and count
- */
-function pruneTombstonesByAge(
-  tombstones: TombstoneEntry[],
-  maxAge: number = 30 * 24 * 60 * 60 * 1000,
-  maxCount: number = 100
-): TombstoneEntry[] {
-  const now = Date.now();
-  let result = tombstones.filter(t => (now - t.timestamp) < maxAge);
-
-  if (result.length > maxCount) {
-    result = [...result].sort((a, b) => b.timestamp - a.timestamp);
-    result = result.slice(0, maxCount);
-  }
-
-  return result;
-}
-
-/**
- * Prune Map by count
- */
-function pruneMapByCount<T>(items: Map<string, T>, maxCount: number): Map<string, T> {
-  if (items.size <= maxCount) {
-    return new Map(items);
-  }
-
-  const entries = [...items.entries()];
-  const toKeep = entries.slice(entries.length - maxCount);
-  return new Map(toKeep);
-}
-
-/**
- * Find best token version from archives
- */
-function findBestTokenVersion(
-  tokenId: string,
-  archivedTokens: Map<string, TxfToken>,
-  forkedTokens: Map<string, TxfToken>
-): TxfToken | null {
-  const candidates: TxfToken[] = [];
-
-  const archived = archivedTokens.get(tokenId);
-  if (archived) candidates.push(archived);
-
-  for (const [key, forked] of forkedTokens) {
-    if (key.startsWith(tokenId + '_')) {
-      candidates.push(forked);
-    }
-  }
-
-  if (candidates.length === 0) return null;
-
-  candidates.sort((a, b) => countCommittedTxns(b) - countCommittedTxns(a));
-  return candidates[0];
-}
+// All extract*/dedup/tombstone/archive helpers moved to `./tokens/` in
+// Phase 5 (see block imports above).
 
 // =============================================================================
 // Configuration
