@@ -44,6 +44,7 @@
     "node_modules",
     "dist",
     "**/*.test.ts",
-    "token-engine/**/*.ts"
+    "token-engine/**/*.ts",
+    "modules/payments/legacy-v1/**/*.ts"
   ]
 }

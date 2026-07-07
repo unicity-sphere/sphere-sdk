@@ -70,12 +70,19 @@ concern taxonomy where useful:
 ## Compile / test posture during Phase 5
 
 Files remain wired to the facade via `PaymentsModule.ts` delegating to
-them (or re-exporting from `PaymentsModule.ts`'s class body via a
-`legacyV1` composition object — Phase 5 later step). Test files targeting
-these behaviors stay live until Phase 6.C's `git rm` wave.
+them (each [C] method's body is a one-line `xxxImpl.call(this, ...args)`
+delegation to a helper in this directory). Test files targeting these
+behaviors stay live until Phase 6.C's `git rm` wave.
 
-Once ALL rows tagged [C] have moved into this directory, add
-`modules/payments/legacy-v1/**/*.ts` to `tsconfig.json` `exclude` so that
-Phase 6.C's `git rm -r modules/payments/legacy-v1/` produces a clean
-`removed 15 files` diff with a single facade edit removing the delegation
-stubs.
+**Landed (waves 1–3):** all rows tagged [C] in the disposition ledger
+have moved into this directory. `modules/payments/legacy-v1/**/*.ts` is
+now in `tsconfig.json`'s `exclude` list — the quarantine directory is no
+longer part of the primary compilation root set, so Phase 6.C's
+`git rm -r modules/payments/legacy-v1/` produces a clean bulk-delete diff
+with a single facade edit (remove the barrel import + the delegator
+methods) plus the tsconfig line removal.
+
+Excluding the directory from the tsconfig root set does not stop TS from
+compiling the files transitively via the facade's barrel import — it
+declares the quarantine intent and lets Phase 6.C's `git rm` land without
+needing to touch `include`/`exclude`.
