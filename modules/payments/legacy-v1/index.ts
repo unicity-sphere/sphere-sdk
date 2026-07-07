@@ -11,3 +11,4 @@ export * from './v5-saves';
 export * from './combined-transfer';
 export * from './instant-split';
 export * from './finalization';
+export * from './commitment';
