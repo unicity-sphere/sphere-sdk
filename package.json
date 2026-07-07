@@ -150,7 +150,7 @@
     "@noble/curves": "^2.0.1",
     "@noble/hashes": "^2.0.1",
     "@unicitylabs/nostr-js-sdk": "^0.5.0",
-    "@unicitylabs/state-transition-sdk": "1.6.1-rc.f37cb85",
+    "@unicitylabs/state-transition-sdk": "2.0.0-rc.68bc1e5",
     "stsdk-v1": "npm:@unicitylabs/state-transition-sdk@1.6.1-rc.f37cb85",
     "async-mutex": "^0.5.0",
     "bip39": "^3.1.0",
