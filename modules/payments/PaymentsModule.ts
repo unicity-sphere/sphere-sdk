@@ -103,6 +103,13 @@ import { SphereError } from '../../core/errors';
 // SDK-shaped).
 import { encodeTransferPayload, decodeNostrEventContent } from '../../extensions/uxf/bundle/transfer-payload';
 import { isUxfTransferPayloadCar, isUxfTransferPayloadCid } from '../../extensions/uxf/types/uxf-transfer';
+import type { UxfTransferPayloadCid } from '../../extensions/uxf/types/uxf-transfer';
+// CID-fetch pipeline — wave 6-P2-11 wires the recipient side of the
+// `kind: 'uxf-cid'` envelope. `fetchCarByCid` walks the configured
+// gateway list, verifies the CAR root CID matches the requested
+// bundleCid, and returns the bytes on success.
+import { fetchCarByCid } from '../../extensions/uxf/pipeline/cid-fetcher';
+import { CarReader } from '@ipld/car';
 
 // SpendQueue is retained per the wave brief but its stsdk-v1-based
 // parser is not on the hot path in the v2 slim rebuild; we re-export
@@ -1064,6 +1071,89 @@ export class PaymentsModule {
   }
 
   /**
+   * Wave 6-P2-11 — Fetch a `uxf-cid` bundle from configured IPFS gateways
+   * and extract the inline token blobs the receive tail expects.
+   *
+   * Returns `null` on any failure (empty gateway list, transient fetch
+   * failure, structural CAR issue). The caller treats `null` as
+   * "retention required" and reports back to the transport so the event
+   * can be retried.
+   *
+   * Success returns an array of raw token blob bytes (possibly empty if
+   * the CAR's root block is a well-formed envelope containing no tokens
+   * — that's a peer-side sender bug, not a delivery failure, so no
+   * retention).
+   *
+   * **Never expose gateway URLs in logs.** `fetchCarByCid` carries the
+   * gateway list on the `SphereError.cause`, but we only surface the
+   * error message which is bounded to `"fetchCarByCid: …"` shape by
+   * construction. Downstream fetch errors surface via their message and
+   * are truncated defensively.
+   */
+  private async fetchAndExtractCidBundle(
+    payload: UxfTransferPayloadCid,
+    senderTransportPubkey: string,
+  ): Promise<Uint8Array[] | null> {
+    const gateways = this.deps?.cidFetchGateways;
+    if (!gateways || gateways.length === 0) {
+      logger.warn(
+        'Payments',
+        `Ignoring uxf-cid payload (${payload.bundleCid.slice(0, 16)}...); no cidFetchGateways configured`,
+      );
+      return null;
+    }
+    let carBytes: Uint8Array;
+    try {
+      const result = await fetchCarByCid(payload.bundleCid, {
+        gateways,
+        senderTransportPubkey,
+      });
+      carBytes = result.carBytes;
+    } catch (err) {
+      // Never surface gateway URLs to logs — strip any URL-looking
+      // token from the raw message and bound the length.
+      const raw = err instanceof Error ? err.message : String(err);
+      const stripped = raw.replace(/https?:\/\/[^\s"',<>]+/gi, '[gateway-redacted]');
+      const safe = stripped.length > 200 ? stripped.slice(0, 200) + '…' : stripped;
+      logger.warn(
+        'Payments',
+        `uxf-cid fetch failed for ${payload.bundleCid.slice(0, 16)}...: ${safe}`,
+      );
+      return null;
+    }
+    // Parse the CAR and extract the root block. In the slim receive path
+    // the root block bytes carry the same JSON envelope the inline
+    // `uxf-car` path packs into `carBase64` — we re-run the shared
+    // decoder so the downstream "same tail" (isOwnedBy → verify →
+    // persist) is bit-identical.
+    try {
+      const reader = await CarReader.fromBytes(carBytes);
+      const roots = await reader.getRoots();
+      if (roots.length !== 1) {
+        logger.warn(
+          'Payments',
+          `uxf-cid CAR has ${roots.length} roots; expected exactly 1`,
+        );
+        return null;
+      }
+      const rootBlock = await reader.get(roots[0]);
+      if (!rootBlock) {
+        logger.warn('Payments', 'uxf-cid CAR root block missing from CAR');
+        return null;
+      }
+      const envelopeBase64 = Buffer.from(rootBlock.bytes).toString('base64');
+      return extractInlineTokenBlobs(envelopeBase64);
+    } catch (err) {
+      logger.warn(
+        'Payments',
+        `uxf-cid CAR decode failed for ${payload.bundleCid.slice(0, 16)}...:`,
+        err,
+      );
+      return null;
+    }
+  }
+
+  /**
    * Handle an incoming transport transfer event. Returns `true` when the
    * event is durably persisted (advances the transport's `since` cursor).
    */
@@ -1079,14 +1169,21 @@ export class PaymentsModule {
       if (isUxfTransferPayloadCar(payload)) {
         blobs = extractInlineTokenBlobs(payload.carBase64);
       } else if (isUxfTransferPayloadCid(payload)) {
-        // CID-by-reference — v2 slim rebuild does not fetch CARs. Log and
-        // return false so the transport retains the event for a fatter
-        // consumer.
-        logger.warn(
-          'Payments',
-          `Ignoring uxf-cid payload (${payload.bundleCid}); CID-fetch not wired in v2 slim receive`,
+        // Wave 6-P2-11 — CID-by-reference receive. `fetchAndExtractCidBundle`
+        // walks `deps.cidFetchGateways` in order, verifies the CAR root
+        // CID matches `payload.bundleCid`, and extracts the same JSON-
+        // envelope token blobs the inline `uxf-car` path consumes. On any
+        // failure (empty gateway list, transient fetch failure, structural
+        // CAR issue) it returns null and we hand back `false` so the
+        // transport retains the event for retry.
+        const fetched = await this.fetchAndExtractCidBundle(
+          payload,
+          transfer.senderTransportPubkey,
         );
-        return false;
+        if (fetched === null) {
+          return false;
+        }
+        blobs = fetched;
       } else {
         logger.debug('Payments', 'Ignoring non-UXF transfer payload (legacy shape)');
         return false;
