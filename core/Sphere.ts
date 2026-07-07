@@ -160,6 +160,21 @@ import {
   initializeIdentityFromMasterKeyImpl as identityInitializeFromMasterKey,
   type IdentityStorageHost,
 } from './sphere-identity-storage';
+import {
+  reconnectImpl as providersReconnect,
+  disableProviderImpl as providersDisableProvider,
+  enableProviderImpl as providersEnableProvider,
+  isProviderEnabledImpl as providersIsProviderEnabled,
+  getDisabledProviderIdsImpl as providersGetDisabledProviderIds,
+  findProviderByIdImpl as providersFindProviderById,
+  subscribeToProviderEventsImpl as providersSubscribeToProviderEvents,
+  forwardPointerPublishedToNostrImpl as providersForwardPointerPublishedToNostr,
+  maybeInstallPointerWinSubscriptionImpl as providersMaybeInstallPointerWinSubscription,
+  handleIncomingPointerWinBroadcastImpl as providersHandleIncomingPointerWinBroadcast,
+  emitConnectionChangedImpl as providersEmitConnectionChanged,
+  cleanupProviderEventSubscriptionsImpl as providersCleanupProviderEventSubscriptions,
+  type ProvidersHost,
+} from './sphere-providers';
 // Phase 6-P2-4d: SigningService import routed through token-engine anti-corruption
 // barrel; the v1 predicate primitives (`TokenType`, `HashAlgorithm`,
 // `UnmaskedPredicateReference`) that used to compose the DIRECT address by hand
@@ -3925,9 +3940,7 @@ export class Sphere {
   }
 
   async reconnect(): Promise<void> {
-    await this._transport.disconnect();
-    await this._transport.connect();
-    // connection:changed is emitted automatically by provider event bridge
+    return providersReconnect(this as unknown as ProvidersHost);
   }
 
   // ===========================================================================
@@ -3939,113 +3952,36 @@ export class Sphere {
    * and skipped during operations (e.g., sync).
    *
    * Main storage provider cannot be disabled.
+   * Extracted to `core/sphere-providers.ts` — see there for detail.
    *
    * @returns true if successfully disabled, false if provider not found
    */
   async disableProvider(providerId: string): Promise<boolean> {
-    if (providerId === this._storage.id) {
-      throw new SphereError('Cannot disable the main storage provider', 'INVALID_CONFIG');
-    }
-
-    const provider = this.findProviderById(providerId);
-    if (!provider) return false;
-
-    this._disabledProviders.add(providerId);
-
-    try {
-      if ('disable' in provider && typeof provider.disable === 'function') {
-        // L1PaymentsModule — dedicated disable that disconnects + blocks operations
-        provider.disable();
-      } else if ('shutdown' in provider && typeof provider.shutdown === 'function') {
-        await provider.shutdown();
-      } else if ('disconnect' in provider && typeof provider.disconnect === 'function') {
-        await provider.disconnect();
-      } else if ('clearCache' in provider && typeof provider.clearCache === 'function') {
-        // Stateless providers (e.g. PriceProvider) — just clear cache
-        provider.clearCache();
-      }
-    } catch {
-      // Provider disconnect may fail — still mark as disabled
-    }
-
-    this.emitEvent('connection:changed', {
-      provider: providerId,
-      connected: false,
-      status: 'disconnected',
-      enabled: false,
-    });
-
-    return true;
+    return providersDisableProvider(this as unknown as ProvidersHost, providerId);
   }
 
   /**
    * Re-enable a previously disabled provider. Reconnects and resumes operations.
+   * Extracted to `core/sphere-providers.ts` — see there for detail.
    *
    * @returns true if successfully enabled, false if provider not found
    */
   async enableProvider(providerId: string): Promise<boolean> {
-    const provider = this.findProviderById(providerId);
-    if (!provider) return false;
-
-    this._disabledProviders.delete(providerId);
-
-    // L1 — dedicated enable(), reconnects lazily on next operation
-    if ('enable' in provider && typeof provider.enable === 'function') {
-      provider.enable();
-      this.emitEvent('connection:changed', {
-        provider: providerId,
-        connected: false,
-        status: 'disconnected',
-        enabled: true,
-      });
-      return true;
-    }
-
-    // Stateless providers (PriceProvider) — no connect needed
-    const hasLifecycle = ('connect' in provider && typeof provider.connect === 'function')
-      || ('initialize' in provider && typeof provider.initialize === 'function');
-
-    if (hasLifecycle) {
-      try {
-        if ('connect' in provider && typeof provider.connect === 'function') {
-          await provider.connect();
-        } else if ('initialize' in provider && typeof provider.initialize === 'function') {
-          await provider.initialize();
-        }
-      } catch (err) {
-        this.emitEvent('connection:changed', {
-          provider: providerId,
-          connected: false,
-          status: 'error',
-          enabled: true,
-          error: err instanceof Error ? err.message : String(err),
-        });
-        return false;
-      }
-    }
-
-    this.emitEvent('connection:changed', {
-      provider: providerId,
-      connected: true,
-      status: 'connected',
-      enabled: true,
-    });
-
-    return true;
+    return providersEnableProvider(this as unknown as ProvidersHost, providerId);
   }
 
   /**
    * Check if a provider is currently enabled
    */
   isProviderEnabled(providerId: string): boolean {
-    return !this._disabledProviders.has(providerId);
+    return providersIsProviderEnabled(this as unknown as ProvidersHost, providerId);
   }
 
   /**
    * Get the set of disabled provider IDs (for passing to modules)
    */
   getDisabledProviderIds(): ReadonlySet<string> {
-    return this._disabledProviders;
+    return providersGetDisabledProviderIds(this as unknown as ProvidersHost);
   }
 
   /** Get the price provider's ID (implementation detail — not on PriceProvider interface) */
@@ -4057,19 +3993,11 @@ export class Sphere {
 
   /**
    * Find a provider by ID across all provider collections
+   * Extracted to `core/sphere-providers.ts` — see there for detail.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private findProviderById(providerId: string): Record<string, any> | null {
-    if (this._storage.id === providerId) return this._storage;
-    if (this._transport.id === providerId) return this._transport;
-    if (this._oracle.id === providerId) return this._oracle;
-    if (this._tokenStorageProviders.has(providerId)) {
-      return this._tokenStorageProviders.get(providerId)!;
-    }
-    if (this._priceProvider && this._priceProviderId === providerId) {
-      return this._priceProvider;
-    }
-    return null;
+    return providersFindProviderById(this as unknown as ProvidersHost, providerId);
   }
 
   // ===========================================================================
@@ -4853,321 +4781,32 @@ export class Sphere {
 
   /**
    * Subscribe to provider-level events and bridge them to Sphere connection:changed events.
-   * Uses deduplication to avoid emitting duplicate events.
+   * Extracted to `core/sphere-providers.ts` — see there for detail.
    */
   private subscribeToProviderEvents(): void {
-    this.cleanupProviderEventSubscriptions();
-
-    // Bridge transport events
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const transportAny = this._transport as any;
-    if (typeof transportAny.onEvent === 'function') {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const unsub = transportAny.onEvent((event: any) => {
-        const type = event?.type as string;
-        if (type === 'transport:connected') {
-          this.emitConnectionChanged(this._transport.id, true, 'connected');
-        } else if (type === 'transport:disconnected') {
-          this.emitConnectionChanged(this._transport.id, false, 'disconnected');
-        } else if (type === 'transport:reconnecting') {
-          this.emitConnectionChanged(this._transport.id, false, 'connecting');
-        } else if (type === 'transport:error') {
-          this.emitConnectionChanged(this._transport.id, false, 'error', event?.error);
-        }
-      });
-      if (unsub) this._providerEventCleanups.push(unsub);
-    }
-
-    // Bridge oracle events
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const oracleAny = this._oracle as any;
-    if (typeof oracleAny.onEvent === 'function') {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const unsub = oracleAny.onEvent((event: any) => {
-        const type = event?.type as string;
-        if (type === 'oracle:connected') {
-          this.emitConnectionChanged(this._oracle.id, true, 'connected');
-        } else if (type === 'oracle:disconnected') {
-          this.emitConnectionChanged(this._oracle.id, false, 'disconnected');
-        } else if (type === 'oracle:error') {
-          this.emitConnectionChanged(this._oracle.id, false, 'error', event?.error);
-        }
-      });
-      if (unsub) this._providerEventCleanups.push(unsub);
-    }
-
-    // Bridge token storage events
-    for (const [providerId, provider] of this._tokenStorageProviders) {
-      if (typeof provider.onEvent === 'function') {
-        const unsub = provider.onEvent((event) => {
-          if (event.type === 'storage:error' || event.type === 'sync:error') {
-            this.emitConnectionChanged(providerId, provider.isConnected(), provider.getStatus(), event.error);
-          }
-          // RFC-251 Approach D / issue #255 Problem B — pointer-publish
-          // win-broadcast publisher side. After the lifecycle manager
-          // emits a `storage:pointer-published` event (containing the
-          // already-signed payload + broadcast tag), forward it to
-          // Nostr so sibling devices sharing this wallet's identity
-          // can adopt V=N without waiting for the aggregator's 30-60s
-          // read-replica lag.
-          //
-          // Best-effort: any failure (transport down, relay reject) is
-          // logged and dropped. The aggregator publish has already
-          // succeeded; the wallet's own state is correct without the
-          // broadcast. Siblings just fall back to the existing
-          // WALKBACK_FLOOR + reconcile path (~60-90 s).
-          if (event.type === 'storage:pointer-published') {
-            void this.forwardPointerPublishedToNostr(event);
-            // Also try to install the sibling-subscription side now
-            // that we know a pointer layer is live (signing is what
-            // produced this event). Idempotent — repeat calls no-op
-            // when the subscription is already in place.
-            void this.maybeInstallPointerWinSubscription();
-          }
-          // Issue #264 — bridge `storage:monotonicity-recovered` to a
-          // user-visible Sphere event so dashboards / telemetry
-          // pipelines subscribing via `sphere.on(...)` can observe
-          // auto-merge convergence work without dropping to provider-
-          // direct subscriptions. Pure informational forward — the
-          // provider's data payload rides through verbatim with
-          // `providerId` added for fan-out attribution.
-          if (event.type === 'storage:monotonicity-recovered') {
-            const d = (event.data ?? {}) as {
-              recoveredTokenIds?: string[];
-              recoveredTokenCount?: number;
-              mergedUnknownBundleCids?: string[];
-              mergedUnknownBundleCount?: number;
-              residualUnknownBundleCids?: string[];
-              residualUnknownBundleCount?: number;
-              residualTokenMissingIds?: string[];
-              residualTokenMissingCount?: number;
-              recoveredOutboxIdsDroppedAsSent?: string[];
-              recoveredOutboxIdsDroppedAsSentCount?: number;
-              truncated?: boolean;
-            };
-            this.emitEvent('storage:monotonicity-recovered', {
-              providerId,
-              recoveredTokenIds: d.recoveredTokenIds ?? [],
-              recoveredTokenCount: d.recoveredTokenCount ?? 0,
-              mergedUnknownBundleCids: d.mergedUnknownBundleCids ?? [],
-              mergedUnknownBundleCount: d.mergedUnknownBundleCount ?? 0,
-              residualUnknownBundleCids: d.residualUnknownBundleCids ?? [],
-              residualUnknownBundleCount: d.residualUnknownBundleCount ?? 0,
-              residualTokenMissingIds: d.residualTokenMissingIds ?? [],
-              residualTokenMissingCount: d.residualTokenMissingCount ?? 0,
-              recoveredOutboxIdsDroppedAsSent: d.recoveredOutboxIdsDroppedAsSent ?? [],
-              recoveredOutboxIdsDroppedAsSentCount: d.recoveredOutboxIdsDroppedAsSentCount ?? 0,
-              truncated: d.truncated === true,
-            });
-          }
-        });
-        if (unsub) this._providerEventCleanups.push(unsub);
-      }
-    }
+    return providersSubscribeToProviderEvents(this as unknown as ProvidersHost);
   }
 
   /**
-   * RFC-251 Approach D / issue #255 Problem B — publisher side.
-   *
-   * Receives a `storage:pointer-published` event from the lifecycle
-   * manager (which carries an already-signed broadcast payload + its
-   * per-wallet tag) and forwards it over Nostr. Best-effort:
-   * - No publish? Drop silently (transport doesn't support broadcasts
-   *   — falls back to existing WALKBACK_FLOOR convergence).
-   * - Publish throws? Log warn and drop.
-   *
-   * The signing happened upstream (in lifecycle-manager where the
-   * pointer layer is reachable). This method does pure transport I/O.
+   * RFC-251 Approach D — pointer-published Nostr forwarder.
+   * Extracted to `core/sphere-providers.ts` — see there for detail.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async forwardPointerPublishedToNostr(event: any): Promise<void> {
-    try {
-      const data = event?.data as
-        | {
-            signedPayloadJson?: unknown;
-            broadcastTag?: unknown;
-            version?: unknown;
-            cid?: unknown;
-          }
-        | undefined;
-      const signedPayloadJson = data?.signedPayloadJson;
-      const broadcastTag = data?.broadcastTag;
-      if (
-        typeof signedPayloadJson !== 'string' ||
-        typeof broadcastTag !== 'string' ||
-        signedPayloadJson.length === 0 ||
-        broadcastTag.length === 0
-      ) {
-        // Event shape didn't include the signed payload (e.g. pointer
-        // layer absent at sign time, or upstream sign failure). Caller
-        // already logged the sign error; nothing useful to publish.
-        return;
-      }
-      if (typeof this._transport.publishBroadcast !== 'function') {
-        // Transport doesn't support broadcasts (e.g., file-only mock).
-        // Silently skip — the existing WALKBACK_FLOOR path still
-        // handles cross-device convergence.
-        return;
-      }
-      await this._transport.publishBroadcast(signedPayloadJson, [broadcastTag]);
-      logger.debug(
-        'Sphere',
-        `pointer-win broadcast published: version=${String(data?.version ?? '?')} ` +
-        `cid=${String(data?.cid ?? '?')} tag=${broadcastTag}`,
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn(
-        'Sphere',
-        `pointer-win broadcast publish failed (best-effort, ignored): ${msg}`,
-      );
-    }
+    return providersForwardPointerPublishedToNostr(this as unknown as ProvidersHost, event);
   }
 
   /**
-   * RFC-251 Approach D / issue #255 Problem B — subscriber side.
-   *
-   * Install the per-wallet Nostr subscription so this device receives
-   * pointer-win broadcasts from sibling devices sharing the same
-   * wallet identity. Idempotent — safe to call repeatedly; once the
-   * subscription is in place for a given signing pubkey, subsequent
-   * invocations short-circuit.
-   *
-   * Pointer layer is built async during OrbitDB attach, so the
-   * subscription cannot be installed at Sphere init time. Two
-   * triggers eventually fire `maybeInstallPointerWinSubscription`:
-   *   - Lazy-on-own-publish: our own first `storage:pointer-published`
-   *     event implies pointer is live. We install then.
-   *   - (Phase 2 expansion) An eager polling loop after init for
-   *     receive-only devices that never publish themselves. NOT
-   *     wired in Phase 1 — those devices currently miss broadcasts
-   *     until they themselves publish at least once. Acceptable for
-   *     prototype; document as known-gap.
+   * RFC-251 Approach D — sibling pointer-win subscription install.
+   * Extracted to `core/sphere-providers.ts` — see there for detail.
    */
   private async maybeInstallPointerWinSubscription(): Promise<void> {
-    if (this._pointerWinInstallInFlight) return;
-    this._pointerWinInstallInFlight = true;
-    try {
-      const storageWithPointer = this._storage as unknown as {
-        getPointerLayer?: () =>
-          | import('../extensions/uxf/profile/aggregator-pointer/ProfilePointerLayer').ProfilePointerLayer
-          | null;
-      };
-      const pointer = storageWithPointer.getPointerLayer?.() ?? null;
-      if (!pointer) {
-        // Pointer layer not yet built; try again on the next event.
-        return;
-      }
-      // Issue #264 — gated behind the pointer layer's
-      // `enablePointerWinBroadcasts` capability (default OFF). With
-      // the flag false this subscriber side is dormant: no per-wallet
-      // Nostr subscription is installed, so no sibling broadcasts can
-      // reach `handleIncomingPointerWinBroadcast`. The aggregator
-      // pointer + auto-merge convergence path covers correctness
-      // without the broadcast optimization.
-      //
-      // Tolerant of pointer stubs that predate the
-      // `winBroadcastsEnabled` accessor (mirrors the symmetric guard
-      // in `lifecycle-manager.ts:publishAggregatorPointerBestEffort`):
-      // a missing method is treated as flag=false (fail-closed). The
-      // production code path always builds a real `ProfilePointerLayer`
-      // which implements the method; this defensive check keeps the
-      // contract robust for any future test stub or duck-typed
-      // consumer.
-      // Defensive try/catch around the accessor: same rationale as
-      // lifecycle-manager. The accessor contract says
-      // `winBroadcastsEnabled()` MUST NOT throw, but a misbehaving
-      // stub could violate it. Without this catch, an accessor
-      // throw would escape to the outer `try { ... } catch (err)`
-      // and surface as a noisy "subscription install failed (will
-      // retry on next event)" warn — re-arming on every subsequent
-      // `storage:pointer-published` event indefinitely. Treat the
-      // throw as flag=false (fail-closed) so the early-return path
-      // fires cleanly with no noise.
-      let armed = false;
-      try {
-        armed =
-          typeof pointer.winBroadcastsEnabled === 'function' &&
-          // Strict `=== true` mirrors the production normalization
-          // in ProfilePointerLayer's frozen config snapshot. A test
-          // stub returning a truthy non-boolean (`1`, `'yes'`, `{}`)
-          // must be treated as flag=false — same fail-closed policy.
-          pointer.winBroadcastsEnabled() === true &&
-          // Symmetric stub guard: a fake pointer that returns
-          // `winBroadcastsEnabled() === true` but lacks
-          // `getSignerForWinBroadcast` would TypeError at the call
-          // below; fail-closed earlier.
-          typeof pointer.getSignerForWinBroadcast === 'function';
-      } catch (accessorErr) {
-        const msg =
-          accessorErr instanceof Error
-            ? accessorErr.message
-            : String(accessorErr);
-        logger.debug(
-          'Sphere',
-          `pointer-win subscription: winBroadcastsEnabled() threw ` +
-            `(accessor contract violation, treating as flag=false): ${msg}`,
-        );
-        armed = false;
-      }
-      if (!armed) {
-        return;
-      }
-      const signerHandle = pointer.getSignerForWinBroadcast();
-      const signingPubKeyHex = signerHandle.signingPubKeyHex;
-      if (this._pointerWinSubscriptions.has(signingPubKeyHex)) {
-        // Already subscribed for this wallet identity.
-        return;
-      }
-      if (typeof this._transport.subscribeToBroadcast !== 'function') {
-        return;
-      }
-
-      // Late-imported to avoid pulling the win-broadcast module into the
-      // happy path for wallets that disable pointer broadcasts entirely.
-      const {
-        buildWinBroadcastTag,
-        verifyWinBroadcastPayload,
-      } = await import('../extensions/uxf/profile/aggregator-pointer/win-broadcast');
-      const tag = buildWinBroadcastTag(signingPubKeyHex);
-
-      const unsub = this._transport.subscribeToBroadcast(
-        [tag],
-        (broadcast) => {
-          void this.handleIncomingPointerWinBroadcast(broadcast.content, signingPubKeyHex, pointer, verifyWinBroadcastPayload);
-        },
-      );
-      this._pointerWinSubscriptions.set(signingPubKeyHex, unsub);
-      logger.debug(
-        'Sphere',
-        `pointer-win subscription installed: tag=${tag}`,
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn(
-        'Sphere',
-        `pointer-win subscription install failed (will retry on next event): ${msg}`,
-      );
-    } finally {
-      this._pointerWinInstallInFlight = false;
-    }
+    return providersMaybeInstallPointerWinSubscription(this as unknown as ProvidersHost);
   }
 
   /**
    * Handle an incoming pointer-win broadcast from a sibling device.
-   *
-   * Flow:
-   *   1. Parse JSON content.
-   *   2. Verify signature against own signingPubKey (signature mismatch
-   *      = spoofed or wrong-wallet event; drop silently).
-   *   3. Dedup by (signingPubKey, version) — bounded LRU.
-   *   4. Trigger early reconcile: `recoverLatest()` + `reconcileLocalVersionDownward()`.
-   *      Same path the WALKBACK_FLOOR catch arm runs (lifecycle-manager.ts
-   *      lines 1311-1331), just collapsed to "now" instead of "60s
-   *      throttle expiry".
-   *
-   * All errors are caught and logged at debug — never propagate to the
-   * transport handler.
+   * Extracted to `core/sphere-providers.ts` — see there for detail.
    */
   private async handleIncomingPointerWinBroadcast(
     contentJson: string,
@@ -5178,74 +4817,18 @@ export class Sphere {
       expectedSigningPubKeyHex: string,
     ) => Promise<boolean>,
   ): Promise<void> {
-    try {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(contentJson);
-      } catch {
-        // Not our JSON; relay-noise on the same tag (improbable but
-        // defensive). Drop.
-        return;
-      }
-      const payload = parsed as import('../extensions/uxf/profile/aggregator-pointer/win-broadcast').SignedWinBroadcastPayload;
-      const ok = await verify(payload, ownSigningPubKeyHex);
-      if (!ok) {
-        logger.debug(
-          'Sphere',
-          'pointer-win broadcast: verification failed (spoof, expired, or wrong-wallet); dropped',
-        );
-        return;
-      }
-      const dedupKey = `${payload.signingPubKey}:${payload.version}`;
-      if (this._pointerWinSeen.has(dedupKey)) {
-        return;
-      }
-      // Bounded LRU — drop oldest insertion when over cap.
-      if (this._pointerWinSeen.size >= 256) {
-        const oldest = this._pointerWinSeen.values().next().value;
-        if (oldest !== undefined) this._pointerWinSeen.delete(oldest);
-      }
-      this._pointerWinSeen.add(dedupKey);
-
-      logger.debug(
-        'Sphere',
-        `pointer-win broadcast received: version=${payload.version} ` +
-        `cid=${payload.cid} — triggering early reconcile`,
-      );
-
-      // Phase 1: trigger an early `recoverLatest` + `reconcileLocalVersionDownward`.
-      // This is the same path the WALKBACK_FLOOR catch arm runs after a
-      // race-loss; here we run it eagerly on the broadcast without
-      // waiting for the throttle to expire. Acknowledged limitation:
-      // when own localVersion is already at broadcast.version (same-
-      // version race), reconcileDownward is a no-op — Phase 2 would add
-      // a `ProfilePointerLayer.adoptBroadcast(payload)` entrypoint that
-      // bypasses the >= comparison. For Phase 1 this still helps the
-      // cross-version case where own localVersion < broadcast.version.
-      const recovered = await pointer.recoverLatest();
-      // `'cid' in recovered` narrows RecoverResult | RecoverAllUnfetchableResult
-      // to RecoverResult — RecoverAllUnfetchableResult has no `cid` field.
-      // RecoverAllUnfetchableResult has no fetchable version to adopt, so skip.
-      if (recovered && 'cid' in recovered) {
-        const outcome = await pointer.reconcileLocalVersionDownward(recovered);
-        logger.debug(
-          'Sphere',
-          `pointer-win broadcast: post-receipt reconcile ` +
-          `reconciled=${outcome.reconciled} ` +
-          `fromVersion=${outcome.fromVersion} toVersion=${outcome.toVersion}`,
-        );
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.debug(
-        'Sphere',
-        `pointer-win broadcast: handler threw (dropped): ${msg}`,
-      );
-    }
+    return providersHandleIncomingPointerWinBroadcast(
+      this as unknown as ProvidersHost,
+      contentJson,
+      ownSigningPubKeyHex,
+      pointer,
+      verify,
+    );
   }
 
   /**
    * Emit connection:changed with deduplication — only emits if status actually changed.
+   * Extracted to `core/sphere-providers.ts` — see there for detail.
    */
   private emitConnectionChanged(
     providerId: string,
@@ -5253,42 +4836,11 @@ export class Sphere {
     status: ProviderStatus,
     error?: string,
   ): void {
-    const lastConnected = this._lastProviderConnected.get(providerId);
-    if (lastConnected === connected) return; // No change — skip
-
-    this._lastProviderConnected.set(providerId, connected);
-
-    this.emitEvent('connection:changed', {
-      provider: providerId,
-      connected,
-      status,
-      enabled: !this._disabledProviders.has(providerId),
-      ...(error ? { error } : {}),
-    });
+    return providersEmitConnectionChanged(this as unknown as ProvidersHost, providerId, connected, status, error);
   }
 
   private cleanupProviderEventSubscriptions(): void {
-    for (const cleanup of this._providerEventCleanups) {
-      try { cleanup(); } catch { /* ignore */ }
-    }
-    this._providerEventCleanups = [];
-    this._lastProviderConnected.clear();
-    // RFC-251 Approach D — also tear down per-wallet pointer-win
-    // broadcast subscriptions to avoid relay-side subscription leaks
-    // across Sphere reinit cycles. Defensive: legacy test harnesses
-    // construct Sphere via `Object.create(prototype)` which skips
-    // class-field initializers, leaving these fields undefined. Skip
-    // the cleanup cleanly when the state never got installed.
-    if (this._pointerWinSubscriptions !== undefined) {
-      for (const unsub of this._pointerWinSubscriptions.values()) {
-        try { unsub(); } catch { /* ignore */ }
-      }
-      this._pointerWinSubscriptions.clear();
-    }
-    if (this._pointerWinSeen !== undefined) {
-      this._pointerWinSeen.clear();
-    }
-    this._pointerWinInstallInFlight = false;
+    return providersCleanupProviderEventSubscriptions(this as unknown as ProvidersHost);
   }
 
   private async initializeModules(): Promise<void> {

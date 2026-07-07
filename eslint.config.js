@@ -65,6 +65,7 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
   'core/sphere-identity-storage.ts',
   'core/sphere-nametag.ts',
   'core/sphere-nametag-sync.ts',
+  'core/sphere-providers.ts',
   'core/sphere-wallet-io.ts',
   'modules/payments/PaymentsModule.ts',
   // Phase 5 sync/ concern extraction — inherits the facade's
