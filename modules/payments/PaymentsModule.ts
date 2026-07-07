@@ -242,6 +242,10 @@ import {
   type OutboxSetEntryType,
 } from '../../extensions/uxf/pipeline/module-glue/outbox-ops';
 import {
+  maybeEmitCapabilityWarning as maybeEmitCapabilityWarningImpl,
+  type CapabilityWarningHost,
+} from '../../extensions/uxf/pipeline/module-glue/capability-warning';
+import {
   sweepOrphanSpendingTokens,
   type OrphanSweepResult,
   type OrphanSpendingFinding,
@@ -8740,53 +8744,17 @@ export class PaymentsModule {
     request: TransferRequest,
     mode: 'instant' | 'conservative' | 'txf',
   ): Promise<void> {
-    const transport = this.deps?.transport;
-    if (!transport?.resolve) return;
+    return maybeEmitCapabilityWarningImpl(this.capabilityWarningHost(), request, mode);
+  }
 
-    let peerInfo: PeerInfo | null;
-    try {
-      peerInfo = (await transport.resolve(request.recipient)) ?? null;
-    } catch {
-      // Resolve failures aren't capability concerns — let the dispatcher
-      // surface its own typed error.
-      return;
-    }
-    if (!peerInfo) return;
-
-    const outboundAssetKinds = this.computeOutboundAssetKinds(request);
-    const outboundWireProtocol = this.resolveOutboundWireProtocol(mode);
-
-    // W20: assetKinds absent on the wire ⇒ assume ['coin']. We preserve
-    // the empty-array case (peer present but explicitly empty) as-is so
-    // diagnostics distinguish "older peer" from "explicitly empty".
-    const recipientAssetKinds: ReadonlyArray<string> = peerInfo.assetKinds
-      ?? DEFAULT_ASSET_KINDS_WHEN_ABSENT;
-    const recipientWireProtocols = peerInfo.wireProtocols;
-
-    const advertisedKinds = new Set(recipientAssetKinds);
-    const mismatchedAssetKinds = outboundAssetKinds.filter(k => !advertisedKinds.has(k));
-
-    // wireProtocolMismatch fires only when hints were PRESENT and the
-    // outbound protocol is not in the set. Absent hints make NO claim.
-    let wireProtocolMismatch = false;
-    if (recipientWireProtocols !== undefined) {
-      const advertisedWP = new Set(recipientWireProtocols);
-      wireProtocolMismatch = !advertisedWP.has(outboundWireProtocol);
-    }
-
-    if (mismatchedAssetKinds.length === 0 && !wireProtocolMismatch) {
-      return; // Everything advertised — nothing to warn about.
-    }
-
-    this.deps!.emitEvent('transfer:capability-warning', {
-      recipientTransportPubkey: peerInfo.transportPubkey,
-      recipientAssetKinds,
-      recipientWireProtocols,
-      outboundAssetKinds,
-      outboundWireProtocol,
-      mismatchedAssetKinds,
-      wireProtocolMismatch,
-    });
+  /** Host-shim builder for {@link maybeEmitCapabilityWarningImpl}. */
+  private capabilityWarningHost(): CapabilityWarningHost {
+    return {
+      transport: this.deps?.transport,
+      emitEvent: (type, data) => this.deps!.emitEvent(type, data),
+      computeOutboundAssetKinds: (req) => this.computeOutboundAssetKinds(req),
+      resolveOutboundWireProtocol: (m) => this.resolveOutboundWireProtocol(m),
+    };
   }
 
   // ===========================================================================
