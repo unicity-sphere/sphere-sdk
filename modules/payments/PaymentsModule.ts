@@ -742,6 +742,12 @@ import {
   findBestTokenVersion,
 } from './tokens';
 
+// Phase 5 mint/ concern — free function form of `mintFungibleToken`.
+// Facade delegates to keep the public API stable while the implementation
+// lives in a small, single-purpose file. See modules/payments/mint/README.md
+// for the routing plan; Phase 6.C will rewire this onto `ITokenEngine`.
+import { mintFungibleTokenImpl } from './mint';
+
 // Issue #245 #1 — `extractCurrentStatePublicKeyHexFromSdkData` was extracted
 // to `./extract-state-publickey.ts` (issue #535) so SwapModule.verifyPayout
 // can reuse the same logic without re-implementing predicate parsing.
@@ -11703,122 +11709,27 @@ export class PaymentsModule {
     amount: bigint,
   ): Promise<{ success: true; token: Token; tokenId: string } | { success: false; error: string }> {
     this.ensureInitialized();
-
-    const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
-    if (!stClient) {
-      return { success: false, error: 'State transition client not available' };
-    }
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
-    if (!trustBase) {
-      return { success: false, error: 'Trust base not available' };
-    }
-
-    try {
-      const signingService = await this.createSigningService();
-      const { TokenId } = await import('@unicitylabs/state-transition-sdk/lib/token/TokenId');
-      const { TokenCoinData } = await import('@unicitylabs/state-transition-sdk/lib/token/fungible/TokenCoinData');
-      const { UnmaskedPredicateReference } = await import('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference');
-
-      // Use the same token-type prefix the wider SDK uses for fungible
-      // genesis (see InvoiceTokenType / NametagMinter conventions). This
-      // keeps the sdkData shape compatible with the rest of PaymentsModule.
-      const tokenTypeBytes = fromHex('f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509');
-      const tokenType = new TokenType(tokenTypeBytes);
-
-      // Random tokenId — each mint produces a unique token.
-      const tokenIdBytes = new Uint8Array(32);
-      crypto.getRandomValues(tokenIdBytes);
-      const tokenId = new TokenId(tokenIdBytes);
-
-      const coinIdBytes = fromHex(coinIdHex);
-      const coinId = new CoinId(coinIdBytes);
-      const coinData = TokenCoinData.create([[coinId, amount]]);
-
-      // Recipient = self via UnmaskedPredicateReference → DirectAddress.
-      const addressRef = await UnmaskedPredicateReference.create(
-        tokenType,
-        signingService.algorithm,
-        signingService.publicKey,
-        HashAlgorithm.SHA256,
-      );
-      const ownerAddress = await addressRef.toAddress();
-
-      // Random salt — uniqueness gate for the mint commitment.
-      const salt = new Uint8Array(32);
-      crypto.getRandomValues(salt);
-
-      const mintData = await MintTransactionData.create(
-        tokenId,
-        tokenType,
-        null,            // tokenData: no metadata
-        coinData,        // fungible coin data
-        ownerAddress,    // recipient = self
-        salt,
-        null,            // recipientDataHash
-        null,            // reason: null (genesis, no burn predecessor)
-      );
-
-      const commitment = await MintCommitment.create(mintData);
-
-      // Submit with retry — REQUEST_ID_EXISTS counts as success (idempotent).
-      const MAX_RETRIES = 3;
-      let lastStatus: string | undefined;
-      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        const response = await stClient.submitMintCommitment(commitment);
-        lastStatus = response.status;
-        if (response.status === 'SUCCESS' || response.status === 'REQUEST_ID_EXISTS') break;
-        if (attempt === MAX_RETRIES) {
-          return { success: false, error: `Mint submit failed after ${MAX_RETRIES} attempts: ${response.status}` };
-        }
-        await new Promise((r) => setTimeout(r, 1000 * attempt));
-      }
-      if (lastStatus !== 'SUCCESS' && lastStatus !== 'REQUEST_ID_EXISTS') {
-        return { success: false, error: `Mint submit failed: ${lastStatus}` };
-      }
-
-      const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
-      const genesisTransaction = commitment.toTransaction(inclusionProof);
-
-      // Build the token state with an UnmaskedPredicate so this wallet
-      // owns the token (predicate verification matches signingService).
-      const predicate = await UnmaskedPredicate.create(
-        tokenId,
-        tokenType,
-        signingService,
-        HashAlgorithm.SHA256,
-        salt,
-      );
-      const tokenState = new TokenState(predicate, null);
-      const sdkToken = await SdkToken.mint(trustBase, tokenState, genesisTransaction);
-
-      // Convert to wallet Token and add it. addToken does the persistence
-      // + cache + tombstone bookkeeping.
-      const tokenIdHex = tokenId.toJSON();
-      const symbol = this.getCoinSymbol(coinIdHex);
-      const name = this.getCoinName(coinIdHex);
-      const decimals = this.getCoinDecimals(coinIdHex);
-      const iconUrl = this.getCoinIconUrl(coinIdHex);
-      const uiToken: Token = {
-        id: tokenIdHex,
-        coinId: coinIdHex,
-        symbol,
-        name,
-        decimals,
-        ...(iconUrl !== undefined ? { iconUrl } : {}),
-        amount: amount.toString(),
-        status: 'confirmed',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        sdkData: JSON.stringify(sdkToken.toJSON()),
-      };
-      await this.addToken(uiToken);
-
-      return { success: true, token: uiToken, tokenId: tokenIdHex };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { success: false, error: `Local mint failed: ${msg}` };
-    }
+    // Phase 5 mint/ concern extraction: implementation lives in
+    // modules/payments/mint/fungible.ts. The facade retains this method
+    // signature verbatim so external callers (public API) are unaffected;
+    // Phase 6.C will rewire the free function onto `ITokenEngine`.
+    return mintFungibleTokenImpl(
+      {
+        stateTransitionClient: this.deps!.oracle.getStateTransitionClient?.() as
+          | StateTransitionClient
+          | undefined,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        trustBase: (this.deps!.oracle as any).getTrustBase?.(),
+        createSigningService: () => this.createSigningService(),
+        getCoinSymbol: (id) => this.getCoinSymbol(id),
+        getCoinName: (id) => this.getCoinName(id),
+        getCoinDecimals: (id) => this.getCoinDecimals(id),
+        getCoinIconUrl: (id) => this.getCoinIconUrl(id),
+        addToken: (token) => this.addToken(token),
+      },
+      coinIdHex,
+      amount,
+    );
   }
 
   /**

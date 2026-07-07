@@ -95,6 +95,7 @@ const STSDK_CORE_BURNDOWN = [
   'modules/payments/NametagMinter.ts',
   'modules/payments/PaymentsModule.ts',
   'modules/payments/SpendQueue.ts',
+  'modules/payments/mint/fungible.ts',
   'modules/payments/TokenRecoveryService.ts',
   'modules/payments/TokenSplitCalculator.ts',
   'modules/payments/TokenSplitExecutor.ts',
