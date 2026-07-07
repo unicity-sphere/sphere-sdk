@@ -42,6 +42,7 @@
   "exclude": [
     "node_modules",
     "dist",
-    "**/*.test.ts"
+    "**/*.test.ts",
+    "token-engine/**/*.ts"
   ]
 }

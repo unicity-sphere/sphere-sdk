@@ -371,8 +371,40 @@ export const DEFAULT_AGGREGATOR_URL = 'https://aggregator.unicity.network/rpc' a
 /** Dev aggregator URL */
 export const DEV_AGGREGATOR_URL = 'https://dev-aggregator.dyndns.org/rpc' as const;
 
-/** Test aggregator URL (Goggregator) */
+/** Test aggregator URL (Goggregator — v1 protocol, retired once Phase 6.C rewires core to v2) */
 export const TEST_AGGREGATOR_URL = 'https://goggregator-test.unicity.network' as const;
+
+/**
+ * testnet2 gateway URL — v2 state-transition SDK protocol.
+ *
+ * Adopted from unicity-sphere/sphere-sdk main@ce758f6b as the mandatory
+ * network for Phase 6 (STSDK v1→v2 swap). The `token-engine/` adapter (see
+ * repo-root `token-engine/` — SHA-pinned) speaks this endpoint's
+ * certification RPC; the v1 aggregator at `goggregator-test.unicity.network`
+ * cannot serve a v2 client (different wire protocol, per
+ * scratchpad/investigation-stsdk-v2.md §2c).
+ *
+ * Wired into `NETWORKS.testnet2` below. Not yet consumed by anything in
+ * core — Phase 6.C rewire is pending.
+ */
+export const TESTNET2_GATEWAY_URL = 'https://gateway.testnet2.unicity.network' as const;
+
+/**
+ * testnet2 root trust base — raw GitHub URL, per mainstream's convention
+ * (referenced by execution-plan-v2 §7 R3). The v2 engine's
+ * `NetworkId` is taken from `RootTrustBase.networkId` in this JSON
+ * (testnet2 = 4). Fetched lazily when the engine is constructed; not held
+ * in-memory as a constant.
+ */
+export const TESTNET2_TRUST_BASE_URL =
+  'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet2.json' as const;
+
+/**
+ * testnet2 token registry URL (v2). Distinct from `TOKEN_REGISTRY_URL`
+ * (mainnet/testnet1 v1 endpoint).
+ */
+export const TESTNET2_TOKEN_REGISTRY_URL =
+  'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json' as const;
 
 /** Default aggregator request timeout (ms) */
 export const DEFAULT_AGGREGATOR_TIMEOUT = 30000;
@@ -531,6 +563,21 @@ export const NETWORKS = {
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
+  },
+  // Phase 6 (STSDK v1→v2). testnet2 is a NEW key alongside `testnet` so both
+  // remain resolvable until the core rewire is complete. Only the `token-engine/`
+  // adapter can consume this endpoint (it speaks the v2 certification RPC); the
+  // v1 aggregator objects (RequestId/Authenticator/SubmitCommitmentRequest) that
+  // core code still uses cannot talk to it. Phase 6.C flips consumers from
+  // `testnet` → `testnet2` once the rewire lands. Kept separate — mainstream
+  // aliases `testnet` to testnet2, but we cannot until v1 is out of core.
+  testnet2: {
+    name: 'Testnet2 (v2 gateway)',
+    aggregatorUrl: TESTNET2_GATEWAY_URL,
+    nostrRelays: TEST_NOSTR_RELAYS,
+    ipfsGateways: DEFAULT_IPFS_GATEWAYS,
+    groupRelays: DEFAULT_GROUP_RELAYS,
+    tokenRegistryUrl: TESTNET2_TOKEN_REGISTRY_URL,
   },
   dev: {
     name: 'Development',
