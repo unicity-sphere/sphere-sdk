@@ -28,7 +28,10 @@ import {
 import { createSphereTokenEngine } from '../token-engine';
 import type { CoinId, EngineIdentity } from '../token-engine';
 
-const UCT_COIN_ID = 'UCT' as CoinId;
+// Canonical UCT (Unicity testnet2 native coin) id from
+// https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json
+// v2 CoinIds are 64-char lowercase hex (not the human-readable symbol).
+const UCT_COIN_ID = 'f581d30f593e4b369d684a4563b5246f07b1d265f7178a2c0a82b81f39c24dc0' as CoinId;
 const MINT_AMOUNT = BigInt(1000);
 
 function log(step: string, detail?: unknown): void {
