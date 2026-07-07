@@ -15,7 +15,7 @@ import { logger } from '../../../core/logger';
 import { TokenRegistry } from '../../../registry';
 import {
   buildSyntheticV5PendingSdkData,
-} from '../v5-pending-shape';
+} from './v5-pending-shape';
 import { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
 import {

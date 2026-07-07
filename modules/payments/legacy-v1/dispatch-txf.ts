@@ -29,7 +29,7 @@ import {
 import { classifyToken as classifyTokenLike } from '../../../extensions/uxf/pipeline/classify-token';
 import { parseInvoiceMemoForOnChain } from '../../accounting/memo.js';
 import { computeAddressId } from '../../../extensions/uxf/profile/types.js';
-import type { SplitPlan } from '../TokenSplitCalculator';
+import type { SplitPlan } from './TokenSplitCalculator';
 
 export async function dispatchTxfSendImpl(this: any, 
     originalRequest: TransferRequest,

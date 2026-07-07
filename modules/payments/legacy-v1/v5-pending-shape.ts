@@ -18,11 +18,11 @@
  *
  * Extracted from PaymentsModule.ts:6226-6288 (IIFE) for unit testability.
  */
-import type { IAuthenticatorJson } from '@unicitylabs/state-transition-sdk/lib/api/Authenticator';
-import type { IMintTransactionDataJson } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData';
-import type { ITransferTransactionDataJson } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransactionData';
-import type { ITokenStateJson } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
-import type { InstantSplitBundleV5, PendingV5Finalization } from '../../types/instant-split';
+import type { IAuthenticatorJson } from 'stsdk-v1/lib/api/Authenticator';
+import type { IMintTransactionDataJson } from 'stsdk-v1/lib/transaction/MintTransactionData';
+import type { ITransferTransactionDataJson } from 'stsdk-v1/lib/transaction/TransferTransactionData';
+import type { ITokenStateJson } from 'stsdk-v1/lib/token/TokenState';
+import type { InstantSplitBundleV5, PendingV5Finalization } from '../../../types/instant-split';
 
 /**
  * Canonical JSON shape of `TransferCommitment.toJSON()`. Re-declared here

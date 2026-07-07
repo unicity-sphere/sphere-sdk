@@ -1,5 +1,5 @@
 /**
- * Tests for modules/payments/TokenSplitCalculator.ts
+ * Tests for modules/payments/legacy-v1/TokenSplitCalculator.ts
  * Covers optimal token split calculation for partial transfers
  */
 
@@ -8,7 +8,7 @@ import {
   TokenSplitCalculator,
   createTokenSplitCalculator,
   type SplitPlan,
-} from '../../../modules/payments/TokenSplitCalculator';
+} from '../../../modules/payments/legacy-v1/TokenSplitCalculator';
 import type { Token } from '../../../types';
 
 // =============================================================================

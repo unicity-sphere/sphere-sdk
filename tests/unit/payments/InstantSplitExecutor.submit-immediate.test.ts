@@ -32,7 +32,7 @@ vi.mock('@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils', () => 
   waitInclusionProof: vi.fn().mockResolvedValue({ __mockProof: true }),
 }));
 
-import { InstantSplitExecutor } from '../../../modules/payments/InstantSplitExecutor';
+import { InstantSplitExecutor } from '../../../modules/payments/legacy-v1/InstantSplitExecutor';
 import { isSphereError } from '../../../core/errors';
 
 function makeExecutor(client: any): InstantSplitExecutor {

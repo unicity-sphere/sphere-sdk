@@ -12,7 +12,7 @@ import type {
 import { logger } from '../../../core/logger';
 import { SphereError } from '../../../core/errors';
 import { isInstantSplitBundle as isInstantSplitBundleImpl_, isInstantSplitBundleV5 } from '../../../types/instant-split';
-import { InstantSplitProcessor } from '../InstantSplitProcessor';
+import { InstantSplitProcessor } from './InstantSplitProcessor';
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
 import { extractTokenIdFromSdkData } from '../tokens';

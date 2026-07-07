@@ -15,7 +15,7 @@ import {
 } from '../../../modules/payments/SpendQueue';
 import type { ParsedTokenPool, ParsedTokenEntry, PlanResult } from '../../../modules/payments/SpendQueue';
 import { TokenReservationLedger } from '../../../modules/payments/TokenReservationLedger';
-import type { SplitPlan, TokenWithAmount } from '../../../modules/payments/TokenSplitCalculator';
+import type { SplitPlan, TokenWithAmount } from '../../../modules/payments/legacy-v1/TokenSplitCalculator';
 import type { Token } from '../../../types';
 
 // ---------------------------------------------------------------------------

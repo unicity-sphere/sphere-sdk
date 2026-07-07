@@ -16,3 +16,14 @@ export * from './dispatch-txf';
 export * from './proof-polling';
 export * from './v6-recover';
 export * from './mint-nametag';
+
+// Wave 6-P2-2 — Group A helpers relocated from modules/payments/ root
+// into the quarantine (still slated for Phase 6.C wholesale deletion).
+// Route STSDK usage inside these files through the `stsdk-v1` alias so
+// v1 runtime semantics survive the v2 SDK bump that landed in 6-P2-1.
+export * from './v5-pending-shape';
+export * from './extract-state-publickey';
+export * from './TokenSplitCalculator';
+export * from './TokenSplitExecutor';
+export * from './InstantSplitExecutor';
+export * from './InstantSplitProcessor';

@@ -4,10 +4,10 @@
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { logger } from '../../core/logger';
-import type { Token } from '../../types';
-import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
+import { logger } from '../../../core/logger';
+import type { Token } from '../../../types';
+import { Token as SdkToken } from 'stsdk-v1/lib/token/Token';
+import { CoinId } from 'stsdk-v1/lib/token/fungible/CoinId';
 
 // =============================================================================
 // Types

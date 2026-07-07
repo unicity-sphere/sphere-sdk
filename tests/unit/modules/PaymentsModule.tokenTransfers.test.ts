@@ -19,7 +19,7 @@ import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/I
 
 // Mock TokenSplitCalculator — controls what split plan is returned
 const mockCalculateOptimalSplit = vi.fn();
-vi.mock('../../../modules/payments/TokenSplitCalculator', () => ({
+vi.mock('../../../modules/payments/legacy-v1/TokenSplitCalculator', () => ({
   TokenSplitCalculator: class {
     calculateOptimalSplit = mockCalculateOptimalSplit;
     calculateOptimalSplitSync = vi.fn();
@@ -53,7 +53,7 @@ vi.mock('../../../modules/payments/SpendQueue', () => ({
 // Mock InstantSplitExecutor — controls split execution result
 const mockExecuteSplitInstant = vi.fn();
 const mockBuildSplitBundle = vi.fn();
-vi.mock('../../../modules/payments/InstantSplitExecutor', () => ({
+vi.mock('../../../modules/payments/legacy-v1/InstantSplitExecutor', () => ({
   InstantSplitExecutor: class {
     constructor() {}
     executeSplitInstant = mockExecuteSplitInstant;
@@ -63,7 +63,7 @@ vi.mock('../../../modules/payments/InstantSplitExecutor', () => ({
 
 // Mock TokenSplitExecutor — controls conservative split execution result
 const mockExecuteSplit = vi.fn();
-vi.mock('../../../modules/payments/TokenSplitExecutor', () => ({
+vi.mock('../../../modules/payments/legacy-v1/TokenSplitExecutor', () => ({
   TokenSplitExecutor: class {
     constructor() {}
     executeSplit = mockExecuteSplit;

@@ -23,7 +23,7 @@ import {
 } from '../../../modules/payments/SpendQueue';
 import { TokenReservationLedger } from '../../../modules/payments/TokenReservationLedger';
 import type { Token } from '../../../types';
-import type { SplitPlan, TokenWithAmount } from '../../../modules/payments/TokenSplitCalculator';
+import type { SplitPlan, TokenWithAmount } from '../../../modules/payments/legacy-v1/TokenSplitCalculator';
 
 // =============================================================================
 // Test helpers

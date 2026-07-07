@@ -40,9 +40,9 @@ import type {
 import type { OracleProvider } from '../../../oracle';
 import type { PeerInfo, TransportProvider } from '../../../transport';
 import { parseInvoiceMemoForOnChain } from '../../../modules/accounting/memo.js';
-import { TokenSplitExecutor } from '../../../modules/payments/TokenSplitExecutor';
+import { TokenSplitExecutor } from '../../../modules/payments/legacy-v1/TokenSplitExecutor';
 import type { ParsedTokenEntry, SpendPlanner, SpendQueue } from '../../../modules/payments/SpendQueue';
-import type { SplitPlan } from '../../../modules/payments/TokenSplitCalculator';
+import type { SplitPlan } from '../../../modules/payments/legacy-v1/TokenSplitCalculator';
 import type { TokenReservationLedger } from '../../../modules/payments/TokenReservationLedger';
 
 import {

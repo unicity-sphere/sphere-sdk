@@ -31,7 +31,7 @@ import { describe, it, expect } from 'vitest';
 import {
   buildSyntheticV5PendingSdkData,
   readV5FinalizationInputsFromToken,
-} from '../../../modules/payments/v5-pending-shape';
+} from '../../../modules/payments/legacy-v1/v5-pending-shape';
 import type {
   InstantSplitBundleV5,
   PendingV5Finalization,

@@ -14,7 +14,7 @@
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import type { Token } from '../../types';
-import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
+import type { SplitPlan, TokenWithAmount } from './legacy-v1/TokenSplitCalculator';
 import type { TokenReservationLedger } from './TokenReservationLedger';
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';

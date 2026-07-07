@@ -13,7 +13,7 @@ import type {
   InstantSplitResult,
 } from '../../../types/instant-split';
 import type { PeerInfo } from '../../../transport';
-import { InstantSplitExecutor } from '../InstantSplitExecutor';
+import { InstantSplitExecutor } from './InstantSplitExecutor';
 import { logger } from '../../../core/logger';
 import { SphereError } from '../../../core/errors';
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';

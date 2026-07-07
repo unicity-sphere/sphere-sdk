@@ -107,24 +107,24 @@ const STSDK_CORE_BURNDOWN = [
   'core/Sphere.ts',
   'modules/accounting/AccountingModule.ts',
   'modules/payments/BackgroundCommitmentService.ts',
-  'modules/payments/InstantSplitExecutor.ts',
-  'modules/payments/InstantSplitProcessor.ts',
   'modules/payments/NametagMinter.ts',
   'modules/payments/nametag/availability.ts',
   'modules/payments/PaymentsModule.ts',
   'modules/payments/SpendQueue.ts',
   'modules/payments/mint/fungible.ts',
   'modules/payments/TokenRecoveryService.ts',
-  'modules/payments/TokenSplitCalculator.ts',
-  'modules/payments/TokenSplitExecutor.ts',
-  'modules/payments/extract-state-publickey.ts',
-  'modules/payments/v5-pending-shape.ts',
   'modules/swap/payout-verifier.ts',
   'oracle/UnicityAggregatorProvider.ts',
-  // Phase 5 wave-3 [C] quarantine — files were carved out of
-  // PaymentsModule.ts wholesale and inherit its v1 SDK imports. Phase
-  // 6.C runs `git rm -r modules/payments/legacy-v1/` in a single diff,
-  // at which point this entry retires.
+  // Phase 5 wave-3 [C] + Phase 6 wave-P2-2 Group-A quarantine —
+  // files were carved out of PaymentsModule.ts (and its Group-A
+  // helpers TokenSplitCalculator / TokenSplitExecutor /
+  // InstantSplitExecutor / InstantSplitProcessor /
+  // extract-state-publickey / v5-pending-shape) and now live under
+  // legacy-v1/. Wave 6-P2-2 rewired them to use the `stsdk-v1`
+  // alias, so they no longer need a burndown entry for direct
+  // `@unicitylabs/state-transition-sdk` imports; but the wave-3
+  // files still do, so the glob stays until Phase 6.C runs
+  // `git rm -r modules/payments/legacy-v1/` in a single diff.
   'modules/payments/legacy-v1/**/*.ts',
 ];
 

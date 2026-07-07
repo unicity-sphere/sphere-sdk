@@ -50,9 +50,9 @@ import type {
   SpendQueue,
   ParsedTokenEntry,
 } from '../../../modules/payments/SpendQueue';
-import { type SplitPlan } from '../../../modules/payments/TokenSplitCalculator';
+import { type SplitPlan } from '../../../modules/payments/legacy-v1/TokenSplitCalculator';
 import type { TokenReservationLedger } from '../../../modules/payments/TokenReservationLedger';
-import { InstantSplitExecutor } from '../../../modules/payments/InstantSplitExecutor';
+import { InstantSplitExecutor } from '../../../modules/payments/legacy-v1/InstantSplitExecutor';
 import { parseInvoiceMemoForOnChain } from '../../../modules/accounting/memo.js';
 
 // SDK imports for token parsing and transfers — extension code parked on v1

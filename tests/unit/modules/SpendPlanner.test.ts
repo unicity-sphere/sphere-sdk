@@ -15,7 +15,7 @@ import { SpendPlanner, type ParsedTokenPool, type ParsedTokenEntry, type PlanRes
 import { TokenReservationLedger } from '../../../modules/payments/TokenReservationLedger';
 import { SphereError } from '../../../core/errors';
 import type { Token } from '../../../types';
-import type { SplitPlan } from '../../../modules/payments/TokenSplitCalculator';
+import type { SplitPlan } from '../../../modules/payments/legacy-v1/TokenSplitCalculator';
 
 // =============================================================================
 // Helpers

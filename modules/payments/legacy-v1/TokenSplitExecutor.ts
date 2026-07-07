@@ -10,20 +10,20 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import { logger } from '../../core/logger';
-import { SphereError } from '../../core/errors';
-import { hexToBytes as fromHex } from '../../core/hex';
-import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
-import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
-import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
-import { TokenCoinData } from '@unicitylabs/state-transition-sdk/lib/token/fungible/TokenCoinData';
-import { TokenSplitBuilder } from '@unicitylabs/state-transition-sdk/lib/transaction/split/TokenSplitBuilder';
-import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
-import { UnmaskedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate';
-import { UnmaskedPredicateReference } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference';
-import { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
-import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
+import { logger } from '../../../core/logger';
+import { SphereError } from '../../../core/errors';
+import { hexToBytes as fromHex } from '../../../core/hex';
+import { Token } from 'stsdk-v1/lib/token/Token';
+import { TokenId } from 'stsdk-v1/lib/token/TokenId';
+import { TokenState } from 'stsdk-v1/lib/token/TokenState';
+import { CoinId } from 'stsdk-v1/lib/token/fungible/CoinId';
+import { TokenCoinData } from 'stsdk-v1/lib/token/fungible/TokenCoinData';
+import { TokenSplitBuilder } from 'stsdk-v1/lib/transaction/split/TokenSplitBuilder';
+import { HashAlgorithm } from 'stsdk-v1/lib/hash/HashAlgorithm';
+import { UnmaskedPredicate } from 'stsdk-v1/lib/predicate/embedded/UnmaskedPredicate';
+import { UnmaskedPredicateReference } from 'stsdk-v1/lib/predicate/embedded/UnmaskedPredicateReference';
+import { TransferCommitment } from 'stsdk-v1/lib/transaction/TransferCommitment';
+import { waitInclusionProof } from 'stsdk-v1/lib/util/InclusionProofUtils';
 
 // =============================================================================
 // Types

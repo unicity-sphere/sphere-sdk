@@ -30,7 +30,7 @@ import type { SphereEventType, SphereEventMap, Token } from '../../../../types';
 import { SphereError } from '../../../../core/errors';
 import { logger } from '../../../../core/logger';
 import { extractStateHashFromSdkData } from '../../../../modules/payments/tokens/identity';
-import { extractCurrentStatePublicKeyHexFromSdkData } from '../../../../modules/payments/extract-state-publickey';
+import { extractCurrentStatePublicKeyHexFromSdkData } from '../../../../modules/payments/legacy-v1/extract-state-publickey';
 
 // -----------------------------------------------------------------
 // writeSentEntryFromOutbox

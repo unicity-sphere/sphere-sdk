@@ -57,7 +57,7 @@
  */
 
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { extractCurrentStatePublicKeyHexFromSdkData } from '../payments/extract-state-publickey';
+import { extractCurrentStatePublicKeyHexFromSdkData } from '../payments/legacy-v1/extract-state-publickey';
 import type { Token } from '../../types';
 
 export type PayoutVerificationResult =

@@ -15,22 +15,22 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import { logger } from '../../core/logger';
-import { SphereError } from '../../core/errors';
-import { hexToBytes as fromHex } from '../../core/hex';
-import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
-import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
-import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
-import { UnmaskedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate';
-import { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
-import { TransferTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction';
-import { MintCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/MintCommitment';
-import { MintTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData';
-import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
-import type { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
-import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
-import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
+import { logger } from '../../../core/logger';
+import { SphereError } from '../../../core/errors';
+import { hexToBytes as fromHex } from '../../../core/hex';
+import { Token } from 'stsdk-v1/lib/token/Token';
+import { TokenState } from 'stsdk-v1/lib/token/TokenState';
+import { TokenType } from 'stsdk-v1/lib/token/TokenType';
+import { HashAlgorithm } from 'stsdk-v1/lib/hash/HashAlgorithm';
+import { UnmaskedPredicate } from 'stsdk-v1/lib/predicate/embedded/UnmaskedPredicate';
+import { TransferCommitment } from 'stsdk-v1/lib/transaction/TransferCommitment';
+import { TransferTransaction } from 'stsdk-v1/lib/transaction/TransferTransaction';
+import { MintCommitment } from 'stsdk-v1/lib/transaction/MintCommitment';
+import { MintTransactionData } from 'stsdk-v1/lib/transaction/MintTransactionData';
+import { waitInclusionProof } from 'stsdk-v1/lib/util/InclusionProofUtils';
+import type { SigningService } from 'stsdk-v1/lib/sign/SigningService';
+import type { StateTransitionClient } from 'stsdk-v1/lib/StateTransitionClient';
+import type { RootTrustBase } from 'stsdk-v1/lib/bft/RootTrustBase';
 
 import {
   type InstantSplitBundle,
@@ -39,7 +39,7 @@ import {
   type InstantSplitProcessResult,
   isInstantSplitBundleV5,
   isInstantSplitBundleV4,
-} from '../../types/instant-split';
+} from '../../../types/instant-split';
 
 // =============================================================================
 // Types
@@ -213,7 +213,7 @@ export class InstantSplitProcessor {
           try {
             const nametagToken = await Token.fromJSON(JSON.parse(bundle.nametagTokenJson));
             // Validate PROXY address matches nametag token
-            const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+            const { ProxyAddress } = await import('stsdk-v1/lib/address/ProxyAddress');
             const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
             if (proxy.address !== recipientAddressStr) {
               logger.warn('InstantSplit', 'Unicity ID PROXY address mismatch, ignoring bundle token');

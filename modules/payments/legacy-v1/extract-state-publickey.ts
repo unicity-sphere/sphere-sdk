@@ -22,9 +22,9 @@
  * check itself.
  */
 
-import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { PredicateEngineService } from '@unicitylabs/state-transition-sdk/lib/predicate/PredicateEngineService';
-import { bytesToHex } from '../../core/hex';
+import { Token as SdkToken } from 'stsdk-v1/lib/token/Token';
+import { PredicateEngineService } from 'stsdk-v1/lib/predicate/PredicateEngineService';
+import { bytesToHex } from '../../../core/hex';
 
 export async function extractCurrentStatePublicKeyHexFromSdkData(
   sdkData: string | undefined,

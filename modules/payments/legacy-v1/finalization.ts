@@ -35,7 +35,7 @@ import {
   readV5FinalizationInputsFromToken,
   type V5FinalizationInputs,
   type ITransferCommitmentJson,
-} from '../v5-pending-shape';
+} from './v5-pending-shape';
 import {
   extractPendingChainFromSdkData,
   finalizeSourceTokenChain,

@@ -30,8 +30,8 @@ import type {
   TombstoneEntry,
   NametagData,
 } from '../../types/txf';
-import { TokenSplitCalculator, type SplitPlan, type TokenWithAmount } from './TokenSplitCalculator';
-import { TokenSplitExecutor } from './TokenSplitExecutor';
+import { TokenSplitCalculator, type SplitPlan, type TokenWithAmount } from './legacy-v1/TokenSplitCalculator';
+import { TokenSplitExecutor } from './legacy-v1/TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
 import { NametagMinter, type MintNametagResult } from './NametagMinter';
@@ -332,8 +332,8 @@ import { hexToBytes as fromHex, bytesToHex } from '../../core/hex';
 import { computeAddressId } from '../../extensions/uxf/profile/types.js';
 
 // Instant split imports
-import { InstantSplitExecutor } from './InstantSplitExecutor';
-import { InstantSplitProcessor } from './InstantSplitProcessor';
+import { InstantSplitExecutor } from './legacy-v1/InstantSplitExecutor';
+import { InstantSplitProcessor } from './legacy-v1/InstantSplitProcessor';
 import type {
   InstantSplitBundle,
   InstantSplitBundleV5,
@@ -351,11 +351,11 @@ import {
   readV5FinalizationInputsFromToken,
   type V5FinalizationInputs,
   type ITransferCommitmentJson,
-} from './v5-pending-shape';
+} from './legacy-v1/v5-pending-shape';
 
 // SDK imports for token parsing and transfers
 import { PredicateEngineService } from '@unicitylabs/state-transition-sdk/lib/predicate/PredicateEngineService';
-import { extractCurrentStatePublicKeyHexFromSdkData } from './extract-state-publickey';
+import { extractCurrentStatePublicKeyHexFromSdkData } from './legacy-v1/extract-state-publickey';
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
 import { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';

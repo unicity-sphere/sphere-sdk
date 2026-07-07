@@ -1,5 +1,5 @@
 /**
- * Tests for modules/payments/TokenSplitExecutor.ts
+ * Tests for modules/payments/legacy-v1/TokenSplitExecutor.ts
  * Covers token split execution interface and configuration
  */
 
@@ -9,7 +9,7 @@ import {
   createTokenSplitExecutor,
   type SplitResult,
   type TokenSplitExecutorConfig,
-} from '../../../modules/payments/TokenSplitExecutor';
+} from '../../../modules/payments/legacy-v1/TokenSplitExecutor';
 
 // =============================================================================
 // Tests - Interface and Configuration
