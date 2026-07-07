@@ -92,6 +92,11 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
   // Legacy operator tool — evaluate for drop-or-relocate during Phase 7
   // (tools/ is not part of the shipped surface but is CI-linted).
   'tools/restore-legacy-outbox.ts',
+  // Phase 5 wave-3 [C] quarantine — files were carved out of
+  // PaymentsModule.ts wholesale and inherit its `extensions/` crossings.
+  // Phase 6.C runs `git rm -r modules/payments/legacy-v1/` in a single
+  // diff, at which point this entry retires.
+  'modules/payments/legacy-v1/**/*.ts',
 ];
 
 // Phase 6.C burn-down: core files that still import v1 STSDK directly.
@@ -116,6 +121,11 @@ const STSDK_CORE_BURNDOWN = [
   'modules/payments/v5-pending-shape.ts',
   'modules/swap/payout-verifier.ts',
   'oracle/UnicityAggregatorProvider.ts',
+  // Phase 5 wave-3 [C] quarantine — files were carved out of
+  // PaymentsModule.ts wholesale and inherit its v1 SDK imports. Phase
+  // 6.C runs `git rm -r modules/payments/legacy-v1/` in a single diff,
+  // at which point this entry retires.
+  'modules/payments/legacy-v1/**/*.ts',
 ];
 
 // Pattern definitions kept as named constants so the overrides below can
