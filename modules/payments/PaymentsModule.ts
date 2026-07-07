@@ -251,6 +251,11 @@ import {
   type RecordUxfBundleSentHistoryArgs,
 } from '../../extensions/uxf/pipeline/module-glue/sent-history-recorder';
 import {
+  awaitAllProvidersDurable as awaitAllProvidersDurableImpl,
+  type DurabilityGateHost,
+} from '../../extensions/uxf/pipeline/module-glue/durability-gate';
+import { validateSourceOwnership as validateSourceOwnershipImpl } from '../../extensions/uxf/pipeline/module-glue/source-ownership';
+import {
   sweepOrphanSpendingTokens,
   type OrphanSweepResult,
   type OrphanSpendingFinding,
@@ -10836,60 +10841,7 @@ export class PaymentsModule {
     sourceTokens: ReadonlyArray<{ uiToken: Token; sdkToken: SdkToken<any> } | Token>,
     signingService: SigningService,
   ): Promise<void> {
-    const publicKey = signingService.publicKey;
-    for (const entry of sourceTokens) {
-      // Accept both UI Token (with sdkData) and TokenWithAmount-shaped objects
-      // {uiToken, sdkToken}. The latter is what splitPlan.tokensToTransferDirectly
-      // already has parsed; the former is the splitPlan.tokenToSplit.uiToken
-      // before we parse it.
-      let sdkToken: SdkToken<any> | null = null;
-      let uiTokenId: string;
-      if ('sdkToken' in entry) {
-        sdkToken = entry.sdkToken;
-        uiTokenId = entry.uiToken.id;
-      } else {
-        const sdkData = entry.sdkData;
-        uiTokenId = entry.id;
-        if (!sdkData) continue; // not an on-chain spendable token — skip
-        try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          sdkToken = await SdkToken.fromJSON(JSON.parse(sdkData) as any) as SdkToken<any>;
-        } catch {
-          // Unparseable sdkData — let downstream code handle (will throw on
-          // commitment construction). Don't fail the pre-check here.
-          continue;
-        }
-      }
-      // Defensive: if any of the SDK shape is missing (e.g. mocked-out test
-      // doubles), skip — we cannot validate without a real predicate, and
-      // letting downstream code run is the existing behaviour for these
-      // cases. Production tokens always carry a real predicate.
-      if (!sdkToken || !sdkToken.state || !sdkToken.state.predicate) continue;
-      let predicate;
-      try {
-        predicate = await PredicateEngineService.createPredicate(sdkToken.state.predicate);
-      } catch {
-        // Predicate engine couldn't materialise the predicate — same logic
-        // as above; let downstream handle it rather than fail-closing here
-        // on a shape we can't reason about.
-        continue;
-      }
-      let owned: boolean;
-      try {
-        owned = await predicate.isOwner(publicKey);
-      } catch {
-        // isOwner threw — defer to downstream. We only fail-fast on the
-        // EXPLICIT non-ownership case where every SDK call succeeded.
-        continue;
-      }
-      if (!owned) {
-        throw new SphereError(
-          `Cannot spend token ${uiTokenId.slice(0, 16)}: source state predicate does not match wallet's signing key. ` +
-            `The token may be in a stale post-receive state — try sync + receive --finalize, or re-import.`,
-          'OWNERSHIP_VERIFICATION_FAILED',
-        );
-      }
-    }
+    return validateSourceOwnershipImpl(sourceTokens, signingService);
   }
 
   /**
@@ -11285,52 +11237,14 @@ export class PaymentsModule {
    * in the deferred publish path.
    */
   private async awaitAllProvidersDurable(timeoutMs = 60_000): Promise<boolean> {
-    const providers = this.getTokenStorageProviders();
-    if (providers.size === 0) return true;
-    // Issue #274: dominant §C.2 latency consumer per perf forensics. Span emits
-    // one debug line on exit with per-provider durations + final durable flag.
-    const __span = logger.time('payments:durability', 'awaitAllProvidersDurable', {
-      providers: providers.size,
-      timeoutMs,
-    });
-    let allDurable = true;
-    for (const [providerId, provider] of providers) {
-      // Issue #444 — prefer the local-only flush primitive when the
-      // provider supports it. Falls back to legacy full flush when
-      // absent (the two are equivalent on local-only providers).
-      //
-      // Issue #454 finding #9 — use the typed optional declarations on
-      // the TokenStorageProvider interface (`awaitNextLocalFlush?` and
-      // `awaitNextFlush?`) instead of a structural-name cast. The cast
-      // let any provider exposing a method NAME silently win — even a
-      // no-op stub that mocks `awaitNextLocalFlush` would advance the
-      // Nostr cursor without actually persisting anything, defeating the
-      // at-least-once invariant. The typed access narrows to the
-      // declared `(timeoutMs?: number) => Promise<void>` contract so
-      // misshaped providers fail at compile time rather than silently
-      // breaking the gate at runtime.
-      const flusher = provider.awaitNextLocalFlush ?? provider.awaitNextFlush;
-      if (typeof flusher !== 'function') continue;
-      const __t0 = Date.now();
-      try {
-        await flusher.call(provider, timeoutMs);
-        __span.mark(`provider:${providerId}`, { durationMs: Date.now() - __t0, ok: true });
-      } catch (err) {
-        __span.mark(`provider:${providerId}`, {
-          durationMs: Date.now() - __t0,
-          ok: false,
-          err: err instanceof Error ? err.message : String(err),
-        });
-        logger.warn(
-          'Payments',
-          `[AT-LEAST-ONCE] provider ${providerId} local flush failed — Nostr event will NOT be acked, replayed on next reconnect:`,
-          err instanceof Error ? err.message : err,
-        );
-        allDurable = false;
-      }
-    }
-    __span.end({ allDurable });
-    return allDurable;
+    return awaitAllProvidersDurableImpl(this.durabilityGateHost(), timeoutMs);
+  }
+
+  /** Host-shim builder for {@link awaitAllProvidersDurableImpl}. */
+  private durabilityGateHost(): DurabilityGateHost {
+    return {
+      getProviders: () => this.getTokenStorageProviders(),
+    };
   }
 
   /**
