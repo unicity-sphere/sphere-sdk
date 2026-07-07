@@ -1244,16 +1244,10 @@ export class NostrTransportProvider implements TransportProvider {
     const nametagValue = nametag || binding.nametag;
     let proxyAddress: string | undefined = binding.proxyAddress;
 
-    // Compute PROXY address from nametag if not already in binding
-    if (nametagValue && !proxyAddress) {
-      try {
-        const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-        const proxyAddr = await ProxyAddress.fromNameTag(nametagValue);
-        proxyAddress = proxyAddr.toString();
-      } catch {
-        // Ignore — proxy address computation is best-effort
-      }
-    }
+    // v2: PROXY:// address scheme removed — DIRECT-only. Skip synthesis;
+    // downstream consumers must fall back to `directAddress` for delivery.
+    // (Legacy `binding.proxyAddress` is still surfaced verbatim above so
+    // pre-v2 relay records remain readable.)
 
     // T.8.B — Best-effort capability hint enrichment. Upstream BindingInfo
     // is lossy w.r.t. wireProtocols / assetKinds; query the predictable
@@ -1520,10 +1514,8 @@ export class NostrTransportProvider implements TransportProvider {
     const nostrPubkey = this.getNostrPubkey();
 
     if (nametag) {
-      // Delegate to nostr-js-sdk — handles conflict detection, encryption, and event creation
-      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-      const proxyAddr = await ProxyAddress.fromNameTag(nametag);
-
+      // v2: PROXY:// address scheme removed — DIRECT-only. Publish binding
+      // without a proxyAddress; nostr-js-sdk accepts absence as "no proxy".
       try {
         const success = await this.nostrClient!.publishNametagBinding(
           nametag,
@@ -1531,7 +1523,6 @@ export class NostrTransportProvider implements TransportProvider {
           {
             publicKey: chainPubkey,
             directAddress,
-            proxyAddress: proxyAddr.toString(),
           },
         );
 
@@ -1541,15 +1532,9 @@ export class NostrTransportProvider implements TransportProvider {
           // T.8.B — Additionally publish a no-nametag identity binding event
           // carrying capability hints (wireProtocols + assetKinds, §10.4).
           // The nametag binding above uses a different d-tag (hashedNametag)
-          // so the two events coexist; capability hints live on the
-          // predictable per-pubkey d-tag and remain queryable via
-          // resolveTransportPubkeyInfo() even when the nametag is unknown
-          // to the caller. We pass the nametag through so the per-pubkey
-          // event also carries the plaintext nametag — without this,
-          // `resolveTransportPubkeyInfo` (most-recent-author wins) would
-          // return `nametag: undefined` after this event lands.
+          // so the two events coexist.
           await this.publishIdentityBindingWithCapabilities(
-            chainPubkey, directAddress, nametag, proxyAddr.toString(),
+            chainPubkey, directAddress, nametag,
           );
         }
         return success;

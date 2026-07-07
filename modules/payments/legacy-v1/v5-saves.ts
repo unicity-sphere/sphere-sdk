@@ -16,8 +16,8 @@ import { TokenRegistry } from '../../../registry';
 import {
   buildSyntheticV5PendingSdkData,
 } from './v5-pending-shape';
-import { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
-import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
+import { TransferCommitment } from 'stsdk-v1/lib/transaction/TransferCommitment';
+import type { StateTransitionClient } from 'stsdk-v1/lib/StateTransitionClient';
 import {
   extractTokenIdFromSdkData,
   extractStateHashFromSdkData,
