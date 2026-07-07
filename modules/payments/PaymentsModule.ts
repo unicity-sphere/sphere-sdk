@@ -411,43 +411,15 @@ export interface ReceiveResult {
 // =============================================================================
 // Sync Options & Result
 // =============================================================================
+//
+// Phase 5 [A] survive extraction — SyncOptions / SyncResult now live in
+// `./sync/types`. Re-exported here so external consumer imports
+// (`import { SyncOptions, SyncResult } from '@unicitylabs/sphere-sdk'`)
+// keep working unchanged. See modules/payments/sync/README.md for the
+// full routing plan.
 
-export interface SyncOptions {
-  /** When true (default), drain pending V5 finalizations before flushing to
-   *  token-storage providers. Without draining, any token whose `sdkData`
-   *  still carries `_pendingFinalization` round-trips through `tokenToTxf`
-   *  as null and is silently dropped from the published CAR — a remote
-   *  device joining via `recoverLatest()` then sees a partial inventory.
-   *  Set false to preserve the legacy "publish whatever's confirmed"
-   *  semantics. */
-  drainPending?: boolean;
-  /** Max time in ms to wait for pending V5 tokens to finalize before
-   *  giving up (default: 30000). When `forceFlushOnDrainTimeout` is
-   *  false (default) AND tokens remain pending after this budget, the
-   *  flush is skipped and `drainTimedOut: true` is returned — the caller
-   *  can retry once tokens have confirmed. */
-  drainTimeoutMs?: number;
-  /** Poll interval in ms while draining (default: 2000). */
-  drainPollIntervalMs?: number;
-  /** When true, publish whatever's confirmed even if pending tokens
-   *  remain after `drainTimeoutMs`. Restores legacy behavior — pending
-   *  tokens are silently dropped from the CAR. Default false. */
-  forceFlushOnDrainTimeout?: boolean;
-}
-
-export interface SyncResult {
-  /** Tokens added to local state from remote-merged data. */
-  added: number;
-  /** Tokens removed from local state via remote tombstones. */
-  removed: number;
-  /** Number of V5-pending tokens still unresolved when the flush ran.
-   *  Non-zero only when `drainPending: false` was requested OR
-   *  `forceFlushOnDrainTimeout: true` overrode a timed-out drain. */
-  pendingAtFlush?: number;
-  /** True iff `drainPending` was on, the drain timed out, and the flush
-   *  was skipped (no partial CAR published). */
-  drainTimedOut?: boolean;
-}
+import type { SyncOptions, SyncResult } from './sync/types';
+export type { SyncOptions, SyncResult } from './sync/types';
 
 // =============================================================================
 // Token Parsing Utilities
@@ -705,6 +677,22 @@ import { mintFungibleTokenImpl } from './mint';
 // thin facade delegations to pure functions in `./import-export/`.
 // See modules/payments/import-export/README.md for the routing plan.
 import { exportTokensFromMap, importTokensInto } from './import-export';
+
+// Phase 5 [A] survive extraction — sync engine + storage-event helpers.
+// The facade retains its public method signatures and delegates to
+// free-function form in `./sync/`. See modules/payments/sync/README.md.
+import {
+  runSync,
+  validateTokensAgainstOracle,
+  getActiveTokenStorageProviders,
+} from './sync/engine';
+import {
+  SYNC_DEBOUNCE_MS,
+  subscribeToStorageEventsHelper,
+  unsubscribeStorageEventsHelper,
+  debouncedSyncFromRemoteUpdateHelper,
+  type DebounceTimerRef,
+} from './sync/storage-events';
 
 // Issue #245 #1 — `extractCurrentStatePublicKeyHexFromSdkData` was extracted
 // to `./extract-state-publickey.ts` (issue #535) so SwapModule.verifyPayout
@@ -1380,10 +1368,11 @@ export class PaymentsModule {
    */
   private proxyAddressCache: Set<string> = new Set();
 
-  // Storage event subscriptions (push-based sync)
+  // Storage event subscriptions (push-based sync). Delegation targets in
+  // `./sync/storage-events` — the helpers mutate the `unsubscribers` array
+  // and `timerRef.timer` in place, so the facade retains ownership of both.
   private storageEventUnsubscribers: (() => void)[] = [];
-  private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-  private static readonly SYNC_DEBOUNCE_MS = 500;
+  private syncDebounceTimerRef: DebounceTimerRef = { timer: null };
 
   /** Sync coalescing: concurrent sync() calls share the same operation.
    *  Options from the first in-flight call are used; subsequent callers
@@ -11326,231 +11315,26 @@ export class PaymentsModule {
   }
 
   private async _doSync(options?: SyncOptions): Promise<SyncResult> {
-    this.deps!.emitEvent('sync:started', { source: 'payments' });
-
-    try {
-      // Get all token storage providers
-      const providers = this.getTokenStorageProviders();
-
-      if (providers.size === 0) {
-        // No providers - just save locally. No draining: save() goes to
-        // the kv StorageProvider which preserves _pendingFinalization
-        // shape, so dropping pending tokens is not an issue here.
-        await this.save();
-        this.deps!.emitEvent('sync:completed', {
-          source: 'payments',
-          count: this.tokens.size,
-        });
-        return { added: 0, removed: 0 };
-      }
-
-      // Drain pending V5 finalizations BEFORE serializing localData via
-      // tokenToTxf. Default-on; opt out via `drainPending: false`.
-      const drainPending = options?.drainPending ?? true;
-      if (drainPending) {
-        const drain = await this.drainPendingFinalizations({
-          timeoutMs: options?.drainTimeoutMs ?? 30_000,
-          pollIntervalMs: options?.drainPollIntervalMs ?? 2_000,
-        });
-        if (drain.timedOut && !drain.skipped) {
-          // Drain ran but didn't finish in time. Count residual pending.
-          const pendingAtFlush = Array.from(this.tokens.values()).filter(
-            (t) => t.status === 'submitted' || t.status === 'pending',
-          ).length;
-          // DEFAULT-FLUSH (per user requirement): we MUST publish
-          // unconfirmed tokens to IPFS so that on profile loss,
-          // recovery picks them up and the load-time
-          // `tryLocalFinalizeUnconfirmed` flow attempts re-finalization.
-          // Previously this defaulted to "skip flush to avoid partial
-          // CAR" — but that left unfinalized tokens un-recoverable
-          // (Nostr-only delivery, so a wipe + re-import after the
-          // sender's outbox aged out lost the funds entirely).
-          //
-          // Opt OUT explicitly via `forceFlushOnDrainTimeout: false`
-          // when the caller wants the pre-existing skip-flush
-          // behaviour (e.g. test scenarios that depend on
-          // determinism). The default is to publish — tokens that
-          // are still pending land in the CAR with their current
-          // sdkData (sender's state.predicate). The recipient device
-          // (or a recovered profile) then runs
-          // `tryLocalFinalizeUnconfirmed` to apply the transition
-          // locally using the on-disk proof, flipping state.predicate
-          // to its own signing key.
-          const forceFlush = options?.forceFlushOnDrainTimeout ?? true;
-          if (!forceFlush) {
-            logger.warn(
-              'Payments',
-              `sync: drain timed out with ${pendingAtFlush} token(s) still pending V5 finalization — skipping flush (forceFlushOnDrainTimeout=false) to avoid partial CAR. Retry sync() once finalization completes.`,
-            );
-            this.deps!.emitEvent('sync:completed', {
-              source: 'payments',
-              count: this.tokens.size,
-            });
-            return { added: 0, removed: 0, drainTimedOut: true, pendingAtFlush };
-          }
-          logger.warn(
-            'Payments',
-            `sync: drain timed out with ${pendingAtFlush} token(s) still pending V5 finalization — flushing anyway (default: publish unfinalized state for recovery). The recipient/recovered profile will re-attempt local finalization on load.`,
-          );
-        }
-      }
-
-      // Create local data once
-      const localData = await this.createStorageData();
-
-      let totalAdded = 0;
-      let totalRemoved = 0;
-
-      // Sync with each provider. Nametag preservation when merged data
-      // omits `_nametags` is handled inside `loadFromStorageData` (#136).
-      for (const [providerId, provider] of providers) {
-        try {
-          const result = await provider.sync(localData);
-
-          if (result.success && result.merged) {
-            // Address guard: reject data from a different address.
-            // Stale IPFS records may contain tokens from a previously active
-            // address if a write-behind flush raced with an address switch.
-            //
-            // Accept two representations (one per writer):
-            //   - chain pubkey — canonical post-L1-removal `_meta.address`
-            //     shape (see storage rekey in c09dfd9d)
-            //   - Profile short ID (`DIRECT_{first6}_{last6}`) — written by
-            //     ProfileTokenStorageProvider via `computeAddressId`
-            //
-            // Legacy `alpha1...` bech32 addresses in `_meta.address` are
-            // tolerated on READ — mirrors the tolerance in `load()` above.
-            // A resave from this Phase-2 code rewrites the field to
-            // chainPubkey. Rejecting alpha1 here would silently drop merged
-            // payloads from cross-version peers still writing the legacy form.
-            const mergedMeta = (result.merged as TxfStorageDataBase)?._meta;
-            const currentChain = this.deps!.identity.chainPubkey;
-            const currentDirect = this.deps!.identity.directAddress;
-            const currentProfileShortId = currentDirect ? computeAddressId(currentDirect) : null;
-            const isLegacyAlpha = mergedMeta?.address?.startsWith('alpha1') ?? false;
-            if (
-              mergedMeta?.address &&
-              !isLegacyAlpha &&
-              mergedMeta.address !== currentChain &&
-              mergedMeta.address !== currentProfileShortId
-            ) {
-              const accepted = [
-                currentChain ? `chain=${currentChain.slice(0, 16)}…` : null,
-                currentProfileShortId ? `profile=${currentProfileShortId}` : null,
-                `legacy alpha1 (migration tolerance)`,
-              ].filter(Boolean).join(', ');
-              logger.warn(
-                'Payments',
-                `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 24)} accepted=[${accepted}])`,
-              );
-              continue;
-            }
-
-            // Snapshot tokens that can't survive TXF round-trip (V5 pending)
-            // AND tokens that were added after the localData snapshot.
-            // Sync can race with resolveUnconfirmed() or incoming transfers.
-            const savedTokens = new Map(this.tokens);
-
-            // Apply merged data from each provider
-            this.loadFromStorageData(result.merged);
-
-            // Restore tokens lost by loadFromStorageData()'s tokens.clear().
-            // Only restore if no token with the same genesis tokenId already
-            // exists (avoids duplicating tokens whose ID changed from v5split
-            // to real genesis ID during TXF round-trip).
-            // Build index of existing genesis tokenIds for O(1) lookup instead of O(n²).
-            const existingGenesisIds = new Set<string>();
-            for (const existing of this.tokens.values()) {
-              const gid = extractTokenIdFromSdkData(existing.sdkData);
-              if (gid) existingGenesisIds.add(gid);
-            }
-
-            let restoredCount = 0;
-            for (const [tokenId, token] of savedTokens) {
-              if (this.tokens.has(tokenId)) continue;
-
-              // Check tombstones
-              const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
-              const stateHash = extractStateHashFromSdkData(token.sdkData);
-              if (sdkTokenId && stateHash && this.isStateTombstoned(sdkTokenId, stateHash)) {
-                continue;
-              }
-
-              // Skip if an equivalent token (same genesis tokenId) already
-              // exists under a different ID — avoids balance doubling.
-              if (sdkTokenId && existingGenesisIds.has(sdkTokenId)) {
-                continue;
-              }
-
-              this.tokens.set(tokenId, token);
-              if (sdkTokenId) existingGenesisIds.add(sdkTokenId);
-              restoredCount++;
-            }
-            if (restoredCount > 0) {
-              logger.debug('Payments', `Sync: restored ${restoredCount} token(s) lost by loadFromStorageData`);
-            }
-
-            // Rebuild parsedTokenCache for spend queue (loadFromStorageData bypasses addToken)
-            await this.rebuildParsedTokenCache();
-
-            // Import merged history from IPFS sync into local store
-            const txfData = result.merged as TxfStorageDataBase;
-            if (txfData._history && txfData._history.length > 0) {
-              const imported = await this.importRemoteHistoryEntries(txfData._history as HistoryRecord[]);
-              if (imported > 0) {
-                logger.debug('Payments', `Imported ${imported} history entries from IPFS sync`);
-              }
-            }
-
-            totalAdded += result.added;
-            totalRemoved += result.removed;
-          }
-
-          this.deps!.emitEvent('sync:provider', {
-            providerId,
-            success: result.success,
-            added: result.added,
-            removed: result.removed,
-          });
-        } catch (providerError) {
-          // Log error but continue with other providers
-          logger.warn('Payments', `Sync failed for provider ${providerId}:`, providerError);
-          this.deps!.emitEvent('sync:provider', {
-            providerId,
-            success: false,
-            error: providerError instanceof Error ? providerError.message : String(providerError),
-          });
-        }
-      }
-
-      // Persist merged state to primary storage so it survives process restarts
-      if (totalAdded > 0 || totalRemoved > 0) {
-        await this.save();
-      }
-
-      this.deps!.emitEvent('sync:completed', {
-        source: 'payments',
-        count: this.tokens.size,
-      });
-
-      // Surface any tokens that rode through the flush in pending-V5 state
-      // so callers can detect partial-CAR risk (relevant when drain was
-      // skipped due to no oracle, OR forceFlushOnDrainTimeout overrode a
-      // timed-out drain). Successful drain → pendingAtFlush = 0 → omit
-      // from the result.
-      const pendingAtFlush = Array.from(this.tokens.values()).filter(
-        (t) => t.status === 'submitted' || t.status === 'pending',
-      ).length;
-      const result: SyncResult = { added: totalAdded, removed: totalRemoved };
-      if (pendingAtFlush > 0) result.pendingAtFlush = pendingAtFlush;
-      return result;
-    } catch (error) {
-      this.deps!.emitEvent('sync:error', {
-        source: 'payments',
-        error: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
-    }
+    // Phase 5 sync/ concern extraction: implementation lives in
+    // modules/payments/sync/engine.ts. The facade delegates so its
+    // signature (private but referenced from `sync()`) is preserved and
+    // the coalescing wrapper above continues to own the in-flight
+    // promise. See modules/payments/sync/README.md for the routing plan.
+    return runSync(options, {
+      identity: this.deps!.identity,
+      disabledProviderIds: this.deps!.disabledProviderIds,
+      tokenStorageProviders: this.deps!.tokenStorageProviders,
+      tokenStorage: this.deps!.tokenStorage,
+      tokens: this.tokens,
+      emitEvent: (type, data) => this.deps!.emitEvent(type, data),
+      drainPendingFinalizations: (opts) => this.drainPendingFinalizations(opts),
+      save: () => this.save(),
+      createStorageData: () => this.createStorageData(),
+      loadFromStorageData: (data) => this.loadFromStorageData(data),
+      isStateTombstoned: (tokenId, stateHash) => this.isStateTombstoned(tokenId, stateHash),
+      rebuildParsedTokenCache: () => this.rebuildParsedTokenCache(),
+      importRemoteHistoryEntries: (entries) => this.importRemoteHistoryEntries(entries),
+    });
   }
 
   // ===========================================================================
@@ -11566,32 +11350,18 @@ export class PaymentsModule {
     this.unsubscribeStorageEvents();
 
     const providers = this.getTokenStorageProviders();
-    for (const [providerId, provider] of providers) {
-      if (provider.onEvent) {
-        const unsub = provider.onEvent((event) => {
-          if (event.type === 'storage:remote-updated') {
-            logger.debug('Payments', 'Remote update detected from provider', providerId, event.data);
-            this.debouncedSyncFromRemoteUpdate(providerId, event.data);
-          }
-        });
-        this.storageEventUnsubscribers.push(unsub);
-      }
-    }
+    subscribeToStorageEventsHelper(
+      providers,
+      this.storageEventUnsubscribers,
+      (providerId, eventData) => this.debouncedSyncFromRemoteUpdate(providerId, eventData),
+    );
   }
 
   /**
    * Unsubscribe from all storage provider events and clear debounce timer.
    */
   private unsubscribeStorageEvents(): void {
-    for (const unsub of this.storageEventUnsubscribers) {
-      unsub();
-    }
-    this.storageEventUnsubscribers = [];
-
-    if (this.syncDebounceTimer) {
-      clearTimeout(this.syncDebounceTimer);
-      this.syncDebounceTimer = null;
-    }
+    unsubscribeStorageEventsHelper(this.storageEventUnsubscribers, this.syncDebounceTimerRef);
   }
 
   /**
@@ -11599,60 +11369,25 @@ export class PaymentsModule {
    * Waits 500ms to batch rapid updates, then performs sync.
    */
   private debouncedSyncFromRemoteUpdate(providerId: string, eventData: unknown): void {
-    if (this.syncDebounceTimer) {
-      clearTimeout(this.syncDebounceTimer);
-    }
-
-    this.syncDebounceTimer = setTimeout(() => {
-      this.syncDebounceTimer = null;
-      this.sync()
-        .then((result) => {
-          const data = eventData as { name?: string; sequence?: number; cid?: string } | undefined;
-          this.deps?.emitEvent('sync:remote-update', {
-            providerId,
-            name: data?.name ?? '',
-            sequence: data?.sequence ?? 0,
-            cid: data?.cid ?? '',
-            added: result.added,
-            removed: result.removed,
-          });
-        })
-        .catch((err) => {
-          logger.debug('Payments', 'Auto-sync from remote update failed:', err);
-        });
-    }, PaymentsModule.SYNC_DEBOUNCE_MS);
+    debouncedSyncFromRemoteUpdateHelper(
+      this.syncDebounceTimerRef,
+      providerId,
+      eventData,
+      () => this.sync(),
+      (type, data) => this.deps?.emitEvent(type, data),
+      SYNC_DEBOUNCE_MS,
+    );
   }
 
   /**
    * Get all active (non-disabled) token storage providers
    */
   private getTokenStorageProviders(): Map<string, TokenStorageProvider<TxfStorageDataBase>> {
-    let providers: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
-
-    // Prefer new multi-provider map
-    if (this.deps!.tokenStorageProviders && this.deps!.tokenStorageProviders.size > 0) {
-      providers = this.deps!.tokenStorageProviders;
-    } else if (this.deps!.tokenStorage) {
-      // Fallback to deprecated single provider
-      providers = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
-      providers.set(this.deps!.tokenStorage.id, this.deps!.tokenStorage);
-    } else {
-      return new Map();
-    }
-
-    // Filter out disabled providers
-    const disabled = this.deps!.disabledProviderIds;
-    if (disabled && disabled.size > 0) {
-      const filtered = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
-      for (const [id, provider] of providers) {
-        if (!disabled.has(id)) {
-          filtered.set(id, provider);
-        }
-      }
-      return filtered;
-    }
-
-    return providers;
+    return getActiveTokenStorageProviders({
+      disabledProviderIds: this.deps!.disabledProviderIds,
+      tokenStorageProviders: this.deps!.tokenStorageProviders,
+      tokenStorage: this.deps!.tokenStorage,
+    });
   }
 
   /**
@@ -11689,46 +11424,15 @@ export class PaymentsModule {
    */
   async validate(): Promise<{ valid: Token[]; invalid: Token[] }> {
     this.ensureInitialized();
-
-    const valid: Token[] = [];
-    const invalid: Token[] = [];
-
-    for (const token of this.tokens.values()) {
-      // Issue #389 finding #7 — short-circuit ledgered tokens. The
-      // V6-RECOVER permanent-verdict ledger is authoritative: the
-      // wallet has decided structurally / by-recipient-mismatch that
-      // it cannot finalize this token. Re-asking the aggregator about
-      // it is wasted round-trips (and, worse, can return `valid=true`
-      // for a token the wallet permanently rejected — a
-      // `validate()` caller would then see a "valid" entry in the
-      // returned array that the rest of the SDK would refuse to
-      // spend). Route ledgered tokens straight to `invalid` so the
-      // returned partition reflects on-wallet reality.
-      if (this.isV6RecoverPermanentToken(token)) {
-        if (token.status !== 'invalid') {
-          token.status = 'invalid';
-        }
-        this.parsedTokenCache.delete(token.id);
-        invalid.push(token);
-        continue;
-      }
-
-      const result = await this.deps!.oracle.validateToken(token.sdkData);
-
-      if (result.valid && !result.spent) {
-        valid.push(token);
-      } else {
-        token.status = 'invalid';
-        this.parsedTokenCache.delete(token.id);
-        invalid.push(token);
-      }
-    }
-
-    if (invalid.length > 0) {
-      await this.save();
-    }
-
-    return { valid, invalid };
+    // Phase 5 sync/ concern extraction: implementation lives in
+    // modules/payments/sync/engine.ts. Facade delegates.
+    return validateTokensAgainstOracle({
+      tokens: this.tokens,
+      oracle: this.deps!.oracle,
+      parsedTokenCache: this.parsedTokenCache,
+      isV6RecoverPermanentToken: (token) => this.isV6RecoverPermanentToken(token),
+      save: () => this.save(),
+    });
   }
 
   /**

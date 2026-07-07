@@ -60,6 +60,11 @@ const EXTENSION_BOUNDARY_ALLOWLIST = [
   // out to `extensions/uxf/profile/wiring.ts` behind lifecycle hooks.
   'core/Sphere.ts',
   'modules/payments/PaymentsModule.ts',
+  // Phase 5 sync/ concern extraction — inherits the facade's
+  // `computeAddressId` crossing (address-guard on remote merged data).
+  // Burns down alongside the parent facade in Phase 7 when the
+  // extensions layer inverts control.
+  'modules/payments/sync/engine.ts',
   'modules/accounting/AccountingModule.ts',
   'modules/accounting/types.ts',
   'modules/communications/CommunicationsModule.ts',
