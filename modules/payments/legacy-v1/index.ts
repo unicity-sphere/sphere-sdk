@@ -14,3 +14,5 @@ export * from './finalization';
 export * from './commitment';
 export * from './dispatch-txf';
 export * from './proof-polling';
+export * from './v6-recover';
+export * from './mint-nametag';
