@@ -155,6 +155,25 @@ describe('PaymentsModule.load() — single-flight (#642)', () => {
     });
   });
 
+  it('the trailing re-run calls resyncInventory(false) so it cannot chain into back-to-back loads (sphere-sdk#646 review)', async () => {
+    const { provider, release } = gatedTokenStorage();
+    const { module } = makeModule(provider);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const resyncSpy = vi.spyOn(module as any, 'resyncInventory');
+
+    const p1 = module.load();
+    const p2 = module.load(); // coalesces → arms the trailing re-run
+    release();
+    await Promise.all([p1, p2]);
+
+    // The re-run is the only resyncInventory caller here (no poll timer without
+    // an injected delivery). If it fired without an explicit `false`, a re-run
+    // that coalesces onto an in-flight load would request YET another re-run —
+    // the gapless back-to-back loads the poll opt-out exists to prevent.
+    await vi.waitFor(() => expect(resyncSpy).toHaveBeenCalled());
+    expect(resyncSpy).toHaveBeenCalledWith(false);
+  });
+
   it('does not coalesce sequential calls — each load runs fresh', async () => {
     const { provider, stats, release } = gatedTokenStorage();
     const { module } = makeModule(provider);

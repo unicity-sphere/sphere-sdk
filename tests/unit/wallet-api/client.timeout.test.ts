@@ -111,16 +111,18 @@ describe('WalletApiClient — per-request timeout (#642)', () => {
   it('still aborts on runtimes without AbortSignal.timeout (the #617 older-WebView guard)', async () => {
     // iOS 15 / older Android WebViews lack AbortSignal.timeout — the client
     // must fall back to timeoutSignal's AbortController path, not crash.
+    // Use defineProperty (not bare assignment): AbortSignal.timeout can be a
+    // non-writable own property on some runtimes, where `= undefined` throws.
+    // Mirrors tests/unit/core/timeout.test.ts.
     const original = AbortSignal.timeout;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (AbortSignal as any).timeout = undefined;
+    Object.defineProperty(AbortSignal, 'timeout', { value: undefined, configurable: true, writable: true });
     try {
       const seen: { signal?: AbortSignal }[] = [];
       const client = makeClient(stallingFetch('/v1/inventory', seen), 100);
       await expect(client.listInventory()).rejects.toMatchObject({ code: 'NETWORK' });
       expect(seen[0]?.signal).toBeInstanceOf(AbortSignal); // fallback signal supplied
     } finally {
-      AbortSignal.timeout = original;
+      Object.defineProperty(AbortSignal, 'timeout', { value: original, configurable: true, writable: true });
     }
   });
 

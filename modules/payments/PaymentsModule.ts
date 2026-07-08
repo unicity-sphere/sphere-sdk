@@ -1604,10 +1604,17 @@ export class PaymentsModule {
         // and re-init can cancel it even after the flag was consumed, and run
         // under the inventory pump health so a failure is classified
         // (quiet-then-escalate) instead of an unhandled rejection.
+        //
+        // rerunOnCoalesce=false: the re-run IS the convergence pass. If, when
+        // its macrotask fires, another load is already in flight (e.g. a poll
+        // tick started one in the gap), coalescing onto it already observes
+        // the change — requesting yet another re-run would chain into gapless
+        // back-to-back loads under slow-load regimes, the exact behavior the
+        // poll opt-out prevents.
         this.loadRerunRequested = false;
         this.loadRerunTimer = setTimeout(() => {
           this.loadRerunTimer = null;
-          this.pumpHealth.run('inventory', () => this.resyncInventory());
+          this.pumpHealth.run('inventory', () => this.resyncInventory(false));
         }, 0);
       }
     });
@@ -5009,8 +5016,10 @@ export class PaymentsModule {
 
   /**
    * Debounced inventory resync driven by an `inventory` wake — coalesces a
-   * burst of wakes into one pull. Runs the same {@link resyncInventory} as the
-   * poll backstop: a wake just makes it fire sooner.
+   * burst of wakes into one pull. Unlike the poll backstop, a wake DOES want
+   * the trailing re-run (rerunOnCoalesce=true): if it coalesces onto a load
+   * that started before the wake's change, that re-run is what converges it
+   * without waiting for the next poll tick.
    */
   private debouncedInventorySyncFromWake(): void {
     if (this.syncDebounceTimer) {
@@ -5018,7 +5027,7 @@ export class PaymentsModule {
     }
     this.syncDebounceTimer = setTimeout(() => {
       this.syncDebounceTimer = null;
-      this.pumpHealth.run('inventory', () => this.resyncInventory());
+      this.pumpHealth.run('inventory', () => this.resyncInventory(true));
     }, PaymentsModule.SYNC_DEBOUNCE_MS);
   }
 
