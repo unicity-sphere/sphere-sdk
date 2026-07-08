@@ -708,15 +708,17 @@ export class FlushScheduler {
       // in as a permanent debug tool — useful for catching any future
       // regression where save and no-data sources diverge. Run with
       // DEBUG=Profile-TokenStorage or equivalent to surface.
+      // Wave 6-P2-17: token entries carry the v2 envelope shape now
+      // (`{ tokenId, network, v, token }`) — coinId lives inside the
+      // encrypted CBOR blob and cannot be surfaced without decoding
+      // through the engine. Fall back to the tokenId prefix so the
+      // per-coin histogram still yields a useful cardinality signal
+      // in production logs.
       const tokenCoinIds = tokenValues
         .map((t) => {
-          const tok = t as {
-            genesis?: { data?: { coinData?: ReadonlyArray<readonly [string, string]> } };
-            coinData?: ReadonlyArray<readonly [string, string]>;
-          };
-          const c = tok.genesis?.data?.coinData ?? tok.coinData;
-          if (!c || c.length === 0) return '∅';
-          return String(c[0]?.[0] ?? '').slice(-6);
+          const tok = t as { tokenId?: string };
+          if (typeof tok.tokenId !== 'string') return '∅';
+          return tok.tokenId.slice(0, 6);
         })
         .sort();
       const counts: Record<string, number> = {};

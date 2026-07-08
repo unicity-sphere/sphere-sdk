@@ -564,8 +564,12 @@ export type {
   ReturnPaymentParams,
 } from './modules/accounting/types';
 
-// TxfToken type for serialization workflows
-export type { TxfToken } from './types/txf';
+// v2 persistence entry — canonical shape for tokens stored in Profile / txf
+// storage layers. The old `TxfToken` name is a deprecated `any` alias
+// (see `types/txf.ts`); persistence-oriented consumers should use
+// `SphereTokenPersistenceEntry`.
+export type { SphereTokenPersistenceEntry, TxfToken } from './types/txf';
+export { isSphereTokenPersistenceEntry } from './types/txf';
 
 // Master-key provider status re-export (already re-exported via ./types barrel,
 // but keeping explicit here for consumers that want to import direct types).

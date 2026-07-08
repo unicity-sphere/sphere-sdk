@@ -245,8 +245,9 @@ export function txfToToken(tokenId: string, txf: TxfToken): Token {
 }
 
 function __txfToTokenImpl(tokenId: string, txf: TxfToken): Token {
-  const coinData = txf.genesis.data.coinData ?? [];
-  const totalAmount = coinData.reduce((sum, [, amt]) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const coinData = (txf.genesis?.data?.coinData ?? []) as Array<[string, string]>;
+  const totalAmount = coinData.reduce((sum: bigint, [, amt]) => {
     return sum + BigInt(amt || '0');
   }, BigInt(0));
 
@@ -700,7 +701,7 @@ export function hasMissingNewStateHash(txf: TxfToken): boolean {
   if (!txf.transactions || txf.transactions.length === 0) {
     return false;
   }
-  return txf.transactions.some(tx => !tx.newStateHash);
+  return txf.transactions.some((tx: { newStateHash?: unknown }) => !tx.newStateHash);
 }
 
 /**
