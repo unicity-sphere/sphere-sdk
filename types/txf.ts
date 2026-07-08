@@ -1,20 +1,23 @@
 /**
  * TXF (Token eXchange Format) Type Definitions — v2 persistence layer.
  *
- * Wave 6-P2-17: the profile persistence layer now stores v2 SphereToken
+ * Wave 6-P2-17: the profile persistence layer stores v2 SphereToken
  * blobs wrapped in a small JSON envelope — the same shape the v2
  * wire path (`PaymentsModule.deliverTokens`) uses over Nostr. The v1
  * chain shape (`TxfToken` with `genesis` / `state` / `transactions` /
  * `_integrity`) is gone; there is NO backward compatibility with v1
  * persistence, per the phase-6 migration mandate.
  *
- * This file used to define the v1 chain deconstruction shape:
- *   TxfToken, TxfGenesis, TxfGenesisData, TxfState, TxfTransaction,
- *   TxfIntegrity, TxfInclusionProof, TxfAuthenticator, TxfMerkleTreePath,
- *   TxfMerkleStep
- * All of those are deleted. Callers that still want to reference "the
- * shape a token takes when stored in Profile" use
- * `SphereTokenPersistenceEntry`.
+ * Wave 6-P2-18: the deprecated v1 chain-shape name aliases
+ * (`TxfToken`, `TxfGenesis`, `TxfGenesisData`, `TxfState`,
+ * `TxfTransaction`, `TxfIntegrity`, `TxfInclusionProof`,
+ * `TxfAuthenticator`, `TxfMerkleTreePath`, `TxfMerkleStep`) that were
+ * kept for one wave of source compat are now DELETED. Non-legacy
+ * runtime code that still consumes the underlying state-transition-sdk
+ * v1-shape JSON uses `unknown` at the type boundary or a local minimal
+ * interface — the v1 alias no longer exists anywhere in the type
+ * system. Consumers that want "the shape a token takes when stored in
+ * Profile" use `SphereTokenPersistenceEntry`.
  */
 
 // =============================================================================
@@ -51,42 +54,26 @@ export interface SphereTokenPersistenceEntry {
 }
 
 // =============================================================================
-// Deprecated v1 chain-shape aliases (to be removed post-Phase-6)
+// v1 chain-shape aliases — DELETED (Wave 6-P2-18)
 // =============================================================================
 //
-// Wave 6-P2-17: the concrete v1 chain shapes (with genesis / state /
-// transactions / _integrity fields) are DELETED. The names below are
-// preserved as loose `Record<string, unknown>` aliases only so the
-// tsc surface can compile while the last v1-shape helpers (the
-// AccountingModule invoice payload constructor, the standalone
-// `serialization/txf-serializer.ts`, etc.) are ported off them or
-// removed outright in a follow-up wave.
+// The `TxfToken` / `TxfGenesis` / `TxfGenesisData` / `TxfState` /
+// `TxfTransaction` / `TxfIntegrity` / `TxfInclusionProof` /
+// `TxfAuthenticator` / `TxfMerkleTreePath` / `TxfMerkleStep` type
+// aliases that Wave 6-P2-17 kept as one-wave-of-source-compat
+// deprecated `any` aliases are DELETED here.
 //
-// New code MUST NOT rely on these — reach for
-// `SphereTokenPersistenceEntry` instead. There is NO v1 backward
-// compatibility on any hot persistence / wire path.
-/* eslint-disable @typescript-eslint/no-explicit-any */
-/** @deprecated v1 chain shape — no runtime meaning. */
-export type TxfToken = any;
-/** @deprecated v1 chain shape — no runtime meaning. */
-export type TxfGenesis = any;
-/** @deprecated v1 chain shape — no runtime meaning. */
-export type TxfGenesisData = any;
-/** @deprecated v1 chain shape — no runtime meaning. */
-export type TxfState = any;
-/** @deprecated v1 chain shape — no runtime meaning. */
-export type TxfTransaction = any;
-/** @deprecated v1 chain shape — no runtime meaning. */
-export type TxfIntegrity = any;
-/** @deprecated v1 chain shape — no runtime meaning. */
-export type TxfInclusionProof = any;
-/** @deprecated v1 chain shape — no runtime meaning. */
-export type TxfAuthenticator = any;
-/** @deprecated v1 chain shape — no runtime meaning. */
-export type TxfMerkleTreePath = any;
-/** @deprecated v1 chain shape — no runtime meaning. */
-export type TxfMerkleStep = any;
-/* eslint-enable @typescript-eslint/no-explicit-any */
+// Any non-legacy consumer that used to import one of those names
+// migrates to either:
+//   - `SphereTokenPersistenceEntry` (this file) — for the v2 envelope
+//     stored in Profile / TXF storage;
+//   - `unknown` at the type boundary + a local minimal interface for
+//     the fields it actually reads — for the state-transition-sdk
+//     v1-shape JSON that survives until the STSDK v2 swap lands.
+//
+// There is NO v1 backward compatibility on any hot persistence / wire
+// path. Files under `**/legacy-v1/**` still speak the v1 shape but
+// are excluded from the main test surface.
 
 // =============================================================================
 // Storage Format (for IPFS/File storage)
@@ -191,16 +178,13 @@ export interface TxfStorageData {
   _invalidatedNametags?: InvalidatedNametagEntry[];
   _outbox?: OutboxEntry[];
   _mintOutbox?: MintOutboxEntry[];
-  [key: string]:
-    | SphereTokenPersistenceEntry
-    | TxfMeta
-    | NametagData
-    | NametagData[]
-    | TombstoneEntry[]
-    | InvalidatedNametagEntry[]
-    | OutboxEntry[]
-    | MintOutboxEntry[]
-    | undefined;
+  // Wave 6-P2-18: token entries under `_${tokenId}` are held as
+  // `unknown` at the storage type surface. The v2 Profile persistence
+  // layer stores `SphereTokenPersistenceEntry`; other adapters (the
+  // legacy FileTokenStorage that still speaks the state-transition-sdk
+  // v1 JSON) put v1-shape entries here. Consumers narrow via
+  // `isSphereTokenPersistenceEntry` at read time.
+  [key: string]: unknown;
 }
 
 // =============================================================================

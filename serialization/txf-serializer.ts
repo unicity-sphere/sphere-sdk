@@ -6,8 +6,6 @@
  */
 
 import type {
-  TxfToken,
-  TxfTransaction,
   TxfStorageData,
   TxfMeta,
   NametagData,
@@ -16,6 +14,48 @@ import type {
   MintOutboxEntry,
   InvalidatedNametagEntry,
 } from '../types/txf';
+
+// Wave 6-P2-18: the v1 chain-shape type aliases (`V1TxfShape`,
+// `V1TxfTransactionShape`, `TxfGenesis`, …) are deleted. This serializer still
+// operates on the state-transition-sdk's v1 JSON shape until the STSDK
+// v2 swap lands; we retype the transient JSON via local minimal
+// interfaces here rather than reintroducing the shared v1 aliases.
+interface V1TxfTransactionShape {
+  previousStateHash?: string;
+  newStateHash?: string;
+  inclusionProof?: {
+    authenticator?: {
+      publicKey?: unknown;
+      signature?: unknown;
+      stateHash?: string;
+    };
+  } | null;
+}
+interface V1TxfShape {
+  version?: string;
+  genesis?: {
+    data?: {
+      tokenId?: string;
+      tokenType?: string;
+      salt?: string;
+      coinData?: Array<[string, string]> | null;
+    };
+    inclusionProof?: {
+      authenticator?: {
+        publicKey?: unknown;
+        signature?: unknown;
+        stateHash?: string;
+      };
+    };
+  };
+  state?: unknown;
+  transactions?: V1TxfTransactionShape[];
+  nametags?: unknown[];
+  _integrity?: {
+    genesisDataJSONHash?: string;
+    currentStateHash?: string;
+  };
+}
 import type { HistoryRecord } from '../storage';
 import {
   isTokenKey,
@@ -70,7 +110,7 @@ function normalizeToHex(value: unknown): string {
  * Normalize SDK token JSON to canonical TXF storage format.
  * Converts all bytes objects to hex strings before storage.
  */
-export function normalizeSdkTokenToStorage(sdkTokenJson: unknown): TxfToken {
+export function normalizeSdkTokenToStorage(sdkTokenJson: unknown): V1TxfShape {
   // structuredClone is faster than JSON.parse(JSON.stringify()) and avoids
   // double serialization overhead that was blocking the main thread.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -116,7 +156,7 @@ export function normalizeSdkTokenToStorage(sdkTokenJson: unknown): TxfToken {
     }
   }
 
-  return txf as TxfToken;
+  return txf as V1TxfShape;
 }
 
 // =============================================================================
@@ -126,7 +166,7 @@ export function normalizeSdkTokenToStorage(sdkTokenJson: unknown): TxfToken {
 /**
  * Extract TXF token structure from Token.sdkData (jsonData)
  */
-export function tokenToTxf(token: Token): TxfToken | null {
+export function tokenToTxf(token: Token): V1TxfShape | null {
   const jsonData = token.sdkData;
   if (!jsonData) {
     return null;
@@ -172,7 +212,7 @@ interface TokenLike {
 /**
  * Extract TXF from any object with id and sdkData
  */
-export function objectToTxf(obj: TokenLike): TxfToken | null {
+export function objectToTxf(obj: TokenLike): V1TxfShape | null {
   if (!obj.sdkData) return null;
   try {
     const txfData = normalizeSdkTokenToStorage(JSON.parse(obj.sdkData));
@@ -200,9 +240,10 @@ export function objectToTxf(obj: TokenLike): TxfToken | null {
  * balance-model invariant in `loadFromStorageData` would archive the
  * token while it still has a real finalization plan.
  */
-function determineTokenStatus(txf: TxfToken): TokenStatus {
-  if (txf.transactions.length > 0) {
-    const lastTx = txf.transactions[txf.transactions.length - 1];
+function determineTokenStatus(txf: V1TxfShape): TokenStatus {
+  const txns = txf.transactions ?? [];
+  if (txns.length > 0) {
+    const lastTx = txns[txns.length - 1];
     // Missing field => null (canonical default).
     const proof = lastTx.inclusionProof === undefined ? null : lastTx.inclusionProof;
     if (proof === null) {
@@ -234,7 +275,7 @@ function determineTokenStatus(txf: TxfToken): TokenStatus {
  * `invoice-list / invoice-status / invoice-pay` all return "not found"
  * for any persisted invoice.
  */
-export function txfToToken(tokenId: string, txf: TxfToken): Token {
+export function txfToToken(tokenId: string, txf: unknown): Token {
   incr('serialization.txfSerializer.txfToToken.calls');
   const __t0 = performance.now();
   try {
@@ -244,7 +285,8 @@ export function txfToToken(tokenId: string, txf: TxfToken): Token {
   }
 }
 
-function __txfToTokenImpl(tokenId: string, txf: TxfToken): Token {
+function __txfToTokenImpl(tokenId: string, txfIn: unknown): Token {
+  const txf = txfIn as V1TxfShape;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const coinData = (txf.genesis?.data?.coinData ?? []) as Array<[string, string]>;
   const totalAmount = coinData.reduce((sum: bigint, [, amt]) => {
@@ -260,7 +302,7 @@ function __txfToTokenImpl(tokenId: string, txf: TxfToken): Token {
     }
   }
 
-  const tokenType = txf.genesis.data.tokenType;
+  const tokenType = txf.genesis?.data?.tokenType;
   const isNft = tokenType === '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89';
   const isInvoice = tokenType === INVOICE_TOKEN_TYPE_HEX;
 
@@ -322,8 +364,8 @@ export async function buildTxfStorageData(
   options?: {
     nametags?: NametagData[];
     tombstones?: TombstoneEntry[];
-    archivedTokens?: Map<string, TxfToken>;
-    forkedTokens?: Map<string, TxfToken>;
+    archivedTokens?: Map<string, unknown>;
+    forkedTokens?: Map<string, unknown>;
     outboxEntries?: OutboxEntry[];
     mintOutboxEntries?: MintOutboxEntry[];
     invalidatedNametags?: InvalidatedNametagEntry[];
@@ -365,8 +407,10 @@ export async function buildTxfStorageData(
   for (const token of tokens) {
     const txf = tokenToTxf(token);
     if (txf) {
-      const actualTokenId = txf.genesis.data.tokenId;
-      storageData[keyFromTokenId(actualTokenId)] = txf;
+      const actualTokenId = txf.genesis?.data?.tokenId;
+      if (actualTokenId) {
+        storageData[keyFromTokenId(actualTokenId)] = txf;
+      }
     }
   }
 
@@ -399,8 +443,8 @@ export interface ParsedStorageData {
   meta: TxfMeta | null;
   nametags: NametagData[];
   tombstones: TombstoneEntry[];
-  archivedTokens: Map<string, TxfToken>;
-  forkedTokens: Map<string, TxfToken>;
+  archivedTokens: Map<string, unknown>;
+  forkedTokens: Map<string, unknown>;
   outboxEntries: OutboxEntry[];
   mintOutboxEntries: MintOutboxEntry[];
   invalidatedNametags: InvalidatedNametagEntry[];
@@ -546,7 +590,7 @@ function __parseTxfStorageDataImpl(data: unknown): ParsedStorageData {
     if (isTokenKey(key)) {
       const tokenId = tokenIdFromKey(key);
       try {
-        const txfToken = storageData[key] as TxfToken;
+        const txfToken = storageData[key] as V1TxfShape;
         if (txfToken?.genesis?.data?.tokenId) {
           const token = txfToToken(tokenId, txfToken);
           result.tokens.push(token);
@@ -559,7 +603,7 @@ function __parseTxfStorageDataImpl(data: unknown): ParsedStorageData {
     else if (isArchivedKey(key)) {
       const tokenId = tokenIdFromArchivedKey(key);
       try {
-        const txfToken = storageData[key] as TxfToken;
+        const txfToken = storageData[key] as V1TxfShape;
         if (txfToken?.genesis?.data?.tokenId) {
           result.archivedTokens.set(tokenId, txfToken);
         }
@@ -572,7 +616,7 @@ function __parseTxfStorageDataImpl(data: unknown): ParsedStorageData {
       const parsed = parseForkedKey(key);
       if (parsed) {
         try {
-          const txfToken = storageData[key] as TxfToken;
+          const txfToken = storageData[key] as V1TxfShape;
           if (txfToken?.genesis?.data?.tokenId) {
             const mapKey = `${parsed.tokenId}_${parsed.stateHash}`;
             result.forkedTokens.set(mapKey, txfToken);
@@ -585,7 +629,7 @@ function __parseTxfStorageDataImpl(data: unknown): ParsedStorageData {
     // Individual file format tokens (from IPFS storage's saveToken)
     else if (key.startsWith('token-')) {
       try {
-        const entry = storageData[key] as { token?: TxfToken };
+        const entry = storageData[key] as { token?: V1TxfShape };
         const txfToken = entry?.token;
         if (txfToken?.genesis?.data?.tokenId) {
           const tokenId = txfToken.genesis.data.tokenId;
@@ -630,10 +674,12 @@ export function getTokenId(token: Token): string {
  * 3. Last transaction's inclusionProof authenticator stateHash
  * 4. Genesis inclusionProof authenticator stateHash (for never-transferred tokens)
  */
-export function getCurrentStateHash(txf: TxfToken): string | undefined {
+export function getCurrentStateHash(txf: unknown): string | undefined {
+  const t = txf as V1TxfShape | null | undefined;
+  if (!t) return undefined;
   // Check last transaction's explicit newStateHash
-  if (txf.transactions && txf.transactions.length > 0) {
-    const lastTx = txf.transactions[txf.transactions.length - 1];
+  if (t.transactions && t.transactions.length > 0) {
+    const lastTx = t.transactions[t.transactions.length - 1];
     if (lastTx?.newStateHash) {
       return lastTx.newStateHash;
     }
@@ -644,13 +690,13 @@ export function getCurrentStateHash(txf: TxfToken): string | undefined {
   }
 
   // Check integrity metadata
-  if (txf._integrity?.currentStateHash) {
-    return txf._integrity.currentStateHash;
+  if (t._integrity?.currentStateHash) {
+    return t._integrity.currentStateHash;
   }
 
   // For tokens with no transactions, use genesis proof's stateHash
-  if (txf.genesis?.inclusionProof?.authenticator?.stateHash) {
-    return txf.genesis.inclusionProof.authenticator.stateHash;
+  if (t.genesis?.inclusionProof?.authenticator?.stateHash) {
+    return t.genesis.inclusionProof.authenticator.stateHash;
   }
 
   return undefined;
@@ -687,7 +733,7 @@ export function hasUncommittedTransactions(token: Token): boolean {
     if (!txf.transactions || txf.transactions.length === 0) return false;
 
     return txf.transactions.some(
-      (tx: TxfTransaction) => tx.inclusionProof === null
+      (tx: V1TxfTransactionShape) => tx.inclusionProof === null
     );
   } catch {
     return false;
@@ -697,11 +743,12 @@ export function hasUncommittedTransactions(token: Token): boolean {
 /**
  * Check if a TXF token has missing newStateHash on any transaction
  */
-export function hasMissingNewStateHash(txf: TxfToken): boolean {
-  if (!txf.transactions || txf.transactions.length === 0) {
+export function hasMissingNewStateHash(txf: unknown): boolean {
+  const t = txf as V1TxfShape | null | undefined;
+  if (!t?.transactions || t.transactions.length === 0) {
     return false;
   }
-  return txf.transactions.some((tx: { newStateHash?: unknown }) => !tx.newStateHash);
+  return t.transactions.some((tx: { newStateHash?: unknown }) => !tx.newStateHash);
 }
 
 /**
@@ -715,7 +762,7 @@ export function countCommittedTransactions(token: Token): number {
     if (!txf.transactions) return 0;
 
     return txf.transactions.filter(
-      (tx: TxfTransaction) => tx.inclusionProof !== null
+      (tx: V1TxfTransactionShape) => tx.inclusionProof !== null
     ).length;
   } catch {
     return 0;

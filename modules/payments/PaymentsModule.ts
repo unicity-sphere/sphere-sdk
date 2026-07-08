@@ -50,7 +50,6 @@ import type {
 } from '../../types';
 import type {
   SphereTokenPersistenceEntry,
-  TxfToken,
   TombstoneEntry,
   NametagData,
 } from '../../types/txf';
@@ -364,8 +363,8 @@ export class PaymentsModule {
   // Repository state — retained for API stability though only history +
   // nametags are exercised on the v2 hot path.
   private tombstones: TombstoneEntry[] = [];
-  private archivedTokens: Map<string, TxfToken> = new Map();
-  private forkedTokens: Map<string, TxfToken> = new Map();
+  private archivedTokens: Map<string, unknown> = new Map();
+  private forkedTokens: Map<string, unknown> = new Map();
   private _historyCache: TransactionHistoryEntry[] = [];
   private nametags: NametagData[] = [];
 
@@ -1697,15 +1696,15 @@ export class PaymentsModule {
     // v2 slim: no time-based expiry — retained for API stability.
   }
 
-  getArchivedTokens(): Map<string, TxfToken> {
+  getArchivedTokens(): Map<string, unknown> {
     return new Map(this.archivedTokens);
   }
 
-  getBestArchivedVersion(tokenId: string): TxfToken | null {
+  getBestArchivedVersion(tokenId: string): unknown | null {
     return this.archivedTokens.get(tokenId) ?? null;
   }
 
-  async mergeArchivedTokens(remote: Map<string, TxfToken>): Promise<number> {
+  async mergeArchivedTokens(remote: Map<string, unknown>): Promise<number> {
     let added = 0;
     for (const [id, tok] of remote) {
       if (!this.archivedTokens.has(id)) {
@@ -1720,16 +1719,16 @@ export class PaymentsModule {
     /* no-op */
   }
 
-  getForkedTokens(): Map<string, TxfToken> {
+  getForkedTokens(): Map<string, unknown> {
     return new Map(this.forkedTokens);
   }
 
-  async storeForkedToken(tokenId: string, _stateHash: string, txfToken: TxfToken): Promise<void> {
+  async storeForkedToken(tokenId: string, _stateHash: string, txfToken: unknown): Promise<void> {
     this.forkedTokens.set(tokenId, txfToken);
     await this.persistAll();
   }
 
-  async mergeForkedTokens(remote: Map<string, TxfToken>): Promise<number> {
+  async mergeForkedTokens(remote: Map<string, unknown>): Promise<number> {
     let added = 0;
     for (const [id, tok] of remote) {
       if (!this.forkedTokens.has(id)) {

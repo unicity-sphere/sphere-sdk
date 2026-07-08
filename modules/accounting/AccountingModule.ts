@@ -42,7 +42,7 @@ import type {
   SphereEventType,
   Token,
 } from '../../types/index.js';
-import type { TxfToken } from '../../types/txf.js';
+import type { SphereTokenPersistenceEntry } from '../../types/txf.js';
 import type {
   AccountingModuleConfig,
   AccountingModuleDependencies,
@@ -449,8 +449,11 @@ export class AccountingModule {
         };
       }
 
-      // Cache terms + build a lightweight TxfToken shape for callers that
-      // still consume it via CreateInvoiceResult.token.
+      // Cache terms + build the v2 SphereTokenPersistenceEntry envelope
+      // that CreateInvoiceResult.token exposes to callers. Wave 6-P2-18
+      // deleted the v1 `TxfToken` alias entirely; the on-wire shape peers
+      // hand back to `importInvoice` is now the same canonical envelope
+      // the send pipeline ships over Nostr.
       this.invoiceTermsCache.set(invoiceId, terms);
       // v2-6c: hash the lowercased invoiceId to stay in sync with the
       // memo-side `hashInvoiceId` (memo.ts:60), which lowercases before
@@ -463,18 +466,15 @@ export class AccountingModule {
         .join('');
       this.invoiceIdHashIndex.set(hashHex, invoiceId);
 
-      const token: TxfToken = {
-        genesis: {
-          data: {
-            tokenId: invoiceId,
-            tokenType: INVOICE_TOKEN_TYPE_HEX,
-            tokenData: invoiceJson,
-            coinData: null,
-          },
-          proof: null,
-        },
-        transactions: [],
-      } as unknown as TxfToken;
+      const blob = tokenEngine.encodeToken(sphereToken);
+      const token: SphereTokenPersistenceEntry = {
+        _sdkVersion: 'v2',
+        _format: 'sphere-token-blob',
+        v: blob.v,
+        network: blob.network,
+        tokenId: blob.tokenId,
+        token: Buffer.from(blob.token).toString('base64'),
+      };
 
       // Emit event and hand back result.
       deps.emitEvent('invoice:created', { invoiceId, confirmed: true });
@@ -496,20 +496,37 @@ export class AccountingModule {
   /**
    * Import an existing invoice token (received from a peer).
    *
-   * Accepts either a TxfToken structure or a decoded SDK token blob;
-   * the slim rebuild honors the wide callable shape by treating the
-   * input as a TxfToken and pulling the terms JSON out of
-   * genesis.data.tokenData.
+   * Wave 6-P2-18: accepts the canonical v2 `SphereTokenPersistenceEntry`
+   * envelope that peers produce via `createInvoice()`. The engine
+   * decodes the CBOR blob and hands back the on-chain `data` bytes we
+   * originally minted (the JSON-serialized invoice terms). Also accepts
+   * a JSON-string form of the same envelope (for CLI / IPC transport).
+   *
+   * No v1 backward compat — the deleted `TxfToken` genesis-shape path
+   * is gone.
    */
-  async importInvoice(token: TxfToken | string | unknown): Promise<InvoiceTerms> {
+  async importInvoice(token: SphereTokenPersistenceEntry | string | unknown): Promise<InvoiceTerms> {
     this.ensureNotDestroyed();
     this.ensureInitialized();
     const deps = this.deps!;
+    // Same resolution pattern as createInvoice: honor either
+    // `deps.tokenEngine` or `deps.payments.tokenEngine`.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const tokenEngine: any =
+      (deps as unknown as { tokenEngine?: unknown }).tokenEngine
+      ?? (deps.payments as unknown as { tokenEngine?: unknown }).tokenEngine;
+    if (!tokenEngine) {
+      throw new SphereError(
+        'Invoice import requires a v2 token engine; none configured.',
+        'INVOICE_INVALID_DATA',
+      );
+    }
 
-    let txf: TxfToken;
+    // Step 0: normalize to a v2 envelope.
+    let envelope: SphereTokenPersistenceEntry;
     if (typeof token === 'string') {
       try {
-        txf = JSON.parse(token) as TxfToken;
+        envelope = JSON.parse(token) as SphereTokenPersistenceEntry;
       } catch {
         throw new SphereError(
           'Invoice import failed: token is not valid JSON.',
@@ -517,39 +534,55 @@ export class AccountingModule {
         );
       }
     } else {
-      txf = token as TxfToken;
+      envelope = token as SphereTokenPersistenceEntry;
     }
-
-    // Step 1: Validate token type.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const genesis = (txf as any)?.genesis;
-    const tokenType = genesis?.data?.tokenType;
-    if (tokenType !== INVOICE_TOKEN_TYPE_HEX) {
+    if (
+      !envelope ||
+      typeof envelope !== 'object' ||
+      envelope._format !== 'sphere-token-blob' ||
+      typeof envelope.token !== 'string' ||
+      typeof envelope.tokenId !== 'string' ||
+      typeof envelope.network !== 'number'
+    ) {
       throw new SphereError(
-        `Invoice import failed: token type "${tokenType}" is not the expected invoice type.`,
-        'INVOICE_WRONG_TOKEN_TYPE',
+        'Invoice import failed: token is not a v2 sphere-token-blob envelope.',
+        'INVOICE_INVALID_DATA',
       );
     }
 
-    // Step 2: Parse tokenData.
-    const tokenData = genesis?.data?.tokenData;
-    if (!tokenData || typeof tokenData !== 'string') {
+    // Step 1: decode the CBOR blob → SphereToken → invoice data bytes.
+    let sphereToken;
+    let dataBytes: Uint8Array | null;
+    try {
+      sphereToken = await tokenEngine.decodeToken({
+        v: envelope.v ?? 1,
+        network: envelope.network,
+        tokenId: envelope.tokenId,
+        token: new Uint8Array(Buffer.from(envelope.token, 'base64')),
+      });
+      dataBytes = tokenEngine.readTokenData(sphereToken);
+    } catch (err) {
+      throw new SphereError(
+        `Invoice import failed: engine could not decode envelope: ${err instanceof Error ? err.message : String(err)}`,
+        'INVOICE_INVALID_DATA',
+      );
+    }
+
+    // Step 2: sanity — invoice tokens are data tokens (value === null).
+    if (tokenEngine.readValue(sphereToken) !== null) {
+      throw new SphereError(
+        'Invoice import failed: envelope carries a value-bearing token, not an invoice data-token.',
+        'INVOICE_WRONG_TOKEN_TYPE',
+      );
+    }
+    if (!dataBytes || dataBytes.length === 0) {
       throw new SphereError(
         'Invoice import failed: missing or invalid tokenData field.',
         'INVOICE_INVALID_DATA',
       );
     }
 
-    // May be plain JSON or hex-encoded UTF-8 JSON.
-    let jsonString = tokenData;
-    if (!/^\s*[[{"]/.test(tokenData)) {
-      try {
-        const bytes = hexToBytes(tokenData);
-        jsonString = new TextDecoder().decode(bytes);
-      } catch {
-        // fall through
-      }
-    }
+    const jsonString = new TextDecoder().decode(dataBytes);
     let terms: InvoiceTerms;
     try {
       terms = JSON.parse(jsonString) as InvoiceTerms;
@@ -675,13 +708,18 @@ export class AccountingModule {
     }
 
     // Step 4: Check duplicate.
-    const tokenId = genesis?.data?.tokenId;
-    if (!tokenId || typeof tokenId !== 'string') {
+    // Wave 6-P2-18: tokenId comes from the v2 envelope, not the deleted
+    // v1 genesis.data.tokenId path. Also re-verify against the engine's
+    // canonical id so a peer that lies about `envelope.tokenId` is
+    // rejected before it can shadow a legitimate invoice.
+    const engineTokenId = tokenEngine.tokenId(sphereToken);
+    if (engineTokenId !== envelope.tokenId) {
       throw new SphereError(
-        'Invoice import failed: missing tokenId in genesis data.',
+        `Invoice import failed: envelope tokenId "${envelope.tokenId}" does not match engine-derived tokenId "${engineTokenId}".`,
         'INVOICE_INVALID_DATA',
       );
     }
+    const tokenId = envelope.tokenId;
     if (this.invoiceTermsCache.has(tokenId)) {
       throw new SphereError(
         `Invoice already exists locally: ${tokenId}`,

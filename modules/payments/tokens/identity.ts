@@ -7,10 +7,31 @@
  */
 
 import type { Token } from '../../../types';
-import type { TxfToken, TxfTransaction } from '../../../types/txf';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { getCurrentStateHash } from '../../../serialization/txf-serializer';
 import { parseSdkDataCached } from './parse-cache';
+
+/**
+ * Wave 6-P2-18: the v1 `TxfToken` / `TxfTransaction` name aliases in
+ * `types/txf` are deleted. Non-legacy runtime code that still needs to
+ * read the underlying state-transition-sdk v1 JSON declares local
+ * minimal shapes for the fields it actually reads — no cross-file v1
+ * type reuse remains.
+ */
+interface MinimalV1Token {
+  genesis?: {
+    data?: {
+      tokenId?: string;
+    };
+  };
+  transactions?: ReadonlyArray<MinimalV1Transaction>;
+}
+
+interface MinimalV1Transaction {
+  previousStateHash?: string;
+  newStateHash?: string;
+  inclusionProof?: unknown;
+}
 
 /**
  * Extract token ID (genesis tokenId) from sdkData/jsonData
@@ -106,7 +127,7 @@ export function pendingMintDedupKey(txf: {
 export function effectiveDedupKey(
   txf: Parameters<typeof pendingMintDedupKey>[0] & Parameters<typeof getCurrentStateHash>[0],
 ): string {
-  const stateHash = getCurrentStateHash(txf as TxfToken) ?? '';
+  const stateHash = getCurrentStateHash(txf) ?? '';
   if (stateHash) return stateHash;
   return pendingMintDedupKey(txf);
 }
@@ -133,13 +154,17 @@ export function isSameTokenState(t1: Token, t2: Token): boolean {
 /**
  * Check if incoming token is an incremental update
  */
-export function isIncrementalUpdate(existing: TxfToken, incoming: TxfToken): boolean {
-  if (existing.genesis?.data?.tokenId !== incoming.genesis?.data?.tokenId) {
+export function isIncrementalUpdate(existing: unknown, incoming: unknown): boolean {
+  const e = existing as MinimalV1Token | null | undefined;
+  const i = incoming as MinimalV1Token | null | undefined;
+  if (!e || !i) return false;
+
+  if (e.genesis?.data?.tokenId !== i.genesis?.data?.tokenId) {
     return false;
   }
 
-  const existingTxns = existing.transactions || [];
-  const incomingTxns = incoming.transactions || [];
+  const existingTxns = e.transactions || [];
+  const incomingTxns = i.transactions || [];
 
   if (incomingTxns.length < existingTxns.length) {
     return false;
@@ -158,7 +183,7 @@ export function isIncrementalUpdate(existing: TxfToken, incoming: TxfToken): boo
   }
 
   for (let i = existingTxns.length; i < incomingTxns.length; i++) {
-    const newTx = incomingTxns[i] as TxfTransaction;
+    const newTx = incomingTxns[i];
     if (newTx.inclusionProof === null) {
       return false;
     }
@@ -170,8 +195,10 @@ export function isIncrementalUpdate(existing: TxfToken, incoming: TxfToken): boo
 /**
  * Count committed transactions
  */
-export function countCommittedTxns(txf: TxfToken): number {
-  return (txf.transactions || []).filter(
-    (tx: TxfTransaction) => tx.inclusionProof !== null,
+export function countCommittedTxns(txf: unknown): number {
+  const t = txf as MinimalV1Token | null | undefined;
+  if (!t) return 0;
+  return (t.transactions || []).filter(
+    (tx: MinimalV1Transaction) => tx.inclusionProof !== null,
   ).length;
 }

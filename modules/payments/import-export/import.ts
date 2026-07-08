@@ -11,8 +11,24 @@
  */
 
 import type { Token, TokenStatus } from '../../../types';
-import type { TxfToken } from '../../../types/txf';
 import { txfToToken } from '../../../serialization/txf-serializer';
+
+/**
+ * Wave 6-P2-18: the v1 `TxfToken` alias in `types/txf` is deleted. The
+ * TXF wire format still speaks the state-transition-sdk v1 JSON shape
+ * (it is the format two SDKs on the same network exchange), so the
+ * import path retains a local minimal interface for the fields it
+ * actually reads.
+ */
+interface WireTxfToken {
+  genesis?: {
+    data?: {
+      tokenId?: string;
+    };
+  };
+  state?: unknown;
+  transactions?: unknown[];
+}
 import { logger } from '../../../core/logger';
 import {
   effectiveDedupKey,
@@ -53,7 +69,7 @@ export interface ImportTokensOptions {
  */
 export async function importTokensInto(
   host: ImportHost,
-  txfTokens: readonly TxfToken[],
+  txfTokens: readonly WireTxfToken[],
   options?: ImportTokensOptions,
 ): Promise<ImportTokensResult> {
   const added: ImportAdded[] = [];
@@ -82,7 +98,7 @@ export async function importTokensInto(
     // Effective dedup key combines current-state hash (for
     // finalized tokens) and a genesis-content hash (for pending-
     // mint tokens). See `effectiveDedupKey`.
-    const incomingDedupKey = effectiveDedupKey(txf);
+    const incomingDedupKey = effectiveDedupKey(txf as Parameters<typeof effectiveDedupKey>[0]);
 
     // Real stateHash for the tombstone check — via the canonical
     // `parseSdkDataCached` path. Tombstones are only keyed on

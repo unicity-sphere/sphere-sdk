@@ -8,7 +8,7 @@
  */
 
 import type { FullIdentity, TrackedAddress, SphereEventType, SphereEventMap, TransferResult, Token } from '../../types';
-import type { TxfToken } from '../../types/txf';
+import type { SphereTokenPersistenceEntry } from '../../types/txf';
 import type { StorageProvider, TokenStorageProvider } from '../../storage/storage-provider';
 import type { OracleProvider } from '../../oracle/oracle-provider';
 import type { PaymentsModule } from '../payments/PaymentsModule';
@@ -20,12 +20,11 @@ import type { CidRefStore } from '../../extensions/uxf/profile/cid-ref-store';
 // =============================================================================
 
 /**
- * A fungible coin entry — same [coinId, amount] tuple used in TxfGenesisData.coinData.
+ * A fungible coin entry — [coinId, amount] tuple. The same shape the
+ * legacy v1 coinData tuple used; retained as the canonical invoice
+ * target entry so the SDK contract survives across the v1→v2 swap.
  *
- * Examples: ["UCT", "1000000"], ["USDU", "500000000"], ["ALPHA", "200000"]
- *
- * This is the EXISTING format from TxfGenesisData.coinData: [string, string][].
- * Invoice targets reuse this exact type for consistency.
+ * Examples: ["UCT", "1000000"], ["USDU", "500000000"], ["ALPHA", "200000"].
  */
 export type CoinEntry = [string, string]; // [coinId, amount in smallest units]
 
@@ -393,8 +392,15 @@ export interface CreateInvoiceResult {
   readonly success: boolean;
   /** Invoice token ID (if successful) */
   readonly invoiceId?: string;
-  /** Invoice token in TXF format (if successful) */
-  readonly token?: TxfToken;
+  /**
+   * Invoice token as a canonical v2 `SphereTokenPersistenceEntry`
+   * envelope — the same shape the send pipeline ships over Nostr and
+   * the same shape `AccountingModule.importInvoice()` accepts.
+   *
+   * Wave 6-P2-18: the old v1 `TxfToken`-shape return (with `genesis`,
+   * `state`, `transactions`) is deleted with no backward compat.
+   */
+  readonly token?: SphereTokenPersistenceEntry;
   /** Parsed invoice terms (if successful) */
   readonly terms?: InvoiceTerms;
   /** Error message (if failed) */

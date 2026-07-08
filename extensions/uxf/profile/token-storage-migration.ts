@@ -139,7 +139,34 @@ import type {
 import type { OracleProvider } from '../../../oracle/oracle-provider.js';
 import type { FullIdentity } from '../../../types';
 import { isTokenKey, isArchivedKey, isForkedKey, archivedKeyFromTokenId } from '../../../types/txf.js';
-import type { TxfToken } from '../../../types/txf.js';
+
+/**
+ * Wave 6-P2-18: the v1 `MigrationTxfToken` name alias is deleted. The legacy
+ * token-storage migration path processes state-transition-sdk v1 JSON
+ * shapes (that's the wire/persistence format on `TokenStorageProvider
+ * <TxfStorageDataBase>` for pre-v2 storage); we hold them at the local
+ * minimal-interface level here rather than reintroducing the shared
+ * v1 alias.
+ */
+interface MigrationTxfToken {
+  genesis?: {
+    data?: {
+      tokenId?: string;
+    };
+    inclusionProof?: {
+      authenticator?: {
+        stateHash?: string;
+      };
+    };
+  };
+  transactions?: Array<{
+    inclusionProof?: {
+      authenticator?: {
+        stateHash?: string;
+      };
+    } | null;
+  }>;
+}
 // Issue #292 — Sphere-bound overload of `migrateLegacyToProfile`. Type-only
 // imports keep the dependency direction profile→core (matches browser.ts /
 // node.ts factory imports); the runtime `attachIdentityToProfileProviders`
@@ -1098,9 +1125,9 @@ function markerKeyFor(direction: MigrationDirection, addressId: string): string 
 
 interface TxfBuckets {
   /** Active token entries (`_<tokenId>` keys, excluding reserved). */
-  activeTokens: Array<{ key: string; txf: TxfToken }>;
+  activeTokens: Array<{ key: string; txf: MigrationTxfToken }>;
   /** Archived token entries (`archived-<tokenId>` keys). */
-  archivedTokens: Array<{ key: string; txf: TxfToken }>;
+  archivedTokens: Array<{ key: string; txf: MigrationTxfToken }>;
   /** Number of `_forked_*` keys observed (copied as-is to target). */
   forksMigrated: number;
 }
@@ -1111,8 +1138,8 @@ interface TxfBuckets {
  * classified via the txf key helpers.
  */
 function classifyBuckets(data: TxfStorageDataBase): TxfBuckets {
-  const activeTokens: Array<{ key: string; txf: TxfToken }> = [];
-  const archivedTokens: Array<{ key: string; txf: TxfToken }> = [];
+  const activeTokens: Array<{ key: string; txf: MigrationTxfToken }> = [];
+  const archivedTokens: Array<{ key: string; txf: MigrationTxfToken }> = [];
   let forksMigrated = 0;
 
   for (const [key, value] of Object.entries(data)) {
@@ -1124,7 +1151,7 @@ function classifyBuckets(data: TxfStorageDataBase): TxfBuckets {
       continue;
     }
     if (!value || typeof value !== 'object') continue;
-    const txf = value as TxfToken;
+    const txf = value as MigrationTxfToken;
     if (isArchivedKey(key)) {
       archivedTokens.push({ key, txf });
     } else if (isTokenKey(key)) {
@@ -1154,12 +1181,12 @@ function shallowCopyStorageData(data: TxfStorageDataBase): TxfStorageDataBase {
 }
 
 /**
- * Extract the current state hash from a TxfToken by reading the last
+ * Extract the current state hash from a MigrationTxfToken by reading the last
  * non-null inclusion proof's authenticator. Returns the empty string
  * when the token has no committed state transitions (a pending mint
  * — no state hash to probe).
  */
-function extractCurrentStateHashFromTxf(txf: TxfToken): string {
+function extractCurrentStateHashFromTxf(txf: MigrationTxfToken): string {
   if (!txf) return '';
   // Walk transactions backwards — the latest committed transition is
   // the one whose inclusionProof is non-null. Pending (uncommitted)
