@@ -1,5 +1,7 @@
 # Sphere SDK
 
+[![Listed on TakoAPI](https://takoapi.com/api/badge/unicity-sphere-sphere-sdk)](https://takoapi.com/agents/unicity-sphere-sphere-sdk)
+
 A modular TypeScript SDK for Unicity wallet operations on Layer 3 (Unicity state transition network).
 
 ## Features
