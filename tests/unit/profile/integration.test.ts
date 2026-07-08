@@ -1,12 +1,12 @@
 /**
  * Tests for profile integration — end-to-end tests using mock providers.
  * Exercises the full provider stack: factory wiring, lifecycle, save/load,
- * multi-device simulation, and migration.
+ * and multi-device simulation. Legacy v1→v2 migration coverage lives
+ * under tests/legacy-v1/ (wave 6-P2-19 deletion).
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-import { ProfileMigration } from '../../../extensions/uxf/profile/migration';
 import { createProfileProviders } from '../../../extensions/uxf/profile/factory';
 import { ProfileStorageProvider } from '../../../extensions/uxf/profile/profile-storage-provider';
 import { ProfileTokenStorageProvider } from '../../../extensions/uxf/profile/profile-token-storage-provider';
@@ -274,172 +274,6 @@ describe('Profile Integration', () => {
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // Migration flow
-  // ---------------------------------------------------------------------------
-
-  describe('migration flow', () => {
-    it('legacy data migrates to Profile and verifies correctly', async () => {
-      const legacyStorage = createMockLegacyStorage({
-        wallet_exists: 'true',
-        mnemonic: 'abandon abandon abandon',
-        master_key: 'deadbeef',
-        chain_code: 'cafebabe',
-      });
-
-      const txfData: TxfStorageDataBase = {
-        _meta: { version: 1, address: 'DIRECT_aabbcc_ddeeff', formatVersion: '1.0.0', updatedAt: Date.now() },
-        _token1: { id: 'token1', amount: '100' },
-        _token2: { id: 'token2', amount: '200' },
-      } as any;
-
-      const legacyTokenStorage = createMockLegacyTokenStorage(txfData);
-
-      // Use mock profile providers that accept and return data
-      const profileStore = new Map<string, string>();
-      const profileStorage = {
-        async get(key: string) { return profileStore.get(key) ?? null; },
-        async set(key: string, value: string) { profileStore.set(key, value); },
-        async remove(key: string) { profileStore.delete(key); },
-        async has(key: string) { return profileStore.has(key); },
-        async keys() { return [...profileStore.keys()]; },
-        async clear() { profileStore.clear(); },
-        setIdentity() {},
-        async saveTrackedAddresses() {},
-        async loadTrackedAddresses() { return []; },
-        async connect() {},
-        async disconnect() {},
-        isConnected() { return true; },
-        getStatus() { return 'connected'; },
-      } as any;
-
-      let savedData: TxfStorageDataBase | null = null;
-      const historyEntries: any[] = [];
-      // C2 (Audit #333) — mock simulates the real flush contract:
-      //   - save() places data in "pendingData" (source: 'cache')
-      //   - awaitNextFlush() promotes it to "durable" (source: 'remote')
-      let _flushed = false;
-      const profileTokenStorage = {
-        setIdentity() {},
-        async initialize() { return true; },
-        async shutdown() {},
-        async save(data: TxfStorageDataBase) {
-          savedData = data;
-          _flushed = false;
-          return { success: true, timestamp: Date.now() };
-        },
-        async awaitNextFlush(_timeoutMs?: number) { _flushed = true; },
-        async load() {
-          return {
-            success: savedData !== null,
-            data: savedData,
-            source: _flushed ? 'remote' : 'cache',
-            timestamp: Date.now(),
-          };
-        },
-        async sync() { return { success: true, added: 0, removed: 0, conflicts: 0 }; },
-        async clear() { return true; },
-        async connect() {},
-        async disconnect() {},
-        isConnected() { return true; },
-        getStatus() { return 'connected'; },
-        async getHistoryEntries() { return historyEntries; },
-        async addHistoryEntry(e: any) { historyEntries.push(e); },
-      } as any;
-
-      const migration = new ProfileMigration();
-      const result = await migration.migrate(
-        legacyStorage,
-        legacyTokenStorage,
-        profileStorage,
-        profileTokenStorage,
-      );
-
-      expect(result.success).toBe(true);
-      expect(result.tokensMigrated).toBe(2);
-      expect(result.keysMigrated).toBeGreaterThan(0);
-
-      // Verify identity keys live in the Profile localCache under
-      // their LEGACY name (not the `identity.*` Profile key). The
-      // migration writes them as cache-only — they must not appear
-      // under `identity.*` because OrbitDB replicates that namespace.
-      // This mock profileStorage doesn't distinguish localCache vs
-      // OrbitDB, so we just verify the legacy key is present and the
-      // identity.* key is NOT.
-      expect(profileStore.has('identity.mnemonic')).toBe(false);
-      expect(profileStore.has('mnemonic')).toBe(true);
-      expect(profileStore.get('mnemonic')).toBe('abandon abandon abandon');
-    });
-
-    it('post-migration cleanup removes legacy data', async () => {
-      const legacyStorage = createMockLegacyStorage({
-        wallet_exists: 'true',
-        mnemonic: 'test',
-        master_key: 'abc',
-        some_custom_key: 'value',
-      });
-
-      const legacyTokenStorage = createMockLegacyTokenStorage(null);
-
-      const profileStore = new Map<string, string>();
-      const profileStorage = {
-        async get(key: string) { return profileStore.get(key) ?? null; },
-        async set(key: string, value: string) { profileStore.set(key, value); },
-        async remove(key: string) { profileStore.delete(key); },
-        async has(key: string) { return profileStore.has(key); },
-        async keys() { return [...profileStore.keys()]; },
-        async clear() { profileStore.clear(); },
-        setIdentity() {},
-        async saveTrackedAddresses() {},
-        async loadTrackedAddresses() { return []; },
-        async connect() {},
-        async disconnect() {},
-        isConnected() { return true; },
-        getStatus() { return 'connected'; },
-      } as any;
-
-      // C2 (Audit #333) — null-txfData path: no save() call, no flush
-      // requirement (migration's stepPersistToOrbitDb skips when
-      // data.txfData === null). The mock still implements awaitNextFlush
-      // for future-proofing in case the migration tightens the contract.
-      const profileTokenStorage = {
-        setIdentity() {},
-        async initialize() { return true; },
-        async shutdown() {},
-        async save() { return { success: true, timestamp: Date.now() }; },
-        async awaitNextFlush(_timeoutMs?: number) { /* no-op */ },
-        async load() { return { success: true, data: undefined, source: 'remote', timestamp: Date.now() }; },
-        async sync() { return { success: true, added: 0, removed: 0, conflicts: 0 }; },
-        async connect() {},
-        async disconnect() {},
-        isConnected() { return true; },
-        getStatus() { return 'connected'; },
-        async getHistoryEntries() { return []; },
-      } as any;
-
-      const migration = new ProfileMigration();
-      const result = await migration.migrate(
-        legacyStorage,
-        legacyTokenStorage,
-        profileStorage,
-        profileTokenStorage,
-      );
-
-      expect(result.success).toBe(true);
-
-      // Legacy storage should be empty except migration tracking
-      const legacyStore = (legacyStorage as any)._store as Map<string, string>;
-      const remainingKeys = [...legacyStore.keys()];
-      // Only migration.phase and migration.startedAt should remain
-      for (const key of remainingKeys) {
-        expect(key).toMatch(/^migration\./);
-      }
-    });
-  });
-
-  // ---------------------------------------------------------------------------
-  // Factory function
-  // ---------------------------------------------------------------------------
 
   describe('factory function', () => {
     it('createProfileProviders returns valid storage and tokenStorage', () => {
