@@ -85,6 +85,14 @@ async function makeModule(): Promise<AccountingModule> {
       return { _tokenId: 'invoice-' + seq.toString(16).padStart(60, '0') };
     }),
     tokenId: vi.fn((t: { _tokenId: string }) => t._tokenId),
+    // Wave 6-P2-18: envelope encoder for the v2
+    // `SphereTokenPersistenceEntry` returned by createInvoice.
+    encodeToken: vi.fn((t: { _tokenId: string }) => ({
+      v: 1,
+      network: 2,
+      tokenId: t._tokenId,
+      token: new Uint8Array([9, 9, 9, 9]),
+    })),
   };
 
   const deps: AccountingModuleDependencies = {
