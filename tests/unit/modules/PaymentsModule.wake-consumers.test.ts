@@ -206,7 +206,12 @@ describe('wallet-api wake streams converge a second session (§9 cross-session s
     await windowB.module.load();
     await waitFor(() => fake.socketCount(OWNER.chainPubkey) >= 1);
 
-    const loadSpy = vi.spyOn(windowB.module, 'load');
+    // #642: the wake resync runs through the internal single-flight loadWith()
+    // (public load() is now a thin wrapper) — spy where the pull actually runs.
+    const loadSpy = vi.spyOn(
+      windowB.module as unknown as { loadWith: (...args: unknown[]) => Promise<void> },
+      'loadWith',
+    );
     await seedServerToken(fake, windowB, OWNER, 500n);
     // A rapid burst — they MUST collapse to a single trailing resync.
     fake.wakeOwner(OWNER.chainPubkey, 'inventory');

@@ -30,6 +30,7 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 
 import { signMessage } from '../core/crypto';
+import { timeoutSignal } from '../core/timeout';
 import { completeSignMessage, progressSignMessage } from './intent-signing';
 import { WalletApiError } from './errors';
 import { verifyChallengeTemplate } from './challenge';
@@ -184,6 +185,13 @@ const DEFAULT_RETRY: ResolvedRetryConfig = {
   maxRetryAfterMs: 60_000,
 };
 
+/**
+ * Default per-request timeout for the §16 REST path (#642). Generous — a JSON
+ * page normally answers in well under a second; this only cuts off requests
+ * that would otherwise hang indefinitely on a stalled socket.
+ */
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
 /** A finite number ≥ `min`, else `fallback` — sanitizes the public retry config. */
 function finiteAtLeast(value: number | undefined, fallback: number, min: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= min ? value : fallback;
@@ -219,6 +227,8 @@ export class WalletApiClient {
   private readonly wsFactory: WebSocketFactoryLike;
   private readonly now: () => number;
   private readonly retry: ResolvedRetryConfig;
+  /** Per-request timeout in ms for the §16 REST path (#642); `0` disables. */
+  private readonly requestTimeoutMs: number;
 
   private identity: WalletApiIdentity | null = null;
   private jwt: string | null = null;
@@ -255,6 +265,7 @@ export class WalletApiClient {
     this.wsFactory = config.webSocketFactory ?? defaultWebSocketFactory;
     this.now = config.now ?? (() => Date.now());
     this.retry = resolveRetry(config.retry);
+    this.requestTimeoutMs = finiteAtLeast(config.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 0);
     this.config = config;
   }
 
@@ -445,6 +456,13 @@ export class WalletApiClient {
         method,
         headers,
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        // #642: a stalled request must not hang until the browser/OS gives up
+        // (under a connection-pool pile-up that is effectively forever). The
+        // abort lands in the catch below as the transient NETWORK class, so
+        // the retry policy applies unchanged (GETs retry, writes don't).
+        // timeoutSignal, NOT bare AbortSignal.timeout — the #617 older-WebView
+        // guard (iOS 15 / older Android WebViews lack AbortSignal.timeout).
+        signal: this.requestTimeoutMs > 0 ? timeoutSignal(this.requestTimeoutMs) : undefined,
       });
     } catch (err) {
       throw new WalletApiError(`wallet-api request failed: ${method} ${path}`, 'NETWORK', undefined, err);

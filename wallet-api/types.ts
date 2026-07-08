@@ -28,6 +28,12 @@ export type FetchLike = (url: string, init?: {
   method?: string;
   headers?: Record<string, string>;
   body?: string | Uint8Array;
+  /**
+   * Request-timeout abort (#642). Native `fetch` honors it; a test double that
+   * ignores it simply behaves like a pre-timeout client (hangs), so doubles
+   * exercising timeout behavior MUST observe it.
+   */
+  signal?: AbortSignal;
 }) => Promise<FetchResponseLike>;
 
 /**
@@ -99,6 +105,16 @@ export interface WalletApiClientConfig {
    * `false` to disable (a single attempt). See {@link WalletApiRetryConfig}.
    */
   retry?: WalletApiRetryConfig | false;
+  /**
+   * Per-request timeout for the §16 REST path in ms (#642; default 30 000,
+   * `0` disables). Without it a stalled request hangs until the browser/OS
+   * gives up — under a connection-pool pile-up that is effectively forever. A
+   * timeout aborts the fetch and surfaces as the transient `NETWORK` error
+   * class, so the retry policy applies unchanged (GETs retry, writes don't).
+   * Blob transfers (presigned S3 URLs) and the wake socket are NOT governed by
+   * this — large blobs may legitimately stream longer.
+   */
+  requestTimeoutMs?: number;
 }
 
 /**

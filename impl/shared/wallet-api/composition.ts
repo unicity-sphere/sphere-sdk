@@ -105,6 +105,8 @@ export interface WalletApiCompositionConfig {
   verifyToken?: (blob: TokenBlob) => Promise<boolean>;
   /** Transient-failure retry policy for the §16 REST path (default-on; `false` disables). */
   retry?: WalletApiRetryConfig | false;
+  /** Per-request timeout in ms for the §16 REST path (#642; default 30 000, `0` disables). */
+  requestTimeoutMs?: number;
 }
 
 /** What the wallet-api presets add to the base bundle. */
@@ -138,6 +140,7 @@ function buildClient(base: SphereBaseProviders, config: WalletApiCompositionConf
       fetchFn: config.fetchFn,
       webSocketFactory: config.webSocketFactory,
       ...(config.retry !== undefined ? { retry: config.retry } : {}),
+      ...(config.requestTimeoutMs !== undefined ? { requestTimeoutMs: config.requestTimeoutMs } : {}),
     });
   return { client, stateStore };
 }

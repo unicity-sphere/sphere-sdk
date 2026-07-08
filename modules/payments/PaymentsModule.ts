@@ -125,6 +125,15 @@ const MAX_SYNCED_HISTORY_ENTRIES = 5000;
 const MAX_HISTORY_HYDRATION_PAGES = 100;
 
 /**
+ * Force a FULL history re-pull every N incremental pulls (#642). The
+ * incremental stop condition assumes the server's keyset order matches arrival
+ * order (append-only log); if a row ever lands "behind" already-pulled pages
+ * (backdated ts, cross-device clock skew), the periodic full pull bounds how
+ * long it can stay invisible (~N × the 30s poll interval).
+ */
+const FULL_HISTORY_REPULL_EVERY = 20;
+
+/**
  * Cap on the number of gap-free `?since=` pages pulled when rebuilding the
  * incoming payment-request view from the server on reload (the wallet-api
  * composition — the #556 reload fix). At the §16 page limit this bounds a
@@ -1048,6 +1057,36 @@ export class PaymentsModule {
   private loadedPromise: Promise<void> | null = null;
   private loaded = false;
 
+  /**
+   * #642 single-flight guard for {@link load}: the in-flight load, the owner
+   * (chainPubkey) it runs for, and whether a coalesced caller asked for one
+   * trailing re-run once it completes. The 30s inventory poll backstop and the
+   * `inventory` wakes both funnel into load() via {@link resyncInventory}; on a
+   * heavy wallet one load can outlive the poll interval, and uncoalesced calls
+   * would stack concurrent full loads — each with its own history hydration.
+   * The re-run is scheduled on a tracked macrotask (`loadRerunTimer`) so
+   * destroy()/re-init can cancel it even after the flag was consumed.
+   */
+  private loadInFlight: Promise<void> | null = null;
+  private loadInFlightOwner: string | null = null;
+  private loadRerunRequested = false;
+  private loadRerunTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Owner (chainPubkey) whose server history hydration last completed —
+   * enables the #642 incremental fast path in {@link hydrateHistoryFromServer}.
+   * Reset on re-init (address switch). `serverSeenHistoryKeys` holds only
+   * dedupKeys actually PULLED from the server (never locally-POSTed ones), so
+   * the incremental stop condition can't be masked by our own fresh POSTs;
+   * `incrementalHistoryPulls` forces a periodic full re-pull to bound the
+   * staleness window if server keyset order ever diverges from arrival order.
+   * `hydrationEpoch` guards a pull racing a same-owner re-init.
+   */
+  private historyHydratedFor: string | null = null;
+  private serverSeenHistoryKeys = new Set<string>();
+  private incrementalHistoryPulls = 0;
+  private hydrationEpoch = 0;
+
   // Storage event subscriptions (push-based sync)
   private storageEventUnsubscribers: (() => void)[] = [];
   private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1198,6 +1237,15 @@ export class PaymentsModule {
     this.archivedTokens.clear();
     this.forkedTokens.clear();
     this._historyCache = [];
+    this.historyHydratedFor = null;
+    this.serverSeenHistoryKeys = new Set();
+    this.incrementalHistoryPulls = 0;
+    this.hydrationEpoch++;
+    this.loadRerunRequested = false;
+    if (this.loadRerunTimer !== null) {
+      clearTimeout(this.loadRerunTimer);
+      this.loadRerunTimer = null;
+    }
     this.nametags = [];
 
     // Reset spend queue state
@@ -1258,8 +1306,11 @@ export class PaymentsModule {
       }, DELIVERY_POLL_INTERVAL_MS);
       // Inventory poll backstop (§9): converges the owned-token set even if an
       // `inventory` wake is missed, mirroring the delivery/PR pumps' interval.
+      // rerunOnCoalesce=false: the poll's next tick IS its retry — requesting
+      // the #642 trailing re-run here would turn any load slower than the poll
+      // interval into gapless back-to-back loads.
       this.inventoryPollTimer = setInterval(() => {
-        this.pumpHealth.run('inventory', () => this.resyncInventory());
+        this.pumpHealth.run('inventory', () => this.resyncInventory(false));
       }, DELIVERY_POLL_INTERVAL_MS);
     } else {
       // Subscribe to incoming transfers
@@ -1307,7 +1358,50 @@ export class PaymentsModule {
    * triggers a fire-and-forget {@link resolveUnconfirmed} call.
    */
   async load(): Promise<void> {
+    return this.loadWith(true);
+  }
+
+  /**
+   * #642: like {@link load}, but the caller must observe storage as of NOW —
+   * it must never coalesce onto a load that began before the caller's writes
+   * (the shared snapshot would omit them, and its `loadFromStorageData` would
+   * drop them from the in-memory map). Serializes behind any in-flight load
+   * (whose failure is not this caller's) and then runs fresh.
+   */
+  private async loadFresh(): Promise<void> {
+    while (this.loadInFlight) {
+      await this.loadInFlight.catch(() => {});
+    }
+    return this.loadWith(true);
+  }
+
+  /**
+   * @param rerunOnCoalesce whether a call coalesced onto an in-flight load
+   *   should schedule the trailing re-run. The wake path and direct callers
+   *   want it (converge now, not at the next tick); the 30s poll backstop
+   *   passes `false` — its next tick IS the retry, and re-running on its
+   *   behalf would turn any load slower than the poll interval into gapless
+   *   back-to-back loads.
+   */
+  private async loadWith(rerunOnCoalesce: boolean): Promise<void> {
     this.ensureInitialized();
+
+    // #642 single-flight: coalesce same-owner callers onto the in-flight load
+    // instead of stacking concurrent full loads (each with its own history
+    // hydration — on a heavy wallet that is a 100-page storm per caller). A
+    // coalesced call schedules exactly ONE trailing re-run, so an `inventory`
+    // wake that raced a load still converges without waiting for the next
+    // 30s poll tick. A DIFFERENT-owner call (re-init mid-load) serializes
+    // behind the stale load and then runs fresh — its data must not come from
+    // a load started for the previous address.
+    const owner = this.deps!.identity.chainPubkey;
+    while (this.loadInFlight) {
+      if (this.loadInFlightOwner === owner) {
+        if (rerunOnCoalesce) this.loadRerunRequested = true;
+        return this.loadInFlight;
+      }
+      await this.loadInFlight.catch(() => {});
+    }
 
     // Expose a promise that incoming transfer handlers can await to ensure
     // the token map is populated before running dedup checks.
@@ -1475,25 +1569,49 @@ export class PaymentsModule {
       this.loaded = true;
     };
 
-    this.loadedPromise = doLoad();
-    await this.loadedPromise;
+    const run = async (): Promise<void> => {
+      this.loadedPromise = doLoad();
+      await this.loadedPromise;
 
-    // Replay finished-but-undelivered v2 blobs from a previous session
-    // (fire-and-forget; failures are kept journaled for the next load).
-    void this.replayPendingV2Deliveries().catch((err) =>
-      logger.warn('Payments', 'Pending v2 delivery replay failed:', err));
+      // Replay finished-but-undelivered v2 blobs from a previous session
+      // (fire-and-forget; failures are kept journaled for the next load).
+      void this.replayPendingV2Deliveries().catch((err) =>
+        logger.warn('Payments', 'Pending v2 delivery replay failed:', err));
 
-    // S3: drain the delivery port's incoming feed once at load (poll + wake
-    // keep it drained afterwards).
-    if (this.injectedDelivery) {
-      this.pumpHealth.run('delivery', () => this.pumpIncomingDeliveries());
-    }
+      // S3: drain the delivery port's incoming feed once at load (poll + wake
+      // keep it drained afterwards).
+      if (this.injectedDelivery) {
+        this.pumpHealth.run('delivery', () => this.pumpIncomingDeliveries());
+      }
 
-    // S4: drain the payment-request `?since=` stream once at load (the poll
-    // keeps it drained afterwards).
-    if (this.paymentRequestsApi()) {
-      this.pumpHealth.run('payment-requests', () => this.pumpPaymentRequests());
-    }
+      // S4: drain the payment-request `?since=` stream once at load (the poll
+      // keeps it drained afterwards).
+      if (this.paymentRequestsApi()) {
+        this.pumpHealth.run('payment-requests', () => this.pumpPaymentRequests());
+      }
+    };
+
+    this.loadInFlightOwner = owner;
+    this.loadInFlight = run().finally(() => {
+      this.loadInFlight = null;
+      this.loadInFlightOwner = null;
+      if (this.loadRerunRequested) {
+        // One trailing re-run on behalf of the coalesced callers, routed
+        // through resyncInventory() so the convergence it brings emits
+        // `sync:remote-update` with the re-run's actual delta (a bare load()
+        // would merge new tokens silently and the UI would not refresh until
+        // the next poll tick). Scheduled on a TRACKED macrotask so destroy()
+        // and re-init can cancel it even after the flag was consumed, and run
+        // under the inventory pump health so a failure is classified
+        // (quiet-then-escalate) instead of an unhandled rejection.
+        this.loadRerunRequested = false;
+        this.loadRerunTimer = setTimeout(() => {
+          this.loadRerunTimer = null;
+          this.pumpHealth.run('inventory', () => this.resyncInventory());
+        }, 0);
+      }
+    });
+    return this.loadInFlight;
   }
 
   /**
@@ -1503,6 +1621,14 @@ export class PaymentsModule {
    * no longer needed.
    */
   destroy(): void {
+    // A load still in flight may finish after teardown — make sure its
+    // trailing re-run (#642) does not restart work on a destroyed module,
+    // whether the flag is still pending or already consumed into the timer.
+    this.loadRerunRequested = false;
+    if (this.loadRerunTimer !== null) {
+      clearTimeout(this.loadRerunTimer);
+      this.loadRerunTimer = null;
+    }
     this.unsubscribeTransfers?.();
     this.unsubscribeTransfers = null;
     this.unsubscribePaymentRequests?.();
@@ -2974,7 +3100,9 @@ export class PaymentsModule {
     // Handlers save tokens during processing (with potentially different IDs for
     // V5 pending tokens vs finalized tokens). load() clears the in-memory map
     // and reloads from TXF + pending V5 storage, ensuring no duplicates.
-    await this.load();
+    // loadFresh (#642): must observe the handlers' saves — coalescing onto a
+    // load that started BEFORE them would drop the just-received tokens.
+    await this.loadFresh();
 
     // Identify newly added tokens
     const received: IncomingTransfer[] = [];
@@ -3900,6 +4028,13 @@ export class PaymentsModule {
    * session must not double-list). The S6 `memo` / `counterpartyNametag`
    * envelopes are decrypted with the owner's own field key on the way in.
    *
+   * #642 incremental fast path: after one completed hydration for this owner,
+   * later pulls stop at the first non-empty page holding nothing new — the
+   * §10 log is append-only (newest-first keyset), so everything past a fully
+   * known page is already cached. The steady-state 30s inventory resync then
+   * costs ONE history page instead of a full re-pagination (which on a wallet
+   * whose history overflows the page cap was 100 pages, every tick, forever).
+   *
    * Best-effort, like the §10 history POST: history is untrusted DISPLAY data,
    * so a backend outage during hydration must NEVER fail `load()` (the money
    * path) — the in-session cache is left intact and the pull retries next load.
@@ -3911,28 +4046,73 @@ export class PaymentsModule {
     // client per owner so this can't normally happen; the guard ensures a stale
     // pull never replaces the active owner's history with another owner's.
     const owner = this.deps!.identity.chainPubkey;
+    // Also guard against a SAME-owner re-init racing this pull (the epoch is
+    // bumped by initialize()): a truncated incremental prefix written after
+    // the re-init cleared the cache would otherwise be pinned as "hydrated".
+    const epoch = this.hydrationEpoch;
+    // Incremental only against dedupKeys actually PULLED from the server —
+    // a locally-POSTed key must not make a page look "fully known" before the
+    // pull has ever seen the server's copy. Bounded by the periodic full
+    // re-pull (see FULL_HISTORY_REPULL_EVERY).
+    const known = this.historyHydratedFor === owner &&
+      this.serverSeenHistoryKeys.size > 0 &&
+      this.incrementalHistoryPulls < FULL_HISTORY_REPULL_EVERY
+      ? this.serverSeenHistoryKeys
+      : null;
     const byDedupKey = new Map<string, TransactionHistoryEntry>();
+    const pulledKeys = new Set<string>();
+    // True when the pull is CONTIGUOUS with what we already hold — it reached
+    // the log's end or a fully-known page. Only then may the pulled prefix be
+    // merged into the cache; a pull cut off by the page cap must replace it
+    // instead (merging would hide the gap between the prefix and the cache).
+    let contiguous = false;
     try {
       let before: string | undefined;
       for (let page = 0; page < MAX_HISTORY_HYDRATION_PAGES; page++) {
         const result = await api.listHistory(before !== undefined ? { before } : {});
+        let unknown = 0;
         for (const wire of result.records) {
+          pulledKeys.add(wire.dedupKey);
+          if (known && !known.has(wire.dedupKey)) unknown++;
           if (!byDedupKey.has(wire.dedupKey)) {
             byDedupKey.set(wire.dedupKey, this.historyEntryFromWire(wire));
           }
         }
-        if (!result.more || result.cursor === null) break;
+        if (known && result.records.length > 0 && unknown === 0) {
+          contiguous = true;
+          break;
+        }
+        if (!result.more || result.cursor === null) {
+          contiguous = true;
+          break;
+        }
         before = result.cursor;
       }
     } catch (err) {
       logger.warn('Payments', 'history hydration from server failed (kept in-memory; retries next load):', err);
       return;
     }
-    if (this.deps!.identity.chainPubkey !== owner) {
-      logger.warn('Payments', 'history hydration owner changed mid-pull — discarding stale result (owner guard)');
+    if (this.deps!.identity.chainPubkey !== owner || this.hydrationEpoch !== epoch) {
+      logger.warn('Payments', 'history hydration owner/epoch changed mid-pull — discarding stale result (owner guard)');
       return;
     }
+    if (known && contiguous) {
+      // Merge: keep cached entries the pull stopped short of (older pages) and
+      // local-only entries whose §10 POST hasn't landed server-side yet.
+      // Display order is unaffected — getHistory() sorts by timestamp.
+      for (const e of this._historyCache) {
+        if (!byDedupKey.has(e.dedupKey)) byDedupKey.set(e.dedupKey, e);
+      }
+      this.incrementalHistoryPulls++;
+      for (const k of pulledKeys) this.serverSeenHistoryKeys.add(k);
+    } else {
+      // Full pull (or an incremental one cut off by the page cap, which
+      // degenerates to a replace): the server view IS the pulled set.
+      this.incrementalHistoryPulls = 0;
+      this.serverSeenHistoryKeys = pulledKeys;
+    }
     this._historyCache = [...byDedupKey.values()];
+    this.historyHydratedFor = owner;
   }
 
   /**
@@ -4852,9 +5032,9 @@ export class PaymentsModule {
    * `sync()` reports none). Used by BOTH the `inventory` wake and the poll
    * backstop, so convergence never depends on a wake arriving.
    */
-  private async resyncInventory(): Promise<void> {
+  private async resyncInventory(rerunOnCoalesce = true): Promise<void> {
     const before = this.tokens.size;
-    await this.load();
+    await this.loadWith(rerunOnCoalesce);
     const after = this.tokens.size;
     this.deps?.emitEvent('sync:remote-update', {
       providerId: 'wallet-api',

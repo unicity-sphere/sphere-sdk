@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — heavy-wallet request storm (#642)
+- **`PaymentsModule.load()` is single-flight:** the 30s inventory poll backstop and the
+  `inventory` wakes funnel into `load()` via `resyncInventory()`; on a wallet whose load outlives
+  the poll interval, uncoalesced calls stacked concurrent full loads — each with its own complete
+  history hydration. Same-owner concurrent callers now share the in-flight load (plus exactly one
+  trailing re-run so a wake that raced a load still converges); a different-owner call (re-init
+  mid-load) serializes behind the stale load and runs fresh.
+- **Incremental history hydration:** after one completed hydration per owner, later pulls page
+  newest-first only until the first non-empty page with nothing new, and MERGE into the cache
+  (also preserving local entries whose §10 POST hasn't landed yet). Before, every resync
+  re-paginated from page 0 — on a wallet whose history overflows `MAX_HISTORY_HYDRATION_PAGES`
+  that was 100 `GET /v1/history` pages every 30 seconds, forever (measured: 2,646 requests in
+  8 minutes from one idle tab, 84% history pages). A pull cut off by the page cap still replaces
+  the cache (merging would hide the gap).
+- **Per-request timeout in the wallet-api client:** `WalletApiClientConfig.requestTimeoutMs`
+  (default 30 000 ms, `0` disables; plumbed through `WalletApiCompositionConfig`). A stalled
+  request aborts via `timeoutSignal()` (the #617 older-WebView guard, NOT bare
+  `AbortSignal.timeout`) and surfaces as the transient `NETWORK` class, so the #630 retry policy
+  applies unchanged (GETs retry, writes don't). Without it, requests starved by a connection-pool
+  pile-up hung indefinitely and eventually failed the background token-storage save — the
+  `storage:degraded` red-toast storm. Blob transfers and the wake socket are not governed by
+  this timeout.
+
 ### Added
 - **wallet-api client resilience (#630):** the §16 REST client now rides out transient failures
   instead of surfacing them raw. Idempotent GETs retry a dropped/reset connection (a DNS /
