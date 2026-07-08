@@ -1,0 +1,89 @@
+name: Publish GitHub Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish from the checked-out branch"
+        required: true
+        type: string
+      tag:
+        description: "npm dist-tag"
+        required: true
+        default: "bridge-test"
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Validate version
+        run: |
+          if ! echo "${{ inputs.version }}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Invalid semver: ${{ inputs.version }}"
+            exit 1
+          fi
+
+      - name: Update package version
+        run: npm version "${{ inputs.version }}" --no-git-tag-version
+
+      - name: Install dependencies
+        run: |
+          npm install --include=optional --ignore-scripts
+          npm rebuild
+
+      - name: Test
+        run: npm run test:run
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify packaging
+        run: |
+          for f in dist/index.d.ts dist/core/index.d.ts dist/token-engine/index.d.ts dist/wallet-api/index.d.ts; do
+            test -f "$f" || { echo "Missing $f"; exit 1; }
+          done
+          npm pack --dry-run
+
+      - name: Configure GitHub Packages auth
+        run: |
+          npm config set @unicity-sphere:registry https://npm.pkg.github.com
+          npm config set //npm.pkg.github.com/:_authToken "${NODE_AUTH_TOKEN}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare GitHub Packages artifact
+        run: |
+          rm -rf /tmp/sphere-sdk-npm
+          mkdir -p /tmp/sphere-sdk-npm
+          cp -R dist /tmp/sphere-sdk-npm/dist
+          cp package.json /tmp/sphere-sdk-npm/package.json
+          cp README.md /tmp/sphere-sdk-npm/README.md
+          test ! -f LICENSE || cp LICENSE /tmp/sphere-sdk-npm/LICENSE
+          npm pkg set name=@unicity-sphere/sphere-sdk --prefix /tmp/sphere-sdk-npm
+
+      - name: Publish
+        run: npm publish /tmp/sphere-sdk-npm --tag "${{ inputs.tag }}" --registry https://npm.pkg.github.com
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit release metadata
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "chore: publish sphere-sdk v${{ inputs.version }} to GitHub Packages"
+          git tag "github-packages-v${{ inputs.version }}"
+          git push origin HEAD --tags
