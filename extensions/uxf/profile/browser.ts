@@ -34,27 +34,17 @@ import type { ProfileStorageProvider } from './profile-storage-provider';
 import type { ProfileTokenStorageProvider } from './profile-token-storage-provider';
 import type { OracleProvider } from '../../../oracle';
 import type { Sphere } from '../../../core/Sphere';
-import type { TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
 import { createProfileProviders } from './factory';
 import {
   ProfileKvAdapter,
   ProfileKvBrowser,
   LocalBlockCacheBrowser,
 } from './kv';
-import {
-  createIndexedDBStorageProvider,
-  createIndexedDBTokenStorageProvider,
-} from '../../../impl/browser/storage';
+import { createIndexedDBStorageProvider } from '../../../impl/browser/storage';
 import { getNetworkConfig } from '../../../impl/shared';
 import { DEFAULT_IPFS_GATEWAYS } from '../../../constants';
 import type { NetworkType } from '../../../constants';
 import { attachIdentityToProfileProviders } from './attach-identity';
-import { migrateLegacyToProfile } from './token-storage-migration';
-import { LEGACY_MIGRATED_MARKER } from './migration';
-import type {
-  MigrateLegacyToProfileFromSphereOptions,
-  MigrateLegacyToProfileFromSphereResult,
-} from './token-storage-migration';
 
 /**
  * Configuration for the browser Profile factory.
@@ -81,21 +71,6 @@ export interface BrowserProfileProviders {
   readonly storage: ProfileStorageProvider;
   /** Profile-backed token storage provider (drop-in for IndexedDBTokenStorageProvider) */
   readonly tokenStorage: ProfileTokenStorageProvider;
-  /**
-   * Issue #330 — read-only fallback token storage, present only when
-   * the underlying legacy `sphere-storage` IDB carries the migration
-   * marker (`migration.migratedAt`). Pass through to `Sphere.init` /
-   * `Sphere.load` as `fallbackTokenStorage` so tokens that were
-   * durable in the legacy IDB pre-migration are recoverable when the
-   * Profile blockstore loses them. Wired automatically by
-   * {@link createBrowserProfileProvidersAuto}; absent for sync
-   * `createBrowserProfileProviders` callers.
-   *
-   * Spreading the providers into `Sphere.init({ ...providers })`
-   * propagates this transparently since `SphereInitOptions` already
-   * has the same field name.
-   */
-  readonly fallbackTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
 }
 
 /**
@@ -167,82 +142,6 @@ export function createBrowserProfileProviders(
   );
 
   return { storage, tokenStorage };
-}
-
-// =============================================================================
-// Issue #330 — auto-wiring async factory with legacy-fallback detection
-// =============================================================================
-
-/**
- * Async variant of {@link createBrowserProfileProviders} that also
- * probes the legacy `sphere-storage` IndexedDB for the migration
- * marker (`migration.migratedAt`) and, when present, constructs a
- * legacy {@link IndexedDBTokenStorageProvider} as a read-only
- * fallback token storage. The result's `fallbackTokenStorage` field
- * is the wired fallback (or `undefined` for fresh, never-migrated
- * wallets).
- *
- * **Recommended for production browser wallets** that may have been
- * migrated from a pre-Profile layout. The sync sister factory is kept
- * for backward compatibility but does NOT detect or wire the fallback.
- *
- * Spreading the result into `Sphere.init` / `Sphere.load` propagates
- * the fallback transparently (the field names match):
- *
- * @example
- * ```ts
- * const providers = await createBrowserProfileProvidersAuto({
- *   network: 'testnet',
- * });
- * const { sphere } = await Sphere.init({
- *   ...providers,           // storage, tokenStorage, fallbackTokenStorage
- *   transport,
- *   oracle,
- * });
- * ```
- *
- * Detection is best-effort: a missing marker, a marker that decodes
- * to an invalid timestamp, or any IDB-side failure during probe all
- * yield no fallback. The primary Profile path remains fully functional;
- * only the post-migration recovery contract is lost in that case.
- *
- * @see LEGACY_MIGRATED_MARKER for the marker key written by
- *      `profile/migration.ts` step 5c.
- */
-export async function createBrowserProfileProvidersAuto(
-  config: BrowserProfileProvidersConfig,
-): Promise<BrowserProfileProviders> {
-  // 1. Construct the primary Profile providers via the sync factory.
-  const primary = createBrowserProfileProviders(config);
-
-  // 2. Probe the legacy KV for the migration marker. Uses a separate,
-  //    temporary `IndexedDBStorageProvider` connection — the marker
-  //    write happens against the same DB the local cache reads from,
-  //    so the lookup is cheap. Any failure here yields no fallback.
-  let fallbackTokenStorage: TokenStorageProvider<TxfStorageDataBase> | undefined;
-  try {
-    const probe = createIndexedDBStorageProvider();
-    if (!probe.isConnected()) {
-      await probe.connect();
-    }
-    const markerValue = await probe.get(LEGACY_MIGRATED_MARKER);
-    if (typeof markerValue === 'string' && markerValue.length > 0) {
-      // Marker present — the legacy IDB token storage holds
-      // pre-migration tokens. Construct a fresh provider over the
-      // same per-address DBs and expose it as the fallback.
-      fallbackTokenStorage = createIndexedDBTokenStorageProvider();
-    }
-    // Do NOT close the probe here — `IndexedDBStorageProvider` shares
-    // a singleton DB handle; closing it would invalidate the
-    // primary's local cache connection. The handle is reused by the
-    // Sphere boot path via `localCache` inside the primary providers.
-  } catch {
-    // Probe failed (no IDB, locked DB, quota exceeded, ...). Continue
-    // without a fallback — primary Profile path is unchanged.
-    fallbackTokenStorage = undefined;
-  }
-
-  return { ...primary, fallbackTokenStorage };
 }
 
 // =============================================================================
@@ -319,35 +218,3 @@ export async function createBrowserProfileProvidersFromSphere(
   return providers;
 }
 
-/**
- * Convenience helper: bind the browser Profile factory to
- * `migrateLegacyToProfile` so consumers don't have to thread the
- * `profileFactory` parameter through themselves. Pre-wires the platform-
- * specific factory; the rest of the options surface is identical to
- * `MigrateLegacyToProfileFromSphereOptions` minus `profileFactory`.
- *
- * Internally re-exports the same `migrateLegacyToProfile` function from
- * `./token-storage-migration` with `profileFactory` pre-set. Useful for
- * call sites that want a one-liner.
- *
- * @example
- * ```ts
- * import { migrateLegacyToProfileBrowser } from '@unicitylabs/sphere-sdk/profile/browser';
- *
- * const result = await migrateLegacyToProfileBrowser({
- *   sphere,
- *   legacy: legacyProviders.tokenStorage,
- *   network: 'mainnet',
- *   oracle: providers.oracle,
- * });
- * const { storage, tokenStorage } = result.profileProviders;
- * ```
- */
-export async function migrateLegacyToProfileBrowser(
-  opts: Omit<MigrateLegacyToProfileFromSphereOptions, 'profileFactory'>,
-): Promise<MigrateLegacyToProfileFromSphereResult> {
-  return migrateLegacyToProfile({
-    ...opts,
-    profileFactory: createBrowserProfileProvidersFromSphere,
-  });
-}

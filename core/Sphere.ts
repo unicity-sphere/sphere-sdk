@@ -363,15 +363,12 @@ export interface SphereLoadOptions {
   /**
    * Issue #330 — Optional read-only fallback TOKEN storage consulted by
    * Profile-mode token reads when the primary (OrbitDB-backed) read
-   * returns nothing or fails (e.g. `CRITICAL-BLOCK-EVICTED`). Intended
-   * for Profile-mode boots where a previously-working legacy
-   * `IndexedDBTokenStorageProvider` still holds tokens from before the
-   * migration to Profile. Token-side analogue of `fallbackStorage`.
-   * Never written to.
+   * returns nothing or fails (e.g. `CRITICAL-BLOCK-EVICTED`). Token-
+   * side analogue of `fallbackStorage`. Never written to.
    *
-   * Use `migrateLegacyToProfileBrowser` / `migrateLegacyToProfile` to
-   * write a "migrated" marker so legacy is preserved as read-only
-   * fallback (the post-#330 default) rather than wiped (pre-#330).
+   * Wave 6-P2-19 — the legacy `migrateLegacyToProfile*` helpers that
+   * previously auto-wired this field are gone. Callers now supply
+   * their own token storage manually if they need this fallback.
    */
   fallbackTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Transport provider instance */
@@ -1492,38 +1489,10 @@ export class Sphere {
     // `getTokenStorage().setFallbackTokenStorage(...)` further below.
     sphere._fallbackTokenStorage = options.fallbackTokenStorage ?? null;
 
-    // Issue #330 — warn loudly when the underlying storage carries the
-    // legacy-migration marker but no `fallbackTokenStorage` was wired.
-    // This catches consumer apps that updated their SDK but did not
-    // migrate to the auto-wiring factory (`createBrowserProfileProvidersAuto`
-    // / equivalent). Without a fallback, pre-migration tokens are
-    // unrecoverable if the Profile blockstore loses them — exactly
-    // the symptom #330 sought to fix. Best-effort: any error during
-    // the probe is swallowed (the storage may not yet be connected,
-    // or the legacy KV may not implement `get`).
-    if (sphere._fallbackTokenStorage === null) {
-      try {
-        if (
-          typeof options.storage.isConnected === 'function' &&
-          options.storage.isConnected() &&
-          typeof options.storage.get === 'function'
-        ) {
-          const markerValue = await options.storage.get('migration.migratedAt');
-          if (typeof markerValue === 'string' && markerValue.length > 0) {
-            logger.warn(
-              'Sphere',
-              'Issue #330: legacy-migration marker detected on storage but no `fallbackTokenStorage` ' +
-                'was provided to Sphere.init/load. Tokens that were durable in the legacy IndexedDB ' +
-                'before Profile migration are NOT recoverable from this session. Use ' +
-                '`createBrowserProfileProvidersAuto` (or wire a legacy `IndexedDBTokenStorageProvider` ' +
-                'as `fallbackTokenStorage` manually) to close this gap.',
-            );
-          }
-        }
-      } catch {
-        // Probe is best-effort. Continue without warning.
-      }
-    }
+    // Wave 6-P2-19 — the legacy `migration.migratedAt` marker probe
+    // is deleted with the v1→v2 wallet-import path. `fallbackTokenStorage`
+    // survives as a generic optional read-only fallback that any caller
+    // can wire manually; the SDK no longer detects legacy IDBs.
 
     // Issue #330 — propagate the fallback into any token storage
     // provider that supports it (Profile-mode providers expose
@@ -2261,9 +2230,7 @@ export class Sphere {
    * Attach this Sphere's internal {@link FullIdentity} (with privateKey) to
    * a pair of identity-consuming providers WITHOUT exposing the private key
    * to the caller. Used exclusively by the Sphere-bound Profile factories
-   * in `profile/browser.ts` / `profile/node.ts` and the
-   * `migrateLegacyToProfile({ sphere, ... })` overload in
-   * `profile/token-storage-migration.ts`.
+   * in `profile/browser.ts` / `profile/node.ts`.
    *
    * The `privateKey` field is read from `this._identity` (a private field),
    * passed directly into `setIdentity` on each provider, and never escapes
@@ -2291,7 +2258,7 @@ export class Sphere {
    *
    * @internal — sphere-sdk private. Not part of the public API surface.
    *           Consumers should use `createBrowserProfileProvidersFromSphere`
-   *           or `migrateLegacyToProfile({ sphere, ... })` instead.
+   *           / `createNodeProfileProvidersFromSphere` instead.
    */
   _withFullIdentityForProfileFactory(
     applySetIdentity: (identity: FullIdentity) => void,

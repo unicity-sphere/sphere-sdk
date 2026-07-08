@@ -48,11 +48,6 @@ import {
 } from './kv';
 import type { NetworkType } from '../../../constants';
 import { attachIdentityToProfileProviders } from './attach-identity';
-import { migrateLegacyToProfile } from './token-storage-migration';
-import type {
-  MigrateLegacyToProfileFromSphereOptions,
-  MigrateLegacyToProfileFromSphereResult,
-} from './token-storage-migration';
 
 /**
  * Configuration for the Node.js Profile factory.
@@ -240,29 +235,6 @@ export async function createNodeProfileProvidersFromSphere(
   await attachIdentityToProfileProviders(sphere, providers);
 
   return providers;
-}
-
-/**
- * Convenience helper: bind the Node.js Profile factory to
- * `migrateLegacyToProfile` so consumers don't have to thread the
- * `profileFactory` parameter through themselves. See
- * `migrateLegacyToProfileBrowser` for the browser equivalent.
- */
-export async function migrateLegacyToProfileNode(
-  opts: Omit<MigrateLegacyToProfileFromSphereOptions, 'profileFactory'> & {
-    /** Node.js-specific: directory for wallet data storage (local cache). */
-    readonly dataDir: string;
-  },
-): Promise<MigrateLegacyToProfileFromSphereResult> {
-  const { dataDir, ...rest } = opts;
-  return migrateLegacyToProfile({
-    ...rest,
-    profileFactory: async (sphere, config) =>
-      createNodeProfileProvidersFromSphere(sphere, {
-        ...config,
-        dataDir,
-      }),
-  });
 }
 
 // =============================================================================

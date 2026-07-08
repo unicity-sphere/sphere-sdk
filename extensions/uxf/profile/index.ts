@@ -115,49 +115,17 @@ export { ConsolidationEngine } from './consolidation';
 export type { ConsolidationResult } from './consolidation';
 
 // =============================================================================
-// Migration
+// Migration (invalid-tokens per-entry-key, T.1.E)
 // =============================================================================
-
-/**
- * @deprecated Prefer the import-based migration via `importLegacyTokens`
- * (re-exported below). The 6-step destructive `ProfileMigration`
- * predates the explicit / non-destructive / re-runnable model the CLI
- * now uses. Kept for backwards compatibility.
- */
-export { ProfileMigration } from './migration';
-
-// Import-based migration (current model): non-destructive, idempotent,
-// joint-inventory semantics. See profile/import-from-legacy.ts.
-export { importLegacyTokens } from './import-from-legacy';
-export type {
-  LegacyImportOptions,
-  LegacyImportResult,
-} from './import-from-legacy';
-
-// Bidirectional token-storage migration (Issue #286). Operates at the
-// TokenStorageProvider boundary — copies a full TxfStorageDataBase
-// snapshot between any two providers (legacy ↔ Profile) with
-// idempotency, crash-safety, and optional aggregator-spent gating.
-// See profile/token-storage-migration.ts module docstring for the
-// consumer integration pattern (sphere.telco SphereProvider.initialize).
-export {
-  migrateTokenStorage,
-  migrateLegacyToProfile,
-  migrateProfileToLegacy,
-  isTokenStorageMigrationComplete,
-  clearTokenStorageMigrationMarker,
-  TOKEN_STORAGE_MIGRATION_MARKER_VERSION,
-} from './token-storage-migration';
-export type {
-  MigrationDirection,
-  TokenStorageMigrationOptions,
-  TokenStorageMigrationProgress,
-  TokenStorageMigrationCounts,
-  TokenStorageMigrationResult,
-  MigrateLegacyToProfileOptions,
-  MigrateLegacyToProfileFromSphereOptions,
-  MigrateLegacyToProfileFromSphereResult,
-} from './token-storage-migration';
+//
+// Wave 6-P2-19 — the v1 → v2 wallet-import migration path is deleted per
+// the strict "No v1 backward compatibility!" directive: no
+// `ProfileMigration`, no `importLegacyTokens`, no `migrateLegacyToProfile`.
+// The `migrateInvalidTokensToPerEntryKey` helper below is an unrelated
+// intra-profile schema migration (single-blob → per-entry-key `invalid.*`)
+// and stays.
+export { migrateInvalidTokensToPerEntryKey } from './migration';
+export type { InvalidTokensMigrationResult } from './migration';
 
 // =============================================================================
 // SphereCryptographer (Issue #292 foundation — sketched, not fully wired)
