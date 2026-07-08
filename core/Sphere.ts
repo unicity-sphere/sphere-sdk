@@ -214,6 +214,15 @@ import {
 } from '../token-engine';
 import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
 
+/**
+ * Phase 6-P2-14 — process-wide trust-base cache. Keyed by fetch URL.
+ * Populated on first successful fetch; subsequent Sphere.init calls
+ * within the process share the parsed JSON, avoiding
+ * raw.githubusercontent.com's ~60 req/hr per-IP rate limit that trips
+ * during multi-wallet soaks / CLI reruns.
+ */
+const TRUST_BASE_CACHE = new Map<string, unknown>();
+
 export function isValidNametag(nametag: string): boolean {
   if (isPhoneNumber(nametag)) return true;
   return /^[a-z0-9_-]{3,20}$/.test(nametag);
@@ -2186,15 +2195,25 @@ export class Sphere {
     }
 
     if (this._cachedTrustBaseJson === null) {
-      logger.debug('Sphere', `Fetching trust base from ${trustBaseUrl}`);
-      const resp = await fetch(trustBaseUrl);
-      if (!resp.ok) {
-        throw new SphereError(
-          `Trust base fetch failed (${resp.status} ${resp.statusText}): ${trustBaseUrl}`,
-          'INVALID_CONFIG',
-        );
+      // Phase 6-P2-14 — cross-Sphere-instance module-level cache. Multiple
+      // Sphere.init calls within a process (CLI reruns, multi-wallet soaks,
+      // multi-tenant tests) share the fetched trust base to avoid
+      // raw.githubusercontent.com's ~60 req/hr per-IP rate limit.
+      const cached = TRUST_BASE_CACHE.get(trustBaseUrl);
+      if (cached !== undefined) {
+        this._cachedTrustBaseJson = cached;
+      } else {
+        logger.debug('Sphere', `Fetching trust base from ${trustBaseUrl}`);
+        const resp = await fetch(trustBaseUrl);
+        if (!resp.ok) {
+          throw new SphereError(
+            `Trust base fetch failed (${resp.status} ${resp.statusText}): ${trustBaseUrl}`,
+            'INVALID_CONFIG',
+          );
+        }
+        this._cachedTrustBaseJson = await resp.json();
+        TRUST_BASE_CACHE.set(trustBaseUrl, this._cachedTrustBaseJson);
       }
-      this._cachedTrustBaseJson = await resp.json();
     }
 
     const privateKey = strictHexToBytes(this._identity.privateKey);
