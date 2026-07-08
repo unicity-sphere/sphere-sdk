@@ -77,6 +77,7 @@ import {
   isTokenKey,
   isArchivedKey,
   isForkedKey,
+  isSphereTokenPersistenceEntry,
 } from '../../../types/txf.js';
 import { buildLocalEntry } from './oplog-entry.js';
 import type { OpLogEntryEnvelope } from './oplog-entry.js';
@@ -2367,7 +2368,15 @@ export class ProfileTokenStorageProvider
   // ===========================================================================
 
   /**
-   * Extract token entries from TxfStorageDataBase.
+   * Extract token entries from `TxfStorageDataBase`.
+   *
+   * Wave 6-P2-17: the persisted entry shape is now a v2
+   * `SphereTokenPersistenceEntry` — an envelope wrapping raw v2
+   * SphereToken CBOR bytes plus `{ tokenId, network, v }` metadata.
+   * The v1 chain shape (with `genesis` / `state` / `transactions`) is
+   * gone; there is NO v1 backward compatibility. Entries lacking the
+   * expected v2 envelope signature are logged and skipped.
+   *
    * Token keys include:
    * - Keys starting with `_` (standard tokens, excluding operational keys)
    * - Keys starting with `archived-` (archived tokens)
@@ -2378,32 +2387,19 @@ export class ProfileTokenStorageProvider
   ): Map<string, unknown> {
     const tokens = new Map<string, unknown>();
 
-    // Use canonical token-key predicates from `types/txf.ts` rather than a
-    // local ad-hoc operational-key allowlist. The local list previously
-    // missed `_nametags`, `_nametag`, and `_integrity` — when those keys
-    // were present in storage data, they were misclassified as token
-    // entries and passed to `pkg.ingestAll`, which threw
-    // `[UXF:INVALID_PACKAGE] Token must have a genesis field` because
-    // arrays of NametagData / IntegrityRecord don't have a `genesis`
-    // field. The flush silently re-queued forever, the pointer never
-    // published, and recovery was systematically broken on real infra.
-    // Routing through `RESERVED_KEYS` (the single source of truth) keeps
-    // the two callsites in sync and prevents future drift.
     for (const key of Object.keys(data)) {
       if (!isTokenKey(key) && !isArchivedKey(key) && !isForkedKey(key)) continue;
       const value = (data as unknown as Record<string, unknown>)[key];
-      // Defense-in-depth: skip anything that isn't a non-array object
-      // (TxfToken is shaped { genesis, state, transactions, ... }).
-      // An array would be an operational entry that snuck past the key
-      // filter; a primitive is an unrecognized payload.
+      // Defense-in-depth: skip anything that isn't a non-array object.
       if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
-      // Defense-in-depth: validate the TxfToken shape before adding to the
-      // ingest set. UxfPackage.ingestAll requires `genesis`. If a future
-      // storage entry slips through the key filter without a `genesis`
-      // field, log + skip rather than DOS the entire flush by throwing.
-      const candidate = value as { genesis?: unknown };
-      if (!candidate.genesis || typeof candidate.genesis !== 'object') {
-        logger.warn('Profile', `extractTokensFromTxfData: skipping malformed token at key="${key}" (no genesis field)`);
+      // v2 envelope shape signature: `tokenId` string + `token` string
+      // (base64 CBOR bytes) + `network` number.
+      if (!isSphereTokenPersistenceEntry(value)) {
+        logger.warn(
+          'Profile',
+          `extractTokensFromTxfData: skipping non-v2 entry at key="${key}" ` +
+            `(expected SphereTokenPersistenceEntry envelope)`,
+        );
         continue;
       }
       tokens.set(key, value);

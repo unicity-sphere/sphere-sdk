@@ -1,118 +1,99 @@
 /**
- * TXF (Token eXchange Format) Type Definitions
- * Based on TXF Format Specification v2.0
+ * TXF (Token eXchange Format) Type Definitions — v2 persistence layer.
  *
- * These types define the serialization format for tokens,
- * independent of any UI or storage implementation.
+ * Wave 6-P2-17: the profile persistence layer now stores v2 SphereToken
+ * blobs wrapped in a small JSON envelope — the same shape the v2
+ * wire path (`PaymentsModule.deliverTokens`) uses over Nostr. The v1
+ * chain shape (`TxfToken` with `genesis` / `state` / `transactions` /
+ * `_integrity`) is gone; there is NO backward compatibility with v1
+ * persistence, per the phase-6 migration mandate.
+ *
+ * This file used to define the v1 chain deconstruction shape:
+ *   TxfToken, TxfGenesis, TxfGenesisData, TxfState, TxfTransaction,
+ *   TxfIntegrity, TxfInclusionProof, TxfAuthenticator, TxfMerkleTreePath,
+ *   TxfMerkleStep
+ * All of those are deleted. Callers that still want to reference "the
+ * shape a token takes when stored in Profile" use
+ * `SphereTokenPersistenceEntry`.
  */
 
 // =============================================================================
-// TXF Token Structure (v2.0)
+// v2 Persistence Entry (Wave 6-P2-17)
 // =============================================================================
 
 /**
- * Complete token object in TXF format
+ * A v2 SphereToken envelope, stored under `_${tokenId}` in the
+ * Profile-shaped `TxfStorageDataBase`.
+ *
+ * The envelope wraps the raw v2 SphereToken CBOR blob (base64-encoded)
+ * along with the blob's `v` / `network` / `tokenId` metadata so consumers
+ * can select the right `ITokenEngine.decodeToken` implementation without
+ * decoding the payload first.
+ *
+ * Byte-for-byte compatible with the `SphereTokenEnvelope` produced by
+ * `encodeSdkDataEnvelope` in `modules/payments/PaymentsModule.ts` and
+ * consumed by the send/receive wire path — so persisted tokens and
+ * in-flight tokens share a single canonical serialization.
  */
-export interface TxfToken {
-  version: '2.0';
-  genesis: TxfGenesis;
-  state: TxfState;
-  transactions: TxfTransaction[];
-  nametags?: string[];
-  _integrity?: TxfIntegrity;
+export interface SphereTokenPersistenceEntry {
+  /** Envelope schema tag. `'v2'` for wave 6-P2-17. */
+  _sdkVersion: string;
+  /** Envelope format identifier. `'sphere-token-blob'` for wave 6-P2-17. */
+  _format: string;
+  /** v2 SphereToken blob version (`TokenBlob.v`). */
+  v: number;
+  /** Network ID (`TokenBlob.network`; 1=mainnet, 2=testnet2/dev). */
+  network: number;
+  /** 64-char hex token identifier. */
+  tokenId: string;
+  /** Base64-encoded raw v2 SphereToken CBOR bytes. */
+  token: string;
 }
 
-/**
- * Genesis transaction (initial minting)
- */
-export interface TxfGenesis {
-  data: TxfGenesisData;
-  inclusionProof: TxfInclusionProof;
-}
-
-/**
- * Genesis data payload
- */
-export interface TxfGenesisData {
-  tokenId: string;              // 64-char hex
-  tokenType: string;            // 64-char hex
-  coinData: [string, string][]; // [[coinId, amount], ...]
-  tokenData: string;            // Optional metadata
-  salt: string;                 // 64-char hex
-  recipient: string;            // DIRECT://... address
-  recipientDataHash: string | null;
-  reason: string | null;
-}
-
-/**
- * Current token state
- */
-export interface TxfState {
-  data: string;
-  predicate: string;  // Hex-encoded CBOR predicate
-}
-
-/**
- * State transition transaction
- */
-export interface TxfTransaction {
-  previousStateHash: string;
-  newStateHash?: string;
-  predicate: string;
-  inclusionProof: TxfInclusionProof | null;  // null = uncommitted
-  data?: Record<string, unknown>;
-}
-
-/**
- * Sparse Merkle Tree inclusion proof
- */
-export interface TxfInclusionProof {
-  authenticator: TxfAuthenticator;
-  merkleTreePath: TxfMerkleTreePath;
-  transactionHash: string;
-  unicityCertificate: string;  // Hex-encoded CBOR
-}
-
-/**
- * Proof authenticator
- */
-export interface TxfAuthenticator {
-  algorithm: string;
-  publicKey: string;
-  signature: string;
-  stateHash: string;
-}
-
-/**
- * Merkle tree path for proof verification
- */
-export interface TxfMerkleTreePath {
-  root: string;
-  steps: TxfMerkleStep[];
-}
-
-/**
- * Single step in merkle path
- */
-export interface TxfMerkleStep {
-  data: string;
-  path: string;
-}
-
-/**
- * Token integrity metadata
- */
-export interface TxfIntegrity {
-  genesisDataJSONHash: string;
-  currentStateHash?: string;
-}
+// =============================================================================
+// Deprecated v1 chain-shape aliases (to be removed post-Phase-6)
+// =============================================================================
+//
+// Wave 6-P2-17: the concrete v1 chain shapes (with genesis / state /
+// transactions / _integrity fields) are DELETED. The names below are
+// preserved as loose `Record<string, unknown>` aliases only so the
+// tsc surface can compile while the last v1-shape helpers (the
+// AccountingModule invoice payload constructor, the standalone
+// `serialization/txf-serializer.ts`, etc.) are ported off them or
+// removed outright in a follow-up wave.
+//
+// New code MUST NOT rely on these — reach for
+// `SphereTokenPersistenceEntry` instead. There is NO v1 backward
+// compatibility on any hot persistence / wire path.
+/* eslint-disable @typescript-eslint/no-explicit-any */
+/** @deprecated v1 chain shape — no runtime meaning. */
+export type TxfToken = any;
+/** @deprecated v1 chain shape — no runtime meaning. */
+export type TxfGenesis = any;
+/** @deprecated v1 chain shape — no runtime meaning. */
+export type TxfGenesisData = any;
+/** @deprecated v1 chain shape — no runtime meaning. */
+export type TxfState = any;
+/** @deprecated v1 chain shape — no runtime meaning. */
+export type TxfTransaction = any;
+/** @deprecated v1 chain shape — no runtime meaning. */
+export type TxfIntegrity = any;
+/** @deprecated v1 chain shape — no runtime meaning. */
+export type TxfInclusionProof = any;
+/** @deprecated v1 chain shape — no runtime meaning. */
+export type TxfAuthenticator = any;
+/** @deprecated v1 chain shape — no runtime meaning. */
+export type TxfMerkleTreePath = any;
+/** @deprecated v1 chain shape — no runtime meaning. */
+export type TxfMerkleStep = any;
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 // =============================================================================
 // Storage Format (for IPFS/File storage)
 // =============================================================================
 
 /**
- * Nametag data (one per identity)
+ * Nametag data (one per identity).
  */
 export interface NametagData {
   name: string;
@@ -123,16 +104,17 @@ export interface NametagData {
 }
 
 /**
- * Tombstone entry for tracking spent token states
+ * Tombstone entry for tracking spent token states.
  */
 export interface TombstoneEntry {
   tokenId: string;
   stateHash: string;
   timestamp: number;
+  deletedAt?: number;
 }
 
 /**
- * Invalidated nametag entry
+ * Invalidated nametag entry.
  */
 export interface InvalidatedNametagEntry {
   name: string;
@@ -145,7 +127,7 @@ export interface InvalidatedNametagEntry {
 }
 
 /**
- * Outbox entry for pending transfers
+ * Outbox entry for pending transfers.
  */
 export interface OutboxEntry {
   id: string;
@@ -163,7 +145,7 @@ export interface OutboxEntry {
 }
 
 /**
- * Mint outbox entry for pending mints
+ * Mint outbox entry for pending mints.
  */
 export interface MintOutboxEntry {
   id: string;
@@ -178,19 +160,28 @@ export interface MintOutboxEntry {
 }
 
 /**
- * Storage metadata
+ * Storage metadata.
+ *
+ * Wave 6-P2-17: `updatedAt` is optional (some pre-existing writers
+ * populate it, some do not). `address` is kept for compat with the
+ * pre-#652 (chainPubkey-rekey) reader path; new writers may leave it
+ * empty and use only `chainPubkey`.
  */
 export interface TxfMeta {
   version: number;
   address: string;
-  ipnsName: string;
-  formatVersion: '2.0';
+  ipnsName?: string;
+  formatVersion: string;
   lastCid?: string;
   deviceId?: string;
+  updatedAt?: number;
 }
 
 /**
- * Complete storage data structure
+ * Complete storage data structure.
+ *
+ * Wave 6-P2-17: token entries under `_${tokenId}` keys carry
+ * `SphereTokenPersistenceEntry` values — the v2 envelope shape.
  */
 export interface TxfStorageData {
   _meta: TxfMeta;
@@ -200,7 +191,16 @@ export interface TxfStorageData {
   _invalidatedNametags?: InvalidatedNametagEntry[];
   _outbox?: OutboxEntry[];
   _mintOutbox?: MintOutboxEntry[];
-  [key: string]: TxfToken | TxfMeta | NametagData | NametagData[] | TombstoneEntry[] | InvalidatedNametagEntry[] | OutboxEntry[] | MintOutboxEntry[] | undefined;
+  [key: string]:
+    | SphereTokenPersistenceEntry
+    | TxfMeta
+    | NametagData
+    | NametagData[]
+    | TombstoneEntry[]
+    | InvalidatedNametagEntry[]
+    | OutboxEntry[]
+    | MintOutboxEntry[]
+    | undefined;
 }
 
 // =============================================================================
@@ -208,8 +208,13 @@ export interface TxfStorageData {
 // =============================================================================
 
 /**
- * Base interface that storage providers must implement
- * to support TXF token storage
+ * Base interface that storage providers must implement to support v2
+ * token persistence.
+ *
+ * The index signature is `unknown` so the file/indexedDB/IPFS layers
+ * that shuttle this object around do not need to know the token shape.
+ * Consumers (PaymentsModule, ProfileTokenStorageProvider) resolve the
+ * shape at read time via `SphereTokenPersistenceEntry`.
  */
 export interface TxfStorageDataBase {
   _meta: TxfMeta;
@@ -220,6 +225,10 @@ export interface TxfStorageDataBase {
   _outbox?: OutboxEntry[];
   _mintOutbox?: MintOutboxEntry[];
   _history?: unknown[];
+  _sent?: unknown[];
+  _invalid?: unknown[];
+  _audit?: unknown[];
+  _finalizationQueue?: unknown[];
   [key: string]: unknown;
 }
 
@@ -245,69 +254,85 @@ export interface TokenValidationResult {
 
 const ARCHIVED_PREFIX = 'archived-';
 const FORKED_PREFIX = '_forked_';
-const RESERVED_KEYS = ['_meta', '_nametag', '_nametags', '_tombstones', '_invalidatedNametags', '_outbox', '_mintOutbox', '_sent', '_invalid', '_integrity', '_history'];
+const RESERVED_KEYS = [
+  '_meta',
+  '_nametag',
+  '_nametags',
+  '_tombstones',
+  '_invalidatedNametags',
+  '_outbox',
+  '_mintOutbox',
+  '_sent',
+  '_invalid',
+  '_integrity',
+  '_history',
+  '_audit',
+  '_finalizationQueue',
+];
 
 /**
- * Check if a key is an active token key
+ * Check if a key is an active token key.
  */
 export function isTokenKey(key: string): boolean {
-  return key.startsWith('_') &&
+  return (
+    key.startsWith('_') &&
     !key.startsWith(ARCHIVED_PREFIX) &&
     !key.startsWith(FORKED_PREFIX) &&
-    !RESERVED_KEYS.includes(key);
+    !RESERVED_KEYS.includes(key)
+  );
 }
 
 /**
- * Check if a key is an archived token key
+ * Check if a key is an archived token key.
  */
 export function isArchivedKey(key: string): boolean {
   return key.startsWith(ARCHIVED_PREFIX);
 }
 
 /**
- * Check if a key is a forked token key
+ * Check if a key is a forked token key.
  */
 export function isForkedKey(key: string): boolean {
   return key.startsWith(FORKED_PREFIX);
 }
 
 /**
- * Extract token ID from storage key
+ * Extract token ID from storage key.
  */
 export function tokenIdFromKey(key: string): string {
   return key.startsWith('_') ? key.substring(1) : key;
 }
 
 /**
- * Create storage key from token ID
+ * Create storage key from token ID.
  */
 export function keyFromTokenId(tokenId: string): string {
   return `_${tokenId}`;
 }
 
 /**
- * Extract token ID from archived key
+ * Extract token ID from archived key.
  */
 export function tokenIdFromArchivedKey(key: string): string {
   return key.startsWith(ARCHIVED_PREFIX) ? key.substring(ARCHIVED_PREFIX.length) : key;
 }
 
 /**
- * Create archived key from token ID
+ * Create archived key from token ID.
  */
 export function archivedKeyFromTokenId(tokenId: string): string {
   return `${ARCHIVED_PREFIX}${tokenId}`;
 }
 
 /**
- * Create forked key from token ID and state hash
+ * Create forked key from token ID and state hash.
  */
 export function forkedKeyFromTokenIdAndState(tokenId: string, stateHash: string): string {
   return `${FORKED_PREFIX}${tokenId}_${stateHash}`;
 }
 
 /**
- * Parse forked key into tokenId and stateHash
+ * Parse forked key into tokenId and stateHash.
  */
 export function parseForkedKey(key: string): { tokenId: string; stateHash: string } | null {
   if (!key.startsWith(FORKED_PREFIX)) return null;
@@ -323,20 +348,32 @@ export function parseForkedKey(key: string): { tokenId: string; stateHash: strin
 /**
  * Validate 64-character hex token ID.
  *
- * Round 3 — tightened from the case-insensitive `[0-9a-fA-F]{64}` form
- * to the canonical lowercase `[0-9a-f]{64}` form so this validator
+ * The canonical lowercase `[0-9a-f]{64}` form so this validator
  * agrees with the importer's `CANONICAL_TOKEN_ID_RE` shape contract
- * (`modules/payments/transfer/import-inclusion-proof.ts`).
- *
- * The two-shape disagreement was a per-tokenId mutex hazard: an
- * uppercase tokenId that satisfied `isValidTokenId` (legacy form)
- * was rejected by the importer's strict regex, but downstream paths
- * that took a different branch on `isValidTokenId` could acquire a
- * separate mutex slot keyed on the uppercase string and race past
- * the importer's serialization promise. Callers that legitimately
- * receive uppercase hex from the SDK MUST lowercase-normalize at the
- * call site before invoking this validator.
+ * (`modules/payments/transfer/import-inclusion-proof.ts`). Callers
+ * that legitimately receive uppercase hex from the SDK MUST
+ * lowercase-normalize at the call site before invoking this validator.
  */
 export function isValidTokenId(tokenId: string): boolean {
   return /^[0-9a-f]{64}$/.test(tokenId);
+}
+
+/**
+ * Structural predicate for a v2 `SphereTokenPersistenceEntry`.
+ *
+ * Wave 6-P2-17: recognizes the envelope by its shape signature —
+ * `tokenId` string, `token` string (base64 blob bytes), and `network`
+ * number. `_format` is checked when present (defensive) but is not
+ * required.
+ */
+export function isSphereTokenPersistenceEntry(
+  value: unknown,
+): value is SphereTokenPersistenceEntry {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const v = value as Partial<SphereTokenPersistenceEntry>;
+  if (typeof v.tokenId !== 'string') return false;
+  if (typeof v.token !== 'string') return false;
+  if (typeof v.network !== 'number') return false;
+  if (v._format !== undefined && v._format !== 'sphere-token-blob') return false;
+  return true;
 }

@@ -49,10 +49,12 @@ import type {
   PaymentRequestResponseHandler,
 } from '../../types';
 import type {
+  SphereTokenPersistenceEntry,
   TxfToken,
   TombstoneEntry,
   NametagData,
 } from '../../types/txf';
+import { isSphereTokenPersistenceEntry } from '../../types/txf';
 import type {
   StorageProvider,
   TokenStorageProvider,
@@ -583,14 +585,22 @@ export class PaymentsModule {
     for (const key of Object.keys(data as unknown as Record<string, unknown>)) {
       if (RESERVED.has(key)) continue;
       if (!key.startsWith('_')) continue;
-      const raw = (data as unknown as Record<string, unknown>)[key] as TxfToken | undefined;
-      if (!raw || typeof raw !== 'object') continue;
-      const token = txfEntryToToken(raw);
-      if (!token) continue;
-      this.tokens.set(token.id, token);
-      if (engine && token.sdkData) {
-        const st = await decodeSdkDataEnvelope(engine, token.sdkData);
-        if (st) this.engineTokens.set(token.id, st);
+      const raw = (data as unknown as Record<string, unknown>)[key];
+      if (!isSphereTokenPersistenceEntry(raw)) continue;
+      // Reconstitute the v2 SphereToken from the persisted envelope. If
+      // no engine is wired the token is still added to the UI map (so
+      // read paths that just want asset counts keep working) but no
+      // engine ops will be possible.
+      if (engine) {
+        const st = await decodeSdkDataFromEntry(engine, raw);
+        if (!st) continue;
+        this.engineTokens.set(raw.tokenId, st);
+        this.tokens.set(raw.tokenId, this.uiTokenFromSphereToken(engine, st));
+      } else {
+        // Engine-less fallback: surface only what the envelope tells us
+        // directly (id + a stub UI token). Values / balances won't be
+        // populated. Legitimate at cold-boot before ITokenEngine wires.
+        this.tokens.set(raw.tokenId, uiTokenFromEnvelope(raw));
       }
     }
   }
@@ -627,8 +637,11 @@ export class PaymentsModule {
     };
     // Nametags are persisted under the txf-domain `_nametags` slot.
     (data as unknown as Record<string, unknown>)._nametags = [...this.nametags];
+    const engine = this.deps?.tokenEngine;
     for (const [id, token] of this.tokens) {
-      (data as unknown as Record<string, unknown>)[`_${id}`] = tokenToTxfEntry(token);
+      const entry = tokenToPersistenceEntry(engine, token, this.engineTokens.get(id));
+      if (!entry) continue;
+      (data as unknown as Record<string, unknown>)[`_${id}`] = entry;
     }
     return data;
   }
@@ -1889,30 +1902,114 @@ export class PaymentsModule {
 }
 
 // =============================================================================
-// TxfToken bridge
+// v2 persistence entry helpers
 // =============================================================================
 
-function txfEntryToToken(raw: TxfToken): Token | null {
-  const anyRaw = raw as unknown as Record<string, unknown>;
-  if (typeof anyRaw.id !== 'string') return null;
-  return {
-    id: anyRaw.id as string,
-    coinId: (anyRaw.coinId as string) ?? '',
-    symbol: (anyRaw.symbol as string) ?? '',
-    name: (anyRaw.name as string) ?? '',
-    decimals: (anyRaw.decimals as number) ?? 0,
-    ...(typeof anyRaw.iconUrl === 'string' ? { iconUrl: anyRaw.iconUrl } : {}),
-    amount: (anyRaw.amount as string) ?? '0',
-    status: (anyRaw.status as TokenStatus) ?? 'confirmed',
-    createdAt: (anyRaw.createdAt as number) ?? Date.now(),
-    updatedAt: (anyRaw.updatedAt as number) ?? Date.now(),
-    ...(typeof anyRaw.sdkData === 'string' ? { sdkData: anyRaw.sdkData } : {}),
-  };
+/**
+ * Encode a v2 UI Token into its Profile persistence envelope.
+ *
+ * The persisted shape is a `SphereTokenPersistenceEntry` — the same
+ * envelope the v2 wire path uses (`encodeSdkDataEnvelope` /
+ * `PaymentsModule.deliverTokens`), so persistence and delivery share a
+ * single canonical serialization.
+ *
+ * Two source paths:
+ *   1. If the caller supplies the live `SphereToken`, we re-encode it
+ *      via `engine.encodeToken(...)`. This is the freshest source.
+ *   2. Otherwise fall back to `token.sdkData`, which already holds the
+ *      JSON envelope. Callers that lose the engine handle (rare — cold
+ *      loaders that never wire an engine) still get a persistable form.
+ *
+ * Returns `null` when neither path yields a valid envelope. Callers
+ * skip the entry rather than persisting a malformed body that the
+ * loader would drop on the next cycle.
+ */
+function tokenToPersistenceEntry(
+  engine: ITokenEngine | undefined,
+  token: Token,
+  sphereToken?: SphereToken,
+): SphereTokenPersistenceEntry | null {
+  // Prefer live re-encode from the SphereToken so persisted bytes
+  // always reflect the latest state.
+  if (engine && sphereToken) {
+    const blob = engine.encodeToken(sphereToken);
+    return {
+      _sdkVersion: SDK_ENVELOPE_VERSION,
+      _format: SDK_ENVELOPE_FORMAT,
+      v: blob.v,
+      network: blob.network,
+      tokenId: blob.tokenId,
+      token: bytesToBase64(blob.token),
+    };
+  }
+  // Fallback: parse the JSON envelope that's already on the UI token.
+  if (typeof token.sdkData === 'string') {
+    try {
+      const env = JSON.parse(token.sdkData) as Partial<SphereTokenPersistenceEntry>;
+      if (
+        typeof env.tokenId === 'string' &&
+        typeof env.token === 'string' &&
+        typeof env.network === 'number'
+      ) {
+        return {
+          _sdkVersion: env._sdkVersion ?? SDK_ENVELOPE_VERSION,
+          _format: env._format ?? SDK_ENVELOPE_FORMAT,
+          v: env.v ?? 1,
+          network: env.network,
+          tokenId: env.tokenId,
+          token: env.token,
+        };
+      }
+    } catch {
+      // fall through to null
+    }
+  }
+  return null;
 }
 
-function tokenToTxfEntry(token: Token): TxfToken {
+/**
+ * Decode a persisted v2 envelope back into a live `SphereToken` via the
+ * engine. Returns null on any parse/decode failure — callers skip.
+ */
+async function decodeSdkDataFromEntry(
+  engine: ITokenEngine,
+  entry: SphereTokenPersistenceEntry,
+): Promise<SphereToken | null> {
+  try {
+    const bytes = base64ToBytes(entry.token);
+    return await engine.decodeToken({
+      v: entry.v,
+      network: entry.network,
+      tokenId: entry.tokenId,
+      token: bytes,
+    });
+  } catch (err) {
+    logger.debug('Payments', 'decodeSdkDataFromEntry failed:', err);
+    return null;
+  }
+}
+
+/**
+ * Materialize an engine-less UI Token from a persisted envelope. Used
+ * only in the rare cold-load path where no `ITokenEngine` is wired yet
+ * (e.g., during migration). The resulting token has minimal fields —
+ * no coinId / amount / decoded value — so consumers rendering it are
+ * responsible for treating it as opaque metadata.
+ */
+function uiTokenFromEnvelope(entry: SphereTokenPersistenceEntry): Token {
+  const now = Date.now();
+  const sdkData = JSON.stringify(entry);
   return {
-    ...(token as unknown as TxfToken),
+    id: entry.tokenId,
+    coinId: '',
+    symbol: entry.tokenId.slice(0, 8),
+    name: entry.tokenId.slice(0, 8),
+    decimals: 0,
+    amount: '0',
+    status: 'confirmed' as TokenStatus,
+    createdAt: now,
+    updatedAt: now,
+    sdkData,
   };
 }
 
