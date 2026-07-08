@@ -1,4 +1,9 @@
 // SHA-pinned from unicity-sphere/sphere-sdk main@ce758f6b — do not modify without a re-sync note.
+// Wave 6-P2-20: aggregator client wrapped in `createRetryingAggregatorClient`
+// so transient 5xx / network errors on `submitCertificationRequest` are
+// retried with bounded backoff (~13s total). Testnet2 gateway 503s
+// were tripping Sphere.init nametag mints fatally. The retry helper is
+// not SHA-pinned; wiring it in is the only edit vs upstream.
 /**
  * token-engine/factory.ts — the real engine constructor (A4).
  *
@@ -25,6 +30,7 @@ import {
   SplitMintJustificationVerifier,
   StateTransitionClient,
 } from './sdk';
+import { createRetryingAggregatorClient } from './retrying-aggregator-client';
 import { decodeSpherePaymentData } from './SpherePaymentData';
 import { type EngineDeps, SphereTokenEngine } from './SphereTokenEngine';
 import type { EngineConfig, ITokenEngine } from './engine';
@@ -49,7 +55,11 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
   );
 
   const deps: EngineDeps = {
-    client: new StateTransitionClient(new AggregatorClient(config.aggregatorUrl, config.apiKey ?? null)),
+    client: new StateTransitionClient(
+      createRetryingAggregatorClient(
+        new AggregatorClient(config.aggregatorUrl, config.apiKey ?? null),
+      ),
+    ),
     trustBase,
     predicateVerifier,
     mintJustificationVerifier,
