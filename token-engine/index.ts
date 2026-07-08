@@ -56,7 +56,7 @@ export { TransferConflictError } from './errors';
 export { createUnicityIdMinter } from './unicity-id';
 export type { IUnicityIdMinter, UnicityIdMintResult } from './unicity-id';
 
-// The SpherePaymentData codec (CBOR tag 39048) — the value envelope inside
+// The SpherePaymentData codec (CBOR tag 39050) — the value envelope inside
 // Sphere tokens. Exported via the `./token-engine` subpath so server-side
 // consumers (wallet-api deposit validation) can decode token values without
 // pulling the browser/IPFS/Nostr dependency closure of the root entry.

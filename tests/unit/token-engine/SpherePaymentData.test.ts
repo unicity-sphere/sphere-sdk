@@ -9,6 +9,10 @@ const COIN_A = 'a'.repeat(64);
 const COIN_B = 'b'.repeat(64);
 
 describe('SpherePaymentData', () => {
+  it('uses the registered SpherePaymentData CBOR tag', () => {
+    expect(SpherePaymentData.CBOR_TAG).toBe(39050n);
+  });
+
   it('round-trips a single-coin value through encode/decode', async () => {
     const value: SphereValue = { assets: [{ coinId: COIN_A, amount: 1000n }] };
     const bytes = await SpherePaymentData.fromValue(value).encode();

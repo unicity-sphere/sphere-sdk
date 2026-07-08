@@ -48,7 +48,7 @@ export function sphereAssetToSdk(coinId: CoinId, amount: bigint): Asset {
 
 export class SpherePaymentData implements IPaymentData {
   /** Sphere-private CBOR tag (verified free in the v2 SDK tag space). */
-  public static readonly CBOR_TAG = 39048n;
+  public static readonly CBOR_TAG = 39050n;
   /** Envelope version; bump when the structure changes. */
   public static readonly VERSION = 1n;
 
@@ -90,7 +90,7 @@ export class SpherePaymentData implements IPaymentData {
     return new SpherePaymentData(PaymentAssetCollection.fromCBOR(fields[1]), memo);
   }
 
-  /** Deterministic, versioned, tagged CBOR: `tag(39048)[ version, assets, memo? ]`. */
+  /** Deterministic, versioned, tagged CBOR: `tag(39050)[ version, assets, memo? ]`. */
   public encode(): Promise<Uint8Array> {
     return Promise.resolve(
       CborSerializer.encodeTag(
