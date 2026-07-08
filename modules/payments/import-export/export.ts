@@ -8,8 +8,16 @@
  */
 
 import type { Token } from '../../../types';
-import type { TxfToken } from '../../../types/txf';
 import { tokenToTxf } from '../../../serialization/txf-serializer';
+
+/**
+ * Wave 6-P2-18: the v1 `TxfToken` alias in `types/txf` is deleted. The
+ * exported TXF triple's `txf` field carries the state-transition-sdk
+ * v1 JSON shape (that's what two SDKs on the same network exchange
+ * on the wire) — held as `unknown` at the export boundary and narrowed
+ * by consumers via the wire schema.
+ */
+export type WireTxfBlob = unknown;
 
 export interface ExportTokensOptions {
   ids?: readonly string[];
@@ -20,7 +28,7 @@ export interface ExportTokensOptions {
 export interface ExportedToken {
   readonly localId: string;
   readonly genesisTokenId: string;
-  readonly txf: TxfToken;
+  readonly txf: WireTxfBlob;
 }
 
 /**

@@ -151,14 +151,17 @@ function makePaymentsStub(): {
   };
 }
 
-// Fake engine — AccountingModule.createInvoice only calls
-// `tokenEngine.mintDataToken(...)` and `tokenEngine.tokenId(...)`. Every
-// mint gets a deterministic-ish tokenId derived from `data` so
-// `createInvoice` + `importInvoice` see stable ids.
+// Fake engine — AccountingModule.createInvoice calls `mintDataToken`,
+// `tokenId`, and (wave 6-P2-18) `encodeToken` to build the v2
+// `SphereTokenPersistenceEntry` envelope returned as
+// `CreateInvoiceResult.token`. Every mint gets a deterministic-ish
+// tokenId derived from `data` so `createInvoice` + `importInvoice` see
+// stable ids.
 let invoiceSeq = 0;
 function makeEngine(): {
   mintDataToken: ReturnType<typeof vi.fn>;
   tokenId: ReturnType<typeof vi.fn>;
+  encodeToken: ReturnType<typeof vi.fn>;
   raw: unknown;
 } {
   const mintDataToken = vi.fn(async (params: { data: Uint8Array }) => {
@@ -169,10 +172,20 @@ function makeEngine(): {
     return { _tokenId: id, _dataLen: params.data.length };
   });
   const tokenId = vi.fn((t: { _tokenId: string }) => t._tokenId);
+  // Wave 6-P2-18: envelope encoder. Returns a synthetic TokenBlob shape
+  // that the AccountingModule wraps into a `SphereTokenPersistenceEntry`
+  // for callers.
+  const encodeToken = vi.fn((t: { _tokenId: string }) => ({
+    v: 1,
+    network: 2,
+    tokenId: t._tokenId,
+    token: new Uint8Array([1, 2, 3, 4]),
+  }));
   return {
     mintDataToken,
     tokenId,
-    raw: { mintDataToken, tokenId },
+    encodeToken,
+    raw: { mintDataToken, tokenId, encodeToken },
   };
 }
 

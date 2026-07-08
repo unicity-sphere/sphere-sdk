@@ -7,8 +7,15 @@
  * step promotes them into a full TokenArchive class.
  */
 
-import type { TxfToken } from '../../../types/txf';
 import { countCommittedTxns } from './identity';
+
+/**
+ * Wave 6-P2-18: the `TxfToken` type alias is deleted. Archived and forked
+ * entries are shaped by the underlying state-transition-sdk v1 JSON
+ * (still v1 until the STSDK v2 swap lands); we hold them as `unknown` at
+ * the archive-store boundary and let `countCommittedTxns` narrow.
+ */
+type ArchivedTokenValue = unknown;
 
 /**
  * Find best token version from archives — the archived or forked entry
@@ -19,10 +26,10 @@ import { countCommittedTxns } from './identity';
  */
 export function findBestTokenVersion(
   tokenId: string,
-  archivedTokens: Map<string, TxfToken>,
-  forkedTokens: Map<string, TxfToken>,
-): TxfToken | null {
-  const candidates: TxfToken[] = [];
+  archivedTokens: Map<string, ArchivedTokenValue>,
+  forkedTokens: Map<string, ArchivedTokenValue>,
+): ArchivedTokenValue | null {
+  const candidates: ArchivedTokenValue[] = [];
 
   const archived = archivedTokens.get(tokenId);
   if (archived) candidates.push(archived);

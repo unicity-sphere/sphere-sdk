@@ -646,7 +646,9 @@ function parseAnnounceResult(obj: Record<string, unknown>): ParsedSwapDM | null 
 function parseInvoiceDelivery(obj: Record<string, unknown>): ParsedSwapDM | null {
   if (!isValidSwapId(obj.swap_id)) return null;
   if (obj.invoice_type !== 'deposit' && obj.invoice_type !== 'payout') return null;
-  // invoice_token is required and must be a non-null object (TxfToken JSON).
+  // invoice_token is required and must be a non-null object. Wave 6-P2-18:
+  // the SDK canonical shape is `SphereTokenPersistenceEntry` (a v2
+  // sphere-token-blob envelope) — see AccountingModule.importInvoice.
   // Cap serialized size to 64 KiB to prevent memory amplification from a malicious escrow.
   if (obj.invoice_token === undefined || obj.invoice_token === null || typeof obj.invoice_token !== 'object') return null;
   const MAX_INVOICE_TOKEN_BYTES = 65_536;

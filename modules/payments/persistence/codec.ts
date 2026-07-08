@@ -30,7 +30,23 @@
  */
 
 import type { Token, SphereEventType, SphereEventMap, FullIdentity } from '../../../types';
-import type { TxfToken, TombstoneEntry, NametagData } from '../../../types/txf';
+import type { TombstoneEntry, NametagData } from '../../../types/txf';
+
+/**
+ * Wave 6-P2-18: the v1 `TxfToken` alias in `types/txf` is deleted. The
+ * archive / forked stores carry state-transition-sdk v1 JSON shapes
+ * until the STSDK v2 swap lands; we keep them at `unknown` type on the
+ * store boundary and read `genesis?.data?.tokenId` via a local minimal
+ * interface for the single site that needs it.
+ */
+type ArchivedTokenValue = unknown;
+interface MinimalTxfShape {
+  genesis?: {
+    data?: {
+      tokenId?: string;
+    };
+  };
+}
 import type { TxfStorageDataBase } from '../../../storage';
 import {
   tokenToTxf,
@@ -57,8 +73,8 @@ import { MAX_SYNCED_HISTORY_ENTRIES, type TransactionHistoryEntry } from '../rea
  * incremental-vs-fork decision — see PR #144 / FIX E.
  */
 export interface ArchiveTokenHost {
-  readonly archivedTokens: Map<string, TxfToken>;
-  storeForkedToken(tokenId: string, stateHash: string, txf: TxfToken): Promise<void>;
+  readonly archivedTokens: Map<string, ArchivedTokenValue>;
+  storeForkedToken(tokenId: string, stateHash: string, txf: ArchivedTokenValue): Promise<void>;
 }
 
 /**
@@ -103,8 +119,8 @@ export interface CreateStorageDataSnapshot {
   readonly tokens: ReadonlyMap<string, Token>;
   readonly nametags: readonly NametagData[];
   readonly tombstones: readonly TombstoneEntry[];
-  readonly archivedTokens: ReadonlyMap<string, TxfToken>;
-  readonly forkedTokens: ReadonlyMap<string, TxfToken>;
+  readonly archivedTokens: ReadonlyMap<string, ArchivedTokenValue>;
+  readonly forkedTokens: ReadonlyMap<string, ArchivedTokenValue>;
   readonly historyCache: readonly TransactionHistoryEntry[];
 }
 
@@ -129,8 +145,8 @@ export async function createStorageData(
     {
       nametags: snap.nametags as NametagData[],
       tombstones: snap.tombstones as TombstoneEntry[],
-      archivedTokens: snap.archivedTokens as Map<string, TxfToken>,
-      forkedTokens: snap.forkedTokens as Map<string, TxfToken>,
+      archivedTokens: snap.archivedTokens as Map<string, ArchivedTokenValue>,
+      forkedTokens: snap.forkedTokens as Map<string, ArchivedTokenValue>,
       historyEntries: sorted.slice(0, MAX_SYNCED_HISTORY_ENTRIES),
     },
   )) as unknown as TxfStorageDataBase;
@@ -157,8 +173,8 @@ export interface LoadFromStorageDataHost {
   readonly tokens: Map<string, Token>;
   tombstones: TombstoneEntry[];
   tombstoneKeySet: Set<string>;
-  archivedTokens: Map<string, TxfToken>;
-  forkedTokens: Map<string, TxfToken>;
+  archivedTokens: Map<string, ArchivedTokenValue>;
+  forkedTokens: Map<string, ArchivedTokenValue>;
   nametags: NametagData[];
   emitEvent<T extends SphereEventType>(type: T, data: SphereEventMap[T]): void;
   latestStatePredicateMatchesWallet(token: Token): boolean;
@@ -182,8 +198,8 @@ export interface LoadFromStorageDataDiff {
   readonly tombstones: TombstoneEntry[];
   readonly tombstoneKeySet: Set<string>;
   readonly nametags: NametagData[];
-  readonly archivedTokens: Map<string, TxfToken>;
-  readonly forkedTokens: Map<string, TxfToken>;
+  readonly archivedTokens: Map<string, ArchivedTokenValue>;
+  readonly forkedTokens: Map<string, ArchivedTokenValue>;
 }
 
 /**

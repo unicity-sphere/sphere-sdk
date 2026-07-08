@@ -565,10 +565,10 @@ export type {
 } from './modules/accounting/types';
 
 // v2 persistence entry — canonical shape for tokens stored in Profile / txf
-// storage layers. The old `TxfToken` name is a deprecated `any` alias
-// (see `types/txf.ts`); persistence-oriented consumers should use
-// `SphereTokenPersistenceEntry`.
-export type { SphereTokenPersistenceEntry, TxfToken } from './types/txf';
+// storage layers. The old `TxfToken` name (a deprecated `any` alias in
+// wave 6-P2-17) is DELETED as of wave 6-P2-18; consumers use
+// `SphereTokenPersistenceEntry` or `unknown` at the type boundary.
+export type { SphereTokenPersistenceEntry } from './types/txf';
 export { isSphereTokenPersistenceEntry } from './types/txf';
 
 // Master-key provider status re-export (already re-exported via ./types barrel,

@@ -47,7 +47,7 @@ export type ImportSkipCode =
   | 'unknown';
 
 export type ImportRejectCode =
-  /** TxfToken structure is invalid (missing fields, wrong types, etc.). */
+  /** Wire-format token structure is invalid (missing fields, wrong types, etc.). */
   | 'malformed'
   /** addToken threw an unexpected error during the write path. */
   | 'add-failed';

@@ -8,8 +8,9 @@
  *
  *   - `createInvoice` mints via `tokenEngine.mintDataToken` (v2 slim
  *     path, one atomic call — see AccountingModule.ts §createInvoice).
- *   - `importInvoice` accepts a `TxfToken` and populates the recipient's
- *     invoice cache.
+ *   - `importInvoice` accepts a v2 `SphereTokenPersistenceEntry`
+ *     envelope (wave 6-P2-18: the v1 `TxfToken` shape is gone) and
+ *     populates the recipient's invoice cache.
  *   - `payInvoice` routes through `PaymentsModule.send` with the invoice
  *     memo attached.
  *   - Status transitions OPEN → PARTIAL/COVERED via

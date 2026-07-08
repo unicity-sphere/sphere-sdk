@@ -9,7 +9,6 @@
  * Cleared on address switch via {@link clearSdkDataCache}.
  */
 
-import type { TxfToken } from '../../../types/txf';
 import { getCurrentStateHash } from '../../../serialization/txf-serializer';
 
 // Cache parsed sdkData fields. Key = sdkData string reference,
@@ -28,7 +27,7 @@ export function parseSdkDataCached(
   try {
     const txf = JSON.parse(sdkData);
     tokenId = txf.genesis?.data?.tokenId || null;
-    stateHash = getCurrentStateHash(txf as TxfToken) || '';
+    stateHash = getCurrentStateHash(txf) || '';
 
     // Try alternative locations if not found in standard place
     if (!stateHash) {

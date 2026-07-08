@@ -46,7 +46,8 @@ import {
   resetTokenSeq,
 } from './__fixtures__/v2-harness';
 import type { Token } from '../../../../types';
-import type { TxfToken } from '../../../../types/txf';
+// Wave 6-P2-18: the v1 `TxfToken` alias is deleted. The archive / forked
+// remote-merge APIs are `Map<string, unknown>` in the v2 slim rebuild.
 
 function makeToken(overrides: Partial<Token> = {}): Token {
   return {
@@ -149,7 +150,7 @@ describe('PaymentsModule import/export + repository API (v2 slim)', () => {
     expect(h.module.getArchivedTokens().size).toBe(0);
     expect(h.module.getBestArchivedVersion('none')).toBeNull();
 
-    const remote = new Map<string, TxfToken>([
+    const remote = new Map<string, unknown>([
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       ['a', { id: 'a' } as any],
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -169,7 +170,7 @@ describe('PaymentsModule import/export + repository API (v2 slim)', () => {
     await h.module.storeForkedToken('t1', 'state-a', { id: 't1' } as any);
     expect(h.module.getForkedTokens().size).toBe(1);
 
-    const remote = new Map<string, TxfToken>([
+    const remote = new Map<string, unknown>([
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       ['t1', { id: 't1' } as any],
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

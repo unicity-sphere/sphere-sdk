@@ -34,13 +34,28 @@ import type {
   TokenStorageProvider,
   TxfStorageDataBase,
 } from '../../../storage/storage-provider.js';
-import type { TxfToken } from '../../../types/txf.js';
 import type { PaymentsModule } from '../../../modules/payments/PaymentsModule.js';
 import {
   isTokenKey,
   isArchivedKey,
   isForkedKey,
 } from '../../../types/txf.js';
+
+/**
+ * Wave 6-P2-18: the v1 `LegacyTxfToken` name alias is deleted. The legacy
+ * import path processes state-transition-sdk v1-shape JSON tokens
+ * (that's the shape stored by pre-v2 TxfStorage); we hold them at the
+ * local minimal-interface level here rather than reintroducing the
+ * shared v1 alias.
+ */
+interface LegacyTxfToken {
+  genesis?: {
+    data?: {
+      tokenId?: string;
+    };
+  };
+  state?: unknown;
+}
 
 // =============================================================================
 // Types
@@ -56,7 +71,7 @@ export interface LegacyImportOptions {
 
 export interface LegacyImportResult {
   readonly success: boolean;
-  /** Active + archived TxfTokens extracted from legacy storage. */
+  /** Active + archived LegacyTxfTokens extracted from legacy storage. */
   readonly tokensFound: number;
   /**
    * Forked-token entries (`_forked_*`) found in legacy. Forks are
@@ -141,11 +156,11 @@ export async function importLegacyTokens(
     });
   }
 
-  // 2. Extract TxfToken values from the storage data. We collect from
+  // 2. Extract LegacyTxfToken values from the storage data. We collect from
   //    active and archived keys; forked entries (`_forked_*`) are
   //    counted but NOT imported — see LegacyImportResult.forksSkipped.
   //    Operational keys (_meta, _tombstones, _outbox, etc.) are skipped.
-  const { tokens: txfTokens, forksSkipped } = extractTxfTokensFromStorageData(loaded.data);
+  const { tokens: txfTokens, forksSkipped } = extractLegacyTxfTokensFromStorageData(loaded.data);
 
   if (options.dryRun) {
     return {
@@ -239,15 +254,15 @@ export async function importLegacyTokens(
 // Internal helpers
 // =============================================================================
 
-function extractTxfTokensFromStorageData(data: TxfStorageDataBase): {
-  tokens: TxfToken[];
+function extractLegacyTxfTokensFromStorageData(data: TxfStorageDataBase): {
+  tokens: LegacyTxfToken[];
   forksSkipped: number;
 } {
-  const tokens: TxfToken[] = [];
+  const tokens: LegacyTxfToken[] = [];
   let forksSkipped = 0;
   for (const [key, value] of Object.entries(data)) {
     if (!value || typeof value !== 'object') continue;
-    const candidate = value as Partial<TxfToken>;
+    const candidate = value as Partial<LegacyTxfToken>;
 
     if (isForkedKey(key)) {
       // Forks are NOT imported — promoting a fork would archive the
@@ -259,7 +274,7 @@ function extractTxfTokensFromStorageData(data: TxfStorageDataBase): {
     if (!(isTokenKey(key) || isArchivedKey(key))) continue;
 
     if (candidate.genesis && candidate.state && candidate.genesis.data?.tokenId) {
-      tokens.push(value as TxfToken);
+      tokens.push(value as LegacyTxfToken);
     }
   }
   return { tokens, forksSkipped };
