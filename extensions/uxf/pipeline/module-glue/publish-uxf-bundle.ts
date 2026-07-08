@@ -113,6 +113,12 @@ export async function publishUxfBundle(
   const senderField = {
     transportPubkey: host.identity.chainPubkey,
     ...(host.identity.nametag !== undefined ? { nametag: host.identity.nametag } : {}),
+    // Phase 6-P2-12: sender DIRECT hint eliminates the transport-binding
+    // race on receive that leaves auto-return unable to find a refund
+    // destination. See uxf-transfer.ts sender.directAddress JSDoc.
+    ...(host.identity.directAddress !== undefined
+      ? { directAddress: host.identity.directAddress }
+      : {}),
   };
   let payload: UxfTransferPayload;
   if (params.publishViaIpfsCid) {

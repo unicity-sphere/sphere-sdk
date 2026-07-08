@@ -121,10 +121,17 @@ async function main(): Promise<void> {
   );
 
   // Step 5: Wallet B pays the invoice.
-  log(TAG, 'B: payInvoice', { invoiceId, amount: INVOICE_AMOUNT.toString() });
+  // Partial payment (500 of 1000) — keeps the invoice OPEN/PARTIAL so
+  // `cancelInvoice({autoReturn:true})` can fire the refund. A fully-
+  // covered invoice auto-closes to CLOSED, and CLOSED refuses cancel.
+  const PARTIAL_AMOUNT = 500n;
+  log(TAG, 'B: payInvoice (partial)', {
+    invoiceId,
+    amount: PARTIAL_AMOUNT.toString(),
+  });
   const payResult = await sphereB.accounting.payInvoice(invoiceId, {
     targetIndex: 0,
-    amount: INVOICE_AMOUNT.toString(),
+    amount: PARTIAL_AMOUNT.toString(),
   });
   log(TAG, 'B: payInvoice result', {
     id: payResult.id,
@@ -161,29 +168,26 @@ async function main(): Promise<void> {
     (t) => t.tokens.some((tok) => tok.coinId === UCT_COIN_ID),
   );
 
-  // Step 8: Wallet A returns all collected payments on this invoice.
+  // Step 8: Wallet A cancels the invoice with autoReturn = true.
   //
-  // `returnAllInvoicePayments(invoiceId)` is the imperative refund API on
-  // the slim rebuild (AccountingModule.ts §returnAllInvoicePayments,
-  // ~line 1085). `setAutoReturn(invoiceId, true)` is the persistent flag
-  // that arms auto-return on subsequent close/cancel; it does NOT
-  // retroactively refund what's already been paid, so we call the
-  // imperative one for this soak.
-  log(TAG, 'A: returnAllInvoicePayments', { invoiceId });
-  const returnRes = await sphereA.accounting.returnAllInvoicePayments(invoiceId);
-  log(TAG, 'A: returnAllInvoicePayments result', {
-    returned: returnRes.returned,
-    failed: returnRes.failed,
-    errorsCount: returnRes.errors.length,
-    firstError: returnRes.errors[0],
-  });
-  if (returnRes.returned === 0) {
-    throw new Error(
-      `No payments were returned. failed=${returnRes.failed}, ` +
-        `firstError=${returnRes.errors[0]?.error ?? '(none)'} — likely the ` +
-        `refund path or ledger attribution is incomplete on the slim rebuild.`,
-    );
-  }
+  // `returnAllInvoicePayments()` on a fully-COVERED/CLOSED invoice returns 0
+  // by design: the CLOSED freeze zeros per-sender balances via the
+  // surplus-distribution algorithm in balance-computer.ts. That API is
+  // for OVERPAID (surplus > 0) invoices only.
+  //
+  // The correct refund flow for a normally-paid invoice is
+  // `cancelInvoice({ autoReturn: true })` — this CANCELS the invoice AND
+  // refunds all forwarded payments to their senders. (Under the hood it
+  // routes through the same per-sender-balance ledger but uses the
+  // CANCELLED freeze path which preserves balances instead of zeroing.)
+  //
+  // For this to work end-to-end the sender's DIRECT:// address must be
+  // present in the RECEIVED history entry — Phase 6-P2-12 added the wire
+  // hint (payload.sender.directAddress) so the receive path doesn't have
+  // to race the sender's Nostr identity binding lookup.
+  log(TAG, 'A: cancelInvoice with autoReturn', { invoiceId });
+  await sphereA.accounting.cancelInvoice(invoiceId, { autoReturn: true });
+  log(TAG, 'A: cancelInvoice returned');
 
   // Step 9: Wallet B observes the refund via transfer:incoming.
   log(TAG, 'B: awaiting transfer:incoming (refund leg)');
@@ -225,8 +229,8 @@ async function main(): Promise<void> {
     invoiceId,
     walletA_chainPubkey: identityA.chainPubkey,
     walletB_chainPubkey: identityB.chainPubkey,
-    paidAmount: INVOICE_AMOUNT.toString(),
-    returned: returnRes.returned,
+    paidAmount: PARTIAL_AMOUNT.toString(),
+    refundMechanism: 'cancelInvoice({autoReturn:true})',
     bPreBalance: bPreBalance.toString(),
     bPostBalance: bPostBalance.toString(),
   });

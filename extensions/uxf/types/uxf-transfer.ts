@@ -70,6 +70,30 @@ export interface UxfTransferPayloadBase {
      * identity-binding event. See §9.3 and T.7.B.5.
      */
     readonly nametag?: string;
+    /**
+     * Sender's L3 `DIRECT://` address. Phase-6 P2-12 addition.
+     *
+     * UNAUTHENTICATED on wire (same as `nametag`) — a hostile sender
+     * could claim any address. Used by receivers as a HINT to populate
+     * the RECEIVED history entry's `senderAddress` field, unblocking
+     * downstream refund / auto-return routing (see AccountingModule's
+     * `returnAllInvoicePayments` — refunds go to this address).
+     *
+     * Rationale: transport-binding lookup at receive time
+     * (`resolveTransportPubkeyInfo`) can race the sender's identity-
+     * binding publication and return null, leaving `senderAddress`
+     * unresolved and auto-return silently no-oping. The wire hint
+     * eliminates the race for cooperating peers; receivers still fall
+     * back to the binding lookup when the hint is absent (older peers
+     * or peers that opted out).
+     *
+     * SECURITY NOTE for auto-return callers: if a hostile sender
+     * claims a `directAddress` they don't control, the refund goes to
+     * that address — but the funds are the caller's own money being
+     * refunded, so the sender only harms themselves. No receiver-side
+     * risk.
+     */
+    readonly directAddress?: string;
   };
 }
 
