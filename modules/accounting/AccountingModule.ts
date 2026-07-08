@@ -476,6 +476,37 @@ export class AccountingModule {
         token: Buffer.from(blob.token).toString('base64'),
       };
 
+      // Phase-6 UXF v2 fork: register the invoice token in payments so
+      // `sphere.payments.getToken(invoiceId)` returns it. This preserves
+      // the cross-process contract used by escrow-service (and any other
+      // module that treats the invoice as a first-class token) — without
+      // this registration, `payments.getToken(invoiceId)` returns
+      // undefined and the caller can't reach the sdkData envelope after
+      // createInvoice returns.
+      try {
+        const nowMs = Date.now();
+        const uiToken: import('../../types').Token = {
+          id: invoiceId,
+          coinId: '',
+          symbol: 'INVOICE',
+          name: 'Invoice',
+          decimals: 0,
+          amount: '0',
+          status: 'confirmed',
+          createdAt: nowMs,
+          updatedAt: nowMs,
+          sdkData: JSON.stringify(token),
+        };
+        await deps.payments.addToken(uiToken);
+      } catch (err) {
+        // Non-fatal — the invoice itself is minted successfully. Log
+        // and continue so callers still get the token via the return.
+        logger.warn(
+          LOG_TAG,
+          `createInvoice: failed to register invoice token in payments: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
       // Emit event and hand back result.
       deps.emitEvent('invoice:created', { invoiceId, confirmed: true });
 
