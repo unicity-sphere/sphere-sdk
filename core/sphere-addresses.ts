@@ -498,6 +498,12 @@ export async function postSwitchSyncImpl(
 
     if (!host._payments.hasNametag()) {
       logger.debug('Sphere', `Minting nametag token for @${newNametag}...`);
+      // Phase 6-P2-15: ensure v2 token engine is ready before minting.
+      // `postSwitchSync` runs detached from `switchToAddress`, so it can
+      // race the async trust-base fetch on first init. Without this
+      // await the mint fires with `deps.tokenEngine === null` and
+      // returns "Token engine not available".
+      await host.ensureTokenEngine();
       try {
         const result = await host.mintNametag(newNametag);
         if (result.success) {
@@ -517,6 +523,8 @@ export async function postSwitchSyncImpl(
   } else if (host._identity?.nametag && !host._payments.hasNametag()) {
     // Existing address with nametag but missing token — mint it
     logger.debug('Sphere', `Unicity ID @${host._identity.nametag} has no token after switch, minting...`);
+    // Phase 6-P2-15: same rationale as above — ensure v2 engine ready.
+    await host.ensureTokenEngine();
     try {
       const result = await host.mintNametag(host._identity.nametag);
       if (result.success) {

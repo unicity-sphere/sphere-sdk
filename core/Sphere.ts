@@ -1600,6 +1600,10 @@ export class Sphere {
     if (sphere._identity?.nametag && !sphere._payments.hasNametag()) {
       progress?.({ step: 'registering_nametag', message: 'Restoring nametag token...' });
       logger.debug('Sphere', `Unicity ID @${sphere._identity.nametag} has no token, attempting to mint...`);
+      // Phase 6-P2-15: ensure v2 engine is ready before minting — this
+      // background retry runs off Sphere.init but predates the trust-base
+      // fetch settling on slow networks.
+      await sphere.ensureTokenEngine();
       try {
         const result = await sphere.mintNametag(sphere._identity.nametag);
         if (result.success) {
