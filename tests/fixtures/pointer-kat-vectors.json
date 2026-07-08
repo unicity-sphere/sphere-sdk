@@ -1,8 +1,8 @@
 {
   "$schema": "SPEC §14 KAT vectors for Profile Aggregator Pointer Layer",
-  "description": "Known-Answer Test vectors. Inputs are non-secret test values. Outputs pinned from a correct impl of SPEC §3, §4.",
-  "spec_version": "v3.3",
-  "computed_at": "2026-04-21T13:47:07.070Z",
+  "description": "Known-Answer Test vectors. Inputs are non-secret test values. Outputs pinned from a correct impl of SPEC §3, §4. Regenerated in wave 6-P2-16 for v2 SDK — new SigningService(seed) uses the seed directly as scalar (no createFromSecret hash step) so signingPubKey_hex and StateId values differ from the v1 KAT.",
+  "spec_version": "v3.3-v2",
+  "computed_at": "2026-07-08T00:00:00.000Z",
   "inputs": {
     "walletPrivateKey_hex": "0101010101010101010101010101010101010101010101010101010101010101",
     "walletPrivateKey_note": "32 bytes, all 0x01 — canonical test value, NOT a real wallet",
@@ -23,9 +23,10 @@
     "signingSeed_hex": "12f93cecbf9ce82acc8f6cca0b68d8d2785f97df3e323eb18cd604abbff5df88",
     "xorSeed_hex": "fc6a39782f385661ff26a3041d28025e565a7d020100aab41f6c4bce27ce085d",
     "padSeed_hex": "94e467b5b2b249e63845daf215af681b3a82340d6817fc1ece47277ffaa67117",
-    "signingScalar_hex": "8daffba2847ff017ce1d4462fa390209662a0ca1811dbadcc527798864155d62",
-    "signingPubKey_hex": "03464815898a4f571f94703df31a1643117ec4075c9f16c8c172ef4d8b3cadda1f",
-    "signingPubKey_len": 33
+    "signingScalar_hex": "12f93cecbf9ce82acc8f6cca0b68d8d2785f97df3e323eb18cd604abbff5df88",
+    "signingPubKey_hex": "032591ae0f9bdcc446c972da5830144fd48c386dc8b230ecc4118c2bcd86721cdf",
+    "signingPubKey_len": 33,
+    "signingScalar_note": "v2 semantics — the SDK's SigningService constructor uses the input as the scalar directly (v1's createFromSecret SHA-256-hashed the input first)."
   },
   "per_version_per_side": {
     "v_1": {
@@ -35,8 +36,9 @@
       "xorKey_B_hex": "8f781a5e84b640c069888d97d63ac59c5579cd77147403c0647e57943068da8e",
       "paddingBytes_cidLen36_hex": "84cd9cfbf5b8b68d96bd358df4c11b2007d9e52774a0d00653920a",
       "paddingBytes_cidLen36_len": 27,
-      "requestId_A_hex": "c12cbfef6146507daee1b5874e54c2670a523cb37d65dbde8ccce7a93037b821",
-      "requestId_B_hex": "a521d2a2a71cc08722d0a57629a2b4af2d8ab2b1e56f88972a4201caa3aef588"
+      "stateId_A_hex": "18f364d6eb8beaf5a7ff5863f1bf05bbeec78b7896378fa60eb202e0f9b7097e",
+      "stateId_B_hex": "c62b2e103dff35085a658252ec452ad2607a2972b51979dda805be11191d4fd1",
+      "stateId_note": "v2 StateId = SHA256(CBOR([lockScript CBOR, stateHashDigest])) where lockScript is EncodedPredicate.fromPredicate(SignaturePredicate.create(signingPubKey))."
     }
   },
   "domain_separation_check": {

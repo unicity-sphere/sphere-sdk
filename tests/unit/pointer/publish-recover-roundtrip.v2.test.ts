@@ -1,45 +1,56 @@
 /**
- * Wave 6-P2-10b — publish → decode round-trip coverage restoration.
+ * Wave 6-P2-16 — publish → decode round-trip on the v2 aggregator API.
  *
- * The legacy integration in tests/legacy-v1/integration/pointer/publish-recover-roundtrip.test.ts
- * exercised the full `ProfilePointerLayer.publish` → `recoverLatest` path.
- * That layer has many external deps (fetchAndJoin, resolveRemoteCid, mutex,
- * BLOCKED-state flag store, etc.) — restoring the whole surface into a unit
- * test requires more scaffolding than the wave-10b budget allows.
- *
- * This file restores the CORE round-trip contract that both paths depend on:
+ * The v2 aggregator replaces v1's
+ * `submitCommitment(requestId, transactionHash, authenticator)` with
+ * `submitCertificationRequest(certificationData)` and derives a `StateId`
+ * from the lockScript+sourceStateHash. This test verifies:
  *
  *   1. A publisher (submitPointer) commits a CID at version v. The
- *      aggregator receives two DataHash commitments — one per side.
- *      Each hash's `data` is the ciphertext `ctSide` (SPEC §6).
+ *      aggregator receives a CertificationData whose transactionHash
+ *      carries the ciphertext `ctSide` (SPEC §6).
  *
  *   2. A recoverer (decodeVersionCid) later reads back the inclusion
- *      proofs. The proof's transactionHash MUST carry the SAME ct bytes
- *      the submitter stored, because the aggregator's SMT is content-
- *      addressed by DataHash. XOR-decoding those ct bytes against the
- *      per-side xorKey recovers the 32-byte plaintext half; concatenated
- *      + length-prefix-decoded, they yield the original cidBytes.
+ *      proof by StateId. The proof's certificationData.transactionHash
+ *      MUST carry the SAME ct bytes the submitter stored — XOR-decoding
+ *      those against the per-side xorKey recovers the plaintext half.
  *
- * The fake aggregator here memoizes `requestId.toString() → ct.data` on
- * submit and echoes `ct.data` back on getInclusionProof. It does NOT run
- * merkle-path or signature verification — the fake proof's `verify()`
- * returns OK unconditionally. That is exactly what the round-trip
- * contract requires: what's on the wire in equals what comes out later.
- *
- * Coverage:
- *   - Single-round-trip: publish v=1, decodeVersionCid at v=1 recovers cidBytes
- *   - Distinct wallets: seed A publishes; a wallet-B recover attempt fails
- *     (transient) because seed B derives different request IDs
- *   - Cross-version: publish v=1 only → decodeVersionCid at v=2 returns
- *     'transient' (nothing stored under those request IDs)
- *   - Round-trip with multi-byte cidBytes: prove the length-prefix decoder
- *     survives non-trivial CID lengths (36 bytes = typical CIDv1 sha256 raw)
+ * The fake aggregator memoizes `stateId.toString() → certificationData` on
+ * submit and echoes the certificationData back on getInclusionProof.
+ * `InclusionProofVerificationRule.verify` is mocked to return OK when a
+ * committed record exists (the round-trip contract does not need real
+ * merkle-path cryptography).
  */
 
-import { describe, it, expect } from 'vitest';
-import { SubmitCommitmentStatus } from 'stsdk-v1/lib/api/SubmitCommitmentResponse.js';
-import type { AggregatorClient } from 'stsdk-v1/lib/api/AggregatorClient.js';
-import type { RootTrustBase } from 'stsdk-v1/lib/bft/RootTrustBase.js';
+import { describe, it, expect, vi } from 'vitest';
+import {
+  AggregatorClient,
+  CertificationData,
+  CertificationStatus,
+  InclusionProofVerificationStatus,
+  RootTrustBase,
+  StateId,
+} from '../../../token-engine/sdk.js';
+
+// Mock InclusionProofVerificationRule so the probe path succeeds whenever
+// the fake aggregator has a matching commitment stored. When there is no
+// commitment (fake proof carries no certificationData) the mock returns
+// INCLUSION_CERTIFICATE_MISSING so the runDecodePhases path reports
+// 'semantic' failure — matching the v1 round-trip contract.
+vi.mock('../../../token-engine/sdk.js', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    InclusionProofVerificationRule: {
+      verify: vi.fn(async (_trustBase, _predVerifier, proof) => {
+        if (proof && (proof.__missing || proof.certificationData == null)) {
+          return { status: InclusionProofVerificationStatus.INCLUSION_CERTIFICATE_MISSING };
+        }
+        return { status: InclusionProofVerificationStatus.OK };
+      }),
+    },
+  };
+});
 
 import {
   submitPointer,
@@ -65,54 +76,56 @@ async function fixturesFromSeed(seed: Uint8Array): Promise<Fixtures> {
 
 interface FakeAggregator {
   client: AggregatorClient;
-  commitments: Map<string, Uint8Array>;
+  commitments: Map<string, CertificationData>;
+}
+
+function stateIdKey(stateId: StateId): string {
+  return Array.from(stateId.data)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 /**
- * Build a fake aggregator that stores per-`requestId` the ciphertext bytes
- * carried by `transactionHash.data`, then echoes them back on
- * `getInclusionProof`.
- *
- * The fake proof's `verify()` returns OK unconditionally — the round-trip
- * contract doesn't need real inclusion-proof cryptography.
+ * Build a fake aggregator that stores per-`stateId` the CertificationData
+ * received via submitCertificationRequest, then echoes it back on
+ * getInclusionProof(stateId).
  */
 function makeFakeAggregator(): FakeAggregator {
-  const commitments = new Map<string, Uint8Array>();
+  const commitments = new Map<string, CertificationData>();
   const client = {
-    async submitCommitment(
-      requestId: { toString(): string },
-      transactionHash: { data: Uint8Array },
-      _authenticator: unknown,
-    ) {
-      commitments.set(requestId.toString(), new Uint8Array(transactionHash.data));
-      return { status: SubmitCommitmentStatus.SUCCESS };
+    async submitCertificationRequest(certificationData: CertificationData) {
+      const stateId = await StateId.fromCertificationData(certificationData);
+      commitments.set(stateIdKey(stateId), certificationData);
+      return { status: CertificationStatus.SUCCESS };
     },
-    async getInclusionProof(requestId: { toString(): string }) {
-      const stored = commitments.get(requestId.toString());
+    async getInclusionProof(stateId: StateId) {
+      const stored = commitments.get(stateIdKey(stateId));
       if (!stored) {
+        // No commitment — return a proof whose mocked verify() reports
+        // INCLUSION_CERTIFICATE_MISSING.
         return {
           inclusionProof: {
-            verify: async () => 'PATH_NOT_INCLUDED',
-            transactionHash: null,
+            __missing: true,
+            certificationData: null,
+            inclusionCertificate: null,
             unicityCertificate: {
               unicitySeal: { epoch: 1n },
               inputRecord: { epoch: 1n },
             },
           },
+          blockNumber: 0n,
         };
       }
       return {
         inclusionProof: {
-          verify: async () => 'OK',
-          transactionHash: {
-            data: stored,
-            imprint: new Uint8Array([0x00, 0x00, ...stored]),
-          },
+          certificationData: stored,
+          inclusionCertificate: {},
           unicityCertificate: {
             unicitySeal: { epoch: 1n },
             inputRecord: { epoch: 1n },
           },
         },
+        blockNumber: 1n,
       };
     },
   } as unknown as AggregatorClient;
@@ -121,13 +134,6 @@ function makeFakeAggregator(): FakeAggregator {
 
 const fakeTrustBase = { epoch: 1n } as unknown as RootTrustBase;
 
-/**
- * Length-prefix CID decoder — matches the production wiring's contract.
- * The 64-byte plaintext `full` buffer is:
- *   [0]              = cidLen (uint8, non-zero)
- *   [1..1+cidLen]    = cidBytes
- *   [1+cidLen..64]   = derived padding
- */
 const lengthPrefixCidDecoder: CidDecoder = (full) => {
   if (full.length === 0) return { ok: false };
   const cidLen = full[0];
@@ -139,7 +145,7 @@ const lengthPrefixCidDecoder: CidDecoder = (full) => {
 
 // ── Round-trip tests ──────────────────────────────────────────────────────
 
-describe('publish → decode round-trip (T-C1 ↔ T-C2 contract)', () => {
+describe('publish → decode round-trip (T-C1 ↔ T-C2 contract, v2 API)', () => {
   it('publishes cidBytes at v=1 and decodeVersionCid recovers the same bytes', async () => {
     const seed = new Uint8Array(32).fill(0x33);
     const { keyMaterial, signer } = await fixturesFromSeed(seed);
@@ -155,7 +161,6 @@ describe('publish → decode round-trip (T-C1 ↔ T-C2 contract)', () => {
       aggregatorClient: client,
       marker: null,
     });
-    // Both sides SUCCESS → row 1 of §7.3.
     expect(outcome.kind).toBe('success');
 
     const recovered = await decodeVersionCid({
@@ -177,7 +182,6 @@ describe('publish → decode round-trip (T-C1 ↔ T-C2 contract)', () => {
     const { keyMaterial, signer } = await fixturesFromSeed(seed);
     const { client } = makeFakeAggregator();
 
-    // CID_MAX_BYTES = 63.
     const cidBytes = new Uint8Array(63);
     for (let i = 0; i < 63; i++) cidBytes[i] = (i * 7 + 13) & 0xff;
 
@@ -236,7 +240,7 @@ describe('publish → decode round-trip (T-C1 ↔ T-C2 contract)', () => {
     }
   });
 
-  it('recovering at an unpublished version returns { ok:false, reason:"transient" }', async () => {
+  it('recovering at an unpublished version returns { ok:false, reason:"semantic" }', async () => {
     const seed = new Uint8Array(32).fill(0x66);
     const { keyMaterial, signer } = await fixturesFromSeed(seed);
     const { client } = makeFakeAggregator();
@@ -251,9 +255,6 @@ describe('publish → decode round-trip (T-C1 ↔ T-C2 contract)', () => {
       marker: null,
     });
 
-    // We asked to decode v=2 but only v=1 was published. The fake
-    // aggregator returns "no proof stored" → verify → PATH_NOT_INCLUDED
-    // on both sides → decode phase reports 'semantic' outcome per SPEC.
     const recovered = await decodeVersionCid({
       v: 2,
       keyMaterial,
@@ -269,18 +270,12 @@ describe('publish → decode round-trip (T-C1 ↔ T-C2 contract)', () => {
   });
 
   it('cross-wallet: seed-A publishes; seed-B recover returns { ok:false } (isolation)', async () => {
-    // Two independent wallets share the same aggregator. Seed B's request
-    // IDs are derived from seed B's signingPubKey — they do NOT collide with
-    // seed A's request IDs, so seed B sees "no proof stored" at v=1 → the
-    // fake proof carries no data, decodeCid reports 'semantic'. This
-    // proves per-wallet key isolation from the round-trip's perspective.
     const seedA = new Uint8Array(32).fill(0x88);
     const seedB = new Uint8Array(32).fill(0x99);
     const fixA = await fixturesFromSeed(seedA);
     const fixB = await fixturesFromSeed(seedB);
     const { client } = makeFakeAggregator();
 
-    // Sanity check that the derived pubkeys are actually distinct.
     expect(fixA.signer.signingPubKeyHex).not.toBe(fixB.signer.signingPubKeyHex);
 
     const cidBytes = new Uint8Array(36).fill(0xaa);
@@ -293,7 +288,6 @@ describe('publish → decode round-trip (T-C1 ↔ T-C2 contract)', () => {
       marker: null,
     });
 
-    // A recovers OK.
     const recoveredA = await decodeVersionCid({
       v: 1,
       keyMaterial: fixA.keyMaterial,
@@ -304,7 +298,6 @@ describe('publish → decode round-trip (T-C1 ↔ T-C2 contract)', () => {
     });
     expect(recoveredA.ok).toBe(true);
 
-    // B sees nothing at v=1 under its own request IDs.
     const recoveredB = await decodeVersionCid({
       v: 1,
       keyMaterial: fixB.keyMaterial,

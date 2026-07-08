@@ -1,48 +1,38 @@
 /**
- * Wave 6-P2-10b — Aggregator submit (T-C1) coverage restoration.
+ * Wave 6-P2-16 — Aggregator submit (T-C1) v2 API coverage.
  *
- * Legacy tests in tests/legacy-v1/unit/profile/pointer/aggregator-submit.test.ts
- * were quarantined in wave 6-P2-5. This file restores the core §7.3
- * state-machine coverage using the pointer layer's own `__internal`
- * test-only exports (classifySideResult, combineOutcomes) — the same
- * hooks the module publishes for out-of-band verification.
+ * The v2 state-transition SDK replaced v1's
+ * `submitCommitment(requestId, transactionHash, authenticator)` /
+ * `SubmitCommitmentStatus` with
+ * `submitCertificationRequest(certificationData)` /
+ * `CertificationStatus`. The pointer classifier's
+ * `SUCCESS/REJECTED/AGGREGATOR_REJECTED/EXISTS` buckets are unchanged;
+ * only the on-wire status strings differ. This file locks in the
+ * v2-status mappings and re-asserts the SPEC §7.3 13-row state machine.
  *
- * Coverage split:
+ * Bucket mapping (`REJECTED_STATUSES` and `AGGREGATOR_REJECTED_STATUSES`
+ * are exported via `__internal` for reference):
  *
- *   classifySideResult — per-side settled-Promise → SideOutcome mapping:
- *     - SUCCESS / REQUEST_ID_EXISTS / AUTHENTICATOR_VERIFICATION_FAILED /
- *       REQUEST_ID_MISMATCH → 'success' / 'exists' / 'rejected'
- *     - Unknown SubmitCommitmentStatus → 'protocol_error'
- *     - JsonRpcNetworkError 429 → 'retry_after' with 1s default
- *     - JsonRpcNetworkError 5xx → 'backoff' (retry-with-budget)
- *     - JsonRpcNetworkError 4xx (not 429) → 'aggregator_rejected' permanent
- *     - JsonRpcError -32006 (ConcurrencyLimit) → 'retry_after' 1s
- *     - JsonRpcError other → 'protocol_error'
- *     - SyntaxError (parse failure) → 'protocol_error'
- *     - Unclassified Error → 'network_error'
+ *   SUCCESS                                → 'success'      (row 1)
+ *   SIGNATURE_VERIFICATION_FAILED          → 'rejected'     (row 9)
+ *   INVALID_SIGNATURE_FORMAT               → 'rejected'     (row 9)
+ *   INVALID_PUBLIC_KEY_FORMAT              → 'rejected'     (row 9)
+ *   STATE_ID_MISMATCH                      → 'aggregator_rejected' (row 12)
+ *   INVALID_SOURCE_STATE_HASH_FORMAT       → 'aggregator_rejected' (row 12)
+ *   INVALID_TRANSACTION_HASH_FORMAT        → 'aggregator_rejected' (row 12)
+ *   UNSUPPORTED_ALGORITHM                  → 'aggregator_rejected' (row 12)
+ *   INVALID_SHARD                          → 'aggregator_rejected' (row 12)
+ *   any other status string                → 'exists'  (v2 tolerance
+ *     contract: unknown statuses mean "certification for this state
+ *     may already exist"; pointer's marker-match / isIdempotentRetryHint
+ *     path then discriminates row 4 vs row 5)
  *
- *   combineOutcomes — SPEC §7.3 13-row state machine:
- *     Row 1 — SUCCESS + SUCCESS → { kind:'success', v }
- *     Row 2/3 — SUCCESS + REQUEST_ID_EXISTS (either side) → 'idempotent_replay'
- *     Row 4 — EXISTS + EXISTS with idempotent hint → 'idempotent_replay'
- *     Row 5 — EXISTS + EXISTS fresh publish (no hint) → 'conflict'
- *     Row 6/7 — SUCCESS + network_error → 'retry_side' with committedSideKind='success'
- *     Row 6/7 (variant) — EXISTS + network_error → 'retry_side' with committedSideKind='exists'
- *     Row 8 — network_error + network_error → 'retry_both'
- *     Row 9 — REJECTED (either side) → 'rejected' with failedSide + reason
- *     Row 10 — 'retry_after' priority takes precedence over 5xx backoff
- *     Row 11 — 5xx backoff (no retry_after present)
- *     Row 12 — 4xx (aggregator_rejected) — permanent
- *     Row 13 — JSON-RPC -32006 → maps to retry_after in classifySideResult
- *     Row 14/15 — SyntaxError / unknown status → protocol_error precedence
- *
- * The tests exercise ONLY the pure classification + reducer logic. No real
- * signing, no key derivation, no aggregator client. This mirrors the
- * module's own `__internal` export contract.
+ * The state-machine combineOutcomes tests are the same as v1; only the
+ * per-side classification renames.
  */
 
 import { describe, it, expect } from 'vitest';
-import { SubmitCommitmentStatus } from 'stsdk-v1/lib/api/SubmitCommitmentResponse.js';
+import { CertificationStatus } from '../../../token-engine/sdk.js';
 
 import { __internal } from '../../../extensions/uxf/profile/aggregator-pointer/aggregator-submit.js';
 import { SIDE_A_NUM, SIDE_B_NUM } from '../../../extensions/uxf/profile/aggregator-pointer/types.js';
@@ -52,7 +42,7 @@ const { classifySideResult, combineOutcomes } = __internal;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function fulfilled(status: SubmitCommitmentStatus) {
+function fulfilled(status: string) {
   return { status: 'fulfilled' as const, value: { status } };
 }
 
@@ -82,38 +72,72 @@ const CID_HASH = new Uint8Array(32).fill(0xcd);
 
 describe('classifySideResult (per-side outcome mapping)', () => {
   it('maps SUCCESS → success', () => {
-    expect(classifySideResult(fulfilled(SubmitCommitmentStatus.SUCCESS))).toEqual({
+    expect(classifySideResult(fulfilled(CertificationStatus.SUCCESS))).toEqual({
       type: 'success',
     });
   });
 
-  it('maps REQUEST_ID_EXISTS → exists', () => {
-    expect(classifySideResult(fulfilled(SubmitCommitmentStatus.REQUEST_ID_EXISTS))).toEqual({
-      type: 'exists',
-    });
-  });
-
-  it('maps AUTHENTICATOR_VERIFICATION_FAILED → rejected', () => {
+  it('maps SIGNATURE_VERIFICATION_FAILED → rejected (row 9 H8 v-burn)', () => {
     expect(
-      classifySideResult(fulfilled(SubmitCommitmentStatus.AUTHENTICATOR_VERIFICATION_FAILED)),
+      classifySideResult(fulfilled(CertificationStatus.SIGNATURE_VERIFICATION_FAILED)),
     ).toEqual({
       type: 'rejected',
-      reason: 'AUTHENTICATOR_VERIFICATION_FAILED',
+      reason: CertificationStatus.SIGNATURE_VERIFICATION_FAILED,
     });
   });
 
-  it('maps REQUEST_ID_MISMATCH → rejected', () => {
-    expect(classifySideResult(fulfilled(SubmitCommitmentStatus.REQUEST_ID_MISMATCH))).toEqual({
+  it('maps INVALID_SIGNATURE_FORMAT → rejected (row 9 H8 v-burn)', () => {
+    expect(
+      classifySideResult(fulfilled(CertificationStatus.INVALID_SIGNATURE_FORMAT)),
+    ).toEqual({
       type: 'rejected',
-      reason: 'REQUEST_ID_MISMATCH',
+      reason: CertificationStatus.INVALID_SIGNATURE_FORMAT,
     });
   });
 
-  it('maps unknown SubmitCommitmentStatus → protocol_error (row 15 fail-closed)', () => {
-    const out = classifySideResult(
-      fulfilled('SOMETHING_NEW' as unknown as SubmitCommitmentStatus),
-    );
-    expect(out.type).toBe('protocol_error');
+  it('maps INVALID_PUBLIC_KEY_FORMAT → rejected (row 9 H8 v-burn)', () => {
+    expect(
+      classifySideResult(fulfilled(CertificationStatus.INVALID_PUBLIC_KEY_FORMAT)),
+    ).toEqual({
+      type: 'rejected',
+      reason: CertificationStatus.INVALID_PUBLIC_KEY_FORMAT,
+    });
+  });
+
+  it('maps STATE_ID_MISMATCH → aggregator_rejected (row 12 permanent)', () => {
+    const out = classifySideResult(fulfilled(CertificationStatus.STATE_ID_MISMATCH));
+    expect(out.type).toBe('aggregator_rejected');
+  });
+
+  it('maps INVALID_SOURCE_STATE_HASH_FORMAT → aggregator_rejected', () => {
+    const out = classifySideResult(fulfilled(CertificationStatus.INVALID_SOURCE_STATE_HASH_FORMAT));
+    expect(out.type).toBe('aggregator_rejected');
+  });
+
+  it('maps INVALID_TRANSACTION_HASH_FORMAT → aggregator_rejected', () => {
+    const out = classifySideResult(fulfilled(CertificationStatus.INVALID_TRANSACTION_HASH_FORMAT));
+    expect(out.type).toBe('aggregator_rejected');
+  });
+
+  it('maps UNSUPPORTED_ALGORITHM → aggregator_rejected', () => {
+    const out = classifySideResult(fulfilled(CertificationStatus.UNSUPPORTED_ALGORITHM));
+    expect(out.type).toBe('aggregator_rejected');
+  });
+
+  it('maps INVALID_SHARD → aggregator_rejected', () => {
+    const out = classifySideResult(fulfilled(CertificationStatus.INVALID_SHARD));
+    expect(out.type).toBe('aggregator_rejected');
+  });
+
+  it('maps unknown status string → exists (v2 tolerance contract)', () => {
+    // Per CertificationResponse.d.ts, the aggregator may emit statuses
+    // unknown to this SDK version — the caller must NOT fail-closed, and
+    // must instead treat them as "certification for this state may
+    // already exist". The pointer's H2/H3 state machine then applies
+    // marker-match / isIdempotentRetryHint to distinguish idempotent
+    // replay (row 4) from cross-device conflict (row 5).
+    const out = classifySideResult(fulfilled('SOMETHING_NEW'));
+    expect(out.type).toBe('exists');
   });
 
   it('maps HTTP 429 → retry_after with 1s default (SDK cannot read Retry-After)', () => {
@@ -251,8 +275,6 @@ describe('combineOutcomes (SPEC §7.3 13-row state machine)', () => {
   });
 
   it('row 6 variant: EXISTS + network_error → retry_side B, committedSideKind=exists', () => {
-    // Signals a cross-device race: the sibling committed at THIS side,
-    // so the retry loop must NOT escalate isIdempotentRetryHint.
     const out = combineOutcomes(
       { type: 'exists' },
       { type: 'network_error' },
@@ -280,7 +302,7 @@ describe('combineOutcomes (SPEC §7.3 13-row state machine)', () => {
 
   it('row 9: rejected side A → { kind:"rejected", failedSide:A, reason }', () => {
     const out = combineOutcomes(
-      { type: 'rejected', reason: 'AUTHENTICATOR_VERIFICATION_FAILED' },
+      { type: 'rejected', reason: CertificationStatus.SIGNATURE_VERIFICATION_FAILED },
       { type: 'success' },
       V,
       CID_BYTES,
@@ -290,14 +312,14 @@ describe('combineOutcomes (SPEC §7.3 13-row state machine)', () => {
       kind: 'rejected',
       v: V,
       failedSide: SIDE_A_NUM,
-      reason: 'AUTHENTICATOR_VERIFICATION_FAILED',
+      reason: CertificationStatus.SIGNATURE_VERIFICATION_FAILED,
     });
   });
 
   it('row 9: rejected side B when A is SUCCESS → failedSide=B', () => {
     const out = combineOutcomes(
       { type: 'success' },
-      { type: 'rejected', reason: 'REQUEST_ID_MISMATCH' },
+      { type: 'rejected', reason: CertificationStatus.INVALID_PUBLIC_KEY_FORMAT },
       V,
       CID_BYTES,
       null,
@@ -306,7 +328,7 @@ describe('combineOutcomes (SPEC §7.3 13-row state machine)', () => {
       kind: 'rejected',
       v: V,
       failedSide: SIDE_B_NUM,
-      reason: 'REQUEST_ID_MISMATCH',
+      reason: CertificationStatus.INVALID_PUBLIC_KEY_FORMAT,
     });
   });
 
@@ -377,10 +399,9 @@ describe('combineOutcomes (SPEC §7.3 13-row state machine)', () => {
   });
 
   it('protocol_error precedence: even when side B is REJECTED, A protocol_error wins', () => {
-    // The reducer's priority order guarantees protocol_error > rejected.
     const out = combineOutcomes(
       { type: 'protocol_error', reason: 'JSON parse failed' },
-      { type: 'rejected', reason: 'AUTHENTICATOR_VERIFICATION_FAILED' },
+      { type: 'rejected', reason: CertificationStatus.SIGNATURE_VERIFICATION_FAILED },
       V,
       CID_BYTES,
       null,

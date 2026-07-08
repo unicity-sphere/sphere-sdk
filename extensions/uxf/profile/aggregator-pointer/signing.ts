@@ -1,18 +1,20 @@
 /**
- * SigningService wrapper (T-A8) — enforces SPEC §4.3 `createFromSecret`
- * discipline.
+ * SigningService wrapper (T-A8) — v2 migration (Wave 6-P2-16).
  *
- * The SDK's raw `new SigningService(privKey)` constructor uses the
- * 32-byte input AS the scalar. createFromSecret SHA-256-hashes the
- * input first, producing a different signingPubKey for the same seed.
- * These are non-interoperable. This wrapper ensures the pointer layer
- * always uses createFromSecret.
+ * The v2 `SigningService` constructor uses the 32-byte input directly AS the
+ * scalar. There is no v1-style `createFromSecret` hash-then-scalar helper on
+ * the v2 SDK. For testnet2 the pointer signing key is therefore derived
+ * one-to-one from the HKDF `signingSeed`: `pubkey = curve.G * signingSeed`.
  *
- * The wrapper also captures signingPubKey as hex for use in
- * MUTEX_KEY / PENDING_VERSION_KEY / BLOCKED_FLAG_KEY templates.
+ * Non-interop note: this changes the derived `signingPubKey` for every wallet
+ * relative to the v1 pointer layer (which SHA-256-hashed the seed via
+ * `createFromSecret`). Testnet2 wallets are fresh; there is no wallet on both
+ * networks. The wrapper still exists — it captures `signingPubKey` as hex
+ * for use in `MUTEX_KEY` / `PENDING_VERSION_KEY` / `BLOCKED_FLAG_KEY`
+ * templates.
  */
 
-import { SigningService } from 'stsdk-v1/lib/sign/SigningService.js';
+import { SigningService } from '../../../../token-engine/sdk.js';
 import type { SecretKey } from './secret-key.js';
 
 export interface PointerSigner {
@@ -24,13 +26,13 @@ export interface PointerSigner {
 /**
  * Build the pointer-layer signer from the HKDF-derived signingSeed.
  *
- * Uses SigningService.createFromSecret(seed) — NEVER the raw
- * constructor. Tests (and P4 AST-grep) enforce this.
+ * v2 semantics: `new SigningService(seed)` uses the seed AS the scalar.
+ * The caller-owned `signingSeed.reveal()` copy is zeroed after use.
  */
 export async function buildPointerSigner(signingSeed: SecretKey): Promise<PointerSigner> {
   const seed = signingSeed.reveal();
   try {
-    const service = await SigningService.createFromSecret(seed);
+    const service = new SigningService(seed);
     const signingPubKey = service.publicKey;
     const signingPubKeyHex = bytesToHex(signingPubKey);
     return { service, signingPubKey, signingPubKeyHex };

@@ -35,10 +35,13 @@
  * reject any `v !== 1`.
  */
 
-import { DataHasher } from 'stsdk-v1/lib/hash/DataHasher.js';
-import { HashAlgorithm } from 'stsdk-v1/lib/hash/HashAlgorithm.js';
-import { Signature } from 'stsdk-v1/lib/sign/Signature.js';
-import { SigningService } from 'stsdk-v1/lib/sign/SigningService.js';
+import {
+  DataHash,
+  DataHasher,
+  HashAlgorithm,
+  Signature,
+  SigningService,
+} from '../../../../token-engine/sdk.js';
 import type { PointerSigner } from './signing.js';
 
 /**
@@ -117,7 +120,7 @@ export function buildWinBroadcastTag(signingPubKeyHex: string): string {
  */
 export async function buildWinBroadcastHash(
   payload: UnsignedWinBroadcastPayload,
-): Promise<import('stsdk-v1/lib/hash/DataHash.js').DataHash> {
+): Promise<DataHash> {
   if (payload.v !== WIN_BROADCAST_SCHEMA_VERSION) {
     throw new Error(`buildWinBroadcastHash: unsupported schema version ${payload.v}`);
   }
