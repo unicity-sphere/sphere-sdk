@@ -986,6 +986,11 @@ export class PaymentsModule {
       sender: {
         transportPubkey: identity.chainPubkey,
         ...(identity.nametag !== undefined ? { nametag: identity.nametag } : {}),
+        // Phase 6-P2-12: sender DIRECT hint eliminates transport-binding race
+        // on receive (see uxf-transfer.ts sender.directAddress JSDoc).
+        ...(identity.directAddress !== undefined
+          ? { directAddress: identity.directAddress }
+          : {}),
       },
       ...(memo !== undefined ? { memo } : {}),
       carBase64,
@@ -1228,20 +1233,30 @@ export class PaymentsModule {
         // "coverage counted but sender cannot be refunded" (documented on
         // `IncomingTransfer.senderAddress`).
         let senderDirectAddress: string | undefined;
-        try {
-          const resolveInfo = this.deps!.transport.resolveTransportPubkeyInfo;
-          if (resolveInfo) {
-            const info = await resolveInfo(transfer.senderTransportPubkey);
-            if (info?.directAddress) {
-              senderDirectAddress = info.directAddress;
-            }
+        // Phase 6-P2-12: prefer payload.sender.directAddress hint (eliminates
+        // the transport-binding race — see uxf-transfer.ts JSDoc).
+        if (isUxfTransferPayloadCar(payload) || isUxfTransferPayloadCid(payload)) {
+          const hinted = payload.sender?.directAddress;
+          if (typeof hinted === 'string' && hinted.startsWith('DIRECT://')) {
+            senderDirectAddress = hinted;
           }
-        } catch (err) {
-          logger.debug(
-            'Payments',
-            'sender directAddress resolve failed (best-effort):',
-            err,
-          );
+        }
+        if (senderDirectAddress === undefined) {
+          try {
+            const resolveInfo = this.deps!.transport.resolveTransportPubkeyInfo;
+            if (resolveInfo) {
+              const info = await resolveInfo(transfer.senderTransportPubkey);
+              if (info?.directAddress) {
+                senderDirectAddress = info.directAddress;
+              }
+            }
+          } catch (err) {
+            logger.debug(
+              'Payments',
+              'sender directAddress resolve failed (best-effort):',
+              err,
+            );
+          }
         }
         const incomingTransfer: IncomingTransfer = {
           id: transfer.id,
