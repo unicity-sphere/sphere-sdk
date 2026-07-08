@@ -60,8 +60,7 @@ import type { OracleProvider } from '../../../oracle';
 import { logger } from '../../../core/logger';
 import { hexToBytes as strictHexToBytesCore } from '../../../core/hex';
 
-import type { AggregatorClient } from 'stsdk-v1/lib/api/AggregatorClient.js';
-import type { RootTrustBase } from 'stsdk-v1/lib/bft/RootTrustBase.js';
+import type { AggregatorClient, RootTrustBase } from '../../../token-engine/sdk.js';
 
 import {
   ProfilePointerLayer,

@@ -1,40 +1,48 @@
 /**
  * Aggregator probe (T-C2) — SPEC §8.1, §8.2.
  *
+ * Wave 6-P2-16 migration: v2 SDK renamed `getInclusionProof(RequestId)` to
+ * `getInclusionProof(StateId)` and returns `InclusionProofResponse` (with
+ * `.inclusionProof` and `.blockNumber`). Verification moved off of the
+ * `InclusionProof.verify(trustBase, requestId)` v1 method (which no longer
+ * exists) to `InclusionProofVerificationRule.verify(trustBase,
+ * predicateVerifier, proof, transaction)`.
+ *
  * Three public entry points:
  *
  *   probeVersion(v)
- *     H2 OR-predicate. Returns true iff at least one side (A or B) has a
- *     verified inclusion proof. Used by the Phase-1/Phase-2 discovery walk.
+ *     H2 OR-predicate. Returns true iff at least one side (A or B) has an
+ *     inclusion certificate. Used by the Phase-1/Phase-2 discovery walk.
  *     Trust-base rotation is detected on verify failure (§8.4.1).
  *
  *   classifyVersion(v, ...)
  *     H1 four-way classifier. Returns VALID | SEMANTICALLY_INVALID |
- *     PROOF_TRANSIENT | CAR_TRANSIENT. Used by Phase-3 walkback.
- *     Requires an injected IPFS/CAR fetcher (the pointer layer does
- *     not own IPFS itself — that stays in profile/ipfs-client.ts).
+ *     PROOF_TRANSIENT | CAR_TRANSIENT. Requires an injected IPFS/CAR
+ *     fetcher.
  *
  *   isReachable(signingPubKey)
  *     Health check. Issues a getInclusionProof for the wallet's HEALTH_CHECK
- *     request id (SPEC §11.12) and returns true iff the aggregator answered
- *     (status is irrelevant — the request is not expected to be included).
- *     Used by BLOCKED-state CLEAR paths (SPEC §10.2).
- *
- * No side-channel leakage: timing does not depend on which side verified.
+ *     stateId and returns true iff the aggregator answered.
  */
 
-import type { AggregatorClient } from 'stsdk-v1/lib/api/AggregatorClient.js';
-import { RequestId } from 'stsdk-v1/lib/api/RequestId.js';
-import { DataHash } from 'stsdk-v1/lib/hash/DataHash.js';
-import { HashAlgorithm } from 'stsdk-v1/lib/hash/HashAlgorithm.js';
-import { InclusionProofVerificationStatus } from 'stsdk-v1/lib/transaction/InclusionProof.js';
-import type { InclusionProof } from 'stsdk-v1/lib/transaction/InclusionProof.js';
-import type { RootTrustBase } from 'stsdk-v1/lib/bft/RootTrustBase.js';
+import {
+  AggregatorClient,
+  DataHash,
+  HashAlgorithm,
+  InclusionProof,
+  InclusionProofResponse,
+  InclusionProofVerificationRule,
+  InclusionProofVerificationStatus,
+  PredicateVerifierService,
+  RootTrustBase,
+  StateId,
+} from '../../../../token-engine/sdk.js';
 
 import { PROBE_REQUEST_TIMEOUT_MS } from './constants.js';
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
 import { deriveHealthCheckRequestId } from './health-check.js';
 import { deriveStateHashDigest, deriveXorKey, type PointerKeyMaterial } from './key-derivation.js';
+import { PointerTransaction } from './pointer-transaction.js';
 import type { PointerSigner } from './signing.js';
 import { raiseForTrustBaseMismatch } from './trust-base-rotation.js';
 import { SIDE_A_NUM, SIDE_B_NUM, type PointerVersion } from './types.js';
@@ -44,48 +52,21 @@ import { SIDE_A_NUM, SIDE_B_NUM, type PointerVersion } from './types.js';
 /**
  * Four-way version classification per H1 (SPEC §8.2 classifyVersion).
  *
- * The original three-way classification collapsed two distinct failure
- * modes under `TRANSIENT_UNAVAILABLE`:
+ *   PROOF_TRANSIENT — the aggregator proof RPC failed (network/timeout).
+ *                     Slot existence UNKNOWN — Phase 3 MUST NOT skip past.
  *
- *   (a) PROOF_TRANSIENT — the aggregator proof RPC failed (network error,
- *       timeout, etc.). The slot's existence is UNKNOWN — we cannot tell
- *       whether the version was ever published. Phase 3 MUST NOT skip past
- *       this: doing so would silently walk through a slot we haven't
- *       examined.
- *
- *   (b) CAR_TRANSIENT — the proof was verified AND the CID decoded
- *       successfully (the slot EXISTS), but every IPFS gateway returned
- *       transient failure (404, 5xx, timeout) for the CAR bytes. The
- *       slot provably EXISTS on-chain but is unreachable in storage.
- *       Phase 3 MAY skip past this under the `skipUnfetchableInWalkback`
- *       policy — skipping an EXISTS-BUT-UNFETCHABLE slot is the intended
- *       production recovery for IPFS gateway loss.
- *
- * Callers that previously pattern-matched `'TRANSIENT_UNAVAILABLE'` MUST
- * now handle BOTH `'PROOF_TRANSIENT'` and `'CAR_TRANSIENT'`. The two
- * values intentionally do NOT share a common prefix to prevent accidental
- * string-equality matches.
- *
- * The legacy `TRANSIENT_UNAVAILABLE` value is removed. Any existing code
- * that compared against it will get a compile-time type error.
+ *   CAR_TRANSIENT   — proof verified + CID decoded (slot EXISTS on-chain)
+ *                     but IPFS gateways returned transient failure. Phase 3
+ *                     MAY skip past under `skipUnfetchableInWalkback: true`.
  */
 export type VersionClassification =
   | 'VALID'
   | 'SEMANTICALLY_INVALID'
-  /** Proof RPC failed — slot existence unknown. Do NOT skip-past. */
   | 'PROOF_TRANSIENT'
-  /** Proof OK + CID decoded but CAR unfetchable — slot EXISTS. May skip-past. */
   | 'CAR_TRANSIENT';
 
 /**
  * Injected CAR fetch + deserialize callback for classifyVersion.
- *
- * Returns:
- *   - `{ ok: true }` on successful content-address-verified CAR deserialization
- *   - `{ ok: false, kind: 'transient_unavailable' }` when all gateways return
- *     network errors / timeouts / 5xx
- *   - `{ ok: false, kind: 'content_mismatch' }` on CID hash mismatch
- *   - `{ ok: false, kind: 'car_parse_failed' }` on structural CAR failure
  */
 export type CarFetchResult =
   | { readonly ok: true }
@@ -93,16 +74,6 @@ export type CarFetchResult =
 
 export type CarFetcher = (cidBytes: Uint8Array) => Promise<CarFetchResult>;
 
-/**
- * Injected CID decoder — reconstructs cidBytes from the two 32-byte halves
- * (partA || partB) after XOR-decode. Throws on length-prefix violation, bad
- * varints, or out-of-bounds.
- *
- * The pointer layer does not own CID multiformat parsing — the caller supplies
- * a decoder that returns either:
- *   - `{ ok: true, cidBytes: Uint8Array }` on structural success
- *   - `{ ok: false }` on any semantic failure (treated as SEMANTICALLY_INVALID)
- */
 export type CidDecodeResult =
   | { readonly ok: true; readonly cidBytes: Uint8Array }
   | { readonly ok: false };
@@ -111,46 +82,55 @@ export type CidDecoder = (full: Uint8Array) => CidDecodeResult;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/** Compute both requestIds for version v (sides A and B) in parallel. */
-async function buildRequestIds(
+/** Shared v2 predicate verifier — pointer only ever uses the default builtin set. */
+const POINTER_PREDICATE_VERIFIER = PredicateVerifierService.create();
+
+/**
+ * Build the (stateId, tx) pair per side for version v.
+ *
+ * v2 replaces v1's `RequestId` with `StateId = hash(lockScript CBOR,
+ * sourceStateHash)`. Side-effect: the stateId no longer directly encodes the
+ * pubkey; it encodes the CBOR of the SignaturePredicate wrapping the pubkey
+ * plus the derived sourceStateHash.
+ *
+ * Returns a `PointerTransaction` per side (without the transaction hash — the
+ * caller fills that in from either the received proof's certificationData or
+ * a locally-computed ct hash) plus the derived stateIds.
+ */
+async function buildProbeContext(
   keyMaterial: PointerKeyMaterial,
   signer: PointerSigner,
   v: PointerVersion,
-): Promise<{ reqA: RequestId; reqB: RequestId; stateHashA: DataHash; stateHashB: DataHash }> {
+): Promise<{
+  stateIdA: StateId;
+  stateIdB: StateId;
+  stateHashA: DataHash;
+  stateHashB: DataHash;
+  probeTxA: PointerTransaction;
+  probeTxB: PointerTransaction;
+}> {
   const stateHashDigestA = deriveStateHashDigest(keyMaterial.xorSeed, SIDE_A_NUM, v);
   const stateHashDigestB = deriveStateHashDigest(keyMaterial.xorSeed, SIDE_B_NUM, v);
   try {
     const stateHashA = new DataHash(HashAlgorithm.SHA256, stateHashDigestA);
     const stateHashB = new DataHash(HashAlgorithm.SHA256, stateHashDigestB);
-    const [reqA, reqB] = await Promise.all([
-      RequestId.createFromImprint(signer.signingPubKey, stateHashA.imprint),
-      RequestId.createFromImprint(signer.signingPubKey, stateHashB.imprint),
+    const probeTxA = PointerTransaction.createForStateId(signer.signingPubKey, stateHashA);
+    const probeTxB = PointerTransaction.createForStateId(signer.signingPubKey, stateHashB);
+    const [stateIdA, stateIdB] = await Promise.all([
+      StateId.fromTransaction(probeTxA),
+      StateId.fromTransaction(probeTxB),
     ]);
-    return { reqA, reqB, stateHashA, stateHashB };
+    return { stateIdA, stateIdB, stateHashA, stateHashB, probeTxA, probeTxB };
   } finally {
-    // The state-hash digests are not secret per se (they are derived from
-    // xorSeed and appear in requestIds anyway) but we zero them for
-    // defense-in-depth consistency with the submit path.
     stateHashDigestA.fill(0);
     stateHashDigestB.fill(0);
   }
 }
 
-/** Fetch an inclusion-proof response with a hard timeout.
- *
- * Wave G.2 — accepts an optional `abortSignal` so the discovery
- * wall-clock deadline can cancel an in-flight probe (previously the
- * deadline was checked only BETWEEN probes, so a probe whose RPC was
- * stuck for the full `timeoutMs` could blow past the deadline by up
- * to that amount). The signal races against the timeout; a fired
- * abort rejects the same way as a timeout (caller's outer try/catch
- * buckets it as 'transient' which is the correct discovery semantics
- * — a cancelled probe is by definition unverified, not "this v is
- * not included").
- */
+/** Fetch an inclusion-proof response with a hard timeout. */
 async function fetchProofWithTimeout(
   client: AggregatorClient,
-  requestId: RequestId,
+  stateId: StateId,
   timeoutMs: number,
   abortSignal?: AbortSignal,
 ): Promise<InclusionProof> {
@@ -179,14 +159,12 @@ async function fetchProofWithTimeout(
       })
     : null;
   try {
-    const racers: Array<Promise<unknown>> = [client.getInclusionProof(requestId), timeoutPromise];
+    const racers: Array<Promise<unknown>> = [client.getInclusionProof(stateId), timeoutPromise];
     if (abortPromise) racers.push(abortPromise);
-    const response = await (Promise.race(racers) as Promise<Awaited<ReturnType<typeof client.getInclusionProof>>>);
+    const response = (await Promise.race(racers)) as InclusionProofResponse | { inclusionProof?: unknown };
     // Shape guard: SDK drift (rename, added envelope, nullable shape) would
-    // otherwise raise an unclassified TypeError that the outer try/catch in
-    // classifyVersion buckets as 'transient'. That's wrong for a permanent
-    // SDK-shape breakage. Explicitly reject with PROTOCOL_ERROR so the
-    // caller surfaces a clear diagnostic instead of a silent retry loop.
+    // otherwise raise an unclassified TypeError. Explicitly reject with
+    // PointerProtocolError so the caller surfaces a clear diagnostic.
     if (
       response === null ||
       typeof response !== 'object' ||
@@ -200,13 +178,48 @@ async function fetchProofWithTimeout(
       err.name = 'PointerProtocolError';
       throw err;
     }
-    return response.inclusionProof;
+    return response.inclusionProof as InclusionProof;
   } finally {
     if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
     if (abortListener && abortSignal) {
       abortSignal.removeEventListener('abort', abortListener);
     }
   }
+}
+
+/**
+ * Verify an inclusion proof against a pointer transaction using v2's
+ * `InclusionProofVerificationRule`. The pointer's synthetic transaction
+ * needs its `transactionHash` to match the proof's `certificationData` —
+ * so we rebuild the transaction using the proof's own transactionHash
+ * before verifying (the pointer never "knows" the exact ct at probe time;
+ * it only knows the stateId).
+ *
+ * Returns the {@link InclusionProofVerificationStatus} value.
+ */
+async function verifyPointerInclusionProof(
+  trustBase: RootTrustBase,
+  proof: InclusionProof,
+  signingPubKey: Uint8Array,
+  sourceStateHash: DataHash,
+): Promise<InclusionProofVerificationStatus> {
+  const cd = proof.certificationData;
+  // If certificationData is null/undefined, verification will short-circuit
+  // with MISSING_CERTIFICATION_DATA (or INCLUSION_CERTIFICATE_MISSING) —
+  // pass a zero-hash transaction to satisfy the type contract; the rule's
+  // own null checks will surface the correct status.
+  const tx = PointerTransaction.create(
+    signingPubKey,
+    sourceStateHash,
+    cd == null ? new DataHash(HashAlgorithm.SHA256, new Uint8Array(32)) : cd.transactionHash,
+  );
+  const result = await InclusionProofVerificationRule.verify(
+    trustBase,
+    POINTER_PREDICATE_VERIFIER,
+    proof,
+    tx,
+  );
+  return result.status;
 }
 
 // ── probeVersion (H2 OR-predicate) ─────────────────────────────────────────
@@ -218,13 +231,6 @@ export interface ProbeInput {
   readonly aggregatorClient: AggregatorClient;
   readonly trustBase: RootTrustBase;
   readonly timeoutMs?: number;
-  /**
-   * Wave G.2: caller-supplied deadline propagation. The discovery
-   * algorithm tripping its wall-clock budget passes its abort signal
-   * here; the in-flight inclusion-proof RPC is then cancelled
-   * promptly instead of waiting up to `timeoutMs` for the per-probe
-   * timeout to fire.
-   */
   readonly abortSignal?: AbortSignal;
 }
 
@@ -232,38 +238,35 @@ export interface ProbeInput {
  * Inclusion check for version v. Returns true iff at least one side (A or B)
  * has a trustlessly-verified inclusion proof (H2 OR-predicate).
  *
- * Verification failure (PATH_INVALID / NOT_AUTHENTICATED) on EITHER side
- * short-circuits to `raiseForTrustBaseMismatch` — the caller gets either
- * `TRUST_BASE_STALE` (legitimate rotation) or `UNTRUSTED_PROOF` (forgery).
+ * Verification failure (PATH_INVALID / NOT_AUTHENTICATED / INVALID_TRUSTBASE)
+ * on EITHER side short-circuits to `raiseForTrustBaseMismatch` — the caller
+ * gets either `TRUST_BASE_STALE` (legitimate rotation) or `UNTRUSTED_PROOF`
+ * (forgery).
  *
- * PATH_NOT_INCLUDED on BOTH sides → returns false (legitimate non-inclusion).
+ * INCLUSION_CERTIFICATE_MISSING on BOTH sides → returns false (legitimate
+ * non-inclusion).
  */
 export async function probeVersion(input: ProbeInput): Promise<boolean> {
   const { v, keyMaterial, signer, aggregatorClient, trustBase } = input;
   const timeoutMs = input.timeoutMs ?? PROBE_REQUEST_TIMEOUT_MS;
 
-  const { reqA, reqB } = await buildRequestIds(keyMaterial, signer, v);
+  const { stateIdA, stateIdB, stateHashA, stateHashB } = await buildProbeContext(keyMaterial, signer, v);
   const [proofA, proofB] = await Promise.all([
-    fetchProofWithTimeout(aggregatorClient, reqA, timeoutMs, input.abortSignal),
-    fetchProofWithTimeout(aggregatorClient, reqB, timeoutMs, input.abortSignal),
+    fetchProofWithTimeout(aggregatorClient, stateIdA, timeoutMs, input.abortSignal),
+    fetchProofWithTimeout(aggregatorClient, stateIdB, timeoutMs, input.abortSignal),
   ]);
 
   const [statusA, statusB] = await Promise.all([
-    proofA.verify(trustBase, reqA),
-    proofB.verify(trustBase, reqB),
+    verifyPointerInclusionProof(trustBase, proofA, signer.signingPubKey, stateHashA),
+    verifyPointerInclusionProof(trustBase, proofB, signer.signingPubKey, stateHashB),
   ]);
 
-  // Integrity failures: NOT_AUTHENTICATED / PATH_INVALID → rotation or forgery.
-  if (
-    statusA === InclusionProofVerificationStatus.NOT_AUTHENTICATED ||
-    statusA === InclusionProofVerificationStatus.PATH_INVALID
-  ) {
+  // Integrity failures: NOT_AUTHENTICATED / PATH_INVALID / INVALID_TRUSTBASE
+  // → rotation or forgery.
+  if (isIntegrityFailure(statusA)) {
     raiseForTrustBaseMismatch(trustBase, proofA, `probeVersion(v=${v}, side=A)`);
   }
-  if (
-    statusB === InclusionProofVerificationStatus.NOT_AUTHENTICATED ||
-    statusB === InclusionProofVerificationStatus.PATH_INVALID
-  ) {
+  if (isIntegrityFailure(statusB)) {
     raiseForTrustBaseMismatch(trustBase, proofB, `probeVersion(v=${v}, side=B)`);
   }
 
@@ -273,7 +276,16 @@ export async function probeVersion(input: ProbeInput): Promise<boolean> {
   return aIncluded || bIncluded;
 }
 
-// ── classifyVersion (H1 three-way) ─────────────────────────────────────────
+function isIntegrityFailure(status: InclusionProofVerificationStatus): boolean {
+  return (
+    status === InclusionProofVerificationStatus.NOT_AUTHENTICATED ||
+    status === InclusionProofVerificationStatus.PATH_INVALID ||
+    status === InclusionProofVerificationStatus.INVALID_TRUSTBASE ||
+    status === InclusionProofVerificationStatus.SHARD_ID_MISMATCH
+  );
+}
+
+// ── classifyVersion (H1 four-way) ──────────────────────────────────────────
 
 export interface ClassifyInput {
   readonly v: PointerVersion;
@@ -281,32 +293,15 @@ export interface ClassifyInput {
   readonly signer: PointerSigner;
   readonly aggregatorClient: AggregatorClient;
   readonly trustBase: RootTrustBase;
-  /** Reconstructs cidBytes from the decoded 64-byte plaintext. */
   readonly decodeCid: CidDecoder;
-  /** Fetches and content-address-verifies the CAR from IPFS. */
   readonly fetchCar: CarFetcher;
   readonly timeoutMs?: number;
-  /** Wave G.2: caller-supplied deadline propagation (see ProbeInput). */
   readonly abortSignal?: AbortSignal;
 }
 
 /**
  * Shared Phase 1+2 primitive: fetch inclusion proofs + XOR-decode the
- * 64-byte plaintext + delegate CID parsing. Consumed by both
- * `classifyVersion` (which then does Phase 3 CAR verify) and
- * `decodeVersionCid` (used by the Phase-D `resolveRemoteCid` callback
- * after discovery has already classified the version).
- *
- * Emits one of three outcomes:
- *   - `{ ok: 'cid', cidBytes }` — proofs verified, CID decoded
- *   - `{ ok: 'transient' }`     — proof fetch failed (network-class)
- *   - `{ ok: 'semantic' }`      — partial inclusion, malformed CT, or
- *                                 CID decoder rejected the plaintext
- *
- * Trust-base rotation / forgery (`NOT_AUTHENTICATED`, `PATH_INVALID`)
- * short-circuits to `raiseForTrustBaseMismatch` and throws — the
- * caller always sees either one of the three outcomes or a thrown
- * `AggregatorPointerError`.
+ * 64-byte plaintext + delegate CID parsing.
  */
 type DecodePhaseOutcome =
   | { readonly ok: 'cid'; readonly cidBytes: Uint8Array }
@@ -323,26 +318,16 @@ async function runDecodePhases(
   timeoutMs: number,
   abortSignal?: AbortSignal,
 ): Promise<DecodePhaseOutcome> {
-  // Step 1: both inclusion proofs (§8.2 step 1).
-  const { reqA, reqB } = await buildRequestIds(keyMaterial, signer, v);
+  const { stateIdA, stateIdB, stateHashA, stateHashB } = await buildProbeContext(keyMaterial, signer, v);
 
   let proofA: InclusionProof;
   let proofB: InclusionProof;
   try {
     [proofA, proofB] = await Promise.all([
-      fetchProofWithTimeout(aggregatorClient, reqA, timeoutMs, abortSignal),
-      fetchProofWithTimeout(aggregatorClient, reqB, timeoutMs, abortSignal),
+      fetchProofWithTimeout(aggregatorClient, stateIdA, timeoutMs, abortSignal),
+      fetchProofWithTimeout(aggregatorClient, stateIdB, timeoutMs, abortSignal),
     ]);
   } catch (err) {
-    // Discriminate on error class:
-    //   PointerProtocolError — SDK shape drift (missing inclusionProof
-    //     field in getInclusionProof response). This is a DETERMINISTIC
-    //     failure — the aggregator/SDK combination will fail identically
-    //     on every retry. Surface it as AggregatorPointerError with
-    //     PROTOCOL_ERROR so classifyVersion / recoverLatest / publish
-    //     callers see a stable error code, not a transient-class retry.
-    //   Everything else — network failure, timeout, serialization error.
-    //     Transient by design; caller retries.
     if (err instanceof Error && err.name === 'PointerProtocolError') {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.PROTOCOL_ERROR,
@@ -355,26 +340,18 @@ async function runDecodePhases(
   }
 
   const [statusA, statusB] = await Promise.all([
-    proofA.verify(trustBase, reqA),
-    proofB.verify(trustBase, reqB),
+    verifyPointerInclusionProof(trustBase, proofA, signer.signingPubKey, stateHashA),
+    verifyPointerInclusionProof(trustBase, proofB, signer.signingPubKey, stateHashB),
   ]);
 
   // Integrity failures: rotation or forgery.
-  if (
-    statusA === InclusionProofVerificationStatus.NOT_AUTHENTICATED ||
-    statusA === InclusionProofVerificationStatus.PATH_INVALID
-  ) {
+  if (isIntegrityFailure(statusA)) {
     raiseForTrustBaseMismatch(trustBase, proofA, `classifyVersion(v=${v}, side=A)`);
   }
-  if (
-    statusB === InclusionProofVerificationStatus.NOT_AUTHENTICATED ||
-    statusB === InclusionProofVerificationStatus.PATH_INVALID
-  ) {
+  if (isIntegrityFailure(statusB)) {
     raiseForTrustBaseMismatch(trustBase, proofB, `classifyVersion(v=${v}, side=B)`);
   }
 
-  // Both sides required for a full XOR decode. A missing side yields
-  // SEMANTICALLY_INVALID (the XOR plaintext would be truncated).
   if (
     statusA !== InclusionProofVerificationStatus.OK ||
     statusB !== InclusionProofVerificationStatus.OK
@@ -383,17 +360,14 @@ async function runDecodePhases(
   }
 
   // Step 2: XOR-decode + CID parse (§8.2 step 2).
-  //
-  // The proof's transactionHash.data is the ctSide ciphertext (per §6.3).
-  // We XOR with the deterministic xorKey to recover the 32-byte half, then
-  // concatenate to form the 64-byte `full` buffer and delegate CID parsing.
-  const txHashA = proofA.transactionHash;
-  const txHashB = proofB.transactionHash;
-  if (txHashA === null || txHashB === null) {
+  // In v2, the ct bytes live on `certificationData.transactionHash.data`.
+  const cdA = proofA.certificationData;
+  const cdB = proofB.certificationData;
+  if (cdA == null || cdB == null) {
     return { ok: 'semantic' };
   }
-  const ctA = txHashA.data;
-  const ctB = txHashB.data;
+  const ctA = cdA.transactionHash.data;
+  const ctB = cdB.transactionHash.data;
   if (ctA.length !== 32 || ctB.length !== 32) {
     return { ok: 'semantic' };
   }
@@ -410,9 +384,6 @@ async function runDecodePhases(
     if (!decoded.ok) {
       return { ok: 'semantic' };
     }
-    // Copy out — caller keeps the CID bytes; `full` is zeroed in
-    // `finally`. `decoded.cidBytes` may alias a buffer backed by the
-    // multiformats lib; we clone so the consumer owns a stable slice.
     return { ok: 'cid', cidBytes: new Uint8Array(decoded.cidBytes) };
   } finally {
     full.fill(0);
@@ -421,21 +392,6 @@ async function runDecodePhases(
   }
 }
 
-/**
- * Four-way classify per SPEC §8.2 classifyVersion helper:
- *   VALID                — both sides verified + CID parseable + CAR fetched
- *   SEMANTICALLY_INVALID — proof partial, CID corrupt, or CAR fails content-address
- *   PROOF_TRANSIENT      — aggregator proof RPC failed; slot existence UNKNOWN
- *   CAR_TRANSIENT        — proof OK + CID decoded but all IPFS gateways unavailable
- *
- * The split matters for Phase 3 skip-past policy:
- *   - PROOF_TRANSIENT must NOT be skipped (we cannot tell whether the slot
- *     exists — walking past it would silently skip an unexamined version).
- *   - CAR_TRANSIENT MAY be skipped under `skipUnfetchableInWalkback: true`
- *     (the slot provably exists on-chain; only its CAR bytes are unavailable).
- *
- * classifyVersion requires BOTH sides included (stricter than probe's OR).
- */
 export async function classifyVersion(input: ClassifyInput): Promise<VersionClassification> {
   const { v, keyMaterial, signer, aggregatorClient, trustBase, decodeCid, fetchCar } = input;
   const timeoutMs = input.timeoutMs ?? PROBE_REQUEST_TIMEOUT_MS;
@@ -450,22 +406,15 @@ export async function classifyVersion(input: ClassifyInput): Promise<VersionClas
     timeoutMs,
     input.abortSignal,
   );
-  // Case (a): aggregator proof RPC failed — slot existence UNKNOWN.
-  // Return PROOF_TRANSIENT, NOT CAR_TRANSIENT — Phase 3 must not skip past this.
   if (phase12.ok === 'transient') return 'PROOF_TRANSIENT';
   if (phase12.ok === 'semantic') return 'SEMANTICALLY_INVALID';
 
-  // Step 3: fetch + content-address verify (§8.2 step 3).
-  // Reaching here means proof was verified AND CID decoded — the slot EXISTS.
   const carResult = await fetchCar(phase12.cidBytes);
   if (carResult.ok) {
     return 'VALID';
   }
   switch (carResult.kind) {
     case 'transient_unavailable':
-      // Case (b): slot EXISTS (proof ok + CID decoded) but CAR is unreachable.
-      // Return CAR_TRANSIENT — Phase 3 may skip past this under the
-      // skipUnfetchableInWalkback policy.
       return 'CAR_TRANSIENT';
     case 'content_mismatch':
     case 'car_parse_failed':
@@ -476,18 +425,6 @@ export async function classifyVersion(input: ClassifyInput): Promise<VersionClas
 
 // ── decodeVersionCid ───────────────────────────────────────────────────────
 
-/**
- * Phase 1+2 of classifyVersion, exposed standalone.
- *
- * Used by `ProfilePointerLayer.recoverLatest()`'s `resolveRemoteCid`
- * callback: discovery has already certified the version as VALID
- * (via an earlier classifyVersion pass), so the caller only needs the
- * CID bytes without re-running the CAR fetch. Skipping Phase 3 avoids
- * a second IPFS round-trip on the happy path.
- *
- * Semantic and transient failures map 1:1 onto pointer-layer error
- * codes so the caller can propagate a clear diagnostic.
- */
 export interface DecodeVersionCidInput {
   readonly v: PointerVersion;
   readonly keyMaterial: PointerKeyMaterial;
@@ -530,37 +467,24 @@ export interface ReachableInput {
 /**
  * Aggregator health check (SPEC §11.12).
  *
- * Issues a getInclusionProof for the wallet's HEALTH_CHECK request id (deterministic
- * derivation of a request id guaranteed NOT to be in the SMT). The aggregator
- * should respond with PATH_NOT_INCLUDED; we treat any well-formed response
- * (even PATH_NOT_INCLUDED / NOT_AUTHENTICATED) as "reachable".
- *
- * Only network-level failures (timeout, DNS, TLS, 5xx) indicate unreachability.
+ * The health-check request-id was derived in v1 as `SHA256(signingPubKey ||
+ * [0x00, 0x00] || deriveHealthCheckRequestId(pubkey))`. In v2 we build a
+ * synthetic PointerTransaction over the same 32-byte digest and use its
+ * StateId — any response (including error) means the aggregator is reachable.
  */
 export async function isReachable(input: ReachableInput): Promise<boolean> {
   const { signingPubKey, aggregatorClient } = input;
   const timeoutMs = input.timeoutMs ?? PROBE_REQUEST_TIMEOUT_MS;
 
   try {
-    // deriveHealthCheckRequestId returns the raw 32-byte digest. We wrap it
-    // in a RequestId by constructing the 34-byte SHA-256 imprint
-    // ([0x00, 0x00, ...digest]) and hex-encoding it for RequestId.fromJSON.
     const digest = deriveHealthCheckRequestId(signingPubKey);
-    const imprint = new Uint8Array(34);
-    imprint[0] = 0x00;
-    imprint[1] = 0x00;
-    imprint.set(digest, 2);
-    let hex = '';
-    for (const b of imprint) hex += b.toString(16).padStart(2, '0');
-    const healthCheckRequestId = RequestId.fromJSON(hex);
-    await fetchProofWithTimeout(aggregatorClient, healthCheckRequestId, timeoutMs);
-    // Any response (including PATH_NOT_INCLUDED) means the aggregator is
-    // reachable and responsive. No .verify() call — the semantic outcome is
-    // irrelevant.
+    const healthStateHash = new DataHash(HashAlgorithm.SHA256, digest);
+    const tx = PointerTransaction.createForStateId(signingPubKey, healthStateHash);
+    const healthStateId = await StateId.fromTransaction(tx);
+    await fetchProofWithTimeout(aggregatorClient, healthStateId, timeoutMs);
     return true;
   } catch (err: unknown) {
-    // JsonRpcNetworkError (5xx, 4xx) is still a response — the aggregator is
-    // reachable, just unhappy. Treat those as reachable.
+    // JsonRpcNetworkError (5xx, 4xx) still means the aggregator answered.
     if (
       err !== null &&
       typeof err === 'object' &&
@@ -568,7 +492,7 @@ export async function isReachable(input: ReachableInput): Promise<boolean> {
     ) {
       return true;
     }
-    // JsonRpcDataError (JSON-RPC-level error) — reachable.
+    // JsonRpcDataError — reachable.
     if (
       err !== null &&
       typeof err === 'object' &&
@@ -576,7 +500,6 @@ export async function isReachable(input: ReachableInput): Promise<boolean> {
     ) {
       return true;
     }
-    // Genuine network / timeout failures → unreachable.
     return false;
   }
 }
@@ -584,7 +507,9 @@ export async function isReachable(input: ReachableInput): Promise<boolean> {
 // ── Test-only exports ──────────────────────────────────────────────────────
 
 export const __internal = {
-  buildRequestIds,
+  buildProbeContext,
   fetchProofWithTimeout,
   runDecodePhases,
+  verifyPointerInclusionProof,
+  isIntegrityFailure,
 };

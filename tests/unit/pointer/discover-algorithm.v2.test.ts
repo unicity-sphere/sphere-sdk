@@ -39,10 +39,27 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { InclusionProofVerificationStatus } from 'stsdk-v1/lib/transaction/InclusionProof.js';
-import type { InclusionProof } from 'stsdk-v1/lib/transaction/InclusionProof.js';
-import type { AggregatorClient } from 'stsdk-v1/lib/api/AggregatorClient.js';
-import type { RootTrustBase } from 'stsdk-v1/lib/bft/RootTrustBase.js';
+import {
+  AggregatorClient,
+  InclusionProof,
+  InclusionProofVerificationStatus,
+  RootTrustBase,
+} from '../../../token-engine/sdk.js';
+
+// Mock InclusionProofVerificationRule so the discovery walk can be driven
+// from the fake proof's `__verifyResult` marker.
+vi.mock('../../../token-engine/sdk.js', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    InclusionProofVerificationRule: {
+      verify: vi.fn(async (_trustBase, _predVerifier, proof: InclusionProof) => {
+        const withResult = proof as InclusionProof & { __verifyResult?: string };
+        return { status: withResult.__verifyResult ?? 'INCLUSION_CERTIFICATE_MISSING' };
+      }),
+    },
+  };
+});
 
 import {
   findLatestValidVersion,
@@ -71,11 +88,14 @@ async function buildFixtures() {
 
 function fakeProof(status: InclusionProofVerificationStatus): InclusionProof {
   return {
-    verify: vi.fn(async () => status),
-    transactionHash: {
-      data: new Uint8Array(32).fill(0x01),
-      imprint: new Uint8Array(34),
+    __verifyResult: status,
+    certificationData: {
+      transactionHash: {
+        data: new Uint8Array(32).fill(0x01),
+        imprint: new Uint8Array(34),
+      },
     },
+    inclusionCertificate: status === InclusionProofVerificationStatus.OK ? {} : null,
     unicityCertificate: {
       unicitySeal: { epoch: 1n },
       inputRecord: { epoch: 1n },
@@ -90,7 +110,7 @@ function fakeTrustBase(): RootTrustBase {
 function allNotIncludedClient(): AggregatorClient {
   return {
     getInclusionProof: vi.fn(async () => ({
-      inclusionProof: fakeProof(InclusionProofVerificationStatus.PATH_NOT_INCLUDED),
+      inclusionProof: fakeProof(InclusionProofVerificationStatus.INCLUSION_CERTIFICATE_MISSING),
     })),
   } as unknown as AggregatorClient;
 }

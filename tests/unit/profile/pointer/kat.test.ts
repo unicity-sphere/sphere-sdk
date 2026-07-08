@@ -1,9 +1,18 @@
 /**
- * KAT test (T-A9, SPEC §14, TEST-SPEC P8).
+ * KAT test (T-A9, SPEC §14, TEST-SPEC P8) — v2 vectors.
  *
  * Verifies the Phase A key-derivation chain produces the exact bytes
  * pinned in tests/fixtures/pointer-kat-vectors.json. Any divergence
- * means HKDF / SigningService / health-check drift — fail loudly.
+ * means HKDF / SigningService / StateId drift — fail loudly.
+ *
+ * Wave 6-P2-16 regenerated the pubkey / StateId vectors under v2 SDK
+ * semantics — the SDK's SigningService constructor uses the input as
+ * the scalar directly (v1's `createFromSecret` SHA-256-hashed the input
+ * first, so the derived pubkey differs). The stateHashDigest / xorKey /
+ * paddingBytes vectors are unchanged (derived from xorSeed / padSeed
+ * only, no signing involvement). Requests are now `StateId`
+ * (SHA256(CBOR([lockScript CBOR, stateHash]))) — the v1 `RequestId`
+ * shape no longer exists.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -21,7 +30,13 @@ import {
   SIDE_A_NUM,
   SIDE_B_NUM,
 } from '../../../../extensions/uxf/profile/aggregator-pointer/index.js';
-import { sha256 } from '@noble/hashes/sha2.js';
+import {
+  DataHash,
+  EncodedPredicate,
+  HashAlgorithm,
+  SignaturePredicate,
+  StateId,
+} from '../../../../token-engine/sdk.js';
 
 interface KatVectors {
   inputs: {
@@ -44,8 +59,8 @@ interface KatVectors {
       xorKey_A_hex: string;
       xorKey_B_hex: string;
       paddingBytes_cidLen36_hex: string;
-      requestId_A_hex: string;
-      requestId_B_hex: string;
+      stateId_A_hex: string;
+      stateId_B_hex: string;
     };
   };
 }
@@ -61,7 +76,7 @@ function hexToBytes(hex: string): Uint8Array {
 const vectorsPath = resolve(__dirname, '../../../../tests/fixtures/pointer-kat-vectors.json');
 const vectors: KatVectors = JSON.parse(readFileSync(vectorsPath, 'utf8'));
 
-describe('KAT vectors (T-A9 / P8)', () => {
+describe('KAT vectors (T-A9 / P8, v2)', () => {
   const walletPrivateKey = hexToBytes(vectors.inputs.walletPrivateKey_hex);
   const v = vectors.inputs.version_v;
   const cidLen = vectors.inputs.cidLen_bytes;
@@ -93,7 +108,7 @@ describe('KAT vectors (T-A9 / P8)', () => {
     expect(new Set([a, b, c, d]).size).toBe(4);
   });
 
-  it('SigningService.createFromSecret produces expected signingPubKey', async () => {
+  it('SigningService produces expected signingPubKey (v2: raw-scalar constructor)', async () => {
     const signer = await buildPointerSigner(km.signingSeed);
     expect(signer.signingPubKeyHex).toBe(vectors.derived_keys.signingPubKey_hex);
   });
@@ -123,25 +138,32 @@ describe('KAT vectors (T-A9 / P8)', () => {
     expect(bytesToHex(pad)).toBe(vectors.per_version_per_side.v_1.paddingBytes_cidLen36_hex);
   });
 
-  it('requestId matches for SIDE_A @ v=1 (§4.7 67-byte preimage)', async () => {
+  it('v2 StateId matches for SIDE_A @ v=1 (SHA256(CBOR([lockScript CBOR, stateHash])))', async () => {
     const signer = await buildPointerSigner(km.signingSeed);
     const stateDigest = deriveStateHashDigest(km.xorSeed, SIDE_A_NUM, v);
-    // requestId = SHA256(signingPubKey || [0x00, 0x00] || stateHashDigest)
-    const preimage = new Uint8Array(33 + 2 + 32);
-    preimage.set(signer.signingPubKey, 0);
-    preimage.set([0x00, 0x00], 33);
-    preimage.set(stateDigest, 35);
-    expect(bytesToHex(sha256(preimage))).toBe(vectors.per_version_per_side.v_1.requestId_A_hex);
+    const stateHash = new DataHash(HashAlgorithm.SHA256, stateDigest);
+    const encoded = EncodedPredicate.fromPredicate(SignaturePredicate.create(signer.signingPubKey));
+    // Build a fake transaction that carries the lockScript + sourceStateHash
+    // and derive its StateId via the public helper.
+    const fakeTx = {
+      lockScript: encoded,
+      sourceStateHash: stateHash,
+    } as unknown as import('../../../../token-engine/sdk.js').ITransaction;
+    const stateId = await StateId.fromTransaction(fakeTx);
+    expect(bytesToHex(stateId.data)).toBe(vectors.per_version_per_side.v_1.stateId_A_hex);
   });
 
-  it('requestId matches for SIDE_B @ v=1', async () => {
+  it('v2 StateId matches for SIDE_B @ v=1', async () => {
     const signer = await buildPointerSigner(km.signingSeed);
     const stateDigest = deriveStateHashDigest(km.xorSeed, SIDE_B_NUM, v);
-    const preimage = new Uint8Array(33 + 2 + 32);
-    preimage.set(signer.signingPubKey, 0);
-    preimage.set([0x00, 0x00], 33);
-    preimage.set(stateDigest, 35);
-    expect(bytesToHex(sha256(preimage))).toBe(vectors.per_version_per_side.v_1.requestId_B_hex);
+    const stateHash = new DataHash(HashAlgorithm.SHA256, stateDigest);
+    const encoded = EncodedPredicate.fromPredicate(SignaturePredicate.create(signer.signingPubKey));
+    const fakeTx = {
+      lockScript: encoded,
+      sourceStateHash: stateHash,
+    } as unknown as import('../../../../token-engine/sdk.js').ITransaction;
+    const stateId = await StateId.fromTransaction(fakeTx);
+    expect(bytesToHex(stateId.data)).toBe(vectors.per_version_per_side.v_1.stateId_B_hex);
   });
 
   it('deriveHealthCheckRequestId is deterministic for a given signingPubKey', async () => {
