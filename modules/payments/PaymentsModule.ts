@@ -1201,6 +1201,18 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
+   * Swap the live token engine WITHOUT re-initializing the module — used by
+   * `Sphere.setOracleApiKey()` after it rebuilds the engine with a new gateway
+   * key. Operations snapshot `this.deps.tokenEngine` into a local at their start
+   * (see send/mint/split), so an in-flight op finishes on the PREVIOUS engine
+   * (submit + proof stay paired); only ops started after this use the new one.
+   */
+  setTokenEngine(engine?: ITokenEngine): void {
+    if (this.deps) this.deps.tokenEngine = engine;
+    this.spendPlanner.setEngine(engine);
+  }
+
+  /**
    * Initialize module with dependencies
    */
   initialize(deps: PaymentsModuleDependencies): void {

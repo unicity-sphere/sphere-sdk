@@ -1568,6 +1568,29 @@ export class Sphere {
   }
 
   /**
+   * Apply a new gateway API key to the LIVE oracle + token engine WITHOUT a full
+   * Sphere rebuild (transport / realtime socket / discovery stay up). Use this to
+   * inject a per-wallet subscription key provisioned AFTER init, or a per-address
+   * key on an address switch, so the next money operation authenticates with it.
+   *
+   * Money-safety: the running token engine is snapshotted per-operation (the
+   * payments module reads `deps.tokenEngine` into a local at op start), so an
+   * in-flight send/mint completes on the OLD key (submit + proof stay paired on
+   * one client) and only operations started AFTER this call use the new key.
+   * Only the ACTIVE address's engine is rebuilt — other tracked addresses re-key
+   * on their next switch/build. No-op-safe if the engine can't be built (the
+   * modules fall back to their legacy path, same as init).
+   */
+  async setOracleApiKey(apiKey: string): Promise<void> {
+    this._oracle.setApiKey?.(apiKey);
+    // Rebuild ONLY the token engine (buildTokenEngine reads getApiKey() fresh)
+    // and swap it into the live payments module — no transport/socket/storage
+    // teardown, unlike a full re-init.
+    this._tokenEngine = await this.buildTokenEngine();
+    this._payments.setTokenEngine(this._tokenEngine);
+  }
+
+  /**
    * Check if wallet has BIP32 master key for HD derivation
    */
   hasMasterKey(): boolean {

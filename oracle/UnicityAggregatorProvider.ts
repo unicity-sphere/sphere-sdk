@@ -108,6 +108,17 @@ export class UnicityAggregatorProvider implements OracleProvider {
     return this.config.apiKey || undefined;
   }
 
+  /**
+   * Update the API key on this live provider. The v2 token engine snapshots the
+   * key at build time, so this alone does NOT change money operations already
+   * wired into a running engine — `Sphere.setOracleApiKey()` rebuilds the engine
+   * for that. Paths that read `getApiKey()` fresh (e.g. the Unicity-ID minter)
+   * pick up the new value immediately.
+   */
+  setApiKey(apiKey: string): void {
+    this.config.apiKey = apiKey ?? '';
+  }
+
   // ===========================================================================
   // BaseProvider Implementation
   // ===========================================================================

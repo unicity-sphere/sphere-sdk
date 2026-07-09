@@ -45,6 +45,15 @@ export interface OracleProvider extends BaseProvider {
 
   /** Gateway API key, when the gateway requires one (e.g. testnet2). */
   getApiKey(): string | undefined;
+
+  /**
+   * Update the gateway API key on a LIVE provider (optional). Lets a consumer
+   * swap the key (e.g. a per-wallet subscription key provisioned after init)
+   * WITHOUT rebuilding the whole Sphere. Note: the token engine snapshots the
+   * key when it is built, so the caller must rebuild the engine for the change
+   * to reach money operations — use `Sphere.setOracleApiKey()`, which does both.
+   */
+  setApiKey?(apiKey: string): void;
 }
 
 // =============================================================================
