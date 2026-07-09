@@ -516,6 +516,23 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
       await this.syncInventory();
       return { success: true, timestamp: Date.now() };
     } catch (error) {
+      // A §5.3 lineage CONFLICT means the server already holds an equal/newer
+      // or evidenced-tombstoned state for a token we tried to push — the local
+      // snapshot is stale, NOT a failed save (recoverRemoved() treats the same
+      // CONFLICT as benign). Converge the view to server truth and report
+      // success: the mirror is already up to date, just not via our push.
+      // Surfacing this as a failure produced a red "storage degraded" toast and
+      // a Sentry error for a routine concurrency outcome, and left the stale
+      // view to re-conflict next cycle. Only genuine errors (network / protocol
+      // / auth) are a real degraded save.
+      if (error instanceof WalletApiError && error.code === 'CONFLICT') {
+        try {
+          await this.syncInventory();
+        } catch {
+          // Convergence is best-effort; the next save/sync cycle reconciles.
+        }
+        return { success: true, timestamp: Date.now() };
+      }
       return {
         success: false,
         error: error instanceof Error ? error.message : 'wallet-api save failed',

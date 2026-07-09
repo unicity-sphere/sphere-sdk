@@ -10,7 +10,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { WalletApiClient } from '../../wallet-api';
+import { WalletApiClient, WalletApiError } from '../../wallet-api';
 import { WalletApiTokenStorageProvider } from '../../impl/shared/wallet-api/WalletApiTokenStorageProvider';
 import { deriveFieldEncryptionKey, encryptField } from '../../core/field-encryption';
 import type { FullIdentity } from '../../types';
@@ -100,6 +100,39 @@ describe('WalletApiTokenStorageProvider — S2 remote semantics', () => {
     const view = await provider.listInventory();
     expect(view.items).toHaveLength(5);
     expect(view.more).toBe(false);
+  });
+
+  it('a write-behind lineage CONFLICT is a benign no-op — save() converges and reports success (#663)', async () => {
+    const { client, provider } = makeDevice(fake, baseUrl, 22, 'dev-conflict');
+    await provider.initialize();
+
+    // Force the write-behind apply into a §5.3 lineage conflict (server holds
+    // an equal/newer or evidenced-tombstoned state). This is a routine
+    // concurrency outcome — the on-chain send already happened; the mirror is
+    // simply stale — so save() must treat it as success, not a degraded failure.
+    let applyCalls = 0;
+    client.applyInventoryDelta = async () => {
+      applyCalls += 1;
+      throw new WalletApiError(
+        'POST /v1/inventory/apply: CONFLICT lineage conflict for token [hex]',
+        'CONFLICT'
+      );
+    };
+
+    const result = await provider.save(buildTxfData([makeTestToken()]));
+    expect(result.success).toBe(true);
+    expect(applyCalls).toBeGreaterThan(0); // the push really attempted the apply
+  });
+
+  it('a genuine (non-CONFLICT) apply error still fails the save', async () => {
+    const { client, provider } = makeDevice(fake, baseUrl, 23, 'dev-neterr');
+    await provider.initialize();
+    client.applyInventoryDelta = async () => {
+      throw new WalletApiError('inventory/apply request failed', 'NETWORK');
+    };
+    const result = await provider.save(buildTxfData([makeTestToken()]));
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/apply request failed/);
   });
 
   it('a tombstoned delta converges a stale device (§5.1)', async () => {
