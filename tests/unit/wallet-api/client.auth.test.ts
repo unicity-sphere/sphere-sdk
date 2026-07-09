@@ -79,14 +79,18 @@ describe('WalletApiClient — auth (§4)', () => {
     expect(fake.verifyRequests).toBe(0);
   });
 
-  it('refuses a challenge with implausible timestamps', async () => {
+  it('signs a challenge whose (server) timestamps are far from the device clock (#662)', async () => {
+    // A device clock skewed by decades vs the server-issued timestamps must NOT
+    // block sign-in: the window is well-formed and the server is authoritative
+    // on expiry. Previously this threw a client-side "expired" and locked the
+    // user out of every send.
     fake.tamperNextChallenge((c) =>
       c
         .replace(/"issuedAt":"[^"]*"/, '"issuedAt":"1970-01-01T00:00:00.000Z"')
         .replace(/"expiresAt":"[^"]*"/, '"expiresAt":"1970-01-01T00:05:00.000Z"')
     );
-    await expect(client.signIn()).rejects.toThrowError(/expired/);
-    expect(fake.verifyRequests).toBe(0);
+    await expect(client.signIn()).resolves.toBeUndefined();
+    expect(fake.verifyRequests).toBe(1); // proceeded to verify; server decides expiry
   });
 
   it('silently refreshes (with rotation) when the access token expires', async () => {
@@ -175,6 +179,24 @@ describe('verifyChallengeTemplate — direct edge cases (S1)', () => {
   it('rejects an implausible validity window', () => {
     const longWindow = challengeJson({ expiresAt: '2026-06-13T12:00:00.000Z' });
     expect(() => verifyChallengeTemplate(longWindow, expect4)).toThrowError(/window/);
+  });
+
+  it('accepts server timestamps regardless of device clock skew (#662)', () => {
+    // Device clock 10 min FAST (nowMs well past expiresAt): must NOT throw
+    // "expired" — the server enforces expiry, not the device.
+    const fast = { ...expect4, nowMs: Date.parse('2026-06-11T12:14:00.000Z') };
+    expect(() => verifyChallengeTemplate(valid, fast)).not.toThrow();
+    // Device clock 10 min SLOW (issuedAt appears "in the future"): must NOT throw.
+    const slow = { ...expect4, nowMs: Date.parse('2026-06-11T11:49:00.000Z') };
+    expect(() => verifyChallengeTemplate(valid, slow)).not.toThrow();
+    // nowMs omitted entirely: still fine (field is deprecated/ignored).
+    const noClock = { pubkey: identity.chainPubkey, nonce: 'abc123', network: 'testnet2' };
+    expect(() => verifyChallengeTemplate(valid, noClock)).not.toThrow();
+  });
+
+  it('still rejects a non-positive validity window using server timestamps only', () => {
+    const inverted = challengeJson({ issuedAt: '2026-06-11T12:04:00.000Z', expiresAt: '2026-06-11T12:00:00.000Z' });
+    expect(() => verifyChallengeTemplate(inverted, expect4)).toThrowError(/window/);
   });
 
   it('throws the typed error', () => {
