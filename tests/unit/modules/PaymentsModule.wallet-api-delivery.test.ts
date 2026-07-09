@@ -255,6 +255,27 @@ describe('send — full wallet-api preset (S2 consumer + S3 + §7 pipeline)', ()
     expect(sent!.memo).not.toContain('lunch');
   });
 
+  it('bridgeBurn materializes a lazy inventory token before burning it', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-bridge-burn-1');
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
+
+    await sender.module.load();
+
+    const lazy = sender.module.getTokens()[0];
+    expect(lazy).toMatchObject({ id: `v2_${sourceTokenId}`, lazy: true });
+    expect(lazy.sdkData).toBeUndefined();
+
+    const result = await sender.module.bridgeBurn({
+      tokenId: lazy.id,
+      reasonHash: new Uint8Array(32).fill(1),
+      reasonBytes: new Uint8Array([1, 2, 3]),
+    });
+
+    expect(result.success).toBe(true);
+    expect(sender.module.getTokens()[0].sdkData).toBeDefined();
+  });
+
   it('a split send uploads the change output and applies it in the SAME delta (700 stays)', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-send-2');

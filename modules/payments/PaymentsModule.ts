@@ -2182,6 +2182,44 @@ export class PaymentsModule {
   }
 
   /**
+   * Materialize one lazy inventory token for non-send spend paths such as
+   * bridge-out burns. The send path goes through materializeSelectedSources();
+   * bridgeBurn receives only a token id, so it must fetch the blob itself.
+   */
+  private async materializeTokenForEngine(token: Token): Promise<SphereToken> {
+    const engine = this.deps!.tokenEngine;
+    if (!engine) {
+      throw new SphereError('Cannot materialize token — token engine missing', 'STORAGE_ERROR');
+    }
+
+    if (token.sdkData) {
+      return engine.decodeToken(decodeTokenBlob(hexToBytes(token.sdkData)));
+    }
+
+    if (!token.lazy) {
+      throw new SphereError(`Token ${token.id} has no token blob`, 'STORAGE_ERROR');
+    }
+
+    const provider = this.getActiveTokenStorageProvider();
+    if (!provider) {
+      throw new SphereError('Cannot materialize lazy token — storage provider missing', 'STORAGE_ERROR');
+    }
+
+    const genesisId = token.id.replace(/^v2_/, '');
+    const blob = await provider.getToken(genesisId);
+    const sdkToken = await engine.decodeToken(blob);
+    const sdkData = bytesToHex(encodeTokenBlob(blob));
+    (token as { sdkData?: string }).sdkData = sdkData;
+
+    const live = this.tokens.get(token.id);
+    if (live && live !== token) {
+      (live as { sdkData?: string }).sdkData = sdkData;
+    }
+
+    return sdkToken;
+  }
+
+  /**
    * The E.3 intent payload — `{ sources, recipient, amounts }` concretized to
    * the realization plan, so a resume on ANY device rebuilds byte-identical
    * transactions (same transferId + same inputs + same output order).
@@ -4126,9 +4164,9 @@ export class PaymentsModule {
     const engine = this.deps?.tokenEngine;
     if (!engine) return { success: false, error: 'Bridge burn requires the v2 token engine.' };
     const uiToken = this.getTokens().find((t) => t.id === params.tokenId);
-    if (!uiToken || !uiToken.sdkData) return { success: false, error: `Token ${params.tokenId} not found` };
+    if (!uiToken) return { success: false, error: `Token ${params.tokenId} not found` };
     try {
-      const sdkToken = await engine.decodeToken(decodeTokenBlob(hexToBytes(uiToken.sdkData)));
+      const sdkToken = await this.materializeTokenForEngine(uiToken);
       const result = await engine.bridgeBurn({ token: sdkToken, reasonHash: params.reasonHash, reasonBytes: params.reasonBytes });
       return { success: true, ...result };
     } catch (err) {
