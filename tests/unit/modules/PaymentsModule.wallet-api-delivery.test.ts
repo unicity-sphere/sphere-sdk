@@ -273,7 +273,7 @@ describe('send — full wallet-api preset (S2 consumer + S3 + §7 pipeline)', ()
     });
 
     expect(result.success).toBe(true);
-    expect(sender.module.getTokens()[0].sdkData).toBeDefined();
+    expect(sender.module.getTokens()).toHaveLength(0);
   });
 
   it('a split send uploads the change output and applies it in the SAME delta (700 stays)', async () => {

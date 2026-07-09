@@ -4172,6 +4172,17 @@ export class PaymentsModule {
     try {
       const sdkToken = await this.materializeTokenForEngine(uiToken);
       const result = await engine.bridgeBurn({ token: sdkToken, reasonHash: params.reasonHash, reasonBytes: params.reasonBytes });
+      const cleanupId = randomUUID();
+      try {
+        const sourceTokenId = extractTokenIdFromSdkData(uiToken.sdkData);
+        const storage = this.getActiveTokenStorageProvider();
+        if (sourceTokenId && storage) {
+          await storage.applyDelta(cleanupId, [sourceTokenId], []);
+        }
+        await this.removeToken(uiToken.id, cleanupId);
+      } catch (cleanupErr) {
+        logger.warn('Payments', `Bridge burn succeeded but local inventory cleanup failed for ${uiToken.id}:`, cleanupErr);
+      }
       return { success: true, ...result };
     } catch (err) {
       return { success: false, error: `Bridge burn failed: ${err instanceof Error ? err.message : String(err)}` };
