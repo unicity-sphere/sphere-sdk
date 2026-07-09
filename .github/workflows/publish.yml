@@ -22,7 +22,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22.14.0'
+          # Current Node LTS (24 "Krypton"). Supports `npm@latest` (npm 12+,
+          # engine ^22.22.2 || ^24.15 || >=26); the old pin 22.14.0 broke publish
+          # with EBADENGINE once npm 12 shipped.
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
 
@@ -66,9 +69,11 @@ jobs:
             echo "tag=dev" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upgrade npm for OIDC trusted publishing
-        run: npm install -g npm@latest
-
+      # No `npm install -g npm@latest` here: Node 24 already bundles a modern npm
+      # (11.x) that supports OIDC trusted publishing AND ships a working
+      # `sigstore` for provenance. Forcing npm@12 broke publish two ways — first
+      # EBADENGINE, then `Cannot find module 'sigstore'` from its provenance path
+      # (a fresh-major regression). Use the toolchain's shipped npm instead.
       - name: Publish to npm
         run: npm publish --access public --tag ${{ steps.dist-tag.outputs.tag }}
 

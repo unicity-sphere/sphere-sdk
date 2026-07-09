@@ -12,7 +12,9 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [20, 22]
+        # Supported range per package.json engines (>=22): the 22 LTS floor and
+        # the current 24 "Krypton" LTS. (20 is below the engine floor.)
+        node-version: [22, 24]
 
     steps:
       - uses: actions/checkout@v4
