@@ -10,6 +10,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { ITokenEngine } from '../../../token-engine';
+import { Asset, AssetId, PaymentAssetCollection } from '../../../token-engine/sdk';
 
 export function runEngineContract(name: string, makeEngine: () => ITokenEngine): void {
   describe(`ITokenEngine contract — ${name}`, () => {
@@ -121,6 +122,27 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
       // to the identical, stable tokenId (the invoice-id use case).
       const again = await e.mintDataToken({ recipientPubkey: PK_A, data, tokenType, salt });
       expect(e.tokenId(again)).toBe(e.tokenId(t));
+    });
+
+    it('custom mint can carry bare SDK PaymentAssetCollection data', async () => {
+      const e = makeEngine();
+      const data = PaymentAssetCollection.create(new Asset(new AssetId(hex(COIN)), 9n)).toCBOR();
+      const t = await e.mint({ recipientPubkey: PK_A, data });
+      expect(e.readTokenData(t)).toEqual(data);
+      expect(e.readValue(t)).toEqual({ assets: [{ coinId: COIN, amount: 9n }] });
+      expect(e.balanceOf(t, COIN)).toBe(9n);
+    });
+
+    it('custom mint rejects mixing Sphere value and raw data', async () => {
+      const e = makeEngine();
+      const data = PaymentAssetCollection.create(new Asset(new AssetId(hex(COIN)), 9n)).toCBOR();
+      await expect(
+        e.mint({
+          recipientPubkey: PK_A,
+          value: { assets: [{ coinId: COIN, amount: 9n }] },
+          data,
+        }),
+      ).rejects.toThrow(/both value and raw data/);
     });
 
     it('isOwnedBy matches the current state owner and follows transfers', async () => {

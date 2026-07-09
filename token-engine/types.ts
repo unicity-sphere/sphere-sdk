@@ -88,6 +88,11 @@ export interface MintParams {
   /** Value to embed in the mint; null mints a value-less token. */
   readonly value?: SphereValue | null;
   /**
+   * Raw `MintTransaction.data` for custom mints whose value format is not
+   * SpherePaymentData. Mutually exclusive with `value`.
+   */
+  readonly data?: Uint8Array | null;
+  /**
    * Custom 32-byte token type (e.g. a bridged asset's TokenType). Random when
    * omitted. Bridge-in (06 §A1.1) passes the asset's TokenType so the minted
    * token is the bridged asset, not an ad-hoc one.

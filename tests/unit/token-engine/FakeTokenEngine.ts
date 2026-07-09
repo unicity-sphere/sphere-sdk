@@ -8,10 +8,10 @@
  * in memory. Token ids are a monotonic counter (or the salt for data tokens), so
  * behaviour is fully deterministic.
  *
- * Its state mirrors the real engine: a token carries raw `genesisData` (a
- * SpherePaymentData envelope for value tokens, opaque bytes for data tokens) plus
- * an optional `transferMemo` (the latest transfer's data). value / readMemo /
- * readTokenData are derived exactly as the real adapter derives them.
+ * Its state mirrors the real engine: a token carries raw `genesisData`
+ * (SpherePaymentData, bare bridge PaymentAssetCollection, or opaque data-token
+ * bytes) plus an optional `transferMemo` (the latest transfer's data). value /
+ * readMemo / readTokenData are derived exactly as the real adapter derives them.
  *
  * This is a TEST double (lives under tests/, never shipped). The real adapter
  * puts a genuine v2 Token in SphereToken.sdkToken; here it is an opaque
@@ -23,6 +23,7 @@ import {
   CborSerializer,
   HexConverter,
   NetworkId,
+  PaymentAssetCollection,
   type Token,
   TokenId,
   TokenSalt,
@@ -55,7 +56,7 @@ interface FakeState {
   /** Per-state identity — changes on every transfer; the unit of spent-tracking. */
   readonly stateId: Uint8Array;
   readonly owner: Uint8Array;
-  /** Raw mint data: a SpherePaymentData envelope (value token) or opaque bytes (data token). */
+  /** Raw mint data: SpherePaymentData, bare bridge PaymentAssetCollection, or opaque data-token bytes. */
   readonly genesisData: Uint8Array | null;
   /** The latest transfer's opaque memo, when the token was delivered by transfer. */
   readonly transferMemo: Uint8Array | null;
@@ -115,7 +116,10 @@ export class FakeTokenEngine implements ITokenEngine {
   }
 
   public async mint(params: MintParams, _options?: EngineOpOptions): Promise<SphereToken> {
-    const genesisData = params.value ? await SpherePaymentData.fromValue(params.value).encode() : null;
+    if (params.value && params.data) {
+      throw new Error('Mint cannot specify both value and raw data');
+    }
+    const genesisData = params.data ? new Uint8Array(params.data) : params.value ? await SpherePaymentData.fromValue(params.value).encode() : null;
     return this.makeToken({
       tokenId: this.nextId(),
       stateId: this.nextId(),
@@ -287,8 +291,9 @@ export function decodeFakeTokenAssets(
 ): { coinId: string; amount: bigint }[] | null {
   try {
     const state = decodeFakeState(tokenBytes);
-    if (!state.genesisData || !isSpherePaymentData(state.genesisData)) return null;
-    const value = SpherePaymentData.fromCBOR(state.genesisData).toValue();
+    if (!state.genesisData) return null;
+    const value = valueOf(state);
+    if (!value) return null;
     return value.assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));
   } catch {
     return null;
@@ -330,10 +335,22 @@ function decodeFakeState(bytes: Uint8Array): FakeState {
   };
 }
 
-/** Derive the decoded value exactly as the real adapter does (SpherePaymentData envelope only). */
+/** Derive the decoded value exactly as the real adapter does. */
 function valueOf(state: FakeState): SphereValue | null {
   if (state.genesisData && isSpherePaymentData(state.genesisData)) {
     return SpherePaymentData.fromCBOR(state.genesisData).toValue();
+  }
+  if (state.genesisData) {
+    try {
+      return {
+        assets: PaymentAssetCollection.fromCBOR(state.genesisData).toArray().map((a) => ({
+          coinId: HexConverter.encode(a.id.bytes),
+          amount: a.value,
+        })),
+      };
+    } catch {
+      return null;
+    }
   }
   return null;
 }

@@ -4100,15 +4100,19 @@ export class PaymentsModule {
 
   /**
    * Bridge-in mint (06 §A1.1): mint the bridged token a Tron lock funds. The
-   * caller (the app's bridge flow) derives `tokenType` + the committed `salt` and
-   * builds `genesisReason` (a `TronUsdtLockJustification` CBOR) from the on-chain
-   * `Lock` event. `engine.mint` runs the registered bridge verifier on the reason
+   * caller (the app's bridge flow) derives `tokenType` + the committed `salt`,
+   * supplies bridge-owned `mintData` (bare SDK PaymentAssetCollection CBOR, not
+   * SpherePaymentData(39050)), and builds `genesisReason`
+   * (a `TronUsdtLockJustification` CBOR) from the on-chain `Lock` event.
+   * `engine.mint` runs the registered bridge verifier on the reason
    * (re-checking the lock at `confirmations: 0` — the minter trusts its own lock),
    * then the finished token is stored as a confirmed, spendable balance.
    */
   async bridgeMint(params: {
     coinIdHex: string;
     amount: bigint;
+    /** Raw bridge-owned mint data. Must not be SpherePaymentData(39050). */
+    mintData: Uint8Array;
     tokenType: Uint8Array;
     salt: Uint8Array;
     genesisReason: Uint8Array;
@@ -4130,7 +4134,7 @@ export class PaymentsModule {
       const minted = await engine.mint(
         {
           recipientPubkey: engine.getIdentity().chainPubkey,
-          value: { assets: [{ coinId: params.coinIdHex, amount: params.amount }] },
+          data: params.mintData,
           tokenType: params.tokenType,
           salt: params.salt,
           genesisReason: params.genesisReason,

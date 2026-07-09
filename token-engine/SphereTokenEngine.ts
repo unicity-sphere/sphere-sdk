@@ -147,7 +147,10 @@ export class SphereTokenEngine implements ITokenEngine {
 
   public async mint(params: MintParams, options?: EngineOpOptions): Promise<SphereToken> {
     const recipient = SignaturePredicate.create(params.recipientPubkey);
-    const data = params.value ? await SpherePaymentData.fromValue(params.value).encode() : null;
+    if (params.value && params.data) {
+      throw new SphereError('Mint cannot specify both value and raw data', 'VALIDATION_ERROR');
+    }
+    const data = params.data ? new Uint8Array(params.data) : params.value ? await SpherePaymentData.fromValue(params.value).encode() : null;
 
     // Bridged / custom mints specify a token type, committed salt, and/or a genesis
     // reason (a bridge lock justification). `Token.mint` runs the registered bridge
@@ -515,11 +518,12 @@ export class SphereTokenEngine implements ITokenEngine {
   private wrapToken(sdkToken: Token): SphereToken {
     const data = sdkToken.genesis.data;
     let value: SphereValue | null = null;
-    // Only value tokens carry a SpherePaymentData envelope; data tokens (e.g. invoices)
-    // leave value === null. A corrupt value envelope still errors loudly.
-    if (data && this.isSpherePaymentData(data)) {
+    // Sphere wallet value tokens carry SpherePaymentData(39050). Bridge tokens
+    // carry bare SDK PaymentAssetCollection CBOR. Data tokens (e.g. invoices)
+    // leave value === null.
+    if (data) {
       try {
-        value = SpherePaymentData.fromCBOR(data).toValue();
+        value = this.decodeTokenValue(data);
       } catch (err) {
         throw new SphereError(
           `Failed to decode token payment data: ${err instanceof Error ? err.message : String(err)}`,
@@ -536,7 +540,24 @@ export class SphereTokenEngine implements ITokenEngine {
     return { sdkToken, blob, value };
   }
 
-  /** True if the bytes are a SpherePaymentData envelope (value token) vs a raw data token. */
+  private decodeTokenValue(data: Uint8Array): SphereValue | null {
+    if (this.isSpherePaymentData(data)) {
+      return SpherePaymentData.fromCBOR(data).toValue();
+    }
+    try {
+      const assets = PaymentAssetCollection.fromCBOR(data).toArray();
+      return {
+        assets: assets.map((a) => ({
+          coinId: HexConverter.encode(a.id.bytes),
+          amount: a.value,
+        })),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** True if the bytes are a SpherePaymentData envelope. */
   private isSpherePaymentData(data: Uint8Array): boolean {
     try {
       return CborDeserializer.decodeTag(data).tag === SpherePaymentData.CBOR_TAG;

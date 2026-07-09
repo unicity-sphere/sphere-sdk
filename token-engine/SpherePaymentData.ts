@@ -133,15 +133,9 @@ export function decodeSpherePaymentData(bytes: Uint8Array): Promise<IPaymentData
 }
 
 /**
- * Reads the amount a Sphere token declares for `coinId` (32 raw bytes), or null
- * if it declares none. Shaped as a bridge plugin's value extractor so a bridged
- * mint-reason verifier can confirm the token's declared value equals the amount
- * locked on the source chain.
- *
- * Example:
- * ```ts
- * createTronUsdtBridgePlugin(config, { extractAmount: spherePaymentAmountExtractor });
- * ```
+ * Reads the amount a Sphere-internal value token declares for `coinId` (32 raw
+ * bytes), or null if it declares none. This is for wallet-to-wallet tokens that
+ * use SpherePaymentData(39050), not bridge tokens.
  */
 export function spherePaymentAmountExtractor(data: Uint8Array | null, coinId: Uint8Array): bigint | null {
   if (!data) {
