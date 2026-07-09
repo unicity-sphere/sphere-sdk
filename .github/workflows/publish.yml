@@ -22,7 +22,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22.14.0'
+          # Current Node LTS (24 "Krypton"). Supports `npm@latest` (npm 12+,
+          # engine ^22.22.2 || ^24.15 || >=26); the old pin 22.14.0 broke publish
+          # with EBADENGINE once npm 12 shipped.
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
 
