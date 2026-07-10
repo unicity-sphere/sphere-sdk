@@ -46,6 +46,12 @@ export type SphereErrorCode =
   // a byte-bound checkpoint proof no longer verifies against the current trust base (validator rotation).
   | 'CHECKPOINT_TRUSTBASE_MISMATCH'
   | 'STORAGE_ERROR'
+  // #665: the on-chain spend committed but the post-commit wallet-api mirror
+  // sync (inventory apply / blob upload / save) failed. NOT a lost payment —
+  // the intent is kept open and resume converges the mirror (idempotent apply,
+  // #664). Surfaced distinctly so a UI can reassure ("sent — wallet catching
+  // up") instead of showing a hard send failure.
+  | 'SEND_SYNC_PENDING'
   | 'TRANSPORT_ERROR'
   | 'AGGREGATOR_ERROR'
   | 'VALIDATION_ERROR'

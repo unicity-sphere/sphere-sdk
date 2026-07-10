@@ -1767,6 +1767,14 @@ export class PaymentsModule {
     // §3.1 (#621): set when any leg's post-certification delivery is deferred (kept journaled).
     // Scoped to the whole send so the resolve path below can mark the result delivery-pending.
     let deliveryPending = false;
+    // #665: set once every on-chain submit has certified, right before the
+    // wallet-api persistence (inventory apply / blob upload / save). A failure
+    // AFTER this point means the money already moved on-chain and only the
+    // server-mirror sync failed — the intent stays open and resume converges
+    // it (idempotent apply, #664). We still throw (keep-open + resume is the
+    // exit), but re-tag the error SEND_SYNC_PENDING so the UI can reassure the
+    // user ("sent — wallet catching up") instead of showing a scary failure.
+    let onChainCommitComplete = false;
 
     try {
       // Resolve recipient
@@ -2066,6 +2074,10 @@ export class PaymentsModule {
           if (!serverApply) await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
         }
 
+        // #665: all on-chain submits have certified by here — everything that
+        // follows (wallet-api apply / blob upload / save) is post-commit.
+        onChainCommitComplete = true;
+
         if (serverApply) {
           // §7 steps 4+6: upload the change output, then record the whole
           // spend in ONE idempotent apply carrying the send's transferId. The
@@ -2276,6 +2288,23 @@ export class PaymentsModule {
 
       // Notify queue AFTER cache is rebuilt so queued entries see restored tokens
       this.spendQueue.notifyChange(request.coinId);
+
+      // #665: a failure AFTER the on-chain commit is a mirror-sync-pending
+      // outcome, not a lost payment — the spend landed on-chain, the intent is
+      // kept open, and resume converges the server mirror (idempotent apply,
+      // #664). Do NOT emit transfer:failed (nothing was lost); throw a
+      // re-tagged SEND_SYNC_PENDING so the send caller can reassure the user
+      // instead of showing a hard failure. Excludes a genuine lost race
+      // (TransferConflictError) and the keep-open certification states
+      // (ProofUnconfirmed / split-checkpoint), which are pre-mirror and have
+      // their own handling.
+      if (onChainCommitComplete && !(error instanceof TransferConflictError) && !keepOpen) {
+        throw new SphereError(
+          'Your payment was sent. Your wallet is syncing with the server and will catch up shortly.',
+          'SEND_SYNC_PENDING',
+          error,
+        );
+      }
 
       this.deps!.emitEvent('transfer:failed', result);
       throw error;
