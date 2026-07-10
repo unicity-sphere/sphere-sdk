@@ -7,8 +7,18 @@
  *   1. begins with the fixed domain-separation prefix
  *      `unicity:wallet-api:auth:v1\n`;
  *   2. embeds the client's OWN pubkey (and the nonce returned alongside it);
- *   3. carries plausible timestamps (`issuedAt` near now, `expiresAt` in the
- *      future, a sane validity window).
+ *   3. carries a structurally sane validity window (`issuedAt < expiresAt`,
+ *      window ≤ `MAX_VALIDITY_WINDOW_MS`), using ONLY the server's own
+ *      timestamps — NOT the local device clock (#662).
+ *
+ * Why not gate on the device clock: the challenge is fetched and signed
+ * immediately, and the server authoritatively enforces expiry on
+ * `/v1/auth/verify`. Comparing the server's `issuedAt`/`expiresAt` against the
+ * device's `now` only produced false rejections — a clock off by more than a
+ * few minutes (dead RTC, wrong date, bad NTP) failed EVERY sign-in with
+ * "Challenge is already expired", a hard send blocker with no security
+ * benefit. The anti-forgery property ("never sign arbitrary server text")
+ * comes entirely from the prefix + pubkey + nonce + network binding below.
  *
  * The accepted grammar matches the REAL backend (wallet-api M1,
  * src/auth/service.ts): the prefix followed by a single-line JSON object with
@@ -23,9 +33,6 @@ import { ChallengeTemplateError } from './errors';
 /** Fixed domain-separation prefix (ARCHITECTURE §4 step 1). */
 export const AUTH_CHALLENGE_PREFIX = 'unicity:wallet-api:auth:v1\n';
 
-/** Allowed clock skew between client and server (ms). */
-const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
-
 /** Maximum plausible challenge validity window (server default: NONCE_TTL = 5 min). */
 const MAX_VALIDITY_WINDOW_MS = 60 * 60 * 1000;
 
@@ -36,8 +43,13 @@ export interface ChallengeExpectation {
   nonce: string;
   /** The client's network — refused if the challenge names a different one. */
   network: string;
-  /** Current time, ms since epoch. */
-  nowMs: number;
+  /**
+   * @deprecated Ignored since #662. The challenge is validated against the
+   * server's own timestamps only; the device clock is never used (a skewed
+   * clock previously produced false "expired" rejections). Retained so the
+   * exported signature stays source-compatible for existing callers.
+   */
+  nowMs?: number;
 }
 
 function parseFields(body: string): Map<string, string> {
@@ -105,12 +117,9 @@ export function verifyChallengeTemplate(challenge: string, expect: ChallengeExpe
   const issuedAt = parseTimestamp(requireField(fields, 'issuedAt'), 'issuedAt');
   const expiresAt = parseTimestamp(requireField(fields, 'expiresAt'), 'expiresAt');
 
-  if (issuedAt > expect.nowMs + MAX_CLOCK_SKEW_MS) {
-    throw new ChallengeTemplateError('Challenge issuedAt is in the future');
-  }
-  if (expiresAt <= expect.nowMs - MAX_CLOCK_SKEW_MS) {
-    throw new ChallengeTemplateError('Challenge is already expired');
-  }
+  // Server timestamps only — no device-clock comparison (#662). A well-formed
+  // challenge has a positive, bounded validity window; actual expiry is the
+  // server's authoritative call on /v1/auth/verify.
   if (expiresAt <= issuedAt || expiresAt - issuedAt > MAX_VALIDITY_WINDOW_MS) {
     throw new ChallengeTemplateError('Challenge validity window is implausible');
   }
