@@ -493,11 +493,14 @@ export class WalletApiClient {
   /**
    * Retry transient REST failures with bounded exponential backoff + jitter:
    * - a thrown transient `NETWORK` failure (dropped/reset connection, DNS blip)
-   *   retries on **idempotent GETs only** — a lost-response retry of a write
-   *   could double-apply;
+   *   retries on **idempotent requests** — every GET, plus a write the caller
+   *   marked `idempotentWrite` (the server replays it as a no-op, so a
+   *   lost-response retry cannot double-apply; today only `inventory/apply`,
+   *   idempotent by transferId — #664). A non-idempotent write is single-attempt;
    * - a `429` response retries on **any** method (a 429 is rejected before the
    *   handler runs — the write never executed), honoring the server `Retry-After`;
-   * - a `503` response retries on **GETs only** (a write may have started).
+   * - a `503` response retries on **idempotent requests only** (a non-idempotent
+   *   write may have started).
    * Every other outcome (2xx, or a non-retryable status) is returned to the
    * caller, which maps a non-2xx to a typed {@link WalletApiError}.
    */
@@ -505,9 +508,15 @@ export class WalletApiClient {
     method: string,
     path: string,
     body: unknown,
-    jwt: string
+    jwt: string,
+    idempotentWrite = false
   ): Promise<FetchResponseLike> {
-    const idempotent = method === 'GET';
+    // GETs are idempotent by method; a write is retry-safe only when the caller
+    // explicitly declares it so (idempotentWrite) — i.e. the server makes a
+    // re-applied request a no-op replay, so a lost-response retry cannot double
+    // apply. Today that is `POST /v1/inventory/apply` (idempotent by transferId;
+    // #664).
+    const idempotent = method === 'GET' || idempotentWrite;
     for (let attempt = 1; ; attempt += 1) {
       let res: FetchResponseLike;
       try {
@@ -532,8 +541,8 @@ export class WalletApiClient {
 
   /**
    * Delay before retrying a non-2xx response, or `null` to not retry. `429`
-   * retries on any method (rejected before execution); `503` on idempotent GETs.
-   * Honors a capped `Retry-After` when present, else falls back to backoff.
+   * retries on any method (rejected before execution); `503` on idempotent
+   * requests only. Honors a capped `Retry-After` when present, else backoff.
    */
   private retryDelayForStatus(res: FetchResponseLike, idempotent: boolean, attempt: number): number | null {
     const retryable = res.status === 429 || (res.status === 503 && idempotent);
@@ -564,16 +573,23 @@ export class WalletApiClient {
    * Authenticated JSON request. A 401 triggers one silent re-auth
    * (refresh → challenge fallback) and one retry; {@link rawFetchWithRetry}
    * additionally rides out transient failures — a dropped connection on an
-   * idempotent GET, or a `429`/`503` with `Retry-After` — so a single blip or a
-   * brief rate-limit window doesn't fail the call.
+   * idempotent request (any GET, or a write flagged `opts.idempotent`), or a
+   * `429`/`503` with `Retry-After` — so a single blip or a brief rate-limit
+   * window doesn't fail the call.
    */
-  private async requestJson(method: string, path: string, body?: unknown): Promise<unknown> {
+  private async requestJson(
+    method: string,
+    path: string,
+    body?: unknown,
+    opts?: { idempotent?: boolean }
+  ): Promise<unknown> {
+    const idempotent = opts?.idempotent ?? false;
     if (!this.jwt) await this.signIn();
-    let res = await this.rawFetchWithRetry(method, path, body, this.jwt!);
+    let res = await this.rawFetchWithRetry(method, path, body, this.jwt!, idempotent);
     if (res.status === 401) {
       this.jwt = null;
       await this.signIn();
-      res = await this.rawFetchWithRetry(method, path, body, this.jwt!);
+      res = await this.rawFetchWithRetry(method, path, body, this.jwt!, idempotent);
     }
     if (res.status === 204) return null;
     if (!res.ok) throw await this.toError(res, `${method} ${path}`);
@@ -611,12 +627,20 @@ export class WalletApiClient {
    */
   async applyInventoryDelta(req: ApplyDeltaRequest): Promise<bigint> {
     const cursor = parseApplyResult(
-      await this.requestJson('POST', '/v1/inventory/apply', {
-        transferId: req.transferId,
-        spent: req.spent,
-        added: req.added,
-        ...(req.externalDelivery !== undefined ? { externalDelivery: req.externalDelivery } : {}),
-      })
+      await this.requestJson(
+        'POST',
+        '/v1/inventory/apply',
+        {
+          transferId: req.transferId,
+          spent: req.spent,
+          added: req.added,
+          ...(req.externalDelivery !== undefined ? { externalDelivery: req.externalDelivery } : {}),
+        },
+        // Idempotent by transferId — the server replays a re-applied transferId
+        // to the same cursor (beginApplied), so a lost-response retry on a flaky
+        // link is safe and won't double-apply (#664).
+        { idempotent: true }
+      )
     );
     await this.setLocalIntentStatus(req.transferId, 'completed');
     return cursor;
