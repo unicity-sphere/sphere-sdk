@@ -1767,13 +1767,16 @@ export class PaymentsModule {
     // §3.1 (#621): set when any leg's post-certification delivery is deferred (kept journaled).
     // Scoped to the whole send so the resolve path below can mark the result delivery-pending.
     let deliveryPending = false;
-    // #665: set once every on-chain submit has certified, right before the
-    // wallet-api persistence (inventory apply / blob upload / save). A failure
-    // AFTER this point means the money already moved on-chain and only the
-    // server-mirror sync failed — the intent stays open and resume converges
-    // it (idempotent apply, #664). We still throw (keep-open + resume is the
-    // exit), but re-tag the error SEND_SYNC_PENDING so the UI can reassure the
-    // user ("sent — wallet catching up") instead of showing a scary failure.
+    // #665: set inside the wallet-api-inventory-custody branch below, once every
+    // on-chain submit has certified and right before the server-mirror
+    // persistence (inventory apply / blob upload / save). A failure AFTER this
+    // means the money already moved on-chain and only the server-MIRROR sync
+    // failed — the intent stays open and resume converges it (idempotent apply,
+    // #664). We still throw (keep-open + resume is the exit), but re-tag the
+    // error SEND_SYNC_PENDING so the UI can reassure the user ("sent — wallet
+    // catching up"). Deliberately NOT set for own-storage / no-wallet-api sends:
+    // there is no server mirror, so a post-commit local failure there stays a
+    // normal failure.
     let onChainCommitComplete = false;
 
     try {
@@ -2074,11 +2077,16 @@ export class PaymentsModule {
           if (!serverApply) await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
         }
 
-        // #665: all on-chain submits have certified by here — everything that
-        // follows (wallet-api apply / blob upload / save) is post-commit.
-        onChainCommitComplete = true;
-
         if (serverApply) {
+          // #665: SCOPED to wallet-api inventory custody. Every on-chain submit
+          // has certified by here, and the wallet-api persistence that follows
+          // (blob upload / apply / the save below) is post-commit — a failure is
+          // a server-MIRROR sync-pending, converged by resume. Setting the flag
+          // only inside this branch keeps own-storage / no-wallet-api sends OUT
+          // of the SEND_SYNC_PENDING path: there is no server mirror to catch up,
+          // so a local post-commit save failure there stays a normal failure
+          // (Copilot review, PR #669).
+          onChainCommitComplete = true;
           // §7 steps 4+6: upload the change output, then record the whole
           // spend in ONE idempotent apply carrying the send's transferId. The
           // backend evidence-checks the removals against the mailbox deposit

@@ -297,6 +297,25 @@ describe('send — full wallet-api preset (S2 consumer + S3 + §7 pipeline)', ()
     expect(failed.length).toBeGreaterThan(0);
   });
 
+  it('an OWN-STORAGE post-commit failure stays a hard failure, NOT SEND_SYNC_PENDING (#665 scope, Copilot #669)', async () => {
+    // No wallet-api inventory mirror in own-storage custody, so a post-commit
+    // LOCAL persistence failure must NOT be re-tagged sync-pending (there is no
+    // server mirror to "catch up") — it stays a normal failure.
+    const { fake, baseUrl } = await startFake();
+    const sender = makeOwnStorageWallet(baseUrl, fake.network, SENDER, 'd-665c');
+    await sender.module.load();
+    await sender.module.mintFungibleToken(UCT, 1000n); // token exists BEFORE we break save
+
+    const local = sender.deps.tokenStorageProviders.get('local')!;
+    local.save = vi.fn(async () => ({ success: false, error: 'local save failed', timestamp: 0 }));
+
+    await expect(
+      sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT }),
+    ).rejects.not.toMatchObject({ code: 'SEND_SYNC_PENDING' });
+    const failed = sender.emitEvent.mock.calls.filter((c) => c[0] === 'transfer:failed');
+    expect(failed.length).toBeGreaterThan(0);
+  });
+
   it('a split send uploads the change output and applies it in the SAME delta (700 stays)', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-send-2');
