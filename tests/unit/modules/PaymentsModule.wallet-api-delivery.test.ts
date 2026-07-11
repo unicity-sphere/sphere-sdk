@@ -255,6 +255,67 @@ describe('send — full wallet-api preset (S2 consumer + S3 + §7 pipeline)', ()
     expect(sent!.memo).not.toContain('lunch');
   });
 
+  it('a post-commit apply failure surfaces as SEND_SYNC_PENDING, not a hard failure (#665)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-665');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // The on-chain spend certifies first; then fail the post-commit wallet-api
+    // apply (persistently — outlasting the #664 retry). The money already
+    // moved on-chain, only the server-mirror sync failed.
+    const cause = new WalletApiError('inventory/apply failed', 'NETWORK');
+    sender.client.applyInventoryDelta = async () => {
+      throw cause;
+    };
+
+    await expect(
+      sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT }),
+    ).rejects.toMatchObject({ code: 'SEND_SYNC_PENDING', cause });
+
+    // Not a lost payment: transfer:failed must NOT be emitted for a sync-pending.
+    const failed = sender.emitEvent.mock.calls.filter((c) => c[0] === 'transfer:failed');
+    expect(failed).toHaveLength(0);
+  });
+
+  it('a PRE-commit failure is still a hard failure (transfer:failed), not sync-pending', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-665b');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // putIntent runs FIRST, before any on-chain submit — a failure here is a
+    // genuine pre-commit send failure and must NOT be re-tagged sync-pending.
+    sender.client.putIntent = async () => {
+      throw new WalletApiError('putIntent failed', 'NETWORK');
+    };
+
+    await expect(
+      sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT }),
+    ).rejects.not.toMatchObject({ code: 'SEND_SYNC_PENDING' });
+    const failed = sender.emitEvent.mock.calls.filter((c) => c[0] === 'transfer:failed');
+    expect(failed.length).toBeGreaterThan(0);
+  });
+
+  it('an OWN-STORAGE post-commit failure stays a hard failure, NOT SEND_SYNC_PENDING (#665 scope, Copilot #669)', async () => {
+    // No wallet-api inventory mirror in own-storage custody, so a post-commit
+    // LOCAL persistence failure must NOT be re-tagged sync-pending (there is no
+    // server mirror to "catch up") — it stays a normal failure.
+    const { fake, baseUrl } = await startFake();
+    const sender = makeOwnStorageWallet(baseUrl, fake.network, SENDER, 'd-665c');
+    await sender.module.load();
+    await sender.module.mintFungibleToken(UCT, 1000n); // token exists BEFORE we break save
+
+    const local = sender.deps.tokenStorageProviders.get('local')!;
+    local.save = vi.fn(async () => ({ success: false, error: 'local save failed', timestamp: 0 }));
+
+    await expect(
+      sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT }),
+    ).rejects.not.toMatchObject({ code: 'SEND_SYNC_PENDING' });
+    const failed = sender.emitEvent.mock.calls.filter((c) => c[0] === 'transfer:failed');
+    expect(failed.length).toBeGreaterThan(0);
+  });
+
   it('a split send uploads the change output and applies it in the SAME delta (700 stays)', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-send-2');
