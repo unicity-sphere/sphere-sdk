@@ -30,6 +30,7 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 
 import { signMessage } from '../core/crypto';
+import { logger } from '../core/logger';
 import { timeoutSignal } from '../core/timeout';
 import { completeSignMessage, progressSignMessage } from './intent-signing';
 import { WalletApiError } from './errors';
@@ -864,11 +865,33 @@ export class WalletApiClient {
   }
 
   /**
+   * #670: drop the LOCAL intent copy. Only for a DETERMINISTIC server
+   * rejection of the payload (422 `VALIDATION`) on a send that committed
+   * nothing on-chain: the server row was never created and a re-PUT of the
+   * same bytes can never succeed, so keeping the copy would only poison
+   * {@link resyncOpenIntents} with an eternal 422 replay. NEVER call this for
+   * transient failures (NETWORK/5xx) — the local copy is the #516
+   * double-pay/restore backstop.
+   */
+  async removeLocalIntent(transferId: string): Promise<void> {
+    const intents = await this.readLocalIntents();
+    const intent = intents[transferId];
+    if (!intent) return;
+    // Only a still-'open' copy with no pending server abort is safe to drop:
+    // 'completed' never reverts (§16), and an 'aborted'+abortPending copy is a
+    // #516 backstop whose server row may still be open.
+    if (intent.status !== 'open' || intent.abortPending === true) return;
+    delete intents[transferId];
+    await this.writeLocalIntents(intents);
+  }
+
+  /**
    * Persist a (client-encrypted — S6) intent payload: LOCAL copy first, then
    * `PUT /v1/intents/{transferId}` and await the server ack (E.3 — the engine
    * MUST NOT be called before this resolves). A failed server PUT throws, but
    * the local copy stays as the restore backstop and is re-PUT by
-   * {@link resyncOpenIntents}.
+   * {@link resyncOpenIntents} — except a deterministic 422 `VALIDATION`, which
+   * the send path makes terminal via {@link removeLocalIntent} (#670).
    */
   async putIntent(
     transferId: string,
@@ -999,31 +1022,63 @@ export class WalletApiClient {
    * the row after a restore or a failed original PUT) then abort, so the
    * server row lands as 'aborted' instead of an 'open' intent that resume
    * would re-execute. Completed-wins is preserved server-side (§16).
+   *
+   * #670: replay is per-intent isolated (one failing entry logs and moves on
+   * instead of blocking the rest), and a deterministic 422 `VALIDATION` on the
+   * abortPending re-PUT clears the pending flag instead of retrying forever —
+   * the server will never accept those bytes.
    */
   async resyncOpenIntents(): Promise<void> {
     const intents = await this.readLocalIntents();
     for (const [transferId, intent] of Object.entries(intents)) {
-      if (intent.status === 'open') {
-        // Re-PUT with the SAME requiresSeedClose (the restore dropped the row), then re-POST every
-        // locally-held checkpoint byte-identically (E.4 — the two tables not blob-derivable).
-        await this.requestJson(
-          'PUT',
-          `/v1/intents/${transferId}`,
-          this.intentPutBody(intent.payload, intent.requiresSeedClose === true)
-        );
-        for (const [opIndex, envelope] of Object.entries(intent.progress ?? {})) {
-          // Reconcile to the authoritative record (a concurrent writer may have won the slot) so a
-          // later re-seed never re-POSTs stale losing bytes — the wedge Copilot flagged on #638.
-          await this.postProgressEnvelope(transferId, Number(opIndex), envelope);
+      try {
+        if (intent.status === 'open') {
+          // Re-PUT with the SAME requiresSeedClose (the restore dropped the row), then re-POST every
+          // locally-held checkpoint byte-identically (E.4 — the two tables not blob-derivable).
+          await this.requestJson(
+            'PUT',
+            `/v1/intents/${transferId}`,
+            this.intentPutBody(intent.payload, intent.requiresSeedClose === true)
+          );
+          for (const [opIndex, envelope] of Object.entries(intent.progress ?? {})) {
+            // Reconcile to the authoritative record (a concurrent writer may have won the slot) so a
+            // later re-seed never re-POSTs stale losing bytes — the wedge Copilot flagged on #638.
+            await this.postProgressEnvelope(transferId, Number(opIndex), envelope);
+          }
+        } else if (intent.status === 'aborted' && intent.abortPending === true) {
+          try {
+            await this.requestJson(
+              'PUT',
+              `/v1/intents/${transferId}`,
+              this.intentPutBody(intent.payload, intent.requiresSeedClose === true)
+            );
+          } catch (err) {
+            // #670: a 422 `VALIDATION` rejection is DETERMINISTIC — the server
+            // will never accept this payload, so the re-PUT can never land and
+            // retrying every sync epoch only streams 422s. But a 422 does NOT
+            // prove the row was never created (the server validates the payload
+            // before row existence), so settle the server side first: an abort
+            // that succeeds or 404s proves the row is closed/absent — only then
+            // clear the pending flag. Any other abort failure rethrows into the
+            // per-intent isolation catch and stays pending (#516 backstop).
+            if (!(err instanceof WalletApiError && err.code === 'VALIDATION')) throw err;
+            try {
+              await this.requestJson('POST', `/v1/intents/${transferId}/abort`);
+            } catch (abortErr) {
+              if (!(abortErr instanceof WalletApiError && abortErr.code === 'NOT_FOUND')) throw abortErr;
+            }
+            await this.setLocalIntentStatus(transferId, 'aborted'); // clears abortPending
+            continue;
+          }
+          await this.requestJson('POST', `/v1/intents/${transferId}/abort`);
+          await this.setLocalIntentStatus(transferId, 'aborted'); // clears abortPending
         }
-      } else if (intent.status === 'aborted' && intent.abortPending === true) {
-        await this.requestJson(
-          'PUT',
-          `/v1/intents/${transferId}`,
-          this.intentPutBody(intent.payload, intent.requiresSeedClose === true)
-        );
-        await this.requestJson('POST', `/v1/intents/${transferId}/abort`);
-        await this.setLocalIntentStatus(transferId, 'aborted'); // clears abortPending
+      } catch (err) {
+        // #670: per-intent isolation — one failing entry must not block the
+        // replay of the others (or become an unhandled rejection through the
+        // void-ed noteSyncEpoch callers). The entry keeps its local state and
+        // is retried on the next sync epoch.
+        logger.warn('WalletApi', `resyncOpenIntents: replay of intent ${transferId} failed (retried next epoch):`, err);
       }
     }
   }

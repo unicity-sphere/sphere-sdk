@@ -790,6 +790,12 @@ export interface PaymentsWalletApiPort {
   /** E.2 lost-race cleanup (soft, recoverable). */
   abortIntent(transferId: string): Promise<void>;
   /**
+   * #670: drop the local intent backstop copy — OPTIONAL capability, called only when the intent
+   * PUT was deterministically rejected (422 VALIDATION) with nothing on-chain, so keeping the copy
+   * would poison the resync replay forever. A port without a local copy has nothing to drop.
+   */
+  removeLocalIntent?(transferId: string): Promise<void>;
+  /**
    * E.4 burn checkpoint (sphere-sdk#501) — OPTIONAL capability. When present (the WalletApiClient
    * provides them), a split's resume is checkpoint-protected via {@link WalletApiCheckpointStore};
    * a composed port without them keeps today's residual (a split resumed after a certified mint
@@ -1779,6 +1785,12 @@ export class PaymentsModule {
     // normal failure.
     let onChainCommitComplete = false;
 
+    // #670: set when the intent PUT was deterministically rejected (422
+    // VALIDATION) — the local backstop copy is dropped at the rejection site
+    // and the failure-disposition abort below must be skipped (the server row
+    // never existed; an abort would only 404 and re-mark it abortPending).
+    let intentRejected = false;
+
     try {
       // Resolve recipient
       const peerInfo: PeerInfo | null = await this.deps!.transport.resolve?.(request.recipient) ?? null;
@@ -1923,14 +1935,44 @@ export class PaymentsModule {
           // E.4/#87: a split's terminal close is seed-gated — set requiresSeedClose here, BEFORE
           // the burn, so the funds-critical window is guarded from intent creation (not only once
           // the first checkpoint is appended).
-          await walletApi.putIntent(
-            result.id,
-            encryptField(
-              this.getFieldEncryptionKey(),
-              JSON.stringify(this.buildIntentPayload(request, peerInfo.chainPubkey, splitPlan))
-            ),
-            splitPlan.requiresSplit ? { requiresSeedClose: true } : {}
-          );
+          try {
+            await walletApi.putIntent(
+              result.id,
+              encryptField(
+                this.getFieldEncryptionKey(),
+                JSON.stringify(this.buildIntentPayload(request, peerInfo.chainPubkey, splitPlan))
+              ),
+              splitPlan.requiresSplit ? { requiresSeedClose: true } : {}
+            );
+          } catch (err) {
+            // #670: a 422 VALIDATION rejection is DETERMINISTIC — the server will
+            // never accept this payload (e.g. the intent envelope exceeds the
+            // service's size cap), so the #516 keep-and-replay backstop does not
+            // apply: nothing is on-chain yet (E.3 — the engine has not run) and
+            // the server row was never created. Drop the local copy (keeping it
+            // would poison resyncOpenIntents with an eternal 422) and surface a
+            // TYPED error the app can map instead of the raw wire text
+            // (WalletApiError is not a SphereError). Transient failures
+            // (NETWORK/5xx) rethrow unchanged and keep the backstop.
+            if (err instanceof WalletApiError && err.code === 'VALIDATION' && committedOnChainTokenIds.size === 0) {
+              intentRejected = true;
+              try {
+                await walletApi.removeLocalIntent?.(result.id);
+              } catch (removeErr) {
+                logger.warn('Payments', 'removeLocalIntent failed after intent VALIDATION rejection:', removeErr);
+              }
+              throw new SphereError(
+                // Matches both the server's "envelope exceeds N bytes (§8.3)"
+                // and the SDK checker's "exceeds size cap of N bytes" wording.
+                /exceeds .*bytes/.test(err.message)
+                  ? "The payment could not be registered with the wallet service because it exceeds the service's size limit. Try sending a smaller amount."
+                  : 'The wallet service rejected this payment as invalid.',
+                'VALIDATION_ERROR',
+                err
+              );
+            }
+            throw err;
+          }
         }
 
         // Deliver a journaled finished-token blob via the delivery port (S3:
@@ -2236,7 +2278,10 @@ export class PaymentsModule {
         error instanceof CheckpointPersistFailedError ||
         error instanceof SplitCheckpointLostError ||
         error instanceof CheckpointTrustbaseMismatchError;
-      if (this.deps?.walletApi) {
+      // #670: skip the abort when the intent PUT itself was deterministically
+      // rejected — the local copy is already dropped and the server row never
+      // existed (an abort would only 404 and re-mark the copy abortPending).
+      if (this.deps?.walletApi && !intentRejected) {
         if (error instanceof TransferConflictError || (committedOnChainTokenIds.size === 0 && !keepOpen)) {
           try {
             await this.deps.walletApi.abortIntent(result.id);
