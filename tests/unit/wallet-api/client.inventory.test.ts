@@ -7,6 +7,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { WalletApiClient, WalletApiError } from '../../../wallet-api';
+import type { FetchLike } from '../../../wallet-api';
 import { deriveFieldEncryptionKey, encryptField } from '../../../core/field-encryption';
 import { FakeWalletApi } from '../../support/fake-wallet-api';
 import { makeTestToken, MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
@@ -313,5 +314,98 @@ describe('WalletApiClient — intents (E.3, §16)', () => {
     // re-PUTs its locally-known open intents (idempotent).
     await client.listInventory();
     expect(fake.getIntent(identity.chainPubkey, tid)).toEqual({ payload, status: 'open' });
+  });
+});
+
+describe('WalletApiClient — #670 poisoned-intent self-heal (resyncOpenIntents)', () => {
+  let fake: FakeWalletApi;
+  let client: WalletApiClient;
+  let requests: string[];
+  /** When set, requests whose URL contains this id fail at the transport (NETWORK). */
+  let failFor: string | null;
+  const identity = testIdentity(52);
+  const fieldKey = deriveFieldEncryptionKey(identity.privateKey);
+
+  function envelope(content: string): string {
+    return encryptField(fieldKey, content);
+  }
+
+  beforeEach(async () => {
+    fake = new FakeWalletApi();
+    const baseUrl = await fake.start();
+    requests = [];
+    failFor = null;
+    const fetchFn: FetchLike = (url, init) => {
+      requests.push(`${init?.method ?? 'GET'} ${String(url)}`);
+      if (failFor && String(url).includes(failFor)) return Promise.reject(new TypeError('fetch failed'));
+      return (globalThis.fetch as unknown as FetchLike)(url, init);
+    };
+    client = new WalletApiClient({
+      baseUrl,
+      network: fake.network,
+      deviceId: 'dev-1',
+      storage: new MemoryKeyValueStore(),
+      fetchFn,
+    });
+    client.setIdentity(identity);
+  });
+
+  afterEach(async () => {
+    await fake.stop();
+  });
+
+  it('a poisoned abortPending intent (deterministic 422 re-PUT) is cleared instead of wedging; a later healthy intent still replays', async () => {
+    const tidBad = 'dddddddd-0000-4000-8000-000000000001';
+    const tidGood = 'dddddddd-0000-4000-8000-000000000002';
+    const oversize = envelope('x'.repeat(5000)); // > 4 KiB cap (§7) — deterministic 422
+
+    // The production wedge shape (Sentry SPHERE-R): the PUT 422s AFTER the
+    // local copy is written, the nothing-certified abort then 404s (the row
+    // was never created) → local 'aborted' + abortPending.
+    await expect(client.putIntent(tidBad, oversize)).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(client.abortIntent(tidBad)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+
+    // A healthy open intent queued BEHIND the poisoned one (insertion order),
+    // whose server row a restore then loses.
+    const goodPayload = envelope('healthy');
+    await client.putIntent(tidGood, goodPayload);
+    fake.dropIntent(identity.chainPubkey, tidGood);
+
+    await client.resyncOpenIntents();
+    // The healthy intent replayed despite the poisoned entry ahead of it…
+    expect(fake.getIntent(identity.chainPubkey, tidGood)).toEqual({ payload: goodPayload, status: 'open' });
+    // …and the poisoned entry's pending state is CLEARED: the next epoch
+    // makes no request for it (no recurring background 422 stream).
+    requests.length = 0;
+    await client.resyncOpenIntents();
+    expect(requests.filter((r) => r.includes(tidBad))).toEqual([]);
+    // The server never saw the poisoned intent; resume (status=open) has nothing to re-run.
+    expect(fake.getIntent(identity.chainPubkey, tidBad)).toBeNull();
+    expect((await client.listIntents('open')).map((i) => i.transferId)).toEqual([tidGood]);
+  });
+
+  it('#516 gate: a NETWORK failure on one entry is isolated — others replay, the failing entry stays pending', async () => {
+    const tidDown = 'dddddddd-0000-4000-8000-000000000003';
+    const tidUp = 'dddddddd-0000-4000-8000-000000000004';
+
+    // Two unlanded aborts (dead backend at send-failure cleanup — the #516 shape).
+    await client.putIntent(tidDown, envelope('down'));
+    await client.putIntent(tidUp, envelope('up'));
+    failFor = tidDown;
+    await expect(client.abortIntent(tidDown)).rejects.toMatchObject({ code: 'NETWORK' });
+    failFor = tidUp;
+    await expect(client.abortIntent(tidUp)).rejects.toMatchObject({ code: 'NETWORK' });
+
+    // Replay with tidDown STILL dark: tidUp's abort lands regardless (per-intent isolation).
+    failFor = tidDown;
+    await client.resyncOpenIntents();
+    expect(fake.getIntent(identity.chainPubkey, tidUp)).toMatchObject({ status: 'aborted' });
+    expect(fake.getIntent(identity.chainPubkey, tidDown)).toMatchObject({ status: 'open' }); // abort never landed
+
+    // The transient failure kept the #516 backstop: the entry stayed pending
+    // and converges once the transport heals.
+    failFor = null;
+    await client.resyncOpenIntents();
+    expect(fake.getIntent(identity.chainPubkey, tidDown)).toMatchObject({ status: 'aborted' });
   });
 });

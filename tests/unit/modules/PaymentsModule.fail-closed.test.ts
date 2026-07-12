@@ -13,6 +13,10 @@
  *   marks the LOCAL intent 'aborted'; after reconnect, `resumeOpenIntents`
  *   executes NOTHING and the resync lands the intent as aborted (no-op
  *   execution-wise).
+ * - #670 — a DETERMINISTIC `putIntent` 422 (oversized intent envelope) is
+ *   terminal: the send fails with a TYPED SphereError (VALIDATION_ERROR,
+ *   cause preserved), the local backstop copy is dropped (nothing on-chain),
+ *   and nothing is re-PUT on later sync epochs.
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
@@ -24,7 +28,7 @@ import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, History
 import { FakeTokenEngine, decodeFakeTokenAssets, decodeFakeTokenId } from '../token-engine/FakeTokenEngine';
 import { FakeWalletApi } from '../../support/fake-wallet-api';
 import { MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
-import { WalletApiClient } from '../../../wallet-api';
+import { WalletApiClient, WalletApiError } from '../../../wallet-api';
 import type { FetchLike } from '../../../wallet-api';
 import { WalletApiMailboxProvider, WalletApiTokenStorageProvider } from '../../../impl/shared/wallet-api';
 import { hexToBytes } from '../../../core/crypto';
@@ -335,5 +339,82 @@ describe('#516 — failed putIntent must NOT leave a re-executable open intent',
     expect(outcome2).toEqual({ resumed: [], conflicted: [], failed: [] });
     expect(transferSpy).not.toHaveBeenCalled();
     expect(module.getTokens()[0].status).toBe('confirmed'); // no double-spend of the source
+  });
+});
+
+describe('#670 — deterministic putIntent VALIDATION rejection is terminal', () => {
+  it('send fails with a TYPED SphereError (cause preserved); no local copy remains, nothing re-PUT on later epochs', async () => {
+    // A 64-byte fake intent cap deterministically 422s ANY real intent
+    // envelope — the production shape (a fragmented wallet whose envelope
+    // exceeds the §7 cap, Sentry SPHERE-R).
+    const fake = new FakeWalletApi({
+      decodeAssets: decodeFakeTokenAssets,
+      decodeTokenId: decodeFakeTokenId,
+      intentMaxBytes: 64,
+    });
+    const baseUrl = await fake.start();
+    cleanups.push(() => fake.stop());
+
+    const requests: string[] = [];
+    const fetchFn: FetchLike = (url, init) => {
+      requests.push(`${init?.method ?? 'GET'} ${String(url)}`);
+      return (globalThis.fetch as unknown as FetchLike)(url, init);
+    };
+    const kv = new MemoryKeyValueStore();
+    const client = new WalletApiClient({ baseUrl, network: fake.network, deviceId: 'd-670', storage: kv, fetchFn });
+    const delivery = new WalletApiMailboxProvider({ client, custody: 'external', stateStore: kv });
+    const engine = new FakeTokenEngine({ chainPubkey: hexToBytes(SENDER.chainPubkey) });
+    const emitEvent = vi.fn();
+    const deps: PaymentsModuleDependencies = {
+      identity: fullIdentity(SENDER),
+      storage: mockStorage(),
+      tokenStorageProviders: new Map([['local', mockLocalTokenStorage()]]),
+      transport: mockTransport(),
+      oracle: mockOracle(),
+      emitEvent,
+      tokenEngine: engine,
+      delivery,
+      walletApi: client,
+    };
+    const module = createPaymentsModule({ l1: null });
+    module.initialize(deps);
+    cleanups.push(() => module.destroy());
+
+    await module.load();
+    const mint = await module.mintFungibleToken(UCT, 1000n);
+    expect(mint.success).toBe(true);
+
+    const transferSpy = vi.spyOn(engine, 'transfer');
+    const putIntentSpy = vi.spyOn(client, 'putIntent');
+
+    // The app sees a TYPED error it can map — not the raw wire text.
+    let thrown: unknown;
+    try {
+      await module.send({ recipient: '@bob', amount: '1000', coinId: UCT });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(SphereError);
+    expect((thrown as SphereError).code).toBe('VALIDATION_ERROR');
+    expect((thrown as SphereError).message).toMatch(/size limit/);
+    const cause = (thrown as SphereError).cause;
+    expect(cause).toBeInstanceOf(WalletApiError);
+    expect((cause as WalletApiError).code).toBe('VALIDATION');
+
+    expect(transferSpy).not.toHaveBeenCalled(); // E.3: engine never ran
+    const transferId = putIntentSpy.mock.calls[0][0];
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toBeNull(); // row never created
+
+    // TERMINAL: the local backstop copy is dropped (nothing was on-chain) —
+    // later sync epochs make NO intent request (no repeated 422 stream) and
+    // resume has nothing to re-execute.
+    expect(await client.listLocalOpenIntents()).toEqual([]);
+    requests.length = 0;
+    await client.resyncOpenIntents();
+    expect(requests.filter((r) => r.includes('/v1/intents'))).toEqual([]);
+
+    // The source is restored and spendable; nothing reached the mailbox.
+    expect(module.getTokens()[0].status).toBe('confirmed');
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(0);
   });
 });

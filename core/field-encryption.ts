@@ -40,6 +40,9 @@ const POLY1305_TAG_BYTES = 16;
 /**
  * Default envelope size cap in bytes (UTF-8 length of the full `enc1.…`
  * string). Matches the intent-payload cap (≤ 4 KiB — ARCHITECTURE §7/§11).
+ * NOTE: the server-side INTENT cap is being raised (wallet-api#102); the SDK
+ * deliberately does NOT pre-flight-enforce it on sends (#670) — the server
+ * decides, and a deterministic 422 is handled as terminal by the send path.
  */
 export const FIELD_ENVELOPE_MAX_BYTES = 4096;
 
