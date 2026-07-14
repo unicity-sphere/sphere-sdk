@@ -412,14 +412,14 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 
 ## Intent Actions (require user confirmation)
 
-| Action | Params |
-|--------|--------|
-| `send` | `to, amount, coinId` |
-| `dm` | `to, message` |
-| `payment_request` | `to, amount, coinId, message?` |
-| `receive` | — |
-| `sign_message` | `message` |
-| `mint` | `coinId` (lowercase hex), `amount` (smallest units) |
+| Action | Params | Result (Sphere wallet) |
+|--------|--------|------------------------|
+| `send` | `to, amount, coinId, memo?` | `{ success, transferId?, status, deliveryPending }` |
+| `dm` | `to, message` | `{ sent, messageId, timestamp }` |
+| `payment_request` | `to, amount, coinId, message?` | `{ success, requestId }` |
+| `receive` | — | `{ transfers }` |
+| `sign_message` | `message` | `{ signature, publicKey }` |
+| `mint` | `coinId` (lowercase hex), `amount` (smallest units) | `{ tokenId, coinId, amount }` |
 
 > **Amount units:** `amount` is always in **base units** (the smallest indivisible unit), as a
 > string — the same convention as `mint`, the token engine (`mintFungibleToken(coinId, amount: bigint)`)
@@ -430,6 +430,28 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 > Invoice/accounting intents (`create_invoice` … `set_auto_return`) exist in the protocol but
 > are experimental and not enabled in the Sphere wallet — see
 > [Experimental](#experimental--not-supported-by-the-sphere-wallet).
+
+### send Intent Result — delivery semantics
+
+The `send` result distinguishes **on-chain finality** from **recipient-side delivery**:
+
+- `deliveryPending: false` — the transfer certified on-chain **and** landed in the recipient's
+  mailbox/transport. Done.
+- `deliveryPending: true` — the spend is **final on-chain** but the recipient-side delivery is
+  journaled in the sender's wallet and retries automatically (covenant §3.1). **Never re-issue
+  the send** — the source tokens are terminally spent, and a fresh `intent('send', …)` would
+  pay the recipient a second time from different tokens. `transferId` may be absent on this
+  path (possibly-certified resolutions carry no id; the still-open intent owns settlement).
+- Treat the money as sent in both cases; use `deliveryPending` only to set expectations
+  ("recipient may receive it with a delay") — not to gate retries.
+
+> **Server-side (Node.js) recipients:** a wallet built with bare `createNodeProviders` only
+> listens on the Nostr transport and will **never see** deliveries from wallet-api-composed
+> senders (which includes the hosted Sphere wallet — it delivers via the wallet-api mailbox,
+> not Nostr). A Node.js recipient of dApp/wallet sends **must** compose the wallet-api
+> delivery rail — `createWalletApiProviders(...)` or `createOwnStorageWalletApiProviders(...)`
+> — see [QUICKSTART-NODEJS.md](QUICKSTART-NODEJS.md). Deposits made before the recipient
+> composes the rail stay claimable in the mailbox.
 
 ### sign_message Intent
 
