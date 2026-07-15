@@ -231,6 +231,71 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
     await this.stateStore.set(this.stateKey('knownSpends'), JSON.stringify([...known]));
   }
 
+  /**
+   * #679 durable suspected-spent overlay — DURABLE LOCAL demotions, never on
+   * the server. A source proven spent on-chain (`TransferConflictError`) is
+   * demoted client-side, but the server row is still `active` (no evidenced
+   * tombstone), so `save()` carries nothing and a reload would re-serve the
+   * phantom as spendable `confirmed` balance (SPHERE-4). We keep the tokenId in
+   * this per-device set and re-stamp it onto the active view every converge
+   * (see {@link snapshotView}); the set is pruned once the token leaves the
+   * active view (a real tombstone/spend or handoff), so it stays bounded and
+   * never shadows a legitimately re-added token.
+   */
+  private async readSuspectedSpent(): Promise<Set<string>> {
+    const raw = await this.stateStore.get(this.stateKey('suspectedSpent'));
+    if (!raw) return new Set();
+    try {
+      return new Set(JSON.parse(raw) as string[]);
+    } catch {
+      return new Set();
+    }
+  }
+
+  private async writeSuspectedSpent(ids: Set<string>): Promise<void> {
+    if (ids.size === 0) {
+      await this.stateStore.remove(this.stateKey('suspectedSpent'));
+      return;
+    }
+    await this.stateStore.set(this.stateKey('suspectedSpent'), JSON.stringify([...ids]));
+  }
+
+  /**
+   * #679: durably record a client-side demotion. Called by the consumer
+   * (`PaymentsModule.demoteSuspectedSpent`) when a `TransferConflictError`
+   * proves a source already spent on-chain. LOCAL only — the server view still
+   * shows the row active, so this is the only place the flag can survive a
+   * reload. Re-applied to the view by {@link snapshotView}.
+   */
+  async markSuspectedSpent(tokenId: string): Promise<void> {
+    const overlay = await this.readSuspectedSpent();
+    if (overlay.has(tokenId)) return;
+    overlay.add(tokenId);
+    await this.writeSuspectedSpent(overlay);
+  }
+
+  /**
+   * Prune the durable suspected-spent overlay to the tokens still ACTIVE in the
+   * given view and return the surviving set. Any overlay id that is no longer
+   * active — legitimately tombstoned/spent, handed off, or vanished — is
+   * dropped, so the overlay cannot grow unbounded or shadow a re-added token
+   * (#679 lifecycle). Persists only when the set actually changed.
+   */
+  private async reconcileSuspectedSpent(active: InventoryItem[]): Promise<Set<string>> {
+    const overlay = await this.readSuspectedSpent();
+    if (overlay.size === 0) return overlay;
+    const activeIds = new Set(active.map((i) => i.tokenId));
+    let changed = false;
+    for (const id of overlay) {
+      if (!activeIds.has(id)) {
+        overlay.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) await this.writeSuspectedSpent(overlay);
+    return overlay;
+  }
+
   // ── inventory sync (§5.1) ───────────────────────────────────────────────────
 
   private applyItems(items: InventoryItem[]): void {
@@ -337,7 +402,16 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
   }
 
   private async snapshotView(): Promise<InventoryView> {
-    const items = [...this.view.values()].filter((i) => i.status === 'active');
+    const active = [...this.view.values()].filter((i) => i.status === 'active');
+    // #679: re-apply (and prune) the durable suspected-spent overlay so a
+    // client-side demotion survives this reload — an active row in the overlay
+    // is stamped `suspectedSpent` and the consumer rebuilds it as a demoted,
+    // non-spendable token instead of resurrecting the phantom balance.
+    const overlay = await this.reconcileSuspectedSpent(active);
+    const items =
+      overlay.size === 0
+        ? active
+        : active.map((i) => (overlay.has(i.tokenId) ? { ...i, suspectedSpent: true } : i));
     const cursor = (await this.readCursor()) ?? 0n;
     const syncEpoch = (await this.readSyncEpoch()) ?? 0n;
     return { cursor, syncEpoch, more: false, items };
