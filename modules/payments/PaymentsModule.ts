@@ -102,6 +102,15 @@ import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 export type TransactionHistoryEntry = import('../../storage').HistoryRecord;
 
 /**
+ * #441: a wallet-api `respondPaymentRequest` rejection meaning the request is
+ * NOT open (already resolved / expired) — a 409 CONFLICT. Safe to swallow when
+ * replaying a deferred 'paid' (idempotent); any OTHER error must be retried.
+ */
+function isNonOpenConflict(err: unknown): boolean {
+  return err instanceof WalletApiError && (err.code === 'CONFLICT' || err.status === 409);
+}
+
+/**
  * Compute a dedup key for a history entry.
  * - SENT + transferId → groups multi-token sends into a single entry
  * - type + tokenId → one entry per token per direction
@@ -1073,6 +1082,23 @@ export class PaymentsModule {
    */
   private prBootstrapped = false;
 
+  /**
+   * #441 deferred-paid journal (durable, per network+identity): links a payment
+   * request to the in-flight transfer of a possibly-committed pay so the request
+   * is held NON-payable ('settling') until that transfer completes (→ 'paid',
+   * server told) or aborts (→ payable, journal cleared). Keyed by request wire id
+   * (== requestId for wallet-api-surfaced requests). The in-memory Map is the
+   * synchronous source of truth used by the reload re-apply seam; it is
+   * single-flight loaded and every read-modify-write is serialized through a tail
+   * promise (the #679/#680 lesson: an unserialized RMW drops entries under
+   * concurrency = a re-payable request = the double-pay this fix prevents).
+   */
+  private settlingJournal: Map<string, { transferId: string; createdAt: number; committed?: boolean }> | null = null;
+  private settlingJournalLoad: Promise<void> | null = null;
+  private settlingJournalWrite: Promise<void> = Promise.resolve();
+  /** #441: guard overlapping resume reconciles (resumeOpenIntents has 2 fire-and-forget call sites). */
+  private reconcileInFlight = false;
+
   // Guard: ensure load() completes before processing incoming bundles
   private loadedPromise: Promise<void> | null = null;
   private loaded = false;
@@ -1358,6 +1384,14 @@ export class PaymentsModule {
     // installed. Without the capability the transport subscriptions stay
     // exactly as before (port selection, covenant §3.1-6).
     this.prBootstrapped = false;
+    // #441: reset the deferred-paid journal so it reloads under the new identity's
+    // storage key (the key bakes in chainPubkey). New mutations start a fresh
+    // write chain; any still-queued old-identity mutation is dropped by the
+    // per-mutation key guard in mutateSettlingJournal (it can't pollute the new
+    // identity's journal).
+    this.settlingJournal = null;
+    this.settlingJournalLoad = null;
+    this.settlingJournalWrite = Promise.resolve();
     if (this.paymentRequestsApi()) {
       this.prPollTimer = setInterval(() => {
         this.pumpHealth.run('payment-requests', () => this.pumpPaymentRequests());
@@ -2451,11 +2485,16 @@ export class PaymentsModule {
       // (ProofUnconfirmed / split-checkpoint), which are pre-mirror and have
       // their own handling.
       if (onChainCommitComplete && !(error instanceof TransferConflictError) && !keepOpen) {
-        throw new SphereError(
+        // #441 deferred-paid linkage: stamp the committing attempt's own transferId
+        // so a payment-request consumer can journal request→transfer and resolve
+        // 'paid' only once resumeOpenIntents actually completes this transfer.
+        const pending = new SphereError(
           'Your payment was sent. Your wallet is syncing with the server and will catch up shortly.',
           'SEND_SYNC_PENDING',
           error,
         );
+        pending.transferId = result.id;
+        throw pending;
       }
 
       // #677: a lost race (TransferConflictError) AFTER ≥1 earlier leg already
@@ -2480,6 +2519,15 @@ export class PaymentsModule {
           (remaining > 0n ? remaining : 0n).toString(),
           error,
         );
+      }
+
+      // #441 deferred-paid linkage: the keep-open certification codes
+      // (CERTIFICATION_UNCONFIRMED / CHECKPOINT_PERSIST_FAILED / SPLIT_CHECKPOINT_LOST /
+      // CHECKPOINT_TRUSTBASE_MISMATCH) reach the caller via the terminal throw below.
+      // Stamp this attempt's transferId so a payment-request consumer can journal
+      // request→transfer (idempotent; only fills a possibly-committed keep-open code).
+      if (error instanceof SphereError && isPossiblyCommittedSendOutcome(error)) {
+        error.transferId ??= result.id;
       }
 
       this.deps!.emitEvent('transfer:failed', result);
@@ -2937,12 +2985,21 @@ export class PaymentsModule {
   }
 
   /**
-   * Remove all non-pending incoming payment requests from memory.
+   * Remove resolved incoming payment requests from memory.
    *
-   * Keeps only requests with status `'pending'`.
+   * Keeps requests with status `'pending'` OR `'settling'` (#441). A `'settling'`
+   * request is UNRESOLVED — its linked transfer is still in-flight — so evicting
+   * it would drop the in-memory hold that keeps it non-payable until the journal
+   * re-surfaces it. Only terminal statuses (`'paid'`/`'rejected'`/`'expired'`)
+   * are removed.
    */
   clearProcessedPaymentRequests(): void {
-    this.paymentRequests = this.paymentRequests.filter((r) => r.status === 'pending');
+    // #441: a 'settling' request is UNRESOLVED (its linked transfer is still
+    // in-flight) — it must NOT be evicted, or the reload re-apply loses its
+    // in-memory hold before the journal re-surfaces it.
+    this.paymentRequests = this.paymentRequests.filter(
+      (r) => r.status === 'pending' || r.status === 'settling'
+    );
   }
 
   /**
@@ -2995,16 +3052,53 @@ export class PaymentsModule {
       // #441/#442: reverting to 'pending' makes the request RE-PAYABLE (the guard
       // above admits a re-pay when status is 'pending' OR 'accepted'). That is
       // correct ONLY for a clean pre-commit failure where NOTHING left the wallet.
-      // For a possibly-committed outcome — a post-commit sync-pending / keep-open
-      // certification state, or a PartialSendConflictError (money already left,
-      // the intent completes via resume/claim) — reverting would double-pay. Mark
-      // it 'paid' (durably non-payable) instead and re-throw so the caller still
-      // learns it is pending/partial. This makes the request state durably correct
-      // for every consumer (the app's in-memory override becomes unnecessary).
-      this.updatePaymentRequestStatus(
-        requestId,
-        isPossiblyCommittedSendOutcome(error) ? 'paid' : 'pending',
-      );
+      if (isPossiblyCommittedSendOutcome(error)) {
+        // Money has (or may have) left the wallet on-chain. Do NOT tell the server
+        // 'paid' yet — resumeOpenIntents may still ABORT this transfer. Durably
+        // journal request→transfer and hold the request NON-payable ('settling')
+        // until the linked transfer actually completes (resolves 'paid') or aborts
+        // (returns to payable). Reverting to 'pending' here — or telling the server
+        // 'paid' now — would double-pay after a RELOAD.
+        const linkedTransferId =
+          error instanceof SphereError && error.transferId ? error.transferId : undefined;
+        // Deferral requires the wallet-api resume + respond mechanism. Without a
+        // wallet-api PR port (a Nostr-only composition — where a possibly-committed
+        // outcome does not actually arise, and requests are in-memory push-only, so
+        // there is no reload re-surface to double-pay), keep the prior durable
+        // 'paid' behavior instead of holding an unresolvable 'settling'.
+        if (linkedTransferId && this.paymentRequestsApi()) {
+          // A PartialSendConflictError means ≥1 leg ALREADY certified + delivered
+          // and the anchor intent was soft-aborted — so resume will report it
+          // aborted, but value DID leave the wallet. Journal it as `committed` so
+          // the reconcile resolves it 'paid' and NEVER reverts to payable (a
+          // re-pay would double-pay the delivered leg). Every other keep-open code
+          // is a non-committed link that resume may complete or genuinely abort.
+          const committed = error instanceof PartialSendConflictError;
+          // Order is load-bearing: journal PERSISTS before the in-memory status
+          // flip, so a crash in between leaves the durable link (reload re-applies
+          // settling) — never a lost link (which would re-surface payable).
+          await this.journalSettling(requestId, linkedTransferId, committed);
+          this.updatePaymentRequestStatus(requestId, 'settling');
+        } else {
+          // Either a Nostr-only composition (no wallet-api PR port — no deferral
+          // mechanism, no reload re-surface) or — defensively — a possibly-committed
+          // code with NO stamped transferId (should be impossible after the sendOnce
+          // stamps). Either way FAIL CLOSED to the pre-fix behavior (durably
+          // non-payable) rather than re-surface payable or hold an unresolvable
+          // 'settling'.
+          if (!linkedTransferId) {
+            logger.error(
+              'Payments',
+              `Possibly-committed send for ${requestId} carried no transferId — marking paid (fail-closed)`,
+            );
+          }
+          this.updatePaymentRequestStatus(requestId, 'paid');
+        }
+      } else {
+        // Clean pre-commit failure — nothing left the wallet; re-payable.
+        await this.clearSettling(requestId); // defensive: drop any stale link
+        this.updatePaymentRequestStatus(requestId, 'pending');
+      }
       throw error;
     }
   }
@@ -3019,7 +3113,8 @@ export class PaymentsModule {
       if (eventType === 'payment_request:accepted' ||
           eventType === 'payment_request:rejected' ||
           eventType === 'payment_request:paid' ||
-          eventType === 'payment_request:expired') {
+          eventType === 'payment_request:expired' ||
+          eventType === 'payment_request:settling') {
         this.deps?.emitEvent(eventType, request);
       }
     }
@@ -5486,6 +5581,92 @@ export class PaymentsModule {
     );
   }
 
+  // ── #441 deferred-paid journal (per network + identity — mirrors prCursor) ──
+
+  private prSettlingKey(): string {
+    const network = this.paymentRequestsApi()?.network ?? 'default';
+    return `wallet-api-pr:settling:${network}:${this.deps!.identity.chainPubkey}`;
+  }
+
+  /**
+   * Single-flight load: concurrent callers (the pump's reload re-apply, resume's
+   * reconcile, a live pay catch) share ONE storage.get + ONE Map instance so a
+   * lazy read never overwrites another context's in-memory mutation.
+   */
+  private ensureSettlingJournalLoaded(): Promise<void> {
+    return (this.settlingJournalLoad ??= (async () => {
+      const keyAtLoad = this.prSettlingKey();
+      const raw = await this.deps!.storage.get(keyAtLoad);
+      // Identity switched during the load await (initialize() reset the journal
+      // for a new key): do NOT clobber the NEW identity's settlingJournal with
+      // this stale load. The fresh identity's ensureSettlingJournalLoaded (its
+      // memo was reset to null) loads the correct journal.
+      if (this.prSettlingKey() !== keyAtLoad) return;
+      try {
+        this.settlingJournal = new Map(
+          raw ? Object.entries(JSON.parse(raw) as Record<string, { transferId: string; createdAt: number; committed?: boolean }>) : []
+        );
+      } catch (err) {
+        // A corrupt blob (partial write / manual clear / older format) must NOT
+        // wedge the whole resume + payment-request pump. Fail open to an empty
+        // journal (a settling request may re-surface payable — a rare, bounded
+        // risk) rather than throw and break ALL resume for the session.
+        logger.error('Payments', 'Settling journal unreadable — treating as empty:', err);
+        this.settlingJournal = new Map();
+      }
+    })());
+  }
+
+  /**
+   * Serialize every read-modify-write through a tail-promise chain so two
+   * concurrent mutations can't lose an entry (the #679/#680 mutex lesson — a
+   * dropped entry is a re-payable request is a double-pay). `fn` returns true
+   * when the Map changed and must be persisted.
+   */
+  private mutateSettlingJournal(
+    fn: (m: Map<string, { transferId: string; createdAt: number; committed?: boolean }>) => boolean
+  ): Promise<void> {
+    // Capture the identity's storage key at ENQUEUE time. If the identity
+    // switches before this queued mutation runs, prSettlingKey() will have
+    // changed — skip, so a stale old-identity mutation cannot reload + rewrite
+    // the NEW identity's journal (resetting the chain pointer alone does not
+    // cancel an already-queued .then).
+    const keyAtEnqueue = this.prSettlingKey();
+    this.settlingJournalWrite = this.settlingJournalWrite.catch(() => {}).then(async () => {
+      if (this.prSettlingKey() !== keyAtEnqueue) return; // identity changed — drop the stale mutation
+      await this.ensureSettlingJournalLoaded();
+      // Re-check after the load await: if the identity switched WHILE loading, the
+      // load skipped its assignment (guard above) — bail so we never mutate under
+      // the wrong identity, and so `settlingJournal!` is provably non-null here.
+      if (this.prSettlingKey() !== keyAtEnqueue) return;
+      if (fn(this.settlingJournal!)) {
+        await this.deps!.storage.set(keyAtEnqueue, JSON.stringify(Object.fromEntries(this.settlingJournal!)));
+      }
+    });
+    return this.settlingJournalWrite;
+  }
+
+  /**
+   * #441: link a request to its in-flight transfer. `committed` marks a
+   * DEFINITE spend whose anchor intent is soft-aborted and will NOT resume-
+   * complete — a `PartialSendConflictError` (≥1 leg already delivered). The
+   * reconcile must resolve such a link 'paid' and NEVER revert it to payable
+   * (re-paying the full amount would double-pay the delivered leg). A
+   * non-`committed` link is a keep-open outcome that resume may still complete
+   * OR abort (e.g. CERTIFICATION_UNCONFIRMED losing to a foreign tx delivers
+   * nothing) — those DO revert to payable on abort.
+   */
+  private journalSettling(requestId: string, transferId: string, committed = false): Promise<void> {
+    return this.mutateSettlingJournal((m) => {
+      m.set(requestId, { transferId, createdAt: Date.now(), ...(committed ? { committed: true } : {}) });
+      return true;
+    });
+  }
+
+  private clearSettling(requestId: string): Promise<void> {
+    return this.mutateSettlingJournal((m) => m.delete(requestId));
+  }
+
   // ── the pump ─────────────────────────────────────────────────────────────────
 
   /**
@@ -5540,6 +5721,12 @@ export class PaymentsModule {
    * picks up live updates from the resume point.
    */
   private async pumpIncomingPaymentRequests(api: PaymentRequestsApi): Promise<void> {
+    // #441: the deferred-paid journal must be present in memory BEFORE the first
+    // hydration surfaces any wire — surfaceIncomingPaymentRequest reads it
+    // synchronously to hold a settling request non-payable instead of re-surfacing
+    // it as payable. Single-flight, so ordering vs. resumeOpenIntents is irrelevant.
+    await this.ensureSettlingJournalLoaded();
+
     const persisted = await this.readPrCursorState();
 
     if (!this.prBootstrapped) {
@@ -5630,7 +5817,27 @@ export class PaymentsModule {
       return;
     }
 
-    const status = PaymentsModule.PR_WIRE_STATUS[wire.status];
+    let status = PaymentsModule.PR_WIRE_STATUS[wire.status];
+
+    // #441 reload re-apply: a request linked to an in-flight transfer (durable
+    // journal, loaded before hydration) must NOT be re-surfaced as payable. Read
+    // the SYNCHRONOUS in-memory journal (loaded in pumpIncomingPaymentRequests /
+    // resumeOpenIntents before any surface call).
+    const settling = this.settlingJournal?.get(wire.id);
+    if (settling) {
+      if (wire.status === 'open') {
+        // Hold non-payable; suppresses the new-incoming notify below.
+        status = 'settling';
+      } else {
+        // Server already resolved (paid/declined/expired) — our deferred tell
+        // landed in a prior session, or it expired. Drop the stale link and let
+        // the terminal status flow. Fire-and-forget (surface is sync), but attach
+        // a .catch so a storage I/O failure can't raise an unhandled rejection.
+        void this.clearSettling(wire.id).catch((err) =>
+          logger.warn('Payments', `Failed to clear stale settling link for ${wire.id}:`, err),
+        );
+      }
+    }
 
     // §16 upsert: a request re-surfaces in the incoming ?since= delta at a higher seq when it is
     // resolved (paid/declined) or expired — on another device OR by THIS wallet's other session.
@@ -5866,7 +6073,126 @@ export class PaymentsModule {
         }
       }
     }
+
+    // #441: drive deferred-paid resolution off the DURABLE journal (not in-memory
+    // request presence) — this is the sole seam where a settling transfer
+    // completes (resumed), aborts (conflicted), or stays open (failed).
+    await this.reconcileSettlingPaymentRequests(
+      outcome,
+      new Set(intents.map((i) => i.transferId)),
+      localIntents,
+      localReadFailed,
+    );
+
     return outcome;
+  }
+
+  /**
+   * #441: resolve every journaled settling payment request against a resume
+   * outcome. Completed → send the deferred 'paid' response (server now told) and
+   * resolve 'paid'. Aborted (nothing delivered) → clear journal, return to
+   * payable. Still open → leave it. For an id accounted for by NONE of those
+   * (a crash between resume-complete and the local write), consult the server
+   * `listIntents('aborted')` authority: aborted → payable; else → paid (a
+   * completed row the server GC'd). Direction-of-error is deliberate: the only
+   * residual false-paid is a transfer that aborted server-side AND whose local
+   * 'aborted' write was lost AND whose server aborted-row was later GC'd — it is
+   * treated as paid, erring toward PAID-NEVER-RE-PAYABLE (no double-pay), the
+   * invariant this fix exists to protect.
+   */
+  private async reconcileSettlingPaymentRequests(
+    outcome: { resumed: string[]; conflicted: string[]; failed: string[] },
+    openIntentIds: Set<string>,
+    localIntents: Map<string, { status: 'open' | 'completed' | 'aborted'; abortPending: boolean }> | undefined,
+    localReadFailed: boolean,
+  ): Promise<void> {
+    if (this.reconcileInFlight) return; // an overlapping resume is already reconciling
+    await this.ensureSettlingJournalLoaded();
+    if (this.settlingJournal!.size === 0) return;
+    if (localReadFailed) return; // #676 posture: dispositions unknown → leave settling, retry next sign-in
+    this.reconcileInFlight = true;
+    try {
+      const resumed = new Set(outcome.resumed);
+      const conflicted = new Set(outcome.conflicted); // aborted THIS run — nothing delivered
+
+      // Server ABORTED authority — fetched lazily, only when a journaled id is
+      // unaccounted-for by the cheap checks below (closes the false-paid crash gap
+      // without a local-absence guess).
+      let abortedIds: Set<string> | null = null;
+      const abortedAuthority = async (): Promise<Set<string>> => {
+        if (abortedIds) return abortedIds;
+        const aborted = await this.deps!.walletApi!.listIntents('aborted');
+        abortedIds = new Set(aborted.map((i) => i.transferId));
+        return abortedIds;
+      };
+
+      for (const [requestId, entry] of [...this.settlingJournal!]) {
+        const { transferId, createdAt } = entry;
+        if (Date.now() - createdAt > 7 * 864e5) {
+          logger.warn(
+            'Payments',
+            `Settling link ${requestId}→${transferId.slice(0, 8)}… is >7d old (stuck transfer?)`,
+          );
+        }
+        const local = localIntents?.get(transferId);
+
+        // A `committed` link (PartialSendConflictError) delivered value already;
+        // its anchor intent is soft-aborted, so it will show aborted/conflicted —
+        // but it must NEVER revert to payable (that re-pays the delivered leg).
+        // Resolve it 'paid' unconditionally (retry the response until it lands).
+        if (entry.committed) {
+          await this.resolveSettledPaid(requestId, transferId);
+        } else if (resumed.has(transferId) || local?.status === 'completed') {
+          await this.resolveSettledPaid(requestId, transferId);
+        } else if (conflicted.has(transferId) || local?.status === 'aborted' || local?.abortPending === true) {
+          await this.revertSettlingToPayable(requestId);
+        } else if (openIntentIds.has(transferId)) {
+          // Still open (transient/stuck) → leave journal, retry next sign-in.
+        } else {
+          // Not resumed this run, not locally decided, not in the open list —
+          // consult the server aborted authority.
+          try {
+            const aborted = await abortedAuthority();
+            if (aborted.has(transferId)) await this.revertSettlingToPayable(requestId);
+            else await this.resolveSettledPaid(requestId, transferId); // server GC'd a completed row
+          } catch (e) {
+            logger.warn(
+              'Payments',
+              `listIntents(aborted) failed during reconcile — deferring ${requestId} to next sign-in:`,
+              e,
+            );
+          }
+        }
+      }
+    } finally {
+      this.reconcileInFlight = false;
+    }
+  }
+
+  /** #441: the linked transfer completed — tell the server 'paid' and resolve 'paid'. */
+  private async resolveSettledPaid(requestId: string, transferId: string): Promise<void> {
+    const api = this.paymentRequestsApi();
+    if (!api || typeof api.respondPaymentRequest !== 'function') return; // only wallet-api ports journal
+    try {
+      await api.respondPaymentRequest(requestId, { action: 'paid', transferId });
+    } catch (err) {
+      // Idempotent replay / expiry race: a 409 CONFLICT ('non-open') means the
+      // request is already resolved server-side → swallow and clear. Any OTHER
+      // error (network / 5xx) → leave the journal, retry next sign-in.
+      if (!isNonOpenConflict(err)) {
+        logger.warn('Payments', `Deferred paid response failed for ${requestId} (retried next sign-in):`, err);
+        return;
+      }
+    }
+    await this.clearSettling(requestId);
+    this.updatePaymentRequestStatus(requestId, 'paid'); // reconcile in-memory if surfaced; else next pump sees wire 'paid'
+  }
+
+  /** #441: the linked transfer aborted — nothing was paid; clear the link and return to payable. */
+  private async revertSettlingToPayable(requestId: string): Promise<void> {
+    await this.clearSettling(requestId);
+    // No-op if not in memory; the next pump re-surfaces the open wire as 'pending'.
+    this.updatePaymentRequestStatus(requestId, 'pending');
   }
 
   /**

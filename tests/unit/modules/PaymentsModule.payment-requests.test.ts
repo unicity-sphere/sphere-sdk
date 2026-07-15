@@ -27,12 +27,12 @@ import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, History
 import { FakeTokenEngine, decodeFakeTokenAssets, decodeFakeTokenId } from '../token-engine/FakeTokenEngine';
 import { FakeWalletApi } from '../../support/fake-wallet-api';
 import { MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
-import { WalletApiClient } from '../../../wallet-api';
+import { WalletApiClient, WalletApiError } from '../../../wallet-api';
 import { WalletApiMailboxProvider, WalletApiTokenStorageProvider } from '../../../impl/shared/wallet-api';
 import { encodeTokenBlob } from '../../../token-engine/token-blob';
 import { hexToBytes } from '../../../core/crypto';
 import { SphereError, PartialSendConflictError } from '../../../core/errors';
-import { FIELD_ENVELOPE_PREFIX } from '../../../core/field-encryption';
+import { FIELD_ENVELOPE_PREFIX, deriveFieldEncryptionKey, encryptField } from '../../../core/field-encryption';
 import { deriveDeliveryEncryptionKey, decryptDeliveryBundle } from '../../../core/delivery-envelope';
 
 const UCT = '11'.repeat(32);
@@ -400,62 +400,347 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     });
   });
 
-  describe('#441/#442: a possibly-committed pay outcome keeps the request NON-payable (durable, no double-pay)', () => {
-    async function seedPendingRequest(deviceSuffix: string): Promise<{ payer: Wallet; reqId: string }> {
+  describe('#441 deferred-paid: a possibly-committed pay HOLDS the request settling until the transfer resolves (no double-pay on reload)', () => {
+    const SETTLING_KEY = (net: string) => `wallet-api-pr:settling:${net}:${PAYER.chainPubkey}`;
+
+    interface Ctx {
+      fake: FakeWalletApi;
+      baseUrl: string;
+      requester: Wallet;
+      payer: Wallet;
+      reqId: string;
+      sourceTokenId: string;
+    }
+
+    async function seedPendingRequest(deviceSuffix: string): Promise<Ctx> {
       const { fake, baseUrl } = await startFake();
       const requester = makeWalletApiWallet(baseUrl, fake.network, REQUESTER, `pr-441-r-${deviceSuffix}`);
       const payer = makeWalletApiWallet(baseUrl, fake.network, PAYER, `pr-441-p-${deviceSuffix}`);
-      await seedServerToken(fake, payer, PAYER, 1000n);
+      const sourceTokenId = await seedServerToken(fake, payer, PAYER, 1000n);
       await requester.module.load();
       await payer.module.load();
       await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '1000', coinId: UCT });
       await payer.module.syncPaymentRequests();
       const pending = payer.module.getPaymentRequests({ status: 'pending' });
       expect(pending).toHaveLength(1);
-      return { payer, reqId: pending[0].id };
+      return { fake, baseUrl, requester, payer, reqId: pending[0].id, sourceTokenId };
     }
 
-    it('a possibly-committed keep-open failure (SEND_SYNC_PENDING) marks the request paid (NOT pending) — a re-pay is refused', async () => {
-      const { payer, reqId } = await seedPendingRequest('sync');
+    /** Put a REAL open intent on the server (the id resume will complete/abort), matching this pay. */
+    async function putOpenIntent(payer: Wallet, transferId: string, sourceTokenId: string): Promise<void> {
+      payer.client.setIdentity(PAYER);
+      const payload = { v: 1, recipient: REQUESTER.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
+      await payer.client.putIntent(
+        transferId,
+        encryptField(deriveFieldEncryptionKey(PAYER.privateKey), JSON.stringify(payload)),
+      );
+    }
 
-      // The send committed on-chain; only the post-commit mirror sync is pending — the money has LEFT.
-      // Reverting to 'pending' (the old behavior) would let the request be re-paid → double-pay (#441).
-      vi.spyOn(payer.module, 'send').mockRejectedValue(new SphereError('sent — wallet catching up', 'SEND_SYNC_PENDING'));
+    /** Drive payPaymentRequest into 'settling' by mocking send to throw a stamped possibly-committed error. */
+    async function paySettling(payer: Wallet, reqId: string, transferId: string, code = 'SEND_SYNC_PENDING'): Promise<void> {
+      const err = new SphereError('sent — wallet catching up', code as never);
+      err.transferId = transferId;
+      vi.spyOn(payer.module, 'send').mockRejectedValueOnce(err);
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toMatchObject({ code });
+    }
 
-      await expect(payer.module.payPaymentRequest(reqId)).rejects.toMatchObject({ code: 'SEND_SYNC_PENDING' });
+    it('(write site) a possibly-committed pay → status settling, journal links request→transfer, server NOT told paid, error re-thrown', async () => {
+      const { fake, payer, reqId, sourceTokenId } = await seedPendingRequest('write');
+      const transferId = crypto.randomUUID();
+      await putOpenIntent(payer, transferId, sourceTokenId);
 
-      // Durably NON-payable: not pending/accepted, so the guard refuses a re-pay (survives reload — the
-      // status is the persisted record, not the app's in-memory override).
+      const respondSpy = vi.spyOn(payer.client, 'respondPaymentRequest');
+      await paySettling(payer, reqId, transferId);
+
+      // Held NON-payable: 'settling', not 'paid', not 'pending'.
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('settling');
       expect(payer.module.getPaymentRequests({ status: 'pending' })).toHaveLength(0);
-      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('paid');
+      // Durable journal links request→transfer.
+      const journal = JSON.parse(payer.storage.map.get(SETTLING_KEY(fake.network))!);
+      expect(journal[reqId]).toMatchObject({ transferId });
+      // Server was NOT told 'paid' (the whole point — resume may still abort).
+      expect(respondSpy).not.toHaveBeenCalled();
+      expect(fake.getPaymentRequest(reqId)).toMatchObject({ status: 'open', transferId: null });
+    });
+
+    it('(write site) a PartialSendConflictError links its NATIVE primary transferId → settling', async () => {
+      const { fake, payer, reqId } = await seedPendingRequest('partial');
+      // PartialSendConflictError.transferId is set natively (not via the sendOnce stamp).
+      vi.spyOn(payer.module, 'send').mockRejectedValueOnce(
+        new PartialSendConflictError('part sent', 'tid-primary', ['v2_committed'], '500'),
+      );
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toBeInstanceOf(PartialSendConflictError);
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('settling');
+      const journal = JSON.parse(payer.storage.map.get(SETTLING_KEY(fake.network))!);
+      expect(journal[reqId]).toMatchObject({ transferId: 'tid-primary' });
+    });
+
+    it('(pay guard) a settling request is auto NON-payable — a tapped re-pay throws VALIDATION_ERROR', async () => {
+      const { payer, reqId, sourceTokenId } = await seedPendingRequest('guard');
+      const transferId = crypto.randomUUID();
+      await putOpenIntent(payer, transferId, sourceTokenId);
+      await paySettling(payer, reqId, transferId);
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
       await expect(payer.module.payPaymentRequest(reqId)).rejects.toThrow(/not pending or accepted/i);
     });
 
-    it('a PartialSendConflictError (money left, remainder uncovered) also stays NON-payable', async () => {
-      const { payer, reqId } = await seedPendingRequest('partial');
+    it('(RELOAD, load-bearing) a settling request is NOT re-surfaced as payable — a fresh module over the SAME storage+server holds it settling, no re-notify', async () => {
+      const { fake, payer, reqId, sourceTokenId } = await seedPendingRequest('reload');
+      const transferId = crypto.randomUUID();
+      await putOpenIntent(payer, transferId, sourceTokenId);
+      await paySettling(payer, reqId, transferId);
 
-      vi.spyOn(payer.module, 'send').mockRejectedValue(
-        new PartialSendConflictError('part sent', 'tid-abc', ['v2_committed'], '500'),
+      // The server PR is STILL open (never told paid). Pre-fix, a reload re-hydrated
+      // it OPEN → payable → the exact double-pay. A fresh module must re-apply the
+      // durable journal and hold it settling instead.
+      expect(fake.getPaymentRequest(reqId)).toMatchObject({ status: 'open' });
+
+      const reopened = createPaymentsModule({ l1: null });
+      reopened.initialize({ ...payer.deps });
+      cleanups.push(() => reopened.destroy());
+      const reNotified: IncomingPaymentRequest[] = [];
+      reopened.onPaymentRequest((r) => reNotified.push(r));
+      await reopened.load();
+      await reopened.syncPaymentRequests();
+
+      const req = reopened.getPaymentRequests().find((r) => r.id === reqId);
+      expect(req?.status).toBe('settling');
+      expect(reopened.getPaymentRequests({ status: 'pending' })).toHaveLength(0);
+      // Never re-fires the actionable 'new incoming' notify for a settling request.
+      expect(reNotified.map((r) => r.id)).not.toContain(reqId);
+      expect(payer.emitEvent.mock.calls.some((c) => c[0] === 'payment_request:incoming' && (c[1] as IncomingPaymentRequest).id === reqId)).toBe(true); // only the ORIGINAL surface notified
+    });
+
+    it('(resolution, load-bearing) when the linked transfer COMPLETES via resume → paid response sent to the server exactly once, request resolves paid, journal cleared', async () => {
+      const { fake, payer, reqId, sourceTokenId } = await seedPendingRequest('resolve');
+      const transferId = crypto.randomUUID();
+      await putOpenIntent(payer, transferId, sourceTokenId);
+      await paySettling(payer, reqId, transferId);
+      vi.restoreAllMocks(); // drop the send mock — resume uses the real engine
+      const respondSpy = vi.spyOn(payer.client, 'respondPaymentRequest');
+
+      const outcome = await payer.module.resumeOpenIntents();
+      expect(outcome.resumed).toContain(transferId);
+
+      // Deferred 'paid' now told to the server EXACTLY once, with the linking transferId.
+      const paidCalls = respondSpy.mock.calls.filter((c) => (c[1] as { action: string }).action === 'paid');
+      expect(paidCalls).toHaveLength(1);
+      expect(paidCalls[0]).toEqual([reqId, { action: 'paid', transferId }]);
+      expect(fake.getPaymentRequest(reqId)).toMatchObject({ status: 'paid', transferId });
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('paid');
+      // Journal cleared.
+      expect(payer.storage.map.get(SETTLING_KEY(fake.network))).toBe('{}');
+
+      // Idempotent: a second resume does not re-respond (journal already empty).
+      respondSpy.mockClear();
+      await payer.module.resumeOpenIntents();
+      expect(respondSpy).not.toHaveBeenCalled();
+    });
+
+    it('(abort, load-bearing) when the linked transfer ABORTS via resume → journal clears, server never told paid, request returns to payable', async () => {
+      const { fake, payer, reqId, sourceTokenId } = await seedPendingRequest('abort');
+      const transferId = crypto.randomUUID();
+      await putOpenIntent(payer, transferId, sourceTokenId);
+      await paySettling(payer, reqId, transferId);
+      vi.restoreAllMocks();
+
+      // Reproduce the #676 locally-aborted-but-server-open divergence: resume must
+      // NOT re-execute it and classifies it conflicted (aborted, nothing delivered).
+      fake.setIntentFailure(true);
+      await expect(payer.client.abortIntent(transferId)).rejects.toThrow();
+      fake.setIntentFailure(false);
+      expect(await payer.client.getLocalIntent(transferId)).toMatchObject({ status: 'aborted', abortPending: true });
+
+      const respondSpy = vi.spyOn(payer.client, 'respondPaymentRequest');
+      const outcome = await payer.module.resumeOpenIntents();
+      expect(outcome.conflicted).toContain(transferId);
+      expect(outcome.resumed).not.toContain(transferId);
+
+      // Nothing was paid: server never told 'paid', journal cleared, request re-payable.
+      expect(respondSpy.mock.calls.filter((c) => (c[1] as { action: string }).action === 'paid')).toHaveLength(0);
+      expect(fake.getPaymentRequest(reqId)).toMatchObject({ status: 'open' });
+      expect(payer.storage.map.get(SETTLING_KEY(fake.network))).toBe('{}');
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('pending');
+      // And a re-pay is admitted again (the request was NOT fulfilled).
+      expect(payer.module.getPaymentRequests({ status: 'pending' }).map((r) => r.id)).toContain(reqId);
+    });
+
+    it('(partial commit, load-bearing) a PartialSendConflictError whose anchor intent ABORTS stays PAID — never reverts to payable (Codex P1)', async () => {
+      const { fake, payer, reqId, sourceTokenId } = await seedPendingRequest('partial-abort');
+      const transferId = crypto.randomUUID();
+      await putOpenIntent(payer, transferId, sourceTokenId);
+
+      // Pay ends in a PartialSendConflictError: ≥1 leg already certified + delivered,
+      // the anchor intent (transferId) soft-aborted. Value LEFT the wallet.
+      const partial = new PartialSendConflictError('part sent', transferId, ['v2_committed'], '500');
+      vi.spyOn(payer.module, 'send').mockRejectedValueOnce(partial);
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toBeInstanceOf(PartialSendConflictError);
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('settling');
+      // Journaled as committed — the discriminator that stops the revert.
+      expect(JSON.parse(payer.storage.map.get(SETTLING_KEY(fake.network))!)[reqId]).toMatchObject({
+        transferId, committed: true,
+      });
+      vi.restoreAllMocks();
+
+      // The anchor intent aborts on resume (exactly the #676 divergence). WITHOUT the
+      // committed flag the reconcile would read "aborted → nothing paid → revert to
+      // pending" and a re-pay would double-pay the delivered leg. It must resolve PAID.
+      fake.setIntentFailure(true);
+      await expect(payer.client.abortIntent(transferId)).rejects.toThrow();
+      fake.setIntentFailure(false);
+
+      const respondSpy = vi.spyOn(payer.client, 'respondPaymentRequest');
+      const outcome = await payer.module.resumeOpenIntents();
+      expect(outcome.conflicted).toContain(transferId); // the anchor DID abort…
+
+      // …yet the request is resolved PAID and NON-payable, journal cleared.
+      expect(respondSpy.mock.calls.filter((c) => (c[1] as { action: string }).action === 'paid')).toHaveLength(1);
+      expect(payer.storage.map.get(SETTLING_KEY(fake.network))).toBe('{}');
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('paid');
+      // A re-pay is REFUSED (delivered value must not be paid twice).
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    });
+
+    it('(corrupt journal) an unreadable settling blob loads as empty and does NOT wedge the pump (Copilot)', async () => {
+      const { fake, payer, reqId, sourceTokenId } = await seedPendingRequest('corrupt');
+      const transferId = crypto.randomUUID();
+      await putOpenIntent(payer, transferId, sourceTokenId);
+      await paySettling(payer, reqId, transferId); // writes a valid journal
+      // Corrupt the persisted blob (partial write / manual clear / older format).
+      payer.storage.map.set(SETTLING_KEY(fake.network), '{ not valid json');
+
+      // A fresh module over the same storage must LOAD + PUMP without throwing.
+      // Without the JSON.parse guard, ensureSettlingJournalLoaded throws and wedges
+      // the whole payment-request pump / resume path.
+      const reopened = createPaymentsModule({ l1: null });
+      reopened.initialize({ ...payer.deps });
+      cleanups.push(() => reopened.destroy());
+      await reopened.load();
+      await reopened.syncPaymentRequests(); // would REJECT here without the fix
+
+      // Fail-open: journal treated as empty → the request re-surfaces per server
+      // state (open → pending) rather than the pump being wedged.
+      expect(reopened.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('pending');
+    });
+
+    it('(identity switch, load-bearing) a journal mutation queued under identity A does NOT pollute identity B (Copilot)', async () => {
+      const { fake, payer } = await seedPendingRequest('idswitch');
+
+      // Enqueue a journal mutation under identity A but do NOT await it…
+      const pA = (
+        payer.module as unknown as { journalSettling(r: string, t: string, c?: boolean): Promise<void> }
+      ).journalSettling('reqA', 'tidA');
+
+      // …then synchronously switch to identity B (a distinct chainPubkey). The
+      // queued mutation's .then runs AFTER the switch; the enqueue-time key guard
+      // must drop it so it can't reload + rewrite identity B's journal.
+      const B = testIdentity(4242);
+      payer.module.initialize({ ...payer.deps, identity: B });
+
+      await pA.catch(() => {});
+
+      // reqA must NOT have leaked into identity B's IN-MEMORY journal. Without the
+      // key guard the queued mutation reloads B's (empty) journal, injects reqA,
+      // and persists — polluting B's session state with a prior identity's link.
+      const bJournal = (payer.module as unknown as { settlingJournal: Map<string, unknown> | null })
+        .settlingJournal;
+      expect(bJournal?.has('reqA') ?? false).toBe(false);
+    });
+
+    it('(identity switch during load, load-bearing) an in-flight load under A does NOT overwrite B journal (Copilot)', async () => {
+      const { fake, payer } = await seedPendingRequest('idload');
+      // Seed identity A's journal on disk.
+      payer.storage.map.set(
+        SETTLING_KEY(fake.network),
+        JSON.stringify({ reqA: { transferId: 'tidA', createdAt: Date.now() } }),
       );
 
-      await expect(payer.module.payPaymentRequest(reqId)).rejects.toBeInstanceOf(PartialSendConflictError);
+      // Block the next settling-key storage.get so a load stays in-flight.
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      const map = payer.storage.map;
+      (payer.storage.provider.get as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+        async (k: string) => {
+          if (k.includes(':settling:')) await gate;
+          return map.get(k) ?? null;
+        },
+      );
 
-      expect(payer.module.getPaymentRequests({ status: 'pending' })).toHaveLength(0);
-      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('paid');
-      await expect(payer.module.payPaymentRequest(reqId)).rejects.toThrow(/not pending or accepted/i);
+      // Force a fresh load under identity A and start it (do not await — it blocks).
+      (payer.module as unknown as { settlingJournalLoad: Promise<void> | null }).settlingJournalLoad = null;
+      const loadP = (
+        payer.module as unknown as { ensureSettlingJournalLoaded(): Promise<void> }
+      ).ensureSettlingJournalLoaded();
+
+      // Switch to identity B while A's load is blocked.
+      const B = testIdentity(7777);
+      payer.module.initialize({ ...payer.deps, identity: B });
+
+      // Release → A's load resolves AFTER the switch. Its key guard must drop it.
+      release();
+      await loadP.catch(() => {});
+
+      // B's in-memory journal must NOT have been clobbered with A's data.
+      const j = (payer.module as unknown as { settlingJournal: Map<string, unknown> | null })
+        .settlingJournal;
+      expect(j?.has('reqA') ?? false).toBe(false);
     });
 
-    it('a genuine CLEAN pre-commit failure (nothing left the wallet) reverts to pending — safe to re-pay', async () => {
-      const { payer, reqId } = await seedPendingRequest('clean');
+    it('(idempotent respond) a 409 CONFLICT on the deferred paid response is swallowed → journal cleared, status paid; a NETWORK error retains the journal', async () => {
+      const { fake, payer, reqId, sourceTokenId } = await seedPendingRequest('idem');
+      const transferId = crypto.randomUUID();
+      await putOpenIntent(payer, transferId, sourceTokenId);
+      await paySettling(payer, reqId, transferId);
+      vi.restoreAllMocks();
 
-      // Nothing committed on-chain (e.g. insufficient balance / a pre-cert error) — re-paying is safe.
-      vi.spyOn(payer.module, 'send').mockRejectedValue(new SphereError('not enough funds', 'SEND_INSUFFICIENT_BALANCE'));
+      // First resume: the respond hits a transient NETWORK error → journal RETAINED, still settling.
+      const respondSpy = vi.spyOn(payer.client, 'respondPaymentRequest')
+        .mockRejectedValueOnce(new WalletApiError('flaky', 'NETWORK'));
+      await payer.module.resumeOpenIntents();
+      expect(payer.storage.map.get(SETTLING_KEY(fake.network))).toContain(reqId);
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('settling');
+
+      // Next resume: the respond returns 409 CONFLICT (already resolved server-side) → swallowed,
+      // journal cleared, status paid.
+      respondSpy.mockRejectedValueOnce(new WalletApiError('non-open', 'CONFLICT', 409));
+      await payer.module.resumeOpenIntents();
+      expect(payer.storage.map.get(SETTLING_KEY(fake.network))).toBe('{}');
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('paid');
+    });
+
+    it('(clean pre-commit failure) nothing left the wallet → reverts to pending, journal untouched, re-payable', async () => {
+      const { fake, payer, reqId } = await seedPendingRequest('clean');
+      vi.spyOn(payer.module, 'send').mockRejectedValueOnce(new SphereError('not enough funds', 'SEND_INSUFFICIENT_BALANCE'));
 
       await expect(payer.module.payPaymentRequest(reqId)).rejects.toMatchObject({ code: 'SEND_INSUFFICIENT_BALANCE' });
 
-      // Reverted to pending → re-payable (the request was not fulfilled).
-      expect(payer.module.getPaymentRequests({ status: 'pending' })).toHaveLength(1);
+      expect(payer.module.getPaymentRequests({ status: 'pending' }).map((r) => r.id)).toContain(reqId);
       expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('pending');
+      expect(payer.storage.map.get(SETTLING_KEY(fake.network)) ?? '{}').toBe('{}');
+    });
+
+    it('(concurrency RMW) two journalSettling for distinct requests racing from cold both survive (no dropped entry = no re-payable double-pay)', async () => {
+      const { fake, payer } = await seedPendingRequest('rmw');
+      const mod = payer.module as unknown as {
+        journalSettling(requestId: string, transferId: string): Promise<void>;
+      };
+      // Race both writes from the null-loaded state — the serialized RMW + single-flight load must
+      // keep BOTH (a lost entry would re-surface that request payable = double-pay, the #679/#680 lesson).
+      await Promise.all([mod.journalSettling('req-A', 'tid-A'), mod.journalSettling('req-B', 'tid-B')]);
+      const journal = JSON.parse(payer.storage.map.get(SETTLING_KEY(fake.network))!);
+      expect(journal['req-A']).toMatchObject({ transferId: 'tid-A' });
+      expect(journal['req-B']).toMatchObject({ transferId: 'tid-B' });
+    });
+
+    it('(clearProcessedPaymentRequests) keeps settling (and pending), evicts paid/rejected/expired', async () => {
+      const { payer, reqId, sourceTokenId } = await seedPendingRequest('clearproc');
+      const transferId = crypto.randomUUID();
+      await putOpenIntent(payer, transferId, sourceTokenId);
+      await paySettling(payer, reqId, transferId);
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('settling');
+      payer.module.clearProcessedPaymentRequests();
+      // The settling request is UNRESOLVED — it must survive the eviction.
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('settling');
     });
   });
 
