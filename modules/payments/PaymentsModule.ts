@@ -1787,7 +1787,7 @@ export class PaymentsModule {
         // WAS delivered and the shortfall still owed.
         if (deliveredSourceIds.length > 0) {
           throw new PartialSendConflictError(
-            'Part of your payment was sent, but the remaining amount could not be covered by your other funds. The delivered portion is final — re-plan only the shortfall, never the full amount.',
+            'Part of your payment was sent, but the remaining amount could not be completed (insufficient funds, or a transient error during the remainder re-plan — see cause). The delivered portion is final — re-plan only the shortfall, never the full amount.',
             primaryPartialTransferId!, // always set once a leg delivered (deliveredSourceIds is non-empty)
             deliveredSourceIds,
             currentRequest.amount,

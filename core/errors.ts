@@ -151,8 +151,10 @@ export class SphereError extends Error {
  * transfer. At least one earlier leg certified on-chain and was journaled for
  * delivery (its {@link committedTokenIds}) — that value has irreversibly left
  * the wallet — but a LATER leg raised `TransferConflictError` (a lost race), and
- * `send()` could NOT cover the {@link remainingAmount} from the remaining live
- * sources (the internal remainder re-plan is exhausted — this is the fallback).
+ * `send()` could NOT COMPLETE the {@link remainingAmount} from the remaining live
+ * sources. This is the fallback after the internal remainder re-plan gave up —
+ * either insufficient funds OR a transient/transport error during the re-plan
+ * (the underlying reason is on `cause`), not necessarily an "out of funds" state.
  *
  * Distinct from `TransferConflictError` on purpose: a bare conflict makes the
  * caller re-send the FULL amount, paying the already-delivered leg a second
@@ -165,18 +167,25 @@ export class SphereError extends Error {
  * handlers that re-send in full must NOT treat this as an ordinary conflict.
  */
 export class PartialSendConflictError extends SphereError {
-  /** The send's transferId — its intent was soft-aborted; the delivered legs are journaled under it. */
+  /**
+   * The FIRST partial attempt's transferId — its intent was soft-aborted, and it
+   * is the §6 handoff anchor. NOTE: `send()` may re-plan the remainder across
+   * SEVERAL internal attempts before giving up, so {@link committedTokenIds} can
+   * span MULTIPLE transferIds — they do NOT all map to this single id.
+   */
   readonly transferId: string;
   /**
    * Source token ids whose spend already certified on-chain (and whose finished
    * output blob is journaled for delivery). Their value has already been
-   * delivered; NEVER re-send these.
+   * delivered; NEVER re-send these. May accumulate across several internal
+   * remainder-re-plan attempts (so not all are journaled under {@link transferId}).
    */
   readonly committedTokenIds: readonly string[];
   /**
    * The still-undelivered portion (base units, decimal string) — `send()` could
-   * not cover it from the remaining live sources. Re-plan ONLY this amount, under
-   * a new transferId; the delivered legs converge via the recipient's §6 claim.
+   * not COMPLETE it from the remaining live sources (insufficient funds or a
+   * transient error; see `cause`). Re-plan ONLY this amount, under a new
+   * transferId; the delivered legs converge via the recipient's §6 claim.
    */
   readonly remainingAmount: string;
 
