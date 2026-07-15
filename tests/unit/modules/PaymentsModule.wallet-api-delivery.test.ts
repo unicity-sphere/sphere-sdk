@@ -25,6 +25,7 @@ import type { OracleProvider } from '../../../oracle';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
 import { FakeTokenEngine, decodeFakeTokenAssets, decodeFakeTokenId } from '../token-engine/FakeTokenEngine';
 import { TransferConflictError, ProofUnconfirmedError, SplitCheckpointLostError } from '../../../token-engine';
+import { PartialSendConflictError } from '../../../core/errors';
 import { FakeWalletApi } from '../../support/fake-wallet-api';
 import { MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
 import { WalletApiClient, WalletApiError } from '../../../wallet-api';
@@ -871,6 +872,127 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(sent).toBeDefined();
   });
 
+  it('#676: a locally-aborted intent whose server abort never landed is NOT re-executed on resume (double-pay guard)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-676');
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // Reproduce the #516 unlanded-abort state a clean pre-cert send failure leaves behind against a
+    // dead backend: PUT the intent (server 'open' + local 'open'), then abort while the intent
+    // endpoint is down — abortIntent flips the LOCAL copy to aborted+abortPending and re-throws, but
+    // the SERVER row stays 'open'.
+    const transferId = crypto.randomUUID();
+    const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
+    sender.client.setIdentity(SENDER);
+    await sender.client.putIntent(
+      transferId,
+      encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)),
+    );
+    fake.setIntentFailure(true);
+    await expect(sender.client.abortIntent(transferId)).rejects.toThrow();
+    fake.setIntentFailure(false);
+
+    // Precondition: the server row is STILL 'open' (the double-pay hazard) while the local copy is
+    // aborted+abortPending — exactly the divergence resume must not re-execute.
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'open' });
+    expect(await sender.client.getLocalIntent(transferId)).toMatchObject({ status: 'aborted', abortPending: true });
+
+    const transferSpy = vi.spyOn(sender.engine, 'transfer');
+    const outcome = await sender.module.resumeOpenIntents();
+
+    // THE FIX: not resumed — the engine never re-ran, nothing was delivered, the source was never
+    // re-spent, and the server converges to 'aborted' instead of re-executing the failed send.
+    expect(outcome.resumed).not.toContain(transferId);
+    expect(outcome.conflicted).toContain(transferId);
+    expect(transferSpy).not.toHaveBeenCalled();
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(0);
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'active' });
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'aborted' });
+  });
+
+  it('#676: a server-open intent with NO local copy (fresh device) still resumes — the server copy stays authoritative', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-676-fresh');
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    const transferId = crypto.randomUUID();
+    const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
+    sender.client.setIdentity(SENDER);
+    await sender.client.putIntent(
+      transferId,
+      encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)),
+    );
+    // Drop only the LOCAL backstop copy (server row stays 'open') — the fresh-device state where the
+    // server intent is the sole seed and the #516 local record is absent.
+    await sender.client.removeLocalIntent(transferId);
+    expect(await sender.client.getLocalIntent(transferId)).toBeNull();
+
+    const outcome = await sender.module.resumeOpenIntents();
+
+    // Resume proceeds unchanged: with no local record, the server copy is authoritative.
+    expect(outcome.resumed).toEqual([transferId]);
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(1);
+  });
+
+  it('#676 (PR #681 review): the local intent dispositions are read ONCE for all open intents (batched), not once per intent', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-676-batch');
+    const src1 = await seedServerToken(fake, sender, SENDER, 1000n);
+    const src2 = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // Two independent server-`open` intents (each with a local copy from putIntent).
+    sender.client.setIdentity(SENDER);
+    const putIntent = async (src: string): Promise<string> => {
+      const tid = crypto.randomUUID();
+      const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [src] };
+      await sender.client.putIntent(tid, encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)));
+      return tid;
+    };
+    const t1 = await putIntent(src1);
+    const t2 = await putIntent(src2);
+
+    const mapSpy = vi.spyOn(sender.client, 'getLocalIntentsMap');
+    const outcome = await sender.module.resumeOpenIntents();
+
+    // ONE batched read regardless of the open-intent count (was one full parse per intent before the
+    // PR #681 review fix). Both intents still resume (their local copies are 'open').
+    expect(mapSpy).toHaveBeenCalledTimes(1);
+    expect(outcome.resumed).toEqual(expect.arrayContaining([t1, t2]));
+  });
+
+  it('#676 (PR #681 review): a FAILING local-intent read does not abort resume and does NOT resume any intent — money-safe defer (no double-pay)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-676-throw');
+    const src = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    const transferId = crypto.randomUUID();
+    const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [src] };
+    sender.client.setIdentity(SENDER);
+    await sender.client.putIntent(
+      transferId,
+      encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)),
+    );
+
+    // The local-disposition read throws (storage error). A server-`open` intent could be locally
+    // aborted (the #676 divergence), so re-executing it would double-pay. Resume must NOT crash AND
+    // must NOT resume — it DEFERS the intent (retry next sign-in), erring toward not double-paying.
+    vi.spyOn(sender.client, 'getLocalIntentsMap').mockRejectedValue(new Error('storage unavailable'));
+    const transferSpy = vi.spyOn(sender.engine, 'transfer');
+
+    const outcome = await sender.module.resumeOpenIntents(); // resolves — the loop is not aborted
+
+    expect(outcome.resumed).not.toContain(transferId);
+    expect(outcome.failed).toContain(transferId);                              // deferred
+    expect(transferSpy).not.toHaveBeenCalled();                               // never re-executed
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(0);   // nothing delivered → no double-pay
+    expect(fake.getRow(SENDER.chainPubkey, src)).toMatchObject({ status: 'active' }); // source not re-spent
+  });
+
   it('resume of an already-certified source records the spend instead of wedging on a conflict (§3.1 #621)', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-rs-621');
@@ -1189,7 +1311,7 @@ describe('stale-inventory conflict self-heals (#625) + is SURFACED (#517 item 2)
     expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(1);
   });
 
-  it('does NOT self-heal a conflict AFTER an earlier op certified — avoids a full-amount over-request re-plan (#625 safety)', async () => {
+  it('a conflict AFTER an earlier op certified re-plans ONLY the remainder (not the full amount) — delivers X, never over-requests (#677)', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-partial-1');
     await seedServerToken(fake, sender, SENDER, 1000n);
@@ -1197,7 +1319,7 @@ describe('stale-inventory conflict self-heals (#625) + is SURFACED (#517 item 2)
     await sender.module.load();
 
     // amount 2000 needs BOTH sources (two direct ops). The first certifies; the second conflicts —
-    // so value has already left the wallet and a full-amount re-plan would over-request.
+    // so value has already left the wallet and a FULL-amount re-plan would over-request (send 3000).
     const orig = sender.engine.transfer.bind(sender.engine);
     let calls = 0;
     vi.spyOn(sender.engine, 'transfer').mockImplementation((...args: Parameters<typeof orig>) => {
@@ -1207,10 +1329,12 @@ describe('stale-inventory conflict self-heals (#625) + is SURFACED (#517 item 2)
         : orig(...args);
     });
 
-    // The conflict is NOT self-healed (an earlier op already certified) — it propagates, and nothing
-    // is demoted (no retry).
-    await expect(sender.module.send({ recipient: '@bob', amount: '2000', coinId: UCT }))
-      .rejects.toBeInstanceOf(TransferConflictError);
+    // #677: send() re-plans ONLY the remaining 1000 (the conflict freed the second source, which was
+    // not actually spent), so the recipient receives the full 2000 across exactly TWO legs — never a
+    // third over-request leg. Nothing is demoted: the certified-then-reused source completed cleanly.
+    const result = await sender.module.send({ recipient: '@bob', amount: '2000', coinId: UCT });
+    expect(result.status).toBe('completed');
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(2); // full amount, NOT 3 legs
     expect(sender.module.getTokens().filter((t) => t.suspectedSpent)).toHaveLength(0);
   });
 
@@ -1226,6 +1350,88 @@ describe('stale-inventory conflict self-heals (#625) + is SURFACED (#517 item 2)
       .rejects.toThrow('engine boom');
 
     expect(sender.emitEvent.mock.calls.filter((c) => c[0] === 'inventory:conflict')).toHaveLength(0);
+  });
+});
+
+describe('#677: a mid-send conflict re-plans the remainder inside send() and still delivers the full amount', () => {
+  it('a mid-SPLIT conflict after a certified leg re-plans the remainder — the recipient receives the FULL amount X across a NEW transferId', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-677-split');
+    await seedServerToken(fake, sender, SENDER, 1500n);
+    await seedServerToken(fake, sender, SENDER, 1500n);
+    await sender.module.load();
+
+    // amount 2000 from two 1500s → a direct leg (1500) + a SPLIT leg (500 to recipient, 1000 change).
+    // The direct leg certifies + delivers; the split leg loses its source to a concurrent transfer the
+    // FIRST time (AFTER 1500 has irreversibly left the wallet), then succeeds on the remainder re-plan.
+    const origSplit = sender.engine.split.bind(sender.engine);
+    let splitCalls = 0;
+    vi.spyOn(sender.engine, 'split').mockImplementation((...args: Parameters<typeof origSplit>) => {
+      splitCalls += 1;
+      return splitCalls === 1
+        ? Promise.reject(new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent'))
+        : origSplit(...args);
+    });
+
+    // THE FIX: send() re-plans ONLY the still-owed 500 under a NEW transferId and RESOLVES successfully
+    // — a send for 2000 delivers 2000, never re-sending the certified 1500 leg.
+    const result = await sender.module.send({ recipient: '@bob', amount: '2000', coinId: UCT });
+    expect(result.status).toBe('completed');
+
+    // The recipient receives the full 2000 (1500 direct + 500 split) across the two legs.
+    const recipient = makeFullPresetWallet(baseUrl, fake.network, RECIPIENT, 'd-677-recv');
+    await recipient.module.load();
+    const { transfers } = await recipient.module.receive();
+    const received = transfers.flatMap((t) => t.tokens).reduce((sum, tok) => sum + BigInt(tok.amount), 0n);
+    expect(received).toBe(2000n);
+  });
+
+  it('op1 certifies+delivers, op2 conflicts and the remainder CANNOT be covered → PartialSendConflictError carrying the delivered leg + the shortfall (never a re-sendable failure)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-677');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // amount 2000 → two direct legs. Leg 1 certifies + delivers; every subsequent op conflicts, so the
+    // second source is exhausted (demoted after its own clean conflict) and the remainder cannot be
+    // covered — the insufficient-remainder fallback.
+    const orig = sender.engine.transfer.bind(sender.engine);
+    let calls = 0;
+    vi.spyOn(sender.engine, 'transfer').mockImplementation((...args: Parameters<typeof orig>) => {
+      calls += 1;
+      return calls === 1
+        ? orig(...args)
+        : Promise.reject(new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent'));
+    });
+
+    const thrown = await sender.module
+      .send({ recipient: '@bob', amount: '2000', coinId: UCT })
+      .then(() => { throw new Error('expected the partial send to reject'); }, (e) => e);
+
+    // THE FALLBACK: a DISTINCT partial outcome — NOT a bare TransferConflictError the caller re-sends in
+    // full (which would pay the delivered leg twice).
+    expect(thrown).toBeInstanceOf(PartialSendConflictError);
+    expect(thrown).not.toBeInstanceOf(TransferConflictError);
+    const partial = thrown as PartialSendConflictError;
+    expect(partial.code).toBe('SEND_PARTIALLY_COMPLETED');
+    // It carries exactly the one already-committed leg + the still-owed shortfall (1000) so the caller
+    // re-plans ONLY the remainder, never the whole amount.
+    expect(partial.committedTokenIds).toHaveLength(1);
+    expect(partial.remainingAmount).toBe('1000');
+    expect(partial.transferId).toBeTruthy();
+
+    // Leg 1 delivered (exactly one mailbox entry — the delivered leg is never re-sent) and its source
+    // is terminal 'spent' locally, never restored.
+    const entries = fake.listMailboxEntries(RECIPIENT.chainPubkey);
+    expect(entries).toHaveLength(1);
+    const committedId = partial.committedTokenIds[0];
+    expect(sender.module.getTokens().find((t) => t.id === committedId)?.status).toBe('spent');
+    expect(`v2_${entries[0].tokenId}`).toBe(committedId);
+
+    // Existing behavior preserved: the conflicted intent was soft-aborted (the delivered leg is not
+    // lost — mirrors the SEND_SYNC_PENDING contract).
+    expect(fake.getIntent(SENDER.chainPubkey, partial.transferId)).toMatchObject({ status: 'aborted' });
   });
 });
 

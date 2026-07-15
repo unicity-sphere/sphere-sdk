@@ -31,6 +31,7 @@ import { WalletApiClient } from '../../../wallet-api';
 import { WalletApiMailboxProvider, WalletApiTokenStorageProvider } from '../../../impl/shared/wallet-api';
 import { encodeTokenBlob } from '../../../token-engine/token-blob';
 import { hexToBytes } from '../../../core/crypto';
+import { SphereError, PartialSendConflictError } from '../../../core/errors';
 import { FIELD_ENVELOPE_PREFIX } from '../../../core/field-encryption';
 import { deriveDeliveryEncryptionKey, decryptDeliveryBundle } from '../../../core/delivery-envelope';
 
@@ -396,6 +397,65 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
       expect(requester.module.getTokens()).toContainEqual(
         expect.objectContaining({ amount: '1000', coinId: UCT, status: 'confirmed' })
       );
+    });
+  });
+
+  describe('#441/#442: a possibly-committed pay outcome keeps the request NON-payable (durable, no double-pay)', () => {
+    async function seedPendingRequest(deviceSuffix: string): Promise<{ payer: Wallet; reqId: string }> {
+      const { fake, baseUrl } = await startFake();
+      const requester = makeWalletApiWallet(baseUrl, fake.network, REQUESTER, `pr-441-r-${deviceSuffix}`);
+      const payer = makeWalletApiWallet(baseUrl, fake.network, PAYER, `pr-441-p-${deviceSuffix}`);
+      await seedServerToken(fake, payer, PAYER, 1000n);
+      await requester.module.load();
+      await payer.module.load();
+      await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '1000', coinId: UCT });
+      await payer.module.syncPaymentRequests();
+      const pending = payer.module.getPaymentRequests({ status: 'pending' });
+      expect(pending).toHaveLength(1);
+      return { payer, reqId: pending[0].id };
+    }
+
+    it('a possibly-committed keep-open failure (SEND_SYNC_PENDING) marks the request paid (NOT pending) — a re-pay is refused', async () => {
+      const { payer, reqId } = await seedPendingRequest('sync');
+
+      // The send committed on-chain; only the post-commit mirror sync is pending — the money has LEFT.
+      // Reverting to 'pending' (the old behavior) would let the request be re-paid → double-pay (#441).
+      vi.spyOn(payer.module, 'send').mockRejectedValue(new SphereError('sent — wallet catching up', 'SEND_SYNC_PENDING'));
+
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toMatchObject({ code: 'SEND_SYNC_PENDING' });
+
+      // Durably NON-payable: not pending/accepted, so the guard refuses a re-pay (survives reload — the
+      // status is the persisted record, not the app's in-memory override).
+      expect(payer.module.getPaymentRequests({ status: 'pending' })).toHaveLength(0);
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('paid');
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toThrow(/not pending or accepted/i);
+    });
+
+    it('a PartialSendConflictError (money left, remainder uncovered) also stays NON-payable', async () => {
+      const { payer, reqId } = await seedPendingRequest('partial');
+
+      vi.spyOn(payer.module, 'send').mockRejectedValue(
+        new PartialSendConflictError('part sent', 'tid-abc', ['v2_committed'], '500'),
+      );
+
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toBeInstanceOf(PartialSendConflictError);
+
+      expect(payer.module.getPaymentRequests({ status: 'pending' })).toHaveLength(0);
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('paid');
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toThrow(/not pending or accepted/i);
+    });
+
+    it('a genuine CLEAN pre-commit failure (nothing left the wallet) reverts to pending — safe to re-pay', async () => {
+      const { payer, reqId } = await seedPendingRequest('clean');
+
+      // Nothing committed on-chain (e.g. insufficient balance / a pre-cert error) — re-paying is safe.
+      vi.spyOn(payer.module, 'send').mockRejectedValue(new SphereError('not enough funds', 'SEND_INSUFFICIENT_BALANCE'));
+
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toMatchObject({ code: 'SEND_INSUFFICIENT_BALANCE' });
+
+      // Reverted to pending → re-payable (the request was not fulfilled).
+      expect(payer.module.getPaymentRequests({ status: 'pending' })).toHaveLength(1);
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('pending');
     });
   });
 

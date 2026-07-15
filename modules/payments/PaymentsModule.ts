@@ -82,7 +82,7 @@ import {
 } from '../../serialization/txf-serializer';
 import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
-import { SphereError } from '../../core/errors';
+import { SphereError, PartialSendConflictError, isPossiblyCommittedSendOutcome } from '../../core/errors';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
 import { sleep } from '../../core/utils';
 import { PumpHealth } from './pump-health';
@@ -806,6 +806,20 @@ export interface PaymentsWalletApiPort {
   /** E.3 resume: list open intents at sign-in (any device). */
   listIntents(status: 'open' | 'aborted'): Promise<
     { transferId: string; payload: string; status: 'open' | 'completed' | 'aborted'; createdAt: number }[]
+  >;
+  /**
+   * #676: read the LOCAL intent dispositions (status + the #516 `abortPending`
+   * flag) for EVERY known intent in ONE pass, keyed by transferId — OPTIONAL
+   * capability. Resume reads this ONCE before its loop and consults it per
+   * server-`open` intent: a locally-`aborted` (or abort-pending) copy is a send
+   * the user already watched fail whose soft-abort never reached the server, so
+   * re-executing it would double-pay. A transferId ABSENT from the map (or a port
+   * that omits this method) leaves the server copy authoritative — correct for a
+   * fresh device. Batched (PR #681 review): the per-intent read re-parsed the
+   * whole intents blob N times; this parses it once.
+   */
+  getLocalIntentsMap?(): Promise<
+    Map<string, { status: 'open' | 'completed' | 'aborted'; abortPending: boolean }>
   >;
   /** §5.2 checksum-bound presigned PUTs for spend outputs. */
   getUploadUrls(
@@ -1696,24 +1710,42 @@ export class PaymentsModule {
    */
   /**
    * #625 — self-healing coin selection. If a selected source turns out already spent on-chain
-   * (`TransferConflictError`), demote it (durable `suspectedSpent` — kept in inventory, excluded from
-   * selection) and re-plan with the next candidate, bounded. A fixed plan (`instantSplitSend`) is not
-   * re-planned. Exhausting the live candidates surfaces a clean `SEND_INSUFFICIENT_BALANCE` (or the
-   * final conflict), never an endless loop.
+   * (`TransferConflictError`) with NOTHING certified yet, demote it (durable `suspectedSpent` — kept in
+   * inventory, excluded from selection) and re-plan with the next candidate, bounded. A fixed plan
+   * (`instantSplitSend`) is not re-planned. Exhausting the live candidates surfaces a clean
+   * `SEND_INSUFFICIENT_BALANCE`, never an endless loop.
+   *
+   * #677 — remainder re-plan. If a source is lost mid-send AFTER ≥1 leg already certified + delivered
+   * (`PartialSendConflictError`), a full-amount re-plan would double-pay the delivered leg — so re-plan
+   * ONLY the still-owed remainder (`X − already-delivered`) from the remaining live sources, under a
+   * NEW transferId. A send for X thus still delivers X even through a mid-send conflict; the certified
+   * legs converge via the recipient's §6 claim handoff. `PartialSendConflictError` reaches the CALLER
+   * only as the fallback — when that remainder genuinely cannot be covered by the other sources.
    */
   async send(
     request: TransferRequest,
     internal?: { existingReservationId?: string; existingSplitPlan?: SplitPlan },
   ): Promise<TransferResult> {
+    // #677: the running request shrinks to the still-owed REMAINDER across partial
+    // re-plans while the recipient must ultimately receive the full original amount.
+    let currentRequest = request;
+    let currentInternal = internal;
+    // Certified legs accumulated across partial attempts — carried into the fallback
+    // so it NEVER re-sends them; the first partial intent id anchors the §6 handoff.
+    const deliveredSourceIds: string[] = [];
+    let primaryPartialTransferId: string | undefined;
+
     for (let attempt = 0; ; attempt += 1) {
       try {
-        return await this.sendOnce(request, internal);
+        return await this.sendOnce(currentRequest, currentInternal);
       } catch (err) {
+        // #625 — self-healing full re-plan: a clean conflict with NOTHING certified
+        // in that attempt (safe to re-select the whole amount from the next candidate).
         const conflictedId = err instanceof TransferConflictError ? err.conflictedSourceId : undefined;
         if (
           conflictedId !== undefined &&
           attempt < MAX_RESELECT_ATTEMPTS &&
-          internal?.existingSplitPlan === undefined &&
+          currentInternal?.existingSplitPlan === undefined &&
           this.tokens.has(conflictedId)
         ) {
           await this.demoteSuspectedSpent(conflictedId);
@@ -1722,6 +1754,45 @@ export class PaymentsModule {
             `Source ${conflictedId} already spent on-chain — demoted, re-planning with the next candidate (#625, attempt ${attempt + 1}/${MAX_RESELECT_ATTEMPTS})`,
           );
           continue;
+        }
+
+        // #677 — a mid-send conflict AFTER ≥1 leg certified + delivered. Re-plan ONLY
+        // the remainder (never the full amount) from the remaining live sources, under
+        // a NEW transferId, so the recipient still receives the full amount.
+        if (err instanceof PartialSendConflictError && currentInternal?.existingSplitPlan === undefined) {
+          deliveredSourceIds.push(...err.committedTokenIds);
+          if (primaryPartialTransferId === undefined) primaryPartialTransferId = err.transferId;
+          const remaining = BigInt(err.remainingAmount);
+          if (remaining > 0n && attempt < MAX_RESELECT_ATTEMPTS) {
+            logger.warn(
+              'Payments',
+              `Partial send: ${err.committedTokenIds.length} leg(s) certified — re-planning ONLY the remaining ${remaining} under a NEW transferId (#677, attempt ${attempt + 1}/${MAX_RESELECT_ATTEMPTS})`,
+            );
+            currentRequest = { ...request, amount: remaining.toString() };
+            currentInternal = undefined; // fresh, coherent transfer for the remainder (new transferId + reservation)
+            continue;
+          }
+          // Remainder is 0 (defensive) or the attempt budget is exhausted — surface the
+          // accumulated partial so the caller re-plans only the shortfall, never the full amount.
+          throw new PartialSendConflictError(
+            err.message, primaryPartialTransferId, deliveredSourceIds, err.remainingAmount, err.cause,
+          );
+        }
+
+        // A clean, otherwise re-sendable failure that struck DURING a remainder re-plan
+        // (≥1 leg already delivered): the remainder could not be covered (e.g.
+        // SEND_INSUFFICIENT_BALANCE) or a transient error hit. Surfacing it bare would
+        // make the caller re-send the FULL amount and pay the delivered legs twice — so
+        // surface the partial outcome (the insufficient-remainder fallback) carrying what
+        // WAS delivered and the shortfall still owed.
+        if (deliveredSourceIds.length > 0) {
+          throw new PartialSendConflictError(
+            'Part of your payment was sent, but the remaining amount could not be completed (insufficient funds, or a transient error during the remainder re-plan — see cause). The delivered portion is final — re-plan only the shortfall, never the full amount.',
+            primaryPartialTransferId!, // always set once a leg delivered (deliveredSourceIds is non-empty)
+            deliveredSourceIds,
+            currentRequest.amount,
+            err,
+          );
         }
         throw err;
       }
@@ -1790,6 +1861,12 @@ export class PaymentsModule {
     // this send. The failure handler must never restore these as 'confirmed' —
     // their state is consumed; the finished output blob is journaled separately.
     const committedOnChainTokenIds = new Set<string>();
+    // #677: value (base units) already DELIVERED to the recipient by the certified
+    // legs above — a direct leg delivers its whole token amount, a split leg
+    // delivers only its splitAmount. On a mid-send conflict the remainder that
+    // still owes the recipient is `request.amount − committedDeliveredAmount`;
+    // send() re-plans exactly that so a send for X still delivers X.
+    let committedDeliveredAmount = 0n;
     // §3.1 (#621): set when any leg's post-certification delivery is deferred (kept journaled).
     // Scoped to the whole send so the resolve path below can mark the result delivery-pending.
     let deliveryPending = false;
@@ -2042,6 +2119,7 @@ export class PaymentsModule {
           }
           // The source state is spent on-chain from here on.
           committedOnChainTokenIds.add(tw.uiToken.id);
+          committedDeliveredAmount += tw.amount; // #677: a direct leg delivers its whole amount
           // Journal the finished blob BEFORE delivery: a transport failure or a
           // crash must not lose the recipient's token (replayed on next load()).
           const tokenBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(finished)));
@@ -2103,6 +2181,7 @@ export class PaymentsModule {
           // The split source is burnt on-chain from here on. Journal the
           // recipient's blob BEFORE the delivery attempt.
           committedOnChainTokenIds.add(splitPlan.tokenToSplit.uiToken.id);
+          committedDeliveredAmount += splitPlan.splitAmount ?? 0n; // #677: a split leg delivers only splitAmount
           const recipientBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(outputs[0])));
           await this.savePendingV2Delivery({
             transferId: result.id,
@@ -2375,6 +2454,30 @@ export class PaymentsModule {
         throw new SphereError(
           'Your payment was sent. Your wallet is syncing with the server and will catch up shortly.',
           'SEND_SYNC_PENDING',
+          error,
+        );
+      }
+
+      // #677: a lost race (TransferConflictError) AFTER ≥1 earlier leg already
+      // certified on-chain and was journaled/delivered is NOT a plain,
+      // re-sendable failure. The delivered value has irreversibly left the wallet
+      // (its source is terminal 'spent' above, its blob journaled for delivery),
+      // and the intent was already soft-aborted above. Surfacing a bare
+      // TransferConflictError would make the caller re-send the FULL amount and
+      // pay the delivered leg twice — so surface a DISTINCT partial outcome
+      // carrying the already-committed legs and the still-owed REMAINDER. send()
+      // catches this and re-plans ONLY the remainder under a NEW transferId (the
+      // delivered legs converge via the recipient's claim handoff, §6); this
+      // surfaces to the CALLER only when that remainder cannot be covered. Do NOT
+      // emit transfer:failed: the delivered legs are not lost (mirrors the
+      // SEND_SYNC_PENDING contract).
+      if (error instanceof TransferConflictError && committedOnChainTokenIds.size > 0) {
+        const remaining = BigInt(request.amount) - committedDeliveredAmount;
+        throw new PartialSendConflictError(
+          'Part of your payment was already sent before a source token was spent by a concurrent transfer. Re-plan and send only the remaining amount — do NOT re-send the full amount.',
+          result.id,
+          [...committedOnChainTokenIds],
+          (remaining > 0n ? remaining : 0n).toString(),
           error,
         );
       }
@@ -2889,8 +2992,19 @@ export class PaymentsModule {
 
       return result;
     } catch (error) {
-      // Revert to pending on failure
-      this.updatePaymentRequestStatus(requestId, 'pending');
+      // #441/#442: reverting to 'pending' makes the request RE-PAYABLE (the guard
+      // above admits a re-pay when status is 'pending' OR 'accepted'). That is
+      // correct ONLY for a clean pre-commit failure where NOTHING left the wallet.
+      // For a possibly-committed outcome — a post-commit sync-pending / keep-open
+      // certification state, or a PartialSendConflictError (money already left,
+      // the intent completes via resume/claim) — reverting would double-pay. Mark
+      // it 'paid' (durably non-payable) instead and re-throw so the caller still
+      // learns it is pending/partial. This makes the request state durably correct
+      // for every consumer (the app's in-memory override becomes unnecessary).
+      this.updatePaymentRequestStatus(
+        requestId,
+        isPossiblyCommittedSendOutcome(error) ? 'paid' : 'pending',
+      );
       throw error;
     }
   }
@@ -5645,7 +5759,68 @@ export class PaymentsModule {
     }
 
     const intents = await walletApi.listIntents('open');
+
+    // #676 (PR #681 review): read EVERY local intent disposition ONCE before the
+    // loop (perf: one parse, not one per server-open intent). Best-effort — a
+    // storage read error must NOT abort the whole resume (Copilot robustness),
+    // but it also must NOT let us blindly resume: a server-`open` intent whose
+    // local copy is aborted would re-execute → double-pay. So when the local
+    // read is UNAVAILABLE (threw), we cannot prove any intent safe to resume and
+    // DEFER them all (classify failed, retry next sign-in) — erring toward not
+    // double-paying. A port without the capability (no local intent store) has
+    // no divergence to honor, so it resumes on the server row as before.
+    const localLookupSupported = typeof walletApi.getLocalIntentsMap === 'function';
+    let localIntents: Map<string, { status: 'open' | 'completed' | 'aborted'; abortPending: boolean }> | undefined;
+    let localReadFailed = false;
+    if (localLookupSupported) {
+      try {
+        localIntents = await walletApi.getLocalIntentsMap!();
+      } catch (err) {
+        localReadFailed = true;
+        logger.warn(
+          'Payments',
+          'Could not read local intent dispositions (#676) — deferring resume of all open intents this sign-in to avoid re-executing a locally-aborted send:',
+          err,
+        );
+      }
+    }
+
     for (const intent of intents) {
+      // #676: honor a LOCAL abort the server never learned about. A clean
+      // pre-certification send failure soft-aborts the intent best-effort; when
+      // that abort's server leg cannot land (dead backend), abortIntent flips
+      // the LOCAL copy to aborted+abortPending while the SERVER row stays 'open'.
+      // listIntents('open') (a plain server GET) hands that row back, and
+      // re-executing it would RE-SPEND sources the failure handler restored to
+      // 'confirmed' — paying the recipient a second time for a send the user
+      // already watched fail.
+      if (localLookupSupported) {
+        if (localReadFailed) {
+          // Local disposition unknown (read threw) — cannot prove this intent is
+          // safe to resume, so defer it rather than risk re-executing a locally
+          // aborted send. The next sign-in retries once storage is healthy.
+          outcome.failed.push(intent.transferId);
+          continue;
+        }
+        const localIntent = localIntents!.get(intent.transferId);
+        // Local copy aborted (or abort pending) → do NOT resume; re-attempt the
+        // abort to converge the server and classify with the conflicted
+        // (aborted, re-plan) bucket. A missing local copy (fresh device) leaves
+        // the server row authoritative and resume proceeds, unchanged.
+        if (localIntent && (localIntent.status === 'aborted' || localIntent.abortPending)) {
+          logger.warn(
+            'Payments',
+            `Intent ${intent.transferId.slice(0, 8)}… is locally aborted (the abort never reached the server) — converging, NOT resuming (#676)`,
+          );
+          try {
+            await walletApi.abortIntent(intent.transferId);
+          } catch (abortErr) {
+            logger.warn('Payments', 'abortIntent during resume-skip failed (retried next sign-in):', abortErr);
+          }
+          outcome.conflicted.push(intent.transferId);
+          continue;
+        }
+      }
       let payload: IntentPayloadV1;
       try {
         const plain = decryptField(this.getFieldEncryptionKey(), intent.payload);

@@ -1012,6 +1012,50 @@ export class WalletApiClient {
   }
 
   /**
+   * #676: the LOCAL disposition of one intent — its status and the #516
+   * `abortPending` flag — or `null` when no local copy exists.
+   *
+   * Resume ({@link PaymentsModule.resumeOpenIntents}) consults this BEFORE
+   * re-executing a server-`open` intent. A clean pre-certification send failure
+   * soft-aborts the intent best-effort; when that abort's server leg cannot land
+   * (dead backend), {@link abortIntent} flips the LOCAL copy to
+   * `aborted`+`abortPending` and re-throws — leaving the SERVER row `open`.
+   * `listIntents('open')` (a plain server GET) would then hand that row back and
+   * resume would RE-EXECUTE a send the user already watched fail: a double-pay.
+   * A `null` result (fresh device — no local copy) leaves the server row
+   * authoritative, so resume correctly proceeds.
+   */
+  async getLocalIntent(
+    transferId: string
+  ): Promise<{ status: 'open' | 'completed' | 'aborted'; abortPending: boolean } | null> {
+    const intents = await this.readLocalIntents();
+    const intent = intents[transferId];
+    if (!intent) return null;
+    return { status: intent.status, abortPending: intent.abortPending === true };
+  }
+
+  /**
+   * #676 (PR #681 review): the LOCAL disposition of EVERY known intent, keyed by
+   * transferId, read + parsed in ONE pass. {@link PaymentsModule.resumeOpenIntents}
+   * consults the local record before re-executing each server-`open` intent (see
+   * {@link getLocalIntent}); calling the per-intent read once per server-open
+   * intent re-parses the whole intents blob N times. This batch read parses it
+   * ONCE so resume is O(1) reads regardless of the open-intent count. A `transferId`
+   * absent from the map has no local copy (fresh device) → the server row is
+   * authoritative and resume proceeds.
+   */
+  async getLocalIntentsMap(): Promise<
+    Map<string, { status: 'open' | 'completed' | 'aborted'; abortPending: boolean }>
+  > {
+    const intents = await this.readLocalIntents();
+    const map = new Map<string, { status: 'open' | 'completed' | 'aborted'; abortPending: boolean }>();
+    for (const [transferId, intent] of Object.entries(intents)) {
+      map.set(transferId, { status: intent.status, abortPending: intent.abortPending === true });
+    }
+    return map;
+  }
+
+  /**
    * Re-PUT every locally-known open intent (idempotent — the server PUT is
    * write-once while open/completed). Called after a `syncEpoch` change
    * (server restore — §5.4): intents are the one server table not

@@ -52,6 +52,14 @@ export type SphereErrorCode =
   // #664). Surfaced distinctly so a UI can reassure ("sent — wallet catching
   // up") instead of showing a hard send failure.
   | 'SEND_SYNC_PENDING'
+  // #677: a multi-leg send lost a source to a concurrent transfer AFTER ≥1
+  // earlier leg had already certified on-chain AND been journaled/delivered.
+  // The delivered value has irreversibly left the wallet, so this is NOT a
+  // plain, re-sendable failure: surfacing a bare TransferConflictError makes
+  // the caller re-send the FULL amount and pay the delivered leg twice. Raised
+  // as PartialSendConflictError; the caller MUST re-plan ONLY the remainder
+  // under a NEW transferId, never the whole amount.
+  | 'SEND_PARTIALLY_COMPLETED'
   | 'TRANSPORT_ERROR'
   | 'AGGREGATOR_ERROR'
   | 'VALIDATION_ERROR'
@@ -136,6 +144,93 @@ export class SphereError extends Error {
     this.code = code;
     this.cause = cause;
   }
+}
+
+/**
+ * #677: a send that PARTIALLY completed before losing a source to a concurrent
+ * transfer. At least one earlier leg certified on-chain and was journaled for
+ * delivery (its {@link committedTokenIds}) — that value has irreversibly left
+ * the wallet — but a LATER leg raised `TransferConflictError` (a lost race), and
+ * `send()` could NOT COMPLETE the {@link remainingAmount} from the remaining live
+ * sources. This is the fallback after the internal remainder re-plan gave up —
+ * either insufficient funds OR a transient/transport error during the re-plan
+ * (the underlying reason is on `cause`), not necessarily an "out of funds" state.
+ *
+ * Distinct from `TransferConflictError` on purpose: a bare conflict makes the
+ * caller re-send the FULL amount, paying the already-delivered leg a second
+ * time. Catching THIS type (or `code === 'SEND_PARTIALLY_COMPLETED'`) tells the
+ * caller/UI: the delivered legs are final, the conflicted intent has been
+ * soft-aborted, and only the REMAINDER ({@link remainingAmount}) may be
+ * re-planned — under a NEW transferId, never re-sending the whole amount.
+ *
+ * NOT a subclass of `TransferConflictError` by design: existing conflict
+ * handlers that re-send in full must NOT treat this as an ordinary conflict.
+ */
+export class PartialSendConflictError extends SphereError {
+  /**
+   * The FIRST partial attempt's transferId — its intent was soft-aborted, and it
+   * is the §6 handoff anchor. NOTE: `send()` may re-plan the remainder across
+   * SEVERAL internal attempts before giving up, so {@link committedTokenIds} can
+   * span MULTIPLE transferIds — they do NOT all map to this single id.
+   */
+  readonly transferId: string;
+  /**
+   * Source token ids whose spend already certified on-chain (and whose finished
+   * output blob is journaled for delivery). Their value has already been
+   * delivered; NEVER re-send these. May accumulate across several internal
+   * remainder-re-plan attempts (so not all are journaled under {@link transferId}).
+   */
+  readonly committedTokenIds: readonly string[];
+  /**
+   * The still-undelivered portion (base units, decimal string) — `send()` could
+   * not COMPLETE it from the remaining live sources (insufficient funds or a
+   * transient error; see `cause`). Re-plan ONLY this amount, under a new
+   * transferId; the delivered legs converge via the recipient's §6 claim.
+   */
+  readonly remainingAmount: string;
+
+  constructor(
+    message: string,
+    transferId: string,
+    committedTokenIds: readonly string[],
+    remainingAmount: string,
+    cause?: unknown,
+  ) {
+    super(message, 'SEND_PARTIALLY_COMPLETED', cause);
+    this.name = 'PartialSendConflictError';
+    this.transferId = transferId;
+    this.committedTokenIds = [...committedTokenIds];
+    this.remainingAmount = remainingAmount;
+  }
+}
+
+/**
+ * Error codes for a send outcome where money has (or may have) already left the
+ * wallet on-chain, so the send is NOT a clean, re-sendable failure. A consumer
+ * that persists a "paid" flag (e.g. a payment request) must keep the request
+ * NON-payable on any of these — reverting to a re-payable state would double-pay
+ * (#441). Covers the post-commit mirror-sync-pending / keep-open certification
+ * states AND the partial-conflict outcome.
+ */
+const POSSIBLY_COMMITTED_SEND_CODES: ReadonlySet<SphereErrorCode> = new Set([
+  'SEND_SYNC_PENDING',
+  'CERTIFICATION_UNCONFIRMED',
+  'CHECKPOINT_PERSIST_FAILED',
+  'SPLIT_CHECKPOINT_LOST',
+  'CHECKPOINT_TRUSTBASE_MISMATCH',
+  'SEND_PARTIALLY_COMPLETED',
+]);
+
+/**
+ * #441: true when a send failed with an outcome where the payment has (or may
+ * have) irreversibly left the wallet — a post-commit sync-pending / keep-open
+ * certification state, or a `PartialSendConflictError`. Such a send completes (or
+ * has already partially completed) via resume/claim and MUST NOT be re-sent, so
+ * a persisted "paid" state must stay non-payable. A `false` result is a clean
+ * pre-commit failure — nothing left the wallet, safe to re-pay.
+ */
+export function isPossiblyCommittedSendOutcome(err: unknown): boolean {
+  return isSphereError(err) && POSSIBLY_COMMITTED_SEND_CODES.has(err.code);
 }
 
 /**
