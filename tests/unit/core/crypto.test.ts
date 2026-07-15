@@ -4,7 +4,6 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { ec as EC } from 'elliptic';
 import {
   generateMnemonic,
   validateMnemonic,
@@ -615,17 +614,15 @@ describe('Message Signing', () => {
 // =============================================================================
 
 describe('recoverPubkeyFromSignature', () => {
-  const ec = new EC('secp256k1');
   const PRIVKEY_HEX = '0000000000000000000000000000000000000000000000000000000000000001';
-
-  function pubkeyFor(privkeyHex: string): string {
-    return ec.keyFromPrivate(privkeyHex, 'hex').getPublic().encode('hex', true);
-  }
+  // Compressed SEC1 encoding of the secp256k1 generator point G — the public key
+  // of private key 1. Well-known constant, independent of any crypto library.
+  const PUBKEY_OF_ONE = '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
 
   it('returns compressed pubkey of the signer', () => {
     const message = 'hello sphere';
     const signature = signMessage(PRIVKEY_HEX, message);
-    expect(recoverPubkeyFromSignature(message, signature)).toBe(pubkeyFor(PRIVKEY_HEX));
+    expect(recoverPubkeyFromSignature(message, signature)).toBe(PUBKEY_OF_ONE);
   });
 
   it('is deterministic', () => {
