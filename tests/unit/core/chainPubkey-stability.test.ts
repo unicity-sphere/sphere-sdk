@@ -3,9 +3,10 @@
  *
  * `chainPubkey` is the wallet's identity anchor (Nostr npub and the L3
  * recipient predicate both hang off it). The v1→v2 migration must NOT change it. sphere
- * derives it with `elliptic` (core/crypto); the v2 state-transition SDK derives signing
- * keys with `@noble/curves`. This test locks that, for a fixed private key, both produce
- * the BYTE-IDENTICAL 33-byte compressed secp256k1 public key — so chainPubkey is stable
+ * derives it in core/crypto (formerly `elliptic`, now `@noble/curves` — see #674); the
+ * v2 state-transition SDK derives signing keys through its own `@noble/curves` path.
+ * This test locks that, for a fixed private key, both code paths produce the
+ * BYTE-IDENTICAL 33-byte compressed secp256k1 public key — so chainPubkey is stable
  * across the engine swap regardless of which library computes it.
  *
  * SDK-side import goes through token-engine/sdk (the single SDK boundary), exactly as the
@@ -24,8 +25,8 @@ const PRIVATE_KEYS: readonly string[] = [
   'f0e1d2c3b4a5968778695a4b3c2d1e0ff0e1d2c3b4a5968778695a4b3c2d1e0f',
 ];
 
-describe('chainPubkey stability (D9) — sphere elliptic ≡ v2 SDK @noble', () => {
-  it('getPublicKey (elliptic) === SigningService.publicKey (@noble) for each key', () => {
+describe('chainPubkey stability (D9) — sphere core/crypto ≡ v2 SDK @noble', () => {
+  it('getPublicKey (core/crypto) === SigningService.publicKey (v2 SDK) for each key', () => {
     for (const priv of PRIVATE_KEYS) {
       const sphereCompressed = getPublicKey(priv).toLowerCase();
       const sdkCompressed = HexConverter.encode(new SigningService(hexToBytes(priv)).publicKey).toLowerCase();

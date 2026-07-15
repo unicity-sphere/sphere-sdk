@@ -150,8 +150,7 @@
     "bip39": "^3.1.0",
     "buffer": "^6.0.3",
     "canonicalize": "^3.0.0",
-    "crypto-js": "^4.2.0",
-    "elliptic": "^6.6.1"
+    "crypto-js": "^4.2.0"
   },
   "optionalDependencies": {
     "@libp2p/crypto": "^5.1.13",
@@ -166,7 +165,6 @@
     "@libp2p/interface": "^3.1.0",
     "@libp2p/peer-id": "^6.0.4",
     "@types/crypto-js": "^4.2.2",
-    "@types/elliptic": "^6.4.18",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.54.0",

@@ -5,16 +5,14 @@
  * Platform-independent - no browser-specific APIs.
  */
 
+import { secp256k1 } from '@noble/curves/secp256k1.js';
 import * as bip39 from 'bip39';
 import CryptoJS from 'crypto-js';
-import elliptic from 'elliptic';
 import { SphereError } from './errors';
 
 // =============================================================================
 // Constants
 // =============================================================================
-
-const ec = new elliptic.ec('secp256k1');
 
 /** secp256k1 curve order */
 const CURVE_ORDER = BigInt(
@@ -154,8 +152,7 @@ export function deriveChildKey(
     data = '00' + parentPrivKey + indexHex;
   } else {
     // Non-hardened derivation: compressedPubKey || index
-    const keyPair = ec.keyFromPrivate(parentPrivKey, 'hex');
-    const compressedPubKey = keyPair.getPublic(true, 'hex');
+    const compressedPubKey = getPublicKey(parentPrivKey, true);
     const indexHex = index.toString(16).padStart(8, '0');
     data = compressedPubKey + indexHex;
   }
@@ -239,8 +236,9 @@ export function deriveKeyAtPath(
  * @param compressed - Return compressed public key (default: true)
  */
 export function getPublicKey(privateKey: string, compressed: boolean = true): string {
-  const keyPair = ec.keyFromPrivate(privateKey, 'hex');
-  return keyPair.getPublic(compressed, 'hex');
+  // SEC1 encoding: compressed = 02/03 prefix + x (33 bytes),
+  // uncompressed = 04 prefix + x + y (65 bytes) — identical to elliptic's output.
+  return bytesToHex(secp256k1.getPublicKey(hexToBytes(privateKey), compressed));
 }
 
 /**
@@ -481,30 +479,20 @@ export function hashSignMessage(message: string): string {
  * @param message       - plaintext message to sign
  */
 export function signMessage(privateKeyHex: string, message: string): string {
-  const keyPair = ec.keyFromPrivate(privateKeyHex, 'hex');
   const hashHex = hashSignMessage(message);
-  const hashBytes = Buffer.from(hashHex, 'hex');
-  const sig = keyPair.sign(hashBytes, { canonical: true });
+  // prehash:false — the message is already hashed (double-SHA256 above);
+  // lowS:true — canonical low-S signatures (same as elliptic's {canonical:true});
+  // format:'recovered' — recoveryId(1) || r(32) || s(32), RFC6979-deterministic.
+  const sigBytes = secp256k1.sign(hexToBytes(hashHex), hexToBytes(privateKeyHex), {
+    prehash: false,
+    lowS: true,
+    format: 'recovered',
+  });
 
-  // Find recovery parameter
-  const pub = keyPair.getPublic();
-  let recoveryParam = -1;
-  for (let i = 0; i < 4; i++) {
-    try {
-      if (ec.recoverPubKey(hashBytes, sig, i).eq(pub)) {
-        recoveryParam = i;
-        break;
-      }
-    } catch { /* try next */ }
-  }
-  if (recoveryParam === -1) {
-    throw new SphereError('Could not find recovery parameter', 'SIGNING_ERROR');
-  }
-
+  const recoveryParam = sigBytes[0];
   const v = (31 + recoveryParam).toString(16).padStart(2, '0');
-  const r = sig.r.toString('hex').padStart(64, '0');
-  const s = sig.s.toString('hex').padStart(64, '0');
-  return v + r + s;
+  // r and s are fixed-width 32-byte big-endian — already left-padded.
+  return v + bytesToHex(sigBytes.subarray(1));
 }
 
 /**
@@ -529,12 +517,13 @@ export function verifySignedMessage(
   if (v < 0 || v > 3) return false;
 
   const hashHex = hashSignMessage(message);
-  const hashBytes = Buffer.from(hashHex, 'hex');
 
   try {
-    const recovered = ec.recoverPubKey(hashBytes, { r, s }, v);
-    const recoveredHex = recovered.encode('hex', true); // compressed
-    return recoveredHex === expectedPubkey;
+    const recovered = secp256k1.Signature
+      .fromHex(r + s, 'compact')
+      .addRecoveryBit(v)
+      .recoverPublicKey(hexToBytes(hashHex));
+    return recovered.toHex(true) === expectedPubkey; // compressed
   } catch {
     return false;
   }
@@ -573,11 +562,10 @@ export function recoverPubkeyFromSignature(message: string, signature: string): 
   }
 
   const hashHex = hashSignMessage(message);
-  const hashBytes = Buffer.from(hashHex, 'hex');
 
-  const recovered = ec.recoverPubKey(hashBytes, { r, s }, v);
-  return recovered.encode('hex', true);
+  const recovered = secp256k1.Signature
+    .fromHex(r + s, 'compact')
+    .addRecoveryBit(v)
+    .recoverPublicKey(hexToBytes(hashHex));
+  return recovered.toHex(true); // compressed
 }
-
-// Re-export elliptic instance for advanced use cases
-export { ec };
