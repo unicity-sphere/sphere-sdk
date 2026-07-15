@@ -647,6 +647,45 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
       expect(bJournal?.has('reqA') ?? false).toBe(false);
     });
 
+    it('(identity switch during load, load-bearing) an in-flight load under A does NOT overwrite B journal (Copilot)', async () => {
+      const { fake, payer } = await seedPendingRequest('idload');
+      // Seed identity A's journal on disk.
+      payer.storage.map.set(
+        SETTLING_KEY(fake.network),
+        JSON.stringify({ reqA: { transferId: 'tidA', createdAt: Date.now() } }),
+      );
+
+      // Block the next settling-key storage.get so a load stays in-flight.
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      const map = payer.storage.map;
+      (payer.storage.provider.get as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+        async (k: string) => {
+          if (k.includes(':settling:')) await gate;
+          return map.get(k) ?? null;
+        },
+      );
+
+      // Force a fresh load under identity A and start it (do not await — it blocks).
+      (payer.module as unknown as { settlingJournalLoad: Promise<void> | null }).settlingJournalLoad = null;
+      const loadP = (
+        payer.module as unknown as { ensureSettlingJournalLoaded(): Promise<void> }
+      ).ensureSettlingJournalLoaded();
+
+      // Switch to identity B while A's load is blocked.
+      const B = testIdentity(7777);
+      payer.module.initialize({ ...payer.deps, identity: B });
+
+      // Release → A's load resolves AFTER the switch. Its key guard must drop it.
+      release();
+      await loadP.catch(() => {});
+
+      // B's in-memory journal must NOT have been clobbered with A's data.
+      const j = (payer.module as unknown as { settlingJournal: Map<string, unknown> | null })
+        .settlingJournal;
+      expect(j?.has('reqA') ?? false).toBe(false);
+    });
+
     it('(idempotent respond) a 409 CONFLICT on the deferred paid response is swallowed → journal cleared, status paid; a NETWORK error retains the journal', async () => {
       const { fake, payer, reqId, sourceTokenId } = await seedPendingRequest('idem');
       const transferId = crypto.randomUUID();

@@ -2985,9 +2985,13 @@ export class PaymentsModule {
   }
 
   /**
-   * Remove all non-pending incoming payment requests from memory.
+   * Remove resolved incoming payment requests from memory.
    *
-   * Keeps only requests with status `'pending'`.
+   * Keeps requests with status `'pending'` OR `'settling'` (#441). A `'settling'`
+   * request is UNRESOLVED — its linked transfer is still in-flight — so evicting
+   * it would drop the in-memory hold that keeps it non-payable until the journal
+   * re-surfaces it. Only terminal statuses (`'paid'`/`'rejected'`/`'expired'`)
+   * are removed.
    */
   clearProcessedPaymentRequests(): void {
     // #441: a 'settling' request is UNRESOLVED (its linked transfer is still
@@ -5591,7 +5595,13 @@ export class PaymentsModule {
    */
   private ensureSettlingJournalLoaded(): Promise<void> {
     return (this.settlingJournalLoad ??= (async () => {
-      const raw = await this.deps!.storage.get(this.prSettlingKey());
+      const keyAtLoad = this.prSettlingKey();
+      const raw = await this.deps!.storage.get(keyAtLoad);
+      // Identity switched during the load await (initialize() reset the journal
+      // for a new key): do NOT clobber the NEW identity's settlingJournal with
+      // this stale load. The fresh identity's ensureSettlingJournalLoaded (its
+      // memo was reset to null) loads the correct journal.
+      if (this.prSettlingKey() !== keyAtLoad) return;
       try {
         this.settlingJournal = new Map(
           raw ? Object.entries(JSON.parse(raw) as Record<string, { transferId: string; createdAt: number; committed?: boolean }>) : []
@@ -5625,6 +5635,10 @@ export class PaymentsModule {
     this.settlingJournalWrite = this.settlingJournalWrite.catch(() => {}).then(async () => {
       if (this.prSettlingKey() !== keyAtEnqueue) return; // identity changed — drop the stale mutation
       await this.ensureSettlingJournalLoaded();
+      // Re-check after the load await: if the identity switched WHILE loading, the
+      // load skipped its assignment (guard above) — bail so we never mutate under
+      // the wrong identity, and so `settlingJournal!` is provably non-null here.
+      if (this.prSettlingKey() !== keyAtEnqueue) return;
       if (fn(this.settlingJournal!)) {
         await this.deps!.storage.set(keyAtEnqueue, JSON.stringify(Object.fromEntries(this.settlingJournal!)));
       }
