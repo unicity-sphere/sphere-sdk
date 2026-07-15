@@ -237,10 +237,11 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
    * demoted client-side, but the server row is still `active` (no evidenced
    * tombstone), so `save()` carries nothing and a reload would re-serve the
    * phantom as spendable `confirmed` balance (SPHERE-4). We keep the tokenId in
-   * this per-device set and re-stamp it onto the active view every converge
-   * (see {@link snapshotView}); the set is pruned once the token leaves the
-   * active view (a real tombstone/spend or handoff), so it stays bounded and
-   * never shadows a legitimately re-added token.
+   * this per-device set and re-stamp it onto every returned view — full
+   * snapshot and delta page alike (see {@link applySuspectedSpentOverlay}); the
+   * set is pruned once the token leaves the active view (a real tombstone/spend
+   * or handoff) on either path, so it stays bounded and never shadows a
+   * legitimately re-added token.
    */
   private async readSuspectedSpent(): Promise<Set<string>> {
     const raw = await this.stateStore.get(this.stateKey('suspectedSpent'));
@@ -265,7 +266,8 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
    * (`PaymentsModule.demoteSuspectedSpent`) when a `TransferConflictError`
    * proves a source already spent on-chain. LOCAL only — the server view still
    * shows the row active, so this is the only place the flag can survive a
-   * reload. Re-applied to the view by {@link snapshotView}.
+   * reload. Re-applied to every returned view (full snapshot and delta) by
+   * {@link applySuspectedSpentOverlay}.
    */
   async markSuspectedSpent(tokenId: string): Promise<void> {
     const overlay = await this.readSuspectedSpent();
@@ -398,23 +400,47 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
         await this.persistSyncState(page.cursor, page.syncEpoch);
       }
     }
-    return page;
+    // #679: the suspected-spent overlay is authoritative on the delta path too,
+    // not only in snapshotView — stamp any demoted active row this page carries
+    // (so a delta consumer never sees a demoted source as spendable) and prune
+    // ids this page tombstoned (so a stale overlay entry can't shadow a later
+    // re-add). Both paths converge on the SAME stamp/prune helper.
+    const items = await this.applySuspectedSpentOverlay(page.items);
+    return { ...page, items };
   }
 
   private async snapshotView(): Promise<InventoryView> {
     const active = [...this.view.values()].filter((i) => i.status === 'active');
-    // #679: re-apply (and prune) the durable suspected-spent overlay so a
-    // client-side demotion survives this reload — an active row in the overlay
-    // is stamped `suspectedSpent` and the consumer rebuilds it as a demoted,
-    // non-spendable token instead of resurrecting the phantom balance.
-    const overlay = await this.reconcileSuspectedSpent(active);
-    const items =
-      overlay.size === 0
-        ? active
-        : active.map((i) => (overlay.has(i.tokenId) ? { ...i, suspectedSpent: true } : i));
+    const items = await this.applySuspectedSpentOverlay(active);
     const cursor = (await this.readCursor()) ?? 0n;
     const syncEpoch = (await this.readSyncEpoch()) ?? 0n;
     return { cursor, syncEpoch, more: false, items };
+  }
+
+  /**
+   * #679: the SINGLE place the durable suspected-spent overlay is applied to
+   * inventory rows on their way to a consumer — used by BOTH return paths, the
+   * full snapshot ({@link snapshotView}) and the S2 delta page
+   * ({@link listInventory} with a cursor), so the two can never drift:
+   *  - a returned ACTIVE row whose tokenId is in the overlay is stamped
+   *    `suspectedSpent`, so a client-side demotion survives a reload AND a delta
+   *    consumer is never served a demoted source as spendable (the phantom
+   *    balance / re-spend guard, SPHERE-4);
+   *  - the overlay is pruned to the tokens still active in the WHOLE local view
+   *    — a tombstone arriving on EITHER path has already flipped its `this.view`
+   *    row to `removed`, so its id is dropped here, keeping the overlay bounded
+   *    and unable to shadow a later legitimately re-added token of the same id.
+   * Pruning is reconciled against the whole `this.view`, NOT just `rows`: a
+   * delta page is PARTIAL, so reconciling to only its rows would wrongly drop
+   * still-active overlay ids that simply did not change in this page.
+   */
+  private async applySuspectedSpentOverlay(rows: InventoryItem[]): Promise<InventoryItem[]> {
+    const active = [...this.view.values()].filter((i) => i.status === 'active');
+    const overlay = await this.reconcileSuspectedSpent(active);
+    if (overlay.size === 0) return rows;
+    return rows.map((i) =>
+      i.status === 'active' && overlay.has(i.tokenId) ? { ...i, suspectedSpent: true } : i
+    );
   }
 
   /** Fetch + decode one blob on demand via a short-lived signed GET (§5.1). */
