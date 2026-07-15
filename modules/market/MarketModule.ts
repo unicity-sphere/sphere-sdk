@@ -394,7 +394,7 @@ export class MarketModule {
       // during a 502/503. Treat as transient if the status itself is transient,
       // otherwise treat as permanent.
       const final = new SphereError(
-        `Market API error: HTTP ${res.status} — unexpected response (not JSON)`,
+        `Market API error: HTTP ${res.status} — unexpected response (not JSON): ${text.replace(/\s+/g, ' ').trim().slice(0, 600)}`,
         'NETWORK_ERROR',
       );
       if (isRetryableStatus(res.status)) throw new TransientMarketError(final, res.status);
