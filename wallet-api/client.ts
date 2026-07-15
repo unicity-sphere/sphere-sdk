@@ -1035,6 +1035,27 @@ export class WalletApiClient {
   }
 
   /**
+   * #676 (PR #681 review): the LOCAL disposition of EVERY known intent, keyed by
+   * transferId, read + parsed in ONE pass. {@link PaymentsModule.resumeOpenIntents}
+   * consults the local record before re-executing each server-`open` intent (see
+   * {@link getLocalIntent}); calling the per-intent read once per server-open
+   * intent re-parses the whole intents blob N times. This batch read parses it
+   * ONCE so resume is O(1) reads regardless of the open-intent count. A `transferId`
+   * absent from the map has no local copy (fresh device) → the server row is
+   * authoritative and resume proceeds.
+   */
+  async getLocalIntentsMap(): Promise<
+    Map<string, { status: 'open' | 'completed' | 'aborted'; abortPending: boolean }>
+  > {
+    const intents = await this.readLocalIntents();
+    const map = new Map<string, { status: 'open' | 'completed' | 'aborted'; abortPending: boolean }>();
+    for (const [transferId, intent] of Object.entries(intents)) {
+      map.set(transferId, { status: intent.status, abortPending: intent.abortPending === true });
+    }
+    return map;
+  }
+
+  /**
    * Re-PUT every locally-known open intent (idempotent — the server PUT is
    * write-once while open/completed). Called after a `syncEpoch` change
    * (server restore — §5.4): intents are the one server table not

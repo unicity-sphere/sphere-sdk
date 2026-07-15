@@ -150,14 +150,16 @@ export class SphereError extends Error {
  * #677: a send that PARTIALLY completed before losing a source to a concurrent
  * transfer. At least one earlier leg certified on-chain and was journaled for
  * delivery (its {@link committedTokenIds}) — that value has irreversibly left
- * the wallet — but a LATER leg raised `TransferConflictError` (a lost race).
+ * the wallet — but a LATER leg raised `TransferConflictError` (a lost race), and
+ * `send()` could NOT cover the {@link remainingAmount} from the remaining live
+ * sources (the internal remainder re-plan is exhausted — this is the fallback).
  *
  * Distinct from `TransferConflictError` on purpose: a bare conflict makes the
  * caller re-send the FULL amount, paying the already-delivered leg a second
  * time. Catching THIS type (or `code === 'SEND_PARTIALLY_COMPLETED'`) tells the
  * caller/UI: the delivered legs are final, the conflicted intent has been
- * soft-aborted, and only the REMAINDER may be re-planned — under a NEW
- * transferId, never re-sending the whole amount.
+ * soft-aborted, and only the REMAINDER ({@link remainingAmount}) may be
+ * re-planned — under a NEW transferId, never re-sending the whole amount.
  *
  * NOT a subclass of `TransferConflictError` by design: existing conflict
  * handlers that re-send in full must NOT treat this as an ordinary conflict.
@@ -167,17 +169,59 @@ export class PartialSendConflictError extends SphereError {
   readonly transferId: string;
   /**
    * Source token ids whose spend already certified on-chain (and whose finished
-   * output blob is journaled for delivery). The remainder = the requested amount
-   * minus the value of these legs; re-plan only that, under a new transferId.
+   * output blob is journaled for delivery). Their value has already been
+   * delivered; NEVER re-send these.
    */
   readonly committedTokenIds: readonly string[];
+  /**
+   * The still-undelivered portion (base units, decimal string) — `send()` could
+   * not cover it from the remaining live sources. Re-plan ONLY this amount, under
+   * a new transferId; the delivered legs converge via the recipient's §6 claim.
+   */
+  readonly remainingAmount: string;
 
-  constructor(message: string, transferId: string, committedTokenIds: readonly string[], cause?: unknown) {
+  constructor(
+    message: string,
+    transferId: string,
+    committedTokenIds: readonly string[],
+    remainingAmount: string,
+    cause?: unknown,
+  ) {
     super(message, 'SEND_PARTIALLY_COMPLETED', cause);
     this.name = 'PartialSendConflictError';
     this.transferId = transferId;
     this.committedTokenIds = [...committedTokenIds];
+    this.remainingAmount = remainingAmount;
   }
+}
+
+/**
+ * Error codes for a send outcome where money has (or may have) already left the
+ * wallet on-chain, so the send is NOT a clean, re-sendable failure. A consumer
+ * that persists a "paid" flag (e.g. a payment request) must keep the request
+ * NON-payable on any of these — reverting to a re-payable state would double-pay
+ * (#441). Covers the post-commit mirror-sync-pending / keep-open certification
+ * states AND the partial-conflict outcome.
+ */
+const POSSIBLY_COMMITTED_SEND_CODES: ReadonlySet<SphereErrorCode> = new Set([
+  'SEND_SYNC_PENDING',
+  'CERTIFICATION_UNCONFIRMED',
+  'CHECKPOINT_PERSIST_FAILED',
+  'SPLIT_CHECKPOINT_LOST',
+  'CHECKPOINT_TRUSTBASE_MISMATCH',
+  'SEND_PARTIALLY_COMPLETED',
+]);
+
+/**
+ * #441: true when a send failed with an outcome where the payment has (or may
+ * have) irreversibly left the wallet — a post-commit sync-pending / keep-open
+ * certification state, or a `PartialSendConflictError`. Such a send completes (or
+ * has already partially completed) via resume/claim and MUST NOT be re-sent, so
+ * a persisted "paid" state must stay non-payable. A `false` result is a clean
+ * pre-commit failure — nothing left the wallet, safe to re-pay.
+ */
+export function isPossiblyCommittedSendOutcome(err: unknown): boolean {
+  return isSphereError(err) && POSSIBLY_COMMITTED_SEND_CODES.has(err.code);
 }
 
 /**
