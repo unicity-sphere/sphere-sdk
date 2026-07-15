@@ -565,6 +565,42 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
       expect(payer.module.getPaymentRequests({ status: 'pending' }).map((r) => r.id)).toContain(reqId);
     });
 
+    it('(partial commit, load-bearing) a PartialSendConflictError whose anchor intent ABORTS stays PAID — never reverts to payable (Codex P1)', async () => {
+      const { fake, payer, reqId, sourceTokenId } = await seedPendingRequest('partial-abort');
+      const transferId = crypto.randomUUID();
+      await putOpenIntent(payer, transferId, sourceTokenId);
+
+      // Pay ends in a PartialSendConflictError: ≥1 leg already certified + delivered,
+      // the anchor intent (transferId) soft-aborted. Value LEFT the wallet.
+      const partial = new PartialSendConflictError('part sent', transferId, ['v2_committed'], '500');
+      vi.spyOn(payer.module, 'send').mockRejectedValueOnce(partial);
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toBeInstanceOf(PartialSendConflictError);
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('settling');
+      // Journaled as committed — the discriminator that stops the revert.
+      expect(JSON.parse(payer.storage.map.get(SETTLING_KEY(fake.network))!)[reqId]).toMatchObject({
+        transferId, committed: true,
+      });
+      vi.restoreAllMocks();
+
+      // The anchor intent aborts on resume (exactly the #676 divergence). WITHOUT the
+      // committed flag the reconcile would read "aborted → nothing paid → revert to
+      // pending" and a re-pay would double-pay the delivered leg. It must resolve PAID.
+      fake.setIntentFailure(true);
+      await expect(payer.client.abortIntent(transferId)).rejects.toThrow();
+      fake.setIntentFailure(false);
+
+      const respondSpy = vi.spyOn(payer.client, 'respondPaymentRequest');
+      const outcome = await payer.module.resumeOpenIntents();
+      expect(outcome.conflicted).toContain(transferId); // the anchor DID abort…
+
+      // …yet the request is resolved PAID and NON-payable, journal cleared.
+      expect(respondSpy.mock.calls.filter((c) => (c[1] as { action: string }).action === 'paid')).toHaveLength(1);
+      expect(payer.storage.map.get(SETTLING_KEY(fake.network))).toBe('{}');
+      expect(payer.module.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('paid');
+      // A re-pay is REFUSED (delivered value must not be paid twice).
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    });
+
     it('(idempotent respond) a 409 CONFLICT on the deferred paid response is swallowed → journal cleared, status paid; a NETWORK error retains the journal', async () => {
       const { fake, payer, reqId, sourceTokenId } = await seedPendingRequest('idem');
       const transferId = crypto.randomUUID();

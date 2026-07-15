@@ -1093,7 +1093,7 @@ export class PaymentsModule {
    * promise (the #679/#680 lesson: an unserialized RMW drops entries under
    * concurrency = a re-payable request = the double-pay this fix prevents).
    */
-  private settlingJournal: Map<string, { transferId: string; createdAt: number }> | null = null;
+  private settlingJournal: Map<string, { transferId: string; createdAt: number; committed?: boolean }> | null = null;
   private settlingJournalLoad: Promise<void> | null = null;
   private settlingJournalWrite: Promise<void> = Promise.resolve();
   /** #441: guard overlapping resume reconciles (resumeOpenIntents has 2 fire-and-forget call sites). */
@@ -3060,10 +3060,17 @@ export class PaymentsModule {
         // there is no reload re-surface to double-pay), keep the prior durable
         // 'paid' behavior instead of holding an unresolvable 'settling'.
         if (linkedTransferId && this.paymentRequestsApi()) {
+          // A PartialSendConflictError means ≥1 leg ALREADY certified + delivered
+          // and the anchor intent was soft-aborted — so resume will report it
+          // aborted, but value DID leave the wallet. Journal it as `committed` so
+          // the reconcile resolves it 'paid' and NEVER reverts to payable (a
+          // re-pay would double-pay the delivered leg). Every other keep-open code
+          // is a non-committed link that resume may complete or genuinely abort.
+          const committed = error instanceof PartialSendConflictError;
           // Order is load-bearing: journal PERSISTS before the in-memory status
           // flip, so a crash in between leaves the durable link (reload re-applies
           // settling) — never a lost link (which would re-surface payable).
-          await this.journalSettling(requestId, linkedTransferId);
+          await this.journalSettling(requestId, linkedTransferId, committed);
           this.updatePaymentRequestStatus(requestId, 'settling');
         } else {
           // Either a Nostr-only composition (no wallet-api PR port — no deferral
@@ -5583,7 +5590,7 @@ export class PaymentsModule {
     return (this.settlingJournalLoad ??= (async () => {
       const raw = await this.deps!.storage.get(this.prSettlingKey());
       this.settlingJournal = new Map(
-        raw ? Object.entries(JSON.parse(raw) as Record<string, { transferId: string; createdAt: number }>) : []
+        raw ? Object.entries(JSON.parse(raw) as Record<string, { transferId: string; createdAt: number; committed?: boolean }>) : []
       );
     })());
   }
@@ -5595,7 +5602,7 @@ export class PaymentsModule {
    * when the Map changed and must be persisted.
    */
   private mutateSettlingJournal(
-    fn: (m: Map<string, { transferId: string; createdAt: number }>) => boolean
+    fn: (m: Map<string, { transferId: string; createdAt: number; committed?: boolean }>) => boolean
   ): Promise<void> {
     this.settlingJournalWrite = this.settlingJournalWrite.catch(() => {}).then(async () => {
       await this.ensureSettlingJournalLoaded();
@@ -5609,9 +5616,19 @@ export class PaymentsModule {
     return this.settlingJournalWrite;
   }
 
-  private journalSettling(requestId: string, transferId: string): Promise<void> {
+  /**
+   * #441: link a request to its in-flight transfer. `committed` marks a
+   * DEFINITE spend whose anchor intent is soft-aborted and will NOT resume-
+   * complete — a `PartialSendConflictError` (≥1 leg already delivered). The
+   * reconcile must resolve such a link 'paid' and NEVER revert it to payable
+   * (re-paying the full amount would double-pay the delivered leg). A
+   * non-`committed` link is a keep-open outcome that resume may still complete
+   * OR abort (e.g. CERTIFICATION_UNCONFIRMED losing to a foreign tx delivers
+   * nothing) — those DO revert to payable on abort.
+   */
+  private journalSettling(requestId: string, transferId: string, committed = false): Promise<void> {
     return this.mutateSettlingJournal((m) => {
-      m.set(requestId, { transferId, createdAt: Date.now() });
+      m.set(requestId, { transferId, createdAt: Date.now(), ...(committed ? { committed: true } : {}) });
       return true;
     });
   }
@@ -6086,7 +6103,13 @@ export class PaymentsModule {
         }
         const local = localIntents?.get(transferId);
 
-        if (resumed.has(transferId) || local?.status === 'completed') {
+        // A `committed` link (PartialSendConflictError) delivered value already;
+        // its anchor intent is soft-aborted, so it will show aborted/conflicted —
+        // but it must NEVER revert to payable (that re-pays the delivered leg).
+        // Resolve it 'paid' unconditionally (retry the response until it lands).
+        if (entry.committed) {
+          await this.resolveSettledPaid(requestId, transferId);
+        } else if (resumed.has(transferId) || local?.status === 'completed') {
           await this.resolveSettledPaid(requestId, transferId);
         } else if (conflicted.has(transferId) || local?.status === 'aborted' || local?.abortPending === true) {
           await this.revertSettlingToPayable(requestId);
