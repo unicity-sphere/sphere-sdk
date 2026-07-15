@@ -117,6 +117,17 @@ export interface InventoryItem {
   assets?: InventoryAsset[];
   /** Owner change-cursor value at this row's last change (`?since=` deltas). */
   seq: bigint;
+  /**
+   * #679 client-local demotion overlay: the server still reports this row as
+   * `active`, but a prior `TransferConflictError` proved its state consumed
+   * on-chain (a "suspected spent" source). It is stamped here so the consumer
+   * (`PaymentsModule.mergeLazyInventory`) rebuilds the token as `suspectedSpent`
+   * — kept in inventory, excluded from spendable balance and coin-selection —
+   * and the demotion survives a reload. Providers with server-side custody keep
+   * this flag in DURABLE LOCAL state (never pushed to the server); local
+   * whole-blob providers omit it (they persist the whole token record).
+   */
+  suspectedSpent?: boolean;
 }
 
 /** Result of {@link TokenStorageProvider.listInventory}. */
@@ -289,6 +300,20 @@ export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
    * Only meaningful for providers with server-side tombstones.
    */
   recoverRemoved?(): Promise<RecoverRemovedResult>;
+
+  /**
+   * #679 durable client-side demotion. Record that `tokenId` was proven spent
+   * on-chain (a `TransferConflictError`) even though the server view still
+   * reports its row `active` — so the demotion survives a reload instead of
+   * being re-served as spendable `confirmed` balance every session (the
+   * SPHERE-4 phantom-balance bug). Providers with server-side custody persist
+   * it in DURABLE LOCAL state and re-stamp it onto `listInventory()`
+   * (`InventoryItem.suspectedSpent`); the overlay is never pushed to the server
+   * and is pruned once the token leaves the active view (a real spend/tombstone
+   * or handoff). Local whole-blob providers persist `suspectedSpent` inside the
+   * saved token record and omit this hook.
+   */
+  markSuspectedSpent?(tokenId: string): Promise<void>;
 
   /**
    * Check if data exists

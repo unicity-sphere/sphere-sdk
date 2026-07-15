@@ -1738,6 +1738,26 @@ export class PaymentsModule {
     if (!token) return;
     token.suspectedSpent = true;
     this.tokens.set(tokenId, token);
+    // #679: write the demotion through to any provider that keeps a DURABLE
+    // suspected-spent overlay (the wallet-api thin provider). Its save() below
+    // pushes only additions + confirmed-spend tombstones, so a suspectedSpent
+    // flag on an otherwise-active row is dropped and the phantom resurfaces as
+    // spendable `confirmed` on the next reload (SPHERE-4). The overlay is keyed
+    // by the genesis tokenId; a lazy record carries no sdkData, so derive it
+    // from the `v2_` id. Local whole-blob providers persist the flag via save()
+    // and don't implement this hook.
+    const genesisId =
+      extractTokenIdFromSdkData(token.sdkData) ?? (token.id.startsWith('v2_') ? token.id.slice(3) : null);
+    if (genesisId) {
+      for (const [, provider] of this.getTokenStorageProviders()) {
+        if (typeof provider.markSuspectedSpent !== 'function') continue;
+        try {
+          await provider.markSuspectedSpent(genesisId);
+        } catch (err) {
+          logger.warn('Payments', `Failed to persist suspectedSpent overlay for ${genesisId}:`, err);
+        }
+      }
+    }
     try {
       await this.save();
     } catch (err) {
@@ -2567,6 +2587,11 @@ export class PaymentsModule {
         createdAt: Date.now(),
         updatedAt: Date.now(),
         lazy: true,
+        // #679: the provider re-applied its durable suspected-spent overlay to
+        // this server-active row (a source proven spent on-chain). Rebuild it
+        // demoted so the reload does NOT re-serve the phantom as spendable —
+        // getSpendableTokens/coin-selection and aggregateTokens skip it.
+        ...(item.suspectedSpent ? { suspectedSpent: true } : {}),
       };
       this.tokens.set(token.id, token);
       merged++;

@@ -1281,6 +1281,143 @@ describe('reload (tab refresh) — durable cursor, rebuilt view (#521)', () => {
   });
 });
 
+describe('suspected-spent demotion is DURABLE across a reload (SPHERE-4 phantom balance, #679)', () => {
+  const overlayKey = (network: string) =>
+    `wallet-api-storage:suspectedSpent:${network}:${SENDER.chainPubkey}`;
+
+  it('a #625 demotion survives a tab refresh — the phantom is NOT re-served as spendable confirmed balance', async () => {
+    const { fake, baseUrl } = await startFake();
+    const kv = new MemoryKeyValueStore(); // the SHARED persisted stateStore — survives the "refresh"
+
+    // Session 1 — the only source is already spent on-chain: every certification
+    // attempt raises TransferConflictError, so #625 demotes it and the send
+    // exhausts to a clean SEND_INSUFFICIENT_BALANCE.
+    const tab1 = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-679', kv);
+    const sourceTokenId = await seedServerToken(fake, tab1, SENDER, 1000n);
+    await tab1.module.load();
+    expect(tab1.module.getBalance(UCT)).toEqual([
+      expect.objectContaining({ coinId: UCT, confirmedAmount: '1000' }),
+    ]);
+
+    vi.spyOn(tab1.engine, 'transfer').mockRejectedValue(
+      new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent'),
+    );
+    await expect(tab1.module.send({ recipient: '@bob', amount: '1000', coinId: UCT })).rejects.toThrow(
+      /insufficient balance/i,
+    );
+
+    // In-session: demoted, kept in inventory, excluded from spendable balance…
+    expect(tab1.module.getTokens().find((t) => t.id === `v2_${sourceTokenId}`)?.suspectedSpent).toBe(true);
+    expect(tab1.module.getBalance(UCT)).toEqual([]);
+    // …and the demotion is now on the DURABLE overlay (client-local, never the server).
+    expect(await kv.get(overlayKey(fake.network))).toBe(JSON.stringify([sourceTokenId]));
+    // The server row is still ACTIVE — the demotion was never pushed (no wire change).
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)?.status).toBe('active');
+
+    // Session 2 — a NEW provider+module instance over the SAME persisted store
+    // (the tab refresh). Before #679 mergeLazyInventory re-stamped the still-active
+    // server row as spendable `confirmed` and the phantom returned every session.
+    const tab2 = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-679', kv);
+    await tab2.module.load();
+
+    // The token is kept (visible/recoverable) but DEMOTED — not phantom-confirmed.
+    const reloaded = tab2.module.getTokens().find((t) => t.id === `v2_${sourceTokenId}`);
+    expect(reloaded).toBeDefined();
+    expect(reloaded?.suspectedSpent).toBe(true);
+    // NOT presented as spendable confirmed balance.
+    expect(tab2.module.getBalance(UCT)).toEqual([]);
+    // NOT selectable by coin-selection — the fresh engine has NO conflict spy, so a
+    // broken overlay would let this real send proceed; the demotion blocks it at
+    // selection instead.
+    await expect(tab2.module.send({ recipient: '@bob', amount: '1000', coinId: UCT })).rejects.toThrow(
+      /insufficient balance/i,
+    );
+  });
+
+  it('the overlay is selective: a non-demoted active token stays spendable after reload', async () => {
+    const { fake, baseUrl } = await startFake();
+    const kv = new MemoryKeyValueStore();
+
+    // Two sources: a 1000 (which a 1000-send selects, then finds conflicted) and a
+    // 500 that is too small to cover the send, so it is never touched.
+    const tab1 = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-679-sel', kv);
+    const bigId = await seedServerToken(fake, tab1, SENDER, 1000n);
+    await seedServerToken(fake, tab1, SENDER, 500n);
+    await tab1.module.load();
+
+    vi.spyOn(tab1.engine, 'transfer').mockRejectedValue(
+      new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent'),
+    );
+    await expect(tab1.module.send({ recipient: '@bob', amount: '1000', coinId: UCT })).rejects.toThrow(
+      /insufficient balance/i,
+    );
+    expect(await kv.get(overlayKey(fake.network))).toBe(JSON.stringify([bigId]));
+
+    // Reload: only the demoted 1000 is excluded; the untouched 500 is still spendable.
+    const tab2 = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-679-sel', kv);
+    await tab2.module.load();
+    expect(tab2.module.getTokens().find((t) => t.id === `v2_${bigId}`)?.suspectedSpent).toBe(true);
+    expect(tab2.module.getBalance(UCT)).toEqual([
+      expect.objectContaining({ coinId: UCT, confirmedAmount: '500', confirmedTokenCount: 1 }),
+    ]);
+  });
+
+  it('a legitimately-tombstoned token clears from the overlay (bounded, never shadows a re-add)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const kv = new MemoryKeyValueStore();
+
+    // Demote the only source (as above) → it lands on the durable overlay.
+    const tab1 = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-679-tomb', kv);
+    const sourceTokenId = await seedServerToken(fake, tab1, SENDER, 1000n);
+    await tab1.module.load();
+    vi.spyOn(tab1.engine, 'transfer').mockRejectedValue(
+      new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent'),
+    );
+    await expect(tab1.module.send({ recipient: '@bob', amount: '1000', coinId: UCT })).rejects.toThrow(
+      /insufficient balance/i,
+    );
+    expect(await kv.get(overlayKey(fake.network))).toBe(JSON.stringify([sourceTokenId]));
+
+    // The token is now LEGITIMATELY spent on-chain (the owner's other device):
+    // the server row becomes a real tombstone. On the next converge the overlay
+    // must drop it — it left the active view, so it can neither grow unbounded
+    // nor shadow a legitimately re-added token later.
+    const other = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-679-other');
+    await other.client.applyInventoryDelta({
+      transferId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      spent: [sourceTokenId],
+      added: [],
+    });
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)?.status).toBe('removed');
+
+    const tab2 = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-679-tomb', kv);
+    await tab2.module.load();
+
+    // The demoted token is gone (spent), and the overlay is pruned empty.
+    expect(tab2.module.getTokens().find((t) => t.id === `v2_${sourceTokenId}`)).toBeUndefined();
+    expect(await kv.get(overlayKey(fake.network))).toBeNull();
+  });
+
+  it('concurrent demotions do not clobber the overlay (serialized read-modify-write, #679)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const kv = new MemoryKeyValueStore();
+    const client = new WalletApiClient({ baseUrl, network: fake.network, deviceId: 'd-679-race', storage: kv });
+    const provider = new WalletApiTokenStorageProvider({ client, stateStore: kv });
+    provider.setIdentity(fullIdentity(SENDER));
+
+    // Fire many demotions at once. Each markSuspectedSpent read-modify-writes the
+    // persisted overlay; WITHOUT serialization concurrent calls read the same
+    // stale set and the last write clobbers the rest, dropping suspectedSpent ids
+    // (the phantom returns after reload). The mutex must retain ALL of them.
+    const ids = Array.from({ length: 20 }, (_, i) => `race-tok-${i.toString().padStart(2, '0')}`);
+    await Promise.all(ids.map((id) => provider.markSuspectedSpent(id)));
+
+    const persisted = new Set(JSON.parse((await kv.get(overlayKey(fake.network)))!) as string[]);
+    expect(persisted.size).toBe(ids.length);
+    for (const id of ids) expect(persisted.has(id)).toBe(true);
+  });
+});
+
 describe('history reload (tab refresh) — rebuilt from the server log (J4/J5, #549)', () => {
   it('J4: send → reload → the SENT record is hydrated from the server with its memo decrypted (no loss, no dupes)', async () => {
     const { fake, baseUrl } = await startFake();

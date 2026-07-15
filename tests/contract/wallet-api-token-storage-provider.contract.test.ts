@@ -33,7 +33,12 @@ function makeDevice(
   baseUrl: string,
   identityIndex: number,
   deviceId: string
-): { client: WalletApiClient; provider: WalletApiTokenStorageProvider; pubkey: string } {
+): {
+  client: WalletApiClient;
+  provider: WalletApiTokenStorageProvider;
+  pubkey: string;
+  stateStore: MemoryKeyValueStore;
+} {
   const identity = testIdentity(identityIndex);
   const client = new WalletApiClient({
     baseUrl,
@@ -41,15 +46,16 @@ function makeDevice(
     deviceId,
     storage: new MemoryKeyValueStore(),
   });
+  const stateStore = new MemoryKeyValueStore();
   const provider = new WalletApiTokenStorageProvider({
     client,
-    stateStore: new MemoryKeyValueStore(),
+    stateStore,
   });
   provider.setIdentity({
     privateKey: identity.privateKey,
     chainPubkey: identity.chainPubkey,
   } as FullIdentity);
-  return { client, provider, pubkey: identity.chainPubkey };
+  return { client, provider, pubkey: identity.chainPubkey, stateStore };
 }
 
 async function seedVia(provider: WalletApiTokenStorageProvider, tokens: TestToken[]): Promise<void> {
@@ -158,6 +164,68 @@ describe('WalletApiTokenStorageProvider — S2 remote semantics', () => {
     // And B's converged active view drops it.
     const after = await deviceB.provider.listInventory();
     expect(after.items.map((i) => i.tokenId)).toEqual([t2.tokenId]);
+  });
+
+  // #679 SPHERE-4: the durable suspected-spent overlay is authoritative on the
+  // DELTA path too, not just the full snapshot (snapshotView). Before the fix a
+  // delta page (`listInventory(cursor)`) was applied to the view and returned
+  // RAW, so a demoted source could be served as spendable and a delta tombstone
+  // never pruned the overlay key.
+  const overlayKey = (identityIndex: number): string =>
+    `wallet-api-storage:suspectedSpent:${fake.network}:${testIdentity(identityIndex).chainPubkey}`;
+
+  it('a demoted token served on a DELTA page is stamped suspectedSpent, not spendable (#679)', async () => {
+    const deviceA = makeDevice(fake, baseUrl, 40, 'dev-a');
+    const deviceB = makeDevice(fake, baseUrl, 40, 'dev-b'); // same owner, second device
+    const t1 = makeTestToken();
+    await seedVia(deviceA.provider, [t1]);
+
+    // Device B converges — t1 is active and NOT demoted yet.
+    const before = await deviceB.provider.listInventory();
+    expect(before.items.find((i) => i.tokenId === t1.tokenId)?.suspectedSpent).toBeUndefined();
+
+    // A #625 client-side demotion on device B (a TransferConflictError proved
+    // the source spent on-chain): recorded on the durable per-device overlay.
+    await deviceB.provider.markSuspectedSpent(t1.tokenId);
+
+    // A consumer replaying a delta that re-carries t1 as an ACTIVE row (a
+    // lagging device draining from an older cursor) must see it STAMPED — the
+    // overlay is authoritative on the delta path, exactly like the snapshot.
+    const delta = await deviceB.provider.listInventory(0n);
+    const row = delta.items.find((i) => i.tokenId === t1.tokenId);
+    expect(row?.status).toBe('active');
+    expect(row?.suspectedSpent).toBe(true); // raw delta row before the fix → undefined
+  });
+
+  it('a tombstone arriving on the DELTA path prunes the overlay — a later re-add is NOT shadowed (#679)', async () => {
+    const deviceA = makeDevice(fake, baseUrl, 41, 'dev-a');
+    const deviceB = makeDevice(fake, baseUrl, 41, 'dev-b'); // same owner, second device
+    const t1 = makeTestToken();
+    await seedVia(deviceA.provider, [t1]);
+
+    // Device B converges and demotes t1 client-side (durable overlay).
+    const before = await deviceB.provider.listInventory();
+    await deviceB.provider.markSuspectedSpent(t1.tokenId);
+    expect(await deviceB.stateStore.get(overlayKey(41))).toBe(JSON.stringify([t1.tokenId]));
+
+    // Device A legitimately spends t1 (its other device) → a real tombstone.
+    // Device B learns it ONLY via a delta page — the overlay must be pruned
+    // there (t1 left the active view), or it would shadow a later re-add.
+    await deviceA.provider.applyDelta('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', [t1.tokenId], []);
+    const delta = await deviceB.provider.listInventory(before.cursor);
+    expect(delta.items.find((i) => i.tokenId === t1.tokenId)?.status).toBe('removed');
+    expect(await deviceB.stateStore.get(overlayKey(41))).toBeNull(); // overlay kept t1 before the fix
+
+    // t1 is later legitimately re-added (recovery/reactivation). With the
+    // overlay pruned it returns SPENDABLE — the stale demotion no longer
+    // shadows it. Before the fix the un-pruned overlay re-stamps it on the next
+    // full snapshot, re-hiding a healthy token forever.
+    const recovered = await deviceB.provider.recoverRemoved();
+    expect(recovered.recovered).toContain(t1.tokenId);
+    const restored = await deviceB.provider.listInventory();
+    const row = restored.items.find((i) => i.tokenId === t1.tokenId);
+    expect(row?.status).toBe('active');
+    expect(row?.suspectedSpent).toBeFalsy();
   });
 
   it('syncEpoch change → discard cursors, full pull, re-PUT open intents (§5.4/E.3)', async () => {
