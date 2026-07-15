@@ -19,6 +19,26 @@ const CURVE_ORDER = BigInt(
   '0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141'
 );
 
+/** A secp256k1 private key is exactly 32 bytes — 64 hex chars. */
+const PRIVKEY_HEX_RE = /^[0-9a-fA-F]{64}$/;
+
+/**
+ * Reject a malformed private key BEFORE it reaches the curve (#674 review).
+ * `hexToBytes` coerces any non-hex character to a zero byte
+ * (`parseInt('gg', 16)` → NaN → 0), so a right-length string with a stray
+ * non-hex char would otherwise derive/sign with a DIFFERENT valid key and no
+ * error — silently signing with an unintended key. secp256k1 already rejects
+ * wrong-*length* input; this closes the same-length-wrong-chars hole.
+ */
+function assertPrivKeyHex(privateKeyHex: string): void {
+  if (!PRIVKEY_HEX_RE.test(privateKeyHex)) {
+    throw new SphereError(
+      `Invalid private key: expected 64 hex chars, got ${privateKeyHex.length}`,
+      'VALIDATION_ERROR',
+    );
+  }
+}
+
 /** Default derivation path for Unicity (BIP44) */
 export const DEFAULT_DERIVATION_PATH = "m/44'/0'/0'";
 
@@ -236,6 +256,7 @@ export function deriveKeyAtPath(
  * @param compressed - Return compressed public key (default: true)
  */
 export function getPublicKey(privateKey: string, compressed: boolean = true): string {
+  assertPrivKeyHex(privateKey);
   // SEC1 encoding: compressed = 02/03 prefix + x (33 bytes),
   // uncompressed = 04 prefix + x + y (65 bytes) — identical to elliptic's output.
   return bytesToHex(secp256k1.getPublicKey(hexToBytes(privateKey), compressed));
@@ -479,6 +500,7 @@ export function hashSignMessage(message: string): string {
  * @param message       - plaintext message to sign
  */
 export function signMessage(privateKeyHex: string, message: string): string {
+  assertPrivKeyHex(privateKeyHex);
   const hashHex = hashSignMessage(message);
   // prehash:false — the message is already hashed (double-SHA256 above);
   // lowS:true — canonical low-S signatures (same as elliptic's {canonical:true});

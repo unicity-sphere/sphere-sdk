@@ -211,3 +211,67 @@ describe('crypto noble equivalence — golden vectors captured from elliptic v0.
     });
   });
 });
+
+describe('recovery-id v-byte wiring — all four values [0..3] exercised (#674 review)', () => {
+  // signMessage cannot naturally emit recoveryId 2/3 (needs R.x >= n, probability
+  // ~2^-128 under RFC6979), so no golden signMessage vector can cover them. But
+  // verify/recover ACCEPT external v in [0..3], so decode wiring for 2/3 must
+  // still be exercised: take the privkey=1 vector (recoveryId 1, v=0x20) and
+  // tamper the v byte to every other value, driving addRecoveryBit(0/2/3) for
+  // real. A wiring bug that mapped 2/3 onto 0/1 would let a wrong byte recover
+  // the signer — these assertions would catch it.
+  const v = GOLDEN_VECTORS[0];
+  const signer = v.recovered;
+  const rs = v.signature.slice(2); // r||s (128 hex), v byte stripped
+
+  it('v = 31 + recoveryId is a bijection over [0..3]', () => {
+    for (const rec of [0, 1, 2, 3]) {
+      const vByte = (31 + rec).toString(16).padStart(2, '0');
+      expect(parseInt(vByte, 16) - 31).toBe(rec);
+    }
+  });
+
+  it('only the correct recovery byte (0x20) recovers the signer; 0x1f/0x21/0x22 do not', () => {
+    const tryRecover = (vByte: string): string | null => {
+      try {
+        return recoverPubkeyFromSignature(v.message, vByte + rs);
+      } catch {
+        return null; // no valid point for this recovery id — acceptable
+      }
+    };
+    expect(tryRecover('20')).toBe(signer); // recoveryId 1
+    for (const vByte of ['1f', '21', '22']) {
+      // recoveryId 0, 2, 3 — must reach noble and never return the signer
+      expect(tryRecover(vByte)).not.toBe(signer);
+    }
+  });
+
+  it('verifySignedMessage accepts only the correct recovery byte', () => {
+    expect(verifySignedMessage(v.message, '20' + rs, signer)).toBe(true);
+    for (const vByte of ['1f', '21', '22']) {
+      expect(verifySignedMessage(v.message, vByte + rs, signer)).toBe(false);
+    }
+  });
+});
+
+describe('private-key input validation (#674 review)', () => {
+  const VALID = '0000000000000000000000000000000000000000000000000000000000000001';
+
+  it('getPublicKey rejects a right-length key with a non-hex char (no silent zero-coercion)', () => {
+    // 'gg' would coerce to 0x00 in hexToBytes → a different valid key, no error.
+    expect(() => getPublicKey('gg' + VALID.slice(2))).toThrow(/expected 64 hex/);
+  });
+
+  it('getPublicKey rejects wrong-length keys', () => {
+    expect(() => getPublicKey('0102')).toThrow(/expected 64 hex/);
+    expect(() => getPublicKey('')).toThrow(/expected 64 hex/);
+  });
+
+  it('signMessage rejects a right-length key with a non-hex char', () => {
+    expect(() => signMessage('gg' + VALID.slice(2), 'msg')).toThrow(/expected 64 hex/);
+  });
+
+  it('a valid key still succeeds unchanged', () => {
+    expect(getPublicKey(VALID)).toBe(GOLDEN_VECTORS[0].compressed);
+  });
+});
