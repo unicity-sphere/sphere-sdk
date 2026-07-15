@@ -137,6 +137,14 @@ export type SphereErrorCode =
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
   readonly cause?: unknown;
+  /**
+   * #441 deferred-paid linkage: the transferId of the possibly-committed send,
+   * stamped by `sendOnce` before the error leaves so a payment-request consumer
+   * can durably journal request→transfer and resolve 'paid' only when that
+   * transfer actually completes (never optimistically). Present ONLY on
+   * possibly-committed outcomes ({@link isPossiblyCommittedSendOutcome}).
+   */
+  transferId?: string;
 
   constructor(message: string, code: SphereErrorCode, cause?: unknown) {
     super(message);

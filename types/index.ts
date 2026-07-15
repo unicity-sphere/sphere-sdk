@@ -203,7 +203,7 @@ export interface IncomingTransfer {
 // Payment Request Types
 // =============================================================================
 
-export type PaymentRequestStatus = 'pending' | 'accepted' | 'rejected' | 'paid' | 'expired';
+export type PaymentRequestStatus = 'pending' | 'accepted' | 'rejected' | 'paid' | 'expired' | 'settling';
 
 /**
  * Outgoing payment request (requesting payment from someone)
@@ -409,6 +409,7 @@ export type SphereEventType =
   | 'payment_request:rejected'
   | 'payment_request:paid'
   | 'payment_request:expired'
+  | 'payment_request:settling'
   | 'payment_request:response'
   | 'message:dm'
   | 'message:read'
@@ -503,6 +504,13 @@ export interface SphereEventMap {
   'payment_request:rejected': IncomingPaymentRequest;
   'payment_request:paid': IncomingPaymentRequest;
   'payment_request:expired': IncomingPaymentRequest;
+  /**
+   * #441: a possibly-committed pay linked the request to an in-flight transfer.
+   * The request is held NON-payable until that transfer completes (resolves
+   * 'paid') or aborts (returns to payable). Distinct from 'paid' — money may
+   * have left but the server has NOT yet been told 'paid'.
+   */
+  'payment_request:settling': IncomingPaymentRequest;
   'payment_request:response': PaymentRequestResponse;
   'message:dm': DirectMessage;
   'message:read': { messageIds: string[]; peerPubkey: string };

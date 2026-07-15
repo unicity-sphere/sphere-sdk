@@ -270,9 +270,17 @@ describe('send — full wallet-api preset (S2 consumer + S3 + §7 pipeline)', ()
       throw cause;
     };
 
-    await expect(
-      sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT }),
-    ).rejects.toMatchObject({ code: 'SEND_SYNC_PENDING', cause });
+    const err = await sender.module
+      .send({ recipient: '@bob', amount: '1000', coinId: UCT })
+      .then(() => { throw new Error('expected send to reject'); }, (e: unknown) => e);
+    expect(err).toMatchObject({ code: 'SEND_SYNC_PENDING', cause });
+
+    // #441 stamp: the possibly-committed error carries the committing attempt's
+    // transferId, and it names a real OPEN intent on the server (the id resume
+    // will complete). A payment-request consumer journals this link.
+    const stampedId = (err as { transferId?: string }).transferId;
+    expect(typeof stampedId).toBe('string');
+    expect(fake.getIntent(SENDER.chainPubkey, stampedId!)).toMatchObject({ status: 'open' });
 
     // Not a lost payment: transfer:failed must NOT be emitted for a sync-pending.
     const failed = sender.emitEvent.mock.calls.filter((c) => c[0] === 'transfer:failed');
