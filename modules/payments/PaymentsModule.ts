@@ -1385,10 +1385,13 @@ export class PaymentsModule {
     // exactly as before (port selection, covenant §3.1-6).
     this.prBootstrapped = false;
     // #441: reset the deferred-paid journal so it reloads under the new identity's
-    // storage key (the key bakes in chainPubkey). The pending write chain flushes
-    // its in-flight old-key write naturally.
+    // storage key (the key bakes in chainPubkey). New mutations start a fresh
+    // write chain; any still-queued old-identity mutation is dropped by the
+    // per-mutation key guard in mutateSettlingJournal (it can't pollute the new
+    // identity's journal).
     this.settlingJournal = null;
     this.settlingJournalLoad = null;
+    this.settlingJournalWrite = Promise.resolve();
     if (this.paymentRequestsApi()) {
       this.prPollTimer = setInterval(() => {
         this.pumpHealth.run('payment-requests', () => this.pumpPaymentRequests());
@@ -5589,9 +5592,18 @@ export class PaymentsModule {
   private ensureSettlingJournalLoaded(): Promise<void> {
     return (this.settlingJournalLoad ??= (async () => {
       const raw = await this.deps!.storage.get(this.prSettlingKey());
-      this.settlingJournal = new Map(
-        raw ? Object.entries(JSON.parse(raw) as Record<string, { transferId: string; createdAt: number; committed?: boolean }>) : []
-      );
+      try {
+        this.settlingJournal = new Map(
+          raw ? Object.entries(JSON.parse(raw) as Record<string, { transferId: string; createdAt: number; committed?: boolean }>) : []
+        );
+      } catch (err) {
+        // A corrupt blob (partial write / manual clear / older format) must NOT
+        // wedge the whole resume + payment-request pump. Fail open to an empty
+        // journal (a settling request may re-surface payable — a rare, bounded
+        // risk) rather than throw and break ALL resume for the session.
+        logger.error('Payments', 'Settling journal unreadable — treating as empty:', err);
+        this.settlingJournal = new Map();
+      }
     })());
   }
 
@@ -5604,13 +5616,17 @@ export class PaymentsModule {
   private mutateSettlingJournal(
     fn: (m: Map<string, { transferId: string; createdAt: number; committed?: boolean }>) => boolean
   ): Promise<void> {
+    // Capture the identity's storage key at ENQUEUE time. If the identity
+    // switches before this queued mutation runs, prSettlingKey() will have
+    // changed — skip, so a stale old-identity mutation cannot reload + rewrite
+    // the NEW identity's journal (resetting the chain pointer alone does not
+    // cancel an already-queued .then).
+    const keyAtEnqueue = this.prSettlingKey();
     this.settlingJournalWrite = this.settlingJournalWrite.catch(() => {}).then(async () => {
+      if (this.prSettlingKey() !== keyAtEnqueue) return; // identity changed — drop the stale mutation
       await this.ensureSettlingJournalLoaded();
       if (fn(this.settlingJournal!)) {
-        await this.deps!.storage.set(
-          this.prSettlingKey(),
-          JSON.stringify(Object.fromEntries(this.settlingJournal!))
-        );
+        await this.deps!.storage.set(keyAtEnqueue, JSON.stringify(Object.fromEntries(this.settlingJournal!)));
       }
     });
     return this.settlingJournalWrite;
@@ -5801,8 +5817,11 @@ export class PaymentsModule {
       } else {
         // Server already resolved (paid/declined/expired) — our deferred tell
         // landed in a prior session, or it expired. Drop the stale link and let
-        // the terminal status flow.
-        void this.clearSettling(wire.id);
+        // the terminal status flow. Fire-and-forget (surface is sync), but attach
+        // a .catch so a storage I/O failure can't raise an unhandled rejection.
+        void this.clearSettling(wire.id).catch((err) =>
+          logger.warn('Payments', `Failed to clear stale settling link for ${wire.id}:`, err),
+        );
       }
     }
 

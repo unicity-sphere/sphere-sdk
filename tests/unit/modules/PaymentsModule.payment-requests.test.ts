@@ -601,6 +601,52 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
       await expect(payer.module.payPaymentRequest(reqId)).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
     });
 
+    it('(corrupt journal) an unreadable settling blob loads as empty and does NOT wedge the pump (Copilot)', async () => {
+      const { fake, payer, reqId, sourceTokenId } = await seedPendingRequest('corrupt');
+      const transferId = crypto.randomUUID();
+      await putOpenIntent(payer, transferId, sourceTokenId);
+      await paySettling(payer, reqId, transferId); // writes a valid journal
+      // Corrupt the persisted blob (partial write / manual clear / older format).
+      payer.storage.map.set(SETTLING_KEY(fake.network), '{ not valid json');
+
+      // A fresh module over the same storage must LOAD + PUMP without throwing.
+      // Without the JSON.parse guard, ensureSettlingJournalLoaded throws and wedges
+      // the whole payment-request pump / resume path.
+      const reopened = createPaymentsModule({ l1: null });
+      reopened.initialize({ ...payer.deps });
+      cleanups.push(() => reopened.destroy());
+      await reopened.load();
+      await reopened.syncPaymentRequests(); // would REJECT here without the fix
+
+      // Fail-open: journal treated as empty → the request re-surfaces per server
+      // state (open → pending) rather than the pump being wedged.
+      expect(reopened.getPaymentRequests().find((r) => r.id === reqId)?.status).toBe('pending');
+    });
+
+    it('(identity switch, load-bearing) a journal mutation queued under identity A does NOT pollute identity B (Copilot)', async () => {
+      const { fake, payer } = await seedPendingRequest('idswitch');
+
+      // Enqueue a journal mutation under identity A but do NOT await it…
+      const pA = (
+        payer.module as unknown as { journalSettling(r: string, t: string, c?: boolean): Promise<void> }
+      ).journalSettling('reqA', 'tidA');
+
+      // …then synchronously switch to identity B (a distinct chainPubkey). The
+      // queued mutation's .then runs AFTER the switch; the enqueue-time key guard
+      // must drop it so it can't reload + rewrite identity B's journal.
+      const B = testIdentity(4242);
+      payer.module.initialize({ ...payer.deps, identity: B });
+
+      await pA.catch(() => {});
+
+      // reqA must NOT have leaked into identity B's IN-MEMORY journal. Without the
+      // key guard the queued mutation reloads B's (empty) journal, injects reqA,
+      // and persists — polluting B's session state with a prior identity's link.
+      const bJournal = (payer.module as unknown as { settlingJournal: Map<string, unknown> | null })
+        .settlingJournal;
+      expect(bJournal?.has('reqA') ?? false).toBe(false);
+    });
+
     it('(idempotent respond) a 409 CONFLICT on the deferred paid response is swallowed → journal cleared, status paid; a NETWORK error retains the journal', async () => {
       const { fake, payer, reqId, sourceTokenId } = await seedPendingRequest('idem');
       const transferId = crypto.randomUUID();
