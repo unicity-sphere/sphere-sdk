@@ -1282,7 +1282,8 @@ describe('reload (tab refresh) — durable cursor, rebuilt view (#521)', () => {
 });
 
 describe('suspected-spent demotion is DURABLE across a reload (SPHERE-4 phantom balance, #679)', () => {
-  const overlayKey = () => `wallet-api-storage:suspectedSpent:${'testnet2'}:${SENDER.chainPubkey}`;
+  const overlayKey = (network: string) =>
+    `wallet-api-storage:suspectedSpent:${network}:${SENDER.chainPubkey}`;
 
   it('a #625 demotion survives a tab refresh — the phantom is NOT re-served as spendable confirmed balance', async () => {
     const { fake, baseUrl } = await startFake();
@@ -1309,7 +1310,7 @@ describe('suspected-spent demotion is DURABLE across a reload (SPHERE-4 phantom 
     expect(tab1.module.getTokens().find((t) => t.id === `v2_${sourceTokenId}`)?.suspectedSpent).toBe(true);
     expect(tab1.module.getBalance(UCT)).toEqual([]);
     // …and the demotion is now on the DURABLE overlay (client-local, never the server).
-    expect(await kv.get(overlayKey())).toBe(JSON.stringify([sourceTokenId]));
+    expect(await kv.get(overlayKey(fake.network))).toBe(JSON.stringify([sourceTokenId]));
     // The server row is still ACTIVE — the demotion was never pushed (no wire change).
     expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)?.status).toBe('active');
 
@@ -1350,7 +1351,7 @@ describe('suspected-spent demotion is DURABLE across a reload (SPHERE-4 phantom 
     await expect(tab1.module.send({ recipient: '@bob', amount: '1000', coinId: UCT })).rejects.toThrow(
       /insufficient balance/i,
     );
-    expect(await kv.get(overlayKey())).toBe(JSON.stringify([bigId]));
+    expect(await kv.get(overlayKey(fake.network))).toBe(JSON.stringify([bigId]));
 
     // Reload: only the demoted 1000 is excluded; the untouched 500 is still spendable.
     const tab2 = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-679-sel', kv);
@@ -1375,7 +1376,7 @@ describe('suspected-spent demotion is DURABLE across a reload (SPHERE-4 phantom 
     await expect(tab1.module.send({ recipient: '@bob', amount: '1000', coinId: UCT })).rejects.toThrow(
       /insufficient balance/i,
     );
-    expect(await kv.get(overlayKey())).toBe(JSON.stringify([sourceTokenId]));
+    expect(await kv.get(overlayKey(fake.network))).toBe(JSON.stringify([sourceTokenId]));
 
     // The token is now LEGITIMATELY spent on-chain (the owner's other device):
     // the server row becomes a real tombstone. On the next converge the overlay
@@ -1394,7 +1395,26 @@ describe('suspected-spent demotion is DURABLE across a reload (SPHERE-4 phantom 
 
     // The demoted token is gone (spent), and the overlay is pruned empty.
     expect(tab2.module.getTokens().find((t) => t.id === `v2_${sourceTokenId}`)).toBeUndefined();
-    expect(await kv.get(overlayKey())).toBeNull();
+    expect(await kv.get(overlayKey(fake.network))).toBeNull();
+  });
+
+  it('concurrent demotions do not clobber the overlay (serialized read-modify-write, #679)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const kv = new MemoryKeyValueStore();
+    const client = new WalletApiClient({ baseUrl, network: fake.network, deviceId: 'd-679-race', storage: kv });
+    const provider = new WalletApiTokenStorageProvider({ client, stateStore: kv });
+    provider.setIdentity(fullIdentity(SENDER));
+
+    // Fire many demotions at once. Each markSuspectedSpent read-modify-writes the
+    // persisted overlay; WITHOUT serialization concurrent calls read the same
+    // stale set and the last write clobbers the rest, dropping suspectedSpent ids
+    // (the phantom returns after reload). The mutex must retain ALL of them.
+    const ids = Array.from({ length: 20 }, (_, i) => `race-tok-${i.toString().padStart(2, '0')}`);
+    await Promise.all(ids.map((id) => provider.markSuspectedSpent(id)));
+
+    const persisted = new Set(JSON.parse((await kv.get(overlayKey(fake.network)))!) as string[]);
+    expect(persisted.size).toBe(ids.length);
+    for (const id of ids) expect(persisted.has(id)).toBe(true);
   });
 });
 

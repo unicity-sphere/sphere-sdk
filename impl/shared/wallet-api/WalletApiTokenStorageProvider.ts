@@ -262,6 +262,25 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
   }
 
   /**
+   * #679: serialize overlay read-modify-write. Both {@link markSuspectedSpent}
+   * and {@link reconcileSuspectedSpent} read the persisted overlay, mutate it,
+   * and write it back; without this a concurrent demotion (overlapping `send()`
+   * calls) could read a stale set and clobber another's write, dropping a
+   * `suspectedSpent` id so the phantom balance reappears after reload. A simple
+   * promise-chain mutex — each op runs after the previous settles, and a failing
+   * op never wedges the chain.
+   */
+  private overlayLock: Promise<unknown> = Promise.resolve();
+  private withOverlayLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.overlayLock.then(fn, fn);
+    this.overlayLock = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /**
    * #679: durably record a client-side demotion. Called by the consumer
    * (`PaymentsModule.demoteSuspectedSpent`) when a `TransferConflictError`
    * proves a source already spent on-chain. LOCAL only — the server view still
@@ -270,10 +289,12 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
    * {@link applySuspectedSpentOverlay}.
    */
   async markSuspectedSpent(tokenId: string): Promise<void> {
-    const overlay = await this.readSuspectedSpent();
-    if (overlay.has(tokenId)) return;
-    overlay.add(tokenId);
-    await this.writeSuspectedSpent(overlay);
+    await this.withOverlayLock(async () => {
+      const overlay = await this.readSuspectedSpent();
+      if (overlay.has(tokenId)) return;
+      overlay.add(tokenId);
+      await this.writeSuspectedSpent(overlay);
+    });
   }
 
   /**
@@ -284,18 +305,20 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
    * (#679 lifecycle). Persists only when the set actually changed.
    */
   private async reconcileSuspectedSpent(active: InventoryItem[]): Promise<Set<string>> {
-    const overlay = await this.readSuspectedSpent();
-    if (overlay.size === 0) return overlay;
-    const activeIds = new Set(active.map((i) => i.tokenId));
-    let changed = false;
-    for (const id of overlay) {
-      if (!activeIds.has(id)) {
-        overlay.delete(id);
-        changed = true;
+    return this.withOverlayLock(async () => {
+      const overlay = await this.readSuspectedSpent();
+      if (overlay.size === 0) return overlay;
+      const activeIds = new Set(active.map((i) => i.tokenId));
+      let changed = false;
+      for (const id of overlay) {
+        if (!activeIds.has(id)) {
+          overlay.delete(id);
+          changed = true;
+        }
       }
-    }
-    if (changed) await this.writeSuspectedSpent(overlay);
-    return overlay;
+      if (changed) await this.writeSuspectedSpent(overlay);
+      return overlay;
+    });
   }
 
   // ── inventory sync (§5.1) ───────────────────────────────────────────────────
