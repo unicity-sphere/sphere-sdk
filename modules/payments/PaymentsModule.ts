@@ -82,7 +82,7 @@ import {
 } from '../../serialization/txf-serializer';
 import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
-import { SphereError } from '../../core/errors';
+import { SphereError, PartialSendConflictError } from '../../core/errors';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
 import { sleep } from '../../core/utils';
 import { PumpHealth } from './pump-health';
@@ -807,6 +807,18 @@ export interface PaymentsWalletApiPort {
   listIntents(status: 'open' | 'aborted'): Promise<
     { transferId: string; payload: string; status: 'open' | 'completed' | 'aborted'; createdAt: number }[]
   >;
+  /**
+   * #676: read the LOCAL intent disposition (status + the #516 `abortPending`
+   * flag) — OPTIONAL capability. Resume consults it before re-executing a
+   * server-`open` intent: a locally-`aborted` (or abort-pending) copy is a send
+   * the user already watched fail whose soft-abort never reached the server, so
+   * re-executing it would double-pay. A `null` result (or a port without a local
+   * copy that omits this method) leaves the server copy authoritative — correct
+   * for a fresh device.
+   */
+  getLocalIntent?(
+    transferId: string
+  ): Promise<{ status: 'open' | 'completed' | 'aborted'; abortPending: boolean } | null>;
   /** §5.2 checksum-bound presigned PUTs for spend outputs. */
   getUploadUrls(
     blobs: { sha256: string; size: number }[]
@@ -2355,6 +2367,26 @@ export class PaymentsModule {
         throw new SphereError(
           'Your payment was sent. Your wallet is syncing with the server and will catch up shortly.',
           'SEND_SYNC_PENDING',
+          error,
+        );
+      }
+
+      // #677: a lost race (TransferConflictError) AFTER ≥1 earlier leg already
+      // certified on-chain and was journaled/delivered is NOT a plain,
+      // re-sendable failure. The delivered value has irreversibly left the wallet
+      // (its source is terminal 'spent' above, its blob journaled for delivery),
+      // and the intent was already soft-aborted above. Surfacing a bare
+      // TransferConflictError would make the caller re-send the FULL amount and
+      // pay the delivered leg twice — so surface a DISTINCT partial outcome
+      // carrying the already-committed legs. The caller re-plans ONLY the
+      // remainder under a NEW transferId (the delivered legs converge via the
+      // recipient's claim handoff, §6). Do NOT emit transfer:failed: the
+      // delivered legs are not lost (mirrors the SEND_SYNC_PENDING contract).
+      if (error instanceof TransferConflictError && committedOnChainTokenIds.size > 0) {
+        throw new PartialSendConflictError(
+          'Part of your payment was already sent before a source token was spent by a concurrent transfer. Re-plan and send only the remaining amount — do NOT re-send the full amount.',
+          result.id,
+          [...committedOnChainTokenIds],
           error,
         );
       }
@@ -5621,6 +5653,32 @@ export class PaymentsModule {
 
     const intents = await walletApi.listIntents('open');
     for (const intent of intents) {
+      // #676: honor a LOCAL abort the server never learned about. A clean
+      // pre-certification send failure soft-aborts the intent best-effort; when
+      // that abort's server leg cannot land (dead backend), abortIntent flips
+      // the LOCAL copy to aborted+abortPending while the SERVER row stays 'open'.
+      // listIntents('open') (a plain server GET) hands that row back, and
+      // re-executing it would RE-SPEND sources the failure handler restored to
+      // 'confirmed' — paying the recipient a second time for a send the user
+      // already watched fail. So: if the local copy is aborted (or has a pending
+      // abort), do NOT resume; re-attempt the abort to converge the server and
+      // classify it with the conflicted (aborted, re-plan) bucket. A missing
+      // local copy (fresh device) leaves the server row authoritative and resume
+      // proceeds, unchanged.
+      const localIntent = await walletApi.getLocalIntent?.(intent.transferId);
+      if (localIntent && (localIntent.status === 'aborted' || localIntent.abortPending)) {
+        logger.warn(
+          'Payments',
+          `Intent ${intent.transferId.slice(0, 8)}… is locally aborted (the abort never reached the server) — converging, NOT resuming (#676)`,
+        );
+        try {
+          await walletApi.abortIntent(intent.transferId);
+        } catch (abortErr) {
+          logger.warn('Payments', 'abortIntent during resume-skip failed (retried next sign-in):', abortErr);
+        }
+        outcome.conflicted.push(intent.transferId);
+        continue;
+      }
       let payload: IntentPayloadV1;
       try {
         const plain = decryptField(this.getFieldEncryptionKey(), intent.payload);

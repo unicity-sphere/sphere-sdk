@@ -52,6 +52,14 @@ export type SphereErrorCode =
   // #664). Surfaced distinctly so a UI can reassure ("sent — wallet catching
   // up") instead of showing a hard send failure.
   | 'SEND_SYNC_PENDING'
+  // #677: a multi-leg send lost a source to a concurrent transfer AFTER ≥1
+  // earlier leg had already certified on-chain AND been journaled/delivered.
+  // The delivered value has irreversibly left the wallet, so this is NOT a
+  // plain, re-sendable failure: surfacing a bare TransferConflictError makes
+  // the caller re-send the FULL amount and pay the delivered leg twice. Raised
+  // as PartialSendConflictError; the caller MUST re-plan ONLY the remainder
+  // under a NEW transferId, never the whole amount.
+  | 'SEND_PARTIALLY_COMPLETED'
   | 'TRANSPORT_ERROR'
   | 'AGGREGATOR_ERROR'
   | 'VALIDATION_ERROR'
@@ -135,6 +143,40 @@ export class SphereError extends Error {
     this.name = 'SphereError';
     this.code = code;
     this.cause = cause;
+  }
+}
+
+/**
+ * #677: a send that PARTIALLY completed before losing a source to a concurrent
+ * transfer. At least one earlier leg certified on-chain and was journaled for
+ * delivery (its {@link committedTokenIds}) — that value has irreversibly left
+ * the wallet — but a LATER leg raised `TransferConflictError` (a lost race).
+ *
+ * Distinct from `TransferConflictError` on purpose: a bare conflict makes the
+ * caller re-send the FULL amount, paying the already-delivered leg a second
+ * time. Catching THIS type (or `code === 'SEND_PARTIALLY_COMPLETED'`) tells the
+ * caller/UI: the delivered legs are final, the conflicted intent has been
+ * soft-aborted, and only the REMAINDER may be re-planned — under a NEW
+ * transferId, never re-sending the whole amount.
+ *
+ * NOT a subclass of `TransferConflictError` by design: existing conflict
+ * handlers that re-send in full must NOT treat this as an ordinary conflict.
+ */
+export class PartialSendConflictError extends SphereError {
+  /** The send's transferId — its intent was soft-aborted; the delivered legs are journaled under it. */
+  readonly transferId: string;
+  /**
+   * Source token ids whose spend already certified on-chain (and whose finished
+   * output blob is journaled for delivery). The remainder = the requested amount
+   * minus the value of these legs; re-plan only that, under a new transferId.
+   */
+  readonly committedTokenIds: readonly string[];
+
+  constructor(message: string, transferId: string, committedTokenIds: readonly string[], cause?: unknown) {
+    super(message, 'SEND_PARTIALLY_COMPLETED', cause);
+    this.name = 'PartialSendConflictError';
+    this.transferId = transferId;
+    this.committedTokenIds = [...committedTokenIds];
   }
 }
 
