@@ -6452,11 +6452,38 @@ export class PaymentsModule {
     // Drop any local records of the consumed sources (present when resuming on the
     // originating device). M7: pass the LOCAL state we spent so removeToken's keep-guard
     // fires — if a concurrent claim reactivated the source to a new state (self-send /
-    // round-trip on resume), it is KEPT, not destroyed. Legacy payloads (no spentStates)
-    // pass undefined and fall back to the prior unconditional drop.
+    // round-trip on resume), it is KEPT, not destroyed.
     for (const genesisId of spent) {
       const local = this.tokens.get(`v2_${genesisId}`);
-      if (local) await this.removeToken(local.id, transferId, payload.spentStates?.[genesisId]?.local);
+      if (!local) continue;
+      const spentLocal = payload.spentStates?.[genesisId]?.local;
+      if (spentLocal !== undefined && spentLocal !== '') {
+        await this.removeToken(local.id, transferId, spentLocal);
+        continue;
+      }
+      // LEGACY payload (no persisted spent state — an in-flight intent from before M7,
+      // hit during a rolling deploy). removeToken cannot state-gate, so a self-send /
+      // round-trip source reactivated by the pump would be destroyed (permanent on
+      // own-storage). FAIL-CLOSED: only drop the source if the aggregator confirms its
+      // CURRENT state is spent; a reactivated (unspent) source is KEPT. Unverifiable →
+      // keep (never destroy value we cannot prove is spent).
+      let spentOnChain = false;
+      try {
+        if (local.sdkData) {
+          const decoded = await engine.decodeToken(decodeTokenBlob(hexToBytes(local.sdkData)));
+          spentOnChain = await engine.isSpent(decoded);
+        }
+      } catch {
+        spentOnChain = false;
+      }
+      if (spentOnChain) {
+        await this.removeToken(local.id, transferId, extractStateHashFromSdkData(local.sdkData));
+      } else {
+        logger.warn(
+          'Payments',
+          `Resume(legacy): source ${genesisId.slice(0, 8)}... is unspent on-chain — keeping (reactivated), not dropping`
+        );
+      }
     }
 
     // E.3 uniform close (idempotent; the apply above usually already did it).

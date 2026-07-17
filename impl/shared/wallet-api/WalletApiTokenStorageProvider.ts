@@ -569,12 +569,19 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
     // advanced the view's state before this call). A legacy caller with no spentStates
     // falls back to a bare tokenId record (state-agnostic).
     const spentState = new Map((opts?.spentStates ?? []).map((s) => [s.tokenId, s.stateHash]));
-    await this.addKnownSpends(
-      spent.map((id) => {
+    // Record a COMPOSITE (tokenId, protocolState) knownSpend for each source whose spent
+    // state the caller supplied. Do NOT fall back to a BARE tokenId when it is absent: a
+    // bare record makes recoverRemoved's `mayHaveSpent` SKIP a token whose row a claim later
+    // reactivated (round-trip / legacy-payload resume), blocking recovery of legitimately-
+    // held funds. Absent a precise spent state, recoverRemoved's fail-closed on-chain
+    // `isSpent` gate is the protection instead.
+    const knownSpendKeys = spent
+      .map((id) => {
         const s = spentState.get(id);
-        return s !== undefined && s !== '' ? this.knownSpendKey(id, s) : id;
+        return s !== undefined && s !== '' ? this.knownSpendKey(id, s) : null;
       })
-    );
+      .filter((k): k is string => k !== null);
+    await this.addKnownSpends(knownSpendKeys);
     await this.syncInventory();
   }
 
