@@ -43,6 +43,7 @@ import {
 } from './sdk';
 import { UNICITY_TOKEN_TYPE_HEX } from './identity';
 import type { EngineConfig, EngineOpOptions } from './engine';
+import { DEFAULT_PROOF_POLL_INTERVAL_MS } from './SphereTokenEngine';
 
 export interface UnicityIdMintResult {
   /** UnicityIdToken CBOR, hex-encoded — the storable form (UnicityIdToken.fromCBOR round-trips it). */
@@ -67,6 +68,7 @@ class SelfIssuedUnicityIdMinter implements IUnicityIdMinter {
     private readonly trustBase: RootTrustBase,
     private readonly predicateVerifier: PredicateVerifierService,
     private readonly signingService: SigningService,
+    private readonly proofPollIntervalMs?: number, // #683 finer proof-poll cadence
   ) {}
 
   public async mintUnicityIdToken(name: string, options?: EngineOpOptions): Promise<UnicityIdMintResult> {
@@ -106,6 +108,7 @@ class SelfIssuedUnicityIdMinter implements IUnicityIdMinter {
         this.predicateVerifier,
         mintTx,
         options?.signal,
+        this.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS, // #683 finer poll cadence
       );
       const certified = await mintTx.toCertifiedTransaction(this.trustBase, this.predicateVerifier, proof);
       const token = await UnicityIdToken.mint(this.trustBase, this.predicateVerifier, certified);
@@ -130,11 +133,18 @@ export interface UnicityIdMinterDeps {
   readonly trustBase: RootTrustBase;
   readonly predicateVerifier: PredicateVerifierService;
   readonly signingService: SigningService;
+  readonly proofPollIntervalMs?: number; // #683 finer proof-poll cadence
 }
 
 /** Build the minter from pre-constructed SDK objects (tests / shared wiring). */
 export function createUnicityIdMinterFromDeps(deps: UnicityIdMinterDeps): IUnicityIdMinter {
-  return new SelfIssuedUnicityIdMinter(deps.client, deps.trustBase, deps.predicateVerifier, deps.signingService);
+  return new SelfIssuedUnicityIdMinter(
+    deps.client,
+    deps.trustBase,
+    deps.predicateVerifier,
+    deps.signingService,
+    deps.proofPollIntervalMs,
+  );
 }
 
 /**
@@ -151,5 +161,6 @@ export function createUnicityIdMinter(config: EngineConfig): IUnicityIdMinter {
     trustBase,
     PredicateVerifierService.create(),
     new SigningService(config.privateKey),
+    config.proofPollIntervalMs, // #683 finer proof-poll cadence
   );
 }
