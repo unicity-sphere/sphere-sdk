@@ -437,7 +437,8 @@ The `send` result distinguishes **on-chain finality** from **recipient-side deli
 
 - `deliveryPending: false` — the transfer certified on-chain **and** landed in the recipient's
   mailbox/transport. Done.
-- `deliveryPending: true` — the spend is **final on-chain** but the recipient-side delivery is
+- `deliveryPending: true` — the spend is **committed on-chain** (or, for possibly-certified resolutions,
+  may be) but the recipient-side delivery is
   journaled in the sender's wallet and retries automatically (covenant §3.1). **Never re-issue
   the send** — the source tokens are terminally spent, and a fresh `intent('send', …)` would
   pay the recipient a second time from different tokens. `transferId` may be absent on this
