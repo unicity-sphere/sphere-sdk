@@ -66,6 +66,17 @@ export interface WalletApiTokenStorageConfig {
    * and matches its tokenId.
    */
   verifyToken?: (blob: TokenBlob) => Promise<boolean>;
+  /**
+   * Optional ON-CHAIN spent check used by `recoverRemoved()` before reactivating a
+   * tombstoned blob. A wiped/second device has an EMPTY knownSpends set — the exact
+   * cohort recoverRemoved serves — so the local (tokenId, state) skip cannot protect it;
+   * this asks the aggregator whether the blob's current state is already consumed, so a
+   * genuinely-spent token is never resurrected (a re-spend would be blocked on-chain
+   * anyway, but we must not surface phantom balance). Wire the engine's `isSpent` here at
+   * composition; when unset, recoverRemoved relies on knownSpends + the server's evidenced
+   * -tombstone 409 alone (its prior behavior).
+   */
+  isSpent?: (blob: TokenBlob) => Promise<boolean>;
 }
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -105,6 +116,7 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
   private readonly client: WalletApiClient;
   private readonly stateStore: KeyValueStore;
   private readonly verifyToken?: (blob: TokenBlob) => Promise<boolean>;
+  private readonly isSpentOnChain?: (blob: TokenBlob) => Promise<boolean>;
 
   private status: ProviderStatus = 'disconnected';
   private identity: FullIdentity | null = null;
@@ -124,6 +136,7 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
     this.client = config.client;
     this.stateStore = config.stateStore;
     this.verifyToken = config.verifyToken;
+    this.isSpentOnChain = config.isSpent;
   }
 
   // ── provider lifecycle ──────────────────────────────────────────────────────
@@ -161,6 +174,7 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
       client,
       stateStore: this.stateStore,
       verifyToken: this.verifyToken,
+      isSpent: this.isSpentOnChain,
     });
   }
 
@@ -213,7 +227,13 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
     await this.stateStore.set(this.stateKey('syncEpoch'), syncEpoch.toString());
   }
 
-  /** TokenIds this provider itself spent — `recoverRemoved()` skips these. */
+  /**
+   * States this provider itself spent, so `recoverRemoved()`/`pushRemovals()` can tell
+   * "a state we spent" from "a state a claim reactivated". Entries are composite
+   * `${tokenId}:${protocolStateHash}` keys (the PROTOCOL imprint — same space as the
+   * server row `state_hash`). Legacy builds wrote a BARE `${tokenId}`; those are tolerated
+   * on read as state-agnostic records (see {@link mayHaveSpent}).
+   */
   private async readKnownSpends(): Promise<Set<string>> {
     const raw = await this.stateStore.get(this.stateKey('knownSpends'));
     if (!raw) return new Set();
@@ -224,11 +244,36 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
     }
   }
 
-  private async addKnownSpends(tokenIds: string[]): Promise<void> {
-    if (tokenIds.length === 0) return;
+  private async addKnownSpends(keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
     const known = await this.readKnownSpends();
-    for (const id of tokenIds) known.add(id);
+    for (const k of keys) known.add(k);
     await this.stateStore.set(this.stateKey('knownSpends'), JSON.stringify([...known]));
+  }
+
+  private knownSpendKey(tokenId: string, stateHash: string): string {
+    return `${tokenId}:${stateHash}`;
+  }
+
+  /**
+   * PROVEN spend: we authoritatively recorded spending this token AT EXACTLY this
+   * protocol state. Authorizes an evidence-free removal ({@link pushRemovals}) — STRICT,
+   * so a legacy bare (state-agnostic) entry never authorizes destroying a row that a
+   * claim may have reactivated at a different state. An absent/empty state is never a
+   * proof.
+   */
+  private provenSpentAtState(known: Set<string>, tokenId: string, stateHash: string | undefined): boolean {
+    return stateHash !== undefined && stateHash !== '' && known.has(this.knownSpendKey(tokenId, stateHash));
+  }
+
+  /**
+   * CONSERVATIVE: did we record spending this token — this exact state, OR (a legacy
+   * bare entry) any state? Used to SKIP recovery ({@link recoverRemoved}); errs toward
+   * NOT resurrecting a token we may have transferred away.
+   */
+  private mayHaveSpent(known: Set<string>, tokenId: string, stateHash: string | undefined): boolean {
+    if (known.has(tokenId)) return true; // legacy bare entry — state-agnostic
+    return this.provenSpentAtState(known, tokenId, stateHash);
   }
 
   /**
@@ -519,7 +564,17 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
       added,
       ...(opts?.externalDelivery !== undefined ? { externalDelivery: opts.externalDelivery } : {}),
     });
-    await this.addKnownSpends(spent);
+    // Record knownSpends keyed by (tokenId, PROTOCOL spent state) from the caller's
+    // AUTHORITATIVE spentStates — never from this.view (a concurrent claim can have
+    // advanced the view's state before this call). A legacy caller with no spentStates
+    // falls back to a bare tokenId record (state-agnostic).
+    const spentState = new Map((opts?.spentStates ?? []).map((s) => [s.tokenId, s.stateHash]));
+    await this.addKnownSpends(
+      spent.map((id) => {
+        const s = spentState.get(id);
+        return s !== undefined && s !== '' ? this.knownSpendKey(id, s) : id;
+      })
+    );
     await this.syncInventory();
   }
 
@@ -537,13 +592,24 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
     const knownSpends = await this.readKnownSpends();
     const result: RecoverRemovedResult = { recovered: [], spent: [], skipped: [] };
 
+    // State-scoped skip: reactivate a tombstone UNLESS we recorded spending this token
+    // (this exact protocol state, or a legacy state-agnostic entry). This lets a bogus
+    // (claim-reactivated) removal be undone while never reviving a state we truly spent.
     const candidates = [...this.view.values()].filter(
-      (i) => i.status === 'removed' && !knownSpends.has(i.tokenId)
+      (i) => i.status === 'removed' && !this.mayHaveSpent(knownSpends, i.tokenId, i.stateHash)
     );
     for (const item of candidates) {
       const blobBytes = await this.fetchRemovedBlob(item.tokenId);
       if (blobBytes === null || !(await this.locallyValid(item.tokenId, blobBytes))) {
         result.skipped.push(item.tokenId);
+        continue;
+      }
+      // I4 gate: a wiped/second device has an EMPTY knownSpends, so the skip above can't
+      // protect it — ask the aggregator whether this blob's state is already consumed and
+      // NEVER resurrect a genuinely-spent token (belt-and-suspenders to the server 409).
+      if (this.isSpentOnChain && (await this.isSpentBlob(item.tokenId, blobBytes))) {
+        result.spent.push(item.tokenId);
+        if (item.stateHash) await this.addKnownSpends([this.knownSpendKey(item.tokenId, item.stateHash)]);
         continue;
       }
       // Content-addressed key of the exact bytes we verified (§5.2).
@@ -557,9 +623,12 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
         result.recovered.push(item.tokenId);
       } catch (err) {
         if (err instanceof WalletApiError && err.code === 'CONFLICT') {
-          // Evidenced tombstone (or the token moved on) — actually spent (§5.3).
+          // Evidenced tombstone (or the token moved on) — actually spent (§5.3). Record
+          // the exact state the server 409'd so recovery stays scoped to that state.
           result.spent.push(item.tokenId);
-          await this.addKnownSpends([item.tokenId]);
+          await this.addKnownSpends([
+            item.stateHash ? this.knownSpendKey(item.tokenId, item.stateHash) : item.tokenId,
+          ]);
         } else {
           throw err;
         }
@@ -586,6 +655,12 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
     if (blob.tokenId !== tokenId) return false;
     if (this.verifyToken) return this.verifyToken(blob);
     return true;
+  }
+
+  /** True when the aggregator reports this blob's current state already consumed. */
+  private async isSpentBlob(tokenId: string, bytes: Uint8Array): Promise<boolean> {
+    if (!this.isSpentOnChain) return false;
+    return this.isSpentOnChain(this.wrapWireBlob(tokenId, bytes));
   }
 
   // ── whole-blob surface (thin: the hot path is the lazy port above) ──────────
@@ -700,10 +775,23 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
     // successful inventory load; a spent token is removed only against a
     // confirmed on-chain spend (a tombstone), never mere absence.
     if (!this.hadSuccessfulLoad || tombstoneIds.size === 0) return;
-    const spent = [...tombstoneIds].filter((id) => this.view.get(id)?.status === 'active');
+    const known = await this.readKnownSpends();
+    // FAIL-CLOSED + state-scoped. Push an evidence-free removal (fresh transferId, no
+    // deposit) ONLY for a row the server still shows ACTIVE at EXACTLY the protocol state
+    // we authoritatively spent (provenSpentAtState). A row active at a DIFFERENT state was
+    // reactivated by a claim (self-send / A→B→A round-trip) and is legitimately ours —
+    // destroying it there is the fund-loss bug. A row whose stateHash the server does not
+    // expose (pre-Unit-A backend) is skipped, never removed on tokenId alone (degrade to
+    // prune-primary: the PaymentsModule stale-tombstone prune is the go-forward fix).
+    const spent: string[] = [];
+    for (const id of tombstoneIds) {
+      const row = this.view.get(id);
+      if (row?.status !== 'active') continue;
+      if (this.provenSpentAtState(known, id, row.stateHash)) spent.push(id);
+    }
     if (spent.length === 0) return;
     await this.client.applyInventoryDelta({ transferId: newTransferId(), spent, added: [] });
-    await this.addKnownSpends(spent);
+    await this.addKnownSpends(spent.map((id) => this.knownSpendKey(id, this.view.get(id)!.stateHash!)));
   }
 
   async sync(localData: TxfStorageDataBase): Promise<SyncResult<TxfStorageDataBase>> {

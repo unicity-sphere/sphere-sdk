@@ -83,6 +83,10 @@ function parseInventoryItem(raw: unknown, what: string): InventoryItem {
     status,
     assets: parseAssets(rec.assets, `${what}.assets`),
     seq: parseCounter(rec.seq, `${what}.seq`),
+    // Additive (wallet-api inventory state_hash exposure): the row's current protocol
+    // state hash. Optional so a pre-exposure server (no field) parses fine and the
+    // client degrades to prune-primary rather than mis-firing state-aware removals.
+    ...(rec.stateHash === undefined ? {} : { stateHash: asString(rec.stateHash, `${what}.stateHash`) }),
   };
 }
 

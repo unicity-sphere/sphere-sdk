@@ -2123,7 +2123,12 @@ export class PaymentsModule {
 
         // Sources consumed by this send — the §7 step 6 apply (server path)
         // and the deferred local removals are driven from this list.
-        const consumedSources: { uiTokenId: string; genesisId: string }[] = [];
+        // `sourceSdkData` = the source blob AS WE HELD IT (pre-spend). It is the single
+        // authoritative source for both spent-state derivations — the LOCAL sha256 (for the
+        // state-aware local removeToken, M2) and the PROTOCOL imprint (deliveryKeys → the
+        // server's state_hash, for knownSpends, M3) — so neither is ever read back from a
+        // live view a concurrent claim may have advanced.
+        const consumedSources: { uiTokenId: string; genesisId: string; sourceSdkData: string }[] = [];
 
         // Whole-token direct transfers. ONE realization seed per SEND
         // (ARCHITECTURE §7/§8.1): the intent transferId seeds every engine op,
@@ -2171,11 +2176,16 @@ export class PaymentsModule {
           consumedSources.push({
             uiTokenId: tw.uiToken.id,
             genesisId: extractTokenIdFromSdkData(tw.uiToken.sdkData) ?? tw.uiToken.id.replace(/^v2_/, ''),
+            sourceSdkData: tw.uiToken.sdkData ?? '',
           });
           // Server path: the removal is recorded by the single applyDelta
           // below (its evidence is the deposit just made); locally the source
           // is removed right away on the non-server path (unchanged behavior).
-          if (!serverApply) await this.removeToken(tw.uiToken.id, result.id);
+          // M2: pass the LOCAL state we spent so removeToken never tombstones a state a
+          // concurrent claim already advanced the map entry to.
+          if (!serverApply) {
+            await this.removeToken(tw.uiToken.id, result.id, extractStateHashFromSdkData(tw.uiToken.sdkData));
+          }
         }
 
         // Value-conserving split: recipient gets splitAmount, this wallet keeps
@@ -2248,8 +2258,15 @@ export class PaymentsModule {
             genesisId:
               extractTokenIdFromSdkData(splitPlan.tokenToSplit.uiToken.sdkData) ??
               splitPlan.tokenToSplit.uiToken.id.replace(/^v2_/, ''),
+            sourceSdkData: splitPlan.tokenToSplit.uiToken.sdkData ?? '',
           });
-          if (!serverApply) await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
+          if (!serverApply) {
+            await this.removeToken(
+              splitPlan.tokenToSplit.uiToken.id,
+              result.id,
+              extractStateHashFromSdkData(splitPlan.tokenToSplit.uiToken.sdkData)
+            );
+          }
         }
 
         if (serverApply) {
@@ -2276,15 +2293,30 @@ export class PaymentsModule {
           if (!storage) {
             throw new SphereError('No token storage provider available for applyDelta', 'STORAGE_ERROR');
           }
+          // M3: derive each source's PROTOCOL spent state (deliveryKeys imprint = the
+          // server's row state_hash) from the source blob we HELD — never from the live
+          // view — so the server records knownSpends as (tokenId, exact spent state).
+          // Derived here (server path only), in parallel, off the hot send loop.
+          const spentStates = await Promise.all(
+            consumedSources.map(async (s) => ({
+              tokenId: s.genesisId,
+              stateHash: s.sourceSdkData ? (await engine.deliveryKeys(hexToBytes(s.sourceSdkData))).stateHash : '',
+            }))
+          );
           await storage.applyDelta(
             result.id,
             consumedSources.map((s) => s.genesisId),
-            added
+            added,
+            { spentStates }
           );
           // Local bookkeeping AFTER the server apply (see the ordering note
-          // above): store the change, then drop the consumed sources.
+          // above): store the change, then drop the consumed sources. M2: each
+          // removeToken carries the LOCAL state we spent, so a source the pump
+          // already reactivated to a new state is KEPT, not re-tombstoned.
           if (changeOutput) await this.storeEngineToken(engine, changeOutput);
-          for (const s of consumedSources) await this.removeToken(s.uiTokenId, result.id);
+          for (const s of consumedSources) {
+            await this.removeToken(s.uiTokenId, result.id, extractStateHashFromSdkData(s.sourceSdkData));
+          }
         }
       }
 
@@ -3889,12 +3921,51 @@ export class PaymentsModule {
    *
    * @param tokenId - Local UUID of the token to remove.
    */
-  async removeToken(tokenId: string, excludeReservationId?: string): Promise<void> {
+  /**
+   * Remove a token we spent. `expectedStateHash` (LOCAL sha256 — the state the caller
+   * actually burned) makes this STATE-AWARE (M2): we always tombstone the SPENT state
+   * (so a re-delivery of that exact state is deduped), but if the map entry has since
+   * advanced to a DIFFERENT state — a concurrent claim reactivated this tokenId (a
+   * self-send or A→B→A round-trip direct leg returning at a new state) — that token is
+   * legitimately ours, so we KEEP it instead of deleting it. When `expectedStateHash` is
+   * omitted (legacy callers) or equals the current state, behavior is byte-identical to
+   * before: tombstone the current state and delete.
+   */
+  async removeToken(tokenId: string, excludeReservationId?: string, expectedStateHash?: string): Promise<void> {
     this.ensureInitialized();
 
     const token = this.tokens.get(tokenId);
     if (!token) return;
 
+    const currentStateHash = extractStateHashFromSdkData(token.sdkData);
+    // The state we actually spent: the caller's expected state, else the current state.
+    const spentHash = expectedStateHash !== undefined && expectedStateHash !== '' ? expectedStateHash : currentStateHash;
+    const genesisId = extractTokenIdFromSdkData(token.sdkData);
+
+    // Tombstone the SPENT state (never a reactivated newer state).
+    if (genesisId && spentHash) {
+      const key = `${genesisId}:${spentHash}`;
+      if (!this.tombstoneKeySet.has(key)) {
+        this.tombstones.push({ tokenId: genesisId, stateHash: spentHash, timestamp: Date.now() });
+        this.tombstoneKeySet.add(key);
+        logger.debug('Payments', `Created tombstone for ${genesisId.slice(0, 8)}..._${spentHash.slice(0, 8)}...`);
+      }
+    } else {
+      logger.debug('Payments', `Warning: Could not create tombstone for token ${tokenId.slice(0, 8)}... (missing tokenId or stateHash)`);
+    }
+
+    // M2: the map entry has advanced past the state we spent → a claim reactivated it →
+    // keep the reactivated token; only the spent-state tombstone above stands.
+    if (expectedStateHash !== undefined && expectedStateHash !== '' && currentStateHash !== expectedStateHash) {
+      logger.debug(
+        'Payments',
+        `removeToken kept ${tokenId.slice(0, 8)}...: live state ≠ spent state (reactivated by a concurrent claim)`
+      );
+      await this.save();
+      return;
+    }
+
+    // The state we spent is (still) the one in the map — remove it.
     // Spend Queue: cancel any OTHER active reservations referencing this token.
     // excludeReservationId prevents cancelling the caller's own in-flight reservation.
     this.reservationLedger.cancelForToken(tokenId, excludeReservationId);
@@ -3902,21 +3973,6 @@ export class PaymentsModule {
 
     // Archive before removing
     await this.archiveToken(token);
-
-    // Create tombstone with exact (tokenId, stateHash) - requires both
-    const tombstone = createTombstoneFromToken(token);
-    if (tombstone) {
-      const key = `${tombstone.tokenId}:${tombstone.stateHash}`;
-      if (!this.tombstoneKeySet.has(key)) {
-        this.tombstones.push(tombstone);
-        this.tombstoneKeySet.add(key);
-        logger.debug('Payments', `Created tombstone for ${tombstone.tokenId.slice(0, 8)}..._${tombstone.stateHash.slice(0, 8)}...`);
-      }
-    } else {
-      // No valid tombstone could be created (missing tokenId or stateHash)
-      // Token will still be removed but may be re-synced later
-      logger.debug('Payments', `Warning: Could not create tombstone for token ${tokenId.slice(0, 8)}... (missing tokenId or stateHash)`);
-    }
 
     // Remove from active tokens
     this.tokens.delete(tokenId);
@@ -5214,10 +5270,25 @@ export class PaymentsModule {
       return 'not-owned';
     }
 
-    // Dedup by genesis-stable id (a re-delivered identical token is ignored).
-    const id = `v2_${engine.tokenId(token)}`;
-    if (this.tokens.has(id)) {
-      logger.debug('Payments', `V2 transfer ${id.slice(0, 16)}... already present, skipping`);
+    // Dedup by (tokenId, stateHash) — NOT genesis-id alone. A re-delivered IDENTICAL
+    // state is ignored, but a NEW state of a token we already hold (a self-send or A→B→A
+    // round-trip direct leg returning at a new state) MUST still be received and recorded,
+    // or the wallet keeps the funds but drops the RECEIVED history. The incoming state
+    // hash is taken via the engine-canonical encoding so it lands in the SAME local-sha256
+    // space as stored tokens' state keys; storeEngineToken→addToken below re-checks the
+    // exact duplicate, tombstones, and older-state replacement authoritatively.
+    const genesisId = engine.tokenId(token);
+    const id = `v2_${genesisId}`;
+    const incomingStateHash = extractStateHashFromSdkData(bytesToHex(encodeTokenBlob(engine.encodeToken(token))));
+    const alreadyHeldSameState =
+      incomingStateHash !== '' &&
+      [...this.tokens.values()].some(
+        (t) =>
+          extractTokenIdFromSdkData(t.sdkData) === genesisId &&
+          extractStateHashFromSdkData(t.sdkData) === incomingStateHash
+      );
+    if (alreadyHeldSameState) {
+      logger.debug('Payments', `V2 transfer ${id.slice(0, 16)}... (same state) already present, skipping`);
       return 'duplicate';
     }
 

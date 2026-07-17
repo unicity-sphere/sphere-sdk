@@ -113,6 +113,14 @@ export interface InventoryItem {
   /** Genesis-stable 64-hex token id. */
   tokenId: string;
   status: 'active' | 'removed';
+  /**
+   * The row's CURRENT protocol state hash (DataHash imprint, hex) — the same value
+   * wallet-api stores (§8.2 pipeline `stateHashHex`) and `ITokenEngine.deliveryKeys`
+   * derives. Additive: present only when the server exposes it; a pre-exposure server
+   * omits it, and state-aware removal reconciliation degrades safely to absent. This is
+   * the PROTOCOL hash — never the local sha256-over-bytes journal key.
+   */
+  stateHash?: string;
   /** Decoded value; absent when unknown (e.g. a tombstone). */
   assets?: InventoryAsset[];
   /** Owner change-cursor value at this row's last change (`?since=` deltas). */
@@ -161,6 +169,17 @@ export interface ApplyDeltaOptions {
    * server records them as `external` (never-collected blob retention).
    */
   externalDelivery?: boolean;
+  /**
+   * The PROTOCOL state hash (DataHash imprint, hex — the SAME space as the server's
+   * inventory `state_hash` and `ITokenEngine.deliveryKeys`) of each spent token AS IT
+   * WAS SPENT. Computed authoritatively by the caller from the SOURCE token it burned —
+   * NEVER read from a live inventory view (a concurrent claim can advance the view to a
+   * new state before this call). Lets the provider record `knownSpends` as
+   * `(tokenId, spentState)`, so a later removal/recovery can distinguish "the state we
+   * spent" from "a state a claim reactivated". Absent for legacy callers → `knownSpends`
+   * falls back to a tokenId-only (state-agnostic) record.
+   */
+  spentStates?: { tokenId: string; stateHash: string }[];
 }
 
 /** Result of an explicit `recoverRemoved()` maintenance run (sdk-changes S2). */
