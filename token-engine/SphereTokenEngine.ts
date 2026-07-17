@@ -16,6 +16,7 @@ import { SphereError, type SphereErrorCode } from '../core/errors';
 import { randomUUID } from '../core/uuid';
 import {
   CheckpointPersistFailedError,
+  CheckpointTrustbaseMismatchError,
   ProofUnconfirmedError,
   SplitCheckpointLostError,
   TransferConflictError,
@@ -113,6 +114,23 @@ export const DEFAULT_PROOF_POLL_INTERVAL_MS = 300;
  * gateway load on a large multi-output split.
  */
 const MAX_MINT_CONCURRENCY = 8;
+
+/**
+ * The keep-open engine errors a split leg can raise — mirrors PaymentsModule's `keepOpen` set.
+ * When one of these settles a parallel mint fan-out, the leg's spend MAY already be certified
+ * on-chain, so the intent MUST stay OPEN for checkpoint-based resume; the fan-out must surface a
+ * keep-open outcome rather than an abortable clean failure that would strand a certified sibling
+ * (#684). Only ProofUnconfirmedError / SplitCheckpointLostError are reachable from a mint leg
+ * today; the checkpoint pair is included so the classifier stays faithful to the keep-open family.
+ */
+function isKeepOpenSplitError(err: unknown): boolean {
+  return (
+    err instanceof ProofUnconfirmedError ||
+    err instanceof CheckpointPersistFailedError ||
+    err instanceof SplitCheckpointLostError ||
+    err instanceof CheckpointTrustbaseMismatchError
+  );
+}
 
 /** Canonical lowercase UUID — the spec's `transferId` wire form (sdk-changes E.1). */
 const TRANSFER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -358,12 +376,40 @@ export class SphereTokenEngine implements ITokenEngine {
         )),
       );
     }
-    // Every leg has settled (all batches ran). Throw the LOWEST-index rejection —
-    // byte-identical to the sequential loop's 'fail at first index'. Later batches
-    // still ran, so a leg they certified is recovered idempotently on resume.
+    // Every leg has settled. Aggregate with a KEEP-OPEN BIAS. The old sequential loop never
+    // submitted a later leg once an earlier one failed, so surfacing the first failure could
+    // never orphan a certified sibling. THIS fan-out submits every leg, so a lower-index CLEAN
+    // failure can coexist with a higher-index leg that already CERTIFIED (fulfilled) or MAY have
+    // (a keep-open rejection). Surfacing the lowest-index CLEAN error in that case would let
+    // PaymentsModule abort the intent (its committed-source set is still empty here) and strand
+    // the certified sibling with no checkpoint recovery (Codex P1 on #684). So, in order:
+    //  1. If ANY leg rejected keep-open (ProofUnconfirmed / SplitCheckpointLost / the E.4 pair),
+    //     surface that verbatim (lowest-index) so its specific keep-open type drives
+    //     PaymentsModule's classification exactly as before.
+    //  2. Else if ANY leg CERTIFIED (fulfilled) while another failed cleanly, convert to a
+    //     keep-open ProofUnconfirmedError (cause = the clean failure): the burn is certified +
+    //     checkpointed, so resume re-runs ALL legs and recovers the certified one idempotently
+    //     (HKDF-deterministic stateId → the aggregator returns the existing proof; #631/E.2/E.3).
+    //  3. Else (every rejection is clean AND nothing certified) surface the lowest-index clean
+    //     rejection — nothing is committed, so aborting is safe and the net outcome matches the
+    //     sequential loop.
+    const keepOpenRejection = settled.find(
+      (r): r is PromiseRejectedResult => r.status === 'rejected' && isKeepOpenSplitError(r.reason),
+    );
+    if (keepOpenRejection !== undefined) {
+      throw keepOpenRejection.reason;
+    }
     const firstRejected = settled.findIndex((r) => r.status === 'rejected');
     if (firstRejected !== -1) {
-      throw (settled[firstRejected] as PromiseRejectedResult).reason;
+      const cleanReason = (settled[firstRejected] as PromiseRejectedResult).reason;
+      if (settled.some((r) => r.status === 'fulfilled')) {
+        throw new ProofUnconfirmedError(
+          'a split mint leg certified while a sibling leg failed — keep the intent open; resume ' +
+            'completes all legs idempotently from the burn checkpoint (#684 parallel fan-out)',
+          cleanReason,
+        );
+      }
+      throw cleanReason;
     }
     const outputs = settled.map((r) => (r as PromiseFulfilledResult<SphereToken>).value);
     return { outputs };
