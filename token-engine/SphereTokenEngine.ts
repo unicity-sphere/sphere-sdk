@@ -103,7 +103,16 @@ export interface EngineDeps {
  * poll boundary. Bounded by waitInclusionProof's 10s abort; the extra polls are
  * cheap read-only getInclusionProof calls confined to the ~1.5s finalization window.
  */
-const DEFAULT_PROOF_POLL_INTERVAL_MS = 300;
+export const DEFAULT_PROOF_POLL_INTERVAL_MS = 300;
+
+/**
+ * #684: max split-mint legs minted concurrently. The mints are independent off the
+ * one burn, but an UNBOUNDED fan-out would submit + proof-poll every leg at once
+ * against the gateway (the prior sequential loop naturally paced it to one). This
+ * cap keeps a typical split (K=2 — payment + change) fully parallel while bounding
+ * gateway load on a large multi-output split.
+ */
+const MAX_MINT_CONCURRENCY = 8;
 
 /** Canonical lowercase UUID — the spec's `transferId` wire form (sdk-changes E.1). */
 const TRANSFER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -336,11 +345,22 @@ export class SphereTokenEngine implements ITokenEngine {
     //      deterministic; re-submit → the aggregator already holds it → waitInclusionProof
     //      returns the existing proof — the #631/E.2 resume contract). So legs the sequential
     //      loop would NOT have submitted, but this one did, are never lost — only recovered.
-    const settled = await Promise.allSettled(
-      split.tokens.map((token, i) =>
-        this.mintSplitOutput(token, burntToken, params.outputs[i].data ?? null, options),
-      ),
-    );
+    //    Bounded concurrency (MAX_MINT_CONCURRENCY) paces the fan-out so a large split
+    //    can't storm the gateway; a typical K=2 split runs in a single fully-parallel batch.
+    const settled: PromiseSettledResult<SphereToken>[] = [];
+    for (let start = 0; start < split.tokens.length; start += MAX_MINT_CONCURRENCY) {
+      const batch = split.tokens.slice(start, start + MAX_MINT_CONCURRENCY);
+      settled.push(
+        ...(await Promise.allSettled(
+          batch.map((token, j) =>
+            this.mintSplitOutput(token, burntToken, params.outputs[start + j].data ?? null, options),
+          ),
+        )),
+      );
+    }
+    // Every leg has settled (all batches ran). Throw the LOWEST-index rejection —
+    // byte-identical to the sequential loop's 'fail at first index'. Later batches
+    // still ran, so a leg they certified is recovered idempotently on resume.
     const firstRejected = settled.findIndex((r) => r.status === 'rejected');
     if (firstRejected !== -1) {
       throw (settled[firstRejected] as PromiseRejectedResult).reason;

@@ -69,19 +69,22 @@ describe('SphereTokenEngine — hardening / edge cases', () => {
     expect(outputs.reduce((sum, o) => sum + e.balanceOf(o, COIN_A), 0n)).toBe(100n);
   }, 30000);
 
-  it('split preserves output ORDER despite parallel minting (#684)', async () => {
-    // The mint legs are minted in parallel (Promise.allSettled). Distinct amounts make
-    // the returned order verifiable per index — a regression guard that parallelizing did
-    // not reorder outputs vs. the requested order (index-aligned settled.map).
+  it('split preserves output ORDER across bounded-concurrency batches (#684)', async () => {
+    // The mint legs are minted in parallel with a concurrency cap (MAX_MINT_CONCURRENCY=8),
+    // so >8 outputs span MULTIPLE batches. Distinct amounts make the returned order
+    // verifiable per index — a regression guard that the batched, index-aligned settled.map
+    // preserves the requested order (not just the value sum) across the batch boundary.
     const e = createTestEngine();
     const self = e.getIdentity().chainPubkey;
-    const src = await e.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN_A, amount: 100n }] } });
-    const requested = [10n, 20n, 30n, 40n];
+    const requested = [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n, 10n]; // 10 outputs (> the cap of 8) = 2 batches
+    const total = requested.reduce((s, a) => s + a, 0n);
+    const src = await e.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN_A, amount: total }] } });
     const { outputs } = await e.split({
       token: src,
       outputs: requested.map((amount) => ({ recipientPubkey: freshPubkey(), coinId: COIN_A, amount })),
     });
-    expect(outputs.map((o) => e.balanceOf(o, COIN_A))).toEqual(requested); // exact order, not just sum
+    expect(outputs).toHaveLength(requested.length);
+    expect(outputs.map((o) => e.balanceOf(o, COIN_A))).toEqual(requested); // exact order across batches
   }, 30000);
 
   it('rejects minting a negative or malformed value', async () => {
