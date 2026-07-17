@@ -245,6 +245,7 @@ export async function createHarnessWallet(opts: HarnessWalletOptions): Promise<H
     ...(opts.webSocketFactory ? { webSocketFactory: opts.webSocketFactory } : {}),
     verifyToken: async (blob: TokenBlob): Promise<boolean> =>
       (await engine.verify(await engine.decodeToken(blob))).ok,
+    isSpent: async (blob: TokenBlob): Promise<boolean> => engine.isSpent(await engine.decodeToken(blob)),
   };
   const providers =
     opts.custody === 'inventory'

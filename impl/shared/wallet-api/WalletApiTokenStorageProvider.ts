@@ -604,14 +604,24 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
         result.skipped.push(item.tokenId);
         continue;
       }
-      // I4 gate: a wiped/second device has an EMPTY knownSpends, so the skip above can't
-      // protect it — ask the aggregator whether this blob's state is already consumed and
-      // NEVER resurrect a genuinely-spent token (belt-and-suspenders to the server 409).
-      if (this.isSpentOnChain && (await this.isSpentBlob(item.tokenId, blobBytes))) {
+      // I4 FAIL-CLOSED gate. Reactivating a removed row can resurrect a genuinely-spent
+      // token: the server reactivates an UNEVIDENCED tombstone (validation/lineage), and
+      // the evidence-free write-behind removal produces exactly those. A wiped/second
+      // device has an EMPTY knownSpends, so the (tokenId, state) filter above cannot
+      // protect it. Therefore reactivate ONLY when an ON-CHAIN check POSITIVELY confirms
+      // the state is UNSPENT. Without that check (isSpent not wired at composition) we
+      // cannot prove it — so we DO NOT reactivate (skip). This makes recoverRemoved a safe
+      // no-op absent an engine, rather than a phantom-balance / re-spend hazard.
+      if (!this.isSpentOnChain) {
+        result.skipped.push(item.tokenId);
+        continue;
+      }
+      if (await this.isSpentBlob(item.tokenId, blobBytes)) {
         result.spent.push(item.tokenId);
         if (item.stateHash) await this.addKnownSpends([this.knownSpendKey(item.tokenId, item.stateHash)]);
         continue;
       }
+      // On-chain check confirmed UNSPENT — safe to reactivate.
       // Content-addressed key of the exact bytes we verified (§5.2).
       const key = `${this.client.network}/t/${bytesToHex(sha256(blobBytes))}`;
       try {

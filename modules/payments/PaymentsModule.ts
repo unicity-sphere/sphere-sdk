@@ -910,6 +910,15 @@ interface IntentPayloadV1 {
   direct: string[];
   /** The at-most-one split (ARCHITECTURE §7). */
   split?: { tokenId: string; splitAmount: string; remainderAmount: string };
+  /**
+   * M7: the state each consumed source was SPENT at, keyed by genesis token id, so an
+   * interrupted-send resume is STATE-AWARE without re-reading a live view a concurrent
+   * claim may have advanced. `local` = sha256-over-bytes (for removeToken's keep-guard);
+   * `protocol` = the deliveryKeys imprint = the server state_hash (for the spend's
+   * knownSpends record). Absent on legacy (pre-M7) payloads — resume then falls back to
+   * the fail-closed path (no state-aware keep, no composite knownSpends).
+   */
+  spentStates?: Record<string, { local: string; protocol: string }>;
 }
 
 // =============================================================================
@@ -2071,7 +2080,7 @@ export class PaymentsModule {
               result.id,
               encryptField(
                 this.getFieldEncryptionKey(),
-                JSON.stringify(this.buildIntentPayload(request, peerInfo.chainPubkey, splitPlan))
+                JSON.stringify(await this.buildIntentPayload(request, peerInfo.chainPubkey, splitPlan))
               ),
               splitPlan.requiresSplit ? { requiresSeedClose: true } : {}
             );
@@ -2688,13 +2697,26 @@ export class PaymentsModule {
    * the realization plan, so a resume on ANY device rebuilds byte-identical
    * transactions (same transferId + same inputs + same output order).
    */
-  private buildIntentPayload(
+  private async buildIntentPayload(
     request: TransferRequest,
     recipientChainPubkey: string,
     splitPlan: SplitPlan
-  ): IntentPayloadV1 {
+  ): Promise<IntentPayloadV1> {
+    const engine = this.deps!.tokenEngine!;
     const genesisIdOf = (tw: TokenWithAmount): string =>
       extractTokenIdFromSdkData(tw.uiToken.sdkData) ?? tw.uiToken.id.replace(/^v2_/, '');
+    // M7: capture each source's spent state (BOTH spaces) from the source blob as we hold
+    // it now — so a later resume is state-aware without re-reading a claim-advanced view.
+    const spentStates: Record<string, { local: string; protocol: string }> = {};
+    const recordState = async (tw: TokenWithAmount): Promise<void> => {
+      const sdkData = tw.uiToken.sdkData ?? '';
+      spentStates[genesisIdOf(tw)] = {
+        local: extractStateHashFromSdkData(sdkData),
+        protocol: sdkData ? (await engine.deliveryKeys(hexToBytes(sdkData))).stateHash : '',
+      };
+    };
+    for (const tw of splitPlan.tokensToTransferDirectly) await recordState(tw);
+    if (splitPlan.requiresSplit && splitPlan.tokenToSplit) await recordState(splitPlan.tokenToSplit);
     return {
       v: 2, // E.4: new sends carry the checkpoint-aware resume contract (sphere-sdk#501)
       recipient: recipientChainPubkey,
@@ -2715,6 +2737,7 @@ export class PaymentsModule {
             },
           }
         : {}),
+      ...(Object.keys(spentStates).length > 0 ? { spentStates } : {}),
     };
   }
 
@@ -6417,15 +6440,23 @@ export class PaymentsModule {
         const changeBytes = encodeTokenBlob(engine.encodeToken(changeOutput));
         added.push({ tokenId: engine.tokenId(changeOutput), key: await this.uploadOutputBlob(changeBytes) });
       }
-      await provider.applyDelta(transferId, spent, added);
+      // M7: replay the spend with the PROTOCOL states persisted at send time, so knownSpends
+      // records the exact spent state (→ M4 can repair a stuck-active server row instead of
+      // leaving a phantom). Legacy payloads (no spentStates) fall back to bare knownSpends.
+      await provider.applyDelta(transferId, spent, added, {
+        spentStates: spent.map((id) => ({ tokenId: id, stateHash: payload.spentStates?.[id]?.protocol ?? '' })),
+      });
       if (changeOutput) await this.storeEngineToken(engine, changeOutput);
     }
 
-    // Drop any local records of the consumed sources (present when resuming
-    // on the originating device).
+    // Drop any local records of the consumed sources (present when resuming on the
+    // originating device). M7: pass the LOCAL state we spent so removeToken's keep-guard
+    // fires — if a concurrent claim reactivated the source to a new state (self-send /
+    // round-trip on resume), it is KEPT, not destroyed. Legacy payloads (no spentStates)
+    // pass undefined and fall back to the prior unconditional drop.
     for (const genesisId of spent) {
       const local = this.tokens.get(`v2_${genesisId}`);
-      if (local) await this.removeToken(local.id, transferId);
+      if (local) await this.removeToken(local.id, transferId, payload.spentStates?.[genesisId]?.local);
     }
 
     // E.3 uniform close (idempotent; the apply above usually already did it).
