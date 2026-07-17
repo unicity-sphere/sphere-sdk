@@ -69,6 +69,21 @@ describe('SphereTokenEngine — hardening / edge cases', () => {
     expect(outputs.reduce((sum, o) => sum + e.balanceOf(o, COIN_A), 0n)).toBe(100n);
   }, 30000);
 
+  it('split preserves output ORDER despite parallel minting (#684)', async () => {
+    // The mint legs are minted in parallel (Promise.allSettled). Distinct amounts make
+    // the returned order verifiable per index — a regression guard that parallelizing did
+    // not reorder outputs vs. the requested order (index-aligned settled.map).
+    const e = createTestEngine();
+    const self = e.getIdentity().chainPubkey;
+    const src = await e.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN_A, amount: 100n }] } });
+    const requested = [10n, 20n, 30n, 40n];
+    const { outputs } = await e.split({
+      token: src,
+      outputs: requested.map((amount) => ({ recipientPubkey: freshPubkey(), coinId: COIN_A, amount })),
+    });
+    expect(outputs.map((o) => e.balanceOf(o, COIN_A))).toEqual(requested); // exact order, not just sum
+  }, 30000);
+
   it('rejects minting a negative or malformed value', async () => {
     const e = createTestEngine();
     const self = e.getIdentity().chainPubkey;

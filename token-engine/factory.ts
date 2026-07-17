@@ -59,6 +59,8 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
     // The trust base is the single source of truth for the network id (it carries
     // NetworkId.fromId, so any id works — e.g. testnet2 = 4 — with no enum entry).
     networkId: trustBase.networkId,
+    // #683: forward the (optional) proof-poll cadence; undefined → the engine default.
+    proofPollIntervalMs: config.proofPollIntervalMs,
   };
 
   return new SphereTokenEngine(deps);

@@ -86,7 +86,24 @@ export interface EngineDeps {
    */
   readonly privateKey: Uint8Array;
   readonly networkId: NetworkId;
+  /**
+   * Inclusion-proof poll cadence in ms (#683). The aggregator finalizes in ~1-1.5s,
+   * but the state-transition-sdk's waitInclusionProof default is 1000ms, so the proof
+   * is only caught at ~2s (poll granularity). A finer interval catches it ~0.5-0.75s
+   * sooner PER proof round with zero correctness impact (waitInclusionProof returns
+   * only an OK-verified proof regardless of poll frequency). Undefined → the tuned
+   * default below.
+   */
+  readonly proofPollIntervalMs?: number;
 }
+
+/**
+ * #683: default inclusion-proof poll interval (ms). Finer than the sdk's 1000ms
+ * default so a ~1.2s finalization is caught near ~1.2-1.5s instead of at the 2s
+ * poll boundary. Bounded by waitInclusionProof's 10s abort; the extra polls are
+ * cheap read-only getInclusionProof calls confined to the ~1.5s finalization window.
+ */
+const DEFAULT_PROOF_POLL_INTERVAL_MS = 300;
 
 /** Canonical lowercase UUID — the spec's `transferId` wire form (sdk-changes E.1). */
 const TRANSFER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -198,6 +215,7 @@ export class SphereTokenEngine implements ITokenEngine {
       this.deps.predicateVerifier,
       mintTx,
       options?.signal,
+      this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS, // #683 finer poll cadence
     );
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
     const token = await Token.mint(
@@ -229,6 +247,7 @@ export class SphereTokenEngine implements ITokenEngine {
       this.deps.predicateVerifier,
       mintTx,
       options?.signal,
+      this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS, // #683 finer poll cadence
     );
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
     const token = await Token.mint(
@@ -299,11 +318,34 @@ export class SphereTokenEngine implements ITokenEngine {
     //    split input; a mint certified against proof bytes that were never stored strands #501).
     const burntToken = await this.resolveBurntToken({ params, split, transferId, options });
 
-    // 2. Mint each output, justified by the burnt token + its split proofs.
-    const outputs: SphereToken[] = [];
-    for (let i = 0; i < split.tokens.length; i++) {
-      outputs.push(await this.mintSplitOutput(split.tokens[i], burntToken, params.outputs[i].data ?? null, options));
+    // 2. Mint every output IN PARALLEL (#684), each justified by the burnt token + its
+    //    own split proofs. The mints are independent legs off the ONE already-certified,
+    //    already-checkpointed burn (step 1, outside this fan-out — E.4 burn-before-mint
+    //    is unchanged), so they carry no ordering constraint among themselves.
+    //
+    //    MONEY-SAFETY (identical semantics to the prior sequential loop):
+    //    - `allSettled` waits for EVERY leg (never short-circuits) so an in-flight leg is
+    //      not abandoned mid-submit; then we throw the LOWEST-index rejection's error —
+    //      exactly the error the sequential loop would have surfaced (it failed at the
+    //      first failing index and never attempted later legs). So the caller's keep-open
+    //      classification (ProofUnconfirmedError / SplitCheckpointLostError / …) is byte-for-
+    //      byte unchanged.
+    //    - On any failure the intent stays OPEN (the burn is certified + checkpointed) and
+    //      resume re-runs ALL legs from the durable checkpoint. A leg this fan-out already
+    //      certified is recovered idempotently on resume (its stateId is HKDF-derived and
+    //      deterministic; re-submit → the aggregator already holds it → waitInclusionProof
+    //      returns the existing proof — the #631/E.2 resume contract). So legs the sequential
+    //      loop would NOT have submitted, but this one did, are never lost — only recovered.
+    const settled = await Promise.allSettled(
+      split.tokens.map((token, i) =>
+        this.mintSplitOutput(token, burntToken, params.outputs[i].data ?? null, options),
+      ),
+    );
+    const firstRejected = settled.findIndex((r) => r.status === 'rejected');
+    if (firstRejected !== -1) {
+      throw (settled[firstRejected] as PromiseRejectedResult).reason;
     }
+    const outputs = settled.map((r) => (r as PromiseFulfilledResult<SphereToken>).value);
     return { outputs };
   }
 
@@ -361,17 +403,21 @@ export class SphereTokenEngine implements ITokenEngine {
    * so correctness does NOT depend on the mint loop certifying leg 0 first (E.4 step 3).
    */
   private async assertNoLegStranded(ctx: SplitContext): Promise<void> {
-    for (let i = 0; i < ctx.split.tokens.length; i++) {
-      const leg = ctx.split.tokens[i];
-      const data = await SpherePaymentData.create(leg.assets, ctx.params.outputs[i].data ?? null).encode();
-      const probe = await MintTransaction.create(leg.networkId, leg.recipient, data, leg.tokenType, leg.salt, null);
-      const response = await this.deps.client.getInclusionProof(await StateId.fromTransaction(probe));
-      if (response.inclusionProof.inclusionCertificate !== null) {
-        throw new SplitCheckpointLostError(
-          'a split mint leaf is certified on-chain but no burn checkpoint exists — outputs are unrecoverable',
-        );
-      }
-    }
+    // #684: probe every leg's stateId IN PARALLEL — read-only getInclusionProof calls,
+    // order-independent (it throws if ANY leg is already certified). Promise.all rejects
+    // on the first stranded leg, same as the prior sequential loop.
+    await Promise.all(
+      ctx.split.tokens.map(async (leg, i) => {
+        const data = await SpherePaymentData.create(leg.assets, ctx.params.outputs[i].data ?? null).encode();
+        const probe = await MintTransaction.create(leg.networkId, leg.recipient, data, leg.tokenType, leg.salt, null);
+        const response = await this.deps.client.getInclusionProof(await StateId.fromTransaction(probe));
+        if (response.inclusionProof.inclusionCertificate !== null) {
+          throw new SplitCheckpointLostError(
+            'a split mint leaf is certified on-chain but no burn checkpoint exists — outputs are unrecoverable',
+          );
+        }
+      }),
+    );
   }
 
   /** One split output: build the justification from the burnt token, submit, certify, wrap. */
@@ -556,6 +602,7 @@ export class SphereTokenEngine implements ITokenEngine {
         this.deps.predicateVerifier,
         transaction,
         options?.signal,
+        this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS, // #683 finer poll cadence
       );
     } catch (err) {
       // The SDK surfaces a match-verify mismatch as a generic Error whose
