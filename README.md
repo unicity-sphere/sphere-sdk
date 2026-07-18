@@ -5,7 +5,7 @@ A modular TypeScript SDK for Unicity wallet operations on Layer 3 (Unicity state
 ## Features
 
 - **Wallet Management** - BIP39/BIP32 key derivation; optional password encryption (PBKDF2)
-- **L3 Payments** - Engine-certified token transfers, delivered via the **wallet-api mailbox** (`DeliveryProvider` port); concurrent-send safety (SpendQueue); self-healing coin selection
+- **Payments** - Engine-certified token transfers, delivered via the **wallet-api mailbox** (`DeliveryProvider` port); concurrent-send safety (SpendQueue); self-healing coin selection
 - **Invoicing / Accounting** *(experimental — not production-ready, not enabled in the Sphere wallet)* - On-chain invoice lifecycle with payment attribution, auto-return, privacy-preserving hashed invoice IDs; invoices travel as v2 data-token blobs (hex strings) — `createInvoice()` returns the blob, `importInvoice()` accepts it
 - **Token Swaps** - P2P atomic swaps via escrow with DM-based negotiation protocol
 - **Payment Requests** - Request payments with async response tracking
@@ -303,12 +303,12 @@ console.log(addr2.address, addr2.publicKey);
 
 ### Identity Properties
 
-**Important:** The L3 DIRECT address is the primary address for the Unicity network.
+**Important:** The DIRECT address is the primary address for the Unicity network.
 
 ```typescript
 interface Identity {
-  chainPubkey: string;         // 33-byte compressed secp256k1 public key (for L3 chain)
-  directAddress?: string;      // L3 DIRECT address (DIRECT://...) - PRIMARY ADDRESS
+  chainPubkey: string;         // 33-byte compressed secp256k1 public key
+  directAddress?: string;      // DIRECT address (DIRECT://...) - PRIMARY ADDRESS
   ipnsName?: string;           // IPNS name for token sync
   nametag?: string;            // Registered nametag (@username)
 }
@@ -827,7 +827,7 @@ mnemonic → master key → BIP32 derivation → identity
 ```
 Sphere (main entry point)
 ├── identity       - Wallet identity (address, publicKey, nametag)
-├── payments       - L3 token operations
+├── payments       - Token operations
 ├── accounting     - Invoice lifecycle (via sphere.accounting)
 ├── swap           - P2P token swaps (via sphere.swap)
 ├── market         - Intent bulletin board (via sphere.market)
