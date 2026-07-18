@@ -1,6 +1,6 @@
 # Sphere SDK
 
-A modular TypeScript SDK for Unicity wallet operations on Layer 3 (Unicity state transition network).
+A modular TypeScript SDK for Unicity wallet operations (Unicity state transition network).
 
 ## Features
 
