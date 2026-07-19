@@ -118,4 +118,60 @@ describe.runIf(!!API_KEY)('LIVE self-send + round-trip over staging wallet-api +
     expect(aTotal + bTotal).toBe(10n);
     expect(aTotal).toBe(10n);
   }, 420_000);
+
+  it('multi-wallet path a→b→c→b→a→c→a→b→a with DIRECT + SPLIT transfers conserves value at every hop', async () => {
+    const a = await newWallet('mrt-a');
+    const b = await newWallet('mrt-b');
+    const c = await newWallet('mrt-c');
+    const byName: Record<'a' | 'b' | 'c', HarnessWallet> = { a, b, c };
+
+    const MINT = 100n;
+    expect((await a.module.mintFungibleToken(HARNESS_COIN, MINT)).success).toBe(true);
+    expect(await waitForBalance(a, MINT)).toBe(MINT);
+
+    // The a→b→c→b→a→c→a→b→a path, with amounts chosen so the run exercises EVERY transfer
+    // shape: whole-token DIRECT, multi-token DIRECT (spending fragmented change), and SPLIT
+    // (a partial amount → sent leg + change), while the same genesis lineage is re-acquired
+    // repeatedly across three independent wallets.
+    //   kind  = the transfer shape the sender's holding forces at that amount (documentation).
+    // Traced with smallest-first coin selection (fragment values are selection-dependent, but
+    // the split-vs-direct classification is deterministic: a hop SPLITs iff no whole-token
+    // subset of the sender's holding sums to the amount). Sender holdings per hop:
+    //   1 A{100}  2 B{100}  3 C{60}  4 B{40,60}  5 A{40,60}  6 C{40,30}  7 A{30,40,30}  8 B{30,40,30}
+    const hops: Array<{ from: 'a' | 'b' | 'c'; to: 'a' | 'b' | 'c'; amt: bigint; kind: string }> = [
+      { from: 'a', to: 'b', amt: 100n, kind: 'direct — whole 100-token' },
+      { from: 'b', to: 'c', amt: 60n, kind: 'SPLIT — 60 of a 100-token (60 sent + 40 change)' },
+      { from: 'c', to: 'b', amt: 60n, kind: 'direct — whole 60-token (B re-acquires)' },
+      { from: 'b', to: 'a', amt: 100n, kind: 'direct multi-token — both change tokens (40 + 60)' },
+      { from: 'a', to: 'c', amt: 70n, kind: 'SPLIT — 70 of {40,60}; no whole subset = 70, so a source splits' },
+      { from: 'c', to: 'a', amt: 70n, kind: 'direct multi-token — both received tokens (40 + 30) (A re-acquires)' },
+      { from: 'a', to: 'b', amt: 100n, kind: 'direct multi-token — all held tokens (30 + 40 + 30)' },
+      { from: 'b', to: 'a', amt: 100n, kind: 'direct multi-token — all held tokens (30 + 40 + 30)' },
+    ];
+
+    const bal: Record<'a' | 'b' | 'c', bigint> = { a: MINT, b: 0n, c: 0n };
+    for (const hop of hops) {
+      const from = byName[hop.from];
+      const to = byName[hop.to];
+      await from.module.send({ recipient: to.identity.chainPubkey, amount: hop.amt.toString(), coinId: HARNESS_COIN });
+      bal[hop.from] -= hop.amt;
+      bal[hop.to] += hop.amt;
+      // Both endpoints settle to their exact expected balances (a split leaves the sender its
+      // change; a whole/multi-token send leaves it at its remaining total).
+      expect(await waitForBalance(to, bal[hop.to])).toBe(bal[hop.to]);
+      expect(await waitForBalance(from, bal[hop.from])).toBe(bal[hop.from]);
+      // Conservation across ALL THREE wallets at EVERY hop — no value vanishes mid-path.
+      const total =
+        totalOf(await a.client.getBalances()) +
+        totalOf(await b.client.getBalances()) +
+        totalOf(await c.client.getBalances());
+      expect(total).toBe(MINT);
+    }
+
+    // Path ends at A with the full value, real and spendable; B and C empty.
+    expect(await waitForBalance(a, MINT)).toBe(MINT);
+    expect(totalOf(await b.client.getBalances())).toBe(0n);
+    expect(totalOf(await c.client.getBalances())).toBe(0n);
+    expect(a.module.getTokens().reduce((s, t) => s + BigInt(t.amount), 0n)).toBe(MINT);
+  }, 600_000);
 });
