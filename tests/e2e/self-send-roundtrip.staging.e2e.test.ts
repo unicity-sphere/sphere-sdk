@@ -119,59 +119,69 @@ describe.runIf(!!API_KEY)('LIVE self-send + round-trip over staging wallet-api +
     expect(aTotal).toBe(10n);
   }, 420_000);
 
-  it('multi-wallet path a→b→c→b→a→c→a→b→a with DIRECT + SPLIT transfers conserves value at every hop', async () => {
+  it('round-trips the SAME genesis token (direct) AND a split output (direct) — re-acquired at A, proven by id', async () => {
     const a = await newWallet('mrt-a');
     const b = await newWallet('mrt-b');
     const c = await newWallet('mrt-c');
-    const byName: Record<'a' | 'b' | 'c', HarnessWallet> = { a, b, c };
 
-    const MINT = 100n;
-    expect((await a.module.mintFungibleToken(HARNESS_COIN, MINT)).success).toBe(true);
-    expect(await waitForBalance(a, MINT)).toBe(MINT);
+    // A wallet's held token IDs (v2_<genesisId>) — genesis-stable across transfers, so a
+    // re-acquired token keeps the SAME id. This is what makes it a genuine round-trip of the
+    // SAME token (the actual bug), not a value coincidence.
+    const idsOf = (w: HarnessWallet): string[] => w.module.getTokens().map((t) => t.id).sort();
+    const idOfAmount = (w: HarnessWallet, amt: bigint): string => {
+      const t = w.module.getTokens().find((x) => BigInt(x.amount) === amt);
+      if (!t) throw new Error(`${w.identity.chainPubkey.slice(0, 6)} holds no ${amt}-token (has ${idsOf(w).join(',')})`);
+      return t.id;
+    };
 
-    // The a→b→c→b→a→c→a→b→a path, with amounts chosen so the run exercises EVERY transfer
-    // shape: whole-token DIRECT, multi-token DIRECT (spending fragmented change), and SPLIT
-    // (a partial amount → sent leg + change), while the same genesis lineage is re-acquired
-    // repeatedly across three independent wallets.
-    //   kind  = the transfer shape the sender's holding forces at that amount (documentation).
-    // Traced with smallest-first coin selection (fragment values are selection-dependent, but
-    // the split-vs-direct classification is deterministic: a hop SPLITs iff no whole-token
-    // subset of the sender's holding sums to the amount). Sender holdings per hop:
-    //   1 A{100}  2 B{100}  3 C{60}  4 B{40,60}  5 A{40,60}  6 C{40,30}  7 A{30,40,30}  8 B{30,40,30}
-    const hops: Array<{ from: 'a' | 'b' | 'c'; to: 'a' | 'b' | 'c'; amt: bigint; kind: string }> = [
-      { from: 'a', to: 'b', amt: 100n, kind: 'direct — whole 100-token' },
-      { from: 'b', to: 'c', amt: 60n, kind: 'SPLIT — 60 of a 100-token (60 sent + 40 change)' },
-      { from: 'c', to: 'b', amt: 60n, kind: 'direct — whole 60-token (B re-acquires)' },
-      { from: 'b', to: 'a', amt: 100n, kind: 'direct multi-token — both change tokens (40 + 60)' },
-      { from: 'a', to: 'c', amt: 70n, kind: 'SPLIT — 70 of {40,60}; no whole subset = 70, so a source splits' },
-      { from: 'c', to: 'a', amt: 70n, kind: 'direct multi-token — both received tokens (40 + 30) (A re-acquires)' },
-      { from: 'a', to: 'b', amt: 100n, kind: 'direct multi-token — all held tokens (30 + 40 + 30)' },
-      { from: 'b', to: 'a', amt: 100n, kind: 'direct multi-token — all held tokens (30 + 40 + 30)' },
-    ];
+    expect((await a.module.mintFungibleToken(HARNESS_COIN, 100n)).success).toBe(true);
+    expect(await waitForBalance(a, 100n)).toBe(100n);
+    const g0 = idOfAmount(a, 100n); // the minted token
 
-    const bal: Record<'a' | 'b' | 'c', bigint> = { a: MINT, b: 0n, c: 0n };
-    for (const hop of hops) {
-      const from = byName[hop.from];
-      const to = byName[hop.to];
-      await from.module.send({ recipient: to.identity.chainPubkey, amount: hop.amt.toString(), coinId: HARNESS_COIN });
-      bal[hop.from] -= hop.amt;
-      bal[hop.to] += hop.amt;
-      // Both endpoints settle to their exact expected balances (a split leaves the sender its
-      // change; a whole/multi-token send leaves it at its remaining total).
-      expect(await waitForBalance(to, bal[hop.to])).toBe(bal[hop.to]);
-      expect(await waitForBalance(from, bal[hop.from])).toBe(bal[hop.from]);
-      // Conservation across ALL THREE wallets at EVERY hop — no value vanishes mid-path.
-      const total =
-        totalOf(await a.client.getBalances()) +
-        totalOf(await b.client.getBalances()) +
-        totalOf(await c.client.getBalances());
-      expect(total).toBe(MINT);
-    }
+    // --- Phase 1: round-trip the WHOLE minted token A→B→A (DIRECT). Genesis id is preserved,
+    // so A re-acquires the SAME token g0. (Pre-fix this is where A loses it.) ---
+    await a.module.send({ recipient: b.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN });
+    expect(await waitForBalance(b, 100n)).toBe(100n);
+    expect(idOfAmount(b, 100n)).toBe(g0); // same token now at B
+    await b.module.send({ recipient: a.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN });
+    expect(await waitForBalance(a, 100n)).toBe(100n);
+    expect(idsOf(a)).toEqual([g0]); // ← A re-acquired the SAME genesis token
 
-    // Path ends at A with the full value, real and spendable; B and C empty.
-    expect(await waitForBalance(a, MINT)).toBe(MINT);
+    // --- Phase 2: SPLIT it (60 to B + 40 change at A). This BURNS g0 and mints two NEW genesis
+    // tokens: g1 (60, at B) and g2 (40, A's change). ---
+    await a.module.send({ recipient: b.identity.chainPubkey, amount: '60', coinId: HARNESS_COIN });
+    expect(await waitForBalance(b, 60n)).toBe(60n);
+    expect(await waitForBalance(a, 40n)).toBe(40n);
+    const g1 = idOfAmount(b, 60n); // split output sent to B
+    const g2 = idOfAmount(a, 40n); // split change kept at A
+    expect(new Set([g0, g1, g2]).size).toBe(3); // split minted brand-new genesis ids
+
+    // --- Phase 3: round-trip the SPLIT OUTPUT g1 (60) whole B→C→A (DIRECT) — A re-acquires g1. ---
+    await b.module.send({ recipient: c.identity.chainPubkey, amount: '60', coinId: HARNESS_COIN });
+    expect(await waitForBalance(c, 60n)).toBe(60n);
+    expect(idOfAmount(c, 60n)).toBe(g1);
+    await c.module.send({ recipient: a.identity.chainPubkey, amount: '60', coinId: HARNESS_COIN });
+    expect(await waitForBalance(a, 100n)).toBe(100n); // A now holds g2(40) + g1(60)
+    expect(idOfAmount(a, 60n)).toBe(g1); // ← A re-acquired the SAME split-output token g1
+    expect(idsOf(a)).toEqual([g1, g2].sort());
+
+    // --- Phase 4: round-trip the OTHER split output g2 (40) whole A→C→A (DIRECT) — A re-acquires g2. ---
+    await a.module.send({ recipient: c.identity.chainPubkey, amount: '40', coinId: HARNESS_COIN });
+    expect(await waitForBalance(c, 40n)).toBe(40n);
+    expect(idOfAmount(c, 40n)).toBe(g2);
+    await c.module.send({ recipient: a.identity.chainPubkey, amount: '40', coinId: HARNESS_COIN });
+    expect(await waitForBalance(a, 100n)).toBe(100n);
+    expect(idOfAmount(a, 40n)).toBe(g2); // ← A re-acquired the SAME split-output token g2
+
+    // End: A holds exactly the two split outputs (60 + 40 = 100); B and C empty; conserved.
+    expect(idsOf(a)).toEqual([g1, g2].sort());
+    expect(a.module.getTokens().reduce((s, t) => s + BigInt(t.amount), 0n)).toBe(100n);
     expect(totalOf(await b.client.getBalances())).toBe(0n);
     expect(totalOf(await c.client.getBalances())).toBe(0n);
-    expect(a.module.getTokens().reduce((s, t) => s + BigInt(t.amount), 0n)).toBe(MINT);
+    const total =
+      totalOf(await a.client.getBalances()) +
+      totalOf(await b.client.getBalances()) +
+      totalOf(await c.client.getBalances());
+    expect(total).toBe(100n);
   }, 600_000);
 });
