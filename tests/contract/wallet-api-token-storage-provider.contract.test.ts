@@ -14,6 +14,7 @@ import { WalletApiClient, WalletApiError } from '../../wallet-api';
 import { WalletApiTokenStorageProvider } from '../../impl/shared/wallet-api/WalletApiTokenStorageProvider';
 import { deriveFieldEncryptionKey, encryptField } from '../../core/field-encryption';
 import type { FullIdentity } from '../../types';
+import type { TokenBlob } from '../../token-engine/types';
 import { FakeWalletApi } from '../support/fake-wallet-api';
 import {
   buildTxfData,
@@ -32,7 +33,14 @@ function makeDevice(
   fake: FakeWalletApi,
   baseUrl: string,
   identityIndex: number,
-  deviceId: string
+  deviceId: string,
+  /**
+   * The on-chain spent oracle recoverRemoved fail-closes on (mirrors the engine's
+   * `isSpent`, wired at composition in prod / the harness). A test supplies a set of
+   * tokenIds it considers spent-on-chain; recoverRemoved reactivates only tokens NOT in it.
+   * When omitted, recoverRemoved is a safe no-op (never reactivates) — the unwired default.
+   */
+  spentOnChain?: ReadonlySet<string>
 ): {
   client: WalletApiClient;
   provider: WalletApiTokenStorageProvider;
@@ -50,6 +58,9 @@ function makeDevice(
   const provider = new WalletApiTokenStorageProvider({
     client,
     stateStore,
+    ...(spentOnChain
+      ? { isSpent: (blob: TokenBlob): Promise<boolean> => Promise.resolve(spentOnChain.has(blob.tokenId)) }
+      : {}),
   });
   provider.setIdentity({
     privateKey: identity.privateKey,
@@ -199,7 +210,9 @@ describe('WalletApiTokenStorageProvider — S2 remote semantics', () => {
 
   it('a tombstone arriving on the DELTA path prunes the overlay — a later re-add is NOT shadowed (#679)', async () => {
     const deviceA = makeDevice(fake, baseUrl, 41, 'dev-a');
-    const deviceB = makeDevice(fake, baseUrl, 41, 'dev-b'); // same owner, second device
+    // t1's removal here is an unevidenced (reactivatable) flip, not a genuine on-chain
+    // spend — so isSpent reports it UNSPENT and recoverRemoved may re-add it.
+    const deviceB = makeDevice(fake, baseUrl, 41, 'dev-b', new Set()); // same owner, second device
     const t1 = makeTestToken();
     await seedVia(deviceA.provider, [t1]);
 
@@ -282,11 +295,29 @@ describe('WalletApiTokenStorageProvider — S2 remote semantics', () => {
     expect(fake.getRow(pubkey, t.tokenId)?.status).toBe('active');
   });
 
-  it('a confirmed-spend tombstone IS pushed after a successful load', async () => {
-    const { provider, pubkey } = makeDevice(fake, baseUrl, 25, 'dev-a');
+  it('a confirmed-spend tombstone IS pushed after a successful load (evidence-race desync repair)', async () => {
+    const { provider, pubkey, client } = makeDevice(fake, baseUrl, 25, 'dev-a');
     const t = makeTestToken();
     await seedVia(provider, [t]);
 
+    // The row's current protocol state — the value pushRemovals matches the spend against.
+    const rowStateHash = (await provider.listInventory()).items.find((i) => i.tokenId === t.tokenId)!.stateHash!;
+    expect(rowStateHash).toBeTruthy();
+
+    // Record an AUTHORITATIVE (composite) spend for t at that exact state, WITHOUT removing
+    // the server row: the client apply is a no-op, simulating the evidence-race desync where
+    // the spend's server removal did not stick and the row is left ACTIVE.
+    const realApply = client.applyInventoryDelta.bind(client);
+    client.applyInventoryDelta = (async () => 0n) as typeof client.applyInventoryDelta;
+    await provider.applyDelta('55555555-5555-4555-8555-555555555555', [t.tokenId], [], {
+      spentStates: [{ tokenId: t.tokenId, stateHash: rowStateHash }],
+    });
+    client.applyInventoryDelta = realApply;
+    expect(fake.getRow(pubkey, t.tokenId)?.status).toBe('active'); // the desync: still active
+
+    // A save with the local tombstone repairs it: pushRemovals PROVES the spend (the composite
+    // knownSpend matches the active row's state) and pushes the removal — a token-id-only or
+    // unproven tombstone would be skipped (fail-closed).
     const data = buildTxfData([]);
     data._tombstones = [{ tokenId: t.tokenId, stateHash: '', timestamp: Date.now() }];
     const result = await provider.save(data);
@@ -298,7 +329,8 @@ describe('WalletApiTokenStorageProvider — S2 remote semantics', () => {
   });
 
   it('recoverRemoved() restores a wiped-but-unspent token (§5.3 recovery)', async () => {
-    const { provider, pubkey } = makeDevice(fake, baseUrl, 26, 'dev-a');
+    // isSpent (wired at composition in prod) reports t1 UNSPENT → recoverRemoved reactivates.
+    const { provider, pubkey } = makeDevice(fake, baseUrl, 26, 'dev-a', new Set());
     const t1 = makeTestToken();
     const t2 = makeTestToken();
     await seedVia(provider, [t1, t2]);
@@ -330,8 +362,11 @@ describe('WalletApiTokenStorageProvider — S2 remote semantics', () => {
   });
 
   it('recoverRemoved() keeps an evidenced tombstone — server 409 = actually spent (§5.3)', async () => {
-    const deviceA = makeDevice(fake, baseUrl, 27, 'dev-a');
+    // t is genuinely spent below → isSpent reports it spent → recoverRemoved keeps it as spent.
+    const spentOnChain27 = new Set<string>();
+    const deviceA = makeDevice(fake, baseUrl, 27, 'dev-a', spentOnChain27);
     const t = makeTestToken();
+    spentOnChain27.add(t.tokenId);
     const change = makeTestToken();
     await seedVia(deviceA.provider, [t]);
 
@@ -361,9 +396,13 @@ describe('WalletApiTokenStorageProvider — S2 remote semantics', () => {
     expect(view.items.map((i) => i.tokenId)).toEqual([change.tokenId]);
   });
 
-  it('recoverRemoved() skips the provider’s own known spends', async () => {
-    const { provider, pubkey } = makeDevice(fake, baseUrl, 28, 'dev-a');
+  it('recoverRemoved() never resurrects the provider’s own on-chain spends', async () => {
+    // The provider spends t1 itself; the fail-closed isSpent gate confirms it consumed
+    // on-chain and records it as spent — never reactivating it (I4).
+    const spentOnChain28 = new Set<string>();
+    const { provider, pubkey } = makeDevice(fake, baseUrl, 28, 'dev-a', spentOnChain28);
     const t1 = makeTestToken();
+    spentOnChain28.add(t1.tokenId);
     const t2 = makeTestToken();
     await seedVia(provider, [t1, t2]);
 
@@ -371,7 +410,7 @@ describe('WalletApiTokenStorageProvider — S2 remote semantics', () => {
 
     const result = await provider.recoverRemoved();
     expect(result.recovered).toEqual([]);
-    expect(result.spent).toEqual([]);
+    expect(result.spent).toEqual([t1.tokenId]);
     expect(result.skipped).toEqual([]);
     expect(fake.getRow(pubkey, t1.tokenId)?.status).toBe('removed');
   });

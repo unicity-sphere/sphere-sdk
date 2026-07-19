@@ -103,6 +103,9 @@ export interface WalletApiCompositionConfig {
   webSocketFactory?: WebSocketFactoryLike;
   /** Local token verification for `recoverRemoved()` (wire the engine here). */
   verifyToken?: (blob: TokenBlob) => Promise<boolean>;
+  /** On-chain spent check for `recoverRemoved()` — wire the engine's `isSpent` here so a
+   *  wiped/second device never resurrects a genuinely-spent tombstone (I4 belt-and-suspenders). */
+  isSpent?: (blob: TokenBlob) => Promise<boolean>;
   /** Transient-failure retry policy for the §16 REST path (default-on; `false` disables). */
   retry?: WalletApiRetryConfig | false;
   /** Per-request timeout in ms for the §16 REST path (#642; default 30 000, `0` disables). */
@@ -159,6 +162,7 @@ export function createWalletApiProviders<B extends SphereBaseProviders>(
     client,
     stateStore,
     verifyToken: config.verifyToken,
+    isSpent: config.isSpent,
   });
   const delivery = new WalletApiMailboxProvider({ client, custody: 'inventory', stateStore });
   return { ...base, tokenStorage, delivery, walletApi: client };

@@ -842,6 +842,10 @@ export class FakeWalletApi {
     return {
       tokenId: row.tokenId,
       status: row.status,
+      // Per-row protocol state hash (mirrors the wallet-api inventory state_hash
+      // exposure): carried for active AND removed rows so the client can reconcile a
+      // removal against the row's CURRENT state, not its token id alone.
+      stateHash: row.stateHash,
       // Amounts are decimal strings in every JSON body (§11); asset rows are
       // deleted at the spend, so tombstones carry no assets (§5.3 step 4).
       ...(row.status === 'active' && row.assets

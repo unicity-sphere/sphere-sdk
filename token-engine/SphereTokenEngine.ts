@@ -477,7 +477,12 @@ export class SphereTokenEngine implements ITokenEngine {
         const data = await SpherePaymentData.create(leg.assets, ctx.params.outputs[i].data ?? null).encode();
         const probe = await MintTransaction.create(leg.networkId, leg.recipient, data, leg.tokenType, leg.salt, null);
         const response = await this.deps.client.getInclusionProof(await StateId.fromTransaction(probe));
-        if (response.inclusionProof.inclusionCertificate !== null) {
+        // Inclusion (leaf certified on-chain) is discriminated by `certificationData`, NOT
+        // by the certificate bytes: the aggregator's non-inclusion response carries a
+        // certificate too (an ExclusionCert once non-inclusion proofs ship), so
+        // `inclusionCertificate` is not a reliable "certified" signal (aggregator
+        // types.go: CertificationData != nil ⟺ inclusion).
+        if (response.inclusionProof.certificationData !== null) {
           throw new SplitCheckpointLostError(
             'a split mint leaf is certified on-chain but no burn checkpoint exists — outputs are unrecoverable',
           );
@@ -563,8 +568,14 @@ export class SphereTokenEngine implements ITokenEngine {
     );
     const stateId = await StateId.fromTransaction(probe);
     const response = await this.deps.client.getInclusionProof(stateId);
-    // A present inclusion certificate means the state has already been consumed on-chain.
-    return response.inclusionProof.inclusionCertificate !== null;
+    // A state is consumed on-chain iff the aggregator returns CERTIFICATION DATA for its
+    // stateId — that is the aggregator's own inclusion/non-inclusion discriminator
+    // (types.go: `CertificationData != nil` ⟺ inclusion). Do NOT test
+    // `inclusionCertificate`: a non-inclusion response also carries a certificate (an
+    // ExclusionCert, once non-inclusion proofs are implemented), so a non-null certificate
+    // does NOT imply the state was spent — testing it would report an UNSPENT state as
+    // spent and (via the fail-closed resume/recovery gates) destroy a live token.
+    return response.inclusionProof.certificationData !== null;
   }
 
   // ── serialization ────────────────────────────────────────────────────────────
