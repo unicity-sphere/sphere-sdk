@@ -437,13 +437,16 @@ The `send` result distinguishes **on-chain finality** from **recipient-side deli
 
 - `deliveryPending: false` — the transfer certified on-chain **and** landed in the recipient's
   mailbox/transport. Done.
-- `deliveryPending: true` — the spend is **final on-chain** but the recipient-side delivery is
+- `deliveryPending: true` — the spend is **committed on-chain** (or, for possibly-certified resolutions,
+  may be) but the recipient-side delivery is
   journaled in the sender's wallet and retries automatically (covenant §3.1). **Never re-issue
   the send** — the source tokens are terminally spent, and a fresh `intent('send', …)` would
   pay the recipient a second time from different tokens. `transferId` may be absent on this
   path (possibly-certified resolutions carry no id; the still-open intent owns settlement).
 - Treat the money as sent in both cases; use `deliveryPending` only to set expectations
   ("recipient may receive it with a delay") — not to gate retries.
+- `status` is one of `'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed'`.
+- The SDK's `TransferResult` also carries `deliveryState` (`'landed' | 'pending-delivery'`), but the wallet does **not** forward it over Connect — `deliveryPending` is the only delivery signal a dApp receives.
 
 > **Server-side (Node.js) recipients:** a wallet built with bare `createNodeProviders` only
 > listens on the Nostr transport and will **never see** deliveries from wallet-api-composed
@@ -497,6 +500,8 @@ const result = await client.intent('mint', {
 ```
 
 Requires the `mint:request` permission scope. Minting only succeeds on networks that allow standalone self-mint (testnet2 today); on networks where it is unavailable the wallet returns an error from the token engine.
+
+When the wallet runs with **subscriptions enabled**, a `mint` is rejected with `INTERNAL_ERROR` and the message `Subscription is still being set up — try again in a moment` until the wallet's per-wallet subscription key reaches the oracle. This is transient — treat it as a retry, not a failure. It never occurs on wallets running without subscriptions.
 
 ## Experimental — not supported by the Sphere wallet
 
