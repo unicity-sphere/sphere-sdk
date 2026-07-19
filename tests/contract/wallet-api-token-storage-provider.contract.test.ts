@@ -328,6 +328,57 @@ describe('WalletApiTokenStorageProvider — S2 remote semantics', () => {
     expect(view.items).toEqual([]);
   });
 
+  it('audit#3: pushRemovals keys the knownSpend to the PROVEN-spent state, not a post-await re-read — a round-trip re-acquisition survives', async () => {
+    const A = makeDevice(fake, baseUrl, 90, 'dev-a3');
+    const B = makeDevice(fake, baseUrl, 90, 'dev-b3'); // same owner, 2nd device = the round-trip claimant
+    const t1 = makeTestToken({ amount: 1000n });
+    await seedVia(A.provider, [t1]);
+    const s1 = (await A.provider.listInventory()).items.find((i) => i.tokenId === t1.tokenId)!.stateHash!;
+    expect(s1).toBeTruthy();
+
+    // Authoritative knownSpend for t1 @ S1 (no-op server apply → the row stays active: the
+    // evidence-race desync). S1 is the ONLY state we ever proved spent.
+    const noop = (async () => 0n) as typeof A.client.applyInventoryDelta;
+    const realApply = A.client.applyInventoryDelta.bind(A.client);
+    A.client.applyInventoryDelta = noop;
+    await A.provider.applyDelta('33333333-3333-4333-8333-333333333333', [t1.tokenId], [], {
+      spentStates: [{ tokenId: t1.tokenId, stateHash: s1 }],
+    });
+    A.client.applyInventoryDelta = realApply;
+
+    // Cycle 1 — drive pushRemovals via a tombstone save, and GATE its applyInventoryDelta: AFTER
+    // the removal applies, device B re-acquires t1 at a NEW state S2 (the A→B→A round-trip) and
+    // device A syncs it in. That is the concurrent claim advancing this.view between the spend
+    // decision and the knownSpend write.
+    const t2 = makeTestToken({ tokenId: t1.tokenId, amount: 1000n }); // same id, fresh state S2
+    let raced = false;
+    A.client.applyInventoryDelta = (async (delta: never) => {
+      const r = await realApply(delta);
+      if (!raced) {
+        raced = true;
+        await seedVia(B.provider, [t2]); // server row t1 → active @ S2 (re-acquired)
+        await A.provider.listInventory(); // A.view advances t1 → active @ S2 mid-reconcile
+      }
+      return r;
+    }) as typeof A.client.applyInventoryDelta;
+    const c1 = buildTxfData([]);
+    c1._tombstones = [{ tokenId: t1.tokenId, stateHash: '', timestamp: Date.now() }];
+    await A.provider.save(c1);
+    A.client.applyInventoryDelta = realApply;
+
+    // The round-trip token is back and live at S2 after cycle 1.
+    expect(fake.getRow(A.pubkey, t1.tokenId)?.status).toBe('active');
+
+    // Cycle 2 — a later stale tombstone triggers pushRemovals again. knownSpends must still prove
+    // ONLY S1, so the re-acquired S2 is left alone. Pre-fix, cycle 1's post-await re-read poisoned
+    // knownSpends with t1@S2, so this SECOND pushRemovals destroys the live re-acquisition.
+    const c2 = buildTxfData([]);
+    c2._tombstones = [{ tokenId: t1.tokenId, stateHash: '', timestamp: Date.now() }];
+    await A.provider.save(c2);
+
+    expect(fake.getRow(A.pubkey, t1.tokenId)?.status).toBe('active'); // preserved (pre-fix: 'removed')
+  });
+
   it('recoverRemoved() restores a wiped-but-unspent token (§5.3 recovery)', async () => {
     // isSpent (wired at composition in prod) reports t1 UNSPENT → recoverRemoved reactivates.
     const { provider, pubkey } = makeDevice(fake, baseUrl, 26, 'dev-a', new Set());

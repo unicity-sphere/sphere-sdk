@@ -799,15 +799,22 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
     // destroying it there is the fund-loss bug. A row whose stateHash the server does not
     // expose (pre-Unit-A backend) is skipped, never removed on tokenId alone (degrade to
     // prune-primary: the PaymentsModule stale-tombstone prune is the go-forward fix).
-    const spent: string[] = [];
+    // Capture the state we PROVE spent NOW, alongside the id. Recording the knownSpend from a
+    // post-await re-read of this.view (as this used to) keys it to whatever state a concurrent
+    // claim advanced the row to DURING applyInventoryDelta below — poisoning knownSpends with a
+    // never-spent state, which a later pushRemovals then treats as proof and uses to destroy the
+    // legitimately re-acquired token. (Same hazard applyDelta guards against by keying knownSpends
+    // off the caller's authoritative spentStates, never this.view.)
+    const spent: Array<{ id: string; stateHash: string }> = [];
     for (const id of tombstoneIds) {
       const row = this.view.get(id);
       if (row?.status !== 'active') continue;
-      if (this.provenSpentAtState(known, id, row.stateHash)) spent.push(id);
+      const st = row.stateHash;
+      if (st && this.provenSpentAtState(known, id, st)) spent.push({ id, stateHash: st });
     }
     if (spent.length === 0) return;
-    await this.client.applyInventoryDelta({ transferId: newTransferId(), spent, added: [] });
-    await this.addKnownSpends(spent.map((id) => this.knownSpendKey(id, this.view.get(id)!.stateHash!)));
+    await this.client.applyInventoryDelta({ transferId: newTransferId(), spent: spent.map((s) => s.id), added: [] });
+    await this.addKnownSpends(spent.map((s) => this.knownSpendKey(s.id, s.stateHash)));
   }
 
   async sync(localData: TxfStorageDataBase): Promise<SyncResult<TxfStorageDataBase>> {
