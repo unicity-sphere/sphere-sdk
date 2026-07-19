@@ -85,6 +85,7 @@ async function createSphere(
 
   const result = await Sphere.init({
     ...providers,
+    network: 'testnet',
     autoGenerate: true,
     ...(nametag ? { nametag } : {}),
     ...(opts?.groupChat ? { groupChat: true } : {}),

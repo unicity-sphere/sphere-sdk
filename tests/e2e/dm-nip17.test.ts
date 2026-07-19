@@ -65,7 +65,7 @@ async function createSphere(label: string, nametag?: string) {
       apiKey: DEFAULT_API_KEY,
     },
   });
-  const result = await Sphere.init({ ...providers, autoGenerate: true, ...(nametag ? { nametag } : {}) });
+  const result = await Sphere.init({ ...providers, network: 'testnet', autoGenerate: true, ...(nametag ? { nametag } : {}) });
   return { sphere: result.sphere, dirs };
 }
 
