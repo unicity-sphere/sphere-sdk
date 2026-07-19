@@ -80,6 +80,11 @@ describe.runIf(!!API_KEY)('LIVE self-send + round-trip over staging wallet-api +
     expect((await a.module.mintFungibleToken(HARNESS_COIN, 10n)).success).toBe(true);
     expect(await waitForBalance(a, 10n)).toBe(10n);
 
+    // Prove staging exposes per-row state_hash (Unit A) — else this would silently test the
+    // degraded (skip-primary) path instead of M4's real state-scoped reconciliation.
+    const inv = await a.client.listInventory();
+    expect(inv.items[0]?.stateHash).toMatch(/^[0-9a-f]+$/);
+
     // Send the WHOLE token to our own address — the deterministic-loss case.
     await a.module.send({ recipient: a.identity.chainPubkey, amount: '10', coinId: HARNESS_COIN });
 
