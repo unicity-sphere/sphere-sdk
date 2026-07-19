@@ -5805,25 +5805,6 @@ export class PaymentsModule {
     return this.mutateSettlingJournal((m) => m.delete(requestId));
   }
 
-  /**
-   * Upgrade any settling link for `transferId` to `committed` (§7 partial completion). A committed
-   * link delivered value already, so reconcile must resolve it 'paid' and NEVER revert it to payable
-   * (re-paying the full amount would double-pay the delivered legs — {@link journalSettling}). No-op
-   * for a plain send with no linked request.
-   */
-  private markSettlingCommitted(transferId: string): Promise<void> {
-    return this.mutateSettlingJournal((m) => {
-      let changed = false;
-      for (const [requestId, entry] of m) {
-        if (entry.transferId === transferId && !entry.committed) {
-          m.set(requestId, { ...entry, committed: true });
-          changed = true;
-        }
-      }
-      return changed;
-    });
-  }
-
   // ── the pump ─────────────────────────────────────────────────────────────────
 
   /**
@@ -6212,12 +6193,13 @@ export class PaymentsModule {
           }
           outcome.conflicted.push(intent.transferId);
         } else if (err instanceof PartialSendConflictError) {
-          // §7 PARTIAL completion: ≥1 leg forward-completed (delivered + recorded) before a LATER
-          // source was lost to a foreign tx. resumeIntent has ALREADY, before closing the intent,
-          // durably marked any linked settling request COMMITTED (→ reconcile resolves 'paid', never
-          // reverts → no double-pay), written the delivered-amount SENT history, and emitted the
-          // 'send:partial-remainder' event. So this intent is DONE — classify it resumed; the app
-          // re-plans ONLY the shortfall under a NEW transferId (a background resume never auto-sends).
+          // §7 PARTIAL completion: ≥1 leg forward-completed (delivered + recorded, intent completed by
+          // applyDelta) before a LATER source was lost to a foreign tx. Classify it `resumed` — this is
+          // the durable no-double-pay guard: reconcileSettlingPaymentRequests resolves any linked
+          // request 'paid' via the `resumed || local-completed` branch and NEVER reverts it to payable,
+          // so the delivered legs are never re-paid. resumeIntent already wrote the delivered-amount SENT
+          // history and emitted 'send:partial-remainder'; the app re-plans ONLY the shortfall under a
+          // NEW transferId (a background resume never auto-sends).
           logger.warn(
             'Payments',
             `Intent ${intent.transferId.slice(0, 8)}… PARTIALLY completed — delivered legs final; ${err.remainingAmount} remainder owed (re-plan only the shortfall)`,
@@ -6596,19 +6578,20 @@ export class PaymentsModule {
       }
     }
 
-    // §7 PARTIAL completion: ≥1 leg delivered, then a LATER source was lost to a FOREIGN tx. Write
-    // ALL durable partial state BEFORE closing the intent, so a crash right after completeIntent
-    // cannot lose the shortfall (a completed intent never re-runs): (1) mark any linked settling
-    // request COMMITTED — reconcile resolves it 'paid' for the delivered value and NEVER reverts it to
-    // payable (the delivered legs are never re-paid = no double-pay); idempotent, a no-op for a plain
-    // send; (2) the SENT history for the DELIVERED amount only (never the full amount); (3) the
-    // remainder event so the app re-plans ONLY the shortfall under a NEW transferId (§7). THEN
-    // completeIntent (forward-complete, irreversible per §7; close the server row so listIntents('open')
-    // stops returning it) and surface the PartialSendConflictError.
+    // §7 PARTIAL completion: ≥1 leg delivered, then a LATER source was lost to a FOREIGN tx. The
+    // delivered legs' spends are already recorded by applyDelta above, which also COMPLETED the
+    // intent (server + local status 'completed', client.ts). No double-pay, durably: resumeOpenIntents
+    // classifies this transferId `resumed`, so reconcileSettlingPaymentRequests resolves any linked
+    // request 'paid' (via the `resumed || local-completed` branch) and NEVER reverts it to payable —
+    // the delivered legs are never re-paid. completeIntent FIRST (idempotent; the intent is already
+    // completed) so the best-effort SENT history / remainder event below can never wedge it open.
+    // The remainder event + PartialSendConflictError surface the shortfall so the app re-plans ONLY
+    // it under a NEW transferId (§7). NOTE: the event is a live-session hint; a crash-durable
+    // remainder re-plan (recipient made whole across restarts) is a tracked follow-up.
     if (conflicted) {
       const remaining = undeliveredAmount;
       const delivered = BigInt(payload.amount) - remaining;
-      await this.markSettlingCommitted(transferId);
+      await walletApi.completeIntent(transferId); // idempotent — applyDelta above usually already closed it
       await this.addToHistory({
         type: 'SENT',
         amount: (delivered > 0n ? delivered : 0n).toString(),
@@ -6626,7 +6609,6 @@ export class PaymentsModule {
         coinId: payload.coinId,
         recipient: payload.recipient,
       });
-      await walletApi.completeIntent(transferId);
       throw new PartialSendConflictError(
         'Resume: part of the payment was delivered before a source was consumed by a concurrent transfer — the delivered legs are final; re-plan ONLY the remainder.',
         transferId,
