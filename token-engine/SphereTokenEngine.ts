@@ -386,13 +386,14 @@ export class SphereTokenEngine implements ITokenEngine {
     //  1. If ANY leg rejected keep-open (ProofUnconfirmed / SplitCheckpointLost / the E.4 pair),
     //     surface that verbatim (lowest-index) so its specific keep-open type drives
     //     PaymentsModule's classification exactly as before.
-    //  2. Else if ANY leg CERTIFIED (fulfilled) while another failed cleanly, convert to a
-    //     keep-open ProofUnconfirmedError (cause = the clean failure): the burn is certified +
-    //     checkpointed, so resume re-runs ALL legs and recovers the certified one idempotently
-    //     (HKDF-deterministic stateId → the aggregator returns the existing proof; #631/E.2/E.3).
-    //  3. Else (every rejection is clean AND nothing certified) surface the lowest-index clean
-    //     rejection — nothing is committed, so aborting is safe and the net outcome matches the
-    //     sequential loop.
+    //  2. Else (ANY clean rejection, whether or not a sibling certified) the BURN is already
+    //     committed + checkpointed (resolveBurntToken, above), so the source is spent on-chain.
+    //     Convert to a keep-open ProofUnconfirmedError (cause = the clean failure): a plain
+    //     abortable error would let PaymentsModule abort the intent and STRAND the whole source
+    //     value (the burn cannot be undone; an aborted intent never re-runs). Keep-open so resume
+    //     re-runs ALL legs idempotently from the burn checkpoint (HKDF-deterministic stateId → the
+    //     aggregator returns the existing proof; #631/E.2/E.3). A clean mint reject after a valid,
+    //     value-conserving burn is transient (e.g. a shard reconfiguration), never permanent.
     const keepOpenRejection = settled.find(
       (r): r is PromiseRejectedResult => r.status === 'rejected' && isKeepOpenSplitError(r.reason),
     );

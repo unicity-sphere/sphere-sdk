@@ -3088,6 +3088,9 @@ export class PaymentsModule {
     // Single-flight: a concurrent second call for the same request coalesces onto the first pay
     // instead of issuing a second send (double-pay). Cleared in the inner's finally so a later
     // sequential retry — the reason the status guard re-admits 'accepted' — still proceeds.
+    // NOTE: a coalesced caller receives the FIRST caller's result, so if concurrent callers pass
+    // different `memo` values only the first is used — memo is per-request, not per-call, under
+    // concurrency (a distinct memo needs a distinct request, or a sequential call).
     const inFlight = this.payInFlight.get(requestId);
     if (inFlight) return inFlight;
     const pay = this.payPaymentRequestInner(requestId, memo);
