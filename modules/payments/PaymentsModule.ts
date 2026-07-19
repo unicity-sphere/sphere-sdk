@@ -6213,22 +6213,15 @@ export class PaymentsModule {
           outcome.conflicted.push(intent.transferId);
         } else if (err instanceof PartialSendConflictError) {
           // §7 PARTIAL completion: ≥1 leg forward-completed (delivered + recorded) before a LATER
-          // source was lost to a foreign tx. resumeIntent already completed the intent server-side.
-          // Mark any linked settling request COMMITTED — reconcile then resolves it 'paid' (for the
-          // delivered value) and NEVER reverts it to payable, so the delivered legs are never re-paid
-          // (no double-pay). Surface the undelivered remainder for a re-plan under a NEW transferId
-          // (§7); a background resume does NOT auto-send it — the app re-plans ONLY the shortfall.
+          // source was lost to a foreign tx. resumeIntent has ALREADY, before closing the intent,
+          // durably marked any linked settling request COMMITTED (→ reconcile resolves 'paid', never
+          // reverts → no double-pay), written the delivered-amount SENT history, and emitted the
+          // 'send:partial-remainder' event. So this intent is DONE — classify it resumed; the app
+          // re-plans ONLY the shortfall under a NEW transferId (a background resume never auto-sends).
           logger.warn(
             'Payments',
             `Intent ${intent.transferId.slice(0, 8)}… PARTIALLY completed — delivered legs final; ${err.remainingAmount} remainder owed (re-plan only the shortfall)`,
           );
-          await this.markSettlingCommitted(intent.transferId);
-          this.deps!.emitEvent('send:partial-remainder', {
-            transferId: intent.transferId,
-            remainingAmount: err.remainingAmount,
-            coinId: payload.coinId,
-            recipient: payload.recipient,
-          });
           outcome.resumed.push(intent.transferId);
         } else if (err instanceof SplitCheckpointLostError || err instanceof CheckpointTrustbaseMismatchError) {
           // E.4: a burn-certified split is STUCK on an unrecoverable-for-now checkpoint error (lost
@@ -6420,23 +6413,21 @@ export class PaymentsModule {
     const spent: string[] = []; // DELIVERED legs only (§7 forward-completion)
     let conflicted = false; // ≥1 source was lost to a FOREIGN tx (§8.1) — that leg delivered nothing
     let firstConflict: TransferConflictError | undefined;
-    let deliveredAmount = 0n;
-    // A direct leg moves a WHOLE token, so its delivered value is that source's coin amount.
-    const legAmount = (genesisId: string, source?: SphereToken): bigint => {
-      const local = this.tokens.get(`v2_${genesisId}`)?.amount;
-      if (local !== undefined) return BigInt(local);
-      return source ? engine.balanceOf(source, payload.coinId) : 0n;
-    };
+    // The undelivered shortfall = Σ of the CONFLICTED legs' values. A conflicted leg is always FRESH
+    // (a journaled leg re-delivers, it never conflicts), so its `source` is decoded before the throw
+    // and its whole-token value is exact — computing the shortfall from the UNDELIVERED side avoids
+    // the delivered-side undercount (a journaled leg's source is already gone from this.tokens).
+    let undeliveredAmount = 0n;
     for (const [opIndex, genesisId] of payload.direct.entries()) {
       const existing = journaled.get(opIndex);
       if (existing) {
         await deliverBlob(existing.tokenBlob, opIndex);
         spent.push(genesisId);
-        deliveredAmount += legAmount(genesisId);
       } else {
+        // Decode the source OUTSIDE the try so it is in scope in the catch (a decode failure is a
+        // genuine error, not a conflict, and rethrows).
+        const source = await engine.decodeToken(await provider.getToken(genesisId));
         try {
-          const blob = await provider.getToken(genesisId);
-          const source = await engine.decodeToken(blob);
           const finished = await engine.transfer(
             { token: source, recipientPubkey: recipientChainPubkey, data: memoData },
             // (transferId, opIndex) pairing replayed from the intent's persisted order (§8.1)
@@ -6444,16 +6435,16 @@ export class PaymentsModule {
           );
           await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(finished))), opIndex);
           spent.push(genesisId);
-          deliveredAmount += legAmount(genesisId, source);
         } catch (err) {
           if (!(err instanceof TransferConflictError)) throw err;
           // §8.1: a resume TransferConflictError = a DIFFERENT (foreign) transaction consumed the
           // source. The engine returns the existing proof for OUR OWN resume (a hash-MATCH, no
           // throw — recoverable-engine AC-E1/E2 vs AC-E4), so this leg delivered NOTHING. NEVER
-          // record it as spent (that false-marks the intent PAID). Flag the partial; after the loops
-          // the delivered legs forward-complete and only the undelivered remainder is surfaced (§7).
+          // record it as spent (that false-marks the intent PAID). Flag the partial and add this
+          // WHOLE source token's value to the undelivered shortfall (§7).
           conflicted = true;
           firstConflict ??= err;
+          undeliveredAmount += engine.balanceOf(source, payload.coinId);
           logger.warn('Payments', `Resume op ${opIndex} lost its source to a concurrent transfer — not delivered (§8.1/#4):`, err);
         }
       }
@@ -6526,9 +6517,10 @@ export class PaymentsModule {
           if (err instanceof TransferConflictError) {
             // §8.1: the split SOURCE (burn leg) was consumed by a FOREIGN tx under a DIFFERENT
             // transferId — the split delivered NOTHING. Do NOT record it as spent (that false-marks
-            // the intent paid); flag the partial, handled after the loops like a direct-leg conflict.
+            // the intent paid); flag the partial and add the recipient portion to the shortfall (§7).
             conflicted = true;
             firstConflict ??= err;
+            undeliveredAmount += BigInt(payload.split.splitAmount);
             logger.warn('Payments', `Resume split: source lost to a concurrent transfer — not delivered (§8.1/#4):`, err);
           } else if (err instanceof SplitCheckpointLostError) {
             // LEGACY no-checkpoint residual: the mint leg already certified but there is no checkpoint
@@ -6543,7 +6535,6 @@ export class PaymentsModule {
       }
       if (splitDelivered) {
         spent.push(payload.split.tokenId);
-        deliveredAmount += BigInt(payload.split.splitAmount);
       }
     }
 
@@ -6605,21 +6596,22 @@ export class PaymentsModule {
       }
     }
 
-    // E.3 uniform close (idempotent; the apply above usually already did it). For a PARTIAL (below)
-    // this forward-completes the delivered legs — irreversible per §7 — and closes the server intent
-    // row so the next sign-in's listIntents('open') does not re-return it (no re-run wedge).
-    await walletApi.completeIntent(transferId);
-
-    // §7 PARTIAL completion: ≥1 leg delivered, then a LATER source was lost to a FOREIGN tx. The
-    // delivered legs are recorded + the intent completed (irreversible). Record the SENT history for
-    // the DELIVERED amount only, then surface the undelivered remainder as a PartialSendConflictError:
-    // resumeOpenIntents marks any linked settling request COMMITTED (resolve 'paid' for the delivered
-    // value, NEVER revert-to-payable → the delivered legs are never re-paid = no double-pay) and
-    // surfaces the remainder to re-plan under a NEW transferId (§7). NEVER write the full-amount SENT.
+    // §7 PARTIAL completion: ≥1 leg delivered, then a LATER source was lost to a FOREIGN tx. Write
+    // ALL durable partial state BEFORE closing the intent, so a crash right after completeIntent
+    // cannot lose the shortfall (a completed intent never re-runs): (1) mark any linked settling
+    // request COMMITTED — reconcile resolves it 'paid' for the delivered value and NEVER reverts it to
+    // payable (the delivered legs are never re-paid = no double-pay); idempotent, a no-op for a plain
+    // send; (2) the SENT history for the DELIVERED amount only (never the full amount); (3) the
+    // remainder event so the app re-plans ONLY the shortfall under a NEW transferId (§7). THEN
+    // completeIntent (forward-complete, irreversible per §7; close the server row so listIntents('open')
+    // stops returning it) and surface the PartialSendConflictError.
     if (conflicted) {
+      const remaining = undeliveredAmount;
+      const delivered = BigInt(payload.amount) - remaining;
+      await this.markSettlingCommitted(transferId);
       await this.addToHistory({
         type: 'SENT',
-        amount: deliveredAmount.toString(),
+        amount: (delivered > 0n ? delivered : 0n).toString(),
         coinId: payload.coinId,
         symbol: this.getCoinSymbol(payload.coinId),
         timestamp: Date.now(),
@@ -6628,7 +6620,13 @@ export class PaymentsModule {
         transferId,
         tokenId: spent[0] ? `v2_${spent[0]}` : undefined,
       });
-      const remaining = BigInt(payload.amount) - deliveredAmount;
+      this.deps!.emitEvent('send:partial-remainder', {
+        transferId,
+        remainingAmount: (remaining > 0n ? remaining : 0n).toString(),
+        coinId: payload.coinId,
+        recipient: payload.recipient,
+      });
+      await walletApi.completeIntent(transferId);
       throw new PartialSendConflictError(
         'Resume: part of the payment was delivered before a source was consumed by a concurrent transfer — the delivered legs are final; re-plan ONLY the remainder.',
         transferId,
@@ -6637,6 +6635,9 @@ export class PaymentsModule {
         firstConflict,
       );
     }
+
+    // E.3 uniform close (idempotent; the apply above usually already did it).
+    await walletApi.completeIntent(transferId);
 
     // §10: the SENT record — same dedupKey as the original attempt, so a
     // resume after the history POST is a no-op server-side.
