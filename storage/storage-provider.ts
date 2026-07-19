@@ -78,6 +78,9 @@ export interface HistoryRecord {
   transferId?: string;
   /** Genesis tokenId this entry relates to (used for dedup) */
   tokenId?: string;
+  /** RECEIVED only: the received state (local hash) — makes the dedup key per-state, so a
+   *  genesis token re-acquired at multiple states records each receipt instead of colliding. */
+  stateHash?: string;
   // Sender info (for RECEIVED)
   senderPubkey?: string;
   senderAddress?: string;
@@ -176,8 +179,11 @@ export interface ApplyDeltaOptions {
    * NEVER read from a live inventory view (a concurrent claim can advance the view to a
    * new state before this call). Lets the provider record `knownSpends` as
    * `(tokenId, spentState)`, so a later removal/recovery can distinguish "the state we
-   * spent" from "a state a claim reactivated". Absent for legacy callers → `knownSpends`
-   * falls back to a tokenId-only (state-agnostic) record.
+   * spent" from "a state a claim reactivated". When a token's spent state is absent, the
+   * wallet-api provider records NO knownSpend for it (never a bare tokenId-only record —
+   * that would wrongly block recovery of a reactivated row); its fail-closed on-chain
+   * `isSpent` gate in `recoverRemoved` is the protection instead. Other providers MAY choose
+   * differently, but MUST NOT record a state-agnostic spend that shadows a reactivation.
    */
   spentStates?: { tokenId: string; stateHash: string }[];
 }

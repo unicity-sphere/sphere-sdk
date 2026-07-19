@@ -116,8 +116,13 @@ function isNonOpenConflict(err: unknown): boolean {
  * - type + tokenId → one entry per token per direction
  * - fallback → UUID (no dedup possible)
  */
-function computeHistoryDedupKey(type: string, tokenId?: string, transferId?: string): string {
+function computeHistoryDedupKey(type: string, tokenId?: string, transferId?: string, stateHash?: string): string {
   if (type === 'SENT' && transferId) return `${type}_transfer_${transferId}`;
+  // A genesis token can be RECEIVED more than once at DIFFERENT states (a self-send or an
+  // A→B→A round-trip re-acquires it). Include the received state so each leg is a distinct
+  // receipt instead of upserting the same `RECEIVED_v2_<genesisId>` key — otherwise repeated
+  // re-acquires undercount received history and stop netting against their SENT records.
+  if (tokenId && stateHash) return `${type}_${tokenId}_${stateHash}`;
   if (tokenId) return `${type}_${tokenId}`;
   return `${type}_${randomUUID()}`;
 }
@@ -4314,7 +4319,7 @@ export class PaymentsModule {
   async addToHistory(entry: Omit<TransactionHistoryEntry, 'id' | 'dedupKey'>): Promise<void> {
     this.ensureInitialized();
 
-    const dedupKey = computeHistoryDedupKey(entry.type, entry.tokenId, entry.transferId);
+    const dedupKey = computeHistoryDedupKey(entry.type, entry.tokenId, entry.transferId, entry.stateHash);
     const historyEntry: TransactionHistoryEntry = {
       id: randomUUID(),
       dedupKey,
@@ -5293,26 +5298,35 @@ export class PaymentsModule {
       return 'not-owned';
     }
 
-    // Dedup by (tokenId, stateHash) — NOT genesis-id alone. A re-delivered IDENTICAL
-    // state is ignored, but a NEW state of a token we already hold (a self-send or A→B→A
-    // round-trip direct leg returning at a new state) MUST still be received and recorded,
-    // or the wallet keeps the funds but drops the RECEIVED history. The incoming state
-    // hash is taken via the engine-canonical encoding so it lands in the SAME local-sha256
-    // space as stored tokens' state keys; storeEngineToken→addToken below re-checks the
-    // exact duplicate, tombstones, and older-state replacement authoritatively.
+    // Dedup by (tokenId, stateHash) — NOT genesis-id alone. A re-delivered IDENTICAL state
+    // is ignored, but a NEW state of a token we already hold (a self-send or A→B→A round-trip
+    // direct leg returning at a new state) MUST still be received and recorded, or the wallet
+    // keeps the funds but drops the RECEIVED history. v2 tokens are keyed by `v2_<genesisId>`,
+    // so the currently-held state (if any) is an O(1) lookup.
     const genesisId = engine.tokenId(token);
     const id = `v2_${genesisId}`;
     const incomingStateHash = extractStateHashFromSdkData(bytesToHex(encodeTokenBlob(engine.encodeToken(token))));
-    const alreadyHeldSameState =
-      incomingStateHash !== '' &&
-      [...this.tokens.values()].some(
-        (t) =>
-          extractTokenIdFromSdkData(t.sdkData) === genesisId &&
-          extractStateHashFromSdkData(t.sdkData) === incomingStateHash
-      );
-    if (alreadyHeldSameState) {
-      logger.debug('Payments', `V2 transfer ${id.slice(0, 16)}... (same state) already present, skipping`);
-      return 'duplicate';
+    const held = this.tokens.get(id);
+    if (held) {
+      const heldStateHash = extractStateHashFromSdkData(held.sdkData);
+      if (incomingStateHash !== '' && incomingStateHash === heldStateHash) {
+        logger.debug('Payments', `V2 transfer ${id.slice(0, 16)}... (same state) already present, skipping`);
+        return 'duplicate';
+      }
+      // A DIFFERENT state of a token we ALREADY hold. Accepting it means addToken will
+      // REPLACE the held state (CASE 2). That is correct for a legitimate re-acquire (the
+      // incoming state is the live unspent tip), but a delayed/replayed OLDER, already-spent
+      // state would otherwise swap the spendable state for a phantom spent one — and
+      // mergeLazyInventory won't repair it (it skips genesis ids already in memory). verify()
+      // is cryptographic only; isSpent() is the on-chain unspent check. So gate the replacement:
+      // reject the incoming state if it is already consumed on-chain (Codex P1 on #687).
+      if (await engine.isSpent(token)) {
+        logger.warn(
+          'Payments',
+          `V2 transfer ${id.slice(0, 16)}... is an already-spent state of a held token — rejecting stale/replayed delivery`
+        );
+        return 'duplicate';
+      }
     }
 
     const { uiToken, added } = await this.storeEngineToken(engine, token);
@@ -5350,6 +5364,9 @@ export class PaymentsModule {
       ...(senderNametag !== undefined ? { senderNametag } : {}),
       memo: payload.memo,
       tokenId: id,
+      // Per-state receipt key (Codex #687 P2): a genesis token re-acquired at multiple
+      // states (self-send / round-trip) records each leg instead of upserting one key.
+      ...(incomingStateHash !== '' ? { stateHash: incomingStateHash } : {}),
     });
     return 'stored';
   }

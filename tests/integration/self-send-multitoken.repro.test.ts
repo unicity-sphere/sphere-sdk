@@ -35,7 +35,8 @@
  *     just-claimed ACTIVE row to removed/unevidenced. Balance drops by 2 and
  *     addKnownSpends() blocks recoverRemoved() from ever resurrecting it.
  *
- * Both tests are EXPECTED TO FAIL on the current code — they are bug repros.
+ * Both tests reproduce the bug: they FAIL on the pre-fix revision (main) and PASS on the
+ * state-aware inventory reconciliation fix. They are regression guards, not xfail tests.
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';

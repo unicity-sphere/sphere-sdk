@@ -566,8 +566,7 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
     });
     // Record knownSpends keyed by (tokenId, PROTOCOL spent state) from the caller's
     // AUTHORITATIVE spentStates — never from this.view (a concurrent claim can have
-    // advanced the view's state before this call). A legacy caller with no spentStates
-    // falls back to a bare tokenId record (state-agnostic).
+    // advanced the view's state before this call).
     const spentState = new Map((opts?.spentStates ?? []).map((s) => [s.tokenId, s.stateHash]));
     // Record a COMPOSITE (tokenId, protocolState) knownSpend for each source whose spent
     // state the caller supplied. Do NOT fall back to a BARE tokenId when it is absent: a
