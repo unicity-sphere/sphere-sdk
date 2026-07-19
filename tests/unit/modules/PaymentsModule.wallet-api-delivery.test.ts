@@ -1001,7 +1001,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(fake.getRow(SENDER.chainPubkey, src)).toMatchObject({ status: 'active' }); // source not re-spent
   });
 
-  it('resume of an already-certified source records the spend instead of wedging on a conflict (§3.1 #621)', async () => {
+  it('audit#4: resume of a single source lost to a FOREIGN transfer ABORTS (conflicted) — never falsely completes (§8.1/§7; reverses #621)', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-rs-621');
     const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
@@ -1015,18 +1015,20 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
       encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)),
     );
 
-    // The original send already certified (and delivered) this source — the intent only failed to
-    // close on a later step. Re-running the engine on the spent source raises TransferConflictError.
-    // Old behavior wedged (conflicted + re-certify forever); the fix records the spend and completes.
+    // §8.1: engine.transfer returns the existing proof for OUR OWN resume (a hash-MATCH, no throw);
+    // a TransferConflictError means a DIFFERENT (foreign) transaction consumed the source — this leg
+    // delivered NOTHING. With nothing delivered, resume must ABORT and re-plan the FULL amount (§7),
+    // NOT record the spend + complete (the #621 false-paid this reverses).
     vi.spyOn(sender.engine, 'transfer').mockRejectedValue(
       new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent'),
     );
 
     const outcome = await sender.module.resumeOpenIntents();
-    expect(outcome.resumed).toEqual([transferId]);
-    expect(outcome.conflicted).toEqual([]);
-    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'removed' });
-    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
+    expect(outcome.conflicted).toContain(transferId);
+    expect(outcome.resumed).not.toContain(transferId);
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'aborted' });
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'active' }); // not falsely removed
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(0);
   });
 
   it('#631: a proof-fetch failure AFTER certification keeps the intent OPEN (resume seed survives; no double-spend)', async () => {
@@ -1088,7 +1090,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(fake.getIntent(SENDER.chainPubkey, transferId!)).toMatchObject({ status: 'aborted' });
   });
 
-  it('resume of an already-certified SPLIT source records the spend instead of wedging (#622 review)', async () => {
+  it('audit#4: resume of a split-only source lost to a FOREIGN transfer ABORTS (conflicted) — never falsely completes (§8.1/§7; reverses #622)', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-rs-split-621');
     const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
@@ -1109,19 +1111,61 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
       encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)),
     );
 
-    // The original send already certified the split — re-running engine.split conflicts. Without the
-    // #622-review fix this bubbles up, aborts, and wedges; the fix records the spend and completes.
+    // A TransferConflictError from engine.split = the split SOURCE was consumed by a DIFFERENT
+    // (foreign) transaction (§8.1). With no direct legs, NOTHING was delivered → resume must ABORT
+    // and re-plan the full amount (§7), never record the spend + complete (the #622 false-paid).
     vi.spyOn(sender.engine, 'split').mockRejectedValue(
       new TransferConflictError('TRANSACTION_HASH_MISMATCH: split source already spent'),
     );
 
     const outcome = await sender.module.resumeOpenIntents();
-    expect(outcome.resumed).toEqual([transferId]);
-    expect(outcome.conflicted).toEqual([]);
-    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'removed' });
+    expect(outcome.conflicted).toContain(transferId);
+    expect(outcome.resumed).not.toContain(transferId);
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'aborted' });
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'active' }); // not falsely removed
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(0);
+  });
+
+  it('audit#4 (Codex P1): MULTI-SOURCE partial — the delivered leg is retained (never double-paid); only the remainder is surfaced', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-rs-partial');
+    const g0 = await seedServerToken(fake, sender, SENDER, 600n); // leg 0 — delivers
+    const g1 = await seedServerToken(fake, sender, SENDER, 400n); // leg 1 — lost to a foreign tx
+    await sender.module.load();
+
+    const transferId = crypto.randomUUID();
+    const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [g0, g1] };
+    sender.client.setIdentity(SENDER);
+    await sender.client.putIntent(
+      transferId,
+      encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)),
+    );
+
+    // Resume: leg 0 (opIndex 0) transfers for real (delivers 600); leg 1 (opIndex 1) was consumed by
+    // a FOREIGN tx → engine.transfer conflicts (§8.1). This is exactly the case a bare abort would
+    // DOUBLE-PAY: aborting the whole intent makes a linked request payable and re-pays the delivered
+    // leg 0. The fix forward-completes leg 0 and surfaces ONLY the remainder.
+    const realTransfer = sender.engine.transfer.bind(sender.engine);
+    vi.spyOn(sender.engine, 'transfer').mockImplementation(async (p, o) => {
+      if (o?.opIndex === 1) throw new TransferConflictError('TRANSACTION_HASH_MISMATCH: leg 1 source lost');
+      return realTransfer(p, o);
+    });
+    const applySpy = vi.spyOn(sender.client, 'applyInventoryDelta');
+
+    const outcome = await sender.module.resumeOpenIntents();
+
+    // §7 forward-completion: the delivered leg is FINAL. The intent is RESUMED (completed), NEVER
+    // conflicted — so a linked settling request resolves 'paid' and is NEVER reverted to payable
+    // (no double-pay of leg 0). Only leg 0 (g0) is recorded spent — never the conflicted leg 1 (g1).
+    expect(outcome.resumed).toContain(transferId);
+    expect(outcome.conflicted).not.toContain(transferId);
+    const applyForT = applySpy.mock.calls.find((c) => (c[0] as { transferId?: string })?.transferId === transferId);
+    expect((applyForT?.[0] as { spent: string[] }).spent).toEqual([g0]); // delivered leg only — EXCLUDES the conflicted g1
     expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
-    // The change-token limitation is surfaced (prompts a resync) — never silently lost.
-    expect(sender.emitEvent.mock.calls.some((c) => c[0] === 'inventory:conflict')).toBe(true);
+    // The undelivered remainder (1000 − 600 = 400) is SURFACED for a re-plan under a new transferId —
+    // never re-sent from here, never rolled into a full-amount re-pay.
+    const evt = sender.emitEvent.mock.calls.find((c) => c[0] === 'send:partial-remainder');
+    expect(evt?.[1]).toMatchObject({ transferId, remainingAmount: '400', recipient: RECIPIENT.chainPubkey });
   });
 
   it('legacy (v:1, no store): a resume that hits SplitCheckpointLostError records the spend, never wedges', async () => {

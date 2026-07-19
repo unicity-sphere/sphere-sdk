@@ -423,6 +423,7 @@ export type SphereEventType =
   | 'storage:degraded'
   | 'inventory:conflict'
   | 'split:checkpoint-stuck'
+  | 'send:partial-remainder'
   | 'delivery:undeliverable'
   | 'delivery:deferred'
   | 'walletapi:session'
@@ -545,6 +546,13 @@ export interface SphereEventMap {
    * drain remedy), NOT a silent retry. Distinct from a transient resume failure.
    */
   'split:checkpoint-stuck': { transferId: string; code: string; error: string };
+  /**
+   * §7 partial completion: a resumed multi-source send delivered ≥1 leg, then a LATER source was
+   * lost to a foreign tx. The delivered legs are final (recorded, request resolved 'paid'); the app
+   * should re-plan ONLY `remainingAmount` to `recipient` under a NEW transferId — never the full
+   * amount (that would double-pay the delivered legs).
+   */
+  'send:partial-remainder': { transferId: string; remainingAmount: string; coinId: string; recipient: string };
   /**
    * A journaled finished-but-undelivered v2 transfer blob (#517) has exhausted
    * its bounded replay budget and is now POISON: it stays journaled (the deposit
