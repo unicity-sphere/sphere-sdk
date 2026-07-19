@@ -586,10 +586,17 @@ export class WalletApiClient {
   ): Promise<unknown> {
     const idempotent = opts?.idempotent ?? false;
     if (!this.jwt) await this.signIn();
+    const usedJwt = this.jwt;
     let res = await this.rawFetchWithRetry(method, path, body, this.jwt!, idempotent);
     if (res.status === 401) {
-      this.jwt = null;
-      await this.signIn();
+      // A concurrent request may already have refreshed the JWT since ours went
+      // out. Only drive a (re-)auth if `this.jwt` is still the token we used (or
+      // a peer's in-flight refresh nulled it — `signIn()` then coalesces onto
+      // that same refresh); if a peer already rotated it to a fresh token, reuse
+      // that token and retry once. This avoids a redundant second /auth/refresh
+      // and never nulls a peer's freshly-obtained JWT.
+      if (this.jwt === usedJwt) this.jwt = null;
+      if (!this.jwt) await this.signIn();
       res = await this.rawFetchWithRetry(method, path, body, this.jwt!, idempotent);
     }
     if (res.status === 204) return null;

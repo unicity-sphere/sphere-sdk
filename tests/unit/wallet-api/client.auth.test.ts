@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { WalletApiClient, ChallengeTemplateError, WalletApiError, verifyChallengeTemplate, AUTH_CHALLENGE_PREFIX } from '../../../wallet-api';
+import { WalletApiClient, ChallengeTemplateError, WalletApiError, verifyChallengeTemplate, AUTH_CHALLENGE_PREFIX, type FetchLike } from '../../../wallet-api';
 import { FakeWalletApi } from '../../support/fake-wallet-api';
 import { MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
 
@@ -103,6 +103,47 @@ describe('WalletApiClient — auth (§4)', () => {
     // §4 rotation: the stored refresh token changed.
     expect(storedRefreshToken()).not.toBe(firstRefresh);
     expect(fake.challengeRequests).toBe(1); // no second challenge cycle needed
+  });
+
+  it('concurrent requests after ONE expiry drive EXACTLY one refresh — a peer reuses the rotated JWT, never re-refreshes or clobbers it', async () => {
+    // Regression for the auth double-refresh race (it surfaced as the flaky
+    // G3/J6 idle-resume test: load()'s fire-and-forget pumps race the resume op,
+    // so several authed requests carry the same stale JWT). Force the exact
+    // interleaving deterministically: two authed GETs are dispatched bearing the
+    // SAME stale JWT; the FIRST's 401 → /auth/refresh → retry completes BEFORE
+    // the SECOND's 401 is processed. A correct client makes the second REUSE the
+    // peer's freshly-rotated token — ONE refresh for one expiry — and must NOT
+    // null that fresh token (which would send the retry unauthenticated → a
+    // spurious UNAUTHORIZED). Pre-fix this drove a redundant second refresh.
+    const liveFetch: FetchLike = (u, init) => (globalThis as unknown as { fetch: FetchLike }).fetch(u, init);
+    let releaseSecond!: () => void;
+    const firstRefreshLanded = new Promise<void>((r) => { releaseSecond = r; });
+    let authedGets = 0;
+    const gatedFetch: FetchLike = async (u, init) => {
+      const isAuthedGet = (init?.method ?? 'GET') === 'GET' && !!init?.headers?.['authorization'];
+      // Hold the SECOND authed GET until the first request's refresh has landed,
+      // so its 401 is handled with the client's JWT ALREADY rotated by the peer.
+      if (isAuthedGet && ++authedGets === 2) await firstRefreshLanded;
+      const res = await liveFetch(u, init);
+      if (u.endsWith('/v1/auth/refresh')) releaseSecond();
+      return res;
+    };
+
+    const raced = new WalletApiClient({
+      baseUrl, network: fake.network, deviceId: 'dev-1', storage: new MemoryKeyValueStore(), fetchFn: gatedFetch,
+    });
+    raced.setIdentity(identity);
+    await raced.signIn(); // challenge→verify (POSTs); jwt = J0. Not counted as an authed GET.
+    const refreshesBefore = fake.refreshRequests;
+    fake.expireAccessTokens(); // J0 is now stale on the server
+
+    // Two authed GETs fired concurrently — both capture the stale J0 before any refresh.
+    const [a, b] = await Promise.all([raced.getBalances(), raced.getBalances()]);
+
+    expect(a).toEqual([]);
+    expect(b).toEqual([]); // both succeed — the peer's rotated token was reused, not clobbered
+    expect(fake.refreshRequests - refreshesBefore).toBe(1); // ONE refresh for one expiry, not two
+    expect(fake.challengeRequests).toBe(1); // and no challenge→verify fallback
   });
 
   it('rotation-reuse revocation falls back to a fresh challenge cycle (§4 reuse detection)', async () => {
