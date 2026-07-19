@@ -400,6 +400,40 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     });
   });
 
+  it('audit#2: two concurrent payPaymentRequest calls must NOT double-pay (payer spends the amount ONCE)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const requester = makeWalletApiWallet(baseUrl, fake.network, REQUESTER, 'pr-dbl-1');
+    const payer = makeWalletApiWallet(baseUrl, fake.network, PAYER, 'pr-dbl-2');
+    // Payer holds TWO whole 1000-tokens (2000 total). Two concurrent sends can each pick a
+    // DIFFERENT token — the reservation ledger only blocks two sends selecting the SAME coin,
+    // never two coins fulfilling one request.
+    await seedServerToken(fake, payer, PAYER, 1000n);
+    await seedServerToken(fake, payer, PAYER, 1000n);
+    await requester.module.load();
+    await payer.module.load();
+    const uct = async (w: Wallet): Promise<bigint> =>
+      (await w.client.getBalances()).find((b) => b.coinId === UCT)?.total ?? 0n;
+    expect(await uct(payer)).toBe(2000n);
+
+    const created = await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '1000', coinId: UCT });
+    await payer.module.syncPaymentRequests();
+    expect(payer.module.getPaymentRequests({ status: 'pending' })).toHaveLength(1);
+
+    // Double-tap / two sessions: fire the SAME request twice concurrently. payPaymentRequest flips
+    // the request to 'accepted' SYNCHRONOUSLY before it awaits send(), and the guard re-admits
+    // 'accepted' (intended for retry-after-failure), so pre-fix BOTH calls enter send() and each
+    // spends a different token — the payer is charged twice for one request.
+    await Promise.allSettled([
+      payer.module.payPaymentRequest(created.requestId!),
+      payer.module.payPaymentRequest(created.requestId!),
+    ]);
+
+    // Money invariant (fix-agnostic): ONE request paid ONCE — the payer spends exactly 1000 and
+    // keeps the other 1000-token. Pre-fix this is 0n (both tokens spent = double-pay).
+    expect(await uct(payer)).toBe(1000n);
+    expect(fake.getPaymentRequest(created.requestId!)?.status).toBe('paid');
+  });
+
   describe('#441 deferred-paid: a possibly-committed pay HOLDS the request settling until the transfer resolves (no double-pay on reload)', () => {
     const SETTLING_KEY = (net: string) => `wallet-api-pr:settling:${net}:${PAYER.chainPubkey}`;
 
