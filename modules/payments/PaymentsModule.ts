@@ -1163,6 +1163,15 @@ export class PaymentsModule {
   // Token Spend Queue — concurrent send race condition prevention
   private readonly reservationLedger = new TokenReservationLedger();
   private readonly spendPlanner = new SpendPlanner();
+  /**
+   * Per-request single-flight for {@link payPaymentRequest}. The pay flow flips the request to
+   * 'accepted' before it awaits send(), and the status guard re-admits 'accepted' (intended for a
+   * sequential retry-after-failure) — so a concurrent double-tap / second session would otherwise
+   * enter send() a second time and DOUBLE-PAY (each send picks a different token; the reservation
+   * ledger is coin-scoped, not request-scoped). Concurrent calls for the same requestId coalesce
+   * onto the first in-flight pay; the entry is cleared when it settles, so a later retry is unaffected.
+   */
+  private readonly payInFlight = new Map<string, Promise<TransferResult>>();
   private spendQueue: SpendQueue;
   /** Cache of parsed SdkToken data for synchronous queue re-evaluation */
   private readonly parsedTokenCache: Map<string, ParsedTokenEntry> = new Map();
@@ -3076,6 +3085,24 @@ export class PaymentsModule {
    * Convenience method that accepts, sends, and marks as paid
    */
   async payPaymentRequest(requestId: string, memo?: string): Promise<TransferResult> {
+    // Single-flight: a concurrent second call for the same request coalesces onto the first pay
+    // instead of issuing a second send (double-pay). Cleared in the inner's finally so a later
+    // sequential retry — the reason the status guard re-admits 'accepted' — still proceeds.
+    // NOTE: a coalesced caller receives the FIRST caller's result, so if concurrent callers pass
+    // different `memo` values only the first is used — memo is per-request, not per-call, under
+    // concurrency (a distinct memo needs a distinct request, or a sequential call).
+    const inFlight = this.payInFlight.get(requestId);
+    if (inFlight) return inFlight;
+    const pay = this.payPaymentRequestInner(requestId, memo);
+    this.payInFlight.set(requestId, pay);
+    try {
+      return await pay;
+    } finally {
+      this.payInFlight.delete(requestId);
+    }
+  }
+
+  private async payPaymentRequestInner(requestId: string, memo?: string): Promise<TransferResult> {
     const request = this.paymentRequests.find((r) => r.id === requestId);
     if (!request) {
       throw new SphereError(`Payment request not found: ${requestId}`, 'VALIDATION_ERROR');
