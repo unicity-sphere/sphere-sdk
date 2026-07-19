@@ -203,6 +203,21 @@ describe('WalletApiClient — intents (E.3, §16)', () => {
     expect(await client.getLocalIntent(tidZ)).not.toBeNull();
   });
 
+  it('audit: a queued intent mutation writes to the SUBMITTING identity, not one setIdentity() switched to mid-flight', async () => {
+    const other = testIdentity(52);
+    // A submits putIntent; the mutex DEFERS the local RMW to a microtask. The identity then switches
+    // to B before that RMW runs. The write must land in A's blob (the submitter) — deriving the key
+    // at run time would put A's intent into B's blob (A loses its restore backstop; B's is polluted).
+    const pending = client.putIntent(tid, envelope('{"a":1}')).catch(() => undefined); // the post-switch PUT may fail; ignore
+    client.setIdentity(other);
+    await pending;
+
+    client.setIdentity(other);
+    expect(await client.getLocalIntent(tid)).toBeNull(); // NOT in B's blob (pre-fix: present)
+    client.setIdentity(identity);
+    expect(await client.getLocalIntent(tid)).not.toBeNull(); // in A's blob (the submitter)
+  });
+
   it('the server rejects a non-envelope or oversize intent payload (§8.3)', async () => {
     await expect(client.putIntent(tid, 'plaintext — not an envelope')).rejects.toMatchObject({
       code: 'VALIDATION',
