@@ -402,14 +402,22 @@ export class SphereTokenEngine implements ITokenEngine {
     const firstRejected = settled.findIndex((r) => r.status === 'rejected');
     if (firstRejected !== -1) {
       const cleanReason = (settled[firstRejected] as PromiseRejectedResult).reason;
-      if (settled.some((r) => r.status === 'fulfilled')) {
-        throw new ProofUnconfirmedError(
-          'a split mint leg certified while a sibling leg failed — keep the intent open; resume ' +
-            'completes all legs idempotently from the burn checkpoint (#684 parallel fan-out)',
-          cleanReason,
-        );
-      }
-      throw cleanReason;
+      //  3. Else (every rejection is clean — none keep-open) the burn is STILL committed +
+      //     checkpointed (resolveBurntToken, above), whether or not a sibling certified. Surfacing
+      //     a plain abortable clean error would let PaymentsModule abort the intent and STRAND the
+      //     entire source value — the burn cannot be undone and an aborted intent never re-runs. So
+      //     EVERY post-burn mint failure is keep-open: resume re-runs all legs idempotently from the
+      //     burn checkpoint. (A clean mint reject after a valid, value-conserving burn is transient —
+      //     e.g. a shard reconfiguration — not a permanent validation failure; keep-open leaves the
+      //     funds RECOVERABLE, abort loses them.)
+      throw new ProofUnconfirmedError(
+        settled.some((r) => r.status === 'fulfilled')
+          ? 'a split mint leg certified while a sibling leg failed — keep the intent open; resume ' +
+              'completes all legs idempotently from the burn checkpoint (#684 parallel fan-out)'
+          : 'every split mint leg failed after the burn certified — keep the intent open; resume ' +
+              're-runs all legs idempotently from the burn checkpoint (post-burn must never abort)',
+        cleanReason,
+      );
     }
     const outputs = settled.map((r) => (r as PromiseFulfilledResult<SphereToken>).value);
     return { outputs };

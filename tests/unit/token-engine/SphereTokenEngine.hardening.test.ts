@@ -140,7 +140,7 @@ describe('SphereTokenEngine — hardening / edge cases', () => {
     await expect(e.split({ token: src, outputs: twoOutputs(self) })).rejects.toBeInstanceOf(SplitCheckpointLostError);
   }, 30000);
 
-  it('parallel split: when EVERY leg fails cleanly (nothing certified) surfaces the lowest-index clean error — no spurious keep-open (#684)', async () => {
+  it('parallel split: when EVERY mint leg fails cleanly after the burn CERTIFIED, keep the intent OPEN — aborting would strand the burnt source (audit#1)', async () => {
     const e = createTestEngine();
     const self = e.getIdentity().chainPubkey;
     const src = await e.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN_A, amount: 100n }] } });
@@ -148,12 +148,19 @@ describe('SphereTokenEngine — hardening / edge cases', () => {
     let call = 0;
     vi.spyOn(proto, 'mintSplitOutput').mockImplementation(function (this: unknown) {
       call += 1;
+      // Both mint legs clean-reject; NOTHING mints. But the burn already certified (below).
       return Promise.reject(new SphereError(`leg-${call - 1} failed`, call === 1 ? 'AGGREGATOR_ERROR' : 'TRANSPORT_ERROR'));
     });
-    // No leg committed → the split genuinely failed → surface the lowest-index CLEAN error and
-    // let PaymentsModule abort. Guards against over-correcting into a keep-open that would strand
-    // a genuinely-failed intent open forever.
-    await expect(e.split({ token: src, outputs: twoOutputs(self) })).rejects.toMatchObject({ code: 'AGGREGATOR_ERROR' });
+    // The burn commits on-chain BEFORE the mint fan-out (resolveBurntToken). Previously this case
+    // surfaced the abortable clean error on the theory "no leg committed → the split failed" — but
+    // that ignores the BURN: the source is already spent. Surfacing an abortable error lets
+    // PaymentsModule abort the intent and STRAND the entire source (the burn cannot be undone, an
+    // aborted intent never re-runs). Every post-burn failure must be keep-open so resume re-runs the
+    // mints from the burn checkpoint — funds recoverable, not lost.
+    await expect(e.split({ token: src, outputs: twoOutputs(self) })).rejects.toBeInstanceOf(ProofUnconfirmedError);
+    // Proof the burn really committed (this is exactly why an abort here would strand the funds):
+    // the source is now spent on-chain even though no mint certified.
+    expect(await e.isSpent(src)).toBe(true);
   }, 30000);
 
   it('rejects minting a negative or malformed value', async () => {
