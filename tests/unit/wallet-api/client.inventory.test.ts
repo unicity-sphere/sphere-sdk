@@ -187,6 +187,22 @@ describe('WalletApiClient — intents (E.3, §16)', () => {
     expect(fake.getIntent(identity.chainPubkey, tid)).toEqual({ payload, status: 'open' });
   });
 
+  it('audit#5: concurrent putIntent must not clobber each other locally (the restore/double-pay backstop survives)', async () => {
+    const tidY = 'bbbbbbbb-0000-4000-8000-00000000000a';
+    const tidZ = 'bbbbbbbb-0000-4000-8000-00000000000b';
+    // Two intents PUT concurrently. putIntent does a read-modify-write of the WHOLE local-intents
+    // blob (get → add the key → set) with an await in between; without the mutex both read the same
+    // snapshot and the second's set clobbers the first — dropping one intent's LOCAL copy, which is
+    // the #516/E.3 restore + double-pay backstop (a dropped copy = an un-restorable committed send).
+    await Promise.all([
+      client.putIntent(tidY, envelope('{"y":1}')),
+      client.putIntent(tidZ, envelope('{"z":1}')),
+    ]);
+
+    expect(await client.getLocalIntent(tidY)).not.toBeNull(); // pre-fix: one of these is null (clobbered)
+    expect(await client.getLocalIntent(tidZ)).not.toBeNull();
+  });
+
   it('the server rejects a non-envelope or oversize intent payload (§8.3)', async () => {
     await expect(client.putIntent(tid, 'plaintext — not an envelope')).rejects.toMatchObject({
       code: 'VALIDATION',

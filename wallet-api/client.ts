@@ -854,21 +854,42 @@ export class WalletApiClient {
     await this.storage.set(this.intentsKey(), JSON.stringify(intents));
   }
 
+  /**
+   * Serialize every read-modify-write of the whole local-intents blob. Each mutator (putIntent,
+   * setLocalIntentStatus, removeLocalIntent, backstopProgress) does get→parse→mutate→set with an
+   * await in between; run concurrently they each start from the SAME snapshot and the last writer
+   * clobbers the others' entries — dropping, e.g., a split's freshly-persisted burn checkpoint
+   * (→ SplitCheckpointLostError / stranded funds after a restore). A promise-chain mutex (like the
+   * provider's overlayLock) runs each RMW after the previous settles; a failure never wedges the
+   * chain. Wrap ONLY the local RMW — never a network call — so the lock is held briefly.
+   */
+  private intentsLock: Promise<unknown> = Promise.resolve();
+  private withIntentsLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.intentsLock.then(fn, fn);
+    this.intentsLock = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
   private async setLocalIntentStatus(
     transferId: string,
     status: LocalIntent['status'],
     opts: { abortPending?: boolean } = {}
   ): Promise<void> {
-    const intents = await this.readLocalIntents();
-    const intent = intents[transferId];
-    if (!intent) return;
-    if (intent.status === 'completed') return; // completed never reverts (§16)
-    const abortPending = opts.abortPending === true;
-    if (intent.status === status && (intent.abortPending === true) === abortPending) return;
-    intent.status = status;
-    if (abortPending) intent.abortPending = true;
-    else delete intent.abortPending;
-    await this.writeLocalIntents(intents);
+    return this.withIntentsLock(async () => {
+      const intents = await this.readLocalIntents();
+      const intent = intents[transferId];
+      if (!intent) return;
+      if (intent.status === 'completed') return; // completed never reverts (§16)
+      const abortPending = opts.abortPending === true;
+      if (intent.status === status && (intent.abortPending === true) === abortPending) return;
+      intent.status = status;
+      if (abortPending) intent.abortPending = true;
+      else delete intent.abortPending;
+      await this.writeLocalIntents(intents);
+    });
   }
 
   /**
@@ -881,15 +902,17 @@ export class WalletApiClient {
    * double-pay/restore backstop.
    */
   async removeLocalIntent(transferId: string): Promise<void> {
-    const intents = await this.readLocalIntents();
-    const intent = intents[transferId];
-    if (!intent) return;
-    // Only a still-'open' copy with no pending server abort is safe to drop:
-    // 'completed' never reverts (§16), and an 'aborted'+abortPending copy is a
-    // #516 backstop whose server row may still be open.
-    if (intent.status !== 'open' || intent.abortPending === true) return;
-    delete intents[transferId];
-    await this.writeLocalIntents(intents);
+    return this.withIntentsLock(async () => {
+      const intents = await this.readLocalIntents();
+      const intent = intents[transferId];
+      if (!intent) return;
+      // Only a still-'open' copy with no pending server abort is safe to drop:
+      // 'completed' never reverts (§16), and an 'aborted'+abortPending copy is a
+      // #516 backstop whose server row may still be open.
+      if (intent.status !== 'open' || intent.abortPending === true) return;
+      delete intents[transferId];
+      await this.writeLocalIntents(intents);
+    });
   }
 
   /**
@@ -906,16 +929,18 @@ export class WalletApiClient {
     opts: { requiresSeedClose?: boolean } = {}
   ): Promise<void> {
     const requiresSeedClose = opts.requiresSeedClose === true;
-    const intents = await this.readLocalIntents();
-    if (!intents[transferId]) {
-      intents[transferId] = {
-        payload: payloadEnvelope,
-        status: 'open',
-        createdAt: this.now(),
-        ...(requiresSeedClose ? { requiresSeedClose: true } : {}),
-      };
-      await this.writeLocalIntents(intents);
-    }
+    await this.withIntentsLock(async () => {
+      const intents = await this.readLocalIntents();
+      if (!intents[transferId]) {
+        intents[transferId] = {
+          payload: payloadEnvelope,
+          status: 'open',
+          createdAt: this.now(),
+          ...(requiresSeedClose ? { requiresSeedClose: true } : {}),
+        };
+        await this.writeLocalIntents(intents);
+      }
+    });
     await this.requestJson('PUT', `/v1/intents/${transferId}`, this.intentPutBody(payloadEnvelope, requiresSeedClose));
   }
 
@@ -964,13 +989,15 @@ export class WalletApiClient {
 
   /** Persist the exact envelope locally before the first POST (dual persistence — E.3/E.4). */
   private async backstopProgress(transferId: string, opIndex: number, payloadEnvelope: string): Promise<void> {
-    const intents = await this.readLocalIntents();
-    const intent = intents[transferId];
-    if (!intent) return; // no local intent (fresh-device append) — the server row is the seed
-    const progress = intent.progress ?? {};
-    if (progress[opIndex] === payloadEnvelope) return;
-    intent.progress = { ...progress, [opIndex]: payloadEnvelope };
-    await this.writeLocalIntents(intents);
+    return this.withIntentsLock(async () => {
+      const intents = await this.readLocalIntents();
+      const intent = intents[transferId];
+      if (!intent) return; // no local intent (fresh-device append) — the server row is the seed
+      const progress = intent.progress ?? {};
+      if (progress[opIndex] === payloadEnvelope) return;
+      intent.progress = { ...progress, [opIndex]: payloadEnvelope };
+      await this.writeLocalIntents(intents);
+    });
   }
 
   /** `GET /v1/intents?status=` — server-side intent list. */
