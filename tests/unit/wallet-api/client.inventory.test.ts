@@ -187,6 +187,37 @@ describe('WalletApiClient — intents (E.3, §16)', () => {
     expect(fake.getIntent(identity.chainPubkey, tid)).toEqual({ payload, status: 'open' });
   });
 
+  it('audit#5: concurrent putIntent must not clobber each other locally (the restore/double-pay backstop survives)', async () => {
+    const tidY = 'bbbbbbbb-0000-4000-8000-00000000000a';
+    const tidZ = 'bbbbbbbb-0000-4000-8000-00000000000b';
+    // Two intents PUT concurrently. putIntent does a read-modify-write of the WHOLE local-intents
+    // blob (get → add the key → set) with an await in between; without the mutex both read the same
+    // snapshot and the second's set clobbers the first — dropping one intent's LOCAL copy, which is
+    // the #516/E.3 restore + double-pay backstop (a dropped copy = an un-restorable committed send).
+    await Promise.all([
+      client.putIntent(tidY, envelope('{"y":1}')),
+      client.putIntent(tidZ, envelope('{"z":1}')),
+    ]);
+
+    expect(await client.getLocalIntent(tidY)).not.toBeNull(); // pre-fix: one of these is null (clobbered)
+    expect(await client.getLocalIntent(tidZ)).not.toBeNull();
+  });
+
+  it('audit: a queued intent mutation writes to the SUBMITTING identity, not one setIdentity() switched to mid-flight', async () => {
+    const other = testIdentity(52);
+    // A submits putIntent; the mutex DEFERS the local RMW to a microtask. The identity then switches
+    // to B before that RMW runs. The write must land in A's blob (the submitter) — deriving the key
+    // at run time would put A's intent into B's blob (A loses its restore backstop; B's is polluted).
+    const pending = client.putIntent(tid, envelope('{"a":1}')).catch(() => undefined); // the post-switch PUT may fail; ignore
+    client.setIdentity(other);
+    await pending;
+
+    client.setIdentity(other);
+    expect(await client.getLocalIntent(tid)).toBeNull(); // NOT in B's blob (pre-fix: present)
+    client.setIdentity(identity);
+    expect(await client.getLocalIntent(tid)).not.toBeNull(); // in A's blob (the submitter)
+  });
+
   it('the server rejects a non-envelope or oversize intent payload (§8.3)', async () => {
     await expect(client.putIntent(tid, 'plaintext — not an envelope')).rejects.toMatchObject({
       code: 'VALIDATION',
