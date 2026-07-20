@@ -34,7 +34,11 @@ export { TokenId } from '@unicitylabs/state-transition-sdk/lib/transaction/Token
 export { TokenType } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenType.js';
 export { TokenSalt } from '@unicitylabs/state-transition-sdk/lib/transaction/TokenSalt.js';
 export type { ITransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/ITransaction.js';
+export { StateMask } from '@unicitylabs/state-transition-sdk/lib/transaction/StateMask.js';
 export { MintJustificationVerifierService } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/MintJustificationVerifierService.js';
+export { TokenIssuanceVerifierService } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/TokenIssuanceVerifierService.js';
+export { VerificationContext } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/VerificationContext.js';
+export type { IVerificationContext } from '@unicitylabs/state-transition-sdk/lib/verification/IVerificationContext.js';
 
 // ── predicates / unlock scripts ─────────────────────────────────────────────
 export type { IPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/IPredicate.js';
@@ -67,19 +71,13 @@ export { PaymentAssetCollection } from '@unicitylabs/state-transition-sdk/lib/pa
 export { TokenSplit } from '@unicitylabs/state-transition-sdk/lib/payment/TokenSplit.js';
 export { SplitTokenRequest } from '@unicitylabs/state-transition-sdk/lib/payment/SplitTokenRequest.js';
 export { SplitToken } from '@unicitylabs/state-transition-sdk/lib/payment/SplitToken.js';
-export { SplitAssetProof } from '@unicitylabs/state-transition-sdk/lib/payment/SplitAssetProof.js';
+export { SplitAllocationProof } from '@unicitylabs/state-transition-sdk/lib/payment/SplitAllocationProof.js';
 export { SplitMintJustification } from '@unicitylabs/state-transition-sdk/lib/payment/SplitMintJustification.js';
 export { SplitMintJustificationVerifier } from '@unicitylabs/state-transition-sdk/lib/payment/SplitMintJustificationVerifier.js';
 
 // ── verification result types ───────────────────────────────────────────────
 export { VerificationStatus } from '@unicitylabs/state-transition-sdk/lib/verification/VerificationStatus.js';
 export { VerificationResult } from '@unicitylabs/state-transition-sdk/lib/verification/VerificationResult.js';
-
-// ── unicity-id (nametag) ────────────────────────────────────────────────────
-export { UnicityId } from '@unicitylabs/state-transition-sdk/lib/unicity-id/UnicityId.js';
-export { UnicityIdMintTransaction } from '@unicitylabs/state-transition-sdk/lib/unicity-id/UnicityIdMintTransaction.js';
-export { CertifiedUnicityIdMintTransaction } from '@unicitylabs/state-transition-sdk/lib/unicity-id/CertifiedUnicityIdMintTransaction.js';
-export { UnicityIdToken } from '@unicitylabs/state-transition-sdk/lib/unicity-id/UnicityIdToken.js';
 
 // ── util ────────────────────────────────────────────────────────────────────
 export { HexConverter } from '@unicitylabs/state-transition-sdk/lib/util/HexConverter.js';

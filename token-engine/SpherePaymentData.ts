@@ -33,10 +33,10 @@ function assertAsset(coinId: CoinId, amount: bigint): void {
   if (!COIN_ID_PATTERN.test(coinId)) {
     throw new SphereError(`Invalid coin id (expected even-length lowercase hex): "${coinId}"`, 'VALIDATION_ERROR');
   }
-  if (amount < 0n) {
-    // Negative bigints silently encode to an empty byte string (decoding back to 0n)
-    // in the SDK's BigintConverter — reject loudly to avoid silent value loss.
-    throw new SphereError(`Asset amount must be non-negative: ${amount.toString()}`, 'VALIDATION_ERROR');
+  if (amount <= 0n) {
+    // The 2.0.0 SDK requires a strictly positive 256-bit asset value; reject
+    // here with the typed sphere error before the raw SDK throw.
+    throw new SphereError(`Asset amount must be positive: ${amount.toString()}`, 'VALIDATION_ERROR');
   }
 }
 
@@ -69,6 +69,9 @@ export class SpherePaymentData implements IPaymentData {
 
   /** Build from a sphere-domain value (hex coin id → bigint amount) + optional opaque memo. */
   public static fromValue(value: SphereValue, memo: Uint8Array | null = null): SpherePaymentData {
+    if (value.assets.length === 0) {
+      throw new SphereError('SpherePaymentData requires at least one asset', 'VALIDATION_ERROR');
+    }
     const assets = value.assets.map((a) => sphereAssetToSdk(a.coinId, a.amount));
     return new SpherePaymentData(PaymentAssetCollection.create(...assets), memo);
   }

@@ -29,10 +29,10 @@ describe('SpherePaymentData', () => {
     expect(SpherePaymentData.fromCBOR(bytes).memo).toBeNull();
   });
 
-  it('round-trips multiple coins incl. zero and very large amounts', async () => {
+  it('round-trips multiple coins incl. very large amounts', async () => {
     const value: SphereValue = {
       assets: [
-        { coinId: COIN_A, amount: 0n },
+        { coinId: COIN_A, amount: 1n },
         { coinId: COIN_B, amount: 2n ** 70n },
       ],
     };
@@ -40,10 +40,14 @@ describe('SpherePaymentData', () => {
     expect(SpherePaymentData.fromCBOR(bytes).toValue()).toEqual(value);
   });
 
-  it('round-trips an empty collection', async () => {
-    const value: SphereValue = { assets: [] };
-    const bytes = await SpherePaymentData.fromValue(value).encode();
-    expect(SpherePaymentData.fromCBOR(bytes).toValue()).toEqual(value);
+  it('rejects a zero-amount asset (2.0.0: values are strictly positive)', () => {
+    expect(() => SpherePaymentData.fromValue({ assets: [{ coinId: COIN_A, amount: 0n }] })).toThrow(
+      /Asset amount must be positive/,
+    );
+  });
+
+  it('rejects an empty collection (2.0.0: 1..256 assets)', () => {
+    expect(() => SpherePaymentData.fromValue({ assets: [] })).toThrow(/at least one asset/);
   });
 
   it('balanceOf returns the coin amount, or 0n for an absent coin', () => {
@@ -94,7 +98,9 @@ describe('SpherePaymentData', () => {
   });
 
   it('rejects a negative amount (would silently encode to 0n otherwise)', () => {
-    expect(() => SpherePaymentData.fromValue({ assets: [{ coinId: COIN_A, amount: -1n }] })).toThrow(/non-negative/);
+    expect(() => SpherePaymentData.fromValue({ assets: [{ coinId: COIN_A, amount: -1n }] })).toThrow(
+      /must be positive/,
+    );
   });
 
   it('rejects a malformed coin id', () => {

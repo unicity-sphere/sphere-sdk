@@ -24,6 +24,7 @@ import {
   type RootTrustBase,
   Token,
   type TransferTransaction,
+  type VerificationContext,
 } from './sdk';
 
 /** Checkpoint payload version (the CBOR array's first element). */
@@ -32,11 +33,12 @@ const CHECKPOINT_VERSION = 1;
  * The base-SDK pin whose CBOR wire form governs byte-stability — recorded for a LOUD drift
  * diagnosis only (byte-inequality of the stored burn tx is the actual guard). Bump with the pin.
  */
-const CHECKPOINT_SDK_VERSION = '@unicitylabs/state-transition-sdk@2.0.0-rc.68bc1e5';
+const CHECKPOINT_SDK_VERSION = '@unicitylabs/state-transition-sdk@2.0.0';
 
 export interface CheckpointDeps {
   readonly trustBase: RootTrustBase;
   readonly predicateVerifier: PredicateVerifierService;
+  readonly verificationContext: VerificationContext;
 }
 
 /** Constant-length-agnostic byte-equality (no early-exit timing concern — these are public bytes). */
@@ -154,7 +156,7 @@ export async function burntTokenFromCheckpoint(
   // raw-error escapes (a future wire migration must still surface the typed keep-open error).
   let burntToken: Token;
   try {
-    burntToken = await sourceToken.transfer(deps.trustBase, deps.predicateVerifier, burnCertified);
+    burntToken = await sourceToken.transfer(burnCertified, deps.verificationContext);
   } catch (err) {
     throw new SplitCheckpointLostError('split checkpoint could not rebuild the burnt token', err);
   }

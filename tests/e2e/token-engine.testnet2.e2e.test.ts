@@ -95,35 +95,4 @@ describe.runIf(!!API_KEY)('token-engine e2e — live testnet2 (networkId 4)', ()
     expect(engine.tokenId(restored)).toBe(engine.tokenId(minted));
     expect(engine.balanceOf(restored, COIN)).toBe(250n);
   });
-
-  it('mints a self-issued Unicity ID token, idempotently, and round-trips its CBOR', async () => {
-    const { createUnicityIdMinter } = await import('../../token-engine/unicity-id');
-    const { UnicityIdToken, HexConverter, RootTrustBase, PredicateVerifierService } =
-      await import('../../token-engine/sdk');
-
-    const trustBaseJson = await (await fetch(TRUSTBASE_URL)).json();
-    const privateKey = SigningService.generatePrivateKey();
-    const minter = createUnicityIdMinter({ aggregatorUrl: GATEWAY, apiKey: API_KEY, privateKey, trustBaseJson });
-
-    // Random name per run (the testnet is persistent; the mint is deterministic
-    // per (name, key), so a fixed name + fresh key is also fine — random keeps logs tidy).
-    const name = `e2e-${Math.random().toString(36).slice(2, 10)}`;
-
-    const first = await minter.mintUnicityIdToken(name);
-    expect(first.tokenId).toMatch(/^[0-9a-f]{64}$/);
-
-    // Idempotent re-mint: identical bytes (the lost-storage recovery path).
-    const second = await minter.mintUnicityIdToken(name);
-    expect(second.tokenCborHex).toBe(first.tokenCborHex);
-
-    // Stored form round-trips and verifies against the live trust base with the self issuer pin.
-    const token = await UnicityIdToken.fromCBOR(HexConverter.decode(first.tokenCborHex));
-    const trustBase = RootTrustBase.fromJSON(trustBaseJson);
-    const verdict = await token.verify(
-      trustBase,
-      PredicateVerifierService.create(),
-      new SigningService(privateKey).publicKey,
-    );
-    expect(String(verdict.status)).toBe('OK');
-  });
 });

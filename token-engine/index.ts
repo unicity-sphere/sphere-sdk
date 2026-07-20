@@ -55,12 +55,6 @@ export {
   TransferConflictError,
 } from './errors';
 
-// Self-issued Unicity ID (nametag) token mint — the v2 analog of the v1
-// nametag mint, stored at registration but unused at runtime (D5 + user
-// decision 2026-06-10; see unicity-id.ts header).
-export { createUnicityIdMinter } from './unicity-id';
-export type { IUnicityIdMinter, UnicityIdMintResult } from './unicity-id';
-
 // The SpherePaymentData codec (CBOR tag 39050) — the value envelope inside
 // Sphere tokens. Exported via the `./token-engine` subpath so server-side
 // consumers (wallet-api deposit validation) can decode token values without
