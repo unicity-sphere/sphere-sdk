@@ -25,7 +25,7 @@ describe('checkNetworkHealth — live testnet', () => {
     });
 
     expect(result.services.oracle).toBeDefined();
-    expect(result.services.oracle!.url).toContain('goggregator-test');
+    expect(result.services.oracle!.url).toContain('gateway.testnet2.unicity.network');
     expect(typeof result.services.oracle!.healthy).toBe('boolean');
 
     if (result.services.oracle!.healthy) {

@@ -42,13 +42,31 @@ async function ensureTrustbase(dataDir: string): Promise<void> {
   writeFileSync(trustbasePath, data);
 }
 
-function waitForDM(sphere: Sphere, timeoutMs = 15000): Promise<DirectMessage> {
+/**
+ * Resolve when a DM arrives whose content matches `match` (an exact string or a
+ * predicate); pass no matcher to resolve on the first DM. The live relay
+ * redelivers/echoes stored events on (re)subscribe, so resolving on the FIRST
+ * event races — a stale replay can resolve before the awaited reply lands.
+ * Matching on content ignores those replays.
+ */
+function waitForDM(
+  sphere: Sphere,
+  match?: string | ((m: DirectMessage) => boolean),
+  timeoutMs = 15000,
+): Promise<DirectMessage> {
+  const matches = (m: DirectMessage): boolean =>
+    match === undefined ? true : typeof match === 'string' ? m.content === match : match(m);
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Timeout: DM not received within ${timeoutMs}ms`)), timeoutMs);
-    sphere.communications.onDirectMessage((msg) => {
+    const unsub = sphere.communications.onDirectMessage((msg) => {
+      if (!matches(msg)) return; // ignore echoes/replays that don't match
       clearTimeout(timer);
+      unsub();
       resolve(msg);
     });
+    const timer = setTimeout(() => {
+      unsub();
+      reject(new Error(`Timeout: matching DM not received within ${timeoutMs}ms`));
+    }, timeoutMs);
   });
 }
 
@@ -65,7 +83,7 @@ async function createSphere(label: string, nametag?: string) {
       apiKey: DEFAULT_API_KEY,
     },
   });
-  const result = await Sphere.init({ ...providers, autoGenerate: true, ...(nametag ? { nametag } : {}) });
+  const result = await Sphere.init({ ...providers, network: 'testnet', autoGenerate: true, ...(nametag ? { nametag } : {}) });
   return { sphere: result.sphere, dirs };
 }
 
@@ -90,15 +108,17 @@ describe('NIP-17 DM end-to-end', () => {
     spheres.push(alice, bob);
     cleanupDirs.push(aliceDirs.base, bobDirs.base);
 
+    // Compute the message first so we can match on it (the relay echoes/replays
+    // stored events — we must await THIS message, not merely the first DM).
+    const text = `pubkey test ${Date.now()}`;
     // Subscribe Bob first, then wait for relay subscription to establish
-    const dmPromise = waitForDM(bob);
+    const dmPromise = waitForDM(bob, text);
     await new Promise((r) => setTimeout(r, 3000));
 
     // Use 32-byte x-only pubkey (chainPubkey is 33-byte compressed)
     const bobPubkey = bob.identity!.chainPubkey;
     const bobNostrPubkey = bobPubkey.length === 66 ? bobPubkey.slice(2) : bobPubkey;
 
-    const text = `pubkey test ${Date.now()}`;
     await alice.communications.sendDM(bobNostrPubkey, text);
 
     const msg = await dmPromise;
@@ -120,11 +140,11 @@ describe('NIP-17 DM end-to-end', () => {
     expect(alice.identity!.nametag).toBe(aliceTag);
     expect(bob.identity!.nametag).toBe(bobTag);
 
+    const text = `nametag test ${Date.now()}`;
     // Subscribe Bob, wait for relay subscription + nametag propagation
-    const dmPromise = waitForDM(bob);
+    const dmPromise = waitForDM(bob, text);
     await new Promise((r) => setTimeout(r, 3000));
 
-    const text = `nametag test ${Date.now()}`;
     await alice.communications.sendDM(`@${bobTag}`, text);
 
     const msg = await dmPromise;
@@ -149,10 +169,10 @@ describe('NIP-17 DM end-to-end', () => {
     await new Promise((r) => setTimeout(r, 3000));
 
     // First: Alice -> Bob
-    const bobDmPromise = waitForDM(bob, 30000);
+    const msg1 = `Round-trip A->B ${Date.now()}`;
+    const bobDmPromise = waitForDM(bob, msg1, 30000);
     await new Promise((r) => setTimeout(r, 3000));
 
-    const msg1 = `Round-trip A->B ${Date.now()}`;
     await alice.communications.sendDM(`@${bobTag}`, msg1);
 
     const received1 = await bobDmPromise;
@@ -163,10 +183,10 @@ describe('NIP-17 DM end-to-end', () => {
     await new Promise((r) => setTimeout(r, 5000));
 
     // Second: Bob -> Alice
-    const aliceDmPromise = waitForDM(alice, 30000);
+    const msg2 = `Round-trip B->A ${Date.now()}`;
+    const aliceDmPromise = waitForDM(alice, msg2, 30000);
     await new Promise((r) => setTimeout(r, 3000));
 
-    const msg2 = `Round-trip B->A ${Date.now()}`;
     await bob.communications.sendDM(`@${aliceTag}`, msg2);
 
     const received2 = await aliceDmPromise;
@@ -193,8 +213,8 @@ describe('NIP-17 DM end-to-end', () => {
       console.log(`\n--- Exchange ${i}/${exchanges} ---`);
 
       // Alice -> Bob
-      const bobDmPromise = waitForDM(bob, 30000);
       const msgA = `Exchange ${i} A->B ${Date.now()}`;
+      const bobDmPromise = waitForDM(bob, msgA, 30000);
       console.log(`Alice sending: "${msgA}"`);
       await alice.communications.sendDM(`@${bobTag}`, msgA);
 
@@ -208,8 +228,8 @@ describe('NIP-17 DM end-to-end', () => {
       await new Promise((r) => setTimeout(r, delayBetweenExchanges));
 
       // Bob -> Alice
-      const aliceDmPromise = waitForDM(alice, 30000);
       const msgB = `Exchange ${i} B->A ${Date.now()}`;
+      const aliceDmPromise = waitForDM(alice, msgB, 30000);
       console.log(`Bob sending: "${msgB}"`);
       await bob.communications.sendDM(`@${aliceTag}`, msgB);
 
@@ -250,8 +270,8 @@ describe('NIP-17 DM end-to-end', () => {
 
     // Bob sends initial greeting (like uniclaw does on startup)
     console.log('\n--- Initial greeting (like production startup) ---');
-    const aliceInitialPromise = waitForDM(alice, 30000);
     const greeting = `I'm online! ${Date.now()}`;
+    const aliceInitialPromise = waitForDM(alice, greeting, 30000);
     console.log(`Bob sending greeting: "${greeting}"`);
     await bob.communications.sendDM(`@${aliceTag}`, greeting);
 
@@ -270,8 +290,8 @@ describe('NIP-17 DM end-to-end', () => {
 
     // Now Alice sends a message to Bob (like user sends DM to uniclaw)
     console.log('\n--- Alice sends message after 70s idle ---');
-    const bobDmPromise = waitForDM(bob, 30000);
     const msg = `Message after 70s idle ${Date.now()}`;
+    const bobDmPromise = waitForDM(bob, msg, 30000);
     console.log(`Alice sending: "${msg}"`);
     await alice.communications.sendDM(`@${bobTag}`, msg);
 

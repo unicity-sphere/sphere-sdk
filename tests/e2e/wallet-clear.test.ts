@@ -49,15 +49,20 @@ async function ensureTrustbase(dataDir: string): Promise<void> {
 }
 
 function makeProviders(dirs: { dataDir: string; tokensDir: string }) {
-  return createNodeProviders({
-    network: 'testnet',
-    dataDir: dirs.dataDir,
-    tokensDir: dirs.tokensDir,
-    oracle: {
-      trustBasePath: join(dirs.dataDir, 'trustbase.json'),
-      apiKey: DEFAULT_API_KEY,
-    },
-  });
+  return {
+    ...createNodeProviders({
+      network: 'testnet',
+      dataDir: dirs.dataDir,
+      tokensDir: dirs.tokensDir,
+      oracle: {
+        trustBasePath: join(dirs.dataDir, 'trustbase.json'),
+        apiKey: DEFAULT_API_KEY,
+      },
+    }),
+    // Sphere.init needs options.network for the MAIN bundle's TokenRegistry (createNodeProviders
+    // configures a different bundle's copy). Spread it so every Sphere.init({...providers}) gets it.
+    network: 'testnet' as const,
+  };
 }
 
 function countTokenFiles(tokensDir: string): number {

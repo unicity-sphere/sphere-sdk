@@ -35,16 +35,31 @@ function makeTempDirs(label: string): { dataDir: string; tokensDir: string } {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function waitForDM(sphere: Sphere, timeoutMs = 30000): Promise<DirectMessage> {
+/**
+ * Resolve when a DM arrives whose content matches `match` (an exact string or a
+ * predicate); pass no matcher to resolve on the first DM. The live relay
+ * redelivers/echoes stored events on (re)subscribe, so resolving on the FIRST
+ * event races — a stale replay can resolve before the awaited reply lands.
+ * Matching on content ignores those replays.
+ */
+function waitForDM(
+  sphere: Sphere,
+  match?: string | ((m: DirectMessage) => boolean),
+  timeoutMs = 30000,
+): Promise<DirectMessage> {
+  const matches = (m: DirectMessage): boolean =>
+    match === undefined ? true : typeof match === 'string' ? m.content === match : match(m);
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`Timeout: DM not received within ${timeoutMs}ms`)),
-      timeoutMs,
-    );
-    sphere.communications.onDirectMessage((msg) => {
+    const unsub = sphere.communications.onDirectMessage((msg) => {
+      if (!matches(msg)) return; // ignore echoes/replays that don't match
       clearTimeout(timer);
+      unsub();
       resolve(msg);
     });
+    const timer = setTimeout(() => {
+      unsub();
+      reject(new Error(`Timeout: matching DM not received within ${timeoutMs}ms`));
+    }, timeoutMs);
   });
 }
 
@@ -85,6 +100,7 @@ async function createSphere(
 
   const result = await Sphere.init({
     ...providers,
+    network: 'testnet',
     autoGenerate: true,
     ...(nametag ? { nametag } : {}),
     ...(opts?.groupChat ? { groupChat: true } : {}),
@@ -121,11 +137,11 @@ describe('DM Communications Module E2E', () => {
     spheres.push(alice, bob);
     cleanupDirs.push(aliceDirs.base, bobDirs.base);
 
+    const text = `DM e2e test ${Date.now()}`;
     // Wait for relay subscriptions to establish
-    const dmPromise = waitForDM(bob);
+    const dmPromise = waitForDM(bob, text);
     await sleep(3000);
 
-    const text = `DM e2e test ${Date.now()}`;
     const sent = await alice.communications.sendDM(`@${bobTag}`, text);
 
     // Verify sendDM return value
@@ -156,7 +172,7 @@ describe('DM Communications Module E2E', () => {
     await sleep(3000);
 
     // Alice -> Bob: capture transport pubkeys from message objects
-    const bobDmPromise = waitForDM(bob, 30000);
+    const bobDmPromise = waitForDM(bob, 'Hello Bob', 30000);
     await sleep(1000);
     const sentByAlice = await alice.communications.sendDM(`@${bobTag}`, 'Hello Bob');
     const receivedByBob = await bobDmPromise;
@@ -169,7 +185,7 @@ describe('DM Communications Module E2E', () => {
     await sleep(5000);
 
     // Bob -> Alice
-    const aliceDmPromise = waitForDM(alice, 30000);
+    const aliceDmPromise = waitForDM(alice, 'Hi Alice', 30000);
     await sleep(1000);
     await bob.communications.sendDM(`@${aliceTag}`, 'Hi Alice');
     await aliceDmPromise;
@@ -199,7 +215,7 @@ describe('DM Communications Module E2E', () => {
     await sleep(3000);
 
     // Alice -> Bob
-    const bobDmPromise = waitForDM(bob, 30000);
+    const bobDmPromise = waitForDM(bob, 'msg1', 30000);
     await sleep(1000);
     const sentByAlice = await alice.communications.sendDM(`@${bobTag}`, 'msg1');
     await bobDmPromise;
@@ -207,7 +223,7 @@ describe('DM Communications Module E2E', () => {
     await sleep(5000);
 
     // Bob -> Alice
-    const aliceDmPromise = waitForDM(alice, 30000);
+    const aliceDmPromise = waitForDM(alice, 'msg2', 30000);
     await sleep(1000);
     await bob.communications.sendDM(`@${aliceTag}`, 'msg2');
     await aliceDmPromise;
