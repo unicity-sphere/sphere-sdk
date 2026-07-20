@@ -1165,7 +1165,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     // The undelivered remainder (1000 − 600 = 400) is SURFACED for a re-plan under a new transferId —
     // never re-sent from here, never rolled into a full-amount re-pay.
     const evt = sender.emitEvent.mock.calls.find((c) => c[0] === 'send:partial-remainder');
-    expect(evt?.[1]).toMatchObject({ transferId, remainingAmount: '400', recipient: RECIPIENT.chainPubkey });
+    expect(evt?.[1]).toMatchObject({ transferId, remainingAmount: '400', recipientPubkey: RECIPIENT.chainPubkey });
   });
 
   it('legacy (v:1, no store): a resume that hits SplitCheckpointLostError records the spend, never wedges', async () => {

@@ -6607,7 +6607,7 @@ export class PaymentsModule {
         transferId,
         remainingAmount: (remaining > 0n ? remaining : 0n).toString(),
         coinId: payload.coinId,
-        recipient: payload.recipient,
+        recipientPubkey: payload.recipient,
       });
       throw new PartialSendConflictError(
         'Resume: part of the payment was delivered before a source was consumed by a concurrent transfer — the delivered legs are final; re-plan ONLY the remainder.',
