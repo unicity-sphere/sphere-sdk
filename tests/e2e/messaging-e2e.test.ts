@@ -50,20 +50,16 @@ function waitForDM(
   const matches = (m: DirectMessage): boolean =>
     match === undefined ? true : typeof match === 'string' ? m.content === match : match(m);
   return new Promise((resolve, reject) => {
-    let unsub: (() => void) | undefined;
-    const timer = setTimeout(
-      () => {
-        unsub?.();
-        reject(new Error(`Timeout: matching DM not received within ${timeoutMs}ms`));
-      },
-      timeoutMs,
-    );
-    unsub = sphere.communications.onDirectMessage((msg) => {
+    const unsub = sphere.communications.onDirectMessage((msg) => {
       if (!matches(msg)) return; // ignore echoes/replays that don't match
       clearTimeout(timer);
-      unsub?.();
+      unsub();
       resolve(msg);
     });
+    const timer = setTimeout(() => {
+      unsub();
+      reject(new Error(`Timeout: matching DM not received within ${timeoutMs}ms`));
+    }, timeoutMs);
   });
 }
 
