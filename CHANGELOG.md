@@ -7,15 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed — state-transition-sdk 2.0.0 (was 2.0.0-rc.68bc1e5)
-- **Base SDK bumped to the stable `@unicitylabs/state-transition-sdk@2.0.0` release** (36 commits
+### Changed — state-transition-sdk 2.0.1 (was 2.0.0-rc.68bc1e5)
+- **Base SDK bumped to the stable `@unicitylabs/state-transition-sdk@2.0.1` release** (37 commits
   past the rc pin). Token verification/realization now goes through the SDK's shared
   `VerificationContext` (carried in `EngineDeps`); `StateMask` is a typed class (the HKDF-derived
   realization bytes are wrapped via `StateMask.fromBytes`, determinism unchanged); the split model
   binds each output's FULL payment payload (`SpherePaymentData`, memo included) into the
   allocation proofs — output token type is inherited from the source, no longer chosen per
-  request. Split checkpoint records `…@2.0.0` as its wire-governing SDK version (an rc-era
+  request. Split checkpoint records `…@2.0.1` as its wire-governing SDK version (an rc-era
   checkpoint resumes as a LOUD `SplitCheckpointLostError` byte-drift, by design).
+- **Token issuance verification is fail-closed upstream (2.0.1, state-transition-sdk-js#137):**
+  `TokenIssuanceVerifierService` now rejects any token whose type has no registered issuance
+  verifier, and `VerificationContext` no longer defaults its verifiers — all must be passed
+  explicitly. Sphere token types are generated per token (`TokenType.generate()`), so there is no
+  fixed type to register a policy for; the engine constructs its context with an explicit
+  `new TokenIssuanceVerifierService(false)` (the same opt-out upstream's own examples use).
+  Verification behavior is unchanged.
 - **Value-model contract tightened (upstream):** asset amounts must be strictly positive and a
   payment collection holds 1..256 assets — `SpherePaymentData` rejects zero/empty loudly
   (`VALIDATION_ERROR`). `AggregatorClient` now refuses an API key over plaintext `http://`.

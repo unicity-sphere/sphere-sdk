@@ -30,7 +30,7 @@ This repo is part of the wallet-api program (process: `../wallet-api/development
   (wallet-api backend, sphere frontend) pin exact dev versions. The backend consumes ONLY the
   `./token-engine` subpath (must stay browser/IPFS/Nostr-free — there's an import-closure check in
   its CI eventually; keep `token-engine/` clean).
-- Pinned base SDK: `@unicitylabs/state-transition-sdk@2.0.0` (stable release; bump only via PR).
+- Pinned base SDK: `@unicitylabs/state-transition-sdk@2.0.1` (stable release; bump only via PR).
 
 ## Quick Start (Using SDK as Dependency)
 
@@ -367,7 +367,7 @@ sphere-sdk/
 ### Token Engine (v2) — the only L3 money path
 
 The legacy v1 `@unicitylabs/state-transition-sdk@1.6.1-rc` engine is **removed**.
-The canonical package name resolves to the **v2 SDK, pinned `2.0.0`** (stable).
+The canonical package name resolves to the **v2 SDK, pinned `2.0.1`** (stable).
 
 - The SDK is imported in exactly ONE file: `token-engine/sdk.ts`. An ESLint
   `no-restricted-imports` rule blocks any other import of
@@ -666,7 +666,7 @@ Key test areas:
 ## Dependencies
 
 **Core (from package.json):**
-- `@unicitylabs/state-transition-sdk` — **pinned `2.0.0`** (v2 engine; imported only via `token-engine/sdk.ts`)
+- `@unicitylabs/state-transition-sdk` — **pinned `2.0.1`** (v2 engine; imported only via `token-engine/sdk.ts`)
 - `@unicitylabs/nostr-js-sdk` `^0.5.0` — Nostr protocol
 - `@noble/hashes` `^2`, `@noble/curves` `^2` — cryptography
 - `bip39`, `elliptic`, `crypto-js`, `canonicalize`, `buffer`

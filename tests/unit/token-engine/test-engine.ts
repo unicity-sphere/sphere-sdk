@@ -12,6 +12,7 @@ import {
   SigningService,
   SplitMintJustificationVerifier,
   StateTransitionClient,
+  TokenIssuanceVerifierService,
   VerificationContext,
 } from '../../../token-engine/sdk';
 import { decodeSpherePaymentData } from '../../../token-engine/SpherePaymentData';
@@ -51,7 +52,12 @@ export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngin
     trustBase,
     predicateVerifier,
     mintJustificationVerifier,
-    verificationContext: new VerificationContext(trustBase, predicateVerifier, mintJustificationVerifier),
+    verificationContext: new VerificationContext(
+      trustBase,
+      predicateVerifier,
+      mintJustificationVerifier,
+      new TokenIssuanceVerifierService(false),
+    ),
     signingService: new SigningService(privateKey),
     privateKey,
     networkId: opts.networkId ?? NetworkId.LOCAL,

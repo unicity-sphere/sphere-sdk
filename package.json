@@ -146,7 +146,7 @@
     "@noble/curves": "^2.0.1",
     "@noble/hashes": "^2.0.1",
     "@unicitylabs/nostr-js-sdk": "^0.6.0",
-    "@unicitylabs/state-transition-sdk": "2.0.0",
+    "@unicitylabs/state-transition-sdk": "2.0.1",
     "bip39": "^3.1.0",
     "buffer": "^6.0.3",
     "canonicalize": "^3.0.0",

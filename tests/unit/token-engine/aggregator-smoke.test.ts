@@ -11,6 +11,7 @@ import {
   SigningService,
   StateTransitionClient,
   Token,
+  TokenIssuanceVerifierService,
   VerificationContext,
   waitInclusionProof,
 } from '../../../token-engine/sdk';
@@ -38,7 +39,10 @@ describe('TestAggregatorClient (vendored) — real v2 mint round-trip', () => {
 
     const proof = await waitInclusionProof(client, trustBase, predicateVerifier, mintTx);
     const certified = await mintTx.toCertifiedTransaction(trustBase, predicateVerifier, proof);
-    const token = await Token.mint(certified, new VerificationContext(trustBase, predicateVerifier, mintJustificationVerifier));
+    const token = await Token.mint(
+      certified,
+      new VerificationContext(trustBase, predicateVerifier, mintJustificationVerifier, new TokenIssuanceVerifierService(false)),
+    );
 
     expect(token).toBeInstanceOf(Token);
   }, 15000);

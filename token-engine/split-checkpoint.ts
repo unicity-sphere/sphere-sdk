@@ -33,7 +33,7 @@ const CHECKPOINT_VERSION = 1;
  * The base-SDK pin whose CBOR wire form governs byte-stability — recorded for a LOUD drift
  * diagnosis only (byte-inequality of the stored burn tx is the actual guard). Bump with the pin.
  */
-const CHECKPOINT_SDK_VERSION = '@unicitylabs/state-transition-sdk@2.0.0';
+const CHECKPOINT_SDK_VERSION = '@unicitylabs/state-transition-sdk@2.0.1';
 
 export interface CheckpointDeps {
   readonly trustBase: RootTrustBase;
