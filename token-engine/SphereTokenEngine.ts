@@ -21,7 +21,7 @@ import {
   SplitCheckpointLostError,
   TransferConflictError,
 } from './errors';
-import { deriveDirectAddress, UNICITY_TOKEN_TYPE_HEX } from './identity';
+import { deriveDirectAddress } from './identity';
 import { deriveDeliveryKeys } from './blob-keys';
 import { deriveRealization } from './realization';
 import { burntTokenFromCheckpoint, encodeCheckpoint } from './split-checkpoint';
@@ -47,12 +47,14 @@ import {
   type SplitToken,
   SplitTokenRequest,
   StateId,
+  StateMask,
   type StateTransitionClient,
   Token,
   TokenSalt,
   TokenSplit,
   TokenType,
   TransferTransaction,
+  type VerificationContext,
   VerificationStatus,
   waitInclusionProof,
 } from './sdk';
@@ -79,6 +81,7 @@ export interface EngineDeps {
   readonly trustBase: RootTrustBase;
   readonly predicateVerifier: PredicateVerifierService;
   readonly mintJustificationVerifier: MintJustificationVerifierService;
+  readonly verificationContext: VerificationContext;
   /** The wallet's signing key (its identity + the spender for transfers it owns). */
   readonly signingService: SigningService;
   /**
@@ -245,12 +248,7 @@ export class SphereTokenEngine implements ITokenEngine {
       this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS, // #683 finer poll cadence
     );
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
-    const token = await Token.mint(
-      this.deps.trustBase,
-      this.deps.predicateVerifier,
-      this.deps.mintJustificationVerifier,
-      certified,
-    );
+    const token = await Token.mint(certified, this.deps.verificationContext);
     return this.wrapToken(token);
   }
 
@@ -277,12 +275,7 @@ export class SphereTokenEngine implements ITokenEngine {
       this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS, // #683 finer poll cadence
     );
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
-    const token = await Token.mint(
-      this.deps.trustBase,
-      this.deps.predicateVerifier,
-      this.deps.mintJustificationVerifier,
-      certified,
-    );
+    const token = await Token.mint(certified, this.deps.verificationContext);
     return this.wrapToken(token);
   }
 
@@ -292,7 +285,9 @@ export class SphereTokenEngine implements ITokenEngine {
     const recipient = SignaturePredicate.create(params.recipientPubkey);
     // E.1 deterministic realization: same transferId + inputs ⇒ byte-identical
     // transaction, so an interrupted transfer can be rebuilt and resumed (AC-E1/E2).
-    const stateMask = deriveRealization(this.privateKeyHex, transferId, this.resolveOpIndex(options), 'stateMask');
+    const stateMask = StateMask.fromBytes(
+      deriveRealization(this.privateKeyHex, transferId, this.resolveOpIndex(options), 'stateMask'),
+    );
 
     const transferTx = await TransferTransaction.create(params.token.sdkToken, recipient, stateMask, params.data ?? null);
     const unlockScript = await SignaturePredicateUnlockScript.create(transferTx, this.deps.signingService);
@@ -306,7 +301,7 @@ export class SphereTokenEngine implements ITokenEngine {
       options,
     );
     const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
-    const transferred = await params.token.sdkToken.transfer(this.deps.trustBase, this.deps.predicateVerifier, certified);
+    const transferred = await params.token.sdkToken.transfer(certified, this.deps.verificationContext);
     return this.wrapToken(transferred);
   }
 
@@ -317,15 +312,13 @@ export class SphereTokenEngine implements ITokenEngine {
     }
     const transferId = this.resolveTransferId(options);
 
-    // E.1 deterministic realization: a fixed token type + per-output HKDF salts
-    // make every output's mint transaction (and its salt-derived tokenId)
-    // reproducible from the wallet key + transferId.
-    const tokenType = new TokenType(HexConverter.decode(UNICITY_TOKEN_TYPE_HEX));
+    // E.1 deterministic realization: per-output HKDF salts make every output's
+    // mint transaction (and its salt-derived tokenId) reproducible from the
+    // wallet key + transferId.
     const requests = params.outputs.map((o, i) =>
       SplitTokenRequest.create(
         SignaturePredicate.create(o.recipientPubkey),
-        PaymentAssetCollection.create(sphereAssetToSdk(o.coinId, o.amount)),
-        tokenType,
+        SpherePaymentData.create(PaymentAssetCollection.create(sphereAssetToSdk(o.coinId, o.amount)), o.data ?? null),
         TokenSalt.fromBytes(deriveRealization(this.privateKeyHex, transferId, i, 'salt')),
       ),
     );
@@ -337,7 +330,7 @@ export class SphereTokenEngine implements ITokenEngine {
       params.token.sdkToken,
       decodeSpherePaymentData,
       requests,
-      deriveRealization(this.privateKeyHex, transferId, this.resolveOpIndex(options), 'burn'),
+      StateMask.fromBytes(deriveRealization(this.privateKeyHex, transferId, this.resolveOpIndex(options), 'burn')),
     );
 
     // 1. Resolve the burnt token: from a durable checkpoint on resume, else burn now and persist
@@ -370,9 +363,7 @@ export class SphereTokenEngine implements ITokenEngine {
       const batch = split.tokens.slice(start, start + MAX_MINT_CONCURRENCY);
       settled.push(
         ...(await Promise.allSettled(
-          batch.map((token, j) =>
-            this.mintSplitOutput(token, burntToken, params.outputs[start + j].data ?? null, options),
-          ),
+          batch.map((token) => this.mintSplitOutput(token, burntToken, options)),
         )),
       );
     }
@@ -466,7 +457,7 @@ export class SphereTokenEngine implements ITokenEngine {
     const burnCert = await CertificationData.fromTransaction(burnTx, burnUnlock);
     const burnProof = await this.submitAndAwaitProof(burnCert, burnTx, 'Split burn failed', 'TRANSFER_FAILED', ctx.options);
     const burnCertified = await burnTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, burnProof);
-    const burntToken = await ctx.params.token.sdkToken.transfer(this.deps.trustBase, this.deps.predicateVerifier, burnCertified);
+    const burntToken = await ctx.params.token.sdkToken.transfer(burnCertified, this.deps.verificationContext);
     return { burntToken, burnProof };
   }
 
@@ -482,8 +473,8 @@ export class SphereTokenEngine implements ITokenEngine {
     // order-independent (it throws if ANY leg is already certified). Promise.all rejects
     // on the first stranded leg, same as the prior sequential loop.
     await Promise.all(
-      ctx.split.tokens.map(async (leg, i) => {
-        const data = await SpherePaymentData.create(leg.assets, ctx.params.outputs[i].data ?? null).encode();
+      ctx.split.tokens.map(async (leg) => {
+        const data = await leg.paymentData.encode();
         const probe = await MintTransaction.create(leg.networkId, leg.recipient, data, leg.tokenType, leg.salt, null);
         const response = await this.deps.client.getInclusionProof(await StateId.fromTransaction(probe));
         // Inclusion (leaf certified on-chain) is discriminated by `certificationData`, NOT
@@ -504,10 +495,9 @@ export class SphereTokenEngine implements ITokenEngine {
   private async mintSplitOutput(
     splitToken: SplitToken,
     burntToken: Token,
-    memo: Uint8Array | null,
     options?: EngineOpOptions,
   ): Promise<SphereToken> {
-    const data = await SpherePaymentData.create(splitToken.assets, memo).encode();
+    const data = await splitToken.paymentData.encode();
     const justification = SplitMintJustification.create(burntToken, splitToken.proofs).toCBOR();
     const mintTx = await MintTransaction.create(
       splitToken.networkId,
@@ -520,7 +510,7 @@ export class SphereTokenEngine implements ITokenEngine {
     const certData = await CertificationData.fromMintTransaction(mintTx);
     const proof = await this.submitSplitMintLeg(certData, mintTx, options);
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
-    const token = await Token.mint(this.deps.trustBase, this.deps.predicateVerifier, this.deps.mintJustificationVerifier, certified);
+    const token = await Token.mint(certified, this.deps.verificationContext);
     return this.wrapToken(token);
   }
 
@@ -552,11 +542,7 @@ export class SphereTokenEngine implements ITokenEngine {
   // ── verification ─────────────────────────────────────────────────────────────
 
   public async verify(token: SphereToken, _options?: EngineOpOptions): Promise<EngineVerifyResult> {
-    const result = await token.sdkToken.verify(
-      this.deps.trustBase,
-      this.deps.predicateVerifier,
-      this.deps.mintJustificationVerifier,
-    );
+    const result = await token.sdkToken.verify(this.deps.verificationContext);
     return result.status === VerificationStatus.OK ? { ok: true } : { ok: false, reason: String(result.status) };
   }
 
@@ -573,7 +559,7 @@ export class SphereTokenEngine implements ITokenEngine {
     const probe = await TransferTransaction.create(
       token.sdkToken,
       SignaturePredicate.create(this.deps.signingService.publicKey),
-      new Uint8Array(32),
+      StateMask.fromBytes(new Uint8Array(32)),
     );
     const stateId = await StateId.fromTransaction(probe);
     const response = await this.deps.client.getInclusionProof(stateId);

@@ -30,8 +30,7 @@ This repo is part of the wallet-api program (process: `../wallet-api/development
   (wallet-api backend, sphere frontend) pin exact dev versions. The backend consumes ONLY the
   `./token-engine` subpath (must stay browser/IPFS/Nostr-free — there's an import-closure check in
   its CI eventually; keep `token-engine/` clean).
-- Pinned base SDK: `@unicitylabs/state-transition-sdk@2.0.0-rc.68bc1e5` (the #125 rc: burnStateMask
-  + tolerant status parsing; bump only via PR).
+- Pinned base SDK: `@unicitylabs/state-transition-sdk@2.0.1` (stable release; bump only via PR).
 
 ## Quick Start (Using SDK as Dependency)
 
@@ -308,7 +307,6 @@ sphere-sdk/
 │   ├── SpherePaymentData.ts # Value envelope codec (coins inside v2 tokens)
 │   ├── token-blob.ts       # TokenBlob CBOR encode/decode
 │   ├── identity.ts         # deriveDirectAddress() — vendored v1-identical DIRECT:// derivation
-│   ├── unicity-id.ts       # createUnicityIdMinter() — self-issued v2 UnicityIdToken mint
 │   ├── network.ts          # SphereNetwork ↔ SDK NetworkId mapping
 │   └── sdk.ts              # ⚠️ THE ONLY file allowed to import @unicitylabs/state-transition-sdk
 │
@@ -369,7 +367,7 @@ sphere-sdk/
 ### Token Engine (v2) — the only L3 money path
 
 The legacy v1 `@unicitylabs/state-transition-sdk@1.6.1-rc` engine is **removed**.
-The canonical package name resolves to the **v2 SDK, pinned `2.0.0-rc.68bc1e5`**.
+The canonical package name resolves to the **v2 SDK, pinned `2.0.1`** (stable).
 
 - The SDK is imported in exactly ONE file: `token-engine/sdk.ts`. An ESLint
   `no-restricted-imports` rule blocks any other import of
@@ -585,13 +583,11 @@ authoritative for build success.
   first-seen-wins is the global uniqueness guard). Runtime name resolution is
   Nostr-binding-only; receive is always `SignaturePredicate(chainPubkey)`;
   there is **no PROXY addressing anywhere**.
-- `registerNametag()` ALSO best-effort mints + stores a **self-issued v2
-  `UnicityIdToken`** (`token-engine/unicity-id.ts`, `createUnicityIdMinter`),
-  saved as `NametagData { format: 'v2-cbor', token: <CBOR hex string> }`. The
-  mint is deterministic per (name, wallet key) → idempotent re-mint recovers a
-  lost token; a gateway outage never fails registration (retried on next load).
-  The stored token is unused at runtime (kept for a future issuer/verification
-  model). `NametagMinter` / `mintNametag` DO NOT EXIST anymore.
+- The self-issued `UnicityIdToken` mint was REMOVED with the 2.0.0 SDK bump
+  (upstream deleted the unicity-id primitive, state-transition-sdk-js#132) —
+  registration is Nostr-binding-only. Stored `NametagData { format: 'v2-cbor' }`
+  entries from older versions remain readable but are never consumed.
+  `NametagMinter` / `mintNametag` / `createUnicityIdMinter` DO NOT EXIST anymore.
 - Recovered from Nostr when importing a wallet; each HD address can have its own.
 
 ### Accounting / Invoicing
@@ -670,7 +666,7 @@ Key test areas:
 ## Dependencies
 
 **Core (from package.json):**
-- `@unicitylabs/state-transition-sdk` — **pinned `2.0.0-rc.68bc1e5`** (v2 engine; imported only via `token-engine/sdk.ts`)
+- `@unicitylabs/state-transition-sdk` — **pinned `2.0.1`** (v2 engine; imported only via `token-engine/sdk.ts`)
 - `@unicitylabs/nostr-js-sdk` `^0.5.0` — Nostr protocol
 - `@noble/hashes` `^2`, `@noble/curves` `^2` — cryptography
 - `bip39`, `elliptic`, `crypto-js`, `canonicalize`, `buffer`

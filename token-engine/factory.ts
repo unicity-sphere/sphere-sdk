@@ -23,6 +23,8 @@ import {
   SigningService,
   SplitMintJustificationVerifier,
   StateTransitionClient,
+  TokenIssuanceVerifierService,
+  VerificationContext,
 } from './sdk';
 import { decodeSpherePaymentData } from './SpherePaymentData';
 import { type EngineDeps, SphereTokenEngine } from './SphereTokenEngine';
@@ -44,7 +46,7 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
   const predicateVerifier = PredicateVerifierService.create();
   const mintJustificationVerifier = new MintJustificationVerifierService();
   mintJustificationVerifier.register(
-    new SplitMintJustificationVerifier(trustBase, predicateVerifier, decodeSpherePaymentData),
+      new SplitMintJustificationVerifier(decodeSpherePaymentData),
   );
 
   const deps: EngineDeps = {
@@ -52,6 +54,12 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
     trustBase,
     predicateVerifier,
     mintJustificationVerifier,
+    verificationContext: new VerificationContext(
+      trustBase,
+      predicateVerifier,
+      mintJustificationVerifier,
+      new TokenIssuanceVerifierService(false),
+    ),
     signingService: new SigningService(config.privateKey),
     // Also the HKDF ikm for deterministic realization (Part E.1) — the
     // SigningService wraps the key but does not expose it back.

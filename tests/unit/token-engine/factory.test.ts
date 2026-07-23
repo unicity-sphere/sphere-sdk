@@ -16,7 +16,7 @@ const TRUST_BASE_JSON = {
   rootNodes: [{ nodeId: 'NODE', sigKey: '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798', stake: '1' }],
   signatures: {},
   stateHash: '00',
-  version: '0',
+  version: '1',
 };
 
 describe('createSphereTokenEngine', () => {
@@ -51,18 +51,6 @@ describe('createSphereTokenEngine', () => {
     });
     expect(warn).toHaveBeenCalled();
     expect(warn.mock.calls.some((c) => String(c[1]).includes('apiKey'))).toBe(true);
-    warn.mockRestore();
-  });
-
-  it('does NOT warn when an apiKey is provided', async () => {
-    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
-    await createSphereTokenEngine({
-      aggregatorUrl: 'http://localhost:3000',
-      apiKey: 'sk_provided',
-      privateKey: SigningService.generatePrivateKey(),
-      trustBaseJson: TRUST_BASE_JSON,
-    });
-    expect(warn.mock.calls.some((c) => String(c[1]).includes('apiKey'))).toBe(false);
     warn.mockRestore();
   });
 

@@ -39,6 +39,7 @@ import {
   SigningService,
   type StateId,
   StateTransitionClient,
+  StateMask,
   TransferTransaction,
   waitInclusionProof,
 } from '../../../token-engine/sdk';
@@ -768,7 +769,7 @@ describe('recoverable engine (Part E) — real adapter over in-memory aggregator
     const foreignTx = await TransferTransaction.create(
       src.sdkToken,
       SignaturePredicate.create(freshPubkey()),
-      new Uint8Array(32).fill(7),
+      StateMask.fromBytes(new Uint8Array(32).fill(7)),
       null,
     );
     const err = await waitInclusionProof(

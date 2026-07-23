@@ -71,7 +71,7 @@ export class TestAggregatorClient implements IAggregatorClient {
    * transactionHash, never on proof bytes (sdk-changes E.2, sphere-sdk#501).
    */
   public async getInclusionProof(stateId: StateId): Promise<InclusionProofResponse> {
-    const path = BitString.fromBytesReversedLSB(stateId.data).toBigInt();
+    const path = BitString.fromBytesBigEndian(stateId.data).toBigInt();
     const root = await this.smt.calculateRoot();
 
     const certificationData = this.requests.get(path);
@@ -110,7 +110,7 @@ export class TestAggregatorClient implements IAggregatorClient {
       return CertificationResponse.create(CertificationStatus.SIGNATURE_VERIFICATION_FAILED);
     }
 
-    const path = BitString.fromBytesReversedLSB(stateId.data).toBigInt();
+    const path = BitString.fromBytesBigEndian(stateId.data).toBigInt();
     if (!this.requests.has(path)) {
       await this.smt.addLeaf(stateId.data, certificationData.transactionHash.data);
       this.requests.set(path, certificationData);
