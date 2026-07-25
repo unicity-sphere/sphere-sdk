@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { INTENT_ACTIONS, RPC_METHODS, SPHERE_CONNECT_VERSION } from '../../../connect/protocol';
+import { ERROR_CODES, INTENT_ACTIONS, RPC_METHODS, SPHERE_CONNECT_VERSION, WALLET_EVENTS } from '../../../connect/protocol';
 import { PERMISSION_SCOPES } from '../../../connect/permissions';
 
 /**
@@ -21,7 +21,7 @@ const BUMP_REMINDER =
 
 // Committed snapshot of the wire surface. CHANGE ONLY TOGETHER WITH A VERSION BUMP.
 const EXPECTED = {
-  version: '2.0',
+  version: '2.1',
   intents: [
     'send', 'dm', 'payment_request', 'receive', 'sign_message',
     'create_invoice', 'close_invoice', 'cancel_invoice', 'pay_invoice',
@@ -41,15 +41,31 @@ const EXPECTED = {
     'sphere_getConversations', 'sphere_getMessages', 'sphere_getDMUnreadCount',
     'sphere_markAsRead', 'sphere_getInvoices', 'sphere_getInvoiceStatus',
   ],
+  events: [
+    'wallet:locked', 'wallet:unlocked', 'wallet:disconnected', 'identity:changed',
+  ],
+  // An error code the HOST never sends is client-local and bumps the npm MINOR, NOT the
+  // protocol MINOR. REQUEST_TIMEOUT (4010) is client-generated only and lands in R2 —
+  // it must appear here WITHOUT a SPHERE_CONNECT_VERSION bump when it does.
+  errorCodes: [
+    -32700, -32600, -32601, -32602, -32603,
+    4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009,
+    4100, 4101, 4102, 4200,
+  ],
 };
 
 /** Order-independent canonical form so reordering a registry never trips the guard. */
-function canonical(s: { version: string; intents: string[]; scopes: string[]; methods: string[] }) {
+function canonical(s: {
+  version: string; intents: string[]; scopes: string[]; methods: string[];
+  events: string[]; errorCodes: number[];
+}) {
   return {
     version: s.version,
     intents: [...s.intents].sort(),
     scopes: [...s.scopes].sort(),
     methods: [...s.methods].sort(),
+    events: [...s.events].sort(),
+    errorCodes: [...s.errorCodes].sort((a, b) => a - b),
   };
 }
 
@@ -60,6 +76,8 @@ describe('Connect protocol surface guard', () => {
       intents: Object.values(INTENT_ACTIONS),
       scopes: Object.values(PERMISSION_SCOPES),
       methods: Object.values(RPC_METHODS),
+      events: Object.values(WALLET_EVENTS),
+      errorCodes: Object.values(ERROR_CODES),
     };
     expect(canonical(live), BUMP_REMINDER).toEqual(canonical(EXPECTED));
   });

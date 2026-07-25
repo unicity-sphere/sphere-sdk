@@ -21,6 +21,8 @@ export {
   INTENT_ACTIONS,
   ERROR_CODES,
   WALLET_EVENTS,
+  AUTO_PUSHED_EVENTS,
+  isAutoPushedEvent,
   SPHERE_NETWORKS,
   isSphereConnectMessage,
   createRequestId,
@@ -41,6 +43,11 @@ export type {
   SphereConnectMessage,
   DAppMetadata,
   PublicIdentity,
+  WalletLockedData,
+  WalletLockedPayload,
+  WalletUnlockedPayload,
+  WalletDisconnectedPayload,
+  WalletIdentityChangedPayload,
   NetworkInfo,
 } from './protocol';
 

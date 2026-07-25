@@ -5,6 +5,9 @@ import {
   RPC_METHODS,
   INTENT_ACTIONS,
   ERROR_CODES,
+  WALLET_EVENTS,
+  AUTO_PUSHED_EVENTS,
+  isAutoPushedEvent,
   isSphereConnectMessage,
   createRequestId,
 } from '../../../connect/protocol';
@@ -85,12 +88,15 @@ describe('Protocol', () => {
 });
 
 describe('protocol v2 gate surface', () => {
-  it('Connect version is bumped to 2.0', () => {
-    expect(SPHERE_CONNECT_VERSION).toBe('2.0');
+  it('Connect version is bumped to 2.1', () => {
+    expect(SPHERE_CONNECT_VERSION).toBe('2.1');
   });
   it('has the new error codes', () => {
     expect(ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION).toBe(4007);
     expect(ERROR_CODES.INCOMPATIBLE_NETWORK).toBe(4008);
+    expect(ERROR_CODES.WALLET_LOCKED).toBe(4009);
+    // 4010 is RESERVED for REQUEST_TIMEOUT (R2, client-generated only).
+    expect(Object.values(ERROR_CODES)).not.toContain(4010);
   });
   it('filter accepts same-MAJOR session traffic, drops other-MAJOR', () => {
     const base = { ns: SPHERE_CONNECT_NAMESPACE };
@@ -106,5 +112,31 @@ describe('protocol v2 gate surface', () => {
   it('still rejects non-namespace / non-objects', () => {
     expect(isSphereConnectMessage({ ns: 'other', v: '2.0', type: 'request' })).toBe(false);
     expect(isSphereConnectMessage(null)).toBe(false);
+  });
+});
+
+describe('auto-pushed wallet events', () => {
+  it('covers every WALLET_EVENTS member', () => {
+    expect([...AUTO_PUSHED_EVENTS].sort()).toEqual(Object.values(WALLET_EVENTS).sort());
+  });
+
+  it('names the four lifecycle events explicitly', () => {
+    expect(WALLET_EVENTS.LOCKED).toBe('wallet:locked');
+    expect(WALLET_EVENTS.UNLOCKED).toBe('wallet:unlocked');
+    expect(WALLET_EVENTS.DISCONNECTED).toBe('wallet:disconnected');
+    expect(WALLET_EVENTS.IDENTITY_CHANGED).toBe('identity:changed');
+  });
+
+  it('isAutoPushedEvent accepts the four wallet events', () => {
+    expect(isAutoPushedEvent(WALLET_EVENTS.LOCKED)).toBe(true);
+    expect(isAutoPushedEvent(WALLET_EVENTS.UNLOCKED)).toBe(true);
+    expect(isAutoPushedEvent(WALLET_EVENTS.DISCONNECTED)).toBe(true);
+    expect(isAutoPushedEvent(WALLET_EVENTS.IDENTITY_CHANGED)).toBe(true);
+  });
+
+  it('isAutoPushedEvent rejects subscribable Sphere events', () => {
+    expect(isAutoPushedEvent('transfer:incoming')).toBe(false);
+    expect(isAutoPushedEvent('message:dm')).toBe(false);
+    expect(isAutoPushedEvent('')).toBe(false);
   });
 });
