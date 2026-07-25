@@ -13,7 +13,7 @@ export default defineConfig({
       reporter: ['text', 'html', 'json'],
       include: [
         'core/**/*.ts',
-        'l1/**/*.ts',
+        'connect/**/*.ts',
         'modules/**/*.ts',
         'serialization/**/*.ts',
         'validation/**/*.ts',
