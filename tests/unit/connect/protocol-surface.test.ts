@@ -9,6 +9,8 @@ import { PERMISSION_SCOPES } from '../../../connect/permissions';
  * protocol version — is the wire contract dApps depend on. Per docs/CONNECT.md:
  *   - add an intent / method / scope            -> bump MINOR (e.g. 2.0 -> 2.1)
  *   - remove / rename / change an existing one  -> bump MAJOR (e.g. 2.0 -> 3.0)
+ *   - add an error code the HOST never sends    -> client-local: bump the npm MINOR,
+ *                                                 NOT the protocol MINOR
  *
  * When this test fails: read the diff, decide MINOR vs MAJOR, update
  * SPHERE_CONNECT_VERSION, then update EXPECTED below to match.
@@ -17,6 +19,8 @@ import { PERMISSION_SCOPES } from '../../../connect/permissions';
 const BUMP_REMINDER =
   '\nConnect wire surface changed.\n' +
   'Per docs/CONNECT.md: add intent/method/scope -> MINOR; remove/rename/change -> MAJOR.\n' +
+  'EXCEPTION: an error code the HOST never sends is client-local — bump the npm MINOR,\n' +
+  'not the protocol MINOR (e.g. REQUEST_TIMEOUT 4010, generated only by ConnectClient).\n' +
   'Bump SPHERE_CONNECT_VERSION, then update EXPECTED in this file to match.\n';
 
 // Committed snapshot of the wire surface. CHANGE ONLY TOGETHER WITH A VERSION BUMP.

@@ -30,6 +30,15 @@ jobs:
           npm install --include=optional --ignore-scripts
           npm rebuild
 
+      # MUST run before Build: `prebuild` regenerates connect/version.ts from
+      # package.json, so any check placed after Build inspects the regenerated file and
+      # can never catch a committed-stale SDK_VERSION. A stale one makes the handshake
+      # advertise the wrong sdkVersion and any wallet with a minSdkVersion floor answers
+      # UNSUPPORTED_PROTOCOL_VERSION 4007 — a failure nobody traces back to a generated
+      # constant.
+      - name: Verify connect/version.ts matches package.json
+        run: npm run verify:version
+
       - name: Typecheck
         run: npm run typecheck
 

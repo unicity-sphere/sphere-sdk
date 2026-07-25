@@ -12,6 +12,11 @@ import { SDK_VERSION } from '../../../connect/version';
  *
  * When this fails: run `node scripts/gen-version.mjs` and commit connect/version.ts.
  *
+ * This test is a DEVELOPER convenience, not the CI gate. In CI, `npm run build` (whose
+ * `prebuild` regenerates this file) runs before `npm run test:run`, so by the time the
+ * suite executes the file has already been fixed on disk. The real gate is the
+ * `verify:version` script, wired into ci.yml BEFORE the Build step.
+ *
  * package.json is read from disk rather than imported so this test does not depend on
  * resolveJsonModule or on the bundler's JSON handling.
  */
