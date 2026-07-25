@@ -100,3 +100,44 @@ describe('Sphere.destroy() secret hygiene', () => {
     expect(() => sphere.getWalletInfo()).toThrow('Sphere not initialized');
   });
 });
+
+describe('Sphere.encrypt() fails closed', () => {
+  beforeEach(() => {
+    TokenRegistry.resetInstance();
+    stubFetch();
+    resetSingleton();
+  });
+
+  afterEach(async () => {
+    const live = Sphere.getInstance();
+    if (live) {
+      try { await live.destroy(); } catch { /* ignore */ }
+    }
+    resetSingleton();
+    TokenRegistry.destroy();
+    vi.unstubAllGlobals();
+  });
+
+  function encrypt(sphere: Sphere, data: string): string {
+    return (sphere as unknown as { encrypt(d: string): string }).encrypt(data);
+  }
+
+  it('throws instead of writing plaintext when a protected wallet lost its password', async () => {
+    const sphere = await initWallet('correct horse battery staple');
+    (sphere as unknown as { _password: string | null })._password = null;
+
+    expect(() => encrypt(sphere, 'secret')).toThrow('Wallet password is not available');
+  });
+
+  it('still passes through for a wallet that never had a password', async () => {
+    const sphere = await initWallet();
+    expect(encrypt(sphere, 'plain')).toBe('plain');
+  });
+
+  it('still encrypts normally while the password is present', async () => {
+    const sphere = await initWallet('correct horse battery staple');
+    const out = encrypt(sphere, 'secret');
+    expect(out).not.toBe('secret');
+    expect(out.length).toBeGreaterThan(0);
+  });
+});

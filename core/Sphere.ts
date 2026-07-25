@@ -528,6 +528,10 @@ export class Sphere {
   private _masterKey: MasterKey | null = null;
   private _mnemonic: string | null = null;
   private _password: string | null = null;
+  /** True when the wallet was created/loaded/imported WITH a password. Distinguishes
+   *  "no password by design" (encrypt passes through) from "the password is gone" (encrypt
+   *  must throw rather than silently write plaintext over an encrypted record). */
+  private _passwordProtected = false;
   private _source: WalletSource = 'unknown';
   private _derivationMode: DerivationMode = 'bip32';
   private _basePath: string = DEFAULT_BASE_PATH;
@@ -941,6 +945,7 @@ export class Sphere {
       options.walletApi,
     );
     sphere._password = options.password ?? null;
+    sphere._passwordProtected = sphere._password !== null;
 
     // Store mnemonic (encrypted if password provided, plaintext otherwise)
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
@@ -1040,6 +1045,7 @@ export class Sphere {
       options.walletApi,
     );
     sphere._password = options.password ?? null;
+    sphere._passwordProtected = sphere._password !== null;
 
     // exists() restores original (disconnected) state — reconnect for reads
     if (!options.storage.isConnected()) {
@@ -1145,6 +1151,7 @@ export class Sphere {
       options.walletApi,
     );
     sphere._password = options.password ?? null;
+    sphere._passwordProtected = sphere._password !== null;
 
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
 
@@ -4636,7 +4643,15 @@ export class Sphere {
   // ===========================================================================
 
   private encrypt(data: string): string {
-    if (!this._password) return data; // No password — store as plaintext
+    if (!this._password) {
+      if (this._passwordProtected) {
+        // Fail CLOSED. Failing open here silently rewrites an encrypted record as
+        // plaintext — reachable now that destroy() zeroes _password while the Connect host
+        // stays alive for the whole lock window.
+        throw new SphereError('Wallet password is not available', 'NOT_INITIALIZED');
+      }
+      return data; // No password by design — store as plaintext
+    }
     return encryptSimple(data, this._password);
   }
 
