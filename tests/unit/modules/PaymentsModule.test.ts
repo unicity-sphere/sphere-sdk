@@ -46,6 +46,34 @@ describe('PaymentsModule', () => {
       const module = createPaymentsModule();
       expect(() => module.destroy()).not.toThrow();
     });
+
+    it('clears the token cache so a destroyed module cannot answer balance queries', () => {
+      // getBalance()/getTokens()/getToken() read `tokens` directly, so a destroyed Sphere
+      // kept answering balance queries. The Connect locked gate is now the ONLY thing
+      // between a destroyed wallet and a balance read — this is the defence in depth
+      // behind it.
+      const module = createPaymentsModule();
+      const tokens = (module as unknown as { tokens: Map<string, unknown> }).tokens;
+      tokens.set('tok1', {
+        id: 'tok1',
+        coinId: 'UCT',
+        symbol: 'UCT',
+        name: 'Unicity Coin',
+        decimals: 18,
+        amount: '1000',
+        status: 'confirmed',
+      });
+
+      expect(module.getTokens()).toHaveLength(1);
+      expect(module.getBalance()).toHaveLength(1);
+      expect(module.getToken('tok1')).toBeDefined();
+
+      module.destroy();
+
+      expect(module.getTokens()).toEqual([]);
+      expect(module.getBalance()).toEqual([]);
+      expect(module.getToken('tok1')).toBeUndefined();
+    });
   });
 });
 
