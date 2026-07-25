@@ -25,6 +25,10 @@ import type {
   PublicIdentity,
   SphereRpcError,
   NetworkInfo,
+  WalletLockedData,
+  WalletLockedPayload,
+  WalletUnlockedPayload,
+  WalletDisconnectedPayload,
 } from '../protocol';
 import {
   SPHERE_CONNECT_NAMESPACE,
@@ -190,35 +194,122 @@ export class ConnectHost {
     }
   }
 
-  /** Revoke the current session */
+  /**
+   * The wallet locked (manual lock, idle auto-lock, cross-tab broadcast, cold start).
+   * The session is PRESERVED — a lock is a state, not a teardown. Every request outside
+   * the locked allow-list is answered WALLET_LOCKED (4009) until updateSphere().
+   *
+   * Idempotent: a second call is a no-op and pushes nothing. Required, because
+   * SphereProvider.lock(), ConnectPage's `sphere → null` effect and broadcastLock()'s
+   * same-tab loopback can all fire it for one user action.
+   *
+   * ORDERING CONTRACT: call this BEFORE sphere.destroy(). The host drops its Sphere
+   * reference here; destroying first leaves in-flight requests reading a dead instance
+   * (-32603, or `undefined` returned AS SUCCESS from sphere_getIdentity).
+   */
+  setLocked(): void {
+    if (this._walletState === 'locked') return;
+    assertWalletTransition(this._walletState, 'locked');
+
+    // Freeze BEFORE dropping. snapshot.identity?.chainPubkey IS the lock-edge identity
+    // binding compared in updateSphere() — there is no separate boundIdentity field.
+    this.snapshot = buildWalletSnapshot(this.sphere);
+    this._walletState = 'locked';
+    logger.debug(
+      'ConnectHost',
+      `Wallet locked — session preserved (origin=${this.config.origin ?? 'unverified'}, session=${this.session?.id ?? 'none'})`,
+    );
+
+    if (this.session?.active) {
+      this.pushClientEvent(WALLET_EVENTS.LOCKED, {} as WalletLockedPayload);
+    }
+
+    // Snapshot-then-detach. cleanupEventSubscriptions() ends in .clear() and the Map holds
+    // eventName → closure; Sphere.destroy() kills those closures, so the KEYS are the only
+    // recoverable information. Exclude identity:changed — autoSubscribeIdentityChanged()
+    // re-arms that one itself.
+    for (const key of this.eventSubscriptions.keys()) {
+      if (key === WALLET_EVENTS.IDENTITY_CHANGED) continue;
+      this.suspendedSubscriptions.add(key);
+    }
+    this.cleanupEventSubscriptions();
+
+    // Today only revokeSession() clears these. Under session-preserving semantics an
+    // auto-approved intent would otherwise survive a lock and execute unattended after
+    // the unlock.
+    this.autoApprovedIntents.clear();
+
+    this.settleInFlight(ERROR_CODES.WALLET_LOCKED, WALLET_LOCKED_MESSAGE, { reason: 'locked' });
+    this.sphere = null;
+  }
+
+  /**
+   * The Sphere instance is gone for a NON-LOCK reason (a generic init failure leaves
+   * `sphere === null, isLocked === false` in the wallet).
+   * This is a DEAD END: unlocking does not cure it, so it revokes the session and pushes
+   * wallet:disconnected rather than promising an unlock that cannot help.
+   * Subsequent requests answer NOT_CONNECTED (4001); handshakes get the empty refusal
+   * WITHOUT dereferencing a null Sphere.
+   *
+   * Idempotent. Pushes no 'wallet:unavailable' — there is no such event.
+   */
+  setUnavailable(): void {
+    if (this._walletState === 'unavailable') return;
+    assertWalletTransition(this._walletState, 'unavailable');
+
+    this._walletState = 'unavailable';
+    logger.warn(
+      'ConnectHost',
+      `Sphere unavailable (non-lock) — session revoked (origin=${this.config.origin ?? 'unverified'})`,
+    );
+
+    this.snapshot = EMPTY_WALLET_SNAPSHOT;   // nothing may be served from it
+    this.suspendedSubscriptions.clear();
+    this.revokeSession();                    // pushes wallet:disconnected, settles 4001
+    this.sphere = null;
+  }
+
+  /**
+   * Destroy the SESSION (logout, wallet deleted, dApp sphere_disconnect, popup
+   * beforeunload, expiry, identity mismatch at unlock). Pushes wallet:disconnected BEFORE
+   * tearing down, so the dApp stops believing it is connected instead of finding out at
+   * its next 4001.
+   *
+   * This is the TEARDOWN verb. For a lock use setLocked() — a lock never destroys the
+   * session. revokeSession() does NOT touch walletState: the two axes are orthogonal.
+   */
   revokeSession(): void {
     if (this.session) {
+      logger.debug(
+        'ConnectHost',
+        `Session revoked (origin=${this.config.origin ?? 'unverified'}, session=${this.session.id})`,
+      );
+      if (this.session.active) {
+        this.pushClientEvent(WALLET_EVENTS.DISCONNECTED, {} as WalletDisconnectedPayload);
+      }
       this.session.active = false;
       this.cleanupEventSubscriptions();
       this.autoApprovedIntents.clear();
       this.session = null;
       this.grantedPermissions.clear();
     }
+    this.suspendedSubscriptions.clear();
+    this.settleInFlight(ERROR_CODES.NOT_CONNECTED, NOT_CONNECTED_MESSAGE);
   }
 
-  /**
-   * Notify connected dApp that wallet is locked/logged out, then revoke session.
-   * Call this BEFORE destroy() when the wallet locks so the dApp gets a clean signal
-   * instead of receiving NOT_CONNECTED errors on the next request.
-   */
-  notifyWalletLocked(): void {
-    if (this.session?.active) {
-      this.pushClientEvent(WALLET_EVENTS.LOCKED, {});
-    }
-    this.revokeSession();
-  }
-
-  /** Destroy the host, clean up all resources */
+  /** Destroy the host, clean up all resources. Idempotent. */
   destroy(): void {
-    this.revokeSession();
+    this.revokeSession();                       // pushes wallet:disconnected, settles 4001
+    this.inFlight.destroy();                    // clear timers WITHOUT invoking onExpire
     if (this.unsubscribeTransport) {
       this.unsubscribeTransport();
       this.unsubscribeTransport = null;
+    }
+    this.sphere = null;
+    this.snapshot = EMPTY_WALLET_SNAPSHOT;
+    if (this._walletState !== 'unavailable') {
+      assertWalletTransition(this._walletState, 'unavailable');
+      this._walletState = 'unavailable';
     }
   }
 
@@ -708,6 +799,17 @@ export class ConnectHost {
     logger.warn('ConnectHost', `Request deadline reached: ${entry.kind} ${entry.id}`);
   }
 
+  /** Answer every request already in flight with one coded frame each. A request in flight
+   *  when the Sphere goes away otherwise answers -32603 with a raw JS message, returns
+   *  `undefined` AS SUCCESS (sphere_getIdentity), or — for a delegated intent — never
+   *  answers at all until the client's own 120 s timeout. */
+  private settleInFlight(code: number, message: string, data?: WalletLockedData): void {
+    for (const entry of this.inFlight.settleAll()) {
+      if (entry.kind === 'query') this.sendError(entry.id, code, message, data);
+      else this.sendIntentError(entry.id, code, message, data);
+    }
+  }
+
   private getPublicIdentity(): PublicIdentity | undefined {
     const id = this.requireSphere().identity;
     if (!id) return undefined;
@@ -737,13 +839,13 @@ export class ConnectHost {
     });
   }
 
-  private sendError(id: string, code: number, message: string): void {
+  private sendError(id: string, code: number, message: string, data?: unknown): void {
     this.transport.send({
       ns: SPHERE_CONNECT_NAMESPACE,
       v: SPHERE_CONNECT_VERSION,
       type: 'response',
       id,
-      error: { code, message },
+      error: { code, message, ...(data !== undefined ? { data } : {}) },
     });
   }
 
@@ -757,13 +859,13 @@ export class ConnectHost {
     });
   }
 
-  private sendIntentError(id: string, code: number, message: string): void {
+  private sendIntentError(id: string, code: number, message: string, data?: unknown): void {
     this.transport.send({
       ns: SPHERE_CONNECT_NAMESPACE,
       v: SPHERE_CONNECT_VERSION,
       type: 'intent_result',
       id,
-      error: { code, message },
+      error: { code, message, ...(data !== undefined ? { data } : {}) },
     });
   }
 

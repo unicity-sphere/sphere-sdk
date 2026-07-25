@@ -298,3 +298,243 @@ describe('ConnectHost wallet-binding axis', () => {
     expect(h.sphere.payments.getBalance).toHaveBeenCalledTimes(1);
   });
 });
+
+// ===========================================================================
+// Task 7 — setLocked() / setUnavailable() / revokeSession()
+// ===========================================================================
+
+describe('ConnectHost.setLocked()', () => {
+  it('preserves the session, its dapp and its permissions', async () => {
+    const h = await connectHarness();
+    const before = h.host.getSession()!;
+    const beforePermissions = [...before.permissions];
+
+    lockWallet(h);
+
+    const after = h.host.getSession();
+    expect(after).not.toBeNull();
+    expect(after!.id).toBe(before.id);
+    expect(after!.active).toBe(true);
+    expect(after!.dapp).toEqual(DAPP);
+    expect(after!.permissions).toEqual(beforePermissions);
+    expect(h.host.walletState).toBe('locked');
+    expect(h.host.getState()).toEqual({ walletState: 'locked', session: after });
+  });
+
+  it('pushes exactly one wallet:locked and is idempotent', async () => {
+    const h = await connectHarness();
+
+    h.host.setLocked();
+    h.host.setLocked();
+    h.host.setLocked();
+
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.LOCKED)).toHaveLength(1);
+    expect(h.host.walletState).toBe('locked');
+  });
+
+  it('pushes no wallet:locked when there is no active session', () => {
+    const pair = createMockTransportPair();
+    const host = makeHost(pair);
+
+    host.setLocked();
+
+    expect(eventsOfType(pair.hostSent, WALLET_EVENTS.LOCKED)).toHaveLength(0);
+    expect(host.walletState).toBe('locked');
+  });
+
+  it('freezes the snapshot BEFORE dropping the Sphere reference', async () => {
+    const h = await connectHarness();
+
+    lockWallet(h);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const host = h.host as any;
+    expect(host.sphere).toBeNull();
+    expect(host.snapshot.identity).toEqual({
+      chainPubkey: '02abc123', directAddress: 'DIRECT://test', nametag: 'alice',
+    });
+    expect(host.snapshot.networkId).toBe(4);
+  });
+
+  it('snapshots subscription KEYS before detaching, excluding identity:changed', async () => {
+    const h = await connectHarness();
+    const handler = vi.fn();
+    h.client.on('transfer:incoming', handler);
+    await tick();
+
+    lockWallet(h);
+    h.sphere._emit('transfer:incoming', { amount: '1' });
+    await tick();
+
+    expect(handler).not.toHaveBeenCalled();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const suspended = (h.host as any).suspendedSubscriptions as Set<string>;
+    expect(suspended.has('transfer:incoming')).toBe(true);
+    // autoSubscribeIdentityChanged() re-arms this one itself.
+    expect(suspended.has(WALLET_EVENTS.IDENTITY_CHANGED)).toBe(false);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((h.host as any).eventSubscriptions.size).toBe(0);
+  });
+
+  it('clears auto-approved intents so none can execute unattended after the unlock', async () => {
+    const h = await connectHarness();
+    h.host.setIntentAutoApprove(INTENT_ACTIONS.DM, vi.fn().mockResolvedValue({ result: { ok: true } }));
+
+    lockWallet(h);
+
+    // Today only revokeSession() clears these; under session-preserving semantics an
+    // auto-approved intent would otherwise survive the lock.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((h.host as any).autoApprovedIntents.size).toBe(0);
+  });
+
+  it('answers a Sphere-backed query with 4009 and data.reason after the lock', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    const err = await h.client.query(RPC_METHODS.GET_BALANCE).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConnectError);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
+    expect(h.sphere.payments.getBalance).not.toHaveBeenCalled();
+  });
+});
+
+describe('ConnectHost.setUnavailable()', () => {
+  it('revokes the session and pushes wallet:disconnected — not wallet:locked', async () => {
+    const h = await connectHarness();
+
+    h.host.setUnavailable();
+
+    expect(h.host.walletState).toBe('unavailable');
+    expect(h.host.getSession()).toBeNull();
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.LOCKED)).toHaveLength(0);
+  });
+
+  it('empties the snapshot — nothing may be served from a wallet that is simply gone', async () => {
+    const h = await connectHarness();
+
+    h.host.setUnavailable();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const snap = (h.host as any).snapshot;
+    expect(snap.capturedAt).toBe(0);
+    expect(snap.identity).toBeUndefined();
+    expect(snap.networkId).toBeUndefined();
+  });
+
+  it('answers subsequent queries 4001, never 4009 — unlocking cannot cure it', async () => {
+    const h = await connectHarness();
+    h.host.setUnavailable();
+
+    const err = await h.client.query(RPC_METHODS.GET_BALANCE).catch((e: unknown) => e);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.NOT_CONNECTED);
+    expect((err as ConnectError).code).not.toBe(ERROR_CODES.WALLET_LOCKED);
+  });
+
+  it('is idempotent and pushes wallet:disconnected only once', async () => {
+    const h = await connectHarness();
+
+    h.host.setUnavailable();
+    h.host.setUnavailable();
+
+    expect(h.host.walletState).toBe('unavailable');
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
+  });
+
+  it('pushes no wallet:unavailable — there is no such event', async () => {
+    const h = await connectHarness();
+    h.host.setUnavailable();
+    const events = h.pair.hostSent
+      .filter((m) => m.type === 'event')
+      .map((m) => (m as { event: string }).event);
+    expect(events).not.toContain('wallet:unavailable');
+  });
+});
+
+describe('ConnectHost.revokeSession()', () => {
+  it('pushes wallet:disconnected BEFORE tearing the session down', async () => {
+    const h = await connectHarness();
+
+    h.host.revokeSession();
+
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
+    expect(h.host.getSession()).toBeNull();
+  });
+
+  it('does NOT touch walletState — the two axes are orthogonal', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    h.host.revokeSession();
+
+    expect(h.host.getSession()).toBeNull();
+    expect(h.host.walletState).toBe('locked');
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
+  });
+
+  it('pushes nothing when there was no session', () => {
+    const pair = createMockTransportPair();
+    const host = makeHost(pair);
+
+    host.revokeSession();
+
+    expect(eventsOfType(pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(0);
+    expect(host.walletState).toBe('live');
+  });
+
+  it('clears the suspended-subscription set so an unlock cannot resurrect a dead session', async () => {
+    const h = await connectHarness();
+    h.client.on('transfer:incoming', vi.fn());
+    await tick();
+    lockWallet(h);
+
+    h.host.revokeSession();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(((h.host as any).suspendedSubscriptions as Set<string>).size).toBe(0);
+  });
+});
+
+describe('notifyWalletLocked() is REMOVED, not aliased', () => {
+  it('does not exist on the prototype', () => {
+    // Its old meaning was REVOKE; the new meaning would be LOCK — the opposite. An alias
+    // is a silent runtime inversion at every existing wallet call site, so it is a
+    // compile-time break instead.
+    expect(
+      (ConnectHost.prototype as unknown as Record<string, unknown>).notifyWalletLocked,
+    ).toBeUndefined();
+  });
+
+  it('exposes the four replacement verbs', () => {
+    const p = ConnectHost.prototype as unknown as Record<string, unknown>;
+    expect(typeof p.setLocked).toBe('function');
+    expect(typeof p.setUnavailable).toBe('function');
+    expect(typeof p.updateSphere).toBe('function');
+    expect(typeof p.revokeSession).toBe('function');
+  });
+});
+
+describe('ConnectHost.destroy()', () => {
+  it('revokes, pushes wallet:disconnected and lands in unavailable', async () => {
+    const h = await connectHarness();
+
+    h.host.destroy();
+
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
+    expect(h.host.getSession()).toBeNull();
+    expect(h.host.walletState).toBe('unavailable');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((h.host as any).sphere).toBeNull();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((h.host as any).snapshot.capturedAt).toBe(0);
+  });
+
+  it('is idempotent', async () => {
+    const h = await connectHarness();
+    h.host.destroy();
+    h.host.destroy();
+    expect(h.host.walletState).toBe('unavailable');
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
+  });
+});
