@@ -35,6 +35,45 @@ export interface ConnectSession {
 }
 
 // =============================================================================
+// Wallet binding state (orthogonal to the session — see docs/CONNECT.md)
+// =============================================================================
+
+/**
+ * State of the host's binding to a Sphere instance. ORTHOGONAL to `session`:
+ * a locked wallet keeps its session, and a live wallet may have none.
+ *
+ * - 'live'        — Sphere bound and usable.
+ * - 'locked'      — the wallet is locked: the Sphere reference is DROPPED and the
+ *                   session is PRESERVED. Requests outside the allow-list answer
+ *                   WALLET_LOCKED (4009). Curable by updateSphere().
+ * - 'unavailable' — Sphere is gone for a NON-lock reason (a generic init failure leaves
+ *                   `sphere === null, isLocked === false`). Entering it revokes the
+ *                   session and pushes wallet:disconnected. NOT curable by unlocking.
+ */
+export type WalletState = 'live' | 'locked' | 'unavailable';
+
+/** Context handed to {@link ConnectHostConfig.onLockedRequest}. Notify-only. */
+export interface LockedRequestContext {
+  /** ConnectHostConfig.origin, when the wallet supplied one. NEVER the dApp-claimed
+   *  `session.dapp.url`. Absent = "a connected app"; make no claim you cannot verify. */
+  readonly origin?: string;
+  readonly kind: 'query' | 'intent' | 'handshake';
+  /** An RPC_METHODS value for 'query', an INTENT_ACTIONS value for 'intent',
+   *  the literal 'handshake' for 'handshake'. */
+  readonly name: string;
+}
+
+/** 4th argument of {@link ConnectHostConfig.onIntent} (Connect 2.1). */
+export interface IntentContext {
+  readonly origin?: string;
+  /** Epoch ms after which the host answers on its own and aborts `signal`. */
+  readonly expiresAt: number;
+  /** Aborted when the host settles the intent for ANY reason (deadline, lock, revoke,
+   *  unavailable, destroy). The wallet MUST dismiss its modal on abort. */
+  readonly signal: AbortSignal;
+}
+
+// =============================================================================
 // ConnectHost Config
 // =============================================================================
 

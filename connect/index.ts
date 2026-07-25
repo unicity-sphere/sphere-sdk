@@ -73,4 +73,7 @@ export type {
   ConnectClientConfig,
   ConnectResult,
   ConnectEventHandler,
+  WalletState,
+  LockedRequestContext,
+  IntentContext,
 } from './types';
