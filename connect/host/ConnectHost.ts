@@ -65,6 +65,19 @@ const DEFAULT_REQUEST_DEADLINE_MS = 25000;
 const DEFAULT_INTENT_DEADLINE_MS = 90000;
 const DEFAULT_HANDSHAKE_DEADLINE_MS = 120000;
 
+/** Resolve `promise`, or `fallback()` after `ms`. Used ONLY for onConnectionRequest, which
+ *  has no id and therefore cannot live in InFlightRegistry. A rejection still propagates,
+ *  so handleHandshake's own error handling is unchanged. */
+function withDeadline<T>(promise: Promise<T>, ms: number, fallback: () => T): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(fallback()), ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
 export class ConnectHost {
   /** Null whenever _walletState is 'locked' or 'unavailable' (invariant B). */
   private sphere: SphereInstance | null;
@@ -399,11 +412,15 @@ export class ConnectHost {
 
     const requestedPermissions = msg.permissions as PermissionScope[];
 
-    const { approved, grantedPermissions } = await this.config.onConnectionRequest(
-      dapp,
-      requestedPermissions,
-      msg.silent,
-      clientInfo,
+    const { approved, grantedPermissions } = await withDeadline(
+      Promise.resolve(
+        this.config.onConnectionRequest(dapp, requestedPermissions, msg.silent, clientInfo),
+      ),
+      this.config.handshakeDeadlineMs ?? DEFAULT_HANDSHAKE_DEADLINE_MS,
+      () => {
+        logger.warn('ConnectHost', 'Connection approval prompt timed out', { dapp: dapp.name });
+        return { approved: false, grantedPermissions: [] as PermissionScope[] };
+      },
     );
 
     if (!approved) {
@@ -537,11 +554,17 @@ export class ConnectHost {
       return;
     }
 
-    // 7. Execute.
+    // 7. Register BEFORE the first await, with the timer armed at insertion time, then
+    //    execute. Every send goes through settle(), which returns null when a lock, a
+    //    revoke, a destroy or the deadline already answered this id — the whole
+    //    "exactly one frame per id" mechanism.
+    this.inFlight.add(msg.id, 'query', this.config.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS);
     try {
       const result = await this.executeMethod(msg.method, msg.params ?? {});
+      if (!this.inFlight.settle(msg.id)) return;
       this.sendResult(msg.id, result);
     } catch (error) {
+      if (!this.inFlight.settle(msg.id)) return;
       this.sendError(msg.id, ERROR_CODES.INTERNAL_ERROR, (error as Error).message);
     }
   }
@@ -588,25 +611,40 @@ export class ConnectHost {
       return;
     }
 
-    // Check auto-approve before delegating to wallet UI
-    const autoHandler = this.autoApprovedIntents.get(msg.action);
-    if (autoHandler) {
-      const autoResponse = await autoHandler(msg.action, msg.params, this.session);
-      if (autoResponse.error) {
-        this.sendIntentError(msg.id, autoResponse.error.code, autoResponse.error.message);
+    // 6. Register BEFORE the first await, then delegate. The entry owns the deadline and
+    //    the AbortController, so lock / revoke / unavailable / destroy / deadline all
+    //    settle this id exactly once.
+    const session = this.session;
+    const entry = this.inFlight.add(
+      msg.id,
+      'intent',
+      this.config.intentDeadlineMs ?? DEFAULT_INTENT_DEADLINE_MS,
+    );
+    const ctx: IntentContext = {
+      origin: this.config.origin,
+      expiresAt: entry.deadline,
+      signal: entry.controller.signal,
+    };
+
+    try {
+      const autoHandler = this.autoApprovedIntents.get(msg.action);
+      const response = autoHandler
+        ? await autoHandler(msg.action, msg.params, session)
+        : await this.config.onIntent(msg.action, msg.params, session, ctx);
+
+      if (!this.inFlight.settle(msg.id)) return;
+      if (response.error) {
+        this.sendIntentError(msg.id, response.error.code, response.error.message);
       } else {
-        this.sendIntentResult(msg.id, autoResponse.result);
+        this.sendIntentResult(msg.id, response.result);
       }
-      return;
-    }
-
-    // Delegate to wallet app
-    const response = await this.config.onIntent(msg.action, msg.params, this.session);
-
-    if (response.error) {
-      this.sendIntentError(msg.id, response.error.code, response.error.message);
-    } else {
-      this.sendIntentResult(msg.id, response.result);
+    } catch (error) {
+      // A throw from onIntent or from an auto-approve handler used to reach
+      // handleMessage's catch, which sent NOTHING — the dApp then hung for its full
+      // intentTimeout and ended with a bare Error('Intent timeout: …') carrying no .code.
+      logger.warn('ConnectHost', `Intent handler threw: ${msg.action}`, error);
+      if (!this.inFlight.settle(msg.id)) return;
+      this.sendIntentError(msg.id, ERROR_CODES.INTERNAL_ERROR, INTERNAL_ERROR_MESSAGE);
     }
   }
 
@@ -876,7 +914,15 @@ export class ConnectHost {
   /** InFlightRegistry.onExpire sink. Filled in a later task; declared here so the
    *  constructor can wire it. */
   private settleExpired(entry: InFlightEntry): void {
-    logger.warn('ConnectHost', `Request deadline reached: ${entry.kind} ${entry.id}`);
+    logger.warn(
+      'ConnectHost',
+      `Host deadline reached, answering on our own: ${entry.kind} ${entry.id} (origin=${this.config.origin ?? 'unverified'})`,
+    );
+    if (entry.kind === 'query') {
+      this.sendError(entry.id, ERROR_CODES.INTERNAL_ERROR, INTERNAL_ERROR_MESSAGE);
+    } else {
+      this.sendIntentError(entry.id, ERROR_CODES.INTENT_CANCELLED, 'Intent cancelled');
+    }
   }
 
   /** Answer every request already in flight with one coded frame each. A request in flight

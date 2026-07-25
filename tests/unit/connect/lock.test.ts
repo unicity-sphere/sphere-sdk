@@ -901,3 +901,212 @@ describe('rate limiting on the intent and handshake paths', () => {
     expect(refusal.identity).toBeUndefined();
   });
 });
+
+// ===========================================================================
+// Task 10 — in-flight settlement and host deadlines
+// ===========================================================================
+
+describe('in-flight requests at lock time', () => {
+  it('answers an in-flight query with 4009 instead of -32603 or undefined-as-success', async () => {
+    const h = await connectHarness();
+    // getAssets is the only async payments call — hold it open across the lock.
+    let release!: (v: unknown[]) => void;
+    h.sphere.payments.getAssets.mockReturnValue(new Promise((r) => { release = r; }));
+
+    const pending = h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
+    await tick();
+
+    lockWallet(h);
+    release([{ coinId: 'UCT' }]);
+
+    const err = await pending;
+    expect(err).toBeInstanceOf(ConnectError);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
+    expect((err as ConnectError).data).toEqual({ reason: 'locked' });
+  });
+
+  it('never sends a second frame for an id the lock already settled', async () => {
+    const h = await connectHarness();
+    let release!: (v: unknown[]) => void;
+    h.sphere.payments.getAssets.mockReturnValue(new Promise((r) => { release = r; }));
+
+    const pending = h.client.query(RPC_METHODS.GET_ASSETS).catch(() => undefined);
+    await tick();
+
+    lockWallet(h);
+    release([{ coinId: 'UCT' }]);
+    await pending;
+    await tick();
+
+    const ids = h.pair.hostSent
+      .filter((m) => m.type === 'response')
+      .map((m) => (m as { id: string }).id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('answers a delegated intent that never resolves instead of hanging the dApp', async () => {
+    const h = await connectHarness({ onIntent: vi.fn(() => new Promise(() => {})) });
+
+    const pending = h.client
+      .intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' })
+      .catch((e: unknown) => e);
+    await tick();
+
+    lockWallet(h);
+
+    const err = await pending;
+    expect(err).toBeInstanceOf(ConnectError);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
+  });
+
+  it('aborts ctx.signal when the lock settles a pending intent', async () => {
+    let seen: AbortSignal | undefined;
+    const h = await connectHarness({
+      onIntent: vi.fn((_a: string, _p: unknown, _s: unknown, ctx?: { signal: AbortSignal }) => {
+        seen = ctx?.signal;
+        return new Promise(() => {});
+      }),
+    });
+
+    const pending = h.client
+      .intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' })
+      .catch(() => undefined);
+    await tick();
+
+    expect(seen).toBeDefined();
+    expect(seen!.aborted).toBe(false);
+    lockWallet(h);
+    await pending;
+
+    // The wallet MUST dismiss its modal on abort; without this the host's own deadline
+    // manufactures the double-submit it was added to prevent.
+    expect(seen!.aborted).toBe(true);
+  });
+
+  it('hands onIntent an origin and an expiresAt in the future', async () => {
+    let ctx: { origin?: string; expiresAt: number } | undefined;
+    const h = await connectHarness({
+      onIntent: vi.fn(async (_a: string, _p: unknown, _s: unknown, c?: { origin?: string; expiresAt: number }) => {
+        ctx = c;
+        return { result: { ok: true } };
+      }),
+      intentDeadlineMs: 90_000,
+    });
+
+    await h.client.intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' });
+
+    expect(ctx?.origin).toBe(ORIGIN);
+    expect(ctx!.expiresAt).toBeGreaterThan(Date.now());
+    expect(ctx!.expiresAt).toBeLessThanOrEqual(Date.now() + 90_000);
+  });
+
+  it('settles in-flight work with 4001 on revokeSession()', async () => {
+    const h = await connectHarness();
+    let release!: (v: unknown[]) => void;
+    h.sphere.payments.getAssets.mockReturnValue(new Promise((r) => { release = r; }));
+
+    const pending = h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
+    await tick();
+
+    h.host.revokeSession();
+    release([]);
+
+    const err = await pending;
+    expect((err as ConnectError).code).toBe(ERROR_CODES.NOT_CONNECTED);
+  });
+
+  it('settles in-flight work with 4001 on destroy()', async () => {
+    const h = await connectHarness();
+    let release!: (v: unknown[]) => void;
+    h.sphere.payments.getAssets.mockReturnValue(new Promise((r) => { release = r; }));
+
+    const pending = h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
+    await tick();
+
+    h.host.destroy();
+    release([]);
+
+    const err = await pending;
+    expect((err as ConnectError).code).toBe(ERROR_CODES.NOT_CONNECTED);
+  });
+
+  it('leaves the registry empty after a normal request and a normal intent', async () => {
+    const h = await connectHarness();
+    await h.client.query(RPC_METHODS.GET_BALANCE);
+    await h.client.intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((h.host as any).inFlight.size).toBe(0);
+  });
+
+  it('answers an intent whose onIntent THROWS instead of hanging forever', async () => {
+    const h = await connectHarness({
+      onIntent: vi.fn(async () => { throw new Error('wallet modal crashed'); }),
+    });
+
+    const err = await h.client
+      .intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ConnectError);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.INTERNAL_ERROR);
+    // A raw JS message must never cross the trust boundary.
+    expect((err as ConnectError).message).toBe('Internal wallet error');
+  });
+});
+
+describe('host deadlines', () => {
+  it('cancels an unanswered intent with INTENT_CANCELLED 4200 and aborts the signal', async () => {
+    let seen: AbortSignal | undefined;
+    const h = await connectHarness({
+      intentDeadlineMs: 40,
+      onIntent: vi.fn((_a: string, _p: unknown, _s: unknown, ctx?: { signal: AbortSignal }) => {
+        seen = ctx?.signal;
+        return new Promise(() => {});
+      }),
+    });
+
+    const err = await h.client
+      .intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' })
+      .catch((e: unknown) => e);
+
+    expect((err as ConnectError).code).toBe(ERROR_CODES.INTENT_CANCELLED);
+    expect(seen!.aborted).toBe(true);
+  });
+
+  it('answers an unanswered query with a fixed INTERNAL_ERROR at its deadline', async () => {
+    const h = await connectHarness({ requestDeadlineMs: 40 });
+    h.sphere.payments.getAssets.mockReturnValue(new Promise(() => {}));
+
+    const err = await h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
+
+    expect((err as ConnectError).code).toBe(ERROR_CODES.INTERNAL_ERROR);
+    expect((err as ConnectError).message).toBe('Internal wallet error');
+  });
+
+  it('refuses an unanswered connection approval with the empty refusal', async () => {
+    const pair = createMockTransportPair();
+    makeHost(pair, {
+      handshakeDeadlineMs: 40,
+      onConnectionRequest: vi.fn(() => new Promise(() => {})),
+    });
+    const client = new ConnectClient({ transport: pair.client, dapp: DAPP, network: { id: 4 } });
+
+    // A handshake carries no id, so its deadline sends the EMPTY refusal.
+    await expect(client.connect()).rejects.toThrow('Connection rejected by wallet');
+    expect(handshakeResponses(pair.hostSent)).toHaveLength(1);
+  });
+
+  it('does not interfere with a prompt answered in time', async () => {
+    const h = await connectHarness({
+      intentDeadlineMs: 5_000,
+      onIntent: vi.fn(() => new Promise((resolve) => {
+        setTimeout(() => resolve({ result: { ok: true } }), 20);
+      })),
+    });
+
+    await expect(
+      h.client.intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' }),
+    ).resolves.toEqual({ ok: true });
+  });
+});
