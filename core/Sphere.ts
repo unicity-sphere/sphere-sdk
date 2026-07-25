@@ -1588,6 +1588,7 @@ export class Sphere {
    * Check if wallet has BIP32 master key for HD derivation
    */
   hasMasterKey(): boolean {
+    this.ensureReady();
     return this._masterKey !== null;
   }
 
@@ -1622,6 +1623,7 @@ export class Sphere {
    * Returns null if wallet was imported from file (masterKey only)
    */
   getMnemonic(): string | null {
+    this.ensureReady();
     return this._mnemonic;
   }
 
@@ -1629,6 +1631,7 @@ export class Sphere {
    * Get wallet info for backup/export purposes
    */
   getWalletInfo(): WalletInfo {
+    this.ensureReady();
     let address0: string | null = null;
     try {
       if (this._identity) {
@@ -3976,6 +3979,13 @@ export class Sphere {
     this._initialized = false;
     this._trackedAddressesLoaded = false;
     this._identity = null;
+    // Zero the decrypted key material too. Clearing _identity alone made the wallet's own
+    // "keys leave memory — a real lock, not just a UI gate" comment false, and the
+    // graceful-lock design keeps the Connect host alive for the WHOLE lock window rather
+    // than milliseconds — so the window in which these survive is now user-scale.
+    this._mnemonic = null;
+    this._masterKey = null;
+    this._password = null;
     this._trackedAddresses.clear();
     this._addressIdToIndex.clear();
     this._addressNametags.clear();
