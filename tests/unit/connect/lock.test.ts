@@ -1415,3 +1415,181 @@ describe('sphere_subscribe refuses auto-pushed names', () => {
       .resolves.toEqual({ subscribed: true, event: 'transfer:incoming' });
   });
 });
+
+// ===========================================================================
+// Task 13 — handshake while locked
+// ===========================================================================
+
+describe('handshake while locked', () => {
+  it('a matching resume SUCCEEDS and the response carries locked: true', async () => {
+    const h = await connectHarness();
+    const sessionId = h.host.getSession()!.id;
+    lockWallet(h);
+    const before = handshakeResponses(h.pair.hostSent).length;
+
+    sendRawHandshake(h.pair, { sessionId });
+    await tick();
+
+    const resp = handshakeResponses(h.pair.hostSent)[before];
+    expect(resp.error).toBeUndefined();
+    expect(resp.sessionId).toBe(sessionId);
+    expect(resp.locked).toBe(true);
+    expect(resp.identity).toEqual({
+      chainPubkey: '02abc123', directAddress: 'DIRECT://test', nametag: 'alice',
+    });
+  });
+
+  it('pushes wallet:locked immediately after a locked handshake response', async () => {
+    const h = await connectHarness();
+    const sessionId = h.host.getSession()!.id;
+    lockWallet(h);
+    const before = eventsOfType(h.pair.hostSent, WALLET_EVENTS.LOCKED).length;
+
+    sendRawHandshake(h.pair, { sessionId });
+    await tick();
+
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.LOCKED).length).toBe(before + 1);
+  });
+
+  it('a fresh ConnectClient resuming during a lock lands connected AND locked', async () => {
+    const h = await connectHarness();
+    const sessionId = h.host.getSession()!.id;
+    lockWallet(h);
+
+    const resumed = new ConnectClient({
+      transport: h.pair.client, dapp: DAPP, network: { id: 4 }, resumeSessionId: sessionId,
+    });
+    const result = await resumed.connect();
+
+    expect(result.sessionId).toBe(sessionId);
+    expect(result.locked).toBe(true);
+    expect(resumed.isConnected).toBe(true);
+  });
+
+  it('forces silent: true on every handshake while locked', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+    h.onConnectionRequest.mockClear();
+
+    // A NEW origin, no sessionId, and the dApp did NOT ask for silent.
+    sendRawHandshake(h.pair);
+    await tick();
+
+    // The wallet's own `if (silent) return { approved: false }` branch is what refuses an
+    // unapproved origin with no UI. Forcing the flag is the entire mechanism.
+    expect(h.onConnectionRequest).toHaveBeenCalledTimes(1);
+    expect(h.onConnectionRequest.mock.calls[0][2]).toBe(true);
+  });
+
+  it('mints a session from the snapshot for a previously approved origin', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+    const before = handshakeResponses(h.pair.hostSent).length;
+    // A wallet that has this origin in sphere_connected_sites approves even when silent.
+    h.onConnectionRequest.mockResolvedValue({
+      approved: true, grantedPermissions: [PERMISSION_SCOPES.IDENTITY_READ],
+    });
+
+    sendRawHandshake(h.pair);
+    await tick();
+
+    const resp = handshakeResponses(h.pair.hostSent)[before];
+    expect(resp.sessionId).toBeTypeOf('string');
+    expect(resp.locked).toBe(true);
+    expect(resp.identity).toBeDefined();
+    expect(h.host.getSession()).not.toBeNull();
+    expect(h.host.walletState).toBe('locked');
+  });
+
+  it('gives an unapproved origin todays empty refusal — the lock stays unobservable', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+    const before = handshakeResponses(h.pair.hostSent).length;
+    h.onConnectionRequest.mockResolvedValue({ approved: false, grantedPermissions: [] });
+
+    sendRawHandshake(h.pair, { sessionId: 'someone-elses-session' });
+    await tick();
+
+    const resp = handshakeResponses(h.pair.hostSent)[before];
+    expect(resp.error).toBeUndefined();
+    expect(resp.sessionId).toBeUndefined();
+    expect(resp.identity).toBeUndefined();
+    expect(resp.locked).toBeUndefined();
+  });
+
+  it('never leaks INCOMPATIBLE_NETWORK from a cold-start-locked host', async () => {
+    const pair = createMockTransportPair();
+    const onConnectionRequest = vi.fn().mockResolvedValue({ approved: true, grantedPermissions: [] });
+    makeHost(pair, { sphere: null, initialWalletState: 'locked', onConnectionRequest });
+
+    sendRawHandshake(pair);
+    await tick();
+
+    const responses = handshakeResponses(pair.hostSent);
+    expect(responses).toHaveLength(1);
+    // 4008 here would tell an unapproved origin that a wallet lives at this window AND
+    // hand it walletNetwork { id: -1 }. Step 0 refuses BEFORE checkCompatibility.
+    expect(responses[0].error).toBeUndefined();
+    expect(onConnectionRequest).not.toHaveBeenCalled();
+  });
+
+  it('refuses even a matching resume when there is no snapshot at all', async () => {
+    const pair = createMockTransportPair();
+    const host = makeHost(pair, { sphere: null, initialWalletState: 'locked' });
+
+    sendRawHandshake(pair, { sessionId: 'anything' });
+    await tick();
+
+    // "Never invent a fact about a wallet we have not seen."
+    const resp = handshakeResponses(pair.hostSent)[0];
+    expect(resp.sessionId).toBeUndefined();
+    expect(resp.locked).toBeUndefined();
+    expect(host.walletState).toBe('locked');
+  });
+
+  it('refuses a handshake while unavailable without dereferencing Sphere', async () => {
+    const h = await connectHarness();
+    h.host.setUnavailable();
+    const before = handshakeResponses(h.pair.hostSent).length;
+
+    sendRawHandshake(h.pair);
+    await tick();
+
+    const resp = handshakeResponses(h.pair.hostSent)[before];
+    expect(resp.error).toBeUndefined();
+    expect(resp.sessionId).toBeUndefined();
+  });
+
+  it('fires onLockedRequest with kind: handshake', async () => {
+    const h = await connectHarness();
+    const sessionId = h.host.getSession()!.id;
+    lockWallet(h);
+    h.onLockedRequest.mockClear();
+
+    sendRawHandshake(h.pair, { sessionId });
+    await tick();
+
+    expect(h.onLockedRequest).toHaveBeenCalledWith({
+      origin: ORIGIN, kind: 'handshake', name: 'handshake',
+    });
+  });
+
+  it('never sets locked on a live handshake response', async () => {
+    const h = await connectHarness();
+    const resp = handshakeResponses(h.pair.hostSent)[0];
+    expect(resp.locked).toBeUndefined();
+  });
+
+  it('completes a normal handshake once the wallet is unlocked', async () => {
+    const pair = createMockTransportPair();
+    const host = makeHost(pair, { sphere: null, initialWalletState: 'locked' });
+    host.updateSphere(createMockSphere());
+
+    const client = new ConnectClient({ transport: pair.client, dapp: DAPP, network: { id: 4 } });
+    const result = await client.connect();
+
+    expect(result.sessionId).toBeTypeOf('string');
+    expect(result.locked).toBeUndefined();
+    expect(host.walletState).toBe('live');
+  });
+});

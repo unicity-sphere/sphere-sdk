@@ -462,11 +462,31 @@ export class ConnectHost {
       return;
     }
 
+    // STEP 0 — a host with no live binding AND no snapshot knows nothing about a wallet.
+    // BEFORE checkCompatibility on purpose: snapshot.networkId is undefined on a
+    // cold-start-locked host, so the network check (a missing network is treated as a
+    // mismatch) would answer INCOMPATIBLE_NETWORK 4008 to EVERY origin — leaking
+    // "a wallet lives here, network -1" with no approval, and lying about the cause.
+    if (this._walletState !== 'live' && !this.snapshot.identity) {
+      this.sendHandshakeResponse([], undefined, undefined);
+      return;
+    }
+
     // Rate limit. The handshake path was entirely unmetered: an unapproved origin could
     // loop handshakes and open the approval UI without bound. The refusal is today's EMPTY
     // refusal — it carries no error and reveals nothing about the wallet's state.
     if (!this.checkRateLimit()) {
       logger.warn('ConnectHost', 'Handshake rate-limited', { dapp: dapp.name });
+      this.sendHandshakeResponse([], undefined, undefined);
+      return;
+    }
+
+    const locked = this._walletState === 'locked';
+
+    // Lock gate for the handshake kind. 'unavailable' refuses here WITHOUT dereferencing a
+    // null Sphere — which is the whole reason the state exists separately.
+    const handshakeDecision = gate(this._walletState, !!this.session?.active, 'handshake', 'handshake');
+    if (handshakeDecision.kind === 'refuse') {
       this.sendHandshakeResponse([], undefined, undefined);
       return;
     }
@@ -500,17 +520,38 @@ export class ConnectHost {
 
     // Session resumption: if the client presents a valid existing sessionId,
     // skip the approval popup and restore the session without user interaction.
+    // A resume DURING A LOCK succeeds and carries locked: true — a reloaded dApp is the
+    // most common entry into this feature, and refusing it would leave that dApp with no
+    // channel at all (it is not subscribed, so it would never receive wallet:unlocked).
     if (msg.sessionId && this.session?.active && this.session.id === msg.sessionId) {
-      const identity = this.getPublicIdentity();
-      this.sendHandshakeResponse([...this.grantedPermissions], this.session.id, identity);
+      const identity = locked ? this.snapshotIdentity() : this.getPublicIdentity();
+      this.sendHandshakeResponse(
+        [...this.grantedPermissions],
+        this.session.id,
+        identity,
+        undefined,
+        undefined,
+        undefined,
+        locked ? true : undefined,
+      );
+      if (locked) {
+        this.pushClientEvent(WALLET_EVENTS.LOCKED, {} as WalletLockedPayload);
+        this.notifyLockedRequest('handshake', 'handshake');
+      }
       return;
     }
 
     const requestedPermissions = msg.permissions as PermissionScope[];
 
+    // FORCED SILENT while locked: the wallet's existing `if (silent) return { approved:
+    // false }` branch refuses an unapproved origin with NO UI, and a previously approved
+    // origin is approved from persisted state. No dApp request may ever raise a credential
+    // surface, so a locked handshake must never be able to open one.
+    const silent = msg.silent === true || locked;
+
     const { approved, grantedPermissions } = await withDeadline(
       Promise.resolve(
-        this.config.onConnectionRequest(dapp, requestedPermissions, msg.silent, clientInfo),
+        this.config.onConnectionRequest(dapp, requestedPermissions, silent, clientInfo),
       ),
       this.config.handshakeDeadlineMs ?? DEFAULT_HANDSHAKE_DEADLINE_MS,
       () => {
@@ -521,6 +562,7 @@ export class ConnectHost {
 
     if (!approved) {
       this.sendHandshakeResponse([], undefined, undefined);
+      if (locked) this.notifyLockedRequest('handshake', 'handshake');
       return;
     }
 
@@ -541,12 +583,23 @@ export class ConnectHost {
 
     // Auto-push identity:changed to dApp whenever the wallet switches address.
     // MetaMask pattern: no sphere_subscribe needed — host pushes it unconditionally.
-    this.autoSubscribeIdentityChanged();
+    // SKIPPED while locked: there is no Sphere to attach to. updateSphere() arms it on the
+    // locked -> live edge, so no extra bookkeeping is needed.
+    if (!locked) this.autoSubscribeIdentityChanged();
 
-    // Build public identity
-    const identity = this.getPublicIdentity();
+    // Build public identity — from the snapshot while locked.
+    const identity = locked ? this.snapshotIdentity() : this.getPublicIdentity();
 
-    this.sendHandshakeResponse(allPermissions, sessionId, identity);
+    this.sendHandshakeResponse(
+      allPermissions,
+      sessionId,
+      identity,
+      undefined,
+      undefined,
+      undefined,
+      locked ? true : undefined,
+    );
+    if (locked) this.pushClientEvent(WALLET_EVENTS.LOCKED, {} as WalletLockedPayload);
   }
 
   // `warning` is a forward-compatible deprecation-notice slot (see SphereHandshake.warning);
@@ -558,6 +611,7 @@ export class ConnectHost {
     error?: SphereRpcError,
     echoV?: string,
     warning?: SphereRpcError,
+    locked?: boolean,
   ): void {
     const network: NetworkInfo | undefined =
       typeof this.snapshot.networkId === 'number' ? { id: this.snapshot.networkId } : undefined;
@@ -573,6 +627,7 @@ export class ConnectHost {
       sdkVersion: SDK_VERSION,
       error,
       warning,
+      ...(locked ? { locked: true } : {}),
     });
   }
 

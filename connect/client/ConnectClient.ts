@@ -312,6 +312,9 @@ export class ConnectClient {
         sessionId: msg.sessionId,
         permissions: this.grantedPermissions,
         identity: msg.identity,
+        // A resume DURING a lock succeeds: the dApp is connected on the same session and
+        // must not re-handshake. It will get wallet:unlocked when the user unlocks.
+        ...(m.locked ? { locked: true } : {}),
       });
     } else {
       this.handshakeResolver.reject(new Error('Connection rejected by wallet'));
