@@ -35,50 +35,7 @@ import {
   hasIntentPermission,
 } from '../permissions';
 import type { PermissionScope } from '../permissions';
-
-// Use a minimal interface for the Sphere dependency to avoid circular imports.
-// ConnectHost only needs these public methods from Sphere.
-interface SphereInstance {
-  readonly identity: { chainPubkey: string; directAddress?: string; nametag?: string } | null;
-  readonly networkId?: number;
-  readonly payments: {
-    getBalance(coinId?: string): unknown[];
-    getAssets(coinId?: string): Promise<unknown[]>;
-    getFiatBalance(): Promise<number | null>;
-    getTokens(filter?: { coinId?: string }): unknown[];
-    getHistory(): unknown[];
-  };
-  signMessage(message: string): string;
-  resolve(identifier: string): Promise<unknown>;
-  on<T extends SphereEventType>(type: T, handler: SphereEventHandler<T>): () => void;
-  readonly communications?: {
-    getConversations(): Map<string, ConnectDirectMessage[]>;
-    getConversationPage(
-      peerPubkey: string,
-      options?: { limit?: number; before?: number },
-    ): { messages: ConnectDirectMessage[]; hasMore: boolean; oldestTimestamp: number | null };
-    getUnreadCount(peerPubkey?: string): number;
-    markAsRead(messageIds: string[]): Promise<void>;
-    sendDM(recipient: string, content: string): Promise<ConnectDirectMessage>;
-    resolvePeerNametag(peerPubkey: string): Promise<string | undefined>;
-  };
-  readonly accounting?: {
-    getInvoices(options?: unknown): unknown[];
-    getInvoiceStatus(invoiceId: string): unknown;
-  } | null;
-}
-
-/** Minimal DM type to avoid circular imports with Sphere core types. */
-interface ConnectDirectMessage {
-  readonly id: string;
-  readonly senderPubkey: string;
-  readonly senderNametag?: string;
-  readonly recipientPubkey: string;
-  readonly recipientNametag?: string;
-  readonly content: string;
-  readonly timestamp: number;
-  isRead: boolean;
-}
+import type { SphereInstance, ConnectDirectMessage } from './SphereInstance';
 
 const DEFAULT_SESSION_TTL_MS = 86400000; // 24 hours
 const DEFAULT_MAX_RPS = 20;
