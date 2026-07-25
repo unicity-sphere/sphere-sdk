@@ -1593,3 +1593,87 @@ describe('handshake while locked', () => {
     expect(host.walletState).toBe('live');
   });
 });
+
+// ===========================================================================
+// Task 14 — lifecycle logging
+// ===========================================================================
+
+describe('lifecycle logging', () => {
+  const captured: Array<{ level: string; tag: string; message: string }> = [];
+
+  beforeEach(() => {
+    captured.length = 0;
+    logger.configure({
+      debug: true,
+      handler: (level, tag, message) => { captured.push({ level, tag, message }); },
+    });
+  });
+
+  afterEach(() => {
+    logger.configure({ debug: false, handler: null });
+  });
+
+  function messages(level?: string): string {
+    return captured
+      .filter((e) => e.tag === 'ConnectHost' && (!level || e.level === level))
+      .map((e) => e.message)
+      .join('\n');
+  }
+
+  it('logs the lock, the 4009 refusal, the unlock and the revoke', async () => {
+    const h = await connectHarness();
+
+    lockWallet(h);
+    expect(messages()).toMatch(/Wallet locked/);
+
+    await h.client.query(RPC_METHODS.GET_BALANCE).catch(() => undefined);
+    expect(messages()).toMatch(/WALLET_LOCKED 4009/);
+
+    h.host.updateSphere(createMockSphere());
+    expect(messages()).toMatch(/Wallet unlocked/);
+
+    h.host.revokeSession();
+    expect(messages()).toMatch(/Session revoked/);
+  });
+
+  it('distinguishes unavailable from locked, at warn level', async () => {
+    const h = await connectHarness();
+    h.host.setUnavailable();
+    expect(messages('warn')).toMatch(/Sphere unavailable/);
+    expect(messages('warn')).not.toMatch(/Wallet locked/);
+  });
+
+  it('warns loudly when a different seed comes back behind the lock screen', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    h.host.updateSphere(createMockSphere({ chainPubkey: '02adifferentseed' }));
+
+    expect(messages('warn')).toMatch(/Different wallet behind the lock screen/);
+  });
+
+  it('warns when a session expired while locked', async () => {
+    const h = await connectHarness({ sessionTtlMs: 5 });
+    lockWallet(h);
+    await tick(20);
+
+    h.host.updateSphere(createMockSphere());
+
+    expect(messages('warn')).toMatch(/expired while locked/i);
+  });
+
+  it('warns when a host deadline answers on the wallet behalf', async () => {
+    const h = await connectHarness({ requestDeadlineMs: 30 });
+    h.sphere.payments.getAssets.mockReturnValue(new Promise(() => {}));
+
+    await h.client.query(RPC_METHODS.GET_ASSETS).catch(() => undefined);
+
+    expect(messages('warn')).toMatch(/Host deadline reached/);
+  });
+
+  it('records the origin, or "unverified" when none was supplied', async () => {
+    const h = await connectHarness({ origin: undefined });
+    lockWallet(h);
+    expect(messages()).toMatch(/origin=unverified/);
+  });
+});
