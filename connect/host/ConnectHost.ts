@@ -9,7 +9,14 @@
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import type { SphereEventType, SphereEventHandler } from '../../types';
-import type { ConnectTransport, ConnectSession, ConnectHostConfig } from '../types';
+import type {
+  ConnectTransport,
+  ConnectSession,
+  ConnectHostConfig,
+  WalletState,
+  LockedRequestContext,
+  IntentContext,
+} from '../types';
 import type {
   SphereConnectMessage,
   SphereRpcRequest,
@@ -36,12 +43,51 @@ import {
 } from '../permissions';
 import type { PermissionScope } from '../permissions';
 import type { SphereInstance, ConnectDirectMessage } from './SphereInstance';
+import {
+  assertWalletTransition,
+  gate,
+  WALLET_LOCKED_MESSAGE,
+  INTERNAL_ERROR_MESSAGE,
+  NOT_CONNECTED_MESSAGE,
+} from './host-state';
+import type { WalletSnapshot } from './WalletSnapshot';
+import { EMPTY_WALLET_SNAPSHOT, buildWalletSnapshot } from './WalletSnapshot';
+import { InFlightRegistry } from './InFlightRegistry';
+import type { InFlightEntry } from './InFlightRegistry';
 
 const DEFAULT_SESSION_TTL_MS = 86400000; // 24 hours
 const DEFAULT_MAX_RPS = 20;
+const DEFAULT_REQUEST_DEADLINE_MS = 25000;
+const DEFAULT_INTENT_DEADLINE_MS = 90000;
+const DEFAULT_HANDSHAKE_DEADLINE_MS = 120000;
 
 export class ConnectHost {
-  private sphere: SphereInstance;
+  /** Null whenever _walletState is 'locked' or 'unavailable' (invariant B). */
+  private sphere: SphereInstance | null;
+
+  /** The wallet-binding axis. Underscored because `walletState` is the public getter.
+   *  ORTHOGONAL to `session` — a locked wallet keeps its session, a live wallet may have
+   *  none. Written only by the WALLET (setLocked / setUnavailable / updateSphere / destroy);
+   *  `session` is written by the dApp handshake, sphere_disconnect and expiry. */
+  private _walletState: WalletState;
+
+  /** Immutable public facts about the current binding. Refreshed on every bind
+   *  (constructor, updateSphere); FROZEN by setLocked(); EMPTY after setUnavailable() and
+   *  destroy(). Never read from Sphere while locked — that is a property of the types
+   *  here, not of code review. */
+  private snapshot: WalletSnapshot;
+
+  /** Subscription KEYS captured by setLocked() BEFORE the unsub closures are detached.
+   *  Sphere.destroy() kills those closures, so the keys are the only recoverable
+   *  information. Excludes 'identity:changed' (autoSubscribeIdentityChanged re-arms it).
+   *  A Set, not an array: handleSubscribe may be called twice for the same key while
+   *  locked. */
+  private suspendedSubscriptions: Set<string> = new Set();
+
+  /** Every accepted id, with its own host-side timer. The single convergence point for
+   *  lock / revoke / unavailable / destroy / deadline. */
+  private readonly inFlight: InFlightRegistry;
+
   private readonly transport: ConnectTransport;
   private readonly config: ConnectHostConfig;
 
@@ -64,11 +110,39 @@ export class ConnectHost {
   private unsubscribeTransport: (() => void) | null = null;
 
   constructor(config: ConnectHostConfig) {
-    this.sphere = config.sphere as SphereInstance;
     this.transport = config.transport;
     this.config = config;
 
+    this._walletState = config.initialWalletState ?? 'live';
+    this.sphere = (config.sphere ?? null) as SphereInstance | null;
+    if (this._walletState === 'live' && !this.sphere) {
+      // Fail LOUD but soft: a throw here breaks the wallet's React mount.
+      logger.warn(
+        'ConnectHost',
+        'Constructed live with sphere === null; coercing to unavailable. ' +
+          'Pass initialWalletState: "locked" when the wallet is locked at construction time.',
+      );
+      this._walletState = 'unavailable';
+    }
+    if (this._walletState !== 'live') this.sphere = null; // invariant B, unconditionally
+    this.snapshot = buildWalletSnapshot(this.sphere);      // EMPTY_WALLET_SNAPSHOT when null
+
+    this.inFlight = new InFlightRegistry({ onExpire: (e) => this.settleExpired(e) });
+
     this.unsubscribeTransport = this.transport.onMessage(this.handleMessage.bind(this));
+  }
+
+  /** The wallet-binding axis. Orthogonal to {@link getSession}. Read-only —
+   *  transitions go through setLocked() / setUnavailable() / updateSphere(). */
+  get walletState(): WalletState {
+    return this._walletState;
+  }
+
+  /** Both axes in one read, for UI that must render "connected AND locked".
+   *  Required by the wallet's ConnectPage, which today renders a green pulsing
+   *  "Connected to {dapp}" with no regard for lock state. */
+  getState(): { readonly walletState: WalletState; readonly session: ConnectSession | null } {
+    return { walletState: this._walletState, session: this.session };
   }
 
   /** Get current active session */
@@ -194,7 +268,7 @@ export class ConnectHost {
       clientProtocol: msg.v,
       walletProtocol: SPHERE_CONNECT_VERSION,
       clientNetwork: msg.network,
-      walletNetworkId: this.sphere.networkId ?? -1,
+      walletNetworkId: this.snapshot.networkId ?? -1,
       minMinor: this.config.minMinorVersion,
       clientSdkVersion: msg.sdkVersion,
       minSdkVersion: this.config.minSdkVersion,
@@ -206,7 +280,7 @@ export class ConnectHost {
         clientProtocol: msg.v,
         walletProtocol: SPHERE_CONNECT_VERSION,
         clientNetwork: msg.network ?? null,
-        walletNetwork: this.sphere.networkId ?? null,
+        walletNetwork: this.snapshot.networkId ?? null,
       });
       this.config.onConnectionRejected?.(dapp, result.error, !!msg.silent);
       this.sendHandshakeResponse([], undefined, undefined, result.error, msg.v);
@@ -273,7 +347,7 @@ export class ConnectHost {
     warning?: SphereRpcError,
   ): void {
     const network: NetworkInfo | undefined =
-      typeof this.sphere.networkId === 'number' ? { id: this.sphere.networkId } : undefined;
+      typeof this.snapshot.networkId === 'number' ? { id: this.snapshot.networkId } : undefined;
     this.transport.send({
       ns: SPHERE_CONNECT_NAMESPACE,
       v: (error && echoV ? echoV : SPHERE_CONNECT_VERSION) as typeof SPHERE_CONNECT_VERSION,
@@ -390,34 +464,38 @@ export class ConnectHost {
   // ===========================================================================
 
   private async executeMethod(method: string, params: Record<string, unknown>): Promise<unknown> {
+    // ONE dereference for the whole router. The gate has already proven _walletState is
+    // 'live' before we get here, so this is defence in depth — and it is what makes the
+    // nullable field compile without a single `!`.
+    const sphere = this.requireSphere();
     switch (method) {
       case RPC_METHODS.GET_IDENTITY:
         return this.getPublicIdentity();
 
       case RPC_METHODS.GET_BALANCE:
-        return this.sphere.payments.getBalance(params.coinId as string | undefined);
+        return sphere.payments.getBalance(params.coinId as string | undefined);
 
       case RPC_METHODS.GET_ASSETS:
-        return this.sphere.payments.getAssets(params.coinId as string | undefined);
+        return sphere.payments.getAssets(params.coinId as string | undefined);
 
       case RPC_METHODS.GET_FIAT_BALANCE:
-        return { fiatBalance: await this.sphere.payments.getFiatBalance() };
+        return { fiatBalance: await sphere.payments.getFiatBalance() };
 
       case RPC_METHODS.GET_TOKENS:
         return this.stripTokenSdkData(
-          this.sphere.payments.getTokens(
+          sphere.payments.getTokens(
             params.coinId ? { coinId: params.coinId as string } : undefined,
           ),
         );
 
       case RPC_METHODS.GET_HISTORY:
-        return this.sphere.payments.getHistory();
+        return sphere.payments.getHistory();
 
       case RPC_METHODS.RESOLVE:
         if (!params.identifier) {
           throw new SphereError('Missing required parameter: identifier', 'VALIDATION_ERROR');
         }
-        return this.sphere.resolve(params.identifier as string);
+        return sphere.resolve(params.identifier as string);
 
       case RPC_METHODS.SUBSCRIBE:
         return this.handleSubscribe(params.event as string);
@@ -426,8 +504,9 @@ export class ConnectHost {
         return this.handleUnsubscribe(params.event as string);
 
       case RPC_METHODS.GET_CONVERSATIONS: {
-        if (!this.sphere.communications) throw new SphereError('Communications module not available', 'MODULE_NOT_AVAILABLE');
-        const convos = this.sphere.communications.getConversations();
+        const comms = sphere.communications;
+        if (!comms) throw new SphereError('Communications module not available', 'MODULE_NOT_AVAILABLE');
+        const convos = comms.getConversations();
         const result: Array<{
           peerPubkey: string;
           peerNametag?: string;
@@ -449,7 +528,7 @@ export class ConnectHost {
             peerPubkey: peer,
             peerNametag,
             lastMessage: last,
-            unreadCount: this.sphere.communications.getUnreadCount(peer),
+            unreadCount: comms.getUnreadCount(peer),
             messageCount: messages.length,
           });
           if (!peerNametag) {
@@ -460,7 +539,7 @@ export class ConnectHost {
         if (needsResolve.length > 0) {
           const resolved = await Promise.all(
             needsResolve.map(({ peerPubkey }) =>
-              this.sphere.communications!.resolvePeerNametag(peerPubkey).catch((err) => { logger.debug('Connect', 'Peer Unicity ID resolution failed', err); return undefined; }),
+              comms.resolvePeerNametag(peerPubkey).catch((err) => { logger.debug('Connect', 'Peer Unicity ID resolution failed', err); return undefined; }),
             ),
           );
           for (let i = 0; i < needsResolve.length; i++) {
@@ -474,9 +553,10 @@ export class ConnectHost {
       }
 
       case RPC_METHODS.GET_MESSAGES: {
-        if (!this.sphere.communications) throw new SphereError('Communications module not available', 'MODULE_NOT_AVAILABLE');
+        const comms = sphere.communications;
+        if (!comms) throw new SphereError('Communications module not available', 'MODULE_NOT_AVAILABLE');
         if (!params.peerPubkey) throw new SphereError('Missing required parameter: peerPubkey', 'VALIDATION_ERROR');
-        return this.sphere.communications.getConversationPage(
+        return comms.getConversationPage(
           params.peerPubkey as string,
           {
             limit: params.limit as number | undefined,
@@ -486,25 +566,28 @@ export class ConnectHost {
       }
 
       case RPC_METHODS.GET_DM_UNREAD_COUNT: {
-        if (!this.sphere.communications) throw new SphereError('Communications module not available', 'MODULE_NOT_AVAILABLE');
+        const comms = sphere.communications;
+        if (!comms) throw new SphereError('Communications module not available', 'MODULE_NOT_AVAILABLE');
         return {
-          unreadCount: this.sphere.communications.getUnreadCount(
+          unreadCount: comms.getUnreadCount(
             params.peerPubkey as string | undefined,
           ),
         };
       }
 
       case RPC_METHODS.MARK_AS_READ: {
-        if (!this.sphere.communications) throw new SphereError('Communications module not available', 'MODULE_NOT_AVAILABLE');
+        const comms = sphere.communications;
+        if (!comms) throw new SphereError('Communications module not available', 'MODULE_NOT_AVAILABLE');
         if (!params.messageIds || !Array.isArray(params.messageIds)) {
           throw new SphereError('Missing required parameter: messageIds (string[])', 'VALIDATION_ERROR');
         }
-        await this.sphere.communications.markAsRead(params.messageIds as string[]);
+        await comms.markAsRead(params.messageIds as string[]);
         return { marked: true, count: (params.messageIds as string[]).length };
       }
 
       case RPC_METHODS.GET_INVOICES: {
-        if (!this.sphere.accounting) throw new SphereError('Accounting module not available', 'MODULE_NOT_AVAILABLE');
+        const accounting = sphere.accounting;
+        if (!accounting) throw new SphereError('Accounting module not available', 'MODULE_NOT_AVAILABLE');
         // W23-R2 fix: Extract only known fields to prevent unsanitized dApp params
         // from reaching the module (defense-in-depth).
         const invoiceOpts: Record<string, unknown> = {};
@@ -515,15 +598,16 @@ export class ConnectHost {
         if (params.sortOrder !== undefined) invoiceOpts.sortOrder = params.sortOrder;
         if (params.createdByMe !== undefined) invoiceOpts.createdByMe = params.createdByMe;
         if (params.targetingMe !== undefined) invoiceOpts.targetingMe = params.targetingMe;
-        return this.sphere.accounting.getInvoices(invoiceOpts);
+        return accounting.getInvoices(invoiceOpts);
       }
 
       case RPC_METHODS.GET_INVOICE_STATUS: {
-        if (!this.sphere.accounting) throw new SphereError('Accounting module not available', 'MODULE_NOT_AVAILABLE');
+        const accounting = sphere.accounting;
+        if (!accounting) throw new SphereError('Accounting module not available', 'MODULE_NOT_AVAILABLE');
         if (!params.invoiceId || typeof params.invoiceId !== 'string') {
           throw new SphereError('Missing required parameter: invoiceId', 'VALIDATION_ERROR');
         }
-        return this.sphere.accounting.getInvoiceStatus(params.invoiceId as string);
+        return accounting.getInvoiceStatus(params.invoiceId as string);
       }
 
       default:
@@ -537,7 +621,7 @@ export class ConnectHost {
 
   private autoSubscribeIdentityChanged(): void {
     if (this.eventSubscriptions.has(WALLET_EVENTS.IDENTITY_CHANGED)) return;
-    const unsub = this.sphere.on('identity:changed' as SphereEventType, (data: unknown) => {
+    const unsub = this.requireSphere().on('identity:changed' as SphereEventType, (data: unknown) => {
       this.pushClientEvent(WALLET_EVENTS.IDENTITY_CHANGED, data);
     });
     this.eventSubscriptions.set(WALLET_EVENTS.IDENTITY_CHANGED, unsub);
@@ -550,7 +634,7 @@ export class ConnectHost {
       return { subscribed: true, event: eventName };
     }
 
-    const unsub = this.sphere.on(eventName as SphereEventType, (data: unknown) => {
+    const unsub = this.requireSphere().on(eventName as SphereEventType, (data: unknown) => {
       this.transport.send({
         ns: SPHERE_CONNECT_NAMESPACE,
         v: SPHERE_CONNECT_VERSION,
@@ -597,8 +681,35 @@ export class ConnectHost {
     });
   }
 
+  /** The bound Sphere, or a typed refusal. The ONLY way the router may reach Sphere.
+   *  Unreachable in practice — the gate guarantees 'live' before the router is entered —
+   *  so this is defence in depth, not the primary mechanism. */
+  private requireSphere(): SphereInstance {
+    if (!this.sphere) {
+      throw new SphereError(
+        this._walletState === 'locked' ? WALLET_LOCKED_MESSAGE : 'Wallet unavailable',
+        'NOT_INITIALIZED',
+      );
+    }
+    return this.sphere;
+  }
+
+  /** SNAPSHOT read. `undefined` means "we never saw an identity": callers MUST refuse,
+   *  never answer undefined-as-success — a dApp reads that as "the wallet has no
+   *  identity". Two explicit methods instead of one dual-mode method, so nobody can serve
+   *  a snapshot believing it is live. */
+  private snapshotIdentity(): PublicIdentity | undefined {
+    return this.snapshot.identity;
+  }
+
+  /** InFlightRegistry.onExpire sink. Filled in a later task; declared here so the
+   *  constructor can wire it. */
+  private settleExpired(entry: InFlightEntry): void {
+    logger.warn('ConnectHost', `Request deadline reached: ${entry.kind} ${entry.id}`);
+  }
+
   private getPublicIdentity(): PublicIdentity | undefined {
-    const id = this.sphere.identity;
+    const id = this.requireSphere().identity;
     if (!id) return undefined;
     return {
       chainPubkey: id.chainPubkey,
