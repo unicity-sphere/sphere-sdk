@@ -347,8 +347,11 @@ export class ConnectHost {
         return;
       }
     } catch (error) {
-      // Swallow errors from malformed messages
       logger.warn('ConnectHost', 'Error handling message:', error);
+      // A throw used to send NOTHING, so the dApp hung for its full client timeout and
+      // ended with a bare Error('Query timeout: …') / Error('Intent timeout: …') /
+      // Error('Connection timeout') carrying no .code.
+      this.sendUnhandledError(msg, error);
     }
   }
 
@@ -565,7 +568,18 @@ export class ConnectHost {
       this.sendResult(msg.id, result);
     } catch (error) {
       if (!this.inFlight.settle(msg.id)) return;
-      this.sendError(msg.id, ERROR_CODES.INTERNAL_ERROR, (error as Error).message);
+      // Our OWN SphereError messages are DX ('Missing required parameter: identifier',
+      // 'Communications module not available') and stay. Anything else is internal JS text
+      // that must not cross the trust boundary into a third-party dApp.
+      // instanceof is unreliable across bundle copies — check the name too.
+      const isSphereError =
+        error instanceof SphereError || (error as { name?: string })?.name === 'SphereError';
+      if (isSphereError) {
+        const e = error as SphereError;
+        this.sendError(msg.id, ERROR_CODES.INTERNAL_ERROR, e.message, { reason: e.code });
+        return;
+      }
+      this.sendError(msg.id, ERROR_CODES.INTERNAL_ERROR, INTERNAL_ERROR_MESSAGE);
     }
   }
 
@@ -951,6 +965,27 @@ export class ConnectHost {
       this.config.onLockedRequest?.({ origin: this.config.origin, kind, name });
     } catch (err) {
       logger.warn('ConnectHost', 'onLockedRequest handler error', err);
+    }
+  }
+
+  /** Last-resort answer for a handler that threw before its own catch could run.
+   *  Id-bearing frames get a coded error (InFlightRegistry guarantees exactly one answer
+   *  per id); a handshake gets today's empty refusal, because a failed handshake must
+   *  reveal nothing. */
+  private sendUnhandledError(msg: SphereConnectMessage, error: unknown): void {
+    if (msg.type === 'request') {
+      if (!this.inFlight.settle(msg.id) && this.inFlight.has(msg.id)) return;
+      this.sendError(msg.id, ERROR_CODES.INTERNAL_ERROR, INTERNAL_ERROR_MESSAGE);
+      return;
+    }
+    if (msg.type === 'intent') {
+      this.inFlight.settle(msg.id);
+      this.sendIntentError(msg.id, ERROR_CODES.INTERNAL_ERROR, INTERNAL_ERROR_MESSAGE);
+      return;
+    }
+    if (msg.type === 'handshake' && msg.direction === 'request') {
+      logger.warn('ConnectHost', 'Handshake handler threw; sending the empty refusal', error);
+      this.sendHandshakeResponse([], undefined, undefined);
     }
   }
 

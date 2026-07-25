@@ -1110,3 +1110,72 @@ describe('host deadlines', () => {
     ).resolves.toEqual({ ok: true });
   });
 });
+
+// ===========================================================================
+// Task 11 — every frame with an id is answered; no raw JS text leaks
+// ===========================================================================
+
+describe('unhandled failures still answer the dApp', () => {
+  it('keeps forwarding our own SphereError message, with the code in data', async () => {
+    const h = await connectHarness();
+
+    const err = await h.client.query(RPC_METHODS.RESOLVE).catch((e: unknown) => e);
+
+    // DX, not a leak: the dApp author needs to know which parameter is missing.
+    expect((err as ConnectError).code).toBe(ERROR_CODES.INTERNAL_ERROR);
+    expect((err as ConnectError).message).toBe('Missing required parameter: identifier');
+    expect((err as ConnectError).data).toEqual({ reason: 'VALIDATION_ERROR' });
+  });
+
+  it('replaces a NON-SphereError message with a fixed string', async () => {
+    const h = await connectHarness();
+    h.sphere.payments.getAssets.mockRejectedValue(new TypeError('registry.internals is not a function'));
+
+    const err = await h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
+
+    expect((err as ConnectError).code).toBe(ERROR_CODES.INTERNAL_ERROR);
+    expect((err as ConnectError).message).toBe('Internal wallet error');
+    expect((err as ConnectError).message).not.toMatch(/registry\.internals/);
+  });
+
+  it('answers a handshake whose onConnectionRequest throws with the empty refusal', async () => {
+    const pair = createMockTransportPair();
+    makeHost(pair, {
+      onConnectionRequest: vi.fn(async () => { throw new Error('approval UI crashed'); }),
+    });
+    const client = new ConnectClient({ transport: pair.client, dapp: DAPP, network: { id: 4 } });
+
+    await expect(client.connect()).rejects.toThrow('Connection rejected by wallet');
+    const responses = handshakeResponses(pair.hostSent);
+    expect(responses).toHaveLength(1);
+    // A failed handshake must reveal nothing at all.
+    expect(responses[0].error).toBeUndefined();
+    expect(responses[0].sessionId).toBeUndefined();
+  });
+
+  it('answers a malformed request frame that blows up before the router', async () => {
+    const h = await connectHarness();
+    // Force a throw from inside handleRpcRequest by poisoning the rate limiter.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (h.host as any).checkRateLimit = () => { throw new Error('boom'); };
+
+    const err = await h.client.query(RPC_METHODS.GET_BALANCE).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ConnectError);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.INTERNAL_ERROR);
+    expect((err as ConnectError).message).toBe('Internal wallet error');
+  });
+
+  it('does not double-answer an id the inner catch already settled', async () => {
+    const h = await connectHarness();
+    h.sphere.payments.getAssets.mockRejectedValue(new Error('inner'));
+
+    await h.client.query(RPC_METHODS.GET_ASSETS).catch(() => undefined);
+    await tick();
+
+    const ids = h.pair.hostSent
+      .filter((m) => m.type === 'response')
+      .map((m) => (m as { id: string }).id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
