@@ -1677,3 +1677,208 @@ describe('lifecycle logging', () => {
     expect(messages()).toMatch(/origin=unverified/);
   });
 });
+
+// ===========================================================================
+// Task 15 — ConnectClient and the auto-pushed wallet events
+// ===========================================================================
+
+describe('ConnectClient.walletProtocol', () => {
+  it('is null before a handshake', () => {
+    const pair = createMockTransportPair();
+    const client = new ConnectClient({ transport: pair.client, dapp: DAPP, network: { id: 4 } });
+    expect(client.walletProtocol).toBeNull();
+  });
+
+  it("records this SDK's wallet as 2.1", async () => {
+    const h = await connectHarness();
+    expect(h.client.walletProtocol).toBe(SPHERE_CONNECT_VERSION);
+    expect(h.client.walletProtocol).toBe('2.1');
+  });
+
+  it('records an OLD 2.0 wallet, so a dApp knows wallet:unlocked will never arrive', async () => {
+    const pair = createMockTransportPair();
+    const client = new ConnectClient({ transport: pair.client, dapp: DAPP, network: { id: 4 } });
+
+    const connecting = client.connect();
+    await tick(0);
+
+    // A Connect 2.0 wallet: same MAJOR (so the gate lets it through), but it has no
+    // wallet:unlocked, no wallet:disconnected and no session-preserving lock.
+    pair.host.send({
+      ns: SPHERE_CONNECT_NAMESPACE,
+      v: '2.0',
+      type: 'handshake',
+      direction: 'response',
+      permissions: [PERMISSION_SCOPES.IDENTITY_READ],
+      sessionId: 'old-wallet-session',
+      identity: { chainPubkey: '02old' },
+      network: { id: 4 },
+    } as unknown as SphereConnectMessage);
+
+    await connecting;
+    expect(client.walletProtocol).toBe('2.0');
+  });
+
+  it('is cleared when the session goes away', async () => {
+    const h = await connectHarness();
+    expect(h.client.walletProtocol).toBe('2.1');
+
+    await h.client.disconnect();
+
+    expect(h.client.walletProtocol).toBeNull();
+  });
+});
+
+describe('ConnectClient.walletLocked', () => {
+  it('is false after a live handshake', async () => {
+    const h = await connectHarness();
+    expect(h.client.walletLocked).toBe(false);
+  });
+
+  it('is true after wallet:locked, and the client stays CONNECTED', async () => {
+    const h = await connectHarness();
+
+    lockWallet(h);
+    await tick();
+
+    expect(h.client.walletLocked).toBe(true);
+    expect(h.client.isConnected).toBe(true);
+    expect(h.client.session).not.toBeNull();
+  });
+
+  it('is false again after wallet:unlocked', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+    await tick();
+
+    h.host.updateSphere(createMockSphere());
+    await tick();
+
+    expect(h.client.walletLocked).toBe(false);
+    expect(h.client.isConnected).toBe(true);
+  });
+
+  it('is surfaced on ConnectResult for a resume during a lock', async () => {
+    const h = await connectHarness();
+    const sessionId = h.host.getSession()!.id;
+    lockWallet(h);
+
+    const resumed = new ConnectClient({
+      transport: h.pair.client, dapp: DAPP, network: { id: 4 }, resumeSessionId: sessionId,
+    });
+    const result = await resumed.connect();
+
+    expect(result.locked).toBe(true);
+    expect(resumed.walletLocked).toBe(true);
+  });
+});
+
+describe('ConnectClient and the auto-pushed lifecycle events', () => {
+  it('updates client state on wallet:unlocked BEFORE the handler runs', async () => {
+    const h = await connectHarness();
+
+    // The payload carries the CURRENT identity, which may differ from the one the dApp
+    // connected with — reached by a LEGAL address switch while live, then a lock. It must
+    // NOT be reached by a different seed appearing across the lock: that is the money-safety
+    // case the lock-edge guard revokes instead of unlocking.
+    h.host.updateSphere(createMockSphere({ chainPubkey: '02newaddress' }));
+    lockWallet(h);
+    await tick();
+
+    const seen: Array<{ locked: boolean; chainPubkey?: string }> = [];
+    h.client.on(WALLET_EVENTS.UNLOCKED, (payload) => {
+      seen.push({
+        locked: h.client.walletLocked,
+        chainPubkey: (payload as { identity?: { chainPubkey: string } }).identity?.chainPubkey,
+      });
+    });
+
+    h.host.updateSphere(createMockSphere({ chainPubkey: '02newaddress' }));
+    await tick();
+
+    expect(seen).toEqual([{ locked: false, chainPubkey: '02newaddress' }]);
+    expect(h.client.walletIdentity?.chainPubkey).toBe('02newaddress');
+  });
+
+  it('clears its own state on wallet:disconnected, handler FIRST', async () => {
+    const h = await connectHarness();
+    const seen: Array<{ connected: boolean }> = [];
+    h.client.on(WALLET_EVENTS.DISCONNECTED, () => {
+      // isConnected is already false (step 1), but cleanup() has not run yet (step 3),
+      // so the handler is still registered and still fires.
+      seen.push({ connected: h.client.isConnected });
+    });
+
+    h.host.revokeSession();
+    await tick();
+
+    expect(seen).toEqual([{ connected: false }]);
+    expect(h.client.isConnected).toBe(false);
+    expect(h.client.session).toBeNull();
+  });
+
+  it('rejects pending requests with a TYPED error when the session goes away', async () => {
+    const h = await connectHarness();
+    h.sphere.payments.getAssets.mockReturnValue(new Promise(() => {}));
+    const pending = h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
+    await tick();
+
+    // Silence the host's INBOUND so nothing can answer the id, then deliver the teardown
+    // event by hand. Going through client.disconnect() would park on its own 30 s query
+    // timer against a dead transport — that short-circuit is deferred with the retry queue.
+    h.pair.host.destroy();
+    h.pair.host.send({
+      ns: SPHERE_CONNECT_NAMESPACE,
+      v: SPHERE_CONNECT_VERSION,
+      type: 'event',
+      event: WALLET_EVENTS.DISCONNECTED,
+      data: {},
+    } as unknown as SphereConnectMessage);
+
+    const err = await pending;
+    // new Error('Disconnected') carried no .code, so a dApp could not discriminate it.
+    expect(err).toBeInstanceOf(ConnectError);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.NOT_CONNECTED);
+  });
+
+  it('never sends sphere_subscribe for an auto-pushed event', async () => {
+    const h = await connectHarness();
+
+    h.client.on(WALLET_EVENTS.LOCKED, vi.fn());
+    h.client.on(WALLET_EVENTS.UNLOCKED, vi.fn());
+    h.client.on(WALLET_EVENTS.DISCONNECTED, vi.fn());
+    h.client.on(WALLET_EVENTS.IDENTITY_CHANGED, vi.fn());
+    h.client.on('transfer:incoming', vi.fn());
+    await tick();
+
+    // Sphere.on() accepts any string and would silently never emit for these four; the
+    // host also refuses them outright now, so sending one is a guaranteed error.
+    expect(subscribeCalls(h.pair.clientSent)).toEqual(['transfer:incoming']);
+  });
+
+  it('never sends sphere_unsubscribe for an auto-pushed event either', async () => {
+    const h = await connectHarness();
+    const off = h.client.on(WALLET_EVENTS.LOCKED, vi.fn());
+    await tick();
+
+    off();
+    await tick();
+
+    const unsubs = h.pair.clientSent.filter(
+      (m) => m.type === 'request' && (m as { method: string }).method === RPC_METHODS.UNSUBSCRIBE,
+    );
+    expect(unsubs).toHaveLength(0);
+  });
+
+  it('still delivers wallet:locked to a dApp that registered no other handler', async () => {
+    const h = await connectHarness();
+    const onLocked = vi.fn();
+    h.client.on(WALLET_EVENTS.LOCKED, onLocked);
+
+    lockWallet(h);
+    await tick();
+
+    expect(onLocked).toHaveBeenCalledTimes(1);
+    expect(onLocked).toHaveBeenCalledWith({});
+  });
+});

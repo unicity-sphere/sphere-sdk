@@ -645,8 +645,11 @@ export class ConnectHost {
     // 2. Session expiry — BEFORE the lock gate. A dead session must never be advertised
     //    as "retry after unlock", and the check needs no Sphere.
     if (this.session.expiresAt > 0 && Date.now() > this.session.expiresAt) {
-      this.revokeSession();
+      // Answer THIS request before revoking: revokeSession() pushes wallet:disconnected, and
+      // a client that cleans up on that event would otherwise reject this id locally before
+      // our own frame arrives.
       this.sendError(msg.id, ERROR_CODES.SESSION_EXPIRED, 'Session expired');
+      this.revokeSession();
       return;
     }
 
@@ -676,8 +679,9 @@ export class ConnectHost {
     //     before the permission check, because sphere_disconnect has no mapped permission.
     if (msg.method === RPC_METHODS.DISCONNECT) {
       const disconnectedSession = this.session;
-      this.revokeSession();
+      // Answer BEFORE revoking, for the same reason as the expiry branch above.
       this.sendResult(msg.id, { disconnected: true });
+      this.revokeSession();
       if (disconnectedSession && this.config.onDisconnect) {
         // Fire-and-forget: don't block the response
         Promise.resolve(this.config.onDisconnect(disconnectedSession)).catch((err) => logger.warn('Connect', 'onDisconnect handler error', err));
@@ -744,8 +748,9 @@ export class ConnectHost {
 
     // 2. Session expiry — BEFORE the lock gate (same reason as the query path).
     if (this.session.expiresAt > 0 && Date.now() > this.session.expiresAt) {
-      this.revokeSession();
+      // Answer first — see the query path.
       this.sendIntentError(msg.id, ERROR_CODES.SESSION_EXPIRED, 'Session expired');
+      this.revokeSession();
       return;
     }
 

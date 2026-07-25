@@ -22,7 +22,10 @@ import {
   SPHERE_CONNECT_NAMESPACE,
   SPHERE_CONNECT_VERSION,
   RPC_METHODS,
+  ERROR_CODES,
+  WALLET_EVENTS,
   createRequestId,
+  isAutoPushedEvent,
 } from '../protocol';
 import { SDK_VERSION } from '../version';
 import { ALL_PERMISSIONS } from '../permissions';
@@ -61,6 +64,8 @@ export class ConnectClient {
   private grantedPermissions: PermissionScope[] = [];
   private identity: PublicIdentity | null = null;
   private walletNet: NetworkInfo | null = null;
+  private walletProto: string | null = null;
+  private locked = false;
   private connected = false;
 
   private pendingRequests: Map<string, PendingRequest> = new Map();
@@ -155,13 +160,40 @@ export class ConnectClient {
     return this.walletNet;
   }
 
+  /**
+   * The wallet's Connect protocol version, captured from the handshake response `v`.
+   * Null before the first handshake response and after a disconnect.
+   *
+   * Feature-detect with it: compare against '2.1' to decide whether the wallet can be
+   * trusted to send wallet:unlocked / wallet:disconnected. A Connect 2.0 wallet destroys
+   * the session on lock and never emits either, so a dApp waiting for them against one
+   * waits forever.
+   *
+   * CAVEAT: on an ERROR response the host echoes the dApp's own `v` back
+   * (ConnectHost.sendHandshakeResponse), so after a refused connection this may be the
+   * dApp's version rather than the wallet's. Only trust it after a successful handshake.
+   */
+  get walletProtocol(): string | null {
+    return this.walletProto;
+  }
+
+  /**
+   * Whether the wallet was locked at the last handshake or lifecycle event.
+   * A locked client is still CONNECTED: `isConnected` stays true and `session` stays valid.
+   * Requests answer WALLET_LOCKED (4009) until `wallet:unlocked` arrives on the SAME
+   * session — do not disconnect, do not clear the session, do not re-handshake.
+   */
+  get walletLocked(): boolean {
+    return this.locked;
+  }
+
   // ===========================================================================
   // Query (read data)
   // ===========================================================================
 
   /** Send a query request and return the result */
   async query<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
-    if (!this.connected) throw new SphereError('Not connected', 'NOT_INITIALIZED');
+    if (!this.connected) throw new ConnectError('Not connected', ERROR_CODES.NOT_CONNECTED);
 
     const id = createRequestId();
 
@@ -194,7 +226,7 @@ export class ConnectClient {
 
   /** Send an intent request. The wallet will open its UI for user confirmation. */
   async intent<T = unknown>(action: string, params: Record<string, unknown>): Promise<T> {
-    if (!this.connected) throw new SphereError('Not connected', 'NOT_INITIALIZED');
+    if (!this.connected) throw new ConnectError('Not connected', ERROR_CODES.NOT_CONNECTED);
 
     const id = createRequestId();
 
@@ -229,8 +261,10 @@ export class ConnectClient {
   on(event: string, handler: ConnectEventHandler): () => void {
     if (!this.eventHandlers.has(event)) {
       this.eventHandlers.set(event, new Set());
-      // Tell host to forward this event
-      if (this.connected) {
+      // Tell host to forward this event. Auto-pushed wallet events are NEVER routed through
+      // sphere_subscribe: the host pushes them unconditionally and refuses the RPC, and
+      // Sphere.on() would accept the name and silently never emit.
+      if (this.connected && !isAutoPushedEvent(event)) {
         this.query(RPC_METHODS.SUBSCRIBE, { event }).catch((err) => logger.debug('Connect', 'Event subscription failed', err));
       }
     }
@@ -242,7 +276,7 @@ export class ConnectClient {
         handlers.delete(handler);
         if (handlers.size === 0) {
           this.eventHandlers.delete(event);
-          if (this.connected) {
+          if (this.connected && !isAutoPushedEvent(event)) {
             this.query(RPC_METHODS.UNSUBSCRIBE, { event }).catch((err) => logger.debug('Connect', 'Event unsubscription failed', err));
           }
         }
@@ -275,15 +309,43 @@ export class ConnectClient {
 
     // Event
     if (msg.type === 'event') {
-      const handlers = this.eventHandlers.get(msg.event);
-      if (handlers) {
-        for (const handler of handlers) {
-          try {
-            handler(msg.data);
-          } catch (err) {
-            logger.debug('Connect', 'Event handler error', err);
-          }
-        }
+      // 1. Unconditional NON-DESTRUCTIVE state update, BEFORE any handler lookup, so a
+      //    dApp that registered no handler still ends up with correct client state. The
+      //    client privileged no wallet event before 2.1, so an unhandled
+      //    wallet:disconnected was dropped entirely.
+      if (msg.event === WALLET_EVENTS.LOCKED) {
+        this.locked = true;
+      } else if (msg.event === WALLET_EVENTS.UNLOCKED) {
+        this.locked = false;
+        const identity = (msg.data as { identity?: PublicIdentity } | undefined)?.identity;
+        if (identity) this.identity = identity;
+      } else if (msg.event === WALLET_EVENTS.DISCONNECTED) {
+        // So a handler reading isConnected sees the truth.
+        this.connected = false;
+      } else if (msg.event === WALLET_EVENTS.IDENTITY_CHANGED) {
+        const data = msg.data as PublicIdentity | undefined;
+        if (data && typeof data.chainPubkey === 'string') this.identity = data;
+      }
+
+      // 2. Dispatch to registered handlers.
+      this.dispatchEvent(msg.event, msg.data);
+
+      // 3. Destructive step LAST — cleanup() clears eventHandlers, so running it after
+      //    dispatch is what keeps the dApp's own wallet:disconnected callback alive.
+      if (msg.event === WALLET_EVENTS.DISCONNECTED) {
+        this.cleanup();
+      }
+    }
+  }
+
+  private dispatchEvent(event: string, data: unknown): void {
+    const handlers = this.eventHandlers.get(event);
+    if (!handlers) return;
+    for (const handler of handlers) {
+      try {
+        handler(data);
+      } catch (err) {
+        logger.debug('Connect', 'Event handler error', err);
       }
     }
   }
@@ -294,6 +356,10 @@ export class ConnectClient {
     clearTimeout(this.handshakeResolver.timer);
 
     const m = msg as SphereHandshake;
+
+    // Captured even on a refusal, but see the getter's caveat: the host echoes the dApp's
+    // own `v` on an error response.
+    this.walletProto = (msg as { v?: string }).v ?? null;
 
     if (m.error) {
       this.handshakeResolver.reject(new ConnectError(m.error.message, m.error.code, m.error.data));
@@ -306,6 +372,7 @@ export class ConnectClient {
       this.grantedPermissions = msg.permissions as PermissionScope[];
       this.identity = msg.identity;
       this.walletNet = m.network ?? null;
+      this.locked = m.locked === true;
       this.connected = true;
       if (m.warning) logger.warn('Connect', 'Wallet deprecation notice', m.warning.message);
       this.handshakeResolver.resolve({
@@ -314,7 +381,7 @@ export class ConnectClient {
         identity: msg.identity,
         // A resume DURING a lock succeeds: the dApp is connected on the same session and
         // must not re-handshake. It will get wallet:unlocked when the user unlocks.
-        ...(m.locked ? { locked: true } : {}),
+        ...(this.locked ? { locked: true } : {}),
       });
     } else {
       this.handshakeResolver.reject(new Error('Connection rejected by wallet'));
@@ -351,10 +418,11 @@ export class ConnectClient {
       this.unsubscribeTransport = null;
     }
 
-    // Reject all pending requests
+    // Reject all pending requests with a TYPED error. new Error('Disconnected') carried no
+    // .code, so a dApp could not tell it from a transport failure.
     for (const [, pending] of this.pendingRequests) {
       clearTimeout(pending.timer);
-      pending.reject(new Error('Disconnected'));
+      pending.reject(new ConnectError('Disconnected', ERROR_CODES.NOT_CONNECTED));
     }
     this.pendingRequests.clear();
     this.eventHandlers.clear();
@@ -364,5 +432,7 @@ export class ConnectClient {
     this.grantedPermissions = [];
     this.identity = null;
     this.walletNet = null;
+    this.walletProto = null;
+    this.locked = false;
   }
 }
