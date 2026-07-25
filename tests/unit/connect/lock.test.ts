@@ -767,3 +767,137 @@ describe('onLockedRequest (notify-only)', () => {
     expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
   });
 });
+
+// ===========================================================================
+// Task 9 — locked gate (intent path) + rate limits on all three entries
+// ===========================================================================
+
+describe('locked gate — intents', () => {
+  it('answers every intent with 4009 and data.reason — no allow-list', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    for (const action of [INTENT_ACTIONS.SEND, INTENT_ACTIONS.DM, INTENT_ACTIONS.MINT, INTENT_ACTIONS.RECEIVE]) {
+      const err = await h.client.intent(action, { to: '@bob', amount: '1', coinId: 'UCT' })
+        .catch((e: unknown) => e);
+      expect(err, action).toBeInstanceOf(ConnectError);
+      expect((err as ConnectError).code, action).toBe(ERROR_CODES.WALLET_LOCKED);
+      expect((err as ConnectError).data, action).toEqual({ reason: 'locked' });
+    }
+    expect(h.onIntent).not.toHaveBeenCalled();
+  });
+
+  it('does not run an auto-approve handler while locked', async () => {
+    const h = await connectHarness();
+    const auto = vi.fn().mockResolvedValue({ result: { ok: true } });
+    h.host.setIntentAutoApprove(INTENT_ACTIONS.DM, auto);
+    lockWallet(h);
+
+    const err = await h.client.intent(INTENT_ACTIONS.DM, { to: '@bob', message: 'hi' })
+      .catch((e: unknown) => e);
+
+    expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
+    expect(auto).not.toHaveBeenCalled();
+  });
+
+  it('fires onLockedRequest with kind: intent and the action name', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    await h.client.intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' })
+      .catch(() => undefined);
+
+    expect(h.onLockedRequest).toHaveBeenCalledWith({
+      origin: ORIGIN,
+      kind: 'intent',
+      name: INTENT_ACTIONS.SEND,
+    });
+  });
+
+  it('answers 4001 for an intent when the wallet is unavailable, and raises no badge', async () => {
+    const h = await connectHarness();
+    h.host.setUnavailable();
+
+    const err = await h.client.intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' })
+      .catch((e: unknown) => e);
+
+    expect((err as ConnectError).code).toBe(ERROR_CODES.NOT_CONNECTED);
+    expect(h.onLockedRequest).not.toHaveBeenCalled();
+  });
+
+  it('answers SESSION_EXPIRED 4004 rather than 4009 for an intent on an expired session', async () => {
+    const h = await connectHarness({ sessionTtlMs: 5 });
+    lockWallet(h);
+    await tick(20);
+
+    const err = await h.client.intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' })
+      .catch((e: unknown) => e);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.SESSION_EXPIRED);
+  });
+});
+
+describe('rate limiting on the intent and handshake paths', () => {
+  it('rejects intents over the per-second budget', async () => {
+    // The handshake itself consumes one unit of the budget.
+    const h = await connectHarness({ maxRequestsPerSecond: 3 });
+
+    await h.client.intent(INTENT_ACTIONS.SEND, { to: '@a', amount: '1', coinId: 'UCT' });
+    await h.client.intent(INTENT_ACTIONS.SEND, { to: '@b', amount: '1', coinId: 'UCT' });
+
+    const err = await h.client
+      .intent(INTENT_ACTIONS.SEND, { to: '@c', amount: '1', coinId: 'UCT' })
+      .catch((e: unknown) => e);
+    // The money path was the unlimited one: checkRateLimit() was reachable only from
+    // handleRpcRequest.
+    expect((err as ConnectError).code).toBe(ERROR_CODES.RATE_LIMITED);
+  });
+
+  it('bounds the badge volume a locked origin can farm by looping intents', async () => {
+    const h = await connectHarness({ maxRequestsPerSecond: 3 });
+    lockWallet(h);
+
+    for (let i = 0; i < 8; i++) {
+      await h.client.intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' })
+        .catch(() => undefined);
+    }
+
+    // Every request is still ANSWERED — a refusal is an answer.
+    expect(h.pair.hostSent.filter((m) => m.type === 'intent_result')).toHaveLength(8);
+    // But the badge is metered by the EXISTING limiter, because the gate sits after it.
+    expect(h.onLockedRequest.mock.calls.length).toBeGreaterThan(0);
+    expect(h.onLockedRequest.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it('rate-limits the handshake path, which was entirely unmetered', async () => {
+    const pair = createMockTransportPair();
+    const onConnectionRequest = vi.fn().mockResolvedValue({ approved: true, grantedPermissions: [] });
+    makeHost(pair, { maxRequestsPerSecond: 2, onConnectionRequest });
+
+    for (let i = 0; i < 5; i++) sendRawHandshake(pair);
+    await tick();
+
+    // Every handshake is still ANSWERED (a refusal is an answer) — but the approval UI is
+    // not opened five times by an unapproved origin.
+    expect(handshakeResponses(pair.hostSent)).toHaveLength(5);
+    expect(onConnectionRequest.mock.calls.length).toBeLessThanOrEqual(2);
+  });
+
+  it('the rate-limited handshake refusal reveals nothing', async () => {
+    const pair = createMockTransportPair();
+    makeHost(pair, { maxRequestsPerSecond: 1 });
+
+    sendRawHandshake(pair);
+    sendRawHandshake(pair);
+    await tick();
+
+    // Order is NOT positional: the refusal is sent synchronously, while an approved
+    // handshake answers only after `await onConnectionRequest`, so the success can land
+    // last. Identify the refusal by its shape instead.
+    const responses = handshakeResponses(pair.hostSent);
+    expect(responses).toHaveLength(2);
+    const refusal = responses.find((r) => r.sessionId === undefined)!;
+    expect(refusal).toBeDefined();
+    expect(refusal.error).toBeUndefined();
+    expect(refusal.identity).toBeUndefined();
+  });
+});

@@ -353,6 +353,15 @@ export class ConnectHost {
       return;
     }
 
+    // Rate limit. The handshake path was entirely unmetered: an unapproved origin could
+    // loop handshakes and open the approval UI without bound. The refusal is today's EMPTY
+    // refusal — it carries no error and reveals nothing about the wallet's state.
+    if (!this.checkRateLimit()) {
+      logger.warn('ConnectHost', 'Handshake rate-limited', { dapp: dapp.name });
+      this.sendHandshakeResponse([], undefined, undefined);
+      return;
+    }
+
     // Compatibility gate — runs BEFORE resume and BEFORE onConnectionRequest, so an
     // incompatible/old client cannot slip through on a stale sessionId.
     const result = checkCompatibility({
@@ -542,20 +551,38 @@ export class ConnectHost {
   // ===========================================================================
 
   private async handleIntentRequest(msg: SphereIntentRequest): Promise<void> {
-    // Session check
+    // 1. Session check
     if (!this.session?.active) {
-      this.sendIntentError(msg.id, ERROR_CODES.NOT_CONNECTED, 'Not connected');
+      this.sendIntentError(msg.id, ERROR_CODES.NOT_CONNECTED, NOT_CONNECTED_MESSAGE);
       return;
     }
 
-    // Session expiry
+    // 2. Session expiry — BEFORE the lock gate (same reason as the query path).
     if (this.session.expiresAt > 0 && Date.now() > this.session.expiresAt) {
       this.revokeSession();
       this.sendIntentError(msg.id, ERROR_CODES.SESSION_EXPIRED, 'Session expired');
       return;
     }
 
-    // Permission check
+    // 3. Rate limit. checkRateLimit() was called only from handleRpcRequest, so the intent
+    //    path — the money path, the one that opens wallet modals — was entirely unmetered.
+    if (!this.checkRateLimit()) {
+      this.sendIntentError(msg.id, ERROR_CODES.RATE_LIMITED, 'Too many requests');
+      return;
+    }
+
+    // 4. Lock gate. NO allow-list: every intent needs a live wallet.
+    const decision = gate(this._walletState, true, 'intent', msg.action);
+    if (decision.kind === 'refuse') {
+      this.sendIntentError(msg.id, decision.error.code, decision.error.message, decision.error.data);
+      if (decision.error.code === ERROR_CODES.WALLET_LOCKED) {
+        logger.debug('ConnectHost', `Refused intent ${msg.action} — WALLET_LOCKED 4009 (origin=${this.config.origin ?? 'unverified'})`);
+        this.notifyLockedRequest('intent', msg.action);
+      }
+      return;
+    }
+
+    // 5. Permission check
     if (!hasIntentPermission(this.grantedPermissions, msg.action)) {
       this.sendIntentError(msg.id, ERROR_CODES.PERMISSION_DENIED, `Permission denied for intent: ${msg.action}`);
       return;

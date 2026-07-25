@@ -459,8 +459,11 @@ describe('Sphere Connect Integration', () => {
 
   describe('Rate Limiting', () => {
     it('rejects when rate limit exceeded', async () => {
-      createHost({ maxRequestsPerSecond: 2 });
+      createHost({ maxRequestsPerSecond: 3 });
       createClient();
+      // The handshake now consumes one unit of the SAME per-session budget: the handshake
+      // path used to be entirely unmetered, so an unapproved origin could loop it and open
+      // the approval UI without bound. Budget 3 = handshake + two queries.
       await client.connect();
 
       // First two should succeed
