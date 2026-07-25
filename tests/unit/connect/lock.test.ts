@@ -1179,3 +1179,239 @@ describe('unhandled failures still answer the dApp', () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 });
+
+// ===========================================================================
+// Task 12 — updateSphere() re-arm and the lock-edge identity guard
+// ===========================================================================
+
+describe('updateSphere() re-arm after a lock', () => {
+  it('pushes wallet:unlocked carrying the CURRENT identity, on the same session', async () => {
+    const h = await connectHarness();
+    const sessionId = h.host.getSession()!.id;
+    lockWallet(h);
+
+    h.host.updateSphere(createMockSphere());
+
+    const unlocked = eventsOfType(h.pair.hostSent, WALLET_EVENTS.UNLOCKED);
+    expect(unlocked).toHaveLength(1);
+    expect((unlocked[0] as { data: { identity?: { chainPubkey: string } } }).data.identity)
+      .toEqual({ chainPubkey: '02abc123', directAddress: 'DIRECT://test', nametag: 'alice' });
+    expect(h.host.walletState).toBe('live');
+    expect(h.host.getSession()!.id).toBe(sessionId);
+  });
+
+  it('serves queries again immediately after the re-arm', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    h.host.updateSphere(createMockSphere());
+
+    await expect(h.client.query(RPC_METHODS.GET_BALANCE))
+      .resolves.toEqual([{ coinId: 'UCT', totalAmount: '1000000' }]);
+  });
+
+  it('restores every suspended sphere_subscribe stream BEFORE pushing wallet:unlocked', async () => {
+    const h = await connectHarness();
+    const handler = vi.fn();
+    h.client.on('transfer:incoming', handler);
+    await tick();
+
+    lockWallet(h);
+    const next = createMockSphere();
+    h.host.updateSphere(next);
+
+    // Re-arm BEFORE push: a dApp reacting synchronously to wallet:unlocked must not be
+    // able to race its own event streams.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(((h.host as any).eventSubscriptions as Map<string, unknown>).has('transfer:incoming')).toBe(true);
+
+    next._emit('transfer:incoming', { amount: '500', coinId: 'UCT' });
+    await tick();
+    expect(handler).toHaveBeenCalledWith({ amount: '500', coinId: 'UCT' });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(((h.host as any).suspendedSubscriptions as Set<string>).size).toBe(0);
+  });
+
+  it('records a sphere_subscribe made WHILE locked and arms it on unlock', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    // ConnectClient.on() is fire-and-forget and never retries, so refusing this would kill
+    // the event stream forever after one lock.
+    await expect(h.client.query(RPC_METHODS.SUBSCRIBE, { event: 'transfer:confirmed' }))
+      .resolves.toEqual({ subscribed: true, event: 'transfer:confirmed' });
+
+    const handler = vi.fn();
+    h.client.on('transfer:confirmed', handler);
+    const next = createMockSphere();
+    h.host.updateSphere(next);
+    await tick();
+
+    next._emit('transfer:confirmed', { id: 'tx1' });
+    await tick();
+    expect(handler).toHaveBeenCalledWith({ id: 'tx1' });
+  });
+
+  it('keeps streams alive across two lock/unlock cycles', async () => {
+    const h = await connectHarness();
+    const handler = vi.fn();
+    h.client.on('transfer:incoming', handler);
+    await tick();
+
+    let current = h.sphere;
+    for (let cycle = 0; cycle < 2; cycle++) {
+      h.host.setLocked();
+      current._destroy();
+      current = createMockSphere();
+      h.host.updateSphere(current);
+      await tick();
+      current._emit('transfer:incoming', { cycle });
+      await tick();
+    }
+
+    expect(handler).toHaveBeenCalledTimes(2);
+    expect(handler).toHaveBeenNthCalledWith(1, { cycle: 0 });
+    expect(handler).toHaveBeenNthCalledWith(2, { cycle: 1 });
+  });
+
+  it('refreshes the snapshot so the next handshake reports the new network', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    h.host.updateSphere(createMockSphere({ networkId: 7 }));
+
+    sendRawHandshake(h.pair, { network: { id: 7 } });
+    await tick();
+
+    const last = handshakeResponses(h.pair.hostSent).at(-1)!;
+    expect((last.network as { id: number }).id).toBe(7);
+  });
+
+  it('REVOKES instead of unlocking when a different seed came back', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    // "Forgot password → restore from recovery phrase" installs a DIFFERENT seed behind an
+    // origin-keyed approval. Never send the previous wallet's payment from a new wallet.
+    h.host.updateSphere(createMockSphere({ chainPubkey: '02adifferentseed' }));
+
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.UNLOCKED)).toHaveLength(0);
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
+    expect(h.host.getSession()).toBeNull();
+    expect(h.host.walletState).toBe('live');
+  });
+
+  it('drops a session that expired while locked and pushes wallet:disconnected', async () => {
+    const h = await connectHarness({ sessionTtlMs: 5 });
+    lockWallet(h);
+    await tick(20);
+
+    h.host.updateSphere(createMockSphere());
+
+    // wallet:unlocked into a dead session would make the dApp's next request answer 4004.
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.UNLOCKED)).toHaveLength(0);
+    expect(h.host.getSession()).toBeNull();
+  });
+
+  it('re-arms silently when the locked host had no session', () => {
+    const pair = createMockTransportPair();
+    const host = makeHost(pair, { sphere: null, initialWalletState: 'locked' });
+
+    host.updateSphere(createMockSphere());
+
+    expect(host.walletState).toBe('live');
+    expect(pair.hostSent.filter((m) => m.type === 'event')).toHaveLength(0);
+  });
+
+  it('recovers from unavailable without an identity check and without an event', async () => {
+    const h = await connectHarness();
+    h.host.setUnavailable();
+    const before = h.pair.hostSent.filter((m) => m.type === 'event').length;
+
+    // Nothing was bound to compare against, and the session is already null.
+    h.host.updateSphere(createMockSphere({ chainPubkey: '02totallydifferent' }));
+
+    expect(h.host.walletState).toBe('live');
+    expect(h.pair.hostSent.filter((m) => m.type === 'event')).toHaveLength(before);
+  });
+
+  it('still pushes identity:changed on a live address switch (unchanged behaviour)', async () => {
+    const h = await connectHarness();
+
+    h.host.updateSphere(createMockSphere({ chainPubkey: '02switched' }));
+
+    const changed = eventsOfType(h.pair.hostSent, WALLET_EVENTS.IDENTITY_CHANGED);
+    expect(changed).toHaveLength(1);
+    expect((changed[0] as { data: { chainPubkey: string } }).data.chainPubkey).toBe('02switched');
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.UNLOCKED)).toHaveLength(0);
+    expect(h.host.getSession()).not.toBeNull();
+  });
+
+  it('a legal address switch followed by lock/unlock does NOT revoke', async () => {
+    const h = await connectHarness();
+
+    h.host.updateSphere(createMockSphere({ chainPubkey: '02switched' }));  // legal switch
+    h.host.setLocked();                                                    // freezes 02switched
+    h.host.updateSphere(createMockSphere({ chainPubkey: '02switched' }));  // same seed back
+
+    // This is exactly the false positive a handshake-time boundIdentity would produce.
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.UNLOCKED)).toHaveLength(1);
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(0);
+    expect(h.host.getSession()).not.toBeNull();
+  });
+
+  it('does not resurrect a stream the dApp unsubscribed while locked', async () => {
+    const h = await connectHarness();
+    const handler = vi.fn();
+    h.client.on('transfer:incoming', handler);
+    await tick();
+
+    lockWallet(h);
+    await h.client.query(RPC_METHODS.UNSUBSCRIBE, { event: 'transfer:incoming' });
+
+    const next = createMockSphere();
+    h.host.updateSphere(next);
+    await tick();
+    next._emit('transfer:incoming', { amount: '1' });
+    await tick();
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('settles anything in flight with 4001 when the unlock revokes', async () => {
+    const h = await connectHarness();
+    let release!: (v: unknown[]) => void;
+    h.sphere.payments.getAssets.mockReturnValue(new Promise((r) => { release = r; }));
+    const pending = h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
+    await tick();
+
+    h.host.setLocked();                 // settles the in-flight query with 4009
+    const err = await pending;
+    expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
+    release([]);
+
+    h.host.updateSphere(createMockSphere({ chainPubkey: '02other' }));
+    expect(h.host.getSession()).toBeNull();
+  });
+});
+
+describe('sphere_subscribe refuses auto-pushed names', () => {
+  it('refuses wallet:unlocked and the other three', async () => {
+    const h = await connectHarness();
+
+    for (const event of Object.values(WALLET_EVENTS)) {
+      const err = await h.client.query(RPC_METHODS.SUBSCRIBE, { event }).catch((e: unknown) => e);
+      // Sphere.on() accepts any string and would silently never emit, so the subscribe
+      // would succeed and deliver nothing forever.
+      expect(err, event).toBeInstanceOf(ConnectError);
+      expect((err as ConnectError).message, event).toMatch(/pushed automatically/);
+    }
+  });
+
+  it('still accepts a real Sphere event', async () => {
+    const h = await connectHarness();
+    await expect(h.client.query(RPC_METHODS.SUBSCRIBE, { event: 'transfer:incoming' }))
+      .resolves.toEqual({ subscribed: true, event: 'transfer:incoming' });
+  });
+});

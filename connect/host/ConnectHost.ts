@@ -37,6 +37,7 @@ import {
   ERROR_CODES,
   WALLET_EVENTS,
   createRequestId,
+  isAutoPushedEvent,
 } from '../protocol';
 import { checkCompatibility } from '../compatibility';
 import { SDK_VERSION } from '../version';
@@ -185,26 +186,118 @@ export class ConnectHost {
   }
 
   /**
-   * Update the Sphere instance (e.g. user switched address — new Sphere created).
-   * Re-subscribes auto-push events and notifies connected dApp of the new identity.
+   * Bind a (new) Sphere instance. This is BOTH the re-arm path after setLocked() /
+   * setUnavailable() AND the existing address-switch path in a live wallet.
+   *
+   * From 'live' (address switch): today's behaviour, unchanged — re-arm identity:changed,
+   *   push identity:changed. NO identity comparison: an address switch is legal.
+   *
+   * On the 'locked' -> 'live' edge, in this order:
+   *   1. compare snapshot.identity?.chainPubkey with the new Sphere's chainPubkey.
+   *      MISMATCH => revokeSession() (which pushes wallet:disconnected) and RETURN.
+   *      Never wallet:unlocked. This is the "Forgot password -> restore recovery phrase
+   *      installed a different seed behind an origin-keyed approval" guard.
+   *   2. session.expiresAt passed => revokeSession() and RETURN. A wallet:unlocked into a
+   *      dead session would make the dApp's next request answer SESSION_EXPIRED 4004.
+   *   3. rebind, refresh the snapshot, go live, re-arm identity:changed, replay every
+   *      suspended sphere_subscribe key, and ONLY THEN push wallet:unlocked with the
+   *      CURRENT identity. Re-arm BEFORE push, so a dApp reacting synchronously cannot
+   *      race its own event streams.
+   *
+   * From 'unavailable' -> 'live': rebind + refresh the snapshot, no identity check
+   *   (nothing was bound to compare against) and no event (the session is already null).
    */
   updateSphere(newSphere: unknown): void {
-    this.sphere = newSphere as SphereInstance;
+    const wasLocked = this._walletState === 'locked';
+    const next = (newSphere ?? null) as SphereInstance | null;
 
-    // Re-subscribe identity:changed on the new Sphere instance
-    const existing = this.eventSubscriptions.get(WALLET_EVENTS.IDENTITY_CHANGED);
-    if (existing) {
-      existing();
-      this.eventSubscriptions.delete(WALLET_EVENTS.IDENTITY_CHANGED);
+    if (this._walletState === 'live') {
+      // Address switch on a live host — today's behaviour, verbatim.
+      this.sphere = next;
+      this.snapshot = buildWalletSnapshot(next);
+      const existing = this.eventSubscriptions.get(WALLET_EVENTS.IDENTITY_CHANGED);
+      if (existing) {
+        existing();
+        this.eventSubscriptions.delete(WALLET_EVENTS.IDENTITY_CHANGED);
+      }
+      if (this.session?.active) {
+        this.autoSubscribeIdentityChanged();
+        // Push the new identity immediately so dApp doesn't have to wait for the next event
+        const identity = this.getPublicIdentity();
+        if (identity) {
+          this.pushClientEvent(WALLET_EVENTS.IDENTITY_CHANGED, identity);
+        }
+      }
+      return;
     }
-    if (this.session?.active) {
-      this.autoSubscribeIdentityChanged();
-      // Push the new identity immediately so dApp doesn't have to wait for the next event
-      const identity = this.getPublicIdentity();
-      if (identity) {
-        this.pushClientEvent(WALLET_EVENTS.IDENTITY_CHANGED, identity);
+
+    // 1. Lock-edge identity guard — ONLY on locked -> live. From 'unavailable' there is
+    //    nothing to compare against.
+    if (wasLocked && this.session?.active) {
+      const before = this.snapshot.identity?.chainPubkey;
+      const after = next?.identity?.chainPubkey;
+      if (before && after && before !== after) {
+        logger.warn(
+          'ConnectHost',
+          `Different wallet behind the lock screen (${before} -> ${after}) — revoking instead of unlocking (origin=${this.config.origin ?? 'unverified'})`,
+        );
+        assertWalletTransition(this._walletState, 'live');
+        this._walletState = 'live';
+        this.sphere = next;
+        this.snapshot = buildWalletSnapshot(next);
+        this.revokeSession();   // pushes wallet:disconnected, settles in flight with 4001
+        return;
+      }
+
+      // 2. Expired while locked. The TTL is 24 h by default and expiresAt does not refresh.
+      if (this.session.expiresAt > 0 && Date.now() > this.session.expiresAt) {
+        logger.warn(
+          'ConnectHost',
+          `Session expired while locked — re-handshake required (origin=${this.config.origin ?? 'unverified'})`,
+        );
+        assertWalletTransition(this._walletState, 'live');
+        this._walletState = 'live';
+        this.sphere = next;
+        this.snapshot = buildWalletSnapshot(next);
+        this.revokeSession();
+        return;
       }
     }
+
+    // 3. Rebind and go live. _walletState is set BEFORE the replay, because
+    //    handleSubscribe() branches on it and would otherwise put every key straight back
+    //    into suspendedSubscriptions and arm nothing.
+    assertWalletTransition(this._walletState, 'live');
+    this.sphere = next;
+    this.snapshot = buildWalletSnapshot(next);
+    this._walletState = 'live';
+
+    if (!this.session?.active) {
+      // Nothing to re-arm and nothing to announce.
+      this.suspendedSubscriptions.clear();
+      return;
+    }
+
+    this.autoSubscribeIdentityChanged();
+
+    const suspended = [...this.suspendedSubscriptions];
+    this.suspendedSubscriptions.clear();
+    for (const eventName of suspended) {
+      try {
+        this.handleSubscribe(eventName);
+      } catch (err) {
+        logger.warn('ConnectHost', `Re-subscribe failed after unlock: ${eventName}`, err);
+      }
+    }
+
+    logger.debug(
+      'ConnectHost',
+      `Wallet unlocked — re-armed ${suspended.length} subscription(s) (origin=${this.config.origin ?? 'unverified'})`,
+    );
+
+    this.pushClientEvent(WALLET_EVENTS.UNLOCKED, {
+      identity: this.getPublicIdentity(),
+    } satisfies WalletUnlockedPayload);
   }
 
   /**
@@ -844,16 +937,24 @@ export class ConnectHost {
   private handleSubscribe(eventName: string): { subscribed: boolean; event: string } {
     if (!eventName) throw new SphereError('Missing required parameter: event', 'VALIDATION_ERROR');
 
-    if (this.eventSubscriptions.has(eventName)) {
+    // Sphere.on() accepts ANY string and never emits for these four, so a subscribe would
+    // succeed and deliver nothing forever. The host pushes them unconditionally.
+    if (isAutoPushedEvent(eventName)) {
+      throw new SphereError(
+        `Event ${eventName} is pushed automatically and cannot be subscribed`,
+        'VALIDATION_ERROR',
+      );
+    }
+
+    // While locked there is no Sphere to attach to: record the KEY and answer success.
+    // Refusing would be a bug, not a policy — ConnectClient.on() fires sphere_subscribe
+    // fire-and-forget and never retries, so the stream would die forever after one lock.
+    if (this._walletState === 'locked') {
+      this.suspendedSubscriptions.add(eventName);
       return { subscribed: true, event: eventName };
     }
 
-    // While locked there is no Sphere to attach to, but refusing would be a BUG rather
-    // than a policy: ConnectClient.on() fires sphere_subscribe once, fire-and-forget, and
-    // never retries — the stream would be dead forever after a single lock. Record the key
-    // and answer success; updateSphere() arms it on the way back to 'live'.
-    if (this._walletState === 'locked') {
-      this.suspendedSubscriptions.add(eventName);
+    if (this.eventSubscriptions.has(eventName)) {
       return { subscribed: true, event: eventName };
     }
 
@@ -879,6 +980,9 @@ export class ConnectHost {
       unsub();
       this.eventSubscriptions.delete(eventName);
     }
+    // Also drop it from the lock snapshot: sphere_unsubscribe is on the locked allow-list,
+    // so without this the next updateSphere() re-arm would resurrect the stream.
+    this.suspendedSubscriptions.delete(eventName);
     return { unsubscribed: true, event: eventName };
   }
 
