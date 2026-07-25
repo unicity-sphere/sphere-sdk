@@ -538,3 +538,232 @@ describe('ConnectHost.destroy()', () => {
     expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
   });
 });
+
+// ===========================================================================
+// Task 8 — locked gate (query path) + allow-list + onLockedRequest
+// ===========================================================================
+
+describe('locked gate — queries', () => {
+  it('answers an UNKNOWN method with 4009, not PERMISSION_DENIED 4002', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    const err = await h.client.query('sphere_notAMethod').catch((e: unknown) => e);
+    // Without the gate, hasMethodPermission() returns false for anything unmapped and the
+    // dApp is told "permission denied" for a wallet that is merely locked.
+    expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
+  });
+
+  it('answers a method the dApp was never granted with 4009, not 4002', async () => {
+    const h = await connectHarness({
+      onConnectionRequest: vi.fn().mockResolvedValue({
+        approved: true,
+        grantedPermissions: [PERMISSION_SCOPES.IDENTITY_READ],
+      }),
+    });
+    lockWallet(h);
+
+    const err = await h.client.query(RPC_METHODS.GET_INVOICES).catch((e: unknown) => e);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
+  });
+
+  it('carries data.reason on every 4009', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    const err = await h.client.query(RPC_METHODS.GET_BALANCE).catch((e: unknown) => e);
+    expect((err as ConnectError).data).toEqual({ reason: 'locked' });
+    // unlockSurface is DECLARED in the fail-fast release and always absent.
+    expect((err as ConnectError).data).not.toHaveProperty('unlockSurface');
+  });
+
+  it('refuses balances, tokens, history and fiat balance — never data, never cache', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    for (const method of [
+      RPC_METHODS.GET_BALANCE, RPC_METHODS.GET_ASSETS, RPC_METHODS.GET_FIAT_BALANCE,
+      RPC_METHODS.GET_TOKENS, RPC_METHODS.GET_HISTORY,
+    ]) {
+      const err = await h.client.query(method).catch((e: unknown) => e);
+      expect((err as ConnectError).code, `method ${method}`).toBe(ERROR_CODES.WALLET_LOCKED);
+    }
+    expect(h.sphere.payments.getBalance).not.toHaveBeenCalled();
+    expect(h.sphere.payments.getTokens).not.toHaveBeenCalled();
+    expect(h.sphere.payments.getHistory).not.toHaveBeenCalled();
+  });
+
+  it('answers SESSION_EXPIRED 4004 rather than 4009 for a session that expired while locked', async () => {
+    const h = await connectHarness({ sessionTtlMs: 5 });
+    lockWallet(h);
+    await tick(20);
+
+    const err = await h.client.query(RPC_METHODS.GET_BALANCE).catch((e: unknown) => e);
+    // A dead session must NEVER be advertised as "retry after unlock".
+    expect((err as ConnectError).code).toBe(ERROR_CODES.SESSION_EXPIRED);
+    expect(h.host.getSession()).toBeNull();
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
+  });
+
+  it('answers RATE_LIMITED 4006 rather than 4009 over the budget', async () => {
+    const h = await connectHarness({ maxRequestsPerSecond: 3 });
+    lockWallet(h);
+
+    const codes: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      const err = await h.client.query(RPC_METHODS.GET_BALANCE).catch((e: unknown) => e);
+      codes.push((err as ConnectError).code);
+    }
+    // The limiter is what bounds onLockedRequest volume — no second anti-spam mechanism.
+    expect(codes).toContain(ERROR_CODES.WALLET_LOCKED);
+    expect(codes).toContain(ERROR_CODES.RATE_LIMITED);
+  });
+
+  it('serves sphere_getIdentity FROM THE SNAPSHOT while locked', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    // Those exact bytes were already handed to this origin in the handshake response.
+    await expect(h.client.query(RPC_METHODS.GET_IDENTITY)).resolves.toEqual({
+      chainPubkey: '02abc123', directAddress: 'DIRECT://test', nametag: 'alice',
+    });
+  });
+
+  it('refuses sphere_getIdentity with 4009 when the snapshot has no identity', async () => {
+    const pair = createMockTransportPair();
+    const sphere = createMockSphere();
+    const host = makeHost(pair, { sphere });
+    const client = new ConnectClient({ transport: pair.client, dapp: DAPP, network: { id: 4 } });
+    await client.connect();
+
+    // A wallet whose identity was gone at lock time: the snapshot has none, so there is
+    // nothing to serve — and `undefined` as a SUCCESS result reads to a dApp as
+    // "the wallet has no identity".
+    (sphere as unknown as { identity: unknown }).identity = null;
+    host.setLocked();
+
+    const err = await client.query(RPC_METHODS.GET_IDENTITY).catch((e: unknown) => e);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
+  });
+
+  it('lets sphere_unsubscribe through the gate while locked', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    await expect(
+      h.client.query(RPC_METHODS.UNSUBSCRIBE, { event: 'transfer:incoming' }),
+    ).resolves.toEqual({ unsubscribed: true, event: 'transfer:incoming' });
+  });
+
+  it('lets sphere_disconnect through and fires onDisconnect while locked', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    await expect(h.client.query(RPC_METHODS.DISCONNECT)).resolves.toEqual({ disconnected: true });
+    await tick();
+
+    // Without this, the client swallows the 4001 and calls cleanup() anyway, so the dApp
+    // shows "disconnected" while onDisconnect — the only hook that revokes the persisted
+    // origin approval — never fires, and the next silent autoConnect gets straight back in.
+    expect(h.onDisconnect).toHaveBeenCalledTimes(1);
+    expect(h.host.getSession()).toBeNull();
+  });
+
+  it('answers 4001, never 4009, when there is no session at all', async () => {
+    const pair = createMockTransportPair();
+    const host = makeHost(pair);
+    host.setLocked();
+    // No handshake ever happened: the lock must be unobservable to this origin.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (host as any).handleRpcRequest({
+      ns: SPHERE_CONNECT_NAMESPACE, v: SPHERE_CONNECT_VERSION,
+      type: 'request', id: 'x', method: RPC_METHODS.GET_IDENTITY,
+    });
+    const responses = pair.hostSent.filter((m) => m.type === 'response');
+    expect((responses[0] as { error: { code: number } }).error.code)
+      .toBe(ERROR_CODES.NOT_CONNECTED);
+  });
+
+  it("the 4009 message does not match the reference dApp's teardown regex", async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    const err = await h.client.query(RPC_METHODS.GET_BALANCE).catch((e: unknown) => e);
+    // A courtesy guard, not a wire contract — dApps discriminate on .code.
+    expect((err as Error).message).not.toMatch(/not.connected|timeout|transport|closed|session/i);
+  });
+});
+
+describe('onLockedRequest (notify-only)', () => {
+  it('fires for a locked query with the wallet-supplied origin, kind and name', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    await h.client.query(RPC_METHODS.GET_BALANCE).catch(() => undefined);
+
+    expect(h.onLockedRequest).toHaveBeenCalledWith({
+      origin: ORIGIN,
+      kind: 'query',
+      name: RPC_METHODS.GET_BALANCE,
+    });
+  });
+
+  it('never uses the dApp-claimed session.dapp.url as the origin', async () => {
+    const h = await connectHarness({ origin: 'https://verified.example' });
+    lockWallet(h);
+
+    await h.client.query(RPC_METHODS.GET_BALANCE).catch(() => undefined);
+
+    const ctx = h.onLockedRequest.mock.calls[0]?.[0] as { origin?: string } | undefined;
+    expect(ctx?.origin).toBe('https://verified.example');
+    expect(ctx?.origin).not.toBe(DAPP.url);
+  });
+
+  it('passes origin: undefined when the host was constructed without one', async () => {
+    const pair = createMockTransportPair();
+    const onLockedRequest = vi.fn();
+    const host = makeHost(pair, { onLockedRequest, origin: undefined });
+    const client = new ConnectClient({ transport: pair.client, dapp: DAPP, network: { id: 4 } });
+    await client.connect();
+
+    host.setLocked();
+    await client.query(RPC_METHODS.GET_BALANCE).catch(() => undefined);
+
+    // The wallet must say "a connected app" — never claim an origin it cannot verify.
+    expect(onLockedRequest).toHaveBeenCalledWith({
+      origin: undefined,
+      kind: 'query',
+      name: RPC_METHODS.GET_BALANCE,
+    });
+  });
+
+  it('does NOT fire for an allow-listed method', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    await h.client.query(RPC_METHODS.GET_IDENTITY);
+    await h.client.query(RPC_METHODS.UNSUBSCRIBE, { event: 'transfer:incoming' });
+
+    expect(h.onLockedRequest).not.toHaveBeenCalled();
+  });
+
+  it('does NOT fire when the wallet is merely unavailable', async () => {
+    const h = await connectHarness();
+    h.host.setUnavailable();
+
+    await h.client.query(RPC_METHODS.GET_BALANCE).catch(() => undefined);
+
+    // 'unavailable' is not something the user can unlock — a badge would be a lie.
+    expect(h.onLockedRequest).not.toHaveBeenCalled();
+  });
+
+  it('survives a throwing handler — the dApp still gets its 4009', async () => {
+    const h = await connectHarness({
+      onLockedRequest: vi.fn(() => { throw new Error('wallet UI blew up'); }),
+    });
+    lockWallet(h);
+
+    const err = await h.client.query(RPC_METHODS.GET_BALANCE).catch((e: unknown) => e);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
+  });
+});

@@ -459,26 +459,44 @@ export class ConnectHost {
   // ===========================================================================
 
   private async handleRpcRequest(msg: SphereRpcRequest): Promise<void> {
-    // Session check
+    // 1. Session check
     if (!this.session?.active) {
-      this.sendError(msg.id, ERROR_CODES.NOT_CONNECTED, 'Not connected');
+      this.sendError(msg.id, ERROR_CODES.NOT_CONNECTED, NOT_CONNECTED_MESSAGE);
       return;
     }
 
-    // Session expiry
+    // 2. Session expiry — BEFORE the lock gate. A dead session must never be advertised
+    //    as "retry after unlock", and the check needs no Sphere.
     if (this.session.expiresAt > 0 && Date.now() > this.session.expiresAt) {
       this.revokeSession();
       this.sendError(msg.id, ERROR_CODES.SESSION_EXPIRED, 'Session expired');
       return;
     }
 
-    // Rate limit
+    // 3. Rate limit — BEFORE the lock gate, because this is what bounds onLockedRequest
+    //    volume. A dApp polling in a loop while locked is throttled by the existing
+    //    limiter, which is why there is no second anti-spam mechanism.
     if (!this.checkRateLimit()) {
       this.sendError(msg.id, ERROR_CODES.RATE_LIMITED, 'Too many requests');
       return;
     }
 
-    // Handle disconnect
+    // 4. Lock gate — BEFORE the permission check, because hasMethodPermission() is false
+    //    for anything unmapped, so a locked unknown method would otherwise answer
+    //    PERMISSION_DENIED 4002: an un-retryable code that tells the dApp its permissions
+    //    are wrong.
+    const decision = gate(this._walletState, true, 'query', msg.method);
+    if (decision.kind === 'refuse') {
+      this.sendError(msg.id, decision.error.code, decision.error.message, decision.error.data);
+      if (decision.error.code === ERROR_CODES.WALLET_LOCKED) {
+        logger.debug('ConnectHost', `Refused query ${msg.method} — WALLET_LOCKED 4009 (origin=${this.config.origin ?? 'unverified'})`);
+        this.notifyLockedRequest('query', msg.method);
+      }
+      return;
+    }
+
+    // 4a. Handle disconnect — inside the gate, so it works in EVERY wallet state, and
+    //     before the permission check, because sphere_disconnect has no mapped permission.
     if (msg.method === RPC_METHODS.DISCONNECT) {
       const disconnectedSession = this.session;
       this.revokeSession();
@@ -490,12 +508,27 @@ export class ConnectHost {
       return;
     }
 
-    // Permission check
+    // 5. Permission check
     if (!hasMethodPermission(this.grantedPermissions, msg.method)) {
       this.sendError(msg.id, ERROR_CODES.PERMISSION_DENIED, `Permission denied for ${msg.method}`);
       return;
     }
 
+    // 6. Snapshot answer. Only sphere_getIdentity reaches this branch (host-state.ts).
+    //    An absent snapshot identity REFUSES: `undefined` sent as a SUCCESS result reads
+    //    to a dApp as "the wallet has no identity".
+    if (decision.kind === 'serve-from-snapshot') {
+      const identity = this.snapshotIdentity();
+      if (!identity) {
+        this.sendError(msg.id, ERROR_CODES.WALLET_LOCKED, WALLET_LOCKED_MESSAGE, { reason: 'locked' });
+        this.notifyLockedRequest('query', msg.method);
+        return;
+      }
+      this.sendResult(msg.id, identity);
+      return;
+    }
+
+    // 7. Execute.
     try {
       const result = await this.executeMethod(msg.method, msg.params ?? {});
       this.sendResult(msg.id, result);
@@ -555,6 +588,17 @@ export class ConnectHost {
   // ===========================================================================
 
   private async executeMethod(method: string, params: Record<string, unknown>): Promise<unknown> {
+    // Subscription bookkeeping needs NO Sphere and is allow-listed while locked
+    // (host-state.ts), so it must be answered BEFORE the dereference below — otherwise a
+    // locked sphere_unsubscribe dies on requireSphere() with -32603 despite the gate
+    // having let it through.
+    switch (method) {
+      case RPC_METHODS.SUBSCRIBE:
+        return this.handleSubscribe(params.event as string);
+      case RPC_METHODS.UNSUBSCRIBE:
+        return this.handleUnsubscribe(params.event as string);
+    }
+
     // ONE dereference for the whole router. The gate has already proven _walletState is
     // 'live' before we get here, so this is defence in depth — and it is what makes the
     // nullable field compile without a single `!`.
@@ -725,6 +769,15 @@ export class ConnectHost {
       return { subscribed: true, event: eventName };
     }
 
+    // While locked there is no Sphere to attach to, but refusing would be a BUG rather
+    // than a policy: ConnectClient.on() fires sphere_subscribe once, fire-and-forget, and
+    // never retries — the stream would be dead forever after a single lock. Record the key
+    // and answer success; updateSphere() arms it on the way back to 'live'.
+    if (this._walletState === 'locked') {
+      this.suspendedSubscriptions.add(eventName);
+      return { subscribed: true, event: eventName };
+    }
+
     const unsub = this.requireSphere().on(eventName as SphereEventType, (data: unknown) => {
       this.transport.send({
         ns: SPHERE_CONNECT_NAMESPACE,
@@ -807,6 +860,24 @@ export class ConnectHost {
     for (const entry of this.inFlight.settleAll()) {
       if (entry.kind === 'query') this.sendError(entry.id, code, message, data);
       else this.sendIntentError(entry.id, code, message, data);
+    }
+  }
+
+  /**
+   * Notify-only. The host has ALREADY answered and never waits for the wallet.
+   *
+   * The wallet's only permitted reaction is a PASSIVE badge in its PERMANENT chrome; a
+   * dApp request may trigger a CONSENT prompt but never a credential prompt. Volume is
+   * bounded by checkRateLimit(), which guards all three entry points — there is no
+   * coalescing, no cooldown and no cap by design.
+   *
+   * A throwing handler must not break the host.
+   */
+  private notifyLockedRequest(kind: LockedRequestContext['kind'], name: string): void {
+    try {
+      this.config.onLockedRequest?.({ origin: this.config.origin, kind, name });
+    } catch (err) {
+      logger.warn('ConnectHost', 'onLockedRequest handler error', err);
     }
   }
 
