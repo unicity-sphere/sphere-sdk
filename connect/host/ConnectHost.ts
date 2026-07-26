@@ -628,8 +628,11 @@ export class ConnectHost {
     locked = stateAfterPrompt !== 'live';
 
     if (!approved) {
+      // Deliberately NO notifyLockedRequest here. This origin was DENIED — it holds no
+      // approval, so there is nothing for the user to unlock *for*, and counting it would put
+      // an unvetted name in the wallet's own chrome and leak the lock to it. The notify stays
+      // on the resume path and the approved path, where the origin demonstrably holds one.
       this.sendHandshakeResponse([], undefined, undefined);
-      if (locked) this.notifyLockedRequest('handshake', 'handshake');
       return;
     }
 
@@ -1070,13 +1073,17 @@ export class ConnectHost {
   private handleSubscribe(eventName: string): { subscribed: boolean; event: string } {
     if (!eventName) throw new SphereError('Missing required parameter: event', 'VALIDATION_ERROR');
 
-    // Sphere.on() accepts ANY string and never emits for these four, so a subscribe would
-    // succeed and deliver nothing forever. The host pushes them unconditionally.
+    // The four auto-pushed events must NOT be attached to Sphere.on(): it accepts any string
+    // and never emits for them, so the subscription would deliver nothing forever. But the
+    // answer is SUCCESS, not an error — the host pushes them unconditionally, so "you are
+    // subscribed" is true, just satisfied by a different mechanism.
+    //
+    // Throwing here surfaced as INTERNAL_ERROR -32603 and silently broke every dApp built
+    // before 2.1: `client.on('wallet:locked', …)` fires sphere_subscribe fire-and-forget, and
+    // on 2.0 that call succeeded. A MINOR bump must not turn a working call into a crash. The
+    // 2.1 client skips the call altogether, so this path exists only for older dApps.
     if (isAutoPushedEvent(eventName)) {
-      throw new SphereError(
-        `Event ${eventName} is pushed automatically and cannot be subscribed`,
-        'VALIDATION_ERROR',
-      );
+      return { subscribed: true, event: eventName };
     }
 
     // While locked there is no Sphere to attach to: record the KEY and answer success.

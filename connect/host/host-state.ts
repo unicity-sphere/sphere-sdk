@@ -86,9 +86,30 @@ export function assertWalletTransition(from: WalletState, to: WalletState): void
  *                          the only hook that revokes the persisted origin approval —
  *                          never fires.
  *
- * Balances, assets, tokens, fiat balance and history are NEVER on this list and are NEVER
- * cached: a balance is money state a locked wallet cannot honour, and a dApp with a stale
- * balance is a dApp about to collect an unpayable spend.
+ * WHAT IS BLOCKED — the honest count, because an enumeration of only the money reads reads as
+ * if messaging still works. RPC_METHODS has SIXTEEN entries; four are above. The other TWELVE,
+ * and EVERY intent, are refused:
+ *
+ *   sphere_getBalance, sphere_getAssets, sphere_getFiatBalance, sphere_getTokens,
+ *   sphere_getHistory      — money state a locked wallet cannot honour. Never cached either: a
+ *                            dApp holding a stale balance is a dApp about to offer an
+ *                            unpayable spend.
+ *   sphere_resolve         — nametag resolution needs the live transport.
+ *   sphere_getConversations, sphere_getMessages, sphere_getDMUnreadCount, sphere_markAsRead
+ *                          — DMs are decrypted with keys that left memory. Messaging does NOT
+ *                            keep working while locked; a dApp must stop polling and wait.
+ *   sphere_getInvoices, sphere_getInvoiceStatus
+ *                          — invoice state is money state.
+ *
+ * AND THE CASE WITH NO 4009 AT ALL. Everything above assumes a host that HOLDS a session. A
+ * wallet that COLD-STARTS locked (a page reload, a fresh popup — the password is memory-only,
+ * so this is the common path) has no session and an EMPTY snapshot, so `handleHandshake`
+ * refuses at step 0 with an errorless empty response: the dApp's connect() rejects with a bare
+ * "Connection rejected by wallet" carrying NO code. There is nothing to match 4009 against.
+ * That silence is deliberate — the refusal must reveal nothing about the wallet to an origin
+ * holding no approval — so a dApp cannot distinguish it from a user pressing Reject and must
+ * treat it as "not ready yet": keep waiting for HOST_READY, which the wallet emits when a
+ * human unlocks it.
  */
 export const LOCKED_ALLOWLIST: ReadonlySet<string> = new Set<string>([
   RPC_METHODS.GET_IDENTITY,

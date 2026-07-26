@@ -446,6 +446,15 @@ export class ConnectClient {
       this.unsubscribeTransport = null;
     }
 
+    // A handshake in flight has to be settled too. wallet:disconnected arriving mid-connect()
+    // left it parked for the full client timeout and then rejected untyped, so a dApp could
+    // not tell "the wallet dropped us" from "the wallet is slow".
+    if (this.handshakeResolver) {
+      clearTimeout(this.handshakeResolver.timer);
+      this.handshakeResolver.reject(new ConnectError('Disconnected', ERROR_CODES.NOT_CONNECTED));
+      this.handshakeResolver = null;
+    }
+
     // Reject all pending requests with a TYPED error. new Error('Disconnected') carried no
     // .code, so a dApp could not tell it from a transport failure.
     //

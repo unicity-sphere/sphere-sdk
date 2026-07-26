@@ -1403,17 +1403,30 @@ describe('updateSphere() re-arm after a lock', () => {
   });
 });
 
-describe('sphere_subscribe refuses auto-pushed names', () => {
-  it('refuses wallet:unlocked and the other three', async () => {
+describe('sphere_subscribe and the auto-pushed names', () => {
+  it('answers SUCCESS without attaching them to Sphere.on()', async () => {
     const h = await connectHarness();
 
     for (const event of Object.values(WALLET_EVENTS)) {
-      const err = await h.client.query(RPC_METHODS.SUBSCRIBE, { event }).catch((e: unknown) => e);
-      // Sphere.on() accepts any string and would silently never emit, so the subscribe
-      // would succeed and deliver nothing forever.
-      expect(err, event).toBeInstanceOf(ConnectError);
-      expect((err as ConnectError).message, event).toMatch(/pushed automatically/);
+      // Success is the truthful answer: the host pushes these unconditionally, so the dApp IS
+      // subscribed — just by a different mechanism. Attaching them to Sphere.on() would be the
+      // bug (it accepts any string and never emits for them).
+      //
+      // This test used to assert an ERROR. That silently broke every dApp built before 2.1:
+      // client.on('wallet:locked', …) fires sphere_subscribe fire-and-forget, and on 2.0 that
+      // call succeeded. A MINOR bump must not turn a working call into -32603.
+      await expect(h.client.query(RPC_METHODS.SUBSCRIBE, { event }), event)
+        .resolves.toEqual({ subscribed: true, event });
     }
+  });
+
+  it('does NOT attach them to the Sphere instance', async () => {
+    const h = await connectHarness();
+    const before = h.sphere.on.mock.calls.length;
+
+    await h.client.query(RPC_METHODS.SUBSCRIBE, { event: WALLET_EVENTS.LOCKED });
+
+    expect(h.sphere.on.mock.calls.length).toBe(before);
   });
 
   it('still accepts a real Sphere event', async () => {

@@ -215,7 +215,11 @@ const host = new ConnectHost({
   // Optional host-side deadlines. The host answers within them no matter what the wallet
   // does, so a dApp never hangs on an abandoned modal.
   requestDeadlineMs: 25000,     // query
-  intentDeadlineMs: 90000,      // intent — fires INTENT_CANCELLED 4200 AND aborts ctx.signal
+  // Intent. MUST stay above ConnectClient's own intentTimeout (120 s default): whoever answers
+  // first defines the outcome, and the host cannot know whether the wallet already submitted
+  // the transfer. Expiry answers INTENT_OUTCOME_UNKNOWN (4201) — never a cancellation — and
+  // aborts ctx.signal so a wallet that CAN still back out does.
+  intentDeadlineMs: 180000,
   handshakeDeadlineMs: 120000,  // onConnectionRequest — expiry sends the empty refusal
 
   // Optional secondary floors (rarely needed — the Connect MAJOR is the era gate)
@@ -267,11 +271,22 @@ useEffect(() => {
 }, [sphere, isLoading]);
 ```
 
-While locked the host answers `WALLET_LOCKED` (4009) to everything except `sphere_getIdentity`
-(served from an immutable snapshot), `sphere_subscribe`, `sphere_unsubscribe` and
-`sphere_disconnect`. Balances, tokens and history are never served from a cache: a locked wallet
-cannot honour a payment, and a dApp holding a stale balance is about to collect an unpayable
-spend.
+While locked, a host that HOLDS a session answers exactly four of the sixteen `RPC_METHODS`:
+`sphere_getIdentity` (from an immutable snapshot), `sphere_subscribe`, `sphere_unsubscribe` and
+`sphere_disconnect`. The other **twelve, and every intent**, are refused `WALLET_LOCKED` (4009):
+the five money reads (`getBalance`, `getAssets`, `getFiatBalance`, `getTokens`, `getHistory`),
+`sphere_resolve`, **all four DM reads** (`getConversations`, `getMessages`, `getDMUnreadCount`,
+`markAsRead`) and both invoice reads. Nothing is served from a cache — a dApp holding a stale
+balance is about to offer an unpayable spend — and **messaging does not keep working while
+locked**, so a dApp must stop polling and wait rather than collect refusals.
+
+A wallet that **cold-starts locked** is different, and it is the common path: the password is
+memory-only, so a page reload or a fresh popup lands there. Such a host holds no session and an
+empty snapshot, so the HANDSHAKE itself is refused with an errorless empty response — `connect()`
+rejects with a bare "Connection rejected by wallet" carrying **no code at all**. There is no 4009
+to match on. That silence is deliberate: the refusal must reveal nothing about the wallet to an
+origin holding no approval. Treat it as "not ready yet" rather than a permanent rejection — keep
+waiting for `HOST_READY`, which the wallet emits once a human unlocks it.
 
 On the way back, `updateSphere()` compares the new Sphere's `chainPubkey` against the one frozen
 at lock time. A mismatch — "Forgot password → restore from recovery phrase" installs a different
@@ -691,7 +706,8 @@ try {
 | 4100 | `ERROR_CODES.INSUFFICIENT_BALANCE` | Send intent failed — not enough tokens. |
 | 4101 | `ERROR_CODES.INVALID_RECIPIENT` | Recipient not resolvable to a chain pubkey. |
 | 4102 | `ERROR_CODES.TRANSFER_FAILED` | Transfer execution failed. |
-| 4200 | `ERROR_CODES.INTENT_CANCELLED` | Intent cancelled (user closed wallet UI). |
+| 4200 | `ERROR_CODES.INTENT_CANCELLED` | Intent cancelled — the user declined and **nothing happened**. Safe to re-offer. |
+| 4201 | `ERROR_CODES.INTENT_OUTCOME_UNKNOWN` | The intent reached the wallet and the answer was lost (a host deadline, a lock, a logout). **The outcome is unknown — the money may or may not have moved. Do NOT retry**; reconcile out of band first. |
 
 Rejection `.data` for the two gate errors:
 
