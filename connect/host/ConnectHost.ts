@@ -63,6 +63,26 @@ import type { InFlightEntry } from './InFlightRegistry';
 
 const DEFAULT_SESSION_TTL_MS = 86400000; // 24 hours
 const DEFAULT_MAX_RPS = 20;
+/**
+ * Codes a wallet must never use to answer an intent the host already handed it. Both describe
+ * the CHANNEL, not the operation: by the time `onIntent` has been called the wallet owns the
+ * decision, so "wallet locked" or "not connected" says nothing true about the spend while
+ * inviting a retry — 4009's documented advice is literally "retry after wallet:unlocked". They
+ * are downgraded to INTENT_OUTCOME_UNKNOWN.
+ *
+ * Deliberately NOT here: USER_REJECTED and INTENT_CANCELLED. A user who declines the prompt
+ * BEFORE anything is submitted is a real, retryable rejection; downgrading it would make every
+ * declined payment un-retryable, which is both false and worse UX than the bug. Ensuring the
+ * wallet cannot report a cancel AFTER submitting is the WALLET's job — it must not offer a
+ * cancel control once the transfer is on the wire. The general contract for third-party wallets,
+ * an explicit `ctx.commit()` marking the point of no return after which these two are
+ * downgraded as well, is a follow-up rather than something to fake here.
+ */
+const CHANNEL_ONLY_CODES: ReadonlySet<number> = new Set<number>([
+  ERROR_CODES.WALLET_LOCKED,
+  ERROR_CODES.NOT_CONNECTED,
+]);
+
 const DEFAULT_REQUEST_DEADLINE_MS = 25000;
 // LONGER than ConnectClient's own DEFAULT_INTENT_TIMEOUT (120 s). The host must never be the
 // first to give up on a delegated intent: whoever answers first defines the outcome for the
@@ -877,7 +897,22 @@ export class ConnectHost {
 
       if (!this.inFlight.settle(msg.id)) return;
       if (response.error) {
-        this.sendIntentError(msg.id, response.error.code, response.error.message);
+        // Not relayed blindly: two of these codes describe the CHANNEL and say nothing true
+        // about a spend the wallet has already taken ownership of. Everything else — including
+        // USER_REJECTED, a legitimate pre-submission decline — passes through untouched. See
+        // CHANNEL_ONLY_CODES.
+        const asserts = CHANNEL_ONLY_CODES.has(response.error.code);
+        if (asserts) {
+          logger.warn(
+            'ConnectHost',
+            `Wallet answered intent ${msg.action} with ${response.error.code}, which describes the channel rather than the spend — downgrading to INTENT_OUTCOME_UNKNOWN (origin=${this.config.origin ?? 'unverified'})`,
+          );
+        }
+        this.sendIntentError(
+          msg.id,
+          asserts ? ERROR_CODES.INTENT_OUTCOME_UNKNOWN : response.error.code,
+          asserts ? INTENT_UNKNOWN_MESSAGE : response.error.message,
+        );
       } else {
         this.sendIntentResult(msg.id, response.result);
       }
