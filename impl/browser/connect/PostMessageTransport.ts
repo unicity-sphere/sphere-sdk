@@ -103,7 +103,16 @@ export class PostMessageTransport implements ConnectTransport {
   static forClient(options?: PostMessageClientOptions): PostMessageTransport {
     const target = options?.target ?? window.parent;
     const targetOrigin = options?.targetOrigin ?? '*';
-    const transport = new PostMessageTransport(target, targetOrigin, null);
+    // Accept frames only from the wallet we are talking TO, whenever we know who that is.
+    //
+    // The client used to pass `null` here, i.e. no filter at all: anything able to reach this
+    // window could deliver a wallet event, and those frames now decide the client's
+    // authoritative `identity`, `locked` and `connected` — the same identity the docs tell a
+    // dApp to compare before resuming a spend. A dApp that passes `targetOrigin` (every mode
+    // except the `'*'` fallback does) gets the filter for free; `'*'` keeps the old behaviour
+    // rather than breaking a caller that has no origin to pin.
+    const allowedOrigins = targetOrigin === '*' ? null : [targetOrigin];
+    const transport = new PostMessageTransport(target, targetOrigin, allowedOrigins);
 
     // If target is a popup window, detect when it closes
     if (options?.target && options.target !== window.parent) {

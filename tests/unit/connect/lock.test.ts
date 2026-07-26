@@ -2155,3 +2155,45 @@ describe('escape hatches that must never be gated', () => {
     expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.IDENTITY_CHANGED)).toHaveLength(1);
   });
 });
+
+describe('the client does not trust a frame that predates its session', () => {
+  it('ignores a wallet event that arrives WHILE the handshake is still open', async () => {
+    const pair = createMockTransportPair();
+    // A host that never answers, so the client stays inside connect() with its transport
+    // listener armed and no session yet — the real window.
+    const host = makeHost(pair, {
+      sphere: createMockSphere(),
+      onConnectionRequest: vi.fn(() => new Promise<never>(() => {})),
+    });
+    const client = new ConnectClient({ transport: pair.client, dapp: DAPP, network: { id: 4 } });
+    const pending = client.connect().catch((e) => e);
+    await tick();
+
+    // An injected frame delivering an unlock with an identity of its choosing. These frames
+    // decide the client's authoritative identity — the one the docs tell a dApp to compare
+    // before resuming a spend — so one with no session behind it must not be honoured.
+    pair.host.send({
+      ns: SPHERE_CONNECT_NAMESPACE,
+      v: SPHERE_CONNECT_VERSION,
+      type: 'event',
+      event: WALLET_EVENTS.UNLOCKED,
+      data: { identity: { chainPubkey: '02attacker', directAddress: 'DIRECT://attacker' } },
+    } as unknown as SphereConnectMessage);
+    await tick();
+
+    expect(client.walletIdentity?.chainPubkey).not.toBe('02attacker');
+    expect(client.isConnected).toBe(false);
+    host.destroy();
+    void pending;
+  });
+
+  it('honours the same event once a session exists', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+    expect(h.client.walletLocked).toBe(true);
+
+    h.host.updateSphere(createMockSphere());
+
+    expect(h.client.walletLocked).toBe(false);
+  });
+});

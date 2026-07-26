@@ -325,6 +325,18 @@ export class ConnectClient {
 
     // Event
     if (msg.type === 'event') {
+      // 0. Only an ESTABLISHED session may move this client's authoritative state.
+      //    These frames now decide `identity`, `locked` and `connected` — and the docs tell a
+      //    dApp to gate a money replay on comparing that identity. A PostMessage client accepts
+      //    frames from anything that can reach its window, so an injected iframe could
+      //    otherwise rewrite `walletIdentity` to an address of its choosing before any
+      //    handshake had happened. A pre-connect wallet event is meaningless in any case:
+      //    there is no session for it to describe.
+      if (!this.connected || !this.sessionId) {
+        logger.warn('Connect', `Ignoring wallet event before a session exists: ${msg.event}`);
+        return;
+      }
+
       // 1. Unconditional NON-DESTRUCTIVE state update, BEFORE any handler lookup, so a
       //    dApp that registered no handler still ends up with correct client state. The
       //    client privileged no wallet event before 2.1, so an unhandled
