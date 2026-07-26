@@ -956,7 +956,10 @@ describe('in-flight requests at lock time', () => {
 
     const err = await pending;
     expect(err).toBeInstanceOf(ConnectError);
-    expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
+    // NOT WALLET_LOCKED, which this test used to assert. 4009's documented advice is "retry
+    // after wallet:unlocked" — safe for a read, ruinous for a spend the wallet may already
+    // have submitted. See the "intent outcome contract" block at the end of this file.
+    expect((err as ConnectError).code).toBe(ERROR_CODES.INTENT_OUTCOME_UNKNOWN);
   });
 
   it('aborts ctx.signal when the lock settles a pending intent', async () => {
@@ -1056,7 +1059,7 @@ describe('in-flight requests at lock time', () => {
 });
 
 describe('host deadlines', () => {
-  it('cancels an unanswered intent with INTENT_CANCELLED 4200 and aborts the signal', async () => {
+  it('answers an unanswered intent with OUTCOME UNKNOWN at its deadline, and aborts the signal', async () => {
     let seen: AbortSignal | undefined;
     const h = await connectHarness({
       intentDeadlineMs: 40,
@@ -1070,7 +1073,11 @@ describe('host deadlines', () => {
       .intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' })
       .catch((e: unknown) => e);
 
-    expect((err as ConnectError).code).toBe(ERROR_CODES.INTENT_CANCELLED);
+    // This test used to assert INTENT_CANCELLED (4200). A host deadline means only that we
+    // stopped waiting — the wallet may already have submitted the transfer, and abort() cannot
+    // un-submit one. Asserting a cancel invites the dApp to re-offer a payment that went
+    // through. The signal still fires, so a wallet that CAN still back out does.
+    expect((err as ConnectError).code).toBe(ERROR_CODES.INTENT_OUTCOME_UNKNOWN);
     expect(seen!.aborted).toBe(true);
   });
 
@@ -1880,5 +1887,93 @@ describe('ConnectClient and the auto-pushed lifecycle events', () => {
 
     expect(onLocked).toHaveBeenCalledTimes(1);
     expect(onLocked).toHaveBeenCalledWith({});
+  });
+});
+
+// ===========================================================================
+// The intent OUTCOME contract
+// ===========================================================================
+
+/**
+ * A host may report an intent's RESULT, or that the outcome is UNKNOWN. It may never assert
+ * that nothing happened for an intent it has already handed to the wallet.
+ *
+ * The wallet is the only party that knows whether it submitted the transfer. Once onIntent has
+ * been called, every code the host could invent is a guess — and two of the guesses are
+ * actively dangerous: INTENT_CANCELLED (4200) says the user declined, and WALLET_LOCKED (4009)
+ * invites a retry after the unlock. Either one, sent for an intent the wallet had already
+ * submitted, produces a paid-but-not-credited order and then a double spend on the retry.
+ */
+describe('intent outcome contract (money safety)', () => {
+  it('answers a host-deadline expiry with OUTCOME UNKNOWN, never with a cancellation', async () => {
+    let release: ((v: { result: unknown }) => void) | undefined;
+    const h = await connectHarness({
+      intentDeadlineMs: 20,
+      // The wallet is mid-transfer: it has taken the intent and has not answered yet.
+      onIntent: vi.fn(() => new Promise<{ result: unknown }>((res) => { release = res; })),
+    });
+
+    const failure = h.client.intent(INTENT_ACTIONS.SEND, { to: 'bob', amount: '1' }).catch((e) => e);
+    await new Promise((r) => setTimeout(r, 60));
+    const err = (await failure) as ConnectError;
+
+    expect(err.code).toBe(ERROR_CODES.INTENT_OUTCOME_UNKNOWN);
+    expect(err.code).not.toBe(ERROR_CODES.INTENT_CANCELLED);
+
+    // And the late real result must not produce a second, contradictory frame.
+    const before = h.pair.hostSent.length;
+    release?.({ result: { success: true } });
+    await new Promise((r) => setTimeout(r, 20));
+    const intentResults = h.pair.hostSent
+      .slice(before)
+      .filter((m) => m.type === 'intent_result');
+    expect(intentResults).toHaveLength(0);
+  });
+
+  it('answers a delegated intent with OUTCOME UNKNOWN when the wallet LOCKS mid-flight', async () => {
+    const h = await connectHarness({
+      onIntent: vi.fn(() => new Promise<{ result: unknown }>(() => {})),
+    });
+
+    const failure = h.client.intent(INTENT_ACTIONS.SEND, { to: 'bob', amount: '1' }).catch((e) => e);
+    await new Promise((r) => setTimeout(r, 10));
+    lockWallet(h);
+    const err = (await failure) as ConnectError;
+
+    // NOT 4009: "retry after wallet:unlocked" is safe advice for a read and ruinous for a spend.
+    expect(err.code).toBe(ERROR_CODES.INTENT_OUTCOME_UNKNOWN);
+    expect(err.code).not.toBe(ERROR_CODES.WALLET_LOCKED);
+  });
+
+  it('answers a delegated intent with OUTCOME UNKNOWN when the session is REVOKED mid-flight', async () => {
+    const h = await connectHarness({
+      onIntent: vi.fn(() => new Promise<{ result: unknown }>(() => {})),
+    });
+
+    const failure = h.client.intent(INTENT_ACTIONS.SEND, { to: 'bob', amount: '1' }).catch((e) => e);
+    await new Promise((r) => setTimeout(r, 10));
+    h.host.revokeSession();
+    const err = (await failure) as ConnectError;
+
+    // NOT 4001 either — "not connected" reads as "your request never ran".
+    expect(err.code).toBe(ERROR_CODES.INTENT_OUTCOME_UNKNOWN);
+    expect(err.code).not.toBe(ERROR_CODES.NOT_CONNECTED);
+  });
+
+  it('still settles a QUERY with the lock code, which IS safe to retry', async () => {
+    const h = await connectHarness({
+      sphere: (() => {
+        const s = createMockSphere();
+        s.payments.getBalance = vi.fn(() => new Promise(() => {}));
+        return s;
+      })(),
+    });
+
+    const failure = h.client.query(RPC_METHODS.GET_BALANCE).catch((e) => e);
+    await new Promise((r) => setTimeout(r, 10));
+    lockWallet(h);
+    const err = (await failure) as ConnectError;
+
+    expect(err.code).toBe(ERROR_CODES.WALLET_LOCKED);
   });
 });

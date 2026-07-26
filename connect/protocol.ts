@@ -89,11 +89,28 @@ export const ERROR_CODES = {
   RATE_LIMITED: 4006,
   UNSUPPORTED_PROTOCOL_VERSION: 4007, // Connect MAJOR mismatch (incompatible era)
   INCOMPATIBLE_NETWORK:         4008, // dApp targets a different network than the wallet
-  WALLET_LOCKED:                4009, // wallet locked; THE SESSION IS STILL ALIVE — retry after wallet:unlocked
+  // Wallet locked; THE SESSION IS STILL ALIVE. A QUERY may be retried after wallet:unlocked.
+  // An INTENT already delegated to the wallet is NEVER answered with this code — it gets
+  // INTENT_OUTCOME_UNKNOWN (4201) instead, because a retry could double-spend.
+  WALLET_LOCKED:                4009,
   INSUFFICIENT_BALANCE: 4100,
   INVALID_RECIPIENT: 4101,
   TRANSFER_FAILED: 4102,
   INTENT_CANCELLED: 4200,
+  /**
+   * The intent was DELEGATED to the wallet and the host lost track of the answer — a host
+   * deadline fired, or the wallet locked / logged out mid-flight. **The outcome is UNKNOWN:
+   * the money may or may not have moved.**
+   *
+   * A dApp MUST NOT retry on this code. Reconcile out of band (poll the recipient, the
+   * aggregator, or your own backend) and only then decide.
+   *
+   * This code exists because every other answer would be a lie. `INTENT_CANCELLED` (4200)
+   * asserts the user declined and nothing happened; `WALLET_LOCKED` (4009) invites a retry
+   * after the unlock. Sending either for an intent the wallet had already submitted is how a
+   * paid-but-not-credited order — and then a double spend on retry — happens.
+   */
+  INTENT_OUTCOME_UNKNOWN:       4201,
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];

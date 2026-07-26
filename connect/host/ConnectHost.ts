@@ -53,6 +53,7 @@ import {
   gate,
   WALLET_LOCKED_MESSAGE,
   INTERNAL_ERROR_MESSAGE,
+  INTENT_UNKNOWN_MESSAGE,
   NOT_CONNECTED_MESSAGE,
 } from './host-state';
 import type { WalletSnapshot } from './WalletSnapshot';
@@ -63,7 +64,12 @@ import type { InFlightEntry } from './InFlightRegistry';
 const DEFAULT_SESSION_TTL_MS = 86400000; // 24 hours
 const DEFAULT_MAX_RPS = 20;
 const DEFAULT_REQUEST_DEADLINE_MS = 25000;
-const DEFAULT_INTENT_DEADLINE_MS = 90000;
+// LONGER than ConnectClient's own DEFAULT_INTENT_TIMEOUT (120 s). The host must never be the
+// first to give up on a delegated intent: whoever answers first defines the outcome for the
+// dApp, and the host cannot know whether the wallet has already submitted the transfer. With
+// the client timing out first, the dApp learns "outcome unknown" from its own clock instead of
+// being told, authoritatively and falsely, that nothing happened.
+const DEFAULT_INTENT_DEADLINE_MS = 180000;
 const DEFAULT_HANDSHAKE_DEADLINE_MS = 120000;
 
 /** Resolve `promise`, or `fallback()` after `ms`. Used ONLY for onConnectionRequest, which
@@ -1099,7 +1105,11 @@ export class ConnectHost {
     if (entry.kind === 'query') {
       this.sendError(entry.id, ERROR_CODES.INTERNAL_ERROR, INTERNAL_ERROR_MESSAGE);
     } else {
-      this.sendIntentError(entry.id, ERROR_CODES.INTENT_CANCELLED, 'Intent cancelled');
+      // NOT INTENT_CANCELLED. The wallet was handed this intent and may already have submitted
+      // the transfer — the deadline says only that we stopped waiting for the answer, never
+      // that nothing happened. Asserting a cancel here is how a dApp re-offers a payment that
+      // already went through.
+      this.sendIntentError(entry.id, ERROR_CODES.INTENT_OUTCOME_UNKNOWN, INTENT_UNKNOWN_MESSAGE);
     }
   }
 
@@ -1109,8 +1119,15 @@ export class ConnectHost {
    *  answers at all until the client's own 120 s timeout. */
   private settleInFlight(code: number, message: string, data?: WalletLockedData): void {
     for (const entry of this.inFlight.settleAll()) {
-      if (entry.kind === 'query') this.sendError(entry.id, code, message, data);
-      else this.sendIntentError(entry.id, code, message, data);
+      if (entry.kind === 'query') {
+        this.sendError(entry.id, code, message, data);
+        continue;
+      }
+      // An INTENT is never answered with the caller's code. 4009 invites a retry after the
+      // unlock and 4001 reads as "never happened", but this intent was already delegated to
+      // the wallet: the user may have confirmed it and the transfer may be on the wire. Only
+      // "outcome unknown" is true, and it explicitly forbids a retry.
+      this.sendIntentError(entry.id, ERROR_CODES.INTENT_OUTCOME_UNKNOWN, INTENT_UNKNOWN_MESSAGE);
     }
   }
 

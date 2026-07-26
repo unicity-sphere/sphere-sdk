@@ -47,6 +47,12 @@ interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  /**
+   * A QUERY may be failed with anything truthful — it is idempotent and safe to retry. An
+   * INTENT may not: once it reached the wallet, the money may already be moving, so no local
+   * teardown is allowed to tell the dApp it did not happen.
+   */
+  kind: 'query' | 'intent';
 }
 
 export class ConnectClient {
@@ -207,6 +213,7 @@ export class ConnectClient {
         resolve: resolve as (v: unknown) => void,
         reject,
         timer,
+        kind: 'query',
       });
 
       this.transport.send({
@@ -233,13 +240,22 @@ export class ConnectClient {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(id);
-        reject(new Error(`Intent timeout: ${action}`));
+        // TYPED, and specifically NOT a cancellation. We stopped waiting; the wallet may have
+        // submitted the transfer. A dApp that retries here can pay twice, so the code says
+        // "outcome unknown" and the docs forbid a retry (see ERROR_CODES.INTENT_OUTCOME_UNKNOWN).
+        reject(
+          new ConnectError(
+            `Intent outcome unknown — do not retry; reconcile before acting: ${action}`,
+            ERROR_CODES.INTENT_OUTCOME_UNKNOWN,
+          ),
+        );
       }, this.intentTimeout);
 
       this.pendingRequests.set(id, {
         resolve: resolve as (v: unknown) => void,
         reject,
         timer,
+        kind: 'intent',
       });
 
       this.transport.send({
@@ -420,9 +436,20 @@ export class ConnectClient {
 
     // Reject all pending requests with a TYPED error. new Error('Disconnected') carried no
     // .code, so a dApp could not tell it from a transport failure.
+    //
+    // A pending INTENT is rejected with INTENT_OUTCOME_UNKNOWN, never NOT_CONNECTED: the
+    // wallet already had it and may have submitted the transfer, so "not connected" would read
+    // as "your spend never ran" and invite a retry that pays twice.
     for (const [, pending] of this.pendingRequests) {
       clearTimeout(pending.timer);
-      pending.reject(new ConnectError('Disconnected', ERROR_CODES.NOT_CONNECTED));
+      pending.reject(
+        pending.kind === 'intent'
+          ? new ConnectError(
+              'Intent outcome unknown — do not retry; reconcile before acting',
+              ERROR_CODES.INTENT_OUTCOME_UNKNOWN,
+            )
+          : new ConnectError('Disconnected', ERROR_CODES.NOT_CONNECTED),
+      );
     }
     this.pendingRequests.clear();
     this.eventHandlers.clear();

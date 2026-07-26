@@ -24,6 +24,13 @@ export const WALLET_LOCKED_MESSAGE = 'Wallet is locked';
 /** Fixed text for a non-SphereError throw. A raw JS message must never cross the trust
  *  boundary into a third-party dApp. */
 export const INTERNAL_ERROR_MESSAGE = 'Internal wallet error';
+/**
+ * Recommended text for INTENT_OUTCOME_UNKNOWN (4201). Like every message on this wire it is
+ * NOT a contract — consumers discriminate on the code — but the wording matters here because a
+ * developer reading it must not conclude the intent was cancelled.
+ */
+export const INTENT_UNKNOWN_MESSAGE =
+  'Intent outcome unknown — do not retry; reconcile before acting';
 
 /** Today's literal on the host's not-connected refusals — kept byte-identical.
  *  `unavailable` answers this too: unlocking cannot cure it, so promising an unlock

@@ -55,6 +55,9 @@ const EXPECTED = {
     -32700, -32600, -32601, -32602, -32603,
     4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4009,
     4100, 4101, 4102, 4200,
+    // 4201 INTENT_OUTCOME_UNKNOWN — host-sent. Part of 2.1 from the start: 2.1 has not been
+    // published, so its surface is still being defined rather than extended.
+    4201,
   ],
 };
 
