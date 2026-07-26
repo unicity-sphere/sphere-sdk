@@ -217,6 +217,22 @@ export class ConnectHost {
     const wasLocked = this._walletState === 'locked';
     const next = (newSphere ?? null) as SphereInstance | null;
 
+    // `null` is explicitly anticipated by the coalesce above, and committing 'live' without a
+    // Sphere is unrepresentable: every query would dereference null and answer -32603 forever,
+    // never 4009, while the client keeps reporting walletLocked with nothing able to clear it.
+    // Route it to the verb that actually means "there is no Sphere".
+    if (!next) {
+      if (this._walletState === 'locked') {
+        // Stay locked. The dApp is waiting for a real unlock; a spurious 'unavailable' would
+        // revoke a session that a genuine unlock could still have served.
+        logger.warn('ConnectHost', 'updateSphere(null) while locked — staying locked');
+        return;
+      }
+      logger.warn('ConnectHost', 'updateSphere(null) — treating as a non-lock loss of Sphere');
+      this.setUnavailable();
+      return;
+    }
+
     if (this._walletState === 'live') {
       // Address switch on a live host — today's behaviour, verbatim.
       this.sphere = next;
@@ -240,12 +256,22 @@ export class ConnectHost {
     // 1. Lock-edge identity guard — ONLY on locked -> live. From 'unavailable' there is
     //    nothing to compare against.
     if (wasLocked && this.session?.active) {
-      const before = this.snapshot.identity?.chainPubkey;
-      const after = next?.identity?.chainPubkey;
-      if (before && after && before !== after) {
+      // FAIL CLOSED. `before && after &&` used to no-op the whole guard whenever either side
+      // was absent — and an absent `before` is exactly what a wallet manufactures by calling
+      // sphere.destroy() before setLocked(), an ordering the docs ask for but nothing enforces.
+      // An unknown identity on either side is a mismatch: it is not evidence of sameness.
+      const before = this.snapshot.identity?.chainPubkey ?? null;
+      const after = next.identity?.chainPubkey ?? null;
+      // A NETWORK change is equally unrecoverable and was not checked at all. On main a lock
+      // revoked unconditionally, so a re-handshake ran checkCompatibility and answered 4008;
+      // preserving the session across a lock skipped that gate, leaving the dApp served
+      // balances from a chain it never agreed to while still reporting the old network.
+      const netBefore = this.snapshot.networkId ?? null;
+      const netAfter = next.networkId ?? null;
+      if (before !== after || netBefore !== netAfter) {
         logger.warn(
           'ConnectHost',
-          `Different wallet behind the lock screen (${before} -> ${after}) — revoking instead of unlocking (origin=${this.config.origin ?? 'unverified'})`,
+          `Wallet behind the lock screen is not the one this session was approved for — revoking instead of unlocking (origin=${this.config.origin ?? 'unverified'})`,
         );
         assertWalletTransition(this._walletState, 'live');
         this._walletState = 'live';

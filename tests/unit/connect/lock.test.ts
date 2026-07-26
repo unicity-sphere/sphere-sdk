@@ -1656,7 +1656,10 @@ describe('lifecycle logging', () => {
 
     h.host.updateSphere(createMockSphere({ chainPubkey: '02adifferentseed' }));
 
-    expect(messages('warn')).toMatch(/Different wallet behind the lock screen/);
+    // The wording deliberately no longer contains either chainPubkey: a single log record
+    // holding both the old and the new wallet key is a correlation gift to anyone reading logs.
+    expect(messages('warn')).toMatch(/not the one this session was approved for/);
+    expect(messages('warn')).not.toMatch(/02adifferentseed/);
   });
 
   it('warns when a session expired while locked', async () => {
@@ -1975,5 +1978,68 @@ describe('intent outcome contract (money safety)', () => {
     const err = (await failure) as ConnectError;
 
     expect(err.code).toBe(ERROR_CODES.WALLET_LOCKED);
+  });
+});
+
+// ===========================================================================
+// The lock edge must fail closed
+// ===========================================================================
+
+/**
+ * The locked -> live edge is where this feature hands a preserved session back to a dApp. Every
+ * reason the returning wallet might not be the one the session was approved for has to revoke
+ * instead, and "I cannot tell" must count as "not the same".
+ */
+describe('lock-edge guards fail closed', () => {
+  it('revokes when the returning wallet has NO identity to compare (destroy() ran first)', async () => {
+    const h = await connectHarness();
+    // The ordering contract asks for setLocked() BEFORE sphere.destroy(). A wallet that gets it
+    // wrong leaves the frozen snapshot with no identity at all — and `before && after &&` used
+    // to read that absence as "no mismatch found", handing the session to whatever came back.
+    // Modelled by clearing the identity before the lock freezes the snapshot.
+    h.sphere.identity = undefined;
+    h.host.setLocked();
+    expect(h.host.getSession()).not.toBeNull();
+
+    h.host.updateSphere(createMockSphere({ chainPubkey: '02adifferentseed' }));
+
+    expect(h.host.getSession()).toBeNull();
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.UNLOCKED)).toHaveLength(0);
+  });
+
+  it('revokes when the NETWORK changed behind the lock screen', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    // Same wallet, different chain. On main a lock revoked unconditionally, so a re-handshake
+    // hit checkCompatibility and answered 4008. Preserving the session must not skip that.
+    h.host.updateSphere(createMockSphere({ networkId: 9 }));
+
+    expect(h.host.getSession()).toBeNull();
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.UNLOCKED)).toHaveLength(0);
+  });
+
+  it('updateSphere(null) while locked stays locked instead of committing live-without-Sphere', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+
+    expect(() => h.host.updateSphere(null)).not.toThrow();
+
+    expect(h.host.walletState).toBe('locked');
+    expect(h.host.getSession()).not.toBeNull();
+    const err = await h.client.query(RPC_METHODS.GET_BALANCE).catch((e) => e as ConnectError);
+    // Still a typed lock refusal — not -32603 forever.
+    expect(err.code).toBe(ERROR_CODES.WALLET_LOCKED);
+  });
+
+  it('updateSphere(null) while live degrades to unavailable rather than bricking', async () => {
+    const h = await connectHarness();
+
+    expect(() => h.host.updateSphere(null)).not.toThrow();
+
+    expect(h.host.walletState).toBe('unavailable');
+    expect(h.host.getSession()).toBeNull();
   });
 });
