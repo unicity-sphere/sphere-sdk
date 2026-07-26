@@ -330,6 +330,15 @@ export class ConnectHost {
     this.pushClientEvent(WALLET_EVENTS.UNLOCKED, {
       identity: this.getPublicIdentity(),
     } satisfies WalletUnlockedPayload);
+
+    // AND identity:changed, which main pushed on every unlock and which the Connect 2.0 docs
+    // named as the ONLY unlock signal. checkCompatibility gates on the MAJOR alone, so every
+    // already-shipped 2.0 dApp connects to a 2.1 wallet happily — and then, without this, sits
+    // showing "wallet locked" for the rest of the page's life, because wallet:unlocked is a
+    // name it has never heard of. Idempotent for a 2.1 client: it has already written the same
+    // identity from the payload above, and its IDENTITY_CHANGED branch just rewrites it.
+    const identity = this.getPublicIdentity();
+    if (identity) this.pushClientEvent(WALLET_EVENTS.IDENTITY_CHANGED, identity);
   }
 
   /**
@@ -513,7 +522,10 @@ export class ConnectHost {
       return;
     }
 
-    const locked = this._walletState === 'locked';
+    // Captured for the pre-await decisions; RE-READ after the approval prompt below, because a
+    // human-time await gives the wallet room to lock, unlock or log out underneath us.
+    const stateAtPrompt = this._walletState;
+    let locked = stateAtPrompt === 'locked';
 
     // Lock gate for the handshake kind. 'unavailable' refuses here WITHOUT dereferencing a
     // null Sphere — which is the whole reason the state exists separately.
@@ -591,6 +603,29 @@ export class ConnectHost {
         return { approved: false, grantedPermissions: [] as PermissionScope[] };
       },
     );
+
+    // `locked` was read BEFORE a human-time await. Re-read the axis now, because the wallet can
+    // have moved under us while the modal was open — an idle auto-lock, a cross-tab lock, a
+    // logout, or an unlock.
+    //
+    // Getting this wrong in either direction is bad. Landing in 'locked' or 'unavailable' used
+    // to mint an ACTIVE session on a non-live host while telling the dApp it was rejected: the
+    // wallet then believes an origin is connected that has forgotten it exists, and under
+    // 'unavailable' the gate refuses sphere_disconnect too, so that session is unclearable for
+    // its whole TTL and onDisconnect never revokes the persisted origin approval. Landing in
+    // 'live' (an unlock during the prompt) used to leave the dApp permanently walletLocked,
+    // because the unlock edge had no session to notify at the time it fired.
+    const stateAfterPrompt = this._walletState;
+    if (stateAfterPrompt !== 'live' && stateAfterPrompt !== stateAtPrompt) {
+      logger.warn(
+        'ConnectHost',
+        `Wallet left 'live' while the approval prompt was open — refusing the handshake instead of minting a session (state=${stateAfterPrompt}, origin=${this.config.origin ?? 'unverified'})`,
+      );
+      this.sendHandshakeResponse([], undefined, undefined);
+      return;
+    }
+    // Recompute so the response's `locked` flag and the trailing push describe NOW, not then.
+    locked = stateAfterPrompt !== 'live';
 
     if (!approved) {
       this.sendHandshakeResponse([], undefined, undefined);
@@ -693,7 +728,26 @@ export class ConnectHost {
       return;
     }
 
-    // 4. Lock gate — BEFORE the permission check, because hasMethodPermission() is false
+    // 4. Disconnect, BEFORE the lock gate. It has to work in EVERY wallet state, and the gate
+    //    does not allow that: 'unavailable' refuses every query with NOT_CONNECTED, so a
+    //    session created just before Sphere went away could never be dropped — it sat active
+    //    for its whole TTL (24 h by default) and onDisconnect, the only hook that revokes the
+    //    persisted origin approval, never fired. Also before the permission check, because
+    //    sphere_disconnect has no mapped permission. It stays AFTER the rate limiter so a
+    //    disconnect flood is still throttled.
+    if (msg.method === RPC_METHODS.DISCONNECT) {
+      const disconnectedSession = this.session;
+      // Answer BEFORE revoking, for the same reason as the expiry branch above.
+      this.sendResult(msg.id, { disconnected: true });
+      this.revokeSession();
+      if (disconnectedSession && this.config.onDisconnect) {
+        // Fire-and-forget: don't block the response
+        Promise.resolve(this.config.onDisconnect(disconnectedSession)).catch((err) => logger.warn('Connect', 'onDisconnect handler error', err));
+      }
+      return;
+    }
+
+    // 5. Lock gate — BEFORE the permission check, because hasMethodPermission() is false
     //    for anything unmapped, so a locked unknown method would otherwise answer
     //    PERMISSION_DENIED 4002: an un-retryable code that tells the dApp its permissions
     //    are wrong.
@@ -707,19 +761,6 @@ export class ConnectHost {
       return;
     }
 
-    // 4a. Handle disconnect — inside the gate, so it works in EVERY wallet state, and
-    //     before the permission check, because sphere_disconnect has no mapped permission.
-    if (msg.method === RPC_METHODS.DISCONNECT) {
-      const disconnectedSession = this.session;
-      // Answer BEFORE revoking, for the same reason as the expiry branch above.
-      this.sendResult(msg.id, { disconnected: true });
-      this.revokeSession();
-      if (disconnectedSession && this.config.onDisconnect) {
-        // Fire-and-forget: don't block the response
-        Promise.resolve(this.config.onDisconnect(disconnectedSession)).catch((err) => logger.warn('Connect', 'onDisconnect handler error', err));
-      }
-      return;
-    }
 
     // 5. Permission check
     if (!hasMethodPermission(this.grantedPermissions, msg.method)) {

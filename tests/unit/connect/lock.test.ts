@@ -2043,3 +2043,115 @@ describe('lock-edge guards fail closed', () => {
     expect(h.host.getSession()).toBeNull();
   });
 });
+
+// ===========================================================================
+// The approval prompt is a HUMAN-TIME await
+// ===========================================================================
+
+/**
+ * `onConnectionRequest` can sit open for a minute or more. The wallet axis is free to move
+ * during it — an idle auto-lock, a cross-tab lock, a logout, an unlock — so every decision
+ * taken from a value read BEFORE that await has to be re-read after it.
+ */
+describe('wallet state changing during the approval prompt', () => {
+  it('refuses instead of minting a session on a host that is no longer live', async () => {
+    const pair = createMockTransportPair();
+    const sphere = createMockSphere();
+    let approve: ((v: { approved: boolean; grantedPermissions: string[] }) => void) | undefined;
+    const host = makeHost(pair, {
+      sphere,
+      onConnectionRequest: vi.fn(
+        () => new Promise<{ approved: boolean; grantedPermissions: string[] }>((res) => { approve = res; }),
+      ),
+    });
+
+    sendRawHandshake(pair);
+    await tick();
+
+    // The wallet locks while the user is still reading the permission list.
+    host.setLocked();
+    approve?.({ approved: true, grantedPermissions: Object.values(PERMISSION_SCOPES) });
+    await tick();
+
+    // No session may exist: the dApp is being told "rejected", and a session it does not know
+    // about would sit active for its whole TTL while the wallet believes that origin is
+    // connected. Under 'unavailable' it could not even be disconnected.
+    expect(host.getSession()).toBeNull();
+    const last = handshakeResponses(pair.hostSent).at(-1)!;
+    expect(last.sessionId).toBeUndefined();
+  });
+
+  it('does not leave the dApp permanently locked when the UNLOCK lands during the prompt', async () => {
+    const pair = createMockTransportPair();
+    const sphere = createMockSphere();
+    let approve: ((v: { approved: boolean; grantedPermissions: string[] }) => void) | undefined;
+    const host = makeHost(pair, {
+      sphere: null,
+      initialWalletState: 'locked',
+      onConnectionRequest: vi.fn(
+        () => new Promise<{ approved: boolean; grantedPermissions: string[] }>((res) => { approve = res; }),
+      ),
+    });
+
+    // A locked host with a POPULATED snapshot still reaches onConnectionRequest.
+    host.setLocked();
+    host.updateSphere(sphere);
+    host.setLocked();
+    sendRawHandshake(pair);
+    await tick();
+
+    host.updateSphere(createMockSphere()); // the human unlocks mid-prompt
+    approve?.({ approved: true, grantedPermissions: Object.values(PERMISSION_SCOPES) });
+    await tick();
+
+    const last = handshakeResponses(pair.hostSent).at(-1)!;
+    // `locked` must describe NOW. Answering `locked: true` here left the dApp reporting a
+    // locked wallet for the rest of the page's life: the unlock edge had already fired, with
+    // no session to notify.
+    expect(last.locked).toBeUndefined();
+  });
+});
+
+// ===========================================================================
+// Disconnect and the 2.0 unlock signal
+// ===========================================================================
+
+describe('escape hatches that must never be gated', () => {
+  it('does not mint a session on an UNAVAILABLE host, which could never be disconnected', async () => {
+    const pair = createMockTransportPair();
+    const sphere = createMockSphere();
+    let approve: ((v: { approved: boolean; grantedPermissions: string[] }) => void) | undefined;
+    const host = makeHost(pair, {
+      sphere,
+      onConnectionRequest: vi.fn(
+        () => new Promise<{ approved: boolean; grantedPermissions: string[] }>((res) => { approve = res; }),
+      ),
+    });
+
+    sendRawHandshake(pair);
+    await tick();
+    host.setUnavailable();
+    approve?.({ approved: true, grantedPermissions: Object.values(PERMISSION_SCOPES) });
+    await tick();
+
+    // This is the state that used to be a trap: the gate refuses EVERY query under
+    // 'unavailable', sphere_disconnect included, so a session minted here sat active for its
+    // whole TTL and onDisconnect — the only hook that revokes the persisted origin approval —
+    // never fired. sphere_disconnect is now hoisted above the gate as well, but the real fix
+    // is that the session is never created.
+    expect(host.getSession()).toBeNull();
+  });
+
+  it('pushes identity:changed as well as wallet:unlocked, for dApps built on Connect 2.0', async () => {
+    const h = await connectHarness();
+    lockWallet(h);
+    h.pair.hostSent.length = 0;
+
+    h.host.updateSphere(createMockSphere());
+
+    // A 2.0 dApp has never heard of wallet:unlocked; identity:changed was its ONLY unlock
+    // signal, and the MAJOR-only compatibility gate lets it connect to a 2.1 wallet happily.
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.UNLOCKED)).toHaveLength(1);
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.IDENTITY_CHANGED)).toHaveLength(1);
+  });
+});
