@@ -548,17 +548,6 @@ export function extractTokenStateKey(token: Token): string | null {
 }
 
 /**
- * Convert hex string to Uint8Array
- */
-function fromHex(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-  }
-  return bytes;
-}
-
-/**
  * Check if two tokens have the same genesis tokenId (same token, possibly different states)
  */
 function hasSameGenesisTokenId(t1: Token, t2: Token): boolean {
