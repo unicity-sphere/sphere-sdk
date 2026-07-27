@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `ERROR_CODES.INTENT_OUTCOME_UNKNOWN` (4201), and a rule about what a host may claim
+
+**Read this before upgrading if your dApp spends.** Once `onIntent` has been called, a host may
+report the intent's RESULT or that the OUTCOME IS UNKNOWN. It may never assert that nothing
+happened — it is not the party that knows.
+
+Previously it did. The host's intent deadline was shorter than `ConnectClient`'s own timeout, so
+the host was always first to give up, and it gave up with `INTENT_CANCELLED` (4200) — "the user
+declined and nothing happened". The clock included the human's decision time, so confirming at
+80 s meant the transfer was already on the wire when the deadline fired at 90 s; the real result
+was then dropped. `setLocked()` / `revokeSession()` / `setUnavailable()` had the same shape,
+settling a delegated intent with 4009 (whose documented advice is "retry after
+`wallet:unlocked`") or 4001. Either one, on a spend the wallet had already submitted, is a
+paid-but-not-credited order and a **double spend on the natural retry**.
+
+- **`INTENT_OUTCOME_UNKNOWN` (4201)** — the intent reached the wallet and the answer was lost.
+  **Do not retry**; reconcile out of band, then decide. Emitted by the host on a deadline, a
+  lock, a logout or a teardown, and by `ConnectClient` for its own intent timeout and for a
+  disconnect while an intent is pending.
+- The host intent deadline is now **longer** than the client's, so the host is never the first to
+  give up. If you pass `intentDeadlineMs`, keep it above your `intentTimeout`.
+- A wallet answering an accepted intent with `WALLET_LOCKED` or `NOT_CONNECTED` is downgraded to
+  4201: both describe the CHANNEL and say nothing true about the spend. `USER_REJECTED` is
+  **not** downgraded — a decline before submission is a real, retryable rejection, and it is the
+  wallet's job not to offer a cancel control once the transfer is on the wire.
+- `WALLET_LOCKED` (4009) stays retryable for **queries**. Its "retry after unlock" advice was
+  never safe for an intent.
+
 ### Added — graceful wallet lock (Connect protocol `2.0` → `2.1`)
 
 A wallet lock used to destroy the dApp session: every request after it answered
@@ -19,9 +47,11 @@ teardown** — the session survives it.
 - **Three new wallet events**, all auto-pushed and no longer subscribable:
   `wallet:unlocked` (carries the current identity), `wallet:disconnected` (the teardown signal —
   `revokeSession()` previously sent nothing at all, so a dApp only learned it was disconnected at
-  its next 4001), and `wallet:locked` keeping its name. `sphere_subscribe` now refuses all four:
-  `Sphere.on()` accepts any string and never emits for them, so the subscribe used to succeed and
-  deliver nothing forever.
+  its next 4001), and `wallet:locked` keeping its name. `sphere_subscribe` on any of the four
+  answers success WITHOUT attaching them to `Sphere.on()` — the host pushes them unconditionally,
+  so "you are subscribed" is true, and attaching them would be the bug (`Sphere.on()` accepts any
+  string and never emits for these). The unlock edge also still pushes `identity:changed`, which
+  the Connect 2.0 docs named as the only unlock signal.
 - **`SphereHandshake.locked` / `ConnectResult.locked`** — a resume with a matching `sessionId`
   succeeds while the wallet is locked, which is the common case of a dApp that reloaded mid-lock.
 - **`ConnectHost.setLocked()` / `.setUnavailable()` / `.getState()` / `.walletState`** — the
@@ -81,6 +111,19 @@ connection down on `wallet:locked` behaves exactly as it does today — but both
 `notifyWalletLocked()` is **removed, not aliased**: its old meaning was *revoke* and its new one
 would be *lock*, so an alias would be a silent runtime inversion at every wallet call site.
 `CONNECT_MIN_SDK_VERSION` does not move.
+
+Two more a wallet integrator should know:
+
+- **The locked → live edge fails closed.** It revokes instead of unlocking when the returning
+  wallet's `chainPubkey` differs from the one frozen at lock time, when either side is UNKNOWN
+  (an absent identity is not evidence of sameness — and calling `sphere.destroy()` before
+  `setLocked()` manufactures exactly that), or when the `networkId` changed. A spurious revoke
+  costs a re-handshake, which is silent for an already-approved origin; the alternative is
+  handing a preserved session to a different wallet or a different chain.
+- **`PostMessageTransport` pins the peer WINDOW**, not just the origin, in both directions. An
+  injected same-origin iframe passes any origin allow-list, and wallet event frames now decide
+  the client's authoritative identity. `targetOrigin` is normalised with `new URL(...).origin`,
+  so passing a full wallet URL (with a path, or a trailing slash) works.
 
 ### Changed — state-transition-sdk 2.0.1 (was 2.0.0-rc.68bc1e5)
 - **Base SDK bumped to the stable `@unicitylabs/state-transition-sdk@2.0.1` release** (37 commits
