@@ -77,7 +77,13 @@ export interface SendOutcomeSummary {
   /** True when any committed op's delivery was deferred (§3.1/#621). */
   readonly deliveryPending: boolean;
   readonly changeOutput: SphereToken | null;
-  /** The ONE error to surface (keep-open > conflict > other, lowest opIndex). Undefined = full success. */
+  /**
+   * Every settled failure in plan (opIndex) order — certified-with-error ops
+   * included. The complete picture for logging/diagnosis; {@link primaryError}
+   * is always one of these (empty ⇔ primaryError undefined).
+   */
+  readonly failures: OperationOutcome[];
+  /** The ONE error to surface (precedence in {@link summarizeOutcomes}'s doc). Undefined = full success. */
   readonly primaryError?: unknown;
   /** #625: uiTokenId to tag onto a surfaced conflict — set ONLY when nothing certified in this attempt. */
   readonly conflictTagSourceId?: string;
@@ -103,12 +109,24 @@ export function isKeepOpenSendError(err: unknown): boolean {
  *  1. keep-open (ProofUnconfirmed / checkpoint trio) — surfacing anything else
  *     could let the failure disposition abort an intent while this op's spend
  *     may be on-chain (stranded value);
- *  2. TransferConflictError — carries the #625/#677 recovery contracts;
- *  3. anything else (timeout, network, journal write).
+ *  2. a committed op's post-step failure, when a conflict is also present —
+ *     that op certified but its blob was NEVER journaled, so resume under
+ *     THIS intent is the only path that re-derives it (resume skips aborted
+ *     intents). Surfacing the conflict instead would trigger the conflict
+ *     disposition's soft abort and strand the leg's value; committed>0 +
+ *     non-conflict keeps the intent open, and resume converges every leg —
+ *     it re-derives the un-journaled op and records the foreign spend (§8.1).
+ *     (Sequential-era parity: the journal throw stopped the loop, so a
+ *     surfaced conflict always implied every committed leg was journaled.)
+ *  3. TransferConflictError — carries the #625/#677 recovery contracts;
+ *  4. anything else (timeout, network, journal write).
  */
 export function summarizeOutcomes(outcomes: readonly OperationOutcome[]): SendOutcomeSummary {
   const committed = outcomes
     .filter((o) => o.certified)
+    .sort((a, b) => a.op.opIndex - b.op.opIndex);
+  const failures = outcomes
+    .filter((o) => o.error !== undefined)
     .sort((a, b) => a.op.opIndex - b.op.opIndex);
   const base = {
     committed,
@@ -116,17 +134,20 @@ export function summarizeOutcomes(outcomes: readonly OperationOutcome[]): SendOu
     committedAmount: committed.reduce((sum, o) => sum + o.op.deliveredAmount, 0n),
     deliveryPending: committed.some((o) => o.delivered === false),
     changeOutput: committed.find((o) => o.changeOutput !== undefined)?.changeOutput ?? null,
+    failures,
   };
-
-  const failures = outcomes
-    .filter((o) => o.error !== undefined)
-    .sort((a, b) => a.op.opIndex - b.op.opIndex);
   if (failures.length === 0) return base;
 
   const keepOpen = failures.find((o) => isKeepOpenSendError(o.error));
   if (keepOpen !== undefined) return { ...base, primaryError: keepOpen.error };
 
   const conflict = failures.find((o) => o.error instanceof TransferConflictError);
+  // Precedence rule 2 (see the doc above): never let a conflict drive the
+  // disposition while a committed leg is missing its journal entry.
+  const committedPostStepFailure = committed.find((o) => o.error !== undefined);
+  if (conflict !== undefined && committedPostStepFailure !== undefined) {
+    return { ...base, primaryError: committedPostStepFailure.error };
+  }
   const primary = conflict ?? failures[0];
   return {
     ...base,

@@ -15,6 +15,10 @@
  * implementation-independent and must always pass unchanged.
  * (Sequential-era baseline, for the record: maxConcurrent=1, 110,000 ms.)
  *
+ * The fail-fast scenario pins the between-batch early exit: a failed op stops
+ * further batches from launching (in-flight siblings still settle), so an
+ * outage surfaces after one batch, not ceil(N/MAX) op-timeouts.
+ *
  * Harness mirrors PaymentsModule.v2-send-recovery.test.ts (no SDK vi.mock).
  */
 import { describe, it, expect, vi, beforeAll } from 'vitest';
@@ -117,12 +121,18 @@ class SimulatedNetworkEngine extends FakeTokenEngine {
   constructor(
     private readonly clock: VirtualClock,
     private readonly certifications: ConcurrencyGauge,
+    /** Op whose submit fails after the publish round trip (never certifies). */
+    private readonly failAtOpIndex?: number,
   ) {
     super();
   }
 
   override transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken> {
     return this.certifications.track(async () => {
+      if (this.failAtOpIndex !== undefined && options?.opIndex === this.failAtOpIndex) {
+        await this.clock.wait(PUBLISH_RTT_MS);
+        throw new Error('simulated submit failure');
+      }
       await this.certify();
       return super.transfer(params, options);
     });
@@ -275,6 +285,38 @@ async function runManyTokenSend(): Promise<SendTelemetry> {
   }
 }
 
+interface FailFastTelemetry {
+  error: unknown;
+  certifications: ConcurrencyGauge;
+  deliveries: number;
+  remainingConfirmed: number;
+  virtualElapsedMs: number;
+}
+
+/** Op 0's submit fails inside the FIRST batch — later batches must never launch. */
+async function runFailFastSend(): Promise<FailFastTelemetry> {
+  const clock = new VirtualClock();
+  const certifications = new ConcurrencyGauge();
+  const engine = new SimulatedNetworkEngine(clock, certifications, 0);
+  const { module, transport } = setup(engine, clock);
+  try {
+    await seedWallet(module, engine, TOKEN_COUNT);
+    const startMs = clock.now();
+    const error = await module
+      .send({ recipient: '@bob', amount: (AMOUNT_EACH * BigInt(TOKEN_COUNT)).toString(), coinId: UCT })
+      .then(() => undefined, (err: unknown) => err);
+    return {
+      error,
+      certifications,
+      deliveries: (transport.sendTokenTransfer as any).mock.calls.length,
+      remainingConfirmed: module.getTokens().filter((t) => t.status === 'confirmed').length,
+      virtualElapsedMs: clock.now() - startMs,
+    };
+  } finally {
+    module.destroy();
+  }
+}
+
 /** 110000 → '1m 50s'; 5500 → '5.5s'. */
 function formatDuration(ms: number): string {
   const minutes = Math.floor(ms / 60_000);
@@ -323,5 +365,35 @@ describe(`single send() spending ${TOKEN_COUNT} source tokens`, () => {
         ` virtualWallClock=${formatDuration(t.virtualElapsedMs)}` +
         ` (${batches} batches; sequential-era baseline ${formatDuration(TOKEN_COUNT * (CERTIFY_MS + DELIVER_MS))})`,
     );
+  });
+});
+
+describe('fail-fast: a failed operation stops later batches from launching', () => {
+  let t: FailFastTelemetry;
+
+  beforeAll(async () => {
+    t = await runFailFastSend();
+  }, 30_000);
+
+  it('surfaces the failure after ONE batch instead of certifying every remaining batch', () => {
+    expect(t.error).toBeInstanceOf(Error);
+    expect((t.error as Error).message).toContain('simulated submit failure');
+    // Exactly one op failed → nothing was suppressed (the field is only set
+    // when a batch fails in more than one way).
+    expect((t.error as Error & { suppressedErrors?: unknown[] }).suppressedErrors).toBeUndefined();
+    // Only the first batch launched (sequential-era fail-fast, at batch
+    // granularity): its siblings settled — certified + delivered — and no
+    // further batch started. Without the early exit this would be TOKEN_COUNT
+    // attempts over ceil(TOKEN_COUNT/MAX) batch round trips.
+    expect(t.certifications.count).toBe(MAX_SEND_OPERATION_CONCURRENCY);
+    expect(t.deliveries).toBe(MAX_SEND_OPERATION_CONCURRENCY - 1);
+    expect(t.virtualElapsedMs).toBe(CERTIFY_MS + DELIVER_MS);
+  });
+
+  it('consumes the committed siblings; the failed and never-launched sources stay spendable', () => {
+    // The batch's certified siblings were removed (their value is delivered);
+    // the failed op's source and every never-launched source are restored
+    // 'confirmed' for the retry/re-plan.
+    expect(t.remainingConfirmed).toBe(TOKEN_COUNT - (MAX_SEND_OPERATION_CONCURRENCY - 1));
   });
 });

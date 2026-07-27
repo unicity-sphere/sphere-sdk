@@ -50,7 +50,7 @@ import {
   type SendOperation,
   type SendOutcomeSummary,
 } from './SendOperations';
-import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
+import { SpendPlanner, SpendQueue, type ParsedTokenEntry } from './SpendQueue';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../storage';
 import type {
   TransportProvider,
@@ -2265,6 +2265,16 @@ export class PaymentsModule {
         for (let start = 0; start < operations.length; start += MAX_SEND_OPERATION_CONCURRENCY) {
           const batch = operations.slice(start, start + MAX_SEND_OPERATION_CONCURRENCY);
           outcomes.push(...(await Promise.all(batch.map(sendOperation))));
+          // Fail-fast between batches (sequential-era parity, at batch
+          // granularity: the first throw stopped the loop): once any settled op
+          // failed, this send is on the failure path — launching more batches
+          // would keep certifying value destined for resume/remainder handling
+          // and, in an outage, stack ceil(N/8) op-timeouts before the user sees
+          // the error. In-flight ops always settle (the accounting above needs
+          // the full batch); never-launched sources stay untouched and are
+          // restored 'confirmed' by the failure handler, their value covered by
+          // the remainder re-plan or the user's retry.
+          if (outcomes.some((o) => o.error !== undefined)) break;
         }
         summary = summarizeOutcomes(outcomes);
         deliveryPending = summary.deliveryPending;
@@ -2311,7 +2321,24 @@ export class PaymentsModule {
           if (summary.conflictTagSourceId !== undefined && summary.primaryError instanceof TransferConflictError) {
             summary.primaryError.conflictedSourceId = summary.conflictTagSourceId;
           }
-          throw summary.primaryError;
+          // Report EVERY settled failure, not only the one that steers the
+          // disposition: a parallel batch can fail in several independent ways,
+          // and dropping the rest hides them from apps and bug reports. Log
+          // each op's error, and carry the non-surfaced ones on the thrown
+          // error (`suppressedErrors`) — visibility only, never dispositive.
+          for (const f of summary.failures) {
+            logger.warn(
+              'Payments',
+              `Send op ${f.op.opIndex} (${f.op.kind}) failed${f.certified ? ' AFTER on-chain certification' : ''}:`,
+              f.error,
+            );
+          }
+          const primaryError = summary.primaryError;
+          const suppressed = summary.failures.map((f) => f.error).filter((e) => e !== primaryError);
+          if (suppressed.length > 0 && primaryError instanceof Error) {
+            (primaryError as Error & { suppressedErrors?: unknown[] }).suppressedErrors = suppressed;
+          }
+          throw primaryError;
         }
 
         if (serverApply) {
@@ -2469,7 +2496,12 @@ export class PaymentsModule {
       //  - a TransferConflictError aborts (the prescribed recovery — the
       //    caller re-plans under a NEW transferId; soft abort keeps the row);
       //    any already-certified legs stay journaled for delivery replay and
-      //    converge via the recipient's claim handoff (§6);
+      //    converge via the recipient's claim handoff (§6). summarizeOutcomes
+      //    GUARANTEES that invariant: a conflict is only surfaced when every
+      //    committed leg journaled — a committed leg whose journal write failed
+      //    surfaces ITS error instead (committed>0 + non-conflict ⇒ keep-open
+      //    here), because the abort would strand the un-journaled leg (resume
+      //    skips aborted intents and nothing else re-derives it);
       //  - a PROVEN clean pre-certification failure (nothing certified) also
       //    aborts — an open intent would silently re-execute the transfer at the
       //    next sign-in after the user already saw it fail (and possibly retried

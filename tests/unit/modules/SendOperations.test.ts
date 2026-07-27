@@ -59,6 +59,7 @@ describe('summarizeOutcomes — accounting', () => {
     expect(s.committedAmount).toBe(50n);
     expect(s.deliveryPending).toBe(false);
     expect(s.changeOutput).toBeNull();
+    expect(s.failures).toEqual([]);
   });
 
   it('committed ops are returned in plan (opIndex) order regardless of settle order', () => {
@@ -110,6 +111,34 @@ describe('summarizeOutcomes — error precedence', () => {
     expect(s.primaryError).toBe(conflict);
     expect(s.conflictTagSourceId).toBeUndefined(); // a full-amount re-plan would over-request
     expect(s.committedAmount).toBe(60n);           // remainder = request − 60, exact
+  });
+
+  it('a committed op with a failed post-step SUPPRESSES a sibling conflict (un-journaled leg needs resume)', () => {
+    const journalError = new Error('journal write failed');
+    const conflict = new TransferConflictError('lost race');
+    const s = summarizeOutcomes([
+      { op: directOp(0, 10n), certified: true, error: journalError },
+      failed(directOp(1, 40n), conflict),
+    ]);
+    // Surfacing the conflict would soft-abort the intent and strand op 0's
+    // never-journaled blob (resume skips aborted intents) — the post-step
+    // error keeps the intent open so resume re-derives the leg.
+    expect(s.primaryError).toBe(journalError);
+    expect(s.conflictTagSourceId).toBeUndefined();
+    expect(s.committedUiIds).toEqual(new Set(['ui-0']));
+    expect(s.committedAmount).toBe(10n);
+    // The complete settled picture stays reportable — the suppressed conflict
+    // is in `failures` (plan order), not silently dropped.
+    expect(s.failures.map((f) => f.error)).toEqual([journalError, conflict]);
+  });
+
+  it('keep-open still beats a committed post-step failure', () => {
+    const unconfirmed = new ProofUnconfirmedError('proof fetch inconclusive');
+    const s = summarizeOutcomes([
+      { op: directOp(0, 10n), certified: true, error: new Error('journal write failed') },
+      failed(directOp(1, 10n), unconfirmed),
+    ]);
+    expect(s.primaryError).toBe(unconfirmed);
   });
 
   it('keep-open beats a conflict — the intent must survive for resume (#631)', () => {
