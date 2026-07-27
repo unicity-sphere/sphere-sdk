@@ -10,7 +10,7 @@ import { majorOf } from './semver';
 // =============================================================================
 
 export const SPHERE_CONNECT_NAMESPACE = 'sphere-connect';
-export const SPHERE_CONNECT_VERSION = '2.0';   // Connect protocol version (semver MAJOR.MINOR)
+export const SPHERE_CONNECT_VERSION = '2.1';   // Connect protocol version (semver MAJOR.MINOR)
 
 export { HOST_READY_TYPE, HOST_READY_TIMEOUT, SPHERE_NETWORKS } from '../constants';
 // Import for local use (e.g. SphereHandshake.network) AND re-export for connect consumers.
@@ -89,13 +89,45 @@ export const ERROR_CODES = {
   RATE_LIMITED: 4006,
   UNSUPPORTED_PROTOCOL_VERSION: 4007, // Connect MAJOR mismatch (incompatible era)
   INCOMPATIBLE_NETWORK:         4008, // dApp targets a different network than the wallet
+  // Wallet locked; THE SESSION IS STILL ALIVE. A QUERY may be retried after wallet:unlocked.
+  // An INTENT already delegated to the wallet is NEVER answered with this code — it gets
+  // INTENT_OUTCOME_UNKNOWN (4201) instead, because a retry could double-spend.
+  WALLET_LOCKED:                4009,
   INSUFFICIENT_BALANCE: 4100,
   INVALID_RECIPIENT: 4101,
   TRANSFER_FAILED: 4102,
   INTENT_CANCELLED: 4200,
+  /**
+   * The intent was DELEGATED to the wallet and the host lost track of the answer — a host
+   * deadline fired, or the wallet locked / logged out mid-flight. **The outcome is UNKNOWN:
+   * the money may or may not have moved.**
+   *
+   * A dApp MUST NOT retry on this code. Reconcile out of band (poll the recipient, the
+   * aggregator, or your own backend) and only then decide.
+   *
+   * This code exists because every other answer would be a lie. `INTENT_CANCELLED` (4200)
+   * asserts the user declined and nothing happened; `WALLET_LOCKED` (4009) invites a retry
+   * after the unlock. Sending either for an intent the wallet had already submitted is how a
+   * paid-but-not-credited order — and then a double spend on retry — happens.
+   */
+  INTENT_OUTCOME_UNKNOWN:       4201,
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
+
+/** `data` carried by every WALLET_LOCKED (4009) refusal. */
+export interface WalletLockedData {
+  /** Discriminator. Always the literal 'locked' — reserved for future refusal reasons. */
+  readonly reason: 'locked';
+  /**
+   * Whether the wallet's own unlock surface is currently on screen.
+   * DECLARED in the fail-fast release and always absent there; POPULATED in the resume
+   * release from ConnectHostConfig.unlockSurface(), evaluated at refusal time (visibility
+   * changes over time, so a static value would lie). Feeds
+   * ConnectClientConfig.onWalletAttention.
+   */
+  readonly unlockSurface?: 'visible' | 'background';
+}
 
 // =============================================================================
 // Message Types
@@ -163,6 +195,11 @@ export interface SphereHandshake extends SphereMessageBase {
   readonly error?: SphereRpcError;
   /** Response: non-fatal deprecation notice (does not block the connection). */
   readonly warning?: SphereRpcError;
+  /** Response only: the wallet is LOCKED and the session is ALIVE. The dApp is connected
+   *  and must not re-handshake; it will receive `wallet:unlocked` on the same session.
+   *  Additive and safe for old clients: handleHandshakeResponse reads only sessionId,
+   *  permissions, identity, network, warning and error and ignores unknown fields. */
+  readonly locked?: boolean;
 }
 
 export interface SphereRpcError {
@@ -206,15 +243,68 @@ export interface PublicIdentity {
  * No sphere_subscribe call needed — host sends these unconditionally.
  */
 export const WALLET_EVENTS = {
-  /** Wallet locked or user logged out. dApp shows locked state and waits for unlock.
-   *  Pushed automatically by ConnectHost — no sphere_subscribe needed. */
+  /** Wallet is LOCKED — the session is STILL ALIVE. Requests are answered
+   *  WALLET_LOCKED (4009) until `wallet:unlocked`. The dApp must NOT disconnect,
+   *  must NOT clear its sessionId, and must NOT re-handshake.
+   *  Payload: {@link WalletLockedPayload}. Pushed by ConnectHost.setLocked() and
+   *  immediately after a handshake response carrying `locked: true`. */
   LOCKED: 'wallet:locked',
+  /** Wallet was unlocked — the SAME session continues: no re-handshake, no re-approval,
+   *  no re-subscribe (the host re-arms the dApp's subscriptions before pushing this).
+   *  Payload: {@link WalletUnlockedPayload} — carries the CURRENT identity, which may
+   *  differ from the one the dApp connected with. Pushed by ConnectHost.updateSphere()
+   *  on the locked -> live edge only. */
+  UNLOCKED: 'wallet:unlocked',
+  /** The session is GONE (logout, wallet deleted, dApp sphere_disconnect, expiry seen at
+   *  unlock, a different seed behind the lock screen, host destroy).
+   *  The dApp must clear its session and re-handshake to continue. Unlocking does not cure it.
+   *  Payload: {@link WalletDisconnectedPayload}. Pushed by ConnectHost.revokeSession(). */
+  DISCONNECTED: 'wallet:disconnected',
   /** Active wallet address changed. dApp should update displayed identity.
    *  Pushed automatically by ConnectHost — no sphere_subscribe needed. */
   IDENTITY_CHANGED: 'identity:changed',
 } as const;
 
 export type WalletEvent = (typeof WALLET_EVENTS)[keyof typeof WALLET_EVENTS];
+
+/** Payload of {@link WALLET_EVENTS.LOCKED}. Intentionally empty — matches today's push,
+ *  so an old dApp sees no shape change. */
+export type WalletLockedPayload = Record<string, never>;
+
+/** Payload of {@link WALLET_EVENTS.DISCONNECTED}. Intentionally empty. */
+export type WalletDisconnectedPayload = Record<string, never>;
+
+/** Payload of {@link WALLET_EVENTS.UNLOCKED}. */
+export interface WalletUnlockedPayload {
+  /** The wallet's public identity at unlock time. Absent when the rebound Sphere has no
+   *  identity yet (JSON transports drop undefined keys).
+   *  Unlock is NOT implicitly the same wallet: the lock screen's "Forgot password ->
+   *  restore from recovery phrase" installs a DIFFERENT seed while origin approvals are
+   *  keyed by origin alone. The host's own lock-edge guard is authoritative (it revokes
+   *  instead of pushing this event on a mismatch); this field is what lets a dApp render
+   *  honestly and what the client-side retry queue checks before draining. */
+  readonly identity?: PublicIdentity;
+}
+
+/** Payload of {@link WALLET_EVENTS.IDENTITY_CHANGED} — unchanged: the host forwards
+ *  Sphere's own event data verbatim and pushes a PublicIdentity from updateSphere().
+ *  Typed as the union for honesty. */
+export type WalletIdentityChangedPayload = PublicIdentity | unknown;
+
+/** Events the host pushes unconditionally. They must NEVER be routed through
+ *  `sphere_subscribe`: Sphere.on() accepts any string and would silently never emit,
+ *  so the subscribe would succeed and deliver nothing forever. */
+export const AUTO_PUSHED_EVENTS: readonly WalletEvent[] = [
+  WALLET_EVENTS.LOCKED,
+  WALLET_EVENTS.UNLOCKED,
+  WALLET_EVENTS.DISCONNECTED,
+  WALLET_EVENTS.IDENTITY_CHANGED,
+];
+
+/** True for an event the host pushes unconditionally (see {@link AUTO_PUSHED_EVENTS}). */
+export function isAutoPushedEvent(event: string): event is WalletEvent {
+  return (AUTO_PUSHED_EVENTS as readonly string[]).includes(event);
+}
 
 // =============================================================================
 // Helpers

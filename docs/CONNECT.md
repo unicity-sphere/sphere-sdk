@@ -4,7 +4,7 @@ Sphere Connect is a secure wallet-dApp communication protocol. It allows web app
 
 ## Protocol Version
 
-The current Connect protocol version is **`2.0`** (`SPHERE_CONNECT_VERSION = '2.0'`).
+The current Connect protocol version is **`2.1`** (`SPHERE_CONNECT_VERSION = '2.1'`).
 
 ### Compatibility policy
 
@@ -156,8 +156,12 @@ Use `safeSend` everywhere you would otherwise call `ws.send()` in message handle
 import { ConnectHost } from '@unicitylabs/sphere-sdk/connect';
 
 const host = new ConnectHost({
-  sphere,        // Sphere SDK instance
+  sphere,        // Sphere SDK instance — pass null when initialWalletState is 'locked'
   transport,     // any ConnectTransport
+  origin,        // optional: the origin this host serves, for the wallet's own badge and logs
+                 // (NEVER session.dapp.url, which is dApp-CLAIMED metadata)
+  initialWalletState: 'locked',  // optional — pass when the wallet is already locked at
+                                 // construction (cold start with an encrypted wallet)
 
   // Called when a new dApp requests connection.
   // silent=true means: reject immediately if not already approved — do NOT open any UI.
@@ -173,7 +177,10 @@ const host = new ConnectHost({
   },
 
   // Called when a dApp sends an intent (send tokens, sign message, etc.)
-  onIntent: async (action, params, session) => {
+  // ctx (Connect 2.1) carries the host-side deadline and an AbortSignal: DISMISS YOUR MODAL
+  // when it aborts, otherwise the host's own deadline manufactures a double-submit.
+  onIntent: async (action, params, session, ctx) => {
+    ctx?.signal.addEventListener('abort', () => closeIntentUI());
     const result = await showIntentUI(action, params);
     return { result };
   },
@@ -191,41 +198,114 @@ const host = new ConnectHost({
     if (!silent) showRejectionBanner(dapp?.name, error.message);
   },
 
+  // Notify-only: the host has ALREADY answered WALLET_LOCKED (4009), or refused a handshake
+  // while locked. It never waits for you, and a throw here cannot break it.
+  //
+  // THIS MUST NOT RAISE A CREDENTIAL SURFACE. A dApp request may trigger a CONSENT prompt;
+  // it may never trigger a password field. Light a PASSIVE badge in your PERMANENT chrome
+  // ("N requests waiting — Unlock"); show the password field only after a human clicks it.
+  // Volume is already bounded by the rate limiter — no coalescing, no cooldown, no cap.
+  onLockedRequest: ({ origin, kind, name }) => {
+    bumpWaitingBadge({ origin, kind, name });   // origin may be undefined — say "a connected app"
+  },
+
   // Optional: session TTL in ms (default: 24h, 0 = no expiry)
   sessionTtlMs: 86400000,
+
+  // Optional host-side deadlines. The host answers within them no matter what the wallet
+  // does, so a dApp never hangs on an abandoned modal.
+  requestDeadlineMs: 25000,     // query
+  // Intent. MUST stay above ConnectClient's own intentTimeout (120 s default): whoever answers
+  // first defines the outcome, and the host cannot know whether the wallet already submitted
+  // the transfer. Expiry answers INTENT_OUTCOME_UNKNOWN (4201) — never a cancellation — and
+  // aborts ctx.signal so a wallet that CAN still back out does.
+  intentDeadlineMs: 180000,
+  handshakeDeadlineMs: 120000,  // onConnectionRequest — expiry sends the empty refusal
 
   // Optional secondary floors (rarely needed — the Connect MAJOR is the era gate)
   minSdkVersion: '0.9.0',    // reject dApps whose npm SDK version is older
   minMinorVersion: 0,         // minimum MINOR within the current MAJOR
 });
 
-// Revoke current session without destroying the host
+// The wallet LOCKED. The session is PRESERVED — this is a state, not a teardown.
+host.setLocked();
+
+// The Sphere instance is gone for a NON-lock reason (a generic init failure).
+// A dead end: unlocking cannot cure it, so it revokes.
+host.setUnavailable();
+
+// Destroy the SESSION (logout, wallet deleted, popup closing). Pushes wallet:disconnected.
 host.revokeSession();
 
-// Notify connected dApp that the wallet is locked / logged out
-host.notifyWalletLocked();
+// Bind a (new) Sphere: the address-switch path AND the unlock path.
+host.updateSphere(sphere);
 
 // Destroy host and clean up transport
 host.destroy();
 ```
 
-### notifyWalletLocked()
+### The lifecycle verbs
 
-Wallet hosts **must** call `host.notifyWalletLocked()` when the wallet is logged out or the `Sphere` instance is destroyed. This fires a `WALLET_EVENTS.LOCKED` event to the connected dApp so it can react appropriately (see [Wallet Lock Handling](#wallet-lock-handling) below).
+`notifyWalletLocked()` **no longer exists**. Its old meaning was *revoke*; its new meaning would
+be *lock* — the opposite — so it was removed rather than aliased, to force every call site to pick
+a verb at compile time.
 
-In the Sphere web app's ConnectPage, watch the `sphere` instance and notify when it becomes null:
+| Wallet transition | Call | Wire event | Session |
+|---|---|---|---|
+| manual lock, idle auto-lock, cold start locked | `setLocked()` | `wallet:locked` | **preserved** |
+| unlock | `updateSphere(next)` | `wallet:unlocked` | preserved |
+| logout, wallet deleted, popup `beforeunload` | `revokeSession()` | `wallet:disconnected` | destroyed |
+| Sphere gone for a non-lock reason | `setUnavailable()` | `wallet:disconnected` | destroyed |
+
+**Ordering contract:** call `setLocked()` **before** `sphere.destroy()`. The host drops its own
+Sphere reference in `setLocked()`; destroying first leaves in-flight requests reading a dead
+instance.
 
 ```typescript
 useEffect(() => {
   if (sphere && hostRef.current) {
-    hostRef.current.updateSphere(sphere);
+    hostRef.current.updateSphere(sphere);          // unlock, or a live address switch
   } else if (!sphere && !isLoading && hostRef.current) {
-    hostRef.current.notifyWalletLocked();
+    hostRef.current.setLocked();                   // a LOCK — the dApp stays connected
   }
 }, [sphere, isLoading]);
 ```
 
-The extension's background script should do the same when the wallet is destroyed or the user logs out.
+While locked, a host that HOLDS a session answers exactly four of the sixteen `RPC_METHODS`:
+`sphere_getIdentity` (from an immutable snapshot), `sphere_subscribe`, `sphere_unsubscribe` and
+`sphere_disconnect`. The other **twelve, and every intent**, are refused `WALLET_LOCKED` (4009):
+the five money reads (`getBalance`, `getAssets`, `getFiatBalance`, `getTokens`, `getHistory`),
+`sphere_resolve`, **all four DM reads** (`getConversations`, `getMessages`, `getDMUnreadCount`,
+`markAsRead`) and both invoice reads. Nothing is served from a cache — a dApp holding a stale
+balance is about to offer an unpayable spend — and **messaging does not keep working while
+locked**, so a dApp must stop polling and wait rather than collect refusals.
+
+A wallet that **cold-starts locked** is different, and it is the common path: the password is
+memory-only, so a page reload or a fresh popup lands there. Such a host holds no session and an
+empty snapshot, so the HANDSHAKE itself is refused with an errorless empty response — `connect()`
+rejects with a bare "Connection rejected by wallet" carrying **no code at all**. There is no 4009
+to match on. That silence is deliberate: the refusal must reveal nothing about the wallet to an
+origin holding no approval. Treat it as "not ready yet" rather than a permanent rejection — keep
+waiting for `HOST_READY`, which the wallet emits once a human unlocks it.
+
+On the way back, `updateSphere()` compares the new Sphere's `chainPubkey` against the one frozen
+at lock time. A mismatch — "Forgot password → restore from recovery phrase" installs a different
+seed behind an origin-keyed approval — **revokes** instead of unlocking.
+
+### onLockedRequest — a badge, never a password field
+
+`ConnectHostConfig.onLockedRequest` is notify-only: the host has **already** answered 4009 and
+never waits for the wallet. A throw from it cannot break the host.
+
+**It must not raise a credential surface.** A dApp request may trigger a *consent* prompt; it may
+never trigger a *password* field. Light a passive badge in your permanent chrome ("N requests
+waiting — Unlock") and show the password field only after a human clicks it. Volume is already
+bounded by the rate limiter, which now guards the query, intent and handshake paths — there is no
+coalescing, no cooldown and no cap by design.
+
+`ctx.origin` is `ConnectHostConfig.origin`, i.e. what the *wallet* knows. It is never
+`session.dapp.url`, which is dApp-claimed metadata. When it is absent, say "a connected app" —
+never claim an origin you cannot verify.
 
 ---
 
@@ -524,44 +604,61 @@ rejects these intents with `METHOD_NOT_FOUND`, and the invoice queries error wit
 | `transfer:incoming` | token transfer received | via `sphere_subscribe` |
 | `transfer:confirmed` | transfer confirmed on chain | via `sphere_subscribe` |
 | `transfer:failed` | transfer failed | via `sphere_subscribe` |
-| `wallet:locked` | wallet locked / logged out | auto-pushed (no subscribe) |
+| `wallet:locked` | wallet locked — **the session is alive** | auto-pushed (no subscribe) |
+| `wallet:unlocked` | wallet unlocked, carries the current identity | auto-pushed (no subscribe) |
+| `wallet:disconnected` | the session is GONE — re-handshake to continue | auto-pushed (no subscribe) |
 | `identity:changed` | active identity changed | auto-pushed (no subscribe) |
+
+> The four wallet events are pushed unconditionally and **cannot** be subscribed —
+> `sphere_subscribe` refuses them. `Sphere.on()` accepts any string and would silently never
+> emit for them, so the subscribe used to succeed and deliver nothing forever.
 
 > Session expiry is **not** an event — the next request after the TTL is rejected with
 > error `4004 SESSION_EXPIRED`.
 
 ### Wallet Lock Handling
 
-When the wallet is locked or the user logs out, the host fires a `WALLET_EVENTS.LOCKED` event (see [`notifyWalletLocked()`](#notifywalletlocked) above). How the dApp handles this depends on the transport mode:
-
-#### Popup mode (P3)
-
-Fully disconnect — destroy the transport, clear the client reference, and remove the saved session from `sessionStorage`. **Do not close the popup window itself**, because the user may log into a different wallet in the same popup. The dApp should show the "Connect" button again.
-
-```typescript
-client.on('wallet:locked', async () => {
-  await disconnect();
-  sessionStorage.removeItem(SESSION_KEY);
-  setClient(null);
-  setConnection(null);
-  // Do NOT call popup.close() — user may log in again in the popup
-});
-```
-
-#### Extension / iframe mode (P1, P2)
-
-The wallet's background service worker or parent frame stays alive. Instead of disconnecting, set a `isWalletLocked` flag and wait for the user to unlock. When the wallet is unlocked, the host calls `updateSphere(newSphere)` and fires an `identity:changed` event, which signals the dApp to resume:
+**A lock is not a disconnect.** `wallet:locked` means the wallet is locked and the session is
+**still alive**: stay connected, keep your `sessionId`, do not re-handshake. Requests answer
+`WALLET_LOCKED` (4009) until `wallet:unlocked` arrives on the same session. This is identical in
+every transport mode — the old popup-vs-iframe split is gone.
 
 ```typescript
 client.on('wallet:locked', () => {
-  setIsWalletLocked(true);
+  setWalletLocked(true);           // render "wallet locked — unlock to continue"
+});                                // do NOT disconnect, do NOT clear the session
+
+client.on('wallet:unlocked', ({ identity }) => {
+  setWalletLocked(false);
+  // The identity may differ from the one you connected with (a legal address switch before the
+  // lock). Compare it before replaying anything that moves money.
+  if (identity?.chainPubkey !== connectedChainPubkey) rebuildForNewIdentity(identity);
+  else refresh();                  // your own retry — the SDK does not replay for you
 });
 
-client.on('identity:changed', (identity) => {
-  setIsWalletLocked(false);
-  // Refresh UI with new identity if it changed
+client.on('wallet:disconnected', () => {
+  // THIS is the teardown signal: logout, wallet deleted, or the session expired.
+  fullDisconnect();
 });
 ```
+
+Discriminate on `error.code === 4009` (and `error.data.reason === 'locked'`), never on the
+message text.
+
+The client tracks this for you: `client.walletLocked` is `true` between the two events, and
+`client.isConnected` stays `true` throughout.
+
+#### Old wallets
+
+A Connect **2.0** wallet destroys the session on lock and never emits `wallet:unlocked` or
+`wallet:disconnected`, so a dApp waiting for either against one waits forever. Feature-detect
+with `client.walletProtocol` after a successful handshake.
+
+#### Resuming during a lock
+
+A resume with a matching `sessionId` **succeeds** while the wallet is locked, and
+`ConnectResult.locked` is `true` — this is the common case of a dApp that reloaded mid-lock. It
+is connected and must wait for `wallet:unlocked`, not re-handshake.
 
 ---
 
@@ -599,6 +696,7 @@ try {
 |------|----------|------|
 | 4007 | `ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION` | Connect MAJOR version mismatch (e.g. v1 dApp connecting to v2 wallet). dApp must update its SDK. |
 | 4008 | `ERROR_CODES.INCOMPATIBLE_NETWORK` | dApp targets a different network than the wallet (or omitted `network` in `ConnectClientConfig`). |
+| 4009 | `ERROR_CODES.WALLET_LOCKED` | The wallet is locked. **The session is still alive** — retry after `wallet:unlocked`. Carries `data: { reason: 'locked' }`. Discriminate on the code, never on the message. |
 | 4001 | `ERROR_CODES.NOT_CONNECTED` | Request sent before `connect()` succeeded. |
 | 4002 | `ERROR_CODES.PERMISSION_DENIED` | Method or intent not in granted permissions. |
 | 4003 | `ERROR_CODES.USER_REJECTED` | User rejected an intent in the wallet UI. |
@@ -608,7 +706,8 @@ try {
 | 4100 | `ERROR_CODES.INSUFFICIENT_BALANCE` | Send intent failed — not enough tokens. |
 | 4101 | `ERROR_CODES.INVALID_RECIPIENT` | Recipient not resolvable to a chain pubkey. |
 | 4102 | `ERROR_CODES.TRANSFER_FAILED` | Transfer execution failed. |
-| 4200 | `ERROR_CODES.INTENT_CANCELLED` | Intent cancelled (user closed wallet UI). |
+| 4200 | `ERROR_CODES.INTENT_CANCELLED` | Intent cancelled — the user declined and **nothing happened**. Safe to re-offer. |
+| 4201 | `ERROR_CODES.INTENT_OUTCOME_UNKNOWN` | The intent reached the wallet and the answer was lost (a host deadline, a lock, a logout). **The outcome is unknown — the money may or may not have moved. Do NOT retry**; reconcile out of band first. |
 
 Rejection `.data` for the two gate errors:
 
@@ -734,7 +833,11 @@ Connect uses semver MAJOR.MINOR. The rules:
 | Change or remove an existing message / field | MAJOR | Breaking — requires a deprecation window |
 | Behaviour fix with no wire change | PATCH (no Connect bump) | Invisible to peers |
 
-**Enforced in CI:** `tests/unit/connect/protocol-surface.test.ts` snapshots the full wire surface (intents, scopes, methods) + `SPHERE_CONNECT_VERSION`. Any change to the surface fails that test until you bump the version and update its snapshot — so the bump can't be forgotten.
+**Enforced in CI:** `tests/unit/connect/protocol-surface.test.ts` snapshots the full wire surface (intents, scopes, methods, **events, error codes**) + `SPHERE_CONNECT_VERSION`. Any change to the surface fails that test until you bump the version and update its snapshot — so the bump can't be forgotten.
+
+**One exception:** an error code the **host never sends** is client-local — it bumps the npm MINOR, not the protocol MINOR. The wire surface did not change, so no dApp can observe it from the wallet.
+
+**Also enforced:** `npm run verify:version` (a CI step that runs **before** the build) pins `connect/version.ts` to `package.json`. It has to run before the build because `prebuild` regenerates that file, so any check placed after would inspect the repaired copy and never catch a committed-stale `SDK_VERSION` — which makes every handshake advertise the wrong `sdkVersion` and any wallet with a `minSdkVersion` floor answer `UNSUPPORTED_PROTOCOL_VERSION` (4007).
 
 **Deprecation window for MAJOR changes:** announce the upcoming MAJOR → soft-warn via the handshake response `warning` field (non-fatal, logged by the client) → reject (MAJOR bumped). Never a flag-day cut except the current v1 → v2 migration (v1 peers are genuinely incompatible — no transition period is possible).
 

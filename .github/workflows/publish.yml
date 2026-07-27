@@ -39,6 +39,12 @@ jobs:
       - name: Update package version
         run: npm version ${{ inputs.version }} --no-git-tag-version
 
+      # Immediately after the bump, before any test runs: tests assert that
+      # connect/version.ts === package.json version, and Build (which would regenerate it
+      # via prebuild) only runs later. Without this step every release fails that assertion.
+      - name: Regenerate connect/version.ts for the bumped version
+        run: node scripts/gen-version.mjs
+
       - name: Install dependencies
         run: |
           npm install --include=optional --ignore-scripts
@@ -81,7 +87,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add package.json package-lock.json
+          # connect/version.ts is REGENERATED from the bumped package.json above, and the CI
+          # gate compares the two. Leaving it out of the release commit means main fails
+          # verify:version immediately after every release.
+          git add package.json package-lock.json connect/version.ts
           git commit -m "chore: release v${{ inputs.version }}"
           git tag "v${{ inputs.version }}"
           git push origin HEAD --tags

@@ -528,6 +528,10 @@ export class Sphere {
   private _masterKey: MasterKey | null = null;
   private _mnemonic: string | null = null;
   private _password: string | null = null;
+  /** True when the wallet was created/loaded/imported WITH a password. Distinguishes
+   *  "no password by design" (encrypt passes through) from "the password is gone" (encrypt
+   *  must throw rather than silently write plaintext over an encrypted record). */
+  private _passwordProtected = false;
   private _source: WalletSource = 'unknown';
   private _derivationMode: DerivationMode = 'bip32';
   private _basePath: string = DEFAULT_BASE_PATH;
@@ -941,6 +945,7 @@ export class Sphere {
       options.walletApi,
     );
     sphere._password = options.password ?? null;
+    sphere._passwordProtected = sphere._password !== null;
 
     // Store mnemonic (encrypted if password provided, plaintext otherwise)
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
@@ -1040,6 +1045,7 @@ export class Sphere {
       options.walletApi,
     );
     sphere._password = options.password ?? null;
+    sphere._passwordProtected = sphere._password !== null;
 
     // exists() restores original (disconnected) state — reconnect for reads
     if (!options.storage.isConnected()) {
@@ -1145,6 +1151,7 @@ export class Sphere {
       options.walletApi,
     );
     sphere._password = options.password ?? null;
+    sphere._passwordProtected = sphere._password !== null;
 
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
 
@@ -1588,6 +1595,7 @@ export class Sphere {
    * Check if wallet has BIP32 master key for HD derivation
    */
   hasMasterKey(): boolean {
+    this.ensureReady();
     return this._masterKey !== null;
   }
 
@@ -1622,6 +1630,7 @@ export class Sphere {
    * Returns null if wallet was imported from file (masterKey only)
    */
   getMnemonic(): string | null {
+    this.ensureReady();
     return this._mnemonic;
   }
 
@@ -1629,6 +1638,7 @@ export class Sphere {
    * Get wallet info for backup/export purposes
    */
   getWalletInfo(): WalletInfo {
+    this.ensureReady();
     let address0: string | null = null;
     try {
       if (this._identity) {
@@ -3976,6 +3986,13 @@ export class Sphere {
     this._initialized = false;
     this._trackedAddressesLoaded = false;
     this._identity = null;
+    // Zero the decrypted key material too. Clearing _identity alone made the wallet's own
+    // "keys leave memory — a real lock, not just a UI gate" comment false, and the
+    // graceful-lock design keeps the Connect host alive for the WHOLE lock window rather
+    // than milliseconds — so the window in which these survive is now user-scale.
+    this._mnemonic = null;
+    this._masterKey = null;
+    this._password = null;
     this._trackedAddresses.clear();
     this._addressIdToIndex.clear();
     this._addressNametags.clear();
@@ -4626,7 +4643,15 @@ export class Sphere {
   // ===========================================================================
 
   private encrypt(data: string): string {
-    if (!this._password) return data; // No password — store as plaintext
+    if (!this._password) {
+      if (this._passwordProtected) {
+        // Fail CLOSED. Failing open here silently rewrites an encrypted record as
+        // plaintext — reachable now that destroy() zeroes _password while the Connect host
+        // stays alive for the whole lock window.
+        throw new SphereError('Wallet password is not available', 'NOT_INITIALIZED');
+      }
+      return data; // No password by design — store as plaintext
+    }
     return encryptSimple(data, this._password);
   }
 

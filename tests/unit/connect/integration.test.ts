@@ -269,7 +269,13 @@ describe('Sphere Connect Integration', () => {
         message: 'Hello!',
       });
 
-      expect(onIntent).toHaveBeenCalledWith('dm', { to: '@alice', message: 'Hello!' }, expect.any(Object));
+      // 4th argument is the Connect 2.1 IntentContext (deadline + AbortSignal).
+      expect(onIntent).toHaveBeenCalledWith(
+        'dm',
+        { to: '@alice', message: 'Hello!' },
+        expect.any(Object),
+        expect.objectContaining({ expiresAt: expect.any(Number), signal: expect.any(AbortSignal) }),
+      );
       expect(result.sent).toBe(true);
       expect(result.messageId).toBe('msg123');
     });
@@ -293,6 +299,7 @@ describe('Sphere Connect Integration', () => {
         'mint',
         { coinId: '11'.repeat(32), amount: '500' },
         expect.any(Object),
+        expect.objectContaining({ expiresAt: expect.any(Number), signal: expect.any(AbortSignal) }),
       );
       expect(result.tokenId).toBe('aa'.repeat(32));
       expect(result.amount).toBe('500');
@@ -459,8 +466,11 @@ describe('Sphere Connect Integration', () => {
 
   describe('Rate Limiting', () => {
     it('rejects when rate limit exceeded', async () => {
-      createHost({ maxRequestsPerSecond: 2 });
+      createHost({ maxRequestsPerSecond: 3 });
       createClient();
+      // The handshake now consumes one unit of the SAME per-session budget: the handshake
+      // path used to be entirely unmetered, so an unapproved origin could loop it and open
+      // the approval UI without bound. Budget 3 = handshake + two queries.
       await client.connect();
 
       // First two should succeed

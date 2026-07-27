@@ -31,6 +31,19 @@ export interface PostMessageClientOptions {
 
 const POPUP_CLOSE_CHECK_INTERVAL = 1000;
 
+/**
+ * The origin of a caller-supplied target URL, as a single-entry allow-list. `null` (no filter)
+ * for `'*'` and for anything that will not parse.
+ */
+function originOf(targetOrigin: string): string[] | null {
+  if (targetOrigin === '*') return null;
+  try {
+    return [new URL(targetOrigin).origin];
+  } catch {
+    return null;
+  }
+}
+
 export class PostMessageTransport implements ConnectTransport {
   private readonly targetWindow: Window;
   private readonly targetOrigin: string;
@@ -51,7 +64,18 @@ export class PostMessageTransport implements ConnectTransport {
 
     // Listen for incoming messages
     this.listener = (event: MessageEvent) => {
-      // Origin check (host mode)
+      // WINDOW check, first and unconditional. `event.origin` alone cannot tell the wallet
+      // window from any OTHER frame on the same origin — an injected same-origin iframe passes
+      // an origin allow-list, and in iframe mode there is no allow-list at all because the
+      // client defaults to `'*'`. Only the window we are actually talking to may speak to us.
+      //
+      // Guarded on `event.source` being present: some environments (and jsdom in tests) deliver
+      // synthetic events without one, and dropping those would break every existing consumer.
+      if (event.source && event.source !== this.targetWindow) {
+        return;
+      }
+
+      // Origin check (host mode, and client mode when a concrete targetOrigin was given)
       if (this.allowedOrigins && !this.allowedOrigins.has('*') && !this.allowedOrigins.has(event.origin)) {
         return;
       }
@@ -103,7 +127,21 @@ export class PostMessageTransport implements ConnectTransport {
   static forClient(options?: PostMessageClientOptions): PostMessageTransport {
     const target = options?.target ?? window.parent;
     const targetOrigin = options?.targetOrigin ?? '*';
-    const transport = new PostMessageTransport(target, targetOrigin, null);
+    // Accept frames only from the wallet we are talking TO, whenever we know who that is.
+    //
+    // The client used to pass `null` here, i.e. no filter at all: anything able to reach this
+    // window could deliver a wallet event, and those frames now decide the client's
+    // authoritative `identity`, `locked` and `connected` — the same identity the docs tell a
+    // dApp to compare before resuming a spend.
+    //
+    // NORMALISED. `targetOrigin` is a caller-supplied URL, and callers pass whole wallet URLs:
+    // `https://wallet.example/` and `https://wallet.example/connect` are both perfectly
+    // reasonable values, and neither equals the `event.origin` the browser reports. Comparing
+    // them raw silently dropped every inbound frame and killed popup mode. An unparseable value
+    // falls back to no origin filter — the window check above is the real guard, and refusing to
+    // parse must not brick the transport.
+    const allowedOrigins = originOf(targetOrigin);
+    const transport = new PostMessageTransport(target, targetOrigin, allowedOrigins);
 
     // If target is a popup window, detect when it closes
     if (options?.target && options.target !== window.parent) {

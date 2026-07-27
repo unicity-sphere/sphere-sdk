@@ -1747,6 +1747,9 @@ export class PaymentsModule {
     this.spendQueue.destroy();
     this.reservationLedger.clear();
     this.parsedTokenCache.clear();
+    // getBalance()/getTokens()/getToken() read this map directly, so a destroyed module
+    // otherwise keeps answering balance queries from a wallet that no longer exists.
+    this.tokens.clear();
 
     // Clean up storage event subscriptions
     this.unsubscribeStorageEvents();
