@@ -682,7 +682,10 @@ try {
     showWrongNetwork((e as ConnectError).data);
   } else if (code === ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION) {
     // data.reason = 'protocol_incompatible'
-    // data.walletProtocol = '2.0', data.clientProtocol = '1.0' (for example)
+    // data.walletProtocol = '2.1', data.clientProtocol = '1.0' (for example)
+    // A version floor also sends what it demanded: data.requiredProtocol, or
+    // data.requiredSdk + data.actualSdk. `e.message` already names both sides —
+    // showing it verbatim is enough if you have no custom copy.
     showUpdateRequired((e as ConnectError).data);
   } else {
     showGenericError();
@@ -715,8 +718,15 @@ Rejection `.data` for the two gate errors:
 // UNSUPPORTED_PROTOCOL_VERSION (4007)
 {
   reason: 'protocol_incompatible';
-  walletProtocol: string;  // e.g. '2.0'
+  walletProtocol: string;  // e.g. '2.1'
   clientProtocol: string;  // e.g. '1.0'
+
+  // Only on the optional MINOR floor — the MINOR the wallet demands, e.g. '2.1'.
+  requiredProtocol?: string;
+
+  // Only on the optional npm-SDK floor.
+  requiredSdk?: string;         // e.g. '0.12.0'
+  actualSdk?: string | null;    // null when the dApp reported no sdkVersion
 }
 
 // INCOMPATIBLE_NETWORK (4008)

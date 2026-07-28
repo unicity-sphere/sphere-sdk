@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — compatibility-gate refusals now name the versions
+
+A rejected handshake said `SDK version below the required minimum` and stopped there. The
+numbers were in `error.data` all along, but every UI in the fleet renders `error.message` and
+nothing else, so the one thing a developer needed — *which* version to move to — was the one
+thing never shown.
+
+- `checkCompatibility` now quotes both sides in `message`:
+  `SDK version 0.11.9 is below the required minimum 0.12.0`,
+  `Connect protocol 2.0 is below the required minimum 2.1`,
+  `Incompatible Connect protocol version: app speaks 1.0, wallet speaks 2.1`.
+  A client that sent no `sdkVersion` reads `SDK version unknown (not reported) is below …` —
+  a distinct failure from an old version, and one a developer would otherwise chase in the
+  wrong place.
+- New `data.requiredProtocol` on a MINOR-floor refusal (the floor the wallet demands). The
+  SDK floor already published `requiredSdk` / `actualSdk`; those are unchanged.
+- Nothing else moved: same error codes, same `reason` values, same wire shape. Any UI that
+  prints `error.message` gains the versions with no code change.
+
 ### Added — `ERROR_CODES.INTENT_OUTCOME_UNKNOWN` (4201), and a rule about what a host may claim
 
 **Read this before upgrading if your dApp spends.** Once `onIntent` has been called, a host may
