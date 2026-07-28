@@ -1,11 +1,32 @@
 import eslint from '@eslint/js';
 import tseslint from 'typescript-eslint';
+import commentBudget from './eslint-rules/comment-budget.js';
 
 export default tseslint.config(
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   {
-    ignores: ['dist/', 'node_modules/', 'scripts/', '*.js', '*.cjs', '*.mjs'],
+    ignores: ['dist/', 'node_modules/', 'scripts/', 'eslint-rules/', '*.js', '*.cjs', '*.mjs'],
+  },
+  // ── Code budget ─────────────────────────────────────────────────────────────
+  // Size and complexity come from ESLint core; the two comment rules are local
+  // because core has no equivalent. Existing violations are held by ESLint's
+  // native suppressions (eslint-suppressions.json) — they may not increase, and
+  // `--prune-suppressions` tightens the file as code improves. Raising a limit
+  // here is not the remedy; see docs/CODE-STANDARDS.md.
+  {
+    files: ['**/*.ts'],
+    ignores: ['tests/**'],
+    plugins: { budget: commentBudget },
+    rules: {
+      'max-lines': ['error', { max: 800, skipBlankLines: false, skipComments: false }],
+      'max-lines-per-function': ['error', { max: 50, skipBlankLines: false, skipComments: true }],
+      'max-depth': ['error', 4],
+      'max-params': ['error', 5],
+      complexity: ['error', 15],
+      'budget/comment-ratio': ['error', { max: 0.15 }],
+      'budget/no-long-comment-block': ['error', { max: 5 }],
+    },
   },
   {
     rules: {

@@ -1,6 +1,6 @@
 /**
- * PaymentsModule.send() — v2 engine path: failure modes, recovery, outbox
- * lifecycle, SENT history metadata and TransferResult.tokenTransfers entries.
+ * PaymentsModule.send() — v2 engine path: failure modes, recovery,
+ * SENT history metadata and TransferResult.tokenTransfers entries.
  *
  * Complements PaymentsModule.v2-receive.test.ts (which covers the send
  * happy-path wire format, split balances and memo placement). Clean
@@ -17,7 +17,6 @@ import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 import { encodeTokenBlob } from '../../../token-engine/token-blob';
 import { bytesToHex } from '../../../core/crypto';
 import { SphereError } from '../../../core/errors';
-import { STORAGE_KEYS_ADDRESS } from '../../../constants';
 import type { V2TransferPayload } from '../../../types/v2-transfer';
 
 const FAKE_PRIVATE_KEY = 'a'.repeat(64);
@@ -231,26 +230,6 @@ describe('send — failure recovery (engine.transfer throws mid-send)', () => {
     expect(failed![1].error).toContain('engine transfer failed mid-send');
     expect(transport.sendTokenTransfer).not.toHaveBeenCalled();
     expect(module.getHistory().filter((h) => h.type === 'SENT')).toHaveLength(0);
-  });
-});
-
-describe('send — outbox lifecycle', () => {
-  it('writes an outbox entry during send and removes it on success', async () => {
-    const { module, engine, storage } = setup();
-    await deliver(module, await v2Payload(engine!, UCT, 100n));
-
-    const result = await module.send({ recipient: '@bob', amount: '100', coinId: UCT });
-    expect(result.status).toBe('completed');
-
-    // The transfer was journaled to the outbox while in flight…
-    const outboxWrites = (storage.set as Mock).mock.calls
-      .filter(([key]: [string, string]) => key === STORAGE_KEYS_ADDRESS.OUTBOX);
-    expect(outboxWrites.length).toBeGreaterThanOrEqual(2);
-    expect(outboxWrites[0][1]).toContain(result.id);
-
-    // …and removed once the send completed.
-    const finalOutbox = await storage.get(STORAGE_KEYS_ADDRESS.OUTBOX);
-    expect(JSON.parse(finalOutbox!)).toEqual([]);
   });
 });
 

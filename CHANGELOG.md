@@ -25,6 +25,36 @@ thing never shown.
   SDK floor already published `requiredSdk` / `actualSdk`; those are unchanged.
 - Nothing else moved: same error codes, same `reason` values, same wire shape. Any UI that
   prints `error.message` gains the versions with no code change.
+### Removed — dead code in `PaymentsModule` (no behavior change)
+
+Verified-unreachable code removed from `modules/payments/PaymentsModule.ts` (**7,179 → 7,025
+lines**, −154). Every item was confirmed to have no reader repo-wide before deletion; the full
+suite is green (213 files / 3,374 tests) and typecheck/lint/build are clean. Analysis and the
+staged plan for the rest live in [`docs/PAYMENTS-ANALYSIS.md`](docs/PAYMENTS-ANALYSIS.md) and
+[`docs/PAYMENTS-REFACTOR.md`](docs/PAYMENTS-REFACTOR.md).
+
+**Breaking (public surface):**
+
+- **`payments.getPendingTransfers()`** — removed. It always returned `[]`: nothing anywhere
+  wrote `STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS`, so the backing map was permanently empty. The
+  storage key itself is retained (the wallet-clear and network-isolation suites assert on it).
+- **`payments.waitForPendingOperations()`** — removed. Zero callers; `core/Sphere.ts` documents
+  in a comment that address switching deliberately does *not* use it. The `pendingBackgroundTasks`
+  array it drained was therefore an unbounded leak, and is removed with it.
+- **`ProofPollingJob`** — removed. A v1 NOSTR-FIRST relic with no referent since the v2 cutover;
+  it reached consumers only via `export *`, never named in the root entry point.
+- **`payments.send(request, internal?)`** — the undocumented second parameter is gone.
+  `existingReservationId`/`existingSplitPlan` existed only for `instantSplitSend`, deleted in the
+  v1 cutover; nothing passed it, so both `existingSplitPlan === undefined` guards in the #625/#677
+  re-plan loop were constant-true and are simplified away.
+
+**Internal:** the write-only transfer OUTBOX (`saveToOutbox`/`removeFromOutbox`/`loadOutbox`) is
+removed — it was never replayed (recovery runs off `PENDING_V2_DELIVERIES`), so it cost three
+storage round-trips per send for nothing. The `_outbox` TXF storage field is unrelated and
+unchanged. Also removed: `reloadNametagsFromStorage`, `createTombstoneFromToken`, a local
+`fromHex` duplicating `core/crypto.hexToBytes`, and an unused `ParsedTokenPool` import. One test
+asserting the deleted outbox lifecycle was removed (`PaymentsModule.tokenTransfers.test.ts`); no
+test was weakened.
 
 ### Added — `ERROR_CODES.INTENT_OUTCOME_UNKNOWN` (4201), and a rule about what a host may claim
 

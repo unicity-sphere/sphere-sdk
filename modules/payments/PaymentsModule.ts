@@ -566,25 +566,6 @@ function isSameTokenState(t1: Token, t2: Token): boolean {
 }
 
 /**
- * Create tombstone from token - requires valid tokenId and stateHash
- */
-function createTombstoneFromToken(token: Token): TombstoneEntry | null {
-  const tokenId = extractTokenIdFromSdkData(token.sdkData);
-  const stateHash = extractStateHashFromSdkData(token.sdkData);
-
-  // Both tokenId and stateHash are required for a valid tombstone
-  if (!tokenId || !stateHash) {
-    return null;
-  }
-
-  return {
-    tokenId,
-    stateHash,
-    timestamp: Date.now(),
-  };
-}
-
-/**
  * Check if incoming token is an incremental update
  */
 function isIncrementalUpdate(existing: TxfToken, incoming: TxfToken): boolean {
@@ -700,24 +681,6 @@ export interface PaymentsModuleConfig {
   maxRetries?: number;
   /** Enable debug logging */
   debug?: boolean;
-}
-
-// =============================================================================
-// NOSTR-FIRST Proof Polling Types
-// =============================================================================
-
-/**
- * Job for background proof polling (NOSTR-FIRST pattern)
- */
-export interface ProofPollingJob {
-  tokenId: string;
-  requestIdHex: string;
-  commitmentJson: string;
-  startedAt: number;
-  attemptCount: number;
-  lastAttemptAt: number;
-  /** Callback when proof is received */
-  onProofReceived?: (tokenId: string) => void;
 }
 
 // =============================================================================
@@ -1029,8 +992,6 @@ export class PaymentsModule {
 
   // Token State
   private tokens: Map<string, Token> = new Map();
-  private pendingTransfers: Map<string, TransferResult> = new Map();
-  private pendingBackgroundTasks: Promise<void>[] = [];
 
   // Repository State (tombstones, archives, forked, history)
   private tombstones: TombstoneEntry[] = [];
@@ -1309,7 +1270,6 @@ export class PaymentsModule {
     // Reset per-address state (will be re-populated by load())
     this.tokens.clear();
     clearSdkDataCache();
-    this.pendingTransfers.clear();
     this.tombstones = [];
     this.tombstoneKeySet.clear();
     this.archivedTokens.clear();
@@ -1643,15 +1603,6 @@ export class PaymentsModule {
       // Load transaction history from dedicated history store (with migration from legacy KV)
       await this.loadHistory();
 
-      // Load pending transfers
-      const pending = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
-      if (pending) {
-        const transfers = JSON.parse(pending) as TransferResult[];
-        for (const transfer of transfers) {
-          this.pendingTransfers.set(transfer.id, transfer);
-        }
-      }
-
       this.loaded = true;
     };
 
@@ -1761,16 +1712,12 @@ export class PaymentsModule {
    * Supports automatic token splitting when exact amount is needed
    *
    * @param request - Transfer request.
-   * @param internal - Internal options (not part of the public API).
-   *   `existingReservationId` and `existingSplitPlan` allow callers (e.g. instantSplitSend)
-   *   to pass an already-acquired reservation, skipping the planSend() critical section.
    */
   /**
    * #625 — self-healing coin selection. If a selected source turns out already spent on-chain
    * (`TransferConflictError`) with NOTHING certified yet, demote it (durable `suspectedSpent` — kept in
-   * inventory, excluded from selection) and re-plan with the next candidate, bounded. A fixed plan
-   * (`instantSplitSend`) is not re-planned. Exhausting the live candidates surfaces a clean
-   * `SEND_INSUFFICIENT_BALANCE`, never an endless loop.
+   * inventory, excluded from selection) and re-plan with the next candidate, bounded. Exhausting the
+   * live candidates surfaces a clean `SEND_INSUFFICIENT_BALANCE`, never an endless loop.
    *
    * #677 — remainder re-plan. If a source is lost mid-send AFTER ≥1 leg already certified + delivered
    * (`PartialSendConflictError`), a full-amount re-plan would double-pay the delivered leg — so re-plan
@@ -1779,14 +1726,10 @@ export class PaymentsModule {
    * legs converge via the recipient's §6 claim handoff. `PartialSendConflictError` reaches the CALLER
    * only as the fallback — when that remainder genuinely cannot be covered by the other sources.
    */
-  async send(
-    request: TransferRequest,
-    internal?: { existingReservationId?: string; existingSplitPlan?: SplitPlan },
-  ): Promise<TransferResult> {
+  async send(request: TransferRequest): Promise<TransferResult> {
     // #677: the running request shrinks to the still-owed REMAINDER across partial
     // re-plans while the recipient must ultimately receive the full original amount.
     let currentRequest = request;
-    let currentInternal = internal;
     // Certified legs accumulated across partial attempts — carried into the fallback
     // so it NEVER re-sends them; the first partial intent id anchors the §6 handoff.
     const deliveredSourceIds: string[] = [];
@@ -1794,7 +1737,7 @@ export class PaymentsModule {
 
     for (let attempt = 0; ; attempt += 1) {
       try {
-        return await this.sendOnce(currentRequest, currentInternal);
+        return await this.sendOnce(currentRequest);
       } catch (err) {
         // #625 — self-healing full re-plan: a clean conflict with NOTHING certified
         // in that attempt (safe to re-select the whole amount from the next candidate).
@@ -1802,7 +1745,6 @@ export class PaymentsModule {
         if (
           conflictedId !== undefined &&
           attempt < MAX_RESELECT_ATTEMPTS &&
-          currentInternal?.existingSplitPlan === undefined &&
           this.tokens.has(conflictedId)
         ) {
           await this.demoteSuspectedSpent(conflictedId);
@@ -1816,7 +1758,7 @@ export class PaymentsModule {
         // #677 — a mid-send conflict AFTER ≥1 leg certified + delivered. Re-plan ONLY
         // the remainder (never the full amount) from the remaining live sources, under
         // a NEW transferId, so the recipient still receives the full amount.
-        if (err instanceof PartialSendConflictError && currentInternal?.existingSplitPlan === undefined) {
+        if (err instanceof PartialSendConflictError) {
           deliveredSourceIds.push(...err.committedTokenIds);
           if (primaryPartialTransferId === undefined) primaryPartialTransferId = err.transferId;
           const remaining = BigInt(err.remainingAmount);
@@ -1826,7 +1768,6 @@ export class PaymentsModule {
               `Partial send: ${err.committedTokenIds.length} leg(s) certified — re-planning ONLY the remaining ${remaining} under a NEW transferId (#677, attempt ${attempt + 1}/${MAX_RESELECT_ATTEMPTS})`,
             );
             currentRequest = { ...request, amount: remaining.toString() };
-            currentInternal = undefined; // fresh, coherent transfer for the remainder (new transferId + reservation)
             continue;
           }
           // Remainder is 0 (defensive) or the attempt budget is exhausted — surface the
@@ -1893,22 +1834,12 @@ export class PaymentsModule {
     }
   }
 
-  private async sendOnce(
-    request: TransferRequest,
-    internal?: { existingReservationId?: string; existingSplitPlan?: SplitPlan },
-  ): Promise<TransferResult> {
+  private async sendOnce(request: TransferRequest): Promise<TransferResult> {
     this.ensureInitialized();
-
-    // Track this send() so switchToAddress() waits for it via waitForPendingOperations().
-    // Without this, the user can switch addresses while send() is still running,
-    // and save() calls inside send() would write to the wrong address's storage.
-    let resolveSendTracker!: () => void;
-    const sendTracker = new Promise<void>(r => { resolveSendTracker = r; });
-    this.pendingBackgroundTasks.push(sendTracker);
 
     // Use mutable result for building the transfer
     const result: { -readonly [K in keyof TransferResult]: TransferResult[K] } = {
-      id: internal?.existingReservationId ?? randomUUID(),
+      id: randomUUID(),
       status: 'pending',
       tokens: [],
       tokenTransfers: [],
@@ -1965,56 +1896,50 @@ export class PaymentsModule {
 
       let splitPlan: SplitPlan;
 
-      if (internal?.existingSplitPlan) {
-        // W23 fix: Reuse the reservation + plan from instantSplitSend to avoid
-        // the cancel-then-reacquire race window.
-        splitPlan = internal.existingSplitPlan;
+      // ── Coin symbol → coinId resolution ────────────────────────────────────
+      // Swap manifests store currencies as short symbols (e.g. "ETH", "BTC")
+      // while token storage uses 64/68-char hex coinIds. If no tokens match
+      // the literal coinId, attempt to resolve via the token registry.
+      const resolvedCoinId = (() => {
+        const literalMatch = Array.from(this.tokens.values()).some(t => t.coinId === request.coinId);
+        if (!literalMatch && request.coinId.length <= 20) {
+          const def = TokenRegistry.getInstance().getDefinitionBySymbol(request.coinId);
+          if (def?.id) return def.id;
+        }
+        return request.coinId;
+      })();
+      if (resolvedCoinId !== request.coinId) {
+        request = { ...request, coinId: resolvedCoinId };
+      }
+
+      // ── Spend Queue: Pre-parse token pool (async, before critical section) ──
+      const parsedPool = await this.spendPlanner.buildParsedPool(
+        Array.from(this.tokens.values()),
+        request.coinId
+      );
+
+      // ── Spend Queue: SYNCHRONOUS CRITICAL SECTION (no awaits) ──────────────
+      // planSend reads free amounts, runs split calculation, and creates a
+      // reservation atomically. No concurrent send() can interleave here.
+      // Count pending change tokens (status='transferring') so concurrent sends
+      // queue instead of failing with SEND_INSUFFICIENT_BALANCE.
+      let pendingChangeAmount = 0n;
+      for (const [, t] of this.tokens) {
+        if (t.coinId === request.coinId && t.status === 'transferring') {
+          pendingChangeAmount += BigInt(t.amount || '0');
+        }
+      }
+
+      const planResult = this.spendPlanner.planSend(
+        request, parsedPool, this.reservationLedger, this.spendQueue, result.id, pendingChangeAmount
+      );
+
+      if (planResult === 'queued') {
+        // Wait for change tokens to arrive and wake this entry
+        const queueResult = await this.spendQueue.waitForEntry(result.id);
+        splitPlan = queueResult.splitPlan;
       } else {
-        // ── Coin symbol → coinId resolution ────────────────────────────────────
-        // Swap manifests store currencies as short symbols (e.g. "ETH", "BTC")
-        // while token storage uses 64/68-char hex coinIds. If no tokens match
-        // the literal coinId, attempt to resolve via the token registry.
-        const resolvedCoinId = (() => {
-          const literalMatch = Array.from(this.tokens.values()).some(t => t.coinId === request.coinId);
-          if (!literalMatch && request.coinId.length <= 20) {
-            const def = TokenRegistry.getInstance().getDefinitionBySymbol(request.coinId);
-            if (def?.id) return def.id;
-          }
-          return request.coinId;
-        })();
-        if (resolvedCoinId !== request.coinId) {
-          request = { ...request, coinId: resolvedCoinId };
-        }
-
-        // ── Spend Queue: Pre-parse token pool (async, before critical section) ──
-        const parsedPool = await this.spendPlanner.buildParsedPool(
-          Array.from(this.tokens.values()),
-          request.coinId
-        );
-
-        // ── Spend Queue: SYNCHRONOUS CRITICAL SECTION (no awaits) ──────────────
-        // planSend reads free amounts, runs split calculation, and creates a
-        // reservation atomically. No concurrent send() can interleave here.
-        // Count pending change tokens (status='transferring') so concurrent sends
-        // queue instead of failing with SEND_INSUFFICIENT_BALANCE.
-        let pendingChangeAmount = 0n;
-        for (const [, t] of this.tokens) {
-          if (t.coinId === request.coinId && t.status === 'transferring') {
-            pendingChangeAmount += BigInt(t.amount || '0');
-          }
-        }
-
-        const planResult = this.spendPlanner.planSend(
-          request, parsedPool, this.reservationLedger, this.spendQueue, result.id, pendingChangeAmount
-        );
-
-        if (planResult === 'queued') {
-          // Wait for change tokens to arrive and wake this entry
-          const queueResult = await this.spendQueue.waitForEntry(result.id);
-          splitPlan = queueResult.splitPlan;
-        } else {
-          splitPlan = planResult.splitPlan;
-        }
+        splitPlan = planResult.splitPlan;
       }
 
       if (!splitPlan) {
@@ -2037,9 +1962,6 @@ export class PaymentsModule {
         this.parsedTokenCache.delete(token.id);
       }
       await this.save({ critical: true });
-
-      // Save to outbox for recovery
-      await this.saveToOutbox(result, recipientPubkey);
 
       result.status = 'submitted';
 
@@ -2402,9 +2324,7 @@ export class PaymentsModule {
 
       result.status = 'delivered';
 
-      // Save state and remove outbox entry
       await this.save();
-      await this.removeFromOutbox(result.id);
 
       result.status = 'completed';
 
@@ -2592,12 +2512,6 @@ export class PaymentsModule {
       } catch (saveErr) {
         logger.error('Payments', 'Failed to persist send-failure restore:', saveErr);
       }
-      // The pre-send outbox snapshot can recover nothing (finished blobs are
-      // journaled in PENDING_V2_DELIVERIES) — prune it on failure too.
-      try {
-        await this.removeFromOutbox(result.id);
-      } catch { /* best-effort */ }
-
       // Notify queue AFTER cache is rebuilt so queued entries see restored tokens
       this.spendQueue.notifyChange(request.coinId);
 
@@ -2660,8 +2574,6 @@ export class PaymentsModule {
 
       this.deps!.emitEvent('transfer:failed', result);
       throw error;
-    } finally {
-      resolveSendTracker();
     }
   }
 
@@ -3626,20 +3538,6 @@ export class PaymentsModule {
    */
   setPriceProvider(provider: PriceProvider): void {
     this.priceProvider = provider;
-  }
-
-  /**
-   * Wait for all pending background operations (e.g., instant split change token creation).
-   * Call this before process exit to ensure all tokens are saved.
-   */
-  async waitForPendingOperations(): Promise<void> {
-    logger.debug('Payments', `waitForPendingOperations: ${this.pendingBackgroundTasks.length} pending tasks`);
-    if (this.pendingBackgroundTasks.length > 0) {
-      logger.debug('Payments', 'waitForPendingOperations: waiting...');
-      await Promise.allSettled(this.pendingBackgroundTasks);
-      this.pendingBackgroundTasks = [];
-      logger.debug('Payments', 'waitForPendingOperations: all tasks completed');
-    }
   }
 
   /**
@@ -4806,32 +4704,6 @@ export class PaymentsModule {
   }
 
   /**
-   * Reload nametag data from storage providers into memory.
-   *
-   * Used as a recovery mechanism when `this.nametags` is unexpectedly empty
-   * (e.g., wiped by sync or race condition) but nametag data exists in storage.
-   */
-  private async reloadNametagsFromStorage(): Promise<void> {
-    const providers = this.getTokenStorageProviders();
-    for (const [, provider] of providers) {
-      try {
-        const result = await provider.load();
-        if (result.success && result.data) {
-          const parsed = parseTxfStorageData(result.data);
-          if (parsed.nametags.length > 0) {
-            this.nametags = parsed.nametags;
-            logger.debug('Payments', `Reloaded ${parsed.nametags.length} Unicity ID(s) from storage`);
-            return;
-          }
-        }
-      } catch {
-        // Continue to next provider
-      }
-    }
-  }
-
-
-  /**
    * Self-mint fungible tokens to this wallet (no faucet) via the v2 token
    * engine (engine.mint — a finished token, no commitment round-trip).
    * Returns the stored token and its genesis-stable id, or an error result.
@@ -5296,15 +5168,6 @@ export class PaymentsModule {
     }
 
     return { valid, invalid };
-  }
-
-  /**
-   * Get all in-progress (pending) outgoing transfers.
-   *
-   * @returns Array of {@link TransferResult} objects for transfers that have not yet completed.
-   */
-  getPendingTransfers(): TransferResult[] {
-    return Array.from(this.pendingTransfers.values());
   }
 
   // ===========================================================================
@@ -6790,23 +6653,6 @@ export class PaymentsModule {
       }
       this.deps!.emitEvent('storage:degraded', { providerId: id, error });
     }
-  }
-
-  private async saveToOutbox(transfer: TransferResult, recipient: string): Promise<void> {
-    const outbox = await this.loadOutbox();
-    outbox.push({ transfer, recipient, createdAt: Date.now() });
-    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(outbox));
-  }
-
-  private async removeFromOutbox(transferId: string): Promise<void> {
-    const outbox = await this.loadOutbox();
-    const filtered = outbox.filter((e) => e.transfer.id !== transferId);
-    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(filtered));
-  }
-
-  private async loadOutbox(): Promise<Array<{ transfer: TransferResult; recipient: string; createdAt: number }>> {
-    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.OUTBOX);
-    return data ? JSON.parse(data) : [];
   }
 
   // ===========================================================================
