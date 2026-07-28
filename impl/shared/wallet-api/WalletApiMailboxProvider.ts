@@ -39,7 +39,7 @@ import type {
   WakeStream,
   WakeChannelStatus,
 } from '../../../transport/delivery-provider';
-import { composeDeliveryKeys, computeDeliveryId } from '../../../transport/delivery-provider';
+import { composeDeliveryKeys } from '../../../transport/delivery-provider';
 import { unwrapTokenBlobBytes } from '../../../token-engine/token-blob';
 import {
   deriveDeliveryEncryptionKey,
