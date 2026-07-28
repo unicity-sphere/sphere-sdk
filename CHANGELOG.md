@@ -25,6 +25,56 @@ thing never shown.
   SDK floor already published `requiredSdk` / `actualSdk`; those are unchanged.
 - Nothing else moved: same error codes, same `reason` values, same wire shape. Any UI that
   prints `error.message` gains the versions with no code change.
+### Removed — the last v1 token remnants
+
+The v2 cutover left v1 code paths behind to keep stored v1 TXF tokens *displayable*.
+Those paths are now gone. Stored v1 tokens are unspendable (and have been since the
+cutover); they are no longer parsed for display, no longer validated, and report as
+`UNKNOWN` if surfaced.
+
+**Breaking:**
+
+- **`OracleProvider.validateToken()`** — removed from the interface and from
+  `UnicityAggregatorProvider`. Token verification is entirely the engine's job
+  (`engine.verify` + `engine.isSpent`). Custom `OracleProvider` implementations no
+  longer need to supply it. The `ValidationResult` type it returned is removed with it,
+  including its re-export from the root entry point. **This also deletes a latent data
+  bug** rather than fixing it: `validateToken` caught *all* errors — including network
+  failures — and returned `{valid: false}` instead of throwing, so a single gateway
+  outage during `validate()` durably marked **every** stored v1 token `'invalid'` and
+  persisted it, while the v2 branch fifteen lines above had an explicit
+  "never invalidate funds on an outage" guard.
+- With `validateToken` gone the oracle issues **no JSON-RPC calls at all** — it is now
+  purely a network-config provider, as its own docstring already claimed. The internal
+  `rpcCall`/`ensureConnected` plumbing and the spent-state cache are removed.
+
+**Behavior:**
+
+- `payments.validate()` is v2-only. A stored v1 relic is neither reported valid nor
+  marked invalid — it is left untouched, because the engine cannot read it and guessing
+  corrupts the user's view of their legacy holdings.
+- `parseTokenInfo()` no longer contains the v1 TXF JSON display parser (this also
+  removes a 37-line literal clone between its `genesis.coinData` and `state.coinData`
+  branches).
+- `load()` no longer terminalizes orphaned pending-V5 tokens into `'invalid'`; that
+  migration ran on every load since the cutover and has served its purpose. The legacy
+  `PENDING_V5_TOKENS` key is still dropped so it does not linger.
+
+**Deliberately kept:** the non-blob key-derivation branch in `parseSdkDataCached`.
+Despite reading the legacy JSON shape it is **not** a v1 feature — tombstone and journal
+dedup are storage-level and version-agnostic, keyed by `(tokenId, stateHash)`, and the
+tombstone suite covers both stored shapes on purpose. Removing it would have silently
+weakened dedup in the money path.
+
+**Also kept:** the archived/forked `TxfToken` stores. They look like v1 remnants but
+have four live consumers in `AccountingModule` (invoice payment attribution) and no real
+test coverage — they are Stage 10 of `docs/PAYMENTS-REFACTOR.md`, which requires
+characterization tests first.
+
+Verified: typecheck and lint clean, 210 test files / 3,329 tests green, and the **live
+testnet2 e2e suite green** (6 files / 35 tests — including `payments-v2.testnet2` and
+`token-engine.testnet2`), identical to the pre-change baseline.
+
 ### Removed — dead code in `PaymentsModule` (no behavior change)
 
 Verified-unreachable code removed from `modules/payments/PaymentsModule.ts` (**7,179 → 7,025

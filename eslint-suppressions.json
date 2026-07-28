@@ -734,19 +734,19 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 64
+      "count": 63
     },
     "complexity": {
-      "count": 13
+      "count": 12
     },
     "max-depth": {
-      "count": 16
+      "count": 14
     },
     "max-lines": {
       "count": 1
     },
     "max-lines-per-function": {
-      "count": 19
+      "count": 18
     }
   },
   "modules/payments/SendOperations.ts": {

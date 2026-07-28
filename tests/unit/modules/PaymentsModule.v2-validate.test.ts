@@ -175,13 +175,20 @@ describe('validate() — v2 engine branch', () => {
     expect(module.getTokens().find((t) => t.id === token.id)?.status).toBe('confirmed');
   });
 
-  it('routes legacy v1 TXF JSON tokens through oracle.validateToken', async () => {
-    const { module, oracle } = setup();
+  it('leaves legacy v1 TXF JSON tokens untouched — never judged, never invalidated', async () => {
+    const { module } = setup();
     const token = await storeLegacyToken(module);
+    const statusBefore = module.getTokens().find((t) => t.id === token.id)?.status;
 
-    const { valid } = await module.validate();
+    const { valid, invalid } = await module.validate();
 
-    expect(oracle.validateToken).toHaveBeenCalledWith(token.sdkData);
-    expect(valid.map((t) => t.id)).toContain(token.id);
+    // v1 removal: the oracle's legacy validateToken RPC is gone. A stored v1 relic
+    // is neither reported valid nor marked invalid — the engine cannot read it, and
+    // guessing would durably corrupt the user's view of their legacy holdings
+    // (the pre-removal branch marked them 'invalid' on any gateway outage, because
+    // validateToken returns {valid:false} rather than throwing on a network error).
+    expect(valid.map((t) => t.id)).not.toContain(token.id);
+    expect(invalid.map((t) => t.id)).not.toContain(token.id);
+    expect(module.getTokens().find((t) => t.id === token.id)?.status).toBe(statusBefore);
   });
 });

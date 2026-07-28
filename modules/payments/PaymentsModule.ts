@@ -341,91 +341,13 @@ export async function parseTokenInfo(tokenData: unknown, engine?: ITokenEngine):
       return { ...defaultInfo, tokenId: engine.tokenId(token) };
     } catch (error) {
       logger.warn('Payments', 'Failed to parse token info via engine:', error);
-      // fall through to legacy parsing
     }
   }
 
-  try {
-    // If it's a string, try to parse as JSON
-    const data = typeof tokenData === 'string' ? JSON.parse(tokenData) : tokenData;
-
-    // Manual extraction from legacy v1 TXF JSON (display-only — the v1 engine is
-    // gone, so stored TXF tokens are parsed as plain JSON, never via an SDK).
-    if (data.genesis?.data) {
-      const genesis = data.genesis.data;
-      if (genesis.coinData) {
-        // coinData can be: [[coinIdHex, amount]] or {coinIdHex: amount}
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const coinData = genesis.coinData as any;
-        if (Array.isArray(coinData) && coinData.length > 0) {
-          const firstEntry = coinData[0];
-          if (Array.isArray(firstEntry) && firstEntry.length === 2) {
-            const [coinIdHex, amount] = firstEntry;
-            return enrichWithRegistry({
-              coinId: String(coinIdHex),
-              symbol: String(coinIdHex).slice(0, 8),
-              name: `Token ${String(coinIdHex).slice(0, 8)}`,
-              decimals: 0,
-              amount: String(amount),
-              tokenId: genesis.tokenId,
-            });
-          }
-        } else if (typeof coinData === 'object') {
-          const coinEntries = Object.entries(coinData);
-          if (coinEntries.length > 0) {
-            const [coinId, amount] = coinEntries[0] as [string, unknown];
-            return enrichWithRegistry({
-              coinId,
-              symbol: coinId.slice(0, 8),
-              name: `Token ${coinId.slice(0, 8)}`,
-              decimals: 0,
-              amount: String(amount),
-              tokenId: genesis.tokenId,
-            });
-          }
-        }
-      }
-      if (genesis.tokenId) {
-        defaultInfo.tokenId = genesis.tokenId;
-      }
-    }
-
-    // Try to extract from state if available
-    if (data.state?.coinData) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const coinData = data.state.coinData as any;
-      if (Array.isArray(coinData) && coinData.length > 0) {
-        const firstEntry = coinData[0];
-        if (Array.isArray(firstEntry) && firstEntry.length === 2) {
-          const [coinIdHex, amount] = firstEntry;
-          return enrichWithRegistry({
-            coinId: String(coinIdHex),
-            symbol: String(coinIdHex).slice(0, 8),
-            name: `Token ${String(coinIdHex).slice(0, 8)}`,
-            decimals: 0,
-            amount: String(amount),
-            tokenId: defaultInfo.tokenId,
-          });
-        }
-      } else if (typeof coinData === 'object') {
-        const coinEntries = Object.entries(coinData);
-        if (coinEntries.length > 0) {
-          const [coinId, amount] = coinEntries[0] as [string, unknown];
-          return enrichWithRegistry({
-            coinId,
-            symbol: coinId.slice(0, 8),
-            name: `Token ${coinId.slice(0, 8)}`,
-            decimals: 0,
-            amount: String(amount),
-            tokenId: defaultInfo.tokenId,
-          });
-        }
-      }
-    }
-  } catch (error) {
-    logger.warn('Payments', 'Failed to parse token info:', error);
-  }
-
+  // v2-only: anything that is not an engine blob is a stored v1 TXF relic. The
+  // v1 JSON display parser was removed with the rest of the v1 stack, so such a
+  // token reports as UNKNOWN rather than being decoded by a format we no longer
+  // support.
   return defaultInfo;
 }
 
@@ -473,7 +395,11 @@ function parseSdkDataCached(sdkData: string): { tokenId: string | null; stateHas
     looksLikeTokenBlob(sdkData) ? tryParseBlobKeys(sdkData) : null;
 
   if (!entry) {
-    // Legacy v1 TXF JSON.
+    // NOT a v1 feature: tombstone/journal dedup is storage-level and
+    // version-agnostic, keyed by (tokenId, stateHash). This branch derives those
+    // keys for any non-blob stored shape — including the legacy TXF JSON still
+    // sitting in old wallets — so a re-delivery can still be deduped. It stays
+    // after the v1 removal deliberately; losing it would silently weaken dedup.
     let tokenId: string | null = null;
     let stateHash = '';
     try {
@@ -1531,45 +1457,15 @@ export class PaymentsModule {
       const loadedTokens = Array.from(this.tokens.values()).map(t => `${t.id.slice(0, 12)}(${t.status})`);
       logger.debug('Payments', `load(): from TXF providers: ${this.tokens.size} tokens [${loadedTokens.join(', ')}]`);
 
-      // v1 cutover: orphaned pending-V5 tokens (saved by the removed instant-split
-      // receiver) can never confirm — their finalization path was v1-only. Move
-      // them to the terminal 'invalid' state instead of leaving phantom
-      // 'submitted' balance forever. sdkData is kept intact for audit.
-      // They lived in the legacy PENDING_V5_TOKENS KV key (TXF never persisted
-      // them), so this is a one-time KV migration; the in-map sweep below covers
-      // any stragglers that did land in token storage.
-      let terminalized = 0;
+      // v1 cutover: drop the legacy PENDING_V5_TOKENS KV key if a pre-cutover
+      // wallet still carries one. The orphaned-token terminalization it fed ran
+      // for every load since the cutover and has served its purpose; with the v1
+      // stack gone there is nothing left to terminalize, so this is now only a
+      // one-time key cleanup.
       try {
-        const legacyPendingV5 = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
-        if (legacyPendingV5) {
-          const v5Tokens = JSON.parse(legacyPendingV5) as Token[];
-          for (const t of v5Tokens) {
-            if (this.tokens.has(t.id)) continue;
-            t.status = 'invalid';
-            t.updatedAt = Date.now();
-            this.tokens.set(t.id, t);
-            terminalized++;
-          }
-          await this.deps!.storage.remove(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
-        }
+        await this.deps!.storage.remove(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
       } catch (err) {
-        logger.warn('Payments', 'load(): failed to migrate legacy PENDING_V5_TOKENS:', err);
-      }
-      for (const [, t] of this.tokens) {
-        if (t.status !== 'submitted') continue;
-        const isPendingV5 = t.id.startsWith('v5split_')
-          || (t.sdkData?.startsWith('{') && (() => {
-            try { return '_pendingFinalization' in JSON.parse(t.sdkData!); } catch { return false; }
-          })());
-        if (isPendingV5) {
-          t.status = 'invalid';
-          t.updatedAt = Date.now();
-          terminalized++;
-        }
-      }
-      if (terminalized > 0) {
-        logger.warn('Payments', `load(): terminalized ${terminalized} orphaned pending-V5 token(s) (v1 finalization removed)`);
-        await this.save();
+        logger.warn('Payments', 'load(): failed to drop legacy PENDING_V5_TOKENS:', err);
       }
 
       // Crash recovery: tokens persisted mid-send stay 'transferring' forever —
@@ -5130,36 +5026,27 @@ export class PaymentsModule {
 
     const engine = this.deps?.tokenEngine;
     for (const token of this.tokens.values()) {
-      // v2 blob tokens are verified via the engine (local proof check + on-chain
-      // spent-status); the oracle's validateToken only understands v1 TXF.
-      if (engine && token.sdkData && looksLikeTokenBlob(token.sdkData)) {
-        try {
-          const sphereToken = await engine.decodeToken(decodeTokenBlob(hexToBytes(token.sdkData)));
-          const verdict = await engine.verify(sphereToken);
-          const spent = verdict.ok ? await engine.isSpent(sphereToken) : false;
-          if (verdict.ok && !spent) {
-            valid.push(token);
-          } else {
-            token.status = 'invalid';
-            this.parsedTokenCache.delete(token.id);
-            invalid.push(token);
-          }
-        } catch (err) {
-          // Transient failure (decode/network) — do NOT invalidate funds on an
-          // outage; skip this token for this run.
-          logger.warn('Payments', `validate: engine check failed for ${token.id}, skipping:`, err);
+      // v2-only: tokens are verified via the engine (local proof check + on-chain
+      // spent-status). Anything that is not an engine blob is a stored v1 TXF
+      // relic — unspendable since the cutover and no longer inspected here, so it
+      // is left untouched rather than judged by a validator that cannot read it.
+      if (!engine || !token.sdkData || !looksLikeTokenBlob(token.sdkData)) continue;
+
+      try {
+        const sphereToken = await engine.decodeToken(decodeTokenBlob(hexToBytes(token.sdkData)));
+        const verdict = await engine.verify(sphereToken);
+        const spent = verdict.ok ? await engine.isSpent(sphereToken) : false;
+        if (verdict.ok && !spent) {
+          valid.push(token);
+        } else {
+          token.status = 'invalid';
+          this.parsedTokenCache.delete(token.id);
+          invalid.push(token);
         }
-        continue;
-      }
-
-      const result = await this.deps!.oracle.validateToken(token.sdkData);
-
-      if (result.valid && !result.spent) {
-        valid.push(token);
-      } else {
-        token.status = 'invalid';
-        this.parsedTokenCache.delete(token.id);
-        invalid.push(token);
+      } catch (err) {
+        // Transient failure (decode/network) — do NOT invalidate funds on an
+        // outage; skip this token for this run.
+        logger.warn('Payments', `validate: engine check failed for ${token.id}, skipping:`, err);
       }
     }
 
