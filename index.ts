@@ -240,7 +240,6 @@ export type {
 export type {
   // Oracle (Aggregator) — v2: network-config provider for the token engine
   OracleProvider,
-  ValidationResult,
   OracleEvent,
   OracleEventType,
   OracleEventCallback,

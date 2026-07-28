@@ -273,8 +273,8 @@ describe('handleV2Transfer — storage rejection gates events (v2)', () => {
   });
 });
 
-describe('load() — orphaned pending-V5 terminalization', () => {
-  it("migrates the legacy PENDING_V5_TOKENS KV key: tokens become terminal 'invalid', key removed", async () => {
+describe('load() — legacy PENDING_V5_TOKENS cleanup', () => {
+  it('drops the legacy KV key without materializing its tokens', async () => {
     const { module, storage } = setup();
     // Inject the key exactly as the removed v1 receiver persisted it.
     storage.map.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, JSON.stringify([{
@@ -285,11 +285,10 @@ describe('load() — orphaned pending-V5 terminalization', () => {
 
     await module.load();
 
-    const v5 = module.getTokens({ status: 'invalid' });
-    expect(v5).toHaveLength(1);
-    expect(v5[0].id).toBe('v5split_abc');
-    // Not counted as confirmed balance, and the legacy key is gone.
-    expect(module.getTokens({ status: 'confirmed' })).toHaveLength(0);
+    // v1 removal: the terminalize-into-'invalid' migration is gone. These tokens
+    // were never spendable and are no longer surfaced at all — the only remaining
+    // obligation is that the legacy key does not linger.
+    expect(module.getTokens()).toHaveLength(0);
     expect(storage.map.has(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS)).toBe(false);
   });
 });

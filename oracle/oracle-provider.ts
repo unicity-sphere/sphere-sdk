@@ -7,9 +7,9 @@
  * engine (token-engine/) builds its own aggregator clients from these — no
  * SDK client objects cross this boundary anymore.
  *
- * `validateToken` survives as a best-effort JSON-RPC check for LEGACY v1 TXF
- * tokens still present in storage (display-path only); v2 blob tokens are
- * verified via the engine (`engine.verify` + `engine.isSpent`).
+ * Token verification is entirely the engine's job (`engine.verify` +
+ * `engine.isSpent`); the legacy v1 `validateToken` RPC was removed with the
+ * rest of the v1 stack.
  */
 
 import type { BaseProvider } from '../types';
@@ -26,12 +26,6 @@ export interface OracleProvider extends BaseProvider {
    * @param trustBaseJson - Optional raw trust-base JSON (overrides the loader).
    */
   initialize(trustBaseJson?: unknown): Promise<void>;
-
-  /**
-   * Validate a LEGACY v1 TXF token against the aggregator (best-effort RPC).
-   * v2 blob tokens never reach this — they are verified via the token engine.
-   */
-  validateToken(tokenData: unknown): Promise<ValidationResult>;
 
   // ── v2 token-engine config surface ─────────────────────────────────────────
   // Sphere.buildTokenEngine reads exactly these three accessors; the engine
@@ -59,13 +53,6 @@ export interface OracleProvider extends BaseProvider {
 // =============================================================================
 // Validation Types
 // =============================================================================
-
-export interface ValidationResult {
-  valid: boolean;
-  spent: boolean;
-  error?: string;
-  stateHash?: string;
-}
 
 // =============================================================================
 // Oracle Events

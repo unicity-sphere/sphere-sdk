@@ -6,9 +6,6 @@
  * and exposes the gateway URL + API key. The engine (token-engine/) builds its
  * own SDK clients from these — no state-transition SDK objects live here.
  *
- * `validateToken` remains as a best-effort JSON-RPC check for LEGACY v1 TXF
- * tokens still present in storage (display-path only).
- *
  * TrustBaseLoader is injected for platform-specific loading:
  * - Browser: fetch from URL
  * - Node.js: read from file
@@ -18,13 +15,11 @@ import { logger } from '../core/logger';
 import type { ProviderStatus } from '../types';
 import type {
   OracleProvider,
-  ValidationResult,
   OracleEvent,
   OracleEventCallback,
   TrustBaseLoader,
 } from './oracle-provider';
 import { DEFAULT_AGGREGATOR_TIMEOUT } from '../constants';
-import { SphereError } from '../core/errors';
 
 // =============================================================================
 // Configuration
@@ -46,17 +41,6 @@ export interface UnicityAggregatorProviderConfig {
 }
 
 // =============================================================================
-// RPC Response Types
-// =============================================================================
-
-interface RpcValidateResponse {
-  valid?: boolean;
-  spent?: boolean;
-  stateHash?: string;
-  error?: string;
-}
-
-// =============================================================================
 // Implementation
 // =============================================================================
 
@@ -75,8 +59,6 @@ export class UnicityAggregatorProvider implements OracleProvider {
   /** Raw trust-base JSON as loaded (the v2 token engine parses it itself). */
   private trustBaseJson: unknown | null = null;
 
-  // Cache for spent states reported by validateToken (immutable once spent)
-  private spentCache: Map<string, boolean> = new Map();
 
   constructor(config: UnicityAggregatorProviderConfig) {
     this.config = {
@@ -170,45 +152,6 @@ export class UnicityAggregatorProvider implements OracleProvider {
     this.log('Initialized with trust base JSON:', !!this.trustBaseJson);
   }
 
-  /**
-   * Best-effort RPC validation for LEGACY v1 TXF tokens (display path only).
-   * v2 blob tokens are verified via the token engine and never reach this.
-   */
-  async validateToken(tokenData: unknown): Promise<ValidationResult> {
-    this.ensureConnected();
-
-    try {
-      const response = await this.rpcCall<RpcValidateResponse>('validateToken', { token: tokenData });
-
-      const valid = response.valid ?? false;
-      const spent = response.spent ?? false;
-
-      this.emitEvent({
-        type: 'validation:completed',
-        timestamp: Date.now(),
-        data: { valid },
-      });
-
-      // Cache spent state if spent
-      if (response.stateHash && spent) {
-        this.spentCache.set(response.stateHash, true);
-      }
-
-      return {
-        valid,
-        spent,
-        stateHash: response.stateHash,
-        error: response.error,
-      };
-    } catch (error) {
-      return {
-        valid: false,
-        spent: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
   // ===========================================================================
   // Event Subscription
   // ===========================================================================
@@ -219,53 +162,8 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   // ===========================================================================
-  // Private: RPC
-  // ===========================================================================
-
-  private async rpcCall<T>(method: string, params: unknown): Promise<T> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.config.timeout);
-
-    try {
-      const response = await fetch(this.config.url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: Date.now(),
-          method,
-          params,
-        }),
-        signal: controller.signal,
-      });
-
-      if (!response.ok) {
-        throw new SphereError(`HTTP ${response.status}: ${response.statusText}`, 'AGGREGATOR_ERROR');
-      }
-
-      const result = await response.json();
-
-      if (result.error) {
-        throw new SphereError(result.error.message ?? 'RPC error', 'AGGREGATOR_ERROR');
-      }
-
-      return (result.result ?? {}) as T;
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-
-  // ===========================================================================
   // Private: Helpers
   // ===========================================================================
-
-  private ensureConnected(): void {
-    if (this.status !== 'connected') {
-      throw new SphereError('UnicityAggregatorProvider not connected', 'NOT_INITIALIZED');
-    }
-  }
 
   private emitEvent(event: OracleEvent): void {
     for (const callback of this.eventCallbacks) {
