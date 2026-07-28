@@ -61,3 +61,51 @@ describe('checkCompatibility', () => {
     if (!r.ok) expect(r.error.code).toBe(ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION);
   });
 });
+
+/**
+ * The refusal a human actually sees.
+ *
+ * `error.data` has carried the versions all along, but every UI in the fleet renders
+ * `error.message` and nothing else — so a version floor read as "SDK version below the
+ * required minimum" with no hint of WHICH version to move to. The numbers belong in the
+ * message; `data` stays authoritative for anything that wants to branch on them.
+ */
+describe('checkCompatibility — refusal messages name the versions', () => {
+  const base = { walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET } as const;
+
+  it('names both SDK versions on the sdk floor', () => {
+    const r = checkCompatibility({ ...base, clientProtocol: '2.0', clientSdkVersion: '0.9.0', minSdkVersion: '0.10.0' });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.message).toBe('SDK version 0.9.0 is below the required minimum 0.10.0');
+      expect(r.error.data).toMatchObject({ requiredSdk: '0.10.0', actualSdk: '0.9.0' });
+    }
+  });
+
+  it('still names the required SDK version when the client reported none', () => {
+    const r = checkCompatibility({ ...base, clientProtocol: '2.0', minSdkVersion: '0.10.0' });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.message).toBe('SDK version unknown (not reported) is below the required minimum 0.10.0');
+      expect(r.error.data).toMatchObject({ requiredSdk: '0.10.0', actualSdk: null });
+    }
+  });
+
+  it('names both protocol versions on the MINOR floor, and publishes requiredProtocol', () => {
+    const r = checkCompatibility({ ...base, clientProtocol: '2.0', minMinor: 1 });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.message).toBe('Connect protocol 2.0 is below the required minimum 2.1');
+      expect(r.error.data).toMatchObject({ clientProtocol: '2.0', requiredProtocol: '2.1' });
+    }
+  });
+
+  it('names both protocol versions on a MAJOR mismatch', () => {
+    const r = checkCompatibility({ ...base, clientProtocol: '1.0' });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.message).toBe(`Incompatible Connect protocol version: app speaks 1.0, wallet speaks ${W}`);
+      expect(r.error.data).toMatchObject({ walletProtocol: W, clientProtocol: '1.0' });
+    }
+  });
+});
