@@ -113,22 +113,25 @@ describe('summarizeOutcomes — error precedence', () => {
     expect(s.committedAmount).toBe(60n);           // remainder = request − 60, exact
   });
 
-  it('a committed op with a failed post-step SUPPRESSES a sibling conflict (un-journaled leg needs resume)', () => {
+  it('a sibling conflict beats a committed op\'s post-step failure (the outcome must not classify clean)', () => {
     const journalError = new Error('journal write failed');
     const conflict = new TransferConflictError('lost race');
     const s = summarizeOutcomes([
       { op: directOp(0, 10n), certified: true, error: journalError },
       failed(directOp(1, 40n), conflict),
     ]);
-    // Surfacing the conflict would soft-abort the intent and strand op 0's
-    // never-journaled blob (resume skips aborted intents) — the post-step
-    // error keeps the intent open so resume re-derives the leg.
-    expect(s.primaryError).toBe(journalError);
-    expect(s.conflictTagSourceId).toBeUndefined();
+    // Surfacing the bare journal error instead would classify as a CLEAN
+    // pre-commit failure (not a SphereError) — the #677 partial outcome is
+    // never built and a payment-request consumer reverts to re-payable while
+    // op 0's value is burned on-chain (double-pay, #441). The conflict feeds
+    // the SEND_PARTIALLY_COMPLETED path; op 0 needs no precedence help
+    // (committed>0 blocks the abort, resume re-derives the un-journaled leg).
+    expect(s.primaryError).toBe(conflict);
+    expect(s.conflictTagSourceId).toBeUndefined(); // committed>0 — a full re-plan would over-request
     expect(s.committedUiIds).toEqual(new Set(['ui-0']));
-    expect(s.committedAmount).toBe(10n);
-    // The complete settled picture stays reportable — the suppressed conflict
-    // is in `failures` (plan order), not silently dropped.
+    expect(s.committedAmount).toBe(10n); // the errored-but-certified op still counts (#677 exactness)
+    // The demoted journal failure stays reportable — in `failures` (plan
+    // order), carried onto the surfaced error as suppressed by the caller.
     expect(s.failures.map((f) => f.error)).toEqual([journalError, conflict]);
   });
 

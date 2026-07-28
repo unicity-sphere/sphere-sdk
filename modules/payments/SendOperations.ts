@@ -125,17 +125,17 @@ export function isKeepOpenSendError(err: unknown): boolean {
  *  1. keep-open (ProofUnconfirmed / checkpoint trio) — surfacing anything else
  *     could let the failure disposition abort an intent while this op's spend
  *     may be on-chain (stranded value);
- *  2. a committed op's post-step failure, when a conflict is also present —
- *     that op certified but its blob was NEVER journaled, so resume under
- *     THIS intent is the only path that re-derives it (resume skips aborted
- *     intents). The disposition keeps ANY committed>0 outcome open regardless
- *     of error type, so this precedence is defense-in-depth;
- *     it also surfaces the actionable error (the journal failure, not the
- *     lost race) and keeps the outcome off the #677 remainder re-plan while a
- *     committed leg is un-journaled — resume converges every leg: it
- *     re-derives the un-journaled op and records the foreign spend (§8.1).
- *  3. TransferConflictError — carries the #625/#677 recovery contracts;
- *  4. anything else (timeout, network, journal write).
+ *  2. TransferConflictError — carries the #625/#677 recovery contracts. It
+ *     MUST NOT be displaced by a committed sibling's post-step (journal)
+ *     failure: that is a bare error, so the outcome would classify as a CLEAN
+ *     pre-commit failure (isPossiblyCommittedSendOutcome false) — the #677
+ *     partial outcome is never built and a payment-request consumer reverts
+ *     to re-payable while a certified leg's value is burned on-chain
+ *     (double-pay, #441). The un-journaled committed leg needs no precedence
+ *     help: committed>0 blocks the intent abort regardless of error type, and
+ *     resume re-derives any op missing from the delivery journal (§8.1) — the
+ *     journal failure stays reportable via {@link SendOutcomeSummary.failures};
+ *  3. anything else (timeout, network, journal write).
  */
 export function summarizeOutcomes(outcomes: readonly OperationOutcome[]): SendOutcomeSummary {
   const committed = outcomes
@@ -158,12 +158,6 @@ export function summarizeOutcomes(outcomes: readonly OperationOutcome[]): SendOu
   if (keepOpen !== undefined) return { ...base, primaryError: keepOpen.error };
 
   const conflict = failures.find((o) => o.error instanceof TransferConflictError);
-  // Precedence rule 2 (see the doc above): never let a conflict drive the
-  // disposition while a committed leg is missing its journal entry.
-  const committedPostStepFailure = committed.find((o) => o.error !== undefined);
-  if (conflict !== undefined && committedPostStepFailure !== undefined) {
-    return { ...base, primaryError: committedPostStepFailure.error };
-  }
   const primary = conflict ?? failures[0];
   return {
     ...base,
