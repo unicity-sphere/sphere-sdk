@@ -47,7 +47,7 @@ import {
   decryptDeliveryBundle,
 } from '../../../core/delivery-envelope';
 import { WalletApiClient, WalletApiError } from '../../../wallet-api';
-import type { KeyValueStore, MailboxEntry } from '../../../wallet-api';
+import type { KeyValueStore, MailboxDepositRequest, MailboxEntry } from '../../../wallet-api';
 import { logger } from '../../../core/logger';
 
 export interface WalletApiMailboxProviderConfig {
@@ -75,6 +75,13 @@ function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** One blob prepared for deposit: derived keys, unwrapped wire bytes, content hash (§5.2). */
+interface PreparedDelivery {
+  readonly keys: { tokenId: string; stateHash: string; deliveryId: string };
+  readonly wire: Uint8Array;
+  readonly sha: string;
+}
+
 const TAG = 'WalletApiMailbox';
 
 export class WalletApiMailboxProvider implements DeliveryProvider {
@@ -85,6 +92,9 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
   private deriveKeysFn: ((blobBytes: Uint8Array) => Promise<{ tokenId: string; stateHash: string }>) | null = null;
 
   private identity: { privateKey: string; chainPubkey: string; nametag?: string } | null = null;
+
+  /** True once a batch deposit 404'd (a pre-#111 deployment) — per instance; a re-sign-in re-probes. */
+  private batchDepositUnsupported = false;
 
   constructor(config: WalletApiMailboxProviderConfig) {
     this.client = config.client;
@@ -213,55 +223,121 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
    * (§6), which is what makes the sender's journal replay safe.
    */
   async deliver(recipientPubkey: string, blob: Uint8Array, options: DeliverOptions): Promise<DeliveryReceipt> {
+    const envelope = this.buildDeliveryEnvelope(recipientPubkey, options);
+    const prepared = await this.prepareBlob(blob);
+    const keyBySha = await this.uploadWires([prepared]);
+    return this.depositEntry(
+      this.toDepositRequest(prepared, { recipientPubkey, keyBySha, transferId: options.transferId, envelope }),
+      prepared.keys.deliveryId
+    );
+  }
+
+  /**
+   * Batch deliver (S7 #699): one send's committed blobs to ONE recipient —
+   * one `getUploadUrls` call, N content-addressed PUTs, one
+   * `POST /v1/mailbox/batch`. Receipts in request order. Fallbacks:
+   * - `404 NOT_FOUND` = a pre-#111 deployment — remembered per provider
+   *   instance, then (and on every later call) per-entry deposits over the
+   *   SAME already-uploaded keys;
+   * - `409` = the all-or-nothing batch failed on one conflicted entry (the
+   *   resume-rebuilt-proof case) — per-entry deposits let that one entry
+   *   absorb its own 409 idempotently (the S7 rule in {@link depositEntry})
+   *   while its siblings land;
+   * - anything else (network, 429, 5xx) rethrows — the caller's journal
+   *   replay converges per entry.
+   */
+  async deliverBatch(recipientPubkey: string, blobs: Uint8Array[], options: DeliverOptions): Promise<DeliveryReceipt[]> {
+    if (blobs.length === 0) return [];
+    const envelope = this.buildDeliveryEnvelope(recipientPubkey, options);
+    const prepared = await Promise.all(blobs.map(async (blob) => this.prepareBlob(blob)));
+    const keyBySha = await this.uploadWires(prepared);
+    const entries = prepared.map((p) =>
+      this.toDepositRequest(p, { recipientPubkey, keyBySha, transferId: options.transferId, envelope })
+    );
+    return this.depositBatch(entries, prepared.map((p) => p.keys.deliveryId));
+  }
+
+  private requireIdentity(): { privateKey: string; chainPubkey: string; nametag?: string } {
     if (!this.identity) {
       throw new WalletApiError('No identity set — call setIdentity() first', 'CONFIG');
     }
-    const keys = composeDeliveryKeys(await this.deriveKeys(blob));
+    return this.identity;
+  }
 
-    // S6: bundle the sender's nametag + memo into ONE recipient-addressed
-    // envelope. The key is the ECDH shared secret between the sender's private
-    // key and the RECIPIENT's chain pubkey (symmetric — the recipient
-    // re-derives it from its own key + this entry's senderPubkey), HKDF'd into
-    // the SAME `enc1.` XChaCha20-Poly1305 envelope the self-scoped field
-    // encryption uses (operator-blind, backend-valid — §8.3; no wire change).
-    // Attached whenever there is a nametag OR a memo (so the nametag travels
-    // even on a memo-less transfer); `undefined` ⇒ no `memo` field is sent.
-    const deliveryKey = deriveDeliveryEncryptionKey(this.identity.privateKey, recipientPubkey);
-    const envelope = encryptDeliveryBundle(deliveryKey, {
+  /**
+   * S6: bundle the sender's nametag + memo into ONE recipient-addressed
+   * envelope. The key is the ECDH shared secret between the sender's private
+   * key and the RECIPIENT's chain pubkey (symmetric — the recipient re-derives
+   * it from its own key + this entry's senderPubkey), HKDF'd into the SAME
+   * `enc1.` XChaCha20-Poly1305 envelope the self-scoped field encryption uses
+   * (operator-blind, backend-valid — §8.3; no wire change). Attached whenever
+   * there is a nametag OR a memo (so the nametag travels even on a memo-less
+   * transfer); `undefined` ⇒ no `memo` field is sent. One send = one
+   * recipient + one options set, so a batch computes this ONCE and attaches
+   * the same ciphertext to every entry (no per-entry binding exists; the
+   * entries are already publicly linked by their shared transferId).
+   */
+  private buildDeliveryEnvelope(recipientPubkey: string, options: DeliverOptions): string | undefined {
+    const identity = this.requireIdentity();
+    const deliveryKey = deriveDeliveryEncryptionKey(identity.privateKey, recipientPubkey);
+    return encryptDeliveryBundle(deliveryKey, {
       // The per-call nametag (threaded by PaymentsModule) wins; setIdentity's
       // nametag is the standalone fallback.
-      senderNametag: options.senderNametag ?? this.identity.nametag,
+      senderNametag: options.senderNametag ?? identity.nametag,
       memo: options.memo,
     });
+  }
 
-    // §5.2/§8.2: the wallet-api wire carries the RAW token bytes — the
-    // cross-port blob argument is the sphere envelope; unwrap at the boundary
-    // (the real backend content-addresses and Token.fromCBOR's exactly these
-    // bytes; the 39051 envelope never crosses the §16 API).
+  /**
+   * §5.2/§8.2: the wallet-api wire carries the RAW token bytes — the
+   * cross-port blob argument is the sphere envelope; unwrap at the boundary
+   * (the real backend content-addresses and Token.fromCBOR's exactly these
+   * bytes; the 39051 envelope never crosses the §16 API).
+   */
+  private async prepareBlob(blob: Uint8Array): Promise<PreparedDelivery> {
+    const keys = composeDeliveryKeys(await this.deriveKeys(blob));
     const wire = unwrapTokenBlobBytes(blob);
+    return { keys, wire, sha: bytesToHex(sha256(wire)) };
+  }
 
-    // Upload the finished blob (checksum-bound presigned PUT — §5.2).
-    const sha = bytesToHex(sha256(wire));
-    const urls = await this.client.getUploadUrls([{ sha256: sha, size: wire.length }]);
-    const upload = urls.find((u) => u.sha256 === sha);
-    if (!upload) {
-      throw new WalletApiError(`upload-urls response missing sha256 ${sha}`, 'PROTOCOL');
-    }
-    await this.client.uploadBlob(upload.putUrl, wire); // 412 = already present = success (§5.2)
+  /** Upload the finished blobs: ONE upload-urls request, then a checksum-bound PUT each (§5.2). */
+  private async uploadWires(prepared: readonly PreparedDelivery[]): Promise<Map<string, string>> {
+    const urls = await this.client.getUploadUrls(prepared.map((p) => ({ sha256: p.sha, size: p.wire.length })));
+    const uploads = prepared.map((p) => {
+      const upload = urls.find((u) => u.sha256 === p.sha);
+      if (!upload) {
+        throw new WalletApiError(`upload-urls response missing sha256 ${p.sha}`, 'PROTOCOL');
+      }
+      return { p, upload };
+    });
+    // 412 = already present = success (§5.2)
+    await Promise.all(uploads.map(async ({ p, upload }) => this.client.uploadBlob(upload.putUrl, p.wire)));
+    return new Map(uploads.map(({ p, upload }) => [p.sha, upload.key]));
+  }
 
-    // Deposit (idempotent by entry_id — §6). The nametag+memo envelope is
-    // ECDH-encrypted to the recipient BEFORE it leaves the device (§8.3): the
-    // operator never sees plaintext.
+  private toDepositRequest(
+    prepared: PreparedDelivery,
+    ctx: { recipientPubkey: string; keyBySha: Map<string, string>; transferId: string; envelope: string | undefined }
+  ): MailboxDepositRequest {
+    return {
+      recipientPubkey: ctx.recipientPubkey,
+      key: ctx.keyBySha.get(prepared.sha) ?? '',
+      transferId: ctx.transferId,
+      stateHash: prepared.keys.stateHash,
+      tokenId: prepared.keys.tokenId,
+      ...(ctx.envelope !== undefined ? { memo: ctx.envelope } : {}),
+    };
+  }
+
+  /**
+   * Deposit one entry (idempotent by entry_id — §6). The nametag+memo
+   * envelope is ECDH-encrypted to the recipient BEFORE it leaves the device
+   * (§8.3): the operator never sees plaintext.
+   */
+  private async depositEntry(entry: MailboxDepositRequest, deliveryId: string): Promise<DeliveryReceipt> {
     let entryId: string;
     try {
-      entryId = await this.client.depositMailbox({
-        recipientPubkey,
-        key: upload.key,
-        transferId: options.transferId,
-        stateHash: keys.stateHash,
-        tokenId: keys.tokenId,
-        ...(envelope !== undefined ? { memo: envelope } : {}),
-      });
+      entryId = await this.client.depositMailbox(entry);
     } catch (err) {
       // §6 CONFLICT = the backend already holds a record of EXACTLY this
       // (tokenId, stateHash) with different bytes. Reachable honestly in one
@@ -276,20 +352,63 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
       // conflict can never reach here: the engine's E.2 match-verify raises
       // TransferConflictError before anything is delivered.
       if (err instanceof WalletApiError && err.status === 409) {
-        return { deliveryId: keys.deliveryId };
+        return { deliveryId };
       }
       throw err;
     }
 
     // covenant §3.1-4: the id is CONTENT-DERIVED — computed client-side; a
     // backend returning anything else (e.g. a row id) is a protocol violation.
-    if (entryId !== keys.deliveryId) {
+    if (entryId !== deliveryId) {
       throw new WalletApiError(
-        `mailbox deposit returned a non-content-derived entryId (got ${entryId}, expected ${keys.deliveryId})`,
+        `mailbox deposit returned a non-content-derived entryId (got ${entryId}, expected ${deliveryId})`,
         'PROTOCOL'
       );
     }
-    return { deliveryId: keys.deliveryId };
+    return { deliveryId };
+  }
+
+  /** One batch deposit, falling back to per-entry on 404 (memoized) or 409 — see {@link deliverBatch}. */
+  private async depositBatch(entries: MailboxDepositRequest[], deliveryIds: string[]): Promise<DeliveryReceipt[]> {
+    if (!this.batchDepositUnsupported) {
+      try {
+        const results = await this.client.depositMailboxBatch(entries);
+        // covenant §3.1-4 per entry: content-derived ids, request order; the
+        // batch-only `seq` is data the provider deliberately ignores.
+        if (results.length !== entries.length) {
+          throw new WalletApiError(
+            `mailbox batch deposit returned ${String(results.length)} entries for ${String(entries.length)}`,
+            'PROTOCOL'
+          );
+        }
+        return results.map((result, i) => {
+          if (result.entryId !== deliveryIds[i]) {
+            throw new WalletApiError(
+              `mailbox batch deposit returned a non-content-derived entryId (got ${result.entryId}, expected ${String(deliveryIds[i])})`,
+              'PROTOCOL'
+            );
+          }
+          return { deliveryId: result.entryId };
+        });
+      } catch (err) {
+        if (err instanceof WalletApiError && err.code === 'NOT_FOUND') {
+          // pre-#111 deployment — remember and stop re-probing on this instance
+          this.batchDepositUnsupported = true;
+          logger.warn(TAG, 'POST /v1/mailbox/batch not deployed — falling back to per-entry deposits');
+        } else if (!(err instanceof WalletApiError && err.status === 409)) {
+          throw err;
+        }
+      }
+    }
+    // Per-entry fallback over the SAME already-uploaded keys (never a
+    // recursive deliver — no re-derive, no re-upload). Sequential to keep
+    // receipts in request order; any failure throws (the port contract —
+    // entries that DID land absorb idempotently on the caller's retry).
+    const receipts: DeliveryReceipt[] = [];
+    for (const [i, entry] of entries.entries()) {
+      receipts.push(await this.depositEntry(entry, deliveryIds[i] ?? ''));
+    }
+    return receipts;
   }
 
   // ── incoming (S3: mailbox pull) ─────────────────────────────────────────────

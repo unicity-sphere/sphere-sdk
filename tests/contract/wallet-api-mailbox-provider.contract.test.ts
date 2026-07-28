@@ -10,7 +10,7 @@
  * - S6 memo encryption: ciphertext on the wire, decryptable by the owner.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { FakeWalletApi } from '../support/fake-wallet-api';
 import { MemoryKeyValueStore, makeTestToken, testIdentity, fakeDeliveryKeys } from '../support/wallet-api-test-helpers';
@@ -330,6 +330,122 @@ describe('WalletApiMailboxProvider — provider-specific semantics', () => {
       const delivery = incoming.find((d) => d.deliveryId === deliveryId);
       expect(delivery).toBeDefined();
       await expect(delivery!.fetchBlob()).rejects.toThrow(/blobCollected|no fetchable blob/);
+    });
+  });
+
+  describe('deliverBatch — one deposit per send (#699)', () => {
+    beforeEach(async () => {
+      h = await makeHarness('external');
+    });
+
+    function makeBlobs(n: number): { bytes: Uint8Array; tokenId: string; stateHash: string }[] {
+      return Array.from({ length: n }, () => h.makeBlob());
+    }
+
+    it('N blobs → ONE upload-urls call, ONE batch deposit, ZERO single deposits; receipts in order', async () => {
+      const client = h.sender.walletApiClient;
+      const uploadUrls = vi.spyOn(client, 'getUploadUrls');
+      const batchDeposit = vi.spyOn(client, 'depositMailboxBatch');
+      const singleDeposit = vi.spyOn(client, 'depositMailbox');
+
+      const blobs = makeBlobs(3);
+      const receipts = await h.sender.deliverBatch(h.recipientPubkey, blobs.map((b) => b.bytes), {
+        transferId: 'tf-b1',
+      });
+
+      expect(uploadUrls).toHaveBeenCalledTimes(1);
+      expect(uploadUrls.mock.calls[0][0]).toHaveLength(3);
+      expect(batchDeposit).toHaveBeenCalledTimes(1);
+      expect(batchDeposit.mock.calls[0][0]).toHaveLength(3);
+      expect(singleDeposit).not.toHaveBeenCalled();
+
+      // request order, content-derived ids (covenant §3.1-4)
+      expect(receipts.map((r) => r.deliveryId)).toEqual(
+        blobs.map((b) => hex(sha256(Uint8Array.from([
+          ...Buffer.from(b.tokenId, 'hex'),
+          ...Buffer.from(b.stateHash, 'hex'),
+        ])))),
+      );
+      for (const r of receipts) {
+        expect(h.fake.getMailboxEntry(h.recipientPubkey, r.deliveryId)).toMatchObject({ status: 'unclaimed' });
+      }
+    });
+
+    it('equivalent to sequential deliver: a per-blob replay returns the identical receipts', async () => {
+      const blobs = makeBlobs(2);
+      const batched = await h.sender.deliverBatch(h.recipientPubkey, blobs.map((b) => b.bytes), {
+        transferId: 'tf-b2',
+      });
+      // deliver() of the same blobs is the idempotent replay — same ids, no duplicates
+      for (const [i, blob] of blobs.entries()) {
+        const single = await h.sender.deliver(h.recipientPubkey, blob.bytes, { transferId: 'tf-b2' });
+        expect(single.deliveryId).toBe(batched[i].deliveryId);
+      }
+      // a full re-batch is idempotent too
+      const again = await h.sender.deliverBatch(h.recipientPubkey, blobs.map((b) => b.bytes), {
+        transferId: 'tf-b2',
+      });
+      expect(again).toEqual(batched);
+    });
+
+    it('404 (pre-#111 deployment) falls back to per-entry deposits and never re-probes', async () => {
+      h.fake.setMailboxBatchRoute(false);
+      const client = h.sender.walletApiClient;
+      const batchDeposit = vi.spyOn(client, 'depositMailboxBatch');
+      const singleDeposit = vi.spyOn(client, 'depositMailbox');
+
+      const blobs = makeBlobs(2);
+      const receipts = await h.sender.deliverBatch(h.recipientPubkey, blobs.map((b) => b.bytes), {
+        transferId: 'tf-b3',
+      });
+      expect(receipts).toHaveLength(2);
+      expect(batchDeposit).toHaveBeenCalledTimes(1); // probed once, 404'd
+      expect(singleDeposit).toHaveBeenCalledTimes(2); // per-entry fallback landed both
+
+      // memoized: even with the route back (a fake convenience — real
+      // deployments don't hot-add routes), this instance never re-probes
+      h.fake.setMailboxBatchRoute(true);
+      const more = makeBlobs(2);
+      await h.sender.deliverBatch(h.recipientPubkey, more.map((b) => b.bytes), { transferId: 'tf-b3b' });
+      expect(batchDeposit).toHaveBeenCalledTimes(1);
+      expect(singleDeposit).toHaveBeenCalledTimes(4);
+    });
+
+    it('a batch 409 (one key-variant entry) falls back per-entry: the conflicted entry absorbs, siblings land', async () => {
+      // First deliver a blob, then tamper its stored key — the resume-rebuilt
+      // proof-bytes case (§6/S7). A batch containing it now 409s all-or-nothing.
+      const conflicted = h.makeBlob();
+      const first = await h.sender.deliver(h.recipientPubkey, conflicted.bytes, { transferId: 'tf-b4' });
+      h.fake.tamperMailboxEntryKey(h.recipientPubkey, first.deliveryId);
+
+      const fresh = h.makeBlob();
+      const receipts = await h.sender.deliverBatch(
+        h.recipientPubkey,
+        [conflicted.bytes, fresh.bytes],
+        { transferId: 'tf-b4' },
+      );
+      expect(receipts[0].deliveryId).toBe(first.deliveryId); // absorbed idempotently (S7)
+      expect(h.fake.getMailboxEntry(h.recipientPubkey, receipts[1].deliveryId)).toMatchObject({
+        status: 'unclaimed', // the fresh sibling landed despite the batch-level 409
+      });
+    });
+
+    it('a backend returning non-content-derived ids is a PROTOCOL violation (covenant §3.1-4)', async () => {
+      const client = h.sender.walletApiClient;
+      vi.spyOn(client, 'depositMailboxBatch').mockResolvedValue([{ entryId: 'f'.repeat(64), seq: 1n }]);
+      const blob = h.makeBlob();
+      await expect(
+        h.sender.deliverBatch(h.recipientPubkey, [blob.bytes, blob.bytes], { transferId: 'tf-b5' }),
+      ).rejects.toMatchObject({ code: 'PROTOCOL' });
+    });
+
+    it('an empty batch resolves to [] without touching the network', async () => {
+      const client = h.sender.walletApiClient;
+      const uploadUrls = vi.spyOn(client, 'getUploadUrls');
+      const batchDeposit = vi.spyOn(client, 'depositMailboxBatch');
+      await expect(h.sender.deliverBatch(h.recipientPubkey, [], { transferId: 'tf-b6' })).resolves.toEqual([]);
+      expect(uploadUrls).not.toHaveBeenCalled();
+      expect(batchDeposit).not.toHaveBeenCalled();
     });
   });
 });
