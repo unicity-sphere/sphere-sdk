@@ -28,18 +28,14 @@ export const configs = [
     noExternal: [/^@noble\//],
     external: [
       /^@unicitylabs\//,
-      /^@libp2p\//,
-      /^@helia\//,
       'bip39',
       'buffer',
       'crypto-js',
       'elliptic',
-      'helia',
-      'multiformats',
       'ws',
     ],
   },
-  // Core only (no browser impl with helia) - for Node.js projects
+  // Core only — for Node.js projects
   {
     entry: { 'core/index': 'core/index.ts' },
     format: ['esm', 'cjs'],
@@ -60,7 +56,7 @@ export const configs = [
     ],
   },
   // Token-engine (incl. the SpherePaymentData codec) — for server-side
-  // consumers (wallet-api validation) that must not pull browser/IPFS/Nostr
+  // consumers (wallet-api validation) that must not pull browser/Nostr
   {
     entry: { 'token-engine/index': 'token-engine/index.ts' },
     format: ['esm', 'cjs'],
@@ -100,7 +96,7 @@ export const configs = [
       'ws',
     ],
   },
-  // Browser implementation (without IPFS - no helia dependency)
+  // Browser implementation
   {
     entry: { 'impl/browser/index': 'impl/browser/index.ts' },
     format: ['esm', 'cjs'],
@@ -132,26 +128,6 @@ export const configs = [
       /^@unicitylabs\//,
     ],
   },
-  // Browser IPFS implementation (requires helia)
-  // Separate entry point so users can opt-in to IPFS functionality
-  {
-    entry: { 'impl/browser/ipfs': 'impl/browser/ipfs.ts' },
-    format: ['esm', 'cjs'],
-    dts: false,
-    clean: false,
-    splitting: false,
-    sourcemap: true,
-    platform: 'browser',
-    target: 'es2022',
-    noExternal: [/^@noble\//],
-    external: [
-      /^@unicitylabs\//,
-      /^@libp2p\//,
-      /^@helia\//,
-      'helia',
-      'multiformats',
-    ],
-  },
   // Node.js implementation
   {
     entry: { 'impl/nodejs/index': 'impl/nodejs/index.ts' },
@@ -165,10 +141,6 @@ export const configs = [
     noExternal: [/^@noble\//],
     external: [
       /^@unicitylabs\//,
-      /^@libp2p\//,
-      /^@helia\//,
-      'helia',
-      'multiformats',
       'ws',
     ],
   },

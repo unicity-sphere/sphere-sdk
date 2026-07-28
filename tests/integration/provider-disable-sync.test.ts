@@ -130,7 +130,7 @@ describe('Provider disable/enable integration', () => {
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
     tokenStorageReal = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
-    tokenStorageMock = createMockTokenStorage('ipfs-sync', 'IPFS Sync');
+    tokenStorageMock = createMockTokenStorage('remote-sync', 'Remote Sync');
   });
 
   afterEach(async () => {
@@ -161,7 +161,7 @@ describe('Provider disable/enable integration', () => {
 
     const ids = status.tokenStorage.map((p) => p.id);
     expect(ids).toContain(tokenStorageReal.id);
-    expect(ids).toContain('ipfs-sync');
+    expect(ids).toContain('remote-sync');
 
     // Both should be enabled
     for (const ts of status.tokenStorage) {
@@ -185,11 +185,11 @@ describe('Provider disable/enable integration', () => {
     await sphere.addTokenStorageProvider(tokenStorageMock);
 
     // Disable mock provider (simulates disabling IPFS)
-    await sphere.disableProvider('ipfs-sync');
+    await sphere.disableProvider('remote-sync');
 
     const status = sphere.getStatus();
     const real = status.tokenStorage.find((p) => p.id === tokenStorageReal.id);
-    const mock = status.tokenStorage.find((p) => p.id === 'ipfs-sync');
+    const mock = status.tokenStorage.find((p) => p.id === 'remote-sync');
 
     expect(real!.enabled).toBe(true);
     expect(mock!.enabled).toBe(false);
@@ -211,14 +211,14 @@ describe('Provider disable/enable integration', () => {
     await sphere.addTokenStorageProvider(tokenStorageMock);
 
     // Disable then re-enable
-    await sphere.disableProvider('ipfs-sync');
-    expect(sphere.isProviderEnabled('ipfs-sync')).toBe(false);
+    await sphere.disableProvider('remote-sync');
+    expect(sphere.isProviderEnabled('remote-sync')).toBe(false);
 
-    await sphere.enableProvider('ipfs-sync');
-    expect(sphere.isProviderEnabled('ipfs-sync')).toBe(true);
+    await sphere.enableProvider('remote-sync');
+    expect(sphere.isProviderEnabled('remote-sync')).toBe(true);
 
     const status = sphere.getStatus();
-    const mock = status.tokenStorage.find((p) => p.id === 'ipfs-sync');
+    const mock = status.tokenStorage.find((p) => p.id === 'remote-sync');
     expect(mock!.enabled).toBe(true);
   });
 
@@ -237,8 +237,8 @@ describe('Provider disable/enable integration', () => {
     });
 
     await sphere.addTokenStorageProvider(tokenStorageMock);
-    await sphere.disableProvider('ipfs-sync');
-    expect(sphere.isProviderEnabled('ipfs-sync')).toBe(false);
+    await sphere.disableProvider('remote-sync');
+    expect(sphere.isProviderEnabled('remote-sync')).toBe(false);
 
     // Capture mnemonic for reload
     const mnemonic = sphere.getMnemonic();
@@ -247,7 +247,7 @@ describe('Provider disable/enable integration', () => {
 
     // Reload with same storage dir — fresh provider instances
     const freshReal = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
-    const freshMock = createMockTokenStorage('ipfs-sync', 'IPFS Sync');
+    const freshMock = createMockTokenStorage('remote-sync', 'Remote Sync');
     const transport2 = createMockTransport();
     const oracle2 = createMockOracle();
 
@@ -264,7 +264,7 @@ describe('Provider disable/enable integration', () => {
 
     // Both should be enabled — disabled state was runtime-only
     expect(sphere2.isProviderEnabled(freshReal.id)).toBe(true);
-    expect(sphere2.isProviderEnabled('ipfs-sync')).toBe(true);
+    expect(sphere2.isProviderEnabled('remote-sync')).toBe(true);
 
     const status = sphere2.getStatus();
     for (const ts of status.tokenStorage) {
@@ -291,16 +291,16 @@ describe('Provider disable/enable integration', () => {
     sphere.on('connection:changed', (e) => events.push(e));
 
     // Disable
-    await sphere.disableProvider('ipfs-sync');
+    await sphere.disableProvider('remote-sync');
     // Enable
-    await sphere.enableProvider('ipfs-sync');
+    await sphere.enableProvider('remote-sync');
 
     expect(events).toHaveLength(2);
-    expect(events[0].provider).toBe('ipfs-sync');
+    expect(events[0].provider).toBe('remote-sync');
     expect(events[0].enabled).toBe(false);
     expect(events[0].connected).toBe(false);
 
-    expect(events[1].provider).toBe('ipfs-sync');
+    expect(events[1].provider).toBe('remote-sync');
     expect(events[1].enabled).toBe(true);
   });
 
@@ -318,7 +318,7 @@ describe('Provider disable/enable integration', () => {
     });
 
     await sphere.addTokenStorageProvider(tokenStorageMock);
-    await sphere.disableProvider('ipfs-sync');
+    await sphere.disableProvider('remote-sync');
 
     // shutdown should have been called on the mock
     expect(tokenStorageMock.shutdown).toHaveBeenCalled();

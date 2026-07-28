@@ -32,7 +32,6 @@ import { assertNetworkConsistency } from '../shared/network';
 import { createFileStorageProvider, createFileTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
-import { createNodeIpfsStorageProvider } from './ipfs';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
@@ -42,7 +41,6 @@ import { TokenRegistry } from '../../registry';
 import type { NetworkType } from '../../constants';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
 import type { MarketModuleConfig } from '../../modules/market';
-import type { IpfsStorageConfig } from '../shared/ipfs';
 import {
   type BaseTransportConfig,
   type BaseOracleConfig,
@@ -77,20 +75,6 @@ export type NodeOracleConfig = BaseOracleConfig & NodeOracleExtensions;
 // Node.js Providers Configuration
 // =============================================================================
 
-/** Node.js IPFS sync configuration */
-export interface NodeIpfsSyncConfig {
-  /** Enable IPFS sync (default: false) */
-  enabled?: boolean;
-  /** IPFS storage provider configuration */
-  config?: IpfsStorageConfig;
-}
-
-/** Node.js token sync configuration */
-export interface NodeTokenSyncConfig {
-  /** IPFS sync backend */
-  ipfs?: NodeIpfsSyncConfig;
-}
-
 export interface NodeProvidersConfig {
   /** Network preset: mainnet, testnet, or dev */
   network?: NetworkType;
@@ -108,8 +92,6 @@ export interface NodeProvidersConfig {
   oracle?: NodeOracleConfig;
   /** Price provider configuration (optional — enables fiat value display) */
   price?: BasePriceConfig;
-  /** Token sync backends configuration */
-  tokenSync?: NodeTokenSyncConfig;
   /** Group chat (NIP-29) configuration. true = enable with defaults, object = custom config */
   groupChat?: { enabled?: boolean; relays?: string[] } | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config */
@@ -123,8 +105,6 @@ export interface NodeProviders {
   oracle: OracleProvider;
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
-  /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
-  ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Group chat config (resolved, for passing to Sphere.init) */
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module config (resolved, for passing to Sphere.init) */
@@ -216,12 +196,6 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   });
   const priceConfig = resolvePriceConfig(config?.price, storage);
 
-  // Create IPFS storage provider if enabled
-  const ipfsSync = config?.tokenSync?.ipfs;
-  const ipfsTokenStorage = ipfsSync?.enabled
-    ? createNodeIpfsStorageProvider({ ...ipfsSync.config, network }, storage)
-    : undefined;
-
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
 
@@ -257,6 +231,5 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
       network,
     }),
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
-    ipfsTokenStorage,
   };
 }

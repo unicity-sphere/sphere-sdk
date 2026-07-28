@@ -21,10 +21,6 @@
       "import": "./dist/impl/browser/index.js",
       "require": "./dist/impl/browser/index.cjs"
     },
-    "./impl/browser/ipfs": {
-      "import": "./dist/impl/browser/ipfs.js",
-      "require": "./dist/impl/browser/ipfs.cjs"
-    },
     "./impl/nodejs": {
       "import": {
         "types": "./dist/impl/nodejs/index.d.ts",
@@ -155,18 +151,8 @@
     "canonicalize": "^3.0.0",
     "crypto-js": "^4.2.0"
   },
-  "optionalDependencies": {
-    "@libp2p/crypto": "^5.1.13",
-    "@libp2p/peer-id": "^6.0.4",
-    "ipns": "^10.0.0",
-    "multiformats": "^13.4.2"
-  },
   "devDependencies": {
     "@eslint/js": "^9.39.2",
-    "@libp2p/bootstrap": "^12.0.11",
-    "@libp2p/crypto": "^5.1.13",
-    "@libp2p/interface": "^3.1.0",
-    "@libp2p/peer-id": "^6.0.4",
     "@types/crypto-js": "^4.2.2",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.18.1",
@@ -174,7 +160,6 @@
     "@typescript-eslint/parser": "^8.54.0",
     "eslint": "^9.39.2",
     "fake-indexeddb": "^6.2.5",
-    "multiformats": "^13.4.2",
     "testcontainers": "^11.11.0",
     "tsup": "^8.5.1",
     "tsx": "^4.21.0",
@@ -184,26 +169,10 @@
     "ws": "^8.18.1"
   },
   "peerDependencies": {
-    "@libp2p/crypto": ">=5.0.0",
-    "@libp2p/peer-id": ">=6.0.0",
-    "ipns": ">=10.0.0",
-    "multiformats": ">=13.0.0",
     "ws": ">=8.0.0"
   },
   "peerDependenciesMeta": {
     "ws": {
-      "optional": true
-    },
-    "@libp2p/crypto": {
-      "optional": true
-    },
-    "@libp2p/peer-id": {
-      "optional": true
-    },
-    "ipns": {
-      "optional": true
-    },
-    "multiformats": {
       "optional": true
     }
   },
