@@ -1,0 +1,634 @@
+{
+  "connect/client/ConnectClient.ts": {
+    "fileLines": 487,
+    "functionLines": 61,
+    "commentBlock": 13,
+    "worstFunction": "handleMessage (L307)"
+  },
+  "connect/compatibility.ts": {
+    "commentRatio": 0.294,
+    "commentBlock": 6
+  },
+  "connect/host/ConnectHost.ts": {
+    "fileLines": 1352,
+    "functionLines": 178,
+    "commentBlock": 22,
+    "worstFunction": "handleHandshake (L516)"
+  },
+  "connect/host/InFlightRegistry.ts": {
+    "commentRatio": 0.196,
+    "commentBlock": 11
+  },
+  "connect/host/SphereInstance.ts": {
+    "commentRatio": 0.216,
+    "commentBlock": 8
+  },
+  "connect/host/WalletSnapshot.ts": {
+    "commentRatio": 0.5,
+    "commentBlock": 13
+  },
+  "connect/host/host-state.ts": {
+    "commentRatio": 0.181,
+    "commentBlock": 8
+  },
+  "connect/index.ts": {
+    "commentRatio": 0.164,
+    "commentBlock": 9
+  },
+  "connect/permissions.ts": {
+    "commentRatio": 0.228
+  },
+  "connect/protocol.ts": {
+    "commentRatio": 0.415,
+    "commentBlock": 13
+  },
+  "connect/semver.ts": {
+    "commentRatio": 0.19
+  },
+  "connect/types.ts": {
+    "commentRatio": 0.632,
+    "commentBlock": 14
+  },
+  "connect/version.ts": {
+    "commentRatio": 0.5
+  },
+  "constants.ts": {
+    "fileLines": 505,
+    "commentRatio": 0.193,
+    "commentBlock": 6
+  },
+  "core/Sphere.ts": {
+    "fileLines": 4690,
+    "functionLines": 211,
+    "commentBlock": 39,
+    "worstFunction": "switchToAddress (L2386)"
+  },
+  "core/address.ts": {
+    "commentRatio": 0.522,
+    "commentBlock": 13
+  },
+  "core/async-gate.ts": {
+    "commentRatio": 0.302,
+    "commentBlock": 10
+  },
+  "core/bech32.ts": {
+    "commentRatio": 0.344
+  },
+  "core/crypto.ts": {
+    "fileLines": 594,
+    "commentBlock": 6
+  },
+  "core/currency.ts": {
+    "commentRatio": 0.28
+  },
+  "core/delivery-envelope.ts": {
+    "commentRatio": 0.321,
+    "commentBlock": 30
+  },
+  "core/discover.ts": {
+    "functionLines": 75,
+    "commentRatio": 0.327,
+    "worstFunction": "discoverAddressesImpl (L92)"
+  },
+  "core/encryption.ts": {
+    "commentRatio": 0.441,
+    "commentBlock": 6
+  },
+  "core/errors.ts": {
+    "commentRatio": 0.467,
+    "commentBlock": 25
+  },
+  "core/field-encryption.ts": {
+    "commentRatio": 0.396,
+    "commentBlock": 20
+  },
+  "core/logger.ts": {
+    "commentRatio": 0.41,
+    "commentBlock": 28
+  },
+  "core/network-health.ts": {
+    "functionLines": 84,
+    "commentRatio": 0.319,
+    "commentBlock": 22,
+    "worstFunction": "checkWebSocket (L159)"
+  },
+  "core/timeout.ts": {
+    "commentRatio": 0.576,
+    "commentBlock": 7
+  },
+  "core/transport-resolver.ts": {
+    "functionLines": 146,
+    "commentRatio": 0.305,
+    "commentBlock": 11,
+    "worstFunction": "createTransportAddressResolver (L74)"
+  },
+  "core/utils.ts": {
+    "commentRatio": 0.477
+  },
+  "core/uuid.ts": {
+    "commentRatio": 0.69,
+    "commentBlock": 7
+  },
+  "impl/browser/connect/ExtensionTransport.ts": {
+    "commentRatio": 0.291,
+    "commentBlock": 12
+  },
+  "impl/browser/connect/PostMessageTransport.ts": {
+    "commentRatio": 0.376,
+    "commentBlock": 13
+  },
+  "impl/browser/connect/autoConnect.ts": {
+    "commentRatio": 0.313,
+    "commentBlock": 21
+  },
+  "impl/browser/download.ts": {
+    "commentRatio": 0.295
+  },
+  "impl/browser/index.ts": {
+    "fileLines": 436,
+    "functionLines": 74,
+    "commentRatio": 0.407,
+    "commentBlock": 6,
+    "worstFunction": "createBrowserProviders (L362)"
+  },
+  "impl/browser/ipfs/index.ts": {
+    "commentRatio": 0.448
+  },
+  "impl/browser/ipfs.ts": {
+    "commentRatio": 0.588
+  },
+  "impl/browser/oracle/index.ts": {
+    "commentRatio": 0.297
+  },
+  "impl/browser/storage/IndexedDBStorageProvider.ts": {
+    "fileLines": 409,
+    "functionLines": 52,
+    "worstFunction": "clear (L172)"
+  },
+  "impl/browser/storage/IndexedDBTokenStorageProvider.ts": {
+    "fileLines": 636,
+    "functionLines": 88,
+    "worstFunction": "load (L128)"
+  },
+  "impl/browser/storage/IpfsStorageProvider.ts": {
+    "commentRatio": 0.8,
+    "commentBlock": 7
+  },
+  "impl/browser/storage/index.ts": {
+    "commentRatio": 0.4
+  },
+  "impl/browser/transport/index.ts": {
+    "commentRatio": 0.364
+  },
+  "impl/index.ts": {
+    "commentRatio": 0.9,
+    "commentBlock": 8
+  },
+  "impl/nodejs/connect/WebSocketTransport.ts": {
+    "commentRatio": 0.173,
+    "commentBlock": 9
+  },
+  "impl/nodejs/index.ts": {
+    "functionLines": 92,
+    "commentRatio": 0.407,
+    "worstFunction": "createNodeProviders (L171)"
+  },
+  "impl/nodejs/ipfs/index.ts": {
+    "commentRatio": 0.387
+  },
+  "impl/nodejs/oracle/index.ts": {
+    "commentRatio": 0.297
+  },
+  "impl/nodejs/storage/FileStorageProvider.ts": {
+    "functionLines": 59,
+    "worstFunction": "connect (L57)"
+  },
+  "impl/nodejs/storage/FileTokenStorageProvider.ts": {
+    "functionLines": 71,
+    "worstFunction": "load (L92)"
+  },
+  "impl/nodejs/transport/index.ts": {
+    "commentRatio": 0.415
+  },
+  "impl/shared/config.ts": {
+    "commentRatio": 0.561
+  },
+  "impl/shared/index.ts": {
+    "commentRatio": 0.5
+  },
+  "impl/shared/ipfs/index.ts": {
+    "commentRatio": 0.278
+  },
+  "impl/shared/ipfs/ipfs-cache.ts": {
+    "commentRatio": 0.349
+  },
+  "impl/shared/ipfs/ipfs-error-types.ts": {
+    "commentRatio": 0.376,
+    "commentBlock": 7
+  },
+  "impl/shared/ipfs/ipfs-http-client.ts": {
+    "fileLines": 533,
+    "functionLines": 55,
+    "worstFunction": "fetchContent (L204)"
+  },
+  "impl/shared/ipfs/ipfs-state-persistence.ts": {
+    "commentRatio": 0.364
+  },
+  "impl/shared/ipfs/ipfs-storage-provider.ts": {
+    "fileLines": 887,
+    "functionLines": 107,
+    "commentBlock": 8,
+    "worstFunction": "_doSave (L319)"
+  },
+  "impl/shared/ipfs/ipfs-types.ts": {
+    "commentRatio": 0.529
+  },
+  "impl/shared/ipfs/ipns-key-derivation.ts": {
+    "commentRatio": 0.421,
+    "commentBlock": 11
+  },
+  "impl/shared/ipfs/ipns-record-manager.ts": {
+    "commentRatio": 0.194
+  },
+  "impl/shared/ipfs/ipns-subscription-client.ts": {
+    "fileLines": 450,
+    "functionLines": 68,
+    "commentBlock": 13,
+    "worstFunction": "connect (L179)"
+  },
+  "impl/shared/ipfs/txf-merge.ts": {
+    "functionLines": 102,
+    "worstFunction": "mergeTxfData (L26)"
+  },
+  "impl/shared/ipfs/write-behind-buffer.ts": {
+    "commentRatio": 0.456,
+    "commentBlock": 7
+  },
+  "impl/shared/network.ts": {
+    "commentRatio": 0.407,
+    "commentBlock": 7
+  },
+  "impl/shared/resolvers.ts": {
+    "commentRatio": 0.518
+  },
+  "impl/shared/trustbase-loader.ts": {
+    "commentRatio": 0.377
+  },
+  "impl/shared/wallet-api/WalletApiCheckpointStore.ts": {
+    "commentRatio": 0.263,
+    "commentBlock": 11
+  },
+  "impl/shared/wallet-api/WalletApiMailboxProvider.ts": {
+    "fileLines": 637,
+    "commentBlock": 29
+  },
+  "impl/shared/wallet-api/WalletApiTokenStorageProvider.ts": {
+    "fileLines": 838,
+    "functionLines": 61,
+    "commentBlock": 30,
+    "worstFunction": "recoverRemoved (L596)"
+  },
+  "impl/shared/wallet-api/composition.ts": {
+    "commentRatio": 0.404,
+    "commentBlock": 29
+  },
+  "index.ts": {
+    "fileLines": 563,
+    "commentRatio": 0.276,
+    "commentBlock": 45
+  },
+  "modules/accounting/AccountingModule.ts": {
+    "fileLines": 6402,
+    "functionLines": 335,
+    "commentBlock": 8,
+    "worstFunction": "importInvoice (L1121)"
+  },
+  "modules/accounting/auto-return.ts": {
+    "fileLines": 445,
+    "commentRatio": 0.431,
+    "commentBlock": 11
+  },
+  "modules/accounting/balance-computer.ts": {
+    "fileLines": 902,
+    "functionLines": 274,
+    "commentBlock": 14,
+    "worstFunction": "computeInvoiceStatus (L315)"
+  },
+  "modules/accounting/memo.ts": {
+    "fileLines": 451,
+    "functionLines": 123,
+    "commentRatio": 0.29,
+    "commentBlock": 14,
+    "worstFunction": "decodeTransferMessage (L221)"
+  },
+  "modules/accounting/serialization.ts": {
+    "commentRatio": 0.667,
+    "commentBlock": 22
+  },
+  "modules/accounting/types.ts": {
+    "fileLines": 1146,
+    "commentRatio": 0.704,
+    "commentBlock": 11
+  },
+  "modules/communications/CommunicationsModule.ts": {
+    "fileLines": 818,
+    "functionLines": 85,
+    "worstFunction": "handleIncomingMessage (L567)"
+  },
+  "modules/groupchat/GroupChatModule.ts": {
+    "fileLines": 1850,
+    "functionLines": 90,
+    "commentBlock": 6,
+    "worstFunction": "createGroup (L836)"
+  },
+  "modules/groupchat/types.ts": {
+    "commentRatio": 0.302
+  },
+  "modules/market/MarketModule.ts": {
+    "fileLines": 412,
+    "functionLines": 66,
+    "commentBlock": 7,
+    "worstFunction": "subscribeFeed (L239)"
+  },
+  "modules/market/types.ts": {
+    "commentRatio": 0.216
+  },
+  "modules/payments/PaymentsModule.ts": {
+    "fileLines": 7026,
+    "functionLines": 742,
+    "commentBlock": 12,
+    "worstFunction": "sendOnce (L1837)"
+  },
+  "modules/payments/SendOperations.ts": {
+    "commentRatio": 0.531,
+    "commentBlock": 13
+  },
+  "modules/payments/SpendQueue.ts": {
+    "fileLines": 698,
+    "functionLines": 84,
+    "commentBlock": 9,
+    "worstFunction": "notifyChange (L502)"
+  },
+  "modules/payments/TokenReservationLedger.ts": {
+    "functionLines": 62,
+    "commentRatio": 0.168,
+    "commentBlock": 16,
+    "worstFunction": "reserve (L58)"
+  },
+  "modules/payments/TokenSplitCalculator.ts": {
+    "commentRatio": 0.531,
+    "commentBlock": 9
+  },
+  "modules/payments/TransportDeliveryAdapter.ts": {
+    "commentRatio": 0.456,
+    "commentBlock": 27
+  },
+  "modules/payments/pump-health.ts": {
+    "commentRatio": 0.379,
+    "commentBlock": 20
+  },
+  "modules/swap/SwapModule.ts": {
+    "fileLines": 3734,
+    "functionLines": 1067,
+    "commentBlock": 13,
+    "worstFunction": "handleIncomingDM (L2264)"
+  },
+  "modules/swap/dm-protocol.ts": {
+    "fileLines": 932,
+    "functionLines": 62,
+    "commentRatio": 0.382,
+    "commentBlock": 23,
+    "worstFunction": "parseProposal (L431)"
+  },
+  "modules/swap/escrow-client.ts": {
+    "functionLines": 52,
+    "commentBlock": 10,
+    "worstFunction": "withRetry (L56)"
+  },
+  "modules/swap/manifest.ts": {
+    "functionLines": 84,
+    "commentRatio": 0.226,
+    "commentBlock": 10,
+    "worstFunction": "validateManifest (L124)"
+  },
+  "modules/swap/state-machine.ts": {
+    "commentRatio": 0.353,
+    "commentBlock": 9
+  },
+  "modules/swap/types.ts": {
+    "fileLines": 819,
+    "commentRatio": 0.588,
+    "commentBlock": 9
+  },
+  "oracle/UnicityAggregatorProvider.ts": {
+    "commentRatio": 0.257,
+    "commentBlock": 15
+  },
+  "oracle/oracle-provider.ts": {
+    "commentRatio": 0.644,
+    "commentBlock": 13
+  },
+  "price/CoinGeckoPriceProvider.ts": {
+    "functionLines": 85,
+    "commentBlock": 7,
+    "worstFunction": "doFetch (L153)"
+  },
+  "price/index.ts": {
+    "commentRatio": 0.471
+  },
+  "price/price-provider.ts": {
+    "commentRatio": 0.714,
+    "commentBlock": 6
+  },
+  "registry/TokenRegistry.ts": {
+    "fileLines": 730,
+    "commentRatio": 0.192,
+    "commentBlock": 6
+  },
+  "registry/index.ts": {
+    "commentRatio": 0.32
+  },
+  "serialization/index.ts": {
+    "commentRatio": 0.5
+  },
+  "serialization/txf-serializer.ts": {
+    "fileLines": 679,
+    "functionLines": 179,
+    "commentBlock": 6,
+    "worstFunction": "parseTxfStorageData (L379)"
+  },
+  "serialization/types.ts": {
+    "commentRatio": 0.515
+  },
+  "serialization/wallet-dat.ts": {
+    "fileLines": 552,
+    "functionLines": 98,
+    "commentBlock": 6,
+    "worstFunction": "parseAndDecryptWalletDat (L454)"
+  },
+  "serialization/wallet-text.ts": {
+    "functionLines": 76,
+    "worstFunction": "parseWalletText (L236)"
+  },
+  "storage/storage-provider.ts": {
+    "fileLines": 490,
+    "commentRatio": 0.575,
+    "commentBlock": 23
+  },
+  "storage/whole-blob-inventory-adapter.ts": {
+    "functionLines": 57,
+    "commentRatio": 0.167,
+    "commentBlock": 23,
+    "worstFunction": "applyDelta (L166)"
+  },
+  "token-engine/SpherePaymentData.ts": {
+    "commentBlock": 13
+  },
+  "token-engine/SphereTokenEngine.ts": {
+    "fileLines": 752,
+    "functionLines": 109,
+    "commentBlock": 13,
+    "worstFunction": "split (L308)"
+  },
+  "token-engine/blob-keys.ts": {
+    "commentRatio": 0.676,
+    "commentBlock": 14
+  },
+  "token-engine/engine.ts": {
+    "commentRatio": 0.737,
+    "commentBlock": 9
+  },
+  "token-engine/errors.ts": {
+    "commentRatio": 0.653
+  },
+  "token-engine/factory.ts": {
+    "commentRatio": 0.275,
+    "commentBlock": 14
+  },
+  "token-engine/identity.ts": {
+    "commentRatio": 0.515,
+    "commentBlock": 19
+  },
+  "token-engine/index.ts": {
+    "commentRatio": 0.383,
+    "commentBlock": 10
+  },
+  "token-engine/network.ts": {
+    "commentRatio": 0.429,
+    "commentBlock": 8
+  },
+  "token-engine/realization.ts": {
+    "commentRatio": 0.694,
+    "commentBlock": 22
+  },
+  "token-engine/sdk.ts": {
+    "commentRatio": 0.247,
+    "commentBlock": 11
+  },
+  "token-engine/split-checkpoint.ts": {
+    "commentRatio": 0.185,
+    "commentBlock": 13
+  },
+  "token-engine/token-blob.ts": {
+    "commentRatio": 0.222,
+    "commentBlock": 10
+  },
+  "token-engine/types.ts": {
+    "commentRatio": 0.585,
+    "commentBlock": 14
+  },
+  "transport/MultiAddressTransportMux.ts": {
+    "fileLines": 1964,
+    "functionLines": 151,
+    "commentBlock": 13,
+    "worstFunction": "routeGiftWrap (L972)"
+  },
+  "transport/NostrTransportProvider.ts": {
+    "fileLines": 2248,
+    "functionLines": 178,
+    "commentBlock": 12,
+    "worstFunction": "subscribeToEvents (L1870)"
+  },
+  "transport/delivery-provider.ts": {
+    "commentRatio": 0.767,
+    "commentBlock": 32
+  },
+  "transport/transport-provider.ts": {
+    "fileLines": 506,
+    "commentRatio": 0.619,
+    "commentBlock": 9
+  },
+  "transport/websocket.ts": {
+    "commentRatio": 0.5
+  },
+  "tsup.config.ts": {
+    "commentRatio": 0.667,
+    "commentBlock": 6
+  },
+  "types/index.ts": {
+    "fileLines": 879,
+    "commentRatio": 0.398,
+    "commentBlock": 9
+  },
+  "types/txf.ts": {
+    "commentRatio": 0.359,
+    "commentBlock": 7
+  },
+  "types/v2-transfer.ts": {
+    "commentRatio": 0.586,
+    "commentBlock": 8
+  },
+  "validation/index.ts": {
+    "commentRatio": 0.8
+  },
+  "validation/token-validator.ts": {
+    "commentRatio": 0.279,
+    "commentBlock": 12
+  },
+  "vitest.daemon.config.ts": {
+    "commentRatio": 0.348
+  },
+  "vitest.e2e.config.ts": {
+    "commentRatio": 0.235
+  },
+  "vitest.harness.config.ts": {
+    "commentRatio": 0.48
+  },
+  "vitest.live.config.ts": {
+    "commentRatio": 0.565
+  },
+  "wallet-api/challenge.ts": {
+    "commentRatio": 0.425,
+    "commentBlock": 29
+  },
+  "wallet-api/client.ts": {
+    "fileLines": 1319,
+    "functionLines": 54,
+    "commentBlock": 28,
+    "worstFunction": "resyncOpenIntents (L1160)"
+  },
+  "wallet-api/codec.ts": {
+    "fileLines": 438,
+    "commentBlock": 10
+  },
+  "wallet-api/errors.ts": {
+    "commentRatio": 0.373,
+    "commentBlock": 7
+  },
+  "wallet-api/index.ts": {
+    "commentBlock": 7
+  },
+  "wallet-api/intent-signing.ts": {
+    "commentRatio": 0.529,
+    "commentBlock": 8
+  },
+  "wallet-api/types.ts": {
+    "fileLines": 457,
+    "commentRatio": 0.494,
+    "commentBlock": 9
+  },
+  "wallet-api/wake-supervisor.ts": {
+    "commentRatio": 0.294,
+    "commentBlock": 28
+  }
+}

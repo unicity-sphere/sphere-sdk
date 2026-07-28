@@ -45,6 +45,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Code budget (file/function size, comment density)
+        run: npm run check:budget
+
       - name: Build
         run: npm run build
 
