@@ -29,9 +29,10 @@ import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
 import type { EngineOpOptions, SphereToken, SplitParams, SplitResult, TransferParams } from '../../../token-engine';
+import { TransferConflictError } from '../../../token-engine';
 import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
-import { encodeTokenBlob } from '../../../token-engine/token-blob';
-import { bytesToHex } from '../../../core/crypto';
+import { decodeTokenBlob, encodeTokenBlob } from '../../../token-engine/token-blob';
+import { bytesToHex, hexToBytes } from '../../../core/crypto';
 import type { V2TransferPayload } from '../../../types/v2-transfer';
 
 // ── Scenario ─────────────────────────────────────────────────────────────────
@@ -220,13 +221,18 @@ function mockOracle(): OracleProvider {
   } as unknown as OracleProvider;
 }
 
-function setup(engine: FakeTokenEngine, clock: VirtualClock) {
+function setup(
+  engine: FakeTokenEngine,
+  clock: VirtualClock,
+  walletApi?: PaymentsModuleDependencies['walletApi'],
+) {
   const tokenStorageProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
   tokenStorageProviders.set('local', mockTokenStorage());
   const transport = mockTransport(clock);
   const deps: PaymentsModuleDependencies = {
     identity: mockIdentity(), storage: mockStorage(), tokenStorageProviders,
     transport, oracle: mockOracle(), emitEvent: vi.fn(), tokenEngine: engine,
+    ...(walletApi ? { walletApi } : {}),
   };
   const module = createPaymentsModule({ debug: false });
   module.initialize(deps);
@@ -235,20 +241,25 @@ function setup(engine: FakeTokenEngine, clock: VirtualClock) {
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+/** Mint ONE token of `amount` and receive it into the wallet (no latency). */
+async function seedToken(module: any, engine: FakeTokenEngine, amount: bigint, id: string): Promise<void> {
+  const minted = await engine.mint({
+    recipientPubkey: engine.getIdentity().chainPubkey,
+    value: { assets: [{ coinId: UCT, amount }] },
+  });
+  const payload: V2TransferPayload = {
+    type: 'V2_TRANSFER', version: '2.0',
+    tokenBlob: bytesToHex(encodeTokenBlob(engine.encodeToken(minted))),
+  };
+  await module.handleIncomingTransfer({
+    id, senderTransportPubkey: SENDER_TRANSPORT_PUBKEY, payload, timestamp: 0,
+  });
+}
+
 /** Mint `count` × AMOUNT_EACH tokens and receive them into the wallet (no latency). */
 async function seedWallet(module: any, engine: FakeTokenEngine, count: number): Promise<void> {
   for (let i = 0; i < count; i++) {
-    const minted = await engine.mint({
-      recipientPubkey: engine.getIdentity().chainPubkey,
-      value: { assets: [{ coinId: UCT, amount: AMOUNT_EACH }] },
-    });
-    const payload: V2TransferPayload = {
-      type: 'V2_TRANSFER', version: '2.0',
-      tokenBlob: bytesToHex(encodeTokenBlob(engine.encodeToken(minted))),
-    };
-    await module.handleIncomingTransfer({
-      id: `seed-${i}`, senderTransportPubkey: SENDER_TRANSPORT_PUBKEY, payload, timestamp: 0,
-    });
+    await seedToken(module, engine, AMOUNT_EACH, `seed-${i}`);
   }
 }
 
@@ -395,5 +406,91 @@ describe('fail-fast: a failed operation stops later batches from launching', () 
     // the failed op's source and every never-launched source are restored
     // 'confirmed' for the retry/re-plan.
     expect(t.remainingConfirmed).toBe(TOKEN_COUNT - (MAX_SEND_OPERATION_CONCURRENCY - 1));
+  });
+});
+
+// ── A direct-op conflict settling alongside a FULLY certified split must not
+// abort the intent that owns the split. Pre-fix, the disposition aborted on
+// ANY TransferConflictError; the certified split's change output — not yet
+// uploaded/stored (the throw precedes the apply) — then had no resume seed
+// (resume lists 'open' intents only). ───────────────────────────────────────
+
+/** Engine whose FIRST transfer() loses the race; every later op certifies. */
+class ConflictFirstTransferEngine extends FakeTokenEngine {
+  private conflicted = false;
+
+  override async transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken> {
+    if (!this.conflicted) {
+      this.conflicted = true;
+      throw new TransferConflictError('source state already spent by a foreign transaction');
+    }
+    return super.transfer(params, options);
+  }
+}
+
+describe('conflict + certified split keeps the intent open', () => {
+  // Neither source covers the amount alone → the plan is one direct transfer
+  // + one split, certified concurrently in the same batch.
+  const SOURCE_AMOUNTS = [3n, 5n];
+  const SEND_AMOUNT = 7n;
+
+  it('never aborts the partial intent; change survives; the remainder re-plan completes the send', async () => {
+    const clock = new VirtualClock();
+    const engine = new ConflictFirstTransferEngine();
+    const walletApi = {
+      putIntent: vi.fn().mockResolvedValue(undefined),
+      completeIntent: vi.fn().mockResolvedValue(undefined),
+      abortIntent: vi.fn().mockResolvedValue(undefined),
+      listIntents: vi.fn().mockResolvedValue([]),
+      getUploadUrls: vi.fn().mockResolvedValue([]),
+      uploadBlob: vi.fn().mockResolvedValue(undefined),
+      postHistoryRecords: vi.fn().mockResolvedValue(undefined),
+      listHistory: vi.fn().mockResolvedValue({ records: [], more: false, cursor: null, syncEpoch: 0n }),
+    };
+    const { module, transport } = setup(
+      engine, clock, walletApi as unknown as PaymentsModuleDependencies['walletApi'],
+    );
+    try {
+      for (const [i, amount] of SOURCE_AMOUNTS.entries()) {
+        await seedToken(module, engine, amount, `conflict-seed-${i}`);
+      }
+      const result = await module.send({
+        recipient: '@bob', amount: SEND_AMOUNT.toString(), coinId: UCT,
+      });
+      expect(result.status).not.toBe('failed');
+
+      // THE regression pin: the first attempt's intent owns a fully-certified
+      // split whose change output only that intent can re-derive — the
+      // conflicted direct sibling must NOT soft-abort it.
+      expect(walletApi.abortIntent).not.toHaveBeenCalled();
+
+      // Two attempts: the partial first intent stays OPEN (put, never closed);
+      // the #677 remainder re-plan runs under a NEW transferId and completes.
+      expect(walletApi.putIntent).toHaveBeenCalledTimes(2);
+      const firstIntentId = walletApi.putIntent.mock.calls[0][0];
+      const secondIntentId = walletApi.putIntent.mock.calls[1][0];
+      expect(secondIntentId).not.toBe(firstIntentId);
+      expect(walletApi.completeIntent).toHaveBeenCalledTimes(1);
+      expect(walletApi.completeIntent).toHaveBeenCalledWith(secondIntentId);
+
+      // The recipient received EXACTLY the full amount across the certified
+      // split leg + the re-planned direct leg — no leg paid twice.
+      const deliveredAmounts = await Promise.all(
+        (transport.sendTokenTransfer as any).mock.calls.map(async (call: any[]) => {
+          const token = await engine.decodeToken(decodeTokenBlob(hexToBytes(call[1].tokenBlob)));
+          return engine.balanceOf(token, UCT);
+        }),
+      );
+      expect(deliveredAmounts.reduce((a: bigint, b: bigint) => a + b, 0n)).toBe(SEND_AMOUNT);
+
+      // The split's change token survived the failed first attempt (persisted
+      // BEFORE the failure surfaced) — total held value = sources − sent.
+      const heldAmount = module.getTokens()
+        .filter((t: { status: string }) => t.status === 'confirmed')
+        .reduce((sum: bigint, t: { amount?: string }) => sum + BigInt(t.amount || '0'), 0n);
+      expect(heldAmount).toBe(SOURCE_AMOUNTS.reduce((a, b) => a + b, 0n) - SEND_AMOUNT);
+    } finally {
+      module.destroy();
+    }
   });
 });

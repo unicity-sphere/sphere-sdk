@@ -496,8 +496,9 @@ export class WalletApiClient {
    * - a thrown transient `NETWORK` failure (dropped/reset connection, DNS blip)
    *   retries on **idempotent requests** — every GET, plus a write the caller
    *   marked `idempotentWrite` (the server replays it as a no-op, so a
-   *   lost-response retry cannot double-apply; today only `inventory/apply`,
-   *   idempotent by transferId — #664). A non-idempotent write is single-attempt;
+   *   lost-response retry cannot double-apply; today `inventory/apply` —
+   *   idempotent by transferId, #664 — and `mailbox` — idempotent by
+   *   content-derived entry_id, §6). A non-idempotent write is single-attempt;
    * - a `429` response retries on **any** method (a 429 is rejected before the
    *   handler runs — the write never executed), honoring the server `Retry-After`;
    * - a `503` response retries on **idempotent requests only** (a non-idempotent
@@ -516,7 +517,7 @@ export class WalletApiClient {
     // explicitly declares it so (idempotentWrite) — i.e. the server makes a
     // re-applied request a no-op replay, so a lost-response retry cannot double
     // apply. Today that is `POST /v1/inventory/apply` (idempotent by transferId;
-    // #664).
+    // #664) and `POST /v1/mailbox` (idempotent by content-derived entry_id; §6).
     const idempotent = method === 'GET' || idempotentWrite;
     for (let attempt = 1; ; attempt += 1) {
       let res: FetchResponseLike;
@@ -706,14 +707,23 @@ export class WalletApiClient {
    */
   async depositMailbox(req: MailboxDepositRequest): Promise<string> {
     return parseDepositResult(
-      await this.requestJson('POST', '/v1/mailbox', {
-        recipientPubkey: req.recipientPubkey,
-        key: req.key,
-        transferId: req.transferId,
-        stateHash: req.stateHash,
-        tokenId: req.tokenId,
-        ...(req.memo !== undefined ? { memo: req.memo } : {}),
-      })
+      await this.requestJson(
+        'POST',
+        '/v1/mailbox',
+        {
+          recipientPubkey: req.recipientPubkey,
+          key: req.key,
+          transferId: req.transferId,
+          stateHash: req.stateHash,
+          tokenId: req.tokenId,
+          ...(req.memo !== undefined ? { memo: req.memo } : {}),
+        },
+        // Idempotent by content-derived entry_id (§6, see the doc above): an
+        // existing entry in ANY status replays to 200 with its id, so a
+        // lost-response retry / 503 retry cannot double-deposit (the 8-wide
+        // send fan-out makes 503s likelier).
+        { idempotent: true }
+      )
     );
   }
 

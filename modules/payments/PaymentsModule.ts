@@ -2168,6 +2168,17 @@ export class PaymentsModule {
           deliveredAmount: tw.amount, // #677: a direct op delivers its whole amount
         }));
         if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+          const { splitAmount, remainderAmount } = splitPlan;
+          if (splitAmount === null || remainderAmount === null) {
+            // Planner invariant (SpendQueue.calculateOptimalSplitSync):
+            // requiresSplit implies both amounts. Defaulting a null to 0n would
+            // silently construct a 0-value split — fail loudly instead; no
+            // engine op has run yet, so nothing is on-chain.
+            throw new SphereError(
+              'Split plan invariant violated: requiresSplit with null splitAmount/remainderAmount',
+              'TRANSFER_FAILED'
+            );
+          }
           operations.push({
             kind: 'split',
             // The split's opIndex follows the direct ops (stable across resume —
@@ -2177,8 +2188,8 @@ export class PaymentsModule {
             genesisId: genesisIdOf(splitPlan.tokenToSplit.uiToken),
             sourceSdkData: splitPlan.tokenToSplit.uiToken.sdkData ?? '',
             sdkToken: splitPlan.tokenToSplit.sdkToken as SphereToken,
-            deliveredAmount: splitPlan.splitAmount ?? 0n, // #677: a split op delivers only splitAmount
-            remainderAmount: splitPlan.remainderAmount ?? 0n,
+            deliveredAmount: splitAmount, // #677: a split op delivers only splitAmount
+            remainderAmount,
           });
         }
         const selfChainPubkey = hexToBytes(this.deps.identity.chainPubkey);
@@ -2207,7 +2218,7 @@ export class PaymentsModule {
                   token: op.sdkToken,
                   outputs: [
                     { recipientPubkey: recipientChainPubkey, coinId: request.coinId, amount: op.deliveredAmount, data: memoData },
-                    { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: op.remainderAmount! },
+                    { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: op.remainderAmount },
                   ],
                 },
                 {
@@ -2221,7 +2232,12 @@ export class PaymentsModule {
               changeOutput = outputs[1];
             }
           } catch (error) {
-            return { op, certified: false, error }; // never reached the chain
+            // No proof in hand — NOT necessarily "never reached the chain":
+            // for the keep-open family (isKeepOpenSendError) the submit may
+            // have been accepted and the spend may be on-chain. certified:false
+            // records only what was observed; the failure disposition keeps the
+            // intent open and resume settles the truth (#631/E.4).
+            return { op, certified: false, error };
           }
           // The source state is spent on-chain from here on — every return below
           // reports certified: true so the accounting counts it even when a
@@ -2482,15 +2498,19 @@ export class PaymentsModule {
       }
 
       // Intent disposition on failure (E.2/E.3):
-      //  - a TransferConflictError aborts (the prescribed recovery — the
-      //    caller re-plans under a NEW transferId; soft abort keeps the row);
-      //    any already-certified legs stay journaled for delivery replay and
-      //    converge via the recipient's claim handoff (§6). summarizeOutcomes
-      //    GUARANTEES that invariant: a conflict is only surfaced when every
-      //    committed leg journaled — a committed leg whose journal write failed
-      //    surfaces ITS error instead (committed>0 + non-conflict ⇒ keep-open
-      //    here), because the abort would strand the un-journaled leg (resume
-      //    skips aborted intents and nothing else re-derives it);
+      //  - a TransferConflictError with NOTHING certified aborts (the
+      //    prescribed E.2 recovery — the caller re-plans the full amount under
+      //    a NEW transferId; soft abort keeps the row);
+      //  - a conflict AFTER ≥1 certified leg keeps the intent OPEN:
+      //    the `throw primaryError` above precedes the serverApply
+      //    block, so on the wallet-api custody path a certified split's change
+      //    output is neither uploaded nor stored locally — the open intent is
+      //    its ONLY recovery seed (a deterministic re-run rebuilds it;
+      //    resyncOpenIntents lists 'open' only, so an abort would strand the
+      //    value). The certified legs' delivery converges via journal replay +
+      //    the recipient's claim handoff (§6), and send()'s #677 remainder
+      //    re-plan covers the conflicted leg under a NEW transferId. (Mirrors
+      //    the engine-level keep-open bias of the split-mint fan-out, #684.)
       //  - a PROVEN clean pre-certification failure (nothing certified) also
       //    aborts — an open intent would silently re-execute the transfer at the
       //    next sign-in after the user already saw it fail (and possibly retried
@@ -2514,7 +2534,11 @@ export class PaymentsModule {
       // rejected — the local copy is already dropped and the server row never
       // existed (an abort would only 404 and re-mark the copy abortPending).
       if (this.deps?.walletApi && !intentRejected) {
-        if (error instanceof TransferConflictError || (committedUiIds.size === 0 && !keepOpen)) {
+        // Abort ONLY a proven-clean failure with NOTHING certified. A conflict
+        // is never keep-open (isKeepOpenSendError), so the E.2 clean-conflict
+        // abort is contained in this predicate; a conflict alongside a
+        // certified leg keeps the intent open (see the disposition doc above).
+        if (committedUiIds.size === 0 && !keepOpen) {
           try {
             await this.deps.walletApi.abortIntent(result.id);
           } catch (abortErr) {
@@ -2600,7 +2624,9 @@ export class PaymentsModule {
       // certified on-chain and was journaled/delivered is NOT a plain,
       // re-sendable failure. The delivered value has irreversibly left the wallet
       // (its source is terminal 'spent' above, its blob journaled for delivery),
-      // and the intent was already soft-aborted above. Surfacing a bare
+      // and the intent stays OPEN (committed legs block the abort above) —
+      // resume converges the certified legs, including a certified split's
+      // server apply + change re-derivation. Surfacing a bare
       // TransferConflictError would make the caller re-send the FULL amount and
       // pay the delivered leg twice — so surface a DISTINCT partial outcome
       // carrying the already-committed legs and the still-owed REMAINDER. send()

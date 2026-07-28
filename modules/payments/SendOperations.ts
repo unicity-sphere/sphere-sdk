@@ -29,9 +29,7 @@ import {
  */
 export const MAX_SEND_OPERATION_CONCURRENCY = 8;
 
-/** One on-chain operation of a send: a whole-token transfer, or the at-most-one split. */
-export interface SendOperation {
-  readonly kind: 'direct' | 'split';
+interface SendOperationBase {
   /** Position in the persisted intent's op order — the stable (transferId, opIndex) resume key (§8.1). */
   readonly opIndex: number;
   readonly uiTokenId: string;
@@ -41,9 +39,22 @@ export interface SendOperation {
   readonly sdkToken: SphereToken;
   /** Value this op delivers to the recipient (#677): direct = the whole token amount, split = splitAmount only. */
   readonly deliveredAmount: bigint;
-  /** Split only: the change value minted back to this wallet. */
-  readonly remainderAmount?: bigint;
 }
+
+/** A whole-token transfer to the recipient. */
+export interface DirectSendOperation extends SendOperationBase {
+  readonly kind: 'direct';
+}
+
+/** The at-most-one split: recipient gets deliveredAmount, this wallet keeps the remainder. */
+export interface SplitSendOperation extends SendOperationBase {
+  readonly kind: 'split';
+  /** The change value minted back to this wallet. */
+  readonly remainderAmount: bigint;
+}
+
+/** One on-chain operation of a send: a whole-token transfer, or the at-most-one split. */
+export type SendOperation = DirectSendOperation | SplitSendOperation;
 
 /**
  * Settled outcome of one send operation. `certified` and `error` are
@@ -54,6 +65,11 @@ export interface SendOperation {
  */
 export interface OperationOutcome {
   readonly op: SendOperation;
+  /**
+   * True = OBSERVED certified on-chain. False only means no proof in hand —
+   * for the keep-open error family the submit may still have landed and the
+   * spend may be on-chain (#631); resume settles the truth.
+   */
   readonly certified: boolean;
   /** tryDeliver result; false = deferred, blob stays journaled (§3.1/#621). Only present when certified. */
   readonly delivered?: boolean;
@@ -112,12 +128,12 @@ export function isKeepOpenSendError(err: unknown): boolean {
  *  2. a committed op's post-step failure, when a conflict is also present —
  *     that op certified but its blob was NEVER journaled, so resume under
  *     THIS intent is the only path that re-derives it (resume skips aborted
- *     intents). Surfacing the conflict instead would trigger the conflict
- *     disposition's soft abort and strand the leg's value; committed>0 +
- *     non-conflict keeps the intent open, and resume converges every leg —
- *     it re-derives the un-journaled op and records the foreign spend (§8.1).
- *     (Sequential-era parity: the journal throw stopped the loop, so a
- *     surfaced conflict always implied every committed leg was journaled.)
+ *     intents). The disposition keeps ANY committed>0 outcome open regardless
+ *     of error type, so this precedence is defense-in-depth;
+ *     it also surfaces the actionable error (the journal failure, not the
+ *     lost race) and keeps the outcome off the #677 remainder re-plan while a
+ *     committed leg is un-journaled — resume converges every leg: it
+ *     re-derives the un-journaled op and records the foreign spend (§8.1).
  *  3. TransferConflictError — carries the #625/#677 recovery contracts;
  *  4. anything else (timeout, network, journal write).
  */
