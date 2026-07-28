@@ -1,6 +1,17 @@
 # PaymentsModule.ts — Final Executable Refactoring Plan
 
-**Target:** `/home/pavelg/unicity/sphere-sdk/modules/payments/PaymentsModule.ts` (7,027 lines, 1 class, 161 methods)
+**Target:** `modules/payments/PaymentsModule.ts` (7,027 lines, 1 class, 161 methods)
+
+> **Baseline note.** Every line number, size and method reference in this plan and in
+> [`PAYMENTS-ANALYSIS.md`](./PAYMENTS-ANALYSIS.md) was taken against `main` @ `18ffc802`, where the
+> file was 7,027 lines. `main` has since moved: **#698 (concurrent send)** and **#700 (batch
+> mailbox deposit)** landed, taking it to 7,179 and — importantly — introducing
+> `modules/payments/SendOperations.ts`, which already extracts the send *operation types* and
+> outcome summarization (`DirectSendOperation`, `SplitSendOperation`, `OperationOutcome`,
+> `summarizeOutcomes`, `isKeepOpenSendError`). **Stage 14 must be rebased onto that file rather
+> than re-derived**: it should extend `SendOperations.ts` with the `IntentExecutor` +
+> `ConflictPolicy` seam, not create a parallel one. Re-run the line-number survey before executing
+> any stage past the mechanical ones.
 **Design:** Architecture A (collaborator extraction, risk-first) with Design B's send-pipeline seam, conflict-policy parameter, and verification apparatus grafted in.
 **Status:** ready to execute. Stage 1 is runnable today.
 

@@ -27,10 +27,10 @@ thing never shown.
   prints `error.message` gains the versions with no code change.
 ### Removed — dead code in `PaymentsModule` (no behavior change)
 
-Verified-unreachable code removed from `modules/payments/PaymentsModule.ts` (7,027 → 6,862
-lines). Every item was confirmed to have no reader repo-wide before deletion; the full suite is
-green (210 files / 3,329 tests) and typecheck/lint are clean. Analysis and the staged plan for
-the rest live in [`docs/PAYMENTS-ANALYSIS.md`](docs/PAYMENTS-ANALYSIS.md) and
+Verified-unreachable code removed from `modules/payments/PaymentsModule.ts` (**7,179 → 7,025
+lines**, −154). Every item was confirmed to have no reader repo-wide before deletion; the full
+suite is green (213 files / 3,374 tests) and typecheck/lint/build are clean. Analysis and the
+staged plan for the rest live in [`docs/PAYMENTS-ANALYSIS.md`](docs/PAYMENTS-ANALYSIS.md) and
 [`docs/PAYMENTS-REFACTOR.md`](docs/PAYMENTS-REFACTOR.md).
 
 **Breaking (public surface):**
