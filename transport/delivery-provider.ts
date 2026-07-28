@@ -185,6 +185,23 @@ export interface DeliveryProvider {
   ackBatch?(claimed: string[], rejected: string[]): Promise<void>;
 
   /**
+   * Optional batch deliver (#699): hand N finished blobs to ONE recipient with a single deposit
+   * request (and one upload-urls request) instead of N — a multi-source send then costs O(1)
+   * against the backend's deposit rate limit regardless of fragmentation. Optional like
+   * {@link ackBatch}: the port must not preclude the relay transport or a future federated one,
+   * and neither has a batch primitive — callers probe and fall back to per-blob {@link deliver}.
+   *
+   * Semantically equivalent to awaiting {@link deliver} once per blob, in order:
+   * - receipts return in REQUEST order; each `deliveryId` is the content-derived entry id
+   *   (covenant §3.1-4 — NEVER the batch endpoint's server-assigned seq);
+   * - idempotent per (token, state) exactly like {@link deliver};
+   * - `options` apply to every blob (one send = one transferId/memo/senderNametag);
+   * - throws when ANY blob could not be deposited — blobs that DID land are absorbed
+   *   idempotently when the caller retries, batched or per-blob.
+   */
+  deliverBatch?(recipientPubkey: string, blobs: Uint8Array[], options: DeliverOptions): Promise<DeliveryReceipt[]>;
+
+  /**
    * Optional wake hook: `callback` fires with the {@link WakeStream} that was
    * nudged when new data may be available on it (e.g. a WS nudge — never a
    * correctness dependency, ARCHITECTURE §9). The wallet-api wake socket
