@@ -371,6 +371,137 @@ describe('send — full wallet-api preset (S2 consumer + S3 + §7 pipeline)', ()
   });
 });
 
+describe('send — batched mailbox deposit (#699)', () => {
+  it('an N-source send issues ONE depositMailboxBatch (and ONE upload-urls) carrying all entries, not N', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-699-1');
+    const N = 3;
+    const sourceIds: string[] = [];
+    for (let i = 0; i < N; i += 1) sourceIds.push(await seedServerToken(fake, sender, SENDER, 100n));
+    await sender.module.load();
+
+    const batchDeposit = vi.spyOn(sender.client, 'depositMailboxBatch');
+    const singleDeposit = vi.spyOn(sender.client, 'depositMailbox');
+    const uploadUrls = vi.spyOn(sender.client, 'getUploadUrls');
+
+    const result = await sender.module.send({ recipient: '@bob', amount: '300', coinId: UCT });
+    expect(result.status).toBe('completed');
+    expect(result.deliveryPending).toBeFalsy();
+
+    expect(batchDeposit).toHaveBeenCalledTimes(1);
+    expect(batchDeposit.mock.calls[0][0]).toHaveLength(N);
+    expect(singleDeposit).not.toHaveBeenCalled();
+    expect(uploadUrls).toHaveBeenCalledTimes(1); // no split → no change upload; delivery is the only caller
+    expect(uploadUrls.mock.calls[0][0]).toHaveLength(N);
+
+    // All N entries landed under the send's transferId; the sources' removals
+    // are evidenced by those deposits (§5.3 — deposit still precedes apply).
+    const entries = fake.listMailboxEntries(RECIPIENT.chainPubkey);
+    expect(entries).toHaveLength(N);
+    expect(new Set(entries.map((e) => e.transferId))).toEqual(new Set([result.id]));
+    for (const tokenId of sourceIds) {
+      expect(fake.getRow(SENDER.chainPubkey, tokenId)).toMatchObject({ status: 'removed', removal: 'evidenced' });
+    }
+  });
+
+  it('a single-source send stays on the plain deposit path — the batch endpoint is never touched', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-699-2');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    const batchDeposit = vi.spyOn(sender.client, 'depositMailboxBatch');
+    const singleDeposit = vi.spyOn(sender.client, 'depositMailbox');
+
+    const result = await sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT });
+    expect(result.status).toBe('completed');
+    expect(batchDeposit).not.toHaveBeenCalled();
+    expect(singleDeposit).toHaveBeenCalledTimes(1);
+  });
+
+  it('a pre-#111 deployment (batch 404) falls back to per-entry deposits; the probe is memoized', async () => {
+    const { fake, baseUrl } = await startFake();
+    fake.setMailboxBatchRoute(false);
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-699-3');
+    for (let i = 0; i < 4; i += 1) await seedServerToken(fake, sender, SENDER, 100n);
+    await sender.module.load();
+
+    const batchDeposit = vi.spyOn(sender.client, 'depositMailboxBatch');
+    const singleDeposit = vi.spyOn(sender.client, 'depositMailbox');
+
+    const first = await sender.module.send({ recipient: '@bob', amount: '200', coinId: UCT });
+    expect(first.status).toBe('completed');
+    expect(batchDeposit).toHaveBeenCalledTimes(1); // probed once → 404
+    expect(singleDeposit).toHaveBeenCalledTimes(2); // per-entry fallback landed both
+
+    const second = await sender.module.send({ recipient: '@bob', amount: '200', coinId: UCT });
+    expect(second.status).toBe('completed');
+    expect(batchDeposit).toHaveBeenCalledTimes(1); // memoized — never re-probed
+    expect(singleDeposit).toHaveBeenCalledTimes(4);
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(4);
+  });
+
+  it('a transient batch failure defers ALL legs (journaled, delivery-pending); the next load replays per entry', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-699-4');
+    const N = 3;
+    for (let i = 0; i < N; i += 1) await seedServerToken(fake, sender, SENDER, 100n);
+    await sender.module.load();
+
+    const batchDeposit = vi
+      .spyOn(sender.client, 'depositMailboxBatch')
+      .mockRejectedValue(new WalletApiError('mailbox down', 'NETWORK'));
+    const singleDeposit = vi.spyOn(sender.client, 'depositMailbox');
+
+    const result = await sender.module.send({ recipient: '@bob', amount: '300', coinId: UCT });
+    expect(result.status).not.toBe('failed');
+    expect(result.deliveryPending).toBe(true);
+    expect(result.deliveryState).toBe('pending-delivery');
+    const pendingEvents = sender.emitEvent.mock.calls.filter((c) => c[0] === 'transfer:delivery_pending');
+    expect(pendingEvents).toHaveLength(1);
+
+    // A batch failure is NOT a per-entry fallback trigger — everything stays
+    // journaled instead (the all-or-nothing endpoint may have landed none).
+    expect(singleDeposit).not.toHaveBeenCalled();
+    expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(N);
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(0);
+
+    // "Restart" with the endpoint healthy again: load()'s replay converges the
+    // journal per entry (replayOneDelivery — deliberately not batched, #699).
+    batchDeposit.mockRestore();
+    const second = createPaymentsModule({ l1: null });
+    second.initialize({ ...sender.deps });
+    cleanups.push(() => second.destroy());
+    await second.load();
+    await vi.waitFor(() => {
+      expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(N);
+    });
+    expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
+  });
+
+  it('a batch-level 409 falls back to per-entry deposits inside the provider — the send still completes', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-699-5');
+    for (let i = 0; i < 2; i += 1) await seedServerToken(fake, sender, SENDER, 100n);
+    await sender.module.load();
+
+    // The all-or-nothing endpoint 409s (one conflicted entry — the
+    // resume-rebuilt-proof case); per-entry deposits let each entry settle
+    // itself (the provider-level contract suite pins the real-conflict absorb).
+    const batchDeposit = vi
+      .spyOn(sender.client, 'depositMailboxBatch')
+      .mockRejectedValue(WalletApiError.fromStatus(409, 'entry exists with a different recipient or key'));
+    const singleDeposit = vi.spyOn(sender.client, 'depositMailbox');
+
+    const result = await sender.module.send({ recipient: '@bob', amount: '200', coinId: UCT });
+    expect(result.status).toBe('completed');
+    expect(result.deliveryPending).toBeFalsy();
+    expect(batchDeposit).toHaveBeenCalledTimes(1);
+    expect(singleDeposit).toHaveBeenCalledTimes(2);
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(2);
+  });
+});
+
 describe('incoming — claim/reject batched per page (#623)', () => {
   it('receive() of N entries issues ONE claimMailbox call carrying all ids, not N', async () => {
     const { fake, baseUrl } = await startFake();

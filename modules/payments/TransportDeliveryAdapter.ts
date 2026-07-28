@@ -22,6 +22,8 @@
  *   push subscription (`onTokenTransfer`) exactly as before — this adapter is
  *   the SEND seam, not a full mailbox. The S7 contract suite runs against
  *   real implementations, not this adapter.
+ * - `deliverBatch` is omitted like `ackBatch` (#699): the relay has no batch
+ *   primitive, so the module's delivery pass drives this adapter per blob.
  */
 
 import type {

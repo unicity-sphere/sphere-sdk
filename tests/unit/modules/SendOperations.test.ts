@@ -43,7 +43,7 @@ function splitOp(opIndex: number, splitAmount: bigint, remainderAmount: bigint):
 }
 
 function certified(op: SendOperation, extra: Partial<OperationOutcome> = {}): OperationOutcome {
-  return { op, certified: true, delivered: true, ...extra };
+  return { op, certified: true, tokenBlob: `journal-${String(op.opIndex)}`, ...extra };
 }
 
 function failed(op: SendOperation, error: unknown): OperationOutcome {
@@ -57,7 +57,6 @@ describe('summarizeOutcomes — accounting', () => {
     expect(s.conflictTagSourceId).toBeUndefined();
     expect(s.committedUiIds).toEqual(new Set(['ui-0', 'ui-1']));
     expect(s.committedAmount).toBe(50n);
-    expect(s.deliveryPending).toBe(false);
     expect(s.changeOutput).toBeNull();
     expect(s.failures).toEqual([]);
   });
@@ -65,13 +64,6 @@ describe('summarizeOutcomes — accounting', () => {
   it('committed ops are returned in plan (opIndex) order regardless of settle order', () => {
     const s = summarizeOutcomes([certified(directOp(2, 1n)), certified(directOp(0, 1n)), certified(directOp(1, 1n))]);
     expect(s.committed.map((o) => o.op.opIndex)).toEqual([0, 1, 2]);
-  });
-
-  it('a deferred delivery flips deliveryPending without failing anything (§3.1/#621)', () => {
-    const s = summarizeOutcomes([certified(directOp(0, 1n)), certified(directOp(1, 1n), { delivered: false })]);
-    expect(s.deliveryPending).toBe(true);
-    expect(s.primaryError).toBeUndefined();
-    expect(s.committedAmount).toBe(2n);
   });
 
   it('a split op contributes only splitAmount and propagates its change token (#677)', () => {

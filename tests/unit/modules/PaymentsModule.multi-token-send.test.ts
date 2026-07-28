@@ -149,7 +149,11 @@ class SimulatedNetworkEngine extends FakeTokenEngine {
   private async certify(): Promise<void> {
     await this.clock.wait(PUBLISH_RTT_MS);
     await this.clock.wait(PROOF_WAIT_MS);
+    this.certifyEndMs.push(this.clock.now());
   }
+
+  /** Virtual-clock completion time of every successful certification (#699 hoisting pin). */
+  readonly certifyEndMs: number[] = [];
 }
 
 // ── Harness (mirrors PaymentsModule.v2-send-recovery.test.ts) ────────────────
@@ -197,9 +201,9 @@ function mockTokenStorage(): TokenStorageProvider<TxfStorageDataBase> {
 }
 
 /** Transport whose delivery pays one publish round trip on the virtual clock. */
-function mockTransport(clock: VirtualClock): TransportProvider {
+function mockTransport(clock: VirtualClock, deliveryStartMs: number[] = []): TransportProvider {
   return {
-    sendTokenTransfer: vi.fn(async () => { await clock.wait(DELIVER_MS); }),
+    sendTokenTransfer: vi.fn(async () => { deliveryStartMs.push(clock.now()); await clock.wait(DELIVER_MS); }),
     onTokenTransfer: vi.fn().mockReturnValue(() => {}),
     onPaymentRequest: vi.fn().mockReturnValue(() => {}),
     onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
@@ -225,10 +229,11 @@ function setup(
   engine: FakeTokenEngine,
   clock: VirtualClock,
   walletApi?: PaymentsModuleDependencies['walletApi'],
+  deliveryStartMs: number[] = [],
 ) {
   const tokenStorageProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
   tokenStorageProviders.set('local', mockTokenStorage());
-  const transport = mockTransport(clock);
+  const transport = mockTransport(clock, deliveryStartMs);
   const deps: PaymentsModuleDependencies = {
     identity: mockIdentity(), storage: mockStorage(), tokenStorageProviders,
     transport, oracle: mockOracle(), emitEvent: vi.fn(), tokenEngine: engine,
@@ -271,13 +276,16 @@ interface SendTelemetry {
   deliveries: number;
   remainingConfirmed: number;
   virtualElapsedMs: number;
+  certifyEndMs: number[];
+  deliveryStartMs: number[];
 }
 
 async function runManyTokenSend(): Promise<SendTelemetry> {
   const clock = new VirtualClock();
   const certifications = new ConcurrencyGauge();
   const engine = new SimulatedNetworkEngine(clock, certifications);
-  const { module, transport } = setup(engine, clock);
+  const deliveryStartMs: number[] = [];
+  const { module, transport } = setup(engine, clock, undefined, deliveryStartMs);
   try {
     await seedWallet(module, engine, TOKEN_COUNT);
     const startMs = clock.now();
@@ -290,6 +298,8 @@ async function runManyTokenSend(): Promise<SendTelemetry> {
       deliveries: (transport.sendTokenTransfer as any).mock.calls.length,
       remainingConfirmed: module.getTokens().filter((t) => t.status === 'confirmed').length,
       virtualElapsedMs: clock.now() - startMs,
+      certifyEndMs: engine.certifyEndMs,
+      deliveryStartMs,
     };
   } finally {
     module.destroy();
@@ -360,10 +370,13 @@ describe(`single send() spending ${TOKEN_COUNT} source tokens`, () => {
   });
 
   it('parallel: certifications fan out at the send-operation cap', () => {
-    // CHARACTERIZATION of the batched fan-out: each batch of
-    // MAX_SEND_OPERATION_CONCURRENCY ops overlaps fully on the virtual clock
-    // (certify + deliver), and batches run back to back. The sequential-era
-    // baseline was maxConcurrent=1 at TOKEN_COUNT × 1100 = 110,000 ms.
+    // CHARACTERIZATION of the batched fan-out with the hoisted delivery pass
+    // (#699): certification batches of MAX_SEND_OPERATION_CONCURRENCY run back
+    // to back (batches × CERTIFY_MS), then the delivery pass walks the
+    // committed set at the same width (batches × DELIVER_MS on this batch-less
+    // transport port). The total is numerically the welded-era figure — the
+    // shape changed, the wall clock did not. Sequential-era baseline:
+    // maxConcurrent=1 at TOKEN_COUNT × 1100 = 110,000 ms.
     const batches = Math.ceil(TOKEN_COUNT / MAX_SEND_OPERATION_CONCURRENCY);
     const parallelTotalMs = batches * (CERTIFY_MS + DELIVER_MS);
 
@@ -376,6 +389,12 @@ describe(`single send() spending ${TOKEN_COUNT} source tokens`, () => {
         ` virtualWallClock=${formatDuration(t.virtualElapsedMs)}` +
         ` (${batches} batches; sequential-era baseline ${formatDuration(TOKEN_COUNT * (CERTIFY_MS + DELIVER_MS))})`,
     );
+  });
+
+  it('hoisted delivery (#699): no delivery starts until EVERY certification settled', () => {
+    expect(t.certifyEndMs).toHaveLength(TOKEN_COUNT);
+    expect(t.deliveryStartMs).toHaveLength(TOKEN_COUNT);
+    expect(Math.min(...t.deliveryStartMs)).toBeGreaterThanOrEqual(Math.max(...t.certifyEndMs));
   });
 });
 
@@ -393,9 +412,11 @@ describe('fail-fast: a failed operation stops later batches from launching', () 
     // when a batch fails in more than one way).
     expect((t.error as Error & { suppressedErrors?: unknown[] }).suppressedErrors).toBeUndefined();
     // Only the first batch launched (sequential-era fail-fast, at batch
-    // granularity): its siblings settled — certified + delivered — and no
-    // further batch started. Without the early exit this would be TOKEN_COUNT
-    // attempts over ceil(TOKEN_COUNT/MAX) batch round trips.
+    // granularity): its siblings settled certified, no further batch started,
+    // and the hoisted delivery pass (#699) then delivered the committed
+    // siblings — the failure path still hands certified value to the
+    // recipient. Without the early exit this would be TOKEN_COUNT attempts
+    // over ceil(TOKEN_COUNT/MAX) batch round trips.
     expect(t.certifications.count).toBe(MAX_SEND_OPERATION_CONCURRENCY);
     expect(t.deliveries).toBe(MAX_SEND_OPERATION_CONCURRENCY - 1);
     expect(t.virtualElapsedMs).toBe(CERTIFY_MS + DELIVER_MS);

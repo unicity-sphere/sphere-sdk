@@ -47,6 +47,7 @@ import {
   parseBalances,
   parseBlobUrls,
   parseClaimResult,
+  parseBatchDepositResult,
   parseDepositResult,
   parseHistoryPage,
   parseIntents,
@@ -74,6 +75,7 @@ import type {
   InventoryPage,
   KeyValueStore,
   ListPaymentRequestsParams,
+  MailboxBatchDepositResult,
   MailboxClaimResult,
   MailboxDepositRequest,
   MailboxPage,
@@ -722,6 +724,36 @@ export class WalletApiClient {
         // existing entry in ANY status replays to 200 with its id, so a
         // lost-response retry / 503 retry cannot double-deposit (the 8-wide
         // send fan-out makes 503s likelier).
+        { idempotent: true }
+      )
+    );
+  }
+
+  /**
+   * `POST /v1/mailbox/batch` — deposit a whole send's already-uploaded blobs
+   * to ONE recipient in a single request (§6/§16, #111). ALL-OR-NOTHING: any
+   * per-entry 409/422/429 fails the request with full rollback, while
+   * already-present entries succeed inside a batch, returning their stored
+   * `entryId` + `seq` (request order). Idempotent by the entries'
+   * content-derived entry_ids — a full replay returns the identical result —
+   * so NETWORK/503 retry is safe. A 404 `NOT_FOUND` means a pre-#111
+   * deployment: callers fall back to per-entry {@link depositMailbox}.
+   */
+  async depositMailboxBatch(entries: MailboxDepositRequest[]): Promise<MailboxBatchDepositResult[]> {
+    return parseBatchDepositResult(
+      await this.requestJson(
+        'POST',
+        '/v1/mailbox/batch',
+        {
+          entries: entries.map((req) => ({
+            recipientPubkey: req.recipientPubkey,
+            key: req.key,
+            transferId: req.transferId,
+            stateHash: req.stateHash,
+            tokenId: req.tokenId,
+            ...(req.memo !== undefined ? { memo: req.memo } : {}),
+          })),
+        },
         { idempotent: true }
       )
     );

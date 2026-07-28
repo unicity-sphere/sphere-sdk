@@ -61,7 +61,7 @@ import type {
   IncomingPaymentRequest as TransportPaymentRequest,
   IncomingPaymentRequestResponse as TransportPaymentRequestResponse,
 } from '../../transport';
-import type { DeliveryProvider, IncomingDelivery, WakeStream } from '../../transport/delivery-provider';
+import type { DeliverOptions, DeliveryProvider, IncomingDelivery, WakeStream } from '../../transport/delivery-provider';
 import { TransportDeliveryAdapter } from './TransportDeliveryAdapter';
 import { deriveFieldEncryptionKey, encryptField, decryptField } from '../../core/field-encryption';
 import {
@@ -2128,21 +2128,6 @@ export class PaymentsModule {
           }
         }
 
-        // Deliver a journaled finished-token blob via the delivery port (S3:
-        // the port replaced the direct relay leg; recipients are addressed by
-        // CHAIN pubkey — the canonical identity).
-        const deliverBlob = async (tokenBlob: string): Promise<void> => {
-          // Carry the sender's own CANONICAL nametag so the recipient renders
-          // "@name" instead of "Someone" — bundled with the memo in ONE
-          // recipient-addressed envelope (S6).
-          const nm = this.currentNametagName();
-          await delivery.deliver(recipientChainPubkeyHex, hexToBytes(tokenBlob), {
-            transferId: result.id,
-            memo: request.memo,
-            ...(nm !== undefined ? { senderNametag: nm } : {}),
-          });
-        };
-
         // Sources consumed by this send — the §7 step 6 apply (server path)
         // and the deferred local removals are driven from this list.
         // `sourceSdkData` = the source blob AS WE HELD IT (pre-spend). It is the single
@@ -2197,11 +2182,14 @@ export class PaymentsModule {
         }
         const selfChainPubkey = hexToBytes(this.deps.identity.chainPubkey);
 
-        // One operation: certify → journal → deliver. NEVER rejects (a mid-batch
-        // rejection would stop us observing still-in-flight siblings) and NEVER
-        // touches shared wallet state — this.tokens mutations and save() (an
-        // unlocked whole-map write) are not concurrency-safe; they belong to the
-        // sequential apply section below.
+        // One operation: certify → journal. Delivery is deliberately NOT here —
+        // it runs as one hoisted pass over the committed set below (#699), so a
+        // multi-source send can hand the whole set to the delivery port in one
+        // batched deposit. NEVER rejects (a mid-batch rejection would stop us
+        // observing still-in-flight siblings) and NEVER touches shared wallet
+        // state — this.tokens mutations and save() (an unlocked whole-map
+        // write) are not concurrency-safe; they belong to the sequential apply
+        // section below.
         const sendOperation = async (op: SendOperation): Promise<OperationOutcome> => {
           let finished: SphereToken;
           let changeOutput: SphereToken | undefined;
@@ -2246,8 +2234,9 @@ export class PaymentsModule {
           // reports certified: true so the accounting counts it even when a
           // local post-step fails.
           try {
-            // Journal the finished blob BEFORE delivery: a transport failure or a
-            // crash must not lose the recipient's token (replayed on next load()).
+            // Journal the finished blob BEFORE any delivery: the hoisted pass
+            // below (or the replay on next load()) hands it to the recipient —
+            // a delivery failure or a crash must not lose the recipient's token.
             const tokenBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(finished)));
             await this.savePendingV2Delivery({
               transferId: result.id,
@@ -2257,9 +2246,7 @@ export class PaymentsModule {
               opIndex: op.opIndex,
               createdAt: Date.now(),
             });
-            // §3.1 (#621): a delivery failure after certification must NOT fail the sender.
-            const delivered = await this.tryDeliver(() => deliverBlob(tokenBlob), tokenBlob);
-            return { op, certified: true, delivered, ...(changeOutput !== undefined ? { changeOutput } : {}) };
+            return { op, certified: true, tokenBlob, ...(changeOutput !== undefined ? { changeOutput } : {}) };
           } catch (error) {
             return { op, certified: true, error, ...(changeOutput !== undefined ? { changeOutput } : {}) };
           }
@@ -2285,7 +2272,20 @@ export class PaymentsModule {
           if (outcomes.some((o) => o.error !== undefined)) break;
         }
         summary = summarizeOutcomes(outcomes);
-        deliveryPending = summary.deliveryPending;
+
+        // ── Delivery pass, hoisted out of the certification fan-out (#699):
+        // ONE batched mailbox deposit (when the port offers deliverBatch) or a
+        // per-blob loop over the SETTLED committed set. Runs on the failure
+        // path too — committed siblings of a failed batch get their delivery
+        // attempt before the throw below, exactly as the welded per-op era
+        // delivered them. Never throws (§3.1/#621): a deferred blob stays
+        // journaled and the send resolves delivery-pending.
+        deliveryPending = !(await this.deliverCommittedBlobs(
+          summary.committed.flatMap((o) => (o.tokenBlob === undefined ? [] : [o.tokenBlob])),
+          recipientChainPubkeyHex,
+          result.id,
+          request.memo,
+        ));
 
         // ── Sequential apply — the ONLY writer of shared wallet state. Runs for
         // committed ops even when another op failed: their spend is irreversible
@@ -6855,6 +6855,88 @@ export class PaymentsModule {
         await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(filtered));
       }
     });
+  }
+
+  /**
+   * The hoisted send delivery pass (#699): hand a send's journaled committed
+   * blobs to ONE recipient — a single deliverBatch call when the port offers
+   * it and there is more than one blob, else per-blob deliver at the
+   * certification fan-out width. Returns true iff every blob was delivered
+   * (deferred blobs stay journaled). Never throws (§3.1).
+   */
+  private async deliverCommittedBlobs(
+    blobs: readonly string[],
+    recipientPubkey: string,
+    transferId: string,
+    memo?: string,
+  ): Promise<boolean> {
+    if (blobs.length === 0) return true;
+    // Carry the sender's own CANONICAL nametag so the recipient renders
+    // "@name" instead of "Someone" — bundled with the memo in ONE
+    // recipient-addressed envelope (S6). One send = one options set.
+    const nm = this.currentNametagName();
+    const options: DeliverOptions = {
+      transferId,
+      memo,
+      ...(nm !== undefined ? { senderNametag: nm } : {}),
+    };
+    // A single blob stays on the plain deliver path — byte-identical wire to
+    // the pre-batch era, and no batch probe for the dominant case.
+    if (this.delivery?.deliverBatch && blobs.length > 1) {
+      return this.tryDeliverBatch(blobs, recipientPubkey, options);
+    }
+    return this.deliverPerBlob(blobs, recipientPubkey, options);
+  }
+
+  /**
+   * Batch sibling of {@link tryDeliver}: success clears every journal entry;
+   * ANY failure keeps them ALL journaled (the deposit is idempotent by
+   * content-derived entry_id, so a replay absorbs entries that already
+   * landed). Never throws.
+   */
+  private async tryDeliverBatch(
+    blobs: readonly string[],
+    recipientPubkey: string,
+    options: DeliverOptions,
+  ): Promise<boolean> {
+    try {
+      await this.delivery!.deliverBatch!(recipientPubkey, blobs.map(hexToBytes), options);
+    } catch (err) {
+      logger.warn('Payments', 'Batch delivery deferred (all blobs kept journaled); sender not failed (§3.1):', err);
+      return false;
+    }
+    for (const tokenBlob of blobs) {
+      try {
+        await this.removePendingV2Delivery(tokenBlob);
+      } catch (err) {
+        logger.warn('Payments', 'Delivered, but journal cleanup failed (replay will re-remove):', err);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Per-blob fallback (a batch-less port, or a single blob), chunked at
+   * MAX_SEND_OPERATION_CONCURRENCY so the pass keeps the certification
+   * fan-out era's delivery width. Never throws.
+   */
+  private async deliverPerBlob(
+    blobs: readonly string[],
+    recipientPubkey: string,
+    options: DeliverOptions,
+  ): Promise<boolean> {
+    const results: boolean[] = [];
+    for (let start = 0; start < blobs.length; start += MAX_SEND_OPERATION_CONCURRENCY) {
+      const chunk = blobs.slice(start, start + MAX_SEND_OPERATION_CONCURRENCY);
+      results.push(
+        ...(await Promise.all(
+          chunk.map((tokenBlob) =>
+            this.tryDeliver(() => this.delivery!.deliver(recipientPubkey, hexToBytes(tokenBlob), options), tokenBlob),
+          ),
+        )),
+      );
+    }
+    return results.every(Boolean);
   }
 
   /**

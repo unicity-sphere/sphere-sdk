@@ -10,6 +10,7 @@ export { WalletApiClient } from './client';
 export { WalletApiError, ChallengeTemplateError } from './errors';
 export type { WalletApiErrorCode } from './errors';
 export { AUTH_CHALLENGE_PREFIX, verifyChallengeTemplate } from './challenge';
+export { MAX_MAILBOX_BATCH_ENTRIES } from './types';
 export { completeSignMessage, progressSignMessage } from './intent-signing';
 export type { ChallengeExpectation } from './challenge';
 
@@ -31,6 +32,7 @@ export type {
   ApplyDeltaRequest,
   IntentRecord,
   MailboxDepositRequest,
+  MailboxBatchDepositResult,
   MailboxEntry,
   MailboxEntryStatus,
   MailboxPage,

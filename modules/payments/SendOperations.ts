@@ -3,10 +3,12 @@
  *
  * One send() fans out into N independent on-chain operations (0–N whole-token
  * transfers + at most one split, ARCHITECTURE §7). PaymentsModule certifies
- * them concurrently (bounded batches) and reduces the SETTLED outcomes here:
- * committed accounting plus the one error to surface. Everything in this file
- * is pure data + pure functions — no I/O, no wallet state — so the money-
- * critical failure semantics (#625/#677/#631) are table-testable in isolation
+ * them concurrently (bounded batches) — each op certifies and JOURNALS its
+ * recipient blob; delivery is a separate hoisted pass over the committed set
+ * (#699) — and reduces the SETTLED outcomes here: committed accounting plus
+ * the one error to surface. Everything in this file is pure data + pure
+ * functions — no I/O, no wallet state — so the money-critical failure
+ * semantics (#625/#677/#631) are table-testable in isolation
  * (tests/unit/modules/SendOperations.test.ts).
  */
 
@@ -71,8 +73,12 @@ export interface OperationOutcome {
    * spend may be on-chain (#631); resume settles the truth.
    */
   readonly certified: boolean;
-  /** tryDeliver result; false = deferred, blob stays journaled (§3.1/#621). Only present when certified. */
-  readonly delivered?: boolean;
+  /**
+   * Hex TokenBlob journaled for the recipient — present iff certified AND the
+   * journal write succeeded. Input to the hoisted delivery pass (#699); absent
+   * on a certified outcome ⇔ the blob was never journaled (resume re-derives).
+   */
+  readonly tokenBlob?: string;
   /** Split only: the change token minted back to this wallet (present once certified). */
   readonly changeOutput?: SphereToken;
   readonly error?: unknown;
@@ -90,8 +96,6 @@ export interface SendOutcomeSummary {
   readonly committedUiIds: Set<string>;
   /** Σ deliveredAmount over committed ops (#677). */
   readonly committedAmount: bigint;
-  /** True when any committed op's delivery was deferred (§3.1/#621). */
-  readonly deliveryPending: boolean;
   readonly changeOutput: SphereToken | null;
   /**
    * Every settled failure in plan (opIndex) order — certified-with-error ops
@@ -148,7 +152,6 @@ export function summarizeOutcomes(outcomes: readonly OperationOutcome[]): SendOu
     committed,
     committedUiIds: new Set(committed.map((o) => o.op.uiTokenId)),
     committedAmount: committed.reduce((sum, o) => sum + o.op.deliveredAmount, 0n),
-    deliveryPending: committed.some((o) => o.delivered === false),
     changeOutput: committed.find((o) => o.changeOutput !== undefined)?.changeOutput ?? null,
     failures,
   };
