@@ -631,10 +631,6 @@ const { valid, invalid } = await sphere.payments.validate();
 
 Get sorted transaction history (L3 transfers).
 
-#### `getPendingTransfers(): TransferResult[]`
-
-Get transfers that are still in progress.
-
 #### `load(): Promise<void>`
 
 Load all token data from storage providers. Also performs v2 recovery work:

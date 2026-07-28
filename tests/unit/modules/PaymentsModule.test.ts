@@ -938,7 +938,7 @@ describe('Nametag preservation during sync', () => {
     expect(module.getNametag()?.name).toBe('updateduser');
   });
 
-  it('should recover nametags from storage via reloadNametagsFromStorage', async () => {
+  it('should recover nametags from storage on load()', async () => {
     const mockProvider = {
       id: 'test-provider',
       name: 'Test Provider',

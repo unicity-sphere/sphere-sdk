@@ -570,16 +570,6 @@ for (const entry of history) {
 }
 ```
 
-### Pending Transfers
-
-```typescript
-// Get transfers that are still in progress
-const pending = sphere.payments.getPendingTransfers();
-for (const transfer of pending) {
-  console.log(`${transfer.id}: ${transfer.status}`);
-}
-```
-
 ### Peer Resolution
 
 ```typescript
