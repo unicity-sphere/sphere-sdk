@@ -46,8 +46,9 @@ import {
   encryptDeliveryBundle,
   decryptDeliveryBundle,
 } from '../../../core/delivery-envelope';
-import { WalletApiClient, WalletApiError } from '../../../wallet-api';
+import { WalletApiClient, WalletApiError, MAX_MAILBOX_BATCH_ENTRIES } from '../../../wallet-api';
 import type { KeyValueStore, MailboxDepositRequest, MailboxEntry } from '../../../wallet-api';
+import { MAX_SEND_OPERATION_CONCURRENCY } from '../../../modules/payments/SendOperations';
 import { logger } from '../../../core/logger';
 
 export interface WalletApiMailboxProviderConfig {
@@ -234,8 +235,9 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
 
   /**
    * Batch deliver (S7 #699): one send's committed blobs to ONE recipient —
-   * one `getUploadUrls` call, N content-addressed PUTs, one
-   * `POST /v1/mailbox/batch`. Receipts in request order. Fallbacks:
+   * one `getUploadUrls` call, N content-addressed PUTs (width-capped like
+   * every send fan-out), deposits chunked at the §16 entry cap. Receipts in
+   * request order. Fallbacks:
    * - `404 NOT_FOUND` = a pre-#111 deployment — remembered per provider
    *   instance, then (and on every later call) per-entry deposits over the
    *   SAME already-uploaded keys;
@@ -243,8 +245,12 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
    *   resume-rebuilt-proof case) — per-entry deposits let that one entry
    *   absorb its own 409 idempotently (the S7 rule in {@link depositEntry})
    *   while its siblings land;
+   * - `422` = the all-or-nothing batch failed validation on one entry —
+   *   per-entry deposits land the valid siblings; the bad entry throws its
+   *   own 422 and stays journaled;
    * - anything else (network, 429, 5xx) rethrows — the caller's journal
-   *   replay converges per entry.
+   *   replay converges per entry. A 429 deliberately never falls back:
+   *   per-entry deposits against a rate limiter would multiply requests.
    */
   async deliverBatch(recipientPubkey: string, blobs: Uint8Array[], options: DeliverOptions): Promise<DeliveryReceipt[]> {
     if (blobs.length === 0) return [];
@@ -310,8 +316,12 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
       }
       return { p, upload };
     });
-    // 412 = already present = success (§5.2)
-    await Promise.all(uploads.map(async ({ p, upload }) => this.client.uploadBlob(upload.putUrl, p.wire)));
+    // 412 = already present = success (§5.2). PUTs run at the same width as
+    // every other wallet-api send fan-out (certification, per-blob delivery).
+    for (let start = 0; start < uploads.length; start += MAX_SEND_OPERATION_CONCURRENCY) {
+      const batch = uploads.slice(start, start + MAX_SEND_OPERATION_CONCURRENCY);
+      await Promise.all(batch.map(async ({ p, upload }) => this.client.uploadBlob(upload.putUrl, p.wire)));
+    }
     return new Map(uploads.map(({ p, upload }) => [p.sha, upload.key]));
   }
 
@@ -368,8 +378,22 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
     return { deliveryId };
   }
 
-  /** One batch deposit, falling back to per-entry on 404 (memoized) or 409 — see {@link deliverBatch}. */
+  /** Batch deposit, chunked at the §16 entry cap; receipts in request order — see {@link depositChunk}. */
   private async depositBatch(entries: MailboxDepositRequest[], deliveryIds: string[]): Promise<DeliveryReceipt[]> {
+    const receipts: DeliveryReceipt[] = [];
+    for (let start = 0; start < entries.length; start += MAX_MAILBOX_BATCH_ENTRIES) {
+      receipts.push(
+        ...(await this.depositChunk(
+          entries.slice(start, start + MAX_MAILBOX_BATCH_ENTRIES),
+          deliveryIds.slice(start, start + MAX_MAILBOX_BATCH_ENTRIES)
+        ))
+      );
+    }
+    return receipts;
+  }
+
+  /** One batch deposit, falling back to per-entry on 404 (memoized), 409 or 422 — see {@link deliverBatch}. */
+  private async depositChunk(entries: MailboxDepositRequest[], deliveryIds: string[]): Promise<DeliveryReceipt[]> {
     if (!this.batchDepositUnsupported) {
       try {
         const results = await this.client.depositMailboxBatch(entries);
@@ -395,7 +419,7 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
           // pre-#111 deployment — remember and stop re-probing on this instance
           this.batchDepositUnsupported = true;
           logger.warn(TAG, 'POST /v1/mailbox/batch not deployed — falling back to per-entry deposits');
-        } else if (!(err instanceof WalletApiError && err.status === 409)) {
+        } else if (!(err instanceof WalletApiError && (err.status === 409 || err.status === 422))) {
           throw err;
         }
       }

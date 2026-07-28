@@ -14,7 +14,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { FakeWalletApi } from '../support/fake-wallet-api';
 import { MemoryKeyValueStore, makeTestToken, testIdentity, fakeDeliveryKeys } from '../support/wallet-api-test-helpers';
-import { WalletApiClient } from '../../wallet-api';
+import { WalletApiClient, WalletApiError, MAX_MAILBOX_BATCH_ENTRIES } from '../../wallet-api';
+import { MAX_SEND_OPERATION_CONCURRENCY } from '../../modules/payments/SendOperations';
 import { WalletApiMailboxProvider } from '../../impl/shared/wallet-api';
 import type { DeliveryCustody, IncomingDelivery } from '../../transport/delivery-provider';
 import { FIELD_ENVELOPE_PREFIX } from '../../core/field-encryption';
@@ -342,6 +343,14 @@ describe('WalletApiMailboxProvider — provider-specific semantics', () => {
       return Array.from({ length: n }, () => h.makeBlob());
     }
 
+    /** The covenant §3.1-4 content-derived id: `hex(SHA-256(tokenId ‖ stateHash))`. */
+    function contentId(b: { tokenId: string; stateHash: string }): string {
+      return hex(sha256(Uint8Array.from([
+        ...Buffer.from(b.tokenId, 'hex'),
+        ...Buffer.from(b.stateHash, 'hex'),
+      ])));
+    }
+
     it('N blobs → ONE upload-urls call, ONE batch deposit, ZERO single deposits; receipts in order', async () => {
       const client = h.sender.walletApiClient;
       const uploadUrls = vi.spyOn(client, 'getUploadUrls');
@@ -360,12 +369,7 @@ describe('WalletApiMailboxProvider — provider-specific semantics', () => {
       expect(singleDeposit).not.toHaveBeenCalled();
 
       // request order, content-derived ids (covenant §3.1-4)
-      expect(receipts.map((r) => r.deliveryId)).toEqual(
-        blobs.map((b) => hex(sha256(Uint8Array.from([
-          ...Buffer.from(b.tokenId, 'hex'),
-          ...Buffer.from(b.stateHash, 'hex'),
-        ])))),
-      );
+      expect(receipts.map((r) => r.deliveryId)).toEqual(blobs.map(contentId));
       for (const r of receipts) {
         expect(h.fake.getMailboxEntry(h.recipientPubkey, r.deliveryId)).toMatchObject({ status: 'unclaimed' });
       }
@@ -432,11 +436,103 @@ describe('WalletApiMailboxProvider — provider-specific semantics', () => {
 
     it('a backend returning non-content-derived ids is a PROTOCOL violation (covenant §3.1-4)', async () => {
       const client = h.sender.walletApiClient;
-      vi.spyOn(client, 'depositMailboxBatch').mockResolvedValue([{ entryId: 'f'.repeat(64), seq: 1n }]);
-      const blob = h.makeBlob();
+      const blobs = makeBlobs(2);
+      // Correct count, correct FIRST id — only the second id is wrong, so the
+      // per-entry check (not the length guard) must be what catches it.
+      vi.spyOn(client, 'depositMailboxBatch').mockResolvedValue([
+        { entryId: contentId(blobs[0]), seq: 1n },
+        { entryId: 'f'.repeat(64), seq: 2n },
+      ]);
       await expect(
-        h.sender.deliverBatch(h.recipientPubkey, [blob.bytes, blob.bytes], { transferId: 'tf-b5' }),
+        h.sender.deliverBatch(h.recipientPubkey, blobs.map((b) => b.bytes), { transferId: 'tf-b5' }),
       ).rejects.toMatchObject({ code: 'PROTOCOL' });
+    });
+
+    it('a backend returning the wrong result count is a PROTOCOL violation (covenant §3.1-4)', async () => {
+      const client = h.sender.walletApiClient;
+      const blobs = makeBlobs(2);
+      vi.spyOn(client, 'depositMailboxBatch').mockResolvedValue([
+        { entryId: contentId(blobs[0]), seq: 1n },
+      ]);
+      await expect(
+        h.sender.deliverBatch(h.recipientPubkey, blobs.map((b) => b.bytes), { transferId: 'tf-b5c' }),
+      ).rejects.toMatchObject({ code: 'PROTOCOL' });
+    });
+
+    it('caps concurrent blob PUTs at MAX_SEND_OPERATION_CONCURRENCY', async () => {
+      const client = h.sender.walletApiClient;
+      const realUpload = client.uploadBlob.bind(client);
+      let inflight = 0;
+      let maxInflight = 0;
+      vi.spyOn(client, 'uploadBlob').mockImplementation(async (putUrl, bytes) => {
+        inflight += 1;
+        maxInflight = Math.max(maxInflight, inflight);
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          return await realUpload(putUrl, bytes);
+        } finally {
+          inflight -= 1;
+        }
+      });
+
+      const blobs = makeBlobs(MAX_SEND_OPERATION_CONCURRENCY * 2 + 4);
+      const receipts = await h.sender.deliverBatch(h.recipientPubkey, blobs.map((b) => b.bytes), {
+        transferId: 'tf-b7',
+      });
+      expect(receipts).toHaveLength(blobs.length);
+      expect(maxInflight).toBe(MAX_SEND_OPERATION_CONCURRENCY);
+    });
+
+    it('deposits above MAX_MAILBOX_BATCH_ENTRIES are chunked; receipts stay in request order', async () => {
+      const client = h.sender.walletApiClient;
+      vi.spyOn(client, 'uploadBlob').mockResolvedValue(undefined);
+      const batchDeposit = vi
+        .spyOn(client, 'depositMailboxBatch')
+        .mockImplementation(async (entries) =>
+          entries.map((e, i) => ({ entryId: contentId(e), seq: BigInt(i + 1) }))
+        );
+
+      const blobs = makeBlobs(MAX_MAILBOX_BATCH_ENTRIES + 1);
+      const receipts = await h.sender.deliverBatch(h.recipientPubkey, blobs.map((b) => b.bytes), {
+        transferId: 'tf-b8',
+      });
+
+      expect(batchDeposit).toHaveBeenCalledTimes(2);
+      expect(batchDeposit.mock.calls[0][0]).toHaveLength(MAX_MAILBOX_BATCH_ENTRIES);
+      expect(batchDeposit.mock.calls[1][0]).toHaveLength(1);
+      expect(receipts.map((r) => r.deliveryId)).toEqual(blobs.map(contentId));
+    });
+
+    it('a batch 422 falls back per-entry so one bad entry cannot sink valid siblings', async () => {
+      const client = h.sender.walletApiClient;
+      vi.spyOn(client, 'depositMailboxBatch').mockRejectedValue(
+        WalletApiError.fromStatus(422, 'one bad entry')
+      );
+      const singleDeposit = vi.spyOn(client, 'depositMailbox');
+
+      const blobs = makeBlobs(2);
+      const receipts = await h.sender.deliverBatch(h.recipientPubkey, blobs.map((b) => b.bytes), {
+        transferId: 'tf-b9',
+      });
+      expect(singleDeposit).toHaveBeenCalledTimes(2);
+      expect(receipts.map((r) => r.deliveryId)).toEqual(blobs.map(contentId));
+      for (const r of receipts) {
+        expect(h.fake.getMailboxEntry(h.recipientPubkey, r.deliveryId)).toMatchObject({ status: 'unclaimed' });
+      }
+    });
+
+    it('a batch 429 rethrows — never a per-entry fallback against a rate limiter', async () => {
+      const client = h.sender.walletApiClient;
+      vi.spyOn(client, 'depositMailboxBatch').mockRejectedValue(
+        WalletApiError.fromStatus(429, 'rate limited')
+      );
+      const singleDeposit = vi.spyOn(client, 'depositMailbox');
+
+      const blobs = makeBlobs(2);
+      await expect(
+        h.sender.deliverBatch(h.recipientPubkey, blobs.map((b) => b.bytes), { transferId: 'tf-b10' }),
+      ).rejects.toMatchObject({ status: 429 });
+      expect(singleDeposit).not.toHaveBeenCalled();
     });
 
     it('an empty batch resolves to [] without touching the network', async () => {

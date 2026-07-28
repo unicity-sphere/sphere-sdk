@@ -231,6 +231,13 @@ export interface MailboxDepositRequest {
 }
 
 /**
+ * The §16 batch-deposit entry cap: `POST /v1/mailbox/batch` 422s above 1000
+ * entries. Callers chunk at this bound so a legal send of any size never
+ * emits a request the backend rejects outright.
+ */
+export const MAX_MAILBOX_BATCH_ENTRIES = 1000;
+
+/**
  * One `POST /v1/mailbox/batch` result (§6/§16, #111): the content-derived
  * entry id plus the entry's per-recipient seq (newly on the wire — the single
  * deposit returns `{ entryId }` only), in request order. `seq` is data, never
