@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed — IPFS/IPNS token sync
+
+Sphere syncs tokens through wallet-api. The IPFS rail was opt-in
+(`tokenSync.ipfs.enabled`), off by default, and is gone: **-8,608 lines** across 42 files.
+
+**Breaking:**
+
+- The **`./impl/browser/ipfs` export subpath** is removed, along with
+  `IpfsStorageProvider`, `createBrowserIpfsStorageProvider`, `createNodeIpfsStorageProvider`
+  and every IPNS helper.
+- **`tokenSync` is removed** from `createBrowserProviders` / `createNodeProviders`, as are
+  `IpfsSyncConfig`, `NodeIpfsSyncConfig`, `NodeTokenSyncConfig`, `TokenSyncConfig` and the
+  `ipfsTokenStorage` field on the returned providers. Its other backends (`file`, `cloud`,
+  `mongodb`) were declared but never implemented and went with it.
+- **Constants** `DEFAULT_IPFS_GATEWAYS`, `DEFAULT_IPFS_BOOTSTRAP_PEERS`, `UNICITY_IPFS_NODES`,
+  `getIpfsGatewayUrls`, and `NetworkConfig.ipfsGateways`.
+- **Dead config types** removed from the public surface (they reach consumers via
+  `export * from './types'` but describe a constructor config `Sphere` does not accept, and had
+  zero users): `SphereConfig`, `StorageProviderConfig`, `TransportProviderConfig`,
+  `AggregatorProviderConfig`, `LoggingConfig`.
+- **Dependencies dropped:** `ipns`, `multiformats`, `@libp2p/crypto`, `@libp2p/peer-id`
+  (peer + optional + peerDependenciesMeta), and `@libp2p/bootstrap`, `@libp2p/interface` from
+  devDependencies. The SDK's only remaining peer dependency is `ws`.
+
+**Unchanged:** `TokenStorageProvider` stays a swappable interface with a shared contract suite —
+only the IPFS implementation of it is gone. Nostr is untouched here; it remains the rail for
+identity bindings, DMs and group chat. `sphere.payments.sync()` and the multi-provider merge
+methods still exist and work against any storage implementation.
+
+**Deferred:** `Identity.ipnsName` stays. It is a required field of the persisted TXF `_meta`
+(`types/txf.ts`), so removing it is a storage-format change and gets its own PR.
+
+One integration test was deleted rather than re-pointed: `tests/integration/history-sync.test.ts`
+existed to drive `mergeTxfData` through a mock IPFS provider. Its non-IPFS property — history
+read back from persisted TXF — remains covered by
+`PaymentsModule.history-sync.test.ts` ("should import `_history` entries from loaded TXF data")
+and `PaymentsModule.history.test.ts` ("should migrate legacy KV history to new store on load").
+No test was weakened.
+
 ### Changed — compatibility-gate refusals now name the versions
 
 A rejected handshake said `SDK version below the required minimum` and stopped there. The

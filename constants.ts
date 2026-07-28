@@ -293,45 +293,6 @@ export const DEFAULT_AGGREGATOR_TIMEOUT = 30000;
 
 
 // =============================================================================
-// IPFS Defaults
-// =============================================================================
-
-/** Default IPFS gateways */
-export const DEFAULT_IPFS_GATEWAYS = [
-  'https://unicity-ipfs1.dyndns.org',
-] as const;
-
-/** Unicity IPFS bootstrap peers */
-export const DEFAULT_IPFS_BOOTSTRAP_PEERS = [
-  '/dns4/unicity-ipfs2.dyndns.org/tcp/4001/p2p/12D3KooWLNi5NDPPHbrfJakAQqwBqymYTTwMQXQKEWuCrJNDdmfh',
-  '/dns4/unicity-ipfs3.dyndns.org/tcp/4001/p2p/12D3KooWQ4aujVE4ShLjdusNZBdffq3TbzrwT2DuWZY9H1Gxhwn6',
-  '/dns4/unicity-ipfs4.dyndns.org/tcp/4001/p2p/12D3KooWJ1ByPfUzUrpYvgxKU8NZrR8i6PU1tUgMEbQX9Hh2DEn1',
-  '/dns4/unicity-ipfs5.dyndns.org/tcp/4001/p2p/12D3KooWB1MdZZGHN5B8TvWXntbycfe7Cjcz7n6eZ9eykZadvmDv',
-] as const;
-
-/** Unicity dedicated IPFS nodes (HTTP API access) */
-export const UNICITY_IPFS_NODES = [
-  {
-    host: 'unicity-ipfs1.dyndns.org',
-    peerId: '12D3KooWDKJqEMAhH4nsSSiKtK1VLcas5coUqSPZAfbWbZpxtL4u',
-    httpPort: 9080,
-    httpsPort: 443,
-  },
-] as const;
-
-/**
- * Get IPFS gateway URLs for HTTP API access.
- * @param isSecure - Use HTTPS (default: true). Set false for development.
- */
-export function getIpfsGatewayUrls(isSecure?: boolean): string[] {
-  return UNICITY_IPFS_NODES.map((node) =>
-    isSecure !== false
-      ? `https://${node.host}`
-      : `http://${node.host}:${node.httpPort}`,
-  );
-}
-
-// =============================================================================
 // Wallet Defaults
 // =============================================================================
 
@@ -382,7 +343,6 @@ export interface NetworkConfig {
   readonly name: string;
   readonly aggregatorUrl: string;
   readonly nostrRelays: readonly string[];
-  readonly ipfsGateways: readonly string[];
   readonly groupRelays: readonly string[];
   readonly tokenRegistryUrl: string;
   /** Canonical numeric network id (= RootTrustBase.networkId; testnet2 = 4).
@@ -396,7 +356,6 @@ export const NETWORKS = {
     name: 'Mainnet',
     aggregatorUrl: DEFAULT_AGGREGATOR_URL,
     nostrRelays: DEFAULT_NOSTR_RELAYS,
-    ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
@@ -409,7 +368,6 @@ export const NETWORKS = {
     // v2 state-transition gateway (networkId 4 comes from the trust base). apiKey is env-injected.
     aggregatorUrl: 'https://gateway.testnet2.unicity.network',
     nostrRelays: TEST_NOSTR_RELAYS, // reuse testnet infra (shared relays/ipfs)
-    ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
@@ -420,7 +378,6 @@ export const NETWORKS = {
     // v2 state-transition gateway (networkId 4 comes from the trust base). apiKey is env-injected.
     aggregatorUrl: 'https://gateway.testnet2.unicity.network',
     nostrRelays: TEST_NOSTR_RELAYS, // reuse testnet infra (shared relays/ipfs)
-    ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
@@ -432,7 +389,6 @@ export const NETWORKS = {
     name: 'Development',
     aggregatorUrl: DEV_AGGREGATOR_URL,
     nostrRelays: TEST_NOSTR_RELAYS,
-    ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },

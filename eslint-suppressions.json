@@ -320,16 +320,6 @@
       "count": 1
     }
   },
-  "impl/browser/ipfs.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    }
-  },
-  "impl/browser/ipfs/index.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    }
-  },
   "impl/browser/oracle/index.ts": {
     "budget/comment-ratio": {
       "count": 1
@@ -354,20 +344,7 @@
       "count": 2
     }
   },
-  "impl/browser/storage/IpfsStorageProvider.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
-    "budget/no-long-comment-block": {
-      "count": 1
-    }
-  },
   "impl/browser/storage/LocalStorageProvider.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    }
-  },
-  "impl/browser/storage/index.ts": {
     "budget/comment-ratio": {
       "count": 1
     }
@@ -404,11 +381,6 @@
       "count": 1
     }
   },
-  "impl/nodejs/ipfs/index.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    }
-  },
   "impl/nodejs/oracle/index.ts": {
     "budget/comment-ratio": {
       "count": 1
@@ -439,102 +411,6 @@
   },
   "impl/shared/index.ts": {
     "budget/comment-ratio": {
-      "count": 1
-    }
-  },
-  "impl/shared/ipfs/index.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    }
-  },
-  "impl/shared/ipfs/ipfs-cache.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    }
-  },
-  "impl/shared/ipfs/ipfs-error-types.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
-    "budget/no-long-comment-block": {
-      "count": 1
-    }
-  },
-  "impl/shared/ipfs/ipfs-http-client.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
-    "max-lines-per-function": {
-      "count": 2
-    }
-  },
-  "impl/shared/ipfs/ipfs-state-persistence.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    }
-  },
-  "impl/shared/ipfs/ipfs-storage-provider.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
-    "budget/no-long-comment-block": {
-      "count": 1
-    },
-    "complexity": {
-      "count": 3
-    },
-    "max-lines": {
-      "count": 1
-    },
-    "max-lines-per-function": {
-      "count": 5
-    }
-  },
-  "impl/shared/ipfs/ipfs-types.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    }
-  },
-  "impl/shared/ipfs/ipns-key-derivation.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
-    "budget/no-long-comment-block": {
-      "count": 1
-    }
-  },
-  "impl/shared/ipfs/ipns-record-manager.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    }
-  },
-  "impl/shared/ipfs/ipns-subscription-client.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
-    "budget/no-long-comment-block": {
-      "count": 1
-    },
-    "max-lines-per-function": {
-      "count": 1
-    }
-  },
-  "impl/shared/ipfs/txf-merge.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
-    "complexity": {
-      "count": 1
-    },
-    "max-lines-per-function": {
-      "count": 1
-    }
-  },
-  "impl/shared/ipfs/write-behind-buffer.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
-    "budget/no-long-comment-block": {
       "count": 1
     }
   },

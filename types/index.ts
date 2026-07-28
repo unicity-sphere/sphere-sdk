@@ -669,52 +669,6 @@ export type SphereEventHandler<T extends SphereEventType> = (
 ) => void;
 
 // =============================================================================
-// Configuration Types
-// =============================================================================
-
-export interface SphereConfig {
-  identity: IdentityConfig;
-  storage?: StorageProviderConfig;
-  transport?: TransportProviderConfig;
-  aggregator?: AggregatorProviderConfig;
-  logging?: LoggingConfig;
-}
-
-export interface StorageProviderConfig {
-  type: 'local' | 'ipfs' | 'hybrid';
-  prefix?: string;
-  // IPFS specific
-  gateways?: string[];
-  bootstrapPeers?: string[];
-  enableIpns?: boolean;
-}
-
-export interface TransportProviderConfig {
-  type: 'nostr';
-  relays?: string[];
-  timeout?: number;
-  autoReconnect?: boolean;
-}
-
-/**
- * Aggregator (oracle) provider configuration
- * The aggregator provides verifiable truth about token state through inclusion proofs
- */
-export interface AggregatorProviderConfig {
-  /** Aggregator/oracle URL endpoint */
-  url: string;
-  /** Request timeout in ms */
-  timeout?: number;
-  /** Skip proof verification (for testing only) */
-  skipVerification?: boolean;
-}
-
-export interface LoggingConfig {
-  level: 'debug' | 'info' | 'warn' | 'error' | 'silent';
-  logger?: (level: string, message: string, data?: unknown) => void;
-}
-
-// =============================================================================
 // Error Types (canonical source: core/errors.ts)
 // =============================================================================
 

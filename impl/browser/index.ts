@@ -35,7 +35,6 @@ import { assertNetworkConsistency } from '../shared/network';
 import { createIndexedDBStorageProvider, type IndexedDBStorageProviderConfig, createIndexedDBTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
-import { createBrowserIpfsStorageProvider } from './ipfs';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
@@ -80,86 +79,6 @@ export type OracleConfig = BaseOracleConfig;
 // Token Sync Backend Configurations
 // =============================================================================
 
-/**
- * IPFS sync backend configuration
- */
-export interface IpfsSyncConfig {
-  /** Enable IPFS sync (default: false) */
-  enabled?: boolean;
-  /** Replace default gateways entirely */
-  gateways?: string[];
-  /** Add gateways to network defaults */
-  additionalGateways?: string[];
-  /** Replace default bootstrap peers */
-  bootstrapPeers?: string[];
-  /** Add bootstrap peers to defaults */
-  additionalBootstrapPeers?: string[];
-  /** Use browser DHT (Helia) vs HTTP-only mode */
-  useDht?: boolean;
-}
-
-/**
- * File sync backend configuration (future)
- */
-export interface FileSyncConfig {
-  /** Enable file sync (default: false) */
-  enabled?: boolean;
-  /** Directory path for token files */
-  directory?: string;
-  /** File format: 'json' | 'txf' */
-  format?: 'json' | 'txf';
-}
-
-/**
- * Cloud sync backend configuration (future)
- */
-export interface CloudSyncConfig {
-  /** Enable cloud sync (default: false) */
-  enabled?: boolean;
-  /** Cloud provider */
-  provider?: 'aws' | 'gcp' | 'azure' | 'custom';
-  /** Bucket/container name */
-  bucket?: string;
-  /** API endpoint (for custom provider) */
-  endpoint?: string;
-  /** API key or credentials */
-  apiKey?: string;
-}
-
-/**
- * MongoDB sync backend configuration
- */
-export interface MongoDbSyncConfig {
-  /** Enable MongoDB sync (default: false) */
-  enabled?: boolean;
-  /** MongoDB connection URI */
-  uri?: string;
-  /** Database name */
-  database?: string;
-  /** Collection name (default: 'tokens') */
-  collection?: string;
-  /** Enable authentication */
-  authEnabled?: boolean;
-  /** Username (if authEnabled) */
-  username?: string;
-  /** Password (if authEnabled) */
-  password?: string;
-}
-
-/**
- * Token sync configuration - supports multiple backends
- */
-export interface TokenSyncConfig {
-  /** IPFS sync backend */
-  ipfs?: IpfsSyncConfig;
-  /** File sync backend (future) */
-  file?: FileSyncConfig;
-  /** Cloud sync backend (future) */
-  cloud?: CloudSyncConfig;
-  /** MongoDB sync backend */
-  mongodb?: MongoDbSyncConfig;
-}
-
 // =============================================================================
 // Browser Providers Configuration
 // =============================================================================
@@ -180,7 +99,6 @@ export interface BrowserProvidersConfig {
    * Supports multiple backends: IPFS, file, cloud (future)
    * Each backend can be enabled/disabled independently
    */
-  tokenSync?: TokenSyncConfig;
   /** Price provider configuration (optional — enables fiat value display) */
   price?: BasePriceConfig;
   /** Group chat (NIP-29) configuration. true = enable with defaults, object = custom config */
@@ -197,121 +115,15 @@ export interface BrowserProviders {
   tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
-  /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
-  ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Group chat config (resolved, for passing to Sphere.init) */
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module config (resolved, for passing to Sphere.init) */
   market?: MarketModuleConfig | boolean;
-  /**
-   * Token sync configuration (resolved from tokenSync options)
-   * For advanced use cases when additional sync backends are needed
-   * @deprecated Use tokenStorage provider instead. For custom sync backends,
-   * use Sphere.addTokenStorageProvider() after initialization.
-   */
-  tokenSyncConfig?: {
-    ipfs?: {
-      enabled: boolean;
-      gateways: string[];
-      bootstrapPeers?: string[];
-      useDht?: boolean;
-    };
-    file?: {
-      enabled: boolean;
-      directory?: string;
-      format?: 'json' | 'txf';
-    };
-    cloud?: {
-      enabled: boolean;
-      provider?: string;
-      bucket?: string;
-      endpoint?: string;
-      apiKey?: string;
-    };
-    mongodb?: {
-      enabled: boolean;
-      uri?: string;
-      database?: string;
-      collection?: string;
-    };
-  };
 }
 
 // =============================================================================
 // Token Sync Resolution
 // =============================================================================
-
-/**
- * Resolve IPFS sync configuration with extend/override pattern
- */
-function resolveIpfsSyncConfig(
-  network: NetworkType,
-  config?: IpfsSyncConfig
-): NonNullable<BrowserProviders['tokenSyncConfig']>['ipfs'] | undefined {
-  if (!config) return undefined;
-
-  const networkConfig = getNetworkConfig(network);
-  const gateways = resolveArrayConfig(
-    networkConfig.ipfsGateways,
-    config.gateways,
-    config.additionalGateways
-  );
-
-  return {
-    enabled: config.enabled ?? false,
-    gateways,
-    bootstrapPeers: config.bootstrapPeers ?? config.additionalBootstrapPeers,
-    useDht: config.useDht,
-  };
-}
-
-/**
- * Resolve all token sync backends
- */
-function resolveTokenSyncConfig(
-  network: NetworkType,
-  config?: TokenSyncConfig
-): BrowserProviders['tokenSyncConfig'] {
-  if (!config) return undefined;
-
-  const result: BrowserProviders['tokenSyncConfig'] = {};
-
-  // IPFS backend
-  const ipfs = resolveIpfsSyncConfig(network, config.ipfs);
-  if (ipfs) result.ipfs = ipfs;
-
-  // File backend
-  if (config.file) {
-    result.file = {
-      enabled: config.file.enabled ?? false,
-      directory: config.file.directory,
-      format: config.file.format,
-    };
-  }
-
-  // Cloud backend
-  if (config.cloud) {
-    result.cloud = {
-      enabled: config.cloud.enabled ?? false,
-      provider: config.cloud.provider,
-      bucket: config.cloud.bucket,
-      endpoint: config.cloud.endpoint,
-      apiKey: config.cloud.apiKey,
-    };
-  }
-
-  // MongoDB backend
-  if (config.mongodb) {
-    result.mongodb = {
-      enabled: config.mongodb.enabled ?? false,
-      uri: config.mongodb.uri,
-      database: config.mongodb.database,
-      collection: config.mongodb.collection,
-    };
-  }
-
-  return Object.keys(result).length > 0 ? result : undefined;
-}
 
 // =============================================================================
 // Factory Function
@@ -381,20 +193,9 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   // Resolve configurations using shared utilities
   const transportConfig = resolveTransportConfig(network, config?.transport);
   const oracleConfig = resolveOracleConfig(network, config?.oracle);
-  const tokenSyncConfig = resolveTokenSyncConfig(network, config?.tokenSync);
 
   const storage = createIndexedDBStorageProvider({ ...config?.storage, network });
   const priceConfig = resolvePriceConfig(config?.price, storage);
-
-  // Create IPFS storage provider if enabled
-  const ipfsConfig = tokenSyncConfig?.ipfs;
-  const ipfsTokenStorage = ipfsConfig?.enabled
-    ? createBrowserIpfsStorageProvider({
-        gateways: ipfsConfig.gateways,
-        debug: config?.tokenSync?.ipfs?.useDht, // reuse debug-like flag
-        network,
-      })
-    : undefined;
 
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
@@ -429,7 +230,5 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
     }),
     tokenStorage: createIndexedDBTokenStorageProvider({ network }),
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
-    ipfsTokenStorage,
-    tokenSyncConfig,
   };
 }
