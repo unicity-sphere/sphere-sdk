@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed — the Nostr payment-request channel
+
+Payment requests ride wallet-api (sdk-changes S4). The Nostr fallback is gone, so
+`PaymentsModule` no longer has two implementations of one concept.
+
+**Breaking:** a composition without the wallet-api payment-request capability can no longer
+send or receive payment requests. `sendPaymentRequest()` now returns
+`{ success: false, error: 'Payment requests require the wallet-api payment-request capability' }`
+instead of falling back to Nostr — an explicit refusal at the call site rather than a silent
+no-op. `transport.onPaymentRequest` / `onPaymentRequestResponse` subscriptions are no longer
+installed, and `sendPaymentRequestResponse` no longer has a transport leg.
+
+Removed with it: `handleIncomingPaymentRequest`, `handlePaymentRequestResponse`, the
+`unsubscribePaymentRequests` / `unsubscribePaymentRequestResponses` fields and their teardown.
+`dispatchPaymentRequestResponse` stays — it is shared, and the wallet-api channel uses it.
+
+This narrows the S7 covenant deliberately: payment requests are now wallet-api-only, while
+storage and delivery remain swappable interfaces with contract suites. Nostr is untouched
+elsewhere — it remains the rail for identity bindings, DMs and group chat.
+
+One test was re-pointed, not deleted: `PaymentsModule.payment-requests.test.ts` previously
+asserted "compositions WITHOUT wallet-api keep the Nostr payment-request path"; it now asserts
+that no transport subscriptions are installed and that sending is refused with a wallet-api
+error. No test was weakened.
+
 ### Removed — IPFS/IPNS token sync
 
 Sphere syncs tokens through wallet-api. The IPFS rail was opt-in

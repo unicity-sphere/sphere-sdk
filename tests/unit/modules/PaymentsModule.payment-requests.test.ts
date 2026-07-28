@@ -973,8 +973,8 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
   });
 });
 
-describe('compositions WITHOUT wallet-api keep the Nostr payment-request path (covenant §3.1-6)', () => {
-  it('installs the transport subscriptions and sends via the transport payload', async () => {
+describe('payment requests require wallet-api — there is no Nostr fallback', () => {
+  it('installs no transport subscriptions and refuses to send without the capability', async () => {
     const identity = fullIdentity(REQUESTER);
     const transport = mockTransport();
     const deps: PaymentsModuleDependencies = {
@@ -989,16 +989,16 @@ describe('compositions WITHOUT wallet-api keep the Nostr payment-request path (c
     module.initialize(deps);
     cleanups.push(() => module.destroy());
 
-    // The push subscriptions ARE installed on this path.
-    expect(transport.onPaymentRequest).toHaveBeenCalledTimes(1);
-    expect(transport.onPaymentRequestResponse).toHaveBeenCalledTimes(1);
+    expect(transport.onPaymentRequest).not.toHaveBeenCalled();
+    expect(transport.onPaymentRequestResponse).not.toHaveBeenCalled();
 
+    // Refused explicitly rather than silently doing nothing, so a caller
+    // composed without the capability finds out at the call site.
     const result = await module.sendPaymentRequest('@bob', { amount: '25', coinId: UCT, message: 'hi' });
-    expect(result.success).toBe(true);
-    expect(result.eventId).toBe('nostr-event-1');
-    expect(transport.sendPaymentRequest).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/wallet-api/);
+    expect(transport.sendPaymentRequest).not.toHaveBeenCalled();
 
-    // And the wallet-api pump surface is a no-op without the capability.
     await expect(module.syncPaymentRequests()).resolves.toBeUndefined();
   });
 });
