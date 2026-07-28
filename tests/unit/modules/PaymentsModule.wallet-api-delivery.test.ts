@@ -1481,9 +1481,11 @@ describe('#677: a mid-send conflict re-plans the remainder inside send() and sti
     expect(sender.module.getTokens().find((t) => t.id === committedId)?.status).toBe('spent');
     expect(`v2_${entries[0].tokenId}`).toBe(committedId);
 
-    // Existing behavior preserved: the conflicted intent was soft-aborted (the delivered leg is not
-    // lost — mirrors the SEND_SYNC_PENDING contract).
-    expect(fake.getIntent(SENDER.chainPubkey, partial.transferId)).toMatchObject({ status: 'aborted' });
+    // The partial intent stays OPEN — a conflict may only abort when NOTHING
+    // certified. An abort here would strand committed value only this intent can re-derive (e.g. a
+    // certified split's change output, neither uploaded nor stored when the failure surfaced); resume
+    // converges the committed leg instead. The delivered leg is not lost — mirrors SEND_SYNC_PENDING.
+    expect(fake.getIntent(SENDER.chainPubkey, partial.transferId)).toMatchObject({ status: 'open' });
   });
 });
 

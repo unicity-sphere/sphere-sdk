@@ -42,7 +42,15 @@ import { WalletApiCheckpointStore } from '../../impl/shared/wallet-api/WalletApi
 import { WalletApiError } from '../../wallet-api';
 import { isV2TransferPayload, type V2TransferPayload } from '../../types/v2-transfer';
 import { TokenReservationLedger } from './TokenReservationLedger';
-import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
+import {
+  MAX_SEND_OPERATION_CONCURRENCY,
+  isKeepOpenSendError,
+  summarizeOutcomes,
+  type OperationOutcome,
+  type SendOperation,
+  type SendOutcomeSummary,
+} from './SendOperations';
+import { SpendPlanner, SpendQueue, type ParsedTokenEntry } from './SpendQueue';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../storage';
 import type {
   TransportProvider,
@@ -537,17 +545,6 @@ export function extractTokenStateKey(token: Token): string | null {
   const stateHash = extractStateHashFromSdkData(token.sdkData);
   if (!tokenId || !stateHash) return null;
   return createTokenStateKey(tokenId, stateHash);
-}
-
-/**
- * Convert hex string to Uint8Array
- */
-function fromHex(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-  }
-  return bytes;
 }
 
 /**
@@ -1917,16 +1914,14 @@ export class PaymentsModule {
       tokenTransfers: [],
     };
 
-    // W23-R2 (v2): ids of source tokens whose spend was CERTIFIED on-chain during
-    // this send. The failure handler must never restore these as 'confirmed' —
-    // their state is consumed; the finished output blob is journaled separately.
-    const committedOnChainTokenIds = new Set<string>();
-    // #677: value (base units) already DELIVERED to the recipient by the certified
-    // legs above — a direct leg delivers its whole token amount, a split leg
-    // delivers only its splitAmount. On a mid-send conflict the remainder that
-    // still owes the recipient is `request.amount − committedDeliveredAmount`;
-    // send() re-plans exactly that so a send for X still delivers X.
-    let committedDeliveredAmount = 0n;
+    // Settled per-operation outcomes of this send's engine fan-out (undefined
+    // until every launched op has settled). The failure handler reads committed
+    // accounting EXCLUSIVELY from here (W23-R2/#677): certified sources must
+    // never be restored as 'confirmed', and the remainder still owed to the
+    // recipient is `request.amount − summary.committedAmount` — derived from
+    // settled data so a concurrent certification can never be under-counted
+    // (an under-count re-plans too much and double-pays).
+    let summary: SendOutcomeSummary | undefined;
     // §3.1 (#621): set when any leg's post-certification delivery is deferred (kept journaled).
     // Scoped to the whole send so the resolve path below can mark the result delivery-pending.
     let deliveryPending = false;
@@ -2111,7 +2106,8 @@ export class PaymentsModule {
             // TYPED error the app can map instead of the raw wire text
             // (WalletApiError is not a SphereError). Transient failures
             // (NETWORK/5xx) rethrow unchanged and keep the backstop.
-            if (err instanceof WalletApiError && err.code === 'VALIDATION' && committedOnChainTokenIds.size === 0) {
+            // (The PUT precedes every engine op — nothing can have certified yet.)
+            if (err instanceof WalletApiError && err.code === 'VALIDATION') {
               intentRejected = true;
               try {
                 await walletApi.removeLocalIntent?.(result.id);
@@ -2156,143 +2152,201 @@ export class PaymentsModule {
         // live view a concurrent claim may have advanced.
         const consumedSources: { uiTokenId: string; genesisId: string; sourceSdkData: string }[] = [];
 
-        // Whole-token direct transfers. ONE realization seed per SEND
-        // (ARCHITECTURE §7/§8.1): the intent transferId seeds every engine op,
-        // so any device holding the wallet seed can rebuild the identical
-        // transactions and resume (Part E).
-        for (const [opIndex, tw] of splitPlan.tokensToTransferDirectly.entries()) {
-          let finished;
-          try {
-            finished = await engine.transfer(
-              {
-                token: tw.sdkToken as SphereToken,
-                recipientPubkey: recipientChainPubkey,
-                data: memoData,
-              },
-              // opIndex = position in the persisted intent's `direct` order — the
-              // stable (transferId, opIndex) pairing resume replays (§8.1).
-              { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id, opIndex },
+        // ── The operation list, in plan order. ONE realization seed per SEND
+        // (ARCHITECTURE §7/§8.1): the intent transferId + the plan-derived
+        // opIndex seed every engine op, so any device holding the wallet seed
+        // rebuilds the identical transactions — execution order is irrelevant
+        // to resume (it recovers per-op by journal presence).
+        const genesisIdOf = (t: Token): string =>
+          extractTokenIdFromSdkData(t.sdkData) ?? t.id.replace(/^v2_/, '');
+        const operations: SendOperation[] = splitPlan.tokensToTransferDirectly.map((tw, opIndex) => ({
+          kind: 'direct' as const,
+          // opIndex = position in the persisted intent's `direct` order — the
+          // stable (transferId, opIndex) pairing resume replays (§8.1).
+          opIndex,
+          uiTokenId: tw.uiToken.id,
+          genesisId: genesisIdOf(tw.uiToken),
+          sourceSdkData: tw.uiToken.sdkData ?? '',
+          sdkToken: tw.sdkToken as SphereToken,
+          deliveredAmount: tw.amount, // #677: a direct op delivers its whole amount
+        }));
+        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+          const { splitAmount, remainderAmount } = splitPlan;
+          if (splitAmount === null || remainderAmount === null) {
+            // Planner invariant (SpendQueue.calculateOptimalSplitSync):
+            // requiresSplit implies both amounts. Defaulting a null to 0n would
+            // silently construct a 0-value split — fail loudly instead; no
+            // engine op has run yet, so nothing is on-chain.
+            throw new SphereError(
+              'Split plan invariant violated: requiresSplit with null splitAmount/remainderAmount',
+              'TRANSFER_FAILED'
             );
-          } catch (err) {
-            // #625: tag for self-healing ONLY when nothing has certified yet in this attempt — re-planning
-            // the full amount is then safe. If an earlier op already certified, the certified value has
-            // left the wallet, so a full-amount re-plan would over-request; leave it untagged (no retry).
-            if (err instanceof TransferConflictError && committedOnChainTokenIds.size === 0) {
-              err.conflictedSourceId = tw.uiToken.id;
-            }
-            throw err;
           }
-          // The source state is spent on-chain from here on.
-          committedOnChainTokenIds.add(tw.uiToken.id);
-          committedDeliveredAmount += tw.amount; // #677: a direct leg delivers its whole amount
-          // Journal the finished blob BEFORE delivery: a transport failure or a
-          // crash must not lose the recipient's token (replayed on next load()).
-          const tokenBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(finished)));
-          await this.savePendingV2Delivery({
-            transferId: result.id,
-            recipientPubkey: recipientChainPubkeyHex,
-            tokenBlob,
-            memo: request.memo,
-            opIndex,
-            createdAt: Date.now(),
+          operations.push({
+            kind: 'split',
+            // The split's opIndex follows the direct ops (stable across resume —
+            // it is derived from the intent's order, §8.1).
+            opIndex: operations.length,
+            uiTokenId: splitPlan.tokenToSplit.uiToken.id,
+            genesisId: genesisIdOf(splitPlan.tokenToSplit.uiToken),
+            sourceSdkData: splitPlan.tokenToSplit.uiToken.sdkData ?? '',
+            sdkToken: splitPlan.tokenToSplit.sdkToken as SphereToken,
+            deliveredAmount: splitAmount, // #677: a split op delivers only splitAmount
+            remainderAmount,
           });
-          // §3.1 (#621): a delivery failure after certification must NOT fail the sender.
-          if (!(await this.tryDeliver(() => deliverBlob(tokenBlob), tokenBlob))) deliveryPending = true;
-          result.tokenTransfers.push({ sourceTokenId: tw.uiToken.id, method: 'direct' });
-          consumedSources.push({
-            uiTokenId: tw.uiToken.id,
-            genesisId: extractTokenIdFromSdkData(tw.uiToken.sdkData) ?? tw.uiToken.id.replace(/^v2_/, ''),
-            sourceSdkData: tw.uiToken.sdkData ?? '',
-          });
-          // Server path: the removal is recorded by the single applyDelta
-          // below (its evidence is the deposit just made); locally the source
-          // is removed right away on the non-server path (unchanged behavior).
-          // M2: pass the LOCAL state we spent so removeToken never tombstones a state a
+        }
+        const selfChainPubkey = hexToBytes(this.deps.identity.chainPubkey);
+
+        // One operation: certify → journal → deliver. NEVER rejects (a mid-batch
+        // rejection would stop us observing still-in-flight siblings) and NEVER
+        // touches shared wallet state — this.tokens mutations and save() (an
+        // unlocked whole-map write) are not concurrency-safe; they belong to the
+        // sequential apply section below.
+        const sendOperation = async (op: SendOperation): Promise<OperationOutcome> => {
+          let finished: SphereToken;
+          let changeOutput: SphereToken | undefined;
+          try {
+            if (op.kind === 'direct') {
+              finished = await engine.transfer(
+                { token: op.sdkToken, recipientPubkey: recipientChainPubkey, data: memoData },
+                { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id, opIndex: op.opIndex },
+              );
+            } else {
+              // Value-conserving split: recipient gets splitAmount, this wallet
+              // keeps the remainder. The change token is real + immediate. E.4:
+              // the burn checkpoint persists before the first mint (durable-ack
+              // gated).
+              const { outputs } = await engine.split(
+                {
+                  token: op.sdkToken,
+                  outputs: [
+                    { recipientPubkey: recipientChainPubkey, coinId: request.coinId, amount: op.deliveredAmount, data: memoData },
+                    { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: op.remainderAmount },
+                  ],
+                },
+                {
+                  signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS),
+                  transferId: result.id,
+                  opIndex: op.opIndex,
+                  ...(this.getCheckpointStore() ? { checkpointStore: this.getCheckpointStore() } : {}),
+                },
+              );
+              finished = outputs[0];
+              changeOutput = outputs[1];
+            }
+          } catch (error) {
+            // No proof in hand — NOT necessarily "never reached the chain":
+            // for the keep-open family (isKeepOpenSendError) the submit may
+            // have been accepted and the spend may be on-chain. certified:false
+            // records only what was observed; the failure disposition keeps the
+            // intent open and resume settles the truth (#631/E.4).
+            return { op, certified: false, error };
+          }
+          // The source state is spent on-chain from here on — every return below
+          // reports certified: true so the accounting counts it even when a
+          // local post-step fails.
+          try {
+            // Journal the finished blob BEFORE delivery: a transport failure or a
+            // crash must not lose the recipient's token (replayed on next load()).
+            const tokenBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(finished)));
+            await this.savePendingV2Delivery({
+              transferId: result.id,
+              recipientPubkey: recipientChainPubkeyHex,
+              tokenBlob,
+              memo: request.memo,
+              opIndex: op.opIndex,
+              createdAt: Date.now(),
+            });
+            // §3.1 (#621): a delivery failure after certification must NOT fail the sender.
+            const delivered = await this.tryDeliver(() => deliverBlob(tokenBlob), tokenBlob);
+            return { op, certified: true, delivered, ...(changeOutput !== undefined ? { changeOutput } : {}) };
+          } catch (error) {
+            return { op, certified: true, error, ...(changeOutput !== undefined ? { changeOutput } : {}) };
+          }
+        };
+
+        // Certify concurrently, MAX_SEND_OPERATION_CONCURRENCY at a time (#684
+        // pacing). Every launched op SETTLES before any accounting below — the
+        // #625 tag and the #677 remainder must never be computed while value
+        // may still be certifying in flight.
+        const outcomes: OperationOutcome[] = [];
+        for (let start = 0; start < operations.length; start += MAX_SEND_OPERATION_CONCURRENCY) {
+          const batch = operations.slice(start, start + MAX_SEND_OPERATION_CONCURRENCY);
+          outcomes.push(...(await Promise.all(batch.map(sendOperation))));
+          // Fail-fast between batches (sequential-era parity, at batch
+          // granularity: the first throw stopped the loop): once any settled op
+          // failed, this send is on the failure path — launching more batches
+          // would keep certifying value destined for resume/remainder handling
+          // and, in an outage, stack ceil(N/8) op-timeouts before the user sees
+          // the error. In-flight ops always settle (the accounting above needs
+          // the full batch); never-launched sources stay untouched and are
+          // restored 'confirmed' by the failure handler, their value covered by
+          // the remainder re-plan or the user's retry.
+          if (outcomes.some((o) => o.error !== undefined)) break;
+        }
+        summary = summarizeOutcomes(outcomes);
+        deliveryPending = summary.deliveryPending;
+
+        // ── Sequential apply — the ONLY writer of shared wallet state. Runs for
+        // committed ops even when another op failed: their spend is irreversible
+        // (§7) and the sequential-loop era applied them per-op too. An op that
+        // certified but failed a local post-step keeps its previous disposition:
+        // no bookkeeping here (the failure handler marks it 'spent'; the intent
+        // stays open and resume recovers the journaled blob).
+        for (const o of summary.committed) {
+          if (o.error !== undefined) continue;
+          result.tokenTransfers.push({ sourceTokenId: o.op.uiTokenId, method: o.op.kind });
+          consumedSources.push({ uiTokenId: o.op.uiTokenId, genesisId: o.op.genesisId, sourceSdkData: o.op.sourceSdkData });
+        }
+        if (!serverApply && summary.changeOutput) {
+          // Non-server path: persist the change BEFORE the removals/throw below —
+          // nothing after the on-chain split may depend on anything else
+          // succeeding. On the server path the awaited intent (E.3) is the
+          // recovery seed (a deterministic re-run rebuilds BOTH outputs), and
+          // local storage follows the server apply below so the provider's
+          // write-behind cannot race a second add of the same state.
+          // critical (#515 F2): an unpersisted change token is value loss on
+          // reload — fail the send (the open intent resumes it) rather than
+          // report success.
+          await this.storeEngineToken(engine, summary.changeOutput, { criticalSave: true });
+        }
+        if (!serverApply) {
+          // Server path: removals are recorded by the single applyDelta below
+          // (its evidence is the deposits just made); locally the sources are
+          // removed here on the non-server path. Sequential on purpose —
+          // removeToken's save() is an unlocked whole-map write. M2: pass the
+          // LOCAL state we spent so removeToken never tombstones a state a
           // concurrent claim already advanced the map entry to.
-          if (!serverApply) {
-            await this.removeToken(tw.uiToken.id, result.id, extractStateHashFromSdkData(tw.uiToken.sdkData));
+          for (const o of summary.committed) {
+            if (o.error !== undefined) continue;
+            await this.removeToken(o.op.uiTokenId, result.id, extractStateHashFromSdkData(o.op.sourceSdkData));
           }
         }
-
-        // Value-conserving split: recipient gets splitAmount, this wallet keeps
-        // the remainder. The change token is real + immediate (the engine mints
-        // it) — no placeholder / background-proof step.
-        let changeOutput: SphereToken | null = null;
-        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
-          const selfChainPubkey = hexToBytes(this.deps.identity.chainPubkey);
-          let outputs;
-          try {
-            ({ outputs } = await engine.split(
-              {
-                token: splitPlan.tokenToSplit.sdkToken as SphereToken,
-                outputs: [
-                  { recipientPubkey: recipientChainPubkey, coinId: request.coinId, amount: splitPlan.splitAmount!, data: memoData },
-                  { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: splitPlan.remainderAmount! },
-                ],
-              },
-              // Same per-send seed; the split's opIndex follows the direct ops
-              // (stable across resume — it is derived from the intent's order).
-              // E.4: persist the burn checkpoint before the first mint (durable-ack gated).
-              {
-                signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS),
-                transferId: result.id,
-                opIndex: splitPlan.tokensToTransferDirectly.length,
-                ...(this.getCheckpointStore() ? { checkpointStore: this.getCheckpointStore() } : {}),
-              },
-            ));
-          } catch (err) {
-            // #625: tag for self-healing only when nothing certified yet this attempt (see the direct-op
-            // note) — a split after already-certified direct ops must not trigger a full-amount re-plan.
-            if (err instanceof TransferConflictError && committedOnChainTokenIds.size === 0) {
-              err.conflictedSourceId = splitPlan.tokenToSplit.uiToken.id;
-            }
-            throw err;
+        if (summary.primaryError !== undefined) {
+          // #625: tag for self-healing ONLY when nothing certified in this
+          // attempt — re-planning the full amount is then safe. Decided by the
+          // reduction from the complete settled set, never mid-flight.
+          if (summary.conflictTagSourceId !== undefined && summary.primaryError instanceof TransferConflictError) {
+            summary.primaryError.conflictedSourceId = summary.conflictTagSourceId;
           }
-          // The split source is burnt on-chain from here on. Journal the
-          // recipient's blob BEFORE the delivery attempt.
-          committedOnChainTokenIds.add(splitPlan.tokenToSplit.uiToken.id);
-          committedDeliveredAmount += splitPlan.splitAmount ?? 0n; // #677: a split leg delivers only splitAmount
-          const recipientBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(outputs[0])));
-          await this.savePendingV2Delivery({
-            transferId: result.id,
-            recipientPubkey: recipientChainPubkeyHex,
-            tokenBlob: recipientBlob,
-            memo: request.memo,
-            opIndex: splitPlan.tokensToTransferDirectly.length,
-            createdAt: Date.now(),
-          });
-          changeOutput = outputs[1];
-          if (!serverApply) {
-            // Non-server path: persist the change BEFORE the delivery attempt —
-            // nothing after the on-chain split may depend on the transport
-            // succeeding. On the server path the awaited intent (E.3) is the
-            // recovery seed (a deterministic re-run rebuilds BOTH outputs), and
-            // local storage follows the server apply below so the provider's
-            // write-behind cannot race a second add of the same state.
-            // critical (#515 F2): an unpersisted change token is value loss on
-            // reload — fail the send (the open intent resumes it) rather than
-            // report success.
-            await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
-          }
-
-          // §3.1 (#621): a delivery failure after certification must NOT fail the sender.
-          if (!(await this.tryDeliver(() => deliverBlob(recipientBlob), recipientBlob))) deliveryPending = true;
-
-          result.tokenTransfers.push({ sourceTokenId: splitPlan.tokenToSplit.uiToken.id, method: 'split' });
-          consumedSources.push({
-            uiTokenId: splitPlan.tokenToSplit.uiToken.id,
-            genesisId:
-              extractTokenIdFromSdkData(splitPlan.tokenToSplit.uiToken.sdkData) ??
-              splitPlan.tokenToSplit.uiToken.id.replace(/^v2_/, ''),
-            sourceSdkData: splitPlan.tokenToSplit.uiToken.sdkData ?? '',
-          });
-          if (!serverApply) {
-            await this.removeToken(
-              splitPlan.tokenToSplit.uiToken.id,
-              result.id,
-              extractStateHashFromSdkData(splitPlan.tokenToSplit.uiToken.sdkData)
+          // Report EVERY settled failure, not only the one that steers the
+          // disposition: a parallel batch can fail in several independent ways,
+          // and dropping the rest hides them from apps and bug reports. Log
+          // each op's error, and carry the non-surfaced ones on the thrown
+          // error (`suppressedErrors`) — visibility only, never dispositive.
+          for (const f of summary.failures) {
+            logger.warn(
+              'Payments',
+              `Send op ${f.op.opIndex} (${f.op.kind}) failed${f.certified ? ' AFTER on-chain certification' : ''}:`,
+              f.error,
             );
           }
+          const primaryError = summary.primaryError;
+          const suppressed = summary.failures.map((f) => f.error).filter((e) => e !== primaryError);
+          if (suppressed.length > 0 && primaryError instanceof Error) {
+            (primaryError as Error & { suppressedErrors?: unknown[] }).suppressedErrors = suppressed;
+          }
+          throw primaryError;
         }
 
         if (serverApply) {
@@ -2311,9 +2365,9 @@ export class PaymentsModule {
           // of the same transferId (§5.3) and completes the intent in the
           // same transaction (§16).
           const added: { tokenId: string; key: string }[] = [];
-          if (changeOutput) {
-            const changeBytes = encodeTokenBlob(engine.encodeToken(changeOutput));
-            added.push({ tokenId: engine.tokenId(changeOutput), key: await this.uploadOutputBlob(changeBytes) });
+          if (summary.changeOutput) {
+            const changeBytes = encodeTokenBlob(engine.encodeToken(summary.changeOutput));
+            added.push({ tokenId: engine.tokenId(summary.changeOutput), key: await this.uploadOutputBlob(changeBytes) });
           }
           const storage = this.getActiveTokenStorageProvider();
           if (!storage) {
@@ -2339,7 +2393,7 @@ export class PaymentsModule {
           // above): store the change, then drop the consumed sources. M2: each
           // removeToken carries the LOCAL state we spent, so a source the pump
           // already reactivated to a new state is KEPT, not re-tombstoned.
-          if (changeOutput) await this.storeEngineToken(engine, changeOutput);
+          if (summary.changeOutput) await this.storeEngineToken(engine, summary.changeOutput);
           for (const s of consumedSources) {
             await this.removeToken(s.uiTokenId, result.id, extractStateHashFromSdkData(s.sourceSdkData));
           }
@@ -2413,6 +2467,11 @@ export class PaymentsModule {
       // Cancel reservation — free reserved amounts for other sends
       this.reservationLedger.cancel(result.id);
 
+      // Committed accounting from the SETTLED fan-out (empty when the failure
+      // struck before any engine op ran — e.g. planning, intent PUT).
+      const committedUiIds = summary?.committedUiIds ?? new Set<string>();
+      const committedAmount = summary?.committedAmount ?? 0n;
+
       result.status = 'failed';
       // A TransferConflictError is a LOST RACE (Part E.2): another transaction —
       // typically this owner's other device — already consumed a source token.
@@ -2442,10 +2501,19 @@ export class PaymentsModule {
       }
 
       // Intent disposition on failure (E.2/E.3):
-      //  - a TransferConflictError aborts (the prescribed recovery — the
-      //    caller re-plans under a NEW transferId; soft abort keeps the row);
-      //    any already-certified legs stay journaled for delivery replay and
-      //    converge via the recipient's claim handoff (§6);
+      //  - a TransferConflictError with NOTHING certified aborts (the
+      //    prescribed E.2 recovery — the caller re-plans the full amount under
+      //    a NEW transferId; soft abort keeps the row);
+      //  - a conflict AFTER ≥1 certified leg keeps the intent OPEN:
+      //    the `throw primaryError` above precedes the serverApply
+      //    block, so on the wallet-api custody path a certified split's change
+      //    output is neither uploaded nor stored locally — the open intent is
+      //    its ONLY recovery seed (a deterministic re-run rebuilds it;
+      //    resyncOpenIntents lists 'open' only, so an abort would strand the
+      //    value). The certified legs' delivery converges via journal replay +
+      //    the recipient's claim handoff (§6), and send()'s #677 remainder
+      //    re-plan covers the conflicted leg under a NEW transferId. (Mirrors
+      //    the engine-level keep-open bias of the split-mint fan-out, #684.)
       //  - a PROVEN clean pre-certification failure (nothing certified) also
       //    aborts — an open intent would silently re-execute the transfer at the
       //    next sign-in after the user already saw it fail (and possibly retried
@@ -2455,7 +2523,7 @@ export class PaymentsModule {
       //  - #631: a ProofUnconfirmedError (submit accepted / proof fetch
       //    inconclusive) is NOT "nothing certified" — the source spend may be
       //    on-chain under result.id, and the intent is the only resume seed. Keep
-      //    it OPEN even when committedOnChainTokenIds is still empty (the throw
+      //    it OPEN even when the committed set is still empty (the throw
       //    beat the .add()). Resume re-derives the identical tx: it recovers the
       //    proof + delivery, or records the spend if a foreign tx won — never a
       //    second on-chain spend.
@@ -2463,17 +2531,17 @@ export class PaymentsModule {
       //    certified (or the source is untouched, for a leg-0 strand); a split-mint stateId is
       //    HKDF-derived, so a mismatch is never a foreign spend. Aborting would orphan a
       //    burn-certified split — resume under the same transferId (rebuilding from the stored
-      //    checkpoint) is the only exit. So keep-open even when committedOnChainTokenIds is empty.
-      const keepOpen =
-        error instanceof ProofUnconfirmedError ||
-        error instanceof CheckpointPersistFailedError ||
-        error instanceof SplitCheckpointLostError ||
-        error instanceof CheckpointTrustbaseMismatchError;
+      //    checkpoint) is the only exit. So keep-open even when the committed set is empty.
+      const keepOpen = isKeepOpenSendError(error);
       // #670: skip the abort when the intent PUT itself was deterministically
       // rejected — the local copy is already dropped and the server row never
       // existed (an abort would only 404 and re-mark the copy abortPending).
       if (this.deps?.walletApi && !intentRejected) {
-        if (error instanceof TransferConflictError || (committedOnChainTokenIds.size === 0 && !keepOpen)) {
+        // Abort ONLY a proven-clean failure with NOTHING certified. A conflict
+        // is never keep-open (isKeepOpenSendError), so the E.2 clean-conflict
+        // abort is contained in this predicate; a conflict alongside a
+        // certified leg keeps the intent open (see the disposition doc above).
+        if (committedUiIds.size === 0 && !keepOpen) {
           try {
             await this.deps.walletApi.abortIntent(result.id);
           } catch (abortErr) {
@@ -2496,7 +2564,7 @@ export class PaymentsModule {
           logger.warn('Payments', `Skipping restoration of already-removed token ${token.id}`);
           continue;
         }
-        let spentOnChain = committedOnChainTokenIds.has(token.id);
+        let spentOnChain = committedUiIds.has(token.id);
         if (!spentOnChain && restoreEngine && token.sdkData && looksLikeTokenBlob(token.sdkData)) {
           try {
             const st = await restoreEngine.decodeToken(decodeTokenBlob(hexToBytes(token.sdkData)));
@@ -2559,7 +2627,9 @@ export class PaymentsModule {
       // certified on-chain and was journaled/delivered is NOT a plain,
       // re-sendable failure. The delivered value has irreversibly left the wallet
       // (its source is terminal 'spent' above, its blob journaled for delivery),
-      // and the intent was already soft-aborted above. Surfacing a bare
+      // and the intent stays OPEN (committed legs block the abort above) —
+      // resume converges the certified legs, including a certified split's
+      // server apply + change re-derivation. Surfacing a bare
       // TransferConflictError would make the caller re-send the FULL amount and
       // pay the delivered leg twice — so surface a DISTINCT partial outcome
       // carrying the already-committed legs and the still-owed REMAINDER. send()
@@ -2568,12 +2638,12 @@ export class PaymentsModule {
       // surfaces to the CALLER only when that remainder cannot be covered. Do NOT
       // emit transfer:failed: the delivered legs are not lost (mirrors the
       // SEND_SYNC_PENDING contract).
-      if (error instanceof TransferConflictError && committedOnChainTokenIds.size > 0) {
-        const remaining = BigInt(request.amount) - committedDeliveredAmount;
+      if (error instanceof TransferConflictError && committedUiIds.size > 0) {
+        const remaining = BigInt(request.amount) - committedAmount;
         throw new PartialSendConflictError(
           'Part of your payment was already sent before a source token was spent by a concurrent transfer. Re-plan and send only the remaining amount — do NOT re-send the full amount.',
           result.id,
-          [...committedOnChainTokenIds],
+          [...committedUiIds],
           (remaining > 0n ? remaining : 0n).toString(),
           error,
         );

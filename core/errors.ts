@@ -167,17 +167,18 @@ export class SphereError extends Error {
  * Distinct from `TransferConflictError` on purpose: a bare conflict makes the
  * caller re-send the FULL amount, paying the already-delivered leg a second
  * time. Catching THIS type (or `code === 'SEND_PARTIALLY_COMPLETED'`) tells the
- * caller/UI: the delivered legs are final, the conflicted intent has been
- * soft-aborted, and only the REMAINDER ({@link remainingAmount}) may be
- * re-planned — under a NEW transferId, never re-sending the whole amount.
+ * caller/UI: the delivered legs are final, the conflicted intent stays OPEN
+ * (resume converges its certified legs), and only the REMAINDER
+ * ({@link remainingAmount}) may be re-planned — under a NEW transferId, never
+ * re-sending the whole amount.
  *
  * NOT a subclass of `TransferConflictError` by design: existing conflict
  * handlers that re-send in full must NOT treat this as an ordinary conflict.
  */
 export class PartialSendConflictError extends SphereError {
   /**
-   * The FIRST partial attempt's transferId — its intent was soft-aborted, and it
-   * is the §6 handoff anchor. NOTE: `send()` may re-plan the remainder across
+   * The FIRST partial attempt's transferId — its intent stays open for resume,
+   * and it is the §6 handoff anchor. NOTE: `send()` may re-plan the remainder across
    * SEVERAL internal attempts before giving up, so {@link committedTokenIds} can
    * span MULTIPLE transferIds — they do NOT all map to this single id.
    */
