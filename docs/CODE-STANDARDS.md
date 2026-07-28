@@ -1,23 +1,38 @@
 # Code standards
 
-Enforced by `npm run check:budget` (CI). Not aspirational — measured on the TypeScript AST.
+Enforced by `npm run lint` (CI). No separate tool — these are ESLint rules.
 
 ## Budgets
 
-| Metric | Target | Rationale |
+| Rule | Limit | Rationale |
 |---|---|---|
-| File lines | **400** | Above this nobody reads the whole file, so nobody knows what is already there. Duplication follows. |
-| Function body lines | **50** | A function you cannot see at once is a function you cannot reason about. |
-| Comment ratio | **15%** | See below. |
-| Inline comment block | **5 lines** | Longer means the code needs a name, not a paragraph. |
+| `max-lines` | **800** | Above this nobody reads the whole file, so nobody knows what is already there, and duplication follows. Set against a starting point of one 7,026-line file: 800 is a ~9x reduction and still 6x the repo's 130-line median. Tighten it as the tail shrinks. |
+| `max-lines-per-function` | **50** | A function you cannot see at once is a function you cannot reason about. |
+| `complexity` | **15** | |
+| `max-depth` | **4** | |
+| `max-params` | **5** | |
+| `budget/comment-ratio` | **15%** | See below. |
+| `budget/no-long-comment-block` | **5 lines** | Longer means the code needs a name, not a paragraph. |
 
-`npm run check:budget` uses a **ratchet**: files already over budget are recorded in
-`scripts/code-budget-baseline.json` and tolerated at their recorded size. They may never grow,
-and no new violation may appear. Improving a file and running `--update` tightens the baseline
-permanently.
+Size and complexity are ESLint core rules. Only the two comment rules are local
+(`eslint-rules/comment-budget.js`) — core has no equivalent.
 
-**Raising a limit is not an option.** No mechanism pushing back is precisely how one file reached
-7,027 lines (see [`PAYMENTS-ANALYSIS.md`](./PAYMENTS-ANALYSIS.md)).
+## The ratchet
+
+Existing violations are held by **ESLint's native suppressions** in `eslint-suppressions.json`
+(879 across 150 files at the time of writing; 17 files still exceed `max-lines`). Suppressions store a *count per rule per file*, so:
+
+- a **new** violation anywhere fails
+- a **new** oversized function inside an already-suppressed file fails — the count is exceeded
+- `npm run lint:prune` drops suppressions a file no longer needs, tightening it permanently
+- `npm run lint:suppress` re-baselines (use only when deliberately accepting new debt)
+
+**Raising a limit is not the remedy.** No mechanism pushing back is precisely how one file reached
+7,027 lines — see [`PAYMENTS-ANALYSIS.md`](./PAYMENTS-ANALYSIS.md).
+
+A limit that forces an artificial split — carving a file so the pieces satisfy the metric but
+still cannot be reasoned about alone — is a signal to split along a different seam, not to raise
+the number. No metric can catch that; only review can.
 
 ## Comments
 

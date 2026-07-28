@@ -1,0 +1,1322 @@
+{
+  "connect/client/ConnectClient.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 5
+    },
+    "complexity": {
+      "count": 1
+    }
+  },
+  "connect/compatibility.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "connect/host/ConnectHost.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 9
+    },
+    "complexity": {
+      "count": 5
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 5
+    },
+    "max-params": {
+      "count": 1
+    }
+  },
+  "connect/host/InFlightRegistry.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "connect/host/SphereInstance.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "connect/host/WalletSnapshot.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "connect/host/host-state.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "connect/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "connect/permissions.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "connect/protocol.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "connect/semver.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 1
+    }
+  },
+  "connect/types.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 4
+    }
+  },
+  "connect/version.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "constants.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "core/Sphere.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 22
+    },
+    "complexity": {
+      "count": 12
+    },
+    "max-depth": {
+      "count": 8
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 15
+    },
+    "max-params": {
+      "count": 1
+    }
+  },
+  "core/address.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "core/async-gate.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "core/bech32.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "core/crypto.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "core/currency.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "core/delivery-envelope.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "core/discover.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "core/encryption.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "core/errors.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 3
+    }
+  },
+  "core/field-encryption.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "core/logger.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 2
+    }
+  },
+  "core/network-health.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 2
+    },
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 3
+    }
+  },
+  "core/timeout.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "core/transport-resolver.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 2
+    },
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "core/utils.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "core/uuid.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "impl/browser/connect/ExtensionTransport.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 2
+    }
+  },
+  "impl/browser/connect/PostMessageTransport.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 3
+    }
+  },
+  "impl/browser/connect/autoConnect.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "impl/browser/download.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/browser/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "impl/browser/ipfs.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/browser/ipfs/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/browser/oracle/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/browser/storage/IndexedDBStorageProvider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "impl/browser/storage/IndexedDBTokenStorageProvider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "impl/browser/storage/IpfsStorageProvider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "impl/browser/storage/LocalStorageProvider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/browser/storage/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/browser/transport/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "impl/nodejs/connect/WebSocketTransport.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "impl/nodejs/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "impl/nodejs/ipfs/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/nodejs/oracle/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/nodejs/storage/FileStorageProvider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "max-depth": {
+      "count": 1
+    }
+  },
+  "impl/nodejs/storage/FileTokenStorageProvider.ts": {
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "impl/nodejs/transport/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/shared/config.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/shared/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/shared/ipfs/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/shared/ipfs/ipfs-cache.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/shared/ipfs/ipfs-error-types.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "impl/shared/ipfs/ipfs-http-client.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "impl/shared/ipfs/ipfs-state-persistence.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/shared/ipfs/ipfs-storage-provider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 3
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 5
+    }
+  },
+  "impl/shared/ipfs/ipfs-types.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/shared/ipfs/ipns-key-derivation.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "impl/shared/ipfs/ipns-record-manager.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/shared/ipfs/ipns-subscription-client.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "impl/shared/ipfs/txf-merge.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "impl/shared/ipfs/write-behind-buffer.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "impl/shared/network.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "impl/shared/resolvers.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/shared/trustbase-loader.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "impl/shared/wallet-api/WalletApiCheckpointStore.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "impl/shared/wallet-api/WalletApiMailboxProvider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 9
+    }
+  },
+  "impl/shared/wallet-api/WalletApiTokenStorageProvider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 8
+    },
+    "max-lines": {
+      "count": 1
+    }
+  },
+  "impl/shared/wallet-api/composition.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 3
+    }
+  },
+  "index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 3
+    }
+  },
+  "modules/accounting/AccountingModule.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 33
+    },
+    "complexity": {
+      "count": 29
+    },
+    "max-depth": {
+      "count": 24
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 33
+    },
+    "max-params": {
+      "count": 1
+    }
+  },
+  "modules/accounting/auto-return.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 5
+    }
+  },
+  "modules/accounting/balance-computer.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 4
+    },
+    "complexity": {
+      "count": 2
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 3
+    }
+  },
+  "modules/accounting/memo.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 2
+    },
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "modules/accounting/serialization.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 2
+    }
+  },
+  "modules/accounting/types.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 8
+    },
+    "max-lines": {
+      "count": 1
+    }
+  },
+  "modules/communications/CommunicationsModule.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 1
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "modules/groupchat/GroupChatModule.ts": {
+    "budget/no-long-comment-block": {
+      "count": 2
+    },
+    "complexity": {
+      "count": 2
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 6
+    }
+  },
+  "modules/groupchat/types.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "modules/market/MarketModule.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 2
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "modules/market/types.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "modules/payments/PaymentsModule.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 64
+    },
+    "complexity": {
+      "count": 13
+    },
+    "max-depth": {
+      "count": 16
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 19
+    }
+  },
+  "modules/payments/SendOperations.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "modules/payments/SpendQueue.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 6
+    },
+    "max-lines-per-function": {
+      "count": 4
+    },
+    "max-params": {
+      "count": 1
+    }
+  },
+  "modules/payments/TokenReservationLedger.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 5
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "modules/payments/TokenSplitCalculator.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "modules/payments/TransportDeliveryAdapter.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "modules/payments/pump-health.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "modules/swap/SwapModule.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 22
+    },
+    "complexity": {
+      "count": 11
+    },
+    "max-depth": {
+      "count": 18
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 16
+    }
+  },
+  "modules/swap/dm-protocol.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 3
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    },
+    "max-params": {
+      "count": 1
+    }
+  },
+  "modules/swap/escrow-client.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    },
+    "max-params": {
+      "count": 1
+    }
+  },
+  "modules/swap/manifest.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "modules/swap/state-machine.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "modules/swap/types.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 3
+    },
+    "max-lines": {
+      "count": 1
+    }
+  },
+  "oracle/UnicityAggregatorProvider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 2
+    }
+  },
+  "oracle/oracle-provider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 3
+    }
+  },
+  "price/CoinGeckoPriceProvider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 2
+    },
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "price/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "price/price-provider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "registry/TokenRegistry.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 2
+    }
+  },
+  "registry/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "serialization/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "serialization/txf-serializer.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 3
+    },
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "serialization/types.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "serialization/wallet-dat.ts": {
+    "budget/no-long-comment-block": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 1
+    },
+    "max-depth": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "serialization/wallet-text.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "storage/storage-provider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 10
+    }
+  },
+  "storage/whole-blob-inventory-adapter.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "token-engine/SpherePaymentData.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "token-engine/SphereTokenEngine.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 5
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "token-engine/blob-keys.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "token-engine/engine.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 6
+    }
+  },
+  "token-engine/errors.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "token-engine/factory.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "token-engine/identity.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "token-engine/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "token-engine/network.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "token-engine/realization.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "token-engine/sdk.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "token-engine/split-checkpoint.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "token-engine/token-blob.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "token-engine/types.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "transport/MultiAddressTransportMux.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 3
+    },
+    "complexity": {
+      "count": 3
+    },
+    "max-depth": {
+      "count": 5
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 5
+    }
+  },
+  "transport/NostrTransportProvider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 3
+    },
+    "complexity": {
+      "count": 3
+    },
+    "max-depth": {
+      "count": 4
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 6
+    }
+  },
+  "transport/delivery-provider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 11
+    }
+  },
+  "transport/transport-provider.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 8
+    }
+  },
+  "transport/websocket.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "tsup.config.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "types/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 12
+    },
+    "max-lines": {
+      "count": 1
+    }
+  },
+  "types/txf.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 2
+    }
+  },
+  "types/v2-transfer.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "validation/index.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "validation/token-validator.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "vitest.daemon.config.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "vitest.e2e.config.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "vitest.harness.config.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "vitest.live.config.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    }
+  },
+  "wallet-api/challenge.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 2
+    }
+  },
+  "wallet-api/client.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 8
+    },
+    "max-depth": {
+      "count": 3
+    },
+    "max-lines": {
+      "count": 1
+    }
+  },
+  "wallet-api/codec.ts": {
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "wallet-api/errors.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "wallet-api/index.ts": {
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "wallet-api/intent-signing.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  },
+  "wallet-api/types.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 4
+    }
+  },
+  "wallet-api/wake-supervisor.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    }
+  }
+}
