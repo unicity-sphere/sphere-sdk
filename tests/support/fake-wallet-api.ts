@@ -69,6 +69,16 @@ interface InventoryRow {
 }
 
 /** One mailbox entry (§6): append-only per recipient, content-derived id. */
+/** One deposit's validated wire fields — shared by the single and batch handlers (#111). */
+interface DepositEntryFields {
+  recipientPubkey: string;
+  key: string;
+  transferId: string;
+  tokenId: string;
+  stateHash: string;
+  memo?: string;
+}
+
 interface MailboxEntryRow {
   /** `hex(SHA-256(tokenId bytes ‖ stateHash bytes))` (§6). */
   entryId: string;
@@ -296,6 +306,7 @@ export class FakeWalletApi {
   private tamperChallenge: ((challenge: string) => string) | null = null;
   private failInventory = false;
   private failIntents = false;
+  private mailboxBatchEnabled = true;
 
   constructor(options: FakeWalletApiOptions = {}) {
     this.network = options.network ?? 'testnet2';
@@ -371,6 +382,11 @@ export class FakeWalletApi {
   /** Simulate an intent-endpoint outage (E.3 local-backstop tests). */
   setIntentFailure(fail: boolean): void {
     this.failIntents = fail;
+  }
+
+  /** Simulate a pre-#111 deployment: with false, POST /v1/mailbox/batch 404s like any unknown route. */
+  setMailboxBatchRoute(enabled: boolean): void {
+    this.mailboxBatchEnabled = enabled;
   }
 
   /** Force-expire all access tokens (drives the 401 → refresh path). */
@@ -675,6 +691,11 @@ export class FakeWalletApi {
     if (method === 'POST' && path === '/v1/inventory/apply') return this.handleApply(req, res);
 
     if (method === 'POST' && path === '/v1/mailbox') return this.handleMailboxDeposit(req, res);
+    if (method === 'POST' && path === '/v1/mailbox/batch' && this.mailboxBatchEnabled) {
+      // a pre-#111 deployment has no batch route — with the toggle off this
+      // falls through to the 404 below, exactly what the SDK's fallback probes
+      return this.handleMailboxBatchDeposit(req, res);
+    }
     if (method === 'GET' && path === '/v1/mailbox') return this.handleMailboxList(req, res, url);
     if (method === 'POST' && path === '/v1/mailbox/claim') return this.handleMailboxClaim(req, res);
     if (method === 'POST' && path === '/v1/mailbox/reject') return this.handleMailboxReject(req, res);
@@ -1260,22 +1281,83 @@ export class FakeWalletApi {
   private async handleMailboxDeposit(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const session = this.authenticate(req);
     const body = await this.readJsonBody(req);
-    const { recipientPubkey, key, transferId, stateHash, tokenId, memo } = body as {
+    const entry = this.parseDepositEntry(body, 'deposit');
+
+    // §6: deposit is idempotent by entry_id — an entry in ANY status returns
+    // 200 with the existing entryId and changes nothing, PROVIDED the
+    // request's recipient and key match the stored entry; a mismatch is 409,
+    // never a false success.
+    const existing = this.findExistingOrConflict(entry);
+    if (existing) {
+      this.json(res, 200, { entryId: existing.entryId });
+      return;
+    }
+    this.checkDepositCaps(entry.recipientPubkey, session.pubkey, 1);
+    const assets = this.validateDepositBlob(entry);
+
+    const { entryId } = this.appendMailboxEntry(session.pubkey, entry, assets);
+    this.wakeOwner(entry.recipientPubkey, 'mailbox'); // §9 wake nudge
+    this.json(res, 200, { entryId });
+  }
+
+  /**
+   * `POST /v1/mailbox/batch` (§6/§16, #111): up to 1000 entries for ONE
+   * recipient, ALL-OR-NOTHING — everything is validated (shape, idempotency
+   * mismatch → 409, §8.2 blob checks, caps over the FRESH count) before any
+   * entry is appended, so a failure mutates nothing. Duplicates succeed with
+   * their stored entryId+seq; fresh entries get a contiguous seq run in
+   * request order. One wake for the whole request.
+   */
+  private async handleMailboxBatchDeposit(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const session = this.authenticate(req);
+    const body = await this.readJsonBody(req);
+    const rawEntries = (body as { entries?: unknown }).entries;
+    if (!Array.isArray(rawEntries) || rawEntries.length < 1 || rawEntries.length > 1000) {
+      throw new HttpError(422, 'VALIDATION', 'entries must be an array of 1..1000 deposit entries');
+    }
+    const entries = rawEntries.map((raw, i) => this.parseDepositEntry(raw, `entries[${i}]`));
+    if (new Set(entries.map((e) => e.recipientPubkey)).size > 1) {
+      throw new HttpError(422, 'VALIDATION', 'all entries must share one recipientPubkey');
+    }
+    if (new Set(entries.map((e) => `${e.tokenId}:${e.stateHash}`)).size !== entries.length) {
+      throw new HttpError(422, 'VALIDATION', 'entries must be distinct (tokenId, stateHash) pairs');
+    }
+
+    // validation phase — request order, nothing stored yet
+    const resolved = entries.map((entry) => ({ entry, existing: this.findExistingOrConflict(entry) }));
+    const fresh = resolved.filter((r) => r.existing === null);
+    const recipientPubkey = entries[0].recipientPubkey;
+    this.checkDepositCaps(recipientPubkey, session.pubkey, fresh.length);
+    const freshAssets = new Map(fresh.map((r) => [r.entry, this.validateDepositBlob(r.entry)]));
+
+    // append phase — consecutive seqs in request order; one wake per request
+    const results = resolved.map(({ entry, existing }) => {
+      if (existing) return { entryId: existing.entryId, seq: existing.seq };
+      return this.appendMailboxEntry(session.pubkey, entry, freshAssets.get(entry) ?? []);
+    });
+    if (fresh.length > 0) this.wakeOwner(recipientPubkey, 'mailbox');
+    this.json(res, 200, {
+      entries: results.map((r) => ({ entryId: r.entryId, seq: r.seq.toString() })),
+    });
+  }
+
+  private parseDepositEntry(raw: unknown, where: string): DepositEntryFields {
+    const { recipientPubkey, key, transferId, stateHash, tokenId, memo } = (raw ?? {}) as {
       recipientPubkey?: unknown; key?: unknown; transferId?: unknown;
       stateHash?: unknown; tokenId?: unknown; memo?: unknown;
     };
     if (typeof recipientPubkey !== 'string' || !/^0[23][0-9a-f]{64}$/i.test(recipientPubkey)) {
-      throw new HttpError(422, 'VALIDATION', 'recipientPubkey must be a 33-byte compressed secp256k1 key (hex)');
+      throw new HttpError(422, 'VALIDATION', `${where}: recipientPubkey must be a 33-byte compressed secp256k1 key (hex)`);
     }
-    if (typeof key !== 'string' || key === '') throw new HttpError(422, 'VALIDATION', 'key is required');
+    if (typeof key !== 'string' || key === '') throw new HttpError(422, 'VALIDATION', `${where}: key is required`);
     if (typeof transferId !== 'string' || transferId === '') {
-      throw new HttpError(422, 'VALIDATION', 'transferId is required');
+      throw new HttpError(422, 'VALIDATION', `${where}: transferId is required`);
     }
     if (typeof tokenId !== 'string' || !/^[0-9a-f]{64}$/.test(tokenId)) {
-      throw new HttpError(422, 'VALIDATION', 'tokenId must be 64-hex');
+      throw new HttpError(422, 'VALIDATION', `${where}: tokenId must be 64-hex`);
     }
     if (typeof stateHash !== 'string' || !/^[0-9a-f]{64}$/.test(stateHash)) {
-      throw new HttpError(422, 'VALIDATION', 'stateHash must be 64-hex');
+      throw new HttpError(422, 'VALIDATION', `${where}: stateHash must be 64-hex`);
     }
     if (memo !== undefined) {
       // §8.3 wire mapping: the memo is an `enc1.` envelope, validated for
@@ -1286,48 +1368,52 @@ export class FakeWalletApi {
         throw new HttpError(422, 'VALIDATION', err instanceof Error ? err.message : 'bad memo envelope');
       }
     }
+    return { recipientPubkey, key, transferId, tokenId, stateHash, ...(memo !== undefined ? { memo: memo as string } : {}) };
+  }
 
-    // §6: deposit is idempotent by entry_id — an entry in ANY status returns
-    // 200 with the existing entryId and changes nothing, PROVIDED the
-    // request's recipient and key match the stored entry; a mismatch is 409,
-    // never a false success.
-    const entryId = this.entryIdFor(tokenId, stateHash);
-    const existing = this.findMailboxEntry(entryId);
-    if (existing) {
-      if (existing.recipientPubkey !== recipientPubkey || existing.s3Key !== key) {
-        throw new HttpError(409, 'CONFLICT', 'entry exists with a different recipient or key');
-      }
-      this.json(res, 200, { entryId });
-      return;
+  /** §6 idempotency: a stored entry (matching recipient+key) or null; a mismatch is 409, never a false success. */
+  private findExistingOrConflict(entry: DepositEntryFields): MailboxEntryRow | null {
+    const existing = this.findMailboxEntry(this.entryIdFor(entry.tokenId, entry.stateHash));
+    if (!existing) return null;
+    if (existing.recipientPubkey !== entry.recipientPubkey || existing.s3Key !== entry.key) {
+      throw new HttpError(409, 'CONFLICT', 'entry exists with a different recipient or key');
     }
+    return existing;
+  }
 
-    // §6/§5.5 caps — what bounds abuse is validation plus quotas, not token
-    // cost: the per-recipient unclaimed cap and the per-sender-pair sub-cap
-    // (so a third party cannot fill the whole inbox). A 429 after
-    // certification is not a loss — the blob is regenerable and the sender's
-    // resume keeps retrying.
+  /**
+   * §6/§5.5 caps — what bounds abuse is validation plus quotas, not token
+   * cost: the per-recipient unclaimed cap and the per-sender-pair sub-cap
+   * (so a third party cannot fill the whole inbox). A batch counts its FRESH
+   * entries: admit only when every one fits (all-or-nothing). A 429 after
+   * certification is not a loss — the blob is regenerable and the sender's
+   * resume keeps retrying.
+   */
+  private checkDepositCaps(recipientPubkey: string, senderPubkey: string, newCount: number): void {
     const recipient = this.owner(recipientPubkey); // accounts auto-provisioned on first touch (§4/§9)
     let unclaimed = 0;
     let unclaimedFromSender = 0;
     for (const e of recipient.mailbox.values()) {
       if (e.status !== 'unclaimed') continue;
       unclaimed++;
-      if (e.senderPubkey === session.pubkey) unclaimedFromSender++;
+      if (e.senderPubkey === senderPubkey) unclaimedFromSender++;
     }
-    if (unclaimed >= this.mailboxUnclaimedCap) {
+    if (unclaimed + newCount > this.mailboxUnclaimedCap) {
       throw new HttpError(429, 'RATE_LIMITED', 'recipient unclaimed-entry cap reached (§5.5)');
     }
-    if (unclaimedFromSender >= this.mailboxPerPairCap) {
+    if (unclaimedFromSender + newCount > this.mailboxPerPairCap) {
       throw new HttpError(429, 'RATE_LIMITED', 'per-sender-pair unclaimed sub-cap reached (§6)');
     }
+  }
 
-    // §8.2 deposit validation pipeline (nothing invalid is stored):
+  /** §8.2 deposit validation pipeline (nothing invalid is stored) — returns the decoded assets. */
+  private validateDepositBlob(entry: DepositEntryFields): FakeAsset[] {
     // step 1 — fetch the blob by key; size cap.
-    const bytes = this.blobStore.get(key);
-    if (!bytes) throw new HttpError(422, 'VALIDATION', `no blob stored at key ${key}`);
+    const bytes = this.blobStore.get(entry.key);
+    if (!bytes) throw new HttpError(422, 'VALIDATION', `no blob stored at key ${entry.key}`);
     if (bytes.length > this.maxBlobBytes) throw new HttpError(413, 'TOO_LARGE', 'blob exceeds MAX_BLOB_BYTES');
     // step 2 — recompute SHA-256; it MUST equal the content-addressed key (§5.2).
-    if (`${this.network}/t/${hex(sha256(bytes))}` !== key) {
+    if (`${this.network}/t/${hex(sha256(bytes))}` !== entry.key) {
       throw new HttpError(422, 'VALIDATION', 'blob bytes do not match the content-addressed key');
     }
     // step 3 — APPROXIMATION: the real server runs the SDK's three-service
@@ -1340,10 +1426,10 @@ export class FakeWalletApi {
     if (resolved.tokenId === null) {
       throw new HttpError(422, 'VALIDATION', 'blob does not decode to a token id');
     }
-    if (resolved.tokenId !== tokenId) {
+    if (resolved.tokenId !== entry.tokenId) {
       throw new HttpError(422, 'VALIDATION', 'decoded tokenId does not match the claimed tokenId');
     }
-    if (hex(sha256(resolved.inner)) !== stateHash) {
+    if (hex(sha256(resolved.inner)) !== entry.stateHash) {
       throw new HttpError(422, 'VALIDATION', 'decoded state hash does not match the claimed stateHash');
     }
     // step 5 — APPROXIMATION: recipient-ownership (predicate decode) is not
@@ -1354,26 +1440,34 @@ export class FakeWalletApi {
     if (assets === null) throw new HttpError(422, 'VALIDATION', 'token value does not decode');
     // step 7 (lineage) applies to inventory writes; the mailbox append itself
     // is replay-guarded by the content-derived entry_id above.
+    return assets;
+  }
 
-    // §6: assign a per-recipient monotonic seq and append; notify.
+  /** §6: assign the next per-recipient monotonic seq and append (caller wakes). */
+  private appendMailboxEntry(
+    senderPubkey: string,
+    entry: DepositEntryFields,
+    assets: FakeAsset[],
+  ): { entryId: string; seq: bigint } {
+    const recipient = this.owner(entry.recipientPubkey);
+    const entryId = this.entryIdFor(entry.tokenId, entry.stateHash);
     recipient.mailboxSeq += 1n;
     recipient.mailbox.set(entryId, {
       entryId,
       seq: recipient.mailboxSeq,
       status: 'unclaimed',
-      recipientPubkey,
-      senderPubkey: session.pubkey,
-      transferId,
-      tokenId,
-      stateHash,
-      s3Key: key,
+      recipientPubkey: entry.recipientPubkey,
+      senderPubkey,
+      transferId: entry.transferId,
+      tokenId: entry.tokenId,
+      stateHash: entry.stateHash,
+      s3Key: entry.key,
       assets,
-      ...(memo !== undefined ? { memo: memo as string } : {}),
+      ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
       createdAt: new Date().toISOString(),
       blobCollected: false,
     });
-    this.wakeOwner(recipientPubkey, 'mailbox'); // §9 wake nudge
-    this.json(res, 200, { entryId });
+    return { entryId, seq: recipient.mailboxSeq };
   }
 
   private mailboxEntryToWire(entry: MailboxEntryRow): Record<string, unknown> {

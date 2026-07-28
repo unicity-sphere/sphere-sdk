@@ -18,6 +18,7 @@ import type {
   HistoryWireRecord,
   IntentRecord,
   InventoryPage,
+  MailboxBatchDepositResult,
   MailboxClaimResult,
   MailboxEntry,
   MailboxPage,
@@ -201,6 +202,18 @@ export function parseProgressRecords(body: unknown): ProgressRecord[] {
 export function parseDepositResult(body: unknown): string {
   const rec = asRecord(body, 'mailbox deposit response');
   return asString(rec.entryId, 'mailbox deposit response .entryId');
+}
+
+/** `POST /v1/mailbox/batch` → {@link MailboxBatchDepositResult}[] in request order (§16, #111). */
+export function parseBatchDepositResult(body: unknown): MailboxBatchDepositResult[] {
+  const rec = asRecord(body, 'mailbox batch deposit response');
+  return asArray(rec.entries, 'mailbox batch deposit response .entries').map((raw, i) => {
+    const entry = asRecord(raw, `entries[${i}]`);
+    return {
+      entryId: asString(entry.entryId, `entries[${i}].entryId`),
+      seq: parseCounter(entry.seq, `entries[${i}].seq`),
+    };
+  });
 }
 
 function parseMailboxEntry(raw: unknown, what: string): MailboxEntry {

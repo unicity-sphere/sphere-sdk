@@ -230,6 +230,17 @@ export interface MailboxDepositRequest {
   memo?: string;
 }
 
+/**
+ * One `POST /v1/mailbox/batch` result (§6/§16, #111): the content-derived
+ * entry id plus the entry's per-recipient seq (newly on the wire — the single
+ * deposit returns `{ entryId }` only), in request order. `seq` is data, never
+ * an id: the S7 deliveryId stays content-derived.
+ */
+export interface MailboxBatchDepositResult {
+  entryId: string;
+  seq: bigint;
+}
+
 export type MailboxEntryStatus = 'unclaimed' | 'claimed' | 'rejected'; // §11/§16 wire values
 
 /** One `GET /v1/mailbox` entry (§16). */

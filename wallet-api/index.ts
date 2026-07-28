@@ -31,6 +31,7 @@ export type {
   ApplyDeltaRequest,
   IntentRecord,
   MailboxDepositRequest,
+  MailboxBatchDepositResult,
   MailboxEntry,
   MailboxEntryStatus,
   MailboxPage,
