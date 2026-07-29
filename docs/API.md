@@ -251,11 +251,9 @@ interface TransferRequest {
   readonly coinId: string;       // Coin type (hex string)
   readonly amount: string;       // Amount in smallest units (decimal string)
   readonly recipient: string;    // @nametag, hex chain pubkey, or DIRECT:// address
-  readonly memo?: string;        // Optional message (transport-only; invoice refs also go on-chain)
+  readonly memo?: string;        // Optional message (transport-only)
   readonly addressMode?: AddressMode;    // 'auto' | 'direct' — both resolve to the recipient's key-based DIRECT address
   readonly transferMode?: TransferMode;  // @deprecated: accepted but IGNORED (single engine path)
-  readonly invoiceRefundAddress?: string; // Invoice refund address (DIRECT://) — embedded in the on-chain message
-  readonly invoiceContact?: { address: string; url?: string }; // Invoice contact — embedded in the on-chain message
 }
 
 type AddressMode = 'auto' | 'direct';
@@ -453,7 +451,7 @@ Add a token to the wallet.
 
 - **Tombstone check**: Rejected if exact `(tokenId, stateHash)` is tombstoned.
 - **Duplicate check**: Rejected if same composite key already exists.
-- **State replacement**: If same `tokenId` with different `stateHash`, archives old state and adds new.
+- **State replacement**: If same `tokenId` with different `stateHash`, the old state is dropped and the new one added.
 
 Returns `true` if added, `false` if rejected.
 
@@ -463,7 +461,7 @@ Update an existing token. Matches by genesis tokenId or `token.id`. Falls back t
 
 #### `removeToken(tokenId: string, excludeReservationId?: string): Promise<void>`
 
-Remove a token. Archives it first and creates a tombstone `(tokenId, stateHash)`.
+Remove a token and create a tombstone `(tokenId, stateHash)` so the same state cannot be re-added.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -502,49 +500,6 @@ Remove tombstones older than `maxAge` (default: 30 days) and cap at 100 entries.
 
 ---
 
-### Methods: Archives
-
-Archived tokens are spent or superseded token versions kept for recovery and sync.
-
-#### `getArchivedTokens(): Map<string, TxfToken>`
-
-Get all archived tokens. Key is genesis token ID.
-
-#### `getBestArchivedVersion(tokenId: string): TxfToken | null`
-
-Get the version with the most committed transactions from both archives and forks.
-
-#### `mergeArchivedTokens(remoteArchived: Map<string, TxfToken>): Promise<number>`
-
-Merge remote archived tokens. Handles incremental updates and forks. Returns count of tokens updated/added.
-
-#### `pruneArchivedTokens(maxCount?: number): Promise<void>`
-
-Keep at most `maxCount` archived tokens (default: 100).
-
----
-
-### Methods: Forked Tokens
-
-Forked tokens are alternative histories detected during sync.
-
-#### `getForkedTokens(): Map<string, TxfToken>`
-
-Get all forked tokens. Key is `{tokenId}_{stateHash}`.
-
-#### `storeForkedToken(tokenId: string, stateHash: string, txfToken: TxfToken): Promise<void>`
-
-Store a forked token version. No-op if key already exists.
-
-#### `mergeForkedTokens(remoteForked: Map<string, TxfToken>): Promise<number>`
-
-Merge remote forked tokens (adds missing keys). Returns count added.
-
-#### `pruneForkedTokens(maxCount?: number): Promise<void>`
-
-Keep at most `maxCount` forked tokens (default: 50).
-
----
 
 ### Methods: Transaction History
 
@@ -612,7 +567,7 @@ Remove nametag data from memory and storage.
 
 #### `sync(): Promise<{ added: number; removed: number }>`
 
-Sync with all remote storage providers (IPFS, etc.). Merges local and remote token data.
+Sync with all remote storage providers. Merges local and remote token data.
 
 ```typescript
 const result = await sphere.payments.sync();
@@ -1010,7 +965,7 @@ interface Identity {
   chainPubkey: string;
   /** L3 DIRECT address (DIRECT://...) */
   directAddress?: string;
-  /** IPNS identifier for storage */
+  /** Legacy derived id; retained in the TXF `_meta` shape */
   ipnsName?: string;
   /** Registered @name alias */
   nametag?: string;
@@ -1170,7 +1125,7 @@ interface PaymentsModuleDependencies {
   storage: StorageProvider;
   /** @deprecated Use tokenStorageProviders instead */
   tokenStorage?: TokenStorageProvider;
-  /** Multiple token storage providers (e.g., IPFS, MongoDB, file) */
+  /** Multiple token storage providers */
   tokenStorageProviders?: Map<string, TokenStorageProvider>;
   transport: TransportProvider;
   oracle: OracleProvider;
@@ -1324,14 +1279,13 @@ For custom token storage backends (instead of thin wallet-api storage):
 
 ```typescript
 import { createOwnStorageWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
-import { createNodeIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
 const base = createNodeProviders({ network: 'testnet2', ... });
-const ipfsStorage = createNodeIpfsStorageProvider({ /* config */ }, base.storage);
 
-// Put the custody token-storage port on the base bundle; the own-storage preset preserves it
-// (its config has no `tokenStorage` field — it only adds the `delivery` + `walletApi` ports).
-const ownStorageBase = { ...base, tokenStorage: ipfsStorage };
+// Put your own custody token-storage implementation on the base bundle; the
+// own-storage preset preserves it (its config has no `tokenStorage` field — it
+// only adds the `delivery` + `walletApi` ports).
+const ownStorageBase = { ...base, tokenStorage: myTokenStorageProvider };
 
 const providers = createOwnStorageWalletApiProviders(ownStorageBase, {
   baseUrl: 'https://wallet-api.unicity.network',

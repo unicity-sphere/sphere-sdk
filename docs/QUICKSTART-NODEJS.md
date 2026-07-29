@@ -142,7 +142,6 @@ Node.js implementation uses **file-based storage**:
 | Wallet (keys, nametag) | `dataDir/wallet.json` (or custom file name) | JSON (plaintext or password-encrypted mnemonic) |
 | Tokens | `tokensDir/_<tokenId>.json` | One JSON file per token |
 
-> **Note:** IPFS sync is available for both browser and Node.js. See [IPFS Token Sync](#ipfs-token-sync-optional) below.
 
 ## Minimal Example
 
@@ -251,39 +250,6 @@ const providers = createWalletApiProviders(base, {
   deviceId: 'my-device-id',                        // Stable per-device label (optional — random if omitted)
 });
 ```
-
-## IPFS Token Sync (Optional)
-
-Enable decentralized token backup to IPFS/IPNS. No extra packages needed — uses built-in HTTP API.
-
-```typescript
-const base = createNodeProviders({
-  network: 'testnet',
-  dataDir: './wallet-data',
-  tokensDir: './tokens-data',
-  tokenSync: {
-    ipfs: { enabled: true },
-  },
-});
-
-const providers = createWalletApiProviders(base, {
-  baseUrl: 'https://wallet-api.unicity.network',
-  network: 'testnet2',
-  deviceId: 'my-stable-device-id',
-});
-
-const { sphere } = await Sphere.init({
-  ...providers,
-  network: 'testnet2',
-  autoGenerate: true,
-});
-
-// Sync tokens with IPFS (merges local and remote data)
-const result = await sphere.payments.sync();
-console.log(`Sync: +${result.added} -${result.removed}`);
-```
-
-**Recovery after local data loss:** Re-initialize the wallet with the same mnemonic and call `sync()`. Tokens stored on IPFS will be restored automatically.
 
 ## Common Operations
 

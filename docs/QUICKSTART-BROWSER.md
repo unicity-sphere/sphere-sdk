@@ -255,7 +255,7 @@ The v2 SDK combines three storage mechanisms:
 
 **SSR Note:** If `localStorage` is unavailable (SSR), an in-memory fallback is used.
 
-**Wallet-API Delivery:** The WalletApiMailboxProvider polls the wallet-api server for incoming certified transfers (on behalf of recipient nametags). This is the reference implementation of v2 token delivery — Nostr and IPFS are messaging/backup only, not the payment rail.
+**Wallet-API Delivery:** The WalletApiMailboxProvider polls the wallet-api server for incoming certified transfers (on behalf of recipient nametags). This is the reference implementation of v2 token delivery — Nostr is messaging only, not the payment rail.
 
 ## Configuration Options
 
@@ -293,14 +293,6 @@ const base = createBrowserProviders({
     platform: 'coingecko',    // Currently supported: 'coingecko'
     apiKey: 'CG-xxx',         // Optional (free tier works without key)
     cacheTtlMs: 60000,        // Cache TTL in ms (default: 60s)
-  },
-
-  // Token sync (optional IPFS backup)
-  tokenSync: {
-    ipfs: {
-      enabled: true,
-      additionalGateways: ['https://my-ipfs-gateway.com'],
-    },
   },
 });
 

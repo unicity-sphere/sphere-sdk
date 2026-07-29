@@ -52,7 +52,6 @@ function randomHex(length: number): string {
 export interface MockPaymentsModule {
   // Public API stubs
   getTokens: ReturnType<typeof vi.fn>;
-  getArchivedTokens: ReturnType<typeof vi.fn>;
   getAssets: ReturnType<typeof vi.fn>;
   getHistory: ReturnType<typeof vi.fn>;
   send: ReturnType<typeof vi.fn>;
@@ -61,7 +60,6 @@ export interface MockPaymentsModule {
   l1: null;
   // Test helpers
   _tokens: Token[];
-  _archivedTokens: Map<string, unknown>;
   _sendResult: TransferResult;
   _handlers: Map<string, Array<(data: unknown) => void>>;
   _emit: (event: string, data: unknown) => void;
@@ -83,14 +81,8 @@ export function createMockPaymentsModule(): MockPaymentsModule {
   // Mutable send result — tests can reassign mock._sendResult
   let sendResult = { ...defaultSendResult };
 
-  const archivedTokens = new Map<string, unknown>();
-
   const getTokens = vi.fn().mockImplementation((_filter?: unknown) => {
     return mock._tokens.slice();
-  });
-
-  const getArchivedTokens = vi.fn().mockImplementation(() => {
-    return new Map(mock._archivedTokens);
   });
 
   const getAssets = vi.fn().mockImplementation((_coinId?: string): Asset[] => {
@@ -142,7 +134,6 @@ export function createMockPaymentsModule(): MockPaymentsModule {
 
   const mock: MockPaymentsModule = {
     getTokens,
-    getArchivedTokens,
     getAssets,
     getHistory,
     send,
@@ -150,7 +141,6 @@ export function createMockPaymentsModule(): MockPaymentsModule {
     onTokenChange,
     l1: null,
     _tokens: tokens,
-    _archivedTokens: archivedTokens,
     get _sendResult(): TransferResult {
       return sendResult;
     },

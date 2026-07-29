@@ -400,25 +400,6 @@ export class AccountingModule {
         }
       }
 
-      // Also scan archived tokens (spec §5.4 Phase 2 step 5)
-      const archivedTokens = deps.payments.getArchivedTokens();
-      for (const [archivedId, txf] of archivedTokens) {
-        try {
-          const tokenType = txf.genesis?.data?.tokenType;
-          if (tokenType !== INVOICE_TOKEN_TYPE_HEX) continue;
-
-          const tokenData = txf.genesis?.data?.tokenData;
-          if (!tokenData) continue;
-
-          const rawTerms = this._parseInvoiceTerms(tokenData);
-          if (rawTerms) {
-            this.invoiceTermsCache.set(archivedId, this._normalizeInvoiceTerms(rawTerms));
-          }
-        } catch (err) {
-          logger.warn(LOG_TAG, `Failed to parse archived invoice token ${archivedId}:`, err);
-        }
-      }
-
       // Build hash→ID index for privacy-preserving on-chain lookups
       this._rebuildHashIndex();
 
@@ -1050,15 +1031,6 @@ export class AccountingModule {
         if (await this._scanTokenForAttribution(token, 0)) anyScanDirty = true;
       }
 
-      // Also scan archived tokens (spec §5.4 Phase 2 step 5)
-      const archivedTokensForScan = deps.payments.getArchivedTokens();
-      for (const [archivedId, txf] of archivedTokensForScan) {
-        const txCount = txf.transactions?.length ?? 0;
-        if (txCount === 0) continue;
-        this._processTokenTransactions(archivedId, txf, 0);
-        anyScanDirty = true;
-      }
-
       if (anyScanDirty) {
         await this._flushDirtyLedgerEntries();
       }
@@ -1423,17 +1395,6 @@ export class AccountingModule {
     for (const existingToken of allTokens) {
       const startIndex = this.tokenScanState.get(existingToken.id) ?? 0;
       if (await this._scanTokenForAttribution(existingToken, startIndex)) {
-        anyDirty = true;
-      }
-    }
-
-    // Also scan archived tokens (spec §5.4 Phase 2 step 5)
-    const archivedTokensForGap = deps.payments.getArchivedTokens();
-    for (const [archivedId, txf] of archivedTokensForGap) {
-      const transactions = txf.transactions ?? [];
-      const startIndex = this.tokenScanState.get(archivedId) ?? 0;
-      if (transactions.length > startIndex) {
-        this._processTokenTransactions(archivedId, txf, startIndex);
         anyDirty = true;
       }
     }
@@ -4007,17 +3968,6 @@ export class AccountingModule {
     for (const token of allTokens) {
       const startIndex = this.tokenScanState.get(token.id) ?? 0;
       if (await this._scanTokenForAttribution(token, startIndex)) {
-        anyDirty = true;
-      }
-    }
-
-    // Also scan archived tokens (spec §5.4 Phase 2 step 5)
-    const archivedTokens = deps.payments.getArchivedTokens();
-    for (const [archivedId, txf] of archivedTokens) {
-      const transactions = txf.transactions ?? [];
-      const startIndex = this.tokenScanState.get(archivedId) ?? 0;
-      if (transactions.length > startIndex) {
-        this._processTokenTransactions(archivedId, txf, startIndex);
         anyDirty = true;
       }
     }
