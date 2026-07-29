@@ -604,16 +604,16 @@
       "count": 40
     },
     "complexity": {
-      "count": 11
+      "count": 10
     },
     "max-depth": {
-      "count": 14
+      "count": 2
     },
     "max-lines": {
       "count": 1
     },
     "max-lines-per-function": {
-      "count": 17
+      "count": 16
     }
   },
   "modules/payments/SendOperations.ts": {

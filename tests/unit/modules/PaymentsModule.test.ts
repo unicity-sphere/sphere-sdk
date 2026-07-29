@@ -890,54 +890,6 @@ describe('Nametag preservation during sync', () => {
     expect(module.getNametag()?.token).toBeTruthy();
   });
 
-  it('should update nametags when sync provider returns valid _nametags', async () => {
-    const updatedNametag = {
-      name: 'updateduser',
-      token: { genesis: { data: 'updated' }, state: {}, transactions: [], nametags: [] },
-      timestamp: Date.now() + 1000,
-      format: 'txf',
-      version: '2.0',
-    };
-
-    const mockProvider = {
-      id: 'test-provider',
-      name: 'Test Provider',
-      type: 'local' as const,
-      setIdentity: vi.fn(),
-      initialize: vi.fn().mockResolvedValue(true),
-      shutdown: vi.fn().mockResolvedValue(undefined),
-      connect: vi.fn().mockResolvedValue(undefined),
-      disconnect: vi.fn().mockResolvedValue(undefined),
-      isConnected: vi.fn().mockReturnValue(true),
-      getStatus: vi.fn().mockReturnValue('connected' as const),
-      save: vi.fn().mockResolvedValue({ success: true, timestamp: Date.now() }),
-      load: vi.fn().mockResolvedValue({ success: true, data: { _meta: { version: 1, address: '', formatVersion: '2.0', updatedAt: Date.now() } }, source: 'local', timestamp: Date.now() }),
-      sync: vi.fn().mockResolvedValue({
-        success: true,
-        merged: {
-          _meta: { version: 2, address: '', formatVersion: '2.0', updatedAt: Date.now() },
-          _nametags: [updatedNametag],
-        },
-        added: 0,
-        removed: 0,
-        conflicts: 0,
-      }),
-    };
-
-    const providers = new Map([['test', mockProvider]]);
-    const module = createInitializedModule(providers);
-
-    await module.setNametag(TEST_NAMETAG);
-    expect(module.getNametag()?.name).toBe('testuser');
-
-    // Sync — provider returns merged data WITH different nametag
-    await module.sync();
-
-    // Nametag should be updated to the one from merged data
-    expect(module.hasNametag()).toBe(true);
-    expect(module.getNametag()?.name).toBe('updateduser');
-  });
-
   it('should recover nametags from storage on load()', async () => {
     const mockProvider = {
       id: 'test-provider',

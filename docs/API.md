@@ -567,11 +567,15 @@ Remove nametag data from memory and storage.
 
 #### `sync(): Promise<{ added: number; removed: number }>`
 
-Sync with all remote storage providers. Merges local and remote token data.
+Flush local token state to every configured token storage provider.
+
+Named `sync` for history: it once merged remote TXF state back in, which only the
+IPFS provider ever supplied. The remaining providers implement `sync()` as "save and
+return the input unchanged", so this is a write and **the returned counts are always
+zero**.
 
 ```typescript
-const result = await sphere.payments.sync();
-console.log(`Sync: +${result.added} -${result.removed}`);
+await sphere.payments.sync(); // { added: 0, removed: 0 }
 ```
 
 #### `validate(): Promise<{ valid: Token[]; invalid: Token[] }>`
