@@ -502,49 +502,6 @@ Remove tombstones older than `maxAge` (default: 30 days) and cap at 100 entries.
 
 ---
 
-### Methods: Archives
-
-Archived tokens are spent or superseded token versions kept for recovery and sync.
-
-#### `getArchivedTokens(): Map<string, TxfToken>`
-
-Get all archived tokens. Key is genesis token ID.
-
-#### `getBestArchivedVersion(tokenId: string): TxfToken | null`
-
-Get the version with the most committed transactions from both archives and forks.
-
-#### `mergeArchivedTokens(remoteArchived: Map<string, TxfToken>): Promise<number>`
-
-Merge remote archived tokens. Handles incremental updates and forks. Returns count of tokens updated/added.
-
-#### `pruneArchivedTokens(maxCount?: number): Promise<void>`
-
-Keep at most `maxCount` archived tokens (default: 100).
-
----
-
-### Methods: Forked Tokens
-
-Forked tokens are alternative histories detected during sync.
-
-#### `getForkedTokens(): Map<string, TxfToken>`
-
-Get all forked tokens. Key is `{tokenId}_{stateHash}`.
-
-#### `storeForkedToken(tokenId: string, stateHash: string, txfToken: TxfToken): Promise<void>`
-
-Store a forked token version. No-op if key already exists.
-
-#### `mergeForkedTokens(remoteForked: Map<string, TxfToken>): Promise<number>`
-
-Merge remote forked tokens (adds missing keys). Returns count added.
-
-#### `pruneForkedTokens(maxCount?: number): Promise<void>`
-
-Keep at most `maxCount` forked tokens (default: 50).
-
----
 
 ### Methods: Transaction History
 

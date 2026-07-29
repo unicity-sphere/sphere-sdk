@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed — the archived / forked TXF token stores
+
+Dead since the v1 removal. `archiveToken` calls `tokenToTxf`, which does `JSON.parse(sdkData)`;
+a v2 token's `sdkData` is hex-of-CBOR, so the parse throws, `tokenToTxf` returns `null` and
+`archiveToken` returns early. **No v2 token has ever been archivable**, so these maps could only
+hold pre-cutover leftovers and nothing could add to them.
+
+**Breaking — 8 documented public methods removed** from `PaymentsModule`
+(`docs/API.md` "Methods: Archives" and "Methods: Forked Tokens" are deleted with them):
+`getArchivedTokens`, `getBestArchivedVersion`, `mergeArchivedTokens`, `pruneArchivedTokens`,
+`getForkedTokens`, `storeForkedToken`, `mergeForkedTokens`, `pruneForkedTokens`.
+
+Every one had zero callers outside `PaymentsModule` except `getArchivedTokens`, which
+`AccountingModule` used at 4 sites to scan `txf.transactions` for invoice attribution — a v1-only
+structure that no v2 token carries. Those scans are removed too, so **accounting no longer reaches
+into payments for archives**.
+
+Also removed: `archiveToken` and its 5 call sites in `addToken`/`updateToken`/`removeToken`, the
+`archivedTokens` / `forkedTokens` fields and their persistence in `createStorageData` /
+`loadFromStorageData`, and four module-level helpers left with no callers —
+`findBestTokenVersion`, `pruneMapByCount`, `isIncrementalUpdate`, `countCommittedTxns`.
+
+Wallets carrying archived entries from the v1 era will drop them on the next save. Those entries
+described v1 tokens, which have been unspendable since the cutover and undisplayed since the v1
+removal.
+
+No test changed: **not one test touched any of this** — which is also why it is worth stating that
+the safety argument here is the `tokenToTxf` no-op above, not test coverage.
+
 ### Changed — accounting detached from payments; sends no longer carry on-chain memos
 
 `PaymentsModule` no longer produces on-chain memos. `parseInvoiceMemoForOnChain` was the sole

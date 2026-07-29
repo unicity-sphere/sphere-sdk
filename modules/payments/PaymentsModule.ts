@@ -487,50 +487,6 @@ function isSameTokenState(t1: Token, t2: Token): boolean {
 }
 
 /**
- * Check if incoming token is an incremental update
- */
-function isIncrementalUpdate(existing: TxfToken, incoming: TxfToken): boolean {
-  if (existing.genesis?.data?.tokenId !== incoming.genesis?.data?.tokenId) {
-    return false;
-  }
-
-  const existingTxns = existing.transactions || [];
-  const incomingTxns = incoming.transactions || [];
-
-  if (incomingTxns.length < existingTxns.length) {
-    return false;
-  }
-
-  for (let i = 0; i < existingTxns.length; i++) {
-    const existingTx = existingTxns[i];
-    const incomingTx = incomingTxns[i];
-
-    if (existingTx.previousStateHash !== incomingTx.previousStateHash ||
-        existingTx.newStateHash !== incomingTx.newStateHash) {
-      return false;
-    }
-  }
-
-  for (let i = existingTxns.length; i < incomingTxns.length; i++) {
-    const newTx = incomingTxns[i] as TxfTransaction;
-    if (newTx.inclusionProof === null) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-/**
- * Count committed transactions
- */
-function countCommittedTxns(txf: TxfToken): number {
-  return (txf.transactions || []).filter(
-    (tx: TxfTransaction) => tx.inclusionProof !== null
-  ).length;
-}
-
-/**
  * Prune tombstones by age and count
  */
 function pruneTombstonesByAge(
@@ -547,44 +503,6 @@ function pruneTombstonesByAge(
   }
 
   return result;
-}
-
-/**
- * Prune Map by count
- */
-function pruneMapByCount<T>(items: Map<string, T>, maxCount: number): Map<string, T> {
-  if (items.size <= maxCount) {
-    return new Map(items);
-  }
-
-  const entries = [...items.entries()];
-  const toKeep = entries.slice(entries.length - maxCount);
-  return new Map(toKeep);
-}
-
-/**
- * Find best token version from archives
- */
-function findBestTokenVersion(
-  tokenId: string,
-  archivedTokens: Map<string, TxfToken>,
-  forkedTokens: Map<string, TxfToken>
-): TxfToken | null {
-  const candidates: TxfToken[] = [];
-
-  const archived = archivedTokens.get(tokenId);
-  if (archived) candidates.push(archived);
-
-  for (const [key, forked] of forkedTokens) {
-    if (key.startsWith(tokenId + '_')) {
-      candidates.push(forked);
-    }
-  }
-
-  if (candidates.length === 0) return null;
-
-  candidates.sort((a, b) => countCommittedTxns(b) - countCommittedTxns(a));
-  return candidates[0];
 }
 
 // =============================================================================
@@ -916,8 +834,6 @@ export class PaymentsModule {
   private tombstones: TombstoneEntry[] = [];
   // O(1) lookup set derived from tombstones array. Rebuilt via rebuildTombstoneKeySet().
   private tombstoneKeySet: Set<string> = new Set();
-  private archivedTokens: Map<string, TxfToken> = new Map();
-  private forkedTokens: Map<string, TxfToken> = new Map();
   private _historyCache: TransactionHistoryEntry[] = [];
   private nametags: NametagData[] = [];
 
@@ -1185,8 +1101,6 @@ export class PaymentsModule {
     clearSdkDataCache();
     this.tombstones = [];
     this.tombstoneKeySet.clear();
-    this.archivedTokens.clear();
-    this.forkedTokens.clear();
     this._historyCache = [];
     this.historyHydratedFor = null;
     this.serverSeenHistoryKeys = new Set();
@@ -3551,8 +3465,6 @@ export class PaymentsModule {
         // Remove old state (it will be archived) and add new state
         if (incomingStateHash && existingStateHash && incomingStateHash !== existingStateHash) {
           logger.debug('Payments', `Token ${incomingTokenId?.slice(0, 8)}... state updated: ${existingStateHash.slice(0, 8)}... -> ${incomingStateHash.slice(0, 8)}...`);
-          // Archive old state before removing
-          await this.archiveToken(existing);
           this.tokens.delete(existingId);
           break;
         }
@@ -3561,7 +3473,6 @@ export class PaymentsModule {
         if (!incomingStateHash || !existingStateHash) {
           if (existingId !== token.id) {
             logger.debug('Payments', `Token ${incomingTokenId?.slice(0, 8)}... .id changed, replacing`);
-            await this.archiveToken(existing);
             this.tokens.delete(existingId);
             break;
           }
@@ -3572,9 +3483,6 @@ export class PaymentsModule {
     // Add the new token state
     this.tokens.set(token.id, token);
     logger.debug('Payments', `addToken: stored id=${token.id.slice(0, 16)}... mapSize=${this.tokens.size}`);
-
-    // Archive the token (for recovery purposes)
-    await this.archiveToken(token);
 
     await this.save({ critical: opts.criticalSave });
     logger.debug('Payments', `addToken: saved id=${token.id.slice(0, 16)}...`);
@@ -3641,7 +3549,6 @@ export class PaymentsModule {
     }
 
     // Archive the updated token
-    await this.archiveToken(token);
 
     await this.save();
 
@@ -3711,7 +3618,6 @@ export class PaymentsModule {
     this.parsedTokenCache.delete(tokenId);
 
     // Archive before removing
-    await this.archiveToken(token);
 
     // Remove from active tokens
     this.tokens.delete(tokenId);
@@ -3830,156 +3736,9 @@ export class PaymentsModule {
   // Public API - Archives
   // ===========================================================================
 
-  /**
-   * Get all archived (spent/superseded) tokens in TXF format.
-   *
-   * Archived tokens are kept for recovery and sync purposes. The map key is
-   * the genesis token ID.
-   *
-   * @returns A shallow copy of the archived token map.
-   */
-  getArchivedTokens(): Map<string, TxfToken> {
-    return new Map(this.archivedTokens);
-  }
-
-  /**
-   * Get the best (most committed transactions) archived version of a token.
-   *
-   * Searches both archived and forked token maps and returns the version with
-   * the highest number of committed transactions.
-   *
-   * @param tokenId - The genesis token ID to look up.
-   * @returns The best TXF token version, or `null` if not found.
-   */
-  getBestArchivedVersion(tokenId: string): TxfToken | null {
-    return findBestTokenVersion(tokenId, this.archivedTokens, this.forkedTokens);
-  }
-
-  /**
-   * Merge archived tokens from a remote sync source.
-   *
-   * For each remote token:
-   * - If missing locally, it is added.
-   * - If the remote version is an incremental update of the local, it replaces it.
-   * - If the histories diverge (fork), the remote version is stored via {@link storeForkedToken}.
-   *
-   * @param remoteArchived - Map of genesis token ID → TXF token from remote.
-   * @returns Number of tokens that were updated or added locally.
-   */
-  async mergeArchivedTokens(remoteArchived: Map<string, TxfToken>): Promise<number> {
-    let mergedCount = 0;
-
-    for (const [tokenId, remoteTxf] of remoteArchived) {
-      const existingArchive = this.archivedTokens.get(tokenId);
-
-      if (!existingArchive) {
-        this.archivedTokens.set(tokenId, remoteTxf);
-        mergedCount++;
-      } else if (isIncrementalUpdate(existingArchive, remoteTxf)) {
-        this.archivedTokens.set(tokenId, remoteTxf);
-        mergedCount++;
-      } else if (!isIncrementalUpdate(remoteTxf, existingArchive)) {
-        // It's a fork
-        const stateHash = getCurrentStateHash(remoteTxf) || '';
-        await this.storeForkedToken(tokenId, stateHash, remoteTxf);
-      }
-    }
-
-    if (mergedCount > 0) {
-      await this.save();
-    }
-
-    return mergedCount;
-  }
-
-  /**
-   * Prune archived tokens to keep at most `maxCount` entries.
-   *
-   * Oldest entries (by insertion order) are removed first.
-   *
-   * @param maxCount - Maximum number of archived tokens to retain (default: 100).
-   */
-  async pruneArchivedTokens(maxCount: number = 100): Promise<void> {
-    if (this.archivedTokens.size <= maxCount) return;
-
-    const originalCount = this.archivedTokens.size;
-    this.archivedTokens = pruneMapByCount(this.archivedTokens, maxCount);
-
-    await this.save();
-    logger.debug('Payments', `Pruned archived tokens from ${originalCount} to ${this.archivedTokens.size}`);
-  }
-
   // ===========================================================================
   // Public API - Forked Tokens
   // ===========================================================================
-
-  /**
-   * Get all forked token versions.
-   *
-   * Forked tokens represent alternative histories detected during sync.
-   * The map key is `{tokenId}_{stateHash}`.
-   *
-   * @returns A shallow copy of the forked tokens map.
-   */
-  getForkedTokens(): Map<string, TxfToken> {
-    return new Map(this.forkedTokens);
-  }
-
-  /**
-   * Store a forked token version (alternative history).
-   *
-   * No-op if the exact `(tokenId, stateHash)` key already exists.
-   *
-   * @param tokenId - Genesis token ID.
-   * @param stateHash - State hash of this forked version.
-   * @param txfToken - The TXF token data to store.
-   */
-  async storeForkedToken(tokenId: string, stateHash: string, txfToken: TxfToken): Promise<void> {
-    const key = `${tokenId}_${stateHash}`;
-    if (this.forkedTokens.has(key)) return;
-
-    this.forkedTokens.set(key, txfToken);
-    logger.debug('Payments', `Stored forked token ${tokenId.slice(0, 8)}... state ${stateHash.slice(0, 12)}...`);
-    await this.save();
-  }
-
-  /**
-   * Merge forked tokens from a remote sync source. Only new keys are added.
-   *
-   * @param remoteForked - Map of `{tokenId}_{stateHash}` → TXF token from remote.
-   * @returns Number of new forked tokens added.
-   */
-  async mergeForkedTokens(remoteForked: Map<string, TxfToken>): Promise<number> {
-    let addedCount = 0;
-
-    for (const [key, remoteTxf] of remoteForked) {
-      if (!this.forkedTokens.has(key)) {
-        this.forkedTokens.set(key, remoteTxf);
-        addedCount++;
-      }
-    }
-
-    if (addedCount > 0) {
-      await this.save();
-    }
-
-    return addedCount;
-  }
-
-  /**
-   * Prune forked tokens to keep at most `maxCount` entries.
-   *
-   * @param maxCount - Maximum number of forked tokens to retain (default: 50).
-   */
-  async pruneForkedTokens(maxCount: number = 50): Promise<void> {
-    if (this.forkedTokens.size <= maxCount) return;
-
-    const originalCount = this.forkedTokens.size;
-    this.forkedTokens = pruneMapByCount(this.forkedTokens, maxCount);
-
-    await this.save();
-    logger.debug('Payments', `Pruned forked tokens from ${originalCount} to ${this.forkedTokens.size}`);
-  }
 
   // ===========================================================================
   // Public API - Transaction History
@@ -6275,31 +6034,6 @@ export class PaymentsModule {
   // Private: Archive
   // ===========================================================================
 
-  private async archiveToken(token: Token): Promise<void> {
-    const txf = tokenToTxf(token);
-    if (!txf) return;
-
-    const tokenId = txf.genesis?.data?.tokenId;
-    if (!tokenId) return;
-
-    const existingArchive = this.archivedTokens.get(tokenId);
-
-    if (existingArchive) {
-      if (isIncrementalUpdate(existingArchive, txf)) {
-        this.archivedTokens.set(tokenId, txf);
-        logger.debug('Payments', `Updated archived token ${tokenId.slice(0, 8)}...`);
-      } else {
-        // Fork
-        const stateHash = getCurrentStateHash(txf) || '';
-        await this.storeForkedToken(tokenId, stateHash, txf);
-        logger.debug('Payments', `Archived token ${tokenId.slice(0, 8)}... is a fork`);
-      }
-    } else {
-      this.archivedTokens.set(tokenId, txf);
-      logger.debug('Payments', `Archived token ${tokenId.slice(0, 8)}...`);
-    }
-  }
-
   // ===========================================================================
   // Private: Storage
   // ===========================================================================
@@ -6654,8 +6388,6 @@ export class PaymentsModule {
       {
         nametags: this.nametags,
         tombstones: this.tombstones,
-        archivedTokens: this.archivedTokens,
-        forkedTokens: this.forkedTokens,
         historyEntries: sorted.slice(0, MAX_SYNCED_HISTORY_ENTRIES),
       }
     ) as unknown as TxfStorageDataBase;
@@ -6699,8 +6431,6 @@ export class PaymentsModule {
     }
 
     // Load other data
-    this.archivedTokens = parsed.archivedTokens;
-    this.forkedTokens = parsed.forkedTokens;
     this.nametags = parsed.nametags;
   }
 
