@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — `payments.sync()` is a flush; the IPFS-era merge machinery is gone
+
+`sync()` once merged remote TXF state back into the wallet. Only the IPFS provider ever supplied
+any. **All three remaining providers** — wallet-api, IndexedDB, file — implement `sync()` as
+"save and return the input unchanged" (`added: 0, removed: 0, merged: localData`), so the merge
+path had nothing to merge.
+
+`sync()` is retained and still called by consumers, but it is now what it actually does: a write
+to every configured provider. **The returned counts are always zero.**
+
+Removed with it:
+
+- `_doSync`'s merge application — address-mismatch rejection, merged-nametag restore,
+  `parsedTokenCache` rebuild and merged-history import, all operating on data identical to what
+  was sent.
+- The push-sync path: `subscribeToStorageEvents`, `unsubscribeStorageEvents`,
+  `debouncedSyncFromRemoteUpdate`, `storageEventUnsubscribers`. **No implementation has provided
+  `TokenStorageProvider.onEvent` since IPFS was removed**, so this could never fire. The optional
+  `onEvent` member is dropped from the port, along with the now-dead bridge in `core/Sphere.ts`.
+
+**This also fixes a latent bug** the earlier analysis recorded: `syncDebounceTimer` was shared by
+two debouncers doing *different* work — a storage-remote-update sync and an inventory wake resync
+— so each cancelled the other, and `unsubscribeStorageEvents()` silently dropped a pending
+inventory resync. With the storage-event debouncer gone the field has a single owner and is
+renamed `inventoryDebounceTimer`.
+
+**Also removed: the `sync:provider` event.** It reported per-provider merge counts that are now
+structurally zero, and it had **no subscriber** — not in the SDK, not in the Sphere frontend. A
+review caught the flush emitting `success: true` unconditionally even when a provider's `save()`
+failed; deleting the event is the honest fix, since `storage:degraded` already reports an
+active-provider failure.
+
+**Fixed in review (P1):** `teardownDeliveryPump()` did not clear the inventory-wake debounce. The
+only thing that used to clear it was `unsubscribeStorageEvents()`, removed here — so a wake
+landing within the debounce window could survive `destroy()` and resync into a wallet whose token
+map had just been cleared (`destroy()` leaves `deps` set), or cross an address switch. Now cleared
+alongside the rest of the wake/poll teardown, with a test verified RED without the fix.
+
+Three tests covering the merge path were deleted. The capabilities they touched survive on the
+`load()` path and stay covered there: history import by
+`PaymentsModule.history-sync.test.ts` ("should import `_history` entries from loaded TXF data")
+and `PaymentsModule.history.test.ts` ("should migrate legacy KV history to new store on load");
+nametag recovery by `PaymentsModule.test.ts` ("should recover nametags from storage on load()").
+No test was weakened.
+
 ### Removed — the Nostr token-delivery rail
 
 Assets ride the delivery port exclusively. `TransportDeliveryAdapter` (the fallback that wrapped

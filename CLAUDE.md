@@ -121,7 +121,7 @@ const mint = await sphere.payments.mintFungibleToken(coinIdHex, 1000000n);
 // { success: true, token, tokenId } | { success: false, error }
 
 // 9. Sync with remote storage
-const syncResult = await sphere.payments.sync(); // { added, removed }
+await sphere.payments.sync(); // flush to storage providers; counts are always 0
 
 // 10. Transaction history
 const history = sphere.payments.getHistory(); // TransactionHistoryEntry[]
@@ -221,7 +221,7 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `sphere.payments.send(request)` | `Promise<TransferResult>` | Send L3 tokens (engine-only path) |
 | `sphere.payments.receive(options?)` | `Promise<ReceiveResult>` | One-shot fetch of pending transfers (options deprecated no-ops) |
 | `sphere.payments.mintFungibleToken(coinIdHex, amount)` | `{ success, token?, tokenId?, error? }` | Self-mint via engine (no faucet) |
-| `sphere.payments.sync()` | `{ added, removed }` | Sync with remote storage |
+| `sphere.payments.sync()` | `{ added: 0, removed: 0 }` | Flush token state to storage providers |
 | `sphere.payments.validate()` | `{ valid, invalid }` | Verify tokens (engine for v2 blobs, legacy RPC for v1 TXF) |
 | `sphere.payments.getHistory()` | `TransactionHistoryEntry[]` | Transaction history |
 | `sphere.resolve(identifier)` | `PeerInfo \| null` | Resolve @nametag/address/pubkey |
@@ -256,7 +256,6 @@ nullable getters — `null` unless the module was enabled in init options.
 | `nametag:registered` | `{ nametag, addressIndex }` | Unicity ID registered |
 | `nametag:recovered` | `{ nametag }` | Unicity ID recovered from Nostr on import |
 | `address:activated` | `{ address: TrackedAddress }` | New address tracked |
-| `sync:provider` | `{ providerId, success, added?, removed?, error? }` | Per-provider sync result |
 | `payment_request:incoming` | `IncomingPaymentRequest` | Received payment request |
 | `invoice:created` | `{ invoiceId, confirmed }` | Invoice token minted or imported |
 | `invoice:payment` | `{ invoiceId, transfer, paymentDirection, confirmed }` | Payment attributed to invoice |

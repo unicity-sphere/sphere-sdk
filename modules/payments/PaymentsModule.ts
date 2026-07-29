@@ -933,8 +933,7 @@ export class PaymentsModule {
   private hydrationEpoch = 0;
 
   // Storage event subscriptions (push-based sync)
-  private storageEventUnsubscribers: (() => void)[] = [];
-  private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private inventoryDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly SYNC_DEBOUNCE_MS = 500;
   /** Quiet-then-escalate logging for the background wallet-api pumps (#630). */
   private readonly pumpHealth = new PumpHealth();
@@ -1079,7 +1078,6 @@ export class PaymentsModule {
 
     // Stop background subscriptions from the previous address context so they
     // don't call save() in the new address's storage context.
-    this.unsubscribeStorageEvents();
 
     // Cancel pending payment response resolvers
     for (const [, resolver] of this.pendingResponseResolvers) {
@@ -1183,7 +1181,6 @@ export class PaymentsModule {
     }
 
     // Subscribe to storage provider events (push-based sync)
-    this.subscribeToStorageEvents();
   }
 
   /**
@@ -1454,7 +1451,6 @@ export class PaymentsModule {
     this.tokens.clear();
 
     // Clean up storage event subscriptions
-    this.unsubscribeStorageEvents();
   }
 
   // ===========================================================================
@@ -4223,25 +4219,21 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Sync local token state with all configured token storage providers (IPFS, file, etc.).
+   * Flush local token state to every configured token storage provider.
    *
-   * For each provider, the local data is packaged into TXF storage format, sent
-   * to the provider's `sync()` method, and the merged result is applied locally.
-   * Emits `sync:started`, `sync:completed`, and `sync:error` events.
-   *
-   * @returns Summary with counts of tokens added and removed during sync.
+   * Named `sync` for history: it once merged remote TXF state back in, which
+   * only IPFS ever supplied. The remaining providers all implement `sync()` as
+   * "save and return the input unchanged", so this is a write, and the returned
+   * counts are always zero.
    */
   async sync(): Promise<{ added: number; removed: number }> {
     this.ensureInitialized();
 
-    // Sync coalescing: if a sync is already in progress, return its promise.
-    // This prevents race conditions when addTokenStorageProvider() fires a
-    // fire-and-forget sync and the caller also syncs immediately after.
-    if (this._syncInProgress) {
-      return this._syncInProgress;
-    }
+    // Coalesce: a fire-and-forget flush plus an immediate caller flush would
+    // otherwise race the same write.
+    if (this._syncInProgress) return this._syncInProgress;
 
-    this._syncInProgress = this._doSync();
+    this._syncInProgress = this._doFlush();
     try {
       return await this._syncInProgress;
     } finally {
@@ -4249,142 +4241,12 @@ export class PaymentsModule {
     }
   }
 
-  private async _doSync(): Promise<{ added: number; removed: number }> {
+  private async _doFlush(): Promise<{ added: number; removed: number }> {
     this.deps!.emitEvent('sync:started', { source: 'payments' });
-
     try {
-      // Get all token storage providers
-      const providers = this.getTokenStorageProviders();
-
-      if (providers.size === 0) {
-        // No providers - just save locally
-        await this.save();
-        this.deps!.emitEvent('sync:completed', {
-          source: 'payments',
-          count: this.tokens.size,
-        });
-        return { added: 0, removed: 0 };
-      }
-
-      // Create local data once
-      const localData = await this.createStorageData();
-
-      let totalAdded = 0;
-      let totalRemoved = 0;
-
-      // Preserve nametags — sync providers may not include _nametags in merged data
-      const savedNametags = [...this.nametags];
-
-      // Sync with each provider
-      for (const [providerId, provider] of providers) {
-        try {
-          const result = await provider.sync(localData);
-
-          if (result.success && result.merged) {
-            // Address guard: reject data from a different address.
-            // Stale IPFS records may contain tokens from a previously active
-            // address if a write-behind flush raced with an address switch.
-            const mergedMeta = (result.merged as TxfStorageDataBase)?._meta;
-            const currentChain = this.deps!.identity.chainPubkey;
-            const isLegacyAlpha = mergedMeta?.address?.startsWith('alpha1') ?? false;
-            if (mergedMeta?.address && currentChain && !isLegacyAlpha && mergedMeta.address !== currentChain) {
-              logger.warn('Payments', `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 20)}... expected=${currentChain.slice(0, 20)}...)`);
-              continue;
-            }
-
-            // Snapshot tokens that can't survive TXF round-trip (V5 pending)
-            // AND tokens that were added after the localData snapshot.
-            // Sync can race with resolveUnconfirmed() or incoming transfers.
-            const savedTokens = new Map(this.tokens);
-
-            // Apply merged data from each provider
-            this.loadFromStorageData(result.merged);
-
-            // Restore tokens lost by loadFromStorageData()'s tokens.clear().
-            // Only restore if no token with the same genesis tokenId already
-            // exists (avoids duplicating tokens whose ID changed from v5split
-            // to real genesis ID during TXF round-trip).
-            // Build index of existing genesis tokenIds for O(1) lookup instead of O(n²).
-            const existingGenesisIds = new Set<string>();
-            for (const existing of this.tokens.values()) {
-              const gid = extractTokenIdFromSdkData(existing.sdkData);
-              if (gid) existingGenesisIds.add(gid);
-            }
-
-            let restoredCount = 0;
-            for (const [tokenId, token] of savedTokens) {
-              if (this.tokens.has(tokenId)) continue;
-
-              // Check tombstones
-              const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
-              const stateHash = extractStateHashFromSdkData(token.sdkData);
-              if (sdkTokenId && stateHash && this.isStateTombstoned(sdkTokenId, stateHash)) {
-                continue;
-              }
-
-              // Skip if an equivalent token (same genesis tokenId) already
-              // exists under a different ID — avoids balance doubling.
-              if (sdkTokenId && existingGenesisIds.has(sdkTokenId)) {
-                continue;
-              }
-
-              this.tokens.set(tokenId, token);
-              if (sdkTokenId) existingGenesisIds.add(sdkTokenId);
-              restoredCount++;
-            }
-            if (restoredCount > 0) {
-              logger.debug('Payments', `Sync: restored ${restoredCount} token(s) lost by loadFromStorageData`);
-            }
-
-            // Restore nametags if sync wiped them
-            if (this.nametags.length === 0 && savedNametags.length > 0) {
-              this.nametags = savedNametags;
-            }
-
-            // Rebuild parsedTokenCache for spend queue (loadFromStorageData bypasses addToken)
-            await this.rebuildParsedTokenCache();
-
-            // Import merged history from IPFS sync into local store
-            const txfData = result.merged as TxfStorageDataBase;
-            if (txfData._history && txfData._history.length > 0) {
-              const imported = await this.importRemoteHistoryEntries(txfData._history as HistoryRecord[]);
-              if (imported > 0) {
-                logger.debug('Payments', `Imported ${imported} history entries from IPFS sync`);
-              }
-            }
-
-            totalAdded += result.added;
-            totalRemoved += result.removed;
-          }
-
-          this.deps!.emitEvent('sync:provider', {
-            providerId,
-            success: result.success,
-            added: result.added,
-            removed: result.removed,
-          });
-        } catch (providerError) {
-          // Log error but continue with other providers
-          logger.warn('Payments', `Sync failed for provider ${providerId}:`, providerError);
-          this.deps!.emitEvent('sync:provider', {
-            providerId,
-            success: false,
-            error: providerError instanceof Error ? providerError.message : String(providerError),
-          });
-        }
-      }
-
-      // Persist merged state to primary storage so it survives process restarts
-      if (totalAdded > 0 || totalRemoved > 0) {
-        await this.save();
-      }
-
-      this.deps!.emitEvent('sync:completed', {
-        source: 'payments',
-        count: this.tokens.size,
-      });
-
-      return { added: totalAdded, removed: totalRemoved };
+      await this.save();
+      this.deps!.emitEvent('sync:completed', { source: 'payments', count: this.tokens.size });
+      return { added: 0, removed: 0 };
     } catch (error) {
       this.deps!.emitEvent('sync:error', {
         source: 'payments',
@@ -4392,76 +4254,6 @@ export class PaymentsModule {
       });
       throw error;
     }
-  }
-
-  // ===========================================================================
-  // Storage Event Subscription (Push-Based Sync)
-  // ===========================================================================
-
-  /**
-   * Subscribe to 'storage:remote-updated' events from all token storage providers.
-   * When a provider emits this event, a debounced sync is triggered.
-   */
-  private subscribeToStorageEvents(): void {
-    // Clean up existing subscriptions
-    this.unsubscribeStorageEvents();
-
-    const providers = this.getTokenStorageProviders();
-    for (const [providerId, provider] of providers) {
-      if (provider.onEvent) {
-        const unsub = provider.onEvent((event) => {
-          if (event.type === 'storage:remote-updated') {
-            logger.debug('Payments', 'Remote update detected from provider', providerId, event.data);
-            this.debouncedSyncFromRemoteUpdate(providerId, event.data);
-          }
-        });
-        this.storageEventUnsubscribers.push(unsub);
-      }
-    }
-  }
-
-  /**
-   * Unsubscribe from all storage provider events and clear debounce timer.
-   */
-  private unsubscribeStorageEvents(): void {
-    for (const unsub of this.storageEventUnsubscribers) {
-      unsub();
-    }
-    this.storageEventUnsubscribers = [];
-
-    if (this.syncDebounceTimer) {
-      clearTimeout(this.syncDebounceTimer);
-      this.syncDebounceTimer = null;
-    }
-  }
-
-  /**
-   * Debounced sync triggered by a storage:remote-updated event.
-   * Waits 500ms to batch rapid updates, then performs sync.
-   */
-  private debouncedSyncFromRemoteUpdate(providerId: string, eventData: unknown): void {
-    if (this.syncDebounceTimer) {
-      clearTimeout(this.syncDebounceTimer);
-    }
-
-    this.syncDebounceTimer = setTimeout(() => {
-      this.syncDebounceTimer = null;
-      this.sync()
-        .then((result) => {
-          const data = eventData as { name?: string; sequence?: number; cid?: string } | undefined;
-          this.deps?.emitEvent('sync:remote-update', {
-            providerId,
-            name: data?.name ?? '',
-            sequence: data?.sequence ?? 0,
-            cid: data?.cid ?? '',
-            added: result.added,
-            removed: result.removed,
-          });
-        })
-        .catch((err) => {
-          logger.debug('Payments', 'Auto-sync from remote update failed:', err);
-        });
-    }, PaymentsModule.SYNC_DEBOUNCE_MS);
   }
 
   /**
@@ -4516,8 +4308,6 @@ export class PaymentsModule {
   updateTokenStorageProviders(providers: Map<string, TokenStorageProvider<TxfStorageDataBase>>): void {
     if (this.deps) {
       this.deps.tokenStorageProviders = providers;
-      // Re-subscribe to storage events for new providers
-      this.subscribeToStorageEvents();
     }
   }
 
@@ -4738,6 +4528,13 @@ export class PaymentsModule {
   private teardownDeliveryPump(): void {
     this.deliveryWakeUnsub?.();
     this.deliveryWakeUnsub = null;
+    // A wake that landed within the debounce window must not survive teardown:
+    // destroy() leaves `deps` set, so a surviving callback would resyncInventory()
+    // into a wallet that was just cleared, or across an address switch.
+    if (this.inventoryDebounceTimer !== null) {
+      clearTimeout(this.inventoryDebounceTimer);
+      this.inventoryDebounceTimer = null;
+    }
     if (this.deliveryPollTimer !== null) {
       clearInterval(this.deliveryPollTimer);
       this.deliveryPollTimer = null;
@@ -4779,11 +4576,11 @@ export class PaymentsModule {
    * without waiting for the next poll tick.
    */
   private debouncedInventorySyncFromWake(): void {
-    if (this.syncDebounceTimer) {
-      clearTimeout(this.syncDebounceTimer);
+    if (this.inventoryDebounceTimer) {
+      clearTimeout(this.inventoryDebounceTimer);
     }
-    this.syncDebounceTimer = setTimeout(() => {
-      this.syncDebounceTimer = null;
+    this.inventoryDebounceTimer = setTimeout(() => {
+      this.inventoryDebounceTimer = null;
       this.pumpHealth.run('inventory', () => this.resyncInventory(true));
     }, PaymentsModule.SYNC_DEBOUNCE_MS);
   }

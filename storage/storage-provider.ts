@@ -377,8 +377,6 @@ export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
 
   /**
    * Subscribe to storage events
-   */
-  onEvent?(callback: StorageEventCallback): () => void;
 
   // --- History operations (optional — not supported by all providers, e.g. IPFS) ---
 

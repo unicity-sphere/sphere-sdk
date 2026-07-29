@@ -406,7 +406,6 @@ export type SphereEventType =
   | 'message:broadcast'
   | 'sync:started'
   | 'sync:completed'
-  | 'sync:provider'
   | 'sync:error'
   | 'storage:degraded'
   | 'inventory:conflict'
@@ -508,7 +507,6 @@ export interface SphereEventMap {
   'message:broadcast': BroadcastMessage;
   'sync:started': { source: string };
   'sync:completed': { source: string; count: number };
-  'sync:provider': { providerId: string; success: boolean; added?: number; removed?: number; error?: string };
   'sync:error': { source: string; error: string };
   /**
    * The ACTIVE custody token-storage provider failed a background save

@@ -1154,17 +1154,7 @@ console.log('Active providers:', Array.from(providers.keys()));
 // Remove a provider
 await sphere.removeTokenStorageProvider(myTokenStorageProvider.id);
 
-// Listen for per-provider sync events
-sphere.on('sync:provider', (event) => {
-  console.log(`Provider ${event.providerId}: ${event.success ? 'synced' : 'failed'}`);
-  if (event.success) {
-    console.log(`  Added: ${event.added}, Removed: ${event.removed}`);
-  } else {
-    console.log(`  Error: ${event.error}`);
-  }
-});
-
-// Trigger sync (syncs with all active providers)
+// Flush token state to all active providers
 await sphere.payments.sync();
 ```
 

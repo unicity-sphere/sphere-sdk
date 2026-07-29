@@ -244,3 +244,29 @@ describe('wallet-api wake streams converge a second session (§9 cross-session s
     expect(payer.module.getPendingPaymentRequestsCount()).toBe(1);
   });
 });
+
+describe('teardown cancels a pending inventory-wake debounce', () => {
+  it('a wake landing just before destroy() does not resync into a destroyed wallet', async () => {
+    const { fake, baseUrl } = await startFake();
+    const w = makeWallet(baseUrl, fake.network, OWNER, 'teardown-debounce');
+    await w.module.load();
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const m = w.module as any;
+    const resync = vi.spyOn(m, 'resyncInventory');
+
+    // A wake arrives, starting the debounce window…
+    m.debouncedInventorySyncFromWake();
+    expect(m.inventoryDebounceTimer).not.toBeNull();
+
+    // …and the wallet is torn down before the window elapses.
+    w.module.destroy();
+    expect(m.inventoryDebounceTimer).toBeNull();
+
+    // RED without the teardown clear: the timer survives, fires, and resyncs a
+    // wallet whose token map destroy() just emptied (destroy leaves `deps` set).
+    await new Promise((r) => setTimeout(r, 700));
+    expect(resync).not.toHaveBeenCalled();
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+  });
+});
