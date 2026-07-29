@@ -1896,17 +1896,20 @@ export class PaymentsModule {
    * The change is stored locally AFTER the server apply: on this path the
    * awaited intent (E.3) is the recovery seed, and following the apply keeps the
    * provider's write-behind from racing a second add of the same state.
+   *
+   * The caller passes the provider it read the sources from. Resolving the
+   * ACTIVE one here would let a mid-flight `updateTokenStorageProviders()` (an
+   * address switch) apply the spend to a different backend than the one that
+   * supplied them.
    */
   private async applyInventoryDelta(
     engine: ITokenEngine,
     transferId: string,
     spentStates: readonly { tokenId: string; stateHash: string }[],
-    changeOutput: SphereToken | null | undefined
+    changeOutput: SphereToken | null | undefined,
+    /** The SAME provider the sources came from — never re-resolved here (see above). */
+    storage: TokenStorageProvider<TxfStorageDataBase>
   ): Promise<void> {
-    const storage = this.getActiveTokenStorageProvider();
-    if (!storage) {
-      throw new SphereError('No token storage provider available for applyDelta', 'STORAGE_ERROR');
-    }
     const added: { tokenId: string; key: string }[] = [];
     if (changeOutput) {
       const changeBytes = encodeTokenBlob(engine.encodeToken(changeOutput));
@@ -2156,7 +2159,11 @@ export class PaymentsModule {
         stateHash: op.sourceSdkData ? (await engine.deliveryKeys(hexToBytes(op.sourceSdkData))).stateHash : '',
       }))
     );
-    await this.applyInventoryDelta(engine, transferId, spentStates, changeOutput);
+    const storage = this.getActiveTokenStorageProvider();
+    if (!storage) {
+      throw new SphereError('No token storage provider available for applyDelta', 'STORAGE_ERROR');
+    }
+    await this.applyInventoryDelta(engine, transferId, spentStates, changeOutput, storage);
     // M2: each removeToken carries the LOCAL state we spent, so a source the
     // pump already reactivated to a new state is KEPT, not re-tombstoned.
     for (const op of consumed) {
@@ -5687,7 +5694,8 @@ export class PaymentsModule {
         engine,
         transferId,
         spent.map((id) => ({ tokenId: id, stateHash: payload.spentStates?.[id]?.protocol ?? '' })),
-        changeOutput
+        changeOutput,
+        provider // the one the sources were read from, captured for the whole resume
       );
     }
 
