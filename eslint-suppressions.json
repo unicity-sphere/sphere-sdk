@@ -610,7 +610,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 59
+      "count": 58
     },
     "complexity": {
       "count": 11
@@ -659,14 +659,6 @@
     }
   },
   "modules/payments/TokenSplitCalculator.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
-    "budget/no-long-comment-block": {
-      "count": 1
-    }
-  },
-  "modules/payments/TransportDeliveryAdapter.ts": {
     "budget/comment-ratio": {
       "count": 1
     },

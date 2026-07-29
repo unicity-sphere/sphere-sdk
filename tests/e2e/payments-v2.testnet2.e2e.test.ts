@@ -19,6 +19,7 @@ import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../storage';
 import type { V2TransferPayload } from '../../types/v2-transfer';
+import { createMemoryDelivery } from '../support/memory-delivery';
 
 const GATEWAY = process.env.TESTNET2_GATEWAY ?? 'https://gateway.testnet2.unicity.network';
 const API_KEY = process.env.TESTNET2_API_KEY;
@@ -107,13 +108,15 @@ function buildModule(engine: ITokenEngine, recipientChainPubkey: string) {
   const tsp = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
   tsp.set('local', mockTokenStorage());
   const transport = mockTransport(recipientChainPubkey);
+  const delivery = createMemoryDelivery();
   const deps: PaymentsModuleDependencies = {
+    delivery,
     identity, storage: mockStorage(), tokenStorageProviders: tsp,
     transport, oracle: mockOracle(), emitEvent: vi.fn(), tokenEngine: engine,
   };
   const module = createPaymentsModule({ debug: false });
   module.initialize(deps);
-  return { module, transport };
+  return { module, transport, delivery };
 }
 
 // Hand a freshly-minted token (owned by `engine`) to its module via the v2 receiver.
@@ -128,7 +131,7 @@ async function fundModule(
     type: 'V2_TRANSFER', version: '2.0', tokenBlob: bytesToHex(encodeTokenBlob(engine.encodeToken(minted))),
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (module as any).handleIncomingTransfer({ id: 'fund', senderTransportPubkey: 'cc'.repeat(32), payload, timestamp: 0 });
+  await (module as any).handleV2Transfer(payload, 'cc'.repeat(32));
 }
 
 describe.runIf(!!API_KEY)('PaymentsModule v2 payment path — live testnet2', () => {
@@ -137,7 +140,7 @@ describe.runIf(!!API_KEY)('PaymentsModule v2 payment path — live testnet2', ()
     const bobEngine = await makeEngine(SigningService.generatePrivateKey());
     const bobChainPubkey = bytesToHex(bobEngine.getIdentity().chainPubkey);
 
-    const { module: alice, transport } = buildModule(aliceEngine, bobChainPubkey);
+    const { module: alice, delivery } = buildModule(aliceEngine, bobChainPubkey);
     await fundModule(alice, aliceEngine, 100n);
     expect(alice.getTokens()).toHaveLength(1);
 
@@ -146,8 +149,8 @@ describe.runIf(!!API_KEY)('PaymentsModule v2 payment path — live testnet2', ()
     expect(alice.getTokens()).toHaveLength(0); // source consumed
 
     // Bob decodes the handed-over blob and confirms it's a valid, his-owned, unspent token.
-    expect(transport.captured).toHaveLength(1);
-    const blob = decodeTokenBlob(hexToBytes(transport.captured[0].tokenBlob));
+    expect(delivery.delivered).toHaveLength(1);
+    const blob = decodeTokenBlob(delivery.delivered[0].blob);
     const bobToken = await bobEngine.decodeToken(blob);
     expect(bobEngine.balanceOf(bobToken, UCT)).toBe(100n);
     expect((await bobEngine.verify(bobToken)).ok).toBe(true);
@@ -159,14 +162,14 @@ describe.runIf(!!API_KEY)('PaymentsModule v2 payment path — live testnet2', ()
     const aliceEngine = await makeEngine(SigningService.generatePrivateKey());
     const bobEngine = await makeEngine(SigningService.generatePrivateKey());
 
-    const { module: alice, transport } = buildModule(aliceEngine, bytesToHex(bobEngine.getIdentity().chainPubkey));
+    const { module: alice, delivery } = buildModule(aliceEngine, bytesToHex(bobEngine.getIdentity().chainPubkey));
     await fundModule(alice, aliceEngine, 100n);
 
     const result = await alice.send({ recipient: '@bob', amount: '60', coinId: UCT });
     expect(result.status).toBe('completed');
 
     // Bob's 60.
-    const bobToken = await bobEngine.decodeToken(decodeTokenBlob(hexToBytes(transport.captured[0].tokenBlob)));
+    const bobToken = await bobEngine.decodeToken(decodeTokenBlob(delivery.delivered[0].blob));
     expect(bobEngine.balanceOf(bobToken, UCT)).toBe(60n);
     expect((await bobEngine.verify(bobToken)).ok).toBe(true);
 

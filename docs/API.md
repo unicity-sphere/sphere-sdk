@@ -472,7 +472,7 @@ Remove a token and create a tombstone `(tokenId, stateHash)` so the same state c
 
 ### Methods: Tombstones
 
-Tombstones prevent spent tokens from being re-added (e.g. via Nostr re-delivery). Each tombstone is keyed by `(tokenId, stateHash)`.
+Tombstones prevent spent tokens from being re-added (e.g. via a mailbox re-delivery). Each tombstone is keyed by `(tokenId, stateHash)`.
 
 #### `getTombstones(): TombstoneEntry[]`
 

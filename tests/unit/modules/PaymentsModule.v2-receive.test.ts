@@ -18,6 +18,7 @@ import { encodeTokenBlob, decodeTokenBlob } from '../../../token-engine/token-bl
 import { bytesToHex, hexToBytes } from '../../../core/crypto';
 import { decodeTransferMessage } from '../../../modules/accounting/memo';
 import type { V2TransferPayload } from '../../../types/v2-transfer';
+import { createMemoryDelivery } from '../../support/memory-delivery';
 
 const FAKE_PRIVATE_KEY = 'a'.repeat(64);
 const FAKE_PUBKEY = '02' + 'b'.repeat(64);
@@ -112,13 +113,15 @@ function setup(engine = new FakeTokenEngine()) {
   tsp.set('local', mockTokenStorage());
   const emitEvent = vi.fn();
   const transport = mockTransport();
+  const delivery = createMemoryDelivery();
   const deps: PaymentsModuleDependencies = {
+    delivery,
     identity: mockIdentity(), storage: mockStorage(), tokenStorageProviders: tsp,
     transport, oracle: mockOracle(), emitEvent, tokenEngine: engine,
   };
   const module = createPaymentsModule({ debug: false });
   module.initialize(deps);
-  return { module, engine, emitEvent, transport };
+  return { module, engine, emitEvent, transport, delivery };
 }
 
 async function v2Payload(
@@ -129,11 +132,14 @@ async function v2Payload(
   return { type: 'V2_TRANSFER', version: '2.0', tokenBlob: bytesToHex(encodeTokenBlob(engine.encodeToken(st))), memo };
 }
 
+/** The delivered blob, shaped as the V2 payload a recipient wallet ingests. */
+function deliveredPayload(d: { lastBlobHex(): string | undefined }): V2TransferPayload {
+  return { type: 'V2_TRANSFER', version: '2.0', tokenBlob: d.lastBlobHex()! };
+}
+
 /* eslint-disable @typescript-eslint/no-explicit-any */
 function deliver(module: ReturnType<typeof setup>['module'], payload: V2TransferPayload, id = 't1') {
-  return (module as any).handleIncomingTransfer({
-    id, senderTransportPubkey: SENDER_TRANSPORT_PUBKEY, payload, timestamp: 0,
-  });
+  return (module as any).handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
 }
 
 describe('handleV2Transfer — v2 receiver (B1)', () => {
@@ -202,7 +208,7 @@ describe('handleV2Transfer — v2 receiver (B1)', () => {
 
 describe('send — v2 engine path, whole-token (B1)', () => {
   it('round-trips: receive a token, then send it whole via engine.transfer', async () => {
-    const { module, engine, transport } = setup();
+    const { module, engine, delivery } = setup();
     // Receive a 100-UCT token (exact match → no split).
     await deliver(module, await v2Payload(engine, UCT, 100n));
     expect(module.getTokens()).toHaveLength(1);
@@ -214,11 +220,9 @@ describe('send — v2 engine path, whole-token (B1)', () => {
     expect(module.getTokens()).toHaveLength(0);
 
     // A V2_TRANSFER payload (finished token blob) was handed to the recipient.
-    const sent = (transport.sendTokenTransfer as any).mock.calls;
-    expect(sent).toHaveLength(1);
-    expect(sent[0][1].type).toBe('V2_TRANSFER');
-    expect(sent[0][1].memo).toBe('thanks');
-    expect(typeof sent[0][1].tokenBlob).toBe('string');
+    expect(delivery.delivered).toHaveLength(1);
+    expect(delivery.delivered[0].options.memo).toBe('thanks');
+    expect(typeof delivery.lastBlobHex()).toBe('string');
 
     // One SENT history entry.
     const history = module.getHistory().filter((h) => h.type === 'SENT');
@@ -227,13 +231,13 @@ describe('send — v2 engine path, whole-token (B1)', () => {
   });
 
   it('the emitted blob decodes back to a token the recipient can store', async () => {
-    const { module, engine, transport } = setup();
+    const { module, engine, delivery } = setup();
     await deliver(module, await v2Payload(engine, UCT, 100n));
     await module.send({ recipient: '@bob', amount: '100', coinId: UCT });
 
     // Feed the emitted V2_TRANSFER into a fresh recipient wallet (bob's identity,
     // matching the transferred token's new owner predicate).
-    const sentPayload = (transport.sendTokenTransfer as any).mock.calls[0][1];
+    const sentPayload = deliveredPayload(delivery);
     const recipient = setup(new FakeTokenEngine({ chainPubkey: hexToBytes(BOB_CHAIN_PUBKEY) }));
     await deliver(recipient.module, sentPayload);
 
@@ -242,7 +246,7 @@ describe('send — v2 engine path, whole-token (B1)', () => {
   });
 
   it('splits via engine.split: recipient gets the amount, sender keeps the change', async () => {
-    const { module, engine, transport } = setup();
+    const { module, engine, delivery } = setup();
     // Hold a single 1000-UCT token, send 300 → engine split (300 out, 700 change).
     await deliver(module, await v2Payload(engine, UCT, 1000n));
 
@@ -256,15 +260,14 @@ describe('send — v2 engine path, whole-token (B1)', () => {
     expect(tokens[0].status).toBe('confirmed');
 
     // Recipient's V2_TRANSFER decodes to a 300 token (bob's wallet owns it).
-    const sentPayload = (transport.sendTokenTransfer as any).mock.calls[0][1];
-    expect(sentPayload.type).toBe('V2_TRANSFER');
+    const sentPayload = deliveredPayload(delivery);
     const recipient = setup(new FakeTokenEngine({ chainPubkey: hexToBytes(BOB_CHAIN_PUBKEY) }));
     await deliver(recipient.module, sentPayload);
     expect(recipient.module.getTokens()[0].amount).toBe('300');
   });
 
   it('puts NO memo on-chain, not even an invoice-shaped one', async () => {
-    const { module, engine, transport } = setup();
+    const { module, engine, delivery } = setup();
     await deliver(module, await v2Payload(engine, UCT, 100n));
 
     // An INV: memo used to be encoded into the transaction's on-chain data.
@@ -273,19 +276,19 @@ describe('send — v2 engine path, whole-token (B1)', () => {
     const invoiceId = 'ab'.repeat(32);
     await module.send({ recipient: '@bob', amount: '100', coinId: UCT, memo: `INV:${invoiceId}:F` });
 
-    const sentPayload = (transport.sendTokenTransfer as any).mock.calls[0][1];
+    const sentPayload = deliveredPayload(delivery);
     const token = await engine.decodeToken(decodeTokenBlob(hexToBytes(sentPayload.tokenBlob)));
     expect(engine.readMemo(token)).toBeNull();
   });
 
   it('keeps a plain memo transport-only (no on-chain memo, for privacy)', async () => {
-    const { module, engine, transport } = setup();
+    const { module, engine, delivery } = setup();
     await deliver(module, await v2Payload(engine, UCT, 100n));
     await module.send({ recipient: '@bob', amount: '100', coinId: UCT, memo: 'thanks' });
 
-    const sentPayload = (transport.sendTokenTransfer as any).mock.calls[0][1];
+    const sentPayload = deliveredPayload(delivery);
     const token = await engine.decodeToken(decodeTokenBlob(hexToBytes(sentPayload.tokenBlob)));
-    expect(engine.readMemo(token)).toBeNull();  // not put on-chain
-    expect(sentPayload.memo).toBe('thanks');    // still on the transport wire
+    expect(engine.readMemo(token)).toBeNull();                    // not put on-chain
+    expect(delivery.delivered[0].options.memo).toBe('thanks');    // rides the delivery envelope
   });
 });

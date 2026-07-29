@@ -56,7 +56,6 @@ import type {
   IncomingTokenTransfer,
 } from '../../transport';
 import type { DeliverOptions, DeliveryProvider, IncomingDelivery, WakeStream } from '../../transport/delivery-provider';
-import { TransportDeliveryAdapter } from './TransportDeliveryAdapter';
 import { deriveFieldEncryptionKey, encryptField, decryptField } from '../../core/field-encryption';
 import {
   deriveDeliveryEncryptionKey,
@@ -746,12 +745,11 @@ export interface PaymentsModuleDependencies {
   /** Set of disabled provider IDs — disabled providers are skipped during sync/save */
   disabledProviderIds?: ReadonlySet<string>;
   /**
-   * Delivery port (sdk-changes S7). When provided, ASSET transfers ride it
-   * exclusively — outgoing via `deliver()`, incoming via `incoming()` (poll +
-   * wake) — and the transport's token-transfer subscription is NOT installed
-   * (S4: assets leave Nostr; DMs/group-chat/nametags stay). When absent, a
-   * {@link TransportDeliveryAdapter} preserves the legacy relay path through
-   * the same seam.
+   * Delivery port (sdk-changes S7). Asset transfers ride it exclusively —
+   * outgoing via `deliver()`, incoming via `incoming()` (poll + wake). There is
+   * no fallback rail: without it send/receive fail loudly at the call site,
+   * while non-payment Sphere modules keep working. Swappable by construction;
+   * any implementation must pass `tests/contract/delivery-provider.contract.ts`.
    */
   delivery?: DeliveryProvider;
   /**
@@ -849,13 +847,11 @@ export class PaymentsModule {
   }> = new Map();
 
   // Subscriptions
-  private unsubscribeTransfers: (() => void) | null = null;
 
   // Delivery port (sdk-changes S3/S7)
   /** The single delivery seam — an injected provider or the transport adapter. */
   private delivery: DeliveryProvider | null = null;
   /** Set only when a provider was INJECTED — gates the incoming pump (S3). */
-  private injectedDelivery: DeliveryProvider | null = null;
   private deliveryWakeUnsub: (() => void) | null = null;
   private deliveryPollTimer: ReturnType<typeof setInterval> | null = null;
   /**
@@ -1078,8 +1074,6 @@ export class PaymentsModule {
     assertLegalCustodyComposition(deps);
 
     // Clean up previous subscriptions before re-initializing
-    this.unsubscribeTransfers?.();
-    this.unsubscribeTransfers = null;
     this.teardownDeliveryPump();
     this.teardownPaymentRequestPump();
 
@@ -1129,35 +1123,28 @@ export class PaymentsModule {
     // Path B: wire the engine into the planner (value reads use it when present).
     this.spendPlanner.setEngine(deps.tokenEngine);
 
-    // Delivery seam (sdk-changes S3/S7): the injected port, or the transport
-    // adapter preserving the legacy relay leg through the same seam.
-    this.injectedDelivery = deps.delivery ?? null;
     const lazyDeliveryKeys = async (blobBytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }> => {
       const engine = this.deps?.tokenEngine;
       if (!engine) throw new SphereError('Token engine required for delivery-key derivation (S7)', 'AGGREGATOR_ERROR');
       return engine.deliveryKeys(blobBytes);
     };
-    this.delivery = deps.delivery ?? new TransportDeliveryAdapter(deps.transport, lazyDeliveryKeys);
-    // S7: the module owns the engine — late-bind the backend-true derivation
-    // into whatever delivery provider was composed.
-    this.delivery.bindDeliveryKeys?.(lazyDeliveryKeys);
-    this.delivery.setIdentity?.({
-      privateKey: deps.identity.privateKey,
-      chainPubkey: deps.identity.chainPubkey,
-    });
+    this.delivery = deps.delivery ?? null;
+    if (this.delivery) {
+      // S7: the module owns the engine — late-bind the backend-true derivation
+      // into whatever delivery provider was composed.
+      this.delivery.bindDeliveryKeys?.(lazyDeliveryKeys);
+      this.delivery.setIdentity?.({
+        privateKey: deps.identity.privateKey,
+        chainPubkey: deps.identity.chainPubkey,
+      });
 
-    // Incoming assets (sdk-changes S3/S4): with an injected delivery port the
-    // mailbox pull (poll + wake) is the ONLY asset channel — the Nostr
-    // token-transfer subscription is not installed. Without one, the relay
-    // push subscription stays exactly as before.
-    if (this.injectedDelivery) {
       // One wake socket multiplexes all three owner streams (§9): route each
       // nudge to its own (debounced/coalesced) pull. The wake is best-effort —
       // every stream below also has a poll backstop that is the correctness
       // path. (Before this, only `mailbox` was consumed, so a second session
       // saw no realtime inventory/payment-request convergence.)
       this.deliveryWakeUnsub =
-        this.injectedDelivery.onWake?.(
+        this.delivery.onWake?.(
           (stream) => this.handleWake(stream),
           // §9: surface TRUE wake-socket liveness, decoupled from sign-in state,
           // so the frontend can show a "live/reconnecting" indicator.
@@ -1175,11 +1162,6 @@ export class PaymentsModule {
       this.inventoryPollTimer = setInterval(() => {
         this.pumpHealth.run('inventory', () => this.resyncInventory(false));
       }, DELIVERY_POLL_INTERVAL_MS);
-    } else {
-      // Subscribe to incoming transfers
-      this.unsubscribeTransfers = deps.transport.onTokenTransfer((transfer) =>
-        this.handleIncomingTransfer(transfer)
-      );
     }
 
     // Payment requests ride wallet-api (sdk-changes S4). The incoming
@@ -1395,7 +1377,7 @@ export class PaymentsModule {
 
       // S3: drain the delivery port's incoming feed once at load (poll + wake
       // keep it drained afterwards).
-      if (this.injectedDelivery) {
+      if (this.delivery) {
         this.pumpHealth.run('delivery', () => this.pumpIncomingDeliveries());
       }
 
@@ -1451,8 +1433,6 @@ export class PaymentsModule {
       clearTimeout(this.loadRerunTimer);
       this.loadRerunTimer = null;
     }
-    this.unsubscribeTransfers?.();
-    this.unsubscribeTransfers = null;
     this.teardownDeliveryPump();
     this.teardownPaymentRequestPump();
     this.paymentRequestHandlers.clear();
@@ -1610,6 +1590,7 @@ export class PaymentsModule {
 
   private async sendOnce(request: TransferRequest): Promise<TransferResult> {
     this.ensureInitialized();
+    this.ensureDelivery();
 
     // Use mutable result for building the transfer
     const result: { -readonly [K in keyof TransferResult]: TransferResult[K] } = {
@@ -3095,62 +3076,23 @@ export class PaymentsModule {
   ): Promise<ReceiveResult> {
     this.ensureInitialized();
 
-    // S3: with an injected delivery port the one-shot fetch IS a pump of the
-    // port's incoming feed (mailbox pull) — Nostr is not used for assets.
-    if (this.injectedDelivery) {
-      const tokensBefore = new Set(this.tokens.keys());
-      await this.pumpIncomingDeliveriesFresh();
-      const received: IncomingTransfer[] = [];
-      for (const [tokenId, token] of this.tokens) {
-        if (tokensBefore.has(tokenId)) continue;
-        const transfer: IncomingTransfer = {
-          id: tokenId,
-          senderPubkey: '',
-          tokens: [token],
-          receivedAt: Date.now(),
-        };
-        received.push(transfer);
-        if (callback) callback(transfer);
-      }
-      return { transfers: received };
-    }
+    this.ensureDelivery();
 
-    if (!this.deps!.transport.fetchPendingEvents) {
-      throw new SphereError('Transport provider does not support fetchPendingEvents', 'TRANSPORT_ERROR');
-    }
-
-    // Snapshot token keys before fetch
+    // S3: the one-shot fetch IS a pump of the delivery port's incoming feed.
     const tokensBefore = new Set(this.tokens.keys());
-
-    // Fetch and process — events flow through handleIncomingTransfer() pipeline.
-    // fetchPendingEvents() collects events until EOSE, then processes sequentially
-    // with await. Event dedup in the transport layer prevents double-processing
-    // with the persistent subscription.
-    await this.deps!.transport.fetchPendingEvents();
-
-    // Reload from storage to get a clean, consistent state.
-    // Handlers save tokens during processing (with potentially different IDs for
-    // V5 pending tokens vs finalized tokens). load() clears the in-memory map
-    // and reloads from TXF + pending V5 storage, ensuring no duplicates.
-    // loadFresh (#642): must observe the handlers' saves — coalescing onto a
-    // load that started BEFORE them would drop the just-received tokens.
-    await this.loadFresh();
-
-    // Identify newly added tokens
+    await this.pumpIncomingDeliveriesFresh();
     const received: IncomingTransfer[] = [];
     for (const [tokenId, token] of this.tokens) {
-      if (!tokensBefore.has(tokenId)) {
-        const transfer: IncomingTransfer = {
-          id: tokenId,
-          senderPubkey: '',
-          tokens: [token],
-          receivedAt: Date.now(),
-        };
-        received.push(transfer);
-        if (callback) callback(transfer);
-      }
+      if (tokensBefore.has(tokenId)) continue;
+      const transfer: IncomingTransfer = {
+        id: tokenId,
+        senderPubkey: '',
+        tokens: [token],
+        receivedAt: Date.now(),
+      };
+      received.push(transfer);
+      if (callback) callback(transfer);
     }
-
     return { transfers: received };
   }
 
@@ -4789,48 +4731,6 @@ export class PaymentsModule {
     return 'stored';
   }
 
-  private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
-    // Ensure load() has completed so dedup checks see all persisted tokens.
-    if (!this.loaded && this.loadedPromise) {
-      await this.loadedPromise;
-    }
-
-    try {
-      // The only supported wire format is the v2 engine transfer:
-      // { type: 'V2_TRANSFER', tokenBlob } carrying a FINISHED token.
-      const payload = transfer.payload as unknown as Record<string, unknown>;
-      logger.debug('Payments', 'handleIncomingTransfer: keys=', Object.keys(payload).join(','));
-
-      // v2 engine transfer (sender-driven): the sender handed us a FINISHED token.
-      // Decode + store directly — no commitment / proof / finalization round-trip.
-      if (isV2TransferPayload(transfer.payload)) {
-        await this.handleV2Transfer(transfer.payload, transfer.senderTransportPubkey);
-        return;
-      }
-
-      // LEGACY v1 wire formats (V6 combined, V4/V5 instant-split, NOSTR-FIRST,
-      // {sourceToken,transferTx}, plain token JSON) are no longer supported —
-      // their commitment/finalization machinery was removed with the v1 engine.
-      // Drop loudly so an old-version sender is diagnosable from the logs.
-      const payloadType = typeof payload.type === 'string' ? payload.type : undefined;
-      const looksLegacyV1 = payload.sourceToken !== undefined
-        || payload.token !== undefined
-        || payloadType === 'COMBINED_TRANSFER'
-        || payloadType === 'INSTANT_SPLIT';
-      if (looksLegacyV1) {
-        logger.error(
-          'Payments',
-          'Dropped LEGACY v1 transfer payload (v1 support removed in 0.8.0). The sender must upgrade to a v2 wallet.',
-        );
-        return;
-      }
-
-      logger.warn('Payments', 'Unknown transfer payload format');
-    } catch (error) {
-      logger.error('Payments', 'Failed to process incoming transfer:', error);
-    }
-  }
-
   // ===========================================================================
   // Delivery port: incoming pump + intent resume (sdk-changes S3/E.3)
   // ===========================================================================
@@ -4926,7 +4826,7 @@ export class PaymentsModule {
    * Returns the number of newly stored tokens. Concurrent calls coalesce.
    */
   async pumpIncomingDeliveries(): Promise<number> {
-    if (!this.injectedDelivery) return 0;
+    if (!this.delivery) return 0;
     if (this.pumpInFlight) return this.pumpInFlight;
     this.pumpInFlight = this.doPumpIncomingDeliveries().finally(() => {
       this.pumpInFlight = null;
@@ -4953,7 +4853,7 @@ export class PaymentsModule {
   }
 
   private async doPumpIncomingDeliveries(): Promise<number> {
-    const delivery = this.injectedDelivery!;
+    const delivery = this.delivery!;
     if (!this.loaded && this.loadedPromise) {
       await this.loadedPromise;
     }
@@ -6425,6 +6325,21 @@ export class PaymentsModule {
   // ===========================================================================
   // Private: Helpers
   // ===========================================================================
+
+  /**
+   * Assets ride the delivery port exclusively — there is no fallback rail, so a
+   * composition without one fails here rather than at a null dereference deep in
+   * the send path.
+   */
+  private ensureDelivery(): void {
+    if (!this.delivery) {
+      throw new SphereError(
+        'No delivery provider composed — cannot send or receive assets. Compose a wallet-api preset ' +
+          '(impl/shared/wallet-api/composition.ts) or supply your own DeliveryProvider.',
+        'INVALID_CONFIG'
+      );
+    }
+  }
 
   private ensureInitialized(): void {
     if (!this.deps) {

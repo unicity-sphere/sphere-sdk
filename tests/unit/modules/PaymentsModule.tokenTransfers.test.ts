@@ -18,6 +18,7 @@ import { encodeTokenBlob } from '../../../token-engine/token-blob';
 import { bytesToHex } from '../../../core/crypto';
 import { SphereError } from '../../../core/errors';
 import type { V2TransferPayload } from '../../../types/v2-transfer';
+import { createMemoryDelivery } from '../../support/memory-delivery';
 
 const FAKE_PRIVATE_KEY = 'a'.repeat(64);
 const FAKE_PUBKEY = '02' + 'b'.repeat(64);
@@ -117,14 +118,16 @@ function setup(engine: FakeTokenEngine | null = new FakeTokenEngine()) {
   const emitEvent = vi.fn();
   const transport = mockTransport();
   const storage = mockStorage();
+  const delivery = createMemoryDelivery();
   const deps: PaymentsModuleDependencies = {
+    delivery,
     identity: mockIdentity(), storage, tokenStorageProviders: tsp,
     transport, oracle: mockOracle(), emitEvent,
     ...(engine ? { tokenEngine: engine } : {}),
   };
   const module = createPaymentsModule({ debug: false });
   module.initialize(deps);
-  return { module, engine, emitEvent, transport, storage };
+  return { module, engine, emitEvent, transport, storage, delivery };
 }
 
 async function v2Payload(
@@ -137,9 +140,7 @@ async function v2Payload(
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 function deliver(module: ReturnType<typeof setup>['module'], payload: V2TransferPayload, id = 't1') {
-  return (module as any).handleIncomingTransfer({
-    id, senderTransportPubkey: SENDER_TRANSPORT_PUBKEY, payload, timestamp: 0,
-  });
+  return (module as any).handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
 }
 
 async function sendError(promise: Promise<unknown>): Promise<SphereError> {
@@ -150,7 +151,7 @@ async function sendError(promise: Promise<unknown>): Promise<SphereError> {
 
 describe('send — recipient resolution failures', () => {
   it('fails with INVALID_RECIPIENT when transport.resolve returns null', async () => {
-    const { module, engine, transport } = setup();
+    const { module, engine, transport, delivery } = setup();
     await deliver(module, await v2Payload(engine!, UCT, 100n));
     (transport.resolve as Mock).mockResolvedValue(null);
 
@@ -158,12 +159,12 @@ describe('send — recipient resolution failures', () => {
     expect(err.code).toBe('INVALID_RECIPIENT');
 
     // Nothing left the wallet and nothing hit the wire.
-    expect(transport.sendTokenTransfer).not.toHaveBeenCalled();
+    expect(delivery.delivered).toHaveLength(0);
     expect(module.getTokens()).toHaveLength(1);
   });
 
   it('fails with INVALID_RECIPIENT when the peer has no published chain pubkey', async () => {
-    const { module, engine, transport } = setup();
+    const { module, engine, transport, delivery } = setup();
     await deliver(module, await v2Payload(engine!, UCT, 100n));
     // Peer is reachable on transport but never published a chain identity.
     (transport.resolve as Mock).mockResolvedValue({
@@ -173,29 +174,29 @@ describe('send — recipient resolution failures', () => {
     const err = await sendError(module.send({ recipient: '@bob', amount: '100', coinId: UCT }));
     expect(err.code).toBe('INVALID_RECIPIENT');
     expect(err.message).toContain('no published identity');
-    expect(transport.sendTokenTransfer).not.toHaveBeenCalled();
+    expect(delivery.delivered).toHaveLength(0);
   });
 });
 
 describe('send — engine availability', () => {
   it('fails with AGGREGATOR_ERROR when no token engine is configured', async () => {
-    const { module, transport } = setup(null); // no engine wired
+    const { module, transport, delivery } = setup(null); // no engine wired
 
     const err = await sendError(module.send({ recipient: '@bob', amount: '100', coinId: UCT }));
     expect(err.code).toBe('AGGREGATOR_ERROR');
     expect(err.message).toContain('Token engine unavailable');
-    expect(transport.sendTokenTransfer).not.toHaveBeenCalled();
+    expect(delivery.delivered).toHaveLength(0);
   });
 });
 
 describe('send — insufficient balance', () => {
   it('fails with SEND_INSUFFICIENT_BALANCE when the wallet is empty', async () => {
-    const { module, transport } = setup();
+    const { module, transport, delivery } = setup();
 
     const err = await sendError(module.send({ recipient: '@bob', amount: '100', coinId: UCT }));
     expect(err.code).toBe('SEND_INSUFFICIENT_BALANCE');
     expect(err.message).toContain('Insufficient balance');
-    expect(transport.sendTokenTransfer).not.toHaveBeenCalled();
+    expect(delivery.delivered).toHaveLength(0);
   });
 });
 
@@ -207,7 +208,7 @@ describe('send — failure recovery (engine.transfer throws mid-send)', () => {
   }
 
   it('restores the source token to confirmed and notifies the spend queue', async () => {
-    const { module, engine, emitEvent, transport } = setup(new ExplodingTransferEngine());
+    const { module, engine, emitEvent, transport, delivery } = setup(new ExplodingTransferEngine());
     await deliver(module, await v2Payload(engine!, UCT, 100n));
     const notifySpy = vi.spyOn((module as any).spendQueue, 'notifyChange');
 
@@ -228,7 +229,7 @@ describe('send — failure recovery (engine.transfer throws mid-send)', () => {
     expect(failed).toBeDefined();
     expect(failed![1].status).toBe('failed');
     expect(failed![1].error).toContain('engine transfer failed mid-send');
-    expect(transport.sendTokenTransfer).not.toHaveBeenCalled();
+    expect(delivery.delivered).toHaveLength(0);
     expect(module.getHistory().filter((h) => h.type === 'SENT')).toHaveLength(0);
   });
 });
@@ -260,7 +261,7 @@ describe('send — SENT history entry', () => {
 
 describe('TransferResult.tokenTransfers', () => {
   it('produces one direct entry per whole token consumed (multi-token send)', async () => {
-    const { module, engine, transport } = setup();
+    const { module, engine, transport, delivery } = setup();
     // 100 + 40 exactly covers 140 → both tokens go whole, no split.
     await deliver(module, await v2Payload(engine!, UCT, 100n), 't1');
     await deliver(module, await v2Payload(engine!, UCT, 40n), 't2');
@@ -276,7 +277,7 @@ describe('TransferResult.tokenTransfers', () => {
     expect(result.tokenTransfers.map((tt) => tt.sourceTokenId).sort()).toEqual(sourceIds);
 
     // One V2_TRANSFER wire payload per consumed token, but a single SENT entry.
-    expect((transport.sendTokenTransfer as Mock).mock.calls).toHaveLength(2);
+    expect(delivery.delivered).toHaveLength(2);
     expect(module.getHistory().filter((h) => h.type === 'SENT')).toHaveLength(1);
     expect(module.getTokens()).toHaveLength(0);
   });
@@ -296,7 +297,7 @@ describe('TransferResult.tokenTransfers', () => {
 
 describe('send — transferMode is ignored (single engine path)', () => {
   it('sends the same V2_TRANSFER wire payload regardless of transferMode', async () => {
-    const { module, engine, transport } = setup();
+    const { module, engine, transport, delivery } = setup();
     await deliver(module, await v2Payload(engine!, UCT, 100n), 't1');
     await deliver(module, await v2Payload(engine!, UCT, 100n), 't2');
 
@@ -305,12 +306,10 @@ describe('send — transferMode is ignored (single engine path)', () => {
 
     expect(conservative.status).toBe('completed');
     expect(instant.status).toBe('completed');
-    const payloads = (transport.sendTokenTransfer as Mock).mock.calls.map((c: any[]) => c[1]);
-    expect(payloads).toHaveLength(2);
-    for (const p of payloads) {
-      expect(p.type).toBe('V2_TRANSFER');
-      expect(p.version).toBe('2.0');
-      expect(typeof p.tokenBlob).toBe('string');
+    expect(delivery.delivered).toHaveLength(2);
+    for (const d of delivery.delivered) {
+      expect(d.blob.byteLength).toBeGreaterThan(0);
+      expect(d.recipientPubkey).toBe(BOB_CHAIN_PUBKEY);
     }
   });
 });
