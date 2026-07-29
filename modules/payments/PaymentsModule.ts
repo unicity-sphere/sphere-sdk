@@ -1587,6 +1587,7 @@ export class PaymentsModule {
   private async sendOnce(request: TransferRequest): Promise<TransferResult> {
     this.ensureInitialized();
     this.ensureDelivery();
+    this.ensureWalletApi();
 
     // Use mutable result for building the transfer
     const result: { -readonly [K in keyof TransferResult]: TransferResult[K] } = {
@@ -1726,7 +1727,7 @@ export class PaymentsModule {
         // a FINISHED token — no commitment / inclusion-proof / finalization.
         // =================================================================
         const engine = this.deps.tokenEngine;
-        const walletApi = this.deps.walletApi;
+        const walletApi = this.deps.walletApi!;
         const delivery = this.delivery!;
         // §7/§5.3: with wallet-api INVENTORY custody the spend is recorded
         // server-side via ONE applyDelta carrying this send's transferId —
@@ -1734,60 +1735,54 @@ export class PaymentsModule {
         // (the own-storage composition) the sender never calls apply
         // (ARCHITECTURE §6: storage-opt-out senders); local bookkeeping is
         // the record and the intent closes via completeIntent alone.
-        const serverApply = !!walletApi && delivery.custody === 'inventory';
+        const serverApply = delivery.custody === 'inventory';
         const recipientChainPubkeyHex = peerInfo.chainPubkey;
         const recipientChainPubkey = hexToBytes(recipientChainPubkeyHex);
         // S2: blobs are fetched on demand — lazy inventory records selected by
         // coin-selection are materialized (getToken + engine decode) only now.
         await this.materializeSelectedSources(splitPlan);
 
-        // E.3: persist the (client-encrypted — S6) intent and AWAIT the server
-        // ack BEFORE any engine submit — the intent is the only resume seed
-        // for a possibly-already-certified transfer; local-only persistence is
-        // forbidden for the live path.
-        if (walletApi) {
-          // E.4/#87: a split's terminal close is seed-gated — set requiresSeedClose here, BEFORE
-          // the burn, so the funds-critical window is guarded from intent creation (not only once
-          // the first checkpoint is appended).
-          try {
-            await walletApi.putIntent(
-              result.id,
-              encryptField(
-                this.getFieldEncryptionKey(),
-                JSON.stringify(await this.buildIntentPayload(request, peerInfo.chainPubkey, splitPlan))
-              ),
-              splitPlan.requiresSplit ? { requiresSeedClose: true } : {}
-            );
-          } catch (err) {
-            // #670: a 422 VALIDATION rejection is DETERMINISTIC — the server will
-            // never accept this payload (e.g. the intent envelope exceeds the
-            // service's size cap), so the #516 keep-and-replay backstop does not
-            // apply: nothing is on-chain yet (E.3 — the engine has not run) and
-            // the server row was never created. Drop the local copy (keeping it
-            // would poison resyncOpenIntents with an eternal 422) and surface a
-            // TYPED error the app can map instead of the raw wire text
-            // (WalletApiError is not a SphereError). Transient failures
-            // (NETWORK/5xx) rethrow unchanged and keep the backstop.
-            // (The PUT precedes every engine op — nothing can have certified yet.)
-            if (err instanceof WalletApiError && err.code === 'VALIDATION') {
-              intentRejected = true;
-              try {
-                await walletApi.removeLocalIntent?.(result.id);
-              } catch (removeErr) {
-                logger.warn('Payments', 'removeLocalIntent failed after intent VALIDATION rejection:', removeErr);
-              }
-              throw new SphereError(
-                // Matches both the server's "envelope exceeds N bytes (§8.3)"
-                // and the SDK checker's "exceeds size cap of N bytes" wording.
-                /exceeds .*bytes/.test(err.message)
-                  ? "The payment could not be registered with the wallet service because it exceeds the service's size limit. Try sending a smaller amount."
-                  : 'The wallet service rejected this payment as invalid.',
-                'VALIDATION_ERROR',
-                err
-              );
+        // E.3: the intent is the resume seed, so it is persisted and ACKed before
+        // any engine submit. E.4/#87: requiresSeedClose is set here, before the
+        // burn, so the funds-critical window is guarded from intent creation.
+        try {
+          await walletApi.putIntent(
+            result.id,
+            encryptField(
+              this.getFieldEncryptionKey(),
+              JSON.stringify(await this.buildIntentPayload(request, peerInfo.chainPubkey, splitPlan))
+            ),
+            splitPlan.requiresSplit ? { requiresSeedClose: true } : {}
+          );
+        } catch (err) {
+          // #670: a 422 VALIDATION rejection is DETERMINISTIC — the server will
+          // never accept this payload (e.g. the intent envelope exceeds the
+          // service's size cap), so the #516 keep-and-replay backstop does not
+          // apply: nothing is on-chain yet (E.3 — the engine has not run) and
+          // the server row was never created. Drop the local copy (keeping it
+          // would poison resyncOpenIntents with an eternal 422) and surface a
+          // TYPED error the app can map instead of the raw wire text
+          // (WalletApiError is not a SphereError). Transient failures
+          // (NETWORK/5xx) rethrow unchanged and keep the backstop.
+          // (The PUT precedes every engine op — nothing can have certified yet.)
+          if (err instanceof WalletApiError && err.code === 'VALIDATION') {
+            intentRejected = true;
+            try {
+              await walletApi.removeLocalIntent?.(result.id);
+            } catch (removeErr) {
+              logger.warn('Payments', 'removeLocalIntent failed after intent VALIDATION rejection:', removeErr);
             }
-            throw err;
+            throw new SphereError(
+              // Matches both the server's "envelope exceeds N bytes (§8.3)"
+              // and the SDK checker's "exceeds size cap of N bytes" wording.
+              /exceeds .*bytes/.test(err.message)
+                ? "The payment could not be registered with the wallet service because it exceeds the service's size limit. Try sending a smaller amount."
+                : 'The wallet service rejected this payment as invalid.',
+              'VALIDATION_ERROR',
+              err
+            );
           }
+          throw err;
         }
 
         // Sources consumed by this send — the §7 step 6 apply (server path)
@@ -2196,14 +2191,14 @@ export class PaymentsModule {
       // #670: skip the abort when the intent PUT itself was deterministically
       // rejected — the local copy is already dropped and the server row never
       // existed (an abort would only 404 and re-mark the copy abortPending).
-      if (this.deps?.walletApi && !intentRejected) {
+      if (!intentRejected) {
         // Abort ONLY a proven-clean failure with NOTHING certified. A conflict
         // is never keep-open (isKeepOpenSendError), so the E.2 clean-conflict
         // abort is contained in this predicate; a conflict alongside a
         // certified leg keeps the intent open (see the disposition doc above).
         if (committedUiIds.size === 0 && !keepOpen) {
           try {
-            await this.deps.walletApi.abortIntent(result.id);
+            await this.deps!.walletApi!.abortIntent(result.id);
           } catch (abortErr) {
             logger.warn('Payments', 'abortIntent failed (soft abort is best-effort):', abortErr);
           }
@@ -6132,6 +6127,23 @@ export class PaymentsModule {
    * composition without one fails here rather than at a null dereference deep in
    * the send path.
    */
+  /**
+   * E.3: the intent is the ONLY resume seed for a possibly-already-certified
+   * transfer, and it lives server-side. Every shipped preset composes `walletApi`
+   * alongside `delivery`, so this can only fire for a bundle assembled by hand
+   * through `createSphereProviders` — where sending would otherwise certify
+   * on-chain with nothing to resume from.
+   */
+  private ensureWalletApi(): void {
+    if (!this.deps!.walletApi) {
+      throw new SphereError(
+        'No wallet-api client composed — cannot send. The E.3 intent is the only resume seed for a ' +
+          'certified transfer; sending without it would leave a spend unrecoverable after a crash.',
+        'INVALID_CONFIG'
+      );
+    }
+  }
+
   private ensureDelivery(): void {
     if (!this.delivery) {
       throw new SphereError(

@@ -3,92 +3,56 @@
  * SENT history metadata and TransferResult.tokenTransfers entries.
  *
  * Complements PaymentsModule.v2-receive.test.ts (which covers the send
- * happy-path wire format, split balances and memo placement). Clean
- * FakeTokenEngine harness — no SDK vi.mocks; only public APIs plus the
- * deliver() pattern to seed the wallet with received tokens.
+ * happy-path wire format, split balances and memo placement).
+ *
+ * Composition: the REAL FULL wallet-api preset (impl/shared/wallet-api/
+ * composition.ts → createWalletApiProviders) against the in-process
+ * FakeWalletApi — thin server-custody storage + WalletApiMailboxProvider
+ * delivery (custody 'inventory') + the WalletApiClient, exactly as shipped.
+ * The previous memory-delivery / mock-token-storage / no-client wiring was a
+ * composition that cannot exist in production (and `assertLegalCustodyComposition`
+ * refuses the inventory-custody half of it).
+ *
+ * "Nothing hit the wire" is therefore asserted against the RECIPIENT'S REAL
+ * MAILBOX on the fake backend (plus the delivery port's own call log), not
+ * against a double's `delivered` array.
  */
-import { describe, it, expect, vi, type Mock } from 'vitest';
-import { createPaymentsModule, type PaymentsModuleDependencies } from '../../../modules/payments/PaymentsModule';
-import type { FullIdentity } from '../../../types';
+import { describe, it, expect, vi, afterEach, type Mock } from 'vitest';
 import type { TransportProvider } from '../../../transport';
-import type { OracleProvider } from '../../../oracle';
-import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
 import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
-import { encodeTokenBlob } from '../../../token-engine/token-blob';
-import { bytesToHex } from '../../../core/crypto';
 import { SphereError } from '../../../core/errors';
-import type { V2TransferPayload } from '../../../types/v2-transfer';
-import { createMemoryDelivery } from '../../support/memory-delivery';
+import type { FakeWalletApi } from '../../support/fake-wallet-api';
+import { testIdentity } from '../../support/wallet-api-test-helpers';
+import {
+  fullIdentity,
+  makeFullPresetWallet,
+  seedServerToken,
+  startFakeWalletApi,
+  type PresetWallet,
+} from '../../support/preset-wallet';
 
-const FAKE_PRIVATE_KEY = 'a'.repeat(64);
-const FAKE_PUBKEY = '02' + 'b'.repeat(64);
-const SENDER_TRANSPORT_PUBKEY = 'cc'.repeat(32);
 const UCT = '11'.repeat(32); // v2 coin ids are lowercase hex
-const BOB_CHAIN_PUBKEY = '02' + 'ee'.repeat(32); // recipient's 33-byte chain pubkey (hex)
-const BOB_DIRECT_ADDRESS = 'DIRECT://0000b97b4a83dc3fe636d4f21dbfe4c93149e07367539a059a9c8e64ad7d9fdc30644eaaf64b';
 
-function mockIdentity(): FullIdentity {
-  return {
-    chainPubkey: FAKE_PUBKEY, directAddress: 'DIRECT://x',
-    privateKey: FAKE_PRIVATE_KEY, transportPubkey: 'dd'.repeat(32),
-  };
-}
+const ALICE = testIdentity(21); // the wallet under test (real keypair — the backend verifies signatures)
+const BOB = testIdentity(22); // the recipient
+/** Bob's transport-layer coordinates, as the transport would publish them. */
+const BOB_PEER = fullIdentity(BOB);
 
-function mockStorage(): StorageProvider {
-  const s = new Map<string, string>();
-  return {
-    id: 's', name: 's', type: 'local', connect: vi.fn(), disconnect: vi.fn(),
-    isConnected: () => true, getStatus: () => 'connected', setIdentity: vi.fn(),
-    get: vi.fn(async (k: string) => s.get(k) ?? null),
-    set: vi.fn(async (k: string, v: string) => { s.set(k, v); }),
-    remove: vi.fn(async (k: string) => { s.delete(k); }),
-    has: vi.fn(async (k: string) => s.has(k)),
-    keys: vi.fn(async () => [...s.keys()]),
-    clear: vi.fn(async () => { s.clear(); }),
-  } as unknown as StorageProvider;
-}
-
-function mockHistoryStore() {
-  const entries = new Map<string, HistoryRecord>();
-  return {
-    addHistoryEntry: vi.fn(async (e: HistoryRecord) => { entries.set(e.dedupKey, e); }),
-    getHistoryEntries: vi.fn(async () => [...entries.values()]),
-    hasHistoryEntry: vi.fn(async (k: string) => entries.has(k)),
-    clearHistory: vi.fn(async () => entries.clear()),
-    importHistoryEntries: vi.fn(async () => 0),
-  };
-}
-
-function mockTokenStorage(): TokenStorageProvider<TxfStorageDataBase> {
-  return {
-    id: 'ts', name: 'ts', type: 'local',
-    connect: vi.fn().mockResolvedValue(undefined), disconnect: vi.fn().mockResolvedValue(undefined),
-    isConnected: () => true, getStatus: () => 'connected', setIdentity: vi.fn(),
-    initialize: vi.fn().mockResolvedValue(true), shutdown: vi.fn().mockResolvedValue(undefined),
-    save: vi.fn().mockResolvedValue({ success: true, timestamp: 0 }),
-    load: vi.fn().mockResolvedValue({ success: false, source: 'local', timestamp: 0 }),
-    sync: vi.fn().mockResolvedValue({ success: true, added: 0, removed: 0, conflicts: 0 }),
-    ...mockHistoryStore(),
-  } as unknown as TokenStorageProvider<TxfStorageDataBase>;
-}
-
-function mockTransport(nametag = 'alice'): TransportProvider {
+/** Bob is reachable AND has published a chain identity — the happy peer. */
+function mockTransport(): TransportProvider {
   return {
     sendTokenTransfer: vi.fn().mockResolvedValue(undefined),
     onTokenTransfer: vi.fn().mockReturnValue(() => {}),
     onPaymentRequest: vi.fn().mockReturnValue(() => {}),
     onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
     resolve: vi.fn().mockResolvedValue({
-      chainPubkey: BOB_CHAIN_PUBKEY,
-      transportPubkey: 'bob-transport-pubkey',
-      directAddress: BOB_DIRECT_ADDRESS,
+      chainPubkey: BOB.chainPubkey,
+      transportPubkey: BOB_PEER.transportPubkey,
+      directAddress: BOB_PEER.directAddress,
       nametag: 'bob',
     }),
     resolveNametagInfo: vi.fn().mockResolvedValue(null),
-    resolveTransportPubkeyInfo: vi.fn().mockResolvedValue({
-      chainPubkey: FAKE_PUBKEY, transportPubkey: SENDER_TRANSPORT_PUBKEY,
-      directAddress: 'DIRECT://sender', nametag,
-    }),
+    resolveTransportPubkeyInfo: vi.fn().mockResolvedValue(null),
     connect: vi.fn().mockResolvedValue(undefined), disconnect: vi.fn(), isConnected: () => true,
     publishNametag: vi.fn().mockResolvedValue(undefined),
     sendPaymentRequest: vi.fn().mockResolvedValue(undefined),
@@ -96,51 +60,68 @@ function mockTransport(nametag = 'alice'): TransportProvider {
   } as unknown as TransportProvider;
 }
 
-/** Post-cutover oracle surface: network config only (no v1 client accessors). */
-function mockOracle(): OracleProvider {
-  return {
-    id: 'o', name: 'o', type: 'aggregator',
-    connect: vi.fn().mockResolvedValue(undefined), disconnect: vi.fn(),
-    isConnected: () => true, getStatus: () => 'connected',
-    initialize: vi.fn().mockResolvedValue(undefined),
-    validateToken: vi.fn().mockResolvedValue({ valid: true, spent: false }),
-    getTrustBaseJson: () => null,
-    getAggregatorUrl: () => 'https://aggregator.test',
-    getApiKey: () => undefined,
-    onEvent: vi.fn().mockReturnValue(() => {}),
-  } as unknown as OracleProvider;
-}
+const cleanups: (() => Promise<void> | void)[] = [];
+afterEach(async () => {
+  while (cleanups.length) await cleanups.pop()!();
+});
 
-/** engine: undefined → default FakeTokenEngine; null → no engine wired at all. */
-function setup(engine: FakeTokenEngine | null = new FakeTokenEngine()) {
-  const tsp = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
-  tsp.set('local', mockTokenStorage());
-  const emitEvent = vi.fn();
+let deviceSeq = 0;
+
+/**
+ * Alice's wallet over the full wallet-api preset.
+ *
+ * `engine`: omitted → a default FakeTokenEngine bound to Alice's pubkey;
+ * `null` → no engine wired at all; a factory → a custom engine, still bound to
+ * Alice's pubkey (engine and wallet pubkeys MUST agree).
+ */
+async function setup(engine?: ((c: { chainPubkey?: Uint8Array }) => FakeTokenEngine) | null): Promise<{
+  fake: FakeWalletApi;
+  wallet: PresetWallet;
+  module: PresetWallet['module'];
+  engine: FakeTokenEngine | null;
+  emitEvent: PresetWallet['emitEvent'];
+  transport: TransportProvider;
+  delivery: PresetWallet['delivery'];
+}> {
+  const { fake, baseUrl, stop } = await startFakeWalletApi();
+  cleanups.push(stop);
   const transport = mockTransport();
-  const storage = mockStorage();
-  const delivery = createMemoryDelivery();
-  const deps: PaymentsModuleDependencies = {
-    delivery,
-    identity: mockIdentity(), storage, tokenStorageProviders: tsp,
-    transport, oracle: mockOracle(), emitEvent,
-    ...(engine ? { tokenEngine: engine } : {}),
+  deviceSeq += 1;
+  const wallet = makeFullPresetWallet({
+    baseUrl,
+    network: fake.network,
+    who: ALICE,
+    deviceId: `d-tt-${deviceSeq}`,
+    transport,
+    ...(engine !== undefined ? { engine } : {}),
+  });
+  cleanups.push(wallet.destroy);
+  return {
+    fake, wallet, module: wallet.module, engine: wallet.engine,
+    emitEvent: wallet.emitEvent, transport, delivery: wallet.delivery,
   };
-  const module = createPaymentsModule({ debug: false });
-  module.initialize(deps);
-  return { module, engine, emitEvent, transport, storage, delivery };
 }
 
-async function v2Payload(
-  engine: FakeTokenEngine, coinId: string, amount: bigint, memo?: string,
-  recipientPubkey: Uint8Array = engine.getIdentity().chainPubkey,
-): Promise<V2TransferPayload> {
-  const st = await engine.mint({ recipientPubkey, value: { assets: [{ coinId, amount }] } });
-  return { type: 'V2_TRANSFER', version: '2.0', tokenBlob: bytesToHex(encodeTokenBlob(engine.encodeToken(st))), memo };
+/** Watch the REAL delivery port: the closest analogue of the old double's `delivered`. */
+function watchDelivery(wallet: { delivery: PresetWallet['delivery'] }) {
+  const deliver = vi.spyOn(wallet.delivery, 'deliver');
+  const deliverBatch = vi.spyOn(wallet.delivery, 'deliverBatch');
+  return {
+    /** Every (recipientPubkey, blob) pair handed to the rail, batch legs flattened. */
+    legs(): { recipientPubkey: string; blob: Uint8Array }[] {
+      const out: { recipientPubkey: string; blob: Uint8Array }[] = [];
+      for (const [recipientPubkey, blob] of deliver.mock.calls) out.push({ recipientPubkey, blob });
+      for (const [recipientPubkey, blobs] of deliverBatch.mock.calls) {
+        for (const blob of blobs) out.push({ recipientPubkey, blob });
+      }
+      return out;
+    },
+  };
 }
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
-function deliver(module: ReturnType<typeof setup>['module'], payload: V2TransferPayload, id = 't1') {
-  return (module as any).handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
+/** What actually reached Bob — the recipient's real mailbox on the backend. */
+function bobsMailbox(fake: FakeWalletApi) {
+  return fake.listMailboxEntries(BOB.chainPubkey);
 }
 
 async function sendError(promise: Promise<unknown>): Promise<SphereError> {
@@ -151,52 +132,64 @@ async function sendError(promise: Promise<unknown>): Promise<SphereError> {
 
 describe('send — recipient resolution failures', () => {
   it('fails with INVALID_RECIPIENT when transport.resolve returns null', async () => {
-    const { module, engine, transport, delivery } = setup();
-    await deliver(module, await v2Payload(engine!, UCT, 100n));
+    const { fake, wallet, module, transport } = await setup();
+    await seedServerToken(fake, wallet, UCT, 100n);
+    await module.load();
+    const rail = watchDelivery(wallet);
     (transport.resolve as Mock).mockResolvedValue(null);
 
     const err = await sendError(module.send({ recipient: '@ghost', amount: '100', coinId: UCT }));
     expect(err.code).toBe('INVALID_RECIPIENT');
 
     // Nothing left the wallet and nothing hit the wire.
-    expect(delivery.delivered).toHaveLength(0);
+    expect(rail.legs()).toHaveLength(0);
+    expect(bobsMailbox(fake)).toHaveLength(0);
     expect(module.getTokens()).toHaveLength(1);
   });
 
   it('fails with INVALID_RECIPIENT when the peer has no published chain pubkey', async () => {
-    const { module, engine, transport, delivery } = setup();
-    await deliver(module, await v2Payload(engine!, UCT, 100n));
+    const { fake, wallet, module, transport } = await setup();
+    await seedServerToken(fake, wallet, UCT, 100n);
+    await module.load();
+    const rail = watchDelivery(wallet);
     // Peer is reachable on transport but never published a chain identity.
     (transport.resolve as Mock).mockResolvedValue({
-      transportPubkey: 'bob-transport-pubkey', directAddress: BOB_DIRECT_ADDRESS, nametag: 'bob',
+      transportPubkey: BOB_PEER.transportPubkey, directAddress: BOB_PEER.directAddress, nametag: 'bob',
     });
 
     const err = await sendError(module.send({ recipient: '@bob', amount: '100', coinId: UCT }));
     expect(err.code).toBe('INVALID_RECIPIENT');
     expect(err.message).toContain('no published identity');
-    expect(delivery.delivered).toHaveLength(0);
+    expect(rail.legs()).toHaveLength(0);
+    expect(bobsMailbox(fake)).toHaveLength(0);
   });
 });
 
 describe('send — engine availability', () => {
   it('fails with AGGREGATOR_ERROR when no token engine is configured', async () => {
-    const { module, transport, delivery } = setup(null); // no engine wired
+    const { fake, wallet, module } = await setup(null); // no engine wired
+    await module.load();
+    const rail = watchDelivery(wallet);
 
     const err = await sendError(module.send({ recipient: '@bob', amount: '100', coinId: UCT }));
     expect(err.code).toBe('AGGREGATOR_ERROR');
     expect(err.message).toContain('Token engine unavailable');
-    expect(delivery.delivered).toHaveLength(0);
+    expect(rail.legs()).toHaveLength(0);
+    expect(bobsMailbox(fake)).toHaveLength(0);
   });
 });
 
 describe('send — insufficient balance', () => {
   it('fails with SEND_INSUFFICIENT_BALANCE when the wallet is empty', async () => {
-    const { module, transport, delivery } = setup();
+    const { fake, wallet, module } = await setup();
+    await module.load();
+    const rail = watchDelivery(wallet);
 
     const err = await sendError(module.send({ recipient: '@bob', amount: '100', coinId: UCT }));
     expect(err.code).toBe('SEND_INSUFFICIENT_BALANCE');
     expect(err.message).toContain('Insufficient balance');
-    expect(delivery.delivered).toHaveLength(0);
+    expect(rail.legs()).toHaveLength(0);
+    expect(bobsMailbox(fake)).toHaveLength(0);
   });
 });
 
@@ -208,8 +201,11 @@ describe('send — failure recovery (engine.transfer throws mid-send)', () => {
   }
 
   it('restores the source token to confirmed and notifies the spend queue', async () => {
-    const { module, engine, emitEvent, transport, delivery } = setup(new ExplodingTransferEngine());
-    await deliver(module, await v2Payload(engine!, UCT, 100n));
+    const { fake, wallet, module, emitEvent } = await setup((c) => new ExplodingTransferEngine(c));
+    await seedServerToken(fake, wallet, UCT, 100n);
+    await module.load();
+    const rail = watchDelivery(wallet);
+    /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
     const notifySpy = vi.spyOn((module as any).spendQueue, 'notifyChange');
 
     await expect(
@@ -225,19 +221,24 @@ describe('send — failure recovery (engine.transfer throws mid-send)', () => {
     expect(notifySpy).toHaveBeenCalledWith(UCT);
 
     // Failure is surfaced; nothing was handed to the recipient, no SENT history.
+    /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
     const failed = emitEvent.mock.calls.find((c: any[]) => c[0] === 'transfer:failed');
     expect(failed).toBeDefined();
     expect(failed![1].status).toBe('failed');
     expect(failed![1].error).toContain('engine transfer failed mid-send');
-    expect(delivery.delivered).toHaveLength(0);
+    expect(rail.legs()).toHaveLength(0);
+    expect(bobsMailbox(fake)).toHaveLength(0);
     expect(module.getHistory().filter((h) => h.type === 'SENT')).toHaveLength(0);
+    // Nothing was spent server-side either — the source row is still active.
+    expect(fake.getRow(ALICE.chainPubkey, tokens[0].id.replace(/^v2_/, ''))).toMatchObject({ status: 'active' });
   });
 });
 
 describe('send — SENT history entry', () => {
   it('records a single SENT entry with recipient metadata, memo and token breakdown', async () => {
-    const { module, engine } = setup();
-    await deliver(module, await v2Payload(engine!, UCT, 100n));
+    const { fake, wallet, module } = await setup();
+    await seedServerToken(fake, wallet, UCT, 100n);
+    await module.load();
     const sourceTokenId = module.getTokens()[0].id;
 
     const result = await module.send({ recipient: '@bob', amount: '100', coinId: UCT, memo: 'lunch' });
@@ -250,9 +251,9 @@ describe('send — SENT history entry', () => {
       coinId: UCT,
       memo: 'lunch',
       transferId: result.id,
-      recipientPubkey: 'bob-transport-pubkey',
+      recipientPubkey: BOB_PEER.transportPubkey,
       recipientNametag: 'bob',
-      recipientAddress: BOB_DIRECT_ADDRESS,
+      recipientAddress: BOB_PEER.directAddress,
       tokenIds: [{ id: sourceTokenId, amount: '100', source: 'direct' }],
     });
     expect(sent[0].timestamp).toBeGreaterThan(0);
@@ -261,10 +262,12 @@ describe('send — SENT history entry', () => {
 
 describe('TransferResult.tokenTransfers', () => {
   it('produces one direct entry per whole token consumed (multi-token send)', async () => {
-    const { module, engine, transport, delivery } = setup();
+    const { fake, wallet, module } = await setup();
     // 100 + 40 exactly covers 140 → both tokens go whole, no split.
-    await deliver(module, await v2Payload(engine!, UCT, 100n), 't1');
-    await deliver(module, await v2Payload(engine!, UCT, 40n), 't2');
+    await seedServerToken(fake, wallet, UCT, 100n);
+    await seedServerToken(fake, wallet, UCT, 40n);
+    await module.load();
+    const rail = watchDelivery(wallet);
     const sourceIds = module.getTokens().map((t) => t.id).sort();
 
     const result = await module.send({ recipient: '@bob', amount: '140', coinId: UCT });
@@ -276,15 +279,20 @@ describe('TransferResult.tokenTransfers', () => {
     }
     expect(result.tokenTransfers.map((tt) => tt.sourceTokenId).sort()).toEqual(sourceIds);
 
-    // One V2_TRANSFER wire payload per consumed token, but a single SENT entry.
-    expect(delivery.delivered).toHaveLength(2);
+    // One V2_TRANSFER wire payload — one mailbox entry — per consumed token,
+    // all under this send's transferId, but a single SENT entry.
+    expect(rail.legs()).toHaveLength(2);
+    const entries = bobsMailbox(fake);
+    expect(entries).toHaveLength(2);
+    expect(new Set(entries.map((e) => e.transferId))).toEqual(new Set([result.id]));
     expect(module.getHistory().filter((h) => h.type === 'SENT')).toHaveLength(1);
     expect(module.getTokens()).toHaveLength(0);
   });
 
   it('produces a single split entry for a split send and no txHash field', async () => {
-    const { module, engine } = setup();
-    await deliver(module, await v2Payload(engine!, UCT, 1000n));
+    const { fake, wallet, module } = await setup();
+    await seedServerToken(fake, wallet, UCT, 1000n);
+    await module.load();
     const sourceTokenId = module.getTokens()[0].id;
 
     const result = await module.send({ recipient: '@bob', amount: '300', coinId: UCT });
@@ -297,19 +305,28 @@ describe('TransferResult.tokenTransfers', () => {
 
 describe('send — transferMode is ignored (single engine path)', () => {
   it('sends the same V2_TRANSFER wire payload regardless of transferMode', async () => {
-    const { module, engine, transport, delivery } = setup();
-    await deliver(module, await v2Payload(engine!, UCT, 100n), 't1');
-    await deliver(module, await v2Payload(engine!, UCT, 100n), 't2');
+    const { fake, wallet, module } = await setup();
+    await seedServerToken(fake, wallet, UCT, 100n);
+    await seedServerToken(fake, wallet, UCT, 100n);
+    await module.load();
+    const rail = watchDelivery(wallet);
 
     const conservative = await module.send({ recipient: '@bob', amount: '100', coinId: UCT, transferMode: 'conservative' });
     const instant = await module.send({ recipient: '@bob', amount: '100', coinId: UCT, transferMode: 'instant' });
 
     expect(conservative.status).toBe('completed');
     expect(instant.status).toBe('completed');
-    expect(delivery.delivered).toHaveLength(2);
-    for (const d of delivery.delivered) {
-      expect(d.blob.byteLength).toBeGreaterThan(0);
-      expect(d.recipientPubkey).toBe(BOB_CHAIN_PUBKEY);
+
+    // Two deliveries, both non-empty blobs addressed to Bob's CHAIN pubkey…
+    const legs = rail.legs();
+    expect(legs).toHaveLength(2);
+    for (const leg of legs) {
+      expect(leg.blob.byteLength).toBeGreaterThan(0);
+      expect(leg.recipientPubkey).toBe(BOB.chainPubkey);
     }
+    // …and both landed in Bob's mailbox, one per send.
+    const entries = bobsMailbox(fake);
+    expect(entries).toHaveLength(2);
+    expect(new Set(entries.map((e) => e.transferId))).toEqual(new Set([conservative.id, instant.id]));
   });
 });

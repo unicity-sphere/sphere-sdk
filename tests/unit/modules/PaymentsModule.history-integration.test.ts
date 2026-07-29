@@ -16,30 +16,43 @@
  * 8. resolveSenderInfo() — transport resolution and error handling
  * 9. history:updated event on addToHistory
  *
+ * Composition: the REAL own-storage wallet-api preset
+ * (`createOwnStorageWalletApiProviders` — impl/shared/wallet-api/composition.ts):
+ * the app's own (local) storage keeps token custody, while the delivery port is
+ * the real {@link WalletApiMailboxProvider} (custody 'external') over a real
+ * {@link WalletApiClient} pointed at an in-process {@link FakeWalletApi}
+ * backend. `delivery` and `walletApi` are wired TOGETHER, exactly as every
+ * shipped preset returns them — there is no delivery-without-client wallet in
+ * production, so there is none here either.
+ *
  * Clean harness (no SDK vi.mock): the FakeTokenEngine, the real SpendPlanner /
  * SpendQueue and the real send/receive paths run end-to-end.
  */
 
-import { describe, it, expect, vi } from 'vitest';
-import { createPaymentsModule, type PaymentsModuleDependencies } from '../../../modules/payments/PaymentsModule';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { createPaymentsModule, type PaymentsModule, type PaymentsModuleDependencies } from '../../../modules/payments/PaymentsModule';
 import type { Token, FullIdentity } from '../../../types';
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
 import type { V2TransferPayload } from '../../../types/v2-transfer';
-import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
+import { FakeTokenEngine, decodeFakeTokenAssets, decodeFakeTokenId } from '../token-engine/FakeTokenEngine';
 import { encodeTokenBlob } from '../../../token-engine/token-blob';
-import { bytesToHex } from '../../../core/crypto';
-import { createMemoryDelivery } from '../../support/memory-delivery';
+import { bytesToHex, hexToBytes } from '../../../core/crypto';
+import { FakeWalletApi } from '../../support/fake-wallet-api';
+import { MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
+import { WalletApiClient } from '../../../wallet-api';
+import { WalletApiMailboxProvider } from '../../../impl/shared/wallet-api';
 
 // =============================================================================
 // Constants
 // =============================================================================
 
-const FAKE_PRIVATE_KEY = 'a'.repeat(64);
-const FAKE_PUBKEY = '02' + 'b'.repeat(64);
+/** This wallet. A REAL keypair — wallet-api auth signs a challenge with it. */
+const ALICE = testIdentity(31);
+/** The recipient behind '@bob' — the mailbox owner every send deposits into. */
+const BOB = testIdentity(32);
 const SENDER_TRANSPORT_PUBKEY = 'cc'.repeat(32);
-const BOB_CHAIN_PUBKEY = '02' + 'ee'.repeat(32); // recipient's 33-byte chain pubkey (hex)
 const RECIPIENT_DIRECT_ADDRESS = 'DIRECT://recipient';
 const UCT = '11'.repeat(32); // v2 coin ids are lowercase hex
 
@@ -49,9 +62,9 @@ const UCT = '11'.repeat(32); // v2 coin ids are lowercase hex
 
 function createMockIdentity(): FullIdentity {
   return {
-    chainPubkey: FAKE_PUBKEY,
+    chainPubkey: ALICE.chainPubkey,
     directAddress: 'DIRECT://testaddr',
-    privateKey: FAKE_PRIVATE_KEY,
+    privateKey: ALICE.privateKey,
     transportPubkey: 'dd'.repeat(32),
   };
 }
@@ -106,14 +119,14 @@ function createMockTransport(senderNametag?: string): TransportProvider {
     onPaymentRequest: vi.fn().mockReturnValue(() => {}),
     onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
     resolve: vi.fn().mockResolvedValue({
-      chainPubkey: BOB_CHAIN_PUBKEY,
+      chainPubkey: BOB.chainPubkey,
       transportPubkey: 'bob-transport-pubkey',
       directAddress: RECIPIENT_DIRECT_ADDRESS,
       nametag: 'bob',
     }),
     resolveNametagInfo: vi.fn().mockResolvedValue(null),
     resolveTransportPubkeyInfo: vi.fn().mockResolvedValue({
-      chainPubkey: FAKE_PUBKEY,
+      chainPubkey: ALICE.chainPubkey,
       transportPubkey: SENDER_TRANSPORT_PUBKEY,
       directAddress: 'DIRECT://sender',
       nametag: senderNametag ?? 'alice',
@@ -143,20 +156,43 @@ function createMockOracle(): OracleProvider {
 }
 
 interface TestContext {
-  module: ReturnType<typeof createPaymentsModule>;
+  module: PaymentsModule;
   deps: PaymentsModuleDependencies;
   engine: FakeTokenEngine;
   historyStore: ReturnType<typeof createMockHistoryStore>;
   transport: TransportProvider;
+  /** The in-process wallet-api backend — the delivery rail's server side. */
+  fake: FakeWalletApi;
+  client: WalletApiClient;
+  delivery: WalletApiMailboxProvider;
 }
 
-function setupModule(senderNametag?: string): TestContext {
-  const engine = new FakeTokenEngine();
+const cleanups: (() => Promise<void> | void)[] = [];
+afterEach(async () => {
+  // LIFO: tear the modules down (timers, wake sockets) BEFORE the server they talk to.
+  while (cleanups.length) await cleanups.pop()!();
+});
+
+let deviceSeq = 0;
+
+/**
+ * The own-storage wallet-api preset, wired by hand around a live in-process
+ * backend: local token custody + the REAL mailbox delivery provider + the REAL
+ * client (`walletApi`). `module.initialize` binds the identity into the
+ * delivery provider, which forwards it to the client — that is what makes the
+ * challenge/verify sign-in succeed, so the identity MUST be a real keypair.
+ */
+async function setupModule(senderNametag?: string): Promise<TestContext> {
+  const fake = new FakeWalletApi({ decodeAssets: decodeFakeTokenAssets, decodeTokenId: decodeFakeTokenId });
+  const baseUrl = await fake.start();
+  cleanups.push(() => fake.stop());
+
+  const engine = new FakeTokenEngine({ chainPubkey: hexToBytes(ALICE.chainPubkey) });
   const historyStore = createMockHistoryStore();
   const transport = createMockTransport(senderNametag);
 
   const mockTokenStorage = {
-    id: 'mock-token-storage',
+    id: 'local',
     name: 'Mock Token Storage',
     type: 'local' as const,
     connect: vi.fn().mockResolvedValue(undefined),
@@ -175,9 +211,19 @@ function setupModule(senderNametag?: string): TestContext {
   const tokenStorageProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
   tokenStorageProviders.set('local', mockTokenStorage);
 
-  const delivery = createMemoryDelivery();
+  const kv = new MemoryKeyValueStore();
+  deviceSeq += 1;
+  const client = new WalletApiClient({
+    baseUrl,
+    network: fake.network,
+    deviceId: `d-history-${deviceSeq}`,
+    storage: kv,
+  });
+  const delivery = new WalletApiMailboxProvider({ client, custody: 'external', stateStore: kv });
+
   const deps: PaymentsModuleDependencies = {
     delivery,
+    walletApi: client,
     identity: createMockIdentity(),
     storage: createMockStorage(),
     tokenStorageProviders,
@@ -189,8 +235,10 @@ function setupModule(senderNametag?: string): TestContext {
 
   const module = createPaymentsModule({ debug: false });
   module.initialize(deps);
+  cleanups.push(() => module.destroy());
+  await module.load();
 
-  return { module, deps, engine, historyStore, transport, delivery };
+  return { module, deps, engine, historyStore, transport, fake, client, delivery };
 }
 
 /** Mint a v2 engine token owned by this wallet and add it via addToken (no history). */
@@ -247,19 +295,25 @@ describe('History deduplication — integration flows', () => {
 
   describe('send() → single SENT history entry', () => {
     it('should create exactly 1 SENT entry for 2 direct tokens', async () => {
-      const ctx = setupModule();
+      const ctx = await setupModule();
       await addOwnedToken(ctx, 1000000n);
       await addOwnedToken(ctx, 2000000n);
 
-      await ctx.module.send({
+      const result = await ctx.module.send({
         recipient: '@bob',
         amount: '3000000',
         coinId: UCT,
       });
 
-      // Two whole-token transfers went out on the wire...
-      /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
-      expect(ctx.delivery.delivered).toHaveLength(2);
+      // Two whole-token transfers went out on the wire: TWO deposits actually
+      // landed in the recipient's mailbox on the backend, both under this
+      // send's transferId (§7 grouping) and unresolved until the recipient
+      // claims them.
+      expect(result.deliveryPending).toBeFalsy(); // nothing was deferred to the journal
+      const entries = ctx.fake.listMailboxEntries(BOB.chainPubkey);
+      expect(entries).toHaveLength(2);
+      expect(new Set(entries.map((e) => e.transferId))).toEqual(new Set([result.id]));
+      expect(entries.every((e) => e.status === 'unclaimed')).toBe(true);
 
       // ...but exactly ONE SENT history entry was recorded.
       const history = ctx.module.getHistory();
@@ -267,10 +321,17 @@ describe('History deduplication — integration flows', () => {
       expect(history[0].type).toBe('SENT');
       expect(history[0].amount).toBe('3000000');
       expect(history[0].coinId).toBe(UCT);
+
+      // …and the same holds for the durable §10 log the client POSTs: ONE row,
+      // keyed by the send's transferId. A per-token history entry would land
+      // here as two rows under two different dedupKeys.
+      const serverHistory = ctx.fake.getHistoryRecords(ALICE.chainPubkey);
+      expect(serverHistory).toHaveLength(1);
+      expect(serverHistory[0]).toMatchObject({ type: 'SENT', dedupKey: `SENT_transfer_${result.id}` });
     });
 
     it('should create exactly 1 SENT entry for an engine split', async () => {
-      const ctx = setupModule();
+      const ctx = await setupModule();
       await addOwnedToken(ctx, 10000000n);
 
       await ctx.module.send({
@@ -279,7 +340,10 @@ describe('History deduplication — integration flows', () => {
         coinId: UCT,
       });
 
-      // The change token (7000000) was stored confirmed — without history.
+      // One 3000000 leg reached the recipient's mailbox...
+      expect(ctx.fake.listMailboxEntries(BOB.chainPubkey)).toHaveLength(1);
+
+      // ...the change token (7000000) was stored confirmed — without history.
       const tokens = ctx.module.getTokens();
       expect(tokens).toHaveLength(1);
       expect(tokens[0].amount).toBe('7000000');
@@ -292,7 +356,7 @@ describe('History deduplication — integration flows', () => {
     });
 
     it('should preserve memo in SENT history entry', async () => {
-      const ctx = setupModule();
+      const ctx = await setupModule();
       await addOwnedToken(ctx, 5000000n);
 
       await ctx.module.send({
@@ -308,7 +372,7 @@ describe('History deduplication — integration flows', () => {
     });
 
     it('should populate recipient metadata from peerInfo', async () => {
-      const ctx = setupModule();
+      const ctx = await setupModule();
       await addOwnedToken(ctx, 1000000n);
 
       await ctx.module.send({
@@ -324,7 +388,7 @@ describe('History deduplication — integration flows', () => {
     });
 
     it('should NOT create history entries from removeToken during send', async () => {
-      const ctx = setupModule();
+      const ctx = await setupModule();
       const addToHistorySpy = vi.spyOn(ctx.module, 'addToHistory');
       await addOwnedToken(ctx, 1000000n);
 
@@ -352,7 +416,7 @@ describe('History deduplication — integration flows', () => {
 
   describe('V2 transfer receive → single RECEIVED entry', () => {
     it('should create exactly 1 RECEIVED entry', async () => {
-      const ctx = setupModule();
+      const ctx = await setupModule();
 
       await deliver(ctx, await v2Payload(ctx.engine, 500000n, 'hello'));
 
@@ -364,7 +428,7 @@ describe('History deduplication — integration flows', () => {
     });
 
     it('should populate sender info via resolveSenderInfo', async () => {
-      const ctx = setupModule('alice');
+      const ctx = await setupModule('alice');
 
       await deliver(ctx, await v2Payload(ctx.engine, 500000n));
 
@@ -376,7 +440,7 @@ describe('History deduplication — integration flows', () => {
     });
 
     it('should preserve memo in RECEIVED entry', async () => {
-      const ctx = setupModule();
+      const ctx = await setupModule();
 
       await deliver(ctx, await v2Payload(ctx.engine, 500000n, 'Thanks!'));
 
@@ -386,12 +450,12 @@ describe('History deduplication — integration flows', () => {
     });
 
     it('should not create a second entry for a re-delivered identical payload', async () => {
-      const ctx = setupModule();
+      const ctx = await setupModule();
 
       const payload = await v2Payload(ctx.engine, 500000n);
-      await deliver(ctx, payload, 'evt-1');
-      // Same payload again (Nostr re-delivery)
-      await deliver(ctx, payload, 'evt-2');
+      await deliver(ctx, payload);
+      // Same payload again (rail re-delivery)
+      await deliver(ctx, payload);
 
       // Dedup: the genesis-stable token id blocks the second delivery
       expect(ctx.module.getTokens()).toHaveLength(1);
@@ -399,7 +463,7 @@ describe('History deduplication — integration flows', () => {
     });
 
     it('should emit transfer:incoming with senderNametag and memo', async () => {
-      const ctx = setupModule('alice');
+      const ctx = await setupModule('alice');
 
       await deliver(ctx, await v2Payload(ctx.engine, 500000n, 'test memo'));
 
@@ -419,7 +483,7 @@ describe('History deduplication — integration flows', () => {
 
   describe('resolveSenderInfo', () => {
     it('should resolve nametag and address from transport', async () => {
-      const ctx = setupModule('alice');
+      const ctx = await setupModule('alice');
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const mod = ctx.module as any;
 
@@ -429,7 +493,7 @@ describe('History deduplication — integration flows', () => {
     });
 
     it('should return empty object when transport throws', async () => {
-      const ctx = setupModule();
+      const ctx = await setupModule();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (ctx.transport as any).resolveTransportPubkeyInfo = vi.fn().mockRejectedValue(new Error('network error'));
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -440,7 +504,7 @@ describe('History deduplication — integration flows', () => {
     });
 
     it('should return empty object when transport lacks resolveTransportPubkeyInfo', async () => {
-      const ctx = setupModule();
+      const ctx = await setupModule();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       delete (ctx.transport as any).resolveTransportPubkeyInfo;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -451,7 +515,7 @@ describe('History deduplication — integration flows', () => {
     });
 
     it('should return empty object when resolveTransportPubkeyInfo returns null', async () => {
-      const ctx = setupModule();
+      const ctx = await setupModule();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (ctx.transport as any).resolveTransportPubkeyInfo = vi.fn().mockResolvedValue(null);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -468,7 +532,7 @@ describe('History deduplication — integration flows', () => {
 
   describe('history:updated event', () => {
     it('should emit history:updated when addToHistory is called', async () => {
-      const ctx = setupModule();
+      const ctx = await setupModule();
 
       await ctx.module.addToHistory({
         type: 'RECEIVED',

@@ -244,10 +244,30 @@ function mockOracle(): OracleProvider {
   } as unknown as OracleProvider;
 }
 
+/**
+ * The intent surface a send needs. This file models send TIMING against a
+ * VirtualClock, so its ports are instrumented rather than real HTTP — but a
+ * wallet always has a wallet-api client (every shipped preset returns `delivery`
+ * and `walletApi` together), so one is always composed here.
+ */
+function stubWalletApi() {
+  return {
+    putIntent: vi.fn().mockResolvedValue(undefined),
+    completeIntent: vi.fn().mockResolvedValue(undefined),
+    abortIntent: vi.fn().mockResolvedValue(undefined),
+    listIntents: vi.fn().mockResolvedValue([]),
+    getUploadUrls: vi.fn().mockResolvedValue([]),
+    uploadBlob: vi.fn().mockResolvedValue(undefined),
+    postHistoryRecords: vi.fn().mockResolvedValue(undefined),
+    listHistory: vi.fn().mockResolvedValue({ records: [], more: false, cursor: null, syncEpoch: 0n }),
+  };
+}
+
 function setup(
   engine: FakeTokenEngine,
   clock: VirtualClock,
-  walletApi?: PaymentsModuleDependencies['walletApi'],
+  walletApi: PaymentsModuleDependencies['walletApi'] =
+    stubWalletApi() as unknown as PaymentsModuleDependencies['walletApi'],
   deliveryStartMs: number[] = [],
 ) {
   const tokenStorageProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
@@ -258,7 +278,7 @@ function setup(
     delivery,
     identity: mockIdentity(), storage: mockStorage(), tokenStorageProviders,
     transport, oracle: mockOracle(), emitEvent: vi.fn(), tokenEngine: engine,
-    ...(walletApi ? { walletApi } : {}),
+    walletApi,
   };
   const module = createPaymentsModule({ debug: false });
   module.initialize(deps);
@@ -477,16 +497,7 @@ describe('conflict + certified split keeps the intent open', () => {
   it('never aborts the partial intent; change survives; the remainder re-plan completes the send', async () => {
     const clock = new VirtualClock();
     const engine = new ConflictFirstTransferEngine();
-    const walletApi = {
-      putIntent: vi.fn().mockResolvedValue(undefined),
-      completeIntent: vi.fn().mockResolvedValue(undefined),
-      abortIntent: vi.fn().mockResolvedValue(undefined),
-      listIntents: vi.fn().mockResolvedValue([]),
-      getUploadUrls: vi.fn().mockResolvedValue([]),
-      uploadBlob: vi.fn().mockResolvedValue(undefined),
-      postHistoryRecords: vi.fn().mockResolvedValue(undefined),
-      listHistory: vi.fn().mockResolvedValue({ records: [], more: false, cursor: null, syncEpoch: 0n }),
-    };
+    const walletApi = stubWalletApi();
     const { module, transport, delivery } = setup(
       engine, clock, walletApi as unknown as PaymentsModuleDependencies['walletApi'],
     );
