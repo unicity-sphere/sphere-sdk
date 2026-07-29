@@ -6150,6 +6150,10 @@ export class PaymentsModule {
     // would read the same journal snapshot, re-deliver the same entries, and
     // race the per-entry `attempts` read/modify/write. Dropped entries stay
     // journaled and replay on the next load(), so nothing is lost.
+    // No rail composed: return WITHOUT touching the journal. Counting this as a
+    // delivery attempt would burn the poison budget on a configuration state and
+    // strand already-certified funds — the entries stay put until a provider exists.
+    if (!this.delivery) return;
     if (this.replayInFlight) return;
     this.replayInFlight = true;
     try {

@@ -32,6 +32,14 @@ failure still must not fail the sender (#621), the journaled blob still replays,
 minimal `DeliveryProvider` with failure injection; `multi-token-send` keeps its own clock-aware
 one because it asserts delivery *timing*. Test count is unchanged at 3,113.
 
+**Fixed in review (P1):** `load()` replayed the `PENDING_V2_DELIVERIES` journal unconditionally.
+With no delivery provider composed — now an explicitly supported state — `attemptDeliveryWithBackoff`
+dereferenced null, the failure was counted as a delivery attempt, and after
+`MAX_DELIVERY_REPLAY_ATTEMPTS` the entry was marked `undeliverable`, permanently excluding
+already-certified funds from auto-replay even once a provider was composed. The replay is now
+guarded on `this.delivery`, mirroring the incoming pump five lines below it. Covered by a test
+that is verified RED without the guard.
+
 **Now dead, not removed here:** `TransportProvider.sendTokenTransfer` / `.onTokenTransfer` have
 zero production callers. Removing them is a transport-layer change and gets its own PR.
 

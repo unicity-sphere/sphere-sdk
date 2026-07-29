@@ -251,6 +251,60 @@ describe('load() — crash recovery of stuck-transferring tokens (v2)', () => {
   });
 });
 
+describe('journaled deliveries survive a wallet composed without a delivery rail', () => {
+  it('does not burn the poison budget across repeated loads, and delivers once a rail appears', async () => {
+    // A wallet can legitimately run with no delivery provider (non-payment use:
+    // DMs, group chat, market). Replaying a journaled blob against a missing rail
+    // must NOT count as a delivery attempt — 6 such loads would mark the entry
+    // `undeliverable`, and already-certified funds would never auto-deliver again.
+    const engine = new FakeTokenEngine();
+    const tsp = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
+    tsp.set('local', mockTokenStorage());
+    const storage = mockStorage();
+    const railless = createPaymentsModule({ debug: false });
+    railless.initialize({
+      identity: mockIdentity(), storage: storage.provider, tokenStorageProviders: tsp,
+      transport: mockTransport(), oracle: mockOracle(), emitEvent: vi.fn(), tokenEngine: engine,
+    } as PaymentsModuleDependencies);
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    (railless as any).replayBackoffBaseMs = 0; // no real sleeps between retries
+    await (railless as any).savePendingV2Delivery({
+      transferId: 'tx-stranded',
+      recipientPubkey: BOB_CHAIN_PUBKEY,
+      tokenBlob: 'ab'.repeat(40),
+      createdAt: Date.now(),
+    });
+
+    // Drive the replay DIRECTLY, more times than MAX_DELIVERY_REPLAY_ATTEMPTS (6).
+    // load() fires it as `void …catch()`, so awaiting load() would not await the
+    // replay and the test would pass without exercising anything.
+    await railless.load();
+    for (let i = 0; i < 8; i++) await (railless as any).replayPendingV2Deliveries();
+
+    const entries = journal(storage);
+    expect(entries).toHaveLength(1);
+    // RED without the guard: attempts climbs to 6 and undeliverable flips true.
+    expect((entries[0] as any).undeliverable).toBeFalsy();
+    expect((entries[0] as any).attempts ?? 0).toBe(0);
+
+    // Composing a rail later still delivers the certified blob.
+    const delivery = createMemoryDelivery();
+    const withRail = createPaymentsModule({ debug: false });
+    withRail.initialize({
+      delivery,
+      identity: mockIdentity(), storage: storage.provider, tokenStorageProviders: tsp,
+      transport: mockTransport(), oracle: mockOracle(), emitEvent: vi.fn(), tokenEngine: engine,
+    } as PaymentsModuleDependencies);
+    await withRail.load();
+    await (withRail as any).replayPendingV2Deliveries();
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    expect(delivery.delivered).toHaveLength(1);
+    expect(journal(storage)).toHaveLength(0);
+  });
+});
+
 describe('handleV2Transfer — storage rejection gates events (v2)', () => {
   it('a tombstoned re-delivery emits NO transfer:incoming and writes NO history', async () => {
     const { module, engine, emitEvent, delivery } = setup();
