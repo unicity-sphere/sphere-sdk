@@ -200,6 +200,129 @@ const DELIVERY_REPLAY_MAX_DELAY_MS = 8_000;
  * spent) and removed after successful delivery, so a transport failure or a
  * crash never loses the recipient's token. Replayed by load().
  */
+/**
+ * The ONE error a failed fan-out surfaces, prepared for the caller.
+ *
+ * #625: tags the conflict for self-healing only when nothing certified in this
+ * attempt (decided from the complete settled set, never mid-flight), and logs
+ * every settled failure — a parallel batch can fail several independent ways,
+ * and dropping the rest hides them from apps and bug reports. The non-surfaced
+ * ones ride along as `suppressedErrors`: visibility only, never dispositive.
+ */
+function surfacedSendFailure(summary: SendOutcomeSummary): unknown {
+  const primaryError = summary.primaryError;
+  if (summary.conflictTagSourceId !== undefined && primaryError instanceof TransferConflictError) {
+    primaryError.conflictedSourceId = summary.conflictTagSourceId;
+  }
+  for (const f of summary.failures) {
+    logger.warn(
+      'Payments',
+      `Send op ${f.op.opIndex} (${f.op.kind}) failed${f.certified ? ' AFTER on-chain certification' : ''}:`,
+      f.error,
+    );
+  }
+  const suppressed = summary.failures.map((f) => f.error).filter((e) => e !== primaryError);
+  if (suppressed.length > 0 && primaryError instanceof Error) {
+    (primaryError as Error & { suppressedErrors?: unknown[] }).suppressedErrors = suppressed;
+  }
+  return primaryError;
+}
+
+/**
+ * What one send attempt learned about itself, as it progresses. The failure
+ * disposition reads it to tell the three non-plain outcomes apart: a rejected
+ * intent (#670 — no server row to abort), a post-commit mirror lag (#665 —
+ * SEND_SYNC_PENDING), and the settled committed accounting (#677 remainder).
+ */
+interface SendAttemptState {
+  /** Settled fan-out accounting; undefined when the failure preceded every engine op. */
+  summary?: SendOutcomeSummary;
+  /** §3.1 (#621): a leg's post-certification delivery was deferred (blob kept journaled). */
+  deliveryPending: boolean;
+  /** Every submit certified and the server-mirror persistence has begun (inventory custody only). */
+  onChainCommitComplete: boolean;
+  /** The intent PUT was deterministically rejected — the local copy is already dropped. */
+  intentRejected: boolean;
+}
+
+/** Everything one send's engine operations need, fixed for the whole fan-out. */
+interface CertifyContext {
+  readonly engine: ITokenEngine;
+  /** The intent id — half of the (transferId, opIndex) realization seed (§8.1). */
+  readonly transferId: string;
+  readonly recipientChainPubkey: Uint8Array;
+  readonly recipientChainPubkeyHex: string;
+  readonly selfChainPubkey: Uint8Array;
+  readonly coinId: string;
+  readonly memo?: string;
+}
+
+/** The genesis-stable id of a held token — identical across every state (§8.1). */
+function genesisIdOf(token: Token): string {
+  return extractTokenIdFromSdkData(token.sdkData) ?? token.id.replace(/^v2_/, '');
+}
+
+/**
+ * The send's on-chain operations in plan order: the direct transfers, then the
+ * at-most-one split. ONE realization seed per send (ARCHITECTURE §7/§8.1) —
+ * the intent transferId plus this plan-derived opIndex seed every engine op, so
+ * any device holding the wallet seed rebuilds the identical transactions and
+ * resume recovers per-op by journal presence, whatever the execution order was.
+ */
+function buildSendOperations(splitPlan: SplitPlan): SendOperation[] {
+  const operations: SendOperation[] = splitPlan.tokensToTransferDirectly.map((tw, opIndex) => ({
+    kind: 'direct' as const,
+    opIndex,
+    uiTokenId: tw.uiToken.id,
+    genesisId: genesisIdOf(tw.uiToken),
+    sourceSdkData: tw.uiToken.sdkData ?? '',
+    sdkToken: tw.sdkToken as SphereToken,
+    deliveredAmount: tw.amount, // #677: a direct op delivers its whole amount
+  }));
+  if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+    const { splitAmount, remainderAmount } = splitPlan;
+    if (splitAmount === null || remainderAmount === null) {
+      // Planner invariant (SpendQueue.calculateOptimalSplitSync): requiresSplit
+      // implies both amounts. Defaulting a null to 0n would silently construct a
+      // 0-value split — fail loudly; no engine op has run, nothing is on-chain.
+      throw new SphereError(
+        'Split plan invariant violated: requiresSplit with null splitAmount/remainderAmount',
+        'TRANSFER_FAILED'
+      );
+    }
+    operations.push({
+      kind: 'split',
+      opIndex: operations.length,
+      uiTokenId: splitPlan.tokenToSplit.uiToken.id,
+      genesisId: genesisIdOf(splitPlan.tokenToSplit.uiToken),
+      sourceSdkData: splitPlan.tokenToSplit.uiToken.sdkData ?? '',
+      sdkToken: splitPlan.tokenToSplit.sdkToken as SphereToken,
+      deliveredAmount: splitAmount, // #677: a split op delivers only splitAmount
+      remainderAmount,
+    });
+  }
+  return operations;
+}
+
+/**
+ * The app-facing form of a deterministic intent rejection (a raw WalletApiError
+ * is not a SphereError, so it would reach callers untyped).
+ */
+function intentValidationError(err: WalletApiError): SphereError {
+  return new SphereError(
+    // Matches the server's "envelope exceeds N bytes (§8.3)" and the SDK
+    // checker's "exceeds size cap of N bytes".
+    /exceeds .*bytes/.test(err.message)
+      ? "The payment could not be registered with the wallet service because it exceeds the service's size limit. Try sending a smaller amount."
+      : 'The wallet service rejected this payment as invalid.',
+    'VALIDATION_ERROR',
+    err
+  );
+}
+
+/** A {@link TransferResult} under construction — sealed by the time it is returned. */
+type MutableTransferResult = { -readonly [K in keyof TransferResult]: TransferResult[K] };
+
 interface PendingV2Delivery {
   transferId: string;
   recipientPubkey: string;
@@ -1584,732 +1707,686 @@ export class PaymentsModule {
     }
   }
 
+  /**
+   * Resolve the recipient and assert the two preconditions the v2 send path
+   * cannot proceed without: an engine, and a recipient with a PUBLISHED chain
+   * pubkey (transfers lock to `SignaturePredicate(chainPubkey)`).
+   */
+  private async resolveSendTarget(
+    request: TransferRequest
+  ): Promise<{ peerInfo: PeerInfo & { chainPubkey: string }; recipientPubkey: string }> {
+    const peerInfo: PeerInfo | null = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+    const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+    if (!this.deps?.tokenEngine) {
+      throw new SphereError(
+        'Token engine unavailable — cannot send. The oracle must supply a v2 trust base + gateway URL (and API key where required).',
+        'AGGREGATOR_ERROR'
+      );
+    }
+    if (!peerInfo?.chainPubkey) {
+      throw new SphereError(
+        `Recipient ${request.recipient} has no published identity (chain pubkey) — cannot receive v2 transfers.`,
+        'INVALID_RECIPIENT'
+      );
+    }
+    return { peerInfo: peerInfo as PeerInfo & { chainPubkey: string }, recipientPubkey };
+  }
+
+  /** Short symbol (`UCT`) → the 64-hex coinId storage uses. Unknown//hex input passes through. */
+  private resolveCoinId(coinId: string): string {
+    const held = Array.from(this.tokens.values()).some((t) => t.coinId === coinId);
+    if (held || coinId.length > 20) return coinId;
+    return TokenRegistry.getInstance().getDefinitionBySymbol(coinId)?.id ?? coinId;
+  }
+
+  /**
+   * Reserve the sources for one send: parse the pool, then plan + reserve in
+   * ONE synchronous step so two sends never take the same token
+   * (SpendPlanner.planSend → TokenReservationLedger.reserve).
+   *
+   * A send the free balance cannot cover right now QUEUES on the change token
+   * of the send that is holding it, rather than failing outright.
+   */
+  private async reserveSpendPlan(request: TransferRequest, transferId: string): Promise<SplitPlan> {
+    const parsedPool = await this.spendPlanner.buildParsedPool(
+      Array.from(this.tokens.values()),
+      request.coinId
+    );
+    // Pending change (a concurrent send's 'transferring' sources) counts toward
+    // the inventory the plan may wait for — without it a coverable send would
+    // hard-fail SEND_INSUFFICIENT_BALANCE instead of queueing.
+    let pendingChangeAmount = 0n;
+    for (const [, t] of this.tokens) {
+      if (t.coinId === request.coinId && t.status === 'transferring') {
+        pendingChangeAmount += BigInt(t.amount || '0');
+      }
+    }
+    const planResult = this.spendPlanner.planSend(
+      request, parsedPool, this.reservationLedger, this.spendQueue, transferId, pendingChangeAmount
+    );
+    const splitPlan =
+      planResult === 'queued'
+        ? (await this.spendQueue.waitForEntry(transferId)).splitPlan
+        : planResult.splitPlan;
+    if (!splitPlan) throw new SphereError('Insufficient balance', 'SEND_INSUFFICIENT_BALANCE');
+    return splitPlan;
+  }
+
+  /**
+   * Flag the planned sources 'transferring' and persist. critical (#515 F2):
+   * nothing is spent yet, so an unwritable active custody provider must abort
+   * the send HERE, before the intent/engine run.
+   */
+  private async markTransferring(tokens: readonly Token[]): Promise<void> {
+    for (const token of tokens) {
+      token.status = 'transferring';
+      this.tokens.set(token.id, token);
+      this.parsedTokenCache.delete(token.id);
+    }
+    await this.save({ critical: true });
+  }
+
+  /**
+   * Drop the local backstop copy of an intent the server deterministically
+   * rejected — keeping it would poison resyncOpenIntents with an eternal 422.
+   */
+  private async dropRejectedIntent(walletApi: PaymentsWalletApiPort, transferId: string): Promise<void> {
+    try {
+      await walletApi.removeLocalIntent?.(transferId);
+    } catch (err) {
+      logger.warn('Payments', 'removeLocalIntent failed after intent VALIDATION rejection:', err);
+    }
+  }
+
+  /**
+   * Certify one operation on-chain, then JOURNAL its finished blob. Delivery is
+   * deliberately not here — it is one hoisted pass over the committed set
+   * (#699), so a multi-source send deposits in a single batch.
+   *
+   * NEVER rejects (a mid-batch rejection would stop us observing still-in-flight
+   * siblings) and NEVER touches shared wallet state (`this.tokens` mutations and
+   * `save()` are not concurrency-safe — they belong to the sequential apply).
+   */
+  private async certifyOperation(op: SendOperation, ctx: CertifyContext): Promise<OperationOutcome> {
+    let finished: SphereToken;
+    let changeOutput: SphereToken | undefined;
+    const opts = { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId: ctx.transferId, opIndex: op.opIndex };
+    try {
+      if (op.kind === 'direct') {
+        finished = await ctx.engine.transfer({ token: op.sdkToken, recipientPubkey: ctx.recipientChainPubkey }, opts);
+      } else {
+        // Value-conserving split: the recipient gets deliveredAmount, this
+        // wallet keeps the remainder as a real, immediate change token. E.4:
+        // the burn checkpoint persists (durable-ack gated) before the first mint.
+        const checkpointStore = this.getCheckpointStore();
+        const { outputs } = await ctx.engine.split(
+          {
+            token: op.sdkToken,
+            outputs: [
+              { recipientPubkey: ctx.recipientChainPubkey, coinId: ctx.coinId, amount: op.deliveredAmount },
+              { recipientPubkey: ctx.selfChainPubkey, coinId: ctx.coinId, amount: op.remainderAmount },
+            ],
+          },
+          { ...opts, ...(checkpointStore ? { checkpointStore } : {}) },
+        );
+        finished = outputs[0];
+        changeOutput = outputs[1];
+      }
+    } catch (error) {
+      // No proof in hand is NOT "never reached the chain": for the keep-open
+      // family (isKeepOpenSendError) the submit may have been accepted.
+      // certified:false records only what was OBSERVED — the failure
+      // disposition keeps the intent open and resume settles it (#631/E.4).
+      return { op, certified: false, error };
+    }
+    // Spent on-chain from here on: every return below reports certified so the
+    // accounting counts it even when a local post-step fails.
+    const change = changeOutput !== undefined ? { changeOutput } : {};
+    try {
+      // Journal BEFORE any delivery — the hoisted pass below, or the replay on
+      // the next load(), hands it over. A delivery failure or a crash must never
+      // lose the recipient's token.
+      const tokenBlob = bytesToHex(encodeTokenBlob(ctx.engine.encodeToken(finished)));
+      await this.savePendingV2Delivery({
+        transferId: ctx.transferId,
+        recipientPubkey: ctx.recipientChainPubkeyHex,
+        tokenBlob,
+        ...(ctx.memo !== undefined ? { memo: ctx.memo } : {}),
+        opIndex: op.opIndex,
+        createdAt: Date.now(),
+      });
+      return { op, certified: true, tokenBlob, ...change };
+    } catch (error) {
+      return { op, certified: true, error, ...change };
+    }
+  }
+
+  /**
+   * Certify the send's operations concurrently, MAX_SEND_OPERATION_CONCURRENCY
+   * at a time (#684 pacing). Every launched op SETTLES before the caller's
+   * accounting runs — the #625 conflict tag and the #677 remainder must never be
+   * computed while value may still be certifying in flight.
+   *
+   * Fail-fast between batches: once any settled op has failed, this send is on
+   * the failure path, and launching more would certify value destined for
+   * resume/remainder handling (and, in an outage, stack ceil(N/8) op-timeouts
+   * before the user sees the error). Never-launched sources stay untouched —
+   * restored 'confirmed' by the failure disposition.
+   */
+  private async certifySendOperations(
+    operations: readonly SendOperation[],
+    ctx: CertifyContext
+  ): Promise<OperationOutcome[]> {
+    const outcomes: OperationOutcome[] = [];
+    for (let start = 0; start < operations.length; start += MAX_SEND_OPERATION_CONCURRENCY) {
+      const batch = operations.slice(start, start + MAX_SEND_OPERATION_CONCURRENCY);
+      outcomes.push(...(await Promise.all(batch.map((op) => this.certifyOperation(op, ctx)))));
+      if (outcomes.some((o) => o.error !== undefined)) break;
+    }
+    return outcomes;
+  }
+
+  /**
+   * §7 steps 4+6, shared by the send and the resume of a send: upload the change
+   * output, then record the whole spend in ONE idempotent applyDelta carrying
+   * the transferId. The backend evidence-checks the removals against the mailbox
+   * deposit of the same transferId (§5.3) and completes the intent in the same
+   * transaction (§16).
+   *
+   * The change is stored locally AFTER the server apply: on this path the
+   * awaited intent (E.3) is the recovery seed, and following the apply keeps the
+   * provider's write-behind from racing a second add of the same state.
+   */
+  private async applyInventoryDelta(
+    engine: ITokenEngine,
+    transferId: string,
+    spentStates: readonly { tokenId: string; stateHash: string }[],
+    changeOutput: SphereToken | null | undefined
+  ): Promise<void> {
+    const storage = this.getActiveTokenStorageProvider();
+    if (!storage) {
+      throw new SphereError('No token storage provider available for applyDelta', 'STORAGE_ERROR');
+    }
+    const added: { tokenId: string; key: string }[] = [];
+    if (changeOutput) {
+      const changeBytes = encodeTokenBlob(engine.encodeToken(changeOutput));
+      added.push({ tokenId: engine.tokenId(changeOutput), key: await this.uploadOutputBlob(changeBytes) });
+    }
+    await storage.applyDelta(transferId, spentStates.map((s) => s.tokenId), added, { spentStates: [...spentStates] });
+    if (changeOutput) await this.storeEngineToken(engine, changeOutput);
+  }
+
+  /** The SENT row, with the per-source breakdown the UI lists under it. */
+  private async recordSentHistory(ctx: {
+    readonly result: MutableTransferResult;
+    readonly request: TransferRequest;
+    readonly splitPlan: SplitPlan;
+    readonly peerInfo: PeerInfo | null;
+    readonly recipientPubkey: string;
+    readonly recipientNametag: string | undefined;
+  }): Promise<void> {
+    const { result, request, splitPlan, peerInfo, recipientPubkey, recipientNametag } = ctx;
+    const heldAmount = new Map(result.tokens.map((t) => [t.id, t.amount]));
+    const tokenIds = result.tokenTransfers.map((tt) => ({
+      id: tt.sourceTokenId,
+      // A split sent only splitAmount, not the whole source token.
+      amount: tt.method === 'split'
+        ? (splitPlan.splitAmount?.toString() || '0')
+        : (heldAmount.get(tt.sourceTokenId) || '0'),
+      source: tt.method === 'split' ? ('split' as const) : ('direct' as const),
+    }));
+    await this.addToHistory({
+      type: 'SENT',
+      amount: request.amount,
+      coinId: request.coinId,
+      symbol: this.getCoinSymbol(request.coinId),
+      timestamp: Date.now(),
+      recipientPubkey,
+      recipientNametag,
+      recipientAddress: peerInfo?.directAddress || recipientPubkey,
+      memo: request.memo,
+      transferId: result.id,
+      tokenId: (result.tokens[0] ? extractTokenIdFromSdkData(result.tokens[0].sdkData) : undefined) || undefined,
+      tokenIds: tokenIds.length > 0 ? tokenIds : undefined,
+    });
+  }
+
+  /**
+   * Close out a send whose value has left the wallet: persist, close the intent,
+   * record history, release the reservation, and resolve.
+   *
+   * §3.1 (#621): the spend is final regardless of delivery — a leg whose
+   * delivery was deferred (recipient 429 / transient outage) resolves
+   * delivery-pending, with the blob still journaled for replay, rather than
+   * failing the sender.
+   */
+  private async finishSend(ctx: {
+    readonly result: MutableTransferResult;
+    readonly request: TransferRequest;
+    readonly splitPlan: SplitPlan;
+    readonly peerInfo: PeerInfo | null;
+    readonly recipientPubkey: string;
+    readonly recipientNametag: string | undefined;
+    readonly deliveryPending: boolean;
+  }): Promise<TransferResult> {
+    const { result, deliveryPending } = ctx;
+    result.status = 'delivered';
+    await this.save();
+    result.status = 'completed';
+
+    // E.3 uniform close: every finished send ends with completeIntent
+    // (idempotent). Under inventory custody the apply already completed it
+    // server-side; with own storage this call is the ONLY close — without it
+    // every historical send would re-resume at each sign-in forever.
+    if (this.deps!.walletApi) {
+      try {
+        await this.deps!.walletApi.completeIntent(result.id);
+      } catch (err) {
+        logger.warn('Payments', 'completeIntent failed (the next sign-in resume converges it):', err);
+      }
+    }
+
+    await this.recordSentHistory(ctx);
+
+    // Every source is spent on-chain and removed — release the reservation.
+    this.reservationLedger.commit(result.id);
+    if (deliveryPending) result.deliveryPending = true;
+    result.deliveryState = deliveryPending ? 'pending-delivery' : 'landed';
+    this.deps!.emitEvent(deliveryPending ? 'transfer:delivery_pending' : 'transfer:confirmed', result);
+    return result;
+  }
+
   private async sendOnce(request: TransferRequest): Promise<TransferResult> {
     this.ensureInitialized();
     this.ensureDelivery();
     this.ensureWalletApi();
 
-    // Use mutable result for building the transfer
-    const result: { -readonly [K in keyof TransferResult]: TransferResult[K] } = {
+    const result: MutableTransferResult = {
       id: randomUUID(),
       status: 'pending',
       tokens: [],
       tokenTransfers: [],
     };
-
-    // Settled per-operation outcomes of this send's engine fan-out (undefined
-    // until every launched op has settled). The failure handler reads committed
-    // accounting EXCLUSIVELY from here (W23-R2/#677): certified sources must
-    // never be restored as 'confirmed', and the remainder still owed to the
-    // recipient is `request.amount − summary.committedAmount` — derived from
-    // settled data so a concurrent certification can never be under-counted
-    // (an under-count re-plans too much and double-pays).
-    let summary: SendOutcomeSummary | undefined;
-    // §3.1 (#621): set when any leg's post-certification delivery is deferred (kept journaled).
-    // Scoped to the whole send so the resolve path below can mark the result delivery-pending.
-    let deliveryPending = false;
-    // #665: set inside the wallet-api-inventory-custody branch below, once every
-    // on-chain submit has certified and right before the server-mirror
-    // persistence (inventory apply / blob upload / save). A failure AFTER this
-    // means the money already moved on-chain and only the server-MIRROR sync
-    // failed — the intent stays open and resume converges it (idempotent apply,
-    // #664). We still throw (keep-open + resume is the exit), but re-tag the
-    // error SEND_SYNC_PENDING so the UI can reassure the user ("sent — wallet
-    // catching up"). Deliberately NOT set for own-storage / no-wallet-api sends:
-    // there is no server mirror, so a post-commit local failure there stays a
-    // normal failure.
-    let onChainCommitComplete = false;
-
-    // #670: set when the intent PUT was deterministically rejected (422
-    // VALIDATION) — the local backstop copy is dropped at the rejection site
-    // and the failure-disposition abort below must be skipped (the server row
-    // never existed; an abort would only 404 and re-mark it abortPending).
-    let intentRejected = false;
+    const attempt: SendAttemptState = {
+      deliveryPending: false,
+      onChainCommitComplete: false,
+      intentRejected: false,
+    };
 
     try {
-      // Resolve recipient
-      const peerInfo: PeerInfo | null = await this.deps!.transport.resolve?.(request.recipient) ?? null;
-      const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
-
-      // v2: the engine is the only send path — transfers go to the recipient's
-      // chainPubkey (SignaturePredicate). Fail loudly when either is missing.
-      if (!this.deps?.tokenEngine) {
-        throw new SphereError(
-          'Token engine unavailable — cannot send. The oracle must supply a v2 trust base + gateway URL (and API key where required).',
-          'AGGREGATOR_ERROR'
-        );
-      }
-      if (!peerInfo?.chainPubkey) {
-        throw new SphereError(
-          `Recipient ${request.recipient} has no published identity (chain pubkey) — cannot receive v2 transfers.`,
-          'INVALID_RECIPIENT'
-        );
-      }
-
-      let splitPlan: SplitPlan;
-
-      // ── Coin symbol → coinId resolution ────────────────────────────────────
-      // Swap manifests store currencies as short symbols (e.g. "ETH", "BTC")
-      // while token storage uses 64/68-char hex coinIds. If no tokens match
-      // the literal coinId, attempt to resolve via the token registry.
-      const resolvedCoinId = (() => {
-        const literalMatch = Array.from(this.tokens.values()).some(t => t.coinId === request.coinId);
-        if (!literalMatch && request.coinId.length <= 20) {
-          const def = TokenRegistry.getInstance().getDefinitionBySymbol(request.coinId);
-          if (def?.id) return def.id;
-        }
-        return request.coinId;
-      })();
-      if (resolvedCoinId !== request.coinId) {
-        request = { ...request, coinId: resolvedCoinId };
-      }
-
-      // ── Spend Queue: Pre-parse token pool (async, before critical section) ──
-      const parsedPool = await this.spendPlanner.buildParsedPool(
-        Array.from(this.tokens.values()),
-        request.coinId
-      );
-
-      // ── Spend Queue: SYNCHRONOUS CRITICAL SECTION (no awaits) ──────────────
-      // planSend reads free amounts, runs split calculation, and creates a
-      // reservation atomically. No concurrent send() can interleave here.
-      // Count pending change tokens (status='transferring') so concurrent sends
-      // queue instead of failing with SEND_INSUFFICIENT_BALANCE.
-      let pendingChangeAmount = 0n;
-      for (const [, t] of this.tokens) {
-        if (t.coinId === request.coinId && t.status === 'transferring') {
-          pendingChangeAmount += BigInt(t.amount || '0');
-        }
-      }
-
-      const planResult = this.spendPlanner.planSend(
-        request, parsedPool, this.reservationLedger, this.spendQueue, result.id, pendingChangeAmount
-      );
-
-      if (planResult === 'queued') {
-        // Wait for change tokens to arrive and wake this entry
-        const queueResult = await this.spendQueue.waitForEntry(result.id);
-        splitPlan = queueResult.splitPlan;
-      } else {
-        splitPlan = planResult.splitPlan;
-      }
-
-      if (!splitPlan) {
-        throw new SphereError('Insufficient balance', 'SEND_INSUFFICIENT_BALANCE');
-      }
-
-      // Collect all tokens involved
-      const tokensToSend: Token[] = splitPlan.tokensToTransferDirectly.map((t: TokenWithAmount) => t.uiToken);
-      if (splitPlan.tokenToSplit) {
-        tokensToSend.push(splitPlan.tokenToSplit.uiToken);
-      }
-      result.tokens = tokensToSend;
-
-      // Mark as transferring and persist — UI shows "Pending" badge immediately.
-      // critical (#515 F2): nothing is spent yet — an unwritable active custody
-      // provider must abort the send HERE, before the intent/engine run.
-      for (const token of tokensToSend) {
-        token.status = 'transferring';
-        this.tokens.set(token.id, token);
-        this.parsedTokenCache.delete(token.id);
-      }
-      await this.save({ critical: true });
-
+      const { peerInfo, recipientPubkey } = await this.resolveSendTarget(request);
+      request = { ...request, coinId: this.resolveCoinId(request.coinId) };
+      const splitPlan = await this.reserveSpendPlan(request, result.id);
+      result.tokens = [
+        ...splitPlan.tokensToTransferDirectly.map((t: TokenWithAmount) => t.uiToken),
+        ...(splitPlan.tokenToSplit ? [splitPlan.tokenToSplit.uiToken] : []),
+      ];
+      await this.markTransferring(result.tokens);
       result.status = 'submitted';
 
-      // Use resolved peerInfo for history metadata (nametag, directAddress)
-      const recipientNametag = peerInfo?.nametag
-        || (request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined);
+      await this.executeSendPlan({ request, result, splitPlan, recipientChainPubkeyHex: peerInfo.chainPubkey, attempt });
 
-      {
-        // =================================================================
-        // v2 ENGINE MODE (sender-driven): engine.transfer hands the recipient
-        // a FINISHED token — no commitment / inclusion-proof / finalization.
-        // =================================================================
-        const engine = this.deps.tokenEngine;
-        const walletApi = this.deps.walletApi!;
-        const delivery = this.delivery!;
-        // §7/§5.3: with wallet-api INVENTORY custody the spend is recorded
-        // server-side via ONE applyDelta carrying this send's transferId —
-        // the evidence link to the mailbox deposit. With 'external' custody
-        // (the own-storage composition) the sender never calls apply
-        // (ARCHITECTURE §6: storage-opt-out senders); local bookkeeping is
-        // the record and the intent closes via completeIntent alone.
-        const serverApply = delivery.custody === 'inventory';
-        const recipientChainPubkeyHex = peerInfo.chainPubkey;
-        const recipientChainPubkey = hexToBytes(recipientChainPubkeyHex);
-        // S2: blobs are fetched on demand — lazy inventory records selected by
-        // coin-selection are materialized (getToken + engine decode) only now.
-        await this.materializeSelectedSources(splitPlan);
-
-        // E.3: the intent is the resume seed, so it is persisted and ACKed before
-        // any engine submit. E.4/#87: requiresSeedClose is set here, before the
-        // burn, so the funds-critical window is guarded from intent creation.
-        try {
-          await walletApi.putIntent(
-            result.id,
-            encryptField(
-              this.getFieldEncryptionKey(),
-              JSON.stringify(await this.buildIntentPayload(request, peerInfo.chainPubkey, splitPlan))
-            ),
-            splitPlan.requiresSplit ? { requiresSeedClose: true } : {}
-          );
-        } catch (err) {
-          // #670: a 422 VALIDATION rejection is DETERMINISTIC — the server will
-          // never accept this payload (e.g. the intent envelope exceeds the
-          // service's size cap), so the #516 keep-and-replay backstop does not
-          // apply: nothing is on-chain yet (E.3 — the engine has not run) and
-          // the server row was never created. Drop the local copy (keeping it
-          // would poison resyncOpenIntents with an eternal 422) and surface a
-          // TYPED error the app can map instead of the raw wire text
-          // (WalletApiError is not a SphereError). Transient failures
-          // (NETWORK/5xx) rethrow unchanged and keep the backstop.
-          // (The PUT precedes every engine op — nothing can have certified yet.)
-          if (err instanceof WalletApiError && err.code === 'VALIDATION') {
-            intentRejected = true;
-            try {
-              await walletApi.removeLocalIntent?.(result.id);
-            } catch (removeErr) {
-              logger.warn('Payments', 'removeLocalIntent failed after intent VALIDATION rejection:', removeErr);
-            }
-            throw new SphereError(
-              // Matches both the server's "envelope exceeds N bytes (§8.3)"
-              // and the SDK checker's "exceeds size cap of N bytes" wording.
-              /exceeds .*bytes/.test(err.message)
-                ? "The payment could not be registered with the wallet service because it exceeds the service's size limit. Try sending a smaller amount."
-                : 'The wallet service rejected this payment as invalid.',
-              'VALIDATION_ERROR',
-              err
-            );
-          }
-          throw err;
-        }
-
-        // Sources consumed by this send — the §7 step 6 apply (server path)
-        // and the deferred local removals are driven from this list.
-        // `sourceSdkData` = the source blob AS WE HELD IT (pre-spend). It is the single
-        // authoritative source for both spent-state derivations — the LOCAL sha256 (for the
-        // state-aware local removeToken, M2) and the PROTOCOL imprint (deliveryKeys → the
-        // server's state_hash, for knownSpends, M3) — so neither is ever read back from a
-        // live view a concurrent claim may have advanced.
-        const consumedSources: { uiTokenId: string; genesisId: string; sourceSdkData: string }[] = [];
-
-        // ── The operation list, in plan order. ONE realization seed per SEND
-        // (ARCHITECTURE §7/§8.1): the intent transferId + the plan-derived
-        // opIndex seed every engine op, so any device holding the wallet seed
-        // rebuilds the identical transactions — execution order is irrelevant
-        // to resume (it recovers per-op by journal presence).
-        const genesisIdOf = (t: Token): string =>
-          extractTokenIdFromSdkData(t.sdkData) ?? t.id.replace(/^v2_/, '');
-        const operations: SendOperation[] = splitPlan.tokensToTransferDirectly.map((tw, opIndex) => ({
-          kind: 'direct' as const,
-          // opIndex = position in the persisted intent's `direct` order — the
-          // stable (transferId, opIndex) pairing resume replays (§8.1).
-          opIndex,
-          uiTokenId: tw.uiToken.id,
-          genesisId: genesisIdOf(tw.uiToken),
-          sourceSdkData: tw.uiToken.sdkData ?? '',
-          sdkToken: tw.sdkToken as SphereToken,
-          deliveredAmount: tw.amount, // #677: a direct op delivers its whole amount
-        }));
-        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
-          const { splitAmount, remainderAmount } = splitPlan;
-          if (splitAmount === null || remainderAmount === null) {
-            // Planner invariant (SpendQueue.calculateOptimalSplitSync):
-            // requiresSplit implies both amounts. Defaulting a null to 0n would
-            // silently construct a 0-value split — fail loudly instead; no
-            // engine op has run yet, so nothing is on-chain.
-            throw new SphereError(
-              'Split plan invariant violated: requiresSplit with null splitAmount/remainderAmount',
-              'TRANSFER_FAILED'
-            );
-          }
-          operations.push({
-            kind: 'split',
-            // The split's opIndex follows the direct ops (stable across resume —
-            // it is derived from the intent's order, §8.1).
-            opIndex: operations.length,
-            uiTokenId: splitPlan.tokenToSplit.uiToken.id,
-            genesisId: genesisIdOf(splitPlan.tokenToSplit.uiToken),
-            sourceSdkData: splitPlan.tokenToSplit.uiToken.sdkData ?? '',
-            sdkToken: splitPlan.tokenToSplit.sdkToken as SphereToken,
-            deliveredAmount: splitAmount, // #677: a split op delivers only splitAmount
-            remainderAmount,
-          });
-        }
-        const selfChainPubkey = hexToBytes(this.deps.identity.chainPubkey);
-
-        // One operation: certify → journal. Delivery is deliberately NOT here —
-        // it runs as one hoisted pass over the committed set below (#699), so a
-        // multi-source send can hand the whole set to the delivery port in one
-        // batched deposit. NEVER rejects (a mid-batch rejection would stop us
-        // observing still-in-flight siblings) and NEVER touches shared wallet
-        // state — this.tokens mutations and save() (an unlocked whole-map
-        // write) are not concurrency-safe; they belong to the sequential apply
-        // section below.
-        const sendOperation = async (op: SendOperation): Promise<OperationOutcome> => {
-          let finished: SphereToken;
-          let changeOutput: SphereToken | undefined;
-          try {
-            if (op.kind === 'direct') {
-              finished = await engine.transfer(
-                { token: op.sdkToken, recipientPubkey: recipientChainPubkey },
-                { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id, opIndex: op.opIndex },
-              );
-            } else {
-              // Value-conserving split: recipient gets splitAmount, this wallet
-              // keeps the remainder. The change token is real + immediate. E.4:
-              // the burn checkpoint persists before the first mint (durable-ack
-              // gated).
-              const { outputs } = await engine.split(
-                {
-                  token: op.sdkToken,
-                  outputs: [
-                    { recipientPubkey: recipientChainPubkey, coinId: request.coinId, amount: op.deliveredAmount },
-                    { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: op.remainderAmount },
-                  ],
-                },
-                {
-                  signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS),
-                  transferId: result.id,
-                  opIndex: op.opIndex,
-                  ...(this.getCheckpointStore() ? { checkpointStore: this.getCheckpointStore() } : {}),
-                },
-              );
-              finished = outputs[0];
-              changeOutput = outputs[1];
-            }
-          } catch (error) {
-            // No proof in hand — NOT necessarily "never reached the chain":
-            // for the keep-open family (isKeepOpenSendError) the submit may
-            // have been accepted and the spend may be on-chain. certified:false
-            // records only what was observed; the failure disposition keeps the
-            // intent open and resume settles the truth (#631/E.4).
-            return { op, certified: false, error };
-          }
-          // The source state is spent on-chain from here on — every return below
-          // reports certified: true so the accounting counts it even when a
-          // local post-step fails.
-          try {
-            // Journal the finished blob BEFORE any delivery: the hoisted pass
-            // below (or the replay on next load()) hands it to the recipient —
-            // a delivery failure or a crash must not lose the recipient's token.
-            const tokenBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(finished)));
-            await this.savePendingV2Delivery({
-              transferId: result.id,
-              recipientPubkey: recipientChainPubkeyHex,
-              tokenBlob,
-              memo: request.memo,
-              opIndex: op.opIndex,
-              createdAt: Date.now(),
-            });
-            return { op, certified: true, tokenBlob, ...(changeOutput !== undefined ? { changeOutput } : {}) };
-          } catch (error) {
-            return { op, certified: true, error, ...(changeOutput !== undefined ? { changeOutput } : {}) };
-          }
-        };
-
-        // Certify concurrently, MAX_SEND_OPERATION_CONCURRENCY at a time (#684
-        // pacing). Every launched op SETTLES before any accounting below — the
-        // #625 tag and the #677 remainder must never be computed while value
-        // may still be certifying in flight.
-        const outcomes: OperationOutcome[] = [];
-        for (let start = 0; start < operations.length; start += MAX_SEND_OPERATION_CONCURRENCY) {
-          const batch = operations.slice(start, start + MAX_SEND_OPERATION_CONCURRENCY);
-          outcomes.push(...(await Promise.all(batch.map(sendOperation))));
-          // Fail-fast between batches (sequential-era parity, at batch
-          // granularity: the first throw stopped the loop): once any settled op
-          // failed, this send is on the failure path — launching more batches
-          // would keep certifying value destined for resume/remainder handling
-          // and, in an outage, stack ceil(N/8) op-timeouts before the user sees
-          // the error. In-flight ops always settle (the accounting above needs
-          // the full batch); never-launched sources stay untouched and are
-          // restored 'confirmed' by the failure handler, their value covered by
-          // the remainder re-plan or the user's retry.
-          if (outcomes.some((o) => o.error !== undefined)) break;
-        }
-        summary = summarizeOutcomes(outcomes);
-
-        // ── Delivery pass, hoisted out of the certification fan-out (#699):
-        // ONE batched mailbox deposit (when the port offers deliverBatch) or a
-        // per-blob loop over the SETTLED committed set. Runs on the failure
-        // path too — committed siblings of a failed batch get their delivery
-        // attempt before the throw below, exactly as the welded per-op era
-        // delivered them. Never throws (§3.1/#621): a deferred blob stays
-        // journaled and the send resolves delivery-pending.
-        deliveryPending = !(await this.deliverCommittedBlobs(
-          summary.committed.flatMap((o) => (o.tokenBlob === undefined ? [] : [o.tokenBlob])),
-          recipientChainPubkeyHex,
-          result.id,
-          request.memo,
-        ));
-
-        // ── Sequential apply — the ONLY writer of shared wallet state. Runs for
-        // committed ops even when another op failed: their spend is irreversible
-        // (§7) and the sequential-loop era applied them per-op too. An op that
-        // certified but failed a local post-step keeps its previous disposition:
-        // no bookkeeping here (the failure handler marks it 'spent'; the intent
-        // stays open and resume recovers the journaled blob).
-        for (const o of summary.committed) {
-          if (o.error !== undefined) continue;
-          result.tokenTransfers.push({ sourceTokenId: o.op.uiTokenId, method: o.op.kind });
-          consumedSources.push({ uiTokenId: o.op.uiTokenId, genesisId: o.op.genesisId, sourceSdkData: o.op.sourceSdkData });
-        }
-        if (!serverApply && summary.changeOutput) {
-          // Non-server path: persist the change BEFORE the removals/throw below —
-          // nothing after the on-chain split may depend on anything else
-          // succeeding. On the server path the awaited intent (E.3) is the
-          // recovery seed (a deterministic re-run rebuilds BOTH outputs), and
-          // local storage follows the server apply below so the provider's
-          // write-behind cannot race a second add of the same state.
-          // critical (#515 F2): an unpersisted change token is value loss on
-          // reload — fail the send (the open intent resumes it) rather than
-          // report success.
-          await this.storeEngineToken(engine, summary.changeOutput, { criticalSave: true });
-        }
-        if (!serverApply) {
-          // Server path: removals are recorded by the single applyDelta below
-          // (its evidence is the deposits just made); locally the sources are
-          // removed here on the non-server path. Sequential on purpose —
-          // removeToken's save() is an unlocked whole-map write. M2: pass the
-          // LOCAL state we spent so removeToken never tombstones a state a
-          // concurrent claim already advanced the map entry to.
-          for (const o of summary.committed) {
-            if (o.error !== undefined) continue;
-            await this.removeToken(o.op.uiTokenId, result.id, extractStateHashFromSdkData(o.op.sourceSdkData));
-          }
-        }
-        if (summary.primaryError !== undefined) {
-          // #625: tag for self-healing ONLY when nothing certified in this
-          // attempt — re-planning the full amount is then safe. Decided by the
-          // reduction from the complete settled set, never mid-flight.
-          if (summary.conflictTagSourceId !== undefined && summary.primaryError instanceof TransferConflictError) {
-            summary.primaryError.conflictedSourceId = summary.conflictTagSourceId;
-          }
-          // Report EVERY settled failure, not only the one that steers the
-          // disposition: a parallel batch can fail in several independent ways,
-          // and dropping the rest hides them from apps and bug reports. Log
-          // each op's error, and carry the non-surfaced ones on the thrown
-          // error (`suppressedErrors`) — visibility only, never dispositive.
-          for (const f of summary.failures) {
-            logger.warn(
-              'Payments',
-              `Send op ${f.op.opIndex} (${f.op.kind}) failed${f.certified ? ' AFTER on-chain certification' : ''}:`,
-              f.error,
-            );
-          }
-          const primaryError = summary.primaryError;
-          const suppressed = summary.failures.map((f) => f.error).filter((e) => e !== primaryError);
-          if (suppressed.length > 0 && primaryError instanceof Error) {
-            (primaryError as Error & { suppressedErrors?: unknown[] }).suppressedErrors = suppressed;
-          }
-          throw primaryError;
-        }
-
-        if (serverApply) {
-          // #665: SCOPED to wallet-api inventory custody. Every on-chain submit
-          // has certified by here, and the wallet-api persistence that follows
-          // (blob upload / apply / the save below) is post-commit — a failure is
-          // a server-MIRROR sync-pending, converged by resume. Setting the flag
-          // only inside this branch keeps own-storage / no-wallet-api sends OUT
-          // of the SEND_SYNC_PENDING path: there is no server mirror to catch up,
-          // so a local post-commit save failure there stays a normal failure
-          // (Copilot review, PR #669).
-          onChainCommitComplete = true;
-          // §7 steps 4+6: upload the change output, then record the whole
-          // spend in ONE idempotent apply carrying the send's transferId. The
-          // backend evidence-checks the removals against the mailbox deposit
-          // of the same transferId (§5.3) and completes the intent in the
-          // same transaction (§16).
-          const added: { tokenId: string; key: string }[] = [];
-          if (summary.changeOutput) {
-            const changeBytes = encodeTokenBlob(engine.encodeToken(summary.changeOutput));
-            added.push({ tokenId: engine.tokenId(summary.changeOutput), key: await this.uploadOutputBlob(changeBytes) });
-          }
-          const storage = this.getActiveTokenStorageProvider();
-          if (!storage) {
-            throw new SphereError('No token storage provider available for applyDelta', 'STORAGE_ERROR');
-          }
-          // M3: derive each source's PROTOCOL spent state (deliveryKeys imprint = the
-          // server's row state_hash) from the source blob we HELD — never from the live
-          // view — so the server records knownSpends as (tokenId, exact spent state).
-          // Derived here (server path only), in parallel, off the hot send loop.
-          const spentStates = await Promise.all(
-            consumedSources.map(async (s) => ({
-              tokenId: s.genesisId,
-              stateHash: s.sourceSdkData ? (await engine.deliveryKeys(hexToBytes(s.sourceSdkData))).stateHash : '',
-            }))
-          );
-          await storage.applyDelta(
-            result.id,
-            consumedSources.map((s) => s.genesisId),
-            added,
-            { spentStates }
-          );
-          // Local bookkeeping AFTER the server apply (see the ordering note
-          // above): store the change, then drop the consumed sources. M2: each
-          // removeToken carries the LOCAL state we spent, so a source the pump
-          // already reactivated to a new state is KEPT, not re-tombstoned.
-          if (summary.changeOutput) await this.storeEngineToken(engine, summary.changeOutput);
-          for (const s of consumedSources) {
-            await this.removeToken(s.uiTokenId, result.id, extractStateHashFromSdkData(s.sourceSdkData));
-          }
-        }
-      }
-
-      result.status = 'delivered';
-
-      await this.save();
-
-      result.status = 'completed';
-
-      // E.3 uniform close: every finished send ends with completeIntent
-      // (idempotent). With wallet-api inventory custody the apply above has
-      // already completed it server-side (no-op); with own storage this call
-      // is the ONLY close — without it every historical send would re-resume
-      // at each sign-in forever.
-      if (this.deps.walletApi) {
-        try {
-          await this.deps.walletApi.completeIntent(result.id);
-        } catch (err) {
-          logger.warn('Payments', 'completeIntent failed (the next sign-in resume converges it):', err);
-        }
-      }
-
-      // Build token breakdown using a Map for O(1) lookup
-      const tokenMap = new Map(result.tokens.map(t => [t.id, t]));
-      const sentTokenIds: Array<{ id: string; amount: string; source: 'split' | 'direct' }> = result.tokenTransfers.map(tt => ({
-        id: tt.sourceTokenId,
-        // For split tokens, use splitAmount (the portion sent), not the original token amount
-        amount: tt.method === 'split'
-          ? (splitPlan.splitAmount?.toString() || '0')
-          : (tokenMap.get(tt.sourceTokenId)?.amount || '0'),
-        source: tt.method === 'split' ? 'split' : 'direct',
-      }));
-      const sentTokenId = result.tokens[0] ? extractTokenIdFromSdkData(result.tokens[0].sdkData) : undefined;
-
-      await this.addToHistory({
-        type: 'SENT',
-        amount: request.amount,
-        coinId: request.coinId,
-        symbol: this.getCoinSymbol(request.coinId),
-        timestamp: Date.now(),
+      return await this.finishSend({
+        result,
+        request,
+        splitPlan,
+        peerInfo,
         recipientPubkey,
-        recipientNametag,
-        recipientAddress: peerInfo?.directAddress || recipientPubkey,
-        memo: request.memo,
-        transferId: result.id,
-        tokenId: sentTokenId || undefined,
-        tokenIds: sentTokenIds.length > 0 ? sentTokenIds : undefined,
+        recipientNametag:
+          peerInfo.nametag || (request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined),
+        deliveryPending: attempt.deliveryPending,
       });
-
-      // Commit reservation — all tokens have been sent on-chain and removed.
-      this.reservationLedger.commit(result.id);
-
-      // §3.1 (#621): the spend is final regardless of delivery. If any leg's delivery was
-      // deferred (recipient-side 429 / transient outage), resolve as delivery-pending — the
-      // blob stays journaled for (re-)delivery — rather than failing the sender.
-      if (deliveryPending) {
-        result.deliveryPending = true;
-        result.deliveryState = 'pending-delivery';
-      } else {
-        result.deliveryState = 'landed';
-      }
-
-      this.deps!.emitEvent(deliveryPending ? 'transfer:delivery_pending' : 'transfer:confirmed', result);
-      return result;
     } catch (error) {
-      // Cancel reservation — free reserved amounts for other sends
-      this.reservationLedger.cancel(result.id);
-
-      // Committed accounting from the SETTLED fan-out (empty when the failure
-      // struck before any engine op ran — e.g. planning, intent PUT).
-      const committedUiIds = summary?.committedUiIds ?? new Set<string>();
-      const committedAmount = summary?.committedAmount ?? 0n;
-
-      result.status = 'failed';
-      // A TransferConflictError is a LOST RACE (Part E.2): another transaction —
-      // typically this owner's other device — already consumed a source token.
-      // Fail this send cleanly with a distinct message; the restore loop below
-      // marks the conflicted source 'spent' via the on-chain isSpent check.
-      // (Re-planning the uncovered remainder automatically is Part S.)
-      result.error = error instanceof TransferConflictError
-        ? `Send conflicted: a source token was already spent by a concurrent transfer — re-plan and retry (${error.message})`
-        : error instanceof Error ? error.message : String(error);
-
-      // #517 item 2: a TransferConflictError here is the predictable stale-view
-      // race — coin-selection planned from a lazy-inventory view that missed
-      // another device's spend. It is handled (abort + reconcile below) but was
-      // otherwise SILENT; surface it as a distinct, recoverable signal so a UI
-      // can prompt "refresh and retry" instead of just showing a generic failure.
-      if (error instanceof TransferConflictError) {
-        this.deps!.emitEvent('inventory:conflict', {
-          transferId: result.id,
-          coinId: request.coinId,
-          error: error.message,
-        });
-      }
-      // E.4: a stuck checkpoint on the SEND path (lost/withheld record, or a trust-base rotation) —
-      // kept open, but surface the distinct loud signal (never a silent retry — needs the drain).
-      if (error instanceof SplitCheckpointLostError || error instanceof CheckpointTrustbaseMismatchError) {
-        this.deps!.emitEvent('split:checkpoint-stuck', { transferId: result.id, code: error.code, error: error.message });
-      }
-
-      // Intent disposition on failure (E.2/E.3):
-      //  - a TransferConflictError with NOTHING certified aborts (the
-      //    prescribed E.2 recovery — the caller re-plans the full amount under
-      //    a NEW transferId; soft abort keeps the row);
-      //  - a conflict AFTER ≥1 certified leg keeps the intent OPEN:
-      //    the `throw primaryError` above precedes the serverApply
-      //    block, so on the wallet-api custody path a certified split's change
-      //    output is neither uploaded nor stored locally — the open intent is
-      //    its ONLY recovery seed (a deterministic re-run rebuilds it;
-      //    resyncOpenIntents lists 'open' only, so an abort would strand the
-      //    value). The certified legs' delivery converges via journal replay +
-      //    the recipient's claim handoff (§6), and send()'s #677 remainder
-      //    re-plan covers the conflicted leg under a NEW transferId. (Mirrors
-      //    the engine-level keep-open bias of the split-mint fan-out, #684.)
-      //  - a PROVEN clean pre-certification failure (nothing certified) also
-      //    aborts — an open intent would silently re-execute the transfer at the
-      //    next sign-in after the user already saw it fail (and possibly retried
-      //    it manually);
-      //  - a partially-certified non-conflict failure keeps the intent OPEN:
-      //    forward completion via resume is the only exit (§7);
-      //  - #631: a ProofUnconfirmedError (submit accepted / proof fetch
-      //    inconclusive) is NOT "nothing certified" — the source spend may be
-      //    on-chain under result.id, and the intent is the only resume seed. Keep
-      //    it OPEN even when the committed set is still empty (the throw
-      //    beat the .add()). Resume re-derives the identical tx: it recovers the
-      //    proof + delivery, or records the spend if a foreign tx won — never a
-      //    second on-chain spend.
-      //  - E.4 (sphere-sdk#501): the split burn-checkpoint errors are ALL keep-open. The burn is
-      //    certified (or the source is untouched, for a leg-0 strand); a split-mint stateId is
-      //    HKDF-derived, so a mismatch is never a foreign spend. Aborting would orphan a
-      //    burn-certified split — resume under the same transferId (rebuilding from the stored
-      //    checkpoint) is the only exit. So keep-open even when the committed set is empty.
-      const keepOpen = isKeepOpenSendError(error);
-      // #670: skip the abort when the intent PUT itself was deterministically
-      // rejected — the local copy is already dropped and the server row never
-      // existed (an abort would only 404 and re-mark the copy abortPending).
-      if (!intentRejected) {
-        // Abort ONLY a proven-clean failure with NOTHING certified. A conflict
-        // is never keep-open (isKeepOpenSendError), so the E.2 clean-conflict
-        // abort is contained in this predicate; a conflict alongside a
-        // certified leg keeps the intent open (see the disposition doc above).
-        if (committedUiIds.size === 0 && !keepOpen) {
-          try {
-            await this.deps!.walletApi!.abortIntent(result.id);
-          } catch (abortErr) {
-            logger.warn('Payments', 'abortIntent failed (soft abort is best-effort):', abortErr);
-          }
-        }
-      }
-
-      // Restore tokens. Three classes (W23-R2/R3, v2 edition):
-      //  - already removeToken()'d during a partially-successful loop → skip
-      //    (restoring would create phantom tokens);
-      //  - certified on-chain during THIS send (tracked, or — for ops that threw
-      //    mid-flight, e.g. an inclusion-proof timeout AFTER certification — the
-      //    network says spent) → terminal 'spent', NEVER back to 'confirmed'
-      //    (a spent state in the spend pool just fails every future send);
-      //  - genuinely untouched → restore 'confirmed' + re-cache for the queue.
-      const restoreEngine = this.deps?.tokenEngine;
-      for (const token of result.tokens) {
-        if (!this.tokens.has(token.id)) {
-          logger.warn('Payments', `Skipping restoration of already-removed token ${token.id}`);
-          continue;
-        }
-        let spentOnChain = committedUiIds.has(token.id);
-        if (!spentOnChain && restoreEngine && token.sdkData && looksLikeTokenBlob(token.sdkData)) {
-          try {
-            const st = await restoreEngine.decodeToken(decodeTokenBlob(hexToBytes(token.sdkData)));
-            spentOnChain = await restoreEngine.isSpent(st);
-          } catch {
-            // Network/decode failure — restore optimistically; validate() or the
-            // next send attempt reconciles a stale state.
-          }
-        }
-        if (spentOnChain) {
-          token.status = 'spent';
-          this.tokens.set(token.id, token);
-          logger.warn('Payments', `Token ${token.id} was spent on-chain during the failed send — marked 'spent' (output blob journaled for delivery replay)`);
-        } else {
-          token.status = 'confirmed';
-          this.tokens.set(token.id, token);
-          await this.cacheEngineParsedToken(token);
-        }
-      }
-
-      // Persist the restore — without this a crash right after a handled failure
-      // reloads the tokens as stuck-'transferring'.
-      try {
-        await this.save();
-      } catch (saveErr) {
-        logger.error('Payments', 'Failed to persist send-failure restore:', saveErr);
-      }
-      // Notify queue AFTER cache is rebuilt so queued entries see restored tokens
-      this.spendQueue.notifyChange(request.coinId);
-
-      // #665: a failure AFTER the on-chain commit is a mirror-sync-pending
-      // outcome, not a lost payment — the spend landed on-chain, the intent is
-      // kept open, and resume converges the server mirror (idempotent apply,
-      // #664). Do NOT emit transfer:failed (nothing was lost); throw a
-      // re-tagged SEND_SYNC_PENDING so the send caller can reassure the user
-      // instead of showing a hard failure. Excludes a genuine lost race
-      // (TransferConflictError) and the keep-open certification states
-      // (ProofUnconfirmed / split-checkpoint), which are pre-mirror and have
-      // their own handling.
-      if (onChainCommitComplete && !(error instanceof TransferConflictError) && !keepOpen) {
-        // #441 deferred-paid linkage: stamp the committing attempt's own transferId
-        // so a payment-request consumer can journal request→transfer and resolve
-        // 'paid' only once resumeOpenIntents actually completes this transfer.
-        const pending = new SphereError(
-          'Your payment was sent. Your wallet is syncing with the server and will catch up shortly.',
-          'SEND_SYNC_PENDING',
-          error,
-        );
-        pending.transferId = result.id;
-        throw pending;
-      }
-
-      // #677: a lost race (TransferConflictError) AFTER ≥1 earlier leg already
-      // certified on-chain and was journaled/delivered is NOT a plain,
-      // re-sendable failure. The delivered value has irreversibly left the wallet
-      // (its source is terminal 'spent' above, its blob journaled for delivery),
-      // and the intent stays OPEN (committed legs block the abort above) —
-      // resume converges the certified legs, including a certified split's
-      // server apply + change re-derivation. Surfacing a bare
-      // TransferConflictError would make the caller re-send the FULL amount and
-      // pay the delivered leg twice — so surface a DISTINCT partial outcome
-      // carrying the already-committed legs and the still-owed REMAINDER. send()
-      // catches this and re-plans ONLY the remainder under a NEW transferId (the
-      // delivered legs converge via the recipient's claim handoff, §6); this
-      // surfaces to the CALLER only when that remainder cannot be covered. Do NOT
-      // emit transfer:failed: the delivered legs are not lost (mirrors the
-      // SEND_SYNC_PENDING contract).
-      if (error instanceof TransferConflictError && committedUiIds.size > 0) {
-        const remaining = BigInt(request.amount) - committedAmount;
-        throw new PartialSendConflictError(
-          'Part of your payment was already sent before a source token was spent by a concurrent transfer. Re-plan and send only the remaining amount — do NOT re-send the full amount.',
-          result.id,
-          [...committedUiIds],
-          (remaining > 0n ? remaining : 0n).toString(),
-          error,
-        );
-      }
-
-      // #441 deferred-paid linkage: the keep-open certification codes
-      // (CERTIFICATION_UNCONFIRMED / CHECKPOINT_PERSIST_FAILED / SPLIT_CHECKPOINT_LOST /
-      // CHECKPOINT_TRUSTBASE_MISMATCH) reach the caller via the terminal throw below.
-      // Stamp this attempt's transferId so a payment-request consumer can journal
-      // request→transfer (idempotent; only fills a possibly-committed keep-open code).
-      if (error instanceof SphereError && isPossiblyCommittedSendOutcome(error)) {
-        error.transferId ??= result.id;
-      }
-
-      this.deps!.emitEvent('transfer:failed', result);
-      throw error;
+      return await this.failSend({ error, result, request, attempt });
     }
+  }
+
+  /**
+   * The money core of a send: certify every operation on-chain, journal + deliver
+   * the recipient blobs, and record the spend.
+   *
+   * v2 engine mode (sender-driven) — `engine.transfer` hands the recipient a
+   * FINISHED token, so there is no commitment / inclusion-proof / finalization
+   * round-trip. Under wallet-api INVENTORY custody the spend is recorded
+   * server-side by ONE applyDelta carrying this transferId (the evidence link to
+   * the mailbox deposit, §7/§5.3); with 'external' custody the sender never
+   * calls apply at all (§6 storage-opt-out) and local bookkeeping is the record.
+   */
+  private async executeSendPlan(ctx: {
+    readonly request: TransferRequest;
+    readonly result: MutableTransferResult;
+    readonly splitPlan: SplitPlan;
+    readonly recipientChainPubkeyHex: string;
+    readonly attempt: SendAttemptState;
+  }): Promise<void> {
+    const { request, result, splitPlan, recipientChainPubkeyHex, attempt } = ctx;
+    const engine = this.deps!.tokenEngine!;
+    const serverApply = this.delivery!.custody === 'inventory';
+
+    // S2: lazy inventory records selected by coin-selection are materialized
+    // (getToken + engine decode) only now, once they are actually being spent.
+    await this.materializeSelectedSources(splitPlan);
+    await this.openSendIntent(request, result.id, recipientChainPubkeyHex, splitPlan, attempt);
+
+    const summary = summarizeOutcomes(
+      await this.certifySendOperations(buildSendOperations(splitPlan), {
+        engine,
+        transferId: result.id,
+        recipientChainPubkey: hexToBytes(recipientChainPubkeyHex),
+        recipientChainPubkeyHex,
+        selfChainPubkey: hexToBytes(this.deps!.identity.chainPubkey),
+        coinId: request.coinId,
+        ...(request.memo !== undefined ? { memo: request.memo } : {}),
+      })
+    );
+    // The failure disposition reads committed accounting EXCLUSIVELY from here
+    // (W23-R2/#677): certified sources must never be restored 'confirmed', and
+    // the remainder still owed is derived from SETTLED data, so a concurrent
+    // certification can never be under-counted (an under-count double-pays).
+    attempt.summary = summary;
+
+    // Delivery is hoisted out of the certification fan-out (#699): ONE batched
+    // mailbox deposit, or a per-blob loop, over the SETTLED committed set. Runs
+    // on the failure path too — committed siblings of a failed batch get their
+    // delivery attempt before the throw below. Never throws (§3.1/#621): a
+    // deferred blob stays journaled and the send resolves delivery-pending.
+    attempt.deliveryPending = !(await this.deliverCommittedBlobs(
+      summary.committed.flatMap((o) => (o.tokenBlob === undefined ? [] : [o.tokenBlob])),
+      recipientChainPubkeyHex,
+      result.id,
+      request.memo,
+    ));
+
+    // Sequential apply — the ONLY writer of shared wallet state. Runs for
+    // committed ops even when another op failed: their spend is irreversible
+    // (§7). An op that certified but failed a local post-step is left alone —
+    // the failure handler marks it 'spent' and resume recovers its journaled blob.
+    const consumed = summary.committed.filter((o) => o.error === undefined).map((o) => o.op);
+    for (const op of consumed) {
+      result.tokenTransfers.push({ sourceTokenId: op.uiTokenId, method: op.kind });
+    }
+    if (!serverApply) await this.recordLocalSpend(engine, result.id, consumed, summary.changeOutput);
+    if (summary.primaryError !== undefined) throw surfacedSendFailure(summary);
+    if (!serverApply) return;
+
+    // #665: every on-chain submit has certified, so the wallet-api persistence
+    // that follows is post-commit — a failure from here is a server-MIRROR
+    // sync-pending converged by resume, not a lost payment. Scoped to this
+    // branch: own-storage sends have no mirror to catch up.
+    attempt.onChainCommitComplete = true;
+    await this.recordServerSpend(engine, result.id, consumed, summary.changeOutput);
+  }
+
+  /**
+   * Own-storage custody: local bookkeeping IS the record of the spend.
+   *
+   * critical (#515 F2): an unpersisted change token is value loss on reload, and
+   * nothing after the on-chain split may depend on anything else succeeding —
+   * fail the send (the open intent resumes it) rather than report success.
+   */
+  private async recordLocalSpend(
+    engine: ITokenEngine,
+    transferId: string,
+    consumed: readonly SendOperation[],
+    changeOutput: SphereToken | null | undefined
+  ): Promise<void> {
+    if (changeOutput) await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
+    // Sequential on purpose — removeToken's save() is an unlocked whole-map write.
+    for (const op of consumed) {
+      await this.removeToken(op.uiTokenId, transferId, extractStateHashFromSdkData(op.sourceSdkData));
+    }
+  }
+
+  /**
+   * Inventory custody: the spend is recorded server-side by one applyDelta, and
+   * the local sources are dropped only after it lands.
+   */
+  private async recordServerSpend(
+    engine: ITokenEngine,
+    transferId: string,
+    consumed: readonly SendOperation[],
+    changeOutput: SphereToken | null | undefined
+  ): Promise<void> {
+    // M3: derive each source's PROTOCOL spent state (the deliveryKeys imprint =
+    // the server's row state_hash) from the source blob we HELD, never from the
+    // live view, so knownSpends records the exact state.
+    const spentStates = await Promise.all(
+      consumed.map(async (op) => ({
+        tokenId: op.genesisId,
+        stateHash: op.sourceSdkData ? (await engine.deliveryKeys(hexToBytes(op.sourceSdkData))).stateHash : '',
+      }))
+    );
+    await this.applyInventoryDelta(engine, transferId, spentStates, changeOutput);
+    // M2: each removeToken carries the LOCAL state we spent, so a source the
+    // pump already reactivated to a new state is KEPT, not re-tombstoned.
+    for (const op of consumed) {
+      await this.removeToken(op.uiTokenId, transferId, extractStateHashFromSdkData(op.sourceSdkData));
+    }
+  }
+
+  /**
+   * E.3: the intent is the resume seed, so it is persisted and ACKed BEFORE any
+   * engine submit. E.4/#87: `requiresSeedClose` is set here, before the burn, so
+   * the funds-critical window is guarded from intent creation.
+   */
+  private async openSendIntent(
+    request: TransferRequest,
+    transferId: string,
+    recipientChainPubkey: string,
+    splitPlan: SplitPlan,
+    attempt: SendAttemptState
+  ): Promise<void> {
+    const walletApi = this.deps!.walletApi!;
+    try {
+      await walletApi.putIntent(
+        transferId,
+        encryptField(
+          this.getFieldEncryptionKey(),
+          JSON.stringify(await this.buildIntentPayload(request, recipientChainPubkey, splitPlan))
+        ),
+        splitPlan.requiresSplit ? { requiresSeedClose: true } : {}
+      );
+    } catch (err) {
+      // #670: a 422 VALIDATION rejection is DETERMINISTIC (nothing is on-chain —
+      // the PUT precedes every engine op — and no server row exists), so the
+      // #516 keep-and-replay backstop must NOT apply. Transient failures
+      // (NETWORK/5xx) rethrow unchanged and keep it.
+      if (err instanceof WalletApiError && err.code === 'VALIDATION') {
+        attempt.intentRejected = true;
+        await this.dropRejectedIntent(walletApi, transferId);
+        throw intentValidationError(err);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Terminal disposition of a failed send attempt. Always throws — every exit
+   * is a `throw`, so the caller reads as `return await this.failSend(...)`.
+   *
+   * Cancels the reservation, decides the intent disposition (abort a proven-clean
+   * failure, keep every possibly-certified one OPEN for resume), restores or
+   * terminalizes each source token, then re-tags the error for the three outcomes
+   * that are NOT plain failures: post-commit mirror lag (SEND_SYNC_PENDING),
+   * a partially-delivered lost race (PartialSendConflictError), and the
+   * keep-open certification codes.
+   */
+  private async failSend(ctx: {
+    readonly error: unknown;
+    readonly result: MutableTransferResult;
+    readonly request: TransferRequest;
+    readonly attempt: SendAttemptState;
+  }): Promise<never> {
+    const { error, result, request } = ctx;
+    const { summary, onChainCommitComplete, intentRejected } = ctx.attempt;
+    this.reservationLedger.cancel(result.id);
+    // Empty when the failure struck before any engine op ran (planning, intent PUT).
+    const committedUiIds = summary?.committedUiIds ?? new Set<string>();
+
+    result.status = 'failed';
+    // A TransferConflictError is a LOST RACE (E.2): another transaction —
+    // typically this owner's other device — already consumed a source token.
+    result.error = error instanceof TransferConflictError
+      ? `Send conflicted: a source token was already spent by a concurrent transfer — re-plan and retry (${error.message})`
+      : error instanceof Error ? error.message : String(error);
+
+    // #517: the predictable stale-view race (coin-selection planned from a lazy
+    // view that missed another device's spend) was handled but SILENT — surface
+    // it so a UI can prompt "refresh and retry" instead of a generic failure.
+    if (error instanceof TransferConflictError) {
+      this.deps!.emitEvent('inventory:conflict', { transferId: result.id, coinId: request.coinId, error: error.message });
+    }
+    // E.4: a stuck checkpoint needs the loud signal — never a silent retry.
+    if (error instanceof SplitCheckpointLostError || error instanceof CheckpointTrustbaseMismatchError) {
+      this.deps!.emitEvent('split:checkpoint-stuck', { transferId: result.id, code: error.code, error: error.message });
+    }
+
+    const keepOpen = isKeepOpenSendError(error);
+    await this.disposeIntentOnFailure(result.id, { committed: committedUiIds.size > 0, keepOpen, intentRejected });
+    await this.restoreSourcesAfterFailure(result, committedUiIds, request.coinId);
+    this.throwSendOutcome({
+      error,
+      result,
+      request,
+      committedUiIds,
+      committedAmount: summary?.committedAmount ?? 0n,
+      onChainCommitComplete,
+      keepOpen,
+    });
+  }
+
+  /**
+   * Abort the intent, or leave it OPEN for resume (E.2/E.3). ONLY a PROVEN-clean
+   * failure with nothing certified aborts — an open intent there would silently
+   * re-execute the transfer at the next sign-in, after the user already saw it
+   * fail. Everything else keeps the intent, because it is the only resume seed:
+   *
+   *  - a conflict AFTER ≥1 certified leg — a certified split's change output is
+   *    neither uploaded nor stored locally, and resyncOpenIntents lists 'open'
+   *    only, so aborting would strand that value;
+   *  - any partially-certified failure — forward completion via resume is the
+   *    only exit (§7);
+   *  - #631 ProofUnconfirmedError — the spend may be on-chain under this
+   *    transferId even with an empty committed set (the throw beat the .add());
+   *  - E.4 split burn-checkpoint errors — the burn is certified and a split-mint
+   *    stateId is HKDF-derived (never a foreign spend), so resume from the
+   *    checkpoint is the only exit.
+   *
+   * A conflict is never keep-open, so the E.2 clean-conflict abort is contained
+   * in the same predicate. #670: an intent PUT the server deterministically
+   * rejected has no server row — aborting would only 404 and re-mark it.
+   */
+  private async disposeIntentOnFailure(
+    transferId: string,
+    flags: { committed: boolean; keepOpen: boolean; intentRejected: boolean }
+  ): Promise<void> {
+    if (flags.intentRejected || flags.committed || flags.keepOpen) return;
+    try {
+      await this.deps!.walletApi!.abortIntent(transferId);
+    } catch (err) {
+      logger.warn('Payments', 'abortIntent failed (soft abort is best-effort):', err);
+    }
+  }
+
+  /**
+   * Put this send's sources back, in three classes (W23-R2/R3):
+   *  - already removed during a partially-successful fan-out → skip (restoring
+   *    would create phantom tokens);
+   *  - certified on-chain during THIS send (tracked, or — for an op that threw
+   *    after certification — the network says spent) → terminal 'spent', NEVER
+   *    back to 'confirmed': a spent state in the spend pool fails every future send;
+   *  - genuinely untouched → 'confirmed' + re-cached for the queue.
+   */
+  private async restoreSourcesAfterFailure(
+    result: MutableTransferResult,
+    committedUiIds: ReadonlySet<string>,
+    coinId: string
+  ): Promise<void> {
+    const engine = this.deps?.tokenEngine;
+    for (const token of result.tokens) {
+      if (!this.tokens.has(token.id)) {
+        logger.warn('Payments', `Skipping restoration of already-removed token ${token.id}`);
+        continue;
+      }
+      let spentOnChain = committedUiIds.has(token.id);
+      if (!spentOnChain && engine && token.sdkData && looksLikeTokenBlob(token.sdkData)) {
+        try {
+          spentOnChain = await engine.isSpent(await engine.decodeToken(decodeTokenBlob(hexToBytes(token.sdkData))));
+        } catch {
+          // Network/decode failure — restore optimistically; validate() or the
+          // next send attempt reconciles a stale state.
+        }
+      }
+      token.status = spentOnChain ? 'spent' : 'confirmed';
+      this.tokens.set(token.id, token);
+      if (spentOnChain) {
+        logger.warn('Payments', `Token ${token.id} was spent on-chain during the failed send — marked 'spent' (output blob journaled for delivery replay)`);
+      } else {
+        await this.cacheEngineParsedToken(token);
+      }
+    }
+    // Without this a crash right after a handled failure reloads the tokens as
+    // stuck-'transferring'.
+    try {
+      await this.save();
+    } catch (err) {
+      logger.error('Payments', 'Failed to persist send-failure restore:', err);
+    }
+    // AFTER the cache rebuild, so queued entries see the restored tokens.
+    this.spendQueue.notifyChange(coinId);
+  }
+
+  /**
+   * The terminal throw. Two outcomes are NOT plain failures and must not emit
+   * `transfer:failed` — nothing was lost in either:
+   *
+   *  - #665 post-commit mirror lag: the spend landed on-chain, the intent is
+   *    open, resume converges the server mirror. Re-tagged SEND_SYNC_PENDING so
+   *    the caller can reassure the user. Excludes a genuine lost race and the
+   *    keep-open certification states, which are pre-mirror.
+   *  - #677 partial lost race: ≥1 leg already certified and was journaled, so a
+   *    bare TransferConflictError would make the caller re-send the FULL amount
+   *    and pay the delivered leg twice. Surfaces the committed legs and the
+   *    still-owed REMAINDER instead; send() re-plans only that.
+   *
+   * #441: both, plus the keep-open certification codes, carry this attempt's
+   * transferId so a payment-request consumer can journal request→transfer.
+   */
+  private throwSendOutcome(ctx: {
+    readonly error: unknown;
+    readonly result: MutableTransferResult;
+    readonly request: TransferRequest;
+    readonly committedUiIds: ReadonlySet<string>;
+    readonly committedAmount: bigint;
+    readonly onChainCommitComplete: boolean;
+    readonly keepOpen: boolean;
+  }): never {
+    const { error, result, request, committedUiIds, committedAmount, onChainCommitComplete, keepOpen } = ctx;
+    const conflict = error instanceof TransferConflictError;
+    if (onChainCommitComplete && !conflict && !keepOpen) {
+      const pending = new SphereError(
+        'Your payment was sent. Your wallet is syncing with the server and will catch up shortly.',
+        'SEND_SYNC_PENDING',
+        error,
+      );
+      pending.transferId = result.id;
+      throw pending;
+    }
+    if (conflict && committedUiIds.size > 0) {
+      const remaining = BigInt(request.amount) - committedAmount;
+      throw new PartialSendConflictError(
+        'Part of your payment was already sent before a source token was spent by a concurrent transfer. Re-plan and send only the remaining amount — do NOT re-send the full amount.',
+        result.id,
+        [...committedUiIds],
+        (remaining > 0n ? remaining : 0n).toString(),
+        error as TransferConflictError,
+      );
+    }
+    if (error instanceof SphereError && isPossiblyCommittedSendOutcome(error)) {
+      error.transferId ??= result.id;
+    }
+    this.deps!.emitEvent('transfer:failed', result);
+    throw error;
   }
 
   /**
@@ -2437,14 +2514,12 @@ export class PaymentsModule {
     splitPlan: SplitPlan
   ): Promise<IntentPayloadV1> {
     const engine = this.deps!.tokenEngine!;
-    const genesisIdOf = (tw: TokenWithAmount): string =>
-      extractTokenIdFromSdkData(tw.uiToken.sdkData) ?? tw.uiToken.id.replace(/^v2_/, '');
     // M7: capture each source's spent state (BOTH spaces) from the source blob as we hold
     // it now — so a later resume is state-aware without re-reading a claim-advanced view.
     const spentStates: Record<string, { local: string; protocol: string }> = {};
     const recordState = async (tw: TokenWithAmount): Promise<void> => {
       const sdkData = tw.uiToken.sdkData ?? '';
-      spentStates[genesisIdOf(tw)] = {
+      spentStates[genesisIdOf(tw.uiToken)] = {
         local: extractStateHashFromSdkData(sdkData),
         protocol: sdkData ? (await engine.deliveryKeys(hexToBytes(sdkData))).stateHash : '',
       };
@@ -2457,11 +2532,11 @@ export class PaymentsModule {
       coinId: request.coinId,
       amount: request.amount,
       ...(request.memo !== undefined ? { memo: request.memo } : {}),
-      direct: splitPlan.tokensToTransferDirectly.map(genesisIdOf),
+      direct: splitPlan.tokensToTransferDirectly.map((tw) => genesisIdOf(tw.uiToken)),
       ...(splitPlan.requiresSplit && splitPlan.tokenToSplit
         ? {
             split: {
-              tokenId: genesisIdOf(splitPlan.tokenToSplit),
+              tokenId: genesisIdOf(splitPlan.tokenToSplit.uiToken),
               splitAmount: splitPlan.splitAmount!.toString(),
               remainderAmount: splitPlan.remainderAmount!.toString(),
             },
@@ -5605,18 +5680,15 @@ export class PaymentsModule {
     if (conflicted && spent.length === 0) throw firstConflict!;
 
     if (serverApply) {
-      const added: { tokenId: string; key: string }[] = [];
-      if (changeOutput) {
-        const changeBytes = encodeTokenBlob(engine.encodeToken(changeOutput));
-        added.push({ tokenId: engine.tokenId(changeOutput), key: await this.uploadOutputBlob(changeBytes) });
-      }
       // M7: replay the spend with the PROTOCOL states persisted at send time, so knownSpends
       // records the exact spent state (→ M4 can repair a stuck-active server row instead of
       // leaving a phantom). Legacy payloads (no spentStates) fall back to bare knownSpends.
-      await provider.applyDelta(transferId, spent, added, {
-        spentStates: spent.map((id) => ({ tokenId: id, stateHash: payload.spentStates?.[id]?.protocol ?? '' })),
-      });
-      if (changeOutput) await this.storeEngineToken(engine, changeOutput);
+      await this.applyInventoryDelta(
+        engine,
+        transferId,
+        spent.map((id) => ({ tokenId: id, stateHash: payload.spentStates?.[id]?.protocol ?? '' })),
+        changeOutput
+      );
     }
 
     // Drop any local records of the consumed sources (present when resuming on the

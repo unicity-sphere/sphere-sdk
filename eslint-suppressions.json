@@ -601,10 +601,10 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 40
+      "count": 24
     },
     "complexity": {
-      "count": 10
+      "count": 9
     },
     "max-depth": {
       "count": 1
@@ -613,7 +613,7 @@
       "count": 1
     },
     "max-lines-per-function": {
-      "count": 16
+      "count": 15
     }
   },
   "modules/payments/SendOperations.ts": {
