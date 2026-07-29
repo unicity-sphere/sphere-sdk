@@ -9,6 +9,13 @@
  * custody — everything wallet-api owns — were fabricated, so the composition
  * under test did not exist in production.
  *
+ * KNOWN FLAKE: the whole-token test intermittently fails with "Insufficient
+ * balance" when the whole e2e suite runs, while passing 3/3 in isolation — both
+ * staging suites then drive the same shared backend concurrently. Ruled out: the
+ * clear()+repopulate in loadFromStorageData is fully synchronous, so a send
+ * cannot observe a half-loaded token map. Unproven and worth its own look; the
+ * sibling staging suite is independently flaky on the same runs.
+ *
  * Gated on STAGING_AGGREGATOR_KEY. Run:
  *   STAGING_AGGREGATOR_KEY=sk_... npx vitest run --config vitest.e2e.config.ts \
  *     tests/e2e/payments-v2.staging.e2e.test.ts
@@ -55,6 +62,30 @@ function totalOf(balances: CoinBalance[]): bigint {
   return balances.find((b) => b.coinId === HARNESS_COIN)?.total ?? 0n;
 }
 
+/**
+ * Poll — receive()ing each round — until the wallet holds `want` in SPENDABLE
+ * (confirmed) tokens. Three states are eventually consistent here and a test
+ * that spends too early races them: the server balance, the local token set, and
+ * a token's status. `getTokens()` lists tokens of any status, so summing it
+ * counts one that has landed but cannot yet be spent.
+ */
+async function waitForSpendable(w: HarnessWallet, want: bigint, timeoutMs = 90_000): Promise<bigint> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      await w.module.receive();
+    } catch {
+      /* best-effort drain; keep polling */
+    }
+    const held = w.module
+      .getTokens()
+      .filter((t) => t.status === 'confirmed')
+      .reduce((sum, t) => sum + BigInt(t.amount), 0n);
+    if (held === want || Date.now() >= deadline) return held;
+    await new Promise((r) => setTimeout(r, 3_000));
+  }
+}
+
 /** Poll (draining the mailbox each round) until the server balance reaches `want`. */
 async function waitForBalance(w: HarnessWallet, want: bigint, timeoutMs = 120_000): Promise<bigint> {
   const deadline = Date.now() + timeoutMs;
@@ -85,6 +116,9 @@ describe.runIf(!!API_KEY)('PaymentsModule payment path over staging wallet-api +
     expect(await waitForBalance(alice, 0n)).toBe(0n);
 
     // Spendable: Bob sends it onward, which only succeeds if he truly owns it.
+    // Wait for the LOCAL inventory too — spend planning reads that, not the
+    // server balance asserted above.
+    expect(await waitForSpendable(bob, 10n)).toBe(10n);
     const carol = await newWallet('pay-carol');
     await bob.module.send({ recipient: carol.identity.chainPubkey, amount: '10', coinId: HARNESS_COIN });
     expect(await waitForBalance(carol, 10n)).toBe(10n);
