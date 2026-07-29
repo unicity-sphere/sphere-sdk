@@ -85,6 +85,21 @@ swap, not a delete: the invariant becomes a named test in the same commit, and t
 replaced by a pointer to it. A refactor commit that only removes prose, with no test gaining its
 meaning, is a regression.
 
+## Removing code
+
+Deleting a code path reliably leaves survivors: a doc that still promises the behavior, a JSDoc
+describing it, a type field nothing populates, a test mock for a method that no longer exists.
+**Typecheck, lint and tests all pass with every one of those in place** — they are prose and dead
+declarations, not broken code.
+
+Run `npm run check:removed` after any removal. It reads the identifiers your diff deleted and
+greps the repo for anything still referring to them. It is advisory: a hit is either a live
+same-named symbol or a stale reference, and you decide which.
+
+This exists because reviewers caught that class of leftover twice before the author did —
+orphaned type fields in one PR, nine stale archive comments plus five stale doc sections in
+another.
+
 ## Related
 
 - [`PAYMENTS-REFACTOR.md`](./PAYMENTS-REFACTOR.md) — the staged plan

@@ -251,11 +251,9 @@ interface TransferRequest {
   readonly coinId: string;       // Coin type (hex string)
   readonly amount: string;       // Amount in smallest units (decimal string)
   readonly recipient: string;    // @nametag, hex chain pubkey, or DIRECT:// address
-  readonly memo?: string;        // Optional message (transport-only; invoice refs also go on-chain)
+  readonly memo?: string;        // Optional message (transport-only)
   readonly addressMode?: AddressMode;    // 'auto' | 'direct' — both resolve to the recipient's key-based DIRECT address
   readonly transferMode?: TransferMode;  // @deprecated: accepted but IGNORED (single engine path)
-  readonly invoiceRefundAddress?: string; // Invoice refund address (DIRECT://) — embedded in the on-chain message
-  readonly invoiceContact?: { address: string; url?: string }; // Invoice contact — embedded in the on-chain message
 }
 
 type AddressMode = 'auto' | 'direct';
@@ -569,7 +567,7 @@ Remove nametag data from memory and storage.
 
 #### `sync(): Promise<{ added: number; removed: number }>`
 
-Sync with all remote storage providers (IPFS, etc.). Merges local and remote token data.
+Sync with all remote storage providers. Merges local and remote token data.
 
 ```typescript
 const result = await sphere.payments.sync();
@@ -967,7 +965,7 @@ interface Identity {
   chainPubkey: string;
   /** L3 DIRECT address (DIRECT://...) */
   directAddress?: string;
-  /** IPNS identifier for storage */
+  /** Legacy derived id; retained in the TXF `_meta` shape */
   ipnsName?: string;
   /** Registered @name alias */
   nametag?: string;
@@ -1127,7 +1125,7 @@ interface PaymentsModuleDependencies {
   storage: StorageProvider;
   /** @deprecated Use tokenStorageProviders instead */
   tokenStorage?: TokenStorageProvider;
-  /** Multiple token storage providers (e.g., IPFS, MongoDB, file) */
+  /** Multiple token storage providers */
   tokenStorageProviders?: Map<string, TokenStorageProvider>;
   transport: TransportProvider;
   oracle: OracleProvider;
@@ -1281,14 +1279,13 @@ For custom token storage backends (instead of thin wallet-api storage):
 
 ```typescript
 import { createOwnStorageWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
-import { createNodeIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
 const base = createNodeProviders({ network: 'testnet2', ... });
-const ipfsStorage = createNodeIpfsStorageProvider({ /* config */ }, base.storage);
 
-// Put the custody token-storage port on the base bundle; the own-storage preset preserves it
-// (its config has no `tokenStorage` field — it only adds the `delivery` + `walletApi` ports).
-const ownStorageBase = { ...base, tokenStorage: ipfsStorage };
+// Put your own custody token-storage implementation on the base bundle; the
+// own-storage preset preserves it (its config has no `tokenStorage` field — it
+// only adds the `delivery` + `walletApi` ports).
+const ownStorageBase = { ...base, tokenStorage: myTokenStorageProvider };
 
 const providers = createOwnStorageWalletApiProviders(ownStorageBase, {
   baseUrl: 'https://wallet-api.unicity.network',

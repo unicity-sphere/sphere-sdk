@@ -24,11 +24,11 @@ This repo is part of the wallet-api program (process: `../wallet-api/development
   provider-specific logic outside implementations; custody (`intoInventory`) is a composition-time
   property, never a per-call flag.
 - **Never weaken a test to make it pass**; no `.skip`/`.only`. Known pre-existing flaky/failing
-  tests are tracked in #487 (deriveIpnsName: Node-26-local only; CI on 20/22 is authoritative).
+  tests are tracked in #487.
 - **Releases:** npm dev versions publish from the integration branch via `publish.yml`
   (workflow_dispatch, version input) — current line **`0.9.1-dev.#`**, dist-tag `dev`. Consumers
   (wallet-api backend, sphere frontend) pin exact dev versions. The backend consumes ONLY the
-  `./token-engine` subpath (must stay browser/IPFS/Nostr-free — there's an import-closure check in
+  `./token-engine` subpath (must stay browser/Nostr-free — there's an import-closure check in
   its CI eventually; keep `token-engine/` clean).
 - Pinned base SDK: `@unicitylabs/state-transition-sdk@2.0.1` (stable release; bump only via PR).
 
@@ -120,7 +120,7 @@ sphere.on('transfer:incoming', (transfer) => {
 const mint = await sphere.payments.mintFungibleToken(coinIdHex, 1000000n);
 // { success: true, token, tokenId } | { success: false, error }
 
-// 9. Sync with remote storage (IPFS etc.)
+// 9. Sync with remote storage
 const syncResult = await sphere.payments.sync(); // { added, removed }
 
 // 10. Transaction history
@@ -205,7 +205,6 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | Oracle (network config) | Embedded trust base per network; API key injected via `oracle.apiKey` | Same (+ optional `trustBasePath` file) |
 | Price (CoinGecko) | Optional (`price` config) | Optional (`price` config) |
 | Token Registry | Remote fetch + persistent cache | Remote fetch + file cache |
-| IPFS sync | Opt-in (`tokenSync.ipfs.enabled`) | Opt-in |
 
 ### Key API Methods Reference
 
@@ -353,9 +352,9 @@ sphere-sdk/
 ├── assets/                  # Embedded trust bases per network (trustbase.ts)
 │
 ├── impl/                    # Platform-specific implementations
-│   ├── browser/            # IndexedDB storage, browser oracle/transport/IPFS, connect
-│   ├── nodejs/             # FileStorage, Node oracle/transport/IPFS, connect
-│   └── shared/             # Config resolvers, network consistency checks, trust-base loaders, IPFS
+│   ├── browser/            # IndexedDB storage, browser oracle/transport, connect
+│   ├── nodejs/             # FileStorage, Node oracle/transport, connect
+│   └── shared/             # Config resolvers, network consistency checks, trust-base loaders, wallet-api
 │
 ├── tests/                   # Test suite (Vitest): unit/, integration/, e2e/, relay/, fixtures/
 ├── docs/                    # Documentation (CONNECT.md, QUICKSTART-*, ACCOUNTING-*, SWAP-*, ...)
@@ -412,7 +411,7 @@ on it.
 interface Identity {
   chainPubkey: string;      // 33-byte compressed secp256k1 (for L3)
   directAddress?: string;   // L3 DIRECT address
-  ipnsName?: string;        // IPFS/IPNS identifier
+  ipnsName?: string;        // legacy derived id; retained in the TXF _meta shape
   nametag?: string;         // Unicity ID (@username)
 }
 
@@ -458,7 +457,7 @@ Abstract interfaces for platform independence:
 | Provider | Interface | Implementations |
 |----------|-----------|-----------------|
 | Storage | `StorageProvider` | IndexedDBStorageProvider (browser), FileStorageProvider (Node.js) |
-| TokenStorage | `TokenStorageProvider` | IndexedDBTokenStorageProvider, FileTokenStorageProvider, IpfsStorageProvider |
+| TokenStorage | `TokenStorageProvider` | IndexedDBTokenStorageProvider, FileTokenStorageProvider, WalletApiTokenStorageProvider |
 | Transport | `TransportProvider` | NostrTransportProvider |
 | Oracle | `OracleProvider` | UnicityAggregatorProvider |
 | Price | `PriceProvider` | CoinGeckoPriceProvider |
@@ -466,7 +465,6 @@ Abstract interfaces for platform independence:
 **Oracle is a thin network-config provider** (post v1-cutover). Its surface:
 - `initialize(trustBaseJson?)` — loads trust base via the platform loader unless passed explicitly
 - `getTrustBaseJson()` / `getAggregatorUrl()` / `getApiKey()` — REQUIRED members; the v2 engine is built from exactly these three
-- `validateToken(tokenData)` — best-effort legacy JSON-RPC check for v1 TXF tokens only (display path); v2 blobs are verified via the engine
 
 Custom `OracleProvider` implementations MUST provide the three config accessors.
 
@@ -480,7 +478,7 @@ Custom `OracleProvider` implementations MUST provide the three config accessors.
 | `dev` | `dev-aggregator.dyndns.org/rpc` | v1-era aggregator — wallet operations fail loudly (`AGGREGATOR_ERROR`) until cut over |
 
 All networks share Nostr relays (`nostr-relay.testnet.unicity.network` for test
-nets), IPFS gateways and group relays per `NETWORKS`.
+nets) and group relays per `NETWORKS`.
 `assertNetworkConsistency()` (impl/shared/network.ts) refuses provably-broken
 networks at provider creation (null or networkId-mismatched trust base).
 
@@ -569,9 +567,9 @@ authoritative for build success.
   `engine.verify` (full trust-base proof check) + `engine.isOwnedBy(token,
   own chainPubkey)` — tokens that fail verification or are not addressed to
   this wallet are rejected (warn log). Dedup by genesis-stable tokenId.
-- `validate()` checks v2 blob tokens via the engine (`verify` + `isSpent`);
-  legacy v1 TXF tokens fall back to the oracle's `validateToken` RPC.
-  Transient engine failures skip the token (never invalidate funds on an outage).
+- `validate()` checks v2 blob tokens via the engine (`verify` + `isSpent`).
+  A stored v1 relic is left untouched — neither valid nor invalid. Transient
+  engine failures skip the token (never invalidate funds on an outage).
 
 ### Minting
 - `payments.mintFungibleToken(coinIdHex, amount: bigint)` = **engine self-mint**
@@ -673,8 +671,7 @@ Key test areas:
 - `@noble/hashes` `^2`, `@noble/curves` `^2` — cryptography
 - `bip39`, `elliptic`, `crypto-js`, `canonicalize`, `buffer`
 
-**Optional/peer (IPFS + Node WebSocket):**
-- `@libp2p/crypto`, `@libp2p/peer-id`, `ipns`, `multiformats` — IPNS support
+**Optional/peer (Node WebSocket):**
 - `ws` — Node.js WebSocket (peer, optional)
 
 ## File Size Reference

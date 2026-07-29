@@ -2459,7 +2459,7 @@ export class Sphere {
 
     // =========================================================================
     // Per-Address Module Architecture: Lazy Init + Pointer Switch
-    // No destroy, no waitForPendingOperations — old address keeps running.
+    // No destroy and no drain — the old address keeps running.
     // =========================================================================
 
     const firstVisit = !this._addressModules.has(index);

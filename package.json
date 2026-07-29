@@ -124,7 +124,8 @@
     "verify:version": "node -e \"const p=require('./package.json');const s=require('fs').readFileSync('connect/version.ts','utf8');if(!s.includes(\\\"'\\\"+p.version+\\\"'\\\")){console.error('connect/version.ts is stale: expected SDK_VERSION '+p.version+'. Run: node scripts/gen-version.mjs && commit it.');process.exit(1)}console.log('connect/version.ts matches package.json '+p.version)\"",
     "cli": "echo 'The CLI has moved to @unicity-sphere/cli \u2014 install it with: npm install -g @unicity-sphere/cli' && exit 1",
     "lint:suppress": "eslint . --suppress-all",
-    "lint:prune": "eslint . --prune-suppressions"
+    "lint:prune": "eslint . --prune-suppressions",
+    "check:removed": "node scripts/check-removed-refs.mjs"
   },
   "keywords": [
     "unicity",

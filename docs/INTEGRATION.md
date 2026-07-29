@@ -17,7 +17,6 @@
 6. [Payment Requests](#payment-requests)
 7. [Communications](#communications)
 8. [Invoicing / Accounting](#invoicing--accounting)
-9. [Token Sync (IPFS Optional Backup)](#token-sync-ipfs-optional-backup)
 10. [Custom Providers](#custom-providers)
 11. [Events](#events)
 12. [Error Handling](#error-handling)
@@ -546,7 +545,7 @@ await sphere.payments.receive(undefined, (transfer) => {
 ### Sync & Refresh
 
 ```typescript
-// Sync with all remote storage providers (including IPFS backup, if enabled)
+// Sync with all remote storage providers
 // Merges local and remote token data
 const syncResult = await sphere.payments.sync();
 console.log(`Sync: +${syncResult.added} -${syncResult.removed}`);
@@ -1312,54 +1311,6 @@ try {
 
 ---
 
-## Token Sync (IPFS Optional Backup)
-
-IPFS sync provides **optional decentralized token backup**. It is **NOT** a payment delivery mechanism (v2 transfers use the wallet-api mailbox for delivery). IPFS sync merges local and remote token copies for resilience and cross-device recovery.
-
-### Enable IPFS at Initialization
-
-```typescript
-const baseProviders = createBrowserProviders({
-  network: 'testnet',
-  tokenSync: {
-    ipfs: { enabled: true },
-  },
-});
-
-const providers = createWalletApiProviders(baseProviders, {
-  baseUrl: 'https://wallet-api.unicity.network',
-  network: 'testnet2',
-  deviceId: 'my-device',
-});
-```
-
-### Add IPFS Sync at Runtime
-
-```typescript
-import { createBrowserIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/browser/ipfs';
-// For Node.js: import { createNodeIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs/ipfs';
-
-const ipfsProvider = createBrowserIpfsStorageProvider({ debug: true });
-await sphere.addTokenStorageProvider(ipfsProvider);
-
-// Sync merges local and remote token data
-const result = await sphere.payments.sync();
-console.log(`Added: ${result.added}, Removed: ${result.removed}`);
-```
-
-### How It Works
-
-- **Local tokens** are published to IPFS/IPNS for backup.
-- **Remote tokens** from other devices are merged into the local store.
-- **Sync** is idempotent and automatic on `sphere.payments.sync()` or as part of background refresh.
-
-IPFS sync is useful for:
-- Backup resilience (tokens not lost if a device dies)
-- Cross-device token recovery (e.g., phone → laptop)
-- Offline-first applications (publish when connected, merge when reconnected)
-
----
-
 ## Custom Providers
 
 ### Storage Provider Interface
@@ -1429,9 +1380,6 @@ interface OracleProvider {
 
   /** Loads the trust base JSON (via the platform loader when not passed explicitly). */
   initialize(trustBaseJson?: unknown): Promise<void>;
-
-  /** Best-effort JSON-RPC check for LEGACY v1 TXF tokens (display path only). */
-  validateToken(tokenData: unknown): Promise<ValidationResult>;
 
   // v2 token-engine config surface (REQUIRED)
   getTrustBaseJson(): unknown | null;   // raw trust-base JSON (networkId comes from it)
@@ -1585,7 +1533,6 @@ console.log('Wallet exists:', exists);  // Should be true after first run
 // Enable storage debug logs
 logger.setTagDebug('LocalStorage', true);
 logger.setTagDebug('IndexedDB', true);
-logger.setTagDebug('IPFS-Storage', true);
 ```
 
 ### Nametag Sync on Load
@@ -1830,7 +1777,7 @@ The suite spans ~170 test files. Major areas:
 | `tests/unit/serialization` | TXF format, wallet text/dat backups |
 | `tests/unit/transport` | Nostr P2P messaging, event timestamp persistence |
 | `tests/unit/validation` | Engine-based TokenValidator |
-| `tests/unit/impl` | Storage providers (IndexedDB, file), config resolvers, IPFS |
+| `tests/unit/impl` | Storage providers (IndexedDB, file), config resolvers |
 | `tests/integration` | Wallet import/export, nametag round-trips |
 | `tests/e2e` | Live testnet2 flows (gated behind `.env` keys; skipped otherwise) |
 
