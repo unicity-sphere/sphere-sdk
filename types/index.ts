@@ -217,10 +217,6 @@ export interface PaymentRequest {
   readonly coinId: string;
   /** Optional message/memo */
   readonly message?: string;
-  /** Where tokens should be sent */
-  readonly recipientNametag?: string;
-  /** Custom metadata */
-  readonly metadata?: Record<string, unknown>;
   /** Expiration timestamp (ms) */
   readonly expiresAt?: number;
   /** Created timestamp */
@@ -245,16 +241,12 @@ export interface IncomingPaymentRequest {
   readonly symbol: string;
   /** Message from sender */
   readonly message?: string;
-  /** Requester's nametag (where tokens should be sent) */
-  readonly recipientNametag?: string;
   /** Original request ID from sender */
   readonly requestId: string;
   /** Timestamp */
   readonly timestamp: number;
   /** Current status */
   status: PaymentRequestStatus;
-  /** Custom metadata */
-  readonly metadata?: Record<string, unknown>;
 }
 
 /**

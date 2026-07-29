@@ -56,10 +56,6 @@ import type {
   TransportProvider,
   PeerInfo,
   IncomingTokenTransfer,
-  PaymentRequestPayload,
-  PaymentRequestResponsePayload,
-  IncomingPaymentRequest as TransportPaymentRequest,
-  IncomingPaymentRequestResponse as TransportPaymentRequestResponse,
 } from '../../transport';
 import type { DeliverOptions, DeliveryProvider, IncomingDelivery, WakeStream } from '../../transport/delivery-provider';
 import { TransportDeliveryAdapter } from './TransportDeliveryAdapter';
@@ -943,8 +939,6 @@ export class PaymentsModule {
 
   // Subscriptions
   private unsubscribeTransfers: (() => void) | null = null;
-  private unsubscribePaymentRequests: (() => void) | null = null;
-  private unsubscribePaymentRequestResponses: (() => void) | null = null;
 
   // Delivery port (sdk-changes S3/S7)
   /** The single delivery seam — an injected provider or the transport adapter. */
@@ -1175,10 +1169,6 @@ export class PaymentsModule {
     // Clean up previous subscriptions before re-initializing
     this.unsubscribeTransfers?.();
     this.unsubscribeTransfers = null;
-    this.unsubscribePaymentRequests?.();
-    this.unsubscribePaymentRequests = null;
-    this.unsubscribePaymentRequestResponses?.();
-    this.unsubscribePaymentRequestResponses = null;
     this.teardownDeliveryPump();
     this.teardownPaymentRequestPump();
 
@@ -1283,12 +1273,9 @@ export class PaymentsModule {
       );
     }
 
-    // Payment requests (sdk-changes S4): when the composed wallet-api port
-    // carries the §16 payment-request endpoints they ride wallet-api — the
-    // incoming `?since=<seq>` stream is polled (gap-free — §9; the poll is the
-    // correctness path) and the Nostr payment-request channel is NOT
-    // installed. Without the capability the transport subscriptions stay
-    // exactly as before (port selection, covenant §3.1-6).
+    // Payment requests ride wallet-api (sdk-changes S4). The incoming
+    // `?since=<seq>` stream is polled — gap-free per §9, and the poll is the
+    // correctness path.
     this.prBootstrapped = false;
     // #441: reset the deferred-paid journal so it reloads under the new identity's
     // storage key (the key bakes in chainPubkey). New mutations start a fresh
@@ -1302,20 +1289,6 @@ export class PaymentsModule {
       this.prPollTimer = setInterval(() => {
         this.pumpHealth.run('payment-requests', () => this.pumpPaymentRequests());
       }, DELIVERY_POLL_INTERVAL_MS);
-    } else {
-      // Subscribe to incoming payment requests (if supported)
-      if (deps.transport.onPaymentRequest) {
-        this.unsubscribePaymentRequests = deps.transport.onPaymentRequest((request) => {
-          this.handleIncomingPaymentRequest(request);
-        });
-      }
-
-      // Subscribe to payment request responses (if supported)
-      if (deps.transport.onPaymentRequestResponse) {
-        this.unsubscribePaymentRequestResponses = deps.transport.onPaymentRequestResponse((response) => {
-          this.handlePaymentRequestResponse(response);
-        });
-      }
     }
 
     // Subscribe to storage provider events (push-based sync)
@@ -1571,10 +1544,6 @@ export class PaymentsModule {
     }
     this.unsubscribeTransfers?.();
     this.unsubscribeTransfers = null;
-    this.unsubscribePaymentRequests?.();
-    this.unsubscribePaymentRequests = null;
-    this.unsubscribePaymentRequestResponses?.();
-    this.unsubscribePaymentRequestResponses = null;
     this.teardownDeliveryPump();
     this.teardownPaymentRequestPump();
     this.paymentRequestHandlers.clear();
@@ -2718,69 +2687,11 @@ export class PaymentsModule {
   ): Promise<PaymentRequestResult> {
     this.ensureInitialized();
 
-    // S4: with the wallet-api payment-request capability composed, the
-    // request rides the §16 endpoints — the Nostr channel is not used.
     const prApi = this.paymentRequestsApi();
-    if (prApi) {
-      return this.sendWalletApiPaymentRequest(prApi, recipientPubkeyOrNametag, request);
+    if (!prApi) {
+      return { success: false, error: 'Payment requests require the wallet-api payment-request capability' };
     }
-
-    if (!this.deps!.transport.sendPaymentRequest) {
-      return {
-        success: false,
-        error: 'Transport provider does not support payment requests',
-      };
-    }
-
-    try {
-      // Resolve recipient
-      const peerInfo = await this.deps!.transport.resolve?.(recipientPubkeyOrNametag) ?? null;
-      const recipientPubkey = this.resolveTransportPubkey(recipientPubkeyOrNametag, peerInfo);
-
-      // Build payload
-      const payload: PaymentRequestPayload = {
-        amount: request.amount,
-        coinId: request.coinId,
-        message: request.message,
-        recipientNametag: request.recipientNametag,
-        metadata: request.metadata,
-      };
-
-      // Send via transport
-      const eventId = await this.deps!.transport.sendPaymentRequest(recipientPubkey, payload);
-      const requestId = randomUUID();
-
-      // Track outgoing request
-      const outgoingRequest: OutgoingPaymentRequest = {
-        id: requestId,
-        eventId,
-        recipientPubkey,
-        recipientNametag: recipientPubkeyOrNametag.startsWith('@')
-          ? recipientPubkeyOrNametag.slice(1)
-          : undefined,
-        amount: request.amount,
-        coinId: request.coinId,
-        message: request.message,
-        createdAt: Date.now(),
-        status: 'pending',
-      };
-      this.outgoingPaymentRequests.set(requestId, outgoingRequest);
-
-      logger.debug('Payments', `Payment request sent: ${eventId}`);
-
-      return {
-        success: true,
-        requestId,
-        eventId,
-      };
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      logger.debug('Payments', `Failed to send payment request: ${errorMsg}`);
-      return {
-        success: false,
-        error: errorMsg,
-      };
-    }
+    return this.sendWalletApiPaymentRequest(prApi, recipientPubkeyOrNametag, request);
   }
 
   /**
@@ -3088,50 +2999,6 @@ export class PaymentsModule {
     }
   }
 
-  private handleIncomingPaymentRequest(transportRequest: TransportPaymentRequest): void {
-    // Check for duplicates
-    if (this.paymentRequests.find((r) => r.id === transportRequest.id)) {
-      return;
-    }
-
-    // Convert transport request to IncomingPaymentRequest
-    const coinId = transportRequest.request.coinId;
-    const registry = TokenRegistry.getInstance();
-    const coinDef = registry.getDefinition(coinId);
-
-    const request: IncomingPaymentRequest = {
-      id: transportRequest.id,
-      senderPubkey: transportRequest.senderTransportPubkey,
-      senderNametag: transportRequest.senderNametag,
-      amount: transportRequest.request.amount,
-      coinId,
-      symbol: coinDef?.symbol || coinId.slice(0, 8),
-      message: transportRequest.request.message,
-      recipientNametag: transportRequest.request.recipientNametag,
-      requestId: transportRequest.request.requestId,
-      timestamp: transportRequest.timestamp,
-      status: 'pending',
-      metadata: transportRequest.request.metadata,
-    };
-
-    // Add to list (newest first)
-    this.paymentRequests.unshift(request);
-
-    // Emit event
-    this.deps?.emitEvent('payment_request:incoming', request);
-
-    // Notify handlers
-    for (const handler of this.paymentRequestHandlers) {
-      try {
-        handler(request);
-      } catch (error) {
-        logger.debug('Payments', 'Payment request handler error:', error);
-      }
-    }
-
-    logger.debug('Payments', `Incoming payment request: ${request.id} for ${request.amount} ${request.symbol}`);
-  }
-
   // ===========================================================================
   // Public API - Outgoing Payment Requests
   // ===========================================================================
@@ -3228,19 +3095,6 @@ export class PaymentsModule {
     }
   }
 
-  private handlePaymentRequestResponse(transportResponse: TransportPaymentRequestResponse): void {
-    // Convert transport response to PaymentRequestResponse
-    this.dispatchPaymentRequestResponse({
-      id: transportResponse.id,
-      responderPubkey: transportResponse.responderTransportPubkey,
-      requestId: transportResponse.response.requestId,
-      responseType: transportResponse.response.responseType,
-      message: transportResponse.response.message,
-      transferId: transportResponse.response.transferId,
-      timestamp: transportResponse.timestamp,
-    });
-  }
-
   /**
    * Fold a payment-request response into the outgoing surface and notify —
    * shared by the transport subscription and the wallet-api outgoing refresh
@@ -3304,42 +3158,23 @@ export class PaymentsModule {
     const request = this.paymentRequests.find((r) => r.id === requestId);
     if (!request) return;
 
-    // S4: respond via the §16 endpoint. 'accepted' is a LOCAL UI state — the
-    // backend models open → paid|declined|expired only, so nothing is sent
-    // until the actual decision. Unlike the best-effort transport leg below,
-    // server rejections (403 non-addressee / 409 non-open) propagate.
     const prApi = this.paymentRequestsApi();
-    if (prApi) {
-      if (responseType === 'accepted') return;
-      if (responseType === 'paid') {
-        if (transferId === undefined) {
-          throw new SphereError('A paid response requires the fulfilling transferId (§16)', 'VALIDATION_ERROR');
-        }
-        await prApi.respondPaymentRequest(request.requestId, { action: 'paid', transferId });
-      } else {
-        await prApi.respondPaymentRequest(request.requestId, { action: 'declined' });
+    if (!prApi) return;
+
+    // 'accepted' is a LOCAL UI state: the backend models open →
+    // paid|declined|expired, so nothing is sent until the real decision.
+    if (responseType === 'accepted') return;
+
+    // Server rejections (403 non-addressee, 409 non-open) propagate.
+    if (responseType === 'paid') {
+      if (transferId === undefined) {
+        throw new SphereError('A paid response requires the fulfilling transferId (§16)', 'VALIDATION_ERROR');
       }
-      logger.debug('Payments', `Responded to payment request via wallet-api: ${responseType} for ${requestId}`);
-      return;
+      await prApi.respondPaymentRequest(request.requestId, { action: 'paid', transferId });
+    } else {
+      await prApi.respondPaymentRequest(request.requestId, { action: 'declined' });
     }
-
-    if (!this.deps?.transport.sendPaymentRequestResponse) {
-      logger.debug('Payments', 'Transport does not support sendPaymentRequestResponse');
-      return;
-    }
-
-    try {
-      const payload: PaymentRequestResponsePayload = {
-        requestId: request.requestId, // Original request ID from sender
-        responseType,
-        transferId,
-      };
-
-      await this.deps.transport.sendPaymentRequestResponse(request.senderPubkey, payload);
-      logger.debug('Payments', `Sent payment request response: ${responseType} for ${requestId}`);
-    } catch (error) {
-      logger.debug('Payments', 'Failed to send payment request response:', error);
-    }
+    logger.debug('Payments', `Responded to payment request: ${responseType} for ${requestId}`);
   }
 
   // ===========================================================================
