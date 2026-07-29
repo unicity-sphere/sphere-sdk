@@ -4245,9 +4245,6 @@ export class PaymentsModule {
     this.deps!.emitEvent('sync:started', { source: 'payments' });
     try {
       await this.save();
-      for (const [providerId] of this.getTokenStorageProviders()) {
-        this.deps!.emitEvent('sync:provider', { providerId, success: true, added: 0, removed: 0 });
-      }
       this.deps!.emitEvent('sync:completed', { source: 'payments', count: this.tokens.size });
       return { added: 0, removed: 0 };
     } catch (error) {
@@ -4531,6 +4528,13 @@ export class PaymentsModule {
   private teardownDeliveryPump(): void {
     this.deliveryWakeUnsub?.();
     this.deliveryWakeUnsub = null;
+    // A wake that landed within the debounce window must not survive teardown:
+    // destroy() leaves `deps` set, so a surviving callback would resyncInventory()
+    // into a wallet that was just cleared, or across an address switch.
+    if (this.inventoryDebounceTimer !== null) {
+      clearTimeout(this.inventoryDebounceTimer);
+      this.inventoryDebounceTimer = null;
+    }
     if (this.deliveryPollTimer !== null) {
       clearInterval(this.deliveryPollTimer);
       this.deliveryPollTimer = null;

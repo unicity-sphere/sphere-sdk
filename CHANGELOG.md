@@ -33,6 +33,18 @@ two debouncers doing *different* work — a storage-remote-update sync and an in
 inventory resync. With the storage-event debouncer gone the field has a single owner and is
 renamed `inventoryDebounceTimer`.
 
+**Also removed: the `sync:provider` event.** It reported per-provider merge counts that are now
+structurally zero, and it had **no subscriber** — not in the SDK, not in the Sphere frontend. A
+review caught the flush emitting `success: true` unconditionally even when a provider's `save()`
+failed; deleting the event is the honest fix, since `storage:degraded` already reports an
+active-provider failure.
+
+**Fixed in review (P1):** `teardownDeliveryPump()` did not clear the inventory-wake debounce. The
+only thing that used to clear it was `unsubscribeStorageEvents()`, removed here — so a wake
+landing within the debounce window could survive `destroy()` and resync into a wallet whose token
+map had just been cleared (`destroy()` leaves `deps` set), or cross an address switch. Now cleared
+alongside the rest of the wake/poll teardown, with a test verified RED without the fix.
+
 Three tests covering the merge path were deleted. The capabilities they touched survive on the
 `load()` path and stay covered there: history import by
 `PaymentsModule.history-sync.test.ts` ("should import `_history` entries from loaded TXF data")

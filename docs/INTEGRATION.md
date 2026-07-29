@@ -1414,7 +1414,6 @@ sphere.on('message:broadcast', (broadcast) => { });
 // Sync events
 sphere.on('sync:started', ({ source }) => { });
 sphere.on('sync:completed', ({ source, count }) => { });
-sphere.on('sync:provider', ({ providerId, success, added, removed, error }) => { });
 sphere.on('sync:error', ({ source, error }) => { });
 sphere.on('sync:remote-update', ({ providerId, name, sequence, cid, added, removed }) => { });
 

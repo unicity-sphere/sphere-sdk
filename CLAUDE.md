@@ -256,7 +256,6 @@ nullable getters — `null` unless the module was enabled in init options.
 | `nametag:registered` | `{ nametag, addressIndex }` | Unicity ID registered |
 | `nametag:recovered` | `{ nametag }` | Unicity ID recovered from Nostr on import |
 | `address:activated` | `{ address: TrackedAddress }` | New address tracked |
-| `sync:provider` | `{ providerId, success, added?, removed?, error? }` | Per-provider sync result |
 | `payment_request:incoming` | `IncomingPaymentRequest` | Received payment request |
 | `invoice:created` | `{ invoiceId, confirmed }` | Invoice token minted or imported |
 | `invoice:payment` | `{ invoiceId, transfer, paymentDirection, confirmed }` | Payment attributed to invoice |
