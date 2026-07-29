@@ -93,12 +93,6 @@ import { PumpHealth } from './pump-health';
 import { timeoutSignal } from '../../core/timeout';
 import { randomUUID } from '../../core/uuid';
 import { decodeTokenBlob, encodeTokenBlob, unwrapTokenBlobBytes, TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
-// LEGACY DRAIN — the only remaining payments→accounting dependency. Sends no
-// longer produce on-chain memos, but an intent persisted by an earlier version
-// did, and resume must re-derive byte-identical transaction data or the
-// match-verify fails (double-pay on a direct leg, frozen funds on a split leg).
-// Delete once no pre-detachment intent can still be open.
-import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
 // =============================================================================
 // Transaction History Entry
@@ -796,10 +790,6 @@ interface IntentPayloadV1 {
   /** Requested amount (decimal string). */
   amount: string;
   memo?: string;
-  /** Legacy drain — read by resume only; new sends never set these. */
-  invoiceRefundAddress?: string;
-  /** Legacy drain — read by resume only; new sends never set these. */
-  invoiceContact?: { address: string; url?: string };
   /** Genesis token ids transferred whole, in execution order. */
   direct: string[];
   /** The at-most-one split (ARCHITECTURE §7). */
@@ -6011,10 +6001,6 @@ export class PaymentsModule {
 
     const serverApply = delivery.custody === 'inventory';
     const recipientChainPubkey = hexToBytes(payload.recipient);
-    const memoData =
-      parseInvoiceMemoForOnChain(payload.memo, payload.invoiceRefundAddress, payload.invoiceContact) ??
-      undefined;
-
     const deliverBlob = async (tokenBlobHex: string, opIndex: number): Promise<void> => {
       await this.savePendingV2Delivery({
         transferId,
@@ -6061,7 +6047,7 @@ export class PaymentsModule {
         const source = await engine.decodeToken(await provider.getToken(genesisId));
         try {
           const finished = await engine.transfer(
-            { token: source, recipientPubkey: recipientChainPubkey, data: memoData },
+            { token: source, recipientPubkey: recipientChainPubkey },
             // (transferId, opIndex) pairing replayed from the intent's persisted order (§8.1)
             { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex }
           );
@@ -6111,7 +6097,6 @@ export class PaymentsModule {
                   recipientPubkey: recipientChainPubkey,
                   coinId: payload.coinId,
                   amount: BigInt(payload.split.splitAmount),
-                  data: memoData,
                 },
                 {
                   recipientPubkey: selfChainPubkey,

@@ -29,15 +29,17 @@ advance to PARTIAL/COVERED from inbound money, and `invoice:payment` / `invoice:
 fire for it. Attribution of payments sent *before* this change is unaffected. This is a
 deliberate step in retiring accounting, not an oversight.
 
-**Deliberately retained — a money-safety constraint.** The *resume* path still derives the memo
-from a persisted intent, and `IntentPayloadV1` still carries `invoiceRefundAddress` /
-`invoiceContact`. The memo is an **input to the transaction**, not metadata: resume must rebuild
-byte-identical transaction data or `getInclusionProof` match-verify fails. Dropping it would make
-a direct leg look like it was lost to a foreign transaction (the linked payment request reverts to
-payable and is **re-paid in full** — a double pay) and would wedge a split leg on
-`SplitCheckpointLostError` with the intent open forever. This is the one remaining
-payments→accounting import, marked in the source, and is removable once no pre-detachment intent
-can still be open.
+**Fully detached.** `modules/payments/` now imports nothing from `modules/accounting/`.
+`IntentPayloadV1.invoiceRefundAddress` / `.invoiceContact` are gone and the resume path no longer
+derives a memo.
+
+The memo is an input to the transaction, so in principle a resume must rebuild byte-identical
+data — an intent persisted with an invoice memo would otherwise match-verify against a different
+transaction hash. That window is empty in practice: the only producer of an `INV:` memo is
+`accounting.payInvoice`, whose sole in-repo caller is `SwapModule`, which the Sphere wallet does
+not use (0 references). The Connect invoice intents are not enabled. The memo pattern requires
+exactly 64–68 hex characters, so it cannot arise by hand. No shipped path can have created such
+an intent.
 
 Five tests covered removed behavior. One was re-pointed — the send path now asserts that **no**
 memo reaches the chain, not even an invoice-shaped one, which is the whole contract. Four
