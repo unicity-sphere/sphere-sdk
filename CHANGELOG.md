@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — accounting detached from payments; sends no longer carry on-chain memos
+
+`PaymentsModule` no longer produces on-chain memos. `parseInvoiceMemoForOnChain` was the sole
+producer, and it only ever encoded invoice-shaped memos — plain memos were already
+transport-only. **Every memo is now transport-only.**
+
+**Breaking:**
+
+- `TransferRequest.invoiceRefundAddress` and `TransferRequest.invoiceContact` are removed.
+- `PayInvoiceParams.refundAddress` and `PayInvoiceParams.contact` are removed. Both were
+  documented as *"embedded in the on-chain TransferMessagePayload"*; with no on-chain message
+  they were validated and then discarded. Removing them makes that a compile error rather than a
+  silent no-op, and drops `INVOICE_INVALID_REFUND_ADDRESS` / `INVOICE_INVALID_CONTACT` from
+  `payInvoice`'s failure modes.
+
+**Functional consequence, stated plainly:** `AccountingModule` attributes an incoming invoice
+payment by reading the on-chain memo (`engine.readMemo`). Nothing writes one any more, so
+**recipient-side invoice attribution no longer works for new payments** — invoices will not
+advance to PARTIAL/COVERED from inbound money, and `invoice:payment` / `invoice:covered` will not
+fire for it. Attribution of payments sent *before* this change is unaffected. This is a
+deliberate step in retiring accounting, not an oversight.
+
+**Fully detached.** `modules/payments/` now imports nothing from `modules/accounting/`.
+`IntentPayloadV1.invoiceRefundAddress` / `.invoiceContact` are gone and the resume path no longer
+derives a memo.
+
+The memo is an input to the transaction, so in principle a resume must rebuild byte-identical
+data — an intent persisted with an invoice memo would otherwise match-verify against a different
+transaction hash. That window is empty in practice: the only producer of an `INV:` memo is
+`accounting.payInvoice`, whose sole in-repo caller is `SwapModule`, which the Sphere wallet does
+not use (0 references). The Connect invoice intents are not enabled. The memo pattern requires
+exactly 64–68 hex characters, so it cannot arise by hand. No shipped path can have created such
+an intent.
+
+Five tests covered removed behavior. One was re-pointed — the send path now asserts that **no**
+memo reaches the chain, not even an invoice-shaped one, which is the whole contract. Four
+`payInvoice` validation tests were deleted: they asserted runtime rejection of parameters that no
+longer exist, and the type system now rejects them at compile time. No test was weakened.
+
 ### Removed — the Nostr payment-request channel
 
 Payment requests ride wallet-api (sdk-changes S4). The Nostr fallback is gone, so

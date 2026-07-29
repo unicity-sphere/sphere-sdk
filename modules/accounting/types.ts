@@ -710,46 +710,6 @@ export interface PayInvoiceParams {
   readonly amount?: string;
   /** Optional free text appended to memo */
   readonly freeText?: string;
-  /**
-   * Optional refund address (DIRECT:// format) embedded in the on-chain
-   * TransferMessagePayload. Provides an explicit return destination for the
-   * payer. Essential for masked-predicate senders (one-time address that
-   * becomes unresolvable), but also usable by unmasked senders who want
-   * returns routed to a different address. When present, takes priority
-   * over senderAddress for per-sender balance keying.
-   *
-   * This address is NOT included in the transport memo (privacy: transport
-   * memos are human-readable). It is only recorded on-chain in the
-   * structured `inv.ra` field of the TransferMessagePayload.
-   *
-   * Privacy note: while the refund address is not in the memo, it IS the
-   * recipient of auto-return transfers and therefore visible in the transport
-   * layer's addressing metadata (Nostr NIP-04/NIP-17 envelope), as with any
-   * transfer recipient.
-   *
-   * Auto-return destination priority: refundAddress → senderAddress → fail.
-   */
-  readonly refundAddress?: string;
-  /**
-   * Optional contact info embedded in the on-chain TransferMessagePayload
-   * (`inv.ct` field). Allows the invoice target to reach the payer for
-   * future communication: receipts (after close), cancellation notices,
-   * and payment reminders.
-   *
-   * `address`: a reachable DIRECT:// address for the payer (required within the object).
-   * `url`: optional non-Nostr transport URL (https:// or wss://, max 2048 chars).
-   *
-   * NOT included in the transport memo (same privacy model as refund address).
-   * Contact is purely informational — it does not affect auto-return routing,
-   * balance computation, or per-sender keying.
-   *
-   * When not provided, auto-populated from `identity.directAddress` at runtime
-   * (see §4.7). This ensures every outbound invoice payment carries contact info.
-   *
-   * Contact resolution priority (application-level recommendation):
-   * `contacts[0].address → refundAddress → senderAddress → null`
-   */
-  readonly contact?: { address: string; url?: string };
 }
 
 /**

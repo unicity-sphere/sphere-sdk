@@ -93,7 +93,6 @@ import { PumpHealth } from './pump-health';
 import { timeoutSignal } from '../../core/timeout';
 import { randomUUID } from '../../core/uuid';
 import { decodeTokenBlob, encodeTokenBlob, unwrapTokenBlobBytes, TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
-import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
 // =============================================================================
 // Transaction History Entry
@@ -791,8 +790,6 @@ interface IntentPayloadV1 {
   /** Requested amount (decimal string). */
   amount: string;
   memo?: string;
-  invoiceRefundAddress?: string;
-  invoiceContact?: { address: string; url?: string };
   /** Genesis token ids transferred whole, in execution order. */
   direct: string[];
   /** The at-most-one split (ARCHITECTURE §7). */
@@ -1834,12 +1831,6 @@ export class PaymentsModule {
       const recipientNametag = peerInfo?.nametag
         || (request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined);
 
-      const onChainMessage = parseInvoiceMemoForOnChain(
-        request.memo,
-        request.invoiceRefundAddress,
-        request.invoiceContact,
-      );
-
       {
         // =================================================================
         // v2 ENGINE MODE (sender-driven): engine.transfer hands the recipient
@@ -1857,11 +1848,6 @@ export class PaymentsModule {
         const serverApply = !!walletApi && delivery.custody === 'inventory';
         const recipientChainPubkeyHex = peerInfo.chainPubkey;
         const recipientChainPubkey = hexToBytes(recipientChainPubkeyHex);
-        // On-chain memo: the structured invoice ref ({inv:{id,dir}}) for invoice
-        // payments, else null — plain memos stay transport-only (privacy).
-        // parseInvoiceMemoForOnChain already produced the encoded bytes (or null).
-        const memoData = onChainMessage ?? undefined;
-
         // S2: blobs are fetched on demand — lazy inventory records selected by
         // coin-selection are materialized (getToken + engine decode) only now.
         await this.materializeSelectedSources(splitPlan);
@@ -1983,7 +1969,7 @@ export class PaymentsModule {
           try {
             if (op.kind === 'direct') {
               finished = await engine.transfer(
-                { token: op.sdkToken, recipientPubkey: recipientChainPubkey, data: memoData },
+                { token: op.sdkToken, recipientPubkey: recipientChainPubkey },
                 { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id, opIndex: op.opIndex },
               );
             } else {
@@ -1995,7 +1981,7 @@ export class PaymentsModule {
                 {
                   token: op.sdkToken,
                   outputs: [
-                    { recipientPubkey: recipientChainPubkey, coinId: request.coinId, amount: op.deliveredAmount, data: memoData },
+                    { recipientPubkey: recipientChainPubkey, coinId: request.coinId, amount: op.deliveredAmount },
                     { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: op.remainderAmount },
                   ],
                 },
@@ -2587,10 +2573,6 @@ export class PaymentsModule {
       coinId: request.coinId,
       amount: request.amount,
       ...(request.memo !== undefined ? { memo: request.memo } : {}),
-      ...(request.invoiceRefundAddress !== undefined
-        ? { invoiceRefundAddress: request.invoiceRefundAddress }
-        : {}),
-      ...(request.invoiceContact !== undefined ? { invoiceContact: request.invoiceContact } : {}),
       direct: splitPlan.tokensToTransferDirectly.map(genesisIdOf),
       ...(splitPlan.requiresSplit && splitPlan.tokenToSplit
         ? {
@@ -6019,10 +6001,6 @@ export class PaymentsModule {
 
     const serverApply = delivery.custody === 'inventory';
     const recipientChainPubkey = hexToBytes(payload.recipient);
-    const memoData =
-      parseInvoiceMemoForOnChain(payload.memo, payload.invoiceRefundAddress, payload.invoiceContact) ??
-      undefined;
-
     const deliverBlob = async (tokenBlobHex: string, opIndex: number): Promise<void> => {
       await this.savePendingV2Delivery({
         transferId,
@@ -6069,7 +6047,7 @@ export class PaymentsModule {
         const source = await engine.decodeToken(await provider.getToken(genesisId));
         try {
           const finished = await engine.transfer(
-            { token: source, recipientPubkey: recipientChainPubkey, data: memoData },
+            { token: source, recipientPubkey: recipientChainPubkey },
             // (transferId, opIndex) pairing replayed from the intent's persisted order (§8.1)
             { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex }
           );
@@ -6119,7 +6097,6 @@ export class PaymentsModule {
                   recipientPubkey: recipientChainPubkey,
                   coinId: payload.coinId,
                   amount: BigInt(payload.split.splitAmount),
-                  data: memoData,
                 },
                 {
                   recipientPubkey: selfChainPubkey,
