@@ -2061,46 +2061,6 @@ export class AccountingModule {
 
     const asset = target.assets[assetIndex]!;
 
-    // §8.5 step 5: refundAddress must be a valid DIRECT:// address when provided
-    if (params.refundAddress !== undefined) {
-      if (
-        !params.refundAddress.startsWith('DIRECT://') ||
-        params.refundAddress.length <= 'DIRECT://'.length
-      ) {
-        throw new SphereError(
-          'refundAddress must be a valid DIRECT:// address',
-          'INVOICE_INVALID_REFUND_ADDRESS',
-        );
-      }
-    }
-
-    // §8.5 step 6: contact fields must be valid when provided
-    if (params.contact !== undefined) {
-      const { address, url } = params.contact;
-      if (
-        typeof address !== 'string' ||
-        !address.startsWith('DIRECT://') ||
-        address.length <= 'DIRECT://'.length
-      ) {
-        throw new SphereError(
-          'contact.address must be a valid DIRECT:// address',
-          'INVOICE_INVALID_CONTACT',
-        );
-      }
-      if (url !== undefined) {
-        if (
-          typeof url !== 'string' ||
-          (!url.startsWith('https://') && !url.startsWith('wss://')) ||
-          url.length > 2048
-        ) {
-          throw new SphereError(
-            'contact.url must start with https:// or wss:// and be at most 2048 characters',
-            'INVOICE_INVALID_CONTACT',
-          );
-        }
-      }
-    }
-
     // Asset must have a coin entry to determine coinId
     if (!asset.coin) {
       throw new SphereError(
@@ -2110,13 +2070,9 @@ export class AccountingModule {
     }
     const [coinId, requestedAmountStr] = asset.coin;
 
-    // §4.7: Auto-populate contact from identity.directAddress when not explicitly provided.
     if (!deps.identity.directAddress) {
       throw new SphereError('directAddress required for invoice payments', 'NOT_INITIALIZED');
     }
-    const effectiveContact: { address: string; url?: string } = params.contact ?? {
-      address: deps.identity.directAddress,
-    };
 
     // §8.5 step 2 + BUG-002 Fix 2: Hold the gate across terminal check, balance
     // computation, send(), AND provisional ledger write. This prevents concurrent
@@ -2171,14 +2127,16 @@ export class AccountingModule {
         );
       }
 
+      // Payments no longer attaches an on-chain invoice reference, so the memo
+      // travels transport-only and the recipient cannot attribute this payment
+      // to the invoice automatically. See CHANGELOG "accounting detached from
+      // payments".
       // §5.9: Apply 60-second timeout to send() within the gate (matches returnInvoicePayment)
       const sendPromise = deps.payments.send({
         recipient: target.address,
         amount: sendAmount,
         coinId,
         memo,
-        invoiceRefundAddress: params.refundAddress,
-        invoiceContact: effectiveContact,
       });
 
       let timer: ReturnType<typeof setTimeout> | undefined;

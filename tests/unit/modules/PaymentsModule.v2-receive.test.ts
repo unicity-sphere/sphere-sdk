@@ -263,19 +263,19 @@ describe('send — v2 engine path, whole-token (B1)', () => {
     expect(recipient.module.getTokens()[0].amount).toBe('300');
   });
 
-  it('carries the structured invoice ref on-chain for an invoice-memo payment', async () => {
+  it('puts NO memo on-chain, not even an invoice-shaped one', async () => {
     const { module, engine, transport } = setup();
     await deliver(module, await v2Payload(engine, UCT, 100n));
 
-    const invoiceId = 'ab'.repeat(32); // 64-char hex invoice id
+    // An INV: memo used to be encoded into the transaction's on-chain data.
+    // Payments is detached from accounting, so nothing produces on-chain memos
+    // now — every memo is transport-only. This is the whole contract.
+    const invoiceId = 'ab'.repeat(32);
     await module.send({ recipient: '@bob', amount: '100', coinId: UCT, memo: `INV:${invoiceId}:F` });
 
-    // The finished token's on-chain memo decodes to the structured invoice ref.
     const sentPayload = (transport.sendTokenTransfer as any).mock.calls[0][1];
     const token = await engine.decodeToken(decodeTokenBlob(hexToBytes(sentPayload.tokenBlob)));
-    const onChainMemo = engine.readMemo(token);
-    expect(onChainMemo).not.toBeNull();
-    expect(decodeTransferMessage(onChainMemo)?.inv?.id?.toLowerCase()).toBe(invoiceId);
+    expect(engine.readMemo(token)).toBeNull();
   });
 
   it('keeps a plain memo transport-only (no on-chain memo, for privacy)', async () => {

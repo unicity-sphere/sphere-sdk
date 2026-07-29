@@ -149,10 +149,6 @@ export interface TransferRequest {
   readonly addressMode?: AddressMode;
   /** @deprecated v2 has a single engine-driven send path; this field is accepted for backwards-compat but IGNORED. */
   readonly transferMode?: TransferMode;
-  /** Invoice refund address (DIRECT://) — embedded in on-chain message for return routing */
-  readonly invoiceRefundAddress?: string;
-  /** Invoice contact info — embedded in on-chain message for receipt/notice delivery */
-  readonly invoiceContact?: { address: string; url?: string };
 }
 
 /**

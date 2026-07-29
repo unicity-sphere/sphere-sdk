@@ -205,22 +205,6 @@ describe('AccountingModule.payInvoice()', () => {
     ).rejects.toMatchObject({ code: 'INVOICE_INVALID_ASSET_INDEX' });
   });
 
-  // UT-PAY-007
-  it('UT-PAY-007: throws INVOICE_INVALID_REFUND_ADDRESS for invalid refund address', async () => {
-    const terms = makeTerms();
-    const { module, mocks } = createTestAccountingModule();
-    mocks.payments._tokens = [makeInvoiceToken(terms)];
-    await module.load();
-
-    await expect(
-      module.payInvoice(INVOICE_ID, {
-        targetIndex: 0,
-        assetIndex: 0,
-        amount: '1000',
-        refundAddress: 'invalid-not-direct',
-      }),
-    ).rejects.toMatchObject({ code: 'INVOICE_INVALID_REFUND_ADDRESS' });
-  });
 
   // UT-PAY-008
   it('UT-PAY-008: throws INVOICE_NOT_FOUND for unknown invoiceId', async () => {
@@ -247,57 +231,8 @@ describe('AccountingModule.payInvoice()', () => {
     expect(memo).toContain(hashInvoiceId(INVOICE_ID));
   });
 
-  // UT-PAY-010
-  it('UT-PAY-010: contact auto-populated from identity.directAddress', async () => {
-    const terms = makeTerms();
-    const { module, mocks } = createTestAccountingModule();
-    mocks.payments._tokens = [makeInvoiceToken(terms)];
-    await module.load();
 
-    // No contact param provided → should auto-populate from identity
-    await module.payInvoice(INVOICE_ID, { targetIndex: 0, amount: '5000000' });
 
-    const sendCall = mocks.payments.send.mock.calls[0]![0] as Record<string, unknown>;
-    const contact = sendCall.invoiceContact as { address: string } | undefined;
-    expect(contact).toBeDefined();
-    // Auto-populated from DEFAULT_TEST_IDENTITY.directAddress
-    expect(contact!.address).toBe(DEFAULT_TEST_IDENTITY.directAddress);
-  });
-
-  // UT-PAY-011
-  it('UT-PAY-011: throws INVOICE_INVALID_CONTACT for missing DIRECT:// in contact address', async () => {
-    const terms = makeTerms();
-    const { module, mocks } = createTestAccountingModule();
-    mocks.payments._tokens = [makeInvoiceToken(terms)];
-    await module.load();
-
-    await expect(
-      module.payInvoice(INVOICE_ID, {
-        targetIndex: 0,
-        amount: '1000',
-        contact: { address: 'not-a-direct-address' },
-      }),
-    ).rejects.toMatchObject({ code: 'INVOICE_INVALID_CONTACT' });
-  });
-
-  // UT-PAY-012
-  it('UT-PAY-012: throws INVOICE_INVALID_CONTACT for contact URL not https:// or wss://', async () => {
-    const terms = makeTerms();
-    const { module, mocks } = createTestAccountingModule();
-    mocks.payments._tokens = [makeInvoiceToken(terms)];
-    await module.load();
-
-    await expect(
-      module.payInvoice(INVOICE_ID, {
-        targetIndex: 0,
-        amount: '1000',
-        contact: {
-          address: 'DIRECT://valid_contact_addr_xyz',
-          url: 'http://unsafe.example.com',
-        },
-      }),
-    ).rejects.toMatchObject({ code: 'INVOICE_INVALID_CONTACT' });
-  });
 
   // UT-PAY-013
   it('UT-PAY-013: freeText is included in the memo', async () => {
