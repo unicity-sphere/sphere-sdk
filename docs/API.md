@@ -453,7 +453,7 @@ Add a token to the wallet.
 
 - **Tombstone check**: Rejected if exact `(tokenId, stateHash)` is tombstoned.
 - **Duplicate check**: Rejected if same composite key already exists.
-- **State replacement**: If same `tokenId` with different `stateHash`, archives old state and adds new.
+- **State replacement**: If same `tokenId` with different `stateHash`, the old state is dropped and the new one added.
 
 Returns `true` if added, `false` if rejected.
 
@@ -463,7 +463,7 @@ Update an existing token. Matches by genesis tokenId or `token.id`. Falls back t
 
 #### `removeToken(tokenId: string, excludeReservationId?: string): Promise<void>`
 
-Remove a token. Archives it first and creates a tombstone `(tokenId, stateHash)`.
+Remove a token and create a tombstone `(tokenId, stateHash)` so the same state cannot be re-added.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|

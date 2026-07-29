@@ -5,8 +5,6 @@
  * Includes:
  * - Token CRUD operations
  * - Tombstones for sync
- * - Archived tokens (spent history)
- * - Forked tokens (alternative histories)
  * - Transaction history
  * - Nametag storage
  */
@@ -830,7 +828,7 @@ export class PaymentsModule {
   // Token State
   private tokens: Map<string, Token> = new Map();
 
-  // Repository State (tombstones, archives, forked, history)
+  // Repository State (tombstones, history)
   private tombstones: TombstoneEntry[] = [];
   // O(1) lookup set derived from tombstones array. Rebuilt via rebuildTombstoneKeySet().
   private tombstoneKeySet: Set<string> = new Set();
@@ -1266,7 +1264,7 @@ export class PaymentsModule {
       // before parsing tokens — otherwise tokens get fallback truncated coinId values
       await TokenRegistry.waitForReady();
 
-      // Load metadata from TokenStorageProviders (archived, tombstones, forked)
+      // Load metadata from TokenStorageProviders (tombstones, nametags, history)
       // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
       const providers = this.getTokenStorageProviders();
       let loadedProvider: TokenStorageProvider<TxfStorageDataBase> | null = null;
@@ -2447,7 +2445,7 @@ export class PaymentsModule {
       const blob = await provider.getToken(genesisId);
       tw.sdkToken = await engine.decodeToken(blob);
       // Backfill sdkData so the downstream machinery (tombstones, restore
-      // isSpent checks, archive) sees a complete token record.
+      // isSpent checks) sees a complete token record.
       (tw.uiToken as { sdkData?: string }).sdkData = bytesToHex(encodeTokenBlob(blob));
       const live = this.tokens.get(tw.uiToken.id);
       if (live && live !== tw.uiToken) {
@@ -3403,7 +3401,7 @@ export class PaymentsModule {
    * - **Tombstoned** — rejected if the exact `(tokenId, stateHash)` pair has a tombstone.
    * - **Exact duplicate** — rejected if a token with the same composite key already exists.
    * - **State replacement** — if the same `tokenId` exists with a *different* `stateHash`,
-   *   the old state is archived and replaced with the incoming one.
+   *   the old state is dropped and replaced with the incoming one.
    *
    * @param token - The token to add.
    * @param opts - `criticalSave: true` on user-facing flows (mint/send): a
@@ -3462,7 +3460,7 @@ export class PaymentsModule {
         }
 
         // CASE 2: Different stateHash - this is a newer state of the token
-        // Remove old state (it will be archived) and add new state
+        // Replace the old state with the newer one
         if (incomingStateHash && existingStateHash && incomingStateHash !== existingStateHash) {
           logger.debug('Payments', `Token ${incomingTokenId?.slice(0, 8)}... state updated: ${existingStateHash.slice(0, 8)}... -> ${incomingStateHash.slice(0, 8)}...`);
           this.tokens.delete(existingId);
@@ -3548,7 +3546,6 @@ export class PaymentsModule {
       }
     }
 
-    // Archive the updated token
 
     await this.save();
 
@@ -3561,8 +3558,8 @@ export class PaymentsModule {
   /**
    * Remove a token from the wallet.
    *
-   * The token is archived first, then a tombstone `(tokenId, stateHash)` is
-   * created to prevent re-addition via Nostr re-delivery. A `SENT` history
+   * A tombstone `(tokenId, stateHash)` is created to prevent re-addition via
+   * a re-delivery. A `SENT` history
    * entry is created unless `skipHistory` is `true`.
    *
    * @param tokenId - Local UUID of the token to remove.
@@ -3617,7 +3614,6 @@ export class PaymentsModule {
     this.reservationLedger.cancelForToken(tokenId, excludeReservationId);
     this.parsedTokenCache.delete(tokenId);
 
-    // Archive before removing
 
     // Remove from active tokens
     this.tokens.delete(tokenId);
@@ -3731,10 +3727,6 @@ export class PaymentsModule {
       logger.debug('Payments', `Pruned tombstones from ${originalCount} to ${this.tombstones.length}`);
     }
   }
-
-  // ===========================================================================
-  // Public API - Archives
-  // ===========================================================================
 
   // ===========================================================================
   // Public API - Forked Tokens
@@ -6029,10 +6021,6 @@ export class PaymentsModule {
       tokenId: payload.direct[0] ? `v2_${payload.direct[0]}` : undefined,
     });
   }
-
-  // ===========================================================================
-  // Private: Archive
-  // ===========================================================================
 
   // ===========================================================================
   // Private: Storage
