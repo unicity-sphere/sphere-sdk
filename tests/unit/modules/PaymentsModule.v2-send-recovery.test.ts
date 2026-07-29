@@ -26,6 +26,7 @@ import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 import { encodeTokenBlob } from '../../../token-engine/token-blob';
 import { bytesToHex } from '../../../core/crypto';
 import type { V2TransferPayload } from '../../../types/v2-transfer';
+import { createMemoryDelivery } from '../../support/memory-delivery';
 
 const FAKE_PRIVATE_KEY = 'a'.repeat(64);
 const FAKE_PUBKEY = '02' + 'b'.repeat(64);
@@ -115,13 +116,15 @@ function setup(engine = new FakeTokenEngine()) {
   const emitEvent = vi.fn();
   const transport = mockTransport();
   const storage = mockStorage();
+  const delivery = createMemoryDelivery();
   const deps: PaymentsModuleDependencies = {
+    delivery,
     identity: mockIdentity(), storage: storage.provider, tokenStorageProviders: tsp,
     transport, oracle: mockOracle(), emitEvent, tokenEngine: engine,
   };
   const module = createPaymentsModule({ debug: false });
   module.initialize(deps);
-  return { module, engine, emitEvent, transport, storage, tokenStorage, deps };
+  return { module, engine, emitEvent, transport, storage, tokenStorage, deps, delivery };
 }
 
 async function v2Payload(engine: FakeTokenEngine, amount: bigint): Promise<V2TransferPayload> {
@@ -134,9 +137,7 @@ async function v2Payload(engine: FakeTokenEngine, amount: bigint): Promise<V2Tra
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 function deliver(module: ReturnType<typeof setup>['module'], payload: V2TransferPayload, id = 't1') {
-  return (module as any).handleIncomingTransfer({
-    id, senderTransportPubkey: SENDER_TRANSPORT_PUBKEY, payload, timestamp: 0,
-  });
+  return (module as any).handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
 }
 
 function journal(storage: { map: Map<string, string> }): Array<{ transferId: string; tokenBlob: string; recipientPubkey: string }> {
@@ -146,9 +147,9 @@ function journal(storage: { map: Map<string, string> }): Array<{ transferId: str
 
 describe('send() — failure recovery (v2)', () => {
   it('transport failure AFTER engine.transfer (§3.1 #621): send resolves delivery-pending, source consumed, blob journaled', async () => {
-    const { module, engine, transport, storage } = setup();
+    const { module, engine, delivery, storage } = setup();
     await deliver(module, await v2Payload(engine, 100n));
-    (transport.sendTokenTransfer as any).mockRejectedValueOnce(new Error('relay down'));
+    delivery.failNext(new Error('relay down'));
 
     // Covenant: a post-certification delivery failure must NOT fail the sender.
     const result = await module.send({ recipient: '@bob', amount: '100', coinId: UCT });
@@ -167,27 +168,24 @@ describe('send() — failure recovery (v2)', () => {
   });
 
   it('replayPendingV2Deliveries delivers the journaled blob and clears the journal', async () => {
-    const { module, engine, transport, storage } = setup();
+    const { module, engine, delivery, storage } = setup();
     await deliver(module, await v2Payload(engine, 100n));
-    (transport.sendTokenTransfer as any).mockRejectedValueOnce(new Error('relay down'));
+    delivery.failNext(new Error('relay down'));
     const result = await module.send({ recipient: '@bob', amount: '100', coinId: UCT });
     expect(result.deliveryPending).toBe(true);
     expect(journal(storage)).toHaveLength(1);
     const journaledBlob = journal(storage)[0].tokenBlob;
 
-    (transport.sendTokenTransfer as any).mockResolvedValue(undefined);
-    await (module as any).replayPendingV2Deliveries();
+        await (module as any).replayPendingV2Deliveries();
 
     expect(journal(storage)).toHaveLength(0);
-    const replayCall = (transport.sendTokenTransfer as any).mock.calls.at(-1);
-    expect(replayCall[1].type).toBe('V2_TRANSFER');
-    expect(replayCall[1].tokenBlob).toBe(journaledBlob);
+    expect(delivery.lastBlobHex()).toBe(journaledBlob);
   });
 
   it('split: change token is stored and the recipient blob journaled even when delivery fails', async () => {
-    const { module, engine, transport, storage } = setup();
+    const { module, engine, delivery, storage } = setup();
     await deliver(module, await v2Payload(engine, 1000n));
-    (transport.sendTokenTransfer as any).mockRejectedValueOnce(new Error('relay down'));
+    delivery.failNext(new Error('relay down'));
 
     // Covenant §3.1 (#621): delivery failure must not fail the sender.
     const result = await module.send({ recipient: '@bob', amount: '300', coinId: UCT });
@@ -253,15 +251,69 @@ describe('load() — crash recovery of stuck-transferring tokens (v2)', () => {
   });
 });
 
+describe('journaled deliveries survive a wallet composed without a delivery rail', () => {
+  it('does not burn the poison budget across repeated loads, and delivers once a rail appears', async () => {
+    // A wallet can legitimately run with no delivery provider (non-payment use:
+    // DMs, group chat, market). Replaying a journaled blob against a missing rail
+    // must NOT count as a delivery attempt — 6 such loads would mark the entry
+    // `undeliverable`, and already-certified funds would never auto-deliver again.
+    const engine = new FakeTokenEngine();
+    const tsp = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
+    tsp.set('local', mockTokenStorage());
+    const storage = mockStorage();
+    const railless = createPaymentsModule({ debug: false });
+    railless.initialize({
+      identity: mockIdentity(), storage: storage.provider, tokenStorageProviders: tsp,
+      transport: mockTransport(), oracle: mockOracle(), emitEvent: vi.fn(), tokenEngine: engine,
+    } as PaymentsModuleDependencies);
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    (railless as any).replayBackoffBaseMs = 0; // no real sleeps between retries
+    await (railless as any).savePendingV2Delivery({
+      transferId: 'tx-stranded',
+      recipientPubkey: BOB_CHAIN_PUBKEY,
+      tokenBlob: 'ab'.repeat(40),
+      createdAt: Date.now(),
+    });
+
+    // Drive the replay DIRECTLY, more times than MAX_DELIVERY_REPLAY_ATTEMPTS (6).
+    // load() fires it as `void …catch()`, so awaiting load() would not await the
+    // replay and the test would pass without exercising anything.
+    await railless.load();
+    for (let i = 0; i < 8; i++) await (railless as any).replayPendingV2Deliveries();
+
+    const entries = journal(storage);
+    expect(entries).toHaveLength(1);
+    // RED without the guard: attempts climbs to 6 and undeliverable flips true.
+    expect((entries[0] as any).undeliverable).toBeFalsy();
+    expect((entries[0] as any).attempts ?? 0).toBe(0);
+
+    // Composing a rail later still delivers the certified blob.
+    const delivery = createMemoryDelivery();
+    const withRail = createPaymentsModule({ debug: false });
+    withRail.initialize({
+      delivery,
+      identity: mockIdentity(), storage: storage.provider, tokenStorageProviders: tsp,
+      transport: mockTransport(), oracle: mockOracle(), emitEvent: vi.fn(), tokenEngine: engine,
+    } as PaymentsModuleDependencies);
+    await withRail.load();
+    await (withRail as any).replayPendingV2Deliveries();
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    expect(delivery.delivered).toHaveLength(1);
+    expect(journal(storage)).toHaveLength(0);
+  });
+});
+
 describe('handleV2Transfer — storage rejection gates events (v2)', () => {
   it('a tombstoned re-delivery emits NO transfer:incoming and writes NO history', async () => {
-    const { module, engine, emitEvent, transport } = setup();
+    const { module, engine, emitEvent, delivery } = setup();
     const payload = await v2Payload(engine, 100n);
     await deliver(module, payload);
     // Spend it: the send tombstones the exact received state.
     await module.send({ recipient: '@bob', amount: '100', coinId: UCT });
     expect(module.getTokens()).toHaveLength(0);
-    expect(transport.sendTokenTransfer).toHaveBeenCalled();
+    expect(delivery.delivered.length).toBeGreaterThan(0);
     emitEvent.mockClear();
 
     // Relay re-delivers the original transfer after the state was spent.

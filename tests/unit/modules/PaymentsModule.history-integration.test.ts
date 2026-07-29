@@ -30,6 +30,7 @@ import type { V2TransferPayload } from '../../../types/v2-transfer';
 import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 import { encodeTokenBlob } from '../../../token-engine/token-blob';
 import { bytesToHex } from '../../../core/crypto';
+import { createMemoryDelivery } from '../../support/memory-delivery';
 
 // =============================================================================
 // Constants
@@ -174,7 +175,9 @@ function setupModule(senderNametag?: string): TestContext {
   const tokenStorageProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
   tokenStorageProviders.set('local', mockTokenStorage);
 
+  const delivery = createMemoryDelivery();
   const deps: PaymentsModuleDependencies = {
+    delivery,
     identity: createMockIdentity(),
     storage: createMockStorage(),
     tokenStorageProviders,
@@ -187,7 +190,7 @@ function setupModule(senderNametag?: string): TestContext {
   const module = createPaymentsModule({ debug: false });
   module.initialize(deps);
 
-  return { module, deps, engine, historyStore, transport };
+  return { module, deps, engine, historyStore, transport, delivery };
 }
 
 /** Mint a v2 engine token owned by this wallet and add it via addToken (no history). */
@@ -227,13 +230,8 @@ async function v2Payload(
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-function deliver(ctx: TestContext, payload: V2TransferPayload, id = 'nostr-evt-1') {
-  return (ctx.module as any).handleIncomingTransfer({
-    id,
-    senderTransportPubkey: SENDER_TRANSPORT_PUBKEY,
-    payload,
-    timestamp: Date.now(),
-  });
+function deliver(ctx: TestContext, payload: V2TransferPayload) {
+  return (ctx.module as any).handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
@@ -261,7 +259,7 @@ describe('History deduplication — integration flows', () => {
 
       // Two whole-token transfers went out on the wire...
       /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
-      expect((ctx.transport.sendTokenTransfer as any).mock.calls).toHaveLength(2);
+      expect(ctx.delivery.delivered).toHaveLength(2);
 
       // ...but exactly ONE SENT history entry was recorded.
       const history = ctx.module.getHistory();

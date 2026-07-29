@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed — the Nostr token-delivery rail
+
+Assets ride the delivery port exclusively. `TransportDeliveryAdapter` (the fallback that wrapped
+the Nostr relay in the delivery interface) is deleted, along with the `transport.onTokenTransfer`
+subscription, `handleIncomingTransfer` (the Nostr envelope wrapper around the real ingest,
+`handleV2Transfer`), and `receive()`'s `fetchPendingEvents` branch.
+
+**Breaking:** a composition with no delivery provider can no longer send or receive assets.
+`send()` and `receive()` throw `INVALID_CONFIG` with a message naming the fix, rather than
+dereferencing null deep in the send path. Non-payment Sphere modules (DMs, group chat, market)
+are unaffected and still initialize normally — the check is at the point of use, not at
+`initialize()`.
+
+Nostr is untouched as a rail for identity bindings, DMs and group chat. `transport.resolve` is
+still how a recipient's chain pubkey is found, and `resolveTransportPubkey` still supplies history
+metadata.
+
+**Tests: 27 assertions across 6 files were translated, not weakened.** They asserted on the
+`transport.sendTokenTransfer` mock; they now assert on the delivery port that actually carries
+the token. The money-safety cases are unchanged in meaning — a post-certification delivery
+failure still must not fail the sender (#621), the journaled blob still replays, and the
+`transferId`/blob assertions still hold. A new `tests/support/memory-delivery.ts` provides a
+minimal `DeliveryProvider` with failure injection; `multi-token-send` keeps its own clock-aware
+one because it asserts delivery *timing*. Test count is unchanged at 3,113.
+
+**Fixed in review (P1):** `load()` replayed the `PENDING_V2_DELIVERIES` journal unconditionally.
+With no delivery provider composed — now an explicitly supported state — `attemptDeliveryWithBackoff`
+dereferenced null, the failure was counted as a delivery attempt, and after
+`MAX_DELIVERY_REPLAY_ATTEMPTS` the entry was marked `undeliverable`, permanently excluding
+already-certified funds from auto-replay even once a provider was composed. The replay is now
+guarded on `this.delivery`, mirroring the incoming pump five lines below it. Covered by a test
+that is verified RED without the guard.
+
+**Now dead, not removed here:** `TransportProvider.sendTokenTransfer` / `.onTokenTransfer` have
+zero production callers. Removing them is a transport-layer change and gets its own PR.
+
 ### Removed — the archived / forked TXF token stores
 
 Dead since the v1 removal. `archiveToken` calls `tokenToTxf`, which does `JSON.parse(sdkData)`;

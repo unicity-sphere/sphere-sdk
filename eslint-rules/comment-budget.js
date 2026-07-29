@@ -7,7 +7,8 @@
  */
 
 /** A comment run directly above a declaration is API documentation, not inline prose. */
-const DECLARATION = /^\s*(?:export|async|private|public|protected|static|readonly|function|class|interface|type|enum|const|let|abstract|declare|@)/;
+const DECLARATION =
+  /^\s*(?:(?:export|async|private|public|protected|static|readonly|function|class|interface|type|enum|const|let|abstract|declare|@)\b|[A-Za-z_$][\w$]*\??\s*[:(<])/;
 
 const commentRatio = {
   meta: {

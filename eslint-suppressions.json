@@ -23,7 +23,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 9
+      "count": 5
     },
     "complexity": {
       "count": 5
@@ -86,9 +86,6 @@
   "connect/protocol.ts": {
     "budget/comment-ratio": {
       "count": 1
-    },
-    "budget/no-long-comment-block": {
-      "count": 1
     }
   },
   "connect/semver.ts": {
@@ -104,7 +101,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 4
+      "count": 1
     }
   },
   "connect/version.ts": {
@@ -115,9 +112,6 @@
   "constants.ts": {
     "budget/comment-ratio": {
       "count": 1
-    },
-    "budget/no-long-comment-block": {
-      "count": 1
     }
   },
   "core/Sphere.ts": {
@@ -125,7 +119,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 22
+      "count": 6
     },
     "complexity": {
       "count": 12
@@ -209,7 +203,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 3
+      "count": 2
     }
   },
   "core/field-encryption.ts": {
@@ -225,7 +219,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 2
+      "count": 1
     }
   },
   "core/network-health.ts": {
@@ -233,7 +227,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 2
+      "count": 1
     },
     "complexity": {
       "count": 1
@@ -255,7 +249,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 2
+      "count": 1
     },
     "complexity": {
       "count": 1
@@ -282,7 +276,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 2
+      "count": 1
     }
   },
   "impl/browser/connect/PostMessageTransport.ts": {
@@ -308,9 +302,6 @@
   },
   "impl/browser/index.ts": {
     "budget/comment-ratio": {
-      "count": 1
-    },
-    "budget/no-long-comment-block": {
       "count": 1
     },
     "complexity": {
@@ -445,7 +436,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 9
+      "count": 5
     }
   },
   "impl/shared/wallet-api/WalletApiTokenStorageProvider.ts": {
@@ -453,7 +444,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 8
+      "count": 5
     },
     "max-lines": {
       "count": 1
@@ -464,7 +455,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 3
+      "count": 1
     }
   },
   "index.ts": {
@@ -480,7 +471,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 33
+      "count": 26
     },
     "complexity": {
       "count": 28
@@ -503,7 +494,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 5
+      "count": 1
     }
   },
   "modules/accounting/balance-computer.ts": {
@@ -550,7 +541,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 8
+      "count": 2
     },
     "max-lines": {
       "count": 1
@@ -594,7 +585,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 2
+      "count": 1
     },
     "max-lines-per-function": {
       "count": 1
@@ -610,7 +601,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 59
+      "count": 40
     },
     "complexity": {
       "count": 11
@@ -638,7 +629,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 6
+      "count": 1
     },
     "max-lines-per-function": {
       "count": 4
@@ -652,21 +643,13 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 5
+      "count": 1
     },
     "max-lines-per-function": {
       "count": 1
     }
   },
   "modules/payments/TokenSplitCalculator.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
-    "budget/no-long-comment-block": {
-      "count": 1
-    }
-  },
-  "modules/payments/TransportDeliveryAdapter.ts": {
     "budget/comment-ratio": {
       "count": 1
     },
@@ -687,7 +670,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 22
+      "count": 19
     },
     "complexity": {
       "count": 11
@@ -763,7 +746,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 3
+      "count": 2
     },
     "max-lines": {
       "count": 1
@@ -774,7 +757,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 2
+      "count": 1
     }
   },
   "oracle/oracle-provider.ts": {
@@ -782,7 +765,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 3
+      "count": 1
     }
   },
   "price/CoinGeckoPriceProvider.ts": {
@@ -817,7 +800,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 2
+      "count": 1
     }
   },
   "registry/index.ts": {
@@ -876,7 +859,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 10
+      "count": 1
     }
   },
   "storage/whole-blob-inventory-adapter.ts": {
@@ -922,7 +905,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 6
+      "count": 2
     }
   },
   "token-engine/errors.ts": {
@@ -1007,7 +990,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 3
+      "count": 2
     },
     "complexity": {
       "count": 3
@@ -1027,7 +1010,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 3
+      "count": 2
     },
     "complexity": {
       "count": 3
@@ -1047,15 +1030,12 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 11
+      "count": 1
     }
   },
   "transport/transport-provider.ts": {
     "budget/comment-ratio": {
       "count": 1
-    },
-    "budget/no-long-comment-block": {
-      "count": 8
     }
   },
   "transport/websocket.ts": {
@@ -1076,7 +1056,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 12
+      "count": 10
     },
     "max-lines": {
       "count": 1
@@ -1136,7 +1116,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 2
+      "count": 1
     }
   },
   "wallet-api/client.ts": {
@@ -1144,7 +1124,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 8
+      "count": 5
     },
     "max-depth": {
       "count": 3
@@ -1184,7 +1164,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 4
+      "count": 1
     }
   },
   "wallet-api/wake-supervisor.ts": {

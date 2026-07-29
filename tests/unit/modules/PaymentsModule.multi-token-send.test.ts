@@ -34,6 +34,7 @@ import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 import { decodeTokenBlob, encodeTokenBlob } from '../../../token-engine/token-blob';
 import { bytesToHex, hexToBytes } from '../../../core/crypto';
 import type { V2TransferPayload } from '../../../types/v2-transfer';
+import { createMemoryDelivery } from '../../support/memory-delivery';
 
 // ── Scenario ─────────────────────────────────────────────────────────────────
 
@@ -200,10 +201,28 @@ function mockTokenStorage(): TokenStorageProvider<TxfStorageDataBase> {
   } as unknown as TokenStorageProvider<TxfStorageDataBase>;
 }
 
-/** Transport whose delivery pays one publish round trip on the virtual clock. */
-function mockTransport(clock: VirtualClock, deliveryStartMs: number[] = []): TransportProvider {
+/** Delivery port paying one publish round trip on the virtual clock. */
+function clockDelivery(clock: VirtualClock, deliveryStartMs: number[] = []) {
+  const delivered: Array<{ recipientPubkey: string; blob: Uint8Array }> = [];
   return {
-    sendTokenTransfer: vi.fn(async () => { deliveryStartMs.push(clock.now()); await clock.wait(DELIVER_MS); }),
+    custody: 'external' as const,
+    delivered,
+    setIdentity() {},
+    bindDeliveryKeys() {},
+    async deliver(recipientPubkey: string, blob: Uint8Array) {
+      deliveryStartMs.push(clock.now());
+      await clock.wait(DELIVER_MS);
+      delivered.push({ recipientPubkey, blob });
+      return { deliveryId: `d${delivered.length}` };
+    },
+    async ack() {},
+    async *incoming() {},
+  };
+}
+
+function mockTransport(): TransportProvider {
+  return {
+    sendTokenTransfer: vi.fn(),
     onTokenTransfer: vi.fn().mockReturnValue(() => {}),
     onPaymentRequest: vi.fn().mockReturnValue(() => {}),
     onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
@@ -233,15 +252,17 @@ function setup(
 ) {
   const tokenStorageProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
   tokenStorageProviders.set('local', mockTokenStorage());
-  const transport = mockTransport(clock, deliveryStartMs);
+  const transport = mockTransport();
+  const delivery = clockDelivery(clock, deliveryStartMs);
   const deps: PaymentsModuleDependencies = {
+    delivery,
     identity: mockIdentity(), storage: mockStorage(), tokenStorageProviders,
     transport, oracle: mockOracle(), emitEvent: vi.fn(), tokenEngine: engine,
     ...(walletApi ? { walletApi } : {}),
   };
   const module = createPaymentsModule({ debug: false });
   module.initialize(deps);
-  return { module, transport };
+  return { module, transport, delivery };
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -256,9 +277,7 @@ async function seedToken(module: any, engine: FakeTokenEngine, amount: bigint, i
     type: 'V2_TRANSFER', version: '2.0',
     tokenBlob: bytesToHex(encodeTokenBlob(engine.encodeToken(minted))),
   };
-  await module.handleIncomingTransfer({
-    id, senderTransportPubkey: SENDER_TRANSPORT_PUBKEY, payload, timestamp: 0,
-  });
+  await module.handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
 }
 
 /** Mint `count` × AMOUNT_EACH tokens and receive them into the wallet (no latency). */
@@ -285,7 +304,7 @@ async function runManyTokenSend(): Promise<SendTelemetry> {
   const certifications = new ConcurrencyGauge();
   const engine = new SimulatedNetworkEngine(clock, certifications);
   const deliveryStartMs: number[] = [];
-  const { module, transport } = setup(engine, clock, undefined, deliveryStartMs);
+  const { module, transport, delivery } = setup(engine, clock, undefined, deliveryStartMs);
   try {
     await seedWallet(module, engine, TOKEN_COUNT);
     const startMs = clock.now();
@@ -295,7 +314,7 @@ async function runManyTokenSend(): Promise<SendTelemetry> {
     return {
       result,
       certifications,
-      deliveries: (transport.sendTokenTransfer as any).mock.calls.length,
+      deliveries: delivery.delivered.length,
       remainingConfirmed: module.getTokens().filter((t) => t.status === 'confirmed').length,
       virtualElapsedMs: clock.now() - startMs,
       certifyEndMs: engine.certifyEndMs,
@@ -319,7 +338,7 @@ async function runFailFastSend(): Promise<FailFastTelemetry> {
   const clock = new VirtualClock();
   const certifications = new ConcurrencyGauge();
   const engine = new SimulatedNetworkEngine(clock, certifications, 0);
-  const { module, transport } = setup(engine, clock);
+  const { module, transport, delivery } = setup(engine, clock);
   try {
     await seedWallet(module, engine, TOKEN_COUNT);
     const startMs = clock.now();
@@ -329,7 +348,7 @@ async function runFailFastSend(): Promise<FailFastTelemetry> {
     return {
       error,
       certifications,
-      deliveries: (transport.sendTokenTransfer as any).mock.calls.length,
+      deliveries: delivery.delivered.length,
       remainingConfirmed: module.getTokens().filter((t) => t.status === 'confirmed').length,
       virtualElapsedMs: clock.now() - startMs,
     };
@@ -468,7 +487,7 @@ describe('conflict + certified split keeps the intent open', () => {
       postHistoryRecords: vi.fn().mockResolvedValue(undefined),
       listHistory: vi.fn().mockResolvedValue({ records: [], more: false, cursor: null, syncEpoch: 0n }),
     };
-    const { module, transport } = setup(
+    const { module, transport, delivery } = setup(
       engine, clock, walletApi as unknown as PaymentsModuleDependencies['walletApi'],
     );
     try {
@@ -497,8 +516,8 @@ describe('conflict + certified split keeps the intent open', () => {
       // The recipient received EXACTLY the full amount across the certified
       // split leg + the re-planned direct leg — no leg paid twice.
       const deliveredAmounts = await Promise.all(
-        (transport.sendTokenTransfer as any).mock.calls.map(async (call: any[]) => {
-          const token = await engine.decodeToken(decodeTokenBlob(hexToBytes(call[1].tokenBlob)));
+        delivery.delivered.map(async (d) => {
+          const token = await engine.decodeToken(decodeTokenBlob(d.blob));
           return engine.balanceOf(token, UCT);
         }),
       );

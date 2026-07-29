@@ -528,13 +528,12 @@ The `send` result distinguishes **on-chain finality** from **recipient-side deli
 - `status` is one of `'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed'`.
 - The SDK's `TransferResult` also carries `deliveryState` (`'landed' | 'pending-delivery'`), but the wallet does **not** forward it over Connect — `deliveryPending` is the only delivery signal a dApp receives.
 
-> **Server-side (Node.js) recipients:** a wallet built with bare `createNodeProviders` only
-> listens on the Nostr transport and will **never see** deliveries from wallet-api-composed
-> senders (which includes the hosted Sphere wallet — it delivers via the wallet-api mailbox,
-> not Nostr). A Node.js recipient of dApp/wallet sends **must** compose the wallet-api
-> delivery rail — `createWalletApiProviders(...)` or `createOwnStorageWalletApiProviders(...)`
-> — see [QUICKSTART-NODEJS.md](QUICKSTART-NODEJS.md). Deposits made before the recipient
-> composes the rail stay claimable in the mailbox.
+> **Server-side (Node.js) recipients:** a wallet built with bare `createNodeProviders` has no
+> delivery rail at all and can neither send nor receive assets — `send()` and `receive()` fail
+> with `INVALID_CONFIG`. Compose the wallet-api rail — `createWalletApiProviders(...)` or
+> `createOwnStorageWalletApiProviders(...)` — see
+> [QUICKSTART-NODEJS.md](QUICKSTART-NODEJS.md). Deposits made before the recipient composes the
+> rail stay claimable in the mailbox.
 
 ### sign_message Intent
 
