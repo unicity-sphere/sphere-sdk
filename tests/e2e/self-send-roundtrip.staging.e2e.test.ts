@@ -27,7 +27,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { createHarnessWallet, type HarnessWallet } from '../harness/support/harness-wallet';
 import { HARNESS_COIN, randomIdentity } from '../harness/support/stack';
 import type { HarnessStack } from '../harness/support/stack';
-import type { CoinBalance } from '../../wallet-api';
+import {
+  refreshView,
+  sendWhenSpendable,
+  totalOf,
+  waitForBalance,
+  waitForTokenOfAmount,
+  waitForTokens,
+} from '../harness/support/settle';
 
 const API_KEY = process.env.STAGING_AGGREGATOR_KEY;
 
@@ -56,56 +63,6 @@ async function newWallet(deviceId: string, identity = randomIdentity()): Promise
   return w;
 }
 
-function totalOf(balances: CoinBalance[]): bigint {
-  return balances.find((b) => b.coinId === HARNESS_COIN)?.total ?? 0n;
-}
-
-/** Poll (draining the mailbox each round) until the server balance reaches `want`, or timeout. */
-async function waitForBalance(w: HarnessWallet, want: bigint, timeoutMs = 120_000): Promise<bigint> {
-  const deadline = Date.now() + timeoutMs;
-  let last = -1n;
-  for (;;) {
-    try {
-      await w.module.receive();
-    } catch {
-      /* mailbox drain is best-effort; keep polling the server balance */
-    }
-    last = totalOf(await w.client.getBalances());
-    if (last === want || Date.now() >= deadline) return last;
-    await new Promise((r) => setTimeout(r, 3_000));
-  }
-}
-
-/**
- * Poll — sync()ing each round — until the wallet's LOCAL inventory settles to `wantTotal` value
- * and (if given) `wantDistinct` distinct token ids, then return the held {id, amt} list.
- *
- * getTokens() is an eventually-consistent cache. Two reconciliations lag a resync: (a) multiple
- * same-value tokens just claimed from the mailbox, and (b) pruning the spent PARENT after a
- * self-initiated split (custody/server balance is already correct — this is a local over-count,
- * the safe direction, never a loss). This waits that reconciliation out. If it never settles the
- * caller's assertions still fire on the last snapshot, so a genuine inventory bug surfaces as a
- * failure rather than being masked.
- */
-async function waitForTokens(
-  w: HarnessWallet,
-  wantTotal: bigint,
-  wantDistinct?: number,
-  timeoutMs = 90_000,
-): Promise<Array<{ id: string; amt: bigint }>> {
-  const deadline = Date.now() + timeoutMs;
-  let held: Array<{ id: string; amt: bigint }> = [];
-  for (;;) {
-    await w.module.sync();
-    held = w.module.getTokens().map((t) => ({ id: t.id, amt: BigInt(t.amount) }));
-    const total = held.reduce((s, t) => s + t.amt, 0n);
-    const distinct = new Set(held.map((t) => t.id)).size;
-    const settled = total === wantTotal && (wantDistinct === undefined || distinct === wantDistinct);
-    if (settled || Date.now() >= deadline) return held;
-    await new Promise((r) => setTimeout(r, 3_000));
-  }
-}
-
 describe.runIf(!!API_KEY)('LIVE self-send + round-trip over staging wallet-api + testnet2', () => {
   it('whole-token SELF-send conserves funds (pre-fix: 100% loss)', async () => {
     const a = await newWallet('live-ss-a');
@@ -119,7 +76,7 @@ describe.runIf(!!API_KEY)('LIVE self-send + round-trip over staging wallet-api +
     expect(inv.items[0]?.stateHash).toMatch(/^[0-9a-f]+$/);
 
     // Send the WHOLE token to our own address — the deterministic-loss case.
-    await a.module.send({ recipient: a.identity.chainPubkey, amount: '10', coinId: HARNESS_COIN });
+    await sendWhenSpendable(a, a.identity.chainPubkey, 10n);
 
     // The invariant is only that value is CONSERVED once the dust settles — never 0.
     expect(await waitForBalance(a, 10n)).toBe(10n);
@@ -135,13 +92,13 @@ describe.runIf(!!API_KEY)('LIVE self-send + round-trip over staging wallet-api +
     expect(await waitForBalance(a, 10n)).toBe(10n);
 
     // A → B
-    await a.module.send({ recipient: bId.chainPubkey, amount: '10', coinId: HARNESS_COIN });
+    await sendWhenSpendable(a, bId.chainPubkey, 10n);
     const b = await newWallet('live-rt-b', bId);
     expect(await waitForBalance(b, 10n)).toBe(10n);
     expect(await waitForBalance(a, 0n)).toBe(0n);
 
     // B → A (the round-trip — A re-acquires the same genesis token)
-    await b.module.send({ recipient: a.identity.chainPubkey, amount: '10', coinId: HARNESS_COIN });
+    await sendWhenSpendable(b, a.identity.chainPubkey, 10n);
     expect(await waitForBalance(a, 10n)).toBe(10n); // A gets it back, conserved
     expect(await waitForBalance(b, 0n)).toBe(0n);
 
@@ -173,7 +130,7 @@ describe.runIf(!!API_KEY)('LIVE self-send + round-trip over staging wallet-api +
     for (const [fromName, toName] of hops) {
       const from = byName[fromName];
       const to = byName[toName];
-      await from.module.send({ recipient: to.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN });
+      await sendWhenSpendable(from, to.identity.chainPubkey, 100n);
       expect(await waitForBalance(to, 100n)).toBe(100n);
       expect(await waitForBalance(from, 0n)).toBe(0n);
       // Receiver holds exactly ONE token and it is still g0 — same token, never split/duplicated.
@@ -197,48 +154,38 @@ describe.runIf(!!API_KEY)('LIVE self-send + round-trip over staging wallet-api +
     const b = await newWallet('mix-b');
     const c = await newWallet('mix-c');
 
-    // getTokens() is an eventually-consistent LOCAL cache: after multi-token receives or a
-    // self-split it can momentarily miscount until reconciled. sync() reconciles it to the
-    // authoritative server inventory, so every genesis-id/composition read below syncs first.
-    const tokensOf = async (w: HarnessWallet): Promise<Array<{ id: string; amt: bigint }>> => {
-      await w.module.sync();
-      return w.module.getTokens().map((t) => ({ id: t.id, amt: BigInt(t.amount) }));
-    };
-    const idsOf = async (w: HarnessWallet): Promise<string[]> => (await tokensOf(w)).map((t) => t.id).sort();
-    const idOfAmount = async (w: HarnessWallet, amt: bigint): Promise<string> => {
-      const held = await tokensOf(w);
-      const t = held.find((x) => x.amt === amt);
-      if (!t) throw new Error(`${w.identity.chainPubkey.slice(0, 6)} holds no ${amt}-token (has ${held.map((h) => `${h.id.slice(0, 8)}:${h.amt}`).join(',')})`);
-      return t.id;
-    };
+    // Every genesis-id / composition read below goes through the refreshed view: getTokens() is an
+    // eventually-consistent LOCAL cache, and a flush does not reconcile it (see refreshView).
+    const idsOf = async (w: HarnessWallet): Promise<string[]> => (await refreshView(w)).map((t) => t.id).sort();
+    const idOfAmount = waitForTokenOfAmount;
 
     expect((await a.module.mintFungibleToken(HARNESS_COIN, 100n)).success).toBe(true);
     expect(await waitForBalance(a, 100n)).toBe(100n);
     const g0 = await idOfAmount(a, 100n);
 
     // --- Phase 1: whole-token round-trip A→B→A (DIRECT) — A re-acquires the SAME token g0. ---
-    await a.module.send({ recipient: b.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN });
+    await sendWhenSpendable(a, b.identity.chainPubkey, 100n);
     expect(await waitForBalance(b, 100n)).toBe(100n);
-    await b.module.send({ recipient: a.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN });
+    await sendWhenSpendable(b, a.identity.chainPubkey, 100n);
     expect(await waitForBalance(a, 100n)).toBe(100n);
     expect(await idsOf(a)).toEqual([g0]);
 
     // --- Phase 2: two SPLITs fragment A into three tokens spread across the wallets. Each split
     // burns its parent and mints fresh genesis ids. ---
-    await a.module.send({ recipient: b.identity.chainPubkey, amount: '30', coinId: HARNESS_COIN }); // g0 → g1(30@B) + g2(70@A)
+    await sendWhenSpendable(a, b.identity.chainPubkey, 30n); // g0 → g1(30@B) + g2(70@A)
     expect(await waitForBalance(b, 30n)).toBe(30n);
     expect(await waitForBalance(a, 70n)).toBe(70n);
     const g1 = await idOfAmount(b, 30n);
-    await a.module.send({ recipient: c.identity.chainPubkey, amount: '40', coinId: HARNESS_COIN }); // g2 → g3(40@C) + g4(30@A)
+    await sendWhenSpendable(a, c.identity.chainPubkey, 40n); // g2 → g3(40@C) + g4(30@A)
     expect(await waitForBalance(c, 40n)).toBe(40n);
     expect(await waitForBalance(a, 30n)).toBe(30n);
     const g3 = await idOfAmount(c, 40n);
     const g4 = await idOfAmount(a, 30n);
 
     // --- Phase 3: pull the two fragments back so A holds THREE tokens {30, 30, 40} = 100. ---
-    await b.module.send({ recipient: a.identity.chainPubkey, amount: '30', coinId: HARNESS_COIN }); // g1 whole → A
+    await sendWhenSpendable(b, a.identity.chainPubkey, 30n); // g1 whole → A
     expect(await waitForBalance(a, 60n)).toBe(60n);
-    await c.module.send({ recipient: a.identity.chainPubkey, amount: '40', coinId: HARNESS_COIN }); // g3 whole → A
+    await sendWhenSpendable(c, a.identity.chainPubkey, 40n); // g3 whole → A
     expect(await waitForBalance(a, 100n)).toBe(100n);
     const aFrag = await waitForTokens(a, 100n, 3); // settle: three distinct tokens {30, 30, 40}
     const preMixIds = new Set(aFrag.map((t) => t.id));
@@ -248,7 +195,7 @@ describe.runIf(!!API_KEY)('LIVE self-send + round-trip over staging wallet-api +
     // --- Phase 4: THE MIXED SEND. A sends 80 from {30,30,40}. No whole-token subset sums to 80,
     // so coin selection sends two tokens WHOLE (direct) and SPLITS the third for the remaining 20
     // — a single send whose package is a split AND direct transfers together. ---
-    await a.module.send({ recipient: b.identity.chainPubkey, amount: '80', coinId: HARNESS_COIN });
+    await sendWhenSpendable(a, b.identity.chainPubkey, 80n);
     expect(await waitForBalance(b, 80n)).toBe(80n);
     expect(await waitForBalance(a, 20n)).toBe(20n);
 
@@ -277,7 +224,7 @@ describe.runIf(!!API_KEY)('LIVE self-send + round-trip over staging wallet-api +
     ).toBe(100n);
 
     // --- Phase 5: B returns its three tokens whole — value round-trips back to A, conserved. ---
-    await b.module.send({ recipient: a.identity.chainPubkey, amount: '80', coinId: HARNESS_COIN });
+    await sendWhenSpendable(b, a.identity.chainPubkey, 80n);
     expect(await waitForBalance(a, 100n)).toBe(100n);
     expect(totalOf(await b.client.getBalances())).toBe(0n);
     expect(totalOf(await c.client.getBalances())).toBe(0n);

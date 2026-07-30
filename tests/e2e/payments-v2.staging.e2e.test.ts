@@ -9,12 +9,11 @@
  * custody — everything wallet-api owns — were fabricated, so the composition
  * under test did not exist in production.
  *
- * KNOWN FLAKE: the whole-token test intermittently fails with "Insufficient
- * balance" when the whole e2e suite runs, while passing 3/3 in isolation — both
- * staging suites then drive the same shared backend concurrently. Ruled out: the
- * clear()+repopulate in loadFromStorageData is fully synchronous, so a send
- * cannot observe a half-loaded token map. Unproven and worth its own look; the
- * sibling staging suite is independently flaky on the same runs.
+ * The "Insufficient balance" flake this suite used to hit is FIXED, not
+ * suppressed: a send was planned from a local view the server balance had
+ * already outrun. `module.sync()` is a write-only flush, so no amount of polling
+ * it reconciles anything — the waits now live in harness/support/settle.ts and
+ * every send goes through sendWhenSpendable.
  *
  * Gated on STAGING_AGGREGATOR_KEY. Run:
  *   STAGING_AGGREGATOR_KEY=sk_... npx vitest run --config vitest.e2e.config.ts \
@@ -25,7 +24,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { createHarnessWallet, type HarnessWallet } from '../harness/support/harness-wallet';
 import { HARNESS_COIN, randomIdentity } from '../harness/support/stack';
 import type { HarnessStack } from '../harness/support/stack';
-import type { CoinBalance } from '../../wallet-api';
+import { sendWhenSpendable, waitForBalance, waitForSpendable } from '../harness/support/settle';
 
 const API_KEY = process.env.STAGING_AGGREGATOR_KEY;
 
@@ -58,49 +57,6 @@ async function newWallet(deviceId: string): Promise<HarnessWallet> {
   return w;
 }
 
-function totalOf(balances: CoinBalance[]): bigint {
-  return balances.find((b) => b.coinId === HARNESS_COIN)?.total ?? 0n;
-}
-
-/**
- * Poll — receive()ing each round — until the wallet holds `want` in SPENDABLE
- * (confirmed) tokens. Three states are eventually consistent here and a test
- * that spends too early races them: the server balance, the local token set, and
- * a token's status. `getTokens()` lists tokens of any status, so summing it
- * counts one that has landed but cannot yet be spent.
- */
-async function waitForSpendable(w: HarnessWallet, want: bigint, timeoutMs = 90_000): Promise<bigint> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    try {
-      await w.module.receive();
-    } catch {
-      /* best-effort drain; keep polling */
-    }
-    const held = w.module
-      .getTokens()
-      .filter((t) => t.status === 'confirmed')
-      .reduce((sum, t) => sum + BigInt(t.amount), 0n);
-    if (held === want || Date.now() >= deadline) return held;
-    await new Promise((r) => setTimeout(r, 3_000));
-  }
-}
-
-/** Poll (draining the mailbox each round) until the server balance reaches `want`. */
-async function waitForBalance(w: HarnessWallet, want: bigint, timeoutMs = 120_000): Promise<bigint> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    try {
-      await w.module.receive();
-    } catch {
-      /* mailbox drain is best-effort; keep polling the server balance */
-    }
-    const last = totalOf(await w.client.getBalances());
-    if (last === want || Date.now() >= deadline) return last;
-    await new Promise((r) => setTimeout(r, 3_000));
-  }
-}
-
 describe.runIf(!!API_KEY)('PaymentsModule payment path over staging wallet-api + testnet2', () => {
   it('a whole-token send lands in the recipient wallet and is spendable', async () => {
     const alice = await newWallet('pay-alice');
@@ -109,7 +65,7 @@ describe.runIf(!!API_KEY)('PaymentsModule payment path over staging wallet-api +
     expect((await alice.module.mintFungibleToken(HARNESS_COIN, 10n)).success).toBe(true);
     expect(await waitForBalance(alice, 10n)).toBe(10n);
 
-    await alice.module.send({ recipient: bob.identity.chainPubkey, amount: '10', coinId: HARNESS_COIN });
+    await sendWhenSpendable(alice, bob.identity.chainPubkey, 10n);
 
     // The recipient sees it through the real mailbox, not a handed-over blob.
     expect(await waitForBalance(bob, 10n)).toBe(10n);
@@ -120,7 +76,7 @@ describe.runIf(!!API_KEY)('PaymentsModule payment path over staging wallet-api +
     // server balance asserted above.
     expect(await waitForSpendable(bob, 10n)).toBe(10n);
     const carol = await newWallet('pay-carol');
-    await bob.module.send({ recipient: carol.identity.chainPubkey, amount: '10', coinId: HARNESS_COIN });
+    await sendWhenSpendable(bob, carol.identity.chainPubkey, 10n);
     expect(await waitForBalance(carol, 10n)).toBe(10n);
     expect(await waitForBalance(bob, 0n)).toBe(0n);
   }, 300_000);
@@ -132,7 +88,7 @@ describe.runIf(!!API_KEY)('PaymentsModule payment path over staging wallet-api +
     expect((await alice.module.mintFungibleToken(HARNESS_COIN, 100n)).success).toBe(true);
     expect(await waitForBalance(alice, 100n)).toBe(100n);
 
-    await alice.module.send({ recipient: bob.identity.chainPubkey, amount: '60', coinId: HARNESS_COIN });
+    await sendWhenSpendable(alice, bob.identity.chainPubkey, 60n);
 
     // Value is conserved across the split: 60 delivered, 40 change retained.
     expect(await waitForBalance(bob, 60n)).toBe(60n);
