@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed — the Bitcoin Core `wallet.dat` importer
+
+`serialization/wallet-dat.ts` is gone in full: the SQLite byte-scan, the `mkey`/CMasterKey
+extraction, the iterated-SHA512 (PBKDF2-style) key derivation, and every export of the module
+(`parseWalletDat`, `parseAndDecryptWalletDat`, `isSQLiteDatabase`, `isWalletDatEncrypted`,
+`decryptCMasterKey`, `decryptPrivateKey`, `CMasterKeyData`, `WalletDatInfo`). The wallet has been
+L3-only since #604 — there is no Bitcoin Core wallet to import from.
+
+Gone with it, because they existed only to route files into that importer:
+`Sphere.importFromLegacyFile`, `Sphere.detectLegacyFileType`, `Sphere.isLegacyFileEncrypted`, and
+the `LegacyFileType` / `LegacyFileInfo` / `LegacyFileImportOptions` / `DecryptionProgressCallback`
+types (plus the `.dat`-only `encryptionInfo` field on `LegacyFileParseResult`).
+
+**The text backup path is NOT removed.** `sphere.exportToTxt()` (and the browser
+`downloadWalletBackup` helper) still writes password-encrypted `UNICITY WALLET DETAILS` files, so
+`serialization/wallet-text.ts` keeps its readers — `parseWalletText`, `parseAndDecryptWalletText`,
+`isWalletTextFormat`, `isTextWalletEncrypted`, `decryptTextFormatKey` are all still exported from
+the package root. Deleting them would have made a backup the SDK still produces unrestorable.
+Callers that used `Sphere.importFromLegacyFile` for `.txt`/mnemonic/JSON files should call
+`parseAndDecryptWalletText` + `Sphere.import(...)`, or `Sphere.importFromJSON(...)`, directly.
+
+**A `wallet.dat` blob handed to the surviving text parsers is refused loudly.**
+`parseWalletText`/`parseAndDecryptWalletText` detect the `SQLite format 3` magic and return
+`{ success: false, error: 'Bitcoin Core wallet.dat import is no longer supported…' }` instead of
+the old vague "Could not find master private key in backup file" — the master key never silently
+goes missing.
+
 ### Removed — the pre-E.4 (v:1) intent resume path
 
 An intent payload is `v:2` and nothing else. The `v:1` shape stopped being written at the E.4

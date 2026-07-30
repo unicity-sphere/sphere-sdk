@@ -428,11 +428,11 @@ export type StorageEventCallback = (event: StorageEvent) => void;
 export interface TxfStorageDataBase {
   _meta: TxfMeta;
   _tombstones?: TxfTombstone[];
-  _outbox?: TxfOutboxEntry[];
-  _sent?: TxfSentEntry[];
-  _invalid?: TxfInvalidEntry[];
   _history?: HistoryRecord[];
-  // Dynamic token entries: _<tokenId>
+  // Dynamic token entries: _<tokenId>.
+  // NOTE: an old document may still carry the v1 relic slots `_outbox`,
+  // `_sent` and `_invalid`. They have no typed shape any more — nothing writes
+  // or interprets them; providers that see them pass them through as `unknown`.
   [key: `_${string}`]: unknown;
 }
 
@@ -448,28 +448,6 @@ export interface TxfTombstone {
   tokenId: string;
   stateHash: string;
   timestamp: number;
-}
-
-export interface TxfOutboxEntry {
-  id: string;
-  status: string;
-  tokenId: string;
-  recipient: string;
-  createdAt: number;
-  data: unknown;
-}
-
-export interface TxfSentEntry {
-  tokenId: string;
-  recipient: string;
-  txHash: string;
-  sentAt: number;
-}
-
-export interface TxfInvalidEntry {
-  tokenId: string;
-  reason: string;
-  detectedAt: number;
 }
 
 // =============================================================================

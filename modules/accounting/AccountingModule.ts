@@ -1287,7 +1287,7 @@ export class AccountingModule {
     // ------------------------------------------------------------------
     // Step 6: Store the token via PaymentsModule.addToken()
     // Invoice tokens have null coinData — build the uiToken directly like
-    // createInvoice() does, rather than using txfToToken() which would crash
+    // createInvoice() does — a v1 TXF decode would crash on a v2 blob
     // calling .reduce() on null.
     // ------------------------------------------------------------------
     try {

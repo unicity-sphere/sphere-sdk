@@ -5,7 +5,6 @@ export * from './encryption';
 export * from './field-encryption';
 export * from './delivery-envelope';
 export * from './currency';
-export * from './bech32';
 export * from './utils';
 export { logger } from './logger';
 export type { LogLevel, LogHandler, LoggerConfig } from './logger';

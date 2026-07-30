@@ -1,20 +1,24 @@
 /**
- * TXF Serializer for SDK2
- * Converts between SDK Token format and TXF storage format
+ * TXF storage-data serializer.
  *
- * Platform-independent implementation that works with SDK types directly.
+ * Post v1-cutover this file owns exactly one job: build and parse the
+ * `TxfStorageData` DOCUMENT (the `_meta` / `_nametags` / `_tombstones` /
+ * `_history` envelope plus the per-token slots). The v1 TXF *token* codec —
+ * `normalizeSdkTokenToStorage` / `tokenToTxf` / `objectToTxf` / `txfToToken`
+ * and the six v1 utility readers — is GONE. Tokens persist as opaque v2 CBOR
+ * blobs (hex) in `Token.sdkData`.
+ *
+ * A stored v1 TXF token record can still arrive here from an old wallet. It is
+ * NEVER silently reinterpreted as a v2 blob: both the write and the read path
+ * log a warning, record a validation error, and skip the record.
  */
 
 import type {
   TxfToken,
-  TxfTransaction,
   TxfStorageData,
   TxfMeta,
   NametagData,
   TombstoneEntry,
-  OutboxEntry,
-  MintOutboxEntry,
-  InvalidatedNametagEntry,
 } from '../types/txf';
 import type { HistoryRecord } from '../storage';
 import {
@@ -28,219 +32,8 @@ import {
   archivedKeyFromTokenId,
   forkedKeyFromTokenIdAndState,
 } from '../types/txf';
-import type { Token, TokenStatus } from '../types';
-import { TokenRegistry } from '../registry/TokenRegistry';
-
-// =============================================================================
-// SDK Token Normalization
-// =============================================================================
-
-/**
- * Convert bytes array/object to hex string
- */
-function bytesToHex(bytes: number[] | Uint8Array): string {
-  const arr = Array.isArray(bytes) ? bytes : Array.from(bytes);
-  return arr.map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-/**
- * Normalize a value that may be a hex string, bytes object, or Buffer to hex string
- */
-function normalizeToHex(value: unknown): string {
-  if (typeof value === 'string') {
-    return value;
-  }
-  if (value && typeof value === 'object') {
-    const obj = value as Record<string, unknown>;
-    // SDK format: { bytes: [...] }
-    if ('bytes' in obj && (Array.isArray(obj.bytes) || obj.bytes instanceof Uint8Array)) {
-      return bytesToHex(obj.bytes as number[] | Uint8Array);
-    }
-    // Buffer.toJSON() format: { type: "Buffer", data: [...] }
-    if (obj.type === 'Buffer' && Array.isArray(obj.data)) {
-      return bytesToHex(obj.data as number[]);
-    }
-  }
-  return String(value);
-}
-
-/**
- * Normalize SDK token JSON to canonical TXF storage format.
- * Converts all bytes objects to hex strings before storage.
- */
-export function normalizeSdkTokenToStorage(sdkTokenJson: unknown): TxfToken {
-  // structuredClone is faster than JSON.parse(JSON.stringify()) and avoids
-  // double serialization overhead that was blocking the main thread.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const txf = structuredClone(sdkTokenJson) as any;
-
-  // Normalize genesis.data fields
-  if (txf.genesis?.data) {
-    const data = txf.genesis.data;
-    if (data.tokenId !== undefined) {
-      data.tokenId = normalizeToHex(data.tokenId);
-    }
-    if (data.tokenType !== undefined) {
-      data.tokenType = normalizeToHex(data.tokenType);
-    }
-    if (data.salt !== undefined) {
-      data.salt = normalizeToHex(data.salt);
-    }
-  }
-
-  // Normalize authenticator fields in genesis inclusion proof
-  if (txf.genesis?.inclusionProof?.authenticator) {
-    const auth = txf.genesis.inclusionProof.authenticator;
-    if (auth.publicKey !== undefined) {
-      auth.publicKey = normalizeToHex(auth.publicKey);
-    }
-    if (auth.signature !== undefined) {
-      auth.signature = normalizeToHex(auth.signature);
-    }
-  }
-
-  // Normalize transaction authenticators
-  if (Array.isArray(txf.transactions)) {
-    for (const tx of txf.transactions) {
-      if (tx.inclusionProof?.authenticator) {
-        const auth = tx.inclusionProof.authenticator;
-        if (auth.publicKey !== undefined) {
-          auth.publicKey = normalizeToHex(auth.publicKey);
-        }
-        if (auth.signature !== undefined) {
-          auth.signature = normalizeToHex(auth.signature);
-        }
-      }
-    }
-  }
-
-  return txf as TxfToken;
-}
-
-// =============================================================================
-// Token → TXF Conversion
-// =============================================================================
-
-/**
- * Extract TXF token structure from Token.sdkData (jsonData)
- */
-export function tokenToTxf(token: Token): TxfToken | null {
-  const jsonData = token.sdkData;
-  if (!jsonData) {
-    return null;
-  }
-
-  try {
-    const txfData = normalizeSdkTokenToStorage(JSON.parse(jsonData));
-
-    if (!txfData.genesis || !txfData.state) {
-      return null;
-    }
-
-    // Ensure required fields
-    if (!txfData.version) {
-      txfData.version = '2.0';
-    }
-    if (!txfData.transactions) {
-      txfData.transactions = [];
-    }
-    if (!txfData.nametags) {
-      txfData.nametags = [];
-    }
-    if (!txfData._integrity) {
-      txfData._integrity = {
-        genesisDataJSONHash: '0000' + '0'.repeat(60),
-      };
-    }
-
-    return txfData;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Convert token interface to simplified Token for parsing
- */
-interface TokenLike {
-  id: string;
-  sdkData?: string;
-}
-
-/**
- * Extract TXF from any object with id and sdkData
- */
-export function objectToTxf(obj: TokenLike): TxfToken | null {
-  if (!obj.sdkData) return null;
-  try {
-    const txfData = normalizeSdkTokenToStorage(JSON.parse(obj.sdkData));
-    if (!txfData.genesis || !txfData.state) return null;
-    return txfData;
-  } catch {
-    return null;
-  }
-}
-
-// =============================================================================
-// TXF → Token Conversion
-// =============================================================================
-
-/**
- * Determine token status from TXF data
- */
-function determineTokenStatus(txf: TxfToken): TokenStatus {
-  if (txf.transactions.length > 0) {
-    const lastTx = txf.transactions[txf.transactions.length - 1];
-    if (lastTx.inclusionProof === null) {
-      return 'pending';
-    }
-  }
-  return 'confirmed';
-}
-
-/**
- * Convert TXF token to Token interface
- */
-export function txfToToken(tokenId: string, txf: TxfToken): Token {
-  const coinData = txf.genesis.data.coinData;
-  const totalAmount = coinData.reduce((sum, [, amt]) => {
-    return sum + BigInt(amt || '0');
-  }, BigInt(0));
-
-  // Get coin ID (use first non-zero coin, or first coin)
-  let coinId = coinData[0]?.[0] || '';
-  for (const [cid, amt] of coinData) {
-    if (BigInt(amt || '0') > 0) {
-      coinId = cid;
-      break;
-    }
-  }
-
-  const tokenType = txf.genesis.data.tokenType;
-  const isNft = tokenType === '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89';
-
-  const now = Date.now();
-
-  const registry = TokenRegistry.getInstance();
-  const def = registry.getDefinition(coinId);
-
-  return {
-    id: tokenId,
-    coinId,
-    symbol: isNft ? 'NFT' : (def?.symbol || coinId.slice(0, 8)),
-    name: isNft ? 'NFT' : (def?.name ? def.name.charAt(0).toUpperCase() + def.name.slice(1) : 'Token'),
-    decimals: isNft ? 0 : (def?.decimals ?? 8),
-    amount: totalAmount.toString(),
-    status: determineTokenStatus(txf),
-    createdAt: now,
-    updatedAt: now,
-    sdkData: JSON.stringify(txf),
-  };
-}
-
-// =============================================================================
-// Storage Data Building
-// =============================================================================
+import type { Token } from '../types';
+import { logger } from '../core/logger';
 
 // =============================================================================
 // v2 token blob storage (opaque CBOR blob in sdkData, not v1 JSON TXF)
@@ -273,7 +66,25 @@ function isV2TokenEntry(entry: unknown): entry is Token {
 }
 
 /**
- * Build TXF storage data from tokens and metadata
+ * A stored v1 TXF token record (`{ version, genesis, state, transactions }`).
+ * The v1 codec is removed, so these are recognised only to be REFUSED loudly —
+ * never coerced into the v2 blob shape.
+ */
+function isLegacyV1TxfEntry(entry: unknown): boolean {
+  return typeof entry === 'object' && entry !== null && 'genesis' in entry;
+}
+
+// =============================================================================
+// Storage Data Building
+// =============================================================================
+
+/**
+ * Build TXF storage data from tokens and metadata.
+ *
+ * Only v2 blob tokens are written. A token carrying v1 TXF JSON in `sdkData`
+ * is a relic of the pre-v2 wallet: it is unspendable, has no v2 encoding, and
+ * is dropped with a loud warning rather than being written back in a shape the
+ * reader can no longer interpret.
  */
 export async function buildTxfStorageData(
   tokens: Token[],
@@ -283,9 +94,6 @@ export async function buildTxfStorageData(
     tombstones?: TombstoneEntry[];
     archivedTokens?: Map<string, TxfToken>;
     forkedTokens?: Map<string, TxfToken>;
-    outboxEntries?: OutboxEntry[];
-    mintOutboxEntries?: MintOutboxEntry[];
-    invalidatedNametags?: InvalidatedNametagEntry[];
     historyEntries?: HistoryRecord[];
   }
 ): Promise<TxfStorageData> {
@@ -304,34 +112,23 @@ export async function buildTxfStorageData(
     storageData._tombstones = options.tombstones;
   }
 
-  if (options?.outboxEntries && options.outboxEntries.length > 0) {
-    storageData._outbox = options.outboxEntries;
-  }
-
-  if (options?.mintOutboxEntries && options.mintOutboxEntries.length > 0) {
-    storageData._mintOutbox = options.mintOutboxEntries;
-  }
-
-  if (options?.invalidatedNametags && options.invalidatedNametags.length > 0) {
-    storageData._invalidatedNametags = options.invalidatedNametags;
-  }
-
   if (options?.historyEntries && options.historyEntries.length > 0) {
     (storageData as TxfStorageData & { _history: HistoryRecord[] })._history = options.historyEntries;
   }
 
-  // Add active tokens. v2 tokens carry an opaque hex blob in sdkData (not JSON TXF),
-  // so tokenToTxf returns null for them — store the UI token record directly under
-  // its genesis token id (the v2 storage entry).
+  // Add active tokens. v2 tokens carry an opaque hex blob in sdkData; the UI
+  // token record is stored directly under its genesis token id.
   for (const token of tokens) {
-    const txf = tokenToTxf(token);
-    if (txf) {
-      const actualTokenId = txf.genesis.data.tokenId;
-      storageData[keyFromTokenId(actualTokenId)] = txf;
-    } else if (isV2TokenBlob(token.sdkData)) {
+    if (isV2TokenBlob(token.sdkData)) {
       // The v2 entry (a UI token record) lives in the token slot; parse reads it back
       // via isV2TokenEntry. Cast because TxfStorageData's value union predates v2.
       storageData[keyFromTokenId(v2TokenId(token))] = token as unknown as TxfToken;
+    } else {
+      logger.warn(
+        'TXF',
+        `Refusing to persist token ${token.id.slice(0, 16)}...: sdkData is not a v2 token blob ` +
+          '(legacy v1 TXF or empty). The v1 token format is no longer supported — entry skipped.'
+      );
     }
   }
 
@@ -366,9 +163,6 @@ export interface ParsedStorageData {
   tombstones: TombstoneEntry[];
   archivedTokens: Map<string, TxfToken>;
   forkedTokens: Map<string, TxfToken>;
-  outboxEntries: OutboxEntry[];
-  mintOutboxEntries: MintOutboxEntry[];
-  invalidatedNametags: InvalidatedNametagEntry[];
   historyEntries: HistoryRecord[];
   validationErrors: string[];
 }
@@ -384,9 +178,6 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
     tombstones: [],
     archivedTokens: new Map(),
     forkedTokens: new Map(),
-    outboxEntries: [],
-    mintOutboxEntries: [],
-    invalidatedNametags: [],
     historyEntries: [],
     validationErrors: [],
   };
@@ -437,47 +228,6 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
     }
   }
 
-  // Extract outbox entries
-  if (storageData._outbox && Array.isArray(storageData._outbox)) {
-    for (const entry of storageData._outbox) {
-      if (
-        typeof entry === 'object' &&
-        entry !== null &&
-        typeof (entry as OutboxEntry).id === 'string' &&
-        typeof (entry as OutboxEntry).status === 'string'
-      ) {
-        result.outboxEntries.push(entry as OutboxEntry);
-      }
-    }
-  }
-
-  // Extract mint outbox entries
-  if (storageData._mintOutbox && Array.isArray(storageData._mintOutbox)) {
-    for (const entry of storageData._mintOutbox) {
-      if (
-        typeof entry === 'object' &&
-        entry !== null &&
-        typeof (entry as MintOutboxEntry).id === 'string' &&
-        typeof (entry as MintOutboxEntry).status === 'string'
-      ) {
-        result.mintOutboxEntries.push(entry as MintOutboxEntry);
-      }
-    }
-  }
-
-  // Extract invalidated nametags
-  if (storageData._invalidatedNametags && Array.isArray(storageData._invalidatedNametags)) {
-    for (const entry of storageData._invalidatedNametags) {
-      if (
-        typeof entry === 'object' &&
-        entry !== null &&
-        typeof (entry as InvalidatedNametagEntry).name === 'string'
-      ) {
-        result.invalidatedNametags.push(entry as InvalidatedNametagEntry);
-      }
-    }
-  }
-
   // Extract history entries
   if (Array.isArray(storageData._history)) {
     for (const entry of storageData._history) {
@@ -497,182 +247,48 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
     // Active tokens
     if (isTokenKey(key)) {
       const tokenId = tokenIdFromKey(key);
-      try {
-        const txfToken = storageData[key] as TxfToken;
-        if (txfToken?.genesis?.data?.tokenId) {
-          const token = txfToToken(tokenId, txfToken);
-          result.tokens.push(token);
-        } else if (isV2TokenEntry(storageData[key])) {
-          // v2 storage entry — the UI token record (opaque blob in sdkData).
-          result.tokens.push(storageData[key] as Token);
-        }
-      } catch (err) {
-        result.validationErrors.push(`Token ${tokenId}: ${err}`);
+      const entry = storageData[key];
+      if (isV2TokenEntry(entry)) {
+        // v2 storage entry — the UI token record (opaque blob in sdkData).
+        result.tokens.push(entry as Token);
+      } else if (isLegacyV1TxfEntry(entry)) {
+        // A v1 TXF token from a pre-v2 wallet. The v1 codec is gone; refuse it
+        // loudly instead of guessing a v2 blob out of a shape that is not one.
+        const msg = `Token ${tokenId}: legacy v1 TXF record — the v1 token format is no longer supported, entry skipped`;
+        logger.warn('TXF', msg);
+        result.validationErrors.push(msg);
+      } else {
+        const msg = `Token ${tokenId}: unrecognized storage entry (not a v2 token blob) — entry skipped`;
+        logger.warn('TXF', msg);
+        result.validationErrors.push(msg);
       }
     }
     // Archived tokens
     else if (isArchivedKey(key)) {
       const tokenId = tokenIdFromArchivedKey(key);
-      try {
-        const txfToken = storageData[key] as TxfToken;
-        if (txfToken?.genesis?.data?.tokenId) {
-          result.archivedTokens.set(tokenId, txfToken);
-        }
-      } catch {
-        result.validationErrors.push(`Archived token ${tokenId}: invalid structure`);
+      const txfToken = storageData[key] as TxfToken;
+      if (txfToken?.genesis?.data?.tokenId) {
+        result.archivedTokens.set(tokenId, txfToken);
       }
     }
     // Forked tokens
     else if (isForkedKey(key)) {
       const parsed = parseForkedKey(key);
       if (parsed) {
-        try {
-          const txfToken = storageData[key] as TxfToken;
-          if (txfToken?.genesis?.data?.tokenId) {
-            const mapKey = `${parsed.tokenId}_${parsed.stateHash}`;
-            result.forkedTokens.set(mapKey, txfToken);
-          }
-        } catch {
-          result.validationErrors.push(`Forked token ${parsed.tokenId}: invalid structure`);
+        const txfToken = storageData[key] as TxfToken;
+        if (txfToken?.genesis?.data?.tokenId) {
+          const mapKey = `${parsed.tokenId}_${parsed.stateHash}`;
+          result.forkedTokens.set(mapKey, txfToken);
         }
       }
     }
-    // Individual file format tokens (from IPFS storage's saveToken)
+    // Individual file format tokens (legacy per-file `{ token: TxfToken }` records)
     else if (key.startsWith('token-')) {
-      try {
-        const entry = storageData[key] as { token?: TxfToken };
-        const txfToken = entry?.token;
-        if (txfToken?.genesis?.data?.tokenId) {
-          const tokenId = txfToken.genesis.data.tokenId;
-          const token = txfToToken(tokenId, txfToken);
-          result.tokens.push(token);
-        }
-      } catch (err) {
-        result.validationErrors.push(`Token ${key}: ${err}`);
-      }
+      const msg = `Token ${key}: legacy per-file v1 TXF record — the v1 token format is no longer supported, entry skipped`;
+      logger.warn('TXF', msg);
+      result.validationErrors.push(msg);
     }
   }
 
   return result;
-}
-
-// =============================================================================
-// Utility Functions
-// =============================================================================
-
-/**
- * Get token ID from Token object (prefers genesis.data.tokenId)
- */
-export function getTokenId(token: Token): string {
-  if (token.sdkData) {
-    try {
-      const txf = JSON.parse(token.sdkData);
-      if (txf.genesis?.data?.tokenId) {
-        return txf.genesis.data.tokenId;
-      }
-    } catch {
-      // Fall through
-    }
-  }
-  return token.id;
-}
-
-/**
- * Get the current state hash from a TXF token
- * Checks multiple sources in order of preference:
- * 1. Last transaction's newStateHash
- * 2. _integrity.currentStateHash
- * 3. Last transaction's inclusionProof authenticator stateHash
- * 4. Genesis inclusionProof authenticator stateHash (for never-transferred tokens)
- */
-export function getCurrentStateHash(txf: TxfToken): string | undefined {
-  // Check last transaction's explicit newStateHash
-  if (txf.transactions && txf.transactions.length > 0) {
-    const lastTx = txf.transactions[txf.transactions.length - 1];
-    if (lastTx?.newStateHash) {
-      return lastTx.newStateHash;
-    }
-    // Check authenticator stateHash from last transaction's proof
-    if (lastTx?.inclusionProof?.authenticator?.stateHash) {
-      return lastTx.inclusionProof.authenticator.stateHash;
-    }
-  }
-
-  // Check integrity metadata
-  if (txf._integrity?.currentStateHash) {
-    return txf._integrity.currentStateHash;
-  }
-
-  // For tokens with no transactions, use genesis proof's stateHash
-  if (txf.genesis?.inclusionProof?.authenticator?.stateHash) {
-    return txf.genesis.inclusionProof.authenticator.stateHash;
-  }
-
-  return undefined;
-}
-
-/**
- * Check if token has valid TXF data
- */
-export function hasValidTxfData(token: Token): boolean {
-  if (!token.sdkData) return false;
-
-  try {
-    const txf = JSON.parse(token.sdkData);
-    return !!(
-      txf.genesis &&
-      txf.genesis.data &&
-      txf.genesis.data.tokenId &&
-      txf.state &&
-      txf.genesis.inclusionProof
-    );
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Check if token has uncommitted transactions
- */
-export function hasUncommittedTransactions(token: Token): boolean {
-  if (!token.sdkData) return false;
-
-  try {
-    const txf = JSON.parse(token.sdkData);
-    if (!txf.transactions || txf.transactions.length === 0) return false;
-
-    return txf.transactions.some(
-      (tx: TxfTransaction) => tx.inclusionProof === null
-    );
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Check if a TXF token has missing newStateHash on any transaction
- */
-export function hasMissingNewStateHash(txf: TxfToken): boolean {
-  if (!txf.transactions || txf.transactions.length === 0) {
-    return false;
-  }
-  return txf.transactions.some(tx => !tx.newStateHash);
-}
-
-/**
- * Count committed transactions in a token
- */
-export function countCommittedTransactions(token: Token): number {
-  if (!token.sdkData) return 0;
-
-  try {
-    const txf = JSON.parse(token.sdkData);
-    if (!txf.transactions) return 0;
-
-    return txf.transactions.filter(
-      (tx: TxfTransaction) => tx.inclusionProof !== null
-    ).length;
-  } catch {
-    return 0;
-  }
 }

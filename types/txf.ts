@@ -138,52 +138,6 @@ export interface TombstoneEntry {
 }
 
 /**
- * Invalidated nametag entry
- */
-export interface InvalidatedNametagEntry {
-  name: string;
-  token: object;
-  timestamp: number;
-  format: string;
-  version: string;
-  invalidatedAt: number;
-  invalidationReason: string;
-}
-
-/**
- * Outbox entry for pending transfers
- */
-export interface OutboxEntry {
-  id: string;
-  status: 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'failed';
-  sourceTokenId: string;
-  salt: string;
-  commitmentJson: string;
-  recipientPubkey: string;
-  recipientNametag?: string;
-  amount: string;
-  createdAt: number;
-  updatedAt: number;
-  error?: string;
-  retryCount?: number;
-}
-
-/**
- * Mint outbox entry for pending mints
- */
-export interface MintOutboxEntry {
-  id: string;
-  status: 'pending' | 'submitted' | 'confirmed' | 'failed';
-  type: 'split' | 'faucet' | 'other';
-  salt: string;
-  requestIdHex: string;
-  mintDataJson: string;
-  createdAt: number;
-  updatedAt: number;
-  error?: string;
-}
-
-/**
  * Storage metadata
  */
 export interface TxfMeta {
@@ -203,10 +157,7 @@ export interface TxfStorageData {
   _nametag?: NametagData;
   _nametags?: NametagData[];
   _tombstones?: TombstoneEntry[];
-  _invalidatedNametags?: InvalidatedNametagEntry[];
-  _outbox?: OutboxEntry[];
-  _mintOutbox?: MintOutboxEntry[];
-  [key: string]: TxfToken | TxfMeta | NametagData | NametagData[] | TombstoneEntry[] | InvalidatedNametagEntry[] | OutboxEntry[] | MintOutboxEntry[] | undefined;
+  [key: string]: TxfToken | TxfMeta | NametagData | NametagData[] | TombstoneEntry[] | undefined;
 }
 
 // =============================================================================
@@ -222,9 +173,6 @@ export interface TxfStorageDataBase {
   _nametag?: NametagData;
   _nametags?: NametagData[];
   _tombstones?: TombstoneEntry[];
-  _invalidatedNametags?: InvalidatedNametagEntry[];
-  _outbox?: OutboxEntry[];
-  _mintOutbox?: MintOutboxEntry[];
   _history?: unknown[];
   [key: string]: unknown;
 }
@@ -242,7 +190,6 @@ export interface ValidationIssue {
 export interface TokenValidationResult {
   isValid: boolean;
   reason?: string;
-  action?: 'ACCEPT' | 'RETRY_LATER' | 'DISCARD_FORK';
 }
 
 // =============================================================================
@@ -251,6 +198,14 @@ export interface TokenValidationResult {
 
 const ARCHIVED_PREFIX = 'archived-';
 const FORKED_PREFIX = '_forked_';
+/**
+ * Underscore keys that are NEVER a token slot.
+ *
+ * `_invalidatedNametags`, `_outbox`, `_mintOutbox`, `_sent` and `_invalid` are
+ * v1 relics that nothing writes any more — but an old stored document can still
+ * carry them, and dropping them from this list would make `isTokenKey()` claim
+ * those arrays as token entries. They stay as an inert guard, not as a format.
+ */
 const RESERVED_KEYS = ['_meta', '_nametag', '_nametags', '_tombstones', '_invalidatedNametags', '_outbox', '_mintOutbox', '_sent', '_invalid', '_integrity', '_history'];
 
 /**

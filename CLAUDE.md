@@ -290,7 +290,6 @@ sphere-sdk/
 │   ├── Sphere.ts           # Main wallet class (~165KB) - entry point
 │   ├── address.ts          # DIRECT:// address parsing/validation
 │   ├── crypto.ts           # BIP39/BIP32, secp256k1, hashing, message signing
-│   ├── bech32.ts           # Address encoding/decoding
 │   ├── encryption.ts       # AES/Argon2+ChaCha20 encryption utilities
 │   ├── errors.ts           # SphereError + SphereErrorCode
 │   ├── logger.ts           # Centralized logger singleton

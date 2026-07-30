@@ -122,7 +122,7 @@
       "count": 6
     },
     "complexity": {
-      "count": 12
+      "count": 11
     },
     "max-depth": {
       "count": 8
@@ -131,7 +131,7 @@
       "count": 1
     },
     "max-lines-per-function": {
-      "count": 15
+      "count": 14
     },
     "max-params": {
       "count": 1
@@ -150,11 +150,6 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 1
-    }
-  },
-  "core/bech32.ts": {
-    "budget/comment-ratio": {
       "count": 1
     }
   },
@@ -821,7 +816,7 @@
       "count": 1
     },
     "complexity": {
-      "count": 3
+      "count": 2
     },
     "max-lines-per-function": {
       "count": 2
@@ -830,20 +825,6 @@
   "serialization/types.ts": {
     "budget/comment-ratio": {
       "count": 1
-    }
-  },
-  "serialization/wallet-dat.ts": {
-    "budget/no-long-comment-block": {
-      "count": 1
-    },
-    "complexity": {
-      "count": 1
-    },
-    "max-depth": {
-      "count": 1
-    },
-    "max-lines-per-function": {
-      "count": 2
     }
   },
   "serialization/wallet-text.ts": {

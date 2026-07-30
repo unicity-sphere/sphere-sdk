@@ -1770,7 +1770,7 @@ The suite spans ~170 test files. Major areas:
 
 | Area | Description |
 |------|-------------|
-| `tests/unit/core` | Crypto (BIP39/BIP32), bech32, currency, encryption, Sphere lifecycle |
+| `tests/unit/core` | Crypto (BIP39/BIP32), currency, encryption, Sphere lifecycle |
 | `tests/unit/token-engine` | v2 engine adapter: mint, transfer, split, verify, Unicity ID mint |
 | `tests/unit/modules` | PaymentsModule (v2 send/receive/mint/validate, spend queue, history), AccountingModule (full invoice lifecycle), Communications, GroupChat, Market |
 | `tests/unit/serialization` | TXF format, wallet text/dat backups |
@@ -1787,7 +1787,7 @@ Tests follow the structure:
 ```
 tests/
 ├── unit/
-│   ├── core/            # crypto, bech32, currency, encryption, Sphere.*
+│   ├── core/            # crypto, currency, encryption, Sphere.*
 │   ├── token-engine/    # v2 engine adapter + Unicity ID minter
 │   ├── modules/         # PaymentsModule.*, AccountingModule.*, Communications*, ...
 │   ├── price/
