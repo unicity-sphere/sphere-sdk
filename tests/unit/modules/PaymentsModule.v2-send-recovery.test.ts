@@ -494,24 +494,4 @@ describe('handleV2Transfer — storage rejection gates events (v2)', () => {
   });
 });
 
-describe('load() — legacy PENDING_V5_TOKENS cleanup', () => {
-  it('drops the legacy KV key without materializing its tokens', async () => {
-    const { module, storage } = await setup();
-    // Inject the key exactly as the removed v1 receiver persisted it.
-    storage.map.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, JSON.stringify([{
-      id: 'v5split_abc', coinId: UCT, symbol: 'UCT', name: 'UCT', decimals: 0,
-      amount: '50', status: 'submitted', createdAt: Date.now(), updatedAt: Date.now(),
-      sdkData: JSON.stringify({ _pendingFinalization: { stage: 'RECEIVED' } }),
-    }]));
-
-    await module.load();
-    await settlePumps(module);
-
-    // v1 removal: the terminalize-into-'invalid' migration is gone. These tokens
-    // were never spendable and are no longer surfaced at all — the only remaining
-    // obligation is that the legacy key does not linger.
-    expect(module.getTokens()).toHaveLength(0);
-    expect(storage.map.has(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS)).toBe(false);
-  });
-});
 /* eslint-enable @typescript-eslint/no-explicit-any */

@@ -10,10 +10,8 @@
  * 2. send() with an engine split → 1 SENT entry (change-token storage creates none)
  * 3. send() preserves memo and recipient metadata in history
  * 4. V2_TRANSFER receive → 1 RECEIVED entry (storeEngineToken creates none)
- * 5. V2 receive populates sender info via resolveSenderInfo
  * 6. V2 receive passes memo into history
  * 7. Re-delivered identical V2 payload → still 1 entry (dedup by genesis token id)
- * 8. resolveSenderInfo() — transport resolution and error handling
  * 9. history:updated event on addToHistory
  *
  * Composition: the REAL own-storage wallet-api preset
@@ -426,17 +424,6 @@ describe('History deduplication — integration flows', () => {
       expect(history[0].coinId).toBe(UCT);
     });
 
-    it('should populate sender info via resolveSenderInfo', async () => {
-      const ctx = await setupModule('alice');
-
-      await deliver(ctx, await v2Payload(ctx.engine, 500000n));
-
-      const history = ctx.module.getHistory();
-      expect(history).toHaveLength(1);
-      expect(history[0].senderPubkey).toBe(SENDER_TRANSPORT_PUBKEY);
-      expect(history[0].senderNametag).toBe('alice');
-      expect(history[0].senderAddress).toBe('DIRECT://sender');
-    });
 
     it('should preserve memo in RECEIVED entry', async () => {
       const ctx = await setupModule();
@@ -461,69 +448,12 @@ describe('History deduplication — integration flows', () => {
       expect(ctx.module.getHistory()).toHaveLength(1);
     });
 
-    it('should emit transfer:incoming with senderNametag and memo', async () => {
-      const ctx = await setupModule('alice');
-
-      await deliver(ctx, await v2Payload(ctx.engine, 500000n, 'test memo'));
-
-      expect(ctx.deps.emitEvent).toHaveBeenCalledWith(
-        'transfer:incoming',
-        expect.objectContaining({
-          senderNametag: 'alice',
-          memo: 'test memo',
-        }),
-      );
-    });
   });
 
   // ===========================================================================
   // resolveSenderInfo
   // ===========================================================================
 
-  describe('resolveSenderInfo', () => {
-    it('should resolve nametag and address from transport', async () => {
-      const ctx = await setupModule('alice');
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod = ctx.module as any;
-
-      const info = await mod.resolveSenderInfo(SENDER_TRANSPORT_PUBKEY);
-      expect(info.senderNametag).toBe('alice');
-      expect(info.senderAddress).toBe('DIRECT://sender');
-    });
-
-    it('should return empty object when transport throws', async () => {
-      const ctx = await setupModule();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (ctx.transport as any).resolveTransportPubkeyInfo = vi.fn().mockRejectedValue(new Error('network error'));
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod = ctx.module as any;
-
-      const info = await mod.resolveSenderInfo(SENDER_TRANSPORT_PUBKEY);
-      expect(info).toEqual({});
-    });
-
-    it('should return empty object when transport lacks resolveTransportPubkeyInfo', async () => {
-      const ctx = await setupModule();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      delete (ctx.transport as any).resolveTransportPubkeyInfo;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod = ctx.module as any;
-
-      const info = await mod.resolveSenderInfo(SENDER_TRANSPORT_PUBKEY);
-      expect(info).toEqual({});
-    });
-
-    it('should return empty object when resolveTransportPubkeyInfo returns null', async () => {
-      const ctx = await setupModule();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (ctx.transport as any).resolveTransportPubkeyInfo = vi.fn().mockResolvedValue(null);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod = ctx.module as any;
-
-      const info = await mod.resolveSenderInfo(SENDER_TRANSPORT_PUBKEY);
-      expect(info).toEqual({});
-    });
-  });
 
   // ===========================================================================
   // history:updated event

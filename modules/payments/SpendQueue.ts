@@ -22,14 +22,8 @@ import { hexToBytes } from '../../core/crypto';
 // Constants
 // =============================================================================
 
-/** How long a reservation lives before the ledger can expire it. */
-export const RESERVATION_TIMEOUT_MS = 30_000;
-
 /** How long a queued entry waits before being rejected with SEND_QUEUE_TIMEOUT. */
 export const QUEUE_TIMEOUT_MS = 30_000;
-
-/** Exported for test compatibility. Not used by production queue logic. */
-export const MAX_SKIP_COUNT = 10;
 
 /** Maximum number of entries allowed in the queue across all coinIds. */
 export const QUEUE_MAX_SIZE = 100;

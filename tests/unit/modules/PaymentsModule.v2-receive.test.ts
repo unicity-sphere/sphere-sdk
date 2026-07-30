@@ -197,9 +197,10 @@ async function setup(engine?: FakeTokenEngine): Promise<Wallet & { fake: FakeWal
 async function v2Payload(
   engine: FakeTokenEngine, coinId: string, amount: bigint, memo?: string,
   recipientPubkey: Uint8Array = engine.getIdentity().chainPubkey,
+  senderNametag?: string,
 ): Promise<V2TransferPayload> {
   const st = await engine.mint({ recipientPubkey, value: { assets: [{ coinId, amount }] } });
-  return { type: 'V2_TRANSFER', version: '2.0', tokenBlob: bytesToHex(encodeTokenBlob(engine.encodeToken(st))), memo };
+  return { type: 'V2_TRANSFER', version: '2.0', tokenBlob: bytesToHex(encodeTokenBlob(engine.encodeToken(st))), memo, senderNametag };
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -253,15 +254,27 @@ describe('handleV2Transfer — v2 receiver (B1)', () => {
     expect(tokens[0].status).toBe('confirmed');
   });
 
-  it('emits transfer:incoming with the token, memo and resolved sender nametag', async () => {
+  it('emits transfer:incoming with the token, memo and the envelope sender nametag', async () => {
     const { module, engine, emitEvent } = await setup();
-    await deliver(module, await v2Payload(engine, UCT, 250n, 'gm'));
+    await deliver(module, await v2Payload(engine, UCT, 250n, 'gm', undefined, 'alice'));
 
     const call = emitEvent.mock.calls.find((c: unknown[]) => c[0] === 'transfer:incoming');
     expect(call).toBeDefined();
     expect(call![1].tokens).toHaveLength(1);
     expect(call![1].memo).toBe('gm');
     expect(call![1].senderNametag).toBe('alice');
+  });
+
+  it('leaves the sender nametag unset when the envelope carries none', async () => {
+    // The S6 delivery envelope is the ONLY source. There is no transport lookup
+    // behind it: a sender that omits the nametag shows as a pubkey, not as a
+    // name resolved from somewhere else.
+    const { module, engine, emitEvent } = await setup();
+    await deliver(module, await v2Payload(engine, UCT, 250n, 'gm'));
+
+    const call = emitEvent.mock.calls.find((c: unknown[]) => c[0] === 'transfer:incoming');
+    expect(call).toBeDefined();
+    expect(call![1].senderNametag).toBeUndefined();
   });
 
   it('records a single RECEIVED history entry', async () => {
