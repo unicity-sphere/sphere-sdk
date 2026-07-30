@@ -1010,6 +1010,50 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(sent).toBeDefined();
   });
 
+  it('#621: a leg with a journaled blob is RE-DELIVERED, never re-certified', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-journal-1');
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // The original send's state: the op CERTIFIED (source spent on-chain, blob
+    // journaled) and the intent stayed open on a LATER failure — the applyDelta.
+    const transferId = crypto.randomUUID();
+    const provider = [...sender.deps.tokenStorageProviders!.values()][0]!;
+    const source = await sender.engine.decodeToken(await provider.getToken(sourceTokenId));
+    const finished = await sender.engine.transfer({ token: source, recipientPubkey: hexToBytes(RECIPIENT.chainPubkey) });
+    const journaledBlob = bytesToHex(encodeTokenBlob(sender.engine.encodeToken(finished)));
+    sender.storage.map.set(
+      'pending_v2_deliveries',
+      JSON.stringify([
+        { transferId, recipientPubkey: RECIPIENT.chainPubkey, tokenBlob: journaledBlob, opIndex: 0, createdAt: Date.now() },
+      ])
+    );
+
+    sender.client.setIdentity(SENDER);
+    await sender.client.putIntent(
+      transferId,
+      encryptField(
+        deriveFieldEncryptionKey(SENDER.privateKey),
+        JSON.stringify({ v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] })
+      )
+    );
+
+    const transfer = vi.spyOn(sender.engine, 'transfer');
+    const outcome = await sender.module.resumeOpenIntents();
+
+    // The engine is NEVER re-run for a journaled op: its source is already spent,
+    // so a re-certify would conflict and strand the recipient's token.
+    expect(transfer).not.toHaveBeenCalled();
+    expect(outcome.resumed).toEqual([transferId]);
+    // The recipient gets the JOURNALED blob — the very bytes the original send certified.
+    const entries = fake.listMailboxEntries(RECIPIENT.chainPubkey);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].transferId).toBe(transferId);
+    expect(entries[0].tokenId).toBe(sender.engine.tokenId(finished));
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
+  });
+
   it('a provider swap mid-resume applies the spend to the provider the sources came from', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-swap-1');
