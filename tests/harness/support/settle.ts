@@ -36,11 +36,19 @@ export function totalOf(balances: CoinBalance[]): bigint {
   return balances.find((b) => b.coinId === HARNESS_COIN)?.total ?? 0n;
 }
 
-/** Value the wallet can PLAN against right now: confirmed tokens only. */
+/**
+ * Value the wallet can PLAN against right now.
+ *
+ * Mirrors SpendQueue.buildParsedPool exactly — same coin, 'confirmed', and NOT
+ * `suspectedSpent` (#625 demotes an already-spent source: kept in inventory,
+ * excluded from selection). A looser predicate here would report ready and then
+ * hand the planner nothing it can use, recreating the SEND_INSUFFICIENT_BALANCE
+ * this helper exists to prevent.
+ */
 export function spendableOf(w: HarnessWallet): bigint {
   return w.module
     .getTokens()
-    .filter((t) => t.status === 'confirmed')
+    .filter((t) => t.coinId === HARNESS_COIN && t.status === 'confirmed' && !t.suspectedSpent)
     .reduce((sum, t) => sum + BigInt(t.amount), 0n);
 }
 
