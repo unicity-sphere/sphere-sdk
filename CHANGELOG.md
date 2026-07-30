@@ -40,8 +40,18 @@ const { sphere } = await Sphere.init({ ...providers, verification: { createWorke
   runnable Node and browser scripts.
 - `ITokenEngine.dispose?()` (new, optional) terminates the pool. Workers spawn LAZILY, so building
   an engine still costs nothing — which matters because Sphere rebuilds it on every address switch
-  and api-key change. Both of those now dispose the engine they replace, and `sphere.destroy()`
-  disposes the live one; without that, opting in would leak a thread pool per switch.
+  and api-key change.
+- **Per-address engine lifecycle corrected while wiring that up.** Every tracked address builds its
+  OWN engine, so with `verification` enabled each may own its own worker pool:
+  - `_tokenEngine` now follows the ACTIVE address. It did not: a re-visit does not re-run
+    `initializeAddressModules`, so the field kept naming whichever address was initialised last —
+    and `setOracleApiKey()` then terminated THAT address's pool (while it kept running in the
+    background) and leaked the active one's.
+  - `setOracleApiKey()` rebuilds for the active address, updates that address's own module-set
+    record (a stale entry would hand it a disposed engine on the next switch back), and disposes
+    only the engine it actually replaced.
+  - `destroy()` disposes EVERY per-address engine, not just the active pointer — a wallet that has
+    visited three addresses was leaving three pools behind, which can keep a Node process alive.
 - No worker module enters either bundle when unused: we import only the deep `lib/**` paths we
   already used (verified — `worker_threads` appears solely in the Node bundle's pre-existing
   undici/webidl code, identically under 2.0.1).
