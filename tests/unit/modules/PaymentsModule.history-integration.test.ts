@@ -276,7 +276,7 @@ async function v2Payload(
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 function deliver(ctx: TestContext, payload: V2TransferPayload) {
-  return (ctx.module as any).handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
+  return (ctx.module as any).deliveries.handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 

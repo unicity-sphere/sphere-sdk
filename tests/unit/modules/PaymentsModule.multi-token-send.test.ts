@@ -296,7 +296,7 @@ async function seedToken(module: any, engine: FakeTokenEngine, amount: bigint, i
     type: 'V2_TRANSFER', version: '2.0',
     tokenBlob: bytesToHex(encodeTokenBlob(engine.encodeToken(minted))),
   };
-  await module.handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
+  await module.deliveries.handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
 }
 
 /** Mint `count` × AMOUNT_EACH tokens and receive them into the wallet (no latency). */

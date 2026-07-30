@@ -205,7 +205,7 @@ async function v2Payload(
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 function deliver(module: PaymentsModule, payload: V2TransferPayload) {
-  return (module as any).handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
+  return (module as any).deliveries.handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 

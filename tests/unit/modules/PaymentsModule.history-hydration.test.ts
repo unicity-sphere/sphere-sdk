@@ -153,7 +153,9 @@ describe('hydrateHistoryFromServer — incremental fast path (#642)', () => {
     await module.load();
 
     // A local entry not (yet) on the server — e.g. its history POST failed.
-    (module as unknown as { _historyCache: unknown[] })._historyCache.push({
+    (
+      module as unknown as { history: { _historyCache: unknown[] } }
+    ).history._historyCache.push({
       id: 'h-local', dedupKey: 'dk-local', type: 'SENT', amount: '9',
       coinId: UCT, symbol: 'UCT', timestamp: 1_700_000_099_000,
     });

@@ -21,17 +21,14 @@ import type {
   SphereEventMap,
 } from '../../types';
 import type {
-  TxfToken,
   TxfTransaction,
   TombstoneEntry,
   NametagData,
 } from '../../types/txf';
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
-import type { ITokenEngine, SphereToken, TokenBlob } from '../../token-engine';
+import type { ITokenEngine, SphereToken } from '../../token-engine';
 import {
-  CheckpointPersistFailedError,
   CheckpointTrustbaseMismatchError,
-  ProofUnconfirmedError,
   type SplitCheckpointStore,
   SplitCheckpointLostError,
   TransferConflictError,
@@ -49,19 +46,27 @@ import {
   type SendOutcomeSummary,
 } from './SendOperations';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry } from './SpendQueue';
+import { PaymentRequests, type PaymentRequestsHost } from './requests/PaymentRequests';
+import { TransferHistory, type TransferHistoryHost } from './history/TransferHistory';
+import { IntentResume, type IntentResumeHost } from './resume/IntentResume';
+import { Delivery, type DeliveryHost, type ReceiveOptions, type ReceiveResult } from './receive/Delivery';
+import {
+  TokenView,
+  type TokenViewHost,
+  createTokenStateKey,
+  extractStateHashFromSdkData,
+  extractTokenIdFromSdkData,
+  extractTokenStateKey,
+  looksLikeTokenBlob,
+} from './inventory/TokenView';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../storage';
 import type {
   TransportProvider,
   PeerInfo,
   IncomingTokenTransfer,
 } from '../../transport';
-import type { DeliverOptions, DeliveryProvider, IncomingDelivery, WakeStream } from '../../transport/delivery-provider';
-import { deriveFieldEncryptionKey, encryptField, decryptField } from '../../core/field-encryption';
-import {
-  deriveDeliveryEncryptionKey,
-  encryptDeliveryBundle,
-  decryptDeliveryBundle,
-} from '../../core/delivery-envelope';
+import type { DeliveryProvider, IncomingDelivery, WakeStream } from '../../transport/delivery-provider';
+import { deriveFieldEncryptionKey, encryptField } from '../../core/field-encryption';
 import type { OracleProvider } from '../../oracle';
 import type { PriceProvider } from '../../price';
 import type {
@@ -74,7 +79,6 @@ import type {
   PaymentRequestResponse,
   PaymentRequestResponseHandler,
 } from '../../types';
-import { STORAGE_KEYS_ADDRESS } from '../../constants';
 import {
   buildTxfStorageData,
   parseTxfStorageData,
@@ -83,11 +87,10 @@ import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError, PartialSendConflictError, isPossiblyCommittedSendOutcome } from '../../core/errors';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
-import { sleep } from '../../core/utils';
 import { PumpHealth } from './pump-health';
 import { timeoutSignal } from '../../core/timeout';
 import { randomUUID } from '../../core/uuid';
-import { decodeTokenBlob, encodeTokenBlob, unwrapTokenBlobBytes, TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
+import { decodeTokenBlob, encodeTokenBlob, unwrapTokenBlobBytes } from '../../token-engine/token-blob';
 
 // =============================================================================
 // Transaction History Entry
@@ -99,61 +102,8 @@ import { decodeTokenBlob, encodeTokenBlob, unwrapTokenBlobBytes, TOKEN_BLOB_VERS
  */
 export type TransactionHistoryEntry = import('../../storage').HistoryRecord;
 
-/**
- * #441: a wallet-api `respondPaymentRequest` rejection meaning the request is
- * NOT open (already resolved / expired) — a 409 CONFLICT. Safe to swallow when
- * replaying a deferred 'paid' (idempotent); any OTHER error must be retried.
- */
-function isNonOpenConflict(err: unknown): boolean {
-  return err instanceof WalletApiError && (err.code === 'CONFLICT' || err.status === 409);
-}
-
-/**
- * Compute a dedup key for a history entry.
- * - SENT + transferId → groups multi-token sends into a single entry
- * - type + tokenId → one entry per token per direction
- * - fallback → UUID (no dedup possible)
- */
-function computeHistoryDedupKey(type: string, tokenId?: string, transferId?: string, stateHash?: string): string {
-  if (type === 'SENT' && transferId) return `${type}_transfer_${transferId}`;
-  // A genesis token can be RECEIVED more than once at DIFFERENT states (a self-send or an
-  // A→B→A round-trip re-acquires it). Include the received state so each leg is a distinct
-  // receipt instead of upserting the same `RECEIVED_v2_<genesisId>` key — otherwise repeated
-  // re-acquires undercount received history and stop netting against their SENT records.
-  if (tokenId && stateHash) return `${type}_${tokenId}_${stateHash}`;
-  if (tokenId) return `${type}_${tokenId}`;
-  return `${type}_${randomUUID()}`;
-}
-
 /** Maximum number of history entries to include in IPFS-synced TXF data */
 const MAX_SYNCED_HISTORY_ENTRIES = 5000;
-
-/**
- * Cap on the number of newest-first keyset pages pulled when rebuilding history
- * from the server on reload (the wallet-api composition). At the §16 page limit
- * this bounds a single hydration well past any realistic wallet's recent
- * history while staying finite if the server ever mis-reports `more`.
- */
-const MAX_HISTORY_HYDRATION_PAGES = 100;
-
-/**
- * Force a FULL history re-pull every N incremental pulls (#642). The
- * incremental stop condition assumes the server's keyset order matches arrival
- * order (append-only log); if a row ever lands "behind" already-pulled pages
- * (backdated ts, cross-device clock skew), the periodic full pull bounds how
- * long it can stay invisible (~N × the 30s poll interval).
- */
-const FULL_HISTORY_REPULL_EVERY = 20;
-
-/**
- * Cap on the number of gap-free `?since=` pages pulled when rebuilding the
- * incoming payment-request view from the server on reload (the wallet-api
- * composition — the #556 reload fix). At the §16 page limit this bounds a
- * single hydration past any realistic payer's request history while staying
- * finite if the server ever mis-reports `more`. Mirrors
- * {@link MAX_HISTORY_HYDRATION_PAGES}.
- */
-const MAX_PR_HYDRATION_PAGES = 100;
 
 /**
  * Overall timeout for a single engine transfer/split during send(). Overrides
@@ -170,34 +120,13 @@ const SEND_ENGINE_OP_TIMEOUT_MS = 60_000;
  */
 const DELIVERY_POLL_INTERVAL_MS = 30_000;
 
-/**
- * Bounded replay budget for journaled finished-but-undelivered v2 blobs (#517
- * item 1). Each load()'s replay pass makes at most {@link DELIVERY_REPLAY_RETRIES}
- * + 1 attempts per entry with exponential backoff; the cumulative failed-attempt
- * count is journaled across loads. Once it reaches
- * {@link MAX_DELIVERY_REPLAY_ATTEMPTS} (inclusive) the entry is surfaced as poison
- * (`delivery:undeliverable`) and left journaled but no longer auto-retried —
- * the deposit is idempotent, so a later app version may still land it.
- */
-const DELIVERY_REPLAY_RETRIES = 2;
-const MAX_DELIVERY_REPLAY_ATTEMPTS = 6;
 /** #623: incoming claim/reject are submitted in batches of this size (one request each) so a large
  * inbox drain doesn't fire one write per entry and trip the per-owner rate limit. */
 const INCOMING_ACK_BATCH_SIZE = 200;
 /** #625: max times send() re-plans after demoting an already-spent source (self-healing selection).
  * A backstop — each retry permanently demotes one stale source, so convergence is fast. */
 const MAX_RESELECT_ATTEMPTS = 8;
-/** §3.1 (#621): how long a recipient-quota (429) delivery is deferred before the next replay attempt. */
-const DELIVERY_DEFERRAL_MS = 60 * 60 * 1000; // 1h
-const DELIVERY_REPLAY_BASE_DELAY_MS = 1_000;
-const DELIVERY_REPLAY_MAX_DELAY_MS = 8_000;
 
-/**
- * A FINISHED v2 token blob awaiting transport delivery. Journaled the moment
- * the transfer/split output is certified on-chain (the source is already
- * spent) and removed after successful delivery, so a transport failure or a
- * crash never loses the recipient's token. Replayed by load().
- */
 /**
  * The ONE error a failed fan-out surfaces, prepared for the caller.
  *
@@ -244,7 +173,7 @@ interface SendAttemptState {
 }
 
 /** Everything one send's engine operations need, fixed for the whole fan-out. */
-interface CertifyContext {
+export interface CertifyContext {
   readonly engine: ITokenEngine;
   /** The intent id — half of the (transferId, opIndex) realization seed (§8.1). */
   readonly transferId: string;
@@ -255,24 +184,6 @@ interface CertifyContext {
   readonly memo?: string;
   /** E.4 burn checkpoint for the split leg; absent when no store is configured. */
   readonly checkpointStore?: SplitCheckpointStore;
-}
-
-/**
- * Current state hash of a stored v1 TXF relic, for tombstone dedup only.
- *
- * Inlined when the v1 serializer went: this is the one caller left, and it reads
- * the same four places the serializer did — last transaction, its proof, the
- * integrity block, then the genesis proof.
- */
-function currentStateHashOfTxf(txf: TxfToken): string {
-  const last = txf.transactions?.[txf.transactions.length - 1];
-  return (
-    last?.newStateHash ??
-    last?.inclusionProof?.authenticator?.stateHash ??
-    txf._integrity?.currentStateHash ??
-    txf.genesis?.inclusionProof?.authenticator?.stateHash ??
-    ''
-  );
 }
 
 /** The genesis-stable id of a held token — identical across every state (§8.1). */
@@ -341,73 +252,24 @@ function intentValidationError(err: WalletApiError): SphereError {
 /** A {@link TransferResult} under construction — sealed by the time it is returned. */
 type MutableTransferResult = { -readonly [K in keyof TransferResult]: TransferResult[K] };
 
-interface PendingV2Delivery {
-  transferId: string;
-  recipientPubkey: string;
-  /** Hex of the finished token blob (the V2_TRANSFER payload). */
-  tokenBlob: string;
-  memo?: string;
-  createdAt: number;
-  /**
-   * Cumulative failed replay attempts across load()s. Surfaced as poison and
-   * marked `undeliverable` once it reaches {@link MAX_DELIVERY_REPLAY_ATTEMPTS}
-   * so journaled blobs never sit undelivered invisibly (#517).
-   */
-  attempts?: number;
-  /** Set once the entry is surfaced as poison; it stays journaled but is no longer auto-retried. */
-  undeliverable?: boolean;
-  /**
-   * (transferId, opIndex) pairing (§8.1) — the op's position in the intent's persisted order.
-   * Lets resume RE-DELIVER this already-certified blob instead of re-running the engine op
-   * (which would raise TransferConflictError on the spent source). Absent on legacy entries.
-   */
-  opIndex?: number;
-  /**
-   * §3.1 (#621): a recipient-side 429 (full mailbox / never-claimer) is NOT poison — it self-heals
-   * when the recipient drains. Such entries are deferred (kept journaled, never auto-poisoned) and
-   * retried no sooner than this epoch-ms; the count does not consume the case-A poison budget.
-   */
-  deferredUntil?: number;
-  /** Why the entry is deferred (observability) — e.g. 'recipient-quota'. */
-  deferredReason?: string;
-}
-
-/** Running per-coin totals folded by {@link PaymentsModule.aggregateTokens}. */
-interface AssetAccumulator {
-  coinId: string;
-  symbol: string;
-  name: string;
-  decimals: number;
-  iconUrl?: string;
-  confirmedAmount: bigint;
-  unconfirmedAmount: bigint;
-  transferringAmount: bigint;
-  confirmedTokenCount: number;
-  unconfirmedTokenCount: number;
-  transferringTokenCount: number;
-}
-
-// =============================================================================
-// Receive Options & Result
-// =============================================================================
+/**
+ * Receive + delivery types live with the feature ({@link Delivery}); re-exported
+ * here so the module's public surface (and `modules/payments/index.ts`) is
+ * unchanged.
+ */
+export type { PendingV2Delivery, ReceiveOptions, ReceiveResult } from './receive/Delivery';
 
 /**
- * @deprecated v2 transfers arrive as finished tokens — there is no finalization
- * phase. The options are accepted for backwards compatibility and ignored.
+ * Token-key derivation moved with the inventory view ({@link TokenView});
+ * re-exported here so the module's public surface (and
+ * `modules/payments/index.ts`) is unchanged.
  */
-export interface ReceiveOptions {
-  /** @deprecated Ignored — v2 tokens are stored confirmed on receipt. */
-  finalize?: boolean;
-  /** @deprecated Ignored. */
-  timeout?: number;
-  /** @deprecated Ignored. */
-  pollInterval?: number;
-}
-
-export interface ReceiveResult {
-  /** Newly received incoming transfers. */
-  transfers: IncomingTransfer[];
-}
+export {
+  createTokenStateKey,
+  extractStateHashFromSdkData,
+  extractTokenIdFromSdkData,
+  extractTokenStateKey,
+} from './inventory/TokenView';
 
 // =============================================================================
 // Token Parsing Utilities
@@ -488,124 +350,6 @@ export async function parseTokenInfo(tokenData: unknown, engine?: ITokenEngine):
 // Repository Utility Functions
 // =============================================================================
 
-// Cache parsed sdkData fields to avoid repeated JSON.parse in hot loops.
-// Key = sdkData string reference, value = { tokenId, stateHash }.
-// Cleared on address switch via clearSdkDataCache().
-// LOCAL-namespace keys ONLY (journal/tombstone dedup): this stateHash is a
-// plain sha256 over the token bytes — it is NOT the protocol state hash the
-// backend uses (that is token-engine deriveDeliveryKeys / the SDK imprint).
-// Both writers and readers of these keys use THIS function; never mix the two
-// derivations in one comparison.
-const sdkDataCache = new Map<string, { tokenId: string | null; stateHash: string }>();
-const SDK_DATA_CACHE_MAX = 2000;
-
-/** A v2 engine blob is hex (CBOR); legacy v1 TXF is JSON (starts with '{'). */
-function looksLikeTokenBlob(sdkData: string): boolean {
-  return sdkData.length >= 2 && sdkData.length % 2 === 0 && sdkData[0] !== '{' && /^[0-9a-f]+$/i.test(sdkData);
-}
-
-/**
- * Extract keys from a v2 engine blob (hex of CBOR(TokenBlob)). The blob carries
- * its genesis-stable tokenId; the per-state hash is SHA-256 of the token bytes
- * (unique per state — it changes on every transfer). No engine needed.
- * Returns null when the string is not a decodable blob.
- */
-function tryParseBlobKeys(sdkData: string): { tokenId: string; stateHash: string } | null {
-  try {
-    const blob = decodeTokenBlob(hexToBytes(sdkData));
-    return { tokenId: blob.tokenId, stateHash: sha256(bytesToHex(blob.token), 'hex') };
-  } catch {
-    return null;
-  }
-}
-
-function parseSdkDataCached(sdkData: string): { tokenId: string | null; stateHash: string } {
-  const cached = sdkDataCache.get(sdkData);
-  if (cached) return cached;
-
-  // v2 engine blob: self-describing keys (no engine, no JSON).
-  let entry: { tokenId: string | null; stateHash: string } | null =
-    looksLikeTokenBlob(sdkData) ? tryParseBlobKeys(sdkData) : null;
-
-  if (!entry) {
-    // NOT a v1 feature: tombstone/journal dedup is storage-level and
-    // version-agnostic, keyed by (tokenId, stateHash). This branch derives those
-    // keys for any non-blob stored shape — including the legacy TXF JSON still
-    // sitting in old wallets — so a re-delivery can still be deduped. It stays
-    // after the v1 removal deliberately; losing it would silently weaken dedup.
-    let tokenId: string | null = null;
-    let stateHash = '';
-    try {
-      const txf = JSON.parse(sdkData);
-      tokenId = txf.genesis?.data?.tokenId || null;
-      stateHash = currentStateHashOfTxf(txf as TxfToken);
-
-      // Try alternative locations if not found in standard place
-      if (!stateHash) {
-        /* eslint-disable @typescript-eslint/no-explicit-any */
-        if ((txf as any).state?.hash) {
-          stateHash = (txf as any).state.hash;
-        } else if ((txf as any).stateHash) {
-          stateHash = (txf as any).stateHash;
-        } else if ((txf as any).currentStateHash) {
-          stateHash = (txf as any).currentStateHash;
-        }
-        /* eslint-enable @typescript-eslint/no-explicit-any */
-      }
-    } catch {
-      // Invalid JSON — return defaults
-    }
-    entry = { tokenId, stateHash };
-  }
-
-  // Evict cache if it grows too large (unlikely in normal usage)
-  if (sdkDataCache.size >= SDK_DATA_CACHE_MAX) {
-    sdkDataCache.clear();
-  }
-  sdkDataCache.set(sdkData, entry);
-  return entry;
-}
-
-function clearSdkDataCache(): void {
-  sdkDataCache.clear();
-}
-
-/**
- * Extract token ID (genesis tokenId) from sdkData/jsonData
- */
-export function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
-  if (!sdkData) return null;
-  return parseSdkDataCached(sdkData).tokenId;
-}
-
-/**
- * Extract state hash from sdkData/jsonData
- */
-export function extractStateHashFromSdkData(sdkData: string | undefined): string {
-  if (!sdkData) return '';
-  return parseSdkDataCached(sdkData).stateHash;
-}
-
-/**
- * Create composite key from tokenId and stateHash
- * Format: {tokenId}_{stateHash}
- * This uniquely identifies a token at a specific state
- */
-export function createTokenStateKey(tokenId: string, stateHash: string): string {
-  return `${tokenId}_${stateHash}`;
-}
-
-/**
- * Extract composite key (tokenId_stateHash) from token
- * Returns null if token doesn't have valid tokenId and stateHash
- */
-export function extractTokenStateKey(token: Token): string | null {
-  const tokenId = extractTokenIdFromSdkData(token.sdkData);
-  const stateHash = extractStateHashFromSdkData(token.sdkData);
-  if (!tokenId || !stateHash) return null;
-  return createTokenStateKey(tokenId, stateHash);
-}
-
 /**
  * Check if two tokens have the same genesis tokenId (same token, possibly different states)
  */
@@ -622,25 +366,6 @@ function isSameTokenState(t1: Token, t2: Token): boolean {
   const key1 = extractTokenStateKey(t1);
   const key2 = extractTokenStateKey(t2);
   return !!(key1 && key2 && key1 === key2);
-}
-
-/**
- * Prune tombstones by age and count
- */
-function pruneTombstonesByAge(
-  tombstones: TombstoneEntry[],
-  maxAge: number = 30 * 24 * 60 * 60 * 1000,
-  maxCount: number = 100
-): TombstoneEntry[] {
-  const now = Date.now();
-  let result = tombstones.filter(t => (now - t.timestamp) < maxAge);
-
-  if (result.length > maxCount) {
-    result = [...result].sort((a, b) => b.timestamp - a.timestamp);
-    result = result.slice(0, maxCount);
-  }
-
-  return result;
 }
 
 // =============================================================================
@@ -823,21 +548,11 @@ export interface PaymentsWalletApiPort {
 }
 
 /**
- * The S4 capability slice once detected (see
- * {@link PaymentsModule.paymentRequestsApi}) — the optional members above,
- * required.
- */
-type PaymentRequestsApi = Pick<PaymentsWalletApiPort, 'network'> &
-  Required<
-    Pick<PaymentsWalletApiPort, 'createPaymentRequest' | 'listPaymentRequests' | 'respondPaymentRequest'>
-  >;
-
-/**
  * The decrypted E.3 intent payload (`{ sources, recipient, amounts }` concretized).
  * `v:2` (E.4, sphere-sdk#501) is the only shape: a split resumes from its durable
  * burn checkpoint.
  */
-interface IntentPayloadV1 {
+export interface IntentPayloadV1 {
   v: 2;
   /** Recipient chain pubkey (33-byte compressed, hex). */
   recipient: string;
@@ -966,25 +681,22 @@ export class PaymentsModule {
   // Token State
   private tokens: Map<string, Token> = new Map();
 
-  // Repository State (tombstones, history)
-  private tombstones: TombstoneEntry[] = [];
-  // O(1) lookup set derived from tombstones array. Rebuilt via rebuildTombstoneKeySet().
-  private tombstoneKeySet: Set<string> = new Set();
-  private _historyCache: TransactionHistoryEntry[] = [];
   private nametags: NametagData[] = [];
 
-  // Payment Requests State (Incoming)
-  private paymentRequests: IncomingPaymentRequest[] = [];
-  private paymentRequestHandlers: Set<PaymentRequestHandler> = new Set();
+  /** Inventory reads: balances/assets, the token accessors, tombstones, validate(). */
+  private readonly inventory: TokenView;
 
-  // Payment Requests State (Outgoing)
-  private outgoingPaymentRequests: Map<string, OutgoingPaymentRequest> = new Map();
-  private paymentRequestResponseHandlers: Set<PaymentRequestResponseHandler> = new Set();
-  private pendingResponseResolvers: Map<string, {
-    resolve: (response: PaymentRequestResponse) => void;
-    reject: (error: Error) => void;
-    timeout: ReturnType<typeof setTimeout>;
-  }> = new Map();
+  /** Payment requests (incoming + outgoing, the S4 pump, the #441 journal). */
+  private readonly requests: PaymentRequests;
+
+  /** Transaction history (the cache, the dedupKey rules, the §10 server log). */
+  private readonly history: TransferHistory;
+
+  /** E.3/E.4 intent resume (the sign-in replay of OPEN send intents). */
+  private readonly intents: IntentResume;
+
+  /** Receive + delivery (receive(), the v2 receiver, the journal, the replay budget). */
+  private readonly deliveries: Delivery;
 
   // Subscriptions
 
@@ -1006,38 +718,6 @@ export class PaymentsModule {
   private fieldEncryptionKey: Uint8Array | null = null;
   private checkpointStore: SplitCheckpointStore | null = null;
 
-  // wallet-api payment requests (sdk-changes S4 — §10/§16)
-  private prPollTimer: ReturnType<typeof setInterval> | null = null;
-  /** Coalesces concurrent payment-request pump runs. */
-  private prPumpInFlight: Promise<void> | null = null;
-  /**
-   * Set after the once-per-session full incoming hydration (#556): the surfaced
-   * incoming list is in-memory only, so on a fresh engine the CURRENT state of
-   * ALL incoming requests — open AND resolved (paid/declined/expired) — must be
-   * rebuilt from a `role=incoming&since=0` pull, not just the still-open ones.
-   * A status-filtered bootstrap (the pre-#556 `status=open` scan) dropped
-   * requests resolved in a PRIOR session, so the payer reopened and the
-   * 'Paid Successfully' request was gone (twin of #521/#549).
-   */
-  private prBootstrapped = false;
-
-  /**
-   * #441 deferred-paid journal (durable, per network+identity): links a payment
-   * request to the in-flight transfer of a possibly-committed pay so the request
-   * is held NON-payable ('settling') until that transfer completes (→ 'paid',
-   * server told) or aborts (→ payable, journal cleared). Keyed by request wire id
-   * (== requestId for wallet-api-surfaced requests). The in-memory Map is the
-   * synchronous source of truth used by the reload re-apply seam; it is
-   * single-flight loaded and every read-modify-write is serialized through a tail
-   * promise (the #679/#680 lesson: an unserialized RMW drops entries under
-   * concurrency = a re-payable request = the double-pay this fix prevents).
-   */
-  private settlingJournal: Map<string, { transferId: string; createdAt: number; committed?: boolean }> | null = null;
-  private settlingJournalLoad: Promise<void> | null = null;
-  private settlingJournalWrite: Promise<void> = Promise.resolve();
-  /** #441: guard overlapping resume reconciles (resumeOpenIntents has 2 fire-and-forget call sites). */
-  private reconcileInFlight = false;
-
   // Guard: ensure load() completes before processing incoming bundles
   private loadedPromise: Promise<void> | null = null;
   private loaded = false;
@@ -1057,21 +737,6 @@ export class PaymentsModule {
   private loadRerunRequested = false;
   private loadRerunTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /**
-   * Owner (chainPubkey) whose server history hydration last completed —
-   * enables the #642 incremental fast path in {@link hydrateHistoryFromServer}.
-   * Reset on re-init (address switch). `serverSeenHistoryKeys` holds only
-   * dedupKeys actually PULLED from the server (never locally-POSTed ones), so
-   * the incremental stop condition can't be masked by our own fresh POSTs;
-   * `incrementalHistoryPulls` forces a periodic full re-pull to bound the
-   * staleness window if server keyset order ever diverges from arrival order.
-   * `hydrationEpoch` guards a pull racing a same-owner re-init.
-   */
-  private historyHydratedFor: string | null = null;
-  private serverSeenHistoryKeys = new Set<string>();
-  private incrementalHistoryPulls = 0;
-  private hydrationEpoch = 0;
-
   // Storage event subscriptions (push-based sync)
   private inventoryDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly SYNC_DEBOUNCE_MS = 500;
@@ -1087,42 +752,9 @@ export class PaymentsModule {
   // Token Spend Queue — concurrent send race condition prevention
   private readonly reservationLedger = new TokenReservationLedger();
   private readonly spendPlanner = new SpendPlanner();
-  /**
-   * Per-request single-flight for {@link payPaymentRequest}. The pay flow flips the request to
-   * 'accepted' before it awaits send(), and the status guard re-admits 'accepted' (intended for a
-   * sequential retry-after-failure) — so a concurrent double-tap / second session would otherwise
-   * enter send() a second time and DOUBLE-PAY (each send picks a different token; the reservation
-   * ledger is coin-scoped, not request-scoped). Concurrent calls for the same requestId coalesce
-   * onto the first in-flight pay; the entry is cleared when it settles, so a later retry is unaffected.
-   */
-  private readonly payInFlight = new Map<string, Promise<TransferResult>>();
   private spendQueue: SpendQueue;
   /** Cache of parsed SdkToken data for synchronous queue re-evaluation */
   private readonly parsedTokenCache: Map<string, ParsedTokenEntry> = new Map();
-  /**
-   * Base delay (ms) for the journaled-delivery replay backoff (#517 item 1).
-   * A field, not a const, so tests can drive the bounded retry loop without
-   * waiting real time — never mutated in production.
-   */
-  private replayBackoffBaseMs = DELIVERY_REPLAY_BASE_DELAY_MS;
-  /** Deferral window for recipient-quota (429) deliveries (#621). Overridable in tests. */
-  private deliveryDeferralMs = DELIVERY_DEFERRAL_MS;
-  /**
-   * #517: serializes {@link replayPendingV2Deliveries}. `load()` kicks replay
-   * off fire-and-forget and `receive()` calls `load()`, so two passes can
-   * overlap — duplicating delivery attempts and clobbering each other's
-   * `attempts` increments (both read the same stale value, both write N+1,
-   * delaying poison surfacing). Only one pass runs per module instance at a time.
-   */
-  private replayInFlight = false;
-  /**
-   * #517: serializes every read-modify-write of the PENDING_V2_DELIVERIES journal.
-   * save/remove/update each load → mutate → store the WHOLE blob, so a replay
-   * (fire-and-forget from load()) overlapping a send()'s journal write could
-   * clobber a newly-saved undelivered entry and lose it — defeating the crash-
-   * safety guarantee. A promise-chain mutex makes each whole RMW atomic.
-   */
-  private journalMutation: Promise<unknown> = Promise.resolve();
 
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
@@ -1140,6 +772,130 @@ export class PaymentsModule {
       () => this.tokens,
       this.parsedTokenCache
     );
+
+    this.inventory = new TokenView(this.tokenViewHost());
+    this.requests = new PaymentRequests(this.paymentRequestsHost());
+    this.history = new TransferHistory(this.transferHistoryHost());
+    this.intents = new IntentResume(this.intentResumeHost());
+    this.deliveries = new Delivery(this.deliveryHost());
+  }
+
+  /**
+   * The narrow seam {@link TokenView} reaches back through. Live getters for
+   * `deps` and `priceProvider` (both swapped on {@link initialize}); the token
+   * map is handed over as a READ-ONLY view, so the inventory view never becomes
+   * a second writer of it.
+   */
+  private tokenViewHost(): TokenViewHost {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const module = this;
+    return {
+      get deps() { return module.deps; },
+      get priceProvider() { return module.priceProvider; },
+      ensureInitialized: () => this.ensureInitialized(),
+      getHeldTokens: () => this.tokens,
+      isPriceDisabled: () => this.isPriceDisabled(),
+      deleteParsedToken: (tokenId) => { this.parsedTokenCache.delete(tokenId); },
+      save: () => this.save(),
+    };
+  }
+
+  /**
+   * The narrow seam {@link Delivery} reaches back through. Live getters for
+   * `deps` and `delivery` (both swapped on every {@link initialize}); the token
+   * map is handed over as a READ-ONLY view and written only by the module's own
+   * `storeEngineToken`, so delivery never becomes a second writer.
+   */
+  private deliveryHost(): DeliveryHost {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const module = this;
+    return {
+      get deps() { return module.deps; },
+      get delivery() { return module.delivery; },
+      get loaded() { return module.loaded; },
+      get loadedPromise() { return module.loadedPromise; },
+      ensureInitialized: () => this.ensureInitialized(),
+      ensureDelivery: () => this.ensureDelivery(),
+      currentNametagName: () => this.currentNametagName(),
+      getHeldTokens: () => this.tokens,
+      pumpIncomingDeliveriesFresh: () => this.pumpIncomingDeliveriesFresh(),
+      storeEngineToken: (engine, token, opts) => this.storeEngineToken(engine, token, opts),
+      addToHistory: (entry) => this.addToHistory(entry),
+    };
+  }
+
+  /**
+   * The narrow seam {@link PaymentRequests} reaches back through. Live getters,
+   * not a snapshot: `deps` is swapped on every {@link initialize} (address
+   * switch) and the feature must always observe the CURRENT one.
+   */
+  private paymentRequestsHost(): PaymentRequestsHost {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const module = this;
+    return {
+      get deps() { return module.deps; },
+      get pumpHealth() { return module.pumpHealth; },
+      get pollIntervalMs() { return DELIVERY_POLL_INTERVAL_MS; },
+      get loaded() { return module.loaded; },
+      get loadedPromise() { return module.loadedPromise; },
+      ensureInitialized: () => this.ensureInitialized(),
+      currentNametagName: () => this.currentNametagName(),
+      send: (request) => this.send(request),
+    };
+  }
+
+  /**
+   * The narrow seam {@link TransferHistory} reaches back through. Live getter
+   * for `deps` (swapped on every {@link initialize}); the rest are thunks onto
+   * the module's own private helpers — history never touches the token map or
+   * `save()`.
+   */
+  private transferHistoryHost(): TransferHistoryHost {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const module = this;
+    return {
+      get deps() { return module.deps; },
+      ensureInitialized: () => this.ensureInitialized(),
+      getLocalTokenStorageProvider: () => this.getLocalTokenStorageProvider(),
+      getFieldEncryptionKey: () => this.getFieldEncryptionKey(),
+      getCoinSymbol: (coinId) => this.getCoinSymbol(coinId),
+    };
+  }
+
+  /**
+   * The narrow seam {@link IntentResume} reaches back through. Live getters for
+   * `deps` and `delivery` (both swapped on every {@link initialize}); the rest
+   * are thunks onto the module's own helpers. The token map is READ through
+   * `getHeldToken` and written only by the module's `removeToken` /
+   * `storeEngineToken` — resume never becomes a second writer.
+   */
+  private intentResumeHost(): IntentResumeHost {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const module = this;
+    return {
+      get deps() { return module.deps; },
+      get delivery() { return module.delivery; },
+      get loaded() { return module.loaded; },
+      get loadedPromise() { return module.loadedPromise; },
+      ensureInitialized: () => this.ensureInitialized(),
+      getFieldEncryptionKey: () => this.getFieldEncryptionKey(),
+      getActiveTokenStorageProvider: () => this.getActiveTokenStorageProvider(),
+      getCheckpointStore: () => this.getCheckpointStore(),
+      certifyOperation: (op, ctx) => this.certifyOperation(op, ctx),
+      deliverCommittedBlobs: (blobs, recipientPubkey, transferId, memo) =>
+        this.deliveries.deliverCommittedBlobs(blobs, recipientPubkey, transferId, memo),
+      applyInventoryDelta: (engine, transferId, spentStates, changeOutput, storage) =>
+        this.applyInventoryDelta(engine, transferId, spentStates, changeOutput, storage),
+      storeEngineToken: (engine, token, opts) => this.storeEngineToken(engine, token, opts),
+      getHeldToken: (id) => this.tokens.get(id),
+      removeToken: (tokenId, excludeReservationId, expectedStateHash) =>
+        this.removeToken(tokenId, excludeReservationId, expectedStateHash),
+      loadPendingV2Deliveries: () => this.deliveries.loadPendingV2Deliveries(),
+      addToHistory: (entry) => this.addToHistory(entry),
+      getCoinSymbol: (coinId) => this.getCoinSymbol(coinId),
+      reconcileSettlingPaymentRequests: (outcome, openIntentIds, localIntents, localReadFailed) =>
+        this.requests.reconcileSettlingPaymentRequests(outcome, openIntentIds, localIntents, localReadFailed),
+    };
   }
 
   /**
@@ -1214,28 +970,18 @@ export class PaymentsModule {
 
     // Clean up previous subscriptions before re-initializing
     this.teardownDeliveryPump();
-    this.teardownPaymentRequestPump();
+    this.requests.teardownPaymentRequestPump();
 
     // Stop background subscriptions from the previous address context so they
     // don't call save() in the new address's storage context.
 
     // Cancel pending payment response resolvers
-    for (const [, resolver] of this.pendingResponseResolvers) {
-      clearTimeout(resolver.timeout);
-      resolver.reject(new Error('Address switched'));
-    }
-    this.pendingResponseResolvers.clear();
+    this.requests.cancelPendingResponseResolvers('Address switched');
 
     // Reset per-address state (will be re-populated by load())
     this.tokens.clear();
-    clearSdkDataCache();
-    this.tombstones = [];
-    this.tombstoneKeySet.clear();
-    this._historyCache = [];
-    this.historyHydratedFor = null;
-    this.serverSeenHistoryKeys = new Set();
-    this.incrementalHistoryPulls = 0;
-    this.hydrationEpoch++;
+    this.inventory.initialize();
+    this.history.initialize();
     this.loadRerunRequested = false;
     if (this.loadRerunTimer !== null) {
       clearTimeout(this.loadRerunTimer);
@@ -1302,23 +1048,9 @@ export class PaymentsModule {
       }, DELIVERY_POLL_INTERVAL_MS);
     }
 
-    // Payment requests ride wallet-api (sdk-changes S4). The incoming
-    // `?since=<seq>` stream is polled — gap-free per §9, and the poll is the
-    // correctness path.
-    this.prBootstrapped = false;
-    // #441: reset the deferred-paid journal so it reloads under the new identity's
-    // storage key (the key bakes in chainPubkey). New mutations start a fresh
-    // write chain; any still-queued old-identity mutation is dropped by the
-    // per-mutation key guard in mutateSettlingJournal (it can't pollute the new
-    // identity's journal).
-    this.settlingJournal = null;
-    this.settlingJournalLoad = null;
-    this.settlingJournalWrite = Promise.resolve();
-    if (this.paymentRequestsApi()) {
-      this.prPollTimer = setInterval(() => {
-        this.pumpHealth.run('payment-requests', () => this.pumpPaymentRequests());
-      }, DELIVERY_POLL_INTERVAL_MS);
-    }
+    // Payment requests ride wallet-api (sdk-changes S4) — re-armed for the new
+    // identity once `deps` is in place.
+    this.requests.initialize();
 
     // Subscribe to storage provider events (push-based sync)
   }
@@ -1410,7 +1142,7 @@ export class PaymentsModule {
             // Import history from IPFS TXF data into local store
             const txfData = result.data as TxfStorageDataBase;
             if (txfData._history && txfData._history.length > 0) {
-              await this.importRemoteHistoryEntries(txfData._history as HistoryRecord[]);
+              await this.history.importRemoteHistoryEntries(txfData._history as HistoryRecord[]);
             }
             logger.debug('Payments', `Loaded metadata from provider ${id}`);
             loadedProvider = provider;
@@ -1499,7 +1231,7 @@ export class PaymentsModule {
 
       // Replay finished-but-undelivered v2 blobs from a previous session
       // (fire-and-forget; failures are kept journaled for the next load).
-      void this.replayPendingV2Deliveries().catch((err) =>
+      void this.deliveries.replayPendingV2Deliveries().catch((err) =>
         logger.warn('Payments', 'Pending v2 delivery replay failed:', err));
 
       // S3: drain the delivery port's incoming feed once at load (poll + wake
@@ -1510,8 +1242,8 @@ export class PaymentsModule {
 
       // S4: drain the payment-request `?since=` stream once at load (the poll
       // keeps it drained afterwards).
-      if (this.paymentRequestsApi()) {
-        this.pumpHealth.run('payment-requests', () => this.pumpPaymentRequests());
+      if (this.requests.paymentRequestsApi()) {
+        this.pumpHealth.run('payment-requests', () => this.requests.pumpPaymentRequests());
       }
     };
 
@@ -1561,16 +1293,7 @@ export class PaymentsModule {
       this.loadRerunTimer = null;
     }
     this.teardownDeliveryPump();
-    this.teardownPaymentRequestPump();
-    this.paymentRequestHandlers.clear();
-    this.paymentRequestResponseHandlers.clear();
-
-    // Clear pending response resolvers
-    for (const [, resolver] of this.pendingResponseResolvers) {
-      clearTimeout(resolver.timeout);
-      resolver.reject(new Error('Module destroyed'));
-    }
-    this.pendingResponseResolvers.clear();
+    this.requests.destroy();
 
     // Clean up spend queue and reservation ledger
     this.spendQueue.destroy();
@@ -1853,7 +1576,7 @@ export class PaymentsModule {
       // the next load(), hands it over. A delivery failure or a crash must never
       // lose the recipient's token.
       const tokenBlob = bytesToHex(encodeTokenBlob(ctx.engine.encodeToken(finished)));
-      await this.savePendingV2Delivery({
+      await this.deliveries.savePendingV2Delivery({
         transferId: ctx.transferId,
         recipientPubkey: ctx.recipientChainPubkeyHex,
         tokenBlob,
@@ -2100,7 +1823,7 @@ export class PaymentsModule {
     // on the failure path too — committed siblings of a failed batch get their
     // delivery attempt before the throw below. Never throws (§3.1/#621): a
     // deferred blob stays journaled and the send resolves delivery-pending.
-    attempt.deliveryPending = !(await this.deliverCommittedBlobs(
+    attempt.deliveryPending = !(await this.deliveries.deliverCommittedBlobs(
       summary.committed.flatMap((o) => (o.tokenBlob === undefined ? [] : [o.tokenBlob])),
       recipientChainPubkeyHex,
       result.id,
@@ -2627,509 +2350,85 @@ export class PaymentsModule {
   }
 
   // ===========================================================================
-  // Public API - Payment Requests
+  // Public API - Payment Requests (owned by {@link PaymentRequests})
   // ===========================================================================
 
-  /**
-   * Send a payment request to someone
-   * @param recipientPubkeyOrNametag - Recipient's pubkey or @nametag
-   * @param request - Payment request details
-   * @returns Result with event ID
-   */
-  async sendPaymentRequest(
+  /** Send a payment request to someone. @see PaymentRequests.sendPaymentRequest */
+  sendPaymentRequest(
     recipientPubkeyOrNametag: string,
     request: Omit<PaymentRequest, 'id' | 'createdAt'>
   ): Promise<PaymentRequestResult> {
-    this.ensureInitialized();
-
-    const prApi = this.paymentRequestsApi();
-    if (!prApi) {
-      return { success: false, error: 'Payment requests require the wallet-api payment-request capability' };
-    }
-    return this.sendWalletApiPaymentRequest(prApi, recipientPubkeyOrNametag, request);
+    return this.requests.sendPaymentRequest(recipientPubkeyOrNametag, request);
   }
 
-  /**
-   * S4: create the request via wallet-api (§16). The payer is addressed by
-   * CHAIN pubkey (the canonical identity); the memo is S6-encrypted client-
-   * side BEFORE it leaves the device (§8.3) — the operator stores ciphertext.
-   * Mirrors the transport path's no-throw contract: failures (including the
-   * §5.5 per-payer cap → 429) come back as `{ success: false, error }`.
-   */
-  private async sendWalletApiPaymentRequest(
-    api: PaymentRequestsApi,
-    recipientPubkeyOrNametag: string,
-    request: Omit<PaymentRequest, 'id' | 'createdAt'>
-  ): Promise<PaymentRequestResult> {
-    try {
-      const peerInfo = await this.deps!.transport.resolve?.(recipientPubkeyOrNametag) ?? null;
-      const toPubkey =
-        peerInfo?.chainPubkey ??
-        (/^0[23][0-9a-f]{64}$/i.test(recipientPubkeyOrNametag)
-          ? recipientPubkeyOrNametag.toLowerCase()
-          : null);
-      if (!toPubkey) {
-        return {
-          success: false,
-          error: `Recipient ${recipientPubkeyOrNametag} has no published identity (chain pubkey) — cannot receive payment requests.`,
-        };
-      }
-
-      // S6: the requester's nametag + message ride ONE recipient-addressed
-      // envelope keyed off ECDH(requesterPriv, PAYER chain pubkey) — symmetric,
-      // so the payer re-derives it from its own key + this request's fromPubkey
-      // (the PR twin of #546/#547). The self-scoped field key was wrong here:
-      // a memo encrypted with the requester's key could never be opened by the
-      // payer. Same `enc1.` XChaCha20-Poly1305 wire (operator-blind, backend-
-      // valid — no wire/backend change); attached whenever there is a nametag
-      // OR a message, so the payer renders "@requester" even with no message.
-      const memoEnvelope = encryptDeliveryBundle(
-        deriveDeliveryEncryptionKey(this.deps!.identity.privateKey, toPubkey),
-        { senderNametag: this.currentNametagName(), memo: request.message }
-      );
-
-      const wire = await api.createPaymentRequest({
-        toPubkey,
-        // Amounts are decimal strings end-to-end (§11) — BigInt round-trips them exactly.
-        assets: [{ coinId: request.coinId, amount: BigInt(request.amount) }],
-        ...(memoEnvelope !== undefined ? { memo: memoEnvelope } : {}),
-        ...(request.expiresAt !== undefined ? { expiresAt: request.expiresAt } : {}),
-      });
-
-      // Track the outgoing request under the SERVER id — the `?before=`
-      // backfill refresh (refreshOutgoingPaymentRequests) matches on it.
-      const outgoingRequest: OutgoingPaymentRequest = {
-        id: wire.id,
-        eventId: wire.id, // no relay event on this path — the server id stands in
-        recipientPubkey: toPubkey,
-        recipientNametag: recipientPubkeyOrNametag.startsWith('@')
-          ? recipientPubkeyOrNametag.slice(1)
-          : undefined,
-        amount: request.amount,
-        coinId: request.coinId,
-        message: request.message,
-        createdAt: wire.createdAt,
-        status: 'pending',
-      };
-      this.outgoingPaymentRequests.set(wire.id, outgoingRequest);
-
-      logger.debug('Payments', `Payment request created via wallet-api: ${wire.id}`);
-
-      return {
-        success: true,
-        requestId: wire.id,
-        eventId: wire.id,
-      };
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      logger.debug('Payments', `Failed to create wallet-api payment request: ${errorMsg}`);
-      return {
-        success: false,
-        error: errorMsg,
-      };
-    }
-  }
-
-  /**
-   * Subscribe to incoming payment requests
-   * @param handler - Handler function for incoming requests
-   * @returns Unsubscribe function
-   */
+  /** Subscribe to incoming payment requests. @see PaymentRequests.onPaymentRequest */
   onPaymentRequest(handler: PaymentRequestHandler): () => void {
-    this.paymentRequestHandlers.add(handler);
-    return () => this.paymentRequestHandlers.delete(handler);
+    return this.requests.onPaymentRequest(handler);
   }
 
-  /**
-   * Get all payment requests
-   * @param filter - Optional status filter
-   */
+  /** Get all payment requests. @see PaymentRequests.getPaymentRequests */
   getPaymentRequests(filter?: { status?: PaymentRequestStatus }): IncomingPaymentRequest[] {
-    if (filter?.status) {
-      return this.paymentRequests.filter((r) => r.status === filter.status);
-    }
-    return [...this.paymentRequests];
+    return this.requests.getPaymentRequests(filter);
   }
 
-  /**
-   * Get the count of payment requests with status `'pending'`.
-   *
-   * @returns Number of pending incoming payment requests.
-   */
+  /** Count of incoming payment requests with status `'pending'`. @see PaymentRequests.getPendingPaymentRequestsCount */
   getPendingPaymentRequestsCount(): number {
-    return this.paymentRequests.filter((r) => r.status === 'pending').length;
+    return this.requests.getPendingPaymentRequestsCount();
   }
 
-  /**
-   * Accept a payment request and notify the requester.
-   *
-   * Marks the request as `'accepted'` and sends a response via transport.
-   * The caller should subsequently call {@link send} to fulfill the payment.
-   *
-   * @param requestId - ID of the incoming payment request to accept.
-   */
-  async acceptPaymentRequest(requestId: string): Promise<void> {
-    this.updatePaymentRequestStatus(requestId, 'accepted');
-    await this.sendPaymentRequestResponse(requestId, 'accepted');
+  /** Reject a payment request and notify the requester. @see PaymentRequests.rejectPaymentRequest */
+  rejectPaymentRequest(requestId: string): Promise<void> {
+    return this.requests.rejectPaymentRequest(requestId);
   }
 
-  /**
-   * Reject a payment request and notify the requester.
-   *
-   * On the wallet-api path (S4) the respond IS the state change — it is
-   * confirmed server-side (`action: 'declined'`, §16) before the local status
-   * flips, and a server rejection (403/409) propagates to the caller. The
-   * transport path is best-effort and never throws.
-   *
-   * @param requestId - ID of the incoming payment request to reject.
-   */
-  async rejectPaymentRequest(requestId: string): Promise<void> {
-    await this.sendPaymentRequestResponse(requestId, 'rejected');
-    this.updatePaymentRequestStatus(requestId, 'rejected');
-  }
-
-  /**
-   * Mark a payment request as paid (local status update only).
-   *
-   * Typically called after a successful {@link send} to record that the
-   * request has been fulfilled.
-   *
-   * @param requestId - ID of the incoming payment request to mark as paid.
-   */
-  markPaymentRequestPaid(requestId: string): void {
-    this.updatePaymentRequestStatus(requestId, 'paid');
-  }
-
-  /**
-   * Remove resolved incoming payment requests from memory.
-   *
-   * Keeps requests with status `'pending'` OR `'settling'` (#441). A `'settling'`
-   * request is UNRESOLVED — its linked transfer is still in-flight — so evicting
-   * it would drop the in-memory hold that keeps it non-payable until the journal
-   * re-surfaces it. Only terminal statuses (`'paid'`/`'rejected'`/`'expired'`)
-   * are removed.
-   */
+  /** Remove resolved incoming payment requests from memory. @see PaymentRequests.clearProcessedPaymentRequests */
   clearProcessedPaymentRequests(): void {
-    // #441: a 'settling' request is UNRESOLVED (its linked transfer is still
-    // in-flight) — it must NOT be evicted, or the reload re-apply loses its
-    // in-memory hold before the journal re-surfaces it.
-    this.paymentRequests = this.paymentRequests.filter(
-      (r) => r.status === 'pending' || r.status === 'settling'
-    );
+    this.requests.clearProcessedPaymentRequests();
   }
 
-  /**
-   * Remove a specific incoming payment request by ID.
-   *
-   * @param requestId - ID of the payment request to remove.
-   */
+  /** Remove a specific incoming payment request by ID. @see PaymentRequests.removePaymentRequest */
   removePaymentRequest(requestId: string): void {
-    this.paymentRequests = this.paymentRequests.filter((r) => r.id !== requestId);
+    this.requests.removePaymentRequest(requestId);
   }
 
-  /**
-   * Pay a payment request directly
-   * Convenience method that accepts, sends, and marks as paid
-   */
-  async payPaymentRequest(requestId: string, memo?: string): Promise<TransferResult> {
-    // Single-flight: a concurrent second call for the same request coalesces onto the first pay
-    // instead of issuing a second send (double-pay). Cleared in the inner's finally so a later
-    // sequential retry — the reason the status guard re-admits 'accepted' — still proceeds.
-    // NOTE: a coalesced caller receives the FIRST caller's result, so if concurrent callers pass
-    // different `memo` values only the first is used — memo is per-request, not per-call, under
-    // concurrency (a distinct memo needs a distinct request, or a sequential call).
-    const inFlight = this.payInFlight.get(requestId);
-    if (inFlight) return inFlight;
-    const pay = this.payPaymentRequestInner(requestId, memo);
-    this.payInFlight.set(requestId, pay);
-    try {
-      return await pay;
-    } finally {
-      this.payInFlight.delete(requestId);
-    }
+  /** Pay a payment request directly. @see PaymentRequests.payPaymentRequest */
+  payPaymentRequest(requestId: string, memo?: string): Promise<TransferResult> {
+    return this.requests.payPaymentRequest(requestId, memo);
   }
 
-  private async payPaymentRequestInner(requestId: string, memo?: string): Promise<TransferResult> {
-    const request = this.paymentRequests.find((r) => r.id === requestId);
-    if (!request) {
-      throw new SphereError(`Payment request not found: ${requestId}`, 'VALIDATION_ERROR');
-    }
-
-    if (request.status !== 'pending' && request.status !== 'accepted') {
-      throw new SphereError(`Payment request is not pending or accepted: ${request.status}`, 'VALIDATION_ERROR');
-    }
-
-    // Mark as accepted (don't send response yet, wait for payment)
-    this.updatePaymentRequestStatus(requestId, 'accepted');
-
-    try {
-      // Send the payment
-      const result = await this.send({
-        coinId: request.coinId,
-        amount: request.amount,
-        recipient: request.senderPubkey,
-        memo: memo || request.message,
-      });
-
-      // Mark as paid and send response with transfer ID. The transfer already
-      // succeeded — a failed status link (e.g. an expiry race on the
-      // wallet-api respond, §16) is logged, never reported as a failed payment.
-      this.updatePaymentRequestStatus(requestId, 'paid');
-      try {
-        await this.sendPaymentRequestResponse(requestId, 'paid', result.id);
-      } catch (error) {
-        logger.warn('Payments', `Payment sent but the paid response failed for ${requestId}:`, error);
-      }
-
-      return result;
-    } catch (error) {
-      // #441/#442: reverting to 'pending' makes the request RE-PAYABLE (the guard
-      // above admits a re-pay when status is 'pending' OR 'accepted'). That is
-      // correct ONLY for a clean pre-commit failure where NOTHING left the wallet.
-      if (isPossiblyCommittedSendOutcome(error)) {
-        // Money has (or may have) left the wallet on-chain. Do NOT tell the server
-        // 'paid' yet — resumeOpenIntents may still ABORT this transfer. Durably
-        // journal request→transfer and hold the request NON-payable ('settling')
-        // until the linked transfer actually completes (resolves 'paid') or aborts
-        // (returns to payable). Reverting to 'pending' here — or telling the server
-        // 'paid' now — would double-pay after a RELOAD.
-        const linkedTransferId =
-          error instanceof SphereError && error.transferId ? error.transferId : undefined;
-        // Deferral requires the wallet-api resume + respond mechanism. Without a
-        // wallet-api PR port (a Nostr-only composition — where a possibly-committed
-        // outcome does not actually arise, and requests are in-memory push-only, so
-        // there is no reload re-surface to double-pay), keep the prior durable
-        // 'paid' behavior instead of holding an unresolvable 'settling'.
-        if (linkedTransferId && this.paymentRequestsApi()) {
-          // A PartialSendConflictError means ≥1 leg ALREADY certified + delivered
-          // and the anchor intent was soft-aborted — so resume will report it
-          // aborted, but value DID leave the wallet. Journal it as `committed` so
-          // the reconcile resolves it 'paid' and NEVER reverts to payable (a
-          // re-pay would double-pay the delivered leg). Every other keep-open code
-          // is a non-committed link that resume may complete or genuinely abort.
-          const committed = error instanceof PartialSendConflictError;
-          // Order is load-bearing: journal PERSISTS before the in-memory status
-          // flip, so a crash in between leaves the durable link (reload re-applies
-          // settling) — never a lost link (which would re-surface payable).
-          await this.journalSettling(requestId, linkedTransferId, committed);
-          this.updatePaymentRequestStatus(requestId, 'settling');
-        } else {
-          // Either a Nostr-only composition (no wallet-api PR port — no deferral
-          // mechanism, no reload re-surface) or — defensively — a possibly-committed
-          // code with NO stamped transferId (should be impossible after the sendOnce
-          // stamps). Either way FAIL CLOSED to the pre-fix behavior (durably
-          // non-payable) rather than re-surface payable or hold an unresolvable
-          // 'settling'.
-          if (!linkedTransferId) {
-            logger.error(
-              'Payments',
-              `Possibly-committed send for ${requestId} carried no transferId — marking paid (fail-closed)`,
-            );
-          }
-          this.updatePaymentRequestStatus(requestId, 'paid');
-        }
-      } else {
-        // Clean pre-commit failure — nothing left the wallet; re-payable.
-        await this.clearSettling(requestId); // defensive: drop any stale link
-        this.updatePaymentRequestStatus(requestId, 'pending');
-      }
-      throw error;
-    }
-  }
-
-  private updatePaymentRequestStatus(requestId: string, status: PaymentRequestStatus): void {
-    const request = this.paymentRequests.find((r) => r.id === requestId);
-    if (request) {
-      request.status = status;
-
-      // Emit event
-      const eventType = `payment_request:${status}` as const;
-      if (eventType === 'payment_request:accepted' ||
-          eventType === 'payment_request:rejected' ||
-          eventType === 'payment_request:paid' ||
-          eventType === 'payment_request:expired' ||
-          eventType === 'payment_request:settling') {
-        this.deps?.emitEvent(eventType, request);
-      }
-    }
-  }
-
-  // ===========================================================================
-  // Public API - Outgoing Payment Requests
-  // ===========================================================================
-
-  /**
-   * Get outgoing payment requests
-   * @param filter - Optional status filter
-   */
+  /** Get outgoing payment requests. @see PaymentRequests.getOutgoingPaymentRequests */
   getOutgoingPaymentRequests(filter?: { status?: PaymentRequestStatus }): OutgoingPaymentRequest[] {
-    const requests = Array.from(this.outgoingPaymentRequests.values());
-    if (filter?.status) {
-      return requests.filter((r) => r.status === filter.status);
-    }
-    return requests;
+    return this.requests.getOutgoingPaymentRequests(filter);
   }
 
-  /**
-   * Subscribe to payment request responses (for outgoing requests)
-   * @param handler - Handler function for incoming responses
-   * @returns Unsubscribe function
-   */
+  /** Subscribe to payment request responses. @see PaymentRequests.onPaymentRequestResponse */
   onPaymentRequestResponse(handler: PaymentRequestResponseHandler): () => void {
-    this.paymentRequestResponseHandlers.add(handler);
-    return () => this.paymentRequestResponseHandlers.delete(handler);
+    return this.requests.onPaymentRequestResponse(handler);
   }
 
-  /**
-   * Wait for a response to a payment request
-   * @param requestId - The outgoing request ID to wait for
-   * @param timeoutMs - Timeout in milliseconds (default: 60000)
-   * @returns Promise that resolves with the response or rejects on timeout
-   */
-  waitForPaymentResponse(requestId: string, timeoutMs: number = 60000): Promise<PaymentRequestResponse> {
-    const outgoing = this.outgoingPaymentRequests.get(requestId);
-    if (!outgoing) {
-      return Promise.reject(new Error(`Outgoing payment request not found: ${requestId}`));
-    }
-
-    // If already has a response, return it
-    if (outgoing.response) {
-      return Promise.resolve(outgoing.response);
-    }
-
-    // Create a promise that resolves when response arrives or times out
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.pendingResponseResolvers.delete(requestId);
-        // Update status to expired
-        const request = this.outgoingPaymentRequests.get(requestId);
-        if (request && request.status === 'pending') {
-          request.status = 'expired';
-        }
-        reject(new Error(`Payment request response timeout: ${requestId}`));
-      }, timeoutMs);
-
-      this.pendingResponseResolvers.set(requestId, { resolve, reject, timeout });
-    });
+  /** Wait for a response to a payment request. @see PaymentRequests.waitForPaymentResponse */
+  waitForPaymentResponse(requestId: string, timeoutMs?: number): Promise<PaymentRequestResponse> {
+    return this.requests.waitForPaymentResponse(requestId, timeoutMs);
   }
 
-  /**
-   * Cancel an active {@link waitForPaymentResponse} call.
-   *
-   * The pending promise is rejected with a `'Cancelled'` error.
-   *
-   * @param requestId - The outgoing request ID whose wait should be cancelled.
-   */
+  /** Cancel an active {@link waitForPaymentResponse} call. @see PaymentRequests.cancelWaitForPaymentResponse */
   cancelWaitForPaymentResponse(requestId: string): void {
-    const resolver = this.pendingResponseResolvers.get(requestId);
-    if (resolver) {
-      clearTimeout(resolver.timeout);
-      resolver.reject(new Error('Cancelled'));
-      this.pendingResponseResolvers.delete(requestId);
-    }
+    this.requests.cancelWaitForPaymentResponse(requestId);
   }
 
-  /**
-   * Remove an outgoing payment request and cancel any pending wait.
-   *
-   * @param requestId - ID of the outgoing request to remove.
-   */
+  /** Remove an outgoing payment request and cancel any pending wait. @see PaymentRequests.removeOutgoingPaymentRequest */
   removeOutgoingPaymentRequest(requestId: string): void {
-    this.outgoingPaymentRequests.delete(requestId);
-    this.cancelWaitForPaymentResponse(requestId);
+    this.requests.removeOutgoingPaymentRequest(requestId);
   }
 
-  /**
-   * Remove all outgoing payment requests that are `'paid'`, `'rejected'`, or `'expired'`.
-   */
+  /** Remove all `'paid'`/`'rejected'`/`'expired'` outgoing requests. @see PaymentRequests.clearCompletedOutgoingPaymentRequests */
   clearCompletedOutgoingPaymentRequests(): void {
-    for (const [id, request] of this.outgoingPaymentRequests) {
-      if (request.status === 'paid' || request.status === 'rejected' || request.status === 'expired') {
-        this.outgoingPaymentRequests.delete(id);
-      }
-    }
+    this.requests.clearCompletedOutgoingPaymentRequests();
   }
 
-  /**
-   * Fold a payment-request response into the outgoing surface and notify —
-   * shared by the transport subscription and the wallet-api outgoing refresh
-   * (S4): update the matched outgoing request, resolve any
-   * {@link waitForPaymentResponse} waiter, emit the event, run the handlers.
-   */
-  private dispatchPaymentRequestResponse(response: PaymentRequestResponse): void {
-    // Find the outgoing request by matching requestId
-    let outgoingRequest: OutgoingPaymentRequest | undefined;
-    let outgoingRequestId: string | undefined;
-
-    for (const [id, request] of this.outgoingPaymentRequests) {
-      // Match by eventId or requestId from the response
-      if (request.eventId === response.requestId ||
-          request.id === response.requestId) {
-        outgoingRequest = request;
-        outgoingRequestId = id;
-        break;
-      }
-    }
-
-    // Update outgoing request if found
-    if (outgoingRequest && outgoingRequestId) {
-      outgoingRequest.status = response.responseType === 'paid' ? 'paid' :
-                               response.responseType === 'accepted' ? 'accepted' :
-                               'rejected';
-      outgoingRequest.response = response;
-
-      // Resolve pending promise if any
-      const resolver = this.pendingResponseResolvers.get(outgoingRequestId);
-      if (resolver) {
-        clearTimeout(resolver.timeout);
-        resolver.resolve(response);
-        this.pendingResponseResolvers.delete(outgoingRequestId);
-      }
-    }
-
-    // Emit event
-    this.deps?.emitEvent('payment_request:response', response);
-
-    // Notify handlers
-    for (const handler of this.paymentRequestResponseHandlers) {
-      try {
-        handler(response);
-      } catch (error) {
-        logger.debug('Payments', 'Payment request response handler error:', error);
-      }
-    }
-
-    logger.debug('Payments', `Received payment request response: ${response.id} type: ${response.responseType}`);
-  }
-
-  /**
-   * Send a response to a payment request (used internally by accept/reject/pay methods)
-   */
-  private async sendPaymentRequestResponse(
-    requestId: string,
-    responseType: 'accepted' | 'rejected' | 'paid',
-    transferId?: string
-  ): Promise<void> {
-    const request = this.paymentRequests.find((r) => r.id === requestId);
-    if (!request) return;
-
-    const prApi = this.paymentRequestsApi();
-    if (!prApi) return;
-
-    // 'accepted' is a LOCAL UI state: the backend models open →
-    // paid|declined|expired, so nothing is sent until the real decision.
-    if (responseType === 'accepted') return;
-
-    // Server rejections (403 non-addressee, 409 non-open) propagate.
-    if (responseType === 'paid') {
-      if (transferId === undefined) {
-        throw new SphereError('A paid response requires the fulfilling transferId (§16)', 'VALIDATION_ERROR');
-      }
-      await prApi.respondPaymentRequest(request.requestId, { action: 'paid', transferId });
-    } else {
-      await prApi.respondPaymentRequest(request.requestId, { action: 'declined' });
-    }
-    logger.debug('Payments', `Responded to payment request: ${responseType} for ${requestId}`);
+  /** Pull the wallet-api payment-request streams now (S4). @see PaymentRequests.syncPaymentRequests */
+  syncPaymentRequests(): Promise<void> {
+    return this.requests.syncPaymentRequests();
   }
 
   // ===========================================================================
@@ -3149,31 +2448,13 @@ export class PaymentsModule {
    * @param _options - Deprecated; the v1 finalization options are ignored.
    * @param callback - Optional callback invoked for each newly received transfer
    * @returns ReceiveResult with the newly received transfers
+   * @see Delivery.receive
    */
-  async receive(
+  receive(
     _options?: ReceiveOptions,
     callback?: (transfer: IncomingTransfer) => void,
   ): Promise<ReceiveResult> {
-    this.ensureInitialized();
-
-    this.ensureDelivery();
-
-    // S3: the one-shot fetch IS a pump of the delivery port's incoming feed.
-    const tokensBefore = new Set(this.tokens.keys());
-    await this.pumpIncomingDeliveriesFresh();
-    const received: IncomingTransfer[] = [];
-    for (const [tokenId, token] of this.tokens) {
-      if (tokensBefore.has(tokenId)) continue;
-      const transfer: IncomingTransfer = {
-        id: tokenId,
-        senderPubkey: '',
-        tokens: [token],
-        receivedAt: Date.now(),
-      };
-      received.push(transfer);
-      if (callback) callback(transfer);
-    }
-    return { transfers: received };
+    return this.deliveries.receive(_options, callback);
   }
 
   // ===========================================================================
@@ -3190,25 +2471,11 @@ export class PaymentsModule {
   /**
    * Get total portfolio value in USD.
    * Returns null if PriceProvider is not configured.
+   *
+   * @see TokenView.getFiatBalance
    */
-  async getFiatBalance(): Promise<number | null> {
-    const assets = await this.getAssets();
-
-    if (!this.priceProvider || this.isPriceDisabled()) {
-      return null;
-    }
-
-    let total = 0;
-    let hasAnyPrice = false;
-
-    for (const asset of assets) {
-      if (asset.fiatValueUsd != null) {
-        total += asset.fiatValueUsd;
-        hasAnyPrice = true;
-      }
-    }
-
-    return hasAnyPrice ? total : null;
+  getFiatBalance(): Promise<number | null> {
+    return this.inventory.getFiatBalance();
   }
 
   /**
@@ -3226,9 +2493,10 @@ export class PaymentsModule {
    *
    * @param coinId - Optional coin ID to filter by (e.g. hex string). When omitted, all coin types are returned.
    * @returns Array of balance summaries (synchronous — no await needed).
+   * @see TokenView.getBalance
    */
   getBalance(coinId?: string): Asset[] {
-    return this.aggregateTokens(coinId);
+    return this.inventory.getBalance(coinId);
   }
 
   /**
@@ -3237,143 +2505,11 @@ export class PaymentsModule {
    * (`'transferring'`) tokens are reported only in the `transferring*` fields
    * and excluded from `totalAmount` (#517 item 3). Fiat value derives from
    * `totalAmount`, so it likewise excludes in-flight value.
-   */
-  async getAssets(coinId?: string): Promise<Asset[]> {
-    const rawAssets = this.aggregateTokens(coinId);
-
-    // Fetch prices if provider is available
-    if (!this.priceProvider || this.isPriceDisabled() || rawAssets.length === 0) {
-      return rawAssets;
-    }
-
-    try {
-      const registry = TokenRegistry.getInstance();
-      const nameToCoins = new Map<string, string[]>(); // tokenName -> coinIds[]
-
-      for (const asset of rawAssets) {
-        const def = registry.getDefinition(asset.coinId);
-        if (def?.name) {
-          const existing = nameToCoins.get(def.name);
-          if (existing) {
-            existing.push(asset.coinId);
-          } else {
-            nameToCoins.set(def.name, [asset.coinId]);
-          }
-        }
-      }
-
-      if (nameToCoins.size > 0) {
-        const tokenNames = Array.from(nameToCoins.keys());
-        const prices = await this.priceProvider.getPrices(tokenNames);
-
-        return rawAssets.map((raw) => {
-          const def = registry.getDefinition(raw.coinId);
-          const price = def?.name ? prices.get(def.name) : undefined;
-          let fiatValueUsd: number | null = null;
-          let fiatValueEur: number | null = null;
-
-          if (price) {
-            const humanAmount = Number(raw.totalAmount) / Math.pow(10, raw.decimals);
-            fiatValueUsd = humanAmount * price.priceUsd;
-            if (price.priceEur != null) {
-              fiatValueEur = humanAmount * price.priceEur;
-            }
-          }
-
-          return {
-            ...raw,
-            priceUsd: price?.priceUsd ?? null,
-            priceEur: price?.priceEur ?? null,
-            change24h: price?.change24h ?? null,
-            fiatValueUsd,
-            fiatValueEur,
-          };
-        });
-      }
-    } catch (error) {
-      logger.warn('Payments', 'Failed to fetch prices, returning assets without price data:', error);
-    }
-
-    return rawAssets;
-  }
-
-  /**
-   * Aggregate tokens by coinId with confirmed/unconfirmed/transferring breakdown.
-   * Excludes tokens with status 'spent' or 'invalid'.
    *
-   * In-flight (`'transferring'`) tokens are LEAVING the wallet during an active
-   * send, so they are NOT counted as spendable: they are tracked in their own
-   * `transferring*` fields and excluded from `totalAmount`/`unconfirmedAmount`.
-   * Counting them as balance would show the user value they cannot spend (the
-   * #517 incident follow-up).
+   * @see TokenView.getAssets
    */
-  private aggregateTokens(coinId?: string): Asset[] {
-    const assetsMap = new Map<string, AssetAccumulator>();
-
-    for (const token of this.tokens.values()) {
-      // Skip spent and invalid tokens; transferring tokens are tracked separately.
-      if (token.status === 'spent' || token.status === 'invalid') continue;
-      // #625: a suspected-spent source is excluded from spend selection, so it must not inflate the
-      // DISPLAYED spendable balance either (else the wallet shows a total it cannot actually send).
-      if (token.suspectedSpent) continue;
-      if (coinId && token.coinId !== coinId) continue;
-      this.accumulateToken(assetsMap, token);
-    }
-
-    return Array.from(assetsMap.values()).map((raw) => ({
-      coinId: raw.coinId,
-      symbol: raw.symbol,
-      name: raw.name,
-      decimals: raw.decimals,
-      iconUrl: raw.iconUrl,
-      // Spendable + soon-spendable holdings ONLY — the in-flight token is omitted.
-      totalAmount: (raw.confirmedAmount + raw.unconfirmedAmount).toString(),
-      tokenCount: raw.confirmedTokenCount + raw.unconfirmedTokenCount,
-      confirmedAmount: raw.confirmedAmount.toString(),
-      unconfirmedAmount: raw.unconfirmedAmount.toString(),
-      confirmedTokenCount: raw.confirmedTokenCount,
-      unconfirmedTokenCount: raw.unconfirmedTokenCount,
-      transferringTokenCount: raw.transferringTokenCount,
-      transferringAmount: raw.transferringAmount.toString(),
-      priceUsd: null,
-      priceEur: null,
-      change24h: null,
-      fiatValueUsd: null,
-      fiatValueEur: null,
-    }));
-  }
-
-  /** Fold one token into its coin's running totals (see {@link aggregateTokens}). */
-  private accumulateToken(assetsMap: Map<string, AssetAccumulator>, token: Token): void {
-    const acc = assetsMap.get(token.coinId) ?? this.newAssetAccumulator(token);
-    assetsMap.set(token.coinId, acc);
-    const amount = BigInt(token.amount);
-    if (token.status === 'transferring') {
-      acc.transferringAmount += amount;
-      acc.transferringTokenCount++;
-    } else if (token.status === 'confirmed') {
-      acc.confirmedAmount += amount;
-      acc.confirmedTokenCount++;
-    } else {
-      acc.unconfirmedAmount += amount;
-      acc.unconfirmedTokenCount++;
-    }
-  }
-
-  private newAssetAccumulator(token: Token): AssetAccumulator {
-    return {
-      coinId: token.coinId,
-      symbol: token.symbol,
-      name: token.name,
-      decimals: token.decimals,
-      iconUrl: token.iconUrl,
-      confirmedAmount: 0n,
-      unconfirmedAmount: 0n,
-      transferringAmount: 0n,
-      confirmedTokenCount: 0,
-      unconfirmedTokenCount: 0,
-      transferringTokenCount: 0,
-    };
+  getAssets(coinId?: string): Promise<Asset[]> {
+    return this.inventory.getAssets(coinId);
   }
 
   /**
@@ -3383,18 +2519,10 @@ export class PaymentsModule {
    * @param filter.coinId - Return only tokens of this coin type.
    * @param filter.status - Return only tokens with this status (e.g. `'submitted'` for unconfirmed).
    * @returns Array of matching {@link Token} objects (synchronous).
+   * @see TokenView.getTokens
    */
   getTokens(filter?: { coinId?: string; status?: TokenStatus }): Token[] {
-    let tokens = Array.from(this.tokens.values());
-
-    if (filter?.coinId) {
-      tokens = tokens.filter((t) => t.coinId === filter.coinId);
-    }
-    if (filter?.status) {
-      tokens = tokens.filter((t) => t.status === filter.status);
-    }
-
-    return tokens;
+    return this.inventory.getTokens(filter);
   }
 
   /**
@@ -3402,13 +2530,10 @@ export class PaymentsModule {
    *
    * @param id - The local UUID assigned when the token was added.
    * @returns The token, or `undefined` if not found.
+   * @see TokenView.getToken
    */
   getToken(id: string): Token | undefined {
-    const token = this.tokens.get(id);
-    if (!token) {
-      logger.debug('Payments', `getToken: not found id=${id.slice(0, 16)}... mapSize=${this.tokens.size}`);
-    }
-    return token;
+    return this.inventory.getToken(id);
   }
 
   // ===========================================================================
@@ -3608,16 +2733,7 @@ export class PaymentsModule {
     const genesisId = extractTokenIdFromSdkData(token.sdkData);
 
     // Tombstone the SPENT state (never a reactivated newer state).
-    if (genesisId && spentHash) {
-      const key = `${genesisId}:${spentHash}`;
-      if (!this.tombstoneKeySet.has(key)) {
-        this.tombstones.push({ tokenId: genesisId, stateHash: spentHash, timestamp: Date.now() });
-        this.tombstoneKeySet.add(key);
-        logger.debug('Payments', `Created tombstone for ${genesisId.slice(0, 8)}..._${spentHash.slice(0, 8)}...`);
-      }
-    } else {
-      logger.debug('Payments', `Warning: Could not create tombstone for token ${tokenId.slice(0, 8)}... (missing tokenId or stateHash)`);
-    }
+    this.inventory.tombstoneSpentState(tokenId, genesisId, spentHash);
 
     // M2: the map entry has advanced past the state we spent → a claim reactivated it →
     // keep the reactivated token; only the spent-state tombstone above stands.
@@ -3659,9 +2775,10 @@ export class PaymentsModule {
    * token state from being re-added (e.g. via Nostr re-delivery).
    *
    * @returns A shallow copy of the tombstone array.
+   * @see TokenView.getTombstones
    */
   getTombstones(): TombstoneEntry[] {
-    return [...this.tombstones];
+    return this.inventory.getTombstones();
   }
 
   /**
@@ -3671,32 +2788,20 @@ export class PaymentsModule {
    * @param tokenId - The genesis token ID.
    * @param stateHash - The state hash of the token version to check.
    * @returns `true` if the exact combination has been tombstoned.
+   * @see TokenView.isStateTombstoned
    */
   isStateTombstoned(tokenId: string, stateHash: string): boolean {
-    return this.tombstoneKeySet.has(`${tokenId}:${stateHash}`);
-  }
-
-  private rebuildTombstoneKeySet(): void {
-    this.tombstoneKeySet.clear();
-    for (const t of this.tombstones) {
-      this.tombstoneKeySet.add(`${t.tokenId}:${t.stateHash}`);
-    }
+    return this.inventory.isStateTombstoned(tokenId, stateHash);
   }
 
   /**
    * Remove tombstones older than `maxAge` and cap the list at 100 entries.
    *
    * @param maxAge - Maximum age in milliseconds (default: 30 days).
+   * @see TokenView.pruneTombstones
    */
-  async pruneTombstones(maxAge?: number): Promise<void> {
-    const originalCount = this.tombstones.length;
-    this.tombstones = pruneTombstonesByAge(this.tombstones, maxAge);
-    this.rebuildTombstoneKeySet();
-
-    if (this.tombstones.length < originalCount) {
-      await this.save();
-      logger.debug('Payments', `Pruned tombstones from ${originalCount} to ${this.tombstones.length}`);
-    }
+  pruneTombstones(maxAge?: number): Promise<void> {
+    return this.inventory.pruneTombstones(maxAge);
   }
 
   // ===========================================================================
@@ -3711,9 +2816,10 @@ export class PaymentsModule {
    * Get the transaction history sorted newest-first.
    *
    * @returns Array of {@link TransactionHistoryEntry} objects in descending timestamp order.
+   * @see TransferHistory.getHistory
    */
   getHistory(): TransactionHistoryEntry[] {
-    return [...this._historyCache].sort((a, b) => b.timestamp - a.timestamp);
+    return this.history.getHistory();
   }
 
   /**
@@ -3724,303 +2830,19 @@ export class PaymentsModule {
    * Duplicate entries with the same `dedupKey` are silently ignored (upsert).
    *
    * @param entry - History entry fields (without `id` and `dedupKey`).
+   * @see TransferHistory.addToHistory
    */
-  async addToHistory(entry: Omit<TransactionHistoryEntry, 'id' | 'dedupKey'>): Promise<void> {
-    this.ensureInitialized();
-
-    const dedupKey = computeHistoryDedupKey(entry.type, entry.tokenId, entry.transferId, entry.stateHash);
-    const historyEntry: TransactionHistoryEntry = {
-      id: randomUUID(),
-      dedupKey,
-      ...entry,
-    };
-
-    // Persist to the local token storage provider's history store
-    const provider = this.getLocalTokenStorageProvider();
-    if (provider?.addHistoryEntry) {
-      await provider.addHistoryEntry(historyEntry);
-    }
-
-    // Update in-memory cache (replace if same dedupKey, else append)
-    const existingIdx = this._historyCache.findIndex(e => e.dedupKey === dedupKey);
-    if (existingIdx >= 0) {
-      this._historyCache[existingIdx] = historyEntry;
-    } else {
-      this._historyCache.push(historyEntry);
-    }
-
-    // §10: the server-side history log is CLIENT-written (the server never
-    // writes rows), deduped by dedupKey. Memo + counterparty nametag are S6
-    // envelopes — the operator never sees plaintext (§8.3). Best-effort: a
-    // failed POST never fails the money path; the record stays local.
-    const walletApi = this.deps!.walletApi;
-    // §16 wire shape (strict server-side zod; caught drifting by the phase-2
-    // harness — the fake had accepted the module's internal shape):
-    //  - `id` (uuid) + `ts` (ISO-8601), never `timestamp`;
-    //  - `type` is the §16 enum — anything else stays local-only;
-    //  - `tokenId` is the genesis-stable lowercase hex (strip the `v2_` UI prefix);
-    //  - `counterpartyPubkey` only when it IS a 33-byte compressed pubkey.
-    const postableType = historyEntry.type === 'SENT' || historyEntry.type === 'RECEIVED' || historyEntry.type === 'MINT';
-    if (walletApi && postableType) {
-      try {
-        const fieldKey = this.getFieldEncryptionKey();
-        const counterpartyNametag = historyEntry.recipientNametag ?? historyEntry.senderNametag;
-        const wireTokenId = historyEntry.tokenId?.replace(/^v2_/, '');
-        const counterparty = historyEntry.recipientPubkey ?? historyEntry.senderPubkey;
-        await walletApi.postHistoryRecords([
-          {
-            dedupKey: historyEntry.dedupKey,
-            id: randomUUID(),
-            type: historyEntry.type,
-            ts: new Date(historyEntry.timestamp).toISOString(),
-            assets: [{ coinId: historyEntry.coinId, amount: historyEntry.amount }],
-            ...(historyEntry.transferId !== undefined ? { transferId: historyEntry.transferId } : {}),
-            ...(wireTokenId !== undefined && /^(?:[0-9a-f]{2}){1,64}$/.test(wireTokenId)
-              ? { tokenId: wireTokenId }
-              : {}),
-            ...(counterparty !== undefined && /^0[23][0-9a-f]{64}$/.test(counterparty)
-              ? { counterpartyPubkey: counterparty }
-              : {}),
-            ...(historyEntry.memo !== undefined ? { memo: encryptField(fieldKey, historyEntry.memo) } : {}),
-            ...(counterpartyNametag !== undefined
-              ? { counterpartyNametag: encryptField(fieldKey, counterpartyNametag) }
-              : {}),
-          },
-        ]);
-      } catch (err) {
-        logger.warn('Payments', 'history POST failed (kept locally; dedupKey makes retry safe):', err);
-      }
-    }
-
-    // Notify listeners that a history entry was saved
-    this.deps!.emitEvent('history:updated', historyEntry);
+  addToHistory(entry: Omit<TransactionHistoryEntry, 'id' | 'dedupKey'>): Promise<void> {
+    return this.history.addToHistory(entry);
   }
 
   /**
    * Load history into the in-memory cache.
    *
-   * In the wallet-api composition (the `walletApi` client is present) the
-   * durable §10 history log lives on the SERVER — the thin storage provider
-   * keeps none — so the cache is rebuilt from `walletApi.listHistory()`. The
-   * twin of the #521 inventory reload bug: `_historyCache` is process-lifetime,
-   * so a reload (tab refresh) must re-pull it or render an empty history.
-   * Compositions WITHOUT `walletApi` keep the legacy local path below.
+   * @see TransferHistory.loadHistory
    */
-  async loadHistory(): Promise<void> {
-    if (this.deps!.walletApi?.listHistory) {
-      await this.hydrateHistoryFromServer(this.deps!.walletApi);
-      return;
-    }
-    const provider = this.getLocalTokenStorageProvider();
-    if (provider?.getHistoryEntries) {
-      this._historyCache = await provider.getHistoryEntries();
-
-      // One-time migration from legacy KV storage
-      const legacyData = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
-      if (legacyData) {
-        try {
-          const legacyEntries = JSON.parse(legacyData) as TransactionHistoryEntry[];
-          // Ensure legacy entries have dedupKeys for import
-          const records = legacyEntries.map(e => ({
-            ...e,
-            dedupKey: e.dedupKey || computeHistoryDedupKey(e.type, e.tokenId, e.transferId),
-          }));
-          const imported = await provider.importHistoryEntries?.(records) ?? 0;
-          if (imported > 0) {
-            this._historyCache = await provider.getHistoryEntries();
-            logger.debug('Payments', `Migrated ${imported} history entries from KV to history store`);
-          }
-          // Delete legacy key after successful migration
-          await this.deps!.storage.remove(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
-        } catch {
-          // Ignore corrupt legacy data
-        }
-      }
-    } else {
-      // Fallback: load from KV storage (no dedicated provider)
-      const historyData = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
-      if (historyData) {
-        try {
-          this._historyCache = JSON.parse(historyData);
-        } catch {
-          this._historyCache = [];
-        }
-      }
-    }
-  }
-
-  /**
-   * Rebuild `_historyCache` from the server's §10 history log (the wallet-api
-   * composition). Pages newest-first via the keyset cursor until `more:false`
-   * or the page cap; dedups by `dedupKey` (a hydrate-then-receive in the same
-   * session must not double-list). The S6 `memo` / `counterpartyNametag`
-   * envelopes are decrypted with the owner's own field key on the way in.
-   *
-   * #642 incremental fast path: after one completed hydration for this owner,
-   * later pulls stop at the first non-empty page holding nothing new — the
-   * §10 log is append-only (newest-first keyset), so everything past a fully
-   * known page is already cached. The steady-state 30s inventory resync then
-   * costs ONE history page instead of a full re-pagination (which on a wallet
-   * whose history overflows the page cap was 100 pages, every tick, forever).
-   *
-   * Best-effort, like the §10 history POST: history is untrusted DISPLAY data,
-   * so a backend outage during hydration must NEVER fail `load()` (the money
-   * path) — the in-session cache is left intact and the pull retries next load.
-   */
-  private async hydrateHistoryFromServer(api: PaymentsWalletApiPort): Promise<void> {
-    // #583 defense-in-depth owner guard: capture the owner this hydration ran
-    // for and refuse to OVERWRITE `_historyCache` if the module's identity
-    // changed under us (a re-init mid-pull). Per-address isolation pins the
-    // client per owner so this can't normally happen; the guard ensures a stale
-    // pull never replaces the active owner's history with another owner's.
-    const owner = this.deps!.identity.chainPubkey;
-    // Also guard against a SAME-owner re-init racing this pull (the epoch is
-    // bumped by initialize()): a truncated incremental prefix written after
-    // the re-init cleared the cache would otherwise be pinned as "hydrated".
-    const epoch = this.hydrationEpoch;
-    // Incremental only against dedupKeys actually PULLED from the server —
-    // a locally-POSTed key must not make a page look "fully known" before the
-    // pull has ever seen the server's copy. Bounded by the periodic full
-    // re-pull (see FULL_HISTORY_REPULL_EVERY).
-    const known = this.historyHydratedFor === owner &&
-      this.serverSeenHistoryKeys.size > 0 &&
-      this.incrementalHistoryPulls < FULL_HISTORY_REPULL_EVERY
-      ? this.serverSeenHistoryKeys
-      : null;
-    const byDedupKey = new Map<string, TransactionHistoryEntry>();
-    const pulledKeys = new Set<string>();
-    // True when the pull is CONTIGUOUS with what we already hold — it reached
-    // the log's end or a fully-known page. Only then may the pulled prefix be
-    // merged into the cache; a pull cut off by the page cap must replace it
-    // instead (merging would hide the gap between the prefix and the cache).
-    let contiguous = false;
-    try {
-      let before: string | undefined;
-      for (let page = 0; page < MAX_HISTORY_HYDRATION_PAGES; page++) {
-        const result = await api.listHistory(before !== undefined ? { before } : {});
-        let unknown = 0;
-        for (const wire of result.records) {
-          pulledKeys.add(wire.dedupKey);
-          if (known && !known.has(wire.dedupKey)) unknown++;
-          if (!byDedupKey.has(wire.dedupKey)) {
-            byDedupKey.set(wire.dedupKey, this.historyEntryFromWire(wire));
-          }
-        }
-        if (known && result.records.length > 0 && unknown === 0) {
-          contiguous = true;
-          break;
-        }
-        if (!result.more || result.cursor === null) {
-          contiguous = true;
-          break;
-        }
-        before = result.cursor;
-      }
-    } catch (err) {
-      logger.warn('Payments', 'history hydration from server failed (kept in-memory; retries next load):', err);
-      return;
-    }
-    if (this.deps!.identity.chainPubkey !== owner || this.hydrationEpoch !== epoch) {
-      logger.warn('Payments', 'history hydration owner/epoch changed mid-pull — discarding stale result (owner guard)');
-      return;
-    }
-    if (known && contiguous) {
-      // Merge: keep cached entries the pull stopped short of (older pages) and
-      // local-only entries whose §10 POST hasn't landed server-side yet.
-      // Display order is unaffected — getHistory() sorts by timestamp.
-      for (const e of this._historyCache) {
-        if (!byDedupKey.has(e.dedupKey)) byDedupKey.set(e.dedupKey, e);
-      }
-      this.incrementalHistoryPulls++;
-      for (const k of pulledKeys) this.serverSeenHistoryKeys.add(k);
-    } else {
-      // Full pull (or an incremental one cut off by the page cap, which
-      // degenerates to a replace): the server view IS the pulled set.
-      this.incrementalHistoryPulls = 0;
-      this.serverSeenHistoryKeys = pulledKeys;
-    }
-    this._historyCache = [...byDedupKey.values()];
-    this.historyHydratedFor = owner;
-  }
-
-  /**
-   * Map one §16 history wire record onto the display
-   * {@link TransactionHistoryEntry}. `counterpartyNametag` lands on the role-
-   * appropriate field (sender for RECEIVED, recipient otherwise); the S6 memo +
-   * nametag envelopes decrypt under THIS wallet's field key (self-scoped at
-   * rest — §8.3), surfaced as absent if they don't decrypt rather than as
-   * ciphertext (same rule as mailbox/payment-request memos).
-   */
-  private historyEntryFromWire(wire: WalletApiHistoryRecord): TransactionHistoryEntry {
-    const asset = wire.assets[0];
-    const coinId = asset?.coinId ?? '';
-    const received = wire.type === 'RECEIVED';
-    const memo = this.tryDecryptField(wire.memo);
-    const nametag = this.tryDecryptField(wire.counterpartyNametag);
-    return {
-      id: wire.id,
-      dedupKey: wire.dedupKey,
-      type: wire.type as TransactionHistoryEntry['type'],
-      amount: asset?.amount ?? '0',
-      coinId,
-      symbol: this.getCoinSymbol(coinId),
-      timestamp: Date.parse(wire.ts),
-      ...(wire.transferId !== undefined ? { transferId: wire.transferId } : {}),
-      ...(wire.tokenId !== undefined ? { tokenId: wire.tokenId } : {}),
-      ...(wire.counterpartyPubkey !== undefined
-        ? received
-          ? { senderPubkey: wire.counterpartyPubkey }
-          : { recipientPubkey: wire.counterpartyPubkey }
-        : {}),
-      ...(nametag !== undefined
-        ? received
-          ? { senderNametag: nametag }
-          : { recipientNametag: nametag }
-        : {}),
-      ...(memo !== undefined ? { memo } : {}),
-    };
-  }
-
-  /** S6 field decrypt that surfaces an undecryptable envelope as absent (§8.3). */
-  private tryDecryptField(envelope?: string): string | undefined {
-    if (envelope === undefined) return undefined;
-    try {
-      return decryptField(this.getFieldEncryptionKey(), envelope);
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
-   * Import history entries from remote TXF data into local store.
-   * Delegates to the local TokenStorageProvider's importHistoryEntries() for
-   * persistent storage, with in-memory fallback.
-   * Reused by both load() (initial IPFS fetch) and _doSync() (merge result).
-   */
-  private async importRemoteHistoryEntries(entries: HistoryRecord[]): Promise<number> {
-    if (entries.length === 0) return 0;
-
-    const provider = this.getLocalTokenStorageProvider();
-    if (provider?.importHistoryEntries) {
-      const imported = await provider.importHistoryEntries(entries);
-      if (imported > 0) {
-        // Reload cache from provider to stay in sync
-        this._historyCache = await provider.getHistoryEntries!();
-      }
-      return imported;
-    }
-
-    // Fallback: merge into in-memory cache by dedupKey
-    const existingKeys = new Set(this._historyCache.map(e => e.dedupKey));
-    let imported = 0;
-    for (const entry of entries) {
-      if (!existingKeys.has(entry.dedupKey)) {
-        this._historyCache.push(entry);
-        existingKeys.add(entry.dedupKey);
-        imported++;
-      }
-    }
-    return imported;
+  loadHistory(): Promise<void> {
+    return this.history.loadHistory();
   }
 
   /**
@@ -4326,44 +3148,10 @@ export class PaymentsModule {
    * Tokens that fail validation or are detected as spent are marked `'invalid'`.
    *
    * @returns Object with arrays of valid and invalid tokens.
+   * @see TokenView.validate
    */
-  async validate(): Promise<{ valid: Token[]; invalid: Token[] }> {
-    this.ensureInitialized();
-
-    const valid: Token[] = [];
-    const invalid: Token[] = [];
-
-    const engine = this.deps?.tokenEngine;
-    for (const token of this.tokens.values()) {
-      // v2-only: tokens are verified via the engine (local proof check + on-chain
-      // spent-status). Anything that is not an engine blob is a stored v1 TXF
-      // relic — unspendable since the cutover and no longer inspected here, so it
-      // is left untouched rather than judged by a validator that cannot read it.
-      if (!engine || !token.sdkData || !looksLikeTokenBlob(token.sdkData)) continue;
-
-      try {
-        const sphereToken = await engine.decodeToken(decodeTokenBlob(hexToBytes(token.sdkData)));
-        const verdict = await engine.verify(sphereToken);
-        const spent = verdict.ok ? await engine.isSpent(sphereToken) : false;
-        if (verdict.ok && !spent) {
-          valid.push(token);
-        } else {
-          token.status = 'invalid';
-          this.parsedTokenCache.delete(token.id);
-          invalid.push(token);
-        }
-      } catch (err) {
-        // Transient failure (decode/network) — do NOT invalidate funds on an
-        // outage; skip this token for this run.
-        logger.warn('Payments', `validate: engine check failed for ${token.id}, skipping:`, err);
-      }
-    }
-
-    if (invalid.length > 0) {
-      await this.save();
-    }
-
-    return { valid, invalid };
+  validate(): Promise<{ valid: Token[]; invalid: Token[] }> {
+    return this.inventory.validate();
   }
 
   // ===========================================================================
@@ -4398,131 +3186,6 @@ export class PaymentsModule {
       `No binding event found. The recipient must publish their identity first.`,
       'INVALID_RECIPIENT',
     );
-  }
-
-  /**
-   * v2 engine transfer (sender-driven): the sender handed us a FINISHED token.
-   * Decode the blob, dedup by the genesis-stable token id, store it as a
-   * confirmed token, and emit/record the receipt. No commitment / inclusion-proof
-   * / finalization round-trip (contrast the v1 sourceToken+transferTx path).
-   *
-   * Transport-agnostic (sdk-changes S3): fed by the relay push subscription
-   * AND by the delivery port's incoming pump — the returned verdict lets the
-   * pump map outcomes onto `ack('claimed' | 'rejected')`.
-   */
-  private async handleV2Transfer(
-    payload: V2TransferPayload,
-    senderPubkey: string
-  ): Promise<'stored' | 'duplicate' | 'storage-rejected' | 'invalid' | 'not-owned' | 'no-engine'> {
-    this.ensureInitialized();
-    if (!this.loaded && this.loadedPromise) {
-      await this.loadedPromise;
-    }
-
-    const engine = this.deps!.tokenEngine;
-    if (!engine) {
-      logger.error('Payments', 'V2 transfer received but no token engine is configured — payload dropped. Supply the v2 oracle config (trust base + gateway URL).');
-      return 'no-engine';
-    }
-
-    let token: SphereToken;
-    try {
-      // Tolerant read: peers/journals carry the sphere envelope, while the
-      // wallet-api mailbox serves RAW wire bytes (§5.2/§8.2). Either way the
-      // engine's decode re-derives the authoritative blob from the token
-      // itself, so the placeholder fields of a raw wrap are never trusted.
-      const bytes = hexToBytes(payload.tokenBlob);
-      let blob: TokenBlob;
-      try {
-        blob = decodeTokenBlob(bytes);
-      } catch {
-        blob = { v: TOKEN_BLOB_VERSION, network: 0, tokenId: '', token: bytes };
-      }
-      token = await engine.decodeToken(blob);
-    } catch (err) {
-      logger.error('Payments', 'V2 transfer: failed to decode token blob:', err);
-      return 'invalid';
-    }
-
-    // Security: the sender hands us a FINISHED token — verify it cryptographically
-    // and confirm its final state is actually locked to this wallet before it
-    // enters the balance. Both checks are local (trust base + predicate bytes).
-    const verdict = await engine.verify(token);
-    if (!verdict.ok) {
-      logger.warn('Payments', `V2 transfer rejected: verification failed (${verdict.reason ?? 'unknown'})`);
-      return 'invalid';
-    }
-    if (!engine.isOwnedBy(token, engine.getIdentity().chainPubkey)) {
-      logger.warn('Payments', 'V2 transfer rejected: token not addressed to this wallet');
-      return 'not-owned';
-    }
-
-    // Dedup by (tokenId, stateHash) — NOT genesis-id alone. A re-delivered IDENTICAL state
-    // is ignored, but a NEW state of a token we already hold (a self-send or A→B→A round-trip
-    // direct leg returning at a new state) MUST still be received and recorded, or the wallet
-    // keeps the funds but drops the RECEIVED history. v2 tokens are keyed by `v2_<genesisId>`,
-    // so the currently-held state (if any) is an O(1) lookup.
-    const genesisId = engine.tokenId(token);
-    const id = `v2_${genesisId}`;
-    const incomingStateHash = extractStateHashFromSdkData(bytesToHex(encodeTokenBlob(engine.encodeToken(token))));
-    const held = this.tokens.get(id);
-    if (held) {
-      const heldStateHash = extractStateHashFromSdkData(held.sdkData);
-      if (incomingStateHash !== '' && incomingStateHash === heldStateHash) {
-        logger.debug('Payments', `V2 transfer ${id.slice(0, 16)}... (same state) already present, skipping`);
-        return 'duplicate';
-      }
-      // A DIFFERENT state of a token we ALREADY hold. Accepting it means addToken will
-      // REPLACE the held state (CASE 2). That is correct for a legitimate re-acquire (the
-      // incoming state is the live unspent tip), but a delayed/replayed OLDER, already-spent
-      // state would otherwise swap the spendable state for a phantom spent one — and
-      // mergeLazyInventory won't repair it (it skips genesis ids already in memory). verify()
-      // is cryptographic only; isSpent() is the on-chain unspent check. So gate the replacement:
-      // reject the incoming state if it is already consumed on-chain (Codex P1 on #687).
-      if (await engine.isSpent(token)) {
-        logger.warn(
-          'Payments',
-          `V2 transfer ${id.slice(0, 16)}... is an already-spent state of a held token — rejecting stale/replayed delivery`
-        );
-        return 'duplicate';
-      }
-    }
-
-    const { uiToken, added } = await this.storeEngineToken(engine, token);
-    if (!added) {
-      // Storage rejected it: a tombstoned re-delivery of a since-spent state, or
-      // a duplicate race. Emitting transfer:incoming / writing RECEIVED history
-      // here would announce a phantom payment for value the wallet does not hold.
-      logger.warn('Payments', `V2 transfer ${id.slice(0, 16)}... rejected by storage (tombstoned/duplicate) — no event emitted`);
-      return 'storage-rejected';
-    }
-    // The sender's nametag rides the recipient-addressed delivery envelope (S6).
-    const senderNametag = payload.senderNametag;
-
-    this.deps!.emitEvent('transfer:incoming', {
-      id,
-      senderPubkey,
-      senderNametag,
-      tokens: [uiToken],
-      memo: payload.memo,
-      receivedAt: Date.now(),
-    });
-
-    await this.addToHistory({
-      type: 'RECEIVED',
-      amount: uiToken.amount,
-      coinId: uiToken.coinId,
-      symbol: uiToken.symbol,
-      timestamp: Date.now(),
-      senderPubkey,
-      ...(senderNametag !== undefined ? { senderNametag } : {}),
-      memo: payload.memo,
-      tokenId: id,
-      // Per-state receipt key (Codex #687 P2): a genesis token re-acquired at multiple
-      // states (self-send / round-trip) records each leg instead of upserting one key.
-      ...(incomingStateHash !== '' ? { stateHash: incomingStateHash } : {}),
-    });
-    return 'stored';
   }
 
   // ===========================================================================
@@ -4567,7 +3230,7 @@ export class PaymentsModule {
         this.debouncedInventorySyncFromWake();
         return;
       case 'payment_requests':
-        this.pumpHealth.run('payment-requests', () => this.pumpPaymentRequests());
+        this.pumpHealth.run('payment-requests', () => this.requests.pumpPaymentRequests());
         return;
     }
   }
@@ -4726,7 +3389,7 @@ export class PaymentsModule {
       memo: incoming.memo,
       ...(incoming.senderNametag !== undefined ? { senderNametag: incoming.senderNametag } : {}),
     };
-    const verdict = await this.handleV2Transfer(payload, incoming.senderPubkey ?? '');
+    const verdict = await this.deliveries.handleV2Transfer(payload, incoming.senderPubkey ?? '');
     switch (verdict) {
       case 'stored':
         return { disposition: 'claimed', stored: true };
@@ -4761,961 +3424,16 @@ export class PaymentsModule {
   }
 
   // ===========================================================================
-  // wallet-api payment requests: incoming pump + outgoing refresh (S4 — §10/§16)
+  // Public API - Intent Resume (E.3/E.4)
   // ===========================================================================
 
-  /** The S4 capability slice — null unless the composed wallet-api port carries it. */
-  private paymentRequestsApi(): PaymentRequestsApi | null {
-    const api = this.deps?.walletApi;
-    if (
-      !api ||
-      typeof api.createPaymentRequest !== 'function' ||
-      typeof api.listPaymentRequests !== 'function' ||
-      typeof api.respondPaymentRequest !== 'function'
-    ) {
-      return null;
-    }
-    return api as PaymentRequestsApi;
-  }
-
-  private teardownPaymentRequestPump(): void {
-    if (this.prPollTimer !== null) {
-      clearInterval(this.prPollTimer);
-      this.prPollTimer = null;
-    }
-  }
-
-  // ── persisted cursor (per network + identity — mirrors the mailbox cursor) ──
-
-  private prCursorKey(): string {
-    const network = this.paymentRequestsApi()?.network ?? 'default';
-    return `wallet-api-pr:cursor:${network}:${this.deps!.identity.chainPubkey}`;
-  }
-
-  private async readPrCursorState(): Promise<{ cursor: bigint; syncEpoch: bigint } | null> {
-    const raw = await this.deps!.storage.get(this.prCursorKey());
-    if (!raw) return null;
-    try {
-      const parsed = JSON.parse(raw) as { cursor?: string; syncEpoch?: string };
-      if (typeof parsed.cursor !== 'string' || typeof parsed.syncEpoch !== 'string') return null;
-      return { cursor: BigInt(parsed.cursor), syncEpoch: BigInt(parsed.syncEpoch) };
-    } catch {
-      return null;
-    }
-  }
-
-  private async persistPrCursorState(cursor: bigint, syncEpoch: bigint): Promise<void> {
-    await this.deps!.storage.set(
-      this.prCursorKey(),
-      JSON.stringify({ cursor: cursor.toString(), syncEpoch: syncEpoch.toString() })
-    );
-  }
-
-  // ── #441 deferred-paid journal (per network + identity — mirrors prCursor) ──
-
-  private prSettlingKey(): string {
-    const network = this.paymentRequestsApi()?.network ?? 'default';
-    return `wallet-api-pr:settling:${network}:${this.deps!.identity.chainPubkey}`;
-  }
-
   /**
-   * Single-flight load: concurrent callers (the pump's reload re-apply, resume's
-   * reconcile, a live pay catch) share ONE storage.get + ONE Map instance so a
-   * lazy read never overwrites another context's in-memory mutation.
-   */
-  private ensureSettlingJournalLoaded(): Promise<void> {
-    return (this.settlingJournalLoad ??= (async () => {
-      const keyAtLoad = this.prSettlingKey();
-      const raw = await this.deps!.storage.get(keyAtLoad);
-      // Identity switched during the load await (initialize() reset the journal
-      // for a new key): do NOT clobber the NEW identity's settlingJournal with
-      // this stale load. The fresh identity's ensureSettlingJournalLoaded (its
-      // memo was reset to null) loads the correct journal.
-      if (this.prSettlingKey() !== keyAtLoad) return;
-      try {
-        this.settlingJournal = new Map(
-          raw ? Object.entries(JSON.parse(raw) as Record<string, { transferId: string; createdAt: number; committed?: boolean }>) : []
-        );
-      } catch (err) {
-        // A corrupt blob (partial write / manual clear / older format) must NOT
-        // wedge the whole resume + payment-request pump. Fail open to an empty
-        // journal (a settling request may re-surface payable — a rare, bounded
-        // risk) rather than throw and break ALL resume for the session.
-        logger.error('Payments', 'Settling journal unreadable — treating as empty:', err);
-        this.settlingJournal = new Map();
-      }
-    })());
-  }
-
-  /**
-   * Serialize every read-modify-write through a tail-promise chain so two
-   * concurrent mutations can't lose an entry (the #679/#680 mutex lesson — a
-   * dropped entry is a re-payable request is a double-pay). `fn` returns true
-   * when the Map changed and must be persisted.
-   */
-  private mutateSettlingJournal(
-    fn: (m: Map<string, { transferId: string; createdAt: number; committed?: boolean }>) => boolean
-  ): Promise<void> {
-    // Capture the identity's storage key at ENQUEUE time. If the identity
-    // switches before this queued mutation runs, prSettlingKey() will have
-    // changed — skip, so a stale old-identity mutation cannot reload + rewrite
-    // the NEW identity's journal (resetting the chain pointer alone does not
-    // cancel an already-queued .then).
-    const keyAtEnqueue = this.prSettlingKey();
-    this.settlingJournalWrite = this.settlingJournalWrite.catch(() => {}).then(async () => {
-      if (this.prSettlingKey() !== keyAtEnqueue) return; // identity changed — drop the stale mutation
-      await this.ensureSettlingJournalLoaded();
-      // Re-check after the load await: if the identity switched WHILE loading, the
-      // load skipped its assignment (guard above) — bail so we never mutate under
-      // the wrong identity, and so `settlingJournal!` is provably non-null here.
-      if (this.prSettlingKey() !== keyAtEnqueue) return;
-      if (fn(this.settlingJournal!)) {
-        await this.deps!.storage.set(keyAtEnqueue, JSON.stringify(Object.fromEntries(this.settlingJournal!)));
-      }
-    });
-    return this.settlingJournalWrite;
-  }
-
-  /**
-   * #441: link a request to its in-flight transfer. `committed` marks a
-   * DEFINITE spend whose anchor intent is soft-aborted and will NOT resume-
-   * complete — a `PartialSendConflictError` (≥1 leg already delivered). The
-   * reconcile must resolve such a link 'paid' and NEVER revert it to payable
-   * (re-paying the full amount would double-pay the delivered leg). A
-   * non-`committed` link is a keep-open outcome that resume may still complete
-   * OR abort (e.g. CERTIFICATION_UNCONFIRMED losing to a foreign tx delivers
-   * nothing) — those DO revert to payable on abort.
-   */
-  private journalSettling(requestId: string, transferId: string, committed = false): Promise<void> {
-    return this.mutateSettlingJournal((m) => {
-      m.set(requestId, { transferId, createdAt: Date.now(), ...(committed ? { committed: true } : {}) });
-      return true;
-    });
-  }
-
-  private clearSettling(requestId: string): Promise<void> {
-    return this.mutateSettlingJournal((m) => m.delete(requestId));
-  }
-
-  // ── the pump ─────────────────────────────────────────────────────────────────
-
-  /**
-   * Pull the wallet-api payment-request streams now (S4): drains the payer's
-   * incoming `?since=<seq>` stream (gap-free — §9/§16) into the existing
-   * handler/event surface and refreshes outgoing requests still awaiting a
-   * response. The poll interval and `load()` call this automatically; it is
-   * public for explicit fetch-now flows (mirrors {@link receive}). A no-op in
-   * compositions without the wallet-api payment-request capability — there
-   * the Nostr subscription is push-based.
-   */
-  async syncPaymentRequests(): Promise<void> {
-    await this.pumpPaymentRequests();
-  }
-
-  /** Coalesces concurrent pump runs (poll + wake + load can overlap). */
-  private async pumpPaymentRequests(): Promise<void> {
-    const api = this.paymentRequestsApi();
-    if (!api) return;
-    if (this.prPumpInFlight) return this.prPumpInFlight;
-    this.prPumpInFlight = this.doPumpPaymentRequests(api).finally(() => {
-      this.prPumpInFlight = null;
-    });
-    return this.prPumpInFlight;
-  }
-
-  private async doPumpPaymentRequests(api: PaymentRequestsApi): Promise<void> {
-    if (!this.loaded && this.loadedPromise) {
-      await this.loadedPromise;
-    }
-    await this.pumpIncomingPaymentRequests(api);
-    await this.refreshOutgoingPaymentRequests(api);
-  }
-
-  /**
-   * Drain the payer's gap-free `?since=<seq>` stream (§9/§16), mirroring the
-   * mailbox-cursor pattern: the persisted `{cursor, syncEpoch}` is the resume
-   * point; a `syncEpoch` change (server restore — §5.4) voids cursor
-   * continuity, so the tail re-pulls from 0 and the id-dedup in
-   * {@link surfaceIncomingPaymentRequest} absorbs the replays.
+   * E.3 resume of this wallet's OPEN send intents.
    *
-   * Because the surfaced list is in-memory only, each session FIRST runs one
-   * full incoming hydration from `since=0` with NO status filter (#556 —
-   * mirrors {@link hydrateHistoryFromServer}): a fresh engine rebuilds the
-   * CURRENT state of ALL incoming requests — open AND resolved — so a request
-   * paid/declined/expired in a PRIOR session is still present (with its
-   * resolved status) instead of vanishing once the cursor advanced past it.
-   * Hydration NEVER fires the new-incoming handlers/events for resolved
-   * requests — only `open` ones notify (the status-aware
-   * {@link surfaceIncomingPaymentRequest}) — so reopening can't spam stale
-   * 'new request' notifications. After hydration the `since`-cursor delta poll
-   * picks up live updates from the resume point.
+   * @see IntentResume.resumeOpenIntents
    */
-  private async pumpIncomingPaymentRequests(api: PaymentRequestsApi): Promise<void> {
-    // #441: the deferred-paid journal must be present in memory BEFORE the first
-    // hydration surfaces any wire — surfaceIncomingPaymentRequest reads it
-    // synchronously to hold a settling request non-payable instead of re-surfacing
-    // it as payable. Single-flight, so ordering vs. resumeOpenIntents is irrelevant.
-    await this.ensureSettlingJournalLoaded();
-
-    const persisted = await this.readPrCursorState();
-
-    if (!this.prBootstrapped) {
-      let scan = await api.listPaymentRequests({ role: 'incoming', since: 0n });
-      for (let pageCount = 0; pageCount < MAX_PR_HYDRATION_PAGES; pageCount++) {
-        for (const wire of scan.requests) this.surfaceIncomingPaymentRequest(wire);
-        if (!scan.more) break;
-        scan = await api.listPaymentRequests({ role: 'incoming', since: scan.cursor });
-      }
-      // Marked only after the hydration SUCCEEDS — a transient failure here must
-      // not skip recovery for the rest of the session (the next poll retries;
-      // the id-dedup makes a re-hydration safe).
-      this.prBootstrapped = true;
-    }
-
-    let page = await api.listPaymentRequests({ role: 'incoming', since: persisted?.cursor ?? 0n });
-    if (persisted !== null && page.syncEpoch !== persisted.syncEpoch) {
-      page = await api.listPaymentRequests({ role: 'incoming', since: 0n });
-    }
-    for (;;) {
-      for (const wire of page.requests) this.surfaceIncomingPaymentRequest(wire);
-      await this.persistPrCursorState(page.cursor, page.syncEpoch);
-      if (!page.more) break;
-      page = await api.listPaymentRequests({ role: 'incoming', since: page.cursor });
-    }
-  }
-
-  /**
-   * Decrypt a payment-request's recipient-addressed memo envelope into
-   * `{ memo, senderNametag }` (the requester's message + nametag). The key is
-   * the ECDH shared secret between THIS wallet (the payer) and the requester's
-   * chain pubkey (`wire.fromPubkey`) — symmetric with the requester's
-   * create-time derivation. Returns an empty bundle (and logs at debug) on any
-   * absence/failure so the incoming view never wedges on an unreadable memo
-   * (PR twin of #546/#547).
-   */
-  private decryptPaymentRequestMemo(
-    wire: WalletApiPaymentRequest
-  ): { memo?: string; senderNametag?: string } {
-    if (wire.memo === undefined) return {};
-    try {
-      const key = deriveDeliveryEncryptionKey(this.deps!.identity.privateKey, wire.fromPubkey);
-      return decryptDeliveryBundle(key, wire.memo);
-    } catch {
-      logger.debug('Payments', `Payment request ${wire.id.slice(0, 12)}… memo not addressed here / not decryptable`);
-      return {};
-    }
-  }
-
-  /** §16 wire status → the public {@link PaymentRequestStatus} display status. */
-  private static readonly PR_WIRE_STATUS: Record<
-    WalletApiPaymentRequest['status'],
-    PaymentRequestStatus
-  > = { open: 'pending', paid: 'paid', declined: 'rejected', expired: 'expired' };
-
-  /** Terminal local statuses: a re-surfaced wire may advance a request INTO one, never out of it. */
-  private static readonly PR_TERMINAL: ReadonlySet<PaymentRequestStatus> = new Set([
-    'paid',
-    'rejected',
-    'expired',
-  ]);
-
-  /**
-   * Map a §16 wire request onto the public {@link IncomingPaymentRequest}
-   * surface, deduped by id (the in-memory id-dedup doubles as the replay guard
-   * for cursor resets). Requests of EVERY status are surfaced so a reloaded
-   * thin wallet rebuilds the CURRENT state of its incoming view (#556) — open
-   * ones land as actionable `pending`, resolved ones carry their paid/declined
-   * (→ `rejected`)/expired status. Only `open` requests fire the new-incoming
-   * event + handlers; resolved requests are folded into the list silently, so a
-   * reload (or a `syncEpoch` re-pull) never re-notifies for already-resolved
-   * requests. Multi-asset requests surface their first asset (the module's
-   * request surface is single-asset; module-created requests always are).
-   */
-  private surfaceIncomingPaymentRequest(wire: WalletApiPaymentRequest): void {
-    // #583 defense-in-depth owner guard: only surface requests actually
-    // addressed to THIS module's owner. Per-address client isolation means an
-    // orphaned previous-address PR pump runs against its OWN client (its own
-    // owner), so a wire for a different owner should never arrive here — but if
-    // any shared state ever slips through, this drops it (and keeps it out of
-    // the wrong owner's actionable view + cursor) rather than bleeding a foreign
-    // request across addresses. Mirrors the engine.isOwnedBy delivery guard.
-    if (wire.toPubkey !== this.deps!.identity.chainPubkey) {
-      logger.warn(
-        'Payments',
-        `Incoming payment request ${wire.id.slice(0, 12)}… addressed to a different owner — skipping (owner guard)`
-      );
-      return;
-    }
-
-    let status = PaymentsModule.PR_WIRE_STATUS[wire.status];
-
-    // #441 reload re-apply: a request linked to an in-flight transfer (durable
-    // journal, loaded before hydration) must NOT be re-surfaced as payable. Read
-    // the SYNCHRONOUS in-memory journal (loaded in pumpIncomingPaymentRequests /
-    // resumeOpenIntents before any surface call).
-    const settling = this.settlingJournal?.get(wire.id);
-    if (settling) {
-      if (wire.status === 'open') {
-        // Hold non-payable; suppresses the new-incoming notify below.
-        status = 'settling';
-      } else {
-        // Server already resolved (paid/declined/expired) — our deferred tell
-        // landed in a prior session, or it expired. Drop the stale link and let
-        // the terminal status flow. Fire-and-forget (surface is sync), but attach
-        // a .catch so a storage I/O failure can't raise an unhandled rejection.
-        void this.clearSettling(wire.id).catch((err) =>
-          logger.warn('Payments', `Failed to clear stale settling link for ${wire.id}:`, err),
-        );
-      }
-    }
-
-    // §16 upsert: a request re-surfaces in the incoming ?since= delta at a higher seq when it is
-    // resolved (paid/declined) or expired — on another device OR by THIS wallet's other session.
-    // If we already hold it, advance a still-actionable request to its terminal server state and
-    // emit the resolution event (so every session drops it from the actionable view); never
-    // downgrade, and never re-notify a request we've already surfaced.
-    const existing = this.paymentRequests.find((r) => r.id === wire.id);
-    if (existing !== undefined) {
-      if (PaymentsModule.PR_TERMINAL.has(status) && !PaymentsModule.PR_TERMINAL.has(existing.status)) {
-        this.updatePaymentRequestStatus(wire.id, status);
-      }
-      return;
-    }
-
-    const coinId = wire.assets[0]?.coinId ?? '';
-    const coinDef = TokenRegistry.getInstance().getDefinition(coinId);
-
-    // S6: the memo is a recipient-addressed envelope keyed off
-    // ECDH(payerPriv, requester chain pubkey = wire.fromPubkey) — symmetric
-    // with the requester's create-time derivation (the PR twin of #546/#547).
-    // It carries the requester's nametag AND message, so the payer renders
-    // "@requester" + the message instead of a raw pubkey. An envelope not
-    // addressed here, or any tamper, fails authentication and surfaces as
-    // absent — never garbage, and never thrown into the view path. Decrypted
-    // for resolved requests too (#554/dev.12), so a reloaded view renders the
-    // memo/nametag of a paid/declined request, not a raw pubkey.
-    const { memo: message, senderNametag } = this.decryptPaymentRequestMemo(wire);
-
-    const request: IncomingPaymentRequest = {
-      id: wire.id,
-      senderPubkey: wire.fromPubkey,
-      ...(senderNametag !== undefined ? { senderNametag } : {}),
-      amount: (wire.assets[0]?.amount ?? 0n).toString(),
-      coinId,
-      symbol: coinDef?.symbol || coinId.slice(0, 8),
-      ...(message !== undefined ? { message } : {}),
-      requestId: wire.id,
-      timestamp: wire.createdAt,
-      status,
-    };
-
-    // Add to list (newest first)
-    this.paymentRequests.unshift(request);
-
-    // Notify ONLY for actionable (open) requests — a reload-hydrated resolved
-    // request must not re-fire 'new incoming request' (#556). Open requests
-    // surfaced during hydration DO notify, exactly as the prior bootstrap did.
-    if (status === 'pending') {
-      this.deps?.emitEvent('payment_request:incoming', request);
-      for (const handler of this.paymentRequestHandlers) {
-        try {
-          handler(request);
-        } catch (error) {
-          logger.debug('Payments', 'Payment request handler error:', error);
-        }
-      }
-    }
-
-    logger.debug('Payments', `Incoming payment request: ${request.id} (${status}) for ${request.amount} ${request.symbol}`);
-  }
-
-  /**
-   * Outgoing requests are a `?before=` backfill view (§16 — newest-first, no
-   * gap-free tail): refresh only while something local still awaits a
-   * response, paging until every pending id is resolved or the view drains.
-   */
-  private async refreshOutgoingPaymentRequests(api: PaymentRequestsApi): Promise<void> {
-    const pendingIds = new Set(
-      [...this.outgoingPaymentRequests.values()].filter((r) => r.status === 'pending').map((r) => r.id)
-    );
-    if (pendingIds.size === 0) return;
-
-    let before: string | undefined;
-    for (;;) {
-      const page = await api.listPaymentRequests({
-        role: 'outgoing',
-        ...(before !== undefined ? { before } : {}),
-      });
-      for (const wire of page.requests) {
-        if (!pendingIds.delete(wire.id)) continue;
-        this.applyOutgoingPaymentRequestState(wire);
-      }
-      if (pendingIds.size === 0 || !page.more || page.cursor === null) return;
-      before = page.cursor;
-    }
-  }
-
-  /** Fold a server-side status change into the outgoing surface (responses + expiry). */
-  private applyOutgoingPaymentRequestState(wire: WalletApiPaymentRequest): void {
-    if (wire.status === 'open') return;
-    const outgoing = this.outgoingPaymentRequests.get(wire.id);
-    if (!outgoing || outgoing.status !== 'pending') return;
-
-    if (wire.status === 'expired') {
-      // §10: expiry is server-owned, not client-inferred — fold the status in;
-      // there is no responder, so no response is dispatched.
-      outgoing.status = 'expired';
-      return;
-    }
-
-    this.dispatchPaymentRequestResponse({
-      id: wire.id,
-      responderPubkey: wire.toPubkey,
-      requestId: wire.id,
-      responseType: wire.status === 'paid' ? 'paid' : 'rejected',
-      ...(wire.transferId !== null ? { transferId: wire.transferId } : {}),
-      timestamp: Date.now(),
-    });
-  }
-
-  /**
-   * E.3 resume: list this wallet's OPEN intents (server-side — any device),
-   * decrypt each payload, and re-run the engine with the SAME transferId and
-   * inputs — deterministic realization yields byte-identical transactions, so
-   * an interrupted transfer completes instead of failing (proof fetch →
-   * match-verify → apply, Part E). Called at sign-in (S4).
-   */
-  async resumeOpenIntents(): Promise<{ resumed: string[]; conflicted: string[]; failed: string[] }> {
-    this.ensureInitialized();
-    const walletApi = this.deps!.walletApi;
-    const engine = this.deps!.tokenEngine;
-    const outcome = { resumed: [] as string[], conflicted: [] as string[], failed: [] as string[] };
-    if (!walletApi || !engine) return outcome;
-    if (!this.loaded && this.loadedPromise) {
-      await this.loadedPromise;
-    }
-
-    const intents = await walletApi.listIntents('open');
-
-    // #676 (PR #681 review): read EVERY local intent disposition ONCE before the
-    // loop (perf: one parse, not one per server-open intent). Best-effort — a
-    // storage read error must NOT abort the whole resume (Copilot robustness),
-    // but it also must NOT let us blindly resume: a server-`open` intent whose
-    // local copy is aborted would re-execute → double-pay. So when the local
-    // read is UNAVAILABLE (threw), we cannot prove any intent safe to resume and
-    // DEFER them all (classify failed, retry next sign-in) — erring toward not
-    // double-paying. A port without the capability (no local intent store) has
-    // no divergence to honor, so it resumes on the server row as before.
-    const localLookupSupported = typeof walletApi.getLocalIntentsMap === 'function';
-    let localIntents: Map<string, { status: 'open' | 'completed' | 'aborted'; abortPending: boolean }> | undefined;
-    let localReadFailed = false;
-    if (localLookupSupported) {
-      try {
-        localIntents = await walletApi.getLocalIntentsMap!();
-      } catch (err) {
-        localReadFailed = true;
-        logger.warn(
-          'Payments',
-          'Could not read local intent dispositions (#676) — deferring resume of all open intents this sign-in to avoid re-executing a locally-aborted send:',
-          err,
-        );
-      }
-    }
-
-    for (const intent of intents) {
-      // #676: honor a LOCAL abort the server never learned about. A clean
-      // pre-certification send failure soft-aborts the intent best-effort; when
-      // that abort's server leg cannot land (dead backend), abortIntent flips
-      // the LOCAL copy to aborted+abortPending while the SERVER row stays 'open'.
-      // listIntents('open') (a plain server GET) hands that row back, and
-      // re-executing it would RE-SPEND sources the failure handler restored to
-      // 'confirmed' — paying the recipient a second time for a send the user
-      // already watched fail.
-      if (localLookupSupported) {
-        if (localReadFailed) {
-          // Local disposition unknown (read threw) — cannot prove this intent is
-          // safe to resume, so defer it rather than risk re-executing a locally
-          // aborted send. The next sign-in retries once storage is healthy.
-          outcome.failed.push(intent.transferId);
-          continue;
-        }
-        const localIntent = localIntents!.get(intent.transferId);
-        // Local copy aborted (or abort pending) → do NOT resume; re-attempt the
-        // abort to converge the server and classify with the conflicted
-        // (aborted, re-plan) bucket. A missing local copy (fresh device) leaves
-        // the server row authoritative and resume proceeds, unchanged.
-        if (localIntent && (localIntent.status === 'aborted' || localIntent.abortPending)) {
-          logger.warn(
-            'Payments',
-            `Intent ${intent.transferId.slice(0, 8)}… is locally aborted (the abort never reached the server) — converging, NOT resuming (#676)`,
-          );
-          try {
-            await walletApi.abortIntent(intent.transferId);
-          } catch (abortErr) {
-            logger.warn('Payments', 'abortIntent during resume-skip failed (retried next sign-in):', abortErr);
-          }
-          outcome.conflicted.push(intent.transferId);
-          continue;
-        }
-      }
-      let payload: IntentPayloadV1;
-      try {
-        const plain = decryptField(this.getFieldEncryptionKey(), intent.payload);
-        payload = JSON.parse(plain) as IntentPayloadV1;
-        if (payload.v !== 2 || !Array.isArray(payload.direct)) {
-          // A pre-E.4 (v:1) intent has no burn checkpoint, so running it down the
-          // v:2 path would raise SplitCheckpointLostError and keep it open
-          // forever. Refuse it instead: it lands in `failed`, stays OPEN and
-          // untouched on the server, and is visible to an operator by name —
-          // nothing is executed, nothing is aborted.
-          throw new SphereError(
-            `Unsupported intent payload shape (v=${String(payload.v)}) — not resumable by this wallet version`,
-            'VALIDATION_ERROR',
-          );
-        }
-      } catch (err) {
-        logger.warn('Payments', `Intent ${intent.transferId.slice(0, 8)}… payload undecodable — skipped:`, err);
-        outcome.failed.push(intent.transferId);
-        continue;
-      }
-      try {
-        await this.resumeIntent(intent.transferId, payload);
-        outcome.resumed.push(intent.transferId);
-      } catch (err) {
-        if (err instanceof TransferConflictError) {
-          // E.2 lost race: abort (soft), never apply the foreign proof. The
-          // caller re-plans the remainder under a NEW transferId.
-          logger.warn('Payments', `Intent ${intent.transferId.slice(0, 8)}… lost its source to a concurrent transfer — aborted`);
-          try {
-            await walletApi.abortIntent(intent.transferId);
-          } catch (abortErr) {
-            logger.warn('Payments', 'abortIntent during resume failed:', abortErr);
-          }
-          outcome.conflicted.push(intent.transferId);
-        } else if (err instanceof PartialSendConflictError) {
-          // §7 PARTIAL completion: ≥1 leg forward-completed (delivered + recorded, intent completed by
-          // applyDelta) before a LATER source was lost to a foreign tx. Classify it `resumed` — this is
-          // the durable no-double-pay guard: reconcileSettlingPaymentRequests resolves any linked
-          // request 'paid' via the `resumed || local-completed` branch and NEVER reverts it to payable,
-          // so the delivered legs are never re-paid. resumeIntent already wrote the delivered-amount SENT
-          // history and emitted 'send:partial-remainder'; the app re-plans ONLY the shortfall under a
-          // NEW transferId (a background resume never auto-sends).
-          logger.warn(
-            'Payments',
-            `Intent ${intent.transferId.slice(0, 8)}… PARTIALLY completed — delivered legs final; ${err.remainingAmount} remainder owed (re-plan only the shortfall)`,
-          );
-          outcome.resumed.push(intent.transferId);
-        } else if (err instanceof SplitCheckpointLostError || err instanceof CheckpointTrustbaseMismatchError) {
-          // E.4: a burn-certified split is STUCK on an unrecoverable-for-now checkpoint error (lost
-          // checkpoint, or a trust-base rotation). The intent stays OPEN (funds in-flight, never
-          // lost), but this is NOT a transient blip — emit a distinct LOUD signal so the operator
-          // can act (the drain remedy) rather than wait on a silent retry.
-          logger.warn('Payments', `Intent ${intent.transferId.slice(0, 8)}… split checkpoint STUCK (${err.code}) — kept open, needs attention:`, err);
-          this.deps!.emitEvent('split:checkpoint-stuck', {
-            transferId: intent.transferId,
-            code: err.code,
-            error: err.message,
-          });
-          outcome.failed.push(intent.transferId);
-        } else {
-          // Transient — the intent stays open; the next sign-in retries.
-          logger.warn('Payments', `Intent ${intent.transferId.slice(0, 8)}… resume failed (stays open):`, err);
-          outcome.failed.push(intent.transferId);
-        }
-      }
-    }
-
-    // #441: drive deferred-paid resolution off the DURABLE journal (not in-memory
-    // request presence) — this is the sole seam where a settling transfer
-    // completes (resumed), aborts (conflicted), or stays open (failed).
-    await this.reconcileSettlingPaymentRequests(
-      outcome,
-      new Set(intents.map((i) => i.transferId)),
-      localIntents,
-      localReadFailed,
-    );
-
-    return outcome;
-  }
-
-  /**
-   * #441: resolve every journaled settling payment request against a resume
-   * outcome. Completed → send the deferred 'paid' response (server now told) and
-   * resolve 'paid'. Aborted (nothing delivered) → clear journal, return to
-   * payable. Still open → leave it. For an id accounted for by NONE of those
-   * (a crash between resume-complete and the local write), consult the server
-   * `listIntents('aborted')` authority: aborted → payable; else → paid (a
-   * completed row the server GC'd). Direction-of-error is deliberate: the only
-   * residual false-paid is a transfer that aborted server-side AND whose local
-   * 'aborted' write was lost AND whose server aborted-row was later GC'd — it is
-   * treated as paid, erring toward PAID-NEVER-RE-PAYABLE (no double-pay), the
-   * invariant this fix exists to protect.
-   */
-  private async reconcileSettlingPaymentRequests(
-    outcome: { resumed: string[]; conflicted: string[]; failed: string[] },
-    openIntentIds: Set<string>,
-    localIntents: Map<string, { status: 'open' | 'completed' | 'aborted'; abortPending: boolean }> | undefined,
-    localReadFailed: boolean,
-  ): Promise<void> {
-    if (this.reconcileInFlight) return; // an overlapping resume is already reconciling
-    await this.ensureSettlingJournalLoaded();
-    if (this.settlingJournal!.size === 0) return;
-    if (localReadFailed) return; // #676 posture: dispositions unknown → leave settling, retry next sign-in
-    this.reconcileInFlight = true;
-    try {
-      const resumed = new Set(outcome.resumed);
-      const conflicted = new Set(outcome.conflicted); // aborted THIS run — nothing delivered
-
-      // Server ABORTED authority — fetched lazily, only when a journaled id is
-      // unaccounted-for by the cheap checks below (closes the false-paid crash gap
-      // without a local-absence guess).
-      let abortedIds: Set<string> | null = null;
-      const abortedAuthority = async (): Promise<Set<string>> => {
-        if (abortedIds) return abortedIds;
-        const aborted = await this.deps!.walletApi!.listIntents('aborted');
-        abortedIds = new Set(aborted.map((i) => i.transferId));
-        return abortedIds;
-      };
-
-      for (const [requestId, entry] of [...this.settlingJournal!]) {
-        const { transferId, createdAt } = entry;
-        if (Date.now() - createdAt > 7 * 864e5) {
-          logger.warn(
-            'Payments',
-            `Settling link ${requestId}→${transferId.slice(0, 8)}… is >7d old (stuck transfer?)`,
-          );
-        }
-        const local = localIntents?.get(transferId);
-
-        // A `committed` link (PartialSendConflictError) delivered value already;
-        // its anchor intent is soft-aborted, so it will show aborted/conflicted —
-        // but it must NEVER revert to payable (that re-pays the delivered leg).
-        // Resolve it 'paid' unconditionally (retry the response until it lands).
-        if (entry.committed) {
-          await this.resolveSettledPaid(requestId, transferId);
-        } else if (resumed.has(transferId) || local?.status === 'completed') {
-          await this.resolveSettledPaid(requestId, transferId);
-        } else if (conflicted.has(transferId) || local?.status === 'aborted' || local?.abortPending === true) {
-          await this.revertSettlingToPayable(requestId);
-        } else if (openIntentIds.has(transferId)) {
-          // Still open (transient/stuck) → leave journal, retry next sign-in.
-        } else {
-          // Not resumed this run, not locally decided, not in the open list —
-          // consult the server aborted authority.
-          try {
-            const aborted = await abortedAuthority();
-            if (aborted.has(transferId)) await this.revertSettlingToPayable(requestId);
-            else await this.resolveSettledPaid(requestId, transferId); // server GC'd a completed row
-          } catch (e) {
-            logger.warn(
-              'Payments',
-              `listIntents(aborted) failed during reconcile — deferring ${requestId} to next sign-in:`,
-              e,
-            );
-          }
-        }
-      }
-    } finally {
-      this.reconcileInFlight = false;
-    }
-  }
-
-  /** #441: the linked transfer completed — tell the server 'paid' and resolve 'paid'. */
-  private async resolveSettledPaid(requestId: string, transferId: string): Promise<void> {
-    const api = this.paymentRequestsApi();
-    if (!api || typeof api.respondPaymentRequest !== 'function') return; // only wallet-api ports journal
-    try {
-      await api.respondPaymentRequest(requestId, { action: 'paid', transferId });
-    } catch (err) {
-      // Idempotent replay / expiry race: a 409 CONFLICT ('non-open') means the
-      // request is already resolved server-side → swallow and clear. Any OTHER
-      // error (network / 5xx) → leave the journal, retry next sign-in.
-      if (!isNonOpenConflict(err)) {
-        logger.warn('Payments', `Deferred paid response failed for ${requestId} (retried next sign-in):`, err);
-        return;
-      }
-    }
-    await this.clearSettling(requestId);
-    this.updatePaymentRequestStatus(requestId, 'paid'); // reconcile in-memory if surfaced; else next pump sees wire 'paid'
-  }
-
-  /** #441: the linked transfer aborted — nothing was paid; clear the link and return to payable. */
-  private async revertSettlingToPayable(requestId: string): Promise<void> {
-    await this.clearSettling(requestId);
-    // No-op if not in memory; the next pump re-surfaces the open wire as 'pending'.
-    this.updatePaymentRequestStatus(requestId, 'pending');
-  }
-
-  /**
-   * Re-run one intent end-to-end: getToken (works for tombstoned rows — §5.3
-   * recovery surface), engine re-run under the original transferId, journaled
-   * delivery, the single §7 apply (inventory custody only), uniform close,
-   * and the SENT history record (dedupKey'd by transferId — idempotent).
-   */
-  private async resumeIntent(transferId: string, payload: IntentPayloadV1): Promise<void> {
-    const engine = this.deps!.tokenEngine!;
-    const walletApi = this.deps!.walletApi!;
-    const provider = this.getActiveTokenStorageProvider();
-    if (!provider) throw new SphereError('No token storage provider for intent resume', 'STORAGE_ERROR');
-    const serverApply = this.delivery!.custody === 'inventory';
-
-    // The SAME certify context the original send used — (transferId, opIndex)
-    // rebuilds byte-identical transactions (§8.1).
-    const checkpointStore = this.getCheckpointStore();
-    const ctx: CertifyContext = {
-      engine,
-      transferId,
-      recipientChainPubkey: hexToBytes(payload.recipient),
-      recipientChainPubkeyHex: payload.recipient,
-      selfChainPubkey: hexToBytes(this.deps!.identity.chainPubkey),
-      coinId: payload.coinId,
-      ...(payload.memo !== undefined ? { memo: payload.memo } : {}),
-      ...(checkpointStore ? { checkpointStore } : {}),
-    };
-
-    // #621: re-deliver, never re-certify. A journaled blob for (transferId, opIndex) means the op
-    // already certified in the original send (the intent stayed open on a LATER failure, e.g.
-    // applyDelta). Re-running the engine on the now-spent source would raise TransferConflictError —
-    // re-deliver the stored blob instead (idempotent). The engine runs only for an unjournaled op.
-    const journaled = await this.journaledByOp(transferId);
-    const blobs: string[] = []; // journaled + freshly certified, delivered in ONE pass
-    const spent: string[] = []; // DELIVERED legs only (§7 forward-completion)
-    let conflicted = false; // ≥1 source was lost to a FOREIGN tx (§8.1) — that leg delivered nothing
-    let firstConflict: TransferConflictError | undefined;
-    // The undelivered shortfall = Σ of the CONFLICTED legs' values, computed from the UNDELIVERED
-    // side: a conflicted leg is always FRESH (a journaled leg re-delivers, it never conflicts) so its
-    // source is in hand, while a journaled leg's source is already gone from this.tokens.
-    let undeliveredAmount = 0n;
-
-    for (const [opIndex, genesisId] of payload.direct.entries()) {
-      const existing = journaled.get(opIndex);
-      if (existing) {
-        blobs.push(existing.tokenBlob);
-        spent.push(genesisId);
-        continue;
-      }
-      const source = await engine.decodeToken(await provider.getToken(genesisId));
-      const outcome = await this.certifyOperation(
-        {
-          kind: 'direct',
-          opIndex,
-          uiTokenId: `v2_${genesisId}`,
-          genesisId,
-          sourceSdkData: '',
-          sdkToken: source,
-          deliveredAmount: engine.balanceOf(source, payload.coinId),
-        },
-        ctx
-      );
-      if (outcome.error !== undefined) {
-        if (!(outcome.error instanceof TransferConflictError)) throw outcome.error;
-        // §8.1: a resume conflict = a DIFFERENT (foreign) transaction consumed the source. Our own
-        // resume gets the existing proof back as a hash-MATCH, no throw (AC-E1/E2 vs AC-E4), so this
-        // leg delivered NOTHING. NEVER record it spent — that false-marks the intent PAID.
-        conflicted = true;
-        firstConflict ??= outcome.error;
-        undeliveredAmount += engine.balanceOf(source, payload.coinId);
-        logger.warn('Payments', `Resume op ${opIndex} lost its source to a concurrent transfer — not delivered (§8.1/#4):`, outcome.error);
-        continue;
-      }
-      blobs.push(outcome.tokenBlob!);
-      spent.push(genesisId);
-    }
-
-    let changeOutput: SphereToken | null = null;
-    if (payload.split) {
-      // The split's opIndex follows the direct ops — replayed from the intent's order (§8.1).
-      const splitOpIndex = payload.direct.length;
-      let splitDelivered = false;
-      {
-        // E.4 (sphere-sdk#501): a split resumes THROUGH its burn checkpoint — split() rebuilds BOTH
-        // outputs from the stored proof (already-certified legs match-verify), so the change is
-        // recovered even when the split already certified. Re-delivering the journaled blob instead
-        // (the pre-E.4 shortcut, #634) left the change unpersisted and the following applyDelta
-        // recorded the spend with an empty `added`.
-        const source = await engine.decodeToken(await provider.getToken(payload.split.tokenId));
-        const outcome = await this.certifyOperation(
-          {
-            kind: 'split',
-            opIndex: splitOpIndex,
-            uiTokenId: `v2_${payload.split.tokenId}`,
-            genesisId: payload.split.tokenId,
-            sourceSdkData: '',
-            sdkToken: source,
-            deliveredAmount: BigInt(payload.split.splitAmount),
-            remainderAmount: BigInt(payload.split.remainderAmount),
-          },
-          ctx
-        );
-        if (outcome.error === undefined) {
-          changeOutput = outcome.changeOutput ?? null;
-          // critical (#515 F2): own-storage custody — persist-or-stay-open; a throw keeps the intent
-          // open and the next sign-in re-runs it.
-          if (!serverApply && changeOutput) {
-            await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
-          }
-          blobs.push(outcome.tokenBlob!);
-          splitDelivered = true;
-        } else {
-          splitDelivered = this.classifyResumeSplitFailure(outcome.error, (err) => {
-            conflicted = true;
-            firstConflict ??= err;
-            undeliveredAmount += BigInt(payload.split!.splitAmount);
-          });
-        }
-      }
-      if (splitDelivered) spent.push(payload.split.tokenId);
-    }
-
-    // §3.1 (#621): non-fatal — a recipient-side/transient delivery failure must NOT throw out of
-    // resume (the applyDelta below must still reconcile the server); the blob stays journaled.
-    await this.deliverCommittedBlobs(blobs, payload.recipient, transferId, payload.memo);
-
-    // §7/§8.1: NOTHING was delivered — the (only/first) source was consumed by a FOREIGN tx. Surface
-    // the bare conflict: resumeOpenIntents soft-aborts the intent → the linked settling request
-    // reverts to payable and is re-paid IN FULL. Never applyDelta/complete an intent that delivered
-    // nothing (that is the #4 false-paid). The delivered case (≥1 leg) is handled after the tail.
-    if (conflicted && spent.length === 0) throw firstConflict!;
-
-    if (serverApply) {
-      // M7: replay the spend with the PROTOCOL states persisted at send time, so knownSpends records
-      // the exact spent state (→ M4 can repair a stuck-active server row instead of leaving a
-      // phantom). Legacy payloads (no spentStates) fall back to bare knownSpends.
-      await this.applyInventoryDelta(
-        engine,
-        transferId,
-        spent.map((id) => ({ tokenId: id, stateHash: payload.spentStates?.[id]?.protocol ?? '' })),
-        changeOutput,
-        provider // the one the sources were read from, captured for the whole resume
-      );
-    }
-
-    await this.dropResumedSources(spent, transferId, payload);
-
-    // §7 PARTIAL completion: ≥1 leg delivered, then a LATER source was lost to a FOREIGN tx. The
-    // delivered legs' spends are already recorded by applyDelta above, which also COMPLETED the
-    // intent. No double-pay, durably: resumeOpenIntents classifies this transferId `resumed`, so
-    // reconcileSettlingPaymentRequests resolves any linked request 'paid' and NEVER reverts it to
-    // payable. completeIntent FIRST (idempotent) so the best-effort history/event below can never
-    // wedge it open. The remainder event + PartialSendConflictError surface the shortfall so the app
-    // re-plans ONLY it under a NEW transferId (§7). NOTE: the event is a live-session hint; a
-    // crash-durable remainder re-plan is a tracked follow-up.
-    if (conflicted) {
-      const remaining = undeliveredAmount > 0n ? undeliveredAmount : 0n;
-      const delivered = BigInt(payload.amount) - remaining;
-      await walletApi.completeIntent(transferId);
-      await this.recordResumedSentHistory(payload, transferId, delivered > 0n ? delivered.toString() : '0', spent[0]);
-      this.deps!.emitEvent('send:partial-remainder', {
-        transferId,
-        remainingAmount: remaining.toString(),
-        coinId: payload.coinId,
-        recipientPubkey: payload.recipient,
-      });
-      throw new PartialSendConflictError(
-        'Resume: part of the payment was delivered before a source was consumed by a concurrent transfer — the delivered legs are final; re-plan ONLY the remainder.',
-        transferId,
-        spent, // the DELIVERED genesisIds — never the conflicted leg
-        remaining.toString(),
-        firstConflict,
-      );
-    }
-
-    // E.3 uniform close (idempotent; the apply above usually already did it).
-    await walletApi.completeIntent(transferId);
-    await this.recordResumedSentHistory(payload, transferId, payload.amount, payload.direct[0]);
-  }
-
-  /**
-   * A resumed split that produced no output: a lost source means the leg delivered
-   * nothing (returns false), and every checkpoint failure keeps the intent open by
-   * throwing. There is no path here that records the spend.
-   */
-  private classifyResumeSplitFailure(
-    error: unknown,
-    onConflict: (err: TransferConflictError) => void
-  ): boolean {
-    if (error instanceof ProofUnconfirmedError) throw error; // #631 keep-open (indeterminate)
-    // KEEP-OPEN: the burn is certified and a split-mint stateId is HKDF-derived (never a foreign
-    // spend), so resume — rebuilding from the checkpoint — is the only exit. Never record the
-    // spend, never abort.
-    if (
-      error instanceof CheckpointPersistFailedError ||
-      error instanceof SplitCheckpointLostError ||
-      error instanceof CheckpointTrustbaseMismatchError
-    ) {
-      throw error;
-    }
-    if (error instanceof TransferConflictError) {
-      // §8.1: the split SOURCE (burn leg) was consumed by a FOREIGN tx under a DIFFERENT transferId
-      // — the split delivered NOTHING. Do NOT record it as spent (that false-marks the intent paid).
-      onConflict(error);
-      logger.warn('Payments', 'Resume split: source lost to a concurrent transfer — not delivered (§8.1/#4):', error);
-      return false;
-    }
-    throw error;
-  }
-
-  /**
-   * Drop the local records of the sources a resume consumed (present when
-   * resuming on the originating device). M7: each removal carries the LOCAL state
-   * we spent, so a source a concurrent claim reactivated to a NEW state (a
-   * self-send round-trip) is KEPT, not destroyed.
-   */
-  private async dropResumedSources(
-    spent: readonly string[],
-    transferId: string,
-    payload: IntentPayloadV1
-  ): Promise<void> {
-    const engine = this.deps!.tokenEngine!;
-    for (const genesisId of spent) {
-      const local = this.tokens.get(`v2_${genesisId}`);
-      if (!local) continue;
-      const spentLocal = payload.spentStates?.[genesisId]?.local;
-      if (spentLocal !== undefined && spentLocal !== '') {
-        await this.removeToken(local.id, transferId, spentLocal);
-        continue;
-      }
-      // LEGACY payload (no persisted spent state — an in-flight intent from before M7, hit during a
-      // rolling deploy). removeToken cannot state-gate, so a reactivated source would be destroyed
-      // (permanently, on own storage). FAIL-CLOSED: drop it only if the aggregator confirms its
-      // CURRENT state is spent; unverifiable → keep. Never destroy value we cannot prove is spent.
-      let spentOnChain = false;
-      try {
-        if (local.sdkData) {
-          spentOnChain = await engine.isSpent(await engine.decodeToken(decodeTokenBlob(hexToBytes(local.sdkData))));
-        }
-      } catch {
-        spentOnChain = false;
-      }
-      if (spentOnChain) {
-        await this.removeToken(local.id, transferId, extractStateHashFromSdkData(local.sdkData));
-      } else {
-        logger.warn(
-          'Payments',
-          `Resume(legacy): source ${genesisId.slice(0, 8)}... is unspent on-chain — keeping (reactivated), not dropping`
-        );
-      }
-    }
-  }
-
-  /** §10: the SENT record — same dedupKey as the original attempt, so a resume after the history POST is a server-side no-op. */
-  private async recordResumedSentHistory(
-    payload: IntentPayloadV1,
-    transferId: string,
-    amount: string,
-    tokenGenesisId: string | undefined
-  ): Promise<void> {
-    await this.addToHistory({
-      type: 'SENT',
-      amount,
-      coinId: payload.coinId,
-      symbol: this.getCoinSymbol(payload.coinId),
-      timestamp: Date.now(),
-      recipientPubkey: payload.recipient,
-      memo: payload.memo,
-      transferId,
-      tokenId: tokenGenesisId ? `v2_${tokenGenesisId}` : undefined,
-    });
+  resumeOpenIntents(): Promise<{ resumed: string[]; conflicted: string[]; failed: string[] }> {
+    return this.intents.resumeOpenIntents();
   }
 
   // ===========================================================================
@@ -5767,300 +3485,8 @@ export class PaymentsModule {
     }
   }
 
-  // ===========================================================================
-  // Private: Pending v2 deliveries (finished-but-undelivered token blobs)
-  // ===========================================================================
-
-  private async loadPendingV2Deliveries(): Promise<PendingV2Delivery[]> {
-    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES);
-    return data ? (JSON.parse(data) as PendingV2Delivery[]) : [];
-  }
-
-  /**
-   * #621: journaled finished blobs for an intent, keyed by op position. opIndex when present,
-   * else positional among the intent's entries (legacy entries journaled in op order). Resume
-   * uses this to re-deliver an already-certified op instead of re-running the engine on its spent source.
-   */
-  private async journaledByOp(transferId: string): Promise<Map<number, PendingV2Delivery>> {
-    const mine = (await this.loadPendingV2Deliveries()).filter((e) => e.transferId === transferId);
-    const byOp = new Map<number, PendingV2Delivery>();
-    mine.forEach((e, i) => byOp.set(e.opIndex ?? i, e));
-    return byOp;
-  }
-
-  /** #517: run a journal read-modify-write atomically against all other journal mutations. */
-  private withJournalLock<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.journalMutation.then(fn, fn);
-    this.journalMutation = run.then(() => undefined, () => undefined);
-    return run;
-  }
-
-  private async savePendingV2Delivery(entry: PendingV2Delivery): Promise<void> {
-    await this.withJournalLock(async () => {
-      const all = await this.loadPendingV2Deliveries();
-      if (!all.some((e) => e.tokenBlob === entry.tokenBlob)) {
-        all.push(entry);
-        await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(all));
-      }
-    });
-  }
-
-  private async removePendingV2Delivery(tokenBlob: string): Promise<void> {
-    await this.withJournalLock(async () => {
-      const all = await this.loadPendingV2Deliveries();
-      const filtered = all.filter((e) => e.tokenBlob !== tokenBlob);
-      if (filtered.length !== all.length) {
-        await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(filtered));
-      }
-    });
-  }
-
-  /**
-   * The hoisted send delivery pass (#699): hand a send's journaled committed
-   * blobs to ONE recipient — a single deliverBatch call when the port offers
-   * it and there is more than one blob, else per-blob deliver at the
-   * certification fan-out width. Returns true iff every blob was delivered
-   * (deferred blobs stay journaled). Never throws (§3.1).
-   */
-  private async deliverCommittedBlobs(
-    blobs: readonly string[],
-    recipientPubkey: string,
-    transferId: string,
-    memo?: string,
-  ): Promise<boolean> {
-    if (blobs.length === 0) return true;
-    // Carry the sender's own CANONICAL nametag so the recipient renders
-    // "@name" instead of "Someone" — bundled with the memo in ONE
-    // recipient-addressed envelope (S6). One send = one options set.
-    const nm = this.currentNametagName();
-    const options: DeliverOptions = {
-      transferId,
-      memo,
-      ...(nm !== undefined ? { senderNametag: nm } : {}),
-    };
-    // A single blob stays on the plain deliver path — byte-identical wire to
-    // the pre-batch era, and no batch probe for the dominant case.
-    if (this.delivery?.deliverBatch && blobs.length > 1) {
-      return this.tryDeliverBatch(blobs, recipientPubkey, options);
-    }
-    return this.deliverPerBlob(blobs, recipientPubkey, options);
-  }
-
-  /**
-   * Batch sibling of {@link tryDeliver}: success clears every journal entry;
-   * ANY failure keeps them ALL journaled (the deposit is idempotent by
-   * content-derived entry_id, so a replay absorbs entries that already
-   * landed). Never throws.
-   */
-  private async tryDeliverBatch(
-    blobs: readonly string[],
-    recipientPubkey: string,
-    options: DeliverOptions,
-  ): Promise<boolean> {
-    try {
-      await this.delivery!.deliverBatch!(recipientPubkey, blobs.map(hexToBytes), options);
-    } catch (err) {
-      logger.warn('Payments', 'Batch delivery deferred (all blobs kept journaled); sender not failed (§3.1):', err);
-      return false;
-    }
-    for (const tokenBlob of blobs) {
-      try {
-        await this.removePendingV2Delivery(tokenBlob);
-      } catch (err) {
-        logger.warn('Payments', 'Delivered, but journal cleanup failed (replay will re-remove):', err);
-      }
-    }
-    return true;
-  }
-
-  /**
-   * Per-blob fallback (a batch-less port, or a single blob), chunked at
-   * MAX_SEND_OPERATION_CONCURRENCY so the pass keeps the certification
-   * fan-out era's delivery width. Never throws.
-   */
-  private async deliverPerBlob(
-    blobs: readonly string[],
-    recipientPubkey: string,
-    options: DeliverOptions,
-  ): Promise<boolean> {
-    const results: boolean[] = [];
-    for (let start = 0; start < blobs.length; start += MAX_SEND_OPERATION_CONCURRENCY) {
-      const chunk = blobs.slice(start, start + MAX_SEND_OPERATION_CONCURRENCY);
-      results.push(
-        ...(await Promise.all(
-          chunk.map((tokenBlob) =>
-            this.tryDeliver(() => this.delivery!.deliver(recipientPubkey, hexToBytes(tokenBlob), options), tokenBlob),
-          ),
-        )),
-      );
-    }
-    return results.every(Boolean);
-  }
-
-  /**
-   * Covenant §3.1 (#621): once the source is certified on-chain, a delivery failure must NEVER
-   * fail the sender. Recipient-side conditions (a full mailbox / 429 from a never-claiming recipient)
-   * and transient delivery-infra failures (5xx/network) both leave the finished blob JOURNALED for
-   * (re-)delivery — the send resolves as delivery-pending and the sender moves on. The blob is already
-   * journaled (savePendingV2Delivery ran before this); on success we clear the journal, on any failure
-   * we keep it. Returns true if delivered, false if deferred. Never throws.
-   */
-  private async tryDeliver(deliver: () => Promise<unknown>, tokenBlob: string): Promise<boolean> {
-    try {
-      await deliver();
-    } catch (err) {
-      logger.warn('Payments', 'Delivery deferred (kept journaled); sender not failed (§3.1):', err);
-      return false;
-    }
-    // Delivered. Clearing the journal is best-effort — a failure here is harmless (the idempotent
-    // replay re-removes it) and must NOT flip the result to delivery-pending (#622 review).
-    try {
-      await this.removePendingV2Delivery(tokenBlob);
-    } catch (err) {
-      logger.warn('Payments', 'Delivered, but journal cleanup failed (replay will re-remove):', err);
-    }
-    return true;
-  }
-
-  /**
-   * Replay journaled finished-but-undelivered v2 blobs (kicked from load())
-   * through the delivery port (sdk-changes S3). Idempotent end to end: the
-   * mailbox deposit is idempotent by the content-derived entry_id — it succeeds
-   * even after the recipient claimed (§6) — and the relay path's recipient
-   * dedups by the genesis-stable token id.
-   *
-   * #517 item 1: instead of a silent unbounded fire-and-forget, each entry is
-   * retried with bounded exponential backoff, its cumulative failed-attempt
-   * count is journaled across loads, and an entry that exhausts
-   * {@link MAX_DELIVERY_REPLAY_ATTEMPTS} is SURFACED as poison
-   * (`delivery:undeliverable`) and left journaled but no longer auto-retried —
-   * so a journaled blob never sits undelivered invisibly.
-   */
-  private async replayPendingV2Deliveries(): Promise<void> {
-    // #517: drop an overlapping pass — a replay started while one is in flight
-    // would read the same journal snapshot, re-deliver the same entries, and
-    // race the per-entry `attempts` read/modify/write. Dropped entries stay
-    // journaled and replay on the next load(), so nothing is lost.
-    // No rail composed: return WITHOUT touching the journal. Counting this as a
-    // delivery attempt would burn the poison budget on a configuration state and
-    // strand already-certified funds — the entries stay put until a provider exists.
-    if (!this.delivery) return;
-    if (this.replayInFlight) return;
-    this.replayInFlight = true;
-    try {
-      // #621: skip poison and recipient-quota entries still inside their deferral window.
-      const now = Date.now();
-      const entries = (await this.loadPendingV2Deliveries()).filter(
-        (e) => !e.undeliverable && (e.deferredUntil === undefined || e.deferredUntil <= now),
-      );
-      if (entries.length === 0) return;
-      logger.warn('Payments', `${entries.length} undelivered v2 transfer(s) journaled from a previous session — replaying`);
-      for (const e of entries) {
-        await this.replayOneDelivery(e);
-      }
-    } finally {
-      this.replayInFlight = false;
-    }
-  }
-
-  /** Replay a single journaled entry: backoff retries → success/removal, or → bounded poison. */
-  private async replayOneDelivery(entry: PendingV2Delivery): Promise<void> {
-    const tag = entry.transferId.slice(0, 8);
-    try {
-      await this.attemptDeliveryWithBackoff(entry);
-      await this.removePendingV2Delivery(entry.tokenBlob);
-      logger.debug('Payments', `Replayed undelivered v2 transfer ${tag}...`);
-    } catch (err) {
-      // §3.1 (#621): a recipient-side 429 (full mailbox / never-claimer) is NOT poison — it
-      // self-heals when the recipient drains. Defer it (kept journaled, never consumes the case-A
-      // poison budget, retried after the deferral window), distinct from a genuine delivery failure.
-      if (err instanceof WalletApiError && err.status === 429) {
-        await this.deferDelivery(entry, err.message);
-        return;
-      }
-      const attempts = (entry.attempts ?? 0) + 1;
-      const message = err instanceof Error ? err.message : String(err);
-      if (attempts >= MAX_DELIVERY_REPLAY_ATTEMPTS) {
-        await this.markDeliveryPoison(entry, attempts, message);
-        return;
-      }
-      await this.bumpDeliveryAttempts(entry.tokenBlob, attempts);
-      logger.warn('Payments', `Replay of undelivered v2 transfer ${tag}... failed (attempt ${attempts}/${MAX_DELIVERY_REPLAY_ATTEMPTS}, kept for next load):`, err);
-    }
-  }
-
-  /**
-   * §3.1 (#621): defer a recipient-quota (429) delivery — keep it journaled, never poison it (it
-   * self-heals when the recipient claims), and retry no sooner than the deferral window. Surfaced
-   * distinctly (delivery:deferred) so a UI can show "recipient's mailbox is full — will retry".
-   */
-  private async deferDelivery(entry: PendingV2Delivery, error: string): Promise<void> {
-    const deferredUntil = Date.now() + this.deliveryDeferralMs;
-    await this.updatePendingV2Delivery(entry.tokenBlob, (e) => {
-      e.deferredUntil = deferredUntil;
-      e.deferredReason = 'recipient-quota';
-    });
-    logger.warn('Payments', `Undelivered v2 transfer ${entry.transferId.slice(0, 8)}... deferred — recipient mailbox full (429); kept journaled, retried after the deferral window (§3.1):`, error);
-    this.deps!.emitEvent('delivery:deferred', {
-      transferId: entry.transferId,
-      recipientPubkey: entry.recipientPubkey,
-      reason: 'recipient-quota',
-      deferredUntil,
-    });
-  }
-
-  /** One delivery with in-pass exponential backoff; throws the last error if all attempts fail. */
-  private async attemptDeliveryWithBackoff(entry: PendingV2Delivery): Promise<void> {
-    const nm = this.currentNametagName();
-    let lastErr: unknown;
-    for (let attempt = 0; attempt <= DELIVERY_REPLAY_RETRIES; attempt++) {
-      if (attempt > 0) {
-        const delay = Math.min(this.replayBackoffBaseMs * 2 ** (attempt - 1), DELIVERY_REPLAY_MAX_DELAY_MS);
-        if (delay > 0) await sleep(delay);
-      }
-      try {
-        await this.delivery!.deliver(entry.recipientPubkey, hexToBytes(entry.tokenBlob), {
-          transferId: entry.transferId,
-          memo: entry.memo,
-          ...(nm !== undefined ? { senderNametag: nm } : {}),
-        });
-        return;
-      } catch (err) {
-        lastErr = err;
-      }
-    }
-    throw lastErr;
-  }
-
-  /** Mark a journal entry poison (keep it, stop retrying) and surface it (#517 item 1). */
-  private async markDeliveryPoison(entry: PendingV2Delivery, attempts: number, error: string): Promise<void> {
-    await this.updatePendingV2Delivery(entry.tokenBlob, (e) => { e.attempts = attempts; e.undeliverable = true; });
-    logger.error('Payments', `Undelivered v2 transfer ${entry.transferId.slice(0, 8)}... is POISON after ${attempts} attempts — surfaced, kept journaled, no longer auto-retried:`, error);
-    this.deps!.emitEvent('delivery:undeliverable', {
-      transferId: entry.transferId,
-      recipientPubkey: entry.recipientPubkey,
-      attempts,
-      error,
-    });
-  }
-
-  private async bumpDeliveryAttempts(tokenBlob: string, attempts: number): Promise<void> {
-    await this.updatePendingV2Delivery(tokenBlob, (e) => { e.attempts = attempts; });
-  }
-
-  /** Mutate one journaled entry in place (keyed by tokenBlob) and persist. No-op if gone. */
-  private async updatePendingV2Delivery(tokenBlob: string, mutate: (e: PendingV2Delivery) => void): Promise<void> {
-    await this.withJournalLock(async () => {
-      const all = await this.loadPendingV2Deliveries();
-      const target = all.find((e) => e.tokenBlob === tokenBlob);
-      if (!target) return;
-      mutate(target);
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(all));
-    });
-  }
-
   private async createStorageData(): Promise<TxfStorageDataBase> {
-    const sorted = [...this._historyCache].sort((a, b) => b.timestamp - a.timestamp);
+    const sorted = this.history.getHistory();
     return await buildTxfStorageData(
       Array.from(this.tokens.values()),
       {
@@ -6070,7 +3496,7 @@ export class PaymentsModule {
       },
       {
         nametags: this.nametags,
-        tombstones: this.tombstones,
+        tombstones: this.inventory.tombstoneList,
         historyEntries: sorted.slice(0, MAX_SYNCED_HISTORY_ENTRIES),
       }
     ) as unknown as TxfStorageDataBase;
@@ -6081,8 +3507,7 @@ export class PaymentsModule {
     logger.debug('Payments', `loadFromStorageData: parsed ${parsed.tokens.length} tokens, ${parsed.tombstones.length} tombstones, errors=[${parsed.validationErrors.join('; ')}]`);
 
     // Load tombstones FIRST so we can filter tokens
-    this.tombstones = parsed.tombstones;
-    this.rebuildTombstoneKeySet();
+    this.inventory.setTombstones(parsed.tombstones);
     // Load tokens, filtering out tombstoned ones.
     // Preserve tokens with 'transferring' status — they are part of an in-flight send().
     const preservedTransferring = new Map<string, Token>();
