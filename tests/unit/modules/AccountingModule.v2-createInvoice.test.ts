@@ -69,7 +69,7 @@ describe('importInvoice — v2 engine path (B2)', () => {
     // A fresh importer (same engine fixture) decodes + verifies + stores it.
     const importer = createTestAccountingModule({ tokenEngine: engine });
     (importer.mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
-    const terms = await importer.module.importInvoice(created.token);
+    const terms = await importer.module.importInvoice(created.token!);
 
     expect(terms.memo).toBe('round-trip');
     // Stored under the same genesis-stable id with the blob as sdkData.
@@ -90,7 +90,7 @@ describe('importInvoice — v2 engine path (B2)', () => {
     const importer = createTestAccountingModule({ tokenEngine: badEngine });
     (importer.mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
 
-    await expect(importer.module.importInvoice(created.token)).rejects.toThrow(/proof is invalid/i);
+    await expect(importer.module.importInvoice(created.token!)).rejects.toThrow(/proof is invalid/i);
   });
 });
 

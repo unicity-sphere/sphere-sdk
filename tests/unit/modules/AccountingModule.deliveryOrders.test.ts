@@ -15,7 +15,7 @@
  * Test IDs: UT-DELIVERY-001 through UT-DELIVERY-050
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 import {
   createTestAccountingModule,
   createTestTransfer,
@@ -29,7 +29,14 @@ import type { IncomingTransfer } from '../../../types/index.js';
 // suite self-contained — every test should be readable in isolation)
 // ---------------------------------------------------------------------------
 
-const TARGET = DEFAULT_TEST_IDENTITY.directAddress; // wallet under test
+/**
+ * Recorded-call shape of the injected `deps.emitEvent` vi.fn(): `(type, data)`.
+ * Typing the spy this way makes the `mock.calls` filters below type-check
+ * without per-callback tuple annotations.
+ */
+type EmitEventMock = Mock<(type: string, data: Record<string, unknown>) => void>;
+
+const TARGET = DEFAULT_TEST_IDENTITY.directAddress!; // wallet under test
 
 function makeTerms(overrides?: Partial<InvoiceTerms>): InvoiceTerms {
   return {
@@ -140,14 +147,14 @@ function tokenInvoiceMapEntriesFor(
 describe('AccountingModule — payment/invoice delivery ordering', () => {
   let module: ReturnType<typeof createTestAccountingModule>['module'];
   let mocks: ReturnType<typeof createTestAccountingModule>['mocks'];
-  let emitEvent: ReturnType<typeof vi.fn>;
+  let emitEvent: EmitEventMock;
 
   beforeEach(async () => {
     const built = createTestAccountingModule();
     module = built.module;
     mocks = built.mocks;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    emitEvent = (module as unknown as { deps?: { emitEvent?: EmitEventMock } }).deps?.emitEvent as EmitEventMock;
     await module.load();
   });
 
@@ -176,7 +183,7 @@ describe('AccountingModule — payment/invoice delivery ordering', () => {
     );
     // No unknown_reference fired in the happy path.
     const unknownCalls = emitEvent.mock.calls.filter(
-      ([evt]: [string]) => evt === 'invoice:unknown_reference',
+      ([evt]) => evt === 'invoice:unknown_reference',
     );
     expect(unknownCalls).toHaveLength(0);
   });
@@ -195,7 +202,7 @@ describe('AccountingModule — payment/invoice delivery ordering', () => {
 
     // unknown_reference fires — observability preserved.
     const unknownCalls = emitEvent.mock.calls.filter(
-      ([evt]: [string]) => evt === 'invoice:unknown_reference',
+      ([evt]) => evt === 'invoice:unknown_reference',
     );
     expect(unknownCalls).toHaveLength(1);
 
@@ -234,7 +241,7 @@ describe('AccountingModule — payment/invoice delivery ordering', () => {
     expect(forwardSum(module, invoiceId)).toBe(10000000n);
 
     const paymentCalls = emitEvent.mock.calls.filter(
-      ([evt]: [string]) => evt === 'invoice:payment',
+      ([evt]) => evt === 'invoice:payment',
     );
     expect(paymentCalls.length).toBeGreaterThanOrEqual(2); // one per transfer
 
@@ -256,7 +263,7 @@ describe('AccountingModule — payment/invoice delivery ordering', () => {
 
     // Both unknown_reference events fired.
     const unknownCalls = emitEvent.mock.calls.filter(
-      ([evt]: [string]) => evt === 'invoice:unknown_reference',
+      ([evt]) => evt === 'invoice:unknown_reference',
     );
     expect(unknownCalls).toHaveLength(2);
 
@@ -403,7 +410,7 @@ describe('AccountingModule — payment/invoice delivery ordering', () => {
 
     // unknown_reference fired for B (orphan), NOT for A.
     const unknownCalls = emitEvent.mock.calls.filter(
-      ([evt]: [string]) => evt === 'invoice:unknown_reference',
+      ([evt]) => evt === 'invoice:unknown_reference',
     );
     expect(unknownCalls).toHaveLength(1);
     expect(unknownCalls[0][1]).toMatchObject({ invoiceId: invoiceB });

@@ -13,6 +13,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import type { NostrClient } from '@unicitylabs/nostr-js-sdk';
 
 const mockSubscribe = vi.fn().mockReturnValue('mock-sub-id');
 const mockUnsubscribe = vi.fn();
@@ -136,7 +137,7 @@ describe('MultiAddressTransportMux shared-NostrClient (#123)', () => {
     // inside its own connect(). To support the case where the Mux is
     // configured before that happens, the API accepts a getter.
     let lazyClient: ReturnType<typeof makeStub> | null = null;
-    const getter = vi.fn(() => lazyClient);
+    const getter = vi.fn((): NostrClient | null => asClient(lazyClient));
 
     NostrClientCtor.mockClear();
 
@@ -168,7 +169,7 @@ describe('MultiAddressTransportMux shared-NostrClient (#123)', () => {
     // runtime). The Mux must adopt the new client and re-issue its
     // wallet/chat subs.
     let currentClient = makeStub();
-    const getter = vi.fn(() => currentClient);
+    const getter = vi.fn((): NostrClient | null => asClient(currentClient));
 
     const mux = new MultiAddressTransportMux({
       relays: ['wss://relay1.test'],
@@ -532,7 +533,7 @@ describe('MultiAddressTransportMux shared-NostrClient (#123)', () => {
       createWebSocket: (() => {}) as any,
       timeout: 100,
       autoReconnect: false,
-      sharedNostrClient: () => activeClient,
+      sharedNostrClient: () => asClient(activeClient),
     });
 
     await mux.addAddress(0, TEST_IDENTITY);
@@ -554,7 +555,7 @@ describe('MultiAddressTransportMux shared-NostrClient (#123)', () => {
       createWebSocket: (() => {}) as any,
       timeout: 100,
       autoReconnect: false,
-      sharedNostrClient: () => activeClient,
+      sharedNostrClient: () => asClient(activeClient),
     });
 
     await mux.addAddress(0, TEST_IDENTITY);
@@ -609,6 +610,16 @@ describe('MultiAddressTransportMux shared-NostrClient (#123)', () => {
     expect(NostrClientCtor).toHaveBeenCalledTimes(2);
   });
 });
+
+/**
+ * The stubs are deliberately partial doubles of the SDK's NostrClient — only the
+ * members the Mux actually touches. The Mux config demands the real class type,
+ * so cast at that single boundary (the stub itself stays vi.fn-typed so the tests
+ * can assert on `.mock`).
+ */
+function asClient(stub: ReturnType<typeof makeStub> | null): NostrClient | null {
+  return stub as unknown as NostrClient | null;
+}
 
 function makeStub() {
   return {

@@ -61,7 +61,9 @@ const { NostrTransportProvider } = await import('../../../transport/NostrTranspo
 function createProvider() {
   return new NostrTransportProvider({
     relays: ['wss://relay1.test'],
-    createWebSocket: (() => {}) as WebSocketFactory,
+    // Inert: the SDK's NostrClient (mocked here) owns its own sockets, so the
+    // factory is never invoked — it cannot return a real IWebSocket.
+    createWebSocket: (() => {}) as unknown as WebSocketFactory,
     timeout: 5000,
     autoReconnect: false,
   });

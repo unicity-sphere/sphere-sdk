@@ -24,9 +24,9 @@ import type { DirectMessage } from '../../types';
 // Local helpers (the shared v1-era e2e helpers.ts died with the v1 cutover;
 // messaging needs no faucet/gateway — only temp dirs and random names).
 const rand = (n = 6): string => Math.random().toString(36).slice(2, 2 + n);
-function makeTempDirs(label: string): { dataDir: string; tokensDir: string } {
+function makeTempDirs(label: string): { base: string; dataDir: string; tokensDir: string } {
   const base = mkdtempSync(join(tmpdir(), `sphere-e2e-${label}-`));
-  return { dataDir: join(base, 'data'), tokensDir: join(base, 'tokens') };
+  return { base, dataDir: join(base, 'data'), tokensDir: join(base, 'tokens') };
 }
 
 // =============================================================================

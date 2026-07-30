@@ -199,7 +199,9 @@ const TEST_NAMETAG = 'alice';
 function createProvider() {
   return new NostrTransportProvider({
     relays: ['wss://test.relay'],
-    createWebSocket: (() => {}) as WebSocketFactory,
+    // Inert: the SDK's NostrClient (mocked here) owns its own sockets, so the
+    // factory is never invoked — it cannot return a real IWebSocket.
+    createWebSocket: (() => {}) as unknown as WebSocketFactory,
     timeout: 1000,
     autoReconnect: false,
   });

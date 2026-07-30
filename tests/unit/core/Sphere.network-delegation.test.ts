@@ -67,13 +67,12 @@ describe('Sphere.init network → TokenRegistry delegation (regression guard)', 
 
   it('Test A: fresh wallet (create path) fetches testnet2 registry, not testnet', async () => {
     const fetched = stubFetchRecording();
-    const { storage, transport, oracle, l1 } = makeMockProviders({ walletExists: false });
+    const { storage, transport, oracle } = makeMockProviders({ walletExists: false });
 
     const { sphere, created } = await Sphere.init({
       storage,
       transport,
       oracle,
-      l1,
       network: TEST_NETWORK,
       autoGenerate: true,
     });
@@ -96,13 +95,12 @@ describe('Sphere.init network → TokenRegistry delegation (regression guard)', 
 
   it('Test B: existing wallet (load path) fetches testnet2 registry, not testnet', async () => {
     const fetched = stubFetchRecording();
-    const { storage, transport, oracle, l1 } = makeMockProviders({ walletExists: true });
+    const { storage, transport, oracle } = makeMockProviders({ walletExists: true });
 
     const { sphere, created } = await Sphere.init({
       storage,
       transport,
       oracle,
-      l1,
       network: TEST_NETWORK,
     });
 

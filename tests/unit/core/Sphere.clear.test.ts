@@ -7,7 +7,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Sphere } from '../../../core/Sphere';
 import type { StorageProvider } from '../../../storage';
-import type { TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
+import type { InventoryView, TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
+import type { TokenBlob } from '../../../token-engine';
 import type { ProviderStatus } from '../../../types';
 
 // =============================================================================
@@ -63,6 +64,16 @@ function createMockTokenStorage(): TokenStorageProvider<TxfStorageDataBase> & { 
       removed: 0,
       conflicts: 0,
     })),
+    // S2 lazy-inventory surface: present so the double really satisfies the
+    // TokenStorageProvider port. An empty view and a loud getToken are the
+    // honest stand-ins for a store that holds nothing.
+    listInventory: vi.fn(async (): Promise<InventoryView> => ({
+      items: [], cursor: 0n, syncEpoch: 0n, more: false,
+    })),
+    getToken: vi.fn(async (tokenId: string): Promise<TokenBlob> => {
+      throw new Error(`mock token storage: no blob for ${tokenId}`);
+    }),
+    applyDelta: vi.fn(async (): Promise<void> => undefined),
     clear: vi.fn(async () => true),
   };
 }

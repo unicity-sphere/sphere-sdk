@@ -13,7 +13,7 @@
  * Test IDs: UT-AUTOTERM-001 through UT-AUTOTERM-005
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 import {
   createTestAccountingModule,
   createTestTransfer,
@@ -25,6 +25,13 @@ import type { IncomingTransfer } from '../../../types/index.js';
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Recorded-call shape of the injected `deps.emitEvent` vi.fn(): `(type, data)`.
+ * Typing the spy this way makes the `mock.calls` filters below type-check
+ * without per-callback tuple annotations.
+ */
+type EmitEventMock = Mock<(type: string, data: Record<string, unknown>) => void>;
 
 function makeTerms(
   targetAddress = 'DIRECT://test_target_address_abc123',
@@ -119,7 +126,7 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
       config: { autoTerminateOnReturn: true },
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    const emitEvent = (module as unknown as { deps?: { emitEvent?: EmitEventMock } }).deps?.emitEvent as EmitEventMock;
     await module.load();
 
     const terms = makeTerms();
@@ -138,7 +145,7 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     // The invoice should be marked as closed
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const closedInvoices = (module as any).closedInvoices as Set<string>;
-    const closedCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:closed');
+    const closedCalls = emitEvent.mock.calls.filter(([evt]) => evt === 'invoice:closed');
     expect(closedCalls.length).toBeGreaterThan(0);
     expect(closedCalls[0][1]).toMatchObject({ invoiceId, explicit: false });
     expect(closedInvoices.has(invoiceId)).toBe(true);
@@ -154,7 +161,7 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
       config: { autoTerminateOnReturn: true },
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    const emitEvent = (module as unknown as { deps?: { emitEvent?: EmitEventMock } }).deps?.emitEvent as EmitEventMock;
     await module.load();
 
     const terms = makeTerms();
@@ -169,7 +176,7 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     // The invoice should be marked as cancelled
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const cancelledInvoices = (module as any).cancelledInvoices as Set<string>;
-    const cancelledCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:cancelled');
+    const cancelledCalls = emitEvent.mock.calls.filter(([evt]) => evt === 'invoice:cancelled');
     expect(cancelledCalls.length).toBeGreaterThan(0);
     expect(cancelledCalls[0][1]).toMatchObject({ invoiceId });
     expect(cancelledInvoices.has(invoiceId)).toBe(true);
@@ -186,7 +193,7 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
       config: { autoTerminateOnReturn: false },
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    const emitEvent = (module as unknown as { deps?: { emitEvent?: EmitEventMock } }).deps?.emitEvent as EmitEventMock;
     await module.load();
 
     const terms = makeTerms();
@@ -212,10 +219,10 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     expect(cancelledInvoices.has(invoiceId)).toBe(false);
 
     // invoice:return_received SHOULD fire (sender is valid), but no close/cancel
-    const returnCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:return_received');
+    const returnCalls = emitEvent.mock.calls.filter(([evt]) => evt === 'invoice:return_received');
     expect(returnCalls.length).toBeGreaterThan(0);
-    const closedCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:closed');
-    const cancelledCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:cancelled');
+    const closedCalls = emitEvent.mock.calls.filter(([evt]) => evt === 'invoice:closed');
+    const cancelledCalls = emitEvent.mock.calls.filter(([evt]) => evt === 'invoice:cancelled');
     expect(closedCalls.length).toBe(0);
     expect(cancelledCalls.length).toBe(0);
 
@@ -284,7 +291,7 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
       config: { autoTerminateOnReturn: true },
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    const emitEvent = (module as unknown as { deps?: { emitEvent?: EmitEventMock } }).deps?.emitEvent as EmitEventMock;
     await module.load();
 
     // Create invoice with a DIFFERENT target that does NOT match identity.directAddress.
@@ -306,7 +313,7 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     // The sender (identity.directAddress) is NOT a target, so unauthorized_return fires
     expect(closedInvoices.has(invoiceId)).toBe(false);
     const unauthorizedCalls = emitEvent.mock.calls.filter(
-      ([evt, p]: [string, any]) =>
+      ([evt, p]) =>
         evt === 'invoice:irrelevant' && p.reason === 'unauthorized_return',
     );
     expect(unauthorizedCalls.length).toBeGreaterThan(0);

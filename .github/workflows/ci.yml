@@ -42,6 +42,13 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # Tests were excluded from `typecheck` (`**/*.test.ts`), so 332 type errors
+      # had accumulated unseen — including doubles that no longer matched the
+      # interface they stood in for. Kept separate from `typecheck` so a break
+      # names which side it is on.
+      - name: Typecheck tests
+        run: npm run typecheck:tests
+
       - name: Lint
         run: npm run lint
 

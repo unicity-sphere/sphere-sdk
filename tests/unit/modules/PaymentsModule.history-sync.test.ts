@@ -138,7 +138,9 @@ function createMockDeps() {
     onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
   } as unknown as TransportProvider;
 
-  // Post-cutover oracle surface: network config + legacy-TXF validateToken only.
+  // Post-cutover oracle surface: network config only. The legacy v1
+  // `validateToken` RPC was removed from OracleProvider (verification is the
+  // engine's job now), so there is nothing else to stub here.
   const mockOracle: OracleProvider = {
     id: 'mock-oracle',
     name: 'Mock Oracle',
@@ -148,7 +150,6 @@ function createMockDeps() {
     isConnected: vi.fn().mockReturnValue(true),
     getStatus: vi.fn().mockReturnValue('connected' as const),
     initialize: vi.fn().mockResolvedValue(undefined),
-    validateToken: vi.fn().mockResolvedValue({ valid: true, spent: false }),
     getTrustBaseJson: vi.fn().mockReturnValue(null),
     getAggregatorUrl: vi.fn().mockReturnValue('https://aggregator.test'),
     getApiKey: vi.fn().mockReturnValue(undefined),

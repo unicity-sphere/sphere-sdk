@@ -44,7 +44,6 @@ function fullIdentity(id: { privateKey: string; chainPubkey: string }): FullIden
     chainPubkey: id.chainPubkey,
     privateKey: id.privateKey,
     directAddress: `DIRECT://${id.chainPubkey.slice(0, 12)}`,
-    transportPubkey: id.chainPubkey.slice(2),
   };
 }
 
@@ -177,7 +176,7 @@ function makeWalletApiWallet(
     walletApi: client,
     ...(getCurrentNametag !== undefined ? { getCurrentNametag } : {}),
   };
-  const module = createPaymentsModule({ l1: null });
+  const module = createPaymentsModule();
   module.initialize(deps);
   cleanups.push(() => module.destroy());
   return { module, engine, client, transport, emitEvent, storage, deps };
@@ -529,7 +528,7 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
       // durable journal and hold it settling instead.
       expect(fake.getPaymentRequest(reqId)).toMatchObject({ status: 'open' });
 
-      const reopened = createPaymentsModule({ l1: null });
+      const reopened = createPaymentsModule();
       reopened.initialize({ ...payer.deps });
       cleanups.push(() => reopened.destroy());
       const reNotified: IncomingPaymentRequest[] = [];
@@ -646,7 +645,7 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
       // A fresh module over the same storage must LOAD + PUMP without throwing.
       // Without the JSON.parse guard, ensureSettlingJournalLoaded throws and wedges
       // the whole payment-request pump / resume path.
-      const reopened = createPaymentsModule({ l1: null });
+      const reopened = createPaymentsModule();
       reopened.initialize({ ...payer.deps });
       cleanups.push(() => reopened.destroy());
       await reopened.load();
@@ -802,7 +801,7 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     // in-memory — pre-#556 only the still-open `openReq` survived, and the
     // resolved paid/declined requests VANISHED. The #556 full `since=0`
     // hydration must rebuild the CURRENT state of ALL incoming requests.
-    const reopened = createPaymentsModule({ l1: null });
+    const reopened = createPaymentsModule();
     reopened.initialize({ ...payer.deps });
     cleanups.push(() => reopened.destroy());
     const reNotified: IncomingPaymentRequest[] = [];
@@ -948,7 +947,7 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     vi.spyOn(payer.client, 'listPaymentRequests').mockImplementationOnce(() =>
       Promise.reject(new Error('simulated outage'))
     );
-    const restarted = createPaymentsModule({ l1: null });
+    const restarted = createPaymentsModule();
     restarted.initialize({ ...payer.deps });
     cleanups.push(() => restarted.destroy());
 
@@ -985,7 +984,7 @@ describe('payment requests require wallet-api — there is no Nostr fallback', (
       oracle: mockOracle(),
       emitEvent: vi.fn(),
     };
-    const module = createPaymentsModule({ l1: null });
+    const module = createPaymentsModule();
     module.initialize(deps);
     cleanups.push(() => module.destroy());
 

@@ -20,7 +20,8 @@ import type {
 import type { FullIdentity, TrackedAddress, TransferResult, Token, Asset, DirectMessage } from '../../../types/index.js';
 import type { TxfToken, TxfInclusionProof } from '../../../types/txf.js';
 import type { StorageProvider } from '../../../storage/storage-provider.js';
-import type { TokenStorageProvider, LoadResult, SaveResult, SyncResult } from '../../../storage/storage-provider.js';
+import type { InventoryView, TokenStorageProvider, LoadResult, SaveResult, SyncResult } from '../../../storage/storage-provider.js';
+import type { TokenBlob } from '../../../token-engine/index.js';
 import { SphereError } from '../../../core/errors.js';
 import { getAddressId } from '../../../constants.js';
 
@@ -372,6 +373,15 @@ export function createMockTokenStorageProvider(): MockTokenStorageProvider {
 
     addHistoryEntry: vi.fn().mockResolvedValue(undefined),
     getHistoryEntries: vi.fn().mockResolvedValue([]),
+
+    // S2 lazy-inventory surface. Present so this mock actually satisfies the
+    // provider contract; accounting never drives coin selection, so an empty
+    // view and a loud getToken are the honest stand-ins.
+    listInventory: vi.fn(async (): Promise<InventoryView> => ({ items: [], cursor: 0n, syncEpoch: 0n, more: false })),
+    getToken: vi.fn(async (tokenId: string): Promise<TokenBlob> => {
+      throw new Error(`mock token storage: no blob for ${tokenId}`);
+    }),
+    applyDelta: vi.fn(async (): Promise<void> => undefined),
 
     // Test helper: backing token map (for direct assertion in tests)
     _tokens: tokens,
@@ -827,8 +837,6 @@ export function createTestAccountingModule(overrides?: {
   communications?: MockCommunicationsModule;
   identity?: FullIdentity;
   trackedAddresses?: TrackedAddress[];
-  // C6-R17: Allow overriding trustBase for security tests (null/empty = rejection)
-  trustBase?: unknown;
   // Path B: inject a token engine to exercise the v2 mint/read paths.
   tokenEngine?: AccountingModuleDependencies['tokenEngine'];
 }): {
@@ -850,7 +858,6 @@ export function createTestAccountingModule(overrides?: {
     payments: payments as unknown as AccountingModuleDependencies['payments'],
     tokenStorage: tokenStorage as unknown as AccountingModuleDependencies['tokenStorage'],
     oracle: oracle as unknown as AccountingModuleDependencies['oracle'],
-    trustBase: overrides?.trustBase !== undefined ? overrides.trustBase : new Uint8Array([1, 2, 3]),
     identity,
     tokenEngine: overrides?.tokenEngine,
     getActiveAddresses: vi.fn().mockReturnValue(trackedAddresses),

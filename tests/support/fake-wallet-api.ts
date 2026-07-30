@@ -1012,6 +1012,9 @@ export class FakeWalletApi {
       // signature when they are absent or differ. Enforced here because the
       // phase-2 harness caught exactly this drift on first contact with real
       // MinIO (the fake had validated only the body, never the headers).
+      if (entry.sha256 === undefined) {
+        throw new HttpError(500, 'INTERNAL', 'fake: upload entry has no sha256 to check against');
+      }
       const expectedChecksum = Buffer.from(entry.sha256, 'hex').toString('base64');
       if (req.headers['x-amz-checksum-sha256'] !== expectedChecksum) {
         throw new HttpError(403, 'FORBIDDEN', 'x-amz-checksum-sha256 signed header missing or mismatched');

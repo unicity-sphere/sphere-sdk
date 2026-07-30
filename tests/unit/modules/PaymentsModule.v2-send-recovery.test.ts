@@ -52,7 +52,6 @@ function fullIdentity(id: { privateKey: string; chainPubkey: string }): FullIden
     chainPubkey: id.chainPubkey,
     privateKey: id.privateKey,
     directAddress: `DIRECT://${id.chainPubkey.slice(0, 12)}`,
-    transportPubkey: 'dd'.repeat(32),
   };
 }
 

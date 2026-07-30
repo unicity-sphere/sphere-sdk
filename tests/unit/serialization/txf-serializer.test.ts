@@ -407,7 +407,7 @@ describe('buildTxfStorageData()', () => {
       version: '2.0',
     };
 
-    const result = await buildTxfStorageData([], meta, { nametag });
+    const result = await buildTxfStorageData([], meta, { nametags: [nametag] });
 
     // Nametag is no longer saved in TXF to avoid duplication
     // It's saved separately via saveNametagToFileStorage() as nametag-{name}.json

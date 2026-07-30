@@ -70,7 +70,9 @@ describe('Protocol', () => {
     it('defines RPC methods', () => {
       expect(RPC_METHODS.GET_IDENTITY).toBe('sphere_getIdentity');
       expect(RPC_METHODS.GET_BALANCE).toBe('sphere_getBalance');
-      expect(RPC_METHODS.SEND).toBeUndefined();
+      // `send` is an INTENT, never an RPC method — assert its runtime absence through an
+      // index signature, since the const object's type (correctly) has no SEND member.
+      expect((RPC_METHODS as Record<string, string | undefined>).SEND).toBeUndefined();
     });
 
     it('defines intent actions', () => {

@@ -24,7 +24,7 @@ const UCT = '11'.repeat(32);
 function mockIdentity(): FullIdentity {
   return {
     chainPubkey: FAKE_PUBKEY, directAddress: 'DIRECT://x',
-    privateKey: FAKE_PRIVATE_KEY, transportPubkey: 'dd'.repeat(32),
+    privateKey: FAKE_PRIVATE_KEY,
   };
 }
 

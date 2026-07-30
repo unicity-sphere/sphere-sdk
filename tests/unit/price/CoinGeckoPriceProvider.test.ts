@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
 import { CoinGeckoPriceProvider } from '../../../price/CoinGeckoPriceProvider';
 import type { StorageProvider } from '../../../storage';
 import { STORAGE_KEYS_GLOBAL } from '../../../constants';
@@ -16,7 +16,7 @@ function createMockStorage(): StorageProvider {
 }
 
 describe('CoinGeckoPriceProvider', () => {
-  let fetchSpy: ReturnType<typeof vi.spyOn>;
+  let fetchSpy: MockInstance<typeof globalThis.fetch>;
 
   beforeEach(() => {
     fetchSpy = vi.spyOn(globalThis, 'fetch');

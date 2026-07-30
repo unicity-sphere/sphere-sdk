@@ -119,8 +119,8 @@ describe('CommunicationsModule — resolvePeerNametag', () => {
 
   it('should return undefined when transport does not support resolveTransportPubkeyInfo', async () => {
     const transport = createMockTransport();
-    // Ensure resolveTransportPubkeyInfo is not defined
-    delete (transport as Record<string, unknown>).resolveTransportPubkeyInfo;
+    // Ensure resolveTransportPubkeyInfo is not defined (it is an optional member)
+    delete transport.resolveTransportPubkeyInfo;
     mod.initialize(createDeps({ transport }));
 
     const result = await mod.resolvePeerNametag(PEER_PUBKEY);

@@ -22,9 +22,10 @@ import { getEmbeddedTrustBase } from '../../../impl/shared/trustbase-loader';
 describe('fail-loud: network required (no silent defaults)', () => {
   describe('createBrowserProviders', () => {
     it('throws when network is omitted', () => {
-      // @ts-expect-error network is required
+      // `network` is optional in the CONFIG TYPE (so `createBrowserProviders()`
+      // compiles) — the requirement is enforced at runtime, which is what this
+      // asserts.
       expect(() => createBrowserProviders({})).toThrow(/network/i);
-      // @ts-expect-error network is required
       expect(() => createBrowserProviders({})).toThrow(SphereError);
     });
 
@@ -35,9 +36,10 @@ describe('fail-loud: network required (no silent defaults)', () => {
 
   describe('createNodeProviders', () => {
     it('throws when network is omitted', () => {
-      // @ts-expect-error network is required
+      // `network` is optional in the CONFIG TYPE (so `createNodeProviders()`
+      // compiles) — the requirement is enforced at runtime, which is what this
+      // asserts.
       expect(() => createNodeProviders({})).toThrow(/network/i);
-      // @ts-expect-error network is required
       expect(() => createNodeProviders({})).toThrow(SphereError);
     });
 

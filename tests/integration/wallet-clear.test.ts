@@ -286,7 +286,7 @@ describe('Sphere.clear() integration', () => {
       // Verify tokens actually exist by reading them back via load()
       const loadResult = await tokenStorage.load();
       expect(loadResult.success).toBe(true);
-      const loadedData = loadResult.data as Record<string, unknown>;
+      const loadedData = loadResult.data!;
       expect(loadedData._token1).toBeDefined();
       expect((loadedData._token1 as Record<string, unknown>).coinId).toBe('UCT');
       expect(loadedData._nametagToken).toBeDefined();
@@ -304,7 +304,7 @@ describe('Sphere.clear() integration', () => {
       // Verify tokens are gone - by loading
       const loadResultAfter = await tokenStorage.load();
       if (loadResultAfter.success && loadResultAfter.data) {
-        const dataAfter = loadResultAfter.data as Record<string, unknown>;
+        const dataAfter = loadResultAfter.data;
         expect(dataAfter._token1).toBeUndefined();
         expect(dataAfter._nametagToken).toBeUndefined();
       }
@@ -440,7 +440,7 @@ describe('Sphere.clear() integration', () => {
       // Verify tokens exist by loading
       const loadResult = await tokenStorage.load();
       expect(loadResult.success).toBe(true);
-      const loadedData = loadResult.data as Record<string, unknown>;
+      const loadedData = loadResult.data!;
       expect(loadedData._token001).toBeDefined();
       expect(loadedData._token002).toBeDefined();
 
@@ -452,7 +452,7 @@ describe('Sphere.clear() integration', () => {
       // Verify all tokens are gone
       const loadAfterClear = await tokenStorage.load();
       if (loadAfterClear.success && loadAfterClear.data) {
-        const dataAfter = loadAfterClear.data as Record<string, unknown>;
+        const dataAfter = loadAfterClear.data;
         // Only _meta should remain (or nothing)
         const tokenKeysAfter = Object.keys(dataAfter).filter(k => !k.startsWith('_'));
         expect(tokenKeysAfter.length).toBe(0);

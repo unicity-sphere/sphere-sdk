@@ -41,7 +41,6 @@ function createIdentity(): FullIdentity {
 function makeEntry(overrides: Partial<HistoryRecord> & { dedupKey: string }): HistoryRecord {
   return {
     id: crypto.randomUUID(),
-    dedupKey: overrides.dedupKey,
     type: 'RECEIVED',
     amount: '1000',
     coinId: 'UCT',

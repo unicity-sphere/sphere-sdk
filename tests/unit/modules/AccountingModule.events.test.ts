@@ -7,6 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { Mock } from 'vitest';
 import {
   createTestAccountingModule,
   createTestTransfer,
@@ -19,6 +20,15 @@ import type { IncomingTransfer } from '../../../types/index.js';
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * One recorded `deps.emitEvent(type, payload)` call: the event name plus the
+ * payload object the module emits with it.
+ */
+type EmittedEvent = [type: string, payload: Record<string, unknown>];
+
+/** Recorded-call view of the `emitEvent: vi.fn()` the test harness injects. */
+type EmitEventMock = Mock<(...args: EmittedEvent) => void>;
 
 /** Returns minimal InvoiceTerms targeting the default wallet address. */
 function makeTerms(overrides?: Partial<InvoiceTerms>): InvoiceTerms {
@@ -103,7 +113,7 @@ function makeIncomingTransfer(
 describe('AccountingModule — Events', () => {
   let module: ReturnType<typeof createTestAccountingModule>['module'];
   let mocks: ReturnType<typeof createTestAccountingModule>['mocks'];
-  let emitEvent: ReturnType<typeof vi.fn>;
+  let emitEvent: EmitEventMock;
 
   beforeEach(async () => {
     const built = createTestAccountingModule();
@@ -112,7 +122,7 @@ describe('AccountingModule — Events', () => {
     // deps.emitEvent is injected as vi.fn() — extract it directly from the module's
     // internal deps reference, which is accessible via the private field.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    emitEvent = (module as unknown as { deps?: { emitEvent?: EmitEventMock } }).deps?.emitEvent as EmitEventMock;
     await module.load();
   });
 
@@ -197,7 +207,7 @@ describe('AccountingModule — Events', () => {
     mocks.payments._emit('transfer:incoming', transfer);
     await new Promise((r) => setTimeout(r, 30));
 
-    const assetCoveredCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:asset_covered');
+    const assetCoveredCalls = emitEvent.mock.calls.filter(([evt]: EmittedEvent) => evt === 'invoice:asset_covered');
     expect(assetCoveredCalls.length).toBeGreaterThan(0);
     expect(assetCoveredCalls[0][1]).toMatchObject({
       invoiceId,
@@ -234,7 +244,7 @@ describe('AccountingModule — Events', () => {
     mocks.payments._emit('transfer:incoming', transfer);
     await new Promise((r) => setTimeout(r, 30));
 
-    const targetCoveredCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:target_covered');
+    const targetCoveredCalls = emitEvent.mock.calls.filter(([evt]: EmittedEvent) => evt === 'invoice:target_covered');
     expect(targetCoveredCalls.length).toBeGreaterThan(0);
     expect(targetCoveredCalls[0][1]).toMatchObject({
       invoiceId,
@@ -270,7 +280,7 @@ describe('AccountingModule — Events', () => {
     mocks.payments._emit('transfer:incoming', transfer);
     await new Promise((r) => setTimeout(r, 30));
 
-    const coveredCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:covered');
+    const coveredCalls = emitEvent.mock.calls.filter(([evt]: EmittedEvent) => evt === 'invoice:covered');
     expect(coveredCalls.length).toBeGreaterThan(0);
     expect(coveredCalls[0][1]).toMatchObject({ invoiceId });
   });
@@ -307,7 +317,7 @@ describe('AccountingModule — Events', () => {
     await module.getInvoiceStatus(invoiceId);
 
     // Implicit close must fire with explicit: false
-    const closedCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:closed');
+    const closedCalls = emitEvent.mock.calls.filter(([evt]: EmittedEvent) => evt === 'invoice:closed');
     expect(closedCalls.length).toBeGreaterThan(0);
     expect(closedCalls[0][1]).toMatchObject({ invoiceId, explicit: false });
   });
@@ -356,7 +366,7 @@ describe('AccountingModule — Events', () => {
     mocks.payments._emit('transfer:incoming', transfer);
     await new Promise((r) => setTimeout(r, 30));
 
-    const overpaymentCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:overpayment');
+    const overpaymentCalls = emitEvent.mock.calls.filter(([evt]: EmittedEvent) => evt === 'invoice:overpayment');
     expect(overpaymentCalls.length).toBeGreaterThan(0);
     expect(overpaymentCalls[0][1]).toMatchObject({ invoiceId });
   });
@@ -444,10 +454,10 @@ describe('AccountingModule — Events', () => {
     mocks.payments._emit('transfer:incoming', transfer);
     await new Promise((r) => setTimeout(r, 30));
 
-    const irrelevantCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:irrelevant');
+    const irrelevantCalls = emitEvent.mock.calls.filter(([evt]: EmittedEvent) => evt === 'invoice:irrelevant');
     expect(irrelevantCalls.length).toBeGreaterThan(0);
-    const reasons = irrelevantCalls.map(([, p]: [string, any]) => p.reason);
-    expect(reasons.some((r: string) => r === 'unknown_address' || r === 'unknown_address_and_asset')).toBe(true);
+    const reasons = irrelevantCalls.map(([, p]: EmittedEvent) => p.reason);
+    expect(reasons.some((r) => r === 'unknown_address' || r === 'unknown_address_and_asset')).toBe(true);
   });
 
   // -------------------------------------------------------------------------
@@ -530,9 +540,9 @@ describe('AccountingModule — Events', () => {
     mocks.payments._emit('transfer:incoming', transfer);
     await new Promise((r) => setTimeout(r, 30));
 
-    const irrelevantCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:irrelevant');
+    const irrelevantCalls = emitEvent.mock.calls.filter(([evt]: EmittedEvent) => evt === 'invoice:irrelevant');
     const unknownAssetCalls = irrelevantCalls.filter(
-      ([, p]: [string, any]) => p.reason === 'unknown_asset',
+      ([, p]: EmittedEvent) => p.reason === 'unknown_asset',
     );
     expect(unknownAssetCalls.length).toBeGreaterThan(0);
   });
@@ -602,7 +612,7 @@ describe('AccountingModule — Events', () => {
     );
 
     // auto_return_failed must fire since send() was rejected
-    const failedCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:auto_return_failed');
+    const failedCalls = emitEvent.mock.calls.filter(([evt]: EmittedEvent) => evt === 'invoice:auto_return_failed');
     expect(failedCalls.length).toBeGreaterThan(0);
     expect(failedCalls[0][1]).toMatchObject({ invoiceId });
   });
@@ -627,7 +637,7 @@ describe('AccountingModule — Events', () => {
     await new Promise((r) => setTimeout(r, 20));
 
     // Events may fire multiple times (idempotency is on ledger, not events)
-    const paymentCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:payment');
+    const paymentCalls = emitEvent.mock.calls.filter(([evt]: EmittedEvent) => evt === 'invoice:payment');
     expect(paymentCalls.length).toBeGreaterThanOrEqual(1);
 
     // Ledger should not double-count: dedup key prevents it.
@@ -770,7 +780,7 @@ describe('AccountingModule — Events', () => {
     mocks.payments._emit('transfer:incoming', transfer);
     await new Promise((r) => setTimeout(r, 30));
 
-    const unknownCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:unknown_reference');
+    const unknownCalls = emitEvent.mock.calls.filter(([evt]: EmittedEvent) => evt === 'invoice:unknown_reference');
     expect(unknownCalls.length).toBeGreaterThan(0);
     expect(unknownCalls[0][1]).toMatchObject({ invoiceId: unknownInvoiceId });
   });
@@ -805,7 +815,7 @@ describe('AccountingModule — Events', () => {
 
     // unknown_reference still fires (preserves backward-compat observability)
     const unknownCalls = emitEvent.mock.calls.filter(
-      ([evt]: [string]) => evt === 'invoice:unknown_reference',
+      ([evt]: EmittedEvent) => evt === 'invoice:unknown_reference',
     );
     expect(unknownCalls.length).toBeGreaterThan(0);
     expect(unknownCalls[0][1]).toMatchObject({ invoiceId: lateInvoiceId });
@@ -884,7 +894,7 @@ describe('AccountingModule — Events', () => {
     await new Promise((r) => setTimeout(r, 30));
 
     // over_refund_warning must fire since returned (6 UCT) > forwarded (5 UCT)
-    const warnCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:over_refund_warning');
+    const warnCalls = emitEvent.mock.calls.filter(([evt]: EmittedEvent) => evt === 'invoice:over_refund_warning');
     expect(warnCalls.length).toBeGreaterThan(0);
     expect(warnCalls[0][1]).toMatchObject({ invoiceId });
   });
@@ -943,10 +953,9 @@ describe('AccountingModule — Events', () => {
     // Since it's a "back" direction (return), and senderPubkey can't be resolved to a
     // target address, it should fire unauthorized_return (same pattern as UT-EVENTS-003b).
     // The key assertion is that the pipeline did NOT treat this as a forward payment.
-    const paymentCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:payment');
+    const paymentCalls = emitEvent.mock.calls.filter(([evt]: EmittedEvent) => evt === 'invoice:payment');
     const forwardPayments = paymentCalls.filter(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ([, payload]: [string, any]) => payload.paymentDirection === 'forward',
+      ([, payload]: EmittedEvent) => payload.paymentDirection === 'forward',
     );
     // No forward payment events should have fired — the on-chain "back" overrides memo "F"
     expect(forwardPayments.length).toBe(0);

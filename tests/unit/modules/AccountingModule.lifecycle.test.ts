@@ -274,7 +274,7 @@ describe('UT-LIFECYCLE-005: destroy() unsubscribes from events', () => {
 
     // Capture the call count of the actual emitEvent mock BEFORE emitting
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const countBefore = (module as any).deps?.emitEvent?.mock?.calls?.length ?? 0;
+    const countBefore = (module as unknown as { deps?: { emitEvent?: ReturnType<typeof vi.fn> } }).deps?.emitEvent?.mock?.calls?.length ?? 0;
 
     // Re-emit a transfer event — the destroyed module should ignore it
     mocks.payments._emit('transfer:incoming', {
@@ -285,7 +285,7 @@ describe('UT-LIFECYCLE-005: destroy() unsubscribes from events', () => {
 
     // emitEvent should not have been called again after destroy
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const countAfter = (module as any).deps?.emitEvent?.mock?.calls?.length ?? 0;
+    const countAfter = (module as unknown as { deps?: { emitEvent?: ReturnType<typeof vi.fn> } }).deps?.emitEvent?.mock?.calls?.length ?? 0;
     expect(countAfter).toBe(countBefore);
   });
 });
@@ -397,8 +397,8 @@ describe('UT-LIFECYCLE-007: I/O methods throw MODULE_DESTROYED after destroy', (
   it('payInvoice() throws MODULE_DESTROYED', async () => {
     await expectModuleDestroyed(() =>
       module.payInvoice('a'.repeat(64), {
-        targetAddress: 'DIRECT://alice',
-        assets: [{ coin: ['UCT', '100'] }],
+        targetIndex: 0,
+        amount: '100',
       }),
     );
   });
@@ -406,9 +406,9 @@ describe('UT-LIFECYCLE-007: I/O methods throw MODULE_DESTROYED after destroy', (
   it('returnInvoicePayment() throws MODULE_DESTROYED', async () => {
     await expectModuleDestroyed(() =>
       module.returnInvoicePayment('a'.repeat(64), {
-        targetAddress: 'DIRECT://alice',
-        senderAddress: 'DIRECT://sender',
-        assets: [{ coin: ['UCT', '100'] }],
+        recipient: 'DIRECT://sender',
+        amount: '100',
+        coinId: 'UCT',
       }),
     );
   });

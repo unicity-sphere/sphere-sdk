@@ -73,7 +73,8 @@ class MockTokenStorageProvider implements TokenStorageProvider<TxfStorageDataBas
       data: this.data ?? {
         _meta: {
           version: 1,
-          address: this.identity?.address ?? '',
+          // Mirrors the real providers: _meta.address carries the chain pubkey.
+          address: this.identity?.chainPubkey ?? '',
           formatVersion: '2.0',
           updatedAt: Date.now(),
         },
@@ -155,8 +156,8 @@ describe('TokenStorageProvider Management', () => {
 
       const identity: FullIdentity = {
         privateKey: 'a'.repeat(64),
-        publicKey: 'b'.repeat(64),
-        address: '02abtest',
+        chainPubkey: `02${'b'.repeat(64)}`,
+        directAddress: 'DIRECT://test',
         ipnsName: '12D3KooWtest',
       };
 

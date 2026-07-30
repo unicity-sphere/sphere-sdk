@@ -39,8 +39,13 @@ import { testIdentity } from '../../support/wallet-api-test-helpers';
 import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 import type { FakeWalletApi } from '../../support/fake-wallet-api';
 import type { TransportProvider } from '../../../transport';
-import type { SphereToken } from '../../../token-engine';
-import type { EngineOpOptions, SplitParams, SplitResult, TransferParams } from '../../../token-engine/engine';
+import type {
+  EngineOpOptions,
+  SphereToken,
+  SplitParams,
+  SplitResult,
+  TransferParams,
+} from '../../../token-engine';
 
 const UCT = '11'.repeat(32);
 const SELF = testIdentity(41);

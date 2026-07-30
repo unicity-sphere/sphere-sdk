@@ -14,7 +14,7 @@ import * as path from 'path';
 import { Sphere } from '../../core/Sphere';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenStorageProvider';
-import type { TransportProvider, OracleProvider, TokenStorageProvider, TxfStorageDataBase } from '../../index';
+import type { TransportProvider, OracleProvider, TokenStorageProvider, TxfStorageDataBase, InventoryView } from '../../index';
 import type { ProviderStatus } from '../../types';
 import { TEST_NETWORK } from '../test-network';
 
@@ -100,7 +100,19 @@ function createMockTokenStorage(id: string, name: string): TokenStorageProvider<
       removed: 0,
       conflicts: 0,
     })),
-    onEvent: vi.fn().mockReturnValue(() => {}),
+    // Lazy inventory port (sdk-changes S2). This double holds no blobs: the
+    // view is empty (so mergeLazyInventory is a no-op) and getToken has
+    // nothing to materialize.
+    listInventory: vi.fn(async (): Promise<InventoryView> => ({
+      cursor: 0n,
+      syncEpoch: 0n,
+      more: false,
+      items: [],
+    })),
+    getToken: vi.fn(async (tokenId: string) => {
+      throw new Error(`mock token storage holds no blob for ${tokenId}`);
+    }),
+    applyDelta: vi.fn(async () => {}),
   };
 }
 

@@ -361,9 +361,9 @@ describe('Error: MODULE_DESTROYED', () => {
     ];
 
     for (const method of methods) {
-      const err = await (method() as Promise<unknown>).catch((e) => e);
+      const err = await (method() as Promise<unknown>).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(SphereError);
-      expect(err.code).toBe('MODULE_DESTROYED');
+      expect((err as SphereError).code).toBe('MODULE_DESTROYED');
     }
   });
 });

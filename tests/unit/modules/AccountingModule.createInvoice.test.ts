@@ -72,7 +72,7 @@ describe('UT-CREATE-001: simple single-target, single-asset creation', () => {
     expect(typeof result.invoiceId).toBe('string');
     expect(result.invoiceId).toHaveLength(64);
     expect(result.terms).toBeDefined();
-    expect(result.terms.targets).toHaveLength(1);
+    expect(result.terms!.targets).toHaveLength(1);
   });
 });
 
@@ -89,7 +89,7 @@ describe('UT-CREATE-002: anonymous invoice omits creator', () => {
   it('does not include creator field when anonymous: true', async () => {
     const result = await module.createInvoice({ ...validRequest(), anonymous: true });
 
-    expect(result.terms.creator).toBeUndefined();
+    expect(result.terms!.creator).toBeUndefined();
   });
 });
 
@@ -106,7 +106,7 @@ describe('UT-CREATE-003: non-anonymous invoice includes creator pubkey', () => {
   it('sets creator to the wallet chainPubkey when anonymous: false', async () => {
     const result = await module.createInvoice({ ...validRequest(), anonymous: false });
 
-    expect(result.terms.creator).toBe(mocks.identity.chainPubkey);
+    expect(result.terms!.creator).toBe(mocks.identity.chainPubkey);
   });
 
   it('sets creator when anonymous is omitted (default is non-anonymous)', async () => {
@@ -114,7 +114,7 @@ describe('UT-CREATE-003: non-anonymous invoice includes creator pubkey', () => {
     // anonymous is not set — default behaviour is non-anonymous
     const result = await module.createInvoice(req);
 
-    expect(result.terms.creator).toBe(mocks.identity.chainPubkey);
+    expect(result.terms!.creator).toBe(mocks.identity.chainPubkey);
   });
 });
 
@@ -134,7 +134,7 @@ describe('UT-CREATE-004: createdAt set to Date.now() at creation time', () => {
 
     const result = await module.createInvoice(validRequest());
 
-    expect(result.terms.createdAt).toBe(frozenNow);
+    expect(result.terms!.createdAt).toBe(frozenNow);
   });
 });
 
@@ -153,7 +153,7 @@ describe('UT-CREATE-005: dueDate in the future is accepted', () => {
     const result = await module.createInvoice({ ...validRequest(), dueDate: 2000 });
 
     expect(result.success).toBe(true);
-    expect(result.terms.dueDate).toBe(2000);
+    expect(result.terms!.dueDate).toBe(2000);
   });
 });
 
@@ -627,7 +627,7 @@ describe('UT-CREATE-023: multi-target, multi-asset creation succeeds', () => {
     });
 
     expect(result.success).toBe(true);
-    expect(result.terms.targets).toHaveLength(2);
+    expect(result.terms!.targets).toHaveLength(2);
   });
 });
 
@@ -644,7 +644,7 @@ describe('UT-CREATE-024: more than 100 targets is rejected', () => {
   it('throws INVOICE_TOO_MANY_TARGETS for 101 targets', async () => {
     const targets = Array.from({ length: 101 }, (_, i) => ({
       address: `DIRECT://target_${i}`,
-      assets: [{ coin: ['UCT', '100'] }],
+      assets: [{ coin: ['UCT', '100'] as [string, string] }],
     }));
 
     await expect(
@@ -668,13 +668,13 @@ describe('UT-CREATE-025: exactly 100 targets succeeds', () => {
   it('creates invoice with exactly 100 targets', async () => {
     const targets = Array.from({ length: 100 }, (_, i) => ({
       address: `DIRECT://target_${i}`,
-      assets: [{ coin: ['UCT', '100'] }],
+      assets: [{ coin: ['UCT', '100'] as [string, string] }],
     }));
 
     const result = await module.createInvoice({ targets });
 
     expect(result.success).toBe(true);
-    expect(result.terms.targets).toHaveLength(100);
+    expect(result.terms!.targets).toHaveLength(100);
   });
 });
 
@@ -763,7 +763,7 @@ describe('UT-CREATE-029: memo exactly 4096 chars succeeds', () => {
     const result = await module.createInvoice({ ...validRequest(), memo: 'x'.repeat(4096) });
 
     expect(result.success).toBe(true);
-    expect(result.terms.memo).toHaveLength(4096);
+    expect(result.terms!.memo).toHaveLength(4096);
   });
 });
 

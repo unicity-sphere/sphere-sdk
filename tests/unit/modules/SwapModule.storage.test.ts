@@ -71,18 +71,18 @@ describe('SwapModule Storage', () => {
     injectSwapRef(module, swapRef);
 
     // Clear storage mocks so we can track new writes
-    mocks.storage.set.mockClear();
+    vi.mocked(mocks.storage.set).mockClear();
 
     // acceptSwap transitions proposed -> accepted, which triggers persistSwap
     await module.acceptSwap(swapRef.swapId);
 
     // Verify storage.set was called with the swap record key
-    const setCallKeys = mocks.storage.set.mock.calls.map((c: any[]) => c[0] as string);
+    const setCallKeys = vi.mocked(mocks.storage.set).mock.calls.map((c: any[]) => c[0] as string);
     const expectedKey = swapRecordKey(addressId, swapRef.swapId);
     expect(setCallKeys).toContain(expectedKey);
 
     // Verify the stored JSON contains the updated progress
-    const swapRecordCall = mocks.storage.set.mock.calls.find(
+    const swapRecordCall = vi.mocked(mocks.storage.set).mock.calls.find(
       (c: any[]) => (c[0] as string) === expectedKey,
     );
     expect(swapRecordCall).toBeDefined();
@@ -149,7 +149,7 @@ describe('SwapModule Storage', () => {
     injectSwapRef(module, swapRef);
 
     // Clear storage calls from inject/load
-    mocks.storage.set.mockClear();
+    vi.mocked(mocks.storage.set).mockClear();
 
     await module.destroy();
 
@@ -157,7 +157,7 @@ describe('SwapModule Storage', () => {
     expect(mocks.storage.set).toHaveBeenCalled();
 
     const indexKey = swapIndexKey(addressId);
-    const indexCall = mocks.storage.set.mock.calls.find(
+    const indexCall = vi.mocked(mocks.storage.set).mock.calls.find(
       (c: any[]) => (c[0] as string) === indexKey,
     );
     expect(indexCall).toBeDefined();
@@ -238,7 +238,7 @@ describe('SwapModule Storage', () => {
     );
 
     // Clear remove calls
-    mocks.storage.remove.mockClear();
+    vi.mocked(mocks.storage.remove).mockClear();
 
     await module.load();
 
@@ -247,7 +247,7 @@ describe('SwapModule Storage', () => {
     expect(swaps.length).toBe(0);
 
     // storage.remove should have been called for the purged swap's record key
-    const removeCallKeys = mocks.storage.remove.mock.calls.map((c: any[]) => c[0] as string);
+    const removeCallKeys = vi.mocked(mocks.storage.remove).mock.calls.map((c: any[]) => c[0] as string);
     const expectedPurgeKey = swapRecordKey(addressId, completedSwapId);
     expect(removeCallKeys).toContain(expectedPurgeKey);
   });

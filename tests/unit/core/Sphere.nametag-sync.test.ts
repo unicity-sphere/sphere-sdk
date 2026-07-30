@@ -5,7 +5,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import type { StorageProvider, OracleProvider, TransportProvider } from '../../../index';
-import type { FullIdentity, ProviderStatus } from '../../../types';
+import type { FullIdentity, ProviderStatus, TrackedAddressEntry } from '../../../types';
 
 // =============================================================================
 // Mock Providers
@@ -52,6 +52,8 @@ function _createMockStorage(): StorageProvider & { _data: Map<string, string> } 
       }
       return Promise.resolve();
     }),
+    saveTrackedAddresses: vi.fn(async () => {}),
+    loadTrackedAddresses: vi.fn(async (): Promise<TrackedAddressEntry[]> => []),
     _data: data,
   };
 }

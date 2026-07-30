@@ -64,7 +64,7 @@ function createTxfData(tokenIds: string[]): TxfStorageDataBase {
     },
   };
   for (const id of tokenIds) {
-    (data as Record<string, unknown>)[`_${id}`] = {
+    data[`_${id}`] = {
       version: '2.0',
       state: { tokenId: id },
       transactions: [],
@@ -81,7 +81,7 @@ function countTokens(data: TxfStorageDataBase): number {
 }
 
 function hasToken(data: TxfStorageDataBase, id: string): boolean {
-  return (data as Record<string, unknown>)[`_${id}`] !== undefined;
+  return data[`_${id}`] !== undefined;
 }
 
 // =============================================================================

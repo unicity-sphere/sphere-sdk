@@ -4,6 +4,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { MockInstance } from 'vitest';
 import { MarketModule, createMarketModule, DEFAULT_MARKET_API_URL } from '../../../modules/market/MarketModule';
 import type { FullIdentity } from '../../../types';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
@@ -61,7 +62,10 @@ function createRegisteredModule(config?: Parameters<typeof createMarketModule>[0
 // =============================================================================
 
 describe('MarketModule', () => {
-  let fetchSpy: ReturnType<typeof vi.spyOn>;
+  // Typed as a spy of the real `fetch` so `fetchSpy.mock.calls[n]` keeps its
+  // `[input, init?: RequestInit]` shape (untyped `ReturnType<typeof vi.spyOn>`
+  // erases the arguments to `unknown[]`).
+  let fetchSpy: MockInstance<typeof globalThis.fetch>;
 
   beforeEach(() => {
     fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({}));

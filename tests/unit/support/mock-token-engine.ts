@@ -5,7 +5,7 @@ import type {
 
 /** Build a SphereToken stand-in for interaction tests (sdkToken/blob are inert). */
 export function mockSphereToken(value: SphereValue | null = { assets: [] }): SphereToken {
-  const blob: TokenBlob = { v: 1, network: 2, token: new Uint8Array() };
+  const blob: TokenBlob = { v: 1, network: 2, tokenId: '00'.repeat(32), token: new Uint8Array() };
   return { sdkToken: {} as SphereToken['sdkToken'], blob, value };
 }
 
@@ -17,7 +17,13 @@ export function createMockTokenEngine(overrides: Partial<ITokenEngine> = {}): IT
   const base: ITokenEngine = {
     getIdentity: vi.fn((): EngineIdentity => ({ chainPubkey: new Uint8Array(identity.chainPubkey) })),
     deriveIdentityAddress: vi.fn((pubkey?: Uint8Array) => Promise.resolve(`DIRECT://${hex(pubkey ?? identity.chainPubkey)}`)),
+    tokenId: vi.fn((t: SphereToken) => t.blob.tokenId),
     readValue: vi.fn((t: SphereToken) => t.value),
+    readMemo: vi.fn((_t: SphereToken) => null),
+    readTokenData: vi.fn((_t: SphereToken) => null),
+    mintDataToken: vi.fn(async () => mockSphereToken(null)),
+    isOwnedBy: vi.fn((_t: SphereToken, _pubkey: Uint8Array) => true),
+    deliveryKeys: vi.fn(async () => ({ tokenId: '00'.repeat(32), stateHash: '11'.repeat(32) })),
     balanceOf: vi.fn((_t: SphereToken, _c: CoinId) => 0n),
     mint: vi.fn(async () => mockSphereToken()),
     transfer: vi.fn(async () => mockSphereToken()),
