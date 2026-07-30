@@ -132,10 +132,20 @@ async function seedServerToken(fake: FakeWalletApi, wallet: Wallet, who: { chain
   fake.seedInventory(who.chainPubkey, [{ tokenId: wallet.engine.tokenId(minted), assets: [{ coinId: UCT, amount }], blob: bytes }]);
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 4000): Promise<void> {
+/**
+ * Wait for observable state, labelled so a failure says WHICH step never happened.
+ *
+ * The budget is deliberately generous: a reconnect cycle here is jittered backoff
+ * → ticket mint → socket open → a catch-up pull of all three streams, and on a
+ * contended CI runner (many parallel workers, 2 cores) that chain does not fit in
+ * the 4 s this used to allow — which made the suite fail in CI while passing
+ * locally. Polling stays at 10 ms, so a fast machine is unaffected; only the
+ * patience changed, never a predicate.
+ */
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
-    if (Date.now() > deadline) throw new Error('waitFor: predicate never became true');
+    if (Date.now() > deadline) throw new Error(`waitFor timed out after ${timeoutMs}ms: ${label}`);
     await new Promise((r) => setTimeout(r, 10));
   }
 }
@@ -146,11 +156,11 @@ describe('wallet-api wake reconnect converges a window whose socket went dark (�
     const windowB = makeWallet(baseUrl, fake.network, OWNER, 'win-b');
     await windowB.module.load();
     expect(windowB.module.getTokens()).toHaveLength(0);
-    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 1);
+    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 1, 'wake socket connected');
 
     // B's wake socket dies (proxy/idle/network kill) — unobserved by the bare handle.
     expect(fake.dropSockets(OWNER.chainPubkey)).toBe(1);
-    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 0);
+    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 0, 'wake socket gone');
 
     // While B is DARK, window A tops up the shared inventory (+ the wake that
     // fires now reaches nobody — B has no socket; the server does not replay it).
@@ -159,24 +169,24 @@ describe('wallet-api wake reconnect converges a window whose socket went dark (�
 
     // The supervisor reconnects and its catch-up pump full-resyncs every stream:
     // B converges on the top-up it NEVER got a live wake for.
-    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 1);
-    await waitFor(() => windowB.module.getTokens().length === 1);
+    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 1, 'wake socket connected');
+    await waitFor(() => windowB.module.getTokens().length === 1, 'inventory top-up caught up on reconnect');
     expect(windowB.module.getTokens()[0]).toMatchObject({ amount: '1000', coinId: UCT, status: 'confirmed' });
-  });
+  }, 60_000);
 
   it('B reconnects and catches up a payment-request created while it was dark', async () => {
     const { fake, baseUrl } = await startFake();
     const payer = makeWallet(baseUrl, fake.network, OWNER, 'pay-b');
     const requester = makeWallet(baseUrl, fake.network, REQUESTER, 'req-a');
     await payer.module.load();
-    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 1);
+    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 1, 'wake socket connected');
 
     const surfaced: IncomingPaymentRequest[] = [];
     payer.module.onPaymentRequest((r) => surfaced.push(r));
 
     // The payer's socket dies.
     fake.dropSockets(OWNER.chainPubkey);
-    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 0);
+    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 0, 'wake socket gone');
 
     // The requester creates a PR while the payer is dark — its `payment_requests`
     // wake reaches no socket.
@@ -185,22 +195,23 @@ describe('wallet-api wake reconnect converges a window whose socket went dark (�
 
     // On reconnect the catch-up PR pump surfaces the request the payer never got
     // a live wake for — convergence from the reconnect alone, not the poll.
-    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 1);
-    await waitFor(() => surfaced.length === 1);
+    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 1, 'wake socket connected');
+    await waitFor(() => surfaced.length === 1, 'payment request caught up on reconnect');
     expect(surfaced[0]).toMatchObject({ id: created.requestId, amount: '25', coinId: UCT, status: 'pending' });
-  });
+  }, 60_000);
 
   it('destroy() tears the wake socket down and it does not reconnect', async () => {
     const { fake, baseUrl } = await startFake();
     const windowB = makeWallet(baseUrl, fake.network, OWNER, 'win-destroy');
     await windowB.module.load();
-    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 1);
+    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 1, 'wake socket connected');
 
     windowB.module.destroy();
-    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 0);
+    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 0, 'wake socket gone');
 
-    // A torn-down module must never re-establish the socket.
-    await new Promise((r) => setTimeout(r, 150));
+    // A torn-down module must never re-establish the socket. 1 s is well past the
+    // 500 ms backoff base, so a supervisor that did reconnect would be caught.
+    await new Promise((r) => setTimeout(r, 1_000));
     expect(fake.socketCount(OWNER.chainPubkey)).toBe(0);
-  });
+  }, 60_000);
 });
