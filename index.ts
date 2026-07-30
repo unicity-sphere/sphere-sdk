@@ -110,12 +110,6 @@ export {
   safeParseTokenAmount,
   toHumanReadable,
   formatAmount,
-  // Bech32
-  encodeBech32,
-  decodeBech32,
-  createAddress,
-  isValidBech32,
-  getAddressHrp,
   // Utils
   isValidPrivateKey,
   base58Encode,
@@ -150,9 +144,6 @@ export type {
   TxfStorageDataBase,
   TxfMeta,
   TxfTombstone,
-  TxfOutboxEntry,
-  TxfSentEntry,
-  TxfInvalidEntry,
   // Lazy inventory port (sdk-changes S2)
   InventoryAsset,
   InventoryItem,
@@ -355,7 +346,7 @@ export type { NetworkType } from './constants';
 //   import { Sphere } from '@unicitylabs/sphere-sdk/core';
 
 // =============================================================================
-// Serialization (Legacy File Parsing)
+// Serialization (Text Wallet Backup Parsing)
 // =============================================================================
 
 export {
@@ -365,24 +356,13 @@ export {
   isWalletTextFormat,
   isTextWalletEncrypted,
   decryptTextFormatKey,
-  // Dat format
-  parseWalletDat,
-  parseAndDecryptWalletDat,
-  isSQLiteDatabase,
-  isWalletDatEncrypted,
-  decryptCMasterKey,
-  decryptPrivateKey,
 } from './serialization';
 
 export type {
-  LegacyFileType,
-  LegacyFileInfo,
   LegacyFileParsedData,
   LegacyFileParseResult,
-  LegacyFileImportOptions,
+  LegacyFileType,
   DecryptionProgressCallback,
-  CMasterKeyData,
-  WalletDatInfo,
 } from './serialization';
 
 // =============================================================================
@@ -390,21 +370,9 @@ export type {
 // =============================================================================
 
 export {
-  // Token → TXF conversion
-  tokenToTxf,
-  objectToTxf,
-  txfToToken,
   // Storage data
   buildTxfStorageData,
   parseTxfStorageData,
-  // Utilities
-  normalizeSdkTokenToStorage,
-  getTokenId,
-  getCurrentStateHash,
-  hasValidTxfData,
-  hasUncommittedTransactions,
-  hasMissingNewStateHash,
-  countCommittedTransactions,
 } from './serialization/txf-serializer';
 
 export type { ParsedStorageData } from './serialization/txf-serializer';

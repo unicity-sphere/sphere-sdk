@@ -1,9 +1,8 @@
 /**
  * Standard address parsing, validation, and normalization for Unicity addresses.
  *
- * Three address formats:
+ * Two address formats:
  * - DIRECT://  — Resolved on-chain address (hex, 64-80 chars after prefix)
- * - PROXY://   — Proxy address derived from nametag hash
  * - @nametag   — Human-readable alias resolved via transport
  *
  * This module is the single source of truth for address handling.
@@ -12,12 +11,12 @@
  * @module
  */
 
+
 // =============================================================================
 // Constants
 // =============================================================================
 
 const DIRECT_PREFIX = 'DIRECT://';
-const PROXY_PREFIX = 'PROXY://';
 const NAMETAG_PREFIX = '@';
 
 // DIRECT:// accepts any non-empty value after the prefix.
@@ -31,8 +30,8 @@ const NAMETAG_RE = /^[a-z0-9][a-z0-9_-]{0,29}$/;
 // Types
 // =============================================================================
 
-/** The three address format types supported by Unicity. */
-export type AddressType = 'DIRECT' | 'PROXY' | 'NAMETAG';
+/** The address format types supported by Unicity. */
+export type AddressType = 'DIRECT' | 'NAMETAG';
 
 /** A parsed address with its type and components. */
 export interface ParsedAddress {
@@ -40,7 +39,7 @@ export interface ParsedAddress {
   readonly type: AddressType;
   /** Original raw address string */
   readonly raw: string;
-  /** The value part after the prefix (hex for DIRECT/PROXY, name for NAMETAG) */
+  /** The value part after the prefix (hex for DIRECT, name for NAMETAG) */
   readonly value: string;
 }
 
@@ -51,13 +50,12 @@ export interface ParsedAddress {
 /**
  * Parse a Unicity address string into its components.
  *
- * @param address - A DIRECT://, PROXY://, or @nametag address string.
+ * @param address - A DIRECT:// or @nametag address string.
  * @returns Parsed address or null if invalid/unrecognized format.
  *
  * @example
  * parseAddress('DIRECT://0000ab12...') → { type: 'DIRECT', raw: '...', value: '0000ab12...' }
  * parseAddress('@alice')               → { type: 'NAMETAG', raw: '@alice', value: 'alice' }
- * parseAddress('PROXY://abc123...')     → { type: 'PROXY', raw: '...', value: 'abc123...' }
  * parseAddress('invalid')              → null
  */
 export function parseAddress(address: string): ParsedAddress | null {
@@ -70,10 +68,6 @@ export function parseAddress(address: string): ParsedAddress | null {
       return { type: 'DIRECT', raw: trimmed, value };
     }
     return null;
-  }
-
-  if (trimmed.startsWith(PROXY_PREFIX) && trimmed.length > PROXY_PREFIX.length) {
-    return { type: 'PROXY', raw: trimmed, value: trimmed.slice(PROXY_PREFIX.length) };
   }
 
   if (trimmed.startsWith(NAMETAG_PREFIX)) {
@@ -94,7 +88,7 @@ export function parseAddress(address: string): ParsedAddress | null {
 /**
  * Check if a string is a valid Unicity address (any format).
  *
- * Accepts DIRECT://, PROXY://, or @nametag.
+ * Accepts DIRECT:// or @nametag.
  */
 export function isValidAddress(address: string): boolean {
   return parseAddress(address) !== null;
@@ -126,7 +120,6 @@ export function isValidNametag(address: string): boolean {
  * Normalize an address for comparison.
  *
  * - DIRECT:// → lowercase hex
- * - PROXY://  → lowercase hex
  * - @nametag  → lowercase name
  *
  * Returns the original string if not a recognized format.
@@ -138,8 +131,6 @@ export function normalizeAddress(address: string): string {
   switch (parsed.type) {
     case 'DIRECT':
       return `DIRECT://${parsed.value.toLowerCase()}`;
-    case 'PROXY':
-      return `PROXY://${parsed.value.toLowerCase()}`;
     case 'NAMETAG':
       return `@${parsed.value.toLowerCase()}`;
   }

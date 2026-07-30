@@ -153,11 +153,6 @@
       "count": 1
     }
   },
-  "core/bech32.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    }
-  },
   "core/crypto.ts": {
     "budget/comment-ratio": {
       "count": 1
@@ -821,29 +816,15 @@
       "count": 1
     },
     "complexity": {
-      "count": 3
+      "count": 1
     },
     "max-lines-per-function": {
-      "count": 2
+      "count": 1
     }
   },
   "serialization/types.ts": {
     "budget/comment-ratio": {
       "count": 1
-    }
-  },
-  "serialization/wallet-dat.ts": {
-    "budget/no-long-comment-block": {
-      "count": 1
-    },
-    "complexity": {
-      "count": 1
-    },
-    "max-depth": {
-      "count": 1
-    },
-    "max-lines-per-function": {
-      "count": 2
     }
   },
   "serialization/wallet-text.ts": {

@@ -46,34 +46,6 @@ export const ADDRESS_VECTORS = [
   {
     privateKey: '0000000000000000000000000000000000000000000000000000000000000001',
     publicKey: '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798',
-    // hash160 of pubkey: 751e76e8199196d454941c45d1b3a323f1433bd6
-    address: 'test1qw508d6qejxtdg4y5r3zarvary0c5xw7kxw29v6',
-  },
-];
-
-// =============================================================================
-// Bech32 Test Vectors
-// =============================================================================
-
-export const BECH32_VECTORS = [
-  {
-    hrp: 'test',
-    witnessVersion: 0,
-    program: new Uint8Array([
-      0x75, 0x1e, 0x76, 0xe8, 0x19, 0x91, 0x96, 0xd4, 0x54, 0x94, 0x1c, 0x45, 0xd1, 0xb3, 0xa3,
-      0x23, 0xf1, 0x43, 0x3b, 0xd6,
-    ]),
-    // Expected address when witness version is 0
-  },
-  {
-    // Test decode
-    address: 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4',
-    hrp: 'bc',
-    witnessVersion: 0,
-    program: new Uint8Array([
-      0x75, 0x1e, 0x76, 0xe8, 0x19, 0x91, 0x96, 0xd4, 0x54, 0x94, 0x1c, 0x45, 0xd1, 0xb3, 0xa3,
-      0x23, 0xf1, 0x43, 0x3b, 0xd6,
-    ]),
   },
 ];
 

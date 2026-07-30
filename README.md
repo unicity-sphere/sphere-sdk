@@ -633,14 +633,14 @@ if (await Sphere.exists(storage)) {
 
 ## Import from Master Key (Legacy Wallets)
 
-For compatibility with legacy wallet files (.dat, .txt):
+For wallets whose master key was extracted elsewhere (e.g. an older backup):
 
 ```typescript
 // Import from master key + chain code (BIP32 mode)
 const sphere = await Sphere.import({
   masterKey: '64-hex-chars-master-private-key',
   chainCode: '64-hex-chars-chain-code',
-  basePath: "m/84'/1'/0'",  // from wallet.dat descriptor
+  basePath: "m/84'/1'/0'",  // BIP84 account path
   derivationMode: 'bip32',
   storage, transport, oracle,
 });
@@ -695,43 +695,6 @@ if (mnemonic) {
 }
 ```
 
-## Import from Legacy Files (.dat, .txt)
-
-```typescript
-// Import from wallet.dat file
-const fileBuffer = await file.arrayBuffer();
-const result = await Sphere.importFromLegacyFile({
-  fileContent: new Uint8Array(fileBuffer),
-  fileName: 'wallet.dat',
-  password: 'wallet-password',  // if encrypted
-  onDecryptProgress: (i, total) => console.log(`Decrypting: ${i}/${total}`),
-  storage, transport, oracle,
-});
-
-if (result.needsPassword) {
-  // Re-prompt user for password
-}
-
-if (result.success) {
-  const sphere = result.sphere;
-  console.log('Imported wallet:', sphere.identity?.directAddress);
-}
-
-// Import from text backup file
-const textContent = await file.text();
-const result = await Sphere.importFromLegacyFile({
-  fileContent: textContent,
-  fileName: 'backup.txt',
-  storage, transport, oracle,
-});
-
-// Detect file type and encryption status
-const fileType = Sphere.detectLegacyFileType(fileName, content);
-// Returns: 'dat' | 'txt' | 'json' | 'mnemonic' | 'unknown'
-
-const isEncrypted = Sphere.isLegacyFileEncrypted(fileName, content);
-```
-
 ## Core Utilities
 
 The SDK exports commonly needed utility functions:
@@ -750,10 +713,6 @@ import {
   toHumanReadable,      // 1500000000000000000n → "1.5"
   formatAmount,         // Format with decimals and symbol
 
-  // Address encoding
-  encodeBech32, decodeBech32,
-  createAddress, isValidBech32,
-
   // Base58 (Bitcoin-style)
   base58Encode, base58Decode,
   isValidPrivateKey,
@@ -764,30 +723,14 @@ import {
 } from '@unicitylabs/sphere-sdk';
 ```
 
-## TXF Serialization
+## Token storage format
 
-Token eXchange Format for storage. **Note:** TXF is the legacy v1 token format — post v2-cutover, stored v1 TXF tokens remain visible in the wallet (display only) but are unspendable; v2 tokens travel and persist as CBOR blob hex strings. These helpers remain for storage-data handling and legacy display:
+Tokens persist as opaque **v2 CBOR blob hex** in `Token.sdkData`. The storage
+document around them (the `_meta` / `_nametags` / `_tombstones` / `_history`
+envelope) is built and parsed by:
 
 ```typescript
-import {
-  tokenToTxf,           // Token → TXF format
-  txfToToken,           // TXF → Token
-  buildTxfStorageData,  // Build TXF storage data
-  parseTxfStorageData,  // Parse storage data
-  getCurrentStateHash,  // Get token's current state hash
-  hasUncommittedTransactions,
-} from '@unicitylabs/sphere-sdk';
-
-// Convert token to TXF
-const txf = tokenToTxf(token);
-console.log(txf.genesis.data.tokenId);
-
-// Build TXF storage data
-const storageData = await buildTxfStorageData(tokens, {
-  version: 1,
-  address: '02abc123...',  // chain pubkey
-  ipnsName: 'k51...',
-});
+import { buildTxfStorageData, parseTxfStorageData } from '@unicitylabs/sphere-sdk';
 ```
 
 ## Token Validation
@@ -857,7 +800,6 @@ Implementation (platform-specific)
 Core Utilities
 ├── crypto     - Key derivation, hashing, signatures
 ├── currency   - Amount formatting and conversion
-├── bech32     - Address encoding (BIP-173)
 └── utils      - Base58, patterns, sleep, random
 ```
 

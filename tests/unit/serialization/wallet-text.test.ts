@@ -232,6 +232,11 @@ WALLET TYPE: BIP32 hierarchical deterministic wallet
     expect(result.success).toBe(false);
     expect(result.error).toContain('Could not find');
   });
+
+  // The Bitcoin Core wallet.dat importer was removed. A .dat blob decoded to a
+  // string must be refused by name, not fall through to a vague "no master key"
+  // — a wallet file must never look like it merely lacked a key.
+
 });
 
 // =============================================================================

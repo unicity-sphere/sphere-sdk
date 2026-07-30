@@ -76,8 +76,6 @@ import type {
 } from '../../types';
 import { STORAGE_KEYS_ADDRESS } from '../../constants';
 import {
-  tokenToTxf,
-  getCurrentStateHash,
   buildTxfStorageData,
   parseTxfStorageData,
 } from '../../serialization/txf-serializer';
@@ -257,6 +255,24 @@ interface CertifyContext {
   readonly memo?: string;
   /** E.4 burn checkpoint for the split leg; absent when no store is configured. */
   readonly checkpointStore?: SplitCheckpointStore;
+}
+
+/**
+ * Current state hash of a stored v1 TXF relic, for tombstone dedup only.
+ *
+ * Inlined when the v1 serializer went: this is the one caller left, and it reads
+ * the same four places the serializer did — last transaction, its proof, the
+ * integrity block, then the genesis proof.
+ */
+function currentStateHashOfTxf(txf: TxfToken): string {
+  const last = txf.transactions?.[txf.transactions.length - 1];
+  return (
+    last?.newStateHash ??
+    last?.inclusionProof?.authenticator?.stateHash ??
+    txf._integrity?.currentStateHash ??
+    txf.genesis?.inclusionProof?.authenticator?.stateHash ??
+    ''
+  );
 }
 
 /** The genesis-stable id of a held token — identical across every state (§8.1). */
@@ -522,7 +538,7 @@ function parseSdkDataCached(sdkData: string): { tokenId: string | null; stateHas
     try {
       const txf = JSON.parse(sdkData);
       tokenId = txf.genesis?.data?.tokenId || null;
-      stateHash = getCurrentStateHash(txf as TxfToken) || '';
+      stateHash = currentStateHashOfTxf(txf as TxfToken);
 
       // Try alternative locations if not found in standard place
       if (!stateHash) {
@@ -5813,12 +5829,7 @@ export class PaymentsModule {
   private async save(opts: { critical?: boolean } = {}): Promise<void> {
     // Save to TokenStorageProviders (IndexedDB/files)
     const providers = this.getTokenStorageProviders();
-    // Debug: log token serialization status
-    const tokenStats = Array.from(this.tokens.values()).map(t => {
-      const txf = tokenToTxf(t);
-      return `${t.id.slice(0, 12)}(${t.status},txf=${!!txf})`;
-    });
-    logger.debug('Payments', `save(): providers=${providers.size}, tokens=[${tokenStats.join(', ')}]`);
+    logger.debug('Payments', `save(): providers=${providers.size}, tokens=${this.tokens.size}`);
 
     if (providers.size === 0) {
       logger.debug('Payments', 'save(): No token storage providers - TXF not persisted');

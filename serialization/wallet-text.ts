@@ -235,6 +235,7 @@ export function isTextWalletEncrypted(content: string): boolean {
  */
 export function parseWalletText(content: string): LegacyFileParseResult {
   try {
+
     const isEncrypted = isTextWalletEncrypted(content);
 
     if (isEncrypted) {
@@ -318,6 +319,7 @@ export function parseAndDecryptWalletText(
   password: string
 ): LegacyFileParseResult {
   try {
+
     const isEncrypted = isTextWalletEncrypted(content);
 
     if (!isEncrypted) {

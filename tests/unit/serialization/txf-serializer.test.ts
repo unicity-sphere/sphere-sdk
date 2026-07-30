@@ -1,440 +1,138 @@
 /**
  * Tests for serialization/txf-serializer.ts
- * Covers TXF format serialization and deserialization
+ *
+ * Scope after the v1-TXF removal: the storage DOCUMENT only (`_meta`,
+ * `_nametag(s)`, `_tombstones`, `_history`, per-token slots). The v1 TXF token
+ * codec is gone, so the tests that pinned it were deleted; what remains here
+ * pins the document shape plus the loud refusal of legacy v1 token records.
+ * The v2 token blob round-trip lives in `txf-serializer.v2.test.ts`.
  */
 
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
-import { TokenRegistry } from '../../../registry';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
-  normalizeSdkTokenToStorage,
-  tokenToTxf,
-  txfToToken,
   buildTxfStorageData,
   parseTxfStorageData,
-  getTokenId,
-  getCurrentStateHash,
-  hasValidTxfData,
-  hasUncommittedTransactions,
-  countCommittedTransactions,
-  hasMissingNewStateHash,
 } from '../../../serialization/txf-serializer';
+import { logger } from '../../../core/logger';
 import type { Token } from '../../../types';
-import type { TxfToken, TxfTransaction, TxfInclusionProof } from '../../../types/txf';
-
-// =============================================================================
-// TokenRegistry Setup (needed by txfToToken / parseTxfStorageData)
-// =============================================================================
-
-const REGISTRY_DEFS = [
-  { network: 'unicity:testnet', assetKind: 'fungible', name: 'unicity', symbol: 'UCT', decimals: 18, description: '', id: '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89' },
-  { network: 'unicity:testnet', assetKind: 'fungible', name: 'unicity-usd', symbol: 'USDU', decimals: 6, description: '', id: '8f0f3d7a5e7297be0ee98c63b81bcebb2740f43f616566fc290f9823a54f52d7' },
-  { network: 'unicity:testnet', assetKind: 'fungible', name: 'bitcoin', symbol: 'BTC', decimals: 8, description: '', id: '86bc190fcf7b2d07c6078de93db803578760148b16d4431aa2f42a3241ff0daa' },
-  { network: 'unicity:testnet', assetKind: 'fungible', name: 'solana', symbol: 'SOL', decimals: 9, description: '', id: 'dee5f8ce778562eec90e9c38a91296a023210ccc76ff4c29d527ac3eb64ade93' },
-  { network: 'unicity:testnet', assetKind: 'fungible', name: 'ethereum', symbol: 'ETH', decimals: 18, description: '', id: '3c2450f2fd867e7bb60c6a69d7ad0e53ce967078c201a3ecaa6074ed4c0deafb' },
-  { network: 'unicity:testnet', assetKind: 'fungible', name: 'unicity-eur', symbol: 'EURU', decimals: 6, description: '', id: '5e160d5e9fdbb03b553fb9c3f6e6c30efa41fa807be39fb4f18e43776e492925' },
-  { network: 'unicity:testnet', assetKind: 'fungible', name: 'tether_test', symbol: 'TUSD', decimals: 8, description: '', id: 'aabbccdd16ef65818a51f43138031c4284e519300ab0cb60c30a8f9078080e5f' },
-  { network: 'unicity:testnet', assetKind: 'fungible', name: 'tether', symbol: 'USDT', decimals: 6, description: '', id: '40d25444648418fe7efd433e147187a3a6adf049ac62bc46038bda5b960bf690' },
-  { network: 'unicity:testnet', assetKind: 'fungible', name: 'usd-coin', symbol: 'USDC', decimals: 6, description: '', id: '2265121770fa6f41131dd9a6cc571e28679263d09a53eb2642e145b5b9a5b0a2' },
-];
-
-beforeAll(async () => {
-  const json = JSON.stringify(REGISTRY_DEFS);
-  vi.spyOn(globalThis, 'fetch').mockImplementation(
-    () => Promise.resolve(new Response(json, { status: 200 })),
-  );
-  TokenRegistry.configure({ remoteUrl: 'https://test', autoRefresh: false });
-  await TokenRegistry.getInstance().refreshFromRemote();
-  vi.restoreAllMocks();
-});
-
-afterAll(() => {
-  TokenRegistry.destroy();
-});
+import type { TxfToken } from '../../../types/txf';
 
 // =============================================================================
 // Test Fixtures
 // =============================================================================
 
-const createMockInclusionProof = (): TxfInclusionProof => ({
-  authenticator: {
-    algorithm: 'secp256k1',
-    publicKey: 'pubkey_hex',
-    signature: 'sig_hex',
-    stateHash: 'state_hash_hex',
-  },
-  merkleTreePath: {
-    root: 'root_hash_hex',
-    steps: [],
-  },
-  transactionHash: 'tx_hash_hex',
-  unicityCertificate: 'cert_hex',
-});
+const META = { version: 1, address: '02test', ipnsName: 'k51test' };
 
-const createMockTransaction = (overrides: Partial<TxfTransaction> = {}): TxfTransaction => ({
-  previousStateHash: 'prev_hash',
-  newStateHash: 'new_hash',
-  predicate: 'predicate_hex',
-  inclusionProof: createMockInclusionProof(),
-  ...overrides,
-});
-
-const createMockTxf = (): TxfToken => ({
-  version: '2.0',
-  genesis: {
-    data: {
-      tokenId: 'abc123def456789',
-      tokenType: 'fungible_type_hash',
-      salt: 'random_salt_hex',
-      coinData: [['TOKEN_HEX', '1000000000000000000']],
-      tokenData: '',
-      recipient: 'DIRECT://abc123def456789',
-      recipientDataHash: null,
-      reason: null,
-    },
-    inclusionProof: createMockInclusionProof(),
-  },
-  transactions: [],
-  nametags: [],
-  state: {
-    data: 'state_data_hex',
-    predicate: 'predicate_hex',
-  },
-  _integrity: {
-    genesisDataJSONHash: '0'.repeat(64),
-  },
-});
-
-const createMockToken = (overrides: Partial<Token> = {}): Token => {
-  const txf = createMockTxf();
+/**
+ * A v2 storage entry — the UI token record with an opaque hex blob in
+ * `sdkData`. The document layer never decodes the blob, so a short hex string
+ * is a faithful stand-in here (real engine blobs are exercised in the v2 test).
+ */
+function v2Token(overrides: Partial<Token> = {}): Token {
   return {
-    id: 'abc123def456789',
-    coinId: 'TOKEN_HEX',
-    symbol: 'UCT',
-    name: 'Token',
+    id: 'v2_' + 'ab'.repeat(32),
+    coinId: 'cd'.repeat(32),
+    symbol: 'TST',
+    name: 'Test',
     decimals: 8,
-    amount: '1000000000000000000',
+    amount: '1000',
     status: 'confirmed',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    sdkData: JSON.stringify(txf),
+    createdAt: 1,
+    updatedAt: 1,
+    sdkData: 'deadbeefcafe0123',
     ...overrides,
   };
-};
+}
 
-// =============================================================================
-// normalizeSdkTokenToStorage Tests
-// =============================================================================
-
-describe('normalizeSdkTokenToStorage()', () => {
-  it('should preserve string values', () => {
-    const input = {
-      genesis: {
-        data: {
-          tokenId: 'abc123',
-          tokenType: 'type_hex',
-        },
+/** A pre-v2 stored TXF token record — recognised only so it can be refused. */
+function legacyV1TxfEntry(): TxfToken {
+  return {
+    version: '2.0',
+    genesis: {
+      data: {
+        tokenId: 'ef'.repeat(32),
+        tokenType: 'fungible_type_hash',
+        salt: 'random_salt_hex',
+        coinData: [['TOKEN_HEX', '1000']],
+        tokenData: '',
+        recipient: 'DIRECT://abc',
+        recipientDataHash: null,
+        reason: null,
       },
-    };
-
-    const result = normalizeSdkTokenToStorage(input);
-
-    expect(result.genesis.data.tokenId).toBe('abc123');
-    expect(result.genesis.data.tokenType).toBe('type_hex');
-  });
-
-  it('should convert bytes object to hex string', () => {
-    const input = {
-      genesis: {
-        data: {
-          tokenId: { bytes: [0xab, 0xcd, 0xef] },
-          tokenType: 'type_hex',
+      inclusionProof: {
+        authenticator: {
+          algorithm: 'secp256k1',
+          publicKey: 'pubkey_hex',
+          signature: 'sig_hex',
+          stateHash: 'state_hash_hex',
         },
+        merkleTreePath: { root: 'root_hash_hex', steps: [] },
+        transactionHash: 'tx_hash_hex',
+        unicityCertificate: 'cert_hex',
       },
-    };
+    },
+    transactions: [],
+    nametags: [],
+    state: { data: 'state_data_hex', predicate: 'predicate_hex' },
+  };
+}
 
-    const result = normalizeSdkTokenToStorage(input);
-
-    expect(result.genesis.data.tokenId).toBe('abcdef');
-  });
-
-  it('should convert Buffer.toJSON() format to hex', () => {
-    const input = {
-      genesis: {
-        data: {
-          tokenId: { type: 'Buffer', data: [0xab, 0xcd] },
-        },
-      },
-    };
-
-    const result = normalizeSdkTokenToStorage(input);
-
-    expect(result.genesis.data.tokenId).toBe('abcd');
-  });
-
-  it('should normalize authenticator fields', () => {
-    const input = {
-      genesis: {
-        data: { tokenId: 'test' },
-        inclusionProof: {
-          authenticator: {
-            publicKey: { bytes: [0x02, 0xab] },
-            signature: { bytes: [0x30, 0x45] },
-          },
-        },
-      },
-    };
-
-    const result = normalizeSdkTokenToStorage(input);
-
-    expect(result.genesis.inclusionProof.authenticator.publicKey).toBe('02ab');
-    expect(result.genesis.inclusionProof.authenticator.signature).toBe('3045');
-  });
-
-  it('should normalize transaction authenticators', () => {
-    const input = {
-      transactions: [
-        {
-          inclusionProof: {
-            authenticator: {
-              publicKey: { bytes: [0x02, 0xcd] },
-              signature: { bytes: [0x30, 0x46] },
-            },
-          },
-        },
-      ],
-    };
-
-    const result = normalizeSdkTokenToStorage(input);
-
-    expect(result.transactions[0].inclusionProof!.authenticator.publicKey).toBe('02cd');
-    expect(result.transactions[0].inclusionProof!.authenticator.signature).toBe('3046');
-  });
-
-  it('should not modify original object', () => {
-    const input = {
-      genesis: {
-        data: {
-          tokenId: { bytes: [0xab] },
-        },
-      },
-    };
-
-    normalizeSdkTokenToStorage(input);
-
-    // Original should still have bytes object
-    expect((input.genesis.data.tokenId as { bytes: number[] }).bytes).toEqual([0xab]);
-  });
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 // =============================================================================
-// tokenToTxf Tests
-// =============================================================================
-
-describe('tokenToTxf()', () => {
-  it('should extract TXF from Token with sdkData', () => {
-    const token = createMockToken();
-    const result = tokenToTxf(token);
-
-    expect(result).not.toBeNull();
-    expect(result!.genesis.data.tokenId).toBe('abc123def456789');
-    expect(result!.version).toBe('2.0');
-  });
-
-  it('should return null for token without sdkData', () => {
-    const token = createMockToken({ sdkData: undefined });
-    const result = tokenToTxf(token);
-
-    expect(result).toBeNull();
-  });
-
-  it('should return null for invalid JSON', () => {
-    const token = createMockToken({ sdkData: 'invalid json' });
-    const result = tokenToTxf(token);
-
-    expect(result).toBeNull();
-  });
-
-  it('should return null if genesis is missing', () => {
-    const token = createMockToken({ sdkData: JSON.stringify({ state: {} }) });
-    const result = tokenToTxf(token);
-
-    expect(result).toBeNull();
-  });
-
-  it('should add default version if missing', () => {
-    const txf = createMockTxf();
-    delete (txf as unknown as Record<string, unknown>).version;
-    const token = createMockToken({ sdkData: JSON.stringify(txf) });
-
-    const result = tokenToTxf(token);
-
-    expect(result!.version).toBe('2.0');
-  });
-
-  it('should add empty transactions array if missing', () => {
-    const txf = createMockTxf();
-    delete (txf as unknown as Record<string, unknown>).transactions;
-    const token = createMockToken({ sdkData: JSON.stringify(txf) });
-
-    const result = tokenToTxf(token);
-
-    expect(result!.transactions).toEqual([]);
-  });
-});
-
-// =============================================================================
-// txfToToken Tests
-// =============================================================================
-
-describe('txfToToken()', () => {
-  it('should convert TXF to Token', () => {
-    const txf = createMockTxf();
-    const token = txfToToken('abc123def456789', txf);
-
-    expect(token.id).toBe('abc123def456789');
-    expect(token.coinId).toBe('TOKEN_HEX');
-    expect(token.amount).toBe('1000000000000000000');
-    expect(token.status).toBe('confirmed');
-    expect(token.sdkData).toBeDefined();
-  });
-
-  it('should detect pending status from uncommitted transaction', () => {
-    const txf = createMockTxf();
-    txf.transactions = [
-      createMockTransaction({ inclusionProof: null }),
-    ];
-
-    const token = txfToToken('test', txf);
-
-    expect(token.status).toBe('pending');
-  });
-
-  it('should detect confirmed status with committed transaction', () => {
-    const txf = createMockTxf();
-    txf.transactions = [
-      createMockTransaction(),
-    ];
-
-    const token = txfToToken('test', txf);
-
-    expect(token.status).toBe('confirmed');
-  });
-
-  it('should sum amounts from multiple coins', () => {
-    const txf = createMockTxf();
-    txf.genesis.data.coinData = [
-      ['COIN1', '100'],
-      ['COIN2', '200'],
-    ];
-
-    const token = txfToToken('test', txf);
-
-    expect(token.amount).toBe('300');
-  });
-
-  it('should detect NFT tokens', () => {
-    const txf = createMockTxf();
-    txf.genesis.data.tokenType =
-      '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89';
-
-    const token = txfToToken('test', txf);
-
-    expect(token.symbol).toBe('NFT');
-    expect(token.name).toBe('NFT');
-  });
-
-  it('should resolve symbol from TokenRegistry for known coinId (SOL)', () => {
-    const txf = createMockTxf();
-    txf.genesis.data.coinData = [['dee5f8ce778562eec90e9c38a91296a023210ccc76ff4c29d527ac3eb64ade93', '1000000000']];
-
-    const token = txfToToken('test-sol', txf);
-
-    expect(token.symbol).toBe('SOL');
-    expect(token.name).toBe('Solana');
-    expect(token.decimals).toBe(9);
-  });
-
-  it('should fallback to coinId prefix for unknown coinId', () => {
-    const txf = createMockTxf();
-    txf.genesis.data.coinData = [['abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890', '500']];
-
-    const token = txfToToken('test-unknown', txf);
-
-    expect(token.symbol).toBe('abcdef12');
-    expect(token.name).toBe('Token');
-    expect(token.decimals).toBe(8);
-  });
-});
-
-// =============================================================================
-// buildTxfStorageData Tests
+// buildTxfStorageData
 // =============================================================================
 
 describe('buildTxfStorageData()', () => {
   it('should build storage data with meta', async () => {
-    const tokens = [createMockToken()];
-    const meta = { version: 1, address: '02test', ipnsName: 'k51test' };
-
-    const result = await buildTxfStorageData(tokens, meta);
+    const result = await buildTxfStorageData([v2Token()], META);
 
     expect(result._meta).toBeDefined();
     expect(result._meta.version).toBe(1);
     expect(result._meta.formatVersion).toBe('2.0');
   });
 
-  it('should add tokens with underscore prefix', async () => {
-    const token = createMockToken();
-    const meta = { version: 1, address: '02test', ipnsName: '' };
+  it('should store a v2 token under its _<tokenId> key', async () => {
+    const token = v2Token();
+    const result = await buildTxfStorageData([token], META);
 
-    const result = await buildTxfStorageData([token], meta);
-
-    // Tokens are stored with _<tokenId> key (without special prefixes for active tokens)
-    const reservedKeys = ['_meta', '_nametag', '_tombstones', '_outbox', '_mintOutbox', '_invalidatedNametags'];
-    const tokenKeys = Object.keys(result).filter(
-      (k) => k.startsWith('_') && !reservedKeys.includes(k)
-    );
-    expect(tokenKeys.length).toBe(1);
-    expect(tokenKeys[0]).toMatch(/^_[a-z0-9]+$/i);
+    const tokenKeys = Object.keys(result).filter((k) => k.startsWith('_') && k !== '_meta');
+    expect(tokenKeys).toEqual(['_' + 'ab'.repeat(32)]);
   });
 
   it('should NOT include nametag in TXF (saved separately as nametag-{name}.json)', async () => {
-    const meta = { version: 1, address: '02test', ipnsName: '' };
     const nametag = {
       name: 'alice',
-      token: { genesis: {}, state: {} },
+      token: 'aabb',
       timestamp: Date.now(),
-      format: 'txf',
+      format: 'v2-cbor',
       version: '2.0',
     };
 
-    const result = await buildTxfStorageData([], meta, { nametags: [nametag] });
+    const result = await buildTxfStorageData([], META, { nametags: [nametag] });
 
-    // Nametag is no longer saved in TXF to avoid duplication
-    // It's saved separately via saveNametagToFileStorage() as nametag-{name}.json
+    // Nametag is no longer saved as the singular _nametag slot
     expect(result._nametag).toBeUndefined();
+    expect(result._nametags).toEqual([nametag]);
   });
 
   it('should include tombstones if provided', async () => {
-    const meta = { version: 1, address: '02test', ipnsName: '' };
-    const tombstones = [
-      { tokenId: 'abc', stateHash: 'hash', timestamp: Date.now(), reason: 'transferred' as const },
-    ];
+    const tombstones = [{ tokenId: 'abc', stateHash: 'hash', timestamp: Date.now() }];
 
-    const result = await buildTxfStorageData([], meta, { tombstones });
+    const result = await buildTxfStorageData([], META, { tombstones });
 
     expect(result._tombstones).toEqual(tombstones);
   });
 
   it('should not include empty arrays', async () => {
-    const meta = { version: 1, address: '02test', ipnsName: '' };
-
-    const result = await buildTxfStorageData([], meta, { tombstones: [] });
+    const result = await buildTxfStorageData([], META, { tombstones: [] });
 
     expect(result._tombstones).toBeUndefined();
   });
 
   it('should include historyEntries as _history if provided', async () => {
-    const meta = { version: 1, address: '02test', ipnsName: '' };
     const historyEntries = [
       {
         dedupKey: 'RECEIVED_token1',
@@ -447,64 +145,66 @@ describe('buildTxfStorageData()', () => {
       },
     ];
 
-    const result = await buildTxfStorageData([], meta, { historyEntries });
+    const result = await buildTxfStorageData([], META, { historyEntries });
 
     expect((result as Record<string, unknown>)._history).toEqual(historyEntries);
   });
 
   it('should not include _history if historyEntries is empty', async () => {
-    const meta = { version: 1, address: '02test', ipnsName: '' };
-
-    const result = await buildTxfStorageData([], meta, { historyEntries: [] });
+    const result = await buildTxfStorageData([], META, { historyEntries: [] });
 
     expect((result as Record<string, unknown>)._history).toBeUndefined();
+  });
+
+  it('refuses a legacy v1 TXF token loudly instead of persisting it', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const v1 = v2Token({ id: 'legacy1', sdkData: JSON.stringify(legacyV1TxfEntry()) });
+
+    const result = await buildTxfStorageData([v1], META);
+
+    expect(Object.keys(result).filter((k) => k.startsWith('_') && k !== '_meta')).toEqual([]);
+    expect(warn).toHaveBeenCalled();
   });
 });
 
 // =============================================================================
-// parseTxfStorageData Tests
+// parseTxfStorageData
 // =============================================================================
 
 describe('parseTxfStorageData()', () => {
   it('should parse valid storage data', async () => {
-    const tokens = [createMockToken()];
-    const meta = { version: 1, address: '02test', ipnsName: '' };
-    const storageData = await buildTxfStorageData(tokens, meta);
+    const token = v2Token();
+    const storageData = await buildTxfStorageData([token], META);
 
     const parsed = parseTxfStorageData(storageData);
 
     expect(parsed.tokens.length).toBe(1);
+    expect(parsed.tokens[0].sdkData).toBe(token.sdkData);
     expect(parsed.meta).toBeDefined();
     expect(parsed.validationErrors.length).toBe(0);
   });
 
   it('should extract meta and nametag (backwards compatibility)', async () => {
-    const meta = { version: 2, address: '02abc', ipnsName: '' };
     const nametag = {
       name: 'bob',
-      token: { genesis: {}, state: {} },
+      token: 'aabb',
       timestamp: Date.now(),
-      format: 'txf',
+      format: 'v2-cbor',
       version: '2.0',
     };
-    // Simulate old storage format where _nametag was included
-    const storageData = await buildTxfStorageData([], meta);
-    // Manually add _nametag for backwards compatibility test
+    const storageData = await buildTxfStorageData([], { ...META, version: 2 });
+    // Simulate old storage format where the singular _nametag was included
     (storageData as Record<string, unknown>)._nametag = nametag;
 
     const parsed = parseTxfStorageData(storageData);
 
     expect(parsed.meta?.version).toBe(2);
-    // Backwards compatibility: old storage with _nametag should still be parsed
     expect(parsed.nametags[0]?.name).toBe('bob');
   });
 
   it('should extract tombstones', async () => {
-    const meta = { version: 1, address: '02test', ipnsName: '' };
-    const tombstones = [
-      { tokenId: 'dead', stateHash: 'hash1', timestamp: 12345, reason: 'transferred' as const },
-    ];
-    const storageData = await buildTxfStorageData([], meta, { tombstones });
+    const tombstones = [{ tokenId: 'dead', stateHash: 'hash1', timestamp: 12345 }];
+    const storageData = await buildTxfStorageData([], META, { tombstones });
 
     const parsed = parseTxfStorageData(storageData);
 
@@ -526,7 +226,6 @@ describe('parseTxfStorageData()', () => {
   });
 
   it('should extract history entries from _history', async () => {
-    const meta = { version: 1, address: '02test', ipnsName: '' };
     const historyEntries = [
       {
         dedupKey: 'RECEIVED_token1',
@@ -549,7 +248,7 @@ describe('parseTxfStorageData()', () => {
         recipientNametag: 'bob',
       },
     ];
-    const storageData = await buildTxfStorageData([], meta, { historyEntries });
+    const storageData = await buildTxfStorageData([], META, { historyEntries });
 
     const parsed = parseTxfStorageData(storageData);
 
@@ -587,328 +286,48 @@ describe('parseTxfStorageData()', () => {
 });
 
 // =============================================================================
-// Utility Functions Tests
+// Loud refusal of removed v1 shapes
 // =============================================================================
 
-describe('getTokenId()', () => {
-  it('should extract token ID from sdkData genesis', () => {
-    const token = createMockToken();
-    const id = getTokenId(token);
+describe('parseTxfStorageData() — non-v2 records are refused, never coerced', () => {
+  it('reports a stored non-v2 token record as a validation error and drops it', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const tokenId = 'ef'.repeat(32);
 
-    expect(id).toBe('abc123def456789');
-  });
-
-  it('should fallback to token.id if sdkData is missing', () => {
-    const token = createMockToken({ sdkData: undefined, id: 'fallback_id' });
-    const id = getTokenId(token);
-
-    expect(id).toBe('fallback_id');
-  });
-
-  it('should fallback to token.id if sdkData is invalid', () => {
-    const token = createMockToken({ sdkData: 'invalid', id: 'fallback_id' });
-    const id = getTokenId(token);
-
-    expect(id).toBe('fallback_id');
-  });
-});
-
-describe('getCurrentStateHash()', () => {
-  it('should return newStateHash from last transaction', () => {
-    const txf = createMockTxf();
-    txf.transactions = [
-      createMockTransaction({ newStateHash: 'hash1' }),
-      createMockTransaction({ newStateHash: 'hash2' }),
-    ];
-
-    const hash = getCurrentStateHash(txf);
-
-    expect(hash).toBe('hash2');
-  });
-
-  it('should fallback to genesis stateHash if no transactions', () => {
-    const txf = createMockTxf();
-    txf.transactions = [];
-
-    const hash = getCurrentStateHash(txf);
-
-    // Falls back to genesis inclusionProof.authenticator.stateHash
-    expect(hash).toBe('state_hash_hex');
-  });
-
-  it('should return undefined if no transactions and no genesis proof', () => {
-    const txf = createMockTxf();
-    txf.transactions = [];
-    txf.genesis.inclusionProof = undefined as unknown as typeof txf.genesis.inclusionProof;
-
-    const hash = getCurrentStateHash(txf);
-
-    expect(hash).toBeUndefined();
-  });
-
-  it('should fallback to _integrity.currentStateHash', () => {
-    const txf = createMockTxf();
-    txf.transactions = [];
-    txf._integrity!.currentStateHash = 'integrity_hash';
-
-    const hash = getCurrentStateHash(txf);
-
-    expect(hash).toBe('integrity_hash');
-  });
-});
-
-describe('hasValidTxfData()', () => {
-  it('should return true for valid token', () => {
-    const token = createMockToken();
-    expect(hasValidTxfData(token)).toBe(true);
-  });
-
-  it('should return false for token without sdkData', () => {
-    const token = createMockToken({ sdkData: undefined });
-    expect(hasValidTxfData(token)).toBe(false);
-  });
-
-  it('should return false for invalid sdkData', () => {
-    const token = createMockToken({ sdkData: '{}' });
-    expect(hasValidTxfData(token)).toBe(false);
-  });
-});
-
-describe('hasUncommittedTransactions()', () => {
-  it('should return false for token with no transactions', () => {
-    const token = createMockToken();
-    expect(hasUncommittedTransactions(token)).toBe(false);
-  });
-
-  it('should return true if any transaction has null inclusionProof', () => {
-    const txf = createMockTxf();
-    txf.transactions = [
-      createMockTransaction({ inclusionProof: null }),
-    ];
-    const token = createMockToken({ sdkData: JSON.stringify(txf) });
-
-    expect(hasUncommittedTransactions(token)).toBe(true);
-  });
-
-  it('should return false if all transactions are committed', () => {
-    const txf = createMockTxf();
-    txf.transactions = [
-      createMockTransaction(),
-    ];
-    const token = createMockToken({ sdkData: JSON.stringify(txf) });
-
-    expect(hasUncommittedTransactions(token)).toBe(false);
-  });
-});
-
-describe('countCommittedTransactions()', () => {
-  it('should return 0 for token with no transactions', () => {
-    const token = createMockToken();
-    expect(countCommittedTransactions(token)).toBe(0);
-  });
-
-  it('should count only committed transactions', () => {
-    const txf = createMockTxf();
-    txf.transactions = [
-      createMockTransaction(),
-      createMockTransaction({ inclusionProof: null }),
-      createMockTransaction(),
-    ];
-    const token = createMockToken({ sdkData: JSON.stringify(txf) });
-
-    expect(countCommittedTransactions(token)).toBe(2);
-  });
-});
-
-describe('hasMissingNewStateHash()', () => {
-  it('should return false for token with no transactions', () => {
-    const txf = createMockTxf();
-    txf.transactions = [];
-    expect(hasMissingNewStateHash(txf)).toBe(false);
-  });
-
-  it('should return true if any transaction lacks newStateHash', () => {
-    const txf = createMockTxf();
-    txf.transactions = [
-      createMockTransaction({ newStateHash: undefined }),
-    ];
-    expect(hasMissingNewStateHash(txf)).toBe(true);
-  });
-
-  it('should return false if all transactions have newStateHash', () => {
-    const txf = createMockTxf();
-    txf.transactions = [
-      createMockTransaction({ newStateHash: 'hash1' }),
-    ];
-    expect(hasMissingNewStateHash(txf)).toBe(false);
-  });
-});
-
-// =============================================================================
-// Multi-Coin Tests
-// =============================================================================
-
-const SOL_COIN_ID = 'dee5f8ce778562eec90e9c38a91296a023210ccc76ff4c29d527ac3eb64ade93';
-const ETH_COIN_ID = '3c2450f2fd867e7bb60c6a69d7ad0e53ce967078c201a3ecaa6074ed4c0deafb';
-const BTC_COIN_ID = '86bc190fcf7b2d07c6078de93db803578760148b16d4431aa2f42a3241ff0daa';
-const UCT_COIN_ID = '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89';
-const USDU_COIN_ID = '8f0f3d7a5e7297be0ee98c63b81bcebb2740f43f616566fc290f9823a54f52d7';
-const EURU_COIN_ID = '5e160d5e9fdbb03b553fb9c3f6e6c30efa41fa807be39fb4f18e43776e492925';
-const TUSD_COIN_ID = 'aabbccdd16ef65818a51f43138031c4284e519300ab0cb60c30a8f9078080e5f';
-const USDT_COIN_ID = '40d25444648418fe7efd433e147187a3a6adf049ac62bc46038bda5b960bf690';
-const USDC_COIN_ID = '2265121770fa6f41131dd9a6cc571e28679263d09a53eb2642e145b5b9a5b0a2';
-
-function createMockTxfWithCoin(coinId: string, amount: string): TxfToken {
-  const base = createMockTxf();
-  base.genesis.data.coinData = [[coinId, amount]];
-  base.genesis.data.tokenId = `token_${coinId.slice(0, 8)}_${Date.now()}`;
-  return base;
-}
-
-describe('buildTxfStorageData() multi-coin', () => {
-  it('should build storage data with tokens from all registry coin types', async () => {
-    const allCoins = [
-      { coinId: SOL_COIN_ID, symbol: 'SOL', decimals: 9, amount: '1000000000' },
-      { coinId: ETH_COIN_ID, symbol: 'ETH', decimals: 18, amount: '42000000000000000000' },
-      { coinId: BTC_COIN_ID, symbol: 'BTC', decimals: 8, amount: '100000000' },
-      { coinId: UCT_COIN_ID, symbol: 'UCT', decimals: 18, amount: '100000000000000000000' },
-      { coinId: USDU_COIN_ID, symbol: 'USDU', decimals: 6, amount: '1000000000' },
-      { coinId: EURU_COIN_ID, symbol: 'EURU', decimals: 6, amount: '500000000' },
-      { coinId: TUSD_COIN_ID, symbol: 'TUSD', decimals: 8, amount: '200000000' },
-      { coinId: USDT_COIN_ID, symbol: 'USDT', decimals: 6, amount: '1000000000' },
-      { coinId: USDC_COIN_ID, symbol: 'USDC', decimals: 6, amount: '1000000000' },
-    ];
-
-    const tokens = allCoins.map((c) => {
-      const txf = createMockTxfWithCoin(c.coinId, c.amount);
-      return createMockToken({
-        id: txf.genesis.data.tokenId,
-        coinId: c.coinId,
-        symbol: c.symbol,
-        decimals: c.decimals,
-        amount: c.amount,
-        sdkData: JSON.stringify(txf),
-      });
+    const parsed = parseTxfStorageData({
+      _meta: { version: 1, address: '02test', ipnsName: '', formatVersion: '2.0' },
+      [`_${tokenId}`]: legacyV1TxfEntry(),
     });
 
-    const meta = { version: 1, address: '02test', ipnsName: '' };
-    const result = await buildTxfStorageData(tokens, meta);
-
-    const reservedKeys = ['_meta', '_nametag', '_tombstones', '_outbox', '_mintOutbox', '_invalidatedNametags'];
-    const tokenKeys = Object.keys(result).filter(
-      (k) => k.startsWith('_') && !reservedKeys.includes(k),
-    );
-    expect(tokenKeys.length).toBe(9);
+    expect(parsed.tokens).toHaveLength(0);
+    expect(parsed.validationErrors.join(' ')).toContain(tokenId);
+    expect(parsed.validationErrors.join(' ')).toContain('not a v2 token blob');
+    expect(warn).toHaveBeenCalled();
   });
-});
 
-describe('parseTxfStorageData() multi-coin', () => {
-  it('should parse storage data with all coin types preserving coinId', async () => {
-    const allCoins = [
-      { coinId: SOL_COIN_ID, symbol: 'SOL', decimals: 9, amount: '1000000000' },
-      { coinId: ETH_COIN_ID, symbol: 'ETH', decimals: 18, amount: '42000000000000000000' },
-      { coinId: BTC_COIN_ID, symbol: 'BTC', decimals: 8, amount: '100000000' },
-      { coinId: UCT_COIN_ID, symbol: 'UCT', decimals: 18, amount: '100000000000000000000' },
-      { coinId: USDU_COIN_ID, symbol: 'USDU', decimals: 6, amount: '1000000000' },
-      { coinId: EURU_COIN_ID, symbol: 'EURU', decimals: 6, amount: '500000000' },
-      { coinId: TUSD_COIN_ID, symbol: 'TUSD', decimals: 8, amount: '200000000' },
-      { coinId: USDT_COIN_ID, symbol: 'USDT', decimals: 6, amount: '1000000000' },
-      { coinId: USDC_COIN_ID, symbol: 'USDC', decimals: 6, amount: '1000000000' },
-    ];
+  it('reports a legacy per-file `token-` record as a validation error and drops it', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
 
-    const tokens = allCoins.map((c) => {
-      const txf = createMockTxfWithCoin(c.coinId, c.amount);
-      return createMockToken({
-        id: txf.genesis.data.tokenId,
-        coinId: c.coinId,
-        symbol: c.symbol,
-        decimals: c.decimals,
-        amount: c.amount,
-        sdkData: JSON.stringify(txf),
-      });
+    const parsed = parseTxfStorageData({
+      _meta: { version: 1, address: '02test', ipnsName: '', formatVersion: '2.0' },
+      'token-abc': { token: legacyV1TxfEntry() },
     });
 
-    const meta = { version: 1, address: '02test', ipnsName: '' };
-    const storageData = await buildTxfStorageData(tokens, meta);
-    const parsed = parseTxfStorageData(storageData);
-
-    expect(parsed.tokens.length).toBe(9);
-    expect(parsed.validationErrors.length).toBe(0);
-
-    for (const coin of allCoins) {
-      const found = parsed.tokens.find((t) => t.symbol === coin.symbol);
-      expect(found).toBeDefined();
-      expect(found!.coinId).toBe(coin.coinId);
-      expect(found!.decimals).toBe(coin.decimals);
-      expect(found!.amount).toBe(coin.amount);
-    }
+    expect(parsed.tokens).toHaveLength(0);
+    expect(parsed.validationErrors.join(' ')).toContain('token-abc');
+    expect(warn).toHaveBeenCalled();
   });
-});
 
-describe('multi-coin round-trip', () => {
-  it('should preserve all registry coins through build -> parse cycle', async () => {
-    const coins = [
-      { coinId: SOL_COIN_ID, symbol: 'SOL', decimals: 9, amount: '5000000000' },
-      { coinId: ETH_COIN_ID, symbol: 'ETH', decimals: 18, amount: '100000000000000000' },
-      { coinId: BTC_COIN_ID, symbol: 'BTC', decimals: 8, amount: '50000000' },
-      { coinId: UCT_COIN_ID, symbol: 'UCT', decimals: 18, amount: '100000000000000000000' },
-      { coinId: USDU_COIN_ID, symbol: 'USDU', decimals: 6, amount: '1000000000' },
-      { coinId: EURU_COIN_ID, symbol: 'EURU', decimals: 6, amount: '500000000' },
-      { coinId: TUSD_COIN_ID, symbol: 'TUSD', decimals: 8, amount: '200000000' },
-      { coinId: USDT_COIN_ID, symbol: 'USDT', decimals: 6, amount: '750000000' },
-      { coinId: USDC_COIN_ID, symbol: 'USDC', decimals: 6, amount: '250000000' },
-    ];
+  it('reports an unrecognized token slot instead of silently accepting it', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
 
-    const tokens = coins.map((c) => {
-      const txf = createMockTxfWithCoin(c.coinId, c.amount);
-      return createMockToken({
-        id: txf.genesis.data.tokenId,
-        coinId: c.coinId,
-        symbol: c.symbol,
-        decimals: c.decimals,
-        amount: c.amount,
-        sdkData: JSON.stringify(txf),
-      });
+    const parsed = parseTxfStorageData({
+      _meta: { version: 1, address: '02test', ipnsName: '', formatVersion: '2.0' },
+      _somethingElse: { not: 'a token' },
     });
 
-    const meta = { version: 1, address: '02test', ipnsName: 'k51test' };
-    const storageData = await buildTxfStorageData(tokens, meta);
-    const parsed = parseTxfStorageData(storageData);
-
-    expect(parsed.tokens.length).toBe(9);
-    expect(parsed.validationErrors.length).toBe(0);
-
-    for (const coin of coins) {
-      const found = parsed.tokens.find((t) => t.symbol === coin.symbol);
-      expect(found).toBeDefined();
-      expect(found!.coinId).toBe(coin.coinId);
-      expect(found!.amount).toBe(coin.amount);
-      expect(found!.decimals).toBe(coin.decimals);
-    }
-  });
-
-  it('should preserve coin metadata through txfToToken for all registry coins', () => {
-    const knownCoins = [
-      { coinId: SOL_COIN_ID, symbol: 'SOL', name: 'Solana', decimals: 9 },
-      { coinId: ETH_COIN_ID, symbol: 'ETH', name: 'Ethereum', decimals: 18 },
-      { coinId: BTC_COIN_ID, symbol: 'BTC', name: 'Bitcoin', decimals: 8 },
-      { coinId: UCT_COIN_ID, symbol: 'UCT', name: 'Unicity', decimals: 18 },
-      { coinId: USDU_COIN_ID, symbol: 'USDU', name: 'Unicity-usd', decimals: 6 },
-      { coinId: EURU_COIN_ID, symbol: 'EURU', name: 'Unicity-eur', decimals: 6 },
-      { coinId: TUSD_COIN_ID, symbol: 'TUSD', name: 'Tether_test', decimals: 8 },
-      { coinId: USDT_COIN_ID, symbol: 'USDT', name: 'Tether', decimals: 6 },
-      { coinId: USDC_COIN_ID, symbol: 'USDC', name: 'Usd-coin', decimals: 6 },
-    ];
-
-    for (const coin of knownCoins) {
-      const txf = createMockTxfWithCoin(coin.coinId, '12345');
-      const token = txfToToken(`test-${coin.symbol}`, txf);
-
-      expect(token.symbol).toBe(coin.symbol);
-      expect(token.name).toBe(coin.name);
-      expect(token.decimals).toBe(coin.decimals);
-      expect(token.coinId).toBe(coin.coinId);
-      expect(token.amount).toBe('12345');
-    }
+    expect(parsed.tokens).toHaveLength(0);
+    expect(parsed.validationErrors).toHaveLength(1);
+    expect(warn).toHaveBeenCalled();
   });
 });
