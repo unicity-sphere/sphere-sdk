@@ -25,10 +25,42 @@ import {
   StateTransitionClient,
   TokenIssuanceVerifierService,
   VerificationContext,
+  WorkerTokenVerifier,
+  type IWorker,
 } from './sdk';
 import { decodeSpherePaymentData } from './SpherePaymentData';
-import { type EngineDeps, SphereTokenEngine } from './SphereTokenEngine';
-import type { EngineConfig, ITokenEngine } from './engine';
+import { type DisposableTokenVerifier, type EngineDeps, SphereTokenEngine } from './SphereTokenEngine';
+import type { EngineConfig, ITokenEngine, VerificationWorker, VerificationWorkerConfig } from './engine';
+
+const DEFAULT_VERIFICATION_POOL_SIZE = 4;
+
+/**
+ * The consumer's worker factory, bound to the base SDK's pool verifier. The SDK
+ * leaves `createWorker()` abstract so the platform choice stays with the consumer;
+ * the cast is the port boundary (same web-`Worker` subset, payloads `unknown` on
+ * our side so no SDK wire type escapes).
+ */
+class ConfiguredWorkerTokenVerifier extends WorkerTokenVerifier {
+  public constructor(
+    private readonly spawn: () => VerificationWorker,
+    poolSize: number
+  ) {
+    super(poolSize);
+  }
+
+  protected createWorker(): IWorker {
+    return this.spawn() as unknown as IWorker;
+  }
+}
+
+/** Workers spawn LAZILY on first verify and are reused, so this costs nothing to build. */
+export function createWorkerTokenVerifier(config: VerificationWorkerConfig): DisposableTokenVerifier {
+  const poolSize = config.poolSize ?? DEFAULT_VERIFICATION_POOL_SIZE;
+  if (!Number.isInteger(poolSize) || poolSize < 1) {
+    throw new TypeError(`verification.poolSize must be a positive integer, got ${String(config.poolSize)}`);
+  }
+  return new ConfiguredWorkerTokenVerifier(config.createWorker, poolSize);
+}
 
 export async function createSphereTokenEngine(config: EngineConfig): Promise<ITokenEngine> {
   if (config.trustBaseJson == null) {
@@ -69,6 +101,8 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
     networkId: trustBase.networkId,
     // #683: forward the (optional) proof-poll cadence; undefined → the engine default.
     proofPollIntervalMs: config.proofPollIntervalMs,
+    // Opt-in parallel verification (2.0.2). Absent → the sequential verifier.
+    ...(config.verification ? { tokenVerifier: createWorkerTokenVerifier(config.verification) } : {}),
   };
 
   return new SphereTokenEngine(deps);

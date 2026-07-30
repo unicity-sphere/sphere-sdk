@@ -16,6 +16,8 @@ export type {
   EngineOpOptions,
   SplitCheckpointStore,
   CreateTokenEngine,
+  VerificationWorker,
+  VerificationWorkerConfig,
 } from './engine';
 
 export type {
