@@ -30,7 +30,7 @@ This repo is part of the wallet-api program (process: `../wallet-api/development
   (wallet-api backend, sphere frontend) pin exact dev versions. The backend consumes ONLY the
   `./token-engine` subpath (must stay browser/Nostr-free — there's an import-closure check in
   its CI eventually; keep `token-engine/` clean).
-- Pinned base SDK: `@unicitylabs/state-transition-sdk@2.0.1` (stable release; bump only via PR).
+- Pinned base SDK: `@unicitylabs/state-transition-sdk@2.0.2` (stable release; bump only via PR).
 
 ## Quick Start (Using SDK as Dependency)
 
@@ -367,7 +367,7 @@ sphere-sdk/
 ### Token Engine (v2) — the only L3 money path
 
 The legacy v1 `@unicitylabs/state-transition-sdk@1.6.1-rc` engine is **removed**.
-The canonical package name resolves to the **v2 SDK, pinned `2.0.1`** (stable).
+The canonical package name resolves to the **v2 SDK, pinned `2.0.2`** (stable).
 
 - The SDK is imported in exactly ONE file: `token-engine/sdk.ts`. An ESLint
   `no-restricted-imports` rule blocks any other import of
@@ -375,13 +375,21 @@ The canonical package name resolves to the **v2 SDK, pinned `2.0.1`** (stable).
   `ITokenEngine` port and sphere-domain types from `token-engine/`.
 - `ITokenEngine` operations: `getIdentity`, `deriveIdentityAddress`, `tokenId`,
   `readValue`, `balanceOf`, `readMemo`, `readTokenData`, `mint`, `mintDataToken`,
-  `transfer`, `split`, `verify`, `isSpent`, `isOwnedBy`, `encodeToken`, `decodeToken`.
+  `transfer`, `split`, `verify`, `isSpent`, `isOwnedBy`, `encodeToken`,
+  `decodeToken`, `deliveryKeys`, and the optional `dispose` (worker-pool teardown).
 - `Sphere` builds the engine from the oracle's config surface
   (`getTrustBaseJson()` / `getAggregatorUrl()` / `getApiKey()`) via
   `createSphereTokenEngine(EngineConfig)`. The trust base JSON is the single
   source of truth for the network id (`RootTrustBase.networkId`, e.g. testnet2 = 4).
 - `SphereToken.sdkToken` is an OPAQUE handle — callers store it and hand it back
   to the engine, never call methods on it.
+- **Verification is sequential by default; parallel is opt-in** (2.0.2). Pass
+  `verification: { createWorker, poolSize? }` to `Sphere.init` (or `EngineConfig`)
+  and `engine.verify` fans per-transfer work out to a worker pool. The entry
+  script is the CONSUMER's (only their bundler can emit a worker) and its
+  predicate verifier must match the engine's or the verdict silently diverges.
+  Workers spawn lazily; `sphere.destroy()` / an address switch / an api-key change
+  call `engine.dispose()` to terminate the pool. See `docs/VERIFICATION-WORKERS.md`.
 - **The engine is mandatory for money movement**: `send()`, `mintFungibleToken()`,
   `accounting.createInvoice()/importInvoice()` fail loudly (`AGGREGATOR_ERROR` /
   invoice errors) when the oracle does not supply a v2 trust base + gateway URL.
@@ -665,7 +673,7 @@ Key test areas:
 ## Dependencies
 
 **Core (from package.json):**
-- `@unicitylabs/state-transition-sdk` — **pinned `2.0.1`** (v2 engine; imported only via `token-engine/sdk.ts`)
+- `@unicitylabs/state-transition-sdk` — **pinned `2.0.2`** (v2 engine; imported only via `token-engine/sdk.ts`)
 - `@unicitylabs/nostr-js-sdk` `^0.5.0` — Nostr protocol
 - `@noble/hashes` `^2`, `@noble/curves` `^2` — cryptography
 - `bip39`, `elliptic`, `crypto-js`, `canonicalize`, `buffer`

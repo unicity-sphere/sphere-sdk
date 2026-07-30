@@ -116,7 +116,12 @@ import {
   isSQLiteDatabase,
   isWalletDatEncrypted,
 } from '../serialization/wallet-dat';
-import { createSphereTokenEngine, deriveDirectAddress, type ITokenEngine } from '../token-engine';
+import {
+  createSphereTokenEngine,
+  deriveDirectAddress,
+  type ITokenEngine,
+  type VerificationWorkerConfig,
+} from '../token-engine';
 import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
 
 export function isValidNametag(nametag: string): boolean {
@@ -234,6 +239,11 @@ export interface SphereCreateOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Opt in to PARALLEL token verification — see
+   * {@link SphereInitOptions.verification}. Omit for the sequential verifier.
+   */
+  verification?: VerificationWorkerConfig;
 }
 
 /** Options for loading existing wallet */
@@ -289,6 +299,11 @@ export interface SphereLoadOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Opt in to PARALLEL token verification — see
+   * {@link SphereInitOptions.verification}. Omit for the sequential verifier.
+   */
+  verification?: VerificationWorkerConfig;
 }
 
 /** Options for importing a wallet */
@@ -356,6 +371,11 @@ export interface SphereImportOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Opt in to PARALLEL token verification — see
+   * {@link SphereInitOptions.verification}. Omit for the sequential verifier.
+   */
+  verification?: VerificationWorkerConfig;
 }
 
 /** Options for unified init (auto-create or load) */
@@ -431,6 +451,16 @@ export interface SphereInitOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Opt in to PARALLEL token verification: the engine fans each token's
+   * per-transfer verification out to a pool of workers instead of walking it on
+   * the calling thread. Omit for the sequential verifier — the behavior of every
+   * release before this one.
+   *
+   * The worker entry script is yours to author and bundle (see
+   * {@link VerificationWorkerConfig}); `sphere.destroy()` terminates the pool.
+   */
+  verification?: VerificationWorkerConfig;
 }
 
 /** Result of init operation */
@@ -594,6 +624,12 @@ export class Sphere {
   private _groupChatConfig: GroupChatModuleConfig | undefined;
   private _marketConfig: MarketModuleConfig | undefined;
   private _communicationsConfig: CommunicationsModuleConfig | undefined;
+  /**
+   * Opt-in parallel verification (SphereInitOptions.verification). Read by
+   * buildTokenEngine for EVERY engine it builds, so the per-address engines and
+   * the rebuild after an api-key change share one pool configuration.
+   */
+  private _verification: VerificationWorkerConfig | undefined;
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
@@ -944,6 +980,7 @@ export class Sphere {
       options.delivery,
       options.walletApi,
     );
+    sphere._verification = options.verification;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
 
@@ -1044,6 +1081,7 @@ export class Sphere {
       options.delivery,
       options.walletApi,
     );
+    sphere._verification = options.verification;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
 
@@ -1150,6 +1188,7 @@ export class Sphere {
       options.delivery,
       options.walletApi,
     );
+    sphere._verification = options.verification;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
 
@@ -1587,7 +1626,11 @@ export class Sphere {
     // Rebuild ONLY the token engine (buildTokenEngine reads getApiKey() fresh)
     // and swap it into the live payments module — no transport/socket/storage
     // teardown, unlike a full re-init.
+    const replaced = this._tokenEngine;
     this._tokenEngine = await this.buildTokenEngine();
+    // The replaced engine may own a verification worker pool — terminate it, or
+    // every api-key change would leak one.
+    replaced?.dispose?.();
     this._payments.setTokenEngine(this._tokenEngine);
   }
 
@@ -3969,6 +4012,10 @@ export class Sphere {
       this._transportMux = null;
     }
 
+    // Release engine-owned OS resources (the verification worker pool, when the
+    // consumer opted in) — a wallet that is destroyed must not leave threads behind.
+    this._tokenEngine?.dispose?.();
+
     await this._transport.disconnect();
     await this._storage.disconnect();
     await this._oracle.disconnect();
@@ -4403,6 +4450,7 @@ export class Sphere {
         apiKey: oracle.getApiKey?.(),
         privateKey: hexToBytes(privateKey),
         trustBaseJson,
+        ...(this._verification ? { verification: this._verification } : {}),
       });
     } catch (err) {
       logger.warn(
@@ -4423,7 +4471,9 @@ export class Sphere {
 
     // Build the v2 token engine for this active address (from the oracle's gateway +
     // trust base + this address's key). Injected into the caller modules below.
+    const previousEngine = this._tokenEngine;
     this._tokenEngine = await this.buildTokenEngine();
+    if (previousEngine && previousEngine !== this._tokenEngine) previousEngine.dispose?.();
     const tokenEngine = this._tokenEngine;
 
     this._payments.initialize({

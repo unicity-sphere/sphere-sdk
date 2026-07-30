@@ -38,6 +38,9 @@ export { StateMask } from '@unicitylabs/state-transition-sdk/lib/transaction/Sta
 export { MintJustificationVerifierService } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/MintJustificationVerifierService.js';
 export { TokenIssuanceVerifierService } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/TokenIssuanceVerifierService.js';
 export { VerificationContext } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/VerificationContext.js';
+export type { ITokenVerifier } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/ITokenVerifier.js';
+export { WorkerTokenVerifier } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/worker/WorkerTokenVerifier.js';
+export type { IWorker } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/worker/IWorker.js';
 export type { IVerificationContext } from '@unicitylabs/state-transition-sdk/lib/verification/IVerificationContext.js';
 
 // ── predicates / unlock scripts ─────────────────────────────────────────────

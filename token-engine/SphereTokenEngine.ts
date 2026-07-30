@@ -57,6 +57,7 @@ import {
   type VerificationContext,
   VerificationStatus,
   waitInclusionProof,
+  type ITokenVerifier,
 } from './sdk';
 import { decodeSpherePaymentData, SpherePaymentData, sphereAssetToSdk } from './SpherePaymentData';
 import { TOKEN_BLOB_VERSION } from './token-blob';
@@ -76,12 +77,22 @@ import type {
 } from './types';
 
 /** SDK objects the engine operates with; assembled by the factory (A4) or test wiring. */
+/** An `ITokenVerifier` that also owns terminable resources (a worker pool). */
+export interface DisposableTokenVerifier extends ITokenVerifier {
+  dispose(): void;
+}
+
 export interface EngineDeps {
   readonly client: StateTransitionClient;
   readonly trustBase: RootTrustBase;
   readonly predicateVerifier: PredicateVerifierService;
   readonly mintJustificationVerifier: MintJustificationVerifierService;
   readonly verificationContext: VerificationContext;
+  /**
+   * Opt-in parallel verifier (EngineConfig.verification). Absent → tokens verify
+   * sequentially via `Token.verify`, which is what every release before 2.0.2 did.
+   */
+  readonly tokenVerifier?: DisposableTokenVerifier;
   /** The wallet's signing key (its identity + the spender for transfers it owns). */
   readonly signingService: SigningService;
   /**
@@ -542,7 +553,11 @@ export class SphereTokenEngine implements ITokenEngine {
   // ── verification ─────────────────────────────────────────────────────────────
 
   public async verify(token: SphereToken, _options?: EngineOpOptions): Promise<EngineVerifyResult> {
-    const result = await token.sdkToken.verify(this.deps.verificationContext);
+    // Both verifiers produce the same aggregated result; the worker one only
+    // moves the independent per-transfer work off this thread.
+    const result = this.deps.tokenVerifier
+      ? await this.deps.tokenVerifier.verify(token.sdkToken, this.deps.verificationContext)
+      : await token.sdkToken.verify(this.deps.verificationContext);
     return result.status === VerificationStatus.OK ? { ok: true } : { ok: false, reason: String(result.status) };
   }
 
@@ -748,4 +763,12 @@ export class SphereTokenEngine implements ITokenEngine {
       return false;
     }
   }
+  /**
+   * Terminate the verification worker pool, if this engine was configured with
+   * one. Idempotent — the pool's dispose only touches workers it spawned.
+   */
+  public dispose(): void {
+    this.deps.tokenVerifier?.dispose();
+  }
+
 }

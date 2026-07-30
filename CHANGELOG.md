@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — state-transition-sdk 2.0.2 (was 2.0.1)
+
+Upstream is one change (state-transition-sdk-js#138): token verification is now behind an
+`ITokenVerifier` interface, with the sequential logic moved verbatim into a default
+`TokenVerifier` and an OPTIONAL worker-backed implementation alongside it.
+`InclusionProofVerificationRule.verify` takes a precomputed transaction hash + lockScript +
+sourceStateHash instead of the transaction object (so a worker can verify without it), and
+`RootTrustBase`/`RootTrustBaseNodeInfo` gain `toJSON()`.
+
+**No wire change.** Diffing the published 2.0.1 and 2.0.2 builds: not one `toCBOR` implementation
+differs — every changed file is verification plumbing. So split-checkpoint resume is unaffected
+(its guard is byte-equality of the stored vs re-derived `TransferTransaction.toCBOR()`), and a
+checkpoint written under 2.0.1 still rebuilds under 2.0.2. `CHECKPOINT_SDK_VERSION` (recorded for
+drift DIAGNOSIS only) moves to `…@2.0.2` with the pin.
+
+### Added — opt-in parallel token verification
+
+Upstream's worker verifier is only useful if consumers can reach it, so it is now configuration:
+
+```ts
+const { sphere } = await Sphere.init({ ...providers, verification: { createWorker, poolSize: 4 } });
+```
+
+- `EngineConfig.verification` / `SphereInitOptions.verification` (also on the create/load/import
+  options): `{ createWorker: () => VerificationWorker; poolSize?: number }`. Omitted → the
+  sequential verifier, i.e. unchanged behavior. `VerificationWorker` is our own structural view of
+  the web-`Worker` subset, payloads typed `unknown`, so no base-SDK wire type reaches the port.
+- The worker ENTRY SCRIPT is the consumer's — only their bundler can emit a worker. Its predicate
+  verifier must match the engine's or the verdict silently diverges from the sequential one; both
+  sides using `PredicateVerifierService.create()` is safe. `docs/VERIFICATION-WORKERS.md` has
+  runnable Node and browser scripts.
+- `ITokenEngine.dispose?()` (new, optional) terminates the pool. Workers spawn LAZILY, so building
+  an engine still costs nothing — which matters because Sphere rebuilds it on every address switch
+  and api-key change. Both of those now dispose the engine they replace, and `sphere.destroy()`
+  disposes the live one; without that, opting in would leak a thread pool per switch.
+- No worker module enters either bundle when unused: we import only the deep `lib/**` paths we
+  already used (verified — `worker_threads` appears solely in the Node bundle's pre-existing
+  undici/webidl code, identically under 2.0.1).
+
+
 ### Changed — `payments.sync()` is a flush; the IPFS-era merge machinery is gone
 
 `sync()` once merged remote TXF state back into the wallet. Only the IPFS provider ever supplied

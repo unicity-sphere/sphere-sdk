@@ -172,6 +172,13 @@ export interface ITokenEngine {
    * derive their ids through this method, never locally.
    */
   deliveryKeys(blobBytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }>;
+
+  // ── teardown ───────────────────────────────────────────────────────────────
+  /**
+   * Release engine-owned OS resources — today only the verification worker pool.
+   * Idempotent; optional because an engine owning none need not define it.
+   */
+  dispose?(): void;
 }
 
 /**
@@ -182,6 +189,31 @@ export interface ITokenEngine {
  * NOTE: trust-base sourcing + proof-policy defaults are finalized in Phase 0.8;
  * this shape may gain fields there without affecting the ITokenEngine contract.
  */
+/**
+ * The web-`Worker` subset the verification pool drives (a browser `Worker` fits
+ * as-is; in Node wrap a `worker_threads.Worker`). Payloads stay `unknown` so no
+ * base-SDK wire type reaches this port.
+ */
+export interface VerificationWorker {
+  onerror: ((event: { message: string }) => void) | null;
+  onmessage: ((event: { data: unknown }) => void) | null;
+  postMessage(message: unknown): void;
+  terminate(): void;
+}
+
+/**
+ * Opt-in PARALLEL token verification (state-transition-sdk 2.0.2+): per-transfer
+ * work fans out to a worker pool instead of walking the calling thread. You
+ * author and bundle the entry script, and its predicate verifier MUST match the
+ * engine's or the verdict silently diverges — docs/VERIFICATION-WORKERS.md.
+ */
+export interface VerificationWorkerConfig {
+  /** Spawn ONE worker running that entry script. Called lazily, up to `poolSize` times. */
+  readonly createWorker: () => VerificationWorker;
+  /** Maximum workers in the pool (default 4). Workers are reused across verify() calls. */
+  readonly poolSize?: number;
+}
+
 export interface EngineConfig {
   /** Aggregator (gateway) base URL the StateTransitionClient talks to. */
   readonly aggregatorUrl: string;
@@ -200,6 +232,12 @@ export interface EngineConfig {
   readonly proofPollIntervalMs?: number;
   /** Inclusion-proof overall timeout in ms (0/undefined = no engine-side cap). */
   readonly proofTimeoutMs?: number;
+  /**
+   * Opt in to parallel verification. Omitted → the sequential verifier, i.e. the
+   * behavior every release before this had. Requires `dispose()` on teardown to
+   * terminate the pool.
+   */
+  readonly verification?: VerificationWorkerConfig;
 }
 
 /** Factory signature for the real adapter (implemented in Track A). */
