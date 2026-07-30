@@ -25,6 +25,7 @@ import type { FakeWalletApi } from '../../support/fake-wallet-api';
 import { testIdentity } from '../../support/wallet-api-test-helpers';
 import {
   fullIdentity,
+  peerInfoOf,
   makeFullPresetWallet,
   seedServerToken,
   startFakeWalletApi,
@@ -36,7 +37,7 @@ const UCT = '11'.repeat(32); // v2 coin ids are lowercase hex
 const ALICE = testIdentity(21); // the wallet under test (real keypair — the backend verifies signatures)
 const BOB = testIdentity(22); // the recipient
 /** Bob's transport-layer coordinates, as the transport would publish them. */
-const BOB_PEER = fullIdentity(BOB);
+const BOB_PEER = peerInfoOf(BOB, 'bob');
 
 /** Bob is reachable AND has published a chain identity — the happy peer. */
 function mockTransport(): TransportProvider {

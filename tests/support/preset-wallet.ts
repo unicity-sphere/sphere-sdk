@@ -28,7 +28,7 @@ import {
   type PaymentsModuleDependencies,
 } from '../../modules/payments/PaymentsModule';
 import type { FullIdentity } from '../../types';
-import type { TransportProvider } from '../../transport';
+import type { PeerInfo, TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { StorageProvider } from '../../storage';
 import { FakeTokenEngine, decodeFakeTokenAssets, decodeFakeTokenId, type FakeEngineConfig } from '../unit/token-engine/FakeTokenEngine';
@@ -51,7 +51,22 @@ export function fullIdentity(who: TestKeypair): FullIdentity {
     chainPubkey: who.chainPubkey,
     privateKey: who.privateKey,
     directAddress: `DIRECT://${who.chainPubkey.slice(0, 12)}`,
+  };
+}
+
+/**
+ * What a transport `resolve()` would return for `who`. Distinct from
+ * {@link fullIdentity} on purpose: an Identity has no `transportPubkey` — that
+ * belongs to a PEER description, and conflating them is how a test ends up
+ * asserting on a field the wallet never had.
+ */
+export function peerInfoOf(who: TestKeypair, nametag?: string): PeerInfo {
+  return {
+    chainPubkey: who.chainPubkey,
     transportPubkey: who.chainPubkey.slice(2),
+    directAddress: `DIRECT://${who.chainPubkey.slice(0, 12)}`,
+    timestamp: 0,
+    ...(nametag !== undefined ? { nametag } : {}),
   };
 }
 

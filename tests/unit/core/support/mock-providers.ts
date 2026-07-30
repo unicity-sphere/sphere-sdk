@@ -10,7 +10,8 @@
  */
 
 import { vi } from 'vitest';
-import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../../storage';
+import type { InventoryView, StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../../storage';
+import type { TokenBlob } from '../../../../token-engine';
 import type { TransportProvider } from '../../../../transport';
 import type { OracleProvider } from '../../../../oracle';
 import type { ProviderStatus } from '../../../../types';
@@ -140,7 +141,13 @@ function createMockTokenStorage(id: string, name: string): TokenStorageProvider<
       removed: 0,
       conflicts: 0,
     })),
-    onEvent: vi.fn().mockReturnValue(() => {}),
+    // S2 lazy-inventory surface: present so the mock really satisfies the
+    // contract. An empty view and a loud getToken are the honest stand-ins.
+    listInventory: vi.fn(async (): Promise<InventoryView> => ({ items: [], cursor: 0n, syncEpoch: 0n, more: false })),
+    getToken: vi.fn(async (tokenId: string): Promise<TokenBlob> => {
+      throw new Error(`mock token storage: no blob for ${tokenId}`);
+    }),
+    applyDelta: vi.fn(async (): Promise<void> => undefined),
   };
 }
 
