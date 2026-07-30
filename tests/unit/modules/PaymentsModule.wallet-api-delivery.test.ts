@@ -983,7 +983,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     // process died before the engine ran. Resume must complete the transfer.
     const transferId = crypto.randomUUID();
     const payload = {
-      v: 1,
+      v: 2,
       recipient: RECIPIENT.chainPubkey,
       coinId: UCT,
       amount: '1000',
@@ -1035,7 +1035,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
       transferId,
       encryptField(
         deriveFieldEncryptionKey(SENDER.privateKey),
-        JSON.stringify({ v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] })
+        JSON.stringify({ v: 2, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] })
       )
     );
 
@@ -1084,7 +1084,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
       transferId,
       encryptField(
         deriveFieldEncryptionKey(SENDER.privateKey),
-        JSON.stringify({ v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] })
+        JSON.stringify({ v: 2, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] })
       )
     );
 
@@ -1108,7 +1108,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     // endpoint is down — abortIntent flips the LOCAL copy to aborted+abortPending and re-throws, but
     // the SERVER row stays 'open'.
     const transferId = crypto.randomUUID();
-    const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
+    const payload = { v: 2, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
     sender.client.setIdentity(SENDER);
     await sender.client.putIntent(
       transferId,
@@ -1143,7 +1143,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     await sender.module.load();
 
     const transferId = crypto.randomUUID();
-    const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
+    const payload = { v: 2, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
     sender.client.setIdentity(SENDER);
     await sender.client.putIntent(
       transferId,
@@ -1173,7 +1173,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     sender.client.setIdentity(SENDER);
     const putIntent = async (src: string): Promise<string> => {
       const tid = crypto.randomUUID();
-      const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [src] };
+      const payload = { v: 2, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [src] };
       await sender.client.putIntent(tid, encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload)));
       return tid;
     };
@@ -1196,7 +1196,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     await sender.module.load();
 
     const transferId = crypto.randomUUID();
-    const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [src] };
+    const payload = { v: 2, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [src] };
     sender.client.setIdentity(SENDER);
     await sender.client.putIntent(
       transferId,
@@ -1225,7 +1225,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     await sender.module.load();
 
     const transferId = crypto.randomUUID();
-    const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
+    const payload = { v: 2, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
     sender.client.setIdentity(SENDER);
     await sender.client.putIntent(
       transferId,
@@ -1315,7 +1315,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
 
     const transferId = crypto.randomUUID();
     const payload = {
-      v: 1,
+      v: 2,
       recipient: RECIPIENT.chainPubkey,
       coinId: UCT,
       amount: '300',
@@ -1351,7 +1351,7 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     await sender.module.load();
 
     const transferId = crypto.randomUUID();
-    const payload = { v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [g0, g1] };
+    const payload = { v: 2, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [g0, g1] };
     sender.client.setIdentity(SENDER);
     await sender.client.putIntent(
       transferId,
@@ -1385,39 +1385,34 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(evt?.[1]).toMatchObject({ transferId, remainingAmount: '400', recipientPubkey: RECIPIENT.chainPubkey });
   });
 
-  it('legacy (v:1, no store): a resume that hits SplitCheckpointLostError records the spend, never wedges', async () => {
-    // The engine now maps a split-mint-leg mismatch to the keep-open SplitCheckpointLostError. A v:1
-    // intent has NO checkpoint store, so there is nothing to recover from — resume must fall back to
-    // the legacy residual (record the spend + surface a resync), NOT rethrow and wedge the intent.
+  it('a pre-E.4 (v:1) intent is REFUSED, not run down the v:2 path', async () => {
+    // v:1 intents stopped being written at the E.4 cutover and have no burn
+    // checkpoint. Running one through the v:2 resume would raise
+    // SplitCheckpointLostError — keep-open — and wedge it forever. Refuse it: it
+    // lands in `failed`, and the server row is left OPEN and untouched.
     const { fake, baseUrl } = await startFake();
-    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-legacy-lost');
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-v1-refused');
     const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
     await sender.module.load();
 
     const transferId = crypto.randomUUID();
-    const payload = {
-      v: 1,
-      recipient: RECIPIENT.chainPubkey,
-      coinId: UCT,
-      amount: '300',
-      direct: [],
-      split: { tokenId: sourceTokenId, splitAmount: '300', remainderAmount: '700' },
-    };
     sender.client.setIdentity(SENDER);
     await sender.client.putIntent(
       transferId,
-      encryptField(deriveFieldEncryptionKey(SENDER.privateKey), JSON.stringify(payload))
-    );
-    vi.spyOn(sender.engine, 'split').mockRejectedValue(
-      new SplitCheckpointLostError('a split mint leg no longer matches its certified leaf')
+      encryptField(
+        deriveFieldEncryptionKey(SENDER.privateKey),
+        JSON.stringify({ v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] })
+      )
     );
 
     const outcome = await sender.module.resumeOpenIntents();
-    expect(outcome.resumed).toEqual([transferId]); // completed, not wedged
-    expect(outcome.failed).toEqual([]);
-    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'removed' });
-    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
-    expect(sender.emitEvent.mock.calls.some((c) => c[0] === 'inventory:conflict')).toBe(true);
+
+    expect(outcome.failed).toEqual([transferId]);
+    expect(outcome.resumed).toEqual([]);
+    expect(outcome.conflicted).toEqual([]);
+    // Nothing executed: no delivery, and the intent is still open for an operator.
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(0);
+    expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'open' });
   });
 
   it('#634: resume of a v:2 split re-runs the split THROUGH the checkpoint and recovers the change output', async () => {

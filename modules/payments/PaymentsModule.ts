@@ -255,11 +255,7 @@ interface CertifyContext {
   readonly selfChainPubkey: Uint8Array;
   readonly coinId: string;
   readonly memo?: string;
-  /**
-   * E.4 burn checkpoint for the split leg. Supplied by the caller because a
-   * LEGACY (v:1) intent resume must run WITHOUT one — its send never wrote a
-   * checkpoint, so there is nothing to rebuild from.
-   */
+  /** E.4 burn checkpoint for the split leg; absent when no store is configured. */
   readonly checkpointStore?: SplitCheckpointStore;
 }
 
@@ -821,13 +817,12 @@ type PaymentRequestsApi = Pick<PaymentsWalletApiPort, 'network'> &
   >;
 
 /**
- * The decrypted E.3 intent payload (`{ sources, recipient, amounts }` concretized). `v:2` is the
- * E.4 (sphere-sdk#501) variant: its split resumes from the durable burn checkpoint. `v:1` is the
- * pre-E.4 legacy shape — resumed via the change-blind journaled shortcut, sunsetting one release
- * after E.4 (a v:1 split that crashed mid-flight recovers its change via a full inventory resync).
+ * The decrypted E.3 intent payload (`{ sources, recipient, amounts }` concretized).
+ * `v:2` (E.4, sphere-sdk#501) is the only shape: a split resumes from its durable
+ * burn checkpoint.
  */
 interface IntentPayloadV1 {
-  v: 1 | 2;
+  v: 2;
   /** Recipient chain pubkey (33-byte compressed, hex). */
   recipient: string;
   coinId: string;
@@ -5341,8 +5336,16 @@ export class PaymentsModule {
       try {
         const plain = decryptField(this.getFieldEncryptionKey(), intent.payload);
         payload = JSON.parse(plain) as IntentPayloadV1;
-        if ((payload.v !== 1 && payload.v !== 2) || !Array.isArray(payload.direct)) {
-          throw new SphereError('Unknown intent payload shape', 'VALIDATION_ERROR');
+        if (payload.v !== 2 || !Array.isArray(payload.direct)) {
+          // A pre-E.4 (v:1) intent has no burn checkpoint, so running it down the
+          // v:2 path would raise SplitCheckpointLostError and keep it open
+          // forever. Refuse it instead: it lands in `failed`, stays OPEN and
+          // untouched on the server, and is visible to an operator by name —
+          // nothing is executed, nothing is aborted.
+          throw new SphereError(
+            `Unsupported intent payload shape (v=${String(payload.v)}) — not resumable by this wallet version`,
+            'VALIDATION_ERROR',
+          );
         }
       } catch (err) {
         logger.warn('Payments', `Intent ${intent.transferId.slice(0, 8)}… payload undecodable — skipped:`, err);
@@ -5531,9 +5534,8 @@ export class PaymentsModule {
     const serverApply = this.delivery!.custody === 'inventory';
 
     // The SAME certify context the original send used — (transferId, opIndex)
-    // rebuilds byte-identical transactions (§8.1). E.4: only a v:2 intent
-    // resumes THROUGH a burn checkpoint; a v:1 send never wrote one.
-    const checkpointStore = payload.v === 2 ? this.getCheckpointStore() : undefined;
+    // rebuilds byte-identical transactions (§8.1).
+    const checkpointStore = this.getCheckpointStore();
     const ctx: CertifyContext = {
       engine,
       transferId,
@@ -5598,18 +5600,13 @@ export class PaymentsModule {
     if (payload.split) {
       // The split's opIndex follows the direct ops — replayed from the intent's order (§8.1).
       const splitOpIndex = payload.direct.length;
-      const existingSplit = journaled.get(splitOpIndex);
       let splitDelivered = false;
-      if (checkpointStore === undefined && existingSplit) {
-        // Legacy residual (v:1, no checkpoint): re-deliver only; the change recovers via resync.
-        blobs.push(existingSplit.tokenBlob);
-        splitDelivered = true;
-      } else {
-        // E.4 (sphere-sdk#501): a v:2 split resumes THROUGH its burn checkpoint — split() rebuilds
-        // BOTH outputs from the stored proof (already-certified legs match-verify), so the change is
-        // recovered even when the split already certified. This subsumes AND fixes the legacy
-        // journaled shortcut (#634), which re-delivered the recipient blob but left the change
-        // unpersisted — the following applyDelta then recorded the spend with an empty `added`.
+      {
+        // E.4 (sphere-sdk#501): a split resumes THROUGH its burn checkpoint — split() rebuilds BOTH
+        // outputs from the stored proof (already-certified legs match-verify), so the change is
+        // recovered even when the split already certified. Re-delivering the journaled blob instead
+        // (the pre-E.4 shortcut, #634) left the change unpersisted and the following applyDelta
+        // recorded the spend with an empty `added`.
         const source = await engine.decodeToken(await provider.getToken(payload.split.tokenId));
         const outcome = await this.certifyOperation(
           {
@@ -5634,15 +5631,10 @@ export class PaymentsModule {
           blobs.push(outcome.tokenBlob!);
           splitDelivered = true;
         } else {
-          splitDelivered = this.classifyResumeSplitFailure(outcome.error, {
-            transferId,
-            payload,
-            hasCheckpointStore: checkpointStore !== undefined,
-            onConflict: (err) => {
-              conflicted = true;
-              firstConflict ??= err;
-              undeliveredAmount += BigInt(payload.split!.splitAmount);
-            },
+          splitDelivered = this.classifyResumeSplitFailure(outcome.error, (err) => {
+            conflicted = true;
+            firstConflict ??= err;
+            undeliveredAmount += BigInt(payload.split!.splitAmount);
           });
         }
       }
@@ -5708,49 +5700,31 @@ export class PaymentsModule {
   }
 
   /**
-   * A resumed split that did NOT produce an output: decide whether the leg counts
-   * as delivered, and re-throw everything that must keep the intent open.
-   *
-   * Returns true only for the LEGACY (v:1, no checkpoint) residual where the mint
-   * leg already certified but nothing can be rebuilt — the spend is recorded and
-   * the change recovers via the next full inventory resync.
+   * A resumed split that produced no output: a lost source means the leg delivered
+   * nothing (returns false), and every checkpoint failure keeps the intent open by
+   * throwing. There is no path here that records the spend.
    */
   private classifyResumeSplitFailure(
     error: unknown,
-    ctx: {
-      transferId: string;
-      payload: IntentPayloadV1;
-      hasCheckpointStore: boolean;
-      onConflict: (err: TransferConflictError) => void;
-    }
+    onConflict: (err: TransferConflictError) => void
   ): boolean {
     if (error instanceof ProofUnconfirmedError) throw error; // #631 keep-open (indeterminate)
-    // KEEP-OPEN with a checkpoint store (v:2): the burn is certified and a split-mint stateId is
-    // HKDF-derived (never a foreign spend), so resume — rebuilding from the checkpoint — is the only
-    // exit. NEVER record the spend or abort.
+    // KEEP-OPEN: the burn is certified and a split-mint stateId is HKDF-derived (never a foreign
+    // spend), so resume — rebuilding from the checkpoint — is the only exit. Never record the
+    // spend, never abort.
     if (
-      ctx.hasCheckpointStore &&
-      (error instanceof CheckpointPersistFailedError ||
-        error instanceof SplitCheckpointLostError ||
-        error instanceof CheckpointTrustbaseMismatchError)
+      error instanceof CheckpointPersistFailedError ||
+      error instanceof SplitCheckpointLostError ||
+      error instanceof CheckpointTrustbaseMismatchError
     ) {
       throw error;
     }
     if (error instanceof TransferConflictError) {
       // §8.1: the split SOURCE (burn leg) was consumed by a FOREIGN tx under a DIFFERENT transferId
       // — the split delivered NOTHING. Do NOT record it as spent (that false-marks the intent paid).
-      ctx.onConflict(error);
+      onConflict(error);
       logger.warn('Payments', 'Resume split: source lost to a concurrent transfer — not delivered (§8.1/#4):', error);
       return false;
-    }
-    if (error instanceof SplitCheckpointLostError) {
-      logger.warn('Payments', 'Resume split (legacy no-checkpoint): recording the spend; change recovers on the next inventory resync (§3.1):', error);
-      this.deps!.emitEvent('inventory:conflict', {
-        transferId: ctx.transferId,
-        coinId: ctx.payload.coinId,
-        error: error.message,
-      });
-      return true;
     }
     throw error;
   }
