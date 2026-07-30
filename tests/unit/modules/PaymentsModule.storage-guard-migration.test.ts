@@ -35,7 +35,6 @@ function fullIdentity(id: { privateKey: string; chainPubkey: string }): FullIden
     chainPubkey: id.chainPubkey,
     privateKey: id.privateKey,
     directAddress: `DIRECT://${id.chainPubkey.slice(0, 12)}`,
-    transportPubkey: id.chainPubkey.slice(2),
   };
 }
 
@@ -132,7 +131,7 @@ function makeDeps(local: LocalProvider): PaymentsModuleDependencies {
 }
 
 function initModule(deps: PaymentsModuleDependencies) {
-  const module = createPaymentsModule({ l1: null });
+  const module = createPaymentsModule();
   module.initialize(deps);
   cleanups.push(() => module.destroy());
   return module;

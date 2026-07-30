@@ -977,9 +977,9 @@ describe('StorageProvider Cache', () => {
     await registry.refreshFromRemote();
 
     // storage.set should NOT have been called with cache keys
-    const setCalls = (storage.set as ReturnType<typeof vi.fn>).mock.calls;
+    const setCalls = vi.mocked(storage.set).mock.calls;
     const cacheSetCalls = setCalls.filter(
-      ([key]: [string]) => key === STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE,
+      ([key]) => key === STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE,
     );
     expect(cacheSetCalls).toHaveLength(0);
   });

@@ -182,7 +182,7 @@ describe('SwapModule Lifecycle', () => {
     injectSwapRef(module, swapRef);
 
     // Clear storage set calls so far
-    mocks.storage.set.mockClear();
+    vi.mocked(mocks.storage.set).mockClear();
 
     await module.destroy();
 
@@ -190,7 +190,7 @@ describe('SwapModule Lifecycle', () => {
     expect(mocks.storage.set).toHaveBeenCalled();
 
     // Verify that the index was persisted
-    const setCalls = mocks.storage.set.mock.calls;
+    const setCalls = vi.mocked(mocks.storage.set).mock.calls;
     const indexCallFound = setCalls.some((call: any[]) => {
       const key = call[0] as string;
       return key.includes(STORAGE_KEYS_ADDRESS.SWAP_INDEX);

@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ConnectHost } from '../../../connect/host/ConnectHost';
 import { ConnectClient } from '../../../connect/client/ConnectClient';
-import type { ConnectTransport, SphereConnectMessage } from '../../../connect/types';
+import type {
+  ConnectTransport,
+  SphereConnectMessage,
+  ConnectHostConfig,
+  ConnectClientConfig,
+} from '../../../connect/types';
 import { PERMISSION_SCOPES } from '../../../connect/permissions';
 import { ERROR_CODES, RPC_METHODS, INTENT_ACTIONS } from '../../../connect/protocol';
 import type { PermissionScope } from '../../../connect/permissions';
@@ -104,7 +109,7 @@ describe('Sphere Connect Integration', () => {
     mockSphere = createMockSphere();
   });
 
-  function createHost(overrides?: Partial<Parameters<typeof ConnectHost['prototype']['constructor']>[0]>) {
+  function createHost(overrides?: Partial<ConnectHostConfig>) {
     host = new ConnectHost({
       sphere: mockSphere,
       transport: transports.host,
@@ -114,19 +119,17 @@ describe('Sphere Connect Integration', () => {
       }),
       onIntent: vi.fn().mockResolvedValue({ result: { success: true } }),
       ...overrides,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any);
+    });
     return host;
   }
 
-  function createClient(overrides?: Partial<Parameters<typeof ConnectClient['prototype']['constructor']>[0]>) {
+  function createClient(overrides?: Partial<ConnectClientConfig>) {
     client = new ConnectClient({
       transport: transports.client,
       dapp: defaultDapp,
       network: { id: 4 },
       ...overrides,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any);
+    });
     return client;
   }
 

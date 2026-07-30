@@ -364,9 +364,13 @@ describe('AccountingModule.payInvoice() — provisional reservation (BUG-002 Fix
     mocks.payments._tokens = [makeInvoiceToken(terms)];
     await module.load();
 
+    // `storage.set` is declared by StorageProvider as a plain method; the mock
+    // provider backs it with a vi.fn(), so recover the spy surface.
+    const storageSet = vi.mocked(mocks.storage.set);
+
     // Snapshot storage.set call count before payInvoice — load() may have
     // written some bookkeeping entries during initialization.
-    const setCallsBefore = mocks.storage.set.mock.calls.length;
+    const setCallsBefore = storageSet.mock.calls.length;
 
     const result = await module.payInvoice(INVOICE_ID, {
       targetIndex: 0,
@@ -375,7 +379,7 @@ describe('AccountingModule.payInvoice() — provisional reservation (BUG-002 Fix
 
     // Storage MUST have been written to during the payInvoice call — specifically,
     // the inv_ledger:{invoiceId} entry containing the provisional forward ref.
-    const setCallsDuring = mocks.storage.set.mock.calls.slice(setCallsBefore);
+    const setCallsDuring = storageSet.mock.calls.slice(setCallsBefore);
     const ledgerWrites = setCallsDuring.filter(([key]) =>
       typeof key === 'string' && key.includes(`inv_ledger:${INVOICE_ID}`),
     );
@@ -418,9 +422,12 @@ describe('AccountingModule.payInvoice() — provisional reservation (BUG-002 Fix
     // Reject the FIRST `inv_ledger:` storage write that occurs during payInvoice.
     // We must let earlier load()-time writes (and any pre-payInvoice setup writes)
     // pass through — only fail the per-invoice ledger persistence.
-    const realSet = mocks.storage.set.getMockImplementation();
+    // `storage.set` is declared by StorageProvider as a plain method; the mock
+    // provider backs it with a vi.fn(), so recover the spy surface.
+    const storageSet = vi.mocked(mocks.storage.set);
+    const realSet = storageSet.getMockImplementation();
     let rejected = false;
-    mocks.storage.set.mockImplementation((key: string, value: string): Promise<void> => {
+    storageSet.mockImplementation((key: string, value: string): Promise<void> => {
       if (!rejected && key.includes(`inv_ledger:${INVOICE_ID}`)) {
         rejected = true;
         return Promise.reject(new Error('mock storage failure: disk full'));

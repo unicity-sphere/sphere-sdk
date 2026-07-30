@@ -72,15 +72,24 @@ function createMockTransportPair(): MockPair {
 // Mock Sphere
 // ===========================================================================
 
+/** Mirrors `Sphere.identity`, which is `Identity | null`. Absent-able on purpose: the
+ *  lock-edge tests model a wallet whose identity is already gone when the snapshot freezes,
+ *  and the host's `if (!id)` treats null and undefined identically. */
+type MockSphereIdentity =
+  | { chainPubkey: string; directAddress: string; nametag: string }
+  | null
+  | undefined;
+
 function createMockSphere(overrides?: { chainPubkey?: string; networkId?: number }) {
   const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
 
   return {
+    // Widened to MockSphereIdentity (not narrowed to the literal) so tests can clear it.
     identity: {
       chainPubkey: overrides?.chainPubkey ?? '02abc123',
       directAddress: 'DIRECT://test',
       nametag: 'alice',
-    },
+    } as MockSphereIdentity,
     networkId: overrides?.networkId ?? 4,
     payments: {
       getBalance: vi.fn().mockReturnValue([{ coinId: 'UCT', totalAmount: '1000000' }]),
@@ -186,7 +195,7 @@ function eventsOfType(sent: SphereConnectMessage[], event: string) {
 function handshakeResponses(sent: SphereConnectMessage[]) {
   return sent.filter(
     (m) => m.type === 'handshake' && (m as { direction?: string }).direction === 'response',
-  ) as Array<Record<string, unknown>>;
+  ) as unknown as Array<Record<string, unknown>>;
 }
 
 function subscribeCalls(sent: SphereConnectMessage[]): string[] {
@@ -2042,7 +2051,7 @@ describe('lock-edge guards fail closed', () => {
 
     expect(h.host.walletState).toBe('locked');
     expect(h.host.getSession()).not.toBeNull();
-    const err = await h.client.query(RPC_METHODS.GET_BALANCE).catch((e) => e as ConnectError);
+    const err = (await h.client.query(RPC_METHODS.GET_BALANCE).catch((e) => e)) as ConnectError;
     // Still a typed lock refusal — not -32603 forever.
     expect(err.code).toBe(ERROR_CODES.WALLET_LOCKED);
   });

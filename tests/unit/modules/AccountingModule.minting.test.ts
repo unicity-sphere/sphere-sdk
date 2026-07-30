@@ -81,7 +81,9 @@ describe('UT-MINT-001: createInvoice mints via engine.mintDataToken', () => {
     expect(bytesToHex(params.tokenType!)).toBe(INVOICE_TOKEN_TYPE_HEX);
 
     // Mint payload = the canonical serialization of the returned terms.
-    expect(new TextDecoder().decode(params.data)).toBe(canonicalSerialize(result.terms));
+    // `terms` is optional on CreateInvoiceResult (absent only on failure); a
+    // successful createInvoice always populates it.
+    expect(new TextDecoder().decode(params.data)).toBe(canonicalSerialize(result.terms!));
 
     // Deterministic salt: 32 bytes (SHA-256 over signing key || serialized terms).
     expect(params.salt).toBeInstanceOf(Uint8Array);
@@ -143,15 +145,15 @@ describe('UT-MINT-008: stored engine blob carries the canonical serialized terms
     const result = await module.createInvoice(request);
 
     // Returned terms reflect the request.
-    expect(result.terms.memo).toBe('test memo');
-    expect(result.terms.targets).toEqual(request.targets);
+    expect(result.terms!.memo).toBe('test memo');
+    expect(result.terms!.targets).toEqual(request.targets);
 
     // Decode the stored blob via the SAME engine instance and read the data back.
     const added = (mocks.payments as any).addToken.mock.calls.at(-1)[0];
     const token = await engine.decodeToken(decodeTokenBlob(hexToBytes(added.sdkData)));
     const dataBytes = engine.readTokenData(token);
     expect(dataBytes).not.toBeNull();
-    expect(new TextDecoder().decode(dataBytes!)).toBe(canonicalSerialize(result.terms));
+    expect(new TextDecoder().decode(dataBytes!)).toBe(canonicalSerialize(result.terms!));
   });
 
   it('result.token is the transmittable engine-blob hex matching the stored sdkData', async () => {

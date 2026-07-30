@@ -203,7 +203,7 @@ function buildNonTargetTerms(): InvoiceTerms {
 
 /** Get the emitEvent mock fn from a module's injected deps. */
 function getEmitEvent(module: AccountingModule): ReturnType<typeof vi.fn> {
-  return (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+  return (module as unknown as { deps?: { emitEvent?: ReturnType<typeof vi.fn> } }).deps?.emitEvent as ReturnType<typeof vi.fn>;
 }
 
 /** Compute storage key as the module does internally (uses condensed addressId). */
@@ -650,8 +650,11 @@ describe('AccountingModule close/cancel: storage write ordering', () => {
 
     // Track storage.set call order
     const setOrder: string[] = [];
-    const originalSet = mocks.storage.set.getMockImplementation();
-    mocks.storage.set.mockImplementation(async (key: string, value: string) => {
+    // `storage.set` is declared by StorageProvider as a plain method; the mock
+    // provider backs it with a vi.fn(), so recover the spy surface.
+    const storageSet = vi.mocked(mocks.storage.set);
+    const originalSet = storageSet.getMockImplementation();
+    storageSet.mockImplementation(async (key: string, value: string) => {
       setOrder.push(key);
       if (originalSet) {
         return originalSet(key, value);
@@ -680,8 +683,10 @@ describe('AccountingModule close/cancel: storage write ordering', () => {
     seedInvoice(module, invoiceId, terms);
 
     const setOrder: string[] = [];
-    const originalSet = mocks.storage.set.getMockImplementation();
-    mocks.storage.set.mockImplementation(async (key: string, value: string) => {
+    // See above: recover the vi.fn() spy surface behind StorageProvider.set.
+    const storageSet = vi.mocked(mocks.storage.set);
+    const originalSet = storageSet.getMockImplementation();
+    storageSet.mockImplementation(async (key: string, value: string) => {
       setOrder.push(key);
       if (originalSet) {
         return originalSet(key, value);

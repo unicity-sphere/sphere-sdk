@@ -41,7 +41,6 @@ function mockIdentity(): FullIdentity {
     chainPubkey: FAKE_PUBKEY,
     directAddress: 'DIRECT://testaddress',
     privateKey: FAKE_PRIVATE_KEY,
-    transportPubkey: 'c'.repeat(64),
   };
 }
 

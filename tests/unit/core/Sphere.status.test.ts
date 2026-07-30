@@ -4,12 +4,14 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
+import type { InventoryView, StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
+import type { TokenBlob } from '../../../token-engine';
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
+import type { PricePlatform, TokenPrice } from '../../../price';
 import type { ProviderStatus, SphereEventMap } from '../../../types';
 
-import { Sphere } from '../../../core/Sphere';
+import { Sphere, type SphereInitOptions } from '../../../core/Sphere';
 import { TEST_NETWORK } from '../../test-network';
 
 // =============================================================================
@@ -125,7 +127,16 @@ function createMockTokenStorage(id: string, name: string): TokenStorageProvider<
       removed: 0,
       conflicts: 0,
     })),
-    onEvent: vi.fn().mockReturnValue(() => {}),
+    // S2 lazy-inventory surface: present so the double really satisfies the
+    // TokenStorageProvider port. An empty view and a loud getToken are the
+    // honest stand-ins for a store that holds nothing.
+    listInventory: vi.fn(async (): Promise<InventoryView> => ({
+      items: [], cursor: 0n, syncEpoch: 0n, more: false,
+    })),
+    getToken: vi.fn(async (tokenId: string): Promise<TokenBlob> => {
+      throw new Error(`mock token storage: no blob for ${tokenId}`);
+    }),
+    applyDelta: vi.fn(async (): Promise<void> => undefined),
   };
 }
 
@@ -157,9 +168,9 @@ describe('Sphere Status & Provider Management', () => {
   });
 
   async function initSphere(options?: {
-    price?: { platform: string };
+    price?: { platform: PricePlatform };
   }) {
-    const initOpts: Record<string, unknown> = {
+    const initOpts: SphereInitOptions = {
       storage,
       transport: transport as unknown as TransportProvider,
       oracle: oracle as unknown as OracleProvider,
@@ -170,12 +181,12 @@ describe('Sphere Status & Provider Management', () => {
     if (options?.price) {
       initOpts.price = {
         platform: options.price.platform,
-        getPrices: vi.fn().mockResolvedValue(new Map()),
-        getPrice: vi.fn().mockResolvedValue(null),
+        getPrices: vi.fn(async (): Promise<Map<string, TokenPrice>> => new Map()),
+        getPrice: vi.fn(async (): Promise<TokenPrice | null> => null),
         clearCache: vi.fn(),
       };
     }
-    const { sphere } = await Sphere.init(initOpts as Parameters<typeof Sphere.init>[0]);
+    const { sphere } = await Sphere.init(initOpts);
     return sphere;
   }
 

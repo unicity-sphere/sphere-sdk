@@ -15,7 +15,7 @@ import type { SphereToken } from '../../../token-engine';
 function tok(id: number): SphereToken {
   return {
     sdkToken: {} as SphereToken['sdkToken'],
-    blob: { v: 1, network: 2, token: new Uint8Array([id]) },
+    blob: { v: 1, network: 2, tokenId: id.toString(16).padStart(64, '0'), token: new Uint8Array([id]) },
     value: { assets: [] },
   };
 }

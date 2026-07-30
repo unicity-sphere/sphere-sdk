@@ -205,7 +205,7 @@ function startModule(binding: AddressBinding): Wallet {
     delivery: binding.delivery,
     walletApi: binding.client,
   };
-  const module = createPaymentsModule({ l1: null });
+  const module = createPaymentsModule();
   module.initialize(deps);
   cleanups.push(() => module.destroy());
   return { module, client: binding.client, engine: binding.engine, identity: binding.identity, delivery: binding.delivery };

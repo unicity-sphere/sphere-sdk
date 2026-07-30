@@ -11,6 +11,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
+import type { ITokenEngine } from '../../../token-engine';
 import { Sphere } from '../../../core/Sphere';
 import { FileStorageProvider } from '../../../impl/nodejs/storage/FileStorageProvider';
 import { FileTokenStorageProvider } from '../../../impl/nodejs/storage/FileTokenStorageProvider';
@@ -50,6 +51,20 @@ function createMockTransport(): TransportProvider {
   } as TransportProvider;
 }
 
+/** Minimal single-node trust base: parses, dials nothing. */
+const TRUST_BASE_JSON = {
+  changeRecordHash: null,
+  epoch: '0',
+  epochStartRound: '0',
+  networkId: 4,
+  previousEntryHash: null,
+  quorumThreshold: '1',
+  rootNodes: [{ nodeId: 'NODE', sigKey: '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798', stake: '1' }],
+  signatures: {},
+  stateHash: '00',
+  version: '1',
+};
+
 function createMockOracle(): OracleProvider {
   return {
     id: 'mock-oracle',
@@ -60,11 +75,12 @@ function createMockOracle(): OracleProvider {
     isConnected: vi.fn().mockReturnValue(true),
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     initialize: vi.fn().mockResolvedValue(undefined),
-    submitCommitment: vi.fn().mockResolvedValue({ requestId: 'test-id' }),
-    getProof: vi.fn().mockResolvedValue(null),
-    waitForProof: vi.fn().mockResolvedValue({ proof: 'mock' }),
-    validateToken: vi.fn().mockResolvedValue({ valid: true }),
-    mintToken: vi.fn().mockResolvedValue({ success: true, token: { id: 'mock-token' } }),
+    // The three config accessors ARE the post-cutover oracle surface, and they
+    // are what lets Sphere build a token engine here — without one, the
+    // "never mints" guard below would have nothing to watch.
+    getTrustBaseJson: () => TRUST_BASE_JSON,
+    getAggregatorUrl: () => 'https://127.0.0.1:1/never-called',
+    getApiKey: () => undefined,
   } as unknown as OracleProvider;
 }
 
@@ -106,7 +122,14 @@ describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)
     });
 
     (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mockClear();
-    (oracle.submitCommitment as ReturnType<typeof vi.fn>).mockClear();
+
+    // Watch the ONLY surface a nametag mint could go through today. The old
+    // guard watched `oracle.submitCommitment`, which the v1 cutover deleted from
+    // OracleProvider — nothing could call it, so the assertion could not fail.
+    const engine = (sphere as unknown as { _tokenEngine?: ITokenEngine })._tokenEngine;
+    expect(engine).toBeDefined();
+    const mint = vi.spyOn(engine!, 'mint');
+    const mintDataToken = vi.spyOn(engine!, 'mintDataToken');
 
     await sphere.registerNametag('alice');
 
@@ -118,8 +141,9 @@ describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)
     );
     // …updated local state…
     expect(sphere.identity!.nametag).toBe('alice');
-    // …and performed NO on-chain mint: registration never touches the aggregator.
-    expect(oracle.submitCommitment).not.toHaveBeenCalled();
+    // …and performed NO on-chain mint: registration is a Nostr binding, nothing more.
+    expect(mint).not.toHaveBeenCalled();
+    expect(mintDataToken).not.toHaveBeenCalled();
 
     await sphere.destroy();
   });

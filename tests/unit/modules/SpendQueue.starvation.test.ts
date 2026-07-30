@@ -11,7 +11,7 @@
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
 import {
   SpendQueue,
   SpendPlanner,
@@ -28,6 +28,9 @@ import type { SplitPlan, TokenWithAmount } from '../../../modules/payments/Token
 // =============================================================================
 // Test helpers
 // =============================================================================
+
+/** The candidate free-view list the planner is called with. */
+type SplitCandidates = Parameters<SpendPlanner['calculateOptimalSplitSync']>[0];
 
 let tokenCounter = 0;
 
@@ -114,7 +117,7 @@ describe('SpendQueue Starvation Protection', () => {
   let parsedCache: Map<string, ParsedTokenEntry>;
 
   // We spy on calculateOptimalSplitSync to control when plans succeed/fail
-  let calculateSpy: ReturnType<typeof vi.spyOn>;
+  let calculateSpy: MockInstance<SpendPlanner['calculateOptimalSplitSync']>;
 
   // Shared tokens used across tests — large enough pool to support various scenarios
   let smallToken: Token;
@@ -236,7 +239,7 @@ describe('SpendQueue Starvation Protection', () => {
       parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
 
       // large fails, small succeeds
-      calculateSpy.mockImplementation((_candidates: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_candidates: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 1_000_000n) return null;
         return makeDirectPlan([{ token: smallToken, amount: 100_000n }], 100_000n);
       });
@@ -305,7 +308,7 @@ describe('SpendQueue Starvation Protection', () => {
       parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
       parsedCache.set(smallToken2.id, makeParsedEntry(smallToken2, 100_000n));
       let smallCallCount = 0;
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 1_000_000n) return null;
         smallCallCount++;
         if (smallCallCount === 1) return makeDirectPlan([{ token: smallToken, amount: 100_000n }], 100_000n);
@@ -324,7 +327,7 @@ describe('SpendQueue Starvation Protection', () => {
       parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
 
       let largeCanPlan = false;
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 1_000_000n) {
           if (!largeCanPlan) return null;
           return makeDirectPlan([{ token: largeToken, amount: 1_000_000n }], 1_000_000n);
@@ -356,7 +359,7 @@ describe('SpendQueue Starvation Protection', () => {
       parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
 
       let largeCanPlan = false;
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 1_000_000n) {
           if (!largeCanPlan) return null;
           return makeDirectPlan([{ token: largeToken, amount: 1_000_000n }], 1_000_000n);
@@ -428,7 +431,7 @@ describe('SpendQueue Starvation Protection', () => {
 
       // Make 'behind' plannable — queue continues past blocker and serves it
       parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 1_000_000n) return null;
         return makeDirectPlan([{ token: smallToken, amount: 100_000n }], 100_000n);
       });
@@ -442,7 +445,7 @@ describe('SpendQueue Starvation Protection', () => {
     it('successfully planned entry is removed without affecting others', () => {
       const coinId = 'UCT';
 
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 500_000n) return null;
         return makeDirectPlan([{ token: smallToken, amount: 100_000n }], 100_000n);
       });
@@ -465,7 +468,7 @@ describe('SpendQueue Starvation Protection', () => {
       const tokB = makeToken('COIN_B', 100_000n, 'b-tok');
       parsedCache.set(tokB.id, makeParsedEntry(tokB, 100_000n));
 
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 1_000_000n) return null; // COIN_A large
         return makeDirectPlan([{ token: tokB, amount: 100_000n }], 100_000n);
       });
@@ -498,7 +501,7 @@ describe('SpendQueue Starvation Protection', () => {
       const tokB = makeToken('COIN_B', 100_000n, 'b-tok-2');
       parsedCache.set(tokB.id, makeParsedEntry(tokB, 100_000n));
 
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 1_000_000n) return null;
         return makeDirectPlan([{ token: tokB, amount: 100_000n }], 100_000n);
       });
@@ -529,7 +532,7 @@ describe('SpendQueue Starvation Protection', () => {
       parsedCache.set(tinyTok.id, makeParsedEntry(tinyTok, 50_000n));
 
       // large and small fail, tiny succeeds
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 50_000n) {
           return makeDirectPlan([{ token: tinyTok, amount: 50_000n }], 50_000n);
         }
@@ -569,7 +572,7 @@ describe('SpendQueue Starvation Protection', () => {
       parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
 
       let largeCanPlan = false;
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 1_000_000n) {
           if (!largeCanPlan) return null;
           return makeDirectPlan([{ token: largeToken, amount: 1_000_000n }], 1_000_000n);
@@ -678,7 +681,7 @@ describe('SpendQueue Starvation Protection', () => {
       const coinId = 'UCT';
       parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
 
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 1_000_000n) return null; // impossible
         return makeDirectPlan([{ token: smallToken, amount: targetAmount }], targetAmount);
       });
@@ -757,7 +760,7 @@ describe('SpendQueue Starvation Protection', () => {
 
       let allowLarge = false;
       let smallIdx = 0;
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount >= 1_000_000n) {
           if (!allowLarge) return null;
           return makeDirectPlan([{ token: largeToken, amount: 1_000_000n }], 1_000_000n);
@@ -802,7 +805,7 @@ describe('SpendQueue Starvation Protection', () => {
       const coinId = 'UCT';
       parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
 
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 999_999n) return null;
         return makeDirectPlan([{ token: smallToken, amount: 100_000n }], 100_000n);
       });
@@ -918,7 +921,7 @@ describe('SpendQueue Starvation Protection', () => {
       // Round 2: first entry succeeds, second entry fails
       // Round 3: second entry succeeds
       let round = 0;
-      calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
+      calculateSpy.mockImplementation((_c: SplitCandidates, targetAmount: bigint) => {
         if (targetAmount === 200_000n) {
           if (round >= 2) return makeDirectPlan([{ token: smallToken, amount: 200_000n }], 200_000n);
           return null;

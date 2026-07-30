@@ -34,6 +34,13 @@ function hex(bytes: Uint8Array): string {
 
 interface Harness extends DeliveryProviderContractContext {
   fake: FakeWalletApi;
+  /**
+   * Narrowed from the port's `DeliveryProvider`: the provider-specific pins
+   * below reach for the concrete implementation's surface (`walletApiClient`,
+   * the nametag-carrying `setIdentity`, the non-optional `deliverBatch`), which
+   * the generic contract type deliberately keeps optional/absent.
+   */
+  sender: WalletApiMailboxProvider;
   recipientProvider: WalletApiMailboxProvider;
   recipientClient: WalletApiClient;
 }
@@ -311,7 +318,7 @@ describe('WalletApiMailboxProvider — provider-specific semantics', () => {
         transferId: 'tf-h4b',
         memo: 'note to self',
       });
-      const incoming = await drain(selfProvider as WalletApiMailboxProvider);
+      const incoming = await drain(selfProvider);
       const delivery = incoming.find((d) => d.deliveryId === deliveryId);
       expect(delivery).toBeDefined();
       expect(delivery!.memo).toBe('note to self');

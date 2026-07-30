@@ -44,7 +44,6 @@ function fullIdentity(id: { privateKey: string; chainPubkey: string }): FullIden
     chainPubkey: id.chainPubkey,
     privateKey: id.privateKey,
     directAddress: `DIRECT://${id.chainPubkey.slice(0, 12)}`,
-    transportPubkey: id.chainPubkey.slice(2),
   };
 }
 
@@ -166,7 +165,7 @@ function makeFullPresetWallet(
     delivery,
     walletApi: client,
   };
-  const module = createPaymentsModule({ l1: null });
+  const module = createPaymentsModule();
   module.initialize(deps);
   cleanups.push(() => module.destroy());
   return { module, engine, client, delivery, emitEvent, storage, deps };
@@ -197,7 +196,7 @@ function makeOwnStorageWallet(
     delivery,
     walletApi: client,
   };
-  const module = createPaymentsModule({ l1: null });
+  const module = createPaymentsModule();
   module.initialize(deps);
   cleanups.push(() => module.destroy());
   return { module, engine, client, delivery, emitEvent, storage, deps };
@@ -315,7 +314,7 @@ describe('send — full wallet-api preset (S2 consumer + S3 + §7 pipeline)', ()
     await sender.module.load();
     await sender.module.mintFungibleToken(UCT, 1000n); // token exists BEFORE we break save
 
-    const local = sender.deps.tokenStorageProviders.get('local')!;
+    const local = sender.deps.tokenStorageProviders!.get('local')!;
     local.save = vi.fn(async () => ({ success: false, error: 'local save failed', timestamp: 0 }));
 
     await expect(
@@ -469,7 +468,7 @@ describe('send — batched mailbox deposit (#699)', () => {
     // "Restart" with the endpoint healthy again: load()'s replay converges the
     // journal per entry (replayOneDelivery — deliberately not batched, #699).
     batchDeposit.mockRestore();
-    const second = createPaymentsModule({ l1: null });
+    const second = createPaymentsModule();
     second.initialize({ ...sender.deps });
     cleanups.push(() => second.destroy());
     await second.load();
@@ -678,7 +677,7 @@ describe('interrupted deposit — journal replay on next load (S3 AC)', () => {
 
     // "Restart": a fresh module over the SAME storage + providers replays the
     // journal from load() — the deposit lands.
-    const second = createPaymentsModule({ l1: null });
+    const second = createPaymentsModule();
     second.initialize({ ...sender.deps });
     cleanups.push(() => second.destroy());
     await second.load();

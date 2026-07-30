@@ -65,7 +65,6 @@ function createMockIdentity(): FullIdentity {
     chainPubkey: ALICE.chainPubkey,
     directAddress: 'DIRECT://testaddr',
     privateKey: ALICE.privateKey,
-    transportPubkey: 'dd'.repeat(32),
   };
 }
 

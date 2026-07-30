@@ -17,6 +17,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { MockInstance } from 'vitest';
 import {
   createTestAccountingModule,
   createTestTransferRef,
@@ -75,8 +76,16 @@ function addLedgerEntry(
   (module as any).balanceCache.delete(invoiceId);
 }
 
-function getEmitEvent(module: AccountingModule): ReturnType<typeof vi.fn> {
-  return (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+/**
+ * The injected `emitEvent` dependency is a `vi.fn()` (see
+ * `createTestAccountingModule`). Typing it as a mock of the real
+ * `(type, data) => void` signature makes `.mock.calls` a `[string, unknown]`
+ * tuple list instead of `any[]`.
+ */
+type EmitEventMock = MockInstance<(type: string, data: unknown) => void>;
+
+function getEmitEvent(module: AccountingModule): EmitEventMock {
+  return (module as unknown as { deps?: { emitEvent?: EmitEventMock } }).deps?.emitEvent as EmitEventMock;
 }
 
 // =============================================================================
@@ -166,7 +175,7 @@ describe('BUG-002 Fix 3: _executeTerminationReturns per-send timeout', () => {
 
     // Verify auto_return_failed was emitted for the timed-out send
     const failedCalls = emitEvent.mock.calls.filter(
-      ([evt]: [string]) => evt === 'invoice:auto_return_failed',
+      ([evt]) => evt === 'invoice:auto_return_failed',
     );
     expect(failedCalls.length).toBeGreaterThan(0);
     expect(failedCalls[0][1]).toMatchObject({
@@ -212,7 +221,7 @@ describe('BUG-002 Fix 3: _executeTerminationReturns per-send timeout', () => {
 
     // No auto_return_failed event should have fired
     const failedCalls = emitEvent.mock.calls.filter(
-      ([evt]: [string]) => evt === 'invoice:auto_return_failed',
+      ([evt]) => evt === 'invoice:auto_return_failed',
     );
     expect(failedCalls.length).toBe(0);
 

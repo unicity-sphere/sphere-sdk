@@ -47,7 +47,6 @@ function fullIdentity(id: { privateKey: string; chainPubkey: string }): FullIden
     chainPubkey: id.chainPubkey,
     privateKey: id.privateKey,
     directAddress: `DIRECT://${id.chainPubkey.slice(0, 12)}`,
-    transportPubkey: id.chainPubkey.slice(2),
   };
 }
 
@@ -165,7 +164,7 @@ function makeDeps(
 }
 
 function initModule(deps: PaymentsModuleDependencies) {
-  const module = createPaymentsModule({ l1: null });
+  const module = createPaymentsModule();
   module.initialize(deps);
   cleanups.push(() => module.destroy());
   return module;
@@ -194,7 +193,7 @@ describe('#515 F1 — fail-closed composition invariant (S7 legality matrix)', (
 
   it("delivery custody 'inventory' without walletApi throws INVALID_CONFIG", () => {
     const parts = makeParts();
-    const module = createPaymentsModule({ l1: null });
+    const module = createPaymentsModule();
     let thrown: unknown;
     try {
       module.initialize(makeDeps(parts, { storage: parts.localStorage, custody: 'inventory' }));
@@ -208,7 +207,7 @@ describe('#515 F1 — fail-closed composition invariant (S7 legality matrix)', (
 
   it('an active thin storage provider without walletApi throws INVALID_CONFIG (any delivery)', () => {
     const parts = makeParts();
-    const module = createPaymentsModule({ l1: null });
+    const module = createPaymentsModule();
     let thrown: unknown;
     try {
       module.initialize(makeDeps(parts, { storage: parts.thinStorage }));
@@ -222,7 +221,7 @@ describe('#515 F1 — fail-closed composition invariant (S7 legality matrix)', (
 
   it('the full degraded incident composition (thin storage + inventory delivery, no client) throws', () => {
     const parts = makeParts();
-    const module = createPaymentsModule({ l1: null });
+    const module = createPaymentsModule();
     expect(() =>
       module.initialize(makeDeps(parts, { storage: parts.thinStorage, custody: 'inventory' }))
     ).toThrow(SphereError);
@@ -296,7 +295,7 @@ describe('#516 — failed putIntent must NOT leave a re-executable open intent',
       delivery,
       walletApi: client,
     };
-    const module = createPaymentsModule({ l1: null });
+    const module = createPaymentsModule();
     module.initialize(deps);
     cleanups.push(() => module.destroy());
 
@@ -376,7 +375,7 @@ describe('#670 — deterministic putIntent VALIDATION rejection is terminal', ()
       delivery,
       walletApi: client,
     };
-    const module = createPaymentsModule({ l1: null });
+    const module = createPaymentsModule();
     module.initialize(deps);
     cleanups.push(() => module.destroy());
 

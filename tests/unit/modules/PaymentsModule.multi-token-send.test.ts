@@ -34,7 +34,6 @@ import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 import { decodeTokenBlob, encodeTokenBlob } from '../../../token-engine/token-blob';
 import { bytesToHex, hexToBytes } from '../../../core/crypto';
 import type { V2TransferPayload } from '../../../types/v2-transfer';
-import { createMemoryDelivery } from '../../support/memory-delivery';
 
 // ── Scenario ─────────────────────────────────────────────────────────────────
 
@@ -162,7 +161,7 @@ class SimulatedNetworkEngine extends FakeTokenEngine {
 function mockIdentity(): FullIdentity {
   return {
     chainPubkey: FAKE_PUBKEY, directAddress: 'DIRECT://x',
-    privateKey: FAKE_PRIVATE_KEY, transportPubkey: 'dd'.repeat(32),
+    privateKey: FAKE_PRIVATE_KEY,
   };
 }
 

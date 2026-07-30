@@ -19,13 +19,20 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createPaymentsModule, type PaymentsModuleDependencies } from '../../../modules/payments/PaymentsModule';
-import type { Token, FullIdentity } from '../../../types';
+import type { Token, FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { TombstoneEntry } from '../../../types/txf';
-import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
+import type {
+  ApplyDeltaAdded,
+  ApplyDeltaOptions,
+  InventoryView,
+  StorageProvider,
+  TokenStorageProvider,
+  TxfStorageDataBase,
+} from '../../../storage';
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
-import type { SphereToken } from '../../../token-engine';
+import type { SphereToken, TokenBlob } from '../../../token-engine';
 import { encodeTokenBlob } from '../../../token-engine/token-blob';
 import { sha256, bytesToHex } from '../../../core/crypto';
 
@@ -152,6 +159,8 @@ function createMockDeps(engine: FakeTokenEngine): PaymentsModuleDependencies {
     has: vi.fn().mockResolvedValue(false),
     keys: vi.fn().mockResolvedValue([]),
     clear: vi.fn().mockResolvedValue(undefined),
+    saveTrackedAddresses: vi.fn(async (_entries: TrackedAddressEntry[]): Promise<void> => {}),
+    loadTrackedAddresses: vi.fn(async (): Promise<TrackedAddressEntry[]> => []),
   };
 
   const mockTokenStorage: TokenStorageProvider<TxfStorageDataBase> = {
@@ -168,6 +177,21 @@ function createMockDeps(engine: FakeTokenEngine): PaymentsModuleDependencies {
     save: vi.fn().mockResolvedValue({ success: true, timestamp: Date.now() }),
     load: vi.fn().mockResolvedValue({ success: false, source: 'local' as const, timestamp: Date.now() }),
     sync: vi.fn().mockResolvedValue({ success: true, added: 0, removed: 0, conflicts: 0 }),
+    // Lazy-inventory port (S2). This double holds nothing, so the view is empty
+    // and getToken() takes the documented "unknown token" throw. The tombstone
+    // paths under test (addToken/removeToken/mergeTombstones) only ever save().
+    listInventory: vi.fn(async (_since?: bigint): Promise<InventoryView> => ({
+      cursor: 0n, syncEpoch: 0n, more: false, items: [],
+    })),
+    getToken: vi.fn(async (tokenId: string): Promise<TokenBlob> => {
+      throw new Error(`Unknown token: ${tokenId}`);
+    }),
+    applyDelta: vi.fn(async (
+      _transferId: string,
+      _spent: string[],
+      _added: ApplyDeltaAdded[],
+      _opts?: ApplyDeltaOptions,
+    ): Promise<void> => {}),
   };
 
   const tokenStorageProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
@@ -190,7 +214,8 @@ function createMockDeps(engine: FakeTokenEngine): PaymentsModuleDependencies {
     onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
   } as unknown as TransportProvider;
 
-  // Post-cutover oracle surface: network config + legacy-TXF validateToken only.
+  // Post-cutover oracle surface: network config ONLY. `validateToken` was
+  // removed with the v1 stack — verification is the engine's job now.
   const mockOracle: OracleProvider = {
     id: 'mock-oracle',
     name: 'Mock Oracle',
@@ -200,7 +225,6 @@ function createMockDeps(engine: FakeTokenEngine): PaymentsModuleDependencies {
     isConnected: vi.fn().mockReturnValue(true),
     getStatus: vi.fn().mockReturnValue('connected' as const),
     initialize: vi.fn().mockResolvedValue(undefined),
-    validateToken: vi.fn().mockResolvedValue({ valid: true, spent: false }),
     getTrustBaseJson: vi.fn().mockReturnValue(null),
     getAggregatorUrl: vi.fn().mockReturnValue('https://aggregator.test'),
     getApiKey: vi.fn().mockReturnValue(undefined),

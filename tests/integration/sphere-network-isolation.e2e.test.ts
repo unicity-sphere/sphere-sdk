@@ -116,7 +116,6 @@ async function buildWallet(network: NetworkType): Promise<Sphere> {
     network,
     dataDir: SHARED_DATA_DIR,
     tokensDir: SHARED_TOKENS_DIR,
-    l1: undefined,
   });
   const { sphere } = await Sphere.init({
     ...providers,

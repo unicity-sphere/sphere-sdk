@@ -59,7 +59,7 @@ function createTxfData(address: string, tokenIds: string[]): TxfStorageDataBase 
     },
   };
   for (const id of tokenIds) {
-    (data as Record<string, unknown>)[`_${id}`] = {
+    data[`_${id}`] = {
       version: '2.0',
       state: { tokenId: id, coinId: 'UCT', amount: '1000000' },
       transactions: [],

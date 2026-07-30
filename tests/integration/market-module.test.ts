@@ -19,6 +19,7 @@ import { createBrowserProviders } from '../../impl/browser';
 import { createNodeProviders } from '../../impl/nodejs';
 import type { TransportProvider, OracleProvider } from '../../index';
 import type { ProviderStatus } from '../../types';
+import type { MarketModuleConfig } from '../../modules/market';
 import { TEST_NETWORK } from '../test-network';
 
 // =============================================================================
@@ -65,16 +66,38 @@ function createMockOracle(): OracleProvider {
   return {
     id: 'mock-oracle',
     name: 'Mock Oracle',
-    type: 'aggregator' as const,
+    // Same provider kind the real UnicityAggregatorProvider reports.
+    type: 'network' as const,
     connect: vi.fn().mockResolvedValue(undefined),
     disconnect: vi.fn().mockResolvedValue(undefined),
     isConnected: vi.fn().mockReturnValue(true),
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     initialize: vi.fn().mockResolvedValue(undefined),
-    submitCommitment: vi.fn().mockResolvedValue({ requestId: 'test-id' }),
-    getProof: vi.fn().mockResolvedValue(null),
-    validate: vi.fn().mockResolvedValue({ valid: [], invalid: [] }),
-  } as OracleProvider;
+    // The v2 config surface is the whole oracle contract post-cutover. No trust
+    // base → Sphere skips building the token engine, which is what these
+    // market-only tests exercise (no money movement).
+    getTrustBaseJson: vi.fn().mockReturnValue(null),
+    getAggregatorUrl: vi.fn().mockReturnValue('https://mock-aggregator.invalid'),
+    getApiKey: vi.fn().mockReturnValue(undefined),
+  };
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+/**
+ * `BrowserProviders.market` / `NodeProviders.market` are declared
+ * `MarketModuleConfig | boolean` even though the factories always hand back the
+ * resolved OBJECT form (`resolveMarketConfig` returns
+ * `MarketModuleConfig | undefined`). Narrow to that object form so field
+ * assertions type-check; a `boolean` would read back as `undefined` and still
+ * fail the assertion, so nothing is hidden.
+ */
+function marketConfigOf(
+  market: MarketModuleConfig | boolean | undefined
+): MarketModuleConfig | undefined {
+  return typeof market === 'object' ? market : undefined;
 }
 
 // =============================================================================
@@ -619,7 +642,7 @@ describe('MarketModule integration with Sphere', () => {
       });
 
       expect(providers.market).toBeDefined();
-      expect(providers.market?.apiUrl).toBe('https://custom.market.api');
+      expect(marketConfigOf(providers.market)?.apiUrl).toBe('https://custom.market.api');
     });
 
     it('should resolve market: true to empty config (defaults applied by MarketModule)', () => {
@@ -665,7 +688,7 @@ describe('MarketModule integration with Sphere', () => {
       });
 
       expect(providers.market).toBeDefined();
-      expect(providers.market?.apiUrl).toBe('https://node-custom.market.api');
+      expect(marketConfigOf(providers.market)?.apiUrl).toBe('https://node-custom.market.api');
     });
 
     it('should resolve market: true to empty config (defaults applied by MarketModule)', () => {
@@ -689,7 +712,7 @@ describe('MarketModule integration with Sphere', () => {
       });
 
       expect(providers.market).toBeDefined();
-      expect(providers.market?.timeout).toBe(60000);
+      expect(marketConfigOf(providers.market)?.timeout).toBe(60000);
     });
   });
 
@@ -761,7 +784,7 @@ describe('MarketModule integration with Sphere', () => {
       expect(providers.market).toBeDefined();
 
       // Market should have custom URL
-      expect(providers.market?.apiUrl).toBe('https://test-node-market.api');
+      expect(marketConfigOf(providers.market)?.apiUrl).toBe('https://test-node-market.api');
     });
   });
 

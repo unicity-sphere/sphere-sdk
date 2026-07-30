@@ -86,7 +86,7 @@ describe('SwapModule.proposeSwap()', () => {
     await module.proposeSwap(deal);
 
     // resolve called with @alice and @bob (plus escrow)
-    const resolveArgs = mocks.resolve.mock.calls.map((c: unknown[]) => c[0]);
+    const resolveArgs = vi.mocked(mocks.resolve).mock.calls.map((c: unknown[]) => c[0]);
     expect(resolveArgs).toContain('@alice');
     expect(resolveArgs).toContain('@bob');
   });

@@ -254,7 +254,7 @@ describe('CommunicationsModule — storage & pagination', () => {
 
       const transport1 = createMockTransport();
       (transport1.onMessage as ReturnType<typeof vi.fn>).mockReturnValue(unsub1);
-      (transport1 as Record<string, unknown>).onComposing = vi.fn().mockReturnValue(unsub2);
+      transport1.onComposing = vi.fn().mockReturnValue(unsub2);
 
       const deps1 = createDeps({ transport: transport1 });
       mod.initialize(deps1);

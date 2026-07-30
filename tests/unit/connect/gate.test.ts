@@ -31,7 +31,7 @@ describe('ConnectClient gate', () => {
     const h = makeClientHarness();
     void h.client.connect();
     await Promise.resolve();
-    const req = h.sent[0] as Record<string, unknown>;
+    const req = h.sent[0] as unknown as Record<string, unknown>;
     expect((req.network as { id: number }).id).toBe(WALLET_NET);
     expect(typeof req.sdkVersion).toBe('string');
     expect(req.v).toBe(SPHERE_CONNECT_VERSION);
@@ -90,13 +90,15 @@ function makeHostHarness(opts?: { minMinorVersion?: number }) {
   const onConnectionRejected = vi.fn();
   const onConnectionRequest = vi.fn(async () => ({ approved: true, grantedPermissions: [PERMISSION_SCOPES.IDENTITY_READ] }));
   const host = new ConnectHost({ sphere, transport, onConnectionRequest, onConnectionRejected, onIntent: vi.fn(), ...opts });
-  const send = (msg: Partial<SphereConnectMessage> & Record<string, unknown>) =>
-    clientHandler?.({ ns: SPHERE_CONNECT_NAMESPACE, type: 'handshake', direction: 'request', permissions: [], ...msg } as SphereConnectMessage);
+  // Deliberately UNTYPED wire input: these tests hand the host off-version handshakes
+  // (v: '1.0'), which `SphereConnectMessage` cannot express by construction.
+  const send = (msg: Record<string, unknown>) =>
+    clientHandler?.({ ns: SPHERE_CONNECT_NAMESPACE, type: 'handshake', direction: 'request', permissions: [], ...msg } as unknown as SphereConnectMessage);
   return { host, sent, send, onConnectionRejected, onConnectionRequest };
 }
 
 const handshakeResponses = (sent: SphereConnectMessage[]) =>
-  sent.filter((m) => m.type === 'handshake' && (m as { direction?: string }).direction === 'response') as Array<Record<string, unknown>>;
+  sent.filter((m) => m.type === 'handshake' && (m as { direction?: string }).direction === 'response') as unknown as Array<Record<string, unknown>>;
 
 describe('ConnectHost gate', () => {
   it('rejects a v1 client with UNSUPPORTED_PROTOCOL_VERSION and does not call onConnectionRequest', async () => {
