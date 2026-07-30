@@ -1011,6 +1011,49 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(sent).toBeDefined();
   });
 
+  it('a provider swap mid-resume applies the spend to the provider the sources came from', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-swap-1');
+    const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // The provider the resume reads its sources from, and a second one standing
+    // in for the post-switch active provider.
+    const original = sender.deps.tokenStorageProviders!.values().next().value as
+      TokenStorageProvider<TxfStorageDataBase>;
+    const originalApply = vi.spyOn(original, 'applyDelta');
+    const swapped = new WalletApiTokenStorageProvider({ client: sender.client, stateStore: new MemoryKeyValueStore() });
+    swapped.setIdentity(fullIdentity(SENDER));
+    const swappedApply = vi.spyOn(swapped, 'applyDelta');
+
+    // Swap while the resume is in flight — after the sources were read, before
+    // the apply. Delivery is the last step before applyDelta, so this hook lands
+    // squarely inside the window (an address switch does exactly this).
+    const realDeliver = sender.delivery.deliver.bind(sender.delivery);
+    vi.spyOn(sender.delivery, 'deliver').mockImplementation(async (...args) => {
+      sender.module.updateTokenStorageProviders(new Map([[swapped.id, swapped]]));
+      return realDeliver(...args);
+    });
+
+    const transferId = crypto.randomUUID();
+    sender.client.setIdentity(SENDER);
+    await sender.client.putIntent(
+      transferId,
+      encryptField(
+        deriveFieldEncryptionKey(SENDER.privateKey),
+        JSON.stringify({ v: 1, recipient: RECIPIENT.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] })
+      )
+    );
+
+    const outcome = await sender.module.resumeOpenIntents();
+    expect(outcome.resumed).toEqual([transferId]);
+    // The spend lands on the provider that supplied the sources — never on the
+    // one that became active mid-flight.
+    expect(originalApply).toHaveBeenCalledTimes(1);
+    expect(swappedApply).not.toHaveBeenCalled();
+    expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({ status: 'removed' });
+  });
+
   it('#676: a locally-aborted intent whose server abort never landed is NOT re-executed on resume (double-pay guard)', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-676');
