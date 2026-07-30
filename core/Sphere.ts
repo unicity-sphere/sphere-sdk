@@ -1636,9 +1636,6 @@ export class Sphere {
    * (the format `exportToTxt` writes, optionally password-encrypted), a legacy
    * flat-JSON webwallet export, or a bare mnemonic in a text file.
    *
-   * Bitcoin Core `.dat` import was removed — the wallet is L3-only (#604); such a
-   * file is refused by name rather than reported as an unreadable backup.
-   *
    * @example
    * const result = await Sphere.importFromLegacyFile({
    *   fileContent: await file.text(),
@@ -1648,8 +1645,8 @@ export class Sphere {
    * });
    */
   static async importFromLegacyFile(options: Omit<SphereImportOptions, 'mnemonic' | 'masterKey' | 'chainCode' | 'derivationPath' | 'basePath' | 'derivationMode'> & {
-    /** File content - Uint8Array for .dat, string for .txt */
-    fileContent: string | Uint8Array;
+    /** The backup file's text. */
+    fileContent: string;
     /** File name (used for type detection) */
     fileName: string;
     /** Password for encrypted files */
@@ -1683,23 +1680,9 @@ export class Sphere {
       return { success: true, sphere, mnemonic };
     }
 
-    // Bitcoin Core wallet.dat import was removed (the wallet is L3-only since
-    // #604). Refuse it BY NAME: falling through to "unsupported file" reads as
-    // "your backup is broken" when the truth is "this format was dropped".
-    if (fileName.endsWith('.dat')) {
-      return {
-        success: false,
-        error:
-          'Bitcoin Core wallet.dat import is no longer supported. Extract the master private key ' +
-          '(and chain code) externally and use Sphere.import() instead.',
-      };
-    }
-
     // Handle .txt file
     if (fileType === 'txt') {
-      const content = typeof fileContent === 'string'
-        ? fileContent
-        : new TextDecoder().decode(fileContent);
+      const content = fileContent;
 
       let parseResult;
 
@@ -1735,9 +1718,7 @@ export class Sphere {
 
     // Handle JSON
     if (fileType === 'json') {
-      const content = typeof fileContent === 'string'
-        ? fileContent
-        : new TextDecoder().decode(fileContent);
+      const content = fileContent;
 
       let parsed: Record<string, unknown>;
       try {
@@ -1826,12 +1807,7 @@ export class Sphere {
   /**
    * Detect legacy file type from filename and content
    */
-  static detectLegacyFileType(fileName: string, content: string | Uint8Array): LegacyFileType {
-
-    // Check content for type detection
-    const textContent = typeof content === 'string'
-      ? content
-      : (content.length < 1000 ? new TextDecoder().decode(content) : '');
+  static detectLegacyFileType(fileName: string, content: string): LegacyFileType {
 
     // Check for JSON
     if (fileName.endsWith('.json')) {
@@ -1839,7 +1815,7 @@ export class Sphere {
     }
 
     try {
-      const trimmed = textContent.trim();
+      const trimmed = content.trim();
       if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
         JSON.parse(trimmed);
         return 'json';
@@ -1849,7 +1825,7 @@ export class Sphere {
     }
 
     // Check for mnemonic (12 or 24 words)
-    const words = textContent.trim().split(/\s+/);
+    const words = content.trim().split(/\s+/);
     if (
       (words.length === 12 || words.length === 24) &&
       words.every((w) => /^[a-z]+$/.test(w.toLowerCase()))
@@ -1858,7 +1834,7 @@ export class Sphere {
     }
 
     // Check for text wallet format
-    if (isWalletTextFormat(textContent)) {
+    if (isWalletTextFormat(content)) {
       return 'txt';
     }
 
@@ -1868,22 +1844,16 @@ export class Sphere {
   /**
    * Check if a legacy file is encrypted
    */
-  static isLegacyFileEncrypted(fileName: string, content: string | Uint8Array): boolean {
+  static isLegacyFileEncrypted(fileName: string, content: string): boolean {
     const fileType = Sphere.detectLegacyFileType(fileName, content);
 
     if (fileType === 'txt') {
-      const textContent = typeof content === 'string'
-        ? content
-        : new TextDecoder().decode(content);
-      return isTextWalletEncrypted(textContent);
+      return isTextWalletEncrypted(content);
     }
 
     if (fileType === 'json') {
       try {
-        const textContent = typeof content === 'string'
-          ? content
-          : new TextDecoder().decode(content);
-        const data = JSON.parse(textContent);
+        const data = JSON.parse(content);
         return !!data.encrypted;
       } catch {
         return false;

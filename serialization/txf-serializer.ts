@@ -1,18 +1,14 @@
 /**
  * TXF storage-data serializer.
  *
- * Post v1-cutover this file owns exactly one job: build and parse the
- * `TxfStorageData` DOCUMENT (the `_meta` / `_nametags` / `_tombstones` /
- * `_history` envelope plus the per-token slots). The v1 TXF *token* codec —
- * `normalizeSdkTokenToStorage` / `tokenToTxf` / `objectToTxf` / `txfToToken`
- * and the six v1 utility readers — is GONE. Tokens persist as opaque v2 CBOR
- * blobs (hex) in `Token.sdkData`.
+ * Builds and parses the `TxfStorageData` DOCUMENT — the `_meta` / `_nametags` /
+ * `_tombstones` / `_history` envelope plus the per-token slots. Tokens
+ * themselves are opaque v2 CBOR blobs (hex) in `Token.sdkData`; this file never
+ * decodes one.
  *
- * A stored v1 TXF token record can still arrive here from an old wallet. It is
- * NEVER silently reinterpreted as a v2 blob: both the write and the read path
- * log a warning, record a validation error, and skip the record.
+ * A record that is not a v2 blob is logged and skipped on both the read and the
+ * write path — never reinterpreted.
  */
-
 import type {
   TxfToken,
   TxfStorageData,
@@ -65,12 +61,8 @@ function isV2TokenEntry(entry: unknown): entry is Token {
   );
 }
 
-/**
- * A stored v1 TXF token record (`{ version, genesis, state, transactions }`).
- * The v1 codec is removed, so these are recognised only to be REFUSED loudly —
- * never coerced into the v2 blob shape.
- */
-function isLegacyV1TxfEntry(entry: unknown): boolean {
+/** A stored record carrying a decoded token object rather than a v2 blob — unreadable here. */
+function isUndecodableEntry(entry: unknown): boolean {
   return typeof entry === 'object' && entry !== null && 'genesis' in entry;
 }
 
@@ -81,10 +73,9 @@ function isLegacyV1TxfEntry(entry: unknown): boolean {
 /**
  * Build TXF storage data from tokens and metadata.
  *
- * Only v2 blob tokens are written. A token carrying v1 TXF JSON in `sdkData`
- * is a relic of the pre-v2 wallet: it is unspendable, has no v2 encoding, and
- * is dropped with a loud warning rather than being written back in a shape the
- * reader can no longer interpret.
+ * Only v2 blob tokens are written. Anything else in `sdkData` has no v2
+ * encoding, so it is dropped with a warning rather than written back in a shape
+ * the reader cannot interpret.
  */
 export async function buildTxfStorageData(
   tokens: Token[],
@@ -126,8 +117,7 @@ export async function buildTxfStorageData(
     } else {
       logger.warn(
         'TXF',
-        `Refusing to persist token ${token.id.slice(0, 16)}...: sdkData is not a v2 token blob ` +
-          '(legacy v1 TXF or empty). The v1 token format is no longer supported — entry skipped.'
+        `Refusing to persist token ${token.id.slice(0, 16)}...: sdkData is not a v2 token blob — entry skipped`
       );
     }
   }
@@ -251,10 +241,8 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
       if (isV2TokenEntry(entry)) {
         // v2 storage entry — the UI token record (opaque blob in sdkData).
         result.tokens.push(entry as Token);
-      } else if (isLegacyV1TxfEntry(entry)) {
-        // A v1 TXF token from a pre-v2 wallet. The v1 codec is gone; refuse it
-        // loudly instead of guessing a v2 blob out of a shape that is not one.
-        const msg = `Token ${tokenId}: legacy v1 TXF record — the v1 token format is no longer supported, entry skipped`;
+      } else if (isUndecodableEntry(entry)) {
+        const msg = `Token ${tokenId}: sdkData is not a v2 token blob — entry skipped`;
         logger.warn('TXF', msg);
         result.validationErrors.push(msg);
       } else {
@@ -284,7 +272,7 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
     }
     // Individual file format tokens (legacy per-file `{ token: TxfToken }` records)
     else if (key.startsWith('token-')) {
-      const msg = `Token ${key}: legacy per-file v1 TXF record — the v1 token format is no longer supported, entry skipped`;
+      const msg = `Token ${key}: sdkData is not a v2 token blob — entry skipped`;
       logger.warn('TXF', msg);
       result.validationErrors.push(msg);
     }

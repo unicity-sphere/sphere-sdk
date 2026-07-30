@@ -289,8 +289,8 @@ describe('parseTxfStorageData()', () => {
 // Loud refusal of removed v1 shapes
 // =============================================================================
 
-describe('parseTxfStorageData() — legacy v1 records are refused, never coerced', () => {
-  it('reports a stored v1 TXF token as a validation error and drops it', () => {
+describe('parseTxfStorageData() — non-v2 records are refused, never coerced', () => {
+  it('reports a stored non-v2 token record as a validation error and drops it', () => {
     const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const tokenId = 'ef'.repeat(32);
 
@@ -301,7 +301,7 @@ describe('parseTxfStorageData() — legacy v1 records are refused, never coerced
 
     expect(parsed.tokens).toHaveLength(0);
     expect(parsed.validationErrors.join(' ')).toContain(tokenId);
-    expect(parsed.validationErrors.join(' ')).toContain('v1 TXF');
+    expect(parsed.validationErrors.join(' ')).toContain('not a v2 token blob');
     expect(warn).toHaveBeenCalled();
   });
 

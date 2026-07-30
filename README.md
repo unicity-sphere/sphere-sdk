@@ -726,17 +726,12 @@ import {
 ## Token storage format
 
 Tokens persist as opaque **v2 CBOR blob hex** in `Token.sdkData`. The storage
-DOCUMENT around them (the `_meta` / `_nametags` / `_tombstones` / `_history`
+document around them (the `_meta` / `_nametags` / `_tombstones` / `_history`
 envelope) is built and parsed by:
 
 ```typescript
 import { buildTxfStorageData, parseTxfStorageData } from '@unicitylabs/sphere-sdk';
 ```
-
-The v1 TXF *token* codec (`tokenToTxf`, `txfToToken`, `objectToTxf`,
-`getCurrentStateHash`, `hasUncommittedTransactions` and siblings) has been
-removed. A stored v1 TXF record arriving from an old wallet is never
-reinterpreted as a v2 blob — it is logged and skipped.
 
 ## Token Validation
 

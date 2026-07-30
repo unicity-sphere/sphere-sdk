@@ -209,27 +209,6 @@ Anyone with your master private key can access all your funds.`;
 // Detection
 // =============================================================================
 
-/** SQLite file magic — the leading bytes of a Bitcoin Core wallet.dat */
-const SQLITE_MAGIC = 'SQLite format 3';
-
-/**
- * Refuse a Bitcoin Core wallet.dat blob loudly instead of failing with a vague
- * "no master key found". The wallet.dat importer was removed (the wallet is
- * L3-only); callers must extract the master key themselves and use
- * `Sphere.import({ masterKey, chainCode, basePath, derivationMode })`.
- *
- * @returns an error result when the content is a wallet.dat, otherwise null
- */
-function rejectWalletDat(content: string): LegacyFileParseResult | null {
-  if (!content.startsWith(SQLITE_MAGIC)) return null;
-  return {
-    success: false,
-    error:
-      'Bitcoin Core wallet.dat import is no longer supported. Extract the master ' +
-      'private key (and chain code) externally and use Sphere.import() instead.',
-  };
-}
-
 /**
  * Check if content is wallet text format
  */
@@ -256,8 +235,6 @@ export function isTextWalletEncrypted(content: string): boolean {
  */
 export function parseWalletText(content: string): LegacyFileParseResult {
   try {
-    const datRejection = rejectWalletDat(content);
-    if (datRejection) return datRejection;
 
     const isEncrypted = isTextWalletEncrypted(content);
 
@@ -342,8 +319,6 @@ export function parseAndDecryptWalletText(
   password: string
 ): LegacyFileParseResult {
   try {
-    const datRejection = rejectWalletDat(content);
-    if (datRejection) return datRejection;
 
     const isEncrypted = isTextWalletEncrypted(content);
 

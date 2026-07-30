@@ -5,16 +5,12 @@
  * - DIRECT://  — Resolved on-chain address (hex, 64-80 chars after prefix)
  * - @nametag   — Human-readable alias resolved via transport
  *
- * `PROXY://` addressing was removed in the v1→v2 cutover. There is no proxy
- * address scheme anywhere in the SDK; a string in that form is refused here.
- *
  * This module is the single source of truth for address handling.
  * All applications (escrow, sphere app, orchestrator) should import from here.
  *
  * @module
  */
 
-import { logger } from './logger';
 
 // =============================================================================
 // Constants
@@ -22,12 +18,6 @@ import { logger } from './logger';
 
 const DIRECT_PREFIX = 'DIRECT://';
 const NAMETAG_PREFIX = '@';
-
-/**
- * Removed address scheme, kept only so an address in this form is refused
- * loudly instead of falling through as an unrecognized string.
- */
-const REMOVED_PROXY_PREFIX = 'proxy://';
 
 // DIRECT:// accepts any non-empty value after the prefix.
 // Strict hex validation is NOT enforced here — the SDK resolves addresses
@@ -66,7 +56,6 @@ export interface ParsedAddress {
  * @example
  * parseAddress('DIRECT://0000ab12...') → { type: 'DIRECT', raw: '...', value: '0000ab12...' }
  * parseAddress('@alice')               → { type: 'NAMETAG', raw: '@alice', value: 'alice' }
- * parseAddress('PROXY://abc123...')    → null (scheme removed — logged as a warning)
  * parseAddress('invalid')              → null
  */
 export function parseAddress(address: string): ParsedAddress | null {
@@ -78,18 +67,6 @@ export function parseAddress(address: string): ParsedAddress | null {
     if (value.length > 0) {
       return { type: 'DIRECT', raw: trimmed, value };
     }
-    return null;
-  }
-
-  // PROXY:// addressing was removed. Refuse it explicitly and audibly so a
-  // stored record or a peer's message carrying the old form fails visibly
-  // instead of being silently mistaken for a DIRECT address.
-  if (trimmed.toLowerCase().startsWith(REMOVED_PROXY_PREFIX)) {
-    logger.warn(
-      'Address',
-      'Refusing PROXY:// address — proxy addressing was removed; use a DIRECT:// address or @nametag',
-      { address: trimmed }
-    );
     return null;
   }
 
