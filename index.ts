@@ -361,6 +361,8 @@ export {
 export type {
   LegacyFileParsedData,
   LegacyFileParseResult,
+  LegacyFileType,
+  DecryptionProgressCallback,
 } from './serialization';
 
 // =============================================================================

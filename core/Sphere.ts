@@ -112,6 +112,14 @@ import {
   type ITokenEngine,
   type VerificationWorkerConfig,
 } from '../token-engine';
+import {
+  isTextWalletEncrypted,
+  isWalletTextFormat,
+  parseAndDecryptWalletText,
+  parseWalletText,
+} from '../serialization/wallet-text';
+import type { DecryptionProgressCallback, LegacyFileType } from '../serialization/types';
+import { decryptWithSalt } from './encryption';
 import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
 
 export function isValidNametag(nametag: string): boolean {
@@ -1621,6 +1629,268 @@ export class Sphere {
     // Only now terminate what it replaced: the engine may own a verification
     // worker pool, and every api-key change would otherwise leak one.
     if (replaced && replaced !== this._tokenEngine) replaced.dispose?.();
+  }
+
+  /**
+   * Import a wallet from a backup file: a `UNICITY WALLET DETAILS` text backup
+   * (the format `exportToTxt` writes, optionally password-encrypted), a legacy
+   * flat-JSON webwallet export, or a bare mnemonic in a text file.
+   *
+   * Bitcoin Core `.dat` import was removed — the wallet is L3-only (#604); such a
+   * file is refused by name rather than reported as an unreadable backup.
+   *
+   * @example
+   * const result = await Sphere.importFromLegacyFile({
+   *   fileContent: await file.text(),
+   *   fileName: file.name,
+   *   password,          // when the backup is encrypted
+   *   ...providers,
+   * });
+   */
+  static async importFromLegacyFile(options: Omit<SphereImportOptions, 'mnemonic' | 'masterKey' | 'chainCode' | 'derivationPath' | 'basePath' | 'derivationMode'> & {
+    /** File content - Uint8Array for .dat, string for .txt */
+    fileContent: string | Uint8Array;
+    /** File name (used for type detection) */
+    fileName: string;
+    /** Password for encrypted files */
+    password?: string;
+    /** Progress callback for long decryption operations */
+    onDecryptProgress?: DecryptionProgressCallback;
+  }): Promise<{
+    success: boolean;
+    sphere?: Sphere;
+    mnemonic?: string;
+    needsPassword?: boolean;
+    error?: string;
+  }> {
+    const { fileContent, fileName, password, onDecryptProgress, ...baseOptions } = options;
+
+    // Detect file type
+    const fileType = Sphere.detectLegacyFileType(fileName, fileContent);
+
+    if (fileType === 'unknown') {
+      return { success: false, error: 'Unknown file format' };
+    }
+
+    // Handle mnemonic text
+    if (fileType === 'mnemonic') {
+      const mnemonic = (fileContent as string).trim().toLowerCase().split(/\s+/).join(' ');
+      if (!Sphere.validateMnemonic(mnemonic)) {
+        return { success: false, error: 'Invalid mnemonic phrase' };
+      }
+
+      const sphere = await Sphere.import({ ...baseOptions, mnemonic });
+      return { success: true, sphere, mnemonic };
+    }
+
+    // Bitcoin Core wallet.dat import was removed (the wallet is L3-only since
+    // #604). Refuse it BY NAME: falling through to "unsupported file" reads as
+    // "your backup is broken" when the truth is "this format was dropped".
+    if (fileName.endsWith('.dat')) {
+      return {
+        success: false,
+        error:
+          'Bitcoin Core wallet.dat import is no longer supported. Extract the master private key ' +
+          '(and chain code) externally and use Sphere.import() instead.',
+      };
+    }
+
+    // Handle .txt file
+    if (fileType === 'txt') {
+      const content = typeof fileContent === 'string'
+        ? fileContent
+        : new TextDecoder().decode(fileContent);
+
+      let parseResult;
+
+      if (password) {
+        parseResult = parseAndDecryptWalletText(content, password);
+      } else if (isTextWalletEncrypted(content)) {
+        return { success: false, needsPassword: true, error: 'Password required for encrypted wallet' };
+      } else {
+        parseResult = parseWalletText(content);
+      }
+
+      if (parseResult.needsPassword && !password) {
+        return { success: false, needsPassword: true, error: 'Password required for encrypted wallet' };
+      }
+
+      if (!parseResult.success || !parseResult.data) {
+        return { success: false, error: parseResult.error };
+      }
+
+      const { masterKey, chainCode, descriptorPath, derivationMode } = parseResult.data;
+      const basePath = descriptorPath ? `m/${descriptorPath}` : DEFAULT_BASE_PATH;
+
+      const sphere = await Sphere.import({
+        ...baseOptions,
+        masterKey,
+        chainCode,
+        basePath,
+        derivationMode: derivationMode || (chainCode ? 'bip32' : 'wif_hmac'),
+      });
+
+      return { success: true, sphere };
+    }
+
+    // Handle JSON
+    if (fileType === 'json') {
+      const content = typeof fileContent === 'string'
+        ? fileContent
+        : new TextDecoder().decode(fileContent);
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(content);
+      } catch {
+        return { success: false, error: 'Invalid JSON file' };
+      }
+
+      // sphere-wallet format — delegate to importFromJSON
+      if (parsed.type === 'sphere-wallet') {
+        const result = await Sphere.importFromJSON({
+          ...baseOptions,
+          jsonContent: content,
+          password,
+        });
+
+        if (result.success) {
+          const sphere = Sphere.getInstance();
+          return { success: true, sphere: sphere!, mnemonic: result.mnemonic };
+        }
+
+        if (!password && result.error?.includes('Password required')) {
+          return { success: false, needsPassword: true, error: result.error };
+        }
+
+        return { success: false, error: result.error };
+      }
+
+      // Legacy flat JSON format (webwallet export)
+      let masterKey: string | undefined;
+      let mnemonic: string | undefined;
+
+      if (parsed.encrypted && typeof parsed.encrypted === 'object') {
+        // Encrypted legacy JSON — needs password + salt-based PBKDF2 decryption
+        if (!password) {
+          return { success: false, needsPassword: true, error: 'Password required for encrypted wallet' };
+        }
+        const enc = parsed.encrypted as { masterPrivateKey?: string; mnemonic?: string; salt?: string };
+        if (!enc.salt || !enc.masterPrivateKey) {
+          return { success: false, error: 'Invalid encrypted wallet format' };
+        }
+        const decryptedKey = decryptWithSalt(enc.masterPrivateKey, password, enc.salt);
+        if (!decryptedKey) {
+          return { success: false, error: 'Failed to decrypt - incorrect password?' };
+        }
+        masterKey = decryptedKey;
+        if (enc.mnemonic) {
+          mnemonic = decryptWithSalt(enc.mnemonic, password, enc.salt) ?? undefined;
+        }
+      } else {
+        // Unencrypted legacy JSON
+        masterKey = parsed.masterPrivateKey as string | undefined;
+        mnemonic = parsed.mnemonic as string | undefined;
+      }
+
+      if (!masterKey) {
+        return { success: false, error: 'No master key found in wallet JSON' };
+      }
+
+      const chainCode = parsed.chainCode as string | undefined;
+      const descriptorPath = parsed.descriptorPath as string | undefined;
+      const derivationMode = (parsed.derivationMode as string | undefined);
+      const isBIP32 = derivationMode === 'bip32' || !!chainCode;
+      const basePath = descriptorPath
+        ? `m/${descriptorPath}`
+        : (isBIP32 ? "m/84'/1'/0'" : DEFAULT_BASE_PATH);
+
+      if (mnemonic) {
+        const sphere = await Sphere.import({ ...baseOptions, mnemonic, basePath });
+        return { success: true, sphere, mnemonic };
+      }
+
+      const sphere = await Sphere.import({
+        ...baseOptions,
+        masterKey,
+        chainCode,
+        basePath,
+        derivationMode: (derivationMode as DerivationMode) || (chainCode ? 'bip32' : 'wif_hmac'),
+      });
+      return { success: true, sphere };
+    }
+
+    return { success: false, error: 'Unsupported file type' };
+  }
+
+  /**
+   * Detect legacy file type from filename and content
+   */
+  static detectLegacyFileType(fileName: string, content: string | Uint8Array): LegacyFileType {
+
+    // Check content for type detection
+    const textContent = typeof content === 'string'
+      ? content
+      : (content.length < 1000 ? new TextDecoder().decode(content) : '');
+
+    // Check for JSON
+    if (fileName.endsWith('.json')) {
+      return 'json';
+    }
+
+    try {
+      const trimmed = textContent.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        JSON.parse(trimmed);
+        return 'json';
+      }
+    } catch {
+      // Not JSON
+    }
+
+    // Check for mnemonic (12 or 24 words)
+    const words = textContent.trim().split(/\s+/);
+    if (
+      (words.length === 12 || words.length === 24) &&
+      words.every((w) => /^[a-z]+$/.test(w.toLowerCase()))
+    ) {
+      return 'mnemonic';
+    }
+
+    // Check for text wallet format
+    if (isWalletTextFormat(textContent)) {
+      return 'txt';
+    }
+
+    return 'unknown';
+  }
+
+  /**
+   * Check if a legacy file is encrypted
+   */
+  static isLegacyFileEncrypted(fileName: string, content: string | Uint8Array): boolean {
+    const fileType = Sphere.detectLegacyFileType(fileName, content);
+
+    if (fileType === 'txt') {
+      const textContent = typeof content === 'string'
+        ? content
+        : new TextDecoder().decode(content);
+      return isTextWalletEncrypted(textContent);
+    }
+
+    if (fileType === 'json') {
+      try {
+        const textContent = typeof content === 'string'
+          ? content
+          : new TextDecoder().decode(content);
+        const data = JSON.parse(textContent);
+        return !!data.encrypted;
+      } catch {
+        return false;
+      }
+    }
+
+    return false;
   }
 
   /**
