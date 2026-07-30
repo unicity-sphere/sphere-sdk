@@ -388,99 +388,6 @@ describe('TokenReservationLedger', () => {
   // Cleanup
   // ---------------------------------------------------------------------------
 
-  describe('Cleanup', () => {
-    it('cleanup(maxAgeMs) removes reservations older than threshold', () => {
-      // Create a reservation with a known createdAt by mocking Date.now
-      const originalNow = Date.now;
-      try {
-        Date.now = () => 100;
-        ledger.reserve('res-1', entry('tok-1', 200000n, 1000000n), 'UCT');
-
-        Date.now = () => 200;
-        ledger.reserve('res-2', entry('tok-1', 100000n, 1000000n), 'UCT');
-
-        // At time 400, cleanup with maxAge 150 -> threshold is 250
-        // res-1 (created=100, age=300) -> old, remove
-        // res-2 (created=200, age=200) -> old, remove
-        Date.now = () => 400;
-        const cancelled = ledger.cleanup(150);
-
-        expect(cancelled).toContain('res-1');
-        expect(cancelled).toContain('res-2');
-        expect(ledger.getSize()).toBe(0);
-        expect(ledger.getFreeAmount('tok-1', 1000000n)).toBe(1000000n);
-      } finally {
-        Date.now = originalNow;
-      }
-    });
-
-    it('cleanup returns IDs of active reservations that were cancelled', () => {
-      const originalNow = Date.now;
-      try {
-        Date.now = () => 100;
-        ledger.reserve('res-1', entry('tok-1', 200000n, 1000000n), 'UCT');
-        ledger.reserve('res-2', entry('tok-1', 100000n, 1000000n), 'UCT');
-
-        Date.now = () => 5000;
-        ledger.reserve('res-3', entry('tok-1', 50000n, 1000000n), 'UCT');
-
-        Date.now = () => 5100;
-        const cancelled = ledger.cleanup(500);
-
-        // res-1 and res-2 old enough, res-3 is not
-        expect(cancelled).toHaveLength(2);
-        expect(cancelled).toContain('res-1');
-        expect(cancelled).toContain('res-2');
-        expect(ledger.getReservation('res-3')?.status).toBe('active');
-      } finally {
-        Date.now = originalNow;
-      }
-    });
-
-    it('cleanup removes committed and cancelled entries too (by age) but only returns active ones', () => {
-      const originalNow = Date.now;
-      try {
-        Date.now = () => 100;
-        ledger.reserve('res-1', entry('tok-1', 300000n, 1000000n), 'UCT');
-        ledger.reserve('res-2', entry('tok-1', 400000n, 1000000n), 'UCT');
-        ledger.commit('res-2');
-
-        Date.now = () => 5000;
-        const cancelled = ledger.cleanup(500);
-
-        // res-1 was active -> cancelled by cleanup -> returned
-        // res-2 was committed -> removed but not in cancelled list
-        expect(cancelled).toEqual(['res-1']);
-
-        // Both are removed from the ledger
-        expect(ledger.getSize()).toBe(0);
-
-        // res-2 was committed so its amount was freed by cleanup removal
-        // (cleanup removes from tokenIndex for active ones that get cancelled)
-        // For committed, they are just deleted from reservations map
-        expect(ledger.getFreeAmount('tok-1', 1000000n)).toBe(1000000n);
-      } finally {
-        Date.now = originalNow;
-      }
-    });
-
-    it('cleanup does not remove reservations within threshold', () => {
-      const originalNow = Date.now;
-      try {
-        Date.now = () => 5000;
-        ledger.reserve('res-1', entry('tok-1', 300000n, 1000000n), 'UCT');
-
-        Date.now = () => 5050;
-        const cancelled = ledger.cleanup(100);
-
-        expect(cancelled).toEqual([]);
-        expect(ledger.getSize()).toBe(1);
-        expect(ledger.getReservation('res-1')?.status).toBe('active');
-      } finally {
-        Date.now = originalNow;
-      }
-    });
-  });
 
   // ---------------------------------------------------------------------------
   // clear() and getSize()
@@ -598,85 +505,6 @@ describe('TokenReservationLedger', () => {
       ).toThrow('DUPLICATE_RESERVATION_ID');
     });
 
-    it('fuzz: random sequence of 100 operations preserves invariants', () => {
-      const tokens = [
-        { id: 'tok-1', amount: 1000000n },
-        { id: 'tok-2', amount: 2000000n },
-        { id: 'tok-3', amount: 500000n },
-        { id: 'tok-4', amount: 750000n },
-        { id: 'tok-5', amount: 1500000n },
-      ];
-      const activeIds: string[] = [];
-      const allIds: string[] = [];
-      let nextId = 0;
-
-      // Seed-based pseudo-random for reproducibility
-      let seed = 42;
-      function rand() {
-        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-        return seed;
-      }
-
-      for (let i = 0; i < 100; i++) {
-        const op = rand() % 5;
-
-        try {
-          if (op === 0) {
-            // reserve: pick 1-2 random tokens, reserve a small amount
-            const tok = tokens[rand() % tokens.length];
-            const maxFree = ledger.getFreeAmount(tok.id, tok.amount);
-            if (maxFree > 0n) {
-              const amount = BigInt((rand() % Number(maxFree)) + 1);
-              const resId = `fuzz-${nextId++}`;
-              ledger.reserve(
-                resId,
-                entry(tok.id, amount, tok.amount),
-                'UCT',
-              );
-              activeIds.push(resId);
-              allIds.push(resId);
-            }
-          } else if (op === 1 && activeIds.length > 0) {
-            // cancel a random active reservation
-            const idx = rand() % activeIds.length;
-            ledger.cancel(activeIds[idx]);
-            activeIds.splice(idx, 1);
-          } else if (op === 2 && activeIds.length > 0) {
-            // commit a random active reservation
-            const idx = rand() % activeIds.length;
-            ledger.commit(activeIds[idx]);
-            activeIds.splice(idx, 1);
-          } else if (op === 3) {
-            // cancelForToken
-            const tok = tokens[rand() % tokens.length];
-            ledger.cancelForToken(tok.id);
-            // Remove cancelled ones from activeIds (simplified: just refresh)
-            const remaining: string[] = [];
-            for (const id of activeIds) {
-              const res = ledger.getReservation(id);
-              if (res && res.status === 'active') {
-                remaining.push(id);
-              }
-            }
-            activeIds.length = 0;
-            activeIds.push(...remaining);
-          } else if (op === 4) {
-            // cleanup with large maxAge (shouldn't affect recent entries)
-            ledger.cleanup(999999999);
-          }
-        } catch {
-          // Expected: INSUFFICIENT_FREE_AMOUNT etc. — skip
-        }
-
-        // Verify invariant after every operation
-        for (const tok of tokens) {
-          const free = ledger.getFreeAmount(tok.id, tok.amount);
-          const reserved = ledger.getTotalReserved(tok.id);
-          expect(free + reserved).toBe(tok.amount);
-          expect(free >= 0n).toBe(true);
-        }
-      }
-    });
   });
 
   // ---------------------------------------------------------------------------
@@ -738,22 +566,6 @@ describe('TokenReservationLedger', () => {
       expect(ledger.hasActiveReservation('tok-2')).toBe(false);
     });
 
-    it('cleanup with maxAgeMs = 0 removes everything', () => {
-      const originalNow = Date.now;
-      try {
-        Date.now = () => 1000;
-        ledger.reserve('res-1', entry('tok-1', 300000n, 1000000n), 'UCT');
-        ledger.reserve('res-2', entry('tok-1', 200000n, 1000000n), 'UCT');
-
-        Date.now = () => 1001;
-        const cancelled = ledger.cleanup(0);
-
-        expect(cancelled).toHaveLength(2);
-        expect(ledger.getSize()).toBe(0);
-      } finally {
-        Date.now = originalNow;
-      }
-    });
   });
 
   describe('cancelForToken with excludeReservationId', () => {

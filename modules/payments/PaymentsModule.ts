@@ -38,7 +38,7 @@ import {
 } from '../../token-engine';
 import { WalletApiCheckpointStore } from '../../impl/shared/wallet-api/WalletApiCheckpointStore';
 import { WalletApiError } from '../../wallet-api';
-import { isV2TransferPayload, type V2TransferPayload } from '../../types/v2-transfer';
+import type { V2TransferPayload } from '../../types/v2-transfer';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import {
   MAX_SEND_OPERATION_CONCURRENCY,
@@ -1458,16 +1458,6 @@ export class PaymentsModule {
       const loadedTokens = Array.from(this.tokens.values()).map(t => `${t.id.slice(0, 12)}(${t.status})`);
       logger.debug('Payments', `load(): from TXF providers: ${this.tokens.size} tokens [${loadedTokens.join(', ')}]`);
 
-      // v1 cutover: drop the legacy PENDING_V5_TOKENS KV key if a pre-cutover
-      // wallet still carries one. The orphaned-token terminalization it fed ran
-      // for every load since the cutover and has served its purpose; with the v1
-      // stack gone there is nothing left to terminalize, so this is now only a
-      // one-time key cleanup.
-      try {
-        await this.deps!.storage.remove(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
-      } catch (err) {
-        logger.warn('Payments', 'load(): failed to drop legacy PENDING_V5_TOKENS:', err);
-      }
 
       // Crash recovery: tokens persisted mid-send stay 'transferring' forever —
       // nothing else writes that status, and v2 storage round-trips it verbatim.
@@ -3694,57 +3684,6 @@ export class PaymentsModule {
   }
 
   /**
-   * Merge tombstones received from a remote sync source.
-   *
-   * Any local token whose `(tokenId, stateHash)` matches a remote tombstone is
-   * removed. The remote tombstones are then added to the local set (union merge).
-   *
-   * @param remoteTombstones - Tombstone entries from the remote source.
-   * @returns Number of local tokens that were removed.
-   */
-  async mergeTombstones(remoteTombstones: TombstoneEntry[]): Promise<number> {
-    this.ensureInitialized();
-
-    let removedCount = 0;
-    const tombstoneKeys = new Set(
-      remoteTombstones.map(t => `${t.tokenId}:${t.stateHash}`)
-    );
-
-    // Find tokens to remove
-    const tokensToRemove: Token[] = [];
-    for (const token of this.tokens.values()) {
-      const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
-      const currentStateHash = extractStateHashFromSdkData(token.sdkData);
-
-      const key = `${sdkTokenId}:${currentStateHash}`;
-      if (tombstoneKeys.has(key)) {
-        tokensToRemove.push(token);
-      }
-    }
-
-    for (const token of tokensToRemove) {
-      this.tokens.delete(token.id);
-      logger.debug('Payments', `Removed tombstoned token ${token.id.slice(0, 8)}...`);
-      removedCount++;
-    }
-
-    // Merge tombstones (union)
-    for (const remoteTombstone of remoteTombstones) {
-      const key = `${remoteTombstone.tokenId}:${remoteTombstone.stateHash}`;
-      if (!this.tombstoneKeySet.has(key)) {
-        this.tombstones.push(remoteTombstone);
-        this.tombstoneKeySet.add(key);
-      }
-    }
-
-    if (removedCount > 0) {
-      await this.save();
-    }
-
-    return removedCount;
-  }
-
-  /**
    * Remove tombstones older than `maxAge` and cap the list at 100 entries.
    *
    * @param maxAge - Maximum age in milliseconds (default: 30 days).
@@ -3775,30 +3714,6 @@ export class PaymentsModule {
    */
   getHistory(): TransactionHistoryEntry[] {
     return [...this._historyCache].sort((a, b) => b.timestamp - a.timestamp);
-  }
-
-  /**
-   * Best-effort resolve sender's DIRECT address and nametag from their transport pubkey.
-   * Returns empty object if transport doesn't support resolution or lookup fails.
-   */
-  private async resolveSenderInfo(senderTransportPubkey: string): Promise<{
-    senderAddress?: string;
-    senderNametag?: string;
-  }> {
-    try {
-      if (this.deps?.transport?.resolveTransportPubkeyInfo) {
-        const peerInfo = await this.deps.transport.resolveTransportPubkeyInfo(senderTransportPubkey);
-        if (peerInfo) {
-          return {
-            senderAddress: peerInfo.directAddress || undefined,
-            senderNametag: peerInfo.nametag || undefined,
-          };
-        }
-      }
-    } catch {
-      // Best-effort: ignore resolution failures
-    }
-    return {};
   }
 
   /**
@@ -4581,12 +4496,8 @@ export class PaymentsModule {
       logger.warn('Payments', `V2 transfer ${id.slice(0, 16)}... rejected by storage (tombstoned/duplicate) — no event emitted`);
       return 'storage-rejected';
     }
-    // The sender's nametag rides the recipient-addressed delivery envelope
-    // (S6) — the PRIMARY counterparty identity. resolveSenderInfo (a Nostr
-    // transport-pubkey lookup that does NOT understand chain pubkeys) is only a
-    // best-effort FALLBACK and never gates receive.
-    const senderInfo = await this.resolveSenderInfo(senderPubkey);
-    const senderNametag = payload.senderNametag ?? senderInfo.senderNametag;
+    // The sender's nametag rides the recipient-addressed delivery envelope (S6).
+    const senderNametag = payload.senderNametag;
 
     this.deps!.emitEvent('transfer:incoming', {
       id,
@@ -4604,7 +4515,6 @@ export class PaymentsModule {
       symbol: uiToken.symbol,
       timestamp: Date.now(),
       senderPubkey,
-      ...senderInfo,
       ...(senderNametag !== undefined ? { senderNametag } : {}),
       memo: payload.memo,
       tokenId: id,

@@ -6,21 +6,27 @@
  * a blocked one are always scanned and served if tokens are available.
  *
  * Key constants under test:
- *   MAX_SKIP_COUNT = 10   — skipCount tracks how many times an entry was skipped
+ *   SKIP_ROUNDS = 10   — skipCount tracks how many times an entry was skipped
  *   QUEUE_TIMEOUT_MS = 30000 — entries expire after 30s
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
+/**
+ * How many times the queue is nudged while a large entry cannot be planned.
+ * Local to this suite: the queue itself keeps no skip counter — what is asserted
+ * is that later entries keep being served while an unservable one waits.
+ */
 import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
 import {
   SpendQueue,
   SpendPlanner,
-  MAX_SKIP_COUNT,
   QUEUE_TIMEOUT_MS,
   type ParsedTokenPool,
   type ParsedTokenEntry,
   type PlanResult,
 } from '../../../modules/payments/SpendQueue';
+
+const SKIP_ROUNDS = 10;
 import { TokenReservationLedger } from '../../../modules/payments/TokenReservationLedger';
 import type { Token } from '../../../types';
 import type { SplitPlan, TokenWithAmount } from '../../../modules/payments/TokenSplitCalculator';
@@ -279,10 +285,10 @@ describe('SpendQueue Starvation Protection', () => {
   });
 
   // =========================================================================
-  // 3. Starvation bound — MAX_SKIP_COUNT tracking (queue never blocks)
+  // 3. Starvation bound — SKIP_ROUNDS tracking (queue never blocks)
   // =========================================================================
   describe('Starvation bound', () => {
-    it('continues past entry that reaches MAX_SKIP_COUNT to serve later entries', () => {
+    it('continues past entry that reaches SKIP_ROUNDS to serve later entries', () => {
       const coinId = 'UCT';
 
       // All entries always fail to plan — this lets us count skip increments
@@ -292,10 +298,10 @@ describe('SpendQueue Starvation Protection', () => {
       catchUnhandled(enqueueEntry('small-1', coinId, 100_000n));
       catchUnhandled(enqueueEntry('small-2', coinId, 100_000n));
 
-      // Fire notifyChange MAX_SKIP_COUNT times — large gets skipped each time
+      // Fire notifyChange SKIP_ROUNDS times — large gets skipped each time
       // but small-1 and small-2 also can't be planned (null), so they just
       // get their own skipCounts incremented too.
-      for (let i = 0; i < MAX_SKIP_COUNT; i++) {
+      for (let i = 0; i < SKIP_ROUNDS; i++) {
         queue.notifyChange(coinId);
       }
 
@@ -322,7 +328,7 @@ describe('SpendQueue Starvation Protection', () => {
       expect(queue.size(coinId)).toBe(1);
     });
 
-    it('large entry that reaches MAX_SKIP_COUNT is served when tokens become available', async () => {
+    it('large entry that reaches SKIP_ROUNDS is served when tokens become available', async () => {
       const coinId = 'UCT';
       parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
 
@@ -338,8 +344,8 @@ describe('SpendQueue Starvation Protection', () => {
       const largePromise = enqueueEntry('large-1', coinId, 1_000_000n);
       catchUnhandled(enqueueEntry('small-1', coinId, 100_000n));
 
-      // Skip large MAX_SKIP_COUNT times
-      for (let i = 0; i < MAX_SKIP_COUNT; i++) {
+      // Skip large SKIP_ROUNDS times
+      for (let i = 0; i < SKIP_ROUNDS; i++) {
         queue.notifyChange(coinId);
         ledger.cancel('small-1');
       }
@@ -371,7 +377,7 @@ describe('SpendQueue Starvation Protection', () => {
       // Use a dummy small that gets served during skip-ahead rounds
       catchUnhandled(enqueueEntry('small-dummy', coinId, 100_000n));
 
-      for (let i = 0; i < MAX_SKIP_COUNT; i++) {
+      for (let i = 0; i < SKIP_ROUNDS; i++) {
         queue.notifyChange(coinId);
         ledger.cancel('small-dummy');
       }
@@ -422,7 +428,7 @@ describe('SpendQueue Starvation Protection', () => {
       catchUnhandled(enqueueEntry('behind', coinId, 100_000n));
 
       // Push both entries' skipCounts up — both get incremented each round
-      for (let i = 0; i < MAX_SKIP_COUNT; i++) {
+      for (let i = 0; i < SKIP_ROUNDS; i++) {
         queue.notifyChange(coinId);
       }
 
@@ -509,8 +515,8 @@ describe('SpendQueue Starvation Protection', () => {
       catchUnhandled(enqueueEntry('a-blocker', 'COIN_A', 1_000_000n));
       const bPromise = enqueueEntry('b-ok', 'COIN_B', 100_000n);
 
-      // Skip COIN_A blocker past MAX_SKIP_COUNT
-      for (let i = 0; i < MAX_SKIP_COUNT + 1; i++) {
+      // Skip COIN_A blocker past SKIP_ROUNDS
+      for (let i = 0; i < SKIP_ROUNDS + 1; i++) {
         queue.notifyChange('COIN_A');
       }
 
@@ -526,7 +532,7 @@ describe('SpendQueue Starvation Protection', () => {
   // 6. Edge: skipCount reaches limit on same pass as another entry served
   // =========================================================================
   describe('Edge cases', () => {
-    it('when blocker reaches MAX_SKIP_COUNT, entries behind it are still served on that pass', () => {
+    it('when blocker reaches SKIP_ROUNDS, entries behind it are still served on that pass', () => {
       const coinId = 'UCT';
       const tinyTok = makeToken(coinId, 50_000n, 'tiny-tok');
       parsedCache.set(tinyTok.id, makeParsedEntry(tinyTok, 50_000n));
@@ -543,9 +549,9 @@ describe('SpendQueue Starvation Protection', () => {
       catchUnhandled(enqueueEntry('small', coinId, 500_000n));
       catchUnhandled(enqueueEntry('tiny', coinId, 50_000n));
 
-      // Push large to MAX_SKIP_COUNT - 1 = 9
+      // Push large to SKIP_ROUNDS - 1 = 9
       // During each round, large is skipped, small is skipped, tiny is served
-      for (let i = 0; i < MAX_SKIP_COUNT - 1; i++) {
+      for (let i = 0; i < SKIP_ROUNDS - 1; i++) {
         queue.notifyChange(coinId);
         // Release tiny reservation so it can be re-served next round
         ledger.cancel('tiny');
@@ -567,7 +573,7 @@ describe('SpendQueue Starvation Protection', () => {
       expect(queue.size(coinId)).toBe(2);
     });
 
-    it('entry at MAX_SKIP_COUNT - 1 gets served on that pass if tokens arrive', async () => {
+    it('entry at SKIP_ROUNDS - 1 gets served on that pass if tokens arrive', async () => {
       const coinId = 'UCT';
       parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
 
@@ -583,8 +589,8 @@ describe('SpendQueue Starvation Protection', () => {
       const largePromise = enqueueEntry('large', coinId, 1_000_000n);
       catchUnhandled(enqueueEntry('small', coinId, 100_000n));
 
-      // Push large to MAX_SKIP_COUNT - 1
-      for (let i = 0; i < MAX_SKIP_COUNT - 1; i++) {
+      // Push large to SKIP_ROUNDS - 1
+      for (let i = 0; i < SKIP_ROUNDS - 1; i++) {
         queue.notifyChange(coinId);
         ledger.cancel('small');
       }
@@ -645,7 +651,7 @@ describe('SpendQueue Starvation Protection', () => {
       expect(queue.size(coinId)).toBe(0);
     });
 
-    it('three notifyChange calls with nothing plannable leave entries queued; MAX_SKIP_COUNT blocks', () => {
+    it('three notifyChange calls with nothing plannable leave entries queued; SKIP_ROUNDS blocks', () => {
       const coinId = 'UCT';
       calculateSpy.mockReturnValue(null);
 
@@ -659,7 +665,7 @@ describe('SpendQueue Starvation Protection', () => {
       // Both still queued, not at MAX (3 < 10)
       expect(queue.size(coinId)).toBe(2);
 
-      // 7 more should push e1 to MAX_SKIP_COUNT
+      // 7 more should push e1 to SKIP_ROUNDS
       for (let i = 0; i < 7; i++) {
         queue.notifyChange(coinId);
       }
@@ -689,7 +695,7 @@ describe('SpendQueue Starvation Protection', () => {
       const impossiblePromise = catchUnhandled(enqueueEntry('impossible', coinId, 1_000_000n));
 
       // Serve some possible entries while impossible accumulates skips
-      for (let i = 0; i < MAX_SKIP_COUNT - 1; i++) {
+      for (let i = 0; i < SKIP_ROUNDS - 1; i++) {
         const p = enqueueEntry(`possible-${i}`, coinId, 100_000n);
         queue.notifyChange(coinId);
         await p; // each is served immediately via skip-ahead
@@ -747,7 +753,7 @@ describe('SpendQueue Starvation Protection', () => {
       );
     });
 
-    it('one large send among many smalls is served within MAX_SKIP_COUNT rounds', async () => {
+    it('one large send among many smalls is served within SKIP_ROUNDS rounds', async () => {
       const coinId = 'UCT';
 
       // Create unique tokens for each small entry to avoid INSUFFICIENT_FREE_AMOUNT
@@ -777,8 +783,8 @@ describe('SpendQueue Starvation Protection', () => {
         catchUnhandled(enqueueEntry(`small-${i}`, coinId, 50_000n));
       }
 
-      // Skip large up to MAX_SKIP_COUNT
-      for (let i = 0; i < MAX_SKIP_COUNT; i++) {
+      // Skip large up to SKIP_ROUNDS
+      for (let i = 0; i < SKIP_ROUNDS; i++) {
         queue.notifyChange(coinId);
         // Release all small reservations
         for (let j = 0; j < 5; j++) {
@@ -786,7 +792,7 @@ describe('SpendQueue Starvation Protection', () => {
         }
       }
 
-      // After MAX_SKIP_COUNT rounds, large blocks the queue.
+      // After SKIP_ROUNDS rounds, large blocks the queue.
       allowLarge = true;
       parsedCache.set(largeToken.id, makeParsedEntry(largeToken, 1_000_000n));
 
@@ -812,8 +818,8 @@ describe('SpendQueue Starvation Protection', () => {
 
       const headPromise = catchUnhandled(enqueueEntry('head', coinId, 999_999n));
 
-      // Push head to MAX_SKIP_COUNT so its skipCount is high
-      for (let i = 0; i < MAX_SKIP_COUNT; i++) {
+      // Push head to SKIP_ROUNDS so its skipCount is high
+      for (let i = 0; i < SKIP_ROUNDS; i++) {
         queue.notifyChange(coinId);
       }
 
@@ -838,13 +844,13 @@ describe('SpendQueue Starvation Protection', () => {
       expect(queue.size(coinId)).toBe(0);
     });
 
-    it('entry that times out while blocked at MAX_SKIP_COUNT is properly cleaned up', async () => {
+    it('entry that times out while blocked at SKIP_ROUNDS is properly cleaned up', async () => {
       const coinId = 'UCT';
       calculateSpy.mockReturnValue(null);
 
       const p = catchUnhandled(enqueueEntry('doomed', coinId, 1_000_000n));
 
-      for (let i = 0; i < MAX_SKIP_COUNT; i++) {
+      for (let i = 0; i < SKIP_ROUNDS; i++) {
         queue.notifyChange(coinId);
       }
 
@@ -891,14 +897,14 @@ describe('SpendQueue Starvation Protection', () => {
   // 11. cancelAll resets everything
   // =========================================================================
   describe('cancelAll clears starvation state', () => {
-    it('cancelAll rejects all entries including those at MAX_SKIP_COUNT', async () => {
+    it('cancelAll rejects all entries including those at SKIP_ROUNDS', async () => {
       const coinId = 'UCT';
       calculateSpy.mockReturnValue(null);
 
       const p1 = catchUnhandled(enqueueEntry('e1', coinId, 500_000n));
       const p2 = catchUnhandled(enqueueEntry('e2', coinId, 100_000n));
 
-      for (let i = 0; i < MAX_SKIP_COUNT; i++) {
+      for (let i = 0; i < SKIP_ROUNDS; i++) {
         queue.notifyChange(coinId);
       }
 
