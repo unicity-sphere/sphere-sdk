@@ -514,7 +514,7 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
       await putOpenIntent(payer, transferId, sourceTokenId);
       await paySettling(payer, reqId, transferId);
       await expect(payer.module.payPaymentRequest(reqId)).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
-      await expect(payer.module.payPaymentRequest(reqId)).rejects.toThrow(/not pending or accepted/i);
+      await expect(payer.module.payPaymentRequest(reqId)).rejects.toThrow(/not pending/i);
     });
 
     it('(RELOAD, load-bearing) a settling request is NOT re-surfaced as payable — a fresh module over the SAME storage+server holds it settling, no re-notify', async () => {
@@ -661,8 +661,10 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
 
       // Enqueue a journal mutation under identity A but do NOT await it…
       const pA = (
-        payer.module as unknown as { journalSettling(r: string, t: string, c?: boolean): Promise<void> }
-      ).journalSettling('reqA', 'tidA');
+        payer.module as unknown as {
+          requests: { journalSettling(r: string, t: string, c?: boolean): Promise<void> };
+        }
+      ).requests.journalSettling('reqA', 'tidA');
 
       // …then synchronously switch to identity B (a distinct chainPubkey). The
       // queued mutation's .then runs AFTER the switch; the enqueue-time key guard
@@ -675,8 +677,9 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
       // reqA must NOT have leaked into identity B's IN-MEMORY journal. Without the
       // key guard the queued mutation reloads B's (empty) journal, injects reqA,
       // and persists — polluting B's session state with a prior identity's link.
-      const bJournal = (payer.module as unknown as { settlingJournal: Map<string, unknown> | null })
-        .settlingJournal;
+      const bJournal = (
+        payer.module as unknown as { requests: { settlingJournal: Map<string, unknown> | null } }
+      ).requests.settlingJournal;
       expect(bJournal?.has('reqA') ?? false).toBe(false);
     });
 
@@ -700,10 +703,12 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
       );
 
       // Force a fresh load under identity A and start it (do not await — it blocks).
-      (payer.module as unknown as { settlingJournalLoad: Promise<void> | null }).settlingJournalLoad = null;
+      (
+        payer.module as unknown as { requests: { settlingJournalLoad: Promise<void> | null } }
+      ).requests.settlingJournalLoad = null;
       const loadP = (
-        payer.module as unknown as { ensureSettlingJournalLoaded(): Promise<void> }
-      ).ensureSettlingJournalLoaded();
+        payer.module as unknown as { requests: { ensureSettlingJournalLoaded(): Promise<void> } }
+      ).requests.ensureSettlingJournalLoaded();
 
       // Switch to identity B while A's load is blocked.
       const B = testIdentity(7777);
@@ -714,8 +719,9 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
       await loadP.catch(() => {});
 
       // B's in-memory journal must NOT have been clobbered with A's data.
-      const j = (payer.module as unknown as { settlingJournal: Map<string, unknown> | null })
-        .settlingJournal;
+      const j = (
+        payer.module as unknown as { requests: { settlingJournal: Map<string, unknown> | null } }
+      ).requests.settlingJournal;
       expect(j?.has('reqA') ?? false).toBe(false);
     });
 
@@ -754,9 +760,9 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
 
     it('(concurrency RMW) two journalSettling for distinct requests racing from cold both survive (no dropped entry = no re-payable double-pay)', async () => {
       const { fake, payer } = await seedPendingRequest('rmw');
-      const mod = payer.module as unknown as {
-        journalSettling(requestId: string, transferId: string): Promise<void>;
-      };
+      const mod = (payer.module as unknown as {
+        requests: { journalSettling(requestId: string, transferId: string): Promise<void> };
+      }).requests;
       // Race both writes from the null-loaded state — the serialized RMW + single-flight load must
       // keep BOTH (a lost entry would re-surface that request payable = double-pay, the #679/#680 lesson).
       await Promise.all([mod.journalSettling('req-A', 'tid-A'), mod.journalSettling('req-B', 'tid-B')]);

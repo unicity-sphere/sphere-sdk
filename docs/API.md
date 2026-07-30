@@ -664,10 +664,6 @@ const pending = sphere.payments.getPaymentRequests({ status: 'pending' });
 
 Get count of pending payment requests.
 
-#### `acceptPaymentRequest(requestId: string): Promise<void>`
-
-Accept a payment request (marks as accepted, sends response to requester).
-
 #### `rejectPaymentRequest(requestId: string): Promise<void>`
 
 Reject a payment request (marks as rejected, sends response to requester).
@@ -680,12 +676,6 @@ Accept and pay a payment request in one operation.
 // Pay a request directly
 const result = await sphere.payments.payPaymentRequest(requestId, 'Payment for ticket');
 ```
-
-#### `markPaymentRequestPaid(requestId: string): void`
-
-Mark a payment request as paid (local status update only).
-
-Typically called after a successful `send()` to record that the request has been fulfilled.
 
 #### `clearProcessedPaymentRequests(): void`
 

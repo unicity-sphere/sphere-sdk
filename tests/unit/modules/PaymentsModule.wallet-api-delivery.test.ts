@@ -715,13 +715,13 @@ describe('interrupted deposit — journal replay on next load (S3 AC)', () => {
     // Crash-simulated journal entry for the SAME blob; replay must succeed
     // (200 with the same entry_id — §6), not error, and clear the journal.
     /* eslint-disable @typescript-eslint/no-explicit-any */
-    await (sender.module as any).savePendingV2Delivery({
+    await (sender.module as any).deliveries.savePendingV2Delivery({
       transferId: result.id,
       recipientPubkey: RECIPIENT.chainPubkey,
       tokenBlob: bytesToHex(deliveredBlob!),
       createdAt: Date.now(),
     });
-    await (sender.module as any).replayPendingV2Deliveries();
+    await (sender.module as any).deliveries.replayPendingV2Deliveries();
     /* eslint-enable @typescript-eslint/no-explicit-any */
 
     expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
@@ -777,7 +777,7 @@ describe('recipient-side 429 must NOT fail the sender (covenant §3.1 — issue 
     // Recipient drains → the deferred blob lands on the next replay; journal clears.
     quotaFull = false;
     /* eslint-disable @typescript-eslint/no-explicit-any */
-    await (sender.module as any).replayPendingV2Deliveries();
+    await (sender.module as any).deliveries.replayPendingV2Deliveries();
     /* eslint-enable @typescript-eslint/no-explicit-any */
     expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(1);
     expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
@@ -792,12 +792,12 @@ describe('journaled-delivery replay: bounded backoff + poison surfacing (#517 it
 
     // Drive the backoff loop without waiting real time.
     /* eslint-disable @typescript-eslint/no-explicit-any */
-    (sender.module as any).replayBackoffBaseMs = 0;
+    (sender.module as any).deliveries.replayBackoffBaseMs = 0;
 
     // A journaled finished blob whose delivery ALWAYS fails (a wrong/rotated
     // recipient key, a permanently-rejecting rail — the "poison" class).
     const deliverSpy = vi.spyOn(sender.delivery, 'deliver').mockRejectedValue(new Error('rail rejects: bad recipient'));
-    await (sender.module as any).savePendingV2Delivery({
+    await (sender.module as any).deliveries.savePendingV2Delivery({
       transferId: 'poison-tx',
       recipientPubkey: RECIPIENT.chainPubkey,
       tokenBlob: 'aa'.repeat(40),
@@ -808,7 +808,7 @@ describe('journaled-delivery replay: bounded backoff + poison surfacing (#517 it
     // journaled (un-poisoned) and NOT surfaced until the budget is crossed.
     const budget = 6; // MAX_DELIVERY_REPLAY_ATTEMPTS
     for (let i = 0; i < budget - 1; i++) {
-      await (sender.module as any).replayPendingV2Deliveries();
+      await (sender.module as any).deliveries.replayPendingV2Deliveries();
       const journal = JSON.parse(sender.storage.map.get('pending_v2_deliveries')!);
       expect(journal).toHaveLength(1);
       expect(journal[0].undeliverable).toBeUndefined();
@@ -818,7 +818,7 @@ describe('journaled-delivery replay: bounded backoff + poison surfacing (#517 it
 
     // The pass that crosses the budget surfaces it as poison — ONE event,
     // entry kept journaled but flagged so it does not sit undelivered invisibly.
-    await (sender.module as any).replayPendingV2Deliveries();
+    await (sender.module as any).deliveries.replayPendingV2Deliveries();
     const poisonCalls = sender.emitEvent.mock.calls.filter((c) => c[0] === 'delivery:undeliverable');
     expect(poisonCalls).toHaveLength(1);
     expect(poisonCalls[0][1]).toMatchObject({ transferId: 'poison-tx', recipientPubkey: RECIPIENT.chainPubkey, attempts: budget });
@@ -830,7 +830,7 @@ describe('journaled-delivery replay: bounded backoff + poison surfacing (#517 it
     // Poison is terminal for auto-replay: a further pass touches the rail no more
     // and emits no duplicate surfacing.
     const deliverCallsBefore = deliverSpy.mock.calls.length;
-    await (sender.module as any).replayPendingV2Deliveries();
+    await (sender.module as any).deliveries.replayPendingV2Deliveries();
     expect(deliverSpy.mock.calls.length).toBe(deliverCallsBefore);
     expect(sender.emitEvent.mock.calls.filter((c) => c[0] === 'delivery:undeliverable')).toHaveLength(1);
     /* eslint-enable @typescript-eslint/no-explicit-any */
@@ -846,7 +846,7 @@ describe('journaled-delivery replay: bounded backoff + poison surfacing (#517 it
     const deliverSpy = vi
       .spyOn(sender.delivery, 'deliver')
       .mockResolvedValue({ deliveryId: 'concurrent-d1' } as any);
-    await (sender.module as any).savePendingV2Delivery({
+    await (sender.module as any).deliveries.savePendingV2Delivery({
       transferId: 'concurrent-tx',
       recipientPubkey: RECIPIENT.chainPubkey,
       tokenBlob: 'bb'.repeat(40),
@@ -856,8 +856,8 @@ describe('journaled-delivery replay: bounded backoff + poison surfacing (#517 it
     // Kick TWO passes WITHOUT awaiting between them — mirrors load()'s fire-and-
     // forget replay racing a receive()→load(). The guard (set synchronously before
     // the first await) must drop the second pass.
-    const p1 = (sender.module as any).replayPendingV2Deliveries();
-    const p2 = (sender.module as any).replayPendingV2Deliveries();
+    const p1 = (sender.module as any).deliveries.replayPendingV2Deliveries();
+    const p2 = (sender.module as any).deliveries.replayPendingV2Deliveries();
     await Promise.all([p1, p2]);
     /* eslint-enable @typescript-eslint/no-explicit-any */
 
@@ -873,7 +873,7 @@ describe('journaled-delivery replay: bounded backoff + poison surfacing (#517 it
     await sender.module.load();
 
     /* eslint-disable @typescript-eslint/no-explicit-any */
-    const m = sender.module as any;
+    const m = (sender.module as any).deliveries;
     // Two journal writes kicked WITHOUT awaiting between them — mirrors a send()
     // journaling a finished blob while a fire-and-forget replay mutates the journal.
     // Without the lock both read the same snapshot, mutate, and the last write wins.
@@ -897,7 +897,7 @@ describe('journaled-delivery replay: bounded backoff + poison surfacing (#517 it
     await sender.module.load();
 
     /* eslint-disable @typescript-eslint/no-explicit-any */
-    (sender.module as any).replayBackoffBaseMs = 0;
+    (sender.module as any).deliveries.replayBackoffBaseMs = 0;
 
     // Capture a REAL deliverable blob by sending once, then re-journal it and
     // make delivery fail twice (transient outage) before recovering.
@@ -918,7 +918,7 @@ describe('journaled-delivery replay: bounded backoff + poison surfacing (#517 it
 
     // failures is now 1 → the next replay pass retries within-pass (backoff) and
     // recovers; the blob lands and the journal clears with NO poison event.
-    await (sender.module as any).replayPendingV2Deliveries();
+    await (sender.module as any).deliveries.replayPendingV2Deliveries();
     /* eslint-enable @typescript-eslint/no-explicit-any */
 
     expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
@@ -1444,14 +1444,16 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     // checkpoint) so the change is recovered; without the fix the change row would be absent.
     const splitOpIndex = 0; // direct.length
     await (sender.module as unknown as {
-      savePendingV2Delivery(e: {
-        transferId: string;
-        recipientPubkey: string;
-        tokenBlob: string;
-        opIndex: number;
-        createdAt: number;
-      }): Promise<void>;
-    }).savePendingV2Delivery({
+      deliveries: {
+        savePendingV2Delivery(e: {
+          transferId: string;
+          recipientPubkey: string;
+          tokenBlob: string;
+          opIndex: number;
+          createdAt: number;
+        }): Promise<void>;
+      };
+    }).deliveries.savePendingV2Delivery({
       transferId,
       recipientPubkey: RECIPIENT.chainPubkey,
       tokenBlob: 'ab'.repeat(40),
@@ -1496,8 +1498,8 @@ describe('replay classifies recipient-quota (429) as deferred, never poison (§3
     await seedServerToken(fake, sender, SENDER, 1000n);
     await sender.module.load();
     /* eslint-disable @typescript-eslint/no-explicit-any */
-    (sender.module as any).deliveryDeferralMs = 0; // re-eligible immediately — no real wait
-    (sender.module as any).replayBackoffBaseMs = 0;
+    (sender.module as any).deliveries.deliveryDeferralMs = 0; // re-eligible immediately — no real wait
+    (sender.module as any).deliveries.replayBackoffBaseMs = 0;
     /* eslint-enable @typescript-eslint/no-explicit-any */
 
     const realDeliver = sender.delivery.deliver.bind(sender.delivery);
@@ -1510,7 +1512,7 @@ describe('replay classifies recipient-quota (429) as deferred, never poison (§3
     expect(result.deliveryPending).toBe(true);
 
     // Drive far past the case-A poison budget (6) while the recipient stays full — never poison.
-    for (let i = 0; i < 8; i++) await (sender.module as any).replayPendingV2Deliveries();
+    for (let i = 0; i < 8; i++) await (sender.module as any).deliveries.replayPendingV2Deliveries();
     const journaled = JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]');
     expect(journaled).toHaveLength(1);
     expect(journaled[0].undeliverable).toBeUndefined();
@@ -1520,7 +1522,7 @@ describe('replay classifies recipient-quota (429) as deferred, never poison (§3
 
     // Recipient drains → next replay lands and clears the journal.
     recipientFull = false;
-    await (sender.module as any).replayPendingV2Deliveries();
+    await (sender.module as any).deliveries.replayPendingV2Deliveries();
     expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(1);
     expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
   });
