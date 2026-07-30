@@ -19,14 +19,8 @@ import type {
 import type { HistoryRecord } from '../storage';
 import {
   isTokenKey,
-  isArchivedKey,
-  isForkedKey,
   tokenIdFromKey,
-  tokenIdFromArchivedKey,
-  parseForkedKey,
   keyFromTokenId,
-  archivedKeyFromTokenId,
-  forkedKeyFromTokenIdAndState,
 } from '../types/txf';
 import type { Token } from '../types';
 import { logger } from '../core/logger';
@@ -61,11 +55,6 @@ function isV2TokenEntry(entry: unknown): entry is Token {
   );
 }
 
-/** A stored record carrying a decoded token object rather than a v2 blob — unreadable here. */
-function isUndecodableEntry(entry: unknown): boolean {
-  return typeof entry === 'object' && entry !== null && 'genesis' in entry;
-}
-
 // =============================================================================
 // Storage Data Building
 // =============================================================================
@@ -83,8 +72,6 @@ export async function buildTxfStorageData(
   options?: {
     nametags?: NametagData[];
     tombstones?: TombstoneEntry[];
-    archivedTokens?: Map<string, TxfToken>;
-    forkedTokens?: Map<string, TxfToken>;
     historyEntries?: HistoryRecord[];
   }
 ): Promise<TxfStorageData> {
@@ -122,22 +109,7 @@ export async function buildTxfStorageData(
     }
   }
 
-  // Add archived tokens
-  if (options?.archivedTokens && options.archivedTokens.size > 0) {
-    for (const [tokenId, txf] of options.archivedTokens) {
-      storageData[archivedKeyFromTokenId(tokenId)] = txf;
-    }
-  }
 
-  // Add forked tokens
-  if (options?.forkedTokens && options.forkedTokens.size > 0) {
-    for (const [key, txf] of options.forkedTokens) {
-      const [tokenId, stateHash] = key.split('_');
-      if (tokenId && stateHash) {
-        storageData[forkedKeyFromTokenIdAndState(tokenId, stateHash)] = txf;
-      }
-    }
-  }
 
   return storageData;
 }
@@ -151,8 +123,6 @@ export interface ParsedStorageData {
   meta: TxfMeta | null;
   nametags: NametagData[];
   tombstones: TombstoneEntry[];
-  archivedTokens: Map<string, TxfToken>;
-  forkedTokens: Map<string, TxfToken>;
   historyEntries: HistoryRecord[];
   validationErrors: string[];
 }
@@ -166,8 +136,6 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
     meta: null,
     nametags: [],
     tombstones: [],
-    archivedTokens: new Map(),
-    forkedTokens: new Map(),
     historyEntries: [],
     validationErrors: [],
   };
@@ -241,33 +209,10 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
       if (isV2TokenEntry(entry)) {
         // v2 storage entry — the UI token record (opaque blob in sdkData).
         result.tokens.push(entry as Token);
-      } else if (isUndecodableEntry(entry)) {
-        const msg = `Token ${tokenId}: sdkData is not a v2 token blob — entry skipped`;
-        logger.warn('TXF', msg);
-        result.validationErrors.push(msg);
       } else {
         const msg = `Token ${tokenId}: unrecognized storage entry (not a v2 token blob) — entry skipped`;
         logger.warn('TXF', msg);
         result.validationErrors.push(msg);
-      }
-    }
-    // Archived tokens
-    else if (isArchivedKey(key)) {
-      const tokenId = tokenIdFromArchivedKey(key);
-      const txfToken = storageData[key] as TxfToken;
-      if (txfToken?.genesis?.data?.tokenId) {
-        result.archivedTokens.set(tokenId, txfToken);
-      }
-    }
-    // Forked tokens
-    else if (isForkedKey(key)) {
-      const parsed = parseForkedKey(key);
-      if (parsed) {
-        const txfToken = storageData[key] as TxfToken;
-        if (txfToken?.genesis?.data?.tokenId) {
-          const mapKey = `${parsed.tokenId}_${parsed.stateHash}`;
-          result.forkedTokens.set(mapKey, txfToken);
-        }
       }
     }
     // Individual file format tokens (legacy per-file `{ token: TxfToken }` records)
