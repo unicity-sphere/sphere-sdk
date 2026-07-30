@@ -462,7 +462,7 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     /** Put a REAL open intent on the server (the id resume will complete/abort), matching this pay. */
     async function putOpenIntent(payer: Wallet, transferId: string, sourceTokenId: string): Promise<void> {
       payer.client.setIdentity(PAYER);
-      const payload = { v: 1, recipient: REQUESTER.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
+      const payload = { v: 2, recipient: REQUESTER.chainPubkey, coinId: UCT, amount: '1000', direct: [sourceTokenId] };
       await payer.client.putIntent(
         transferId,
         encryptField(deriveFieldEncryptionKey(PAYER.privateKey), JSON.stringify(payload)),

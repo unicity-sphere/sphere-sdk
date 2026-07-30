@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed — the pre-E.4 (v:1) intent resume path
+
+An intent payload is `v:2` and nothing else. The `v:1` shape stopped being written at the E.4
+cutover (2026-07-05, #638); only an intent PUT between 2026-06-12 (when intents first shipped,
+#502) and that date could still carry it, and those builds were the `0.9.1-dev.#`/`0.11.x` line
+that only this program's own staging consumers ran.
+
+Gone with it: the checkpoint-less split branch (re-deliver the journaled blob, change recovers via
+inventory resync), the `SplitCheckpointLostError` "record the spend" case, and the conditional
+checkpoint store — `resumeIntent` now always resumes a split THROUGH its burn checkpoint.
+
+**A v:1 payload is now REFUSED rather than run down the v:2 path.** It has no checkpoint, so
+resuming it would raise `SplitCheckpointLostError` (keep-open) and wedge the intent forever.
+Refusing puts it in `resumeOpenIntents().failed` with the reason in the message, leaves the server
+row OPEN and untouched, and executes nothing.
+
+No wallet-api change: the server stores the payload as an opaque ciphertext envelope
+(`payload bytea`, size-capped) and never parses it — `v` is a client-side contract end to end.
+
+
 ### Changed — state-transition-sdk 2.0.2 (was 2.0.1)
 
 Upstream is one change (state-transition-sdk-js#138): token verification is now behind an
