@@ -1010,6 +1010,85 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(sent).toBeDefined();
   });
 
+  it('#724: a load running mid-drain must not erase a just-stored incoming token', async () => {
+    // The loss: doLoad() reads the storage snapshot, the pump then stores an
+    // incoming token AND acks it claimed (which writes the persistent seen-set, so
+    // it can never be re-delivered), and loadFromStorageData's clear()+repopulate
+    // drops it — the next save() erases it from storage too.
+    //
+    // Own-storage custody makes it permanent: the claim is intoInventory:false, so
+    // the server never learns the token exists and no resync can heal it.
+    //
+    // Both sides are gated so the interleaving is deterministic: the drain is held
+    // until the load has read its (token-free) snapshot, and the load is held until
+    // the drain has stored and acked.
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-724-send');
+    await seedServerToken(fake, sender, SENDER, 100n);
+    await sender.module.load();
+
+    const recipient = makeOwnStorageWallet(baseUrl, fake.network, RECIPIENT, 'd-724-recv');
+    await recipient.module.load();
+
+    // The recipient must already have persisted state, or provider.load() returns
+    // {success:false} and loadFromStorageData never runs — no clear, no race.
+    await seedServerToken(fake, sender, SENDER, 100n);
+    await sender.module.load();
+    await sender.module.send({ recipient: '@bob', amount: '100', coinId: UCT });
+    await vi.waitFor(async () => {
+      await recipient.module.receive();
+      expect(recipient.module.getTokens()).toHaveLength(1);
+    });
+    await recipient.module.sync();
+
+    // Gate 1 — hold every drain until the load has taken its snapshot.
+    let releaseDrain!: () => void;
+    const drainHeld = new Promise<void>((r) => { releaseDrain = r; });
+    const realIncoming = recipient.delivery.incoming.bind(recipient.delivery);
+    vi.spyOn(recipient.delivery, 'incoming').mockImplementation(async function* (cursor?: string) {
+      await drainHeld;
+      yield* realIncoming(cursor);
+    });
+
+    // Gate 2 — hold the load after it has read storage, before it applies it.
+    const provider = recipient.deps.tokenStorageProviders!.get('local')!;
+    const realLoad = provider.load.bind(provider);
+    let releaseLoad!: () => void;
+    const loadHeld = new Promise<void>((r) => { releaseLoad = r; });
+    let snapshotRead = false;
+    vi.spyOn(provider, 'load').mockImplementation(async () => {
+      const snapshot = await realLoad();
+      snapshotRead = true;
+      await loadHeld;
+      return snapshot;
+    });
+
+    await seedServerToken(fake, sender, SENDER, 100n);
+    await sender.module.load();
+    await sender.module.send({ recipient: '@bob', amount: '100', coinId: UCT });
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(2);
+
+    const loading = recipient.module.load();
+    await vi.waitFor(() => expect(snapshotRead).toBe(true)); // snapshot has NO token
+
+    // Start the drain WHILE the load is parked. Before the fix it ran straight
+    // through, stored the token, acked it, and the load's clear()+repopulate from
+    // the stale snapshot then dropped it. Now it serialises behind the load.
+    releaseDrain();
+    const receiving = recipient.module.receive();
+    // Give the drain a window to interleave. UNGATED it uses the window: it stores
+    // the token and acks it, and the load's clear()+repopulate from the stale
+    // snapshot then drops it. GATED it blocks here and the window is harmless.
+    await new Promise((r) => setTimeout(r, 100));
+    releaseLoad();
+    await loading;
+    await receiving;
+
+    // The second token arrived while a load was in flight. It is claimed and in
+    // the seen-set, so it can never be re-delivered — dropping it here loses it.
+    expect(recipient.module.getTokens()).toHaveLength(2);
+  }, 30_000);
+
   it('#621: a leg with a journaled blob is RE-DELIVERED, never re-certified', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-journal-1');

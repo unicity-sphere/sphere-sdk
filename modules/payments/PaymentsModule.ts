@@ -720,7 +720,6 @@ export class PaymentsModule {
 
   // Guard: ensure load() completes before processing incoming bundles
   private loadedPromise: Promise<void> | null = null;
-  private loaded = false;
 
   /**
    * #642 single-flight guard for {@link load}: the in-flight load, the owner
@@ -812,7 +811,6 @@ export class PaymentsModule {
     return {
       get deps() { return module.deps; },
       get delivery() { return module.delivery; },
-      get loaded() { return module.loaded; },
       get loadedPromise() { return module.loadedPromise; },
       ensureInitialized: () => this.ensureInitialized(),
       ensureDelivery: () => this.ensureDelivery(),
@@ -836,7 +834,6 @@ export class PaymentsModule {
       get deps() { return module.deps; },
       get pumpHealth() { return module.pumpHealth; },
       get pollIntervalMs() { return DELIVERY_POLL_INTERVAL_MS; },
-      get loaded() { return module.loaded; },
       get loadedPromise() { return module.loadedPromise; },
       ensureInitialized: () => this.ensureInitialized(),
       currentNametagName: () => this.currentNametagName(),
@@ -875,7 +872,6 @@ export class PaymentsModule {
     return {
       get deps() { return module.deps; },
       get delivery() { return module.delivery; },
-      get loaded() { return module.loaded; },
       get loadedPromise() { return module.loadedPromise; },
       ensureInitialized: () => this.ensureInitialized(),
       getFieldEncryptionKey: () => this.getFieldEncryptionKey(),
@@ -1222,7 +1218,6 @@ export class PaymentsModule {
       // Load transaction history from dedicated history store (with migration from legacy KV)
       await this.loadHistory();
 
-      this.loaded = true;
     };
 
     const run = async (): Promise<void> => {
@@ -3318,9 +3313,12 @@ export class PaymentsModule {
 
   private async doPumpIncomingDeliveries(): Promise<number> {
     const delivery = this.delivery!;
-    if (!this.loaded && this.loadedPromise) {
-      await this.loadedPromise;
-    }
+    // #724: await the CURRENT load, not just the first. Gating on `loaded` let
+    // every later load run concurrently with this drain — and loadFromStorageData
+    // clears the token map, so a token stored mid-load was dropped from memory,
+    // erased by the next save(), and never re-delivered (it is already acked into
+    // the persistent seen-set).
+    await this.loadedPromise;
     let stored = 0;
     // #623: verify+store per entry (§8.2 — the recipient verifies locally), but ACCUMULATE the
     // claim/reject and submit them in batches (one request each) so a large inbox drain doesn't fire

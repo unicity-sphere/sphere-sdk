@@ -44,8 +44,6 @@ export interface IntentResumeHost {
   readonly deps: PaymentsModuleDependencies | null;
   /** The composed delivery port — `custody === 'inventory'` selects the server-apply path (§7). */
   readonly delivery: DeliveryProvider | null;
-  /** load() gate — resume must observe the loaded token map before replaying. */
-  readonly loaded: boolean;
   readonly loadedPromise: Promise<void> | null;
   /** Throws unless the module has dependencies. */
   ensureInitialized(): void;
@@ -113,9 +111,10 @@ export class IntentResume {
     const engine = this.host.deps!.tokenEngine;
     const outcome = { resumed: [] as string[], conflicted: [] as string[], failed: [] as string[] };
     if (!walletApi || !engine) return outcome;
-    if (!this.host.loaded && this.host.loadedPromise) {
-      await this.host.loadedPromise;
-    }
+    // #724: await the CURRENT load, not just the first. An unrelated load failure
+    // must not defer resume to the next sign-in, so its rejection is swallowed here
+    // (the other barrier sites deliberately let it propagate).
+    await this.host.loadedPromise?.catch(() => undefined);
 
     const intents = await walletApi.listIntents('open');
 

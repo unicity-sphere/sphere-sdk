@@ -73,8 +73,6 @@ export interface PaymentRequestsHost {
   readonly pumpHealth: PumpHealth;
   /** Poll interval for the payment-request stream (shared with the delivery/inventory pumps, §9). */
   readonly pollIntervalMs: number;
-  /** load() gate — the pump must not surface requests before the first load completes. */
-  readonly loaded: boolean;
   readonly loadedPromise: Promise<void> | null;
   /** Throws unless the module has dependencies. */
   ensureInitialized(): void;
@@ -822,9 +820,8 @@ export class PaymentRequests {
   }
 
   private async doPumpPaymentRequests(api: PaymentRequestsApi): Promise<void> {
-    if (!this.host.loaded && this.host.loadedPromise) {
-      await this.host.loadedPromise;
-    }
+    // #724: await the CURRENT load, not just the first.
+    await this.host.loadedPromise;
     await this.pumpIncomingPaymentRequests(api);
     await this.refreshOutgoingPaymentRequests(api);
   }
