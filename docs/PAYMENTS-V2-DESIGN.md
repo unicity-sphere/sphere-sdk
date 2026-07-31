@@ -14,17 +14,17 @@
 | Phase | Scope | Status |
 |---|---|---|
 | P0 | Spec edits (wallet-api PR): S7 own-storage rescind, contract pins, topology fix | 🔄 wallet-api#119 open |
-| P1 | Skeleton, interfaces, adversarial fakes, contract-test + `test:mutation` harness | 🔄 contracts landed (`feat/payments-v2`); fakes building |
-| P2 | `WalletApiSession` — auth cell, wake socket, syncEpoch latch | 🔄 building |
-| P3 | `InventoryView` — cursor pull, overlay, recovery, reads (`assets`/`tokens`) | 🔄 view building; providers in phase β |
-| P4 | `CoinSelector` + `Reservations` + queue | 🔄 building |
-| P5 | `TransferMachine` — send happy path, latency rules, first probes | ⬜ |
-| P6 | `TransferMachine` — resume = same machine; conflict/keep-open/partial; E.4 | ⬜ |
-| P7 | `Receive` drain + seen-set + claim + RECEIVED history | ⬜ |
-| P8 | `Requests` (streams + settling journal); `Mint` (+ engine F13 fix) | ⬜ |
-| P9 | `History` read-through; events; Connect adapter; facade assembly | ⬜ |
-| P10 | Live-staging e2e parity + soak + request-count budgets | ⬜ |
-| P11 | Flip PR: wire Sphere, delete old vertical, frontend migration, re-pin | ⬜ |
+| P1 | Skeleton, interfaces, adversarial fakes, contract-test harness | ✅ contracts + FakeWalletApi (61 pins) + FakeGateway; `test:mutation` runner in δ |
+| P2 | `WalletApiSession` — auth cell, wake socket, syncEpoch latch | ✅ F8/F12/F14 mutation-verified + **5/5 live staging e2e** |
+| P3 | `InventoryView` + wallet-api port implementations + S7 contract suites | ✅ F6/F7 closed by schema/construction; providers mutation-verified |
+| P4 | `CoinSelector` + `Reservations` + queue | ✅ work-budget search; fragmented-wallet cliff is a named RED case |
+| P5 | `TransferMachine` — send path | ✅ 5/5 mutation probes; apply-gating amendment (§5.5) found here |
+| P6 | `TransferMachine` — resume = same machine | ✅ #676/#631/#634/audit#4/#690 pinned; 29 tests total with P5 |
+| P7 | `Receive` drain + seen-set + claim + RECEIVED history | ✅ 20 tests; store-before-ack crash window pinned |
+| P8 | `Requests` (streams + settling journal); `Mint` (+ engine F13 fix) | 🔄 requests ✅ (19 tests); mint + F13 in δ |
+| P9 | `History` read-through; events; Connect adapter; facade assembly | 🔄 history ✅ (15 tests); facade + adapter in δ |
+| P10 | Live-staging e2e parity + soak + request-count budgets | 🔄 session e2e live-green; money-path staging e2e after δ |
+| P11 | Flip PR: wire Sphere, delete old vertical, frontend migration, re-pin | ⬜ owner-gated |
 
 ---
 
@@ -286,6 +286,12 @@ Normative behaviors bound into the transitions (not call sites):
   deposit **attempt** of the same `transferId` — delivered, deferred (429), or failed-and-journaled
   alike; a deferred deposit must not leave spent sources listed active on every device (the S3
   rule). Post-commit mirror failure is `SEND_SYNC_PENDING`, never `transfer:failed` (#665).
+  **Amendment (found during P5 build, test-pinned):** apply is *skipped* — deferred to resume —
+  exactly when a keep-open or unjournaled-committed leg exists in the same intent: the server
+  completes an unflagged intent on ANY apply, which would close the only exit (same-`transferId`
+  resume) for the indeterminate leg. Balances converge at resume; the alternative strands funds.
+  Likewise the #690 shortfall record is durable **before** `complete` (the reverse order has a
+  lost-shortfall window while the intent is already unlistable).
 - **Resolution point (latency):** the awaited path of `send()` ends after **APPLYING** — spend
   committed, delivery journaled/attempted, `applyDelta` applied (its failure is the thrown
   `SEND_SYNC_PENDING`, which therefore can surface). `TransferResult.deliveryPending` is `true`
