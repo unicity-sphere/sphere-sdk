@@ -2,3 +2,16 @@ export type { PaymentsV2, PaymentsV2Events, SendRequest, MintResult, HistoryEntr
 export type { StoragePort, DeliveryPort, InventoryItem, InventoryPage, InventoryAsset, ApplyDeltaResult, DeliveryReceipt, IncomingDelivery, DeliverOptions } from './ports';
 export type { IntentPayload, MachinePhase, PlannedOp, OpOutcome, OutcomeClass } from './machine/types';
 export * from './stores';
+export {
+  PaymentsFacade,
+  MAX_RESELECT,
+  ATTENTION_MINT_UNRESOLVED,
+  supportsDeterministicMint,
+} from './PaymentsFacade';
+export type {
+  PaymentsFacadeDeps,
+  FacadeSession,
+  FacadeClient,
+  RecipientInfo,
+  DeterministicMintCapable,
+} from './PaymentsFacade';
