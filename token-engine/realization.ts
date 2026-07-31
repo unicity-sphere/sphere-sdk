@@ -28,8 +28,13 @@ import { HexConverter } from './sdk';
 /** HKDF info prefix — versioned; the same formula appears in ARCHITECTURE §8.1. */
 export const REALIZATION_HKDF_INFO_PREFIX = 'sphere-realization-v1';
 
-/** Domain separator between the realization values of one transfer. */
-export type RealizationField = 'stateMask' | 'salt' | 'tokenType' | 'burn';
+/**
+ * Domain separator between the realization values of one transfer.
+ * 'salt' is indexed by split-OUTPUT ordinal; a standalone mint's salt lives in
+ * the separate 'mint' domain (indexed by opIndex) so the two never collide
+ * under a shared transferId (#692 F13).
+ */
+export type RealizationField = 'stateMask' | 'salt' | 'tokenType' | 'burn' | 'mint';
 
 /**
  * Derive one 32-byte realization value.

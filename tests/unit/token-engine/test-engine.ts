@@ -17,6 +17,7 @@ import {
 } from '../../../token-engine/sdk';
 import { decodeSpherePaymentData } from '../../../token-engine/SpherePaymentData';
 import { type EngineDeps, SphereTokenEngine } from '../../../token-engine/SphereTokenEngine';
+import { AdversarialResubmitClient } from './support/AdversarialResubmitClient';
 import { TestAggregatorClient } from './support/TestAggregatorClient';
 
 export interface TestEngineOptions {
@@ -37,7 +38,14 @@ export interface TestEngineOptions {
   wireClient?: IAggregatorClient;
 }
 
-/** Build a real engine backed by an in-memory aggregator (fresh by default). */
+/**
+ * Build a real engine backed by an in-memory aggregator (fresh by default).
+ *
+ * The default wire client is ADVERSARIAL (#692 F13): a re-submit — duplicate OR
+ * conflict — answers an unknown status instead of TestAggregatorClient's friendly
+ * SUCCESS, so any code inferring "did it certify?" from the submit status fails
+ * here the way it fails against the live gateway. A passed `wireClient` overrides.
+ */
 export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngine {
   const aggregator = opts.aggregator ?? TestAggregatorClient.create();
   const trustBase = aggregator.rootTrustBase;
@@ -48,7 +56,7 @@ export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngin
   );
   const privateKey = opts.privateKey ?? SigningService.generatePrivateKey();
   const deps: EngineDeps = {
-    client: new StateTransitionClient(opts.wireClient ?? aggregator),
+    client: new StateTransitionClient(opts.wireClient ?? new AdversarialResubmitClient(aggregator)),
     trustBase,
     predicateVerifier,
     mintJustificationVerifier,
