@@ -199,7 +199,7 @@ export interface IncomingTransfer {
 // Payment Request Types
 // =============================================================================
 
-export type PaymentRequestStatus = 'pending' | 'accepted' | 'rejected' | 'paid' | 'expired' | 'settling';
+export type PaymentRequestStatus = 'pending' | 'rejected' | 'paid' | 'expired' | 'settling';
 
 /**
  * Outgoing payment request (requesting payment from someone)
@@ -263,7 +263,7 @@ export type PaymentRequestHandler = (request: IncomingPaymentRequest) => void;
 /**
  * Response type for payment requests
  */
-export type PaymentRequestResponseType = 'accepted' | 'rejected' | 'paid';
+export type PaymentRequestResponseType = 'rejected' | 'paid';
 
 /**
  * Outgoing payment request (we sent to someone)
@@ -393,7 +393,6 @@ export type SphereEventType =
   | 'transfer:delivery_pending'
   | 'transfer:invalid'
   | 'payment_request:incoming'
-  | 'payment_request:accepted'
   | 'payment_request:rejected'
   | 'payment_request:paid'
   | 'payment_request:expired'
@@ -488,7 +487,6 @@ export interface SphereEventMap {
    */
   'transfer:invalid': { deliveryId: string; senderPubkey?: string; reason: string };
   'payment_request:incoming': IncomingPaymentRequest;
-  'payment_request:accepted': IncomingPaymentRequest;
   'payment_request:rejected': IncomingPaymentRequest;
   'payment_request:paid': IncomingPaymentRequest;
   'payment_request:expired': IncomingPaymentRequest;

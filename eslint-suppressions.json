@@ -596,19 +596,16 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 23
+      "count": 8
     },
     "complexity": {
-      "count": 9
-    },
-    "max-depth": {
-      "count": 1
+      "count": 2
     },
     "max-lines": {
       "count": 1
     },
     "max-lines-per-function": {
-      "count": 15
+      "count": 5
     }
   },
   "modules/payments/SendOperations.ts": {
@@ -652,12 +649,85 @@
       "count": 1
     }
   },
+  "modules/payments/history/TransferHistory.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 1
+    },
+    "complexity": {
+      "count": 2
+    },
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "modules/payments/inventory/TokenView.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 2
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
   "modules/payments/pump-health.ts": {
     "budget/comment-ratio": {
       "count": 1
     },
     "budget/no-long-comment-block": {
       "count": 1
+    }
+  },
+  "modules/payments/receive/Delivery.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 2
+    },
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "modules/payments/requests/PaymentRequests.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 7
+    },
+    "complexity": {
+      "count": 2
+    },
+    "max-depth": {
+      "count": 1
+    },
+    "max-lines": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 3
+    }
+  },
+  "modules/payments/resume/IntentResume.ts": {
+    "budget/comment-ratio": {
+      "count": 1
+    },
+    "budget/no-long-comment-block": {
+      "count": 5
+    },
+    "complexity": {
+      "count": 2
+    },
+    "max-lines-per-function": {
+      "count": 2
     }
   },
   "modules/swap/SwapModule.ts": {

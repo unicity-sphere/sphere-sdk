@@ -1,5 +1,14 @@
 # PaymentsModule.ts — Final Executable Refactoring Plan
 
+> **Superseded in part — read as a record, not as current guidance.** Written before
+> the work landed, so its file:line references and "largely dead" verdicts describe a
+> tree that no longer exists: #715/#719 restructured the send and resume paths, #722
+> deleted the v1/legacy surfaces, and #723 split PaymentsModule into requests/, receive/,
+> inventory/, resume/ and history/ (6,169 → 3,594 lines) and removed mergeTombstones,
+> resolveSenderInfo, acceptPaymentRequest and markPaymentRequestPaid. Verify against the
+> current tree before acting on any coordinate or verdict here.
+
+
 **Target:** `modules/payments/PaymentsModule.ts` (7,027 lines, 1 class, 161 methods)
 
 > **Baseline note.** Every line number, size and method reference in this plan and in

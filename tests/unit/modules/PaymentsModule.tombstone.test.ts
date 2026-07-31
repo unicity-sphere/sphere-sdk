@@ -5,7 +5,6 @@
  * 1. isStateTombstoned() - direct API
  * 2. addToken() tombstone blocking (edge case: Nostr re-delivery)
  * 3. Nostr re-delivery protection (full add→remove→re-add cycle)
- * 4. mergeTombstones() - remote tombstone merging
  * 5. v2 blob tokens — keys derived from the blob itself (no engine round-trip)
  *
  * Tombstones are storage-level and version-agnostic: keyed by
@@ -179,7 +178,7 @@ function createMockDeps(engine: FakeTokenEngine): PaymentsModuleDependencies {
     sync: vi.fn().mockResolvedValue({ success: true, added: 0, removed: 0, conflicts: 0 }),
     // Lazy-inventory port (S2). This double holds nothing, so the view is empty
     // and getToken() takes the documented "unknown token" throw. The tombstone
-    // paths under test (addToken/removeToken/mergeTombstones) only ever save().
+    // paths under test (addToken/removeToken) only ever save().
     listInventory: vi.fn(async (_since?: bigint): Promise<InventoryView> => ({
       cursor: 0n, syncEpoch: 0n, more: false, items: [],
     })),
@@ -436,104 +435,6 @@ describe('PaymentsModule - Tombstone Enforcement', () => {
     });
   });
 
-  // ===========================================================================
-  // 4. mergeTombstones()
-  // ===========================================================================
-
-  describe('mergeTombstones()', () => {
-    it('should add remote tombstones to local set', async () => {
-      const remoteTombstones: TombstoneEntry[] = [
-        { tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1, timestamp: Date.now() },
-        { tokenId: TOKEN_ID_B, stateHash: STATE_HASH_2, timestamp: Date.now() },
-      ];
-
-      await module.mergeTombstones(remoteTombstones);
-
-      const local = module.getTombstones();
-      expect(local.length).toBe(2);
-      expect(local).toContainEqual(expect.objectContaining({ tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1 }));
-      expect(local).toContainEqual(expect.objectContaining({ tokenId: TOKEN_ID_B, stateHash: STATE_HASH_2 }));
-    });
-
-    it('should remove local tokens matching remote tombstones', async () => {
-      // Add some tokens first
-      const token = createMockToken({ tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1 });
-      await module.addToken(token);
-      expect(module.getTokens().length).toBe(1);
-
-      // Merge tombstones that match the token
-      const remoteTombstones: TombstoneEntry[] = [
-        { tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1, timestamp: Date.now() },
-      ];
-
-      const removedCount = await module.mergeTombstones(remoteTombstones);
-
-      expect(removedCount).toBe(1);
-      expect(module.getTokens().length).toBe(0);
-    });
-
-    it('should not remove tokens that do not match remote tombstones', async () => {
-      const token = createMockToken({ tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1 });
-      await module.addToken(token);
-
-      // Tombstone for a different state
-      const remoteTombstones: TombstoneEntry[] = [
-        { tokenId: TOKEN_ID_A, stateHash: STATE_HASH_2, timestamp: Date.now() },
-      ];
-
-      const removedCount = await module.mergeTombstones(remoteTombstones);
-
-      expect(removedCount).toBe(0);
-      expect(module.getTokens().length).toBe(1);
-    });
-
-    it('should not create duplicate tombstones', async () => {
-      const tombstone: TombstoneEntry = { tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1, timestamp: Date.now() };
-
-      // First merge
-      await module.mergeTombstones([tombstone]);
-      expect(module.getTombstones().length).toBe(1);
-
-      // Second merge with same tombstone
-      await module.mergeTombstones([tombstone]);
-      expect(module.getTombstones().length).toBe(1);
-    });
-
-    it('should merge tombstones as union of local and remote', async () => {
-      // Create local tombstone via add→remove
-      const token = createMockToken({ tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1 });
-      await module.addToken(token);
-      await module.removeToken(token.id);
-      expect(module.getTombstones().length).toBe(1);
-
-      // Merge with remote tombstone (different token)
-      const remoteTombstones: TombstoneEntry[] = [
-        { tokenId: TOKEN_ID_B, stateHash: STATE_HASH_2, timestamp: Date.now() },
-      ];
-
-      await module.mergeTombstones(remoteTombstones);
-
-      const all = module.getTombstones();
-      expect(all.length).toBe(2);
-      expect(all).toContainEqual(expect.objectContaining({ tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1 }));
-      expect(all).toContainEqual(expect.objectContaining({ tokenId: TOKEN_ID_B, stateHash: STATE_HASH_2 }));
-    });
-
-    it('should reject tokens via addToken() after tombstones are merged', async () => {
-      const remoteTombstones: TombstoneEntry[] = [
-        { tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1, timestamp: Date.now() },
-      ];
-
-      await module.mergeTombstones(remoteTombstones);
-
-      // Try to add the tombstoned token
-      const token = createMockToken({ tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1 });
-      const result = await module.addToken(token);
-
-      expect(result).toBe(false);
-      expect(module.getTokens().length).toBe(0);
-    });
-  });
 
   // ===========================================================================
   // 5. v2 blob tokens — keys derived from the blob (tryParseBlobKeys)

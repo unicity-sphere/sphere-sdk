@@ -22,7 +22,6 @@ import {
   type ParsedTokenEntry,
   type PlanResult,
   QUEUE_TIMEOUT_MS,
-  MAX_SKIP_COUNT,
 } from '../../../modules/payments/SpendQueue';
 import type { Token } from '../../../types';
 

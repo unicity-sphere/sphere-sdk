@@ -1,5 +1,14 @@
 # PaymentsModule.ts — Analysis Findings
 
+> **Superseded in part — read as a record, not as current guidance.** Written before
+> the work landed, so its file:line references and "largely dead" verdicts describe a
+> tree that no longer exists: #715/#719 restructured the send and resume paths, #722
+> deleted the v1/legacy surfaces, and #723 split PaymentsModule into requests/, receive/,
+> inventory/, resume/ and history/ (6,169 → 3,594 lines) and removed mergeTombstones,
+> resolveSenderInfo, acceptPaymentRequest and markPaymentRequestPaid. Verify against the
+> current tree before acting on any coordinate or verdict here.
+
+
 Evidence base for [PAYMENTS-REFACTOR.md](./PAYMENTS-REFACTOR.md). Produced by a 15-agent
 analysis (archaeology, responsibility clustering, intra/cross-file duplication scans, coupling
 and invariant inventory, public-surface and dead-code audit), with every claim put through an

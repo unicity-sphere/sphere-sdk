@@ -259,7 +259,7 @@ function restart(deps: PaymentsModuleDependencies): PaymentsModule {
 async function settlePumps(module: PaymentsModule): Promise<void> {
   /* eslint-disable @typescript-eslint/no-explicit-any */
   await (module as any).pumpIncomingDeliveries();
-  await (module as any).pumpPaymentRequests();
+  await (module as any).requests.pumpPaymentRequests();
   /* eslint-enable @typescript-eslint/no-explicit-any */
 }
 
@@ -273,7 +273,7 @@ async function v2Payload(engine: FakeTokenEngine, amount: bigint): Promise<V2Tra
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 function deliver(module: PaymentsModule, payload: V2TransferPayload) {
-  return (module as any).handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
+  return (module as any).deliveries.handleV2Transfer(payload, SENDER_TRANSPORT_PUBKEY);
 }
 
 function journal(storage: { map: Map<string, string> }): Array<{ transferId: string; tokenBlob: string; recipientPubkey: string }> {
@@ -313,7 +313,7 @@ describe('send() — failure recovery (v2)', () => {
     expect(journal(storage)).toHaveLength(1);
     const journaledBlob = journal(storage)[0].tokenBlob;
 
-    await (module as any).replayPendingV2Deliveries();
+    await (module as any).deliveries.replayPendingV2Deliveries();
 
     expect(journal(storage)).toHaveLength(0);
     // Exactly the journaled bytes went onto the rail…
@@ -419,14 +419,14 @@ describe('journaled deliveries survive a wallet composed without a delivery rail
     } as PaymentsModuleDependencies);
     cleanups.push(() => railless.destroy());
 
-    (railless as any).replayBackoffBaseMs = 0; // no real sleeps between retries
+    (railless as any).deliveries.replayBackoffBaseMs = 0; // no real sleeps between retries
     // A REAL certified blob (the rail that appears later actually deposits it).
     const stranded = await engine.mint({
       recipientPubkey: hexToBytes(RECIPIENT.chainPubkey),
       value: { assets: [{ coinId: UCT, amount: 100n }] },
     });
     const strandedBlobHex = bytesToHex(encodeTokenBlob(engine.encodeToken(stranded)));
-    await (railless as any).savePendingV2Delivery({
+    await (railless as any).deliveries.savePendingV2Delivery({
       transferId: 'tx-stranded',
       recipientPubkey: RECIPIENT.chainPubkey,
       tokenBlob: strandedBlobHex,
@@ -437,7 +437,7 @@ describe('journaled deliveries survive a wallet composed without a delivery rail
     // load() fires it as `void …catch()`, so awaiting load() would not await the
     // replay and the test would pass without exercising anything.
     await railless.load();
-    for (let i = 0; i < 8; i++) await (railless as any).replayPendingV2Deliveries();
+    for (let i = 0; i < 8; i++) await (railless as any).deliveries.replayPendingV2Deliveries();
 
     const entries = journal(storage);
     expect(entries).toHaveLength(1);
@@ -449,7 +449,7 @@ describe('journaled deliveries survive a wallet composed without a delivery rail
     // storage) still delivers the certified blob.
     const withRail = makeOwnStorageWallet(baseUrl, fake.network, SENDER, { storage, tokenStorage, engine });
     await withRail.module.load();
-    await (withRail.module as any).replayPendingV2Deliveries();
+    await (withRail.module as any).deliveries.replayPendingV2Deliveries();
 
     // Delivered ONCE, and the backend holds it (load()'s fire-and-forget replay
     // may win the race with the explicit pass — the in-flight guard makes that
@@ -494,24 +494,4 @@ describe('handleV2Transfer — storage rejection gates events (v2)', () => {
   });
 });
 
-describe('load() — legacy PENDING_V5_TOKENS cleanup', () => {
-  it('drops the legacy KV key without materializing its tokens', async () => {
-    const { module, storage } = await setup();
-    // Inject the key exactly as the removed v1 receiver persisted it.
-    storage.map.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, JSON.stringify([{
-      id: 'v5split_abc', coinId: UCT, symbol: 'UCT', name: 'UCT', decimals: 0,
-      amount: '50', status: 'submitted', createdAt: Date.now(), updatedAt: Date.now(),
-      sdkData: JSON.stringify({ _pendingFinalization: { stage: 'RECEIVED' } }),
-    }]));
-
-    await module.load();
-    await settlePumps(module);
-
-    // v1 removal: the terminalize-into-'invalid' migration is gone. These tokens
-    // were never spendable and are no longer surfaced at all — the only remaining
-    // obligation is that the legacy key does not linger.
-    expect(module.getTokens()).toHaveLength(0);
-    expect(storage.map.has(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS)).toBe(false);
-  });
-});
 /* eslint-enable @typescript-eslint/no-explicit-any */

@@ -11,7 +11,6 @@ import {
   SpendPlanner,
   QUEUE_TIMEOUT_MS,
   QUEUE_MAX_SIZE,
-  MAX_SKIP_COUNT,
 } from '../../../modules/payments/SpendQueue';
 import type { ParsedTokenPool, ParsedTokenEntry, PlanResult } from '../../../modules/payments/SpendQueue';
 import { TokenReservationLedger } from '../../../modules/payments/TokenReservationLedger';
@@ -823,7 +822,7 @@ describe('SpendQueue', () => {
       await largeProm.catch(() => {});
     });
 
-    it('continues queue scan past entry that reaches MAX_SKIP_COUNT', () => {
+    it('continues queue scan past entry that reaches 10', () => {
       const pool = buildPool([{ id: 'tok-1', coinId: 'UCT', amount: 50n }]);
       parsedTokenCache.set('tok-1', pool.get('tok-1')!);
 
@@ -833,7 +832,7 @@ describe('SpendQueue', () => {
       const spy = vi.spyOn(planner, 'calculateOptimalSplitSync');
 
       // Rounds 1..9: large can't plan (null), small served, skipCount goes 0->1, 1->2, ..., 8->9
-      for (let round = 1; round <= MAX_SKIP_COUNT - 1; round++) {
+      for (let round = 1; round <= 10 - 1; round++) {
         spy.mockReset();
         spy.mockReturnValueOnce(null); // large
         spy.mockReturnValueOnce(directPlan(pool.get('tok-1')!, 'UCT')); // small
@@ -841,7 +840,7 @@ describe('SpendQueue', () => {
         ledger.clear();
 
         // Re-add small for next round (previous one was resolved and removed)
-        if (round < MAX_SKIP_COUNT - 1) {
+        if (round < 10 - 1) {
           enq({ id: `small-${round + 1}`, request: { amount: '50', coinId: 'UCT' }, parsedPool: pool, coinId: 'UCT', amount: 50n, enqueuedAt: Date.now() });
         }
       }
@@ -922,7 +921,7 @@ describe('SpendQueue', () => {
       queue.notifyChange('UCT');
 
       // Planner was called twice in round 3 (large failed, small-3 succeeded)
-      // This confirms skipCount < MAX_SKIP_COUNT, so queue scan continues past large
+      // This confirms skipCount < 10, so queue scan continues past large
       expect(spy).toHaveBeenCalledTimes(2);
       expect(queue.size('UCT')).toBe(1); // only large remains
     });

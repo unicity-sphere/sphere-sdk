@@ -231,36 +231,6 @@ export class TokenReservationLedger {
   }
 
   /**
-   * Removes reservations older than maxAgeMs.
-   * Active ones get cancelled first, then removed from indexes.
-   * Committed and cancelled ones are removed directly.
-   *
-   * @returns List of reservationIds that were active and got cancelled.
-   */
-  cleanup(maxAgeMs: number): string[] {
-    const now = Date.now();
-    const cancelled: string[] = [];
-    const toRemove: string[] = [];
-
-    for (const [resId, entry] of this.reservations) {
-      if (now - entry.createdAt > maxAgeMs) {
-        if (entry.status === 'active') {
-          entry.status = 'cancelled';
-          this.removeFromTokenIndex(entry);
-          cancelled.push(resId);
-        }
-        toRemove.push(resId);
-      }
-    }
-
-    for (const resId of toRemove) {
-      this.reservations.delete(resId);
-    }
-
-    return cancelled;
-  }
-
-  /**
    * Read-only lookup of a reservation by ID.
    */
   getReservation(reservationId: string): ReservationEntry | undefined {
