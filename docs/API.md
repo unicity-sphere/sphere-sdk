@@ -490,10 +490,6 @@ interface TombstoneEntry {
 
 Check if a specific `(tokenId, stateHash)` is tombstoned.
 
-#### `mergeTombstones(remoteTombstones: TombstoneEntry[]): Promise<number>`
-
-Merge remote tombstones (union). Removes any local tokens matching remote tombstones. Returns number of local tokens removed.
-
 #### `pruneTombstones(maxAge?: number): Promise<void>`
 
 Remove tombstones older than `maxAge` (default: 30 days) and cap at 100 entries.
@@ -639,7 +635,7 @@ const result = await sphere.payments.sendPaymentRequest('@bob', {
 Get incoming payment requests.
 
 ```typescript
-type PaymentRequestStatus = 'pending' | 'accepted' | 'rejected' | 'paid' | 'expired';
+type PaymentRequestStatus = 'pending' | 'rejected' | 'paid' | 'expired' | 'settling';
 
 interface IncomingPaymentRequest {
   id: string;                  // Event ID
@@ -733,7 +729,7 @@ interface PaymentRequestResponse {
   responderPubkey: string;     // Responder's public key
   responderNametag?: string;   // Responder's nametag
   requestId: string;           // Original request ID
-  responseType: 'accepted' | 'rejected' | 'paid';
+  responseType: 'rejected' | 'paid';
   message?: string;            // Response message
   transferId?: string;         // Transfer ID (if paid)
   timestamp: number;           // Response timestamp
@@ -1024,7 +1020,6 @@ type SphereEventType =
   | 'transfer:confirmed'
   | 'transfer:failed'
   | 'payment_request:incoming'
-  | 'payment_request:accepted'
   | 'payment_request:rejected'
   | 'payment_request:paid'
   | 'payment_request:response'
@@ -1060,7 +1055,6 @@ interface SphereEventMap {
   'transfer:confirmed': TransferResult;
   'transfer:failed': TransferResult;
   'payment_request:incoming': IncomingPaymentRequest;
-  'payment_request:accepted': IncomingPaymentRequest;
   'payment_request:rejected': IncomingPaymentRequest;
   'payment_request:paid': IncomingPaymentRequest;
   'payment_request:response': PaymentRequestResponse;

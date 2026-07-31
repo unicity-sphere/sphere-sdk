@@ -683,9 +683,6 @@ if (result.success) {
         console.log('Payment received! Transfer:', response.transferId);
         // Deliver the ticket
         break;
-      case 'accepted':
-        console.log('Request accepted, waiting for payment...');
-        break;
       case 'rejected':
         console.log('Request rejected');
         break;
@@ -1402,7 +1399,6 @@ sphere.on('transfer:failed', (transfer) => { });
 
 // Payment request events
 sphere.on('payment_request:incoming', (request) => { });
-sphere.on('payment_request:accepted', (request) => { });
 sphere.on('payment_request:rejected', (request) => { });
 sphere.on('payment_request:paid', (request) => { });
 sphere.on('payment_request:response', (response) => { });
