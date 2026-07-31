@@ -1,0 +1,130 @@
+[
+  {
+    "name": "machine-putintent-await-skip",
+    "note": "E.3: the intent PUT is awaited before any engine submit (machine.test.ts 'awaits the intent PUT before any engine op' + order pin)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    await this.putIntentGate(plan, envelope);",
+    "replace": "    void this.putIntentGate(plan, envelope).catch(() => undefined);",
+    "tests": ["tests/unit/payments-v2/machine.test.ts"]
+  },
+  {
+    "name": "machine-resume-journal-ignore",
+    "note": "#621: a journaled leg is re-delivered, never re-certified (machine-resume.test.ts)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      const journaled = op.kind === 'direct' ? r.journaled.get(op.opIndex) : undefined;",
+    "replace": "      const journaled = undefined as DeliveryJournalEntry | undefined;",
+    "tests": ["tests/unit/payments-v2/machine-resume.test.ts"]
+  },
+  {
+    "name": "machine-conflicted-leg-as-spent",
+    "note": "audit#4: a conflicted resume leg is never in applyDelta.spent[] (machine-resume.test.ts)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      conflicts.push({ op, error: outcome.error, amount: conflictAmount(engine, r.payload, op, source) });",
+    "replace": "      committed.push({ op, certified: true });\n      conflicts.push({ op, error: outcome.error, amount: conflictAmount(engine, r.payload, op, source) });",
+    "tests": ["tests/unit/payments-v2/machine-resume.test.ts"]
+  },
+  {
+    "name": "machine-conflict-apply-drop",
+    "note": "certified-source-terminal: the conflict path still applies the certified sibling (machine.test.ts 'a source certified during a failed send is terminal')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    if (cls === 'conflict' && committed.length > 0) {\n      await this.applyBestEffort(engine, plan.transferId, committed);\n    }",
+    "replace": "    if (cls === 'conflict' && committed.length > 0) {\n      void committed;\n    }",
+    "tests": ["tests/unit/payments-v2/machine.test.ts"]
+  },
+  {
+    "name": "machine-429-defer-removal",
+    "note": "S3: recipient 429 defers outside the poison budget (machine.test.ts 'recipient 429 defers the journaled blob')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      if (isRateLimited(err)) {\n        await this.stores.deliveryJournal.defer(options.transferId, outcome.op.opIndex, this.deps.now() + RATE_LIMIT_DEFER_MS);",
+    "replace": "      if ((false as boolean) && isRateLimited(err)) {\n        await this.stores.deliveryJournal.defer(options.transferId, outcome.op.opIndex, this.deps.now() + RATE_LIMIT_DEFER_MS);",
+    "tests": ["tests/unit/payments-v2/machine.test.ts"]
+  },
+  {
+    "name": "requests-441-order-swap",
+    "note": "#441: the settling link is durable BEFORE the in-memory flip and the rethrow (requests.test.ts '#441 ordering')",
+    "file": "modules/payments-v2/requests/Requests.ts",
+    "find": "          await this.writeLink(id, transferId, committed);\n          this.setStatus(id, 'settling');",
+    "replace": "          this.setStatus(id, 'settling');\n          void this.writeLink(id, transferId, committed).catch(() => undefined);",
+    "tests": ["tests/unit/payments-v2/requests.test.ts"]
+  },
+  {
+    "name": "requests-decline-409-swallow",
+    "note": "a refused decline must never look like success (requests.test.ts 'decline 409 PROPAGATES')",
+    "file": "modules/payments-v2/requests/Requests.ts",
+    "find": "    await this.deps.client.respondPaymentRequest(id, { action: 'declined' });",
+    "replace": "    await this.deps.client.respondPaymentRequest(id, { action: 'declined' }).catch(() => undefined);",
+    "tests": ["tests/unit/payments-v2/requests.test.ts"]
+  },
+  {
+    "name": "requests-pay-single-flight-removal",
+    "note": "per-request pay single-flight (requests.test.ts 'double-tap pay() coalesces onto ONE send')",
+    "file": "modules/payments-v2/requests/Requests.ts",
+    "find": "    const inFlight = this.payInFlight.get(id);\n    if (inFlight !== undefined) return inFlight;",
+    "replace": "    const inFlight = this.payInFlight.get(id);\n    if (inFlight !== undefined) void inFlight;",
+    "tests": ["tests/unit/payments-v2/requests.test.ts"]
+  },
+  {
+    "name": "history-received-key-tokenid-only",
+    "note": "RECEIVED dedup key is (type, tokenId, stateHash) (history.test.ts 'RECEIVED dedup key is per (tokenId, stateHash)')",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "      dedupKey: `RECEIVED:${input.tokenId.toLowerCase()}:${input.stateHash.toLowerCase()}`,",
+    "replace": "      dedupKey: `RECEIVED:${input.tokenId.toLowerCase()}`,",
+    "tests": ["tests/unit/payments-v2/history.test.ts"]
+  },
+  {
+    "name": "receive-ack-before-store",
+    "note": "#724 outcome: the view store precedes the claimed ack (receive.test.ts 'a claimed ack is issued only after the view store succeeds')",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "    const outcome = await deps.view.store(screened.record);\n    if (outcome === 'rejected') {\n      pending.push(rejectAck(entry, 'storage-rejected'));\n      return;\n    }\n    pending.push(claimAck(entry));",
+    "replace": "    pending.push(claimAck(entry));\n    const outcome = await deps.view.store(screened.record);\n    if (outcome === 'rejected') {\n      pending.push(rejectAck(entry, 'storage-rejected'));\n      return;\n    }",
+    "tests": ["tests/unit/payments-v2/receive.test.ts"]
+  },
+  {
+    "name": "receive-genesis-only-dedup",
+    "note": "dedup is (tokenId, stateHash), a re-acquired token at a new state is accepted (receive.test.ts 'A→B→A')",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "  if (held === keys.stateHash) return { kind: 'ack', ack: claimAck(entry) };",
+    "replace": "  if (held !== null) return { kind: 'ack', ack: claimAck(entry) };",
+    "tests": ["tests/unit/payments-v2/receive.test.ts"]
+  },
+  {
+    "name": "receive-isspent-gate-drop",
+    "note": "#687: a replayed older, already-spent state never displaces the live one (receive.test.ts '#687 gate')",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "  if (held !== null && (await deps.engine.isSpent(token))) {",
+    "replace": "  if (held !== null && (false as boolean) && (await deps.engine.isSpent(token))) {",
+    "tests": ["tests/unit/payments-v2/receive.test.ts"]
+  },
+  {
+    "name": "providers-seen-set-before-ack",
+    "note": "S7: the seen-set records an entry ONLY after its ack succeeded (providers.test.ts delivery-port contract)",
+    "file": "impl/wallet-api-v2/mailbox.ts",
+    "find": "    if (disposition === 'claimed') {\n      const result = await this.client.claim([deliveryId], this.custody === 'inventory');",
+    "replace": "    await this.addSeen(deliveryId);\n    if (disposition === 'claimed') {\n      const result = await this.client.claim([deliveryId], this.custody === 'inventory');",
+    "tests": ["tests/unit/payments-v2/providers.test.ts"]
+  },
+  {
+    "name": "providers-deliveryid-from-seq",
+    "note": "deliveryId is content-derived hex(SHA-256(tokenId ‖ stateHash)), never a server seq (providers.test.ts delivery-port contract)",
+    "file": "impl/wallet-api-v2/mailbox.ts",
+    "find": "      deliveryId: entry.entryId,",
+    "replace": "      deliveryId: String(entry.seq),",
+    "tests": ["tests/unit/payments-v2/providers.test.ts"]
+  },
+  {
+    "name": "checkpoints-re-encrypt-on-retry",
+    "note": "E.4: encrypt once, every retry re-POSTs byte-identical bytes (providers.test.ts 'two puts of the same slot POST byte-identical envelopes')",
+    "file": "impl/wallet-api-v2/checkpoints.ts",
+    "find": "    let envelope = await kv.get<string>(cacheKey);\n    if (envelope === null) {\n      envelope = encryptFieldBytes(fieldKey, bytes, aad);\n      await kv.set(cacheKey, envelope);\n    }",
+    "replace": "    let envelope = await kv.get<string>(cacheKey);\n    envelope = encryptFieldBytes(fieldKey, bytes, aad);\n    await kv.set(cacheKey, envelope);",
+    "tests": ["tests/unit/payments-v2/providers.test.ts"]
+  },
+  {
+    "name": "session-jwtcell-cas-removal",
+    "note": "#692 F8/F14: the JWT cell install is a CAS on the generation (session.test.ts 'the refresh continuation never installs the stale JWT')",
+    "file": "impl/wallet-api-v2/session.ts",
+    "find": "  install(generation: number, jwt: string): boolean {\n    if (generation !== this.gen) return false;",
+    "replace": "  install(generation: number, jwt: string): boolean {\n    if (generation !== this.gen && (false as boolean)) return false;",
+    "tests": ["tests/unit/payments-v2/session.test.ts"]
+  }
+]

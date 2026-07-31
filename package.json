@@ -119,6 +119,7 @@
     "test:relay": "vitest run --config vitest.relay.config.ts",
     "test:harness": "vitest run --config vitest.harness.config.ts",
     "test:e2e:live": "vitest run --config vitest.live.config.ts",
+    "test:mutation": "node scripts/test-mutation.mjs",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "typecheck:tests": "tsc --noEmit -p tsconfig.tests.json",
