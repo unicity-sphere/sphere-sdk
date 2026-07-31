@@ -6,13 +6,17 @@ This file provides context for Claude Code when working with the Sphere SDK proj
 
 This repo is part of the wallet-api program (process: `../wallet-api/development-workflow.md`).
 
-- **Branch topology:** all work branches from and PRs back to **`feat/wallet-api-integration`**
-  (never `main` directly). Every PR links a GitHub issue (`Closes #N`); squash-merge after green CI
-  (CI runs typecheck + lint + build + unit tests on PRs targeting the integration branch).
-- **The normative spec for the program's SDK work is `../wallet-api/sdk-changes.md`** — Part E
-  (recoverable engine) first, then S1–S7 (thin wallet, ports, wallet-api providers). It was
-  adversarially verified; build it, don't redesign it. Spec-first: contract changes land in the spec
-  in the same PR, before code.
+- **Branch topology (updated 2026-07-31):** all work branches from and PRs back to **`main`** —
+  the `feat/wallet-api-integration` era ended when the integration branches merged (releases ship
+  from `main`; wallet-api#119 records this in the process doc). Every PR links a GitHub issue
+  (`Closes #N`, docs-only changes exempt); squash-merge after green CI (typecheck + lint + build +
+  unit tests + typecheck:tests).
+- **The normative spec for the program's SDK work is `../wallet-api/docs/sdk-changes.md`** — Part E
+  (recoverable engine), then S1–S7 (thin wallet, ports, wallet-api providers). It was adversarially
+  verified; build it, don't redesign it. Spec-first: contract changes land in the spec in the same
+  PR, before code. **The payments module is being rebuilt from scratch as a wallet-api-only money
+  vertical — design + build tracker: `docs/PAYMENTS-V2-DESIGN.md` (read it before touching
+  `modules/payments/` or `impl/shared/wallet-api/`).**
 - **Resume is status-agnostic** (sdk-changes E.2): never key engine resume off a submit status —
   submit, always `getInclusionProof`, match-verify (`OK` = mine, `TRANSACTION_HASH_MISMATCH` =
   `TransferConflictError`). The `STATE_ID_EXISTS` aggregator lag is OVER (M7 live e2e observed
