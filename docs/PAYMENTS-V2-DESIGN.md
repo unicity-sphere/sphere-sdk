@@ -14,10 +14,10 @@
 | Phase | Scope | Status |
 |---|---|---|
 | P0 | Spec edits (wallet-api PR): S7 own-storage rescind, contract pins, topology fix | 🔄 wallet-api#119 open |
-| P1 | Skeleton, interfaces, adversarial fakes, contract-test + `test:mutation` harness | ⬜ |
-| P2 | `WalletApiSession` — auth cell, wake socket, syncEpoch latch | ⬜ |
-| P3 | `InventoryView` — cursor pull, overlay, recovery, reads (`assets`/`tokens`) | ⬜ |
-| P4 | `CoinSelector` + `Reservations` + queue | ⬜ |
+| P1 | Skeleton, interfaces, adversarial fakes, contract-test + `test:mutation` harness | 🔄 contracts landed (`feat/payments-v2`); fakes building |
+| P2 | `WalletApiSession` — auth cell, wake socket, syncEpoch latch | 🔄 building |
+| P3 | `InventoryView` — cursor pull, overlay, recovery, reads (`assets`/`tokens`) | 🔄 view building; providers in phase β |
+| P4 | `CoinSelector` + `Reservations` + queue | 🔄 building |
 | P5 | `TransferMachine` — send happy path, latency rules, first probes | ⬜ |
 | P6 | `TransferMachine` — resume = same machine; conflict/keep-open/partial; E.4 | ⬜ |
 | P7 | `Receive` drain + seen-set + claim + RECEIVED history | ⬜ |
