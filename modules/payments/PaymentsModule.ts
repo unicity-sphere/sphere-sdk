@@ -713,6 +713,21 @@ export class PaymentsModule {
    */
   private inventoryPollTimer: ReturnType<typeof setInterval> | null = null;
   /** Coalesces concurrent incoming-pump runs. */
+  /**
+   * #724: load and delivery-drain MUTUAL exclusion.
+   *
+   * They cannot overlap in EITHER direction. A load clears the token map and
+   * repopulates it from a snapshot; a drain stores tokens into that map and acks
+   * them into a persistent seen-set, so an overlap in either order can erase a
+   * token that can never be re-delivered. Awaiting the other side's promise at
+   * entry is not enough — that only sees what is in flight at that instant, and
+   * the wake ordering starts the drain first with the load 500ms behind it.
+   *
+   * A single tail-chained mutex, so the answer to "may I touch the token map"
+   * is one variable rather than four observed at four different moments.
+   */
+  private tokenMapMutex: Promise<unknown> = Promise.resolve();
+
   private pumpInFlight: Promise<number> | null = null;
   /** S6 field-encryption key (intent payloads, history memos) — per identity. */
   private fieldEncryptionKey: Uint8Array | null = null;
@@ -720,7 +735,6 @@ export class PaymentsModule {
 
   // Guard: ensure load() completes before processing incoming bundles
   private loadedPromise: Promise<void> | null = null;
-  private loaded = false;
 
   /**
    * #642 single-flight guard for {@link load}: the in-flight load, the owner
@@ -812,7 +826,6 @@ export class PaymentsModule {
     return {
       get deps() { return module.deps; },
       get delivery() { return module.delivery; },
-      get loaded() { return module.loaded; },
       get loadedPromise() { return module.loadedPromise; },
       ensureInitialized: () => this.ensureInitialized(),
       ensureDelivery: () => this.ensureDelivery(),
@@ -836,7 +849,6 @@ export class PaymentsModule {
       get deps() { return module.deps; },
       get pumpHealth() { return module.pumpHealth; },
       get pollIntervalMs() { return DELIVERY_POLL_INTERVAL_MS; },
-      get loaded() { return module.loaded; },
       get loadedPromise() { return module.loadedPromise; },
       ensureInitialized: () => this.ensureInitialized(),
       currentNametagName: () => this.currentNametagName(),
@@ -875,7 +887,6 @@ export class PaymentsModule {
     return {
       get deps() { return module.deps; },
       get delivery() { return module.delivery; },
-      get loaded() { return module.loaded; },
       get loadedPromise() { return module.loadedPromise; },
       ensureInitialized: () => this.ensureInitialized(),
       getFieldEncryptionKey: () => this.getFieldEncryptionKey(),
@@ -1062,6 +1073,13 @@ export class PaymentsModule {
    * from configured storage providers. Restores pending V5 tokens and
    * triggers a fire-and-forget {@link resolveUnconfirmed} call.
    */
+  /** Run `fn` with exclusive access to the token map (see {@link tokenMapMutex}). */
+  private withTokenMap<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.tokenMapMutex.then(fn, fn);
+    this.tokenMapMutex = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
   async load(): Promise<void> {
     return this.loadWith(true);
   }
@@ -1222,11 +1240,11 @@ export class PaymentsModule {
       // Load transaction history from dedicated history store (with migration from legacy KV)
       await this.loadHistory();
 
-      this.loaded = true;
     };
 
     const run = async (): Promise<void> => {
-      this.loadedPromise = doLoad();
+      // #724: exclusive with the delivery drain, in both directions.
+      this.loadedPromise = this.withTokenMap(doLoad);
       await this.loadedPromise;
 
       // Replay finished-but-undelivered v2 blobs from a previous session
@@ -3316,11 +3334,13 @@ export class PaymentsModule {
     return this.pumpIncomingDeliveries();
   }
 
-  private async doPumpIncomingDeliveries(): Promise<number> {
+  private doPumpIncomingDeliveries(): Promise<number> {
+    // #724: the drain and a load must never overlap — in EITHER direction.
+    return this.withTokenMap(() => this.drainIncomingDeliveries());
+  }
+
+  private async drainIncomingDeliveries(): Promise<number> {
     const delivery = this.delivery!;
-    if (!this.loaded && this.loadedPromise) {
-      await this.loadedPromise;
-    }
     let stored = 0;
     // #623: verify+store per entry (§8.2 — the recipient verifies locally), but ACCUMULATE the
     // claim/reject and submit them in batches (one request each) so a large inbox drain doesn't fire

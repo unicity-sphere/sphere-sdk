@@ -1010,6 +1010,68 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(sent).toBeDefined();
   });
 
+  it('#724: a load and a delivery drain never overlap — in either direction', async () => {
+    // The loss: a load clears the token map and repopulates it from a snapshot
+    // read earlier, while a drain stores tokens into that map and acks them into
+    // the persistent seen-set. Overlap in EITHER order can erase a token that can
+    // never be re-delivered. Own-storage custody makes it permanent: the claim is
+    // intoInventory:false, so the server never learns the token exists.
+    //
+    // This drives the ordering the wake path actually produces — drain first, the
+    // debounced inventory load 500ms behind it — which a one-shot "await the
+    // current load" barrier does NOT cover.
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-724-send');
+    await seedServerToken(fake, sender, SENDER, 100n);
+    await sender.module.load();
+
+    const recipient = makeOwnStorageWallet(baseUrl, fake.network, RECIPIENT, 'd-724-recv');
+    await recipient.module.load();
+
+    // The recipient must already have persisted state, or provider.load() returns
+    // {success:false}, loadFromStorageData never runs, and there is no clear to race.
+    await sender.module.send({ recipient: '@bob', amount: '100', coinId: UCT });
+    await vi.waitFor(async () => {
+      await recipient.module.receive();
+      expect(recipient.module.getTokens()).toHaveLength(1);
+    });
+    await recipient.module.sync();
+
+    // A second token is now in the mailbox, and the drain that will store it is
+    // held mid-flight.
+    await seedServerToken(fake, sender, SENDER, 100n);
+    await sender.module.load();
+    await sender.module.send({ recipient: '@bob', amount: '100', coinId: UCT });
+
+    let releaseDrain!: () => void;
+    const drainHeld = new Promise<void>((r) => { releaseDrain = r; });
+    const realIncoming = recipient.delivery.incoming.bind(recipient.delivery);
+    vi.spyOn(recipient.delivery, 'incoming').mockImplementation(async function* (cursor?: string) {
+      await drainHeld;
+      yield* realIncoming(cursor);
+    });
+
+    const provider = recipient.deps.tokenStorageProviders!.get('local')!;
+    let snapshotRead = false;
+    const realLoad = provider.load.bind(provider);
+    vi.spyOn(provider, 'load').mockImplementation(async () => { snapshotRead = true; return realLoad(); });
+
+    const receiving = recipient.module.receive();   // takes the map, parks in incoming()
+    await new Promise((r) => setTimeout(r, 50));
+
+    const loading = recipient.module.load();        // must NOT proceed past the drain
+    await new Promise((r) => setTimeout(r, 100));
+    expect(snapshotRead).toBe(false);               // the load has not read storage yet
+
+    releaseDrain();
+    await receiving;
+    await loading;
+
+    // Both tokens survive: the load's snapshot was taken AFTER the drain stored
+    // and acked, so its repopulate cannot erase what the drain just added.
+    expect(recipient.module.getTokens()).toHaveLength(2);
+  }, 30_000);
+
   it('#621: a leg with a journaled blob is RE-DELIVERED, never re-certified', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-journal-1');

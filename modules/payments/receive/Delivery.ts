@@ -104,8 +104,6 @@ export interface DeliveryHost {
   readonly deps: PaymentsModuleDependencies | null;
   /** The composed delivery port — the single seam assets ride in and out on. */
   readonly delivery: DeliveryProvider | null;
-  /** load() gate — an incoming transfer must observe the loaded token map before deduping. */
-  readonly loaded: boolean;
   readonly loadedPromise: Promise<void> | null;
   /** Throws unless the module has dependencies. */
   ensureInitialized(): void;
@@ -214,9 +212,9 @@ export class Delivery {
     senderPubkey: string
   ): Promise<'stored' | 'duplicate' | 'storage-rejected' | 'invalid' | 'not-owned' | 'no-engine'> {
     this.host.ensureInitialized();
-    if (!this.host.loaded && this.host.loadedPromise) {
-      await this.host.loadedPromise;
-    }
+    // #724: NO load barrier here. The only production caller is the drain, which
+    // already holds the token-map mutex — awaiting a load from inside it would
+    // deadlock against a load queued behind that same drain.
 
     const engine = this.host.deps!.tokenEngine;
     if (!engine) {
