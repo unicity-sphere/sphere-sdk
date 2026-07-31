@@ -212,8 +212,9 @@ export class Delivery {
     senderPubkey: string
   ): Promise<'stored' | 'duplicate' | 'storage-rejected' | 'invalid' | 'not-owned' | 'no-engine'> {
     this.host.ensureInitialized();
-    // #724: await the CURRENT load — see PaymentsModule.doPumpIncomingDeliveries.
-    await this.host.loadedPromise;
+    // #724: NO load barrier here. The only production caller is the drain, which
+    // already holds the token-map mutex — awaiting a load from inside it would
+    // deadlock against a load queued behind that same drain.
 
     const engine = this.host.deps!.tokenEngine;
     if (!engine) {
