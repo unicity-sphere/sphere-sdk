@@ -21,10 +21,10 @@
 | P5 | `TransferMachine` — send path | ✅ 5/5 mutation probes; apply-gating amendment (§5.5) found here |
 | P6 | `TransferMachine` — resume = same machine | ✅ #676/#631/#634/audit#4/#690 pinned; 29 tests total with P5 |
 | P7 | `Receive` drain + seen-set + claim + RECEIVED history | ✅ 20 tests; store-before-ack crash window pinned |
-| P8 | `Requests` (streams + settling journal); `Mint` (+ engine F13 fix) | 🔄 requests ✅ (19 tests); mint + F13 in δ |
-| P9 | `History` read-through; events; Connect adapter; facade assembly | 🔄 history ✅ (15 tests); facade + adapter in δ |
-| P10 | Live-staging e2e parity + soak + request-count budgets | 🔄 session e2e live-green; money-path staging e2e after δ |
-| P11 | Flip PR: wire Sphere, delete old vertical, frontend migration, re-pin | ⬜ owner-gated |
+| P8 | `Requests` (streams + settling journal); `Mint` (+ engine F13 fix) | ✅ requests 19 tests; journal-first mint; F13 fixed + fake de-lied (124/124 engine) |
+| P9 | `History` read-through; events; facade assembly | ✅ facade 16 tests over real ports; `test:mutation` standing (16/16 KILLED). Connect adapter → P11 |
+| P10 | Live-staging e2e parity + soak + request-count budgets | 🔄 **6/6 money matrix live-green on testnet2** (mint / whole-token / split w/ signed seed-close / self-send / A→B→A / crash-resume paid-once) + 5/5 session e2e. Still owed: exact-combination + E.4-stage interruption cells, soak, request-count budgets |
+| P11 | Flip PR: wire Sphere + Connect adapter, delete old vertical, frontend migration, re-pin | ⬜ owner-gated |
 
 ---
 
