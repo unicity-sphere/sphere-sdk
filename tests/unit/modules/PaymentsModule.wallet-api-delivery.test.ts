@@ -475,7 +475,11 @@ describe('send — batched mailbox deposit (#699)', () => {
     await vi.waitFor(() => {
       expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(N);
     });
-    expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
+    // The journal entry is removed AFTER its deposit is visible — converge,
+    // don't sample (CI flake: run 30945837695 caught removal N lagging deposit N).
+    await vi.waitFor(() => {
+      expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
+    });
   });
 
   it('a batch-level 409 falls back to per-entry deposits inside the provider — the send still completes', async () => {

@@ -181,6 +181,20 @@ export interface SphereWalletApiSession extends PaymentsWalletApiPort {
 }
 
 /** Options for creating a new wallet */
+/**
+ * Opt-in to the payments-v2 vertical (docs/PAYMENTS-V2-DESIGN.md §4).
+ * Absent/false: nothing changes. When true: the legacy module is never
+ * constructed/initialized/loaded (two verticals would double-drain the
+ * mailbox), `sphere.payments` THROWS (INVALID_CONFIG) so stale call sites
+ * fail loudly, and `sphere.paymentsV2` serves the §4 surface. Requires
+ * `walletApi` (its baseUrl/network/deviceId are reused — see
+ * core/payments-v2-wiring.ts); incompatible with `accounting`/`swap`.
+ * The P11 flip makes this the only path.
+ */
+export interface PaymentsV2OptIn {
+  paymentsV2?: boolean;
+}
+
 export interface SphereCreateOptions {
   /** BIP39 mnemonic (12 or 24 words) */
   mnemonic: string;
@@ -208,18 +222,8 @@ export interface SphereCreateOptions {
    * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
    */
   walletApi?: SphereWalletApiSession;
-  /**
-   * EXPERIMENTAL opt-in (P9, docs/PAYMENTS-V2-DESIGN.md): run the wallet-api
-   * payments-v2 vertical INSTEAD of the legacy PaymentsModule. Default false —
-   * nothing changes. When true: the legacy module is never
-   * constructed-for-use/initialized/loaded (two verticals would double-drain
-   * the mailbox), `sphere.payments` THROWS (INVALID_CONFIG) so stale call
-   * sites fail loudly, and `sphere.paymentsV2` serves the §4 surface.
-   * Requires `walletApi` (its baseUrl/network/deviceId are reused — see
-   * core/payments-v2-wiring.ts); incompatible with `accounting`/`swap`.
-   * The P11 flip makes this the only path.
-   */
-  paymentsV2?: boolean;
+  /** See {@link PaymentsV2OptIn}. */
+  paymentsV2?: PaymentsV2OptIn['paymentsV2'];
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -280,18 +284,8 @@ export interface SphereLoadOptions {
    * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
    */
   walletApi?: SphereWalletApiSession;
-  /**
-   * EXPERIMENTAL opt-in (P9, docs/PAYMENTS-V2-DESIGN.md): run the wallet-api
-   * payments-v2 vertical INSTEAD of the legacy PaymentsModule. Default false —
-   * nothing changes. When true: the legacy module is never
-   * constructed-for-use/initialized/loaded (two verticals would double-drain
-   * the mailbox), `sphere.payments` THROWS (INVALID_CONFIG) so stale call
-   * sites fail loudly, and `sphere.paymentsV2` serves the §4 surface.
-   * Requires `walletApi` (its baseUrl/network/deviceId are reused — see
-   * core/payments-v2-wiring.ts); incompatible with `accounting`/`swap`.
-   * The P11 flip makes this the only path.
-   */
-  paymentsV2?: boolean;
+  /** See {@link PaymentsV2OptIn}. */
+  paymentsV2?: PaymentsV2OptIn['paymentsV2'];
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -370,18 +364,8 @@ export interface SphereImportOptions {
    * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
    */
   walletApi?: SphereWalletApiSession;
-  /**
-   * EXPERIMENTAL opt-in (P9, docs/PAYMENTS-V2-DESIGN.md): run the wallet-api
-   * payments-v2 vertical INSTEAD of the legacy PaymentsModule. Default false —
-   * nothing changes. When true: the legacy module is never
-   * constructed-for-use/initialized/loaded (two verticals would double-drain
-   * the mailbox), `sphere.payments` THROWS (INVALID_CONFIG) so stale call
-   * sites fail loudly, and `sphere.paymentsV2` serves the §4 surface.
-   * Requires `walletApi` (its baseUrl/network/deviceId are reused — see
-   * core/payments-v2-wiring.ts); incompatible with `accounting`/`swap`.
-   * The P11 flip makes this the only path.
-   */
-  paymentsV2?: boolean;
+  /** See {@link PaymentsV2OptIn}. */
+  paymentsV2?: PaymentsV2OptIn['paymentsV2'];
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
@@ -434,18 +418,8 @@ export interface SphereInitOptions {
    * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
    */
   walletApi?: SphereWalletApiSession;
-  /**
-   * EXPERIMENTAL opt-in (P9, docs/PAYMENTS-V2-DESIGN.md): run the wallet-api
-   * payments-v2 vertical INSTEAD of the legacy PaymentsModule. Default false —
-   * nothing changes. When true: the legacy module is never
-   * constructed-for-use/initialized/loaded (two verticals would double-drain
-   * the mailbox), `sphere.payments` THROWS (INVALID_CONFIG) so stale call
-   * sites fail loudly, and `sphere.paymentsV2` serves the §4 surface.
-   * Requires `walletApi` (its baseUrl/network/deviceId are reused — see
-   * core/payments-v2-wiring.ts); incompatible with `accounting`/`swap`.
-   * The P11 flip makes this the only path.
-   */
-  paymentsV2?: boolean;
+  /** See {@link PaymentsV2OptIn}. */
+  paymentsV2?: PaymentsV2OptIn['paymentsV2'];
   /** Optional token storage provider (for IPFS sync) */
   tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** BIP39 mnemonic - if wallet doesn't exist, use this to create */
