@@ -113,6 +113,13 @@ import {
   type VerificationWorkerConfig,
 } from '../token-engine';
 import {
+  composePaymentsV2,
+  resolvePaymentsV2Composition,
+  type PaymentsV2Composition,
+} from './payments-v2-wiring';
+import type { PaymentsV2 } from '../modules/payments-v2/api';
+import type { PaymentsFacade } from '../modules/payments-v2/PaymentsFacade';
+import {
   isTextWalletEncrypted,
   isWalletTextFormat,
   parseAndDecryptWalletText,
@@ -201,6 +208,18 @@ export interface SphereCreateOptions {
    * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
    */
   walletApi?: SphereWalletApiSession;
+  /**
+   * EXPERIMENTAL opt-in (P9, docs/PAYMENTS-V2-DESIGN.md): run the wallet-api
+   * payments-v2 vertical INSTEAD of the legacy PaymentsModule. Default false —
+   * nothing changes. When true: the legacy module is never
+   * constructed-for-use/initialized/loaded (two verticals would double-drain
+   * the mailbox), `sphere.payments` THROWS (INVALID_CONFIG) so stale call
+   * sites fail loudly, and `sphere.paymentsV2` serves the §4 surface.
+   * Requires `walletApi` (its baseUrl/network/deviceId are reused — see
+   * core/payments-v2-wiring.ts); incompatible with `accounting`/`swap`.
+   * The P11 flip makes this the only path.
+   */
+  paymentsV2?: boolean;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -261,6 +280,18 @@ export interface SphereLoadOptions {
    * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
    */
   walletApi?: SphereWalletApiSession;
+  /**
+   * EXPERIMENTAL opt-in (P9, docs/PAYMENTS-V2-DESIGN.md): run the wallet-api
+   * payments-v2 vertical INSTEAD of the legacy PaymentsModule. Default false —
+   * nothing changes. When true: the legacy module is never
+   * constructed-for-use/initialized/loaded (two verticals would double-drain
+   * the mailbox), `sphere.payments` THROWS (INVALID_CONFIG) so stale call
+   * sites fail loudly, and `sphere.paymentsV2` serves the §4 surface.
+   * Requires `walletApi` (its baseUrl/network/deviceId are reused — see
+   * core/payments-v2-wiring.ts); incompatible with `accounting`/`swap`.
+   * The P11 flip makes this the only path.
+   */
+  paymentsV2?: boolean;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -339,6 +370,18 @@ export interface SphereImportOptions {
    * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
    */
   walletApi?: SphereWalletApiSession;
+  /**
+   * EXPERIMENTAL opt-in (P9, docs/PAYMENTS-V2-DESIGN.md): run the wallet-api
+   * payments-v2 vertical INSTEAD of the legacy PaymentsModule. Default false —
+   * nothing changes. When true: the legacy module is never
+   * constructed-for-use/initialized/loaded (two verticals would double-drain
+   * the mailbox), `sphere.payments` THROWS (INVALID_CONFIG) so stale call
+   * sites fail loudly, and `sphere.paymentsV2` serves the §4 surface.
+   * Requires `walletApi` (its baseUrl/network/deviceId are reused — see
+   * core/payments-v2-wiring.ts); incompatible with `accounting`/`swap`.
+   * The P11 flip makes this the only path.
+   */
+  paymentsV2?: boolean;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
@@ -391,6 +434,18 @@ export interface SphereInitOptions {
    * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
    */
   walletApi?: SphereWalletApiSession;
+  /**
+   * EXPERIMENTAL opt-in (P9, docs/PAYMENTS-V2-DESIGN.md): run the wallet-api
+   * payments-v2 vertical INSTEAD of the legacy PaymentsModule. Default false —
+   * nothing changes. When true: the legacy module is never
+   * constructed-for-use/initialized/loaded (two verticals would double-drain
+   * the mailbox), `sphere.payments` THROWS (INVALID_CONFIG) so stale call
+   * sites fail loudly, and `sphere.paymentsV2` serves the §4 surface.
+   * Requires `walletApi` (its baseUrl/network/deviceId are reused — see
+   * core/payments-v2-wiring.ts); incompatible with `accounting`/`swap`.
+   * The P11 flip makes this the only path.
+   */
+  paymentsV2?: boolean;
   /** Optional token storage provider (for IPFS sync) */
   tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** BIP39 mnemonic - if wallet doesn't exist, use this to create */
@@ -607,6 +662,21 @@ export class Sphere {
   private _accounting: AccountingModule | null = null;
   private _swap: SwapModule | null = null;
 
+  // payments-v2 (P9 opt-in — see SphereInitOptions.paymentsV2)
+  /** True when init opted into the payments-v2 vertical; the legacy module is then inert. */
+  private _paymentsV2Enabled = false;
+  /** The ACTIVE address's running vertical — §7: exactly one at a time, ever. */
+  private _paymentsV2Active: { index: number; facade: PaymentsFacade } | null = null;
+  /** Resolved wallet-api transport composition (network + per-address factory). */
+  private _paymentsV2Composition: PaymentsV2Composition | null = null;
+  /**
+   * §7 lifecycle mutex: every stop/start pair runs strictly serialized, so
+   * overlapping switch/destroy calls can never observe a half-stopped vertical
+   * and start a second one (an orphan would double-drain its kv on the next
+   * switch-back). The chain never stays rejected.
+   */
+  private _paymentsV2Lifecycle: Promise<void> = Promise.resolve();
+
   // Per-address module instances (Phase 2: independent parallel operation)
   private _addressModules: Map<number, AddressModuleSet> = new Map();
   private _transportMux: MultiAddressTransportMux | null = null;
@@ -771,6 +841,7 @@ export class Sphere {
         // composition to the legacy local-custody one — forward them always.
         delivery: options.delivery,
         walletApi: options.walletApi,
+        paymentsV2: options.paymentsV2,
         price: options.price,
         groupChat,
         market,
@@ -816,6 +887,7 @@ export class Sphere {
       // composition to the legacy local-custody one — forward them always.
       delivery: options.delivery,
       walletApi: options.walletApi,
+      paymentsV2: options.paymentsV2,
       derivationPath: options.derivationPath,
       nametag: options.nametag,
       price: options.price,
@@ -908,6 +980,28 @@ export class Sphere {
   }
 
   /**
+   * P9: validate + resolve the paymentsV2 opt-in BEFORE any storage writes —
+   * fail-closed at init, never a silently-degraded composition.
+   */
+  private static resolvePaymentsV2Flag(
+    flag: boolean | undefined,
+    accountingConfig: AccountingModuleConfig | undefined,
+    swapConfig: SwapModuleConfig | undefined,
+    walletApi: SphereWalletApiSession | undefined,
+  ): boolean {
+    if (flag !== true) return false;
+    if (accountingConfig || swapConfig) {
+      throw new SphereError(
+        'paymentsV2 is incompatible with the accounting/swap modules (both are built on the legacy PaymentsModule and are deleted with the P11 flip) — disable them or the flag.',
+        'INVALID_CONFIG'
+      );
+    }
+    // Throws INVALID_CONFIG when walletApi is absent or exposes no composition.
+    resolvePaymentsV2Composition(walletApi);
+    return true;
+  }
+
+  /**
    * Configure TokenRegistry in the main bundle context.
    *
    * The provider factory functions (createBrowserProviders / createNodeProviders)
@@ -974,6 +1068,9 @@ export class Sphere {
       options.walletApi,
     );
     sphere._verification = options.verification;
+    sphere._paymentsV2Enabled = Sphere.resolvePaymentsV2Flag(
+      options.paymentsV2, accountingConfig, swapConfig, options.walletApi,
+    );
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
 
@@ -1075,6 +1172,9 @@ export class Sphere {
       options.walletApi,
     );
     sphere._verification = options.verification;
+    sphere._paymentsV2Enabled = Sphere.resolvePaymentsV2Flag(
+      options.paymentsV2, accountingConfig, swapConfig, options.walletApi,
+    );
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
 
@@ -1182,6 +1282,9 @@ export class Sphere {
       options.walletApi,
     );
     sphere._verification = options.verification;
+    sphere._paymentsV2Enabled = Sphere.resolvePaymentsV2Flag(
+      options.paymentsV2, accountingConfig, swapConfig, options.walletApi,
+    );
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
 
@@ -1253,7 +1356,8 @@ export class Sphere {
     }
 
     // Auto-sync with token storage providers (e.g., IPFS) to recover tokens
-    if (sphere._tokenStorageProviders.size > 0) {
+    // (legacy vertical only — under paymentsV2 the module is inert)
+    if (!sphere._paymentsV2Enabled && sphere._tokenStorageProviders.size > 0) {
       progress?.({ step: 'syncing_tokens', message: 'Syncing tokens...' });
       try {
         const syncResult = await sphere._payments.sync();
@@ -1413,8 +1517,21 @@ export class Sphere {
 
   /** Payments module (L3) */
   get payments(): PaymentsModule {
+    if (this._paymentsV2Enabled) {
+      // Checked BEFORE ensureReady so a stale call site fails with the typed
+      // reason at any lifecycle stage — never silently on a half-dead module.
+      throw new SphereError('payments (v1) is disabled by paymentsV2 — use sphere.paymentsV2', 'INVALID_CONFIG');
+    }
     this.ensureReady();
     return this._payments;
+  }
+
+  /**
+   * Payments-v2 vertical (P9, EXPERIMENTAL — `SphereInitOptions.paymentsV2`).
+   * Null when the flag is off; otherwise the active address's facade.
+   */
+  get paymentsV2(): PaymentsV2 | null {
+    return this._paymentsV2Active?.facade ?? null;
   }
 
   /** Communications module */
@@ -1626,6 +1743,12 @@ export class Sphere {
     // back reads, and a stale entry would hand that address a disposed engine.
     if (active) active.tokenEngine = this._tokenEngine;
     this._payments.setTokenEngine(this._tokenEngine);
+    // P9: the v2 facade snapshots its engine per operation — swap what FUTURE
+    // operations use; in-flight ones finish on the old engine (disposed below,
+    // which only tears down a verification worker pool).
+    if (this._paymentsV2Active && this._tokenEngine) {
+      this._paymentsV2Active.facade.setEngine(this._tokenEngine);
+    }
     // Only now terminate what it replaced: the engine may own a verification
     // worker pool, and every api-key change would otherwise leak one.
     if (replaced && replaced !== this._tokenEngine) replaced.dispose?.();
@@ -2466,19 +2589,22 @@ export class Sphere {
           privateKey: newIdentity.privateKey,
           chainPubkey: newIdentity.chainPubkey,
         });
-        moduleSet.payments.initialize({
-          identity: newIdentity,
-          storage: this._storage,
-          tokenStorageProviders: moduleSet.tokenStorageProviders,
-          transport: addressTransport,
-          oracle: this._oracle,
-          emitEvent: this.emitEvent.bind(this),
-          price: this._priceProvider ?? undefined,
-          tokenEngine: moduleSet.tokenEngine,
-          delivery: moduleSet.delivery ?? undefined,
-          walletApi: moduleSet.walletApi ?? undefined,
-          getCurrentNametag: () => this.getNametagForAddress(),
-        });
+        // P9: the legacy module is inert under paymentsV2 — never re-init it.
+        if (!this._paymentsV2Enabled) {
+          moduleSet.payments.initialize({
+            identity: newIdentity,
+            storage: this._storage,
+            tokenStorageProviders: moduleSet.tokenStorageProviders,
+            transport: addressTransport,
+            oracle: this._oracle,
+            emitEvent: this.emitEvent.bind(this),
+            price: this._priceProvider ?? undefined,
+            tokenEngine: moduleSet.tokenEngine,
+            delivery: moduleSet.delivery ?? undefined,
+            walletApi: moduleSet.walletApi ?? undefined,
+            getCurrentNametag: () => this.getNametagForAddress(),
+          });
+        }
       }
       // No nametag change → no re-init needed. #583: this address already has
       // its OWN identity-bound client (built at first visit); it never served
@@ -2518,8 +2644,17 @@ export class Sphere {
     // visit retries. The retired rebindWalletApiIdentity used to cover this on
     // the re-visit path; per-address isolation keeps the client itself bound,
     // but these sign-in side effects still need re-running on each switch-back.
-    if (!firstVisit && activeModules.walletApi) {
+    if (!this._paymentsV2Enabled && !firstVisit && activeModules.walletApi) {
       await this.startWalletApiSession(activeModules.payments, activeModules.walletApi);
+    }
+
+    // P9 §7: an address switch is stop-then-start — the previous vertical fully
+    // stops (quiescence: its in-flight ops settle) BEFORE the new one starts,
+    // so two verticals never write one per-address KV; the lifecycle mutex
+    // serializes overlapping switches. Re-visits compose a FRESH vertical
+    // (durable state lives in the scoped KV; a stopped session can't restart).
+    if (this._paymentsV2Enabled) {
+      await this.stopThenStartPaymentsV2(index, newIdentity);
     }
 
     // Persist current index
@@ -2716,20 +2851,24 @@ export class Sphere {
     // client with this address's token storage), so its pumps never share a
     // client with another address.
 
-    // Initialize with address-specific identity and per-address transport
-    payments.initialize({
-      identity,
-      storage: this._storage,
-      tokenStorageProviders,
-      transport: addressTransport,
-      oracle: this._oracle,
-      emitEvent,
-      price: this._priceProvider ?? undefined,
-      tokenEngine,
-      delivery: delivery ?? undefined,
-      walletApi: walletApi ?? undefined,
-      getCurrentNametag: () => this.getNametagForAddress(),
-    });
+    // Initialize with address-specific identity and per-address transport.
+    // P9: with paymentsV2 on, the legacy module stays INERT for every address
+    // (see initializeModules) — switchToAddress starts this address's facade.
+    if (!this._paymentsV2Enabled) {
+      payments.initialize({
+        identity,
+        storage: this._storage,
+        tokenStorageProviders,
+        transport: addressTransport,
+        oracle: this._oracle,
+        emitEvent,
+        price: this._priceProvider ?? undefined,
+        tokenEngine,
+        delivery: delivery ?? undefined,
+        walletApi: walletApi ?? undefined,
+        getCurrentNametag: () => this.getNametagForAddress(),
+      });
+    }
 
     communications.initialize({
       identity,
@@ -2802,13 +2941,15 @@ export class Sphere {
       }
     }
 
-    // payments.load() is critical — must succeed for wallet to be usable
-    await payments.load();
+    if (!this._paymentsV2Enabled) {
+      // payments.load() is critical — must succeed for wallet to be usable
+      await payments.load();
 
-    // S4 auth lifecycle: sign in as this address's identity and resume its
-    // open intents (E.3) — sign-in on unlock / after an account switch. Drives
-    // THIS address's OWN session (#583), never a shared one.
-    await this.startWalletApiSession(payments, walletApi);
+      // S4 auth lifecycle: sign in as this address's identity and resume its
+      // open intents (E.3) — sign-in on unlock / after an account switch. Drives
+      // THIS address's OWN session (#583), never a shared one.
+      await this.startWalletApiSession(payments, walletApi);
+    }
 
     // Non-critical modules load in parallel — failures are non-fatal
     const results = await Promise.allSettled([
@@ -2842,10 +2983,12 @@ export class Sphere {
     this._addressModules.set(index, moduleSet);
     logger.debug('Sphere', `Initialized per-address modules for address ${index} (transport: ${adapter ? 'mux adapter' : 'primary'})`);
 
-    // Background sync after initialization
-    payments.sync().catch((err) => {
-      logger.warn('Sphere', `Post-init sync failed for address ${index}:`, err);
-    });
+    // Background sync after initialization (legacy vertical only)
+    if (!this._paymentsV2Enabled) {
+      payments.sync().catch((err) => {
+        logger.warn('Sphere', `Post-init sync failed for address ${index}:`, err);
+      });
+    }
 
     return moduleSet;
   }
@@ -3886,6 +4029,15 @@ export class Sphere {
   async destroy(): Promise<void> {
     this.cleanupProviderEventSubscriptions();
 
+    // P9: stop the payments-v2 vertical FIRST — stop() awaits quiescence, so
+    // in-flight facade ops settle before their engine is disposed below (and
+    // the mutex orders this after any in-flight switch's stop/start pair).
+    try {
+      await this.queuePaymentsV2Op(() => this.stopPaymentsV2Inner());
+    } catch (err) {
+      logger.warn('Sphere', 'paymentsV2 stop failed during destroy:', err);
+    }
+
     // Destroy swap FIRST — it depends on accounting (which depends on payments)
     try {
       await this._swap?.destroy();
@@ -4399,20 +4551,25 @@ export class Sphere {
     if (previousEngine && previousEngine !== this._tokenEngine) previousEngine.dispose?.();
     const tokenEngine = this._tokenEngine;
 
-    this._payments.initialize({
-      identity: this._identity!,
-      storage: this._storage,
-      tokenStorageProviders: this._tokenStorageProviders,
-      transport: moduleTransport,
-      oracle: this._oracle,
-      emitEvent,
-      price: this._priceProvider ?? undefined,
-      disabledProviderIds: this._disabledProviders,
-      tokenEngine,
-      delivery: this._delivery ?? undefined,
-      walletApi: this._walletApi ?? undefined,
-      getCurrentNametag: () => this.getNametagForAddress(),
-    });
+    // P9: with paymentsV2 on, the legacy module stays INERT for every address —
+    // never initialized/loaded (both verticals draining one mailbox would
+    // double-process incoming transfers). The facade starts below instead.
+    if (!this._paymentsV2Enabled) {
+      this._payments.initialize({
+        identity: this._identity!,
+        storage: this._storage,
+        tokenStorageProviders: this._tokenStorageProviders,
+        transport: moduleTransport,
+        oracle: this._oracle,
+        emitEvent,
+        price: this._priceProvider ?? undefined,
+        disabledProviderIds: this._disabledProviders,
+        tokenEngine,
+        delivery: this._delivery ?? undefined,
+        walletApi: this._walletApi ?? undefined,
+        getCurrentNametag: () => this.getNametagForAddress(),
+      });
+    }
 
     this._communications.initialize({
       identity: this._identity!,
@@ -4490,7 +4647,7 @@ export class Sphere {
     // Load modules in parallel — they are independent of each other.
     // allSettled so one failing module doesn't block the rest.
     const results = await Promise.allSettled([
-      this._payments.load(),
+      this._paymentsV2Enabled ? undefined : this._payments.load(),
       this._communications.load(),
       this._groupChat?.load(),
       this._market?.load(),
@@ -4504,7 +4661,11 @@ export class Sphere {
     }
 
     // S4 auth lifecycle: sign in on unlock and resume open intents (E.3).
-    await this.startWalletApiSession(this._payments);
+    // P9: the v2 vertical owns its own auth + resume — the legacy session
+    // (and its resumeOpenIntents) must not run beside it.
+    if (!this._paymentsV2Enabled) {
+      await this.startWalletApiSession(this._payments);
+    }
 
     // Register in per-address module map. #583: the boot address reuses the
     // composition-time delivery/session instances directly (they ARE this
@@ -4523,6 +4684,12 @@ export class Sphere {
       walletApi: this._walletApi,
       initialized: true,
     });
+
+    // P9 boot: start the payments-v2 vertical for the boot address (address
+    // switches stop/start it in switchToAddress — §7 single active vertical).
+    if (this._paymentsV2Enabled) {
+      await this.stopThenStartPaymentsV2(this._currentAddressIndex, this._identity!);
+    }
   }
 
   // ===========================================================================
@@ -4579,6 +4746,67 @@ export class Sphere {
         }
       })
       .catch((err) => logger.warn('Sphere', 'Open-intent resume failed (retried next sign-in):', err));
+  }
+
+  /** §7 mutex: run one stop/start lifecycle op after all queued ones settle. */
+  private queuePaymentsV2Op<T>(op: () => Promise<T>): Promise<T> {
+    const run = this._paymentsV2Lifecycle.then(op);
+    this._paymentsV2Lifecycle = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  /** P9 switch/boot: stop whatever runs, then start `index`'s vertical — atomically vs other lifecycle ops. */
+  private stopThenStartPaymentsV2(index: number, identity: FullIdentity): Promise<void> {
+    return this.queuePaymentsV2Op(async () => {
+      await this.stopPaymentsV2Inner();
+      await this.startPaymentsV2Inner(index, identity);
+    });
+  }
+
+  /**
+   * P9: compose + start the payments-v2 vertical for ONE address (the §7 rule:
+   * exactly one running vertical; callers stop the previous one first). The
+   * facade REUSES this address's engine record — `engineRef` re-reads it so a
+   * setOracleApiKey rebuild is what future operations snapshot.
+   */
+  private async startPaymentsV2Inner(index: number, identity: FullIdentity): Promise<void> {
+    this._paymentsV2Composition ??= resolvePaymentsV2Composition(this._walletApiTemplate);
+    if (!this._addressModules.get(index)?.tokenEngine) {
+      throw new SphereError(
+        'paymentsV2 requires the v2 token engine — the oracle must supply a trust base + gateway URL (and API key where required).',
+        'INVALID_CONFIG'
+      );
+    }
+    const facade = composePaymentsV2({
+      identity,
+      composition: this._paymentsV2Composition,
+      engineRef: () => {
+        const engine = this._addressModules.get(index)?.tokenEngine;
+        if (!engine) throw new SphereError('paymentsV2: token engine unavailable', 'AGGREGATOR_ERROR');
+        return engine;
+      },
+      host: {
+        storage: this._storage,
+        price: this._priceProvider,
+        emit: (event, payload) =>
+          this.emitEvent(event as SphereEventType, payload as SphereEventMap[SphereEventType]),
+        resolvePeer: (identifier) => this._transport.resolve?.(identifier) ?? Promise.resolve(null),
+        nametag: () => this.getNametagForAddress(),
+      },
+    });
+    this._paymentsV2Active = { index, facade };
+    await facade.start();
+  }
+
+  /** P9 §7: stop the active vertical and await quiescence (in-flight ops settle). */
+  private async stopPaymentsV2Inner(): Promise<void> {
+    const active = this._paymentsV2Active;
+    if (!active) return;
+    this._paymentsV2Active = null;
+    await active.facade.stop();
   }
 
   private ensureReady(): void {
