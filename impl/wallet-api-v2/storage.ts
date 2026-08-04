@@ -9,8 +9,11 @@ export const WALLET_API_V2_FANOUT_WIDTH = 8;
 
 export type StoragePortClient = Pick<
   WalletApiV2Client,
-  'listInventory' | 'balances' | 'blobUrls' | 'uploadUrls' | 'apply' | 'fetchBlob' | 'uploadBlob'
+  'listInventory' | 'blobUrls' | 'uploadUrls' | 'apply' | 'fetchBlob' | 'uploadBlob'
 >;
+
+/** The presigned-upload protocol step shared by storage and delivery (§5.6). */
+export type PresignedUploadClient = Pick<WalletApiV2Client, 'uploadUrls' | 'uploadBlob'>;
 
 /** 409 on applyDelta: the server refused the delta on lineage grounds. */
 export class DeltaConflictError extends Error {
@@ -66,6 +69,27 @@ export async function mapBounded<T, R>(
   return out;
 }
 
+/** upload-urls → bounded PUTs → sha256→key map (S3 412 = exists = success). */
+export async function uploadViaPresigned(
+  client: PresignedUploadClient,
+  blobs: readonly { sha256: string; bytes: Uint8Array }[]
+): Promise<Map<string, string>> {
+  if (blobs.length === 0) return new Map();
+  const urls = await client.uploadUrls(blobs.map((b) => ({ sha256: b.sha256, size: b.bytes.length })));
+  const urlBySha = new Map(urls.map((u) => [u.sha256, u]));
+  const uploads = blobs.map((blob) => {
+    const url = urlBySha.get(blob.sha256);
+    if (url === undefined) {
+      throw new StoragePortProtocolError(`upload-urls response missing sha256 ${blob.sha256}`);
+    }
+    return { blob, url };
+  });
+  await mapBounded(uploads, WALLET_API_V2_FANOUT_WIDTH, ({ blob, url }) =>
+    client.uploadBlob(url.putUrl, blob.bytes)
+  );
+  return new Map(uploads.map(({ blob, url }) => [blob.sha256, url.key]));
+}
+
 export class WalletApiStoragePort implements StoragePort {
   constructor(private readonly client: StoragePortClient) {}
 
@@ -77,10 +101,6 @@ export class WalletApiStoragePort implements StoragePort {
       more: page.more,
       items: page.items,
     };
-  }
-
-  balances(): Promise<{ coinId: string; total: string; tokenCount: number }[]> {
-    return this.client.balances();
   }
 
   async getBlobs(tokenIds: string[]): Promise<Map<string, Uint8Array>> {
@@ -95,21 +115,8 @@ export class WalletApiStoragePort implements StoragePort {
     return result;
   }
 
-  async uploadBlobs(blobs: { sha256: string; bytes: Uint8Array }[]): Promise<Map<string, string>> {
-    if (blobs.length === 0) return new Map();
-    const urls = await this.client.uploadUrls(blobs.map((b) => ({ sha256: b.sha256, size: b.bytes.length })));
-    const urlBySha = new Map(urls.map((u) => [u.sha256, u]));
-    const uploads = blobs.map((blob) => {
-      const url = urlBySha.get(blob.sha256);
-      if (url === undefined) {
-        throw new StoragePortProtocolError(`upload-urls response missing sha256 ${blob.sha256}`);
-      }
-      return { blob, url };
-    });
-    await mapBounded(uploads, WALLET_API_V2_FANOUT_WIDTH, ({ blob, url }) =>
-      this.client.uploadBlob(url.putUrl, blob.bytes)
-    );
-    return new Map(uploads.map(({ blob, url }) => [blob.sha256, url.key]));
+  uploadBlobs(blobs: { sha256: string; bytes: Uint8Array }[]): Promise<Map<string, string>> {
+    return uploadViaPresigned(this.client, blobs);
   }
 
   async applyDelta(delta: {

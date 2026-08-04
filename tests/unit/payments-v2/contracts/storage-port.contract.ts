@@ -140,17 +140,5 @@ export function describeStoragePortContract(
       expect([...(blobs.get(a.tokenId) ?? [])]).toEqual([...a.bytes]);
       expect([...(blobs.get(b.tokenId) ?? [])]).toEqual([...b.bytes]);
     });
-
-    it('balances aggregates active rows only', async () => {
-      const h = await makeHarness();
-      const coin = 'aa'.repeat(32);
-      await seed(h, 'tid-b1', { coinId: coin, amount: '70' });
-      const { blob: gone } = await seed(h, 'tid-b2', { coinId: coin, amount: '30' });
-      await h.port.applyDelta({ transferId: 'tid-b3', spent: [gone.tokenId], added: [] });
-      const balances = await h.port.balances();
-      const row = balances.find((b) => b.coinId === coin);
-      expect(row?.total).toBe('70');
-      expect(row?.tokenCount).toBe(1);
-    });
   });
 }

@@ -1,27 +1,21 @@
 // §5.2 of docs/PAYMENTS-V2-DESIGN.md — in-memory mirror of the server
 // inventory (a view, never a store of record). Single writer of the mirror,
-// the suspectedSpent overlay, the knownSpends set and the in-flight registry.
+// the suspectedSpent overlay, the knownSpends set, the in-flight registry and
+// the §6 inventory StreamCursor record. Display mapping lives in presentation.ts.
 
 import type { Asset, Token } from '../../../types';
-import type { InventoryAsset, InventoryItem, StoragePort } from '../ports';
-import type { ScopedKV } from '../stores';
+import { SerialChain, SingleFlight } from '../async';
+import type { InventoryAsset, InventoryItem, InventoryPage, StoragePort } from '../ports';
+import { STORE_KEYS, type ScopedKV, type StreamCursor } from '../stores';
+import {
+  aggregateAssets,
+  toToken,
+  withPrices,
+  type PriceReader,
+  type RegistryReader,
+} from './presentation';
 
-export interface RegistryReader {
-  getSymbol(coinId: string): string;
-  getName(coinId: string): string;
-  getDecimals(coinId: string): number;
-  getIconUrl(coinId: string): string | null;
-}
-
-export interface PriceQuote {
-  readonly priceUsd: number;
-  readonly priceEur?: number;
-  readonly change24h?: number;
-}
-
-export interface PriceReader {
-  getPrices(tokenNames: string[]): Promise<Map<string, PriceQuote>>;
-}
+export type { PriceQuote, PriceReader, RegistryReader } from './presentation';
 
 // F6: state-scoped by schema — a bare-tokenId spend record is unrepresentable.
 export interface KnownSpend {
@@ -57,15 +51,9 @@ interface MirrorEntry {
   updatedAt: number;
 }
 
-interface CoinTotals {
-  total: bigint;
-  count: number;
-  transferring: bigint;
-  transferringCount: number;
-}
-
 const SUSPECTED_KEY = 'suspected-spent';
 const KNOWN_SPENDS_KEY = 'known-spends';
+const CURSOR_KEY = STORE_KEYS.streamCursor('inventory');
 
 function stateKey(tokenId: string, stateHash: string): string {
   return `${tokenId}:${stateHash}`;
@@ -78,31 +66,28 @@ export class InventoryView {
   private readonly inFlight = new Set<string>();
   private firstPullOk = false;
   private hydrated: Promise<void> | null = null;
-  private chain: Promise<unknown> = Promise.resolve();
-  private overlayChain: Promise<unknown> = Promise.resolve();
-  private sharedPull: Promise<void> | null = null;
+  private readonly chain = new SerialChain();
+  private readonly overlayChain = new SerialChain();
+  private readonly pullFlight = new SingleFlight<void>();
 
   constructor(private readonly deps: InventoryViewDeps) {}
 
   fullPull(): Promise<void> {
-    if (this.sharedPull) return this.sharedPull;
-    const run = this.enqueue(() => this.doFullPull(false)).finally(() => {
-      this.sharedPull = null;
-    });
-    this.sharedPull = run;
-    return run;
+    return this.pullFlight.run(() => this.chain.enqueue(() => this.doFullPull(false)));
   }
 
-  delta(since: number): Promise<void> {
-    return this.enqueue(async () => {
+  // §5.2/§6: incremental pull from the persisted (cursor, epoch) record; a
+  // stale epoch (server restore) voids cursor continuity → full re-pull.
+  delta(): Promise<void> {
+    return this.chain.enqueue(async () => {
       await this.hydrate();
-      if (!this.firstPullOk) {
-        await this.doFullPull(false);
-        return;
-      }
+      const record = this.firstPullOk ? await this.deps.kv.get<StreamCursor>(CURSOR_KEY) : null;
+      if (record === null) return this.doFullPull(false);
+      const first = await this.deps.port.listInventory(Number(record.cursor));
+      if (first.syncEpoch !== record.syncEpoch) return this.doFullPull(true);
       const flags = { changed: false };
       try {
-        await this.runDeltaLoop(since, undefined, flags);
+        await this.consumePages(first, undefined, flags);
       } finally {
         if (flags.changed) this.deps.emit('inventory:updated');
       }
@@ -112,7 +97,7 @@ export class InventoryView {
   // Epoch reset (§5.1): full re-pull with per-key replace; entries absent from
   // the restored server drop only AFTER the new snapshot is fully applied.
   onEpochReset(): Promise<void> {
-    return this.enqueue(() => this.doFullPull(true));
+    return this.chain.enqueue(() => this.doFullPull(true));
   }
 
   async demote(tokenId: string, stateHash: string): Promise<void> {
@@ -121,7 +106,7 @@ export class InventoryView {
     }
     const key = stateKey(tokenId, stateHash);
     if (this.suspected.has(key)) return;
-    const added = await this.inOverlayChain(async () => {
+    const added = await this.overlayChain.enqueue(async () => {
       await this.hydrate();
       if (this.suspected.has(key)) return false;
       await this.deps.kv.set(SUSPECTED_KEY, [...this.suspected, key]);
@@ -136,7 +121,7 @@ export class InventoryView {
     isSpent: (tokenId: string, blob: Uint8Array) => Promise<boolean>,
     reAdd: (tokenId: string, blob: Uint8Array) => Promise<ReAddResult>
   ): Promise<RecoverOutcome> {
-    return this.enqueue(() => this.doRecover(getBlobs, isSpent, reAdd));
+    return this.chain.enqueue(() => this.doRecover(getBlobs, isSpent, reAdd));
   }
 
   markInFlight(tokenId: string): void {
@@ -167,36 +152,26 @@ export class InventoryView {
       const asset = entry.assets[0];
       if (!asset) continue;
       if (filter?.coinId !== undefined && asset.coinId !== filter.coinId) continue;
-      out.push(this.toToken(tokenId, entry, asset, registry));
+      out.push(
+        toToken(tokenId, entry, asset, registry, {
+          transferring: this.inFlight.has(tokenId),
+          suspectedSpent: this.suspected.has(stateKey(tokenId, entry.stateHash)),
+        })
+      );
     }
     return out;
   }
 
   async assets(registry: RegistryReader, price?: PriceReader): Promise<Asset[]> {
-    const raw: Asset[] = [];
-    for (const [coinId, totals] of this.aggregate()) {
-      raw.push(this.toAsset(coinId, totals, registry));
-    }
+    const raw = aggregateAssets(this.activeEntries(), (tokenId) => this.inFlight.has(tokenId), registry);
     if (!price || raw.length === 0) return raw;
-    return this.withPrices(raw, registry, price);
+    return withPrices(raw, registry, price);
   }
 
-  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.chain.then(fn, fn);
-    this.chain = run.then(
-      () => undefined,
-      () => undefined
-    );
-    return run;
-  }
-
-  private inOverlayChain<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.overlayChain.then(fn, fn);
-    this.overlayChain = run.then(
-      () => undefined,
-      () => undefined
-    );
-    return run;
+  private *activeEntries(): Iterable<[string, MirrorEntry]> {
+    for (const [tokenId, entry] of this.mirror) {
+      if (entry.status === 'active') yield [tokenId, entry];
+    }
   }
 
   private hydrate(): Promise<void> {
@@ -232,7 +207,7 @@ export class InventoryView {
       }
       // One immediate since-delta from the page-1 cursor: pulls span snapshots,
       // its tombstones/upserts repair any inter-page flips.
-      await this.runDeltaLoop(firstCursor, seen, flags);
+      await this.consumePages(await this.deps.port.listInventory(firstCursor), seen, flags);
       if (seen && this.dropAbsent(seen)) flags.changed = true;
       this.firstPullOk = true;
     } finally {
@@ -241,17 +216,20 @@ export class InventoryView {
     }
   }
 
-  private async runDeltaLoop(
-    since: number,
+  /** Applies a since-page and its more-loop, then persists the ONE (cursor, epoch) record. */
+  private async consumePages(
+    first: InventoryPage,
     seen: Set<string> | undefined,
     flags: { changed: boolean }
   ): Promise<void> {
-    let page = await this.deps.port.listInventory(since);
+    let page = first;
     if (this.applyItems(page.items, seen)) flags.changed = true;
     while (page.more) {
       page = await this.deps.port.listInventory(page.cursor);
       if (this.applyItems(page.items, seen)) flags.changed = true;
     }
+    const record: StreamCursor = { cursor: page.cursor, syncEpoch: page.syncEpoch };
+    await this.deps.kv.set(CURSOR_KEY, record);
   }
 
   // Synchronous per-key application; the overlay prune runs in this same
@@ -309,9 +287,9 @@ export class InventoryView {
   }
 
   private schedulePersistSuspected(): void {
-    void this.inOverlayChain(() => this.deps.kv.set(SUSPECTED_KEY, [...this.suspected])).catch(
-      () => undefined
-    );
+    void this.overlayChain
+      .enqueue(() => this.deps.kv.set(SUSPECTED_KEY, [...this.suspected]))
+      .catch(() => undefined);
   }
 
   private dropAbsent(seen: Set<string>): boolean {
@@ -390,104 +368,5 @@ export class InventoryView {
     }
     this.knownSpends.add(stateKey(spend.tokenId, spend.stateHash));
     await this.deps.kv.set(KNOWN_SPENDS_KEY, [...this.knownSpends]);
-  }
-
-  private toToken(
-    tokenId: string,
-    entry: MirrorEntry,
-    asset: InventoryAsset,
-    registry: RegistryReader
-  ): Token {
-    const iconUrl = registry.getIconUrl(asset.coinId);
-    const suspected = this.suspected.has(stateKey(tokenId, entry.stateHash));
-    return {
-      id: tokenId,
-      coinId: asset.coinId,
-      symbol: registry.getSymbol(asset.coinId),
-      name: registry.getName(asset.coinId),
-      decimals: registry.getDecimals(asset.coinId),
-      ...(iconUrl !== null ? { iconUrl } : {}),
-      amount: asset.amount,
-      status: this.inFlight.has(tokenId) ? 'transferring' : 'confirmed',
-      createdAt: entry.createdAt,
-      updatedAt: entry.updatedAt,
-      lazy: true,
-      ...(suspected ? { suspectedSpent: true } : {}),
-    };
-  }
-
-  private aggregate(): Map<string, CoinTotals> {
-    const groups = new Map<string, CoinTotals>();
-    for (const [tokenId, entry] of this.mirror) {
-      if (entry.status !== 'active') continue;
-      const moving = this.inFlight.has(tokenId);
-      for (const asset of entry.assets) {
-        let group = groups.get(asset.coinId);
-        if (!group) {
-          group = { total: 0n, count: 0, transferring: 0n, transferringCount: 0 };
-          groups.set(asset.coinId, group);
-        }
-        if (moving) {
-          group.transferring += BigInt(asset.amount);
-          group.transferringCount += 1;
-        } else {
-          group.total += BigInt(asset.amount);
-          group.count += 1;
-        }
-      }
-    }
-    return groups;
-  }
-
-  private toAsset(coinId: string, totals: CoinTotals, registry: RegistryReader): Asset {
-    const iconUrl = registry.getIconUrl(coinId);
-    return {
-      coinId,
-      symbol: registry.getSymbol(coinId),
-      name: registry.getName(coinId),
-      decimals: registry.getDecimals(coinId),
-      ...(iconUrl !== null ? { iconUrl } : {}),
-      totalAmount: totals.total.toString(),
-      tokenCount: totals.count,
-      confirmedAmount: totals.total.toString(),
-      unconfirmedAmount: '0',
-      confirmedTokenCount: totals.count,
-      unconfirmedTokenCount: 0,
-      transferringTokenCount: totals.transferringCount,
-      transferringAmount: totals.transferring.toString(),
-      priceUsd: null,
-      priceEur: null,
-      change24h: null,
-      fiatValueUsd: null,
-      fiatValueEur: null,
-    };
-  }
-
-  private async withPrices(
-    raw: Asset[],
-    registry: RegistryReader,
-    price: PriceReader
-  ): Promise<Asset[]> {
-    try {
-      const names = [...new Set(raw.map((a) => registry.getName(a.coinId)))];
-      const quotes = await price.getPrices(names);
-      return raw.map((a) => this.priceOne(a, quotes.get(registry.getName(a.coinId))));
-    } catch {
-      return raw;
-    }
-  }
-
-  // Fiat display conversion is the one sanctioned Number use (display only).
-  private priceOne(asset: Asset, quote: PriceQuote | undefined): Asset {
-    if (!quote) return asset;
-    const human = Number(asset.totalAmount) / Math.pow(10, asset.decimals);
-    return {
-      ...asset,
-      priceUsd: quote.priceUsd,
-      priceEur: quote.priceEur ?? null,
-      change24h: quote.change24h ?? null,
-      fiatValueUsd: human * quote.priceUsd,
-      fiatValueEur: quote.priceEur != null ? human * quote.priceEur : null,
-    };
   }
 }

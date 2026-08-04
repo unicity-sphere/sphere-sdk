@@ -145,7 +145,6 @@ function hookedClient(inner: FakeWalletApiV2Client, hooks: Hooks, counters: { pu
 function hookedStorage(inner: StoragePort, hooks: Hooks): StoragePort {
   return {
     listInventory: (since) => inner.listInventory(since),
-    balances: () => inner.balances(),
     getBlobs: (ids) => inner.getBlobs(ids),
     uploadBlobs: (blobs) => inner.uploadBlobs(blobs),
     applyDelta: async (delta) => {
@@ -469,7 +468,7 @@ describe('PaymentsFacade — send policy', () => {
       if (shortfallAtFirstComplete === null) {
         firstPartialTransferId = transferId;
         shortfallAtFirstComplete =
-          (await createMachineStores(world.kv).shortfalls.get(transferId)) !== undefined;
+          (await createMachineStores(world.kv).shortfalls.getByKey(transferId)) !== undefined;
       }
     };
 

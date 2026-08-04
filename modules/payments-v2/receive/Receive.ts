@@ -2,10 +2,13 @@
 // Entry order is money-load-bearing: the view store precedes the claimed ack,
 // so a claimed/acked token can never be absent from the view (#724 outcome).
 
+import { logger } from '../../../core/logger';
 import type { ITokenEngine, SphereToken } from '../../../token-engine';
 import { TOKEN_BLOB_VERSION } from '../../../token-engine/token-blob';
 import type { IncomingTransfer, Token } from '../../../types';
+import { SingleFlight } from '../async';
 import type { RegistryReader } from '../inventory/InventoryView';
+import type { AttentionEmitter } from '../machine/journal';
 import type { DeliveryPort, IncomingDelivery } from '../ports';
 import { STORE_KEYS, type ScopedKV, type StreamCursor } from '../stores';
 
@@ -28,7 +31,7 @@ export interface StoredIncoming {
 // Per-key seam over the inventory view (adapted by the facade in P9).
 export interface ReceiveView {
   heldState(tokenId: string): string | null;
-  store(entry: StoredIncoming): Promise<'stored' | 'rejected'>;
+  store(entry: StoredIncoming): Promise<void>;
 }
 
 export interface ReceivedRecord {
@@ -44,18 +47,21 @@ export interface ReceivedRecord {
 
 export interface ReceiveDeps {
   readonly delivery: DeliveryPort;
-  readonly engine: ReceiveEngine;
+  /** Snapshot taken once per drain (§7 collaborator-snapshot rule). */
+  readonly engine: () => ReceiveEngine;
   readonly view: ReceiveView;
   readonly kv: ScopedKV;
   readonly registry: RegistryReader;
   readonly recordReceived: (record: ReceivedRecord) => Promise<void>;
   readonly emit: (event: 'transfer:incoming', transfer: IncomingTransfer) => void;
+  readonly attention: AttentionEmitter;
   readonly syncEpoch: () => string;
   readonly now?: () => number;
 }
 
 export const ACK_BATCH_SIZE = 200;
 export const POLL_INTERVAL_MS = 30_000;
+export const ATTENTION_CLAIM_CONFLICT = 'claim:conflict';
 
 export function receivedDedupKey(tokenId: string, stateHash: string): string {
   // Lowercased like History's keys — a case-variant would defeat server dedup.
@@ -65,26 +71,27 @@ export function receivedDedupKey(tokenId: string, stateHash: string): string {
 interface PendingAck {
   readonly deliveryId: string;
   readonly disposition: 'claimed' | 'rejected';
-  readonly reason?: 'invalid' | 'not-owned' | 'storage-rejected' | 'other';
+  readonly reason?: 'invalid' | 'not-owned' | 'other';
   readonly cursor: string;
+  readonly transferId?: string;
 }
 
 type Screened = { kind: 'ack'; ack: PendingAck } | { kind: 'accept'; record: StoredIncoming };
 
+function isClaimConflict(err: unknown): boolean {
+  const e = err !== null && typeof err === 'object' ? (err as { code?: unknown; failureCode?: unknown }) : null;
+  return e !== null && e.code === 'MAILBOX_CLAIM_FAILED' && e.failureCode === 'CONFLICT';
+}
+
 export class Receive {
-  private inFlight: Promise<IncomingTransfer[]> | null = null;
+  private readonly drainFlight = new SingleFlight<IncomingTransfer[]>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private unsubscribeWake: (() => void) | null = null;
 
   constructor(private readonly deps: ReceiveDeps) {}
 
   drainOnce(): Promise<IncomingTransfer[]> {
-    if (this.inFlight) return this.inFlight;
-    const run = this.doDrain().finally(() => {
-      this.inFlight = null;
-    });
-    this.inFlight = run;
-    return run;
+    return this.drainFlight.run(() => this.doDrain());
   }
 
   start(pollIntervalMs: number = POLL_INTERVAL_MS): void {
@@ -106,6 +113,7 @@ export class Receive {
 
   private async doDrain(): Promise<IncomingTransfer[]> {
     const deps = this.deps;
+    const engine = deps.engine();
     const stored: IncomingTransfer[] = [];
     const pending: PendingAck[] = [];
     let epoch = '';
@@ -114,34 +122,34 @@ export class Receive {
       const record = await deps.kv.get<StreamCursor>(STORE_KEYS.streamCursor('mailbox'));
       const since = record !== null && record.syncEpoch === epoch ? String(record.cursor) : undefined;
       for await (const entry of deps.delivery.incoming(since)) {
-        await this.processEntry(deps, entry, pending, stored);
+        await this.processEntry(deps, engine, entry, pending, stored);
         if (pending.length >= ACK_BATCH_SIZE) await flushAcks(deps, pending, epoch);
       }
       await flushAcks(deps, pending, epoch);
-    } catch {
+    } catch (err) {
       // Infra failure (engine/blob/view/ack): the failed entry stays UNACKED and
       // re-lists next drain; the fully-processed prefix still flushes below.
-      await flushAcks(deps, pending, epoch).catch(() => undefined);
+      logger.warn('PaymentsV2', 'receive drain interrupted — unacked entries retry next drain:', err);
+      await flushAcks(deps, pending, epoch).catch((flushErr: unknown) => {
+        logger.warn('PaymentsV2', 'receive ack flush failed — cursor holds at the acked prefix:', flushErr);
+      });
     }
     return stored;
   }
 
   private async processEntry(
     deps: ReceiveDeps,
+    engine: ReceiveEngine,
     entry: IncomingDelivery,
     pending: PendingAck[],
     stored: IncomingTransfer[]
   ): Promise<void> {
-    const screened = await screen(deps, entry);
+    const screened = await screen(deps, engine, entry);
     if (screened.kind === 'ack') {
       pending.push(screened.ack);
       return;
     }
-    const outcome = await deps.view.store(screened.record);
-    if (outcome === 'rejected') {
-      pending.push(rejectAck(entry, 'storage-rejected'));
-      return;
-    }
+    await deps.view.store(screened.record);
     pending.push(claimAck(entry));
     const transfer = await announce(deps, entry, screened.record);
     stored.push(transfer);
@@ -149,11 +157,11 @@ export class Receive {
   }
 }
 
-async function screen(deps: ReceiveDeps, entry: IncomingDelivery): Promise<Screened> {
+async function screen(deps: ReceiveDeps, engine: ReceiveEngine, entry: IncomingDelivery): Promise<Screened> {
   const blobBytes = await entry.fetchBlob();
   let token: SphereToken;
   try {
-    token = await deps.engine.decodeToken({
+    token = await engine.decodeToken({
       v: TOKEN_BLOB_VERSION,
       network: 0,
       tokenId: '',
@@ -162,15 +170,15 @@ async function screen(deps: ReceiveDeps, entry: IncomingDelivery): Promise<Scree
   } catch {
     return { kind: 'ack', ack: rejectAck(entry, 'invalid') };
   }
-  const verdict = await deps.engine.verify(token);
+  const verdict = await engine.verify(token);
   if (!verdict.ok) return { kind: 'ack', ack: rejectAck(entry, 'invalid') };
-  if (!deps.engine.isOwnedBy(token, deps.engine.getIdentity().chainPubkey)) {
+  if (!engine.isOwnedBy(token, engine.getIdentity().chainPubkey)) {
     return { kind: 'ack', ack: rejectAck(entry, 'not-owned') };
   }
-  const keys = await deps.engine.deliveryKeys(blobBytes);
+  const keys = await engine.deliveryKeys(blobBytes);
   const held = deps.view.heldState(keys.tokenId);
   if (held === keys.stateHash) return { kind: 'ack', ack: claimAck(entry) };
-  if (held !== null && (await deps.engine.isSpent(token))) {
+  if (held !== null && (await engine.isSpent(token))) {
     // #687 gate: a replayed OLDER, already-spent state never displaces the live one.
     return { kind: 'ack', ack: rejectAck(entry, 'invalid') };
   }
@@ -197,8 +205,9 @@ async function announce(
       ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
       receivedAt,
     });
-  } catch {
-    // The history hook never fails the money path (§5.9).
+  } catch (err) {
+    // §5.9: the history hook never fails the money path.
+    logger.debug('PaymentsV2', 'RECEIVED history hook failed (money path unaffected):', err);
   }
   return {
     id: record.tokenId,
@@ -215,7 +224,7 @@ async function flushAcks(deps: ReceiveDeps, pending: PendingAck[], epoch: string
   try {
     while (pending.length > 0) {
       const next = pending[0];
-      await deps.delivery.ack(next.deliveryId, next.disposition, next.reason);
+      await ackOne(deps, next);
       lastAcked = next.cursor;
       pending.shift();
     }
@@ -227,14 +236,30 @@ async function flushAcks(deps: ReceiveDeps, pending: PendingAck[], epoch: string
   }
 }
 
-function claimAck(entry: IncomingDelivery): PendingAck {
-  return { deliveryId: entry.deliveryId, disposition: 'claimed', cursor: entry.cursor };
+async function ackOne(deps: ReceiveDeps, ack: PendingAck): Promise<void> {
+  try {
+    await deps.delivery.ack(ack.deliveryId, ack.disposition, ack.reason);
+  } catch (err) {
+    if (ack.disposition !== 'claimed' || !isClaimConflict(err)) throw err;
+    // §5.7: a lineage CONFLICT on claim is stale by construction (another owner
+    // holds equal-or-newer state) and reject is non-destructive server-side —
+    // terminal for discovery immediately, or this entry re-processes forever.
+    logger.warn('PaymentsV2', `mailbox claim CONFLICT for ${ack.deliveryId} — rejected('other') as stale`);
+    await deps.delivery.ack(ack.deliveryId, 'rejected', 'other');
+    deps.attention(ack.transferId ?? '', ATTENTION_CLAIM_CONFLICT, ack.deliveryId);
+  }
 }
 
-function rejectAck(
-  entry: IncomingDelivery,
-  reason: 'invalid' | 'not-owned' | 'storage-rejected'
-): PendingAck {
+function claimAck(entry: IncomingDelivery): PendingAck {
+  return {
+    deliveryId: entry.deliveryId,
+    disposition: 'claimed',
+    cursor: entry.cursor,
+    ...(entry.transferId !== undefined ? { transferId: entry.transferId } : {}),
+  };
+}
+
+function rejectAck(entry: IncomingDelivery, reason: 'invalid' | 'not-owned'): PendingAck {
   return { deliveryId: entry.deliveryId, disposition: 'rejected', reason, cursor: entry.cursor };
 }
 

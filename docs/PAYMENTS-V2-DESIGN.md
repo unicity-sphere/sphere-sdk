@@ -87,7 +87,7 @@ over wallet-api. No client-store lifecycle (`sync`/`validate`) in the API.
 ```ts
 interface Payments {
   // reads — views over the wallet-api record
-  assets(coinId?: string): Promise<Asset[]>;       // balances + registry metadata + fiat
+  assets(coinId?: string): Promise<Asset[]>;       // inventory-mirror aggregation + registry metadata + fiat
   tokens(filter?: { coinId?: string }): Token[];   // sync read of the inventory view
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage>;
 
@@ -189,15 +189,20 @@ Emits `connection:status`.
 Owns the in-memory mirror of the server inventory — a *view*, never a store of record. Pull
 protocol: paginated full pull finished with an immediate `?since=<page-1 cursor>` delta (pulls
 span snapshots); `?since=` deltas include tombstones and the view applies them; `more`-loops
-always run to completion. Mutations to the mirror are per-key; **there is no clear-and-repopulate,
-so the #724 shape cannot be written.** The `suspectedSpent` overlay is durable and its
+always run to completion. The cursor is live: `delta()` pulls incrementally from the persisted §6
+`(cursor, syncEpoch)` inventory record — one atomic record, advanced after every completed pull; a
+stale epoch voids continuity and falls back to a reconciling full re-pull. Mutations to the mirror
+are per-key; **there is no clear-and-repopulate, so the #724 shape cannot be written.** The
+`suspectedSpent` overlay is durable and its
 prune/apply runs inside the same critical section as the view mutation it reads (kills F7).
 `recoverRemoved()`: knownSpends are **state-scoped `(tokenId, stateHash)` by schema** — a bare
 tokenId record is unrepresentable (kills F6); an evidenced-tombstone 409 on re-add means "actually
 spent", keep the tombstone. Empty-import protection: never push a removal before the first
 successful inventory read; a token is removed only against a confirmed on-chain spend. Serves
-`assets()` (with registry + price), `tokens()` (elements enriched from the registry; status set
-is `'confirmed' | 'transferring'`), and the selector's metadata pool. **In-flight exclusion
+`assets()` (aggregated from the mirror, with registry + price — the server `/v1/balances`
+endpoint has no client consumer and the StoragePort exposes no balances member), `tokens()`
+(elements enriched from the registry; status set is `'confirmed' | 'transferring'`), and the
+selector's metadata pool. **In-flight exclusion
 (#517/#32, re-homed):** sources reserved by an open transfer — including keep-open intents whose
 spend may be on-chain — are excluded from the selector pool AND reported outside the spendable
 total (`transferring*` fields, never `totalAmount`) until their machine settles or resume adopts
@@ -334,9 +339,13 @@ property, never a call-site option — the port contract's rule) → RECEIVED hi
 contract** (the contract suite asserts it); it records an entry **only after its ack succeeded**
 — a crash mid-drain leaves entries unacked and re-listed. Verification failure →
 `mailbox/reject` (terminal for discovery, not for the asset — never wedges the read pointer). A
-claim that lands in the server's `failed[]` bucket (`CONFLICT`) gets bounded retries, then
-`mailbox/reject` (`reason:'other'`) so it becomes terminal for discovery instead of re-processing
-every drain forever. The emitted `transfer:incoming` payload keeps its consumed shape: sender
+claim that lands in the server's `failed[]` bucket (`CONFLICT`) is `mailbox/reject`ed
+(`reason:'other'`) immediately and the drain continues: a lineage CONFLICT is not transient by
+construction — another owner holds equal-or-newer state, the delivery is stale — and reject is
+non-destructive server-side (terminal for discovery only; blob retained; never downgrades a
+claim), so no retry counter exists (zero client state); `transfer:attention`
+`{code:'claim:conflict'}` makes it operator-visible. The emitted `transfer:incoming` payload
+keeps its consumed shape: sender
 nametag resolved via transport, token display fields (`symbol`, `decimals`, `iconUrl`) enriched
 from the registry, memo decrypted from the ECDH bundle. Wake-driven with the 30 s poll as the
 correctness backstop.
@@ -558,8 +567,9 @@ its own keep-open error, never a silent re-burn; absent checkpoint + any certifi
 `SplitCheckpointLostError` before any re-burn; progress append signature-gated with shared
 cross-repo vectors; on `SplitCheckpointLostError` never complete/abort/record-foreign-spent.
 Receive: verify + isOwnedBy before balance; `(tokenId, stateHash)` dedup + isSpent gate;
-storage-rejected emits nothing; state-gated removal (never destroy an advanced state); seen-set
-only after successful ack; drain single-flight. Cross-cutting: owner/address guards on every
+claim-CONFLICT terminally rejected('other') — cursor advances, never re-processed; state-gated
+removal (never destroy an advanced state); seen-set only after successful ack; drain
+single-flight. Cross-cutting: owner/address guards on every
 hydration surface; network+address-scoped keys; history dedup keys (SENT/transferId,
 RECEIVED/(type,tokenId,stateHash), MINT/(MINT,tokenId)); amounts as decimal strings/BigInt
 end-to-end; challenge-template verification incl. network; no concurrent refresh; resume

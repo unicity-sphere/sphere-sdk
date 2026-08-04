@@ -64,7 +64,7 @@ async function dropStaleLocalAborts(
 ): Promise<void> {
   for (const entry of locals.values()) {
     if (entry.disposition !== 'open' && !openIds.has(entry.transferId)) {
-      await stores.backstop.drop(entry.transferId);
+      await stores.backstop.removeByKey(entry.transferId);
     }
   }
 }
@@ -83,7 +83,7 @@ async function gateAndDecode(
       // #676: a locally-aborted intent is NEVER resumed — converge the server.
       try {
         await deps.intents.abort(intent.transferId);
-        await stores.backstop.drop(intent.transferId);
+        await stores.backstop.removeByKey(intent.transferId);
       } catch {
         /* stays locally aborted; converged at the next resume */
       }
@@ -170,7 +170,7 @@ async function classifyResumeFailure(
     // never apply the foreign proof; the caller re-plans under a NEW transferId.
     try {
       await deps.intents.abort(transferId);
-      await stores.backstop.drop(transferId);
+      await stores.backstop.removeByKey(transferId);
     } catch {
       /* retried at the next resume */
     }

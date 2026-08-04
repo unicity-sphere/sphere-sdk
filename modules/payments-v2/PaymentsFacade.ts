@@ -125,7 +125,7 @@ export class PaymentsFacade implements PaymentsV2 {
         this.trackTail(this.receiveLoop.drainOnce());
       }),
       this.deps.session.subscribeStream('inventory', () => {
-        this.trackTail(this.view.delta(0));
+        this.trackTail(this.view.delta());
       }),
       this.deps.session.subscribeStream('payment_requests', () => {
         this.trackTail(this.requests.drainIncoming());
@@ -193,7 +193,7 @@ export class PaymentsFacade implements PaymentsV2 {
 
   async receive(): Promise<{ transfers: IncomingTransfer[] }> {
     const transfers = await this.track(this.receiveLoop.drainOnce());
-    if (transfers.length > 0) this.trackTail(this.view.delta(0));
+    if (transfers.length > 0) this.trackTail(this.view.delta());
     return { transfers };
   }
 
@@ -306,7 +306,7 @@ export class PaymentsFacade implements PaymentsV2 {
       this.stampTransferId(err, ctx.transferId);
       return { kind: 'rethrow', error: err };
     }
-    const backstop = await this.machineStores.backstop.get(ctx.transferId);
+    const backstop = await this.machineStores.backstop.getByKey(ctx.transferId);
     if (backstop !== undefined && backstop.disposition === 'open') {
       return this.convergePartial(ctx);
     }
@@ -398,6 +398,7 @@ export class PaymentsFacade implements PaymentsV2 {
       }
       const token = await engine.decodeToken({ v: TOKEN_BLOB_VERSION, network: 0, tokenId, token: bytes });
       const keys = await engine.deliveryKeys(bytes);
+      // local === protocol by construction; the dual field is wire compat (types.ts).
       spentStates[tokenId] = { local: keys.stateHash, protocol: keys.stateHash };
       sources.set(tokenId, token);
       sourceTokens.push(this.toUiToken(tokenId, request.coinId, engine.balanceOf(token, request.coinId)));
@@ -470,7 +471,7 @@ export class PaymentsFacade implements PaymentsV2 {
   /** Release spent sources only AFTER the mirror refresh tombstoned them. */
   private async refreshThenRelease(coinId: string, spentIds: readonly string[]): Promise<void> {
     try {
-      await this.view.delta(0);
+      await this.view.delta();
       for (const tokenId of spentIds) this.view.release(tokenId);
     } finally {
       this.queue.notifyChange(coinId);
@@ -490,7 +491,7 @@ export class PaymentsFacade implements PaymentsV2 {
 
   private async finishSend(transferId: string, run: SendRun): Promise<TransferResult> {
     for (const id of run.settledShortfalls.splice(0)) {
-      await this.machineStores.shortfalls.clear(id).catch(() => undefined);
+      await this.machineStores.shortfalls.removeByKey(id).catch(() => undefined);
     }
     const result: TransferResult = {
       id: transferId,
@@ -530,7 +531,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private async softAbort(transferId: string): Promise<void> {
     try {
       await this.deps.client.abortIntent(transferId);
-      await this.machineStores.backstop.drop(transferId);
+      await this.machineStores.backstop.removeByKey(transferId);
     } catch {
       // Stays locally recorded; the #676 resume gate converges it later.
     }
@@ -555,7 +556,7 @@ export class PaymentsFacade implements PaymentsV2 {
       tokenId: preDerived,
       createdAt: (this.deps.now ?? Date.now)(),
     };
-    await this.machineStores.mintJournal.record(entry);
+    await this.machineStores.mintJournal.upsert(entry);
     let token: SphereToken;
     try {
       token = await engine.mint(params, { transferId: mintId });
@@ -564,7 +565,7 @@ export class PaymentsFacade implements PaymentsV2 {
       return { success: false, error: messageOf(err) };
     }
     if (token.blob.tokenId !== entry.tokenId) {
-      await this.machineStores.mintJournal.record({ ...entry, tokenId: token.blob.tokenId });
+      await this.machineStores.mintJournal.upsert({ ...entry, tokenId: token.blob.tokenId });
     }
     try {
       await this.finalizeMint(engine, mintId, token, coinId, amount.toString());
@@ -594,9 +595,9 @@ export class PaymentsFacade implements PaymentsV2 {
       added: [{ tokenId: token.blob.tokenId, key }],
     });
     await this.historyStore.recordMint({ tokenId: token.blob.tokenId, coinId, amount });
-    await this.machineStores.mintJournal.remove(mintId);
+    await this.machineStores.mintJournal.removeByKey(mintId);
     this.heldStates.set(token.blob.tokenId, (await engine.deliveryKeys(bytes)).stateHash);
-    this.trackTail(this.view.delta(0));
+    this.trackTail(this.view.delta());
   }
 
   private async replayMints(): Promise<void> {
@@ -611,7 +612,7 @@ export class PaymentsFacade implements PaymentsV2 {
 
   private async replayMint(entry: MintJournalEntry): Promise<void> {
     if (entry.tokenId !== '' && (await this.tokenInServerInventory(entry.tokenId))) {
-      await this.machineStores.mintJournal.remove(entry.mintId);
+      await this.machineStores.mintJournal.removeByKey(entry.mintId);
       return;
     }
     const engine = this.engine();
@@ -627,7 +628,7 @@ export class PaymentsFacade implements PaymentsV2 {
       transferId: entry.mintId,
     });
     if (token.blob.tokenId !== entry.tokenId) {
-      await this.machineStores.mintJournal.record({ ...entry, tokenId: token.blob.tokenId });
+      await this.machineStores.mintJournal.upsert({ ...entry, tokenId: token.blob.tokenId });
     }
     await this.finalizeMint(engine, entry.mintId, token, entry.coinId, entry.amount);
   }
@@ -669,7 +670,7 @@ export class PaymentsFacade implements PaymentsV2 {
       open: report.failed,
     });
     if (report.resumed.length > 0 || report.conflicted.length > 0) {
-      await this.view.delta(0).catch(() => undefined);
+      await this.view.delta().catch(() => undefined);
     }
   }
 

@@ -77,7 +77,6 @@ function makePort(script: PageSource[]): {
       if (!next) throw new Error(`unscripted listInventory(since=${String(since)})`);
       return typeof next === 'function' ? next() : next;
     },
-    balances: reject,
     getBlobs: reject,
     uploadBlobs: reject,
     applyDelta: reject,
@@ -130,7 +129,7 @@ describe('InventoryView pull protocol', () => {
     expect(view.tokens(registry).map((t) => t.id)).toEqual(['B']);
   });
 
-  it('delta(since) drops a spent token per-key via its tombstone and emits inventory:updated', async () => {
+  it('delta() drops a spent token per-key via its tombstone and emits inventory:updated', async () => {
     const { view, queue, events } = makeView([
       page([item('A', { seq: 1 }), item('B', { seq: 2, amount: '50' })], 5),
       page([], 5),
@@ -138,7 +137,7 @@ describe('InventoryView pull protocol', () => {
     await view.fullPull();
     const before = events.length;
     queue.push(page([item('A', { seq: 9, status: 'removed' })], 9));
-    await view.delta(5);
+    await view.delta();
     expect(view.pool(COIN).map((p) => p.tokenId)).toEqual(['B']);
     const assets = await view.assets(registry);
     expect(assets[0].totalAmount).toBe('50');
@@ -159,15 +158,50 @@ describe('InventoryView pull protocol', () => {
     expect(view.pool(COIN).map((p) => p.tokenId)).toEqual(['A']);
   });
 
+  it('delta() resumes from the persisted §6 cursor record: since=<prior cursor>, then the ADVANCED cursor', async () => {
+    const { view, kv, queue, calls } = makeView([page([item('A', { seq: 1 })], 5), page([], 5)]);
+    await view.fullPull();
+    expect(kv.data.get('cursor:inventory')).toEqual({ cursor: 5, syncEpoch: 'e1' });
+
+    queue.push(page([item('A', { seq: 8, state: 'S2' })], 8));
+    await view.delta();
+    expect(calls).toEqual([undefined, 5, 5]);
+    expect(kv.data.get('cursor:inventory')).toEqual({ cursor: 8, syncEpoch: 'e1' });
+
+    queue.push(page([], 8));
+    await view.delta();
+    expect(calls).toEqual([undefined, 5, 5, 8]);
+  });
+
+  it('a stale-epoch cursor record voids continuity: delta() falls back to a full re-pull that reconciles absent rows', async () => {
+    const { view, kv, queue, calls } = makeView([page([item('A', { seq: 1 })], 5), page([], 5)]);
+    await view.fullPull();
+
+    const e2 = (items: InventoryItem[], cursor: number): InventoryPage => ({
+      cursor,
+      syncEpoch: 'e2',
+      more: false,
+      items,
+    });
+    queue.push(e2([], 5)); // the since=<cursor> probe reveals the epoch bump
+    queue.push(e2([item('B', { seq: 1, amount: '70' })], 9));
+    queue.push(e2([], 9));
+    await view.delta();
+
+    expect(calls).toEqual([undefined, 5, 5, undefined, 9]);
+    expect(view.tokens(registry).map((t) => t.id)).toEqual(['B']);
+    expect(kv.data.get('cursor:inventory')).toEqual({ cursor: 9, syncEpoch: 'e2' });
+  });
+
   it('emits inventory:updated only on net change — an identical re-delivered delta stays silent', async () => {
     const { view, queue, events } = makeView([page([item('A', { seq: 1 })], 5), page([], 5)]);
     await view.fullPull();
     expect(events).toEqual(['inventory:updated']);
     queue.push(page([item('A', { seq: 1 })], 5));
-    await view.delta(5);
+    await view.delta();
     expect(events).toHaveLength(1);
     queue.push(page([item('A', { seq: 4, state: 'S2' })], 6));
-    await view.delta(5);
+    await view.delta();
     expect(events).toHaveLength(2);
   });
 });
@@ -213,7 +247,7 @@ describe('InventoryView suspectedSpent overlay (F7)', () => {
     await view.demote('T', 'S1');
     expect(view.pool(COIN)).toEqual([]);
     queue.push(page([item('T', { seq: 7, state: 'S2' })], 7));
-    await view.delta(5);
+    await view.delta();
     expect(view.pool(COIN)).toEqual([{ tokenId: 'T', amount: 100n }]);
     await vi.waitFor(() => {
       expect(kv.data.get('suspected-spent')).toEqual([]);
@@ -251,7 +285,7 @@ describe('InventoryView recoverRemoved (F6)', () => {
     expect(noRecoverCalls.getBlobs).not.toHaveBeenCalled();
 
     queue.push(page([item('T', { seq: 9, state: 'S2', status: 'removed', noAssets: true })], 9));
-    await view.delta(5);
+    await view.delta();
     const reAdd2 = vi.fn(async (): Promise<ReAddResult> => 'added');
     const r2 = await view.recoverRemoved(async () => new Map([['T', blob(2)]]), async () => false, reAdd2);
     expect(r2.recovered).toEqual(['T']);

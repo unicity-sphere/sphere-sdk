@@ -196,7 +196,6 @@ function authedWireClient(session: WalletApiSession, client: WalletApiV2Client):
   const auth = <T>(op: () => Promise<T>): Promise<T> => session.withAuth(() => op());
   return {
     listInventory: (since) => auth(() => client.listInventory(since)),
-    balances: () => auth(() => client.balances()),
     blobUrls: (tokenIds) => auth(() => client.blobUrls(tokenIds)),
     uploadUrls: (blobs) => auth(() => client.uploadUrls(blobs)),
     apply: (delta) => auth(() => client.apply(delta)),

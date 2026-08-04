@@ -26,7 +26,7 @@ describe('TransferMachine send path (§5.5)', () => {
     expect(w.engine.transferCalls).toHaveLength(0);
     expect(await w.engine.isSpent(token)).toBe(false);
     expect(w.log).not.toContain('abortIntent');
-    const backstop = await w.stores().backstop.get(plan.transferId);
+    const backstop = await w.stores().backstop.getByKey(plan.transferId);
     expect(backstop?.disposition).toBe('open');
   });
 
@@ -40,7 +40,7 @@ describe('TransferMachine send path (§5.5)', () => {
 
     await expect(w.machine().run(plan)).rejects.toThrow('payload refused');
 
-    expect(await w.stores().backstop.get(plan.transferId)).toBeUndefined();
+    expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
     expect(w.log).not.toContain('abortIntent');
     expect(w.engine.transferCalls).toHaveLength(0);
   });
@@ -133,7 +133,7 @@ describe('TransferMachine send path (§5.5)', () => {
     await expect(w.machine().run(plan)).rejects.toBe(pue);
 
     expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('open');
-    expect((await w.stores().backstop.get(plan.transferId))?.disposition).toBe('open');
+    expect((await w.stores().backstop.getByKey(plan.transferId))?.disposition).toBe('open');
     expect(w.log).not.toContain('abortIntent');
     expect(w.log).not.toContain('applyDelta');
     expect(isPossiblyCommittedSendOutcome(pue)).toBe(true);
@@ -150,7 +150,7 @@ describe('TransferMachine send path (§5.5)', () => {
     await expect(w.machine().run(plan)).rejects.toThrow('known validation failure');
 
     expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('aborted');
-    expect(await w.stores().backstop.get(plan.transferId)).toBeUndefined();
+    expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
     expect(await w.engine.isSpent(token)).toBe(false);
   });
 

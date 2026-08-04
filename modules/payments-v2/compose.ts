@@ -12,12 +12,12 @@ import type { DeliveryPort, StoragePort } from './ports';
 import type { ScopedKV } from './stores';
 import { History, type HistoryClient } from './history/History';
 import { InventoryView, type PriceReader, type RegistryReader } from './inventory/InventoryView';
-import { Receive, type ReceiveEngine, type ReceivedRecord, type StoredIncoming } from './receive/Receive';
+import { Receive, type ReceivedRecord, type StoredIncoming } from './receive/Receive';
 import { Requests, type RequestMemoCodec, type RequestsWireClient } from './requests/Requests';
 import { ReservationLedger } from './select/ledger';
 import { SpendQueue } from './select/queue';
 import { createMachineStores, type MachineStores } from './machine/journal';
-import { TransferMachine, type IntentApi, type MachineDeps } from './machine/TransferMachine';
+import { TransferMachine, type MachineDeps } from './machine/TransferMachine';
 
 /**
  * F13 landed: `SphereTokenEngine.mint` derives salt/tokenType from
@@ -95,17 +95,7 @@ export interface PaymentsFacadeDeps {
 }
 
 /** Derived (non-authoritative) tokenId→stateHash cache backing the ReceiveView seam. */
-export class HeldStateCache {
-  private readonly held = new Map<string, string>();
-
-  get(tokenId: string): string | null {
-    return this.held.get(tokenId) ?? null;
-  }
-
-  set(tokenId: string, stateHash: string): void {
-    this.held.set(tokenId, stateHash);
-  }
-}
+export type HeldStateCache = Map<string, string>;
 
 export interface FacadeHooks {
   engine(): ITokenEngine;
@@ -149,7 +139,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     ...(deps.newId !== undefined ? { newId: deps.newId } : {}),
   });
   const machineDeps = buildMachineDeps(deps, hooks, historyStore);
-  const heldStates = new HeldStateCache();
+  const heldStates: HeldStateCache = new Map();
 
   return {
     ownPubkeyBytes,
@@ -175,7 +165,13 @@ function buildMachineDeps(
     engine: () => hooks.engine(),
     storage: deps.storagePort,
     delivery: deps.deliveryPort,
-    intents: intentApi(deps.client),
+    intents: {
+      put: (transferId, envelope, requiresSeedClose) =>
+        deps.client.putIntent(transferId, envelope, requiresSeedClose),
+      listOpen: () => deps.client.listIntents('open'),
+      abort: (transferId) => deps.client.abortIntent(transferId),
+      complete: (transferId, signature) => deps.client.completeIntent(transferId, signature),
+    },
     checkpointStore: deps.checkpointStore,
     kv: deps.kv,
     encryptPayload: async (payload) => encryptField(deps.fieldKey, JSON.stringify(payload)),
@@ -196,21 +192,6 @@ function buildMachineDeps(
   };
 }
 
-function intentApi(client: FacadeClient): IntentApi {
-  return {
-    put: (transferId, envelope, requiresSeedClose) =>
-      client.putIntent(transferId, envelope, requiresSeedClose),
-    listOpen: async () =>
-      (await client.listIntents('open')).map((intent) => ({
-        transferId: intent.transferId,
-        payload: intent.payload,
-        createdAt: intent.createdAt,
-      })),
-    abort: (transferId) => client.abortIntent(transferId),
-    complete: (transferId, signature) => client.completeIntent(transferId, signature),
-  };
-}
-
 function buildReceive(
   deps: PaymentsFacadeDeps,
   hooks: FacadeHooks,
@@ -219,33 +200,26 @@ function buildReceive(
 ): Receive {
   return new Receive({
     delivery: deps.deliveryPort,
-    engine: receiveEngine(hooks),
+    engine: () => hooks.engine(),
     view: {
-      heldState: (tokenId) => heldStates.get(tokenId),
+      heldState: (tokenId) => heldStates.get(tokenId) ?? null,
       store: async (entry: StoredIncoming) => {
         heldStates.set(entry.tokenId, entry.stateHash);
-        return 'stored';
       },
     },
     kv: deps.kv,
     registry: deps.registry,
     recordReceived: (record) => recordReceived(historyStore, record),
     emit: (event, transfer) => deps.emit(event, transfer),
+    attention: (transferId, code, detail) => {
+      deps.emit(
+        'transfer:attention',
+        detail === undefined ? { transferId, code } : { transferId, code, detail }
+      );
+    },
     syncEpoch: deps.syncEpoch ?? (() => ''),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
-}
-
-function receiveEngine(hooks: FacadeHooks): ReceiveEngine {
-  return {
-    getIdentity: () => hooks.engine().getIdentity(),
-    decodeToken: (blob) => hooks.engine().decodeToken(blob),
-    verify: (token, options) => hooks.engine().verify(token, options),
-    isOwnedBy: (token, pubkey) => hooks.engine().isOwnedBy(token, pubkey),
-    isSpent: (token, options) => hooks.engine().isSpent(token, options),
-    tokenId: (token) => hooks.engine().tokenId(token),
-    deliveryKeys: (blobBytes) => hooks.engine().deliveryKeys(blobBytes),
-  };
 }
 
 async function recordReceived(historyStore: History, record: ReceivedRecord): Promise<void> {

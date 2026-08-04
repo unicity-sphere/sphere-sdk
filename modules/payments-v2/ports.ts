@@ -27,7 +27,6 @@ export interface ApplyDeltaResult {
 
 export interface StoragePort {
   listInventory(since?: number): Promise<InventoryPage>;
-  balances(): Promise<{ coinId: string; total: string; tokenCount: number }[]>;
   getBlobs(tokenIds: string[]): Promise<Map<string, Uint8Array>>;
   uploadBlobs(blobs: { sha256: string; bytes: Uint8Array }[]): Promise<Map<string, string>>;
   // The one authoritative spend write; runs after the deposit ATTEMPT (§5.5).

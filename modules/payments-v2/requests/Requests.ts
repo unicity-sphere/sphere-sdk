@@ -17,6 +17,7 @@ import type {
   PaymentsV2Events,
   SendRequest,
 } from '../api';
+import { SerialChain, SingleFlight } from '../async';
 import { STORE_KEYS, type ScopedKV, type SettlingLink, type StreamCursor } from '../stores';
 
 export type RequestWireStatus = 'open' | 'paid' | 'declined' | 'expired';
@@ -110,14 +111,14 @@ function isConflict409(err: unknown): boolean {
 export class Requests implements PaymentsRequestsApi {
   private readonly mirror = new Map<string, PaymentRequestView>();
   private hydrated = false;
-  private drainInFlight: Promise<void> | null = null;
+  private readonly drainFlight = new SingleFlight<void>();
 
   private journal: Map<string, SettlingLink> | null = null;
   private journalLoad: Promise<void> | null = null;
-  private journalTail: Promise<void> = Promise.resolve();
+  private readonly journalChain = new SerialChain();
 
   private readonly payInFlight = new Map<string, Promise<TransferResult>>();
-  private reconcileInFlight = false;
+  private readonly reconcileFlight = new SingleFlight<void>();
 
   constructor(private readonly deps: RequestsDeps) {}
 
@@ -142,15 +143,12 @@ export class Requests implements PaymentsRequestsApi {
   }
 
   private mutateJournal(fn: (m: Map<string, SettlingLink>) => boolean): Promise<void> {
-    this.journalTail = this.journalTail
-      .catch(() => undefined)
-      .then(async () => {
-        await this.ensureJournalLoaded();
-        if (fn(this.journal!)) {
-          await this.deps.kv.set(STORE_KEYS.settlingLinks, Object.fromEntries(this.journal!));
-        }
-      });
-    return this.journalTail;
+    return this.journalChain.enqueue(async () => {
+      await this.ensureJournalLoaded();
+      if (fn(this.journal!)) {
+        await this.deps.kv.set(STORE_KEYS.settlingLinks, Object.fromEntries(this.journal!));
+      }
+    });
   }
 
   private writeLink(requestId: string, transferId: string, committed: boolean): Promise<void> {
@@ -167,9 +165,7 @@ export class Requests implements PaymentsRequestsApi {
   // ── incoming stream (gap-free ?since= upsert-by-id) ──────────────────────
 
   drainIncoming(): Promise<void> {
-    return (this.drainInFlight ??= this.doDrain().finally(() => {
-      this.drainInFlight = null;
-    }));
+    return this.drainFlight.run(() => this.doDrain());
   }
 
   private async doDrain(): Promise<void> {
@@ -390,31 +386,31 @@ export class Requests implements PaymentsRequestsApi {
 
   // ── reconcile (#441, fed by resume outcomes) ─────────────────────────────
 
-  async reconcile(outcomes: ResumeOutcomes): Promise<void> {
-    if (this.reconcileInFlight) return;
+  reconcile(outcomes: ResumeOutcomes): Promise<void> {
+    // Single-flight (§7: no sampled *InFlight booleans) — a concurrent call
+    // coalesces onto the running pass instead of racing the journal.
+    return this.reconcileFlight.run(() => this.doReconcile(outcomes));
+  }
+
+  private async doReconcile(outcomes: ResumeOutcomes): Promise<void> {
     await this.ensureJournalLoaded();
     if (this.journal!.size === 0) return;
-    this.reconcileInFlight = true;
-    try {
-      const resumed = new Set(outcomes.resumed);
-      const conflicted = new Set(outcomes.conflicted);
-      const open = new Set(outcomes.open);
-      let aborted: Set<string> | null = null;
+    const resumed = new Set(outcomes.resumed);
+    const conflicted = new Set(outcomes.conflicted);
+    const open = new Set(outcomes.open);
+    let aborted: Set<string> | null = null;
 
-      for (const [requestId, link] of [...this.journal!]) {
-        if (link.committed || resumed.has(link.transferId)) {
-          // Value left the wallet (or the transfer completed) → deferred paid.
-          await this.resolvePaid(requestId, link.transferId);
-        } else if (conflicted.has(link.transferId)) {
-          await this.revertPayable(requestId);
-        } else if (open.has(link.transferId)) {
-          // Still settling — keep the link, retry next session.
-        } else {
-          aborted = await this.reconcileUnaccounted(requestId, link.transferId, aborted);
-        }
+    for (const [requestId, link] of [...this.journal!]) {
+      if (link.committed || resumed.has(link.transferId)) {
+        // Value left the wallet (or the transfer completed) → deferred paid.
+        await this.resolvePaid(requestId, link.transferId);
+      } else if (conflicted.has(link.transferId)) {
+        await this.revertPayable(requestId);
+      } else if (open.has(link.transferId)) {
+        // Still settling — keep the link, retry next session.
+      } else {
+        aborted = await this.reconcileUnaccounted(requestId, link.transferId, aborted);
       }
-    } finally {
-      this.reconcileInFlight = false;
     }
   }
 

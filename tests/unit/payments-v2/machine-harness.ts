@@ -326,9 +326,6 @@ function makeStorage(w: WorldState): StoragePort {
       }));
       return { cursor: page.cursor, syncEpoch: String(page.syncEpoch), more: page.more, items };
     },
-    async balances() {
-      return w.api.balances(w.caller);
-    },
     async getBlobs(tokenIds) {
       const out = new Map<string, Uint8Array>();
       for (const id of tokenIds) {

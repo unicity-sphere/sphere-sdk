@@ -7,19 +7,9 @@ export interface IntentPayload {
   // Stored order is normative (E.3).
   direct: string[];
   split?: { tokenId: string; splitAmount: string; remainderAmount: string };
+  // Dual-field = old-module v:2 wire compat (always equal); collapse at the flip.
   spentStates?: Record<string, { local: string; protocol: string }>;
 }
-
-export type MachinePhase =
-  | 'PLANNED'
-  | 'INTENT_OPEN'
-  | 'CERTIFYING'
-  | 'DELIVERING'
-  | 'APPLYING'
-  | 'CLOSING'
-  | 'DONE'
-  // FAILED = clean pre-certification failure ONLY.
-  | 'FAILED';
 
 export interface PlannedOp {
   kind: 'direct' | 'split';
@@ -38,5 +28,4 @@ export interface OpOutcome {
   error?: unknown;
 }
 
-// Precedence: keep-open > conflict > anything else.
-export type OutcomeClass = 'keep-open' | 'conflict' | 'clean-reject' | 'other';
+export type OutcomeClass = 'keep-open' | 'conflict' | 'other';

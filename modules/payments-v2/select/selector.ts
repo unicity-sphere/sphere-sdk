@@ -22,6 +22,7 @@ export interface SelectorStats {
 
 export interface SelectorOptions {
   readonly workBudget?: number;
+  /** Instrumentation out-param: pins the tested work-budget invariant (select.test.ts). */
   readonly stats?: SelectorStats;
 }
 

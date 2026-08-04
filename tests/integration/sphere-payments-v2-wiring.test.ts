@@ -134,7 +134,6 @@ interface Gates {
 function gatedClient(inner: FakeWalletApiV2Client, gates: Gates): PaymentsV2WireClient {
   return {
     listInventory: (since) => inner.listInventory(since),
-    balances: () => inner.balances(),
     blobUrls: (ids) => inner.blobUrls(ids),
     uploadUrls: (blobs) => inner.uploadUrls(blobs),
     apply: (delta) => inner.apply(delta),

@@ -5,6 +5,7 @@
 
 import { sha256 } from '@noble/hashes/sha2.js';
 
+import { SerialChain } from '../../modules/payments-v2/async';
 import type {
   DeliverOptions,
   DeliveryPort,
@@ -12,6 +13,7 @@ import type {
   IncomingDelivery,
 } from '../../modules/payments-v2/ports';
 import type { ScopedKV } from '../../modules/payments-v2/stores';
+import { bytesToHex, hexToBytes } from '../../core/crypto';
 import {
   decryptDeliveryBundle,
   deriveDeliveryEncryptionKey,
@@ -20,7 +22,7 @@ import {
 } from '../../core/delivery-envelope';
 import { isWalletApiHttpError } from './http';
 import type { MailboxDepositEntry, MailboxEntryWire, WalletApiV2Client } from './client';
-import { mapBounded, WALLET_API_V2_FANOUT_WIDTH } from './storage';
+import { uploadViaPresigned } from './storage';
 
 export type DeliveryPortClient = Pick<
   WalletApiV2Client,
@@ -55,16 +57,6 @@ export class DeliveryProtocolError extends Error {
     super(message);
     this.name = 'DeliveryProtocolError';
   }
-}
-
-function hexToBytes(hex: string): Uint8Array {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  return out;
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 export function computeDeliveryId(tokenIdHex: string, stateHashHex: string): string {
@@ -110,7 +102,7 @@ export class WalletApiDeliveryPort implements DeliveryPort {
   private readonly identity: DeliveryIdentity;
   private readonly wake: WakeSource | null;
   private deriveFn: ((blob: Uint8Array) => Promise<{ tokenId: string; stateHash: string }>) | null;
-  private seenChain: Promise<void> = Promise.resolve();
+  private readonly seenChain = new SerialChain();
 
   constructor(config: WalletApiDeliveryPortConfig) {
     this.client = config.client;
@@ -147,7 +139,10 @@ export class WalletApiDeliveryPort implements DeliveryPort {
     if (blobs.length === 0) return [];
     const prepared = await Promise.all(blobs.map(async (bytes) => this.prepare(bytes)));
     const envelope = this.buildEnvelope(recipientPubkey, options);
-    const keyBySha = await this.upload(prepared);
+    const keyBySha = await uploadViaPresigned(
+      this.client,
+      prepared.map((p) => ({ sha256: p.sha, bytes: p.bytes }))
+    );
     const entries = prepared.map((p): MailboxDepositEntry => {
       const key = keyBySha.get(p.sha);
       if (key === undefined) throw new DeliveryProtocolError(`upload returned no key for sha256 ${p.sha}`);
@@ -180,18 +175,6 @@ export class WalletApiDeliveryPort implements DeliveryPort {
       senderNametag: options.senderNametag ?? this.identity.nametag,
       memo: options.memo,
     });
-  }
-
-  private async upload(prepared: readonly PreparedDelivery[]): Promise<Map<string, string>> {
-    const urls = await this.client.uploadUrls(prepared.map((p) => ({ sha256: p.sha, size: p.bytes.length })));
-    const urlBySha = new Map(urls.map((u) => [u.sha256, u]));
-    const uploads = prepared.map((p) => {
-      const url = urlBySha.get(p.sha);
-      if (url === undefined) throw new DeliveryProtocolError(`upload-urls response missing sha256 ${p.sha}`);
-      return { p, url };
-    });
-    await mapBounded(uploads, WALLET_API_V2_FANOUT_WIDTH, ({ p, url }) => this.client.uploadBlob(url.putUrl, p.bytes));
-    return new Map(uploads.map(({ url }) => [url.sha256, url.key]));
   }
 
   private async depositAll(entries: MailboxDepositEntry[], deliveryIds: string[]): Promise<DeliveryReceipt[]> {
@@ -308,18 +291,11 @@ export class WalletApiDeliveryPort implements DeliveryPort {
   }
 
   private addSeen(deliveryId: string): Promise<void> {
-    const write = async (): Promise<void> => {
+    // SerialChain settles-not-fulfills: a rejected write never bricks later acks.
+    return this.seenChain.enqueue(async () => {
       const seen = await this.readSeen();
       seen.add(deliveryId);
       await this.kv.set(DELIVERY_SEEN_KEY, [...seen]);
-    };
-    // Serialize on settled, not fulfilled: a rejected tail would otherwise
-    // brick every later ack on this port instance (PR #727 review).
-    const run = this.seenChain.then(write, write);
-    this.seenChain = run.then(
-      () => undefined,
-      () => undefined
-    );
-    return run;
+    });
   }
 }

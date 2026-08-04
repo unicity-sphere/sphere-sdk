@@ -223,47 +223,43 @@ describe('selectCoins (pure selector)', () => {
   });
 });
 
-describe('ReservationLedger', () => {
-  it('reserve() claims capacity and getFreeAmount() reflects it', () => {
+describe('ReservationLedger (whole-token set semantics)', () => {
+  it('reserve() holds the whole token: getFreeAmount() reports 0 while held, the full amount when free', () => {
     const ledger = new ReservationLedger();
-    ledger.reserve('r1', [{ tokenId: 't1', amount: 300n, tokenAmount: 1000n }]);
-    expect(ledger.getFreeAmount('t1', 1000n)).toBe(700n);
+    ledger.reserve('r1', [{ tokenId: 't1' }]);
+    expect(ledger.getFreeAmount('t1', 1000n)).toBe(0n);
   });
 
   it('reserve() spans multiple tokens in one reservation', () => {
     const ledger = new ReservationLedger();
-    ledger.reserve('r1', [
-      { tokenId: 't1', amount: 300n, tokenAmount: 300n },
-      { tokenId: 't2', amount: 400n, tokenAmount: 400n },
-    ]);
+    ledger.reserve('r1', [{ tokenId: 't1' }, { tokenId: 't2' }]);
     expect(ledger.getFreeAmount('t1', 300n)).toBe(0n);
     expect(ledger.getFreeAmount('t2', 400n)).toBe(0n);
   });
 
-  it('duplicate tokenIds within one reserve() call accumulate', () => {
+  it('duplicate tokenIds within one reserve() call collapse to one whole-token hold', () => {
     const ledger = new ReservationLedger();
-    ledger.reserve('r1', [
-      { tokenId: 't1', amount: 300n, tokenAmount: 1000n },
-      { tokenId: 't1', amount: 300n, tokenAmount: 1000n },
-    ]);
-    expect(ledger.getFreeAmount('t1', 1000n)).toBe(400n);
+    ledger.reserve('r1', [{ tokenId: 't1' }, { tokenId: 't1' }]);
+    expect(ledger.getFreeAmount('t1', 1000n)).toBe(0n);
+    ledger.cancel('r1');
+    expect(ledger.getFreeAmount('t1', 1000n)).toBe(1000n);
   });
 
-  it('commit() frees capacity and is idempotent', () => {
+  it('commit() frees the tokens and is idempotent', () => {
     const ledger = new ReservationLedger();
-    ledger.reserve('r1', [{ tokenId: 't1', amount: 500n, tokenAmount: 500n }]);
+    ledger.reserve('r1', [{ tokenId: 't1' }]);
     ledger.commit('r1');
     ledger.commit('r1');
     expect(ledger.getFreeAmount('t1', 500n)).toBe(500n);
   });
 
-  it('cancel() frees capacity, is idempotent, and allows re-reserving the same tokens', () => {
+  it('cancel() frees the tokens, is idempotent, and allows re-reserving the same tokens', () => {
     const ledger = new ReservationLedger();
-    ledger.reserve('r1', [{ tokenId: 't1', amount: 500n, tokenAmount: 500n }]);
+    ledger.reserve('r1', [{ tokenId: 't1' }]);
     ledger.cancel('r1');
     ledger.cancel('r1');
     expect(ledger.getFreeAmount('t1', 500n)).toBe(500n);
-    ledger.reserve('r1', [{ tokenId: 't1', amount: 500n, tokenAmount: 500n }]);
+    ledger.reserve('r1', [{ tokenId: 't1' }]);
     expect(ledger.getFreeAmount('t1', 500n)).toBe(0n);
   });
 
@@ -281,83 +277,45 @@ describe('ReservationLedger', () => {
 
   it('reserve() with a duplicate reservationId throws DUPLICATE_RESERVATION_ID', () => {
     const ledger = new ReservationLedger();
-    ledger.reserve('r1', [{ tokenId: 't1', amount: 100n, tokenAmount: 1000n }]);
-    expect(() =>
-      ledger.reserve('r1', [{ tokenId: 't2', amount: 100n, tokenAmount: 1000n }])
-    ).toThrow('DUPLICATE_RESERVATION_ID');
+    ledger.reserve('r1', [{ tokenId: 't1' }]);
+    expect(() => ledger.reserve('r1', [{ tokenId: 't2' }])).toThrow('DUPLICATE_RESERVATION_ID');
   });
 
-  it('reserve() with zero or negative amounts throws INVALID_RESERVATION_AMOUNT', () => {
+  it('reserve() of an already-held token throws INSUFFICIENT_FREE_AMOUNT', () => {
     const ledger = new ReservationLedger();
-    expect(() =>
-      ledger.reserve('r1', [{ tokenId: 't1', amount: 0n, tokenAmount: 100n }])
-    ).toThrow('INVALID_RESERVATION_AMOUNT');
-    expect(() =>
-      ledger.reserve('r2', [{ tokenId: 't1', amount: -1n, tokenAmount: 100n }])
-    ).toThrow('INVALID_RESERVATION_AMOUNT');
-  });
-
-  it('reserve() beyond free capacity throws INSUFFICIENT_FREE_AMOUNT', () => {
-    const ledger = new ReservationLedger();
-    ledger.reserve('r1', [{ tokenId: 't1', amount: 800n, tokenAmount: 1000n }]);
-    expect(() =>
-      ledger.reserve('r2', [{ tokenId: 't1', amount: 300n, tokenAmount: 1000n }])
-    ).toThrow('INSUFFICIENT_FREE_AMOUNT');
-  });
-
-  it('reserve() beyond tokenAmount throws INSUFFICIENT_FREE_AMOUNT', () => {
-    const ledger = new ReservationLedger();
-    expect(() =>
-      ledger.reserve('r1', [{ tokenId: 't1', amount: 200n, tokenAmount: 100n }])
-    ).toThrow('INSUFFICIENT_FREE_AMOUNT');
+    ledger.reserve('r1', [{ tokenId: 't1' }]);
+    expect(() => ledger.reserve('r2', [{ tokenId: 't1' }])).toThrow('INSUFFICIENT_FREE_AMOUNT');
   });
 
   it('reserve() is all-or-nothing: a failing entry leaves earlier entries unreserved', () => {
     const ledger = new ReservationLedger();
-    expect(() =>
-      ledger.reserve('r1', [
-        { tokenId: 'ok', amount: 100n, tokenAmount: 100n },
-        { tokenId: 'bad', amount: 500n, tokenAmount: 100n },
-      ])
-    ).toThrow('INSUFFICIENT_FREE_AMOUNT');
+    ledger.reserve('holder', [{ tokenId: 'bad' }]);
+    expect(() => ledger.reserve('r1', [{ tokenId: 'ok' }, { tokenId: 'bad' }])).toThrow(
+      'INSUFFICIENT_FREE_AMOUNT'
+    );
     expect(ledger.getFreeAmount('ok', 100n)).toBe(100n);
-    ledger.reserve('r2', [{ tokenId: 'ok', amount: 100n, tokenAmount: 100n }]);
+    ledger.reserve('r2', [{ tokenId: 'ok' }]);
   });
 
-  it('two partial reservations on one token both count against free capacity', () => {
-    const ledger = new ReservationLedger();
-    ledger.reserve('r1', [{ tokenId: 't1', amount: 400n, tokenAmount: 1000n }]);
-    ledger.reserve('r2', [{ tokenId: 't1', amount: 400n, tokenAmount: 1000n }]);
-    expect(ledger.getFreeAmount('t1', 1000n)).toBe(200n);
-    ledger.cancel('r1');
-    expect(ledger.getFreeAmount('t1', 1000n)).toBe(600n);
-  });
-
-  it('getFreeAmount() returns the full amount for an untracked token and never goes negative', () => {
+  it('getFreeAmount() returns the full amount for an untracked token', () => {
     const ledger = new ReservationLedger();
     expect(ledger.getFreeAmount('unknown', 500n)).toBe(500n);
-    ledger.reserve('r1', [{ tokenId: 't1', amount: 500n, tokenAmount: 500n }]);
-    expect(ledger.getFreeAmount('t1', 300n)).toBe(0n);
   });
 
-  it('cancelForToken() cancels every other reservation touching the token and returns their ids', () => {
+  it('cancelForToken() cancels the holding reservation and returns its id', () => {
     const ledger = new ReservationLedger();
-    ledger.reserve('r1', [{ tokenId: 't1', amount: 300n, tokenAmount: 1000n }]);
-    ledger.reserve('r2', [{ tokenId: 't1', amount: 300n, tokenAmount: 1000n }]);
-    ledger.reserve('r3', [{ tokenId: 'other', amount: 100n, tokenAmount: 100n }]);
-    const cancelled = ledger.cancelForToken('t1');
-    expect(new Set(cancelled)).toEqual(new Set(['r1', 'r2']));
+    ledger.reserve('r1', [{ tokenId: 't1' }]);
+    ledger.reserve('r3', [{ tokenId: 'other' }]);
+    expect(ledger.cancelForToken('t1')).toEqual(['r1']);
     expect(ledger.getFreeAmount('t1', 1000n)).toBe(1000n);
     expect(ledger.getFreeAmount('other', 100n)).toBe(0n);
   });
 
   it('cancelForToken() preserves the excluded reservation', () => {
     const ledger = new ReservationLedger();
-    ledger.reserve('mine', [{ tokenId: 't1', amount: 300n, tokenAmount: 1000n }]);
-    ledger.reserve('theirs', [{ tokenId: 't1', amount: 300n, tokenAmount: 1000n }]);
-    const cancelled = ledger.cancelForToken('t1', 'mine');
-    expect(cancelled).toEqual(['theirs']);
-    expect(ledger.getFreeAmount('t1', 1000n)).toBe(700n);
+    ledger.reserve('mine', [{ tokenId: 't1' }]);
+    expect(ledger.cancelForToken('t1', 'mine')).toEqual([]);
+    expect(ledger.getFreeAmount('t1', 1000n)).toBe(0n);
   });
 
   it('cancelForToken() on an untracked token returns an empty array', () => {
@@ -367,17 +325,14 @@ describe('ReservationLedger', () => {
 
   it('cancelForToken() on a multi-token reservation frees all its tokens', () => {
     const ledger = new ReservationLedger();
-    ledger.reserve('r1', [
-      { tokenId: 't1', amount: 100n, tokenAmount: 100n },
-      { tokenId: 't2', amount: 200n, tokenAmount: 200n },
-    ]);
+    ledger.reserve('r1', [{ tokenId: 't1' }, { tokenId: 't2' }]);
     ledger.cancelForToken('t1');
     expect(ledger.getFreeAmount('t2', 200n)).toBe(200n);
   });
 
   it('clear() removes all reservations', () => {
     const ledger = new ReservationLedger();
-    ledger.reserve('r1', [{ tokenId: 't1', amount: 100n, tokenAmount: 100n }]);
+    ledger.reserve('r1', [{ tokenId: 't1' }]);
     ledger.clear();
     expect(ledger.getFreeAmount('t1', 100n)).toBe(100n);
   });
@@ -458,7 +413,7 @@ describe('SpendQueue', () => {
 
   it('fails fast with SEND_INSUFFICIENT_BALANCE when in-flight sources declared no expected change', () => {
     const h = track(makeHarness([['t1', 600n]]));
-    h.ledger.reserve('inflight', [{ tokenId: 't1', amount: 600n, tokenAmount: 600n }]);
+    h.ledger.reserve('inflight', [{ tokenId: 't1' }]);
     try {
       h.queue.plan('r1', { coinId: COIN, amount: '500' });
       expect.fail('should have thrown');
@@ -469,7 +424,7 @@ describe('SpendQueue', () => {
 
   it('counts declared expected change, not in-flight full amounts: shortfall fails fast instead of 30s queue death', () => {
     const h = track(makeHarness([['t1', 1000n]]));
-    h.ledger.reserve('inflight', [{ tokenId: 't1', amount: 1000n, tokenAmount: 1000n }]);
+    h.ledger.reserve('inflight', [{ tokenId: 't1' }]);
     h.queue.declareExpectedChange('inflight', COIN, 100n);
     try {
       h.queue.plan('r1', { coinId: COIN, amount: '500' });
@@ -481,7 +436,7 @@ describe('SpendQueue', () => {
 
   it('queues when declared expected change covers the shortfall, then plans when the change arrives', async () => {
     const h = track(makeHarness([['t1', 1000n]]));
-    h.ledger.reserve('inflight', [{ tokenId: 't1', amount: 1000n, tokenAmount: 1000n }]);
+    h.ledger.reserve('inflight', [{ tokenId: 't1' }]);
     h.queue.declareExpectedChange('inflight', COIN, 400n);
     const settled = asQueued(h.queue.plan('r1', { coinId: COIN, amount: '300' }));
     h.addToken('t-change', 400n);
@@ -495,7 +450,7 @@ describe('SpendQueue', () => {
 
   it('skip-ahead: a small entry passes a blocked head without unblocking it', async () => {
     const h = track(makeHarness([['t1', 1000n]]));
-    h.ledger.reserve('inflight', [{ tokenId: 't1', amount: 1000n, tokenAmount: 1000n }]);
+    h.ledger.reserve('inflight', [{ tokenId: 't1' }]);
     h.queue.declareExpectedChange('inflight', COIN, 1000n);
     const headSettled = asQueued(h.queue.plan('head', { coinId: COIN, amount: '800' }));
     const smallSettled = asQueued(h.queue.plan('small', { coinId: COIN, amount: '200' }));
@@ -512,7 +467,7 @@ describe('SpendQueue', () => {
 
   it('serves same-size queued entries in FIFO order', async () => {
     const h = track(makeHarness([['t1', 1000n]]));
-    h.ledger.reserve('inflight', [{ tokenId: 't1', amount: 1000n, tokenAmount: 1000n }]);
+    h.ledger.reserve('inflight', [{ tokenId: 't1' }]);
     h.queue.declareExpectedChange('inflight', COIN, 1000n);
     const first = asQueued(h.queue.plan('first', { coinId: COIN, amount: '100' }));
     const second = asQueued(h.queue.plan('second', { coinId: COIN, amount: '100' }));
@@ -531,7 +486,7 @@ describe('SpendQueue', () => {
   it('timeout expires the head entry with SEND_QUEUE_TIMEOUT after 30s', async () => {
     vi.useFakeTimers();
     const h = track(makeHarness([['t1', 1000n]]));
-    h.ledger.reserve('inflight', [{ tokenId: 't1', amount: 1000n, tokenAmount: 1000n }]);
+    h.ledger.reserve('inflight', [{ tokenId: 't1' }]);
     h.queue.declareExpectedChange('inflight', COIN, 1000n);
     const settled = asQueued(h.queue.plan('r1', { coinId: COIN, amount: '500' }));
     vi.advanceTimersByTime(QUEUE_TIMEOUT_MS + 1);
@@ -540,7 +495,7 @@ describe('SpendQueue', () => {
 
   it('coverage collapse after clearExpectedChange rejects queued entries at the next wake, not at 30s', async () => {
     const h = track(makeHarness([['t1', 1000n]]));
-    h.ledger.reserve('inflight', [{ tokenId: 't1', amount: 1000n, tokenAmount: 1000n }]);
+    h.ledger.reserve('inflight', [{ tokenId: 't1' }]);
     h.queue.declareExpectedChange('inflight', COIN, 500n);
     const settled = asQueued(h.queue.plan('r1', { coinId: COIN, amount: '300' }));
     h.queue.clearExpectedChange('inflight');
@@ -604,13 +559,13 @@ describe('SpendQueue', () => {
 
   it('a reservation failure during wake rejects that entry and keeps serving the rest', async () => {
     const h = track(makeHarness([['t1', 1000n]]));
-    h.ledger.reserve('inflight', [{ tokenId: 't1', amount: 1000n, tokenAmount: 1000n }]);
+    h.ledger.reserve('inflight', [{ tokenId: 't1' }]);
     h.queue.declareExpectedChange('inflight', COIN, 1000n);
     const clashing = asQueued(h.queue.plan('taken-id', { coinId: COIN, amount: '100' }));
     const healthy = asQueued(h.queue.plan('fresh-id', { coinId: COIN, amount: '100' }));
     h.addToken('c1', 100n);
     h.addToken('c2', 100n);
-    h.ledger.reserve('taken-id', [{ tokenId: 'unrelated', amount: 1n, tokenAmount: 1n }]);
+    h.ledger.reserve('taken-id', [{ tokenId: 'unrelated' }]);
     h.queue.notifyChange(COIN);
     await expect(clashing).rejects.toThrow('DUPLICATE_RESERVATION_ID');
     expect((await healthy).plan).toEqual({ direct: ['c1'] });

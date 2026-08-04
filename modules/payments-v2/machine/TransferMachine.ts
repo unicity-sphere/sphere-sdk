@@ -143,7 +143,7 @@ export function summarize(outcomes: OpOutcome[]): {
   firstError: unknown;
 } {
   const committed = outcomes.filter((o) => o.certified);
-  const rank: Record<OutcomeClass, number> = { 'keep-open': 3, conflict: 2, 'clean-reject': 1, other: 1 };
+  const rank: Record<OutcomeClass, number> = { 'keep-open': 3, conflict: 2, other: 1 };
   let cls: OutcomeClass | null = null;
   let firstError: unknown;
   for (const o of outcomes) {
@@ -168,7 +168,7 @@ export class TransferMachine {
   async run(plan: MachinePlan): Promise<{ committed: OpOutcome[]; deliveryPending: boolean }> {
     const engine = this.deps.engine();
     const envelope = await this.deps.encryptPayload(plan.payload);
-    await this.stores.backstop.save({
+    await this.stores.backstop.upsert({
       transferId: plan.transferId,
       payloadEnvelope: envelope,
       requiresSeedClose: plan.payload.split !== undefined,
@@ -228,7 +228,7 @@ export class TransferMachine {
       await this.deps.intents.put(plan.transferId, envelope, plan.payload.split !== undefined);
     } catch (err) {
       // #670: only the deterministic pre-submit 422 proves no server row exists.
-      if (isValidationReject(err)) await this.stores.backstop.drop(plan.transferId);
+      if (isValidationReject(err)) await this.stores.backstop.removeByKey(plan.transferId);
       throw err;
     }
   }
@@ -274,7 +274,7 @@ export class TransferMachine {
     const outcome: OpOutcome = { op, certified: true, ...produced };
     try {
       // #621: journal the instant the op certifies, BEFORE any delivery attempt.
-      await this.stores.deliveryJournal.record({
+      await this.stores.deliveryJournal.upsert({
         transferId: ctx.transferId,
         opIndex: op.opIndex,
         recipientPubkey: ctx.recipientPubkey,
@@ -465,7 +465,7 @@ export class TransferMachine {
     };
     // #690: durable BEFORE complete — after complete the intent is unlistable
     // and no resume could ever rebuild the remainder the app never saw.
-    await this.stores.shortfalls.save(entry);
+    await this.stores.shortfalls.upsert(entry);
     await this.completeIntent(r.transferId, r.payload);
     await this.finishBookkeeping(r.transferId, r.payload, 'resumed');
     return entry;
@@ -494,7 +494,7 @@ export class TransferMachine {
       /* a history failure never fails the money path */
     }
     try {
-      await this.stores.backstop.drop(transferId);
+      await this.stores.backstop.removeByKey(transferId);
     } catch {
       /* stale 'open' backstops are inert — resume lists server-open only */
     }
@@ -505,13 +505,13 @@ export class TransferMachine {
     // family and any partially-certified send leave the intent open (E.2/E.3).
     if (committed.length > 0 || cls === 'keep-open') return;
     try {
-      await this.stores.backstop.setDisposition(transferId, 'abortPending');
+      await this.stores.backstop.patch(transferId, (e) => ({ ...e, disposition: 'abortPending' }));
     } catch {
       /* server abort below still converges; #676 gate covers the gap */
     }
     try {
       await this.deps.intents.abort(transferId);
-      await this.stores.backstop.drop(transferId);
+      await this.stores.backstop.removeByKey(transferId);
     } catch {
       /* stays abortPending — the #676 resume gate converges, never re-executes */
     }

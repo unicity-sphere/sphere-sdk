@@ -158,7 +158,6 @@ describe('WalletApiStoragePort — request shape', () => {
     let maxInflight = 0;
     const counting: StoragePortClient = {
       listInventory: (since) => client.listInventory(since),
-      balances: () => client.balances(),
       uploadUrls: (blobs) => client.uploadUrls(blobs),
       uploadBlob: (url, bytes) => client.uploadBlob(url, bytes),
       apply: (delta) => client.apply(delta),

@@ -4,6 +4,7 @@
 // budget (#517).
 
 import { hexToBytes } from '../../../core/crypto';
+import { SerialChain, SingleFlight } from '../async';
 import type { DeliveryPort } from '../ports';
 import {
   STORE_KEYS,
@@ -46,21 +47,31 @@ export function isValidationReject(err: unknown): boolean {
   return e.status === 422 || e.statusCode === 422 || e.code === 'VALIDATION' || e.code === 'VALIDATION_FAILED';
 }
 
-// Chains are registered per (kv, store key) so EVERY store instance over the
-// same ScopedKV serializes its read-modify-writes with every other instance.
-const chainRegistry = new WeakMap<ScopedKV, Map<string, Promise<unknown>>>();
-const replayRegistry = new WeakMap<ScopedKV, Map<string, Promise<ReplayStats>>>();
+// Registered per (kv, store key) so EVERY store instance over the same
+// ScopedKV serializes its read-modify-writes with every other instance.
+const chainRegistry = new WeakMap<ScopedKV, Map<string, SerialChain>>();
+const replayRegistry = new WeakMap<ScopedKV, Map<string, SingleFlight<ReplayStats>>>();
 
-function registryFor<T>(registry: WeakMap<ScopedKV, Map<string, T>>, kv: ScopedKV): Map<string, T> {
+function registryFor<T>(
+  registry: WeakMap<ScopedKV, Map<string, T>>,
+  kv: ScopedKV,
+  storeKey: string,
+  make: () => T
+): T {
   let perKv = registry.get(kv);
   if (perKv === undefined) {
     perKv = new Map();
     registry.set(kv, perKv);
   }
-  return perKv;
+  let entry = perKv.get(storeKey);
+  if (entry === undefined) {
+    entry = make();
+    perKv.set(storeKey, entry);
+  }
+  return entry;
 }
 
-class ListStore<T> {
+export class ListStore<T> {
   constructor(
     protected readonly kv: ScopedKV,
     protected readonly storeKey: string,
@@ -114,43 +125,11 @@ class ListStore<T> {
   }
 
   protected chained<R>(run: () => Promise<R>): Promise<R> {
-    const perKv = registryFor(chainRegistry, this.kv);
-    const prev = perKv.get(this.storeKey) ?? Promise.resolve();
-    const next = prev.then(run, run);
-    perKv.set(
-      this.storeKey,
-      next.then(
-        () => undefined,
-        () => undefined
-      )
-    );
-    return next;
+    return registryFor(chainRegistry, this.kv, this.storeKey, () => new SerialChain()).enqueue(run);
   }
 
   private async read(): Promise<T[]> {
     return (await this.kv.get<T[]>(this.storeKey)) ?? [];
-  }
-}
-
-export class BackstopStore extends ListStore<IntentBackstopEntry> {
-  constructor(kv: ScopedKV) {
-    super(kv, STORE_KEYS.intentBackstop, (e) => e.transferId);
-  }
-
-  save(entry: IntentBackstopEntry): Promise<void> {
-    return this.upsert(entry);
-  }
-
-  async setDisposition(transferId: string, disposition: IntentBackstopEntry['disposition']): Promise<void> {
-    await this.patch(transferId, (e) => ({ ...e, disposition }));
-  }
-
-  drop(transferId: string): Promise<void> {
-    return this.removeByKey(transferId);
-  }
-
-  get(transferId: string): Promise<IntentBackstopEntry | undefined> {
-    return this.getByKey(transferId);
   }
 }
 
@@ -170,10 +149,6 @@ export interface ReplayDeps {
 export class DeliveryJournal extends ListStore<DeliveryJournalEntry> {
   constructor(kv: ScopedKV) {
     super(kv, STORE_KEYS.deliveryJournal, (e) => `${e.transferId}:${String(e.opIndex)}`);
-  }
-
-  record(entry: DeliveryJournalEntry): Promise<void> {
-    return this.upsert(entry);
   }
 
   async byTransfer(transferId: string): Promise<Map<number, DeliveryJournalEntry>> {
@@ -206,14 +181,9 @@ export class DeliveryJournal extends ListStore<DeliveryJournalEntry> {
 
   /** Single-flight per (kv, store); concurrent calls coalesce onto one pass. */
   replay(deps: ReplayDeps): Promise<ReplayStats> {
-    const perKv = registryFor(replayRegistry, this.kv);
-    const existing = perKv.get(this.storeKey);
-    if (existing !== undefined) return existing;
-    const run = this.replayOnce(deps).finally(() => {
-      perKv.delete(this.storeKey);
-    });
-    perKv.set(this.storeKey, run);
-    return run;
+    return registryFor(replayRegistry, this.kv, this.storeKey, () => new SingleFlight<ReplayStats>()).run(
+      () => this.replayOnce(deps)
+    );
   }
 
   private async replayOnce(deps: ReplayDeps): Promise<ReplayStats> {
@@ -251,54 +221,18 @@ export class DeliveryJournal extends ListStore<DeliveryJournalEntry> {
   }
 }
 
-export class MintJournal extends ListStore<MintJournalEntry> {
-  constructor(kv: ScopedKV) {
-    super(kv, STORE_KEYS.mintJournal, (e) => e.mintId);
-  }
-
-  record(entry: MintJournalEntry): Promise<void> {
-    return this.upsert(entry);
-  }
-
-  remove(mintId: string): Promise<void> {
-    return this.removeByKey(mintId);
-  }
-
-  get(mintId: string): Promise<MintJournalEntry | undefined> {
-    return this.getByKey(mintId);
-  }
-}
-
-export class ShortfallStore extends ListStore<ShortfallEntry> {
-  constructor(kv: ScopedKV) {
-    super(kv, STORE_KEYS.shortfalls, (e) => e.transferId);
-  }
-
-  save(entry: ShortfallEntry): Promise<void> {
-    return this.upsert(entry);
-  }
-
-  clear(transferId: string): Promise<void> {
-    return this.removeByKey(transferId);
-  }
-
-  get(transferId: string): Promise<ShortfallEntry | undefined> {
-    return this.getByKey(transferId);
-  }
-}
-
 export interface MachineStores {
-  readonly backstop: BackstopStore;
+  readonly backstop: ListStore<IntentBackstopEntry>;
   readonly deliveryJournal: DeliveryJournal;
-  readonly mintJournal: MintJournal;
-  readonly shortfalls: ShortfallStore;
+  readonly mintJournal: ListStore<MintJournalEntry>;
+  readonly shortfalls: ListStore<ShortfallEntry>;
 }
 
 export function createMachineStores(kv: ScopedKV): MachineStores {
   return {
-    backstop: new BackstopStore(kv),
+    backstop: new ListStore<IntentBackstopEntry>(kv, STORE_KEYS.intentBackstop, (e) => e.transferId),
     deliveryJournal: new DeliveryJournal(kv),
-    mintJournal: new MintJournal(kv),
-    shortfalls: new ShortfallStore(kv),
+    mintJournal: new ListStore<MintJournalEntry>(kv, STORE_KEYS.mintJournal, (e) => e.mintId),
+    shortfalls: new ListStore<ShortfallEntry>(kv, STORE_KEYS.shortfalls, (e) => e.transferId),
   };
 }

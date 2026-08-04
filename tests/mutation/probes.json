@@ -75,8 +75,16 @@
     "name": "receive-ack-before-store",
     "note": "#724 outcome: the view store precedes the claimed ack (receive.test.ts 'a claimed ack is issued only after the view store succeeds')",
     "file": "modules/payments-v2/receive/Receive.ts",
-    "find": "    const outcome = await deps.view.store(screened.record);\n    if (outcome === 'rejected') {\n      pending.push(rejectAck(entry, 'storage-rejected'));\n      return;\n    }\n    pending.push(claimAck(entry));",
-    "replace": "    pending.push(claimAck(entry));\n    const outcome = await deps.view.store(screened.record);\n    if (outcome === 'rejected') {\n      pending.push(rejectAck(entry, 'storage-rejected'));\n      return;\n    }",
+    "find": "    await deps.view.store(screened.record);\n    pending.push(claimAck(entry));",
+    "replace": "    pending.push(claimAck(entry));\n    await deps.view.store(screened.record);",
+    "tests": ["tests/unit/payments-v2/receive.test.ts"]
+  },
+  {
+    "name": "receive-claim-conflict-swallow",
+    "note": "§5.7: a CONFLICT-bucket claim is terminally rejected('other') so the cursor advances — reverting to the swallow re-processes the entry every drain forever (receive.test.ts 'a CONFLICT-bucket claim is terminally rejected')",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "    if (ack.disposition !== 'claimed' || !isClaimConflict(err)) throw err;",
+    "replace": "    throw err;",
     "tests": ["tests/unit/payments-v2/receive.test.ts"]
   },
   {
@@ -91,8 +99,8 @@
     "name": "receive-isspent-gate-drop",
     "note": "#687: a replayed older, already-spent state never displaces the live one (receive.test.ts '#687 gate')",
     "file": "modules/payments-v2/receive/Receive.ts",
-    "find": "  if (held !== null && (await deps.engine.isSpent(token))) {",
-    "replace": "  if (held !== null && (false as boolean) && (await deps.engine.isSpent(token))) {",
+    "find": "  if (held !== null && (await engine.isSpent(token))) {",
+    "replace": "  if (held !== null && (false as boolean) && (await engine.isSpent(token))) {",
     "tests": ["tests/unit/payments-v2/receive.test.ts"]
   },
   {

@@ -3,7 +3,7 @@
 
 import { SphereError } from '../../../core/errors';
 import { selectCoins, type PoolEntry, type SelectionPlan } from './selector';
-import type { ReservationLedger, ReservationRequest } from './ledger';
+import type { ReservationLedger } from './ledger';
 
 export const QUEUE_TIMEOUT_MS = 30_000;
 export const QUEUE_MAX_SIZE = 100;
@@ -188,10 +188,14 @@ export class SpendQueue {
     plan: SelectionPlan,
     freeView: readonly PoolEntry[]
   ): void {
-    const amounts = new Map(freeView.map((e) => [e.tokenId, e.amount]));
-    const requests = plan.direct.map((tokenId) => wholeToken(tokenId, amounts));
-    if (plan.split) requests.push(wholeToken(plan.split.tokenId, amounts));
-    this.deps.ledger.reserve(reservationId, requests);
+    const pool = new Set(freeView.map((e) => e.tokenId));
+    const tokenIds = [...plan.direct, ...(plan.split ? [plan.split.tokenId] : [])];
+    for (const tokenId of tokenIds) {
+      if (!pool.has(tokenId)) {
+        throw new SphereError('Planned token missing from pool', 'VALIDATION_ERROR');
+      }
+    }
+    this.deps.ledger.reserve(reservationId, tokenIds.map((tokenId) => ({ tokenId })));
   }
 
   private totalQueued(): number {
@@ -199,14 +203,6 @@ export class SpendQueue {
     for (const entries of this.queues.values()) total += entries.length;
     return total;
   }
-}
-
-function wholeToken(tokenId: string, amounts: ReadonlyMap<string, bigint>): ReservationRequest {
-  const amount = amounts.get(tokenId);
-  if (amount === undefined) {
-    throw new SphereError('Planned token missing from pool', 'VALIDATION_ERROR');
-  }
-  return { tokenId, amount, tokenAmount: amount };
 }
 
 function parseAmount(raw: string): bigint {

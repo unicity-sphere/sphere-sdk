@@ -100,7 +100,13 @@ const registry = {
   getIconUrl: () => null,
 };
 
-type AuthedClient = StoragePortClient & DeliveryPortClient & CheckpointClient & FacadeClient;
+// The server /v1/balances endpoint stays a TEST observation surface (serverTotal)
+// even though the StoragePort no longer exposes it (assets() aggregates the mirror).
+type AuthedClient = StoragePortClient &
+  DeliveryPortClient &
+  CheckpointClient &
+  FacadeClient &
+  Pick<WalletApiV2Client, 'balances'>;
 
 /**
  * Every wallet-api call the facade/ports make rides session.withAuth (one 401 →

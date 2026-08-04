@@ -40,12 +40,6 @@ export interface IntentBackstopEntry {
 }
 
 
-export interface CheckpointCacheEntry {
-  transferId: string;
-  opIndex: number;
-  envelope: string;
-}
-
 // #621 delivery journal.
 export interface DeliveryJournalEntry {
   transferId: string;

@@ -89,19 +89,16 @@ class StubEngine implements ReceiveEngine {
 class FakeView implements ReceiveView {
   held = new Map<string, string>();
   storeCalls: StoredIncoming[] = [];
-  rejectAll = false;
   throwOn = new Set<string>();
 
   heldState(tokenId: string): string | null {
     return this.held.get(tokenId) ?? null;
   }
 
-  async store(entry: StoredIncoming): Promise<'stored' | 'rejected'> {
+  async store(entry: StoredIncoming): Promise<void> {
     if (this.throwOn.has(skey(entry))) throw new Error('view store crashed');
     this.storeCalls.push(entry);
-    if (this.rejectAll) return 'rejected';
     this.held.set(entry.tokenId, entry.stateHash);
-    return 'stored';
   }
 }
 
@@ -112,6 +109,7 @@ interface FakeEntry {
   senderPubkey?: string;
   senderNametag?: string;
   memo?: string;
+  transferId?: string;
   status: 'unacked' | 'claimed' | 'rejected';
   fetchGate?: () => Promise<void>;
 }
@@ -128,6 +126,7 @@ class FakeDelivery implements DeliveryPort {
   ackLog: AckLogged[] = [];
   sinceLog: (string | undefined)[] = [];
   acksUntilFail = Infinity;
+  claimConflicts = new Set<string>();
   private seq = 0;
   private wakeCbs = new Set<() => void>();
 
@@ -165,6 +164,7 @@ class FakeDelivery implements DeliveryPort {
         ...(entry.senderPubkey !== undefined ? { senderPubkey: entry.senderPubkey } : {}),
         ...(entry.senderNametag !== undefined ? { senderNametag: entry.senderNametag } : {}),
         ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
+        ...(entry.transferId !== undefined ? { transferId: entry.transferId } : {}),
         fetchBlob: async (): Promise<Uint8Array> => {
           await entry.fetchGate?.();
           return entry.blob;
@@ -179,6 +179,13 @@ class FakeDelivery implements DeliveryPort {
     reason?: 'invalid' | 'not-owned' | 'storage-rejected' | 'other'
   ): Promise<void> {
     if (this.ackLog.length >= this.acksUntilFail) throw new Error('ack flush failed');
+    if (disposition === 'claimed' && this.claimConflicts.has(deliveryId)) {
+      // Server failed[] bucket shape: the lineage CONFLICT surfaced by the port.
+      throw Object.assign(new Error(`mailbox claim failed for ${deliveryId}: CONFLICT`), {
+        code: 'MAILBOX_CLAIM_FAILED',
+        failureCode: 'CONFLICT',
+      });
+    }
     this.ackLog.push({
       deliveryId,
       disposition,
@@ -235,6 +242,7 @@ interface Harness {
   delivery: FakeDelivery;
   kv: ReturnType<typeof makeKV>;
   events: IncomingTransfer[];
+  attentions: { transferId: string; code: string; detail?: string }[];
   historyLog: ReceivedRecord[];
   receive: Receive;
   epoch: string;
@@ -247,6 +255,7 @@ function makeHarness(opts: { epoch?: string; kvSeed?: Record<string, unknown> } 
   const delivery = new FakeDelivery(view);
   const kv = makeKV(opts.kvSeed);
   const events: IncomingTransfer[] = [];
+  const attentions: Harness['attentions'] = [];
   const historyLog: ReceivedRecord[] = [];
   const harness: Harness = {
     engine,
@@ -254,6 +263,7 @@ function makeHarness(opts: { epoch?: string; kvSeed?: Record<string, unknown> } 
     delivery,
     kv,
     events,
+    attentions,
     historyLog,
     epoch: opts.epoch ?? 'e1',
     historyFail: false,
@@ -261,7 +271,7 @@ function makeHarness(opts: { epoch?: string; kvSeed?: Record<string, unknown> } 
   };
   const deps: ReceiveDeps = {
     delivery,
-    engine,
+    engine: () => engine,
     view,
     kv,
     registry,
@@ -271,6 +281,9 @@ function makeHarness(opts: { epoch?: string; kvSeed?: Record<string, unknown> } 
     },
     emit: (_event, transfer) => {
       events.push(transfer);
+    },
+    attention: (transferId, code, detail) => {
+      attentions.push({ transferId, code, ...(detail !== undefined ? { detail } : {}) });
     },
     syncEpoch: () => harness.epoch,
     now: () => 1_700_000_000_000,
@@ -442,19 +455,30 @@ describe('payments-v2 Receive drain', () => {
     expect(h.events).toHaveLength(3);
   });
 
-  it('storage-rejected: a view-rejected token is acked rejected(storage-rejected) with no event and no history', async () => {
+  it('a CONFLICT-bucket claim is terminally rejected(other): cursor advances, the next drain does not re-process, attention emitted (§5.7)', async () => {
     const h = makeHarness();
-    h.view.rejectAll = true;
-    h.delivery.add(meta(T(1), 'S1'));
+    const entry = h.delivery.add(meta(T(1), 'S1'), { transferId: 'tx-c' });
+    h.delivery.add(meta(T(2), 'S1'));
+    h.delivery.claimConflicts.add(entry.deliveryId);
 
-    const transfers = await h.receive.drainOnce();
+    await h.receive.drainOnce();
 
-    expect(transfers).toEqual([]);
-    expect(h.events).toEqual([]);
-    expect(h.historyLog).toEqual([]);
+    // The stale entry went terminal as rejected('other'); the sibling still claimed.
     expect(h.delivery.ackLog).toEqual([
-      expect.objectContaining({ disposition: 'rejected', reason: 'storage-rejected' }),
+      expect.objectContaining({ deliveryId: entry.deliveryId, disposition: 'rejected', reason: 'other' }),
+      expect.objectContaining({ deliveryId: `d:${T(2)}:S1`, disposition: 'claimed' }),
     ]);
+    expect(h.delivery.entries[0].status).toBe('rejected');
+    expect(h.kv.data.get(CURSOR_KEY)).toEqual({ cursor: '2', syncEpoch: 'e1' });
+    expect(h.attentions).toEqual([
+      { transferId: 'tx-c', code: 'claim:conflict', detail: entry.deliveryId },
+    ]);
+
+    const second = await h.receive.drainOnce();
+    expect(second).toEqual([]);
+    expect(h.delivery.sinceLog[1]).toBe('2');
+    expect(h.delivery.ackLog).toHaveLength(2);
+    expect(h.attentions).toHaveLength(1);
   });
 
   it('a claimed ack is issued only after the view store succeeds: a view crash leaves the entry unacked (crash window)', async () => {

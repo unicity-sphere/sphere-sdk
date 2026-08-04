@@ -38,7 +38,7 @@ describe('TransferMachine resume path (§5.5 P6 — same machine, rehydrated)', 
     expect(w.applied.at(-1)).toEqual({ transferId: plan.transferId, spent: [token.blob.tokenId], added: [] });
     expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('completed');
     expect(await w.stores().deliveryJournal.list()).toHaveLength(0);
-    expect(await w.stores().backstop.get(plan.transferId)).toBeUndefined();
+    expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
   });
 
   it('#631: resume converges an indeterminate op under the SAME (transferId, opIndex) — one realization, no second spend', async () => {
@@ -85,7 +85,7 @@ describe('TransferMachine resume path (§5.5 P6 — same machine, rehydrated)', 
     expect(w.applied[0].spent).not.toContain(tokenB.blob.tokenId);
     expect(w.api.inspectInventoryRow(w.caller, tokenB.blob.tokenId)?.status).toBe('active');
     expect(w.api.inspectInventoryRow(w.caller, tokenA.blob.tokenId)?.status).toBe('removed');
-    const shortfall = await createMachineStores(w.kv).shortfalls.get('partial-1');
+    const shortfall = await createMachineStores(w.kv).shortfalls.getByKey('partial-1');
     expect(shortfall).toMatchObject({
       remainingAmount: '400',
       coinId: plan.payload.coinId,
@@ -109,13 +109,13 @@ describe('TransferMachine resume path (§5.5 P6 — same machine, rehydrated)', 
     await w.engine.foreignSpend(tokenB);
     let shortfallVisibleAtComplete = false;
     w.overrides.complete = async (transferId) => {
-      shortfallVisibleAtComplete = (await createMachineStores(w.kv).shortfalls.get(transferId)) !== undefined;
+      shortfallVisibleAtComplete = (await createMachineStores(w.kv).shortfalls.getByKey(transferId)) !== undefined;
     };
 
     await resumeAll(w.deps);
 
     expect(shortfallVisibleAtComplete).toBe(true);
-    const reloaded = await createMachineStores(w.kv).shortfalls.get('partial-2');
+    const reloaded = await createMachineStores(w.kv).shortfalls.getByKey('partial-2');
     expect(reloaded?.remainingAmount).toBe('400');
   });
 
@@ -130,7 +130,7 @@ describe('TransferMachine resume path (§5.5 P6 — same machine, rehydrated)', 
     await expect(w.machine().run(plan)).rejects.toThrow('clean pre-submit reject');
     w.engine.beforeOp = null;
     delete w.overrides.abort;
-    expect((await w.stores().backstop.get(plan.transferId))?.disposition).toBe('abortPending');
+    expect((await w.stores().backstop.getByKey(plan.transferId))?.disposition).toBe('abortPending');
     expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('open');
     const engineCallsAfterSend = w.engine.transferCalls.length;
 
@@ -140,7 +140,7 @@ describe('TransferMachine resume path (§5.5 P6 — same machine, rehydrated)', 
     expect(report.resumed).toEqual([]);
     expect(w.engine.transferCalls.length).toBe(engineCallsAfterSend);
     expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('aborted');
-    expect(await w.stores().backstop.get(plan.transferId)).toBeUndefined();
+    expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
     expect(w.log.filter((l) => l === 'applyDelta')).toHaveLength(0);
   });
 
@@ -213,7 +213,7 @@ describe('TransferMachine resume path (§5.5 P6 — same machine, rehydrated)', 
     expect(w.log.filter((l) => l === 'applyDelta')).toHaveLength(applyCallsAfterSend);
     expect(await w.stores().shortfalls.list()).toHaveLength(0);
     expect(w.completes).toHaveLength(0);
-    expect(await w.stores().backstop.get(plan.transferId)).toBeUndefined();
+    expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
   });
 
   it('duplicate resume is idempotent: a completed intent is unlisted and nothing re-runs', async () => {
