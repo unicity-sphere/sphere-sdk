@@ -20,9 +20,10 @@ import { createMachineStores, type MachineStores } from './machine/journal';
 import { TransferMachine, type IntentApi, type MachineDeps } from './machine/TransferMachine';
 
 /**
- * TODO(mint-F13 seam): `engine.mint` today salts fresh per call, so an
- * interrupted mint is not re-derivable. When F13 lands transferId-seeded
- * determinism the engine advertises it here and replay re-derives by mintId.
+ * F13 landed: `SphereTokenEngine.mint` derives salt/tokenType from
+ * `(transferId, opIndex)` when given. Engines advertise re-derivability here;
+ * replay re-derives by mintId, and a non-advertising engine falls back to the
+ * inventory-guard + hold path (never a blind re-mint).
  */
 export interface DeterministicMintCapable {
   readonly deterministicMint: true;

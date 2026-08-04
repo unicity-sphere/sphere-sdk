@@ -245,6 +245,45 @@ function makeDeliveryPair(
 }
 
 describe('WalletApiDeliveryPort — targeted', () => {
+  it('a transient seen-set write failure fails that ack but never bricks later acks (PR #727 review)', async () => {
+    const fake = new FakeWalletApi();
+    const inner = memKV();
+    let failNextSet = false;
+    const flakyKV: ScopedKV = {
+      get: (k) => inner.get(k),
+      set: (k, v) => {
+        if (failNextSet) {
+          failNextSet = false;
+          return Promise.reject(new Error('kv outage'));
+        }
+        return inner.set(k, v);
+      },
+      remove: (k) => inner.remove(k),
+    };
+    const { senderPort } = makeDeliveryPair(fake, 'inventory');
+    const ownerPort = new WalletApiDeliveryPort({
+      client: new FakeWalletApiV2Client(fake, OWNER),
+      kv: flakyKV,
+      identity: { privateKey: OWNER_PRIV, chainPubkey: OWNER_PUB },
+      custody: 'inventory',
+    });
+    ownerPort.bindDeliveryKeys(deriveFromFakeBlob);
+
+    const blob = fabricateBlob(OWNER_PUB);
+    await senderPort.deliver(OWNER_PUB, blob.bytes, { transferId: 'seen-chain-1' });
+    const deliveries = [];
+    for await (const d of ownerPort.incoming()) deliveries.push(d);
+    expect(deliveries).toHaveLength(1);
+
+    failNextSet = true;
+    await expect(ownerPort.ack(deliveries[0]!.deliveryId, 'claimed')).rejects.toThrow('kv outage');
+
+    await expect(ownerPort.ack(deliveries[0]!.deliveryId, 'claimed')).resolves.toBeUndefined();
+    const replayed = [];
+    for await (const d of ownerPort.incoming()) replayed.push(d);
+    expect(replayed).toHaveLength(0);
+  });
+
   it('the delivery memo travels the wire as an enc1. ciphertext envelope, never plaintext', async () => {
     const fake = new FakeWalletApi();
     const { senderPort } = makeDeliveryPair(fake, 'inventory');

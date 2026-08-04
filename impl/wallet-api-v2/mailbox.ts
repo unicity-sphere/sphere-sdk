@@ -308,11 +308,18 @@ export class WalletApiDeliveryPort implements DeliveryPort {
   }
 
   private addSeen(deliveryId: string): Promise<void> {
-    this.seenChain = this.seenChain.then(async () => {
+    const write = async (): Promise<void> => {
       const seen = await this.readSeen();
       seen.add(deliveryId);
       await this.kv.set(DELIVERY_SEEN_KEY, [...seen]);
-    });
-    return this.seenChain;
+    };
+    // Serialize on settled, not fulfilled: a rejected tail would otherwise
+    // brick every later ack on this port instance (PR #727 review).
+    const run = this.seenChain.then(write, write);
+    this.seenChain = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
   }
 }

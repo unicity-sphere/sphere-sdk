@@ -58,7 +58,8 @@ export const ACK_BATCH_SIZE = 200;
 export const POLL_INTERVAL_MS = 30_000;
 
 export function receivedDedupKey(tokenId: string, stateHash: string): string {
-  return `RECEIVED:${tokenId}:${stateHash}`;
+  // Lowercased like History's keys — a case-variant would defeat server dedup.
+  return `RECEIVED:${tokenId.toLowerCase()}:${stateHash.toLowerCase()}`;
 }
 
 interface PendingAck {
