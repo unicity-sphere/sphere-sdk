@@ -10,6 +10,9 @@
  * SDK objects are injected via `EngineDeps` (built by the factory in A4, or by
  * test wiring around TestAggregatorClient), keeping the engine logic independent
  * of how the aggregator/trust base are constructed.
+ *
+ * Advertises `deterministicMint` (F13): a same-seed `mint` re-call recovers an
+ * existing certification instead of minting a second token.
  */
 
 import { SphereError, type SphereErrorCode } from '../core/errors';
@@ -181,6 +184,9 @@ interface SplitContext {
 }
 
 export class SphereTokenEngine implements ITokenEngine {
+  /** F13 advertisement: mint under a (transferId, opIndex) seed is idempotent-recoverable — a same-seed re-call converges, never double-mints. */
+  public readonly deterministicMint = true;
+
   /** Hex form of the wallet key — deriveRealization's ikm input (Part E.1). */
   private readonly privateKeyHex: string;
 

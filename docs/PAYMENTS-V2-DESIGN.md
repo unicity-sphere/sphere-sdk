@@ -374,10 +374,12 @@ Mint: engine self-mint routed through the **same idempotent submit-then-probe pr
 transfer/split** — the #692 F13 fix lands in `token-engine` (P8); the fake aggregator models
 duplicate-submit adversarially so the contract test stops lying. **Mint durability:** the
 submit-probe primitive fixes idempotency within a process, not crash durability — so mint gets a
-**durable pre-submit journal record** (deterministic seed: coinId, amount, tokenId derived before
-submit), replayed at `start()` exactly like the delivery journal, closing the
+**durable pre-submit journal record** (seed: coinId, amount, mintId; tokenId recorded once the
+mint returns), replayed at `start()` exactly like the delivery journal, closing the
 certification→`applyDelta` window; removed only after the mint is applied to inventory. Without
 it, a crash there mints a token on-chain with zero client record — the mint-path twin of #621.
+Replay converges by an idempotent `mint` re-call under the same journaled `(transferId, opIndex)`
+seed (F13 recovers the existing certification); pre-derivation of the tokenId is dropped.
 
 ## 6. Durable client state — the complete inventory
 
@@ -389,7 +391,7 @@ can lose money.** Each row exists because of a documented server non-guarantee.
 | Intent backstop (open intents, encrypted payloads) | intents not rebuildable after server DB restore — re-PUT on `syncEpoch` change | TransferMachine |
 | E.4 checkpoint ciphertext (encrypt-once bytes) | same, re-POST byte-identical | TransferMachine |
 | Delivery journal (`(transferId, opIndex)` → blob) | certification→deposit window is client-only | Delivery |
-| Mint journal (pre-submit seed: coinId, amount, derived tokenId) | mint certification→`applyDelta` window is client-only (mint has no intent row) | Mint |
+| Mint journal (pre-submit seed: coinId, amount, mintId) | mint certification→`applyDelta` window is client-only (mint has no intent row) | Mint |
 | Partial-shortfall record (`remainingAmount` + delivered set) | the delivered legs' intent completes — resume cannot recover a shortfall the app never saw (#690/#692); written before the partial surfaces, cleared on re-plan/ack | TransferMachine |
 | Seen-set `(tokenId, stateHash)` | mailbox is at-least-once; claimed entries stay listable | delivery impl (S7 port contract) |
 | `suspectedSpent` overlay | server never checks unspentness | InventoryView |

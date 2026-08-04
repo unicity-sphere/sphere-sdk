@@ -4,7 +4,6 @@
 import { hexToBytes } from '../../core/crypto';
 import { decryptField, encryptField } from '../../core/field-encryption';
 import type { ITokenEngine, SplitCheckpointStore } from '../../token-engine/engine';
-import type { MintParams } from '../../token-engine/types';
 import type { TransferResult } from '../../types';
 
 import type { SendRequest } from './api';
@@ -20,21 +19,20 @@ import { createMachineStores, type MachineStores } from './machine/journal';
 import { TransferMachine, type MachineDeps } from './machine/TransferMachine';
 
 /**
- * F13 landed: `SphereTokenEngine.mint` derives salt/tokenType from
- * `(transferId, opIndex)` when given. Engines advertise re-derivability here;
- * replay re-derives by mintId, and a non-advertising engine falls back to the
- * inventory-guard + hold path (never a blind re-mint).
+ * F13 makes `mint(params, { transferId, opIndex })` idempotent-recoverable — a
+ * same-seed re-CALL recovers the existing certification via the E.2 probe
+ * (pinned by tests/unit/token-engine/mint-recovery.test.ts) — so replay needs
+ * no pre-derivation, just a safe re-call; a non-advertising engine falls back
+ * to the inventory-guard + hold path (never a blind re-mint).
  */
 export interface DeterministicMintCapable {
   readonly deterministicMint: true;
-  deriveMintTokenId(params: MintParams, mintId: string): Promise<string>;
 }
 
 export function supportsDeterministicMint(
   engine: ITokenEngine
 ): engine is ITokenEngine & DeterministicMintCapable {
-  const candidate = engine as Partial<DeterministicMintCapable>;
-  return candidate.deterministicMint === true && typeof candidate.deriveMintTokenId === 'function';
+  return (engine as Partial<DeterministicMintCapable>).deterministicMint === true;
 }
 
 export interface RecipientInfo {

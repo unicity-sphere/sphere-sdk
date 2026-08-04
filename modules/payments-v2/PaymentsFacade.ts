@@ -546,14 +546,12 @@ export class PaymentsFacade implements PaymentsV2 {
     const engine = this.engine();
     const mintId = this.newId();
     const params = this.mintParams(coinId, amount);
-    const preDerived = supportsDeterministicMint(engine)
-      ? await engine.deriveMintTokenId(params, mintId)
-      : '';
+    // tokenId stays '' until mint returns; replay converges via the F13 same-seed re-call.
     const entry: MintJournalEntry = {
       mintId,
       coinId,
       amount: amount.toString(),
-      tokenId: preDerived,
+      tokenId: '',
       createdAt: (this.deps.now ?? Date.now)(),
     };
     await this.machineStores.mintJournal.upsert(entry);

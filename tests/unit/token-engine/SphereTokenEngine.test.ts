@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { supportsDeterministicMint } from '../../../modules/payments-v2/compose';
 import { deriveDirectAddress } from '../../../token-engine/identity';
 import { runEngineContract } from './engine-contract';
 import { createTestEngine, freshPubkey } from './test-engine';
@@ -10,6 +11,10 @@ const COIN = 'a'.repeat(64);
 runEngineContract('SphereTokenEngine', () => createTestEngine());
 
 describe('SphereTokenEngine (real adapter, A1–A3) — via in-memory aggregator', () => {
+  it('advertises deterministicMint (F13) — the facade mint replay re-calls instead of holding', () => {
+    expect(supportsDeterministicMint(createTestEngine())).toBe(true);
+  });
+
   it('mints a token and reflects its value', async () => {
     const e = createTestEngine();
     const token = await e.mint({

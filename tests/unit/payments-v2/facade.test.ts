@@ -199,26 +199,29 @@ const memoCodec: RequestMemoCodec = {
   },
 };
 
+/**
+ * Advertising harness modelling F13: mint under a (transferId, opIndex) seed is
+ * idempotent — a re-call with the same seed returns the SAME token (recovered
+ * certification), never a second one. `failNext` simulates a keep-open first
+ * attempt: the token certifies but the call dies before returning.
+ */
 class DetMintEngine extends RealizationEngine implements DeterministicMintCapable {
   readonly deterministicMint = true as const;
-  mintCalls = 0;
+  readonly seeds: { transferId: string | undefined; opIndex: number }[] = [];
+  failNext = false;
   private readonly mintMemo = new Map<string, SphereToken>();
 
-  async deriveMintTokenId(params: MintParams, mintId: string): Promise<string> {
-    return (await this.mintFor(mintId, params)).blob.tokenId;
-  }
-
   override async mint(params: MintParams, options?: EngineOpOptions): Promise<SphereToken> {
-    this.mintCalls += 1;
-    if (options?.transferId !== undefined) return this.mintFor(options.transferId, params);
-    return super.mint(params, options);
-  }
-
-  private async mintFor(mintId: string, params: MintParams): Promise<SphereToken> {
-    let token = this.mintMemo.get(mintId);
+    this.seeds.push({ transferId: options?.transferId, opIndex: options?.opIndex ?? 0 });
+    if (options?.transferId === undefined) return super.mint(params, options);
+    let token = this.mintMemo.get(options.transferId);
     if (token === undefined) {
       token = await super.mint(params);
-      this.mintMemo.set(mintId, token);
+      this.mintMemo.set(options.transferId, token);
+    }
+    if (this.failNext) {
+      this.failNext = false;
+      throw new ProofUnconfirmedError('proof fetch inconclusive after certify (simulated)');
     }
     return token;
   }
@@ -754,24 +757,42 @@ describe('PaymentsFacade — mint', () => {
     ).toBe(true);
   });
 
-  it('mint replay: a deterministic engine re-derives via the SAME mintId — one token, no double-mint across restarts', async () => {
+  it('mint replay: keep-open first attempt on an advertising engine → replay re-calls the SAME (transferId, opIndex) seed — exactly one token/apply/history', async () => {
     const det = new DetMintEngine({ chainPubkey: hexToBytes(OWN_PUB) });
     const world = makeWorld({ engine: det });
-    const entry: MintJournalEntry = { mintId: 'm-redo', coinId: COIN, amount: '50', tokenId: '', createdAt: 1 };
-    await world.kv.set(STORE_KEYS.mintJournal, [entry]);
+    let applies = 0;
+    world.hooks.applyDelta = async () => {
+      applies += 1;
+    };
+    await world.facade.start();
 
+    det.failNext = true; // token certifies, the call dies before returning (F13 keep-open)
+    const first = await world.facade.mint(COIN, 50n);
+    expect(first.success).toBe(false);
+    expect(await createMachineStores(world.kv).mintJournal.list()).toHaveLength(1);
+    expect(world.facade.tokens()).toHaveLength(0);
+
+    await world.facade.stop();
     await world.facade.start();
     await vi.waitFor(async () => {
       expect(await createMachineStores(world.kv).mintJournal.list()).toEqual([]);
     });
-    const minted = world.facade.tokens();
-    expect(minted).toHaveLength(1);
-    expect(det.mintCalls).toBe(1);
+
+    // The engine saw the SAME seed twice — a re-call, never a fresh-seed re-mint.
+    expect(det.seeds).toHaveLength(2);
+    expect(det.seeds[1]).toEqual(det.seeds[0]);
+    expect(det.seeds[0]?.transferId).toBeDefined();
+    expect(applies).toBe(1);
+    const tokens = world.facade.tokens();
+    expect(tokens).toHaveLength(1);
+    const history = await world.api.listHistory(ownCaller);
+    expect(history.records.filter((r) => r.type === 'MINT')).toHaveLength(1);
+    expect(history.records.some((r) => r.type === 'MINT' && r.tokenId === tokens[0]?.id)).toBe(true);
 
     await world.facade.stop();
     await world.facade.start();
     await flushTail();
-    expect(det.mintCalls).toBe(1); // journal drained — the restart mints nothing
+    expect(det.seeds).toHaveLength(2); // journal drained — the restart mints nothing
     expect(world.facade.tokens()).toHaveLength(1);
   });
 });
