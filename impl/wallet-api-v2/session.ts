@@ -161,6 +161,7 @@ export class WalletApiSession {
   private reseedsPending = 0;
 
   private readonly handlers = new Map<WakeStream, Set<() => void>>();
+  private readonly statusHandlers = new Set<(status: ConnectionStatus) => void>();
   private socket: WebSocketLike | null = null;
   private started = false;
   private stopped = false;
@@ -341,10 +342,17 @@ export class WalletApiSession {
     return this.lastStatus ?? 'offline';
   }
 
+  /** Transition feed off the existing emitStatus point (FacadeSession.subscribeStatus). */
+  subscribeStatus(handler: (status: ConnectionStatus) => void): () => void {
+    this.statusHandlers.add(handler);
+    return () => this.statusHandlers.delete(handler);
+  }
+
   private emitStatus(status: ConnectionStatus): void {
     if (this.stopped || this.lastStatus === status) return;
     this.lastStatus = status;
     this.deps.emitStatus(status);
+    for (const handler of this.statusHandlers) handler(status);
   }
 
   private async connect(): Promise<void> {

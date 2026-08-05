@@ -134,5 +134,21 @@
     "find": "  install(generation: number, jwt: string): boolean {\n    if (generation !== this.gen) return false;",
     "replace": "  install(generation: number, jwt: string): boolean {\n    if (generation !== this.gen && (false as boolean)) return false;",
     "tests": ["tests/unit/payments-v2/session.test.ts"]
+  },
+  {
+    "name": "heartbeat-never-scheduled",
+    "note": "§7 in-session convergence: the heartbeat must actually schedule ticks — a keep-open send would otherwise sit half-done until app restart (heartbeat.test.ts in-session test)",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "  private schedule(delayMs: number): void {\n    this.clearTimer();\n    if (!this.running) return;",
+    "replace": "  private schedule(delayMs: number): void {\n    this.clearTimer();\n    if (delayMs >= 0) return;\n    if (!this.running) return;",
+    "tests": ["tests/unit/payments-v2/heartbeat.test.ts"]
+  },
+  {
+    "name": "resume-reissues-fresh-transferid",
+    "note": "the retry path converges under the SAME transferId — a fresh id is a re-issued send and double-pays (#631/#676) (heartbeat.test.ts no-reissue asserts)",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    await ctx.machine.resumeIntent({\n      transferId: job.transferId,",
+    "replace": "    await ctx.machine.resumeIntent({\n      transferId: `${job.transferId}:reissued`,",
+    "tests": ["tests/unit/payments-v2/heartbeat.test.ts"]
   }
 ]

@@ -47,6 +47,16 @@ export function isValidationReject(err: unknown): boolean {
   return e.status === 422 || e.statusCode === 422 || e.code === 'VALIDATION' || e.code === 'VALIDATION_FAILED';
 }
 
+/**
+ * Duck-typed `WalletApiHttpError.retryAfter` (milliseconds) — modules never
+ * import from impl/, so the heartbeat honors the header structurally.
+ */
+export function retryAfterMsOf(err: unknown): number | null {
+  const retryAfter =
+    err !== null && typeof err === 'object' ? (err as { retryAfter?: unknown }).retryAfter : undefined;
+  return typeof retryAfter === 'number' && Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter : null;
+}
+
 // Registered per (kv, store key) so EVERY store instance over the same
 // ScopedKV serializes its read-modify-writes with every other instance.
 const chainRegistry = new WeakMap<ScopedKV, Map<string, SerialChain>>();

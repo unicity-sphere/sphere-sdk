@@ -16,7 +16,9 @@ import type { MintParams, SphereToken } from '../../token-engine/types';
 import { TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
-import type { HistoryPage, MintResult, PaymentsV2, SendRequest } from './api';
+import type { HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest } from './api';
+import { SingleFlight } from './async';
+import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import type { MintJournalEntry, ShortfallEntry } from './stores';
 import type { History } from './history/History';
 import type { InventoryView } from './inventory/InventoryView';
@@ -25,7 +27,6 @@ import type { Requests } from './requests/Requests';
 import type { ReservationLedger } from './select/ledger';
 import type { SpendQueue, PlannedSpend } from './select/queue';
 import type { MachineStores } from './machine/journal';
-import { resumeAll } from './machine/resume';
 import { buildOps, classifyError, type MachineDeps, type MachinePlan, type TransferMachine } from './machine/TransferMachine';
 import type { IntentPayload } from './machine/types';
 import {
@@ -95,6 +96,14 @@ export class PaymentsFacade implements PaymentsV2 {
   private unsubscribers: (() => void)[] = [];
   private started = false;
 
+  // §7 heartbeat: in-memory timing cell + pass runner (see convergence.ts).
+  private readonly heartbeat: ConvergenceHeartbeat;
+  private readonly converger: Converger;
+  /** Resume single-flight (§7): ticks, start() and resumeNow() coalesce onto ONE pass. */
+  private readonly resumeFlight = new SingleFlight<void>();
+  /** §7 ownership: ids with an in-process machine attempt — the pass never adopts one. */
+  private readonly activeMoneyOps = new Set<string>();
+
   constructor(private readonly deps: PaymentsFacadeDeps) {
     const parts = composeFacadeParts(deps, {
       engine: () => this.engine(),
@@ -112,6 +121,21 @@ export class PaymentsFacade implements PaymentsV2 {
     this.ownPubkeyBytes = parts.ownPubkeyBytes;
     this.requests = parts.requests;
     deps.deliveryPort.bindDeliveryKeys((blob) => this.engine().deliveryKeys(blob));
+    this.heartbeat = new ConvergenceHeartbeat({
+      now: () => this.nowMs(),
+      onTick: () => this.trackTail(this.runConvergencePass()),
+    });
+    this.converger = new Converger({
+      machineDeps: this.machineDeps,
+      stores: this.machineStores,
+      delivery: deps.deliveryPort,
+      reconcile: (report) => this.requests.reconcile(report),
+      refreshView: () => this.view.delta(),
+      replayMints: () => this.replayMints(),
+      isActiveOp: (id) => this.activeMoneyOps.has(id),
+      emit: deps.emit,
+      now: () => this.nowMs(),
+    });
   }
 
   // ── lifecycle ──────────────────────────────────────────────────────────────
@@ -119,6 +143,7 @@ export class PaymentsFacade implements PaymentsV2 {
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
+    this.heartbeat.start();
     await this.deps.session.start();
     this.unsubscribers.push(
       this.deps.session.subscribeStream('mailbox', () => {
@@ -131,21 +156,12 @@ export class PaymentsFacade implements PaymentsV2 {
         this.trackTail(this.requests.drainIncoming());
       })
     );
-    // §7 start posture: resume + journal replays are NEVER awaited here.
-    this.trackTail(this.runResume());
-    this.trackTail(
-      this.machineStores.deliveryJournal.replay({
-        delivery: this.deps.deliveryPort,
-        now: this.deps.now ?? Date.now,
-        attention: (transferId, code, detail) => {
-          this.deps.emit(
-            'transfer:attention',
-            detail === undefined ? { transferId, code } : { transferId, code, detail }
-          );
-        },
-      })
-    );
-    this.trackTail(this.replayMints());
+    const statusUnsub = this.deps.session.subscribeStatus?.((status) => {
+      if (status === 'connected') this.heartbeat.recovered();
+    });
+    if (statusUnsub !== undefined) this.unsubscribers.push(statusUnsub);
+    // §7 start posture: never awaited; the heartbeat re-runs this same pass.
+    this.trackTail(this.runConvergencePass());
     this.trackTail(this.seedHeldStates());
     await this.view.fullPull().catch(() => undefined);
     this.receiveLoop.start(this.deps.receivePollMs);
@@ -154,6 +170,7 @@ export class PaymentsFacade implements PaymentsV2 {
   /** §7 same-address restart gate: resolves only after in-flight ops settle. */
   async stop(): Promise<void> {
     this.started = false;
+    this.heartbeat.stop(); // §7 quiescence unchanged: a mid-backoff stop cancels cleanly
     this.receiveLoop.stop();
     for (const unsubscribe of this.unsubscribers) unsubscribe();
     this.unsubscribers = [];
@@ -185,6 +202,11 @@ export class PaymentsFacade implements PaymentsV2 {
     return this.historyStore.page(page ?? {});
   }
 
+  /** §4 pending-transfers UI surface — derived on read, never cached (convergence.ts). */
+  pendingTransfers(): Promise<PendingTransfer[]> {
+    return derivePendingTransfers(this.machineStores, this.machineDeps.decryptPayload);
+  }
+
   // ── money movement ─────────────────────────────────────────────────────────
 
   send(request: SendRequest): Promise<TransferResult> {
@@ -199,6 +221,25 @@ export class PaymentsFacade implements PaymentsV2 {
 
   mint(coinId: string, amount: bigint): Promise<MintResult> {
     return this.track(this.mintInner(coinId, amount));
+  }
+
+  // §4 retry verb: coalesces onto the running pass — NEVER re-issue send() (#631/#676).
+  async resumeNow(): Promise<void> {
+    if (!this.started) return;
+    await this.track(this.runConvergencePass());
+  }
+
+  /** One single-flighted pass + its reschedule: concurrent callers coalesce. */
+  private runConvergencePass(): Promise<void> {
+    return this.resumeFlight.run(async () => {
+      const outcome = await this.converger.convergeOnce();
+      const pending = await this.converger.pendingWork().catch(() => true);
+      this.heartbeat.settle(outcome, pending);
+    });
+  }
+
+  private nowMs(): number {
+    return (this.deps.now ?? Date.now)();
   }
 
   // ── send policy (§5.5 + old-loop parity; the machine stays policy-free) ────
@@ -253,12 +294,15 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   private async runAttempt(ctx: AttemptCtx): Promise<AttemptDisposition> {
+    this.activeMoneyOps.add(ctx.transferId);
     try {
       const { deliveryPending } = await this.machine.run(ctx.plan);
       this.settleSuccess(ctx, ctx.sourceIds);
       return { kind: 'success', deliveryPending };
     } catch (err) {
-      return this.disposeFailedAttempt(ctx, err);
+      return await this.disposeFailedAttempt(ctx, err);
+    } finally {
+      this.activeMoneyOps.delete(ctx.transferId);
     }
   }
 
@@ -273,7 +317,10 @@ export class PaymentsFacade implements PaymentsV2 {
     run: SendRun,
     attempt: number
   ): Promise<TransferResult | null> {
-    run.pendingAny = run.pendingAny || disposition.deliveryPending;
+    if (disposition.deliveryPending) {
+      run.pendingAny = true;
+      this.heartbeat.arm(); // deposits owed — heartbeat work even if the remainder later throws
+    }
     const partial = disposition.entry;
     run.delivered.push(...partial.committedTokenIds);
     run.firstPartialId ??= partial.transferId;
@@ -452,6 +499,7 @@ export class PaymentsFacade implements PaymentsV2 {
   /** Open intent: sources stay reserved + in-flight (§5.2) until resume adopts them. */
   private settleKeepOpen(ctx: AttemptCtx): void {
     this.queue.clearExpectedChange(ctx.transferId);
+    this.heartbeat.arm(); // the parked intent converges in-session — no restart
   }
 
   private settlePartial(ctx: AttemptCtx, partial: ShortfallEntry): void {
@@ -493,6 +541,7 @@ export class PaymentsFacade implements PaymentsV2 {
     for (const id of run.settledShortfalls.splice(0)) {
       await this.machineStores.shortfalls.removeByKey(id).catch(() => undefined);
     }
+    if (run.pendingAny) this.heartbeat.arm(); // deposits owed in the journal — heartbeat work
     const result: TransferResult = {
       id: transferId,
       status: run.pendingAny ? 'confirmed' : 'delivered',
@@ -543,23 +592,32 @@ export class PaymentsFacade implements PaymentsV2 {
     if (!/^(?:[0-9a-f]{2})+$/.test(coinId) || amount <= 0n) {
       return { success: false, error: 'coinId must be even-length lowercase hex and amount positive' };
     }
-    const engine = this.engine();
     const mintId = this.newId();
-    const params = this.mintParams(coinId, amount);
+    this.activeMoneyOps.add(mintId); // its replay stays hands-off while this attempt runs
+    try {
+      return await this.mintUnderJournal(mintId, coinId, amount);
+    } finally {
+      this.activeMoneyOps.delete(mintId);
+    }
+  }
+
+  private async mintUnderJournal(mintId: string, coinId: string, amount: bigint): Promise<MintResult> {
+    const engine = this.engine();
     // tokenId stays '' until mint returns; replay converges via the F13 same-seed re-call.
     const entry: MintJournalEntry = {
       mintId,
       coinId,
       amount: amount.toString(),
       tokenId: '',
-      createdAt: (this.deps.now ?? Date.now)(),
+      createdAt: this.nowMs(),
     };
     await this.machineStores.mintJournal.upsert(entry);
     let token: SphereToken;
     try {
-      token = await engine.mint(params, { transferId: mintId });
+      token = await engine.mint(this.mintParams(coinId, amount), { transferId: mintId });
     } catch (err) {
-      // Entry retained: the start() replay resolves it (inventory check / F13 seed).
+      // Entry retained: the heartbeat / start() replay resolves it (inventory check / F13 seed).
+      this.heartbeat.arm();
       return { success: false, error: messageOf(err) };
     }
     if (token.blob.tokenId !== entry.tokenId) {
@@ -568,6 +626,7 @@ export class PaymentsFacade implements PaymentsV2 {
     try {
       await this.finalizeMint(engine, mintId, token, coinId, amount.toString());
     } catch (err) {
+      this.heartbeat.arm();
       return { success: false, tokenId: token.blob.tokenId, error: messageOf(err) };
     }
     return { success: true, tokenId: token.blob.tokenId };
@@ -598,20 +657,24 @@ export class PaymentsFacade implements PaymentsV2 {
     this.trackTail(this.view.delta());
   }
 
-  private async replayMints(): Promise<void> {
+  /** @returns how many journal entries were RESOLVED (cleared) — heartbeat progress. */
+  private async replayMints(): Promise<number> {
+    let resolved = 0;
     for (const entry of await this.machineStores.mintJournal.list()) {
+      if (this.activeMoneyOps.has(entry.mintId)) continue; // its mintInner still owns it
       try {
-        await this.replayMint(entry);
+        if (await this.replayMint(entry)) resolved += 1;
       } catch {
-        // Entry retained — replayed again at the next start().
+        // Entry retained — replayed again at the next pass / start().
       }
     }
+    return resolved;
   }
 
-  private async replayMint(entry: MintJournalEntry): Promise<void> {
+  private async replayMint(entry: MintJournalEntry): Promise<boolean> {
     if (entry.tokenId !== '' && (await this.tokenInServerInventory(entry.tokenId))) {
       await this.machineStores.mintJournal.removeByKey(entry.mintId);
-      return;
+      return true;
     }
     const engine = this.engine();
     if (!supportsDeterministicMint(engine)) {
@@ -620,7 +683,7 @@ export class PaymentsFacade implements PaymentsV2 {
         transferId: entry.mintId,
         code: ATTENTION_MINT_UNRESOLVED,
       });
-      return;
+      return false; // held, not resolved — never counts as heartbeat progress
     }
     const token = await engine.mint(this.mintParams(entry.coinId, BigInt(entry.amount)), {
       transferId: entry.mintId,
@@ -629,6 +692,7 @@ export class PaymentsFacade implements PaymentsV2 {
       await this.machineStores.mintJournal.upsert({ ...entry, tokenId: token.blob.tokenId });
     }
     await this.finalizeMint(engine, entry.mintId, token, entry.coinId, entry.amount);
+    return true;
   }
 
   private mintParams(coinId: string, amount: bigint): MintParams {
@@ -660,18 +724,6 @@ export class PaymentsFacade implements PaymentsV2 {
     return (this.deps.newId ?? randomUUID)();
   }
 
-  private async runResume(): Promise<void> {
-    const report = await resumeAll(this.machineDeps);
-    await this.requests.reconcile({
-      resumed: report.resumed,
-      conflicted: report.conflicted,
-      open: report.failed,
-    });
-    if (report.resumed.length > 0 || report.conflicted.length > 0) {
-      await this.view.delta().catch(() => undefined);
-    }
-  }
-
   private async seedHeldStates(): Promise<void> {
     let page = await this.deps.storagePort.listInventory();
     for (let i = 0; i < INVENTORY_SCAN_PAGE_LIMIT; i++) {
@@ -686,7 +738,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private toUiToken(tokenId: string, coinId: string, amount: bigint): Token {
     const registry = this.deps.registry;
     const iconUrl = registry.getIconUrl(coinId);
-    const now = (this.deps.now ?? Date.now)();
+    const now = this.nowMs();
     return {
       id: tokenId,
       coinId,

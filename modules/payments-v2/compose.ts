@@ -48,6 +48,12 @@ export interface FacadeSession {
     stream: 'inventory' | 'mailbox' | 'payment_requests',
     handler: () => void
   ): () => void;
+  /**
+   * Optional connection-status feed (same wiring pattern as the streams; the
+   * emission point is the session's existing `connection:status` transition).
+   * The facade's heartbeat resets its backoff on a 'connected' recovery.
+   */
+  subscribeStatus?(handler: (status: 'connected' | 'degraded' | 'offline') => void): () => void;
 }
 
 interface IntentWireLike {

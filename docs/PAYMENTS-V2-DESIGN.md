@@ -22,7 +22,7 @@
 | P6 | `TransferMachine` — resume = same machine | ✅ #676/#631/#634/audit#4/#690 pinned; 29 tests total with P5 |
 | P7 | `Receive` drain + seen-set + claim + RECEIVED history | ✅ 20 tests; store-before-ack crash window pinned |
 | P8 | `Requests` (streams + settling journal); `Mint` (+ engine F13 fix) | ✅ requests 19 tests; journal-first mint; F13 fixed + fake de-lied (124/124 engine) |
-| P9 | `History` read-through; events; facade assembly | ✅ facade 16 tests over real ports; `test:mutation` standing (16/16 KILLED). Connect adapter → P11 |
+| P9 | `History` read-through; events; facade assembly | ✅ facade 16 tests over real ports; `test:mutation` standing (16/16 KILLED). Connect adapter → P11. **2026-08:** §4 gained `pendingTransfers()`/`resumeNow()` + the §7 in-session heartbeat (owner UX add; 9 heartbeat tests, 19/19 probes) |
 | P10 | Live-staging e2e parity + soak + request-count budgets | 🔄 **6/6 money matrix live-green on testnet2** (mint / whole-token / split w/ signed seed-close / self-send / A→B→A / crash-resume paid-once) + 5/5 session e2e + **cross-version interop live-green** (old-module ↔ v2 vertical both directions incl. splits + payment request, 4/4). Still owed: exact-combination + E.4-stage interruption cells, soak, request-count budgets |
 | P11 | Flip PR: wire Sphere + Connect adapter, delete old vertical, frontend migration, re-pin | ⬜ owner-gated |
 
@@ -94,7 +94,11 @@ interface Payments {
   // money movement
   send(req: { recipient: string; amount: string; coinId: string; memo?: string }): Promise<TransferResult>;
   mint(coinId: string, amount: bigint): Promise<MintResult>;
-  receive(): Promise<{ transfers: IncomingTransfer[] }>;   // explicit drain-now
+  receive(): Promise<{ transfers: IncomingTransfer[] }>;
+
+  // convergence (§7 heartbeat surface; owner UX add 2026-08)
+  pendingTransfers(): Promise<PendingTransfer[]>; // on-read view over the intent backstop + delivery journal (+ #690 shortfalls, surfaced distinctly) — never a cached mirror
+  resumeNow(): Promise<void>;                     // immediate resume pass; coalesces with a running one and reschedules the heartbeat from its outcome   // explicit drain-now
 
   // payment requests (wallet-api S4 streams only)
   requests: {
@@ -106,6 +110,11 @@ interface Payments {
   };
 }
 ```
+
+**Retry rule:** a UI retry button calls `resumeNow()`, **NEVER** `send()` — a re-issued send is a
+fresh `transferId` over different sources and double-pays the recipient (#631/#676); `resumeNow()`
+replays the SAME intent. The heartbeat emits no tick events: the UI polls `pendingTransfers()` or
+refreshes on `transfer:updated` / `connection:status`.
 
 **Events (8):** `transfer:incoming` (kept verbatim — most-consumed, dApp-visible),
 `transfer:updated` (replaces `:confirmed`/`:delivery_pending`/`:failed`/`send:partial-remainder`),
@@ -421,6 +430,13 @@ carries over: a testnet journal must never act on another network).
   critical path — `start()` never awaits them (the old `load()` contract; awaiting can deadlock
   and regresses startup) — and resume batches its cross-intent reads rather than going
   per-intent-serial. Pinned by a startup request-count test.
+- **In-session convergence heartbeat:** between `start()` and `stop()`, while open intents exist
+  or the delivery/mint journals are non-empty, the facade re-runs the SAME single-flighted resume
+  pass on an exponential backoff — seed 5 s, ×2, cap 120 s; reset on progress (any leg converging)
+  and on `connection:status` recovery; a surfaced wallet-api `Retry-After` floors the next pass;
+  the pass never adopts an intent whose machine is still running in-process (facade ownership).
+  State is an in-memory timer handle + backoff value only — the pending set is re-read from the
+  §6 stores at every tick, and `stop()` clears the timer (quiescence unchanged).
 - **Address switch** = stop the vertical, start a new one. **`stop()` awaits quiescence** —
   in-flight machines and the drain complete or park before `start()` for the same address may
   run, because both instances would otherwise write the same per-address durable stores (this is

@@ -72,6 +72,23 @@ export interface PaymentsRequestsApi {
   dismissProcessed(): void;
 }
 
+/**
+ * A pending-transfers row, derived ON READ from the §6 stores (intent backstop
+ * + delivery journal + shortfalls) — never a cached mirror. kind 'shortfall' =
+ * a completed partial (#690) whose `amount` is the remainder still owed;
+ * legs.certified counts journaled legs (certified, delivery still owed).
+ */
+export interface PendingTransfer {
+  transferId: string;
+  kind: 'open' | 'shortfall';
+  recipient: string;
+  coinId: string;
+  amount: string;
+  legs: { certified: number; total: number };
+  deliveryPending: boolean;
+  createdAt: number;
+}
+
 export interface PaymentsV2 {
   assets(coinId?: string): Promise<Asset[]>;
   tokens(filter?: { coinId?: string }): Token[];
@@ -80,6 +97,11 @@ export interface PaymentsV2 {
   send(req: SendRequest): Promise<TransferResult>;
   mint(coinId: string, amount: bigint): Promise<MintResult>;
   receive(): Promise<{ transfers: IncomingTransfer[] }>;
+
+  // §7 convergence surface. A retry button calls resumeNow() — NEVER send():
+  // a re-issued send double-pays (#631/#676). Coalesces with a running pass.
+  pendingTransfers(): Promise<PendingTransfer[]>;
+  resumeNow(): Promise<void>;
 
   readonly requests: PaymentsRequestsApi;
 }
