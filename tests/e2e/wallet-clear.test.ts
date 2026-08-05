@@ -17,6 +17,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { Sphere } from '../../core/Sphere';
 import { createNodeProviders } from '../../impl/nodejs';
+import { makePv2World } from '../support/pv2-world';
 import { STORAGE_KEYS_GLOBAL } from '../../constants';
 import { mkdirSync, rmSync, existsSync, writeFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -30,10 +31,8 @@ const DEFAULT_API_KEY = 'sk_06365a9c44654841a366068bcfc68986';
 function makeTempDirs(label: string) {
   const base = join(tmpdir(), `sphere-e2e-clear-${label}-${Date.now()}-${rand()}`);
   const dataDir = join(base, 'data');
-  const tokensDir = join(base, 'tokens');
   mkdirSync(dataDir, { recursive: true });
-  mkdirSync(tokensDir, { recursive: true });
-  return { base, dataDir, tokensDir };
+  return { base, dataDir };
 }
 
 async function ensureTrustbase(dataDir: string): Promise<void> {
@@ -48,35 +47,21 @@ async function ensureTrustbase(dataDir: string): Promise<void> {
   writeFileSync(trustbasePath, data);
 }
 
-function makeProviders(dirs: { dataDir: string; tokensDir: string }) {
+function makeProviders(dirs: { dataDir: string }) {
   return {
     ...createNodeProviders({
       network: 'testnet',
       dataDir: dirs.dataDir,
-      tokensDir: dirs.tokensDir,
       oracle: {
         trustBasePath: join(dirs.dataDir, 'trustbase.json'),
         apiKey: DEFAULT_API_KEY,
       },
     }),
+    walletApi: makePv2World().walletApi,
     // Sphere.init needs options.network for the MAIN bundle's TokenRegistry (createNodeProviders
     // configures a different bundle's copy). Spread it so every Sphere.init({...providers}) gets it.
     network: 'testnet' as const,
   };
-}
-
-function countTokenFiles(tokensDir: string): number {
-  if (!existsSync(tokensDir)) return 0;
-  let count = 0;
-  for (const item of readdirSync(tokensDir, { withFileTypes: true })) {
-    if (item.isDirectory()) {
-      const subdir = join(tokensDir, item.name);
-      count += readdirSync(subdir).filter(f => f.endsWith('.json')).length;
-    } else if (item.name.endsWith('.json')) {
-      count++;
-    }
-  }
-  return count;
 }
 
 describe('Wallet clear end-to-end', () => {
@@ -130,7 +115,7 @@ describe('Wallet clear end-to-end', () => {
     spheres.length = 0;
 
     console.log('Clearing all wallet data...');
-    await Sphere.clear({ storage: providers.storage, tokenStorage: providers.tokenStorage });
+    await Sphere.clear({ storage: providers.storage });
 
     // Verify local wallet is gone
     expect(await Sphere.exists(providers.storage)).toBe(false);
@@ -140,7 +125,6 @@ describe('Wallet clear end-to-end', () => {
     expect(await providers.storage.get(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS)).toBeNull();
 
     // Token files cleared
-    expect(countTokenFiles(dirs.tokensDir)).toBe(0);
 
     console.log('All local data cleared successfully.');
   }, 60000);
@@ -169,7 +153,7 @@ describe('Wallet clear end-to-end', () => {
 
     // Clear local data
     console.log('Clearing local wallet data...');
-    await Sphere.clear({ storage: providers.storage, tokenStorage: providers.tokenStorage });
+    await Sphere.clear({ storage: providers.storage });
     expect(await Sphere.exists(providers.storage)).toBe(false);
 
     // Wait for relay propagation
@@ -217,7 +201,7 @@ describe('Wallet clear end-to-end', () => {
     spheres.length = 0;
 
     // Clear wallet 1 locally
-    await Sphere.clear({ storage: providers1.storage, tokenStorage: providers1.tokenStorage });
+    await Sphere.clear({ storage: providers1.storage });
 
     // Wait for relay
     await new Promise((r) => setTimeout(r, 2000));
@@ -268,7 +252,7 @@ describe('Wallet clear end-to-end', () => {
 
     // Clear local data
     console.log('Clearing local data...');
-    await Sphere.clear({ storage: providers1.storage, tokenStorage: providers1.tokenStorage });
+    await Sphere.clear({ storage: providers1.storage });
     expect(await Sphere.exists(providers1.storage)).toBe(false);
 
     // Wait for relay
@@ -324,7 +308,7 @@ describe('Wallet clear end-to-end', () => {
 
     // Clear
     console.log('Clearing...');
-    await Sphere.clear({ storage: providers.storage, tokenStorage: providers.tokenStorage });
+    await Sphere.clear({ storage: providers.storage });
     expect(await Sphere.exists(providers.storage)).toBe(false);
 
     // Wallet 2 on same directory (fresh)

@@ -10,6 +10,7 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { Sphere } from '../../core/Sphere';
+import { makePv2World } from '../support/pv2-world';
 import { createNodeProviders } from '../../impl/nodejs';
 import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -77,13 +78,12 @@ async function createSphere(label: string, nametag?: string) {
   const providers = createNodeProviders({
     network: 'testnet',
     dataDir: dirs.dataDir,
-    tokensDir: dirs.tokensDir,
     oracle: {
       trustBasePath: join(dirs.dataDir, 'trustbase.json'),
       apiKey: DEFAULT_API_KEY,
     },
   });
-  const result = await Sphere.init({ ...providers, network: 'testnet', autoGenerate: true, ...(nametag ? { nametag } : {}) });
+  const result = await Sphere.init({ ...providers, walletApi: makePv2World().walletApi, network: 'testnet', autoGenerate: true, ...(nametag ? { nametag } : {}) });
   return { sphere: result.sphere, dirs };
 }
 

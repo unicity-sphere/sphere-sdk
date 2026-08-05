@@ -1,11 +1,11 @@
 /**
- * LIVE staging gate for the SPHERE-LEVEL paymentsV2 wiring (P9, docs §10
- * standing rule: fakes prove invariants, STAGING PROVES REALITY): a full
- * `Sphere.init({ paymentsV2: true, autoGenerate: true })` against the REAL
- * staging wallet-api + testnet2 gateway, with the transport composed by the
- * DEFAULT wiring path — the old S4 `WalletApiClient` passed as `walletApi` is
- * only the config source (baseUrl / network / deviceId / ws factory via the
- * `ws` package); the vertical builds its own client + auth lineage.
+ * LIVE staging gate for the SPHERE-LEVEL payments wiring (docs §10 standing
+ * rule: fakes prove invariants, STAGING PROVES REALITY): a full
+ * `Sphere.init({ walletApi, autoGenerate: true })` against the REAL staging
+ * wallet-api + testnet2 gateway, with the transport composed by the DEFAULT
+ * wiring path — `walletApi` is the plain transport config (baseUrl / network /
+ * deviceId / ws factory via the `ws` package); the vertical builds its own
+ * client + auth lineage.
  *
  * Flow: mint HARNESS coin → assets() shows it → self-send the exact amount
  * (spend and claim commute through the wallet's own mailbox) → receive()
@@ -29,15 +29,14 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
-import { Sphere, type SphereWalletApiSession } from '../../core/Sphere';
+import { Sphere, type WalletApiTransportConfig } from '../../core/Sphere';
 import { isPossiblyCommittedSendOutcome } from '../../core/errors';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
-import { WalletApiClient } from '../../wallet-api';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { IncomingTransfer, ProviderStatus, TransferResult } from '../../types';
 import type { PaymentsV2 } from '../../modules/payments-v2/api';
-import { HARNESS_COIN } from '../harness/support/stack';
+import { HARNESS_COIN } from './support/staging';
 import {
   AGGREGATOR_URL,
   BASE_URL,
@@ -77,12 +76,6 @@ function createMockTransport(): TransportProvider {
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     sendMessage: vi.fn().mockResolvedValue('event-id'),
     onMessage: vi.fn().mockReturnValue(() => {}),
-    sendTokenTransfer: vi.fn().mockResolvedValue('transfer-id'),
-    onTokenTransfer: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequest: vi.fn().mockResolvedValue('request-id'),
-    onPaymentRequest: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequestResponse: vi.fn().mockResolvedValue('response-id'),
-    onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
     subscribeToBroadcast: vi.fn().mockReturnValue(() => {}),
     publishBroadcast: vi.fn().mockResolvedValue('broadcast-id'),
     onEvent: vi.fn().mockReturnValue(() => {}),
@@ -131,19 +124,17 @@ const incoming: IncomingTransfer[] = [];
 
 async function bootSphere(): Promise<Sphere> {
   const storage = new FileStorageProvider({ dataDir });
-  const walletApi = new WalletApiClient({
+  const walletApi: WalletApiTransportConfig = {
     baseUrl: BASE_URL,
     network: NETWORK,
     deviceId,
-    storage,
     webSocketFactory: nodeWsFactory,
-  });
+  };
   const { sphere: built } = await Sphere.init({
     storage,
     transport: createMockTransport(),
     oracle: createStagingOracle(trustBaseJson),
-    walletApi: walletApi as unknown as SphereWalletApiSession,
-    paymentsV2: true,
+    walletApi,
     autoGenerate: true,
     network: NETWORK,
   });
@@ -227,13 +218,14 @@ async function sendConvergedThroughThrottle(
   throw new Error(`send never converged via resume\n${await diagnose('send-resume')}`);
 }
 
-describe.runIf(RUN)('LIVE staging: Sphere paymentsV2 wiring (default transport path)', () => {
-  it('init(paymentsV2) → mint → assets → exact self-send → receive drains → balance unchanged → clean destroy', async () => {
+describe.runIf(RUN)('LIVE staging: Sphere payments wiring (default transport path)', () => {
+  it('init → mint → assets → exact self-send → receive drains → balance unchanged → clean destroy', async () => {
     dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sphere-pv2-e2e-'));
     trustBaseJson = await trustbase();
 
     const wallet = await bootSphere();
-    expect(() => wallet.payments).toThrowError(/disabled by paymentsV2/);
+    // Post-flip: `payments` IS the facade; `paymentsV2` is the deprecated alias.
+    expect(wallet.payments).toBe(wallet.paymentsV2);
     expect(wallet.paymentsV2).not.toBeNull();
     logStep(`wallet up: ${wallet.identity!.chainPubkey.slice(0, 12)}… on ${NETWORK}`);
 

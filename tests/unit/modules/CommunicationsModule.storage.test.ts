@@ -37,8 +37,6 @@ function createMockTransport(): TransportProvider {
     setIdentity: vi.fn(),
     sendMessage: vi.fn().mockResolvedValue('mock-event-id'),
     onMessage: vi.fn().mockReturnValue(() => {}),
-    sendTokenTransfer: vi.fn().mockResolvedValue('mock-event-id'),
-    onTokenTransfer: vi.fn().mockReturnValue(() => {}),
   };
 }
 

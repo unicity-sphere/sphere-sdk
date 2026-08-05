@@ -36,12 +36,12 @@ function secrets(sphere: Sphere): SphereSecrets {
 }
 
 async function initWallet(password?: string): Promise<Sphere> {
-  const { storage, transport, oracle, tokenStorage } = makeMockProviders({ walletExists: false });
+  const { storage, transport, oracle, walletApi } = makeMockProviders({ walletExists: false });
   const { sphere } = await Sphere.init({
     storage,
     transport,
     oracle,
-    tokenStorage,
+    walletApi,
     network: TEST_NETWORK,
     mnemonic: TEST_MNEMONIC,
     ...(password ? { password } : {}),

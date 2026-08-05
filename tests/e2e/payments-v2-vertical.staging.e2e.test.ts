@@ -26,7 +26,7 @@ import { isPossiblyCommittedSendOutcome } from '../../core/errors';
 import type { DeliveryPort } from '../../modules/payments-v2/ports';
 import { createMachineStores } from '../../modules/payments-v2/machine/journal';
 import type { TransferResult } from '../../types';
-import { HARNESS_COIN, randomIdentity } from '../harness/support/stack';
+import { HARNESS_COIN, randomIdentity } from './support/staging';
 import { memoryKV, RUN_STAGING as RUN } from './support/staging';
 import {
   activeRows,

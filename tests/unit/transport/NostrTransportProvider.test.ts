@@ -419,14 +419,15 @@ describe('Event subscription pubkey format', () => {
     // Should create two subscriptions: wallet and chat
     expect(mockSubscribe).toHaveBeenCalledTimes(2);
 
-    // First subscription: wallet events (with since filter)
+    // First subscription: wallet events (with since filter). The Nostr asset/
+    // payment-request rail (31113/31115/31116) is GONE — assets ride wallet-api.
     const [walletFilterArg] = mockSubscribe.mock.calls[0];
     const walletFilter = walletFilterArg.toJSON();
-    expect(walletFilter.kinds).toContain(4);     // DIRECT_MESSAGE
-    expect(walletFilter.kinds).toContain(31113); // TOKEN_TRANSFER
-    expect(walletFilter.kinds).toContain(31115); // PAYMENT_REQUEST
-    expect(walletFilter.kinds).toContain(31116); // PAYMENT_REQUEST_RESPONSE
-    expect(walletFilter.since).toBeDefined();    // Wallet has since filter
+    expect(walletFilter.kinds).toContain(4);        // DIRECT_MESSAGE
+    expect(walletFilter.kinds).not.toContain(31113); // TOKEN_TRANSFER rail removed
+    expect(walletFilter.kinds).not.toContain(31115); // PAYMENT_REQUEST rail removed
+    expect(walletFilter.kinds).not.toContain(31116); // PAYMENT_REQUEST_RESPONSE rail removed
+    expect(walletFilter.since).toBeDefined();       // Wallet has since filter
 
     // Second subscription: DM events (GIFT_WRAP, with its own since filter)
     const [chatFilterArg] = mockSubscribe.mock.calls[1];
