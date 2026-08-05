@@ -1453,7 +1453,7 @@ export class Sphere {
     needsPassword?: boolean;
     error?: string;
   }> {
-    const { fileContent, fileName, password, onDecryptProgress, ...baseOptions } = options;
+    const { fileContent, fileName, password, onDecryptProgress: _onDecryptProgress, ...baseOptions } = options;
 
     // Detect file type
     const fileType = Sphere.detectLegacyFileType(fileName, fileContent);

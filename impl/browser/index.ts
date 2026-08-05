@@ -53,7 +53,6 @@ import {
   resolveTransportConfig,
   resolveOracleConfig,
   resolvePriceConfig,
-  resolveArrayConfig,
   getNetworkConfig,
   resolveGroupChatConfig,
   resolveMarketConfig,
