@@ -26,7 +26,6 @@ import { TRUSTBASE_TESTNET2 } from '../../assets/trustbase';
 
 const TEST_DIR = path.join(__dirname, '.test-nametag-normalization');
 const DATA_DIR = path.join(TEST_DIR, 'data');
-const TOKENS_DIR = path.join(TEST_DIR, 'tokens');
 
 // =============================================================================
 // Mock providers

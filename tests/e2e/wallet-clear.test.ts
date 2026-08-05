@@ -19,7 +19,7 @@ import { Sphere } from '../../core/Sphere';
 import { createNodeProviders } from '../../impl/nodejs';
 import { makePv2World } from '../support/pv2-world';
 import { STORAGE_KEYS_GLOBAL } from '../../constants';
-import { mkdirSync, rmSync, existsSync, writeFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 

@@ -6,7 +6,7 @@ export default tseslint.config(
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
   {
-    ignores: ['dist/', 'node_modules/', 'scripts/', 'eslint-rules/', '*.js', '*.cjs', '*.mjs'],
+    ignores: ['dist/', 'node_modules/', 'scripts/', 'eslint-rules/', '.claude/', '*.js', '*.cjs', '*.mjs'],
   },
   // ── Code budget ─────────────────────────────────────────────────────────────
   // Size and complexity come from ESLint core; the two comment rules are local
