@@ -40,10 +40,6 @@ export interface SphereInstance {
     sendDM(recipient: string, content: string): Promise<ConnectDirectMessage>;
     resolvePeerNametag(peerPubkey: string): Promise<string | undefined>;
   };
-  readonly accounting?: {
-    getInvoices(options?: unknown): unknown[];
-    getInvoiceStatus(invoiceId: string): unknown;
-  } | null;
 }
 
 /** Minimal DM type to avoid circular imports with Sphere core types. */

@@ -572,7 +572,7 @@ describe('locked gate — queries', () => {
     });
     lockWallet(h);
 
-    const err = await h.client.query(RPC_METHODS.GET_INVOICES).catch((e: unknown) => e);
+    const err = await h.client.query(RPC_METHODS.GET_HISTORY).catch((e: unknown) => e);
     expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
   });
 

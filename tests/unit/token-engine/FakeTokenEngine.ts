@@ -1,9 +1,8 @@
 /**
  * FakeTokenEngine — a deterministic, in-memory ITokenEngine test double.
  *
- * Track B develops + unit-tests callers (PaymentsModule, AccountingModule, …)
- * against the frozen ITokenEngine port using this fake, before the real adapter
- * lands. It does no network/crypto: it models token identity, value, ownership
+ * Unit-tests engine callers against the frozen ITokenEngine port using this
+ * fake, without network access. It does no network/crypto: it models token identity, value, ownership
  * transfer, value-conserving split, data tokens, on-chain memos and spent-state
  * in memory. Token ids are a monotonic counter (or the salt for data tokens), so
  * behaviour is fully deterministic.

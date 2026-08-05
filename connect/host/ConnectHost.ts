@@ -1083,31 +1083,6 @@ export class ConnectHost {
         return { marked: true, count: (params.messageIds as string[]).length };
       }
 
-      case RPC_METHODS.GET_INVOICES: {
-        const accounting = sphere.accounting;
-        if (!accounting) throw new SphereError('Accounting module not available', 'MODULE_NOT_AVAILABLE');
-        // W23-R2 fix: Extract only known fields to prevent unsanitized dApp params
-        // from reaching the module (defense-in-depth).
-        const invoiceOpts: Record<string, unknown> = {};
-        if (params.state !== undefined) invoiceOpts.state = params.state;
-        if (params.limit !== undefined) invoiceOpts.limit = params.limit;
-        if (params.offset !== undefined) invoiceOpts.offset = params.offset;
-        if (params.sortBy !== undefined) invoiceOpts.sortBy = params.sortBy;
-        if (params.sortOrder !== undefined) invoiceOpts.sortOrder = params.sortOrder;
-        if (params.createdByMe !== undefined) invoiceOpts.createdByMe = params.createdByMe;
-        if (params.targetingMe !== undefined) invoiceOpts.targetingMe = params.targetingMe;
-        return accounting.getInvoices(invoiceOpts);
-      }
-
-      case RPC_METHODS.GET_INVOICE_STATUS: {
-        const accounting = sphere.accounting;
-        if (!accounting) throw new SphereError('Accounting module not available', 'MODULE_NOT_AVAILABLE');
-        if (!params.invoiceId || typeof params.invoiceId !== 'string') {
-          throw new SphereError('Missing required parameter: invoiceId', 'VALIDATION_ERROR');
-        }
-        return accounting.getInvoiceStatus(params.invoiceId as string);
-      }
-
       default:
         throw new SphereError(`Unknown method: ${method}`, 'VALIDATION_ERROR');
     }
