@@ -33,19 +33,6 @@ export interface TransportProvider extends BaseProvider {
   onMessage(handler: MessageHandler): () => void;
 
   /**
-   * Send token transfer payload
-   * @param recipientTransportPubkey - Transport-specific pubkey for messaging
-   * @returns Event ID
-   */
-  sendTokenTransfer(recipientTransportPubkey: string, payload: TokenTransferPayload): Promise<string>;
-
-  /**
-   * Subscribe to incoming token transfers
-   * @returns Unsubscribe function
-   */
-  onTokenTransfer(handler: TokenTransferHandler): () => void;
-
-  /**
    * Resolve any identifier to full peer information.
    * Accepts @nametag, bare nametag, DIRECT://, chain pubkey, or transport pubkey.
    * @param identifier - Any supported identifier format
@@ -65,9 +52,9 @@ export interface TransportProvider extends BaseProvider {
   resolveNametagInfo?(nametag: string): Promise<PeerInfo | null>;
 
   /**
-   * Resolve a DIRECT:// or PROXY:// address to full peer info.
+   * Resolve a DIRECT:// address to full peer info.
    * Performs reverse lookup: address → binding event → PeerInfo.
-   * @param address - L3 address (DIRECT://... or PROXY://...)
+   * @param address - L3 address (DIRECT://...)
    * @returns PeerInfo or null if no binding found for this address
    */
   resolveAddressInfo?(address: string): Promise<PeerInfo | null>;
@@ -118,39 +105,6 @@ export interface TransportProvider extends BaseProvider {
    * Publish broadcast message
    */
   publishBroadcast?(content: string, tags?: string[]): Promise<string>;
-
-  // ===========================================================================
-  // Payment Requests
-  // ===========================================================================
-
-  /**
-   * Send payment request to a recipient
-   * @param recipientTransportPubkey - Transport-specific pubkey for messaging
-   * @returns Event ID
-   */
-  sendPaymentRequest?(recipientTransportPubkey: string, request: PaymentRequestPayload): Promise<string>;
-
-  /**
-   * Subscribe to incoming payment requests
-   * @returns Unsubscribe function
-   */
-  onPaymentRequest?(handler: PaymentRequestHandler): () => void;
-
-  /**
-   * Send response to a payment request
-   * @param recipientTransportPubkey - Transport-specific pubkey for messaging
-   * @returns Event ID
-   */
-  sendPaymentRequestResponse?(
-    recipientTransportPubkey: string,
-    response: PaymentRequestResponsePayload
-  ): Promise<string>;
-
-  /**
-   * Subscribe to incoming payment request responses
-   * @returns Unsubscribe function
-   */
-  onPaymentRequestResponse?(handler: PaymentRequestResponseHandler): () => void;
 
   // ===========================================================================
   // Read Receipts
@@ -297,109 +251,6 @@ export interface IncomingMessage {
 export type MessageHandler = (message: IncomingMessage) => void;
 
 // =============================================================================
-// Token Transfer Types
-// =============================================================================
-
-export interface TokenTransferPayload {
-  /** Serialized token data */
-  token: string;
-  /** Inclusion proof */
-  proof: unknown;
-  /** Optional memo */
-  memo?: string;
-  /** Sender info */
-  sender?: {
-    /** Transport-specific pubkey */
-    transportPubkey: string;
-    nametag?: string;
-  };
-}
-
-export interface IncomingTokenTransfer {
-  id: string;
-  /** Transport-specific pubkey of sender */
-  senderTransportPubkey: string;
-  payload: TokenTransferPayload;
-  timestamp: number;
-}
-
-export type TokenTransferHandler = (transfer: IncomingTokenTransfer) => void | Promise<void>;
-
-// =============================================================================
-// Payment Request Types
-// =============================================================================
-
-export interface PaymentRequestPayload {
-  /** Amount requested (in smallest units) */
-  amount: string | bigint;
-  /** Coin/token type ID */
-  coinId: string;
-  /** Message/memo for recipient */
-  message?: string;
-  /** Recipient's nametag (who should pay) */
-  recipientNametag?: string;
-  /** Custom metadata */
-  metadata?: Record<string, unknown>;
-}
-
-export interface IncomingPaymentRequest {
-  /** Event ID */
-  id: string;
-  /** Transport-specific pubkey of sender */
-  senderTransportPubkey: string;
-  /** Sender's nametag (if included in encrypted content) */
-  senderNametag?: string;
-  /** Parsed request data */
-  request: {
-    requestId: string;
-    amount: string;
-    coinId: string;
-    message?: string;
-    recipientNametag?: string;
-    metadata?: Record<string, unknown>;
-  };
-  /** Timestamp */
-  timestamp: number;
-}
-
-export type PaymentRequestHandler = (request: IncomingPaymentRequest) => void;
-
-// =============================================================================
-// Payment Request Response Types
-// =============================================================================
-
-export type PaymentRequestResponseType = 'accepted' | 'rejected' | 'paid';
-
-export interface PaymentRequestResponsePayload {
-  /** Original request ID */
-  requestId: string;
-  /** Response type */
-  responseType: PaymentRequestResponseType;
-  /** Optional message */
-  message?: string;
-  /** Transfer ID (if paid) */
-  transferId?: string;
-}
-
-export interface IncomingPaymentRequestResponse {
-  /** Event ID */
-  id: string;
-  /** Transport-specific pubkey of responder */
-  responderTransportPubkey: string;
-  /** Parsed response data */
-  response: {
-    requestId: string;
-    responseType: PaymentRequestResponseType;
-    message?: string;
-    transferId?: string;
-  };
-  /** Timestamp */
-  timestamp: number;
-}
-
-export type PaymentRequestResponseHandler = (response: IncomingPaymentRequestResponse) => void;
-
-// =============================================================================
 // Broadcast Types
 // =============================================================================
 
@@ -426,9 +277,7 @@ export type TransportEventType =
   | 'transport:relay_added'
   | 'transport:relay_removed'
   | 'message:received'
-  | 'message:sent'
-  | 'transfer:received'
-  | 'transfer:sent';
+  | 'message:sent';
 
 export interface TransportEvent {
   type: TransportEventType;

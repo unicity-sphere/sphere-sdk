@@ -56,7 +56,7 @@ export type {
   SphereInitOptions,
   SphereInitResult,
   SphereImportOptions,
-  SphereWalletApiSession,
+  WalletApiTransportConfig,
   InitProgressStep,
   InitProgress,
   InitProgressCallback,
@@ -134,56 +134,18 @@ export * from './types';
 export type {
   // Storage
   StorageProvider,
-  TokenStorageProvider,
-  SaveResult,
-  LoadResult,
-  SyncResult,
-  StorageEvent,
-  StorageEventType,
-  StorageEventCallback,
-  TxfStorageDataBase,
-  TxfMeta,
-  TxfTombstone,
-  // Lazy inventory port (sdk-changes S2)
-  InventoryAsset,
-  InventoryItem,
-  InventoryView,
-  ApplyDeltaAdded,
-  ApplyDeltaOptions,
-  RecoverRemovedResult,
-  WholeBlobStore,
+  HistoryRecord,
 } from './storage';
 
-// Default lazy-port adapter for whole-blob providers (sdk-changes S2)
-export { WholeBlobInventoryAdapter } from './storage';
-
 // =============================================================================
-// Wallet-api client (sdk-changes S1) & field encryption (S6)
+// Wallet-api cross-repo protocol strings (§4 auth challenge) & field encryption (S6)
 // =============================================================================
 
 export {
-  WalletApiClient,
-  WalletApiError,
   ChallengeTemplateError,
   AUTH_CHALLENGE_PREFIX,
   verifyChallengeTemplate,
-} from './wallet-api';
-export type {
-  WalletApiErrorCode,
-  WalletApiClientConfig,
-  WalletApiIdentity,
-  KeyValueStore,
-  InventoryPage,
-  CoinBalance,
-  BlobUrlEntry,
-  UploadUrlRequest,
-  UploadUrlEntry,
-  ApplyDeltaRequest,
-  IntentRecord,
-  WakeEvent,
-  WakeCallback,
-  WakeSocketHandle,
-} from './wallet-api';
+} from './core/wallet-api-protocol';
 
 export {
   deriveFieldEncryptionKey,
@@ -198,31 +160,14 @@ export {
   FIELD_ENVELOPE_MAX_BYTES,
 } from './core';
 
-// Delivery port (sdk-changes S7) — the swappable seam for handing finished
-// token blobs to recipients (covenant §3.1-6); wallet-api's mailbox provider
-// (impl/shared/wallet-api) is the reference implementation.
-export { computeDeliveryId, composeDeliveryKeys } from './transport';
-export type {
-  DeliveryProvider,
-  DeliveryReceipt,
-  DeliverOptions,
-  IncomingDelivery,
-  DeliveryDisposition,
-  DeliveryCustody,
-  DeliveryBlobKeys,
-} from './transport';
-
 export type {
   // Transport
   TransportProvider,
   PeerInfo,
   MessageHandler,
-  TokenTransferHandler,
   BroadcastHandler,
   IncomingMessage,
-  IncomingTokenTransfer,
   IncomingBroadcast,
-  TokenTransferPayload,
   TransportEvent,
   TransportEventType,
   TransportEventCallback,
@@ -245,18 +190,10 @@ export type {
 // Modules
 // =============================================================================
 
-export {
-  PaymentsModule,
-  createPaymentsModule,
-} from './modules/payments';
-export type {
-  PaymentsModuleConfig,
-  PaymentsModuleDependencies,
-  PaymentsWalletApiPort,
-  ReceiveOptions,
-  ReceiveResult,
-  TransactionHistoryEntry,
-} from './modules/payments';
+// The payments surface (`sphere.payments`) is the §4 facade — its types ship
+// on the `@unicitylabs/sphere-sdk/payments-v2` subpath. `TransactionHistoryEntry`
+// keeps its name as an alias of the storage HistoryRecord it always was.
+export type { HistoryRecord as TransactionHistoryEntry } from './storage';
 
 export {
   CommunicationsModule,
@@ -310,7 +247,6 @@ export type {
 export {
   // Storage
   STORAGE_PREFIX,
-  STORAGE_KEYS,
   // Nostr
   DEFAULT_NOSTR_RELAYS,
   TEST_NOSTR_RELAYS,
@@ -318,9 +254,6 @@ export {
   NIP29_KINDS,
   DEFAULT_GROUP_RELAYS,
   // Aggregator
-  DEFAULT_AGGREGATOR_URL,
-  DEV_AGGREGATOR_URL,
-  TEST_AGGREGATOR_URL,
   DEFAULT_AGGREGATOR_TIMEOUT,
   // Wallet
   DEFAULT_DERIVATION_PATH,
@@ -364,35 +297,6 @@ export type {
   LegacyFileType,
   DecryptionProgressCallback,
 } from './serialization';
-
-// =============================================================================
-// TXF Serialization
-// =============================================================================
-
-export {
-  // Storage data
-  buildTxfStorageData,
-  parseTxfStorageData,
-} from './serialization/txf-serializer';
-
-export type { ParsedStorageData } from './serialization/txf-serializer';
-
-// =============================================================================
-// Validation
-// =============================================================================
-
-export {
-  TokenValidator,
-  createTokenValidator,
-} from './validation';
-
-export type {
-  ValidationAction,
-  ExtendedValidationResult,
-  SpentTokenInfo,
-  SpentTokenResult,
-  ValidationResult as TokenValidationResult,
-} from './validation';
 
 // =============================================================================
 // Token Registry
@@ -465,24 +369,6 @@ export {
   createPriceProvider,
 } from './price';
 
-// Swap module
-export { SwapModule, createSwapModule } from './modules/swap/index';
-export { computeSwapId, buildManifest, validateManifest, verifyManifestIntegrity, signSwapManifest, verifySwapSignature, createNametagBinding, verifyNametagBinding } from './modules/swap/manifest';
-export type {
-  SwapDeal,
-  SwapManifest,
-  ManifestFields,
-  ManifestSignatures,
-  NametagBindingProof,
-  ManifestAuxiliary,
-  SwapProgress,
-  SwapRole,
-  SwapRef,
-  SwapProposalResult,
-  GetSwapsFilter,
-  SwapModuleConfig,
-} from './modules/swap/types';
-
 // Address parsing
 export { parseAddress, isValidAddress, isValidDirectAddress, normalizeAddress, addressesMatch } from './core/address';
 export type { AddressType, ParsedAddress } from './core/address';
@@ -509,18 +395,3 @@ export type { EncryptedData } from './core/encryption';
 
 // Legacy wallet derivation helper (dual-use: derives chainPubkey in wif_hmac mode)
 export { generateAddressFromMasterKey } from './core/crypto';
-
-// Accounting module types
-export type {
-  CreateInvoiceRequest,
-  InvoiceRequestedAsset,
-  GetInvoicesOptions,
-  PayInvoiceParams,
-  ReturnPaymentParams,
-} from './modules/accounting/types';
-
-// TxfToken type for serialization workflows
-export type { TxfToken } from './types/txf';
-
-// Master-key provider status re-export (already re-exported via ./types barrel,
-// but keeping explicit here for consumers that want to import direct types).

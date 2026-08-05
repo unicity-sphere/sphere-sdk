@@ -3,7 +3,7 @@
  * Base types extended by platform-specific implementations
  */
 
-import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
+import type { StorageProvider } from '../../storage';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { PriceProvider, PricePlatform } from '../../price';
@@ -135,7 +135,6 @@ export interface BaseProvidersConfig {
  */
 export interface BaseProviders {
   storage: StorageProvider;
-  tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
   transport: TransportProvider;
   oracle: OracleProvider;
   /** Price provider (optional — enables fiat value display) */
