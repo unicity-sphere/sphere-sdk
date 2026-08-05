@@ -65,8 +65,8 @@ export const STORAGE_KEYS_GLOBAL = {
  * Final key format: sphere_{DIRECT_xxx_yyy}_{key}
  * Example: sphere_DIRECT_abc123_xyz789_pending_transfers
  *
- * Note: Token data (tokens, tombstones, archived, forked) is stored via
- * TokenStorageProvider, not here. This avoids duplication.
+ * Note: Token data is server custody (wallet-api backend), not here; the
+ * payments vertical's durable client state self-prefixes `pv2:{network}:{pubkey}:`.
  */
 export const STORAGE_KEYS_ADDRESS = {
   /** Transfer outbox for this address (pre-flip key name; kept as the network-scoping witness) */

@@ -7,7 +7,7 @@
  * of this class rather than of every call site.
  *
  * SYNCHRONOUS by design — no `await` anywhere inside. Frame-agnostic: it knows deadlines
- * and kinds, never how to send. Same idiom as PaymentsModule.pendingResponseResolvers.
+ * and kinds, never how to send.
  */
 
 import { logger } from '../../core/logger';

@@ -451,8 +451,8 @@ export class CommunicationsModule {
     this.dmHandlers.add(handler);
 
     // Replay existing messages to new handler — ensures DMs that arrived
-    // before this handler was registered (e.g., swap proposals arriving
-    // during Sphere.init before SwapModule.load) are not lost.
+    // before this handler was registered (e.g., during Sphere.init, before a
+    // consumer module attaches its handler) are not lost.
     // Guard: only replay once per handler reference to prevent duplicate
     // processing when a handler is unsubscribed and re-registered.
     if (!this.replayedHandlers.has(handler)) {
@@ -777,8 +777,8 @@ export class CommunicationsModule {
   }
 
   /**
-   * Get the shared transport address resolver (for use by other modules
-   * that need the same resolution + caching, e.g., PaymentsModule).
+   * Get the shared transport address resolver (for consumers that need the
+   * same resolution + caching, e.g. the payments vertical's recipient lookup).
    */
   getTransportResolver(): TransportAddressResolver | null {
     return this.transportResolver;

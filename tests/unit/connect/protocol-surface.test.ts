@@ -24,26 +24,26 @@ const BUMP_REMINDER =
   'Bump SPHERE_CONNECT_VERSION, then update EXPECTED in this file to match.\n';
 
 // Committed snapshot of the wire surface. CHANGE ONLY TOGETHER WITH A VERSION BUMP.
+// P11 flip: the 9 invoice intents, 2 invoice queries and 2 invoice scopes were removed
+// WITHOUT a MAJOR — they were experimental, never enabled in any wallet host (every call
+// answered MODULE_NOT_AVAILABLE), and the consumer gate found zero dApp users. Version
+// stays 2.1 by owner decision; a removed method now falls through to METHOD_NOT_FOUND.
 const EXPECTED = {
   version: '2.1',
   intents: [
-    'send', 'dm', 'payment_request', 'receive', 'sign_message',
-    'create_invoice', 'close_invoice', 'cancel_invoice', 'pay_invoice',
-    'return_invoice_payment', 'import_invoice', 'send_invoice_receipts',
-    'send_cancellation_notices', 'set_auto_return', 'mint',
+    'send', 'dm', 'payment_request', 'receive', 'sign_message', 'mint',
   ],
   scopes: [
     'identity:read', 'balance:read', 'tokens:read', 'history:read',
     'events:subscribe', 'resolve:peer', 'transfer:request', 'dm:request',
     'dm:read', 'dm:manage', 'payment:request', 'sign:request', 'mint:request',
-    'invoice:read', 'invoice:write',
   ],
   methods: [
     'sphere_getIdentity', 'sphere_getBalance', 'sphere_getAssets',
     'sphere_getFiatBalance', 'sphere_getTokens', 'sphere_getHistory',
     'sphere_resolve', 'sphere_subscribe', 'sphere_unsubscribe', 'sphere_disconnect',
     'sphere_getConversations', 'sphere_getMessages', 'sphere_getDMUnreadCount',
-    'sphere_markAsRead', 'sphere_getInvoices', 'sphere_getInvoiceStatus',
+    'sphere_markAsRead',
   ],
   events: [
     'wallet:locked', 'wallet:unlocked', 'wallet:disconnected', 'identity:changed',
