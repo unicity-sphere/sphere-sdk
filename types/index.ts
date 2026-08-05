@@ -136,36 +136,22 @@ export type TransferStatus =
   | 'completed'
   | 'failed';
 
-export type AddressMode = 'auto' | 'direct';
-
-export type TransferMode = 'instant' | 'conservative';
-
 export interface TransferRequest {
   readonly coinId: string;
   readonly amount: string;
   readonly recipient: string;
   readonly memo?: string;
-  /** Address mode: 'auto' (default) and 'direct' both resolve to the recipient's key-based DirectAddress (D5 — no PROXY). */
-  readonly addressMode?: AddressMode;
-  /** @deprecated v2 has a single engine-driven send path; this field is accepted for backwards-compat but IGNORED. */
-  readonly transferMode?: TransferMode;
 }
 
 /**
- * Per-token transfer detail tracking the on-chain commitment or split operation
- * for each source token involved in a transfer.
+ * Per-token transfer detail tracking the on-chain operation for each source
+ * token involved in a transfer.
  */
 export interface TokenTransferDetail {
   /** Source token ID that was consumed in this transfer */
   readonly sourceTokenId: string;
   /** Transfer method used for this token */
   readonly method: 'direct' | 'split';
-  /** Aggregator commitment request ID hex (for direct transfers) */
-  readonly requestIdHex?: string;
-  /** Split group ID (for split transfers — correlates sender/recipient/change tokens) */
-  readonly splitGroupId?: string;
-  /** Nostr event ID (for split transfers delivered via Nostr) */
-  readonly nostrEventId?: string;
 }
 
 export interface TransferResult {
@@ -194,129 +180,6 @@ export interface IncomingTransfer {
   readonly memo?: string;
   readonly receivedAt: number;
 }
-
-// =============================================================================
-// Payment Request Types
-// =============================================================================
-
-export type PaymentRequestStatus = 'pending' | 'rejected' | 'paid' | 'expired' | 'settling';
-
-/**
- * Outgoing payment request (requesting payment from someone)
- */
-export interface PaymentRequest {
-  /** Unique request ID */
-  readonly id: string;
-  /** Amount requested (in smallest units) */
-  readonly amount: string;
-  /** Coin/token type */
-  readonly coinId: string;
-  /** Optional message/memo */
-  readonly message?: string;
-  /** Expiration timestamp (ms) */
-  readonly expiresAt?: number;
-  /** Created timestamp */
-  readonly createdAt: number;
-}
-
-/**
- * Incoming payment request (someone requesting payment from us)
- */
-export interface IncomingPaymentRequest {
-  /** Event ID from Nostr */
-  readonly id: string;
-  /** Sender's public key */
-  readonly senderPubkey: string;
-  /** Sender's nametag (if known) */
-  readonly senderNametag?: string;
-  /** Amount requested */
-  readonly amount: string;
-  /** Coin/token type */
-  readonly coinId: string;
-  /** Symbol for display */
-  readonly symbol: string;
-  /** Message from sender */
-  readonly message?: string;
-  /** Original request ID from sender */
-  readonly requestId: string;
-  /** Timestamp */
-  readonly timestamp: number;
-  /** Current status */
-  status: PaymentRequestStatus;
-}
-
-/**
- * Result of sending a payment request
- */
-export interface PaymentRequestResult {
-  readonly success: boolean;
-  readonly requestId?: string;
-  readonly eventId?: string;
-  readonly error?: string;
-}
-
-/**
- * Handler for incoming payment requests
- */
-export type PaymentRequestHandler = (request: IncomingPaymentRequest) => void;
-
-/**
- * Response type for payment requests
- */
-export type PaymentRequestResponseType = 'rejected' | 'paid';
-
-/**
- * Outgoing payment request (we sent to someone)
- */
-export interface OutgoingPaymentRequest {
-  /** Unique request ID */
-  readonly id: string;
-  /** Nostr event ID */
-  readonly eventId: string;
-  /** Recipient's public key */
-  readonly recipientPubkey: string;
-  /** Recipient's nametag (if known) */
-  readonly recipientNametag?: string;
-  /** Amount requested */
-  readonly amount: string;
-  /** Coin/token type */
-  readonly coinId: string;
-  /** Message sent with request */
-  readonly message?: string;
-  /** Created timestamp */
-  readonly createdAt: number;
-  /** Current status */
-  status: PaymentRequestStatus;
-  /** Response data (if received) */
-  response?: PaymentRequestResponse;
-}
-
-/**
- * Response to a payment request
- */
-export interface PaymentRequestResponse {
-  /** Response event ID */
-  readonly id: string;
-  /** Responder's public key */
-  readonly responderPubkey: string;
-  /** Responder's nametag (if known) */
-  readonly responderNametag?: string;
-  /** Original request ID */
-  readonly requestId: string;
-  /** Response type */
-  readonly responseType: PaymentRequestResponseType;
-  /** Optional message */
-  readonly message?: string;
-  /** Transfer ID (if paid) */
-  readonly transferId?: string;
-  /** Timestamp */
-  readonly timestamp: number;
-}
-
-/**
- * Handler for payment request responses
- */
-export type PaymentRequestResponseHandler = (response: PaymentRequestResponse) => void;
 
 // =============================================================================
 // Message Types
@@ -387,40 +250,22 @@ export interface TrackedAddress extends TrackedAddressEntry {
 // =============================================================================
 
 export type SphereEventType =
+  // payments events (§4 of docs/PAYMENTS-V2-DESIGN.md — the 8 facade events)
   | 'transfer:incoming'
-  | 'transfer:confirmed'
-  | 'transfer:failed'
-  | 'transfer:delivery_pending'
-  | 'transfer:invalid'
-  // payments-v2 events (§4 of docs/PAYMENTS-V2-DESIGN.md) — emitted only when
-  // the opt-in `paymentsV2` init flag is on (P9); additive until the P11 flip.
   | 'transfer:updated'
   | 'transfer:attention'
   | 'inventory:updated'
+  | 'history:updated'
+  | 'payment_request:incoming'
   | 'payment_request:updated'
   | 'connection:status'
-  | 'payment_request:incoming'
-  | 'payment_request:rejected'
-  | 'payment_request:paid'
-  | 'payment_request:expired'
-  | 'payment_request:settling'
-  | 'payment_request:response'
+  // messaging
   | 'message:dm'
   | 'message:read'
   | 'message:typing'
   | 'composing:started'
   | 'message:broadcast'
-  | 'sync:started'
-  | 'sync:completed'
-  | 'sync:error'
-  | 'storage:degraded'
-  | 'inventory:conflict'
-  | 'split:checkpoint-stuck'
-  | 'send:partial-remainder'
-  | 'delivery:undeliverable'
-  | 'delivery:deferred'
-  | 'walletapi:session'
-  | 'realtime:status'
+  // wallet lifecycle
   | 'connection:changed'
   | 'nametag:registered'
   | 'nametag:recovered'
@@ -428,7 +273,7 @@ export type SphereEventType =
   | 'address:activated'
   | 'address:hidden'
   | 'address:unhidden'
-  | 'sync:remote-update'
+  // group chat
   | 'groupchat:message'
   | 'groupchat:joined'
   | 'groupchat:left'
@@ -437,146 +282,27 @@ export type SphereEventType =
   | 'groupchat:updated'
   | 'groupchat:connection'
   | 'groupchat:ready'
-  | 'communications:ready'
-  | 'history:updated'
-  // Invoice / Accounting events
-  | 'invoice:created'
-  | 'invoice:payment'
-  | 'invoice:asset_covered'
-  | 'invoice:target_covered'
-  | 'invoice:covered'
-  | 'invoice:closed'
-  | 'invoice:cancelled'
-  | 'invoice:expired'
-  | 'invoice:unknown_reference'
-  | 'invoice:overpayment'
-  | 'invoice:irrelevant'
-  | 'invoice:auto_returned'
-  | 'invoice:auto_return_failed'
-  | 'invoice:return_received'
-  | 'invoice:over_refund_warning'
-  | 'invoice:receipt_sent'
-  | 'invoice:receipt_received'
-  | 'invoice:cancellation_sent'
-  | 'invoice:cancellation_received'
-  // Swap events
-  | 'swap:proposal_received'
-  | 'swap:proposed'
-  | 'swap:accepted'
-  | 'swap:rejected'
-  | 'swap:announced'
-  | 'swap:deposit_sent'
-  | 'swap:deposit_confirmed'
-  | 'swap:deposits_covered'
-  | 'swap:concluding'
-  | 'swap:payout_received'
-  | 'swap:completed'
-  | 'swap:cancelled'
-  | 'swap:failed'
-  | 'swap:deposit_returned'
-  | 'swap:bounce_received';
+  | 'communications:ready';
 
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
-  'transfer:confirmed': TransferResult;
-  'transfer:failed': TransferResult;
-  /**
-   * Covenant §3.1 (#621): the send certified on-chain but recipient-side delivery did not land
-   * (a full mailbox / 429, or a transient outage). The source is spent, the finished blob is
-   * journaled for (re-)delivery, and the sender is NOT failed. UI renders "sent — delivery pending".
-   */
-  'transfer:delivery_pending': TransferResult;
-  /**
-   * An incoming delivery failed LOCAL verification and was rejected back to
-   * the delivery rail (sdk-changes S3): terminal for discovery only — the
-   * entry stays claimable server-side and may be retried after an app update
-   * (e.g. a trustbase fix).
-   */
-  'transfer:invalid': { deliveryId: string; senderPubkey?: string; reason: string };
-  'payment_request:incoming': IncomingPaymentRequest;
-  'payment_request:rejected': IncomingPaymentRequest;
-  'payment_request:paid': IncomingPaymentRequest;
-  'payment_request:expired': IncomingPaymentRequest;
-  /**
-   * #441: a possibly-committed pay linked the request to an in-flight transfer.
-   * The request is held NON-payable until that transfer completes (resolves
-   * 'paid') or aborts (returns to payable). Distinct from 'paid' — money may
-   * have left but the server has NOT yet been told 'paid'.
-   */
-  'payment_request:settling': IncomingPaymentRequest;
-  'payment_request:response': PaymentRequestResponse;
+  /** A transfer's lifecycle advanced (send/receive/mint) — carries the full result. */
+  'transfer:updated': TransferResult;
+  /** A transfer needs operator/user attention (undeliverable, checkpoint-stuck, ...) — coded. */
+  'transfer:attention': { transferId: string; code: string; detail?: string };
+  /** The wallet-api inventory mirror changed — re-read tokens()/assets(). */
+  'inventory:updated': Record<string, never>;
+  /** History changed — re-read via history(). */
+  'history:updated': Record<string, never>;
+  'payment_request:incoming': import('../modules/payments-v2/api').PaymentRequestView;
+  'payment_request:updated': { id: string; status: 'pending' | 'settling' | 'paid' | 'rejected' | 'expired' };
+  /** wallet-api session connectivity. */
+  'connection:status': { status: 'connected' | 'degraded' | 'offline' };
   'message:dm': DirectMessage;
   'message:read': { messageIds: string[]; peerPubkey: string };
   'message:typing': { senderPubkey: string; senderNametag?: string; timestamp: number };
   'composing:started': ComposingIndicator;
   'message:broadcast': BroadcastMessage;
-  'sync:started': { source: string };
-  'sync:completed': { source: string; count: number };
-  'sync:error': { source: string; error: string };
-  /**
-   * The ACTIVE custody token-storage provider failed a background save
-   * (#515 D3b): the in-memory token state is NOT durably persisted until a
-   * later save succeeds. User-facing flows (mint/send) fail loudly instead of
-   * emitting this.
-   */
-  'storage:degraded': { providerId: string; error: string };
-  /**
-   * A send lost a race on a source token (#517): coin-selection planned from a
-   * lazy-inventory view that was stale (missing another device's spend), so the
-   * engine raised `TransferConflictError` (Part E.2 — `TRANSACTION_HASH_MISMATCH`).
-   * The send fails cleanly and the conflicted source is reconciled to 'spent';
-   * this surfaces the otherwise-silent recoverable condition so a UI can prompt
-   * "refresh and retry". `transferId` is the aborted send's id.
-   */
-  'inventory:conflict': { transferId: string; coinId: string; error: string };
-  /**
-   * E.4 (sphere-sdk#501): a burn-certified split is stuck on a keep-open checkpoint error — the
-   * stored checkpoint is lost/unreadable (`SPLIT_CHECKPOINT_LOST`) or no longer verifies against the
-   * current trust base (`CHECKPOINT_TRUSTBASE_MISMATCH`, a validator rotation). The intent stays
-   * OPEN (never aborted — funds are in-flight, not lost), but this needs operator attention (the
-   * drain remedy), NOT a silent retry. Distinct from a transient resume failure.
-   */
-  'split:checkpoint-stuck': { transferId: string; code: string; error: string };
-  /**
-   * §7 partial completion: a resumed multi-source send delivered ≥1 leg, then a LATER source was
-   * lost to a foreign tx. The delivered legs are final (recorded, request resolved 'paid'); the app
-   * should re-plan ONLY `remainingAmount` to `recipientPubkey` under a NEW transferId — never the full
-   * amount (that would double-pay the delivered legs).
-   */
-  'send:partial-remainder': { transferId: string; remainingAmount: string; coinId: string; recipientPubkey: string };
-  /**
-   * A journaled finished-but-undelivered v2 transfer blob (#517) has exhausted
-   * its bounded replay budget and is now POISON: it stays journaled (the deposit
-   * is idempotent, so a later app version may still land it) but is no longer
-   * auto-retried, so it does not sit undelivered invisibly. `attempts` counts
-   * failed replay PASSES (one per `load()`), NOT underlying delivery calls — each
-   * pass internally retries with backoff, so the real number of delivery attempts
-   * is higher. Surfacing trips once `attempts` reaches the bounded budget.
-   */
-  'delivery:undeliverable': { transferId: string; recipientPubkey: string; attempts: number; error: string };
-  /**
-   * §3.1 (#621): a delivery was deferred because the recipient's mailbox is full (429 — a never-claimer
-   * or quota). NOT poison: kept journaled and retried after `deferredUntil`. UI: "recipient can't receive
-   * yet — will retry". The sender is NOT failed; the token is the recipient's on-chain.
-   */
-  'delivery:deferred': { transferId: string; recipientPubkey: string; reason: string; deferredUntil: number };
-  /**
-   * wallet-api session state change (#515 F3): 'offline' = sign-in failed and
-   * the wallet runs degraded (no intents barrier, no server custody writes);
-   * flips to 'online' when a later sign-in succeeds. Readable any time via
-   * `sphere.walletApiSessionStatus`.
-   */
-  'walletapi:session': { status: 'online' | 'offline'; error?: string };
-  /**
-   * True liveness of the realtime wake socket (§9), DISTINCT from sign-in
-   * session state (`walletapi:session`) and from provider connectivity
-   * (`connection:changed`): `connected` — a wake socket is open; `reconnecting`
-   * — it dropped and the supervisor is backing off (the poll backstop carries
-   * correctness meanwhile); `closed` — torn down on logout/destroy. The wake is
-   * only a nudge, so this is a frontend "live" indicator, never a correctness
-   * gate.
-   */
-  'realtime:status': { status: 'connecting' | 'connected' | 'reconnecting' | 'closed' };
   'connection:changed': { provider: string; connected: boolean; status?: ProviderStatus; enabled?: boolean; error?: string };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
@@ -584,7 +310,6 @@ export interface SphereEventMap {
   'address:activated': { address: TrackedAddress };
   'address:hidden': { index: number; addressId: string };
   'address:unhidden': { index: number; addressId: string };
-  'sync:remote-update': { providerId: string; name: string; sequence: number; cid: string; added: number; removed: number };
   'groupchat:message': import('../modules/groupchat/types').GroupMessageData;
   'groupchat:joined': { groupId: string; groupName: string };
   'groupchat:left': { groupId: string };
@@ -594,78 +319,6 @@ export interface SphereEventMap {
   'groupchat:connection': { connected: boolean };
   'groupchat:ready': { groupCount: number };
   'communications:ready': { conversationCount: number };
-  // NOTE (paymentsV2): the v2 History emits 'history:updated' with an EMPTY
-  // payload ({} — "re-read via history()"); the legacy entry payload below is
-  // unchanged for the default (flag-off) vertical.
-  'history:updated': import('../modules/payments/PaymentsModule').TransactionHistoryEntry;
-  // payments-v2 events (§4) — fired only when `paymentsV2: true` (P9 opt-in).
-  /** Replaces transfer:confirmed / :delivery_pending / :failed on the v2 vertical. */
-  'transfer:updated': TransferResult;
-  /** Replaces split:checkpoint-stuck / delivery:undeliverable / delivery:deferred (by code). */
-  'transfer:attention': { transferId: string; code: string; detail?: string };
-  /** The wallet-api inventory mirror changed — re-read tokens()/assets(). */
-  'inventory:updated': Record<string, never>;
-  'payment_request:updated': { id: string; status: 'pending' | 'settling' | 'paid' | 'rejected' | 'expired' };
-  /** wallet-api session connectivity (replaces realtime:status + storage:degraded). */
-  'connection:status': { status: 'connected' | 'degraded' | 'offline' };
-  // Invoice / Accounting event payloads
-  'invoice:created': { invoiceId: string; confirmed: boolean };
-  'invoice:payment': {
-    invoiceId: string;
-    transfer: import('../modules/accounting/types').InvoiceTransferRef;
-    paymentDirection: 'forward' | 'back' | 'return_closed' | 'return_cancelled';
-    confirmed: boolean;
-  };
-  'invoice:asset_covered': { invoiceId: string; address: string; coinId: string; confirmed: boolean };
-  'invoice:target_covered': { invoiceId: string; address: string; confirmed: boolean };
-  'invoice:covered': { invoiceId: string; confirmed: boolean };
-  'invoice:closed': { invoiceId: string; explicit: boolean };
-  'invoice:cancelled': { invoiceId: string };
-  'invoice:expired': { invoiceId: string };
-  'invoice:unknown_reference': { invoiceId: string; transfer: import('../modules/accounting/types').InvoiceTransferRef };
-  'invoice:overpayment': { invoiceId: string; address: string; coinId: string; surplus: string; confirmed: boolean };
-  'invoice:irrelevant': {
-    invoiceId: string;
-    transfer: import('../modules/accounting/types').InvoiceTransferRef;
-    reason: import('../modules/accounting/types').IrrelevantTransfer['reason'];
-    confirmed: boolean;
-  };
-  'invoice:auto_returned': {
-    invoiceId: string;
-    originalTransfer: import('../modules/accounting/types').InvoiceTransferRef;
-    returnTransfer: import('../modules/accounting/types').InvoiceTransferRef;
-  };
-  'invoice:auto_return_failed': {
-    invoiceId: string; transferId: string;
-    reason: 'sender_unresolvable' | 'send_failed' | 'max_retries_exceeded';
-    refundAddress?: string; contactAddresses?: string[];
-  };
-  'invoice:return_received': {
-    invoiceId: string;
-    transfer: import('../modules/accounting/types').InvoiceTransferRef;
-    returnReason: 'manual' | 'closed' | 'cancelled';
-  };
-  'invoice:over_refund_warning': { invoiceId: string; senderAddress: string; coinId: string; forwardedAmount: string; returnedAmount: string };
-  'invoice:receipt_sent': { invoiceId: string; sent: number; failed: number };
-  'invoice:receipt_received': { invoiceId: string; receipt: import('../modules/accounting/types').IncomingInvoiceReceipt };
-  'invoice:cancellation_sent': { invoiceId: string; sent: number; failed: number };
-  'invoice:cancellation_received': { invoiceId: string; notice: import('../modules/accounting/types').IncomingCancellationNotice };
-  // Swap event payloads
-  'swap:proposal_received': { swapId: string; deal: Record<string, unknown>; senderPubkey: string; senderNametag?: string };
-  'swap:proposed': { swapId: string; deal: Record<string, unknown>; recipientPubkey: string };
-  'swap:accepted': { swapId: string; role: string };
-  'swap:rejected': { swapId: string; reason?: string };
-  'swap:announced': { swapId: string; depositInvoiceId: string };
-  'swap:deposit_sent': { swapId: string; transferResult: TransferResult };
-  'swap:deposit_confirmed': { swapId: string; party: string; amount: string; coinId: string };
-  'swap:deposits_covered': { swapId: string };
-  'swap:concluding': { swapId: string };
-  'swap:payout_received': { swapId: string; payoutInvoiceId: string };
-  'swap:completed': { swapId: string; payoutVerified: boolean };
-  'swap:cancelled': { swapId: string; reason: string; depositsReturned?: boolean };
-  'swap:failed': { swapId: string; error: string };
-  'swap:deposit_returned': { swapId: string; transfer: import('../modules/accounting/types').InvoiceTransferRef; returnReason: string };
-  'swap:bounce_received': { swapId: string; reason: string; returnedAmount: string; returnedCurrency: string };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (
@@ -752,9 +405,6 @@ export interface WalletJSONExportOptions {
 // =============================================================================
 
 export type { AddressInfo } from '../core/crypto';
-
-// Re-export TXF types
-export * from './txf';
 
 // =============================================================================
 // Network Health Types

@@ -32,10 +32,10 @@ export type {
 import { logger as sdkLogger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { assertNetworkConsistency } from '../shared/network';
-import { createIndexedDBStorageProvider, type IndexedDBStorageProviderConfig, createIndexedDBTokenStorageProvider } from './storage';
+import { createIndexedDBStorageProvider, type IndexedDBStorageProviderConfig } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
-import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
+import type { StorageProvider } from '../../storage';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { NetworkType } from '../../constants';
@@ -111,8 +111,6 @@ export interface BrowserProviders {
   storage: StorageProvider;
   transport: TransportProvider;
   oracle: OracleProvider;
-  /** Token storage provider for local persistence (IndexedDB) */
-  tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
   /** Group chat config (resolved, for passing to Sphere.init) */
@@ -161,14 +159,11 @@ export interface BrowserProviders {
  *   },
  * });
  *
- * // Use with Sphere.init (tokenStorage is automatically included)
+ * // Use with Sphere.init (add the wallet-api transport config)
  * const { sphere } = await Sphere.init({
- *   ...providers,
+ *   ...createWalletApiProviders(providers, { baseUrl, network: 'testnet' }),
  *   autoGenerate: true,
  * });
- *
- * // Add additional sync backends dynamically after init
- * // await sphere.addTokenStorageProvider(myMongoDbProvider);
  * ```
  */
 export function createBrowserProviders(config?: BrowserProvidersConfig): BrowserProviders {
@@ -228,7 +223,6 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
       debug: oracleConfig.debug,
       network,
     }),
-    tokenStorage: createIndexedDBTokenStorageProvider({ network }),
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
   };
 }

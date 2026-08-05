@@ -76,26 +76,6 @@ export const configs = [
       'ws',
     ],
   },
-  // Wallet-api client (sdk-changes S1) — platform-independent (fetch/WS injected)
-  {
-    entry: { 'wallet-api/index': 'wallet-api/index.ts' },
-    format: ['esm', 'cjs'],
-    dts: true,
-    clean: false,
-    splitting: false,
-    sourcemap: true,
-    platform: 'node',
-    target: 'es2022',
-    noExternal: [/^@noble\//],
-    external: [
-      /^@unicitylabs\//,
-      'bip39',
-      'buffer',
-      'crypto-js',
-      'elliptic',
-      'ws',
-    ],
-  },
   // payments-v2 vertical (docs/PAYMENTS-V2-DESIGN.md) — platform-neutral
   {
     entry: { 'modules/payments-v2/index': 'modules/payments-v2/index.ts' },

@@ -1,7 +1,7 @@
 /**
  * Shared transport address resolver.
  *
- * Resolves any valid Unicity address (@nametag, DIRECT://, PROXY://, hex pubkey)
+ * Resolves any valid Unicity address (@nametag, DIRECT://, hex pubkey)
  * to a transport-level pubkey for messaging and token delivery.
  *
  * Used by both CommunicationsModule (DMs) and PaymentsModule (token transfers)
@@ -45,7 +45,7 @@ export interface TransportAddressResolver {
   /**
    * Resolve any Unicity address to a transport pubkey.
    *
-   * Accepts: @nametag, DIRECT://..., PROXY://..., compressed hex (66 chars),
+   * Accepts: @nametag, DIRECT://..., compressed hex (66 chars),
    * x-only hex (64 chars).
    *
    * Results are cached to avoid redundant network round-trips.
@@ -113,8 +113,8 @@ export function createTransportAddressResolver(
       return { pubkey, nametag };
     }
 
-    // DIRECT:// or PROXY:// — resolve via transport address lookup
-    if (address.startsWith('DIRECT://') || address.startsWith('PROXY://')) {
+    // DIRECT:// — resolve via transport address lookup
+    if (address.startsWith('DIRECT://')) {
       // Primary: transport.resolve() handles all address formats
       if (transport.resolve) {
         const peerInfo = await transport.resolve(address);
@@ -130,7 +130,7 @@ export function createTransportAddressResolver(
         }
       }
       // Last resort: strip prefix and try as raw pubkey
-      const prefix = address.startsWith('DIRECT://') ? 'DIRECT://' : 'PROXY://';
+      const prefix = 'DIRECT://';
       const raw = address.slice(prefix.length);
       if (raw.length === 0) {
         throw new SphereError(`Invalid ${prefix} address: empty value`, 'INVALID_RECIPIENT');
@@ -159,7 +159,7 @@ export function createTransportAddressResolver(
 
     throw new SphereError(
       `Cannot resolve "${address.slice(0, 30)}..." to a transport address. ` +
-      `Use @nametag, DIRECT://, PROXY://, or a hex pubkey.`,
+      `Use @nametag, DIRECT://, or a hex pubkey.`,
       'INVALID_RECIPIENT',
     );
   }

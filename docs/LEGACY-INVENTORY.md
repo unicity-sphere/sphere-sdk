@@ -20,6 +20,25 @@ entry by grepping its backticked symbol, not by its address.
   `acceptPaymentRequest` / `markPaymentRequestPaid` and the whole `'accepted'`
   concept.
 - Earlier: the pre-E.4 (`v:1`) intent resume path.
+- **P11 flip (this branch)** — CLOSED-BY-P11: `modules/payments`, `modules/accounting`,
+  `modules/swap`, `wallet-api/` (S1 client), the old `impl/shared/wallet-api` providers,
+  `TokenStorageProvider` + both platform token-storage providers, `DeliveryProvider`,
+  the Nostr asset/PR rail (31113/31115/31116), `types/txf.ts` (its KEEP entry FLIPPED —
+  the last producer, `AccountingModule._scanTokenForAttribution`, died with the module),
+  `serialization/txf-serializer.ts`, `validation/`, the old-module events, `sphere.sync()`,
+  `STORAGE_KEYS` (merged map), `INVOICE_TOKEN_TYPE_HEX`, the dead money storage-key
+  constants. The `unconfirmed` Asset fields KEEP their shape — the v2 presentation pins
+  them `'0'`/`0`.
+  - **The ONE sanctioned P11 refusal fossil** (revisit-and-delete after one release):
+    `accounting:`/`swap:` init options throw typed `INVALID_CONFIG` — public flags whose
+    silent-ignore would hide that invoices/swaps no longer exist.
+  - **NOT taken (P11 stage-2 note):** the `isNetworkScopedAddressKey` cut (judgment call
+    #10). The function + `NETWORK_SCOPED_ADDRESS_KEYS`/`_PREFIXES` + the providers'
+    network-segment plumbing + the witness key names (`OUTBOX`, `AUTO_RETURN`,
+    `AUTO_RETURN_LEDGER`, `SWAP_RECORD_PREFIX`, `CONVERSATIONS`) survive because the
+    KEEP-listed kv/file network-isolation suites pin the fund-leak guard with exactly
+    those keys; the full cut needs an owner call on those tests first. The payments
+    vertical never rides this mechanism (`pv2:{network}:{pubkey}:` self-prefix).
 
 Everything below is what remained when this snapshot was taken. Entries naming
 `modules/payments/PaymentsModule.ts` may now live in `requests/`, `receive/`,

@@ -759,7 +759,7 @@ export class CommunicationsModule {
    * Call before a batch of DM operations to avoid resolution latency
    * on the first sendDM() call. Subsequent calls use the cache.
    *
-   * @param address - Any valid Unicity address (@nametag, DIRECT://, PROXY://, hex pubkey)
+   * @param address - Any valid Unicity address (@nametag, DIRECT://, hex pubkey)
    * @returns The resolved transport pubkey (caller should NOT use this — it's transport-specific)
    */
   async preResolve(address: string): Promise<string> {
