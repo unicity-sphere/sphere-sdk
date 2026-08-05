@@ -785,8 +785,8 @@ export class Sphere {
    * The provider factory functions (createBrowserProviders / createNodeProviders)
    * are compiled into separate bundles by tsup, each with their own inlined copy
    * of TokenRegistry. Their TokenRegistry.configure() call configures a different
-   * singleton than the one used by PaymentsModule (which lives in the main bundle).
-   * This method ensures the main bundle's TokenRegistry is properly configured.
+   * singleton than the one the payments facade uses (which lives in the main
+   * bundle). This method ensures the main bundle's TokenRegistry is configured.
    */
   private static configureTokenRegistry(storage: StorageProvider, network?: NetworkType): void {
     // Fail loud: a dropped/missing network would silently load the wrong-network
@@ -1394,13 +1394,13 @@ export class Sphere {
    * inject a per-wallet subscription key provisioned AFTER init, or a per-address
    * key on an address switch, so the next money operation authenticates with it.
    *
-   * Money-safety: the running token engine is snapshotted per-operation (the
-   * payments module reads `deps.tokenEngine` into a local at op start), so an
-   * in-flight send/mint completes on the OLD key (submit + proof stay paired on
-   * one client) and only operations started AFTER this call use the new key.
+   * Money-safety: the facade reads the engine through `engineRef()` and each
+   * machine operation snapshots it at op start, so an in-flight send/mint
+   * completes on the OLD key (submit + proof stay paired on one client) and
+   * only operations started AFTER this call use the new key.
    * Only the ACTIVE address's engine is rebuilt — other tracked addresses re-key
-   * on their next switch/build. No-op-safe if the engine can't be built (the
-   * modules fall back to their legacy path, same as init).
+   * on their next switch/build. No-op-safe if the engine can't be built (money
+   * operations keep failing loudly until a working key arrives, same as init).
    */
   async setOracleApiKey(apiKey: string): Promise<void> {
     this._oracle.setApiKey?.(apiKey);
@@ -3830,9 +3830,10 @@ export class Sphere {
    * active one) from the oracle's gateway URL + trust base and that address's
    * signing key. The engine is per-address — each address signs with its own key.
    * The trust base is the single source of truth for the network id (so any id
-   * works — e.g. testnet2 = 4 — with no enum entry). Returns undefined (modules
-   * keep their legacy path) when the oracle can't supply a trust base / url, or
-   * construction fails — a misconfigured oracle never breaks initialization.
+   * works — e.g. testnet2 = 4 — with no enum entry). Returns undefined (money
+   * operations fail loudly until an engine exists) when the oracle can't supply
+   * a trust base / url, or construction fails — a misconfigured oracle never
+   * breaks initialization.
    */
   private async buildTokenEngine(identity?: FullIdentity): Promise<ITokenEngine | undefined> {
     const oracle = this._oracle as {
@@ -3844,7 +3845,7 @@ export class Sphere {
     const trustBaseJson = oracle.getTrustBaseJson?.() ?? null;
     const aggregatorUrl = oracle.getAggregatorUrl?.();
     if (!trustBaseJson || !aggregatorUrl || !privateKey) {
-      logger.warn('Sphere', 'v2 token engine not constructed (oracle has no trust base / url, or no identity) — legacy path');
+      logger.warn('Sphere', 'v2 token engine not constructed (oracle has no trust base / url, or no identity) — money operations will fail until one exists');
       return undefined;
     }
     try {
@@ -3858,7 +3859,7 @@ export class Sphere {
     } catch (err) {
       logger.warn(
         'Sphere',
-        `Failed to construct v2 token engine — modules use the legacy path: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to construct v2 token engine — money operations will fail until one exists: ${err instanceof Error ? err.message : String(err)}`,
       );
       return undefined;
     }

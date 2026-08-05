@@ -4,8 +4,8 @@
  * Resolves any valid Unicity address (@nametag, DIRECT://, hex pubkey)
  * to a transport-level pubkey for messaging and token delivery.
  *
- * Used by both CommunicationsModule (DMs) and PaymentsModule (token transfers)
- * to ensure a single resolution path — no code duplication.
+ * Used by CommunicationsModule (DMs) and the payments vertical's recipient
+ * resolution to ensure a single resolution path — no code duplication.
  *
  * Includes an in-memory cache (TTL-based) to avoid redundant network lookups.
  */
