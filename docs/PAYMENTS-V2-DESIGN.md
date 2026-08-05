@@ -23,7 +23,7 @@
 | P7 | `Receive` drain + seen-set + claim + RECEIVED history | ✅ 20 tests; store-before-ack crash window pinned |
 | P8 | `Requests` (streams + settling journal); `Mint` (+ engine F13 fix) | ✅ requests 19 tests; journal-first mint; F13 fixed + fake de-lied (124/124 engine) |
 | P9 | `History` read-through; events; facade assembly | ✅ facade 16 tests over real ports; `test:mutation` standing (16/16 KILLED). Connect adapter → P11 |
-| P10 | Live-staging e2e parity + soak + request-count budgets | 🔄 **6/6 money matrix live-green on testnet2** (mint / whole-token / split w/ signed seed-close / self-send / A→B→A / crash-resume paid-once) + 5/5 session e2e. Still owed: exact-combination + E.4-stage interruption cells, soak, request-count budgets |
+| P10 | Live-staging e2e parity + soak + request-count budgets | 🔄 **6/6 money matrix live-green on testnet2** (mint / whole-token / split w/ signed seed-close / self-send / A→B→A / crash-resume paid-once) + 5/5 session e2e + **cross-version interop live-green** (old-module ↔ v2 vertical both directions incl. splits + payment request, 4/4). Still owed: exact-combination + E.4-stage interruption cells, soak, request-count budgets |
 | P11 | Flip PR: wire Sphere + Connect adapter, delete old vertical, frontend migration, re-pin | ⬜ owner-gated |
 
 ---
