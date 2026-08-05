@@ -1,8 +1,8 @@
 /**
  * Wallet-binding FSM + the single total gate decision.
  *
- * PURE: no I/O, no timers, no Sphere reference, no `await`. Same idiom as
- * modules/swap/state-machine.ts (transition table + assertTransition).
+ * PURE: no I/O, no timers, no Sphere reference, no `await` — a transition
+ * table + assertTransition.
  *
  * Nothing here is re-exported from connect/index.ts — it is host-internal.
  */

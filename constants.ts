@@ -69,25 +69,12 @@ export const STORAGE_KEYS_GLOBAL = {
  * TokenStorageProvider, not here. This avoids duplication.
  */
 export const STORAGE_KEYS_ADDRESS = {
-  /** Pending transfers for this address */
-  PENDING_TRANSFERS: 'pending_transfers',
-  /** Transfer outbox for this address */
+  /** Transfer outbox for this address (pre-flip key name; kept as the network-scoping witness) */
   OUTBOX: 'outbox',
   /** Conversations for this address */
   CONVERSATIONS: 'conversations',
   /** Messages for this address */
   MESSAGES: 'messages',
-  /** Transaction history for this address */
-  TRANSACTION_HISTORY: 'transaction_history',
-  /** Pending V5 finalization tokens (unconfirmed instant split tokens) */
-  PENDING_V5_TOKENS: 'pending_v5_tokens',
-  /**
-   * FINISHED v2 token blobs awaiting transport delivery. Written the moment a
-   * transfer/split output is certified on-chain (the source is already spent),
-   * removed after successful delivery — survives transport failures + crashes
-   * so the recipient's token is never lost with the process.
-   */
-  PENDING_V2_DELIVERIES: 'pending_v2_deliveries',
   /** Group chat: joined groups for this address */
   GROUP_CHAT_GROUPS: 'group_chat_groups',
   /** Group chat: messages for this address */
@@ -96,54 +83,27 @@ export const STORAGE_KEYS_ADDRESS = {
   GROUP_CHAT_MEMBERS: 'group_chat_members',
   /** Group chat: processed event IDs for deduplication */
   GROUP_CHAT_PROCESSED_EVENTS: 'group_chat_processed_events',
-  /** Processed V5 split group IDs for Nostr re-delivery dedup */
-  PROCESSED_SPLIT_GROUP_IDS: 'processed_split_group_ids',
-  /** Processed V6 combined transfer IDs for Nostr re-delivery dedup */
-  PROCESSED_COMBINED_TRANSFER_IDS: 'processed_combined_transfer_ids',
-  // Invoice / Accounting storage keys
-  /** Set of cancelled invoice IDs (JSON string array) */
-  CANCELLED_INVOICES: 'cancelled_invoices',
-  /** Set of closed invoice IDs (JSON string array) */
-  CLOSED_INVOICES: 'closed_invoices',
-  /** Frozen balances for terminated invoices (JSON map: invoiceId → FrozenInvoiceBalances) */
-  FROZEN_BALANCES: 'frozen_balances',
-  /** Auto-return settings (JSON: AutoReturnSettings) */
+  /** Auto-return settings (pre-flip key name; kept as the network-scoping witness) */
   AUTO_RETURN: 'auto_return',
-  /** Auto-return dedup ledger (JSON: AutoReturnLedger) */
+  /** Auto-return dedup ledger (pre-flip key name; kept as the network-scoping witness) */
   AUTO_RETURN_LEDGER: 'auto_return_ledger',
-  /** Invoice-transfer index metadata (JSON: Record<invoiceId, { terminated, frozenAt? }>) */
-  INV_LEDGER_INDEX: 'inv_ledger_index',
-  /** Token scan state watermarks (JSON: Record<tokenId, txCount>) */
-  TOKEN_SCAN_STATE: 'token_scan_state',
-  // Swap storage keys
-  /** Per-swap key: swap:{swapId} */
+  /** Per-swap key prefix (pre-flip key name; kept as the network-scoping witness) */
   SWAP_RECORD_PREFIX: 'swap:',
-  /** Lightweight index array for listing */
-  SWAP_INDEX: 'swap_index',
 } as const;
 
 /**
  * Per-address keys that are ALSO per-network: token/payment operational state. Mixing these
- * across networks is unsafe (e.g. a testnet2 auto-return ledger firing a real send on mainnet).
- * Chat/identity per-address keys (CONVERSATIONS/MESSAGES/GROUP_CHAT_*) are network-AGNOSTIC and
- * are deliberately NOT listed — they stay per-address only.
+ * across networks is unsafe. Chat/identity per-address keys (CONVERSATIONS/MESSAGES/
+ * GROUP_CHAT_*) are network-AGNOSTIC and deliberately NOT listed. The payments vertical
+ * self-prefixes `pv2:{network}:{pubkey}:` and never rides this mechanism; the entries left
+ * here are the pre-flip key names the network-isolation tests pin the provider behavior
+ * with (P11 stage-2 note: the full isNetworkScopedAddressKey cut needs an owner call on
+ * those tests first).
  */
 const NETWORK_SCOPED_ADDRESS_KEYS: readonly string[] = [
-  STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS,
   STORAGE_KEYS_ADDRESS.OUTBOX,
-  STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY,
-  STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS,
-  STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES,
-  STORAGE_KEYS_ADDRESS.PROCESSED_SPLIT_GROUP_IDS,
-  STORAGE_KEYS_ADDRESS.PROCESSED_COMBINED_TRANSFER_IDS,
-  STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
-  STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
-  STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
   STORAGE_KEYS_ADDRESS.AUTO_RETURN,
   STORAGE_KEYS_ADDRESS.AUTO_RETURN_LEDGER,
-  STORAGE_KEYS_ADDRESS.INV_LEDGER_INDEX,
-  STORAGE_KEYS_ADDRESS.TOKEN_SCAN_STATE,
-  STORAGE_KEYS_ADDRESS.SWAP_INDEX,
 ];
 
 /** Composite per-address key prefixes (modules store `{addressId}_{prefix}{id}`) — per-network. */
@@ -167,12 +127,6 @@ export function isNetworkScopedAddressKey(key: string): boolean {
   }
   return false;
 }
-
-/** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */
-export const STORAGE_KEYS = {
-  ...STORAGE_KEYS_GLOBAL,
-  ...STORAGE_KEYS_ADDRESS,
-} as const;
 
 /**
  * Build a per-address storage key using address identifier
@@ -220,12 +174,6 @@ export const DEFAULT_NOSTR_RELAYS = [
 export const NOSTR_EVENT_KINDS = {
   /** NIP-04 encrypted direct message */
   DIRECT_MESSAGE: 4,
-  /** Token transfer (Unicity custom - 31113) */
-  TOKEN_TRANSFER: 31113,
-  /** Payment request (Unicity custom - 31115) */
-  PAYMENT_REQUEST: 31115,
-  /** Payment request response (Unicity custom - 31116) */
-  PAYMENT_REQUEST_RESPONSE: 31116,
   /** Nametag binding (NIP-78 app-specific data) */
   NAMETAG_BINDING: 30078,
   /** Public broadcast */
@@ -284,9 +232,6 @@ export const DEFAULT_AGGREGATOR_URL = 'https://aggregator.unicity.network/rpc' a
 
 /** Dev aggregator URL */
 export const DEV_AGGREGATOR_URL = 'https://dev-aggregator.dyndns.org/rpc' as const;
-
-/** Test aggregator URL (Goggregator) */
-export const TEST_AGGREGATOR_URL = 'https://goggregator-test.unicity.network' as const;
 
 /** Default aggregator request timeout (ms) */
 export const DEFAULT_AGGREGATOR_TIMEOUT = 30000;
@@ -446,8 +391,6 @@ export const HOST_READY_TYPE = 'sphere-connect:host-ready' as const;
 export const HOST_READY_TIMEOUT = 30_000;
 
 /** Validation limits */
-export const INVOICE_TOKEN_TYPE_HEX = '14676a280bda4275baf865b67cd4c611bcd58c9bf8226d508acaa10a8fcaccc6' as const;
-
 export const LIMITS = {
   /** Min nametag length */
   NAMETAG_MIN_LENGTH: 3,

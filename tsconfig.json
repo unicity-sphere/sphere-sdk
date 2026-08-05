@@ -31,15 +31,10 @@
     "transport/**/*.ts",
     "oracle/**/*.ts",
     "serialization/**/*.ts",
-    "validation/**/*.ts",
     "impl/**/*.ts",
     "l1/**/*.ts",
     "registry/**/*.ts",
-    "token-engine/**/*.ts",
-    "wallet-api/**/*.ts",
-    "tests/harness/**/*.ts",
-    "vitest.harness.config.ts",
-    "vitest.live.config.ts"
+    "token-engine/**/*.ts"
   ],
   "exclude": [
     "node_modules",
