@@ -35,9 +35,30 @@ constants whose writers died with the modules. `Sphere.clear` collapses to `{ st
 the `pv2:{network}:{pubkey}:*` scoped KV with the KV store, and sweeps orphaned pre-flip
 `sphere-token-storage-*` IndexedDB databases.
 
+**The Connect invoice surface is removed from the protocol:** the 2 invoice queries
+(`sphere_getInvoices`, `sphere_getInvoiceStatus`), all 9 invoice intents and the
+`invoice:read`/`invoice:write` scopes — the wire surface is now 14 queries / 6 intents /
+13 scopes. The protocol version stays 2.1 by owner decision: the surface was experimental,
+never enabled in any wallet host (every call answered `MODULE_NOT_AVAILABLE`), and the
+consumer gate found zero dApp users; a removed method now answers the standard
+`METHOD_NOT_FOUND` path. Everything else on the wire is preserved by the §4 compat adapter —
+dApps change nothing.
+
 **The ONE sanctioned refusal fossil (revisit-and-delete after one release):** `accounting: true` /
 `swap: true` in init options throw a typed `INVALID_CONFIG` with a pointing message — both were
 public API, and silently ignoring them would hide that invoices/swaps no longer exist in the SDK.
+
+**Scale (per the flip manifest):** old modules deleted 23,905 lines (`modules/payments` 8,231 ×12
+files; `modules/accounting` 9,315 ×7; `modules/swap` 6,359 ×7) + `wallet-api/` 2,657 ×8 + the old
+`impl/shared/wallet-api` providers 1,756 ×5 + both platform token-storage providers 976 + ports,
+rails, types, serializers and constants; test estate: ≈113 old-stack test files (≈52,000 lines)
+deleted, ~12 rewritten onto the flip contract, the v2 suite (19 files / 8,485 lines + port
+contracts + 17 mutation probes) stands. Docs rewritten to the v2 reality: CLAUDE.md, README,
+QUICKSTART-BROWSER/NODEJS, INTEGRATION (invoice section deleted), CONNECT (compat adapter
+documented), API, MIGRATION-PAYMENTS-V2 (flip-release note), LEGACY-INVENTORY (CLOSED-BY-P11
+reconciliation), PAYMENTS-V2-DESIGN (P11 progress). Directory names deliberately stay
+`modules/payments-v2` / `impl/wallet-api-v2` (subpath exports were keeping those names anyway —
+the §5 `git mv` is deferred, zero consumer impact).
 
 ### Fixed — CHANGELOG prose for the `wallet.dat` importer removal (#722)
 

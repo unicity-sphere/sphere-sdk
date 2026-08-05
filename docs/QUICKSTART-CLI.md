@@ -8,4 +8,4 @@ command reference lives with it (kept in sync there, not here):
 - **Use:** `sphere --help`
 
 > The old `npm run cli` script in `sphere-sdk` no longer works. See the CLI repo above for the
-> complete, up-to-date command reference (wallet, payments, messaging, invoicing).
+> complete, up-to-date command reference (wallet, payments, messaging).
