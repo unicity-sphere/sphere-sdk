@@ -34,7 +34,8 @@ async function initWallet() {
     oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' }, // public testnet2 key
   });
 
-  // Step 2: Wrap with wallet-api for v2 mailbox delivery and token storage
+  // Step 2: Attach the wallet-api transport config (REQUIRED — Sphere.init
+  //         throws INVALID_CONFIG without it; money rides the wallet-api vertical)
   const providers = createWalletApiProviders(base, {
     baseUrl: 'https://wallet-api.unicity.network',
     network: 'testnet2',
@@ -77,7 +78,7 @@ function useWallet() {
         oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' }, // public testnet2 key
       });
 
-      // Step 2: Wrap with wallet-api for v2 delivery
+      // Step 2: Attach the wallet-api transport config (REQUIRED — money rides the wallet-api vertical)
       const providers = createWalletApiProviders(base, {
         baseUrl: 'https://wallet-api.unicity.network',
         network: 'testnet2',
@@ -154,7 +155,7 @@ onMounted(async () => {
     oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' }, // public testnet2 key
   });
 
-  // Step 2: Wrap with wallet-api for v2 delivery
+  // Step 2: Attach the wallet-api transport config (REQUIRED — money rides the wallet-api vertical)
   const providers = createWalletApiProviders(base, {
     baseUrl: 'https://wallet-api.unicity.network',
     network: 'testnet2',
@@ -215,7 +216,7 @@ async function initWallet() {
     oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' }, // public testnet2 key
   });
 
-  // Step 2: Wrap with wallet-api for v2 delivery
+  // Step 2: Attach the wallet-api transport config (REQUIRED — money rides the wallet-api vertical)
   const providers = createWalletApiProviders(base, {
     baseUrl: 'https://wallet-api.unicity.network',
     network: 'testnet2',
@@ -245,17 +246,16 @@ export default function WalletPage() {
 
 ## Storage & Delivery
 
-The v2 SDK combines three storage mechanisms:
+Where the wallet's data lives:
 
 | Data | Storage | Persistence | Role |
 |------|---------|-------------|------|
-| Wallet (mnemonic, nametag) | `localStorage` | Per-domain, survives refresh | Local secret key |
-| Tokens (confirmed transfers) | `IndexedDB` | Per-domain, larger capacity | Token ledger |
-| Mailbox (recipient delivery) | Wallet API | Server-backed, cross-device | v2 certified transfer inbox |
+| Wallet (mnemonic, nametag) + payment journals (`pv2:*`) | `localStorage` / `IndexedDB` | Per-domain, survives refresh | Local secrets + durable payment state |
+| Token inventory + transfer intents + mailbox + history | Wallet API | Server-backed, cross-device | Custody + delivery + record |
 
 **SSR Note:** If `localStorage` is unavailable (SSR), an in-memory fallback is used.
 
-**Wallet-API Delivery:** The WalletApiMailboxProvider polls the wallet-api server for incoming certified transfers (on behalf of recipient nametags). This is the reference implementation of v2 token delivery — Nostr is messaging only, not the payment rail.
+**Wallet-API delivery:** incoming certified transfers land in your wallet-api mailbox; the SDK drains it continuously while running (wake WebSocket + poll) and verifies every token against the trust base before it enters the balance. Nostr is messaging only, not the payment rail.
 
 ## Configuration Options
 
@@ -296,7 +296,7 @@ const base = createBrowserProviders({
   },
 });
 
-// Step 2: Wrap with wallet-api for v2 mailbox delivery (REQUIRED for v2)
+// Step 2: Attach the wallet-api transport config (REQUIRED for money)
 const providers = createWalletApiProviders(base, {
   baseUrl: 'https://wallet-api.unicity.network', // Canonical testnet2 host
   network: 'testnet2',
@@ -326,7 +326,7 @@ console.log('Nametag:', identity?.nametag);           // @username
 
 ```typescript
 // Get assets with price data (price fields are null without PriceProvider)
-const assets = await sphere.payments.getAssets();
+const assets = await sphere.payments.assets();
 for (const asset of assets) {
   console.log(`${asset.symbol}: ${asset.totalAmount} (${asset.tokenCount} tokens)`);
   if (asset.fiatValueUsd != null) {
@@ -334,13 +334,12 @@ for (const asset of assets) {
   }
 }
 
-// Per-coin balances (synchronous, no price data)
-const balances = sphere.payments.getBalance();
+// Individual tokens (synchronous inventory view)
+const tokens = sphere.payments.tokens();
 
-// Total portfolio value in USD (null if PriceProvider not configured)
-const totalUsd = await sphere.payments.getFiatBalance();
-document.getElementById('balance').textContent =
-  totalUsd != null ? `$${totalUsd.toFixed(2)}` : 'N/A';
+// Total portfolio value in USD (price fields are null without PriceProvider)
+const totalUsd = assets.reduce((sum, a) => sum + (a.fiatValueUsd ?? 0), 0);
+document.getElementById('balance').textContent = `$${totalUsd.toFixed(2)}`;
 ```
 
 ### Top Up (Testnet Self-Mint)
@@ -350,9 +349,9 @@ There is no faucet — on testnet you top up by **self-minting** tokens via the 
 ```typescript
 import { TokenRegistry } from '@unicitylabs/sphere-sdk';
 
-// mintFungibleToken takes the hex coin id, not the symbol
+// mint takes the hex coin id, not the symbol
 const coinId = TokenRegistry.getInstance().getCoinIdBySymbol('UCT');
-const res = await sphere.payments.mintFungibleToken(coinId!, 100_000_000n);
+const res = await sphere.payments.mint(coinId!, 100_000_000n);
 if (res.success) {
   console.log('Minted token:', res.tokenId);
 } else {
@@ -430,11 +429,11 @@ const { transfers } = await sphere.payments.receive();
 console.log(`Received ${transfers.length} new transfers`);
 ```
 
-> The legacy `ReceiveOptions` (`finalize`, `timeout`, `pollInterval`) are deprecated **no-ops**: v2 transfers arrive as finished tokens and are stored confirmed immediately — there is no finalization phase.
+> `receive()` takes no options: transfers arrive as finished tokens, verified and stored confirmed immediately — there is no finalization phase. While the wallet runs, the mailbox is also drained automatically (you rarely need to call this).
 
 ### Register Nametag
 
-> **Note:** `registerNametag()` registers the name by publishing a Nostr identity binding (name ↔ chain pubkey, first-seen-wins). A self-issued v2 Unicity ID token is additionally minted and stored **best-effort** — registration never fails because of it. Runtime name resolution uses only the Nostr binding.
+> **Note:** `registerNametag()` registers the name by publishing a Nostr identity binding (name ↔ chain pubkey, first-seen-wins). Runtime name resolution uses only the Nostr binding.
 
 ```typescript
 async function registerNametag(username: string) {
@@ -477,166 +476,51 @@ sphere.on('connection:changed', (status) => {
 await sphere.communications.sendDM('@alice', 'Hello from the browser!');
 ```
 
-### Invoicing
+### Payment Requests
 
-> **⚠️ Experimental — not production-ready.** Invoicing/accounting is implemented and
-> unit-tested, but it has no live/e2e verification, is used by no shipped app, and is **not
-> enabled in the Sphere wallet** (nor supported over Connect). Treat the API as unstable.
-
-Enable the accounting module when initializing the wallet:
+Request payments over the wallet-api rail (`sphere.payments.requests`):
 
 ```typescript
-const { sphere } = await Sphere.init({
-  ...providers,
-  autoGenerate: true,
-  accounting: true,  // Enable with defaults
-});
-```
-
-**Create an invoice** (mints an invoice data token via the v2 token engine):
-
-```typescript
-const result = await sphere.accounting!.createInvoice({
-  targets: [
-    {
-      address: sphere.identity!.directAddress!,  // Pay to self (your DIRECT:// address)
-      assets: [
-        { coin: ['UCT', '5000000'] },             // Request 5 UCT (in smallest units)
-      ],
-    },
-  ],
+// Send a payment request (memo travels in an encrypted envelope)
+const result = await sphere.payments.requests.create('@bob', {
+  coinId: 'UCT',
+  amount: '1000000',
   memo: 'Order #1234',
-  dueDate: Date.now() + 7 * 24 * 60 * 60 * 1000, // Due in 7 days
 });
 
-console.log('Invoice ID:', result.invoiceId);
-```
-
-**Check invoice status:**
-
-```typescript
-const status = await sphere.accounting!.getInvoiceStatus(result.invoiceId!);
-// status.state: 'OPEN' | 'PARTIAL' | 'COVERED' | 'CLOSED' | 'CANCELLED' | 'EXPIRED'
-console.log('State:', status.state);
-```
-
-**Pay an invoice** (as the payer, after importing the invoice token):
-
-```typescript
-const transferResult = await sphere.accounting!.payInvoice(invoiceId, {
-  targetIndex: 0,  // Which target to pay (index into invoice.targets)
-  // amount: '5000000',  // Omit to pay the full remaining amount
+// Track outgoing request status
+sphere.on('payment_request:updated', ({ id, status }) => {
+  // 'pending' | 'settling' | 'paid' | 'rejected' | 'expired'
+  console.log(`Request ${id}: ${status}`);
 });
+
+// Handle incoming requests
+sphere.on('payment_request:incoming', async (request) => {
+  console.log(`${request.senderNametag} requests ${request.amount} ${request.symbol}`);
+  await sphere.payments.requests.pay(request.id);      // pay...
+  // await sphere.payments.requests.decline(request.id); // ...or decline
+});
+
+// Current views + housekeeping
+const requests = sphere.payments.requests.list();
+sphere.payments.requests.dismissProcessed();
 ```
 
-**Close an invoice** (only target parties may close):
+> Paying is crash-safe: a request is durably `settling` before any possibly-committed
+> error can surface, so a reload never double-pays.
+
+### Transaction History
+
+History is a server read-through, paged:
 
 ```typescript
-await sphere.accounting!.closeInvoice(invoiceId);
-```
-
-**List invoices:**
-
-```typescript
-const invoices = await sphere.accounting!.getInvoices({ createdByMe: true });
-for (const ref of invoices) {
-  console.log(ref.invoiceId, ref.terms.memo, ref.closed ? 'CLOSED' : 'OPEN');
+const page = await sphere.payments.history({ limit: 50 });
+for (const entry of page.entries) {
+  console.log(entry.type, entry.amount, entry.symbol, new Date(entry.timestamp));
 }
-```
-
-**Listen for invoice events:**
-
-```typescript
-sphere.on('invoice:payment', (data) => {
-  console.log(`Payment received for invoice ${data.invoiceId}`);
-});
-
-sphere.on('invoice:covered', (data) => {
-  console.log(`Invoice ${data.invoiceId} fully covered!`);
-});
-```
-
-> **Note:** `createInvoice()` requires the Oracle provider (v2 gateway config), which is included automatically by `createBrowserProviders()`.
-
-### Token Swaps
-
-The swap module enables trustless two-party token exchanges via an escrow service. Enable it when initializing:
-
-```typescript
-const { sphere } = await Sphere.init({
-  ...providers,
-  autoGenerate: true,
-  accounting: true,  // Required (swap uses invoices internally)
-  swap: true,        // Enable swap module
-});
-```
-
-**Propose a swap:**
-
-```typescript
-const result = await sphere.swap!.proposeSwap({
-  partyA: sphere.identity!.directAddress!,
-  partyB: '@bob',
-  partyACurrency: 'UCT',
-  partyAAmount: '1000000',
-  partyBCurrency: 'USDU',
-  partyBAmount: '500000',
-  timeout: 3600,
-  escrowAddress: '@escrow-testnet',
-});
-
-console.log('Swap ID:', result.swapId);
-// result.swap.progress === 'proposed'
-```
-
-**Listen for incoming proposals and accept:**
-
-```typescript
-sphere.on('swap:proposal_received', async (data) => {
-  console.log('Swap proposal from:', data.senderNametag ?? data.senderPubkey);
-  console.log('Deal:', data.deal);
-
-  // Accept and deposit
-  await sphere.swap!.acceptSwap(data.swapId);
-  await sphere.swap!.deposit(data.swapId);
-});
-```
-
-**Deposit into a swap (proposer side, after counterparty accepts):**
-
-```typescript
-sphere.on('swap:announced', async (data) => {
-  // Escrow is ready, deposit now
-  const transferResult = await sphere.swap!.deposit(data.swapId);
-  console.log('Deposit sent:', transferResult.id);
-});
-```
-
-**Monitor progress:**
-
-```typescript
-sphere.on('swap:completed', (data) => {
-  console.log('Swap completed!', data.swapId, 'Payout verified:', data.payoutVerified);
-});
-
-sphere.on('swap:cancelled', (data) => {
-  console.log('Swap cancelled:', data.swapId, 'Reason:', data.reason);
-});
-
-sphere.on('swap:failed', (data) => {
-  console.log('Swap failed:', data.swapId, data.error);
-});
-```
-
-**List and query swaps:**
-
-```typescript
-// All active swaps
-const swaps = sphere.swap!.getSwaps({ excludeTerminal: true });
-
-// Detailed status (optionally query the escrow for its view)
-const status = await sphere.swap!.getSwapStatus(swapId, { queryEscrow: true });
-console.log('Progress:', status.progress, 'Escrow state:', status.escrowState);
+if (page.more) {
+  const older = await sphere.payments.history({ before: page.cursor!, limit: 50 });
+}
 ```
 
 ## Import Existing Wallet
@@ -691,7 +575,7 @@ function WalletApp() {
         oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' },
       });
 
-      // Step 2: Wrap with wallet-api for v2 delivery
+      // Step 2: Attach the wallet-api transport config (REQUIRED — money rides the wallet-api vertical)
       const providers = createWalletApiProviders(base, {
         baseUrl: 'https://wallet-api.unicity.network',
         network: 'testnet2',
@@ -712,14 +596,16 @@ function WalletApp() {
       setSphere(sphere);
       setStatus('Connected');
 
-      // Load balance (total USD value, null if no PriceProvider)
-      const bal = await sphere.payments.getFiatBalance();
-      setBalance(bal != null ? `$${bal.toFixed(2)}` : 'N/A');
+      // Load balance (total USD value; price fields need a PriceProvider)
+      const sumFiat = async () => {
+        const assets = await sphere.payments.assets();
+        return assets.reduce((sum, a) => sum + (a.fiatValueUsd ?? 0), 0);
+      };
+      setBalance(`$${(await sumFiat()).toFixed(2)}`);
 
       // Listen for incoming
       sphere.on('transfer:incoming', async () => {
-        const newBal = await sphere.payments.getFiatBalance();
-        setBalance(newBal != null ? `$${newBal.toFixed(2)}` : 'N/A');
+        setBalance(`$${(await sumFiat()).toFixed(2)}`);
       });
     };
 
@@ -745,8 +631,8 @@ function WalletApp() {
       setAmount('');
 
       // Refresh balance
-      const bal = await sphere.payments.getFiatBalance();
-      setBalance(bal != null ? `$${bal.toFixed(2)}` : 'N/A');
+      const assets = await sphere.payments.assets();
+      setBalance(`$${assets.reduce((s, a) => s + (a.fiatValueUsd ?? 0), 0).toFixed(2)}`);
     } catch (err: any) {
       setStatus('Error: ' + err.message);
     }
@@ -866,11 +752,9 @@ if (created && generatedMnemonic) {
 // When user logs out
 await sphere.destroy();
 
-// Optionally clear all SDK-owned wallet data (keys + tokens)
-await Sphere.clear({
-  storage: providers.storage,
-  tokenStorage: providers.tokenStorage,
-});
+// Optionally clear all SDK-owned wallet data (keys + payment journals;
+// also sweeps orphaned pre-flip token databases)
+await Sphere.clear({ storage: providers.storage });
 ```
 
 ### Use HTTPS

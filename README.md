@@ -5,15 +5,12 @@ A modular TypeScript SDK for Unicity wallet operations (Unicity state transition
 ## Features
 
 - **Wallet Management** - BIP39/BIP32 key derivation; optional password encryption (PBKDF2)
-- **Payments** - Engine-certified token transfers, delivered via the **wallet-api mailbox** (`DeliveryProvider` port); concurrent-send safety (SpendQueue); self-healing coin selection
-- **Invoicing / Accounting** *(experimental — not production-ready, not enabled in the Sphere wallet)* - On-chain invoice lifecycle with payment attribution, auto-return, privacy-preserving hashed invoice IDs; invoices travel as v2 data-token blobs (hex strings) — `createInvoice()` returns the blob, `importInvoice()` accepts it
-- **Token Swaps** - P2P atomic swaps via escrow with DM-based negotiation protocol
-- **Payment Requests** - Request payments with async response tracking
+- **Payments** - Engine-certified token transfers over the **wallet-api vertical** (durable server-side intents, mailbox delivery, crash-safe resume under the same transferId); server custody — the backend holds inventory, keys stay local
+- **Payment Requests** - Request payments over the wallet-api rail with encrypted memos and durable settling
 - **Market (Intents)** - Signed intent bulletin board with semantic search and live feed
 - **Group Chat** - NIP-29 relay-based group messaging with moderation
-- **Messaging (Nostr)** - NIP-17 DMs + NIP-29 group chat and nametag publishing — **messaging only; not the v2 payment rail**
+- **Messaging (Nostr)** - NIP-17 DMs + NIP-29 group chat and nametag publishing — **messaging only; not the payment rail**
 - **Multi-Address** - HD address derivation (BIP32/BIP44)
-- **Token Validation** - Engine-based token verification (trust base + spent check via the v2 gateway)
 - **Connect Protocol** - dApp ↔ wallet communication via `ConnectClient` / `ConnectHost` (browser extension + popup)
 - **CLI** - Comprehensive command-line interface with shell auto-completion
 
@@ -47,11 +44,10 @@ See [docs/QUICKSTART-CLI.md](docs/QUICKSTART-CLI.md) for the full command refere
 
 ## Quick Start
 
-> **v2 setup is two provider layers, not one.** `createBrowserProviders` / `createNodeProviders`
-> build only the **base** (storage + transport + oracle). You **must** then add the wallet-api rails
-> with `createWalletApiProviders` — that is what gives the wallet its **delivery** (mailbox) and
-> **token-storage** ports. Skipping it does **not** error; you silently get a wallet that cannot send
-> or receive v2 transfers. This single step is what trips most integrators up.
+> **Setup is two provider layers, not one.** `createBrowserProviders` / `createNodeProviders`
+> build only the **base** (storage + transport + oracle). You **must** then attach the wallet-api
+> transport config with `createWalletApiProviders` — money moves only through the wallet-api
+> vertical. Skipping it fails loudly: `Sphere.init` throws `INVALID_CONFIG`.
 
 ```typescript
 import { Sphere } from '@unicitylabs/sphere-sdk';
@@ -65,8 +61,8 @@ const base = createBrowserProviders({
   oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' },   // public testnet2 key
 });
 
-// 2. Add the v2 wallet-api rails: mailbox delivery + server token storage + client.
-//    Returns { ...base, delivery, walletApi, tokenStorage }. THIS is the step v1 docs omitted.
+// 2. Attach the wallet-api transport config. Returns { ...base, walletApi } —
+//    a plain config object ({ network, baseUrl, deviceId?, ... }) that Sphere.init consumes.
 const providers = createWalletApiProviders(base, {
   baseUrl: 'https://wallet-api.unicity.network',   // your wallet-api deployment (testnet2)
   network: 'testnet2',
@@ -94,27 +90,27 @@ console.log(result.status);   // 'completed'
 // result.deliveryPending === true is NORMAL, not a failure: the token is certified on-chain but
 // the recipient's mailbox delivery was deferred and will land on retry (see "Send result" below).
 
-// 5. Receive — incoming transfers arrive automatically via the delivery port (background poll +
-//    wake). To drain explicitly (e.g. a CLI/batch app), call receive():
-const { transfers } = await sphere.payments.receive(undefined, (t) => {
-  console.log('received', t.amount, t.coinId);
-});
+// 5. Receive — incoming transfers land automatically while the wallet runs (mailbox drain +
+//    wake socket). To drain explicitly (e.g. a CLI/batch app), call receive():
+const { transfers } = await sphere.payments.receive();
+sphere.on('transfer:incoming', (t) => console.log('received from', t.senderNametag));
 
-console.log(await sphere.payments.getAssets());
+console.log(await sphere.payments.assets());
 ```
 
 ### What just happened (the provider model)
 
-A v2 wallet is composed from **swappable ports**, layered in two steps:
+A wallet is composed from **swappable ports**, layered in two steps:
 
-| Layer | Built by | Ports it supplies |
+| Layer | Built by | What it supplies |
 |-------|----------|-------------------|
-| **Base** | `createBrowserProviders` / `createNodeProviders` | `storage` (wallet state), `transport` (Nostr — **messaging/nametags only**), `oracle` (gateway/trust base) |
-| **wallet-api rails** | `createWalletApiProviders(base, …)` | `delivery` (mailbox), `walletApi` (REST client), `tokenStorage` (server inventory) |
+| **Base** | `createBrowserProviders` / `createNodeProviders` | `storage` (keys/identity/journals), `transport` (Nostr — **messaging/nametags only**), `oracle` (gateway/trust base) |
+| **wallet-api transport** | `createWalletApiProviders(base, …)` | `walletApi` — the transport CONFIG (`{ network, baseUrl, deviceId?, fetchFn?, webSocketFactory?, paymentsV2Transport? }`) the payments vertical is composed from |
 
-- **Delivery is a port, not Nostr.** In v2, transfers are certified on-chain by the token engine and the finished token is delivered through the **wallet-api mailbox** (`WalletApiMailboxProvider`). Nostr carries messaging/nametags — **it does not move payments.**
-- **Custody.** `createWalletApiProviders` uses server custody (`'inventory'`): the wallet-api holds your token inventory. For **own-custody** (your app keeps token storage, wallet-api is delivery-only), swap in `createOwnStorageWalletApiProviders` (custody `'external'`).
-- **`network` placement.** Required on `createBrowserProviders`/`createNodeProviders` (throws `INVALID_CONFIG` if absent); optional/informational on `Sphere.init`.
+- **The rail is wallet-api, not Nostr.** Transfers are certified on-chain by the token engine and the finished token is deposited into the recipient's **wallet-api mailbox**. Nostr carries messaging/nametags — **it does not move payments.**
+- **Custody is server-side.** The wallet-api backend holds your token inventory; your keys never leave the client. (Own-storage custody was rescinded — there is no local token store.)
+- **The money ports are contract-enforced.** `StoragePort`/`DeliveryPort` (`modules/payments-v2/ports.ts`) have wallet-api implementations; the `paymentsV2Transport` seam in the `walletApi` config lets tests/custom hosts inject a whole replacement bundle.
+- **`network` placement.** Required on `createBrowserProviders`/`createNodeProviders` AND in the `walletApi` config (init throws `INVALID_CONFIG` without either); optional/informational on `Sphere.init`.
 
 For manual/advanced provider wiring, see [Custom Providers Configuration](#custom-providers-configuration). For the deeper integration guide, see [docs/INTEGRATION.md](docs/INTEGRATION.md).
 
@@ -135,7 +131,7 @@ Treat `status === 'completed'` as sent. Use `deliveryPending` only to show a "de
 `send()` throws for genuine failures (`INVALID_RECIPIENT`, insufficient balance, a `TransferConflictError` lost race) **and** for one *indeterminate* case you must handle specially: a **`ProofUnconfirmedError`** (`code: 'CERTIFICATION_UNCONFIRMED'`, `mayHaveCertified: true`). It means the spend **may already be on-chain** but the proof fetch was inconclusive — the SDK keeps the intent **open** and completes it later under the **same `transferId`**.
 
 - ⚠️ **Never re-issue `send()` on `CERTIFICATION_UNCONFIRMED`.** A fresh `send()` mints a new `transferId` on a *different* source, so the original resumes **and** the retry sends → **the recipient is double-paid.** Treat it as *"sent, pending confirmation."*
-- **Recovery is `resumeOpenIntents()`** — it replays the open intent under the same `transferId` (recovers the proof + delivery, or records the spend if a rival tx won; **never a second spend**). It runs automatically at **session start** (`Sphere.init` / `Sphere.load` / re-sign-in). A **long-running bot** that doesn't re-init should call `sphere.payments.resumeOpenIntents()` on startup and periodically — it returns `{ resumed, conflicted, failed }`.
+- **Recovery is automatic.** The open intent is replayed under the same `transferId` (recovers the proof + delivery, or records the spend if a rival tx won; **never a second spend**): partially-committed outcomes converge in-process, and every remaining open intent is resumed when the vertical starts (`Sphere.init` / `Sphere.load` / an address switch). There is no public resume API to call.
 
 ```ts
 import { isSphereError } from '@unicitylabs/sphere-sdk';
@@ -145,15 +141,12 @@ try {
   // result.status === 'completed' (or result.deliveryPending === true) → sent
 } catch (err) {
   if (isSphereError(err) && err.code === 'CERTIFICATION_UNCONFIRMED') {
-    // Possibly already sent on-chain — DO NOT re-send. Resume finishes it
-    // (auto at next sign-in, or: await sphere.payments.resumeOpenIntents()).
+    // Possibly already sent on-chain — DO NOT re-send. Resume finishes it.
   } else {
     // genuine failure — safe to surface to the user / retry
   }
 }
 ```
-
-> `transferMode` on `TransferRequest` is **deprecated** — accepted for backwards-compat but ignored (v2 has a single engine-driven path).
 
 ## Network Configuration
 
@@ -166,7 +159,7 @@ The SDK ships network presets that configure all services automatically. `networ
 | `mainnet` | aggregator.unicity.network (v1-era) | relay.unicity.network (+ public relays) |
 | `dev` | dev-aggregator.dyndns.org (v1-era) | nostr-relay.testnet.unicity.network |
 
-> **v1 → v2 cutover:** `testnet` now points at **testnet2**, the v2 state-transition gateway network (network id 4, taken from the trust base; own testnet2 token registry). The old `goggregator-test` testnet spoke the removed v1 protocol and is gone. `mainnet` and `dev` still point at v1-era aggregators — wallet operations that move money (`send`, `mintFungibleToken`, invoices) **fail loudly** (`AGGREGATOR_ERROR`) on those networks until their gateways are cut over to the v2 protocol. The only supported transfer wire payload is the finished v2 token blob — incoming v1-era payloads are dropped with an explicit error log, so peers must run a >= 0.8 wallet to send to this wallet.
+> **v1 → v2 cutover:** `testnet` now points at **testnet2**, the v2 state-transition gateway network (network id 4, taken from the trust base; own testnet2 token registry). The old `goggregator-test` testnet spoke the removed v1 protocol and is gone. `mainnet` and `dev` still point at v1-era aggregators — wallet operations that move money (`send`, `mint`) **fail loudly** (`AGGREGATOR_ERROR`) on those networks until their gateways are cut over to the v2 protocol. The transfer wire payload is the finished v2 token blob (raw `Token.toCBOR()`), deposited into the recipient's wallet-api mailbox.
 
 ```typescript
 // Use testnet for all services
@@ -227,18 +220,17 @@ const providers = createBrowserProviders({
 
 const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
 
-// Total portfolio value in USD
-const totalUsd = await sphere.payments.getFiatBalance();
-// 1523.45
-
 // Assets with price data
-const assets = await sphere.payments.getAssets();
+const assets = await sphere.payments.assets();
 // [{ coinId, symbol, totalAmount, priceUsd: 97500, fiatValueUsd: 975.00, change24h: 2.3, ... }]
+
+// Total portfolio value in USD
+const totalUsd = assets.reduce((sum, a) => sum + (a.fiatValueUsd ?? 0), 0);
 ```
 
-Without `price` config, `getFiatBalance()` returns `null` and price fields in `getAssets()` are `null`. All other functionality works normally. (`getBalance()` is the synchronous per-coin balance accessor — it returns `Asset[]` without price data.)
+Without `price` config, the price fields in `assets()` are `null`. All other functionality works normally.
 
-You can also set the price provider after initialization:
+You can also set the price provider after initialization — price is a composition-time property of the payments vertical, so verticals composed after the call (the next address switch) pick it up:
 
 ```typescript
 import { createPriceProvider } from '@unicitylabs/sphere-sdk';
@@ -251,7 +243,7 @@ sphere.setPriceProvider(createPriceProvider({
 
 ## Test Tokens on Testnet (Self-Mint)
 
-There is no faucet. On testnet you top up your wallet by **self-minting** fungible tokens via the v2 token engine — `mintFungibleToken(coinIdHex, amount)` mints a finished token directly to this wallet:
+There is no faucet. On testnet you top up your wallet by **self-minting** fungible tokens via the v2 token engine — `mint(coinIdHex, amount)` mints a finished token directly to this wallet (journal-first: crash-safe, a replay converges idempotently):
 
 ```typescript
 import { getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
@@ -259,7 +251,7 @@ import { getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
 // Resolve the coin's hex id from the token registry (or pass a hex coinId directly)
 const coinId = getCoinIdBySymbol('UCT');
 
-const result = await sphere.payments.mintFungibleToken(coinId!, 1000n);
+const result = await sphere.payments.mint(coinId!, 1000n);
 if (result.success) {
   console.log('Minted token:', result.tokenId);
 } else {
@@ -336,39 +328,36 @@ sphere.on('nametag:recovered', (event) => {
 
 ## Payment Requests
 
-Request payments from others with response tracking:
+Request payments from others over the wallet-api rail (`sphere.payments.requests`). Request memos ride an encrypted recipient-ECDH envelope; a `pay()` is durably `settling` before any possibly-committed error can surface, so a crash never double-pays:
 
 ```typescript
-// Send payment request
-const result = await sphere.payments.sendPaymentRequest('@bob', {
-  amount: '1000000',
+// Send a payment request
+const result = await sphere.payments.requests.create('@bob', {
   coinId: 'UCT',
-  message: 'Payment for order #1234',
+  amount: '1000000',
+  memo: 'Payment for order #1234',
 });
 
-// Wait for response (with 2 minute timeout)
-if (result.success) {
-  const response = await sphere.payments.waitForPaymentResponse(result.requestId!, 120000);
-  if (response.responseType === 'paid') {
-    console.log('Payment received! Transfer:', response.transferId);
-  }
-}
-
-// Or subscribe to responses
-sphere.payments.onPaymentRequestResponse((response) => {
-  console.log(`Response: ${response.responseType}`);
+// Track status via the event stream
+sphere.on('payment_request:updated', ({ id, status }) => {
+  // status: 'pending' | 'settling' | 'paid' | 'rejected' | 'expired'
+  if (id === result.requestId && status === 'paid') console.log('Payment received!');
 });
 
 // Handle incoming payment requests
-sphere.payments.onPaymentRequest((request) => {
+sphere.on('payment_request:incoming', async (request) => {
   console.log(`${request.senderNametag} requests ${request.amount} ${request.symbol}`);
 
   // Accept and pay
-  await sphere.payments.payPaymentRequest(request.id);
+  await sphere.payments.requests.pay(request.id);
 
-  // Or reject
-  await sphere.payments.rejectPaymentRequest(request.id);
+  // Or decline (a server 403/409 propagates — a refused decline is not success)
+  await sphere.payments.requests.decline(request.id);
 });
+
+// Current views + housekeeping
+const open = sphere.payments.requests.list();
+sphere.payments.requests.dismissProcessed();
 ```
 
 ## Group Chat (NIP-29)
@@ -614,10 +603,17 @@ const oracle = createUnicityAggregatorProvider({
   network: 'testnet',
 });
 
+// The wallet-api transport config — REQUIRED for money (init throws INVALID_CONFIG without it)
+const walletApi = {
+  network: 'testnet2',
+  baseUrl: 'https://wallet-api.unicity.network',
+  deviceId: 'my-device',
+};
+
 // Check if wallet exists
 if (await Sphere.exists(storage)) {
   // Load existing wallet
-  const sphere = await Sphere.load({ storage, transport, oracle });
+  const sphere = await Sphere.load({ storage, transport, oracle, walletApi });
 } else {
   // Create new wallet with mnemonic
   const mnemonic = Sphere.generateMnemonic();
@@ -626,6 +622,7 @@ if (await Sphere.exists(storage)) {
     storage,
     transport,
     oracle,
+    walletApi,
   });
   console.log('Save this mnemonic:', mnemonic);
 }
@@ -642,14 +639,14 @@ const sphere = await Sphere.import({
   chainCode: '64-hex-chars-chain-code',
   basePath: "m/84'/1'/0'",  // BIP84 account path
   derivationMode: 'bip32',
-  storage, transport, oracle,
+  storage, transport, oracle, walletApi,
 });
 
 // Import from master key only (WIF HMAC mode)
 const sphere = await Sphere.import({
   masterKey: '64-hex-chars-master-private-key',
   derivationMode: 'wif_hmac',
-  storage, transport, oracle,
+  storage, transport, oracle, walletApi,
 });
 ```
 
@@ -723,26 +720,9 @@ import {
 } from '@unicitylabs/sphere-sdk';
 ```
 
-## Token storage format
+## Token format & verification
 
-Tokens persist as opaque **v2 CBOR blob hex** in `Token.sdkData`. The storage
-document around them (the `_meta` / `_nametags` / `_tombstones` / `_history`
-envelope) is built and parsed by:
-
-```typescript
-import { buildTxfStorageData, parseTxfStorageData } from '@unicitylabs/sphere-sdk';
-```
-
-## Token Validation
-
-Post v2-cutover, token verification goes through the token engine (structural validity via `engine.verify`, spent status via `engine.isSpent`). For applications, the supported entry point is the wallet itself:
-
-```typescript
-// Validate all wallet tokens against the network
-const { valid, invalid } = await sphere.payments.validate();
-```
-
-A standalone `TokenValidator` also exists (`createTokenValidator(engine)`, exported from the SDK root) for advanced use. It operates on engine-level `SphereToken` objects and requires an `ITokenEngine` instance — the engine the wallet builds internally from the oracle's trust base + gateway config; there is currently no public factory entry point to construct one yourself.
+Tokens are opaque **v2 CBOR blobs** (`Token.sdkData` carries the hex when a blob is loaded). Inventory lives in the wallet-api backend; the SDK downloads blobs on demand (lazy tokens carry value metadata only until selected for a spend). Every incoming token is engine-verified (full trust-base proof check) and ownership-checked **before it enters the balance** — there is no separate validate step to run.
 
 ## Architecture
 
@@ -768,12 +748,17 @@ mnemonic → master key → BIP32 derivation → identity
 ```
 Sphere (main entry point)
 ├── identity       - Wallet identity (address, publicKey, nametag)
-├── payments       - Token operations
-├── accounting     - Invoice lifecycle (via sphere.accounting)
-├── swap           - P2P token swaps (via sphere.swap)
+├── payments       - The payments facade: assets/tokens/history/send/mint/receive/requests
 ├── market         - Intent bulletin board (via sphere.market)
 ├── groupChat      - NIP-29 group messaging (via sphere.groupChat)
 └── communications - Direct messages & broadcasts
+
+Payments vertical (modules/payments-v2/ — docs/PAYMENTS-V2-DESIGN.md)
+└── PaymentsFacade over swappable money ports (StoragePort / DeliveryPort,
+    contract-test-enforced) + TransferMachine (durable server-side intents,
+    resume under the same transferId) + receive drain (verified before
+    balance) + requests + paged history. Composed per address from the
+    `walletApi` transport config (core/payments-v2-wiring.ts).
 
 Token Engine (token-engine/)
 └── The wallet's boundary to the v2 state-transition SDK: all mint /
@@ -782,18 +767,18 @@ Token Engine (token-engine/)
     (trust base JSON + gateway URL + API key); no state-transition SDK
     objects cross this boundary.
 
-Providers (injectable ports)
-├── StorageProvider      - Wallet-state key-value persistence
+Providers (injectable)
+├── StorageProvider      - Key-value persistence: keys/identity + the pv2:* scoped KV
 ├── TransportProvider    - Messaging (Nostr) — NOT the payment rail
 ├── OracleProvider       - Token-engine config (trust base JSON + gateway URL + API key)
-├── DeliveryProvider     - v2 transfer delivery (wallet-api mailbox — WalletApiMailboxProvider)
-└── TokenStorageProvider - Token inventory (wallet-api server custody, or own/local storage)
+└── walletApi (config)   - WalletApiTransportConfig — the wallet-api wire the
+                           money ports are composed from (not a provider object)
 
 Implementation (platform-specific)
 ├── impl/shared/            - Common interfaces & resolvers
-├── impl/shared/wallet-api/ - the v2 rails (REQUIRED for delivery):
-│   ├── WalletApiMailboxProvider / WalletApiTokenStorageProvider
-│   └── createWalletApiProviders() / createOwnStorageWalletApiProviders()
+├── impl/shared/wallet-api/ - createWalletApiProviders() → { ...base, walletApi }
+├── impl/wallet-api-v2/     - The wallet-api wire: session (auth + wake WS), client,
+│                             storage/mailbox/checkpoint port implementations
 ├── impl/browser/        - Browser base: LocalStorage/IndexedDB + createBrowserProviders()
 └── impl/nodejs/         - Node.js base: File storage + createNodeProviders()
 
@@ -876,16 +861,16 @@ For CLI and server applications:
 ```typescript
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
 
 // Quick start with testnet
 const providers = createNodeProviders({
   network: 'testnet',
   dataDir: './wallet-data',
-  tokensDir: './tokens',
 });
 
 const { sphere } = await Sphere.init({
-  ...providers,
+  ...createWalletApiProviders(providers, { baseUrl: 'https://wallet-api.unicity.network', network: 'testnet2' }),
   autoGenerate: true,
 });
 
@@ -893,7 +878,6 @@ const { sphere } = await Sphere.init({
 const providers = createNodeProviders({
   network: 'testnet',
   dataDir: './wallet-data',
-  tokensDir: './tokens',
   transport: {
     additionalRelays: ['wss://my-relay.com'],
     timeout: 10000,
@@ -911,16 +895,12 @@ const providers = createNodeProviders({
 ```typescript
 import {
   FileStorageProvider,
-  FileTokenStorageProvider,
   createNostrTransportProvider,
   createNodeTrustBaseLoader,
 } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
-// File-based wallet storage
+// File-based wallet storage (keys/identity/journals — tokens are server custody)
 const storage = new FileStorageProvider('./wallet-data');
-
-// File-based token storage (TXF format)
-const tokenStorage = new FileTokenStorageProvider('./tokens');
 
 // Nostr with Node.js WebSocket
 const transport = createNostrTransportProvider({
@@ -995,109 +975,16 @@ const providers = createBrowserProviders({
 ```
 
 
-## Custom Token Storage Provider
+## Custom Money Transport (Advanced)
 
-You can implement your own `TokenStorageProvider` for custom storage backends:
+Token custody is the wallet-api backend — there is no local token store to swap. What IS swappable is the money transport: the `paymentsV2Transport` seam in the `walletApi` config injects a whole per-address bundle (session + wire client) in place of the default HTTP+WebSocket wire. This is how the SDK's own offline test suites run. The port contracts live in `modules/payments-v2/ports.ts` (`StoragePort`, `DeliveryPort`) with conformance suites under `tests/unit/payments-v2/contracts/`.
 
 ```typescript
-import type { TokenStorageProvider, TxfStorageDataBase, SaveResult, LoadResult, SyncResult } from '@unicitylabs/sphere-sdk/storage';
-import type { FullIdentity, ProviderStatus } from '@unicitylabs/sphere-sdk/types';
-
-class MyCustomStorageProvider implements TokenStorageProvider<TxfStorageDataBase> {
-  readonly id = 'my-storage';
-  readonly name = 'My Custom Storage';
-  readonly type = 'remote' as const;
-
-  private status: ProviderStatus = 'disconnected';
-  private identity: FullIdentity | null = null;
-
-  setIdentity(identity: FullIdentity): void {
-    this.identity = identity;
-  }
-
-  async initialize(): Promise<boolean> {
-    // Connect to your storage backend
-    this.status = 'connected';
-    return true;
-  }
-
-  async shutdown(): Promise<void> {
-    this.status = 'disconnected';
-  }
-
-  async connect(): Promise<void> {
-    await this.initialize();
-  }
-
-  async disconnect(): Promise<void> {
-    await this.shutdown();
-  }
-
-  isConnected(): boolean {
-    return this.status === 'connected';
-  }
-
-  getStatus(): ProviderStatus {
-    return this.status;
-  }
-
-  async load(): Promise<LoadResult<TxfStorageDataBase>> {
-    // Load tokens from your storage
-    return {
-      success: true,
-      data: { _meta: { version: 1, address: this.identity?.chainPubkey ?? '', formatVersion: '2.0', updatedAt: Date.now() } },
-      source: 'remote',
-      timestamp: Date.now(),
-    };
-  }
-
-  async save(data: TxfStorageDataBase): Promise<SaveResult> {
-    // Save tokens to your storage
-    return { success: true, timestamp: Date.now() };
-  }
-
-  async sync(localData: TxfStorageDataBase): Promise<SyncResult<TxfStorageDataBase>> {
-    // Merge local and remote data
-    await this.save(localData);
-    return { success: true, merged: localData, added: 0, removed: 0, conflicts: 0 };
-  }
-}
-
-// Use your custom provider
-const myProvider = new MyCustomStorageProvider();
-
-const { sphere } = await Sphere.init({
-  ...providers,
-  tokenStorage: myProvider,
-  autoGenerate: true,
+const providers = createWalletApiProviders(base, {
+  network: 'testnet2',
+  // Instead of baseUrl — supply the transport yourself:
+  paymentsV2Transport: (args) => myTransportBundle(args), // { session, client }
 });
-```
-
-## Dynamic Provider Management (Runtime)
-
-After `Sphere.init()` is called, you can add/remove token storage providers dynamically:
-
-```typescript
-// Add a token storage provider at runtime — any TokenStorageProvider
-// implementation (the interface is documented in docs/API.md).
-await sphere.addTokenStorageProvider(myTokenStorageProvider);
-
-// Provider is now active and will be used in sync operations
-
-// Check if provider exists
-if (sphere.hasTokenStorageProvider(myTokenStorageProvider.id)) {
-  console.log('provider is active');
-}
-
-// Get all active providers
-const providers = sphere.getTokenStorageProviders();
-console.log('Active providers:', Array.from(providers.keys()));
-
-// Remove a provider
-await sphere.removeTokenStorageProvider(myTokenStorageProvider.id);
-
-// Flush token state to all active providers
-await sphere.payments.sync();
 ```
 
 ## Dynamic Relay Management

@@ -1,5 +1,10 @@
 # PaymentsModule.ts — Analysis Findings
 
+> **HISTORICAL — describes the pre-P11 module.** The P11 flip DELETED
+> `modules/payments/` wholesale; the money path is now `modules/payments-v2/`
+> (see `docs/PAYMENTS-V2-DESIGN.md`). Kept as the record the rewrite was
+> justified from.
+
 > **Superseded in part — read as a record, not as current guidance.** Written before
 > the work landed, so its file:line references and "largely dead" verdicts describe a
 > tree that no longer exists: #715/#719 restructured the send and resume paths, #722
