@@ -30,7 +30,6 @@ const __dirname = path.dirname(__filename);
 
 const TEST_DIR = path.join(__dirname, '.test-wallet-password');
 const DATA_DIR = path.join(TEST_DIR, 'data');
-const TOKENS_DIR = path.join(TEST_DIR, 'tokens');
 
 const TEST_MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 const TEST_PASSWORD = 'my-secret-password';

@@ -8,7 +8,7 @@
 
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
-import type { SphereEventType, SphereEventHandler } from '../../types';
+import type { SphereEventType } from '../../types';
 import type {
   ConnectTransport,
   ConnectSession,
