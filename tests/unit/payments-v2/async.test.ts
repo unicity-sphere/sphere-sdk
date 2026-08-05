@@ -5,16 +5,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { SerialChain, SingleFlight } from '../../../modules/payments-v2/async';
-
-function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } {
-  let resolve!: (v: T) => void;
-  let reject!: (e: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
+import { deferred } from './support';
 
 describe('SingleFlight', () => {
   it('coalesces concurrent calls onto ONE run and returns the same promise', async () => {

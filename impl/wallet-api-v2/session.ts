@@ -2,75 +2,18 @@
 // challenge-template verification, wake-socket supervisor, epoch latch.
 
 import { STORE_KEYS, type ScopedKV } from '../../modules/payments-v2/stores';
+import { verifyChallengeTemplate } from '../../core/wallet-api-protocol';
 import { WalletApiHttpError } from './http';
 import type { AuthTokensWire, WalletApiV2Client } from './client';
 
-export const AUTH_CHALLENGE_PREFIX = 'unicity:wallet-api:auth:v1\n';
-const MAX_CHALLENGE_WINDOW_MS = 60 * 60 * 1000;
-
-export class ChallengeTemplateError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'ChallengeTemplateError';
-  }
-}
-
-export interface ChallengeExpectation {
-  pubkey: string;
-  nonce: string;
-  network: string;
-}
-
-function parseChallengeFields(body: string): Record<string, string> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    throw new ChallengeTemplateError('challenge body is not the single-line JSON object the backend emits');
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new ChallengeTemplateError('challenge body must be a JSON object');
-  }
-  const fields: Record<string, string> = {};
-  for (const [key, value] of Object.entries(parsed)) {
-    if (typeof value !== 'string' || value === '') {
-      throw new ChallengeTemplateError(`challenge field "${key}" must be a non-empty string`);
-    }
-    fields[key] = value;
-  }
-  return fields;
-}
-
-function requireChallengeField(fields: Record<string, string>, key: string): string {
-  const value = fields[key];
-  if (value === undefined) throw new ChallengeTemplateError(`challenge is missing the "${key}" field`);
-  return value;
-}
-
-/** The spend key never signs unverified server text — throws on ANY violation. */
-export function verifyChallengeTemplate(challenge: string, expect: ChallengeExpectation): void {
-  if (!challenge.startsWith(AUTH_CHALLENGE_PREFIX)) {
-    throw new ChallengeTemplateError('challenge does not start with the unicity:wallet-api:auth:v1 prefix');
-  }
-  const fields = parseChallengeFields(challenge.slice(AUTH_CHALLENGE_PREFIX.length));
-  if (requireChallengeField(fields, 'pubkey').toLowerCase() !== expect.pubkey.toLowerCase()) {
-    throw new ChallengeTemplateError('challenge embeds a different pubkey than this wallet');
-  }
-  if (requireChallengeField(fields, 'nonce') !== expect.nonce) {
-    throw new ChallengeTemplateError('challenge nonce does not echo the nonce issued with it');
-  }
-  if (requireChallengeField(fields, 'network') !== expect.network) {
-    throw new ChallengeTemplateError('challenge is for a different network than this session');
-  }
-  const issuedAt = Date.parse(requireChallengeField(fields, 'issuedAt'));
-  const expiresAt = Date.parse(requireChallengeField(fields, 'expiresAt'));
-  if (Number.isNaN(issuedAt) || Number.isNaN(expiresAt)) {
-    throw new ChallengeTemplateError('challenge timestamps are not parseable');
-  }
-  if (expiresAt <= issuedAt || expiresAt - issuedAt > MAX_CHALLENGE_WINDOW_MS) {
-    throw new ChallengeTemplateError('challenge validity window is implausible');
-  }
-}
+// The spend key never signs unverified server text (S1/§4) — the canonical
+// verifier is the ONE source; re-exported so existing importers keep working.
+export {
+  AUTH_CHALLENGE_PREFIX,
+  ChallengeTemplateError,
+  verifyChallengeTemplate,
+  type ChallengeExpectation,
+} from '../../core/wallet-api-protocol';
 
 /**
  * The JWT generation cell (#692 F8/F14). Every write is a compare-and-swap on

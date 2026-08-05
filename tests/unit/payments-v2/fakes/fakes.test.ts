@@ -34,18 +34,13 @@ import {
   TokenType,
 } from '../../../../token-engine/sdk';
 import { createTestEngine } from '../../token-engine/test-engine';
+import { freshHex } from '../support';
 
 const NET = 'testnet2';
 const A: FakeCaller = { chainPubkey: `02${'aa'.repeat(32)}`, network: NET };
 const B: FakeCaller = { chainPubkey: `02${'bb'.repeat(32)}`, network: NET };
 const C: FakeCaller = { chainPubkey: `02${'cc'.repeat(32)}`, network: NET };
 const COIN = 'f0'.repeat(32);
-
-let hexCounter = 0;
-function freshHex(): string {
-  hexCounter += 1;
-  return hexCounter.toString(16).padStart(8, '0').repeat(8);
-}
 
 function makeMeta(partial: Partial<FakeBlobMeta> & { ownerPubkey: string }): FakeBlobMeta {
   return {

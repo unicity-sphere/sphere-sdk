@@ -21,11 +21,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { secp256k1 } from '@noble/curves/secp256k1.js';
 
 import { Sphere, type SphereWalletApiSession } from '../../core/Sphere';
 import { SphereError } from '../../core/errors';
-import { hexToBytes } from '../../core/crypto';
+import { getPublicKey, hexToBytes } from '../../core/crypto';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { TRUSTBASE_TESTNET2 } from '../../assets/trustbase';
 import type { TransportProvider } from '../../transport';
@@ -39,17 +38,13 @@ import type {
   PaymentsV2WireClient,
 } from '../../core/payments-v2-wiring';
 import { RealizationEngine, fakeDecodeBlobFor } from '../unit/payments-v2/machine-harness';
+import { FakeSession } from '../unit/payments-v2/support';
 import { FakeWalletApi, sha256Hex, type FakeCaller } from '../unit/payments-v2/fakes/FakeWalletApi';
 import { FakeWalletApiV2Client } from '../unit/payments-v2/fakes/fake-client';
 
 const MNEMONIC = 'test test test test test test test test test test test junk';
 const NET = 'testnet2';
 const COIN = 'aa'.repeat(32);
-
-function pubOf(privHex: string): string {
-  const bytes = secp256k1.getPublicKey(Uint8Array.from(Buffer.from(privHex, 'hex')), true);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-}
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -103,30 +98,6 @@ function createEngineOracle(): OracleProvider {
   } as unknown as OracleProvider;
 }
 
-class FakeSession {
-  private readonly handlers = new Map<string, Set<() => void>>();
-  startCalls = 0;
-  stopCalls = 0;
-  async start(): Promise<void> {
-    this.startCalls += 1;
-  }
-  async stop(): Promise<void> {
-    this.stopCalls += 1;
-  }
-  subscribeStream(stream: 'inventory' | 'mailbox' | 'payment_requests', handler: () => void): () => void {
-    let set = this.handlers.get(stream);
-    if (!set) {
-      set = new Set();
-      this.handlers.set(stream, set);
-    }
-    set.add(handler);
-    return () => set!.delete(handler);
-  }
-  fire(stream: string): void {
-    for (const handler of this.handlers.get(stream) ?? []) handler();
-  }
-}
-
 interface Gates {
   listMailbox?: () => Promise<void>;
 }
@@ -169,7 +140,7 @@ interface TransportRecord {
 
 /** One in-process wallet-api world + the documented `paymentsV2Transport` seam. */
 function makeWorld() {
-  const realization = new RealizationEngine({ chainPubkey: hexToBytes(pubOf('11'.repeat(32))) });
+  const realization = new RealizationEngine({ chainPubkey: hexToBytes(getPublicKey('11'.repeat(32))) });
   const decodeBlob = fakeDecodeBlobFor(realization);
   const api = new FakeWalletApi({ decodeBlob });
   const transports: TransportRecord[] = [];

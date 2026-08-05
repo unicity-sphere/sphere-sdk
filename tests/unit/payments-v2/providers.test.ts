@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { secp256k1 } from '@noble/curves/secp256k1.js';
-
+import { getPublicKey } from '../../../core/crypto';
 import {
   DeltaConflictError,
   WalletApiStoragePort,
@@ -43,43 +42,17 @@ import {
   type DeliveryBlobOptions,
   type DeliveryPortHarness,
 } from './contracts/delivery-port.contract';
+import { freshHex, memoryKV } from './support';
 
 const NET = 'testnet2';
 const OWNER_PRIV = '11'.repeat(32);
 const SENDER_PRIV = '22'.repeat(32);
 
-function pubOf(privHex: string): string {
-  const bytes = secp256k1.getPublicKey(Uint8Array.from(Buffer.from(privHex, 'hex')), true);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-const OWNER_PUB = pubOf(OWNER_PRIV);
-const SENDER_PUB = pubOf(SENDER_PRIV);
+const OWNER_PUB = getPublicKey(OWNER_PRIV);
+const SENDER_PUB = getPublicKey(SENDER_PRIV);
 const OWNER: FakeCaller = { chainPubkey: OWNER_PUB, network: NET };
 const SENDER: FakeCaller = { chainPubkey: SENDER_PUB, network: NET };
 const COIN = 'f0'.repeat(32);
-
-function memKV(): ScopedKV {
-  const map = new Map<string, string>();
-  return {
-    async get<T>(key: string): Promise<T | null> {
-      const raw = map.get(key);
-      return raw === undefined ? null : (JSON.parse(raw) as T);
-    },
-    async set<T>(key: string, value: T): Promise<void> {
-      map.set(key, JSON.stringify(value));
-    },
-    async remove(key: string): Promise<void> {
-      map.delete(key);
-    },
-  };
-}
-
-let uniq = 0;
-function freshHex(): string {
-  uniq += 1;
-  return uniq.toString(16).padStart(8, '0').repeat(8);
-}
 
 interface FabricateOptions extends StorageBlobOptions, DeliveryBlobOptions {}
 
@@ -115,7 +88,7 @@ function storageHarness(): StoragePortHarness {
 
 function deliveryHarness(): DeliveryPortHarness {
   const fake = new FakeWalletApi();
-  const ownerKV = memKV();
+  const ownerKV = memoryKV();
   const storage = new WalletApiStoragePort(new FakeWalletApiV2Client(fake, OWNER));
   const makePort = ({ bound = true }: { bound?: boolean } = {}): WalletApiDeliveryPort => {
     const port = new WalletApiDeliveryPort({
@@ -129,7 +102,7 @@ function deliveryHarness(): DeliveryPortHarness {
   };
   const counterpartyPort = new WalletApiDeliveryPort({
     client: new FakeWalletApiV2Client(fake, SENDER),
-    kv: memKV(),
+    kv: memoryKV(),
     identity: { privateKey: SENDER_PRIV, chainPubkey: SENDER_PUB },
     custody: 'inventory',
   });
@@ -227,7 +200,7 @@ function makeDeliveryPair(
 ): { ownerPort: WalletApiDeliveryPort; senderPort: WalletApiDeliveryPort } {
   const ownerPort = new WalletApiDeliveryPort({
     client: new FakeWalletApiV2Client(fake, OWNER),
-    kv: memKV(),
+    kv: memoryKV(),
     identity: { privateKey: OWNER_PRIV, chainPubkey: OWNER_PUB },
     custody,
     ...(wake !== undefined ? { wake } : {}),
@@ -235,7 +208,7 @@ function makeDeliveryPair(
   ownerPort.bindDeliveryKeys(deriveFromFakeBlob);
   const senderPort = new WalletApiDeliveryPort({
     client: new FakeWalletApiV2Client(fake, SENDER),
-    kv: memKV(),
+    kv: memoryKV(),
     identity: { privateKey: SENDER_PRIV, chainPubkey: SENDER_PUB, nametag: 'sender-tag' },
     custody: 'inventory',
   });
@@ -246,7 +219,7 @@ function makeDeliveryPair(
 describe('WalletApiDeliveryPort — targeted', () => {
   it('a transient seen-set write failure fails that ack but never bricks later acks (PR #727 review)', async () => {
     const fake = new FakeWalletApi();
-    const inner = memKV();
+    const inner = memoryKV();
     let failNextSet = false;
     const flakyKV: ScopedKV = {
       get: (k) => inner.get(k),
@@ -381,7 +354,7 @@ interface CheckpointRig {
   fieldKey: Uint8Array;
 }
 
-function checkpointRig(fake: FakeWalletApi, kv: ScopedKV = memKV()): CheckpointRig {
+function checkpointRig(fake: FakeWalletApi, kv: ScopedKV = memoryKV()): CheckpointRig {
   const client = new FakeWalletApiV2Client(fake, OWNER);
   const fieldKey = deriveFieldEncryptionKey(OWNER_PRIV);
   const posts: CheckpointRig['posts'] = [];

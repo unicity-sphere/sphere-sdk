@@ -20,7 +20,8 @@ import {
   type WakeStream,
   type WebSocketLike,
 } from '../../../impl/wallet-api-v2/session';
-import { STORE_KEYS, type ScopedKV } from '../../../modules/payments-v2/stores';
+import { STORE_KEYS } from '../../../modules/payments-v2/stores';
+import { deferred, memoryKV } from './support';
 
 const BASE = 'https://wallet-api.test';
 const PUB = `02${'ab'.repeat(32)}`;
@@ -29,19 +30,6 @@ const SIG = 'cd'.repeat(65);
 const DEVICE = 'dev-1';
 const ISSUED = '2026-07-31T00:00:00.000Z';
 const EXPIRES = '2026-07-31T00:05:00.000Z';
-
-class MemKV implements ScopedKV {
-  readonly map = new Map<string, unknown>();
-  async get<T>(key: string): Promise<T | null> {
-    return this.map.has(key) ? (this.map.get(key) as T) : null;
-  }
-  async set<T>(key: string, value: T): Promise<void> {
-    this.map.set(key, value);
-  }
-  async remove(key: string): Promise<void> {
-    this.map.delete(key);
-  }
-}
 
 class FakeWS implements WebSocketLike {
   onopen: (() => void) | null = null;
@@ -86,16 +74,6 @@ function jsonRes(status: number, body?: unknown, headers: Record<string, string>
   };
 }
 
-function deferred<T = void>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } {
-  let resolve!: (v: T) => void;
-  let reject!: (e: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
 async function flush(): Promise<void> {
   for (let i = 0; i < 25; i++) await Promise.resolve();
 }
@@ -105,7 +83,7 @@ function makeChallenge(fields: Record<string, string>, prefix: string = AUTH_CHA
 }
 
 function createHarness(opts: { seedRefresh?: boolean } = {}) {
-  const kv = new MemKV();
+  const kv = memoryKV();
   if (opts.seedRefresh) kv.map.set(refreshTokenKey(DEVICE), 'v1.s.seed');
   const cell = new JwtGenerationCell();
   const signer = { pubkey: PUB, network: NET, sign: vi.fn(async (_challenge: string) => SIG) };

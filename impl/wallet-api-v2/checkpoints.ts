@@ -4,28 +4,19 @@
 // break the slot's content idempotency). put() resolves with the STORED
 // envelope's plaintext — the slot winner's bytes (insert-once, first-write-wins).
 
-import { sha256 } from '@noble/hashes/sha2.js';
-
 import { SphereError } from '../../core/errors';
 import { decryptFieldBytes, encryptFieldBytes } from '../../core/field-encryption';
+import { progressSignMessage } from '../../core/wallet-api-protocol';
 import { SplitCheckpointLostError, type SplitCheckpointStore } from '../../token-engine';
 import { STORE_KEYS, type ScopedKV } from '../../modules/payments-v2/stores';
 import type { WalletApiV2Client } from './client';
 
 export type CheckpointClient = Pick<WalletApiV2Client, 'postProgress' | 'getProgress'>;
 
-export const PROGRESS_SIGNATURE_PREFIX = 'wallet-api.progress.v1';
+/** The signed §16 message binding a progress append to its exact envelope bytes. */
+export { progressSignMessage as progressMessage } from '../../core/wallet-api-protocol';
 
 const utf8 = (text: string): Uint8Array => new TextEncoder().encode(text);
-
-function sha256Hex(bytes: Uint8Array): string {
-  return Array.from(sha256(bytes), (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-/** The signed message binding a progress append to its exact envelope bytes. */
-export function progressMessage(transferId: string, opIndex: number, envelope: string): string {
-  return `${PROGRESS_SIGNATURE_PREFIX}:${transferId}:${String(opIndex)}:${sha256Hex(utf8(envelope))}`;
-}
 
 export interface WalletApiSplitCheckpointStoreConfig {
   client: CheckpointClient;
@@ -56,7 +47,7 @@ export class WalletApiSplitCheckpointStore implements SplitCheckpointStore {
       envelope = encryptFieldBytes(fieldKey, bytes, aad);
       await kv.set(cacheKey, envelope);
     }
-    const signature = await signProgress(progressMessage(transferId, opIndex, envelope));
+    const signature = await signProgress(progressSignMessage(transferId, opIndex, envelope));
     const record = await client.postProgress(transferId, opIndex, envelope, signature);
     return this.open(record.payload, aad);
   }

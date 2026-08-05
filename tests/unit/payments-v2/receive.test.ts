@@ -12,9 +12,10 @@ import {
   type ReceivedRecord,
   type StoredIncoming,
 } from '../../../modules/payments-v2/receive/Receive';
-import type { ScopedKV, StreamCursor } from '../../../modules/payments-v2/stores';
+import type { StreamCursor } from '../../../modules/payments-v2/stores';
 import type { EngineVerifyResult, SphereToken, TokenBlob } from '../../../token-engine';
 import type { IncomingTransfer } from '../../../types';
+import { memoryKV, registryStub, type MemoryKV } from './support';
 
 const OWN = `02${'aa'.repeat(32)}`;
 const OTHER = `02${'bb'.repeat(32)}`;
@@ -210,37 +211,17 @@ class FakeDelivery implements DeliveryPort {
   }
 }
 
-const registry: RegistryReader = {
+const registry: RegistryReader = registryStub({
   getSymbol: (coinId) => `SYM${coinId.slice(0, 2)}`,
   getName: (coinId) => `coin-${coinId.slice(0, 2)}`,
   getDecimals: () => 8,
-  getIconUrl: () => null,
-};
-
-function makeKV(seed?: Record<string, unknown>): ScopedKV & { data: Map<string, unknown>; sets: { key: string; value: unknown }[] } {
-  const data = new Map<string, unknown>(Object.entries(seed ?? {}));
-  const sets: { key: string; value: unknown }[] = [];
-  return {
-    data,
-    sets,
-    async get<V>(key: string): Promise<V | null> {
-      return data.has(key) ? (data.get(key) as V) : null;
-    },
-    async set<V>(key: string, value: V): Promise<void> {
-      sets.push({ key, value: JSON.parse(JSON.stringify(value)) });
-      data.set(key, JSON.parse(JSON.stringify(value)));
-    },
-    async remove(key: string): Promise<void> {
-      data.delete(key);
-    },
-  };
-}
+});
 
 interface Harness {
   engine: StubEngine;
   view: FakeView;
   delivery: FakeDelivery;
-  kv: ReturnType<typeof makeKV>;
+  kv: MemoryKV;
   events: IncomingTransfer[];
   attentions: { transferId: string; code: string; detail?: string }[];
   historyLog: ReceivedRecord[];
@@ -253,7 +234,7 @@ function makeHarness(opts: { epoch?: string; kvSeed?: Record<string, unknown> } 
   const engine = new StubEngine();
   const view = new FakeView();
   const delivery = new FakeDelivery(view);
-  const kv = makeKV(opts.kvSeed);
+  const kv = memoryKV({ ...(opts.kvSeed !== undefined ? { seed: opts.kvSeed } : {}) });
   const events: IncomingTransfer[] = [];
   const attentions: Harness['attentions'] = [];
   const historyLog: ReceivedRecord[] = [];
@@ -404,7 +385,7 @@ describe('payments-v2 Receive drain', () => {
     expect(h.delivery.claimed().map((a) => a.deliveryId)).toEqual([`d:${T(1)}:S1`]);
     expect(h.delivery.entries[1].status).toBe('unacked');
     expect(h.delivery.entries[2].status).toBe('unacked');
-    expect(h.kv.data.get(CURSOR_KEY)).toEqual({ cursor: '1', syncEpoch: 'e1' });
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '1', syncEpoch: 'e1' });
 
     h.engine.verifyOutageOn.clear();
     const second = await h.receive.drainOnce();
@@ -412,7 +393,7 @@ describe('payments-v2 Receive drain', () => {
     expect(h.delivery.sinceLog[1]).toBe('1');
     expect(second.map((t) => t.id)).toEqual([T(2), T(3)]);
     expect(h.delivery.claimed()).toHaveLength(3);
-    expect(h.kv.data.get(CURSOR_KEY)).toEqual({ cursor: '3', syncEpoch: 'e1' });
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '3', syncEpoch: 'e1' });
   });
 
   it('acks batch at 200: the first flush happens only after 200 entries are stored, the remainder flushes at drain end', async () => {
@@ -442,7 +423,7 @@ describe('payments-v2 Receive drain', () => {
 
     expect(first).toHaveLength(3);
     expect(h.delivery.claimed().map((a) => a.deliveryId)).toEqual([`d:${T(1)}:S1`]);
-    expect(h.kv.data.get(CURSOR_KEY)).toEqual({ cursor: '1', syncEpoch: 'e1' });
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '1', syncEpoch: 'e1' });
     expect(h.delivery.entries[1].status).toBe('unacked');
     expect(h.delivery.entries[2].status).toBe('unacked');
 
@@ -469,7 +450,7 @@ describe('payments-v2 Receive drain', () => {
       expect.objectContaining({ deliveryId: `d:${T(2)}:S1`, disposition: 'claimed' }),
     ]);
     expect(h.delivery.entries[0].status).toBe('rejected');
-    expect(h.kv.data.get(CURSOR_KEY)).toEqual({ cursor: '2', syncEpoch: 'e1' });
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '2', syncEpoch: 'e1' });
     expect(h.attentions).toEqual([
       { transferId: 'tx-c', code: 'claim:conflict', detail: entry.deliveryId },
     ]);
@@ -567,7 +548,7 @@ describe('payments-v2 Receive drain', () => {
 
     expect(h.kv.sets.every((s) => s.key === CURSOR_KEY)).toBe(true);
     expect(h.kv.sets).toHaveLength(1);
-    const record = h.kv.data.get(CURSOR_KEY) as StreamCursor;
+    const record = h.kv.map.get(CURSOR_KEY) as StreamCursor;
     expect(record).toEqual({ cursor: '2', syncEpoch: 'e1' });
   });
 

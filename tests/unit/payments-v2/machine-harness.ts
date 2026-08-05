@@ -13,11 +13,9 @@ import type {
   SplitParams,
   SplitResult,
   TransferParams,
-  SplitCheckpointStore,
 } from '../../../token-engine';
 import { TransferConflictError } from '../../../token-engine/errors';
 import type { DeliverOptions, DeliveryPort, StoragePort, InventoryItem } from '../../../modules/payments-v2/ports';
-import type { ScopedKV } from '../../../modules/payments-v2/stores';
 import type { IntentPayload } from '../../../modules/payments-v2/machine/types';
 import {
   TransferMachine,
@@ -28,6 +26,7 @@ import {
 } from '../../../modules/payments-v2/machine/TransferMachine';
 import { createMachineStores, type MachineStores } from '../../../modules/payments-v2/machine/journal';
 import { FakeTokenEngine, decodeFakeTokenAssets } from '../token-engine/FakeTokenEngine';
+import { memoryCheckpoints, memoryKV, type MemoryKV } from './support';
 import {
   FakeWalletApi,
   completeMessageFor,
@@ -146,47 +145,6 @@ export function fakeDecodeBlobFor(engine: RealizationEngine): (bytes: Uint8Array
       assets,
       ...(lineage?.splitEvidence !== undefined ? { splitEvidence: lineage.splitEvidence } : {}),
     };
-  };
-}
-
-export interface MemoryKV extends ScopedKV {
-  readonly map: Map<string, string>;
-  readonly failKeys: Set<string>;
-}
-
-export function memoryKV(): MemoryKV {
-  const map = new Map<string, string>();
-  const failKeys = new Set<string>();
-  return {
-    map,
-    failKeys,
-    async get<T>(key: string): Promise<T | null> {
-      if (failKeys.has(key)) throw new Error(`injected kv read failure: ${key}`);
-      const raw = map.get(key);
-      return raw === undefined ? null : (JSON.parse(raw) as T);
-    },
-    async set<T>(key: string, value: T): Promise<void> {
-      map.set(key, JSON.stringify(value));
-    },
-    async remove(key: string): Promise<void> {
-      map.delete(key);
-    },
-  };
-}
-
-function memoryCheckpoints(): SplitCheckpointStore {
-  const slots = new Map<string, Uint8Array>();
-  return {
-    async put(transferId, opIndex, bytes) {
-      const key = `${transferId}:${String(opIndex)}`;
-      const existing = slots.get(key);
-      if (existing !== undefined) return existing;
-      slots.set(key, Uint8Array.from(bytes));
-      return bytes;
-    },
-    async get(transferId, opIndex) {
-      return slots.get(`${transferId}:${String(opIndex)}`) ?? null;
-    },
   };
 }
 

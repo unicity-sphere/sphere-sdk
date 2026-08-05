@@ -6,6 +6,7 @@
 
 import { signMessage } from './crypto';
 import { SphereError } from './errors';
+import { completeSignMessage } from './wallet-api-protocol';
 import { deriveFieldEncryptionKey } from './field-encryption';
 import {
   decryptDeliveryBundle,
@@ -192,7 +193,7 @@ export function defaultPaymentsV2Transport(
  * Every call rides session.withAuth (one 401 → single-flight re-auth → one
  * retry); presigned-S3 fetch/upload carry no bearer and pass straight through.
  */
-function authedWireClient(session: WalletApiSession, client: WalletApiV2Client): PaymentsV2WireClient {
+export function authedWireClient(session: WalletApiSession, client: WalletApiV2Client): PaymentsV2WireClient {
   const auth = <T>(op: () => Promise<T>): Promise<T> => session.withAuth(() => op());
   return {
     listInventory: (since) => auth(() => client.listInventory(since)),
@@ -255,7 +256,7 @@ async function resolveRecipientInfo(
 }
 
 /** The S6 recipient-ECDH bundle codec — the same primitive delivery memos use. */
-function requestMemoCodec(privateKey: string): RequestMemoCodec {
+export function requestMemoCodec(privateKey: string): RequestMemoCodec {
   return {
     encrypt: (peerPubkey, bundle) =>
       encryptDeliveryBundle(deriveDeliveryEncryptionKey(privateKey, peerPubkey), {
@@ -320,8 +321,7 @@ export function composePaymentsV2(spec: ComposePaymentsV2Spec): PaymentsFacade {
     emit: host.emit,
     resolveRecipient: (identifier) => resolveRecipientInfo(identifier, network, host.resolvePeer),
     // The #87 canonical close message the server's seedGate verifies.
-    signComplete: async (transferId) =>
-      signMessage(identity.privateKey, `wallet-api.complete.v1:${transferId}`),
+    signComplete: async (transferId) => signMessage(identity.privateKey, completeSignMessage(transferId)),
     fieldKey,
     network,
     ownPubkey: identity.chainPubkey,

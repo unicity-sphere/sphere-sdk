@@ -28,28 +28,25 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import { WebSocket as NodeWebSocket } from 'ws';
 
 import { Sphere, type SphereWalletApiSession } from '../../core/Sphere';
 import { isPossiblyCommittedSendOutcome } from '../../core/errors';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { WalletApiClient } from '../../wallet-api';
-import type { WebSocketLike as OldWebSocketLike } from '../../wallet-api/types';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { IncomingTransfer, ProviderStatus, TransferResult } from '../../types';
 import type { PaymentsV2 } from '../../modules/payments-v2/api';
 import { HARNESS_COIN } from '../harness/support/stack';
-
-const API_KEY = process.env.STAGING_AGGREGATOR_KEY;
-const RUN = API_KEY !== undefined && API_KEY !== '';
-
-const BASE_URL = process.env.STAGING_WALLET_API ?? 'https://wallet-api.staging.unicity.network';
-const AGGREGATOR_URL = process.env.STAGING_AGGREGATOR ?? 'https://gateway.testnet2.unicity.network';
-const TRUSTBASE_URL =
-  process.env.STAGING_TRUSTBASE ??
-  'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/main/bft-trustbase.testnet2.json';
-const NETWORK = 'testnet2';
+import {
+  AGGREGATOR_URL,
+  BASE_URL,
+  NETWORK,
+  nodeWsFactory,
+  RUN_STAGING as RUN,
+  STAGING_API_KEY as API_KEY,
+  trustbase,
+} from './support/staging';
 
 /**
  * The shared testnet2 submit key is heavily contended (observed 2026-08-04:
@@ -65,28 +62,6 @@ let aborted = false;
 
 function logStep(step: string): void {
   console.log(`[pv2-e2e ${new Date().toISOString()}] ${step}`);
-}
-
-function nodeWsFactory(url: string): OldWebSocketLike {
-  const ws = new NodeWebSocket(url);
-  const like: OldWebSocketLike = {
-    onopen: null,
-    onmessage: null,
-    onclose: null,
-    onerror: null,
-    close: (code?: number, reason?: string) => ws.close(code, reason),
-  };
-  ws.on('open', () => like.onopen?.());
-  ws.on('message', (data) => like.onmessage?.({ data: data.toString() }));
-  ws.on('close', (code) => like.onclose?.({ code }));
-  ws.on('error', (err) => like.onerror?.(err));
-  return like;
-}
-
-async function trustbase(): Promise<unknown> {
-  const res = await fetch(TRUSTBASE_URL);
-  if (!res.ok) throw new Error(`trustbase fetch failed: HTTP ${String(res.status)} (${TRUSTBASE_URL})`);
-  return res.json() as Promise<unknown>;
 }
 
 function createMockTransport(): TransportProvider {

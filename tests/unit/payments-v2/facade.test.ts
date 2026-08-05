@@ -4,27 +4,31 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { secp256k1 } from '@noble/curves/secp256k1.js';
-
-import { hexToBytes } from '../../../core/crypto';
+import { getPublicKey, hexToBytes } from '../../../core/crypto';
 import { PartialSendConflictError, SphereError } from '../../../core/errors';
 import { ProofUnconfirmedError } from '../../../token-engine/errors';
 import type { EngineOpOptions, MintParams, SphereToken } from '../../../token-engine';
 import { WalletApiStoragePort } from '../../../impl/wallet-api-v2/storage';
 import { WalletApiDeliveryPort } from '../../../impl/wallet-api-v2/mailbox';
 import type { DeliveryPort, StoragePort } from '../../../modules/payments-v2/ports';
-import { STORE_KEYS, type MintJournalEntry, type ScopedKV } from '../../../modules/payments-v2/stores';
+import { STORE_KEYS, type MintJournalEntry } from '../../../modules/payments-v2/stores';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
 import {
   ATTENTION_MINT_UNRESOLVED,
   PaymentsFacade,
   type DeterministicMintCapable,
   type FacadeClient,
-  type FacadeSession,
   type RecipientInfo,
 } from '../../../modules/payments-v2/PaymentsFacade';
-import type { RequestMemoCodec } from '../../../modules/payments-v2/requests/Requests';
 import { RealizationEngine, fakeDecodeBlobFor } from './machine-harness';
+import {
+  FakeSession,
+  memoryCheckpoints,
+  memoryKV,
+  registryStub,
+  stubRequestMemoCodec,
+  type MemoryKV,
+} from './support';
 import {
   FakeWalletApi,
   completeMessageFor,
@@ -40,55 +44,10 @@ const OWN_PRIV = '11'.repeat(32);
 const PEER_PRIV = '22'.repeat(32);
 const COIN = 'aa'.repeat(32);
 
-function pubOf(privHex: string): string {
-  const bytes = secp256k1.getPublicKey(Uint8Array.from(Buffer.from(privHex, 'hex')), true);
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-const OWN_PUB = pubOf(OWN_PRIV);
-const PEER_PUB = pubOf(PEER_PRIV);
+const OWN_PUB = getPublicKey(OWN_PRIV);
+const PEER_PUB = getPublicKey(PEER_PRIV);
 const ownCaller: FakeCaller = { chainPubkey: OWN_PUB, network: NET };
 const peerCaller: FakeCaller = { chainPubkey: PEER_PUB, network: NET };
-
-class MemKV implements ScopedKV {
-  readonly map = new Map<string, string>();
-  readonly setLog: string[] = [];
-  async get<T>(key: string): Promise<T | null> {
-    const raw = this.map.get(key);
-    return raw === undefined ? null : (JSON.parse(raw) as T);
-  }
-  async set<T>(key: string, value: T): Promise<void> {
-    this.setLog.push(key);
-    this.map.set(key, JSON.stringify(value));
-  }
-  async remove(key: string): Promise<void> {
-    this.map.delete(key);
-  }
-}
-
-class FakeSession implements FacadeSession {
-  private readonly handlers = new Map<string, Set<() => void>>();
-  startCalls = 0;
-  stopCalls = 0;
-  async start(): Promise<void> {
-    this.startCalls += 1;
-  }
-  async stop(): Promise<void> {
-    this.stopCalls += 1;
-  }
-  subscribeStream(stream: 'inventory' | 'mailbox' | 'payment_requests', handler: () => void): () => void {
-    let set = this.handlers.get(stream);
-    if (!set) {
-      set = new Set();
-      this.handlers.set(stream, set);
-    }
-    set.add(handler);
-    return () => set!.delete(handler);
-  }
-  fire(stream: string): void {
-    for (const handler of this.handlers.get(stream) ?? []) handler();
-  }
-}
 
 interface Gate {
   entered: boolean;
@@ -167,37 +126,8 @@ function hookedDelivery(inner: DeliveryPort, hooks: Hooks): DeliveryPort {
   };
 }
 
-function memoryCheckpoints(): { put: (t: string, o: number, b: Uint8Array) => Promise<Uint8Array>; get: (t: string, o: number) => Promise<Uint8Array | null> } {
-  const slots = new Map<string, Uint8Array>();
-  return {
-    async put(transferId, opIndex, bytes) {
-      const key = `${transferId}:${String(opIndex)}`;
-      const existing = slots.get(key);
-      if (existing !== undefined) return existing;
-      slots.set(key, Uint8Array.from(bytes));
-      return bytes;
-    },
-    async get(transferId, opIndex) {
-      return slots.get(`${transferId}:${String(opIndex)}`) ?? null;
-    },
-  };
-}
-
-const registry = {
-  getSymbol: () => 'TST',
-  getName: () => 'Test Coin',
-  getDecimals: () => 0,
-  getIconUrl: () => null,
-};
-
-const memoCodec: RequestMemoCodec = {
-  encrypt: (_peer, bundle) =>
-    bundle.memo === undefined && bundle.senderNametag === undefined ? undefined : `x.${JSON.stringify(bundle)}`,
-  decrypt: (_peer, envelope) => {
-    if (!envelope.startsWith('x.')) throw new Error('not addressed here');
-    return JSON.parse(envelope.slice(2)) as { memo?: string; senderNametag?: string };
-  },
-};
+const registry = registryStub();
+const memoCodec = stubRequestMemoCodec;
 
 /**
  * Advertising harness modelling F13: mint under a (transferId, opIndex) seed is
@@ -232,7 +162,7 @@ interface World {
   engine: RealizationEngine;
   engines: RealizationEngine[];
   innerClient: FakeWalletApiV2Client;
-  kv: MemKV;
+  kv: MemoryKV;
   session: FakeSession;
   facade: PaymentsFacade;
   hooks: Hooks;
@@ -279,7 +209,7 @@ function makeWorld(options: { engine?: RealizationEngine } = {}): World {
   };
   const api = new FakeWalletApi({ decodeBlob: combined });
   const innerClient = new FakeWalletApiV2Client(api, ownCaller, { decodeBlob: combined });
-  const kv = new MemKV();
+  const kv = memoryKV();
   const session = new FakeSession();
   const hooks: Hooks = {};
   const counters = { putIntent: 0 };
@@ -356,7 +286,7 @@ function makeWorld(options: { engine?: RealizationEngine } = {}): World {
     peerDeliver: async (token: SphereToken, transferId: string) => {
       const peerPort = new WalletApiDeliveryPort({
         client: new FakeWalletApiV2Client(api, peerCaller, { decodeBlob: combined }),
-        kv: new MemKV(),
+        kv: memoryKV(),
         identity: { privateKey: PEER_PRIV, chainPubkey: PEER_PUB },
         custody: 'inventory',
       });

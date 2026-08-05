@@ -6,48 +6,14 @@
  * Run: npx vitest run --config vitest.e2e.config.ts tests/e2e/wallet-api-v2-session.staging.e2e.test.ts
  */
 import { afterAll, describe, expect, it } from 'vitest';
-import { WebSocket as NodeWebSocket } from 'ws';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
 import { signMessage } from '../../core/crypto';
 import { createWalletApiHttp, isWalletApiHttpError } from '../../impl/wallet-api-v2/http';
 import { WalletApiV2Client } from '../../impl/wallet-api-v2/client';
-import {
-  JwtGenerationCell,
-  WalletApiSession,
-  type WebSocketLike,
-} from '../../impl/wallet-api-v2/session';
-import type { ScopedKV } from '../../modules/payments-v2/stores';
+import { JwtGenerationCell, WalletApiSession } from '../../impl/wallet-api-v2/session';
 import { randomIdentity } from '../harness/support/stack';
-
-const BASE_URL = process.env.STAGING_WALLET_API ?? 'https://wallet-api.staging.unicity.network';
-const NETWORK = 'testnet2';
-const RUN = process.env.STAGING_AGGREGATOR_KEY !== undefined;
-
-function memoryKV(): ScopedKV {
-  const m = new Map<string, unknown>();
-  return {
-    get: async <T,>(k: string) => (m.has(k) ? (m.get(k) as T) : null),
-    set: async (k, v) => void m.set(k, v),
-    remove: async (k) => void m.delete(k),
-  };
-}
-
-function nodeWsFactory(url: string): WebSocketLike {
-  const ws = new NodeWebSocket(url);
-  const like: WebSocketLike = {
-    onopen: null,
-    onmessage: null,
-    onclose: null,
-    onerror: null,
-    close: (code?: number, reason?: string) => ws.close(code, reason),
-  };
-  ws.on('open', () => like.onopen?.());
-  ws.on('message', (data) => like.onmessage?.({ data: data.toString() }));
-  ws.on('close', (code) => like.onclose?.({ code }));
-  ws.on('error', (err) => like.onerror?.(err));
-  return like;
-}
+import { BASE_URL, memoryKV, NETWORK, nodeWsFactory, RUN_STAGING as RUN } from './support/staging';
 
 interface Harness {
   session: WalletApiSession;

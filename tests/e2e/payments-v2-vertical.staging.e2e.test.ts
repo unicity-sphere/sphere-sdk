@@ -19,49 +19,42 @@
  *     tests/e2e/payments-v2-vertical.staging.e2e.test.ts
  */
 import { afterAll, describe, expect, it } from 'vitest';
-import { WebSocket as NodeWebSocket } from 'ws';
 
 import { hexToBytes, signMessage } from '../../core/crypto';
 import { isPossiblyCommittedSendOutcome } from '../../core/errors';
 import { deriveFieldEncryptionKey } from '../../core/field-encryption';
+import { completeSignMessage } from '../../core/wallet-api-protocol';
 import {
-  decryptDeliveryBundle,
-  deriveDeliveryEncryptionKey,
-  encryptDeliveryBundle,
-} from '../../core/delivery-envelope';
+  authedWireClient,
+  requestMemoCodec,
+  type PaymentsV2WireClient,
+} from '../../core/payments-v2-wiring';
 import { createWalletApiHttp } from '../../impl/wallet-api-v2/http';
 import { WalletApiV2Client } from '../../impl/wallet-api-v2/client';
-import {
-  JwtGenerationCell,
-  WalletApiSession,
-  type WebSocketLike,
-} from '../../impl/wallet-api-v2/session';
-import { WalletApiStoragePort, type StoragePortClient } from '../../impl/wallet-api-v2/storage';
-import { WalletApiDeliveryPort, type DeliveryPortClient } from '../../impl/wallet-api-v2/mailbox';
-import {
-  WalletApiSplitCheckpointStore,
-  type CheckpointClient,
-} from '../../impl/wallet-api-v2/checkpoints';
-import { PaymentsFacade, type FacadeClient } from '../../modules/payments-v2/PaymentsFacade';
+import { JwtGenerationCell, WalletApiSession } from '../../impl/wallet-api-v2/session';
+import { WalletApiStoragePort } from '../../impl/wallet-api-v2/storage';
+import { WalletApiDeliveryPort } from '../../impl/wallet-api-v2/mailbox';
+import { WalletApiSplitCheckpointStore } from '../../impl/wallet-api-v2/checkpoints';
+import { PaymentsFacade } from '../../modules/payments-v2/PaymentsFacade';
 import type { DeliveryPort, InventoryItem } from '../../modules/payments-v2/ports';
 import type { ScopedKV } from '../../modules/payments-v2/stores';
 import { createMachineStores } from '../../modules/payments-v2/machine/journal';
-import type { RequestMemoCodec } from '../../modules/payments-v2/requests/Requests';
 import { createSphereTokenEngine } from '../../token-engine/factory';
 import type { ITokenEngine } from '../../token-engine/engine';
 import type { HistoryEntry } from '../../modules/payments-v2/api';
 import type { TransferResult } from '../../types';
 import { HARNESS_COIN, randomIdentity } from '../harness/support/stack';
-
-const API_KEY = process.env.STAGING_AGGREGATOR_KEY;
-const RUN = API_KEY !== undefined && API_KEY !== '';
-
-const BASE_URL = process.env.STAGING_WALLET_API ?? 'https://wallet-api.staging.unicity.network';
-const AGGREGATOR_URL = process.env.STAGING_AGGREGATOR ?? 'https://gateway.testnet2.unicity.network';
-const TRUSTBASE_URL =
-  process.env.STAGING_TRUSTBASE ??
-  'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/main/bft-trustbase.testnet2.json';
-const NETWORK = 'testnet2';
+import { registryStub } from '../unit/payments-v2/support';
+import {
+  AGGREGATOR_URL,
+  BASE_URL,
+  memoryKV,
+  NETWORK,
+  nodeWsFactory,
+  RUN_STAGING as RUN,
+  STAGING_API_KEY as API_KEY,
+  trustbase,
+} from './support/staging';
 
 // Replay-convergence pacing (observed 2026-08-04: the shared staging submit key
 // can refuse 9+ paced attempts over 6 min): fast cadence — a cycle is ~30 s —
@@ -79,107 +72,22 @@ function logStep(step: string): void {
 
 // ── shared plumbing ──────────────────────────────────────────────────────────
 
-function memoryKV(): ScopedKV {
-  const m = new Map<string, unknown>();
-  return {
-    get: async <T,>(k: string) => (m.has(k) ? (m.get(k) as T) : null),
-    set: async (k, v) => void m.set(k, v),
-    remove: async (k) => void m.delete(k),
-  };
-}
-
-function nodeWsFactory(url: string): WebSocketLike {
-  const ws = new NodeWebSocket(url);
-  const like: WebSocketLike = {
-    onopen: null,
-    onmessage: null,
-    onclose: null,
-    onerror: null,
-    close: (code?: number, reason?: string) => ws.close(code, reason),
-  };
-  ws.on('open', () => like.onopen?.());
-  ws.on('message', (data) => like.onmessage?.({ data: data.toString() }));
-  ws.on('close', (code) => like.onclose?.({ code }));
-  ws.on('error', (err) => like.onerror?.(err));
-  return like;
-}
-
-// Fetched ONCE per run — the same pinned testnet2 root the other staging suites use.
-let trustbasePromise: Promise<unknown> | null = null;
-function trustbase(): Promise<unknown> {
-  trustbasePromise ??= (async () => {
-    const res = await fetch(TRUSTBASE_URL);
-    if (!res.ok) throw new Error(`trustbase fetch failed: HTTP ${String(res.status)} (${TRUSTBASE_URL})`);
-    return res.json() as Promise<unknown>;
-  })();
-  return trustbasePromise;
-}
-
 // Minimal RegistryReader: answers the harness coin; decimals 0 (integer amounts).
-const registry = {
+const registry = registryStub({
   getSymbol: (coinId: string) => (coinId === HARNESS_COIN ? 'HARN' : coinId.slice(0, 8)),
   getName: (coinId: string) => (coinId === HARNESS_COIN ? 'Harness Coin' : 'Unknown'),
-  getDecimals: () => 0,
-  getIconUrl: () => null,
-};
+});
 
 // The server /v1/balances endpoint stays a TEST observation surface (serverTotal)
 // even though the StoragePort no longer exposes it (assets() aggregates the mirror).
-type AuthedClient = StoragePortClient &
-  DeliveryPortClient &
-  CheckpointClient &
-  FacadeClient &
-  Pick<WalletApiV2Client, 'balances'>;
+type AuthedClient = PaymentsV2WireClient & Pick<WalletApiV2Client, 'balances'>;
 
-/**
- * Every wallet-api call the facade/ports make rides session.withAuth (one 401 →
- * single-flight re-auth → one retry): the suite outlives the 900 s JWT TTL.
- * Presigned-S3 fetch/upload carry no bearer and pass straight through.
- */
+// The PRODUCTION authed wrapper (the suite outlives the 900 s JWT TTL) plus the
+// test-only balances observation surface.
 function authedClient(session: WalletApiSession, client: WalletApiV2Client): AuthedClient {
-  const auth = <T,>(op: () => Promise<T>): Promise<T> => session.withAuth(() => op());
   return {
-    listInventory: (since) => auth(() => client.listInventory(since)),
-    balances: () => auth(() => client.balances()),
-    blobUrls: (tokenIds) => auth(() => client.blobUrls(tokenIds)),
-    uploadUrls: (blobs) => auth(() => client.uploadUrls(blobs)),
-    apply: (delta) => auth(() => client.apply(delta)),
-    fetchBlob: (getUrl) => client.fetchBlob(getUrl),
-    uploadBlob: (putUrl, bytes) => client.uploadBlob(putUrl, bytes),
-    putIntent: (t, payload, requiresSeedClose) => auth(() => client.putIntent(t, payload, requiresSeedClose)),
-    listIntents: (status) => auth(() => client.listIntents(status)),
-    abortIntent: (t) => auth(() => client.abortIntent(t)),
-    completeIntent: (t, signature) => auth(() => client.completeIntent(t, signature)),
-    postProgress: (t, opIndex, payload, signature) => auth(() => client.postProgress(t, opIndex, payload, signature)),
-    getProgress: (t) => auth(() => client.getProgress(t)),
-    deposit: (entry) => auth(() => client.deposit(entry)),
-    depositBatch: (entries) => auth(() => client.depositBatch(entries)),
-    listMailbox: (since) => auth(() => client.listMailbox(since)),
-    claim: (entryIds, intoInventory) => auth(() => client.claim(entryIds, intoInventory)),
-    reject: (entryIds, reason, detail) => auth(() => client.reject(entryIds, reason, detail)),
-    postHistory: (records) => auth(() => client.postHistory(records)),
-    listHistory: (options) => auth(() => client.listHistory(options)),
-    createPaymentRequest: (input) => auth(() => client.createPaymentRequest(input)),
-    listPaymentRequests: (params) => auth(() => client.listPaymentRequests(params)),
-    respondPaymentRequest: (id, response) => auth(() => client.respondPaymentRequest(id, response)),
-  };
-}
-
-// The REAL recipient-ECDH bundle codec (S6) — same primitive delivery memos use.
-function memoCodec(privateKey: string): RequestMemoCodec {
-  return {
-    encrypt: (peerPubkey, bundle) =>
-      encryptDeliveryBundle(deriveDeliveryEncryptionKey(privateKey, peerPubkey), {
-        ...(bundle.memo !== undefined ? { memo: bundle.memo } : {}),
-        ...(bundle.senderNametag !== undefined ? { senderNametag: bundle.senderNametag } : {}),
-      }),
-    decrypt: (peerPubkey, envelope) => {
-      const bundle = decryptDeliveryBundle(deriveDeliveryEncryptionKey(privateKey, peerPubkey), envelope);
-      return {
-        ...(bundle.memo !== undefined ? { memo: bundle.memo } : {}),
-        ...(bundle.senderNametag !== undefined ? { senderNametag: bundle.senderNametag } : {}),
-      };
-    },
+    ...authedWireClient(session, client),
+    balances: () => session.withAuth(() => client.balances()),
   };
 }
 
@@ -271,13 +179,11 @@ async function makeVerticalWallet(tag: string, options: MakeOptions = {}): Promi
     // Raw-pubkey identifiers only (this suite never uses nametags); pinned to the session network.
     resolveRecipient: async (identifier) =>
       /^0[23][0-9a-f]{64}$/.test(identifier) ? { chainPubkey: identifier, network: NETWORK } : null,
-    // The #87 canonical close message the server's seedGate verifies.
-    signComplete: async (transferId) =>
-      signMessage(identity.privateKey, `wallet-api.complete.v1:${transferId}`),
+    signComplete: async (transferId) => signMessage(identity.privateKey, completeSignMessage(transferId)),
     fieldKey,
     network: NETWORK,
     ownPubkey: identity.chainPubkey,
-    requestMemo: memoCodec(identity.privateKey),
+    requestMemo: requestMemoCodec(identity.privateKey),
   });
   await session.ensureAuthenticated();
   await facade.start();

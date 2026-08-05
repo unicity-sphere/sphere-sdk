@@ -10,13 +10,13 @@ import type { SendRequest } from '../../../modules/payments-v2/api';
 import { STORE_KEYS, type ScopedKV, type SettlingLink, type StreamCursor } from '../../../modules/payments-v2/stores';
 import {
   Requests,
-  type RequestMemoCodec,
   type RequestsDeps,
   type RequestsPageWire,
   type RequestsWireClient,
   type RequestWire,
 } from '../../../modules/payments-v2/requests/Requests';
 import { FakeWalletApi, type FakeCaller } from './fakes/FakeWalletApi';
+import { memoryKV, stubRequestMemoCodec, type MemoryKV } from './support';
 
 const NET = 'testnet2';
 const PAYER = `02${'aa'.repeat(32)}`;
@@ -29,28 +29,7 @@ const requesterCaller: FakeCaller = { chainPubkey: REQUESTER, network: NET };
 const SETTLING_KEY = STORE_KEYS.settlingLinks;
 const CURSOR_KEY = STORE_KEYS.streamCursor('payment_requests');
 
-class MemKV implements ScopedKV {
-  readonly map = new Map<string, unknown>();
-  async get<T>(key: string): Promise<T | null> {
-    return this.map.has(key) ? (this.map.get(key) as T) : null;
-  }
-  async set<T>(key: string, value: T): Promise<void> {
-    this.map.set(key, JSON.parse(JSON.stringify(value)));
-  }
-  async remove(key: string): Promise<void> {
-    this.map.delete(key);
-  }
-}
-
-// Symmetric stand-in for the ECDH bundle codec (crypto is not under test here).
-const codec: RequestMemoCodec = {
-  encrypt: (_peer, bundle) =>
-    bundle.memo === undefined && bundle.senderNametag === undefined ? undefined : `x.${JSON.stringify(bundle)}`,
-  decrypt: (_peer, envelope) => {
-    if (!envelope.startsWith('x.')) throw new Error('not addressed here');
-    return JSON.parse(envelope.slice(2)) as { memo?: string; senderNametag?: string };
-  },
-};
+const codec = stubRequestMemoCodec;
 
 function clientOf(api: FakeWalletApi, caller: FakeCaller, log?: { since: (number | undefined)[] }): RequestsWireClient {
   return {
@@ -76,7 +55,7 @@ function possiblyCommitted(transferId: string): SphereError {
 
 interface Harness {
   api: FakeWalletApi;
-  kv: MemKV;
+  kv: MemoryKV;
   events: { event: string; payload: { id?: string; status?: string } }[];
   sendImpl: ReturnType<typeof vi.fn<(req: SendRequest) => Promise<TransferResult>>>;
   abortedIds: string[];
@@ -85,9 +64,9 @@ interface Harness {
   onEmit?: (event: string, payload: unknown) => void;
 }
 
-function makeHarness(over: Partial<RequestsDeps> & { api?: FakeWalletApi; kv?: MemKV } = {}): Harness {
+function makeHarness(over: Partial<RequestsDeps> & { api?: FakeWalletApi; kv?: MemoryKV } = {}): Harness {
   const api = over.api ?? new FakeWalletApi();
-  const kv = over.kv ?? new MemKV();
+  const kv = over.kv ?? memoryKV();
   const events: Harness['events'] = [];
   const sendImpl = vi.fn<(req: SendRequest) => Promise<TransferResult>>(async () => transferResult('tx-default'));
   const abortedIds: string[] = [];
@@ -121,7 +100,7 @@ async function seedRequest(api: FakeWalletApi, memo?: string, amount = '1000'): 
   return wire.id;
 }
 
-function settlingRecord(kv: MemKV): Record<string, SettlingLink> {
+function settlingRecord(kv: MemoryKV): Record<string, SettlingLink> {
   return (kv.map.get(SETTLING_KEY) ?? {}) as Record<string, SettlingLink>;
 }
 
@@ -274,7 +253,7 @@ describe('payments-v2 Requests — pay() and the #441 settling journal', () => {
   });
 
   it('a reloaded settling request is never payable', async () => {
-    const kv = new MemKV();
+    const kv = memoryKV();
     const api = new FakeWalletApi();
     const h1 = makeHarness({ api, kv });
     const id = await seedRequest(api);
@@ -356,7 +335,7 @@ describe('payments-v2 Requests — pay() and the #441 settling journal', () => {
   });
 
   it('a corrupt settling journal fails open to empty (never wedges)', async () => {
-    const kv = new MemKV();
+    const kv = memoryKV();
     const brokenKv: ScopedKV = {
       get: async <T,>(key: string): Promise<T | null> => {
         if (key === SETTLING_KEY) throw new SyntaxError('Unexpected token in JSON');
@@ -366,7 +345,7 @@ describe('payments-v2 Requests — pay() and the #441 settling journal', () => {
       remove: (k) => kv.remove(k),
     };
     const api = new FakeWalletApi();
-    const h = makeHarness({ api, kv: Object.assign(brokenKv, { map: kv.map }) as unknown as MemKV });
+    const h = makeHarness({ api, kv: Object.assign(brokenKv, { map: kv.map }) as unknown as MemoryKV });
     const id = await seedRequest(api);
     await h.requests.drainIncoming();
     expect(h.requests.list()[0]!.status).toBe('pending');
