@@ -1,21 +1,20 @@
 /**
- * Tests for Sphere.clear() - complete wallet data cleanup
- * Verifies that clear() removes all SDK-owned data from both
- * StorageProvider and TokenStorageProvider
+ * Tests for Sphere.clear() — complete wallet data cleanup.
+ * Post-flip: clear({ storage }) wipes the whole KV store, which INCLUDES the
+ * payments vertical's pv2:{network}:{pubkey}:* scoped KV (refresh token,
+ * cursors, journals all live in the plain StorageProvider).
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Sphere } from '../../../core/Sphere';
 import type { StorageProvider } from '../../../storage';
-import type { InventoryView, TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
-import type { TokenBlob } from '../../../token-engine';
 import type { ProviderStatus } from '../../../types';
 
 // =============================================================================
 // Mocks
 // =============================================================================
 
-function createMockStorage(): StorageProvider {
+function createMockStorage(): StorageProvider & { _data: Map<string, string> } {
   const data = new Map<string, string>();
 
   return {
@@ -35,47 +34,8 @@ function createMockStorage(): StorageProvider {
     getStatus: vi.fn((): ProviderStatus => 'connected'),
     saveTrackedAddresses: vi.fn(async () => {}),
     loadTrackedAddresses: vi.fn(async () => []),
-  };
-}
-
-function createMockTokenStorage(): TokenStorageProvider<TxfStorageDataBase> & { clear: ReturnType<typeof vi.fn> } {
-  return {
-    id: 'mock-token-storage',
-    name: 'Mock Token Storage',
-    type: 'local' as const,
-    setIdentity: vi.fn(),
-    initialize: vi.fn(async () => true),
-    shutdown: vi.fn(async () => {}),
-    connect: vi.fn(async () => {}),
-    disconnect: vi.fn(async () => {}),
-    isConnected: vi.fn(() => true),
-    getStatus: vi.fn((): ProviderStatus => 'connected'),
-    load: vi.fn(async () => ({
-      success: true,
-      data: { _meta: { version: 1, address: '', formatVersion: '2.0', updatedAt: Date.now() } },
-      source: 'local' as const,
-      timestamp: Date.now(),
-    })),
-    save: vi.fn(async () => ({ success: true, timestamp: Date.now() })),
-    sync: vi.fn(async (localData: TxfStorageDataBase) => ({
-      success: true,
-      merged: localData,
-      added: 0,
-      removed: 0,
-      conflicts: 0,
-    })),
-    // S2 lazy-inventory surface: present so the double really satisfies the
-    // TokenStorageProvider port. An empty view and a loud getToken are the
-    // honest stand-ins for a store that holds nothing.
-    listInventory: vi.fn(async (): Promise<InventoryView> => ({
-      items: [], cursor: 0n, syncEpoch: 0n, more: false,
-    })),
-    getToken: vi.fn(async (tokenId: string): Promise<TokenBlob> => {
-      throw new Error(`mock token storage: no blob for ${tokenId}`);
-    }),
-    applyDelta: vi.fn(async (): Promise<void> => undefined),
-    clear: vi.fn(async () => true),
-  };
+    _data: data,
+  } as unknown as StorageProvider & { _data: Map<string, string> };
 }
 
 // =============================================================================
@@ -91,79 +51,32 @@ describe('Sphere.clear()', () => {
     }
   });
 
-  describe('with StorageProvider only (backward compatible)', () => {
-    it('should call storage.clear() to remove all data', async () => {
-      const storage = createMockStorage();
+  it('should call storage.clear() to remove all data', async () => {
+    const storage = createMockStorage();
 
-      await Sphere.clear(storage);
+    await Sphere.clear({ storage });
 
-      expect(storage.clear).toHaveBeenCalled();
-    });
-
-    it('should not throw when no instance exists', async () => {
-      const storage = createMockStorage();
-
-      await expect(Sphere.clear(storage)).resolves.not.toThrow();
-    });
+    expect(storage.clear).toHaveBeenCalled();
   });
 
-  describe('with options object (new API)', () => {
-    it('should clear token storage when provided', async () => {
-      const storage = createMockStorage();
-      const tokenStorage = createMockTokenStorage();
+  it('should not throw when no instance exists', async () => {
+    const storage = createMockStorage();
 
-      await Sphere.clear({ storage, tokenStorage });
-
-      expect(tokenStorage.clear).toHaveBeenCalled();
-    });
-
-    it('should clear storage AND token storage', async () => {
-      const storage = createMockStorage();
-      const tokenStorage = createMockTokenStorage();
-
-      await Sphere.clear({ storage, tokenStorage });
-
-      expect(storage.clear).toHaveBeenCalled();
-      expect(tokenStorage.clear).toHaveBeenCalled();
-    });
-
-    it('should work without tokenStorage in options', async () => {
-      const storage = createMockStorage();
-
-      await Sphere.clear({ storage });
-
-      expect(storage.clear).toHaveBeenCalled();
-    });
-
-    it('should handle tokenStorage without clear() method', async () => {
-      const storage = createMockStorage();
-      const tokenStorage = createMockTokenStorage();
-      // Remove clear method to simulate a provider that doesn't support it
-      delete (tokenStorage as Partial<typeof tokenStorage>).clear;
-
-      await expect(Sphere.clear({ storage, tokenStorage })).resolves.not.toThrow();
-      expect(storage.clear).toHaveBeenCalled();
-    });
+    await expect(Sphere.clear({ storage })).resolves.not.toThrow();
   });
 
-  describe('backward compatibility', () => {
-    it('should accept StorageProvider directly (legacy API)', async () => {
-      const storage = createMockStorage();
+  it('wipes the pv2 scoped KV (durable payments state) with the KV store', async () => {
+    const storage = createMockStorage();
+    // Seed pv2 durable-state rows the way the vertical writes them (plain
+    // StorageProvider keys, self-prefixed pv2:{network}:{pubkey}:).
+    storage._data.set('pv2:testnet2:02abc:intents', '[]');
+    storage._data.set('pv2:testnet2:02abc:cursor:mailbox', '{"cursor":1,"syncEpoch":"0"}');
+    storage._data.set('unrelated', 'value');
 
-      // Old-style call: Sphere.clear(storage)
-      await Sphere.clear(storage);
+    await Sphere.clear({ storage });
 
-      expect(storage.clear).toHaveBeenCalled();
-    });
-
-    it('should accept options object (new API)', async () => {
-      const storage = createMockStorage();
-
-      // New-style call: Sphere.clear({ storage })
-      await Sphere.clear({ storage });
-
-      expect(storage.clear).toHaveBeenCalled();
-    });
+    expect(storage.clear).toHaveBeenCalled();
+    expect(storage._data.size).toBe(0);
   });
 
   describe('instance lifecycle', () => {
@@ -178,7 +91,7 @@ describe('Sphere.clear()', () => {
       };
       (Sphere as unknown as { instance: typeof mockInstance }).instance = mockInstance;
 
-      await Sphere.clear(storage);
+      await Sphere.clear({ storage });
 
       expect(mockInstance.destroy).toHaveBeenCalled();
       expect(Sphere.getInstance()).toBeNull();
@@ -188,7 +101,7 @@ describe('Sphere.clear()', () => {
       const storage = createMockStorage();
       (storage.isConnected as ReturnType<typeof vi.fn>).mockReturnValue(false);
 
-      await Sphere.clear(storage);
+      await Sphere.clear({ storage });
 
       expect(storage.connect).toHaveBeenCalled();
     });

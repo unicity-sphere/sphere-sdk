@@ -16,11 +16,12 @@ import * as path from 'path';
 import { Sphere } from '../../core/Sphere';
 import { STORAGE_KEYS_GLOBAL } from '../../constants';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
-import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenStorageProvider';
 import type { TransportProvider, OracleProvider } from '../../index';
 import type { ProviderStatus } from '../../types';
 import { vi } from 'vitest';
 import { TEST_NETWORK } from '../test-network';
+import { makePv2World } from '../support/pv2-world';
+import { TRUSTBASE_TESTNET2 } from '../../assets/trustbase';
 
 // =============================================================================
 // Test directories
@@ -53,12 +54,6 @@ function createMockTransport(): TransportProvider {
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     sendMessage: vi.fn().mockResolvedValue('event-id'),
     onMessage: vi.fn().mockReturnValue(() => {}),
-    sendTokenTransfer: vi.fn().mockResolvedValue('transfer-id'),
-    onTokenTransfer: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequest: vi.fn().mockResolvedValue('request-id'),
-    onPaymentRequest: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequestResponse: vi.fn().mockResolvedValue('response-id'),
-    onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
     subscribeToBroadcast: vi.fn().mockReturnValue(() => {}),
     publishBroadcast: vi.fn().mockResolvedValue('broadcast-id'),
     onEvent: vi.fn().mockReturnValue(() => {}),
@@ -89,11 +84,9 @@ function createMockOracle(): OracleProvider {
     isConnected: vi.fn().mockReturnValue(true),
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     initialize: vi.fn().mockResolvedValue(undefined),
-    submitCommitment: vi.fn().mockResolvedValue({ requestId: 'test-id' }),
-    getProof: vi.fn().mockResolvedValue(null),
-    waitForProof: vi.fn().mockResolvedValue({ proof: 'mock' }),
-    validateToken: vi.fn().mockResolvedValue({ valid: true }),
-    mintToken: vi.fn().mockResolvedValue({ success: true, token: { id: 'mock-token' } }),
+    getTrustBaseJson: () => TRUSTBASE_TESTNET2,
+    getAggregatorUrl: () => 'https://gateway.testnet2.unicity.network',
+    getApiKey: () => 'test-key',
   } as unknown as OracleProvider;
 }
 
@@ -113,7 +106,6 @@ function cleanTestDir(): void {
 
 describe('Tracked addresses integration', () => {
   let storage: FileStorageProvider;
-  let tokenStorage: FileTokenStorageProvider;
 
   beforeEach(() => {
     cleanTestDir();
@@ -122,7 +114,6 @@ describe('Tracked addresses integration', () => {
       (Sphere as unknown as { instance: null }).instance = null;
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
-    tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
   });
 
   afterEach(() => {
@@ -141,7 +132,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
       });
 
@@ -167,7 +158,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'alice',
       });
@@ -189,7 +180,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'alice',
       });
@@ -236,7 +227,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'alice',
       });
@@ -281,7 +272,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
       });
 
@@ -302,7 +293,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'alice',
       });
@@ -336,7 +327,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'alice',
       });
@@ -358,7 +349,6 @@ describe('Tracked addresses integration', () => {
       // --- Reload wallet from same storage ---
       (Sphere as unknown as { instance: null }).instance = null;
       const storage2 = new FileStorageProvider({ dataDir: DATA_DIR });
-      const tokenStorage2 = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
       const transport2 = createMockTransport();
       const oracle2 = createMockOracle();
 
@@ -367,7 +357,7 @@ describe('Tracked addresses integration', () => {
         transport: transport2,
         oracle: oracle2,
         network: TEST_NETWORK,
-        tokenStorage: tokenStorage2,
+        walletApi: makePv2World().walletApi,
       });
 
       expect(wasCreated).toBeFalsy();
@@ -418,7 +408,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
       });
 
@@ -457,7 +447,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'alice',
       });
@@ -501,7 +491,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'alice',
       });
@@ -517,7 +507,7 @@ describe('Tracked addresses integration', () => {
       (Sphere as unknown as { instance: null }).instance = null;
 
       // Clear wallet
-      await Sphere.clear({ storage, tokenStorage });
+      await Sphere.clear({ storage });
 
       // All wallet data removed
       expect(await storage.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES)).toBeNull();
@@ -539,7 +529,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'alice',
       });
@@ -553,18 +543,17 @@ describe('Tracked addresses integration', () => {
       (Sphere as unknown as { instance: null }).instance = null;
 
       // Clear
-      await Sphere.clear({ storage, tokenStorage });
+      await Sphere.clear({ storage });
 
       // Create second wallet on same storage
       const storage2 = new FileStorageProvider({ dataDir: DATA_DIR });
-      const tokenStorage2 = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       const { sphere: second, created } = await Sphere.init({
         storage: storage2,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
-        tokenStorage: tokenStorage2,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
       });
 
@@ -592,7 +581,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'alice',
       });
@@ -633,7 +622,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
       });
 
@@ -665,7 +654,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
       });
 
@@ -703,7 +692,7 @@ describe('Tracked addresses integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
       });
 

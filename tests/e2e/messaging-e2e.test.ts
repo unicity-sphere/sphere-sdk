@@ -15,6 +15,7 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { Sphere } from '../../core/Sphere';
+import { makePv2World } from '../support/pv2-world';
 import { createNodeProviders } from '../../impl/nodejs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -94,12 +95,12 @@ async function createSphere(
   const providers = createNodeProviders({
     network: 'testnet',
     dataDir: dirs.dataDir,
-    tokensDir: dirs.tokensDir,
     ...(opts?.groupChat ? { groupChat: true } : {}),
   });
 
   const result = await Sphere.init({
     ...providers,
+    walletApi: makePv2World().walletApi,
     network: 'testnet',
     autoGenerate: true,
     ...(nametag ? { nametag } : {}),
