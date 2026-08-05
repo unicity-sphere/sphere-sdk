@@ -2,29 +2,46 @@
 
 > For app builders on sphere-sdk ≤0.13.x. The payments vertical was rebuilt
 > from scratch as a wallet-api-only money path (design:
-> `docs/PAYMENTS-V2-DESIGN.md`). During 0.14.0-dev.\* it is opt-in
-> (`paymentsV2: true`); the flip release makes it the only path and deletes
-> the legacy module. This guide is the whole migration — a worked example is
-> the Sphere frontend's own migration (sphere PR #470: +326 −325 across 23
-> files, rename-shaped).
+> `docs/PAYMENTS-V2-DESIGN.md`). During 0.14.0-dev.\* it was opt-in
+> (`paymentsV2: true`); **the flip release (this version) makes it the only
+> path and deletes the legacy module.** This guide is the whole migration — a
+> worked example is the Sphere frontend's own migration (sphere PR #470:
+> +326 −325 across 23 files, rename-shaped).
+
+## 0. THE FLIP RELEASE — what changed at the switch
+
+- **`sphere.payments` IS the v2 facade.** The v1 `PaymentsModule` is deleted;
+  the old surface no longer exists to throw. `sphere.paymentsV2` remains as a
+  **deprecated alias** of the same facade for one release — new code uses
+  `sphere.payments`.
+- **The `paymentsV2` init flag is a no-op** (accepted, deprecated, removed
+  next release). Drop it in your migration PR.
+- **Init is fail-closed on the wallet-api composition:** pass `walletApi`
+  (`{ network, baseUrl, deviceId?, fetchFn?, webSocketFactory?, paymentsV2Transport? }`,
+  built by `createWalletApiProviders` from `impl/shared/wallet-api`) or
+  `Sphere.init` throws `INVALID_CONFIG` before touching storage.
+- `accounting: true` / `swap: true` **throw** typed `INVALID_CONFIG` (the one
+  sanctioned refusal fossil — public flags whose silent-ignore would hide that
+  invoices/swaps no longer exist). Scheduled for deletion after one release.
+- `Sphere.clear` collapses to `{ storage }`; it wipes the `pv2:*` scoped KV
+  with the KV store and sweeps orphaned pre-flip `sphere-token-storage-*`
+  IndexedDB databases.
+- The dir names stay `modules/payments-v2/` / `impl/wallet-api-v2/` and the
+  subpath exports stay `./payments-v2` / `./impl/wallet-api-v2` — no import
+  churn for subpath consumers.
 
 ## 1. Init: one flag (transition) → default (flip)
 
 ```ts
 const { sphere } = await Sphere.init({
   ...providers,          // wallet-api composition REQUIRED (see §3)
-  paymentsV2: true,      // 0.14.0-dev.*; implicit after the flip
 });
-sphere.paymentsV2!.send({ recipient: '@bob', amount: '1000', coinId: 'UCT' });
+sphere.payments.send({ recipient: '@bob', amount: '1000', coinId: 'UCT' });
 ```
-
-With the flag on, `sphere.payments` (v1) THROWS `INVALID_CONFIG` — stale call
-sites fail loudly, never silently. `accounting: true` / `swap: true` are
-refused (both modules are deleted at the flip; see §4).
 
 ## 2. API map (old → new)
 
-| v1 (`sphere.payments`) | v2 (`sphere.paymentsV2`) |
+| v1 (`sphere.payments`, ≤0.13) | v2 (`sphere.payments` post-flip) |
 |---|---|
 | `getAssets(coinId?)` | `assets(coinId?)` |
 | `getBalance(coinId?)` | derive from `assets()` (sync balance dropped) |
@@ -70,13 +87,15 @@ verbatim. Keep your PENDING_COMMIT handling exactly as it is.
   send-to-self, so tokens enter server inventory. Upgrading a build that
   holds local-only tokens strands them until you downgrade and relocate.
 
-## 4. Deleted at the flip
+## 4. Deleted at the flip (DONE in this release)
 
 `modules/accounting` (invoices) and `modules/swap`, the Connect invoice
 surface (`sphere_getInvoices`, `sphere_getInvoiceStatus`, the 9 invoice
-intents, `invoice:read|write` scopes), own-storage custody, and the v1 TXF
-relic handling. If you depend on any of these, say so before the flip ships —
-after it, the code is gone.
+intents, `invoice:read|write` scopes — Connect protocol stays 2.1; they were
+never enabled in any wallet host), own-storage custody (`TokenStorageProvider`
++ both platform providers + `tokenStorage`/`tokensDir` options), the S1
+`WalletApiClient` (`./wallet-api` subpath), the Nostr asset/payment-request
+rail, and the v1 TXF relic handling. The code is gone.
 
 ## 5. Can mixed versions transact?
 

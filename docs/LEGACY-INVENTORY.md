@@ -20,18 +20,55 @@ entry by grepping its backticked symbol, not by its address.
   `acceptPaymentRequest` / `markPaymentRequestPaid` and the whole `'accepted'`
   concept.
 - Earlier: the pre-E.4 (`v:1`) intent resume path.
-- **P11 flip (this branch)** — CLOSED-BY-P11: `modules/payments`, `modules/accounting`,
-  `modules/swap`, `wallet-api/` (S1 client), the old `impl/shared/wallet-api` providers,
-  `TokenStorageProvider` + both platform token-storage providers, `DeliveryProvider`,
-  the Nostr asset/PR rail (31113/31115/31116), `types/txf.ts` (its KEEP entry FLIPPED —
-  the last producer, `AccountingModule._scanTokenForAttribution`, died with the module),
-  `serialization/txf-serializer.ts`, `validation/`, the old-module events, `sphere.sync()`,
-  `STORAGE_KEYS` (merged map), `INVOICE_TOKEN_TYPE_HEX`, the dead money storage-key
-  constants. The `unconfirmed` Asset fields KEEP their shape — the v2 presentation pins
-  them `'0'`/`0`.
+- **P11 flip (this branch, commits 59cc52ac adapter / 83100c72 flip / 0443ff5d deletion
+  wave / 22e28206 test estate + the docs commit)** — CLOSED-BY-P11: `modules/payments`,
+  `modules/accounting`, `modules/swap`, `wallet-api/` (S1 client), the old
+  `impl/shared/wallet-api` providers, `TokenStorageProvider` + both platform
+  token-storage providers, `DeliveryProvider`, the Nostr asset/PR rail
+  (31113/31115/31116), `types/txf.ts` (its KEEP entry FLIPPED — the last producer,
+  `AccountingModule._scanTokenForAttribution`, died with the module),
+  `serialization/txf-serializer.ts`, `validation/`, the old-module events,
+  `sphere.sync()`, `STORAGE_KEYS` (merged map), `INVOICE_TOKEN_TYPE_HEX`, the dead money
+  storage-key constants, and the Connect invoice surface (2 queries + 9 intents +
+  2 scopes; protocol stays 2.1 — never enabled in any host). The `unconfirmed` Asset
+  fields KEEP their shape — the v2 presentation pins them `'0'`/`0`.
+  - **CLOSURE RULE for the sections below:** every entry whose anchor file died in the
+    flip is CLOSED-BY-P11 — that covers every entry under `modules/payments/*`,
+    `modules/accounting/*`, `modules/swap/*`, `wallet-api/*`, the old
+    `impl/shared/wallet-api/*` providers, `impl/browser/storage/IndexedDBTokenStorageProvider.ts`,
+    `impl/nodejs/storage/FileTokenStorageProvider.ts`, `serialization/txf-serializer.ts`,
+    `types/txf.ts`, `types/v2-transfer.ts`, `validation/*`, and
+    `transport/delivery-provider.ts`. Grep the backticked symbol: zero hits = closed.
+    Entries are left in place below as the historical record of WHY each was held.
+  - **KEEP entries that FLIPPED with the hosts:** `Delivery.ts` tolerant decode,
+    `IntentResume.ts` v-check, `TokenView.ts` unconfirmed bucket (the ACCUMULATOR died;
+    the public `Asset.unconfirmed*` FIELDS survive, pinned `'0'`/`0` by
+    `modules/payments-v2/inventory/presentation.ts`), `types/txf.ts`,
+    `modules/swap/dm-protocol.ts` invoice-shape mutual exclusion,
+    `AccountingModule.ts` `resolveInvoiceRef` hash-index machinery.
+  - **KEEP entries RE-VERIFIED surviving the flip (do not re-hunt):**
+    `core/encryption.ts` apparatus (sphere walletLock still calls `encrypt`/`decryptJson`),
+    `SphereInitOptions.verification`, `core/Sphere.ts` `fromLegacy` nametag fallback
+    (shape still produced by today's nostr-js-sdk), `serialization/wallet-text.ts`
+    (+ `importFromLegacyFile`/`detectLegacyFileType`/`isLegacyFileEncrypted` — live
+    frontend onboarding), all four `token-engine/*` KEEP entries (tolerant parse,
+    `TOKEN_BLOB_VERSION`, `unwrapTokenBlobBytes`, optional `checkpointStore`),
+    `connect/protocol.ts` `SphereHandshake.warning`.
   - **The ONE sanctioned P11 refusal fossil** (revisit-and-delete after one release):
     `accounting:`/`swap:` init options throw typed `INVALID_CONFIG` — public flags whose
     silent-ignore would hide that invoices/swaps no longer exist.
+  - **Taken as P11 riders** (stale prose in surviving code): the four `core/Sphere.ts`
+    "legacy path" text fragments now say what actually happens (money ops fail loudly
+    until an engine exists).
+  - **Deliberately NOT taken with P11** (still open below; separate PRs):
+    the oracle deprecated-alias quartet (`UnicityOracleProvider` shims,
+    `Aggregator*` aliases), `core/network-health.ts` `checkOracle` v1 probe,
+    `Sphere.decrypt` `DEFAULT_ENCRYPTION_KEY` fallback (REMOVE-WITH-MIGRATION),
+    `Identity.ipnsName`, `getAllAddressNametags`, `legacy_hmac`,
+    `base58Encode`, the kind-4/kind-14 transport relics, `NametagInfo` shim,
+    registry/`RegistryNetwork`, `impl/shared/config.ts` `timeout`/`skipVerification`
+    knobs, discover.ts single-inhabitant unions, `cleanupOrphanedVestingCache`,
+    and every `token-engine/*` REMOVE-NOW row (the engine was untouched by design).
   - **NOT taken (P11 stage-2 note):** the `isNetworkScopedAddressKey` cut (judgment call
     #10). The function + `NETWORK_SCOPED_ADDRESS_KEYS`/`_PREFIXES` + the providers'
     network-segment plumbing + the witness key names (`OUTBOX`, `AUTO_RETURN`,
