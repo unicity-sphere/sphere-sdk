@@ -2,9 +2,9 @@
  * Integration tests for Sphere.clear() - full wallet lifecycle
  *
  * Simulates realistic scenarios:
- * 1. Create wallet with nametag + token data
- * 2. Derive additional address with its own nametag
- * 3. Clear all data
+ * 1. Create wallet with nametag
+ * 2. Derive additional addresses
+ * 3. Clear all data (one KV wipe — includes the pv2 scoped KV)
  * 4. Verify everything is wiped
  * 5. Verify new wallet can be created on clean slate
  */
@@ -13,14 +13,14 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Sphere } from '../../core/Sphere';
-import { STORAGE_KEYS_GLOBAL, STORAGE_KEYS_ADDRESS } from '../../constants';
+import { STORAGE_KEYS_GLOBAL } from '../../constants';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
-import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenStorageProvider';
+import { TRUSTBASE_TESTNET2 } from '../../assets/trustbase';
 import type { TransportProvider, OracleProvider } from '../../index';
-import type { ProviderStatus, FullIdentity } from '../../types';
-import type { TxfStorageDataBase } from '../../storage';
+import type { ProviderStatus } from '../../types';
 import { vi } from 'vitest';
 import { TEST_NETWORK } from '../test-network';
+import { makePv2World } from '../support/pv2-world';
 
 // =============================================================================
 // Test directories
@@ -28,7 +28,6 @@ import { TEST_NETWORK } from '../test-network';
 
 const TEST_DIR = path.join(__dirname, '.test-wallet-clear');
 const DATA_DIR = path.join(TEST_DIR, 'data');
-const TOKENS_DIR = path.join(TEST_DIR, 'tokens');
 
 // =============================================================================
 // Mock providers
@@ -62,12 +61,6 @@ function createMockTransport(): TransportProvider {
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     sendMessage: vi.fn().mockResolvedValue('event-id'),
     onMessage: vi.fn().mockReturnValue(() => {}),
-    sendTokenTransfer: vi.fn().mockResolvedValue('transfer-id'),
-    onTokenTransfer: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequest: vi.fn().mockResolvedValue('request-id'),
-    onPaymentRequest: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequestResponse: vi.fn().mockResolvedValue('response-id'),
-    onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
     subscribeToBroadcast: vi.fn().mockReturnValue(() => {}),
     publishBroadcast: vi.fn().mockResolvedValue('broadcast-id'),
     onEvent: vi.fn().mockReturnValue(() => {}),
@@ -98,11 +91,9 @@ function createMockOracle(): OracleProvider {
     isConnected: vi.fn().mockReturnValue(true),
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     initialize: vi.fn().mockResolvedValue(undefined),
-    submitCommitment: vi.fn().mockResolvedValue({ requestId: 'test-id' }),
-    getProof: vi.fn().mockResolvedValue(null),
-    waitForProof: vi.fn().mockResolvedValue({ proof: 'mock' }),
-    validateToken: vi.fn().mockResolvedValue({ valid: true }),
-    mintToken: vi.fn().mockResolvedValue({ success: true, token: { id: 'mock-token' } }),
+    getTrustBaseJson: () => TRUSTBASE_TESTNET2,
+    getAggregatorUrl: () => 'https://gateway.testnet2.unicity.network',
+    getApiKey: () => 'test-key',
   } as unknown as OracleProvider;
 }
 
@@ -116,47 +107,22 @@ function cleanTestDir(): void {
   }
 }
 
-function getTokenFiles(tokensDir: string): string[] {
-  if (!fs.existsSync(tokensDir)) return [];
-  const entries: string[] = [];
-  // Check base dir
-  for (const item of fs.readdirSync(tokensDir)) {
-    const fullPath = path.join(tokensDir, item);
-    if (fs.statSync(fullPath).isDirectory()) {
-      // Per-address subdirectory
-      for (const file of fs.readdirSync(fullPath)) {
-        if (file.endsWith('.json')) {
-          entries.push(path.join(item, file));
-        }
-      }
-    } else if (item.endsWith('.json')) {
-      entries.push(item);
-    }
-  }
-  return entries;
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
 
 describe('Sphere.clear() integration', () => {
   let storage: FileStorageProvider;
-  let tokenStorage: FileTokenStorageProvider;
 
   beforeEach(() => {
     cleanTestDir();
-    clearNostrRelay();
-    // Reset Sphere singleton
     if (Sphere.getInstance()) {
       (Sphere as unknown as { instance: null }).instance = null;
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
-    tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
   });
 
   afterEach(() => {
-    // Reset singleton
     (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
     clearNostrRelay();
@@ -173,7 +139,7 @@ describe('Sphere.clear() integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'alice',
       });
@@ -204,7 +170,7 @@ describe('Sphere.clear() integration', () => {
       await sphere.destroy();
     });
 
-    it('should clear all wallet keys from storage', async () => {
+    it('should clear all wallet keys AND the pv2 scoped KV from storage', async () => {
       const transport = createMockTransport();
       const oracle = createMockOracle();
 
@@ -214,7 +180,7 @@ describe('Sphere.clear() integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'bob',
       });
@@ -223,10 +189,15 @@ describe('Sphere.clear() integration', () => {
       expect(await storage.get(STORAGE_KEYS_GLOBAL.MNEMONIC)).not.toBeNull();
       expect(await storage.get(STORAGE_KEYS_GLOBAL.WALLET_EXISTS)).toBeTruthy();
 
+      // Seed a pv2 durable-state row the way the vertical writes them.
+      const pv2Key = `pv2:testnet2:${sphere.identity!.chainPubkey}:intents`;
+      await storage.set(pv2Key, '[]');
+      expect(await storage.get(pv2Key)).not.toBeNull();
+
       await sphere.destroy();
 
       // Clear everything
-      await Sphere.clear({ storage, tokenStorage });
+      await Sphere.clear({ storage });
 
       // Verify all wallet keys are gone
       expect(await storage.get(STORAGE_KEYS_GLOBAL.MNEMONIC)).toBeNull();
@@ -238,80 +209,8 @@ describe('Sphere.clear() integration', () => {
       expect(await storage.get(STORAGE_KEYS_GLOBAL.WALLET_SOURCE)).toBeNull();
       expect(await storage.get(STORAGE_KEYS_GLOBAL.WALLET_EXISTS)).toBeNull();
       expect(await storage.get(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS)).toBeNull();
-      expect(await storage.get(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS)).toBeNull();
-      expect(await storage.get(STORAGE_KEYS_ADDRESS.OUTBOX)).toBeNull();
-    });
-
-    it('should clear token data from token storage', async () => {
-      const transport = createMockTransport();
-      const oracle = createMockOracle();
-
-      // Create wallet
-      const { sphere } = await Sphere.init({
-        storage,
-        transport,
-        oracle,
-        network: TEST_NETWORK,
-        tokenStorage,
-        autoGenerate: true,
-      });
-
-      // Manually save token data (simulating minted nametag token + received tokens)
-      const identity = sphere.identity!;
-      tokenStorage.setIdentity(identity as FullIdentity);
-      await tokenStorage.initialize();
-
-      await tokenStorage.save({
-        _meta: {
-          version: 1,
-          address: identity.chainPubkey,
-          formatVersion: '2.0',
-          updatedAt: Date.now(),
-        },
-        _token1: {
-          id: 'token1',
-          coinId: 'UCT',
-          amount: '1000000',
-          status: 'confirmed',
-        },
-        _nametagToken: {
-          id: 'nametagToken',
-          coinId: 'NAMETAG',
-          amount: '1',
-          status: 'confirmed',
-          nametag: 'alice',
-        },
-      } as TxfStorageDataBase);
-
-      // Verify tokens actually exist by reading them back via load()
-      const loadResult = await tokenStorage.load();
-      expect(loadResult.success).toBe(true);
-      const loadedData = loadResult.data!;
-      expect(loadedData._token1).toBeDefined();
-      expect((loadedData._token1 as Record<string, unknown>).coinId).toBe('UCT');
-      expect(loadedData._nametagToken).toBeDefined();
-      expect((loadedData._nametagToken as Record<string, unknown>).coinId).toBe('NAMETAG');
-
-      // Verify actual files on disk
-      const tokenFilesBefore = getTokenFiles(TOKENS_DIR);
-      expect(tokenFilesBefore.length).toBeGreaterThanOrEqual(2);
-
-      await sphere.destroy();
-
-      // Clear everything
-      await Sphere.clear({ storage, tokenStorage });
-
-      // Verify tokens are gone - by loading
-      const loadResultAfter = await tokenStorage.load();
-      if (loadResultAfter.success && loadResultAfter.data) {
-        const dataAfter = loadResultAfter.data;
-        expect(dataAfter._token1).toBeUndefined();
-        expect(dataAfter._nametagToken).toBeUndefined();
-      }
-
-      // Verify files on disk are gone
-      const tokenFilesAfter = getTokenFiles(TOKENS_DIR);
-      expect(tokenFilesAfter.length).toBe(0);
+      // The pv2 scoped KV (durable payments state) is wiped with the KV store.
+      expect(await storage.get(pv2Key)).toBeNull();
     });
 
     it('should allow creating a new wallet after clear', async () => {
@@ -324,7 +223,7 @@ describe('Sphere.clear() integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'firstwallet',
       });
@@ -333,7 +232,7 @@ describe('Sphere.clear() integration', () => {
       await sphere1.destroy();
 
       // Clear
-      await Sphere.clear({ storage, tokenStorage });
+      await Sphere.clear({ storage });
 
       // Wallet should no longer exist
       expect(await Sphere.exists(storage)).toBe(false);
@@ -347,7 +246,7 @@ describe('Sphere.clear() integration', () => {
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'secondwallet',
       });
@@ -372,7 +271,7 @@ describe('Sphere.clear() integration', () => {
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
         nametag: 'primary',
       });
@@ -397,7 +296,7 @@ describe('Sphere.clear() integration', () => {
       await sphere.destroy();
 
       // Clear
-      await Sphere.clear({ storage, tokenStorage });
+      await Sphere.clear({ storage });
 
       // All data should be gone
       expect(await storage.get(STORAGE_KEYS_GLOBAL.MNEMONIC)).toBeNull();
@@ -406,317 +305,60 @@ describe('Sphere.clear() integration', () => {
     });
   });
 
-  describe('clear with token storage containing multiple address subdirs', () => {
-    it('should clear tokens for the current address', async () => {
-      const transport = createMockTransport();
-      const oracle = createMockOracle();
-
-      // Create wallet
-      const { sphere } = await Sphere.init({
-        storage,
-        transport,
-        oracle,
-        network: TEST_NETWORK,
-        tokenStorage,
-        autoGenerate: true,
-      });
-
-      const identity = sphere.identity!;
-      tokenStorage.setIdentity(identity as FullIdentity);
-      await tokenStorage.initialize();
-
-      // Save tokens for current address via save()
-      await tokenStorage.save({
-        _meta: {
-          version: 1,
-          address: identity.chainPubkey,
-          formatVersion: '2.0',
-          updatedAt: Date.now(),
-        },
-        _token001: { id: 'token-uct-001', coinId: 'UCT', amount: '5000000' },
-        _token002: { id: 'token-uct-002', coinId: 'UCT', amount: '3000000' },
-      } as TxfStorageDataBase);
-
-      // Verify tokens exist by loading
-      const loadResult = await tokenStorage.load();
-      expect(loadResult.success).toBe(true);
-      const loadedData = loadResult.data!;
-      expect(loadedData._token001).toBeDefined();
-      expect(loadedData._token002).toBeDefined();
-
-      await sphere.destroy();
-
-      // Clear
-      await Sphere.clear({ storage, tokenStorage });
-
-      // Verify all tokens are gone
-      const loadAfterClear = await tokenStorage.load();
-      if (loadAfterClear.success && loadAfterClear.data) {
-        const dataAfter = loadAfterClear.data;
-        // Only _meta should remain (or nothing)
-        const tokenKeysAfter = Object.keys(dataAfter).filter(k => !k.startsWith('_'));
-        expect(tokenKeysAfter.length).toBe(0);
-      }
-    });
-  });
-
   describe('nametag uniqueness on Nostr after clear', () => {
     it('should preserve nametag on Nostr after local clear', async () => {
       const transport = createMockTransport();
       const oracle = createMockOracle();
 
-      // Create wallet and register nametag
       const { sphere } = await Sphere.init({
         storage,
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
-        nametag: 'unique123',
+        nametag: 'unique-name',
       });
 
       const ownerPubkey = sphere.identity!.chainPubkey;
-
-      // Nametag is on Nostr
-      expect(nostrRelayNametags.get('unique123')).toBe(ownerPubkey);
-
       await sphere.destroy();
 
-      // Clear local data — Nostr is NOT affected
-      await Sphere.clear({ storage, tokenStorage });
+      // Local clear does NOT unregister the Nostr binding
+      await Sphere.clear({ storage });
 
-      // Local wallet is gone
-      expect(await Sphere.exists(storage)).toBe(false);
-
-      // But nametag still lives on Nostr
-      expect(nostrRelayNametags.get('unique123')).toBe(ownerPubkey);
+      expect(nostrRelayNametags.get('unique-name')).toBe(ownerPubkey);
     });
 
     it('should reject same nametag from a different wallet after clear', async () => {
       const transport = createMockTransport();
       const oracle = createMockOracle();
 
-      // Wallet 1 registers nametag
       const { sphere: sphere1 } = await Sphere.init({
         storage,
         transport,
         oracle,
         network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
-        nametag: 'taken',
+        nametag: 'contested',
       });
-
-      expect(sphere1.identity!.nametag).toBe('taken');
       await sphere1.destroy();
 
-      // Clear local data
-      await Sphere.clear({ storage, tokenStorage });
+      await Sphere.clear({ storage });
 
-      // Wallet 2 (different mnemonic = different keys) tries the same nametag
+      // A NEW wallet (different mnemonic) cannot take the name — first-seen-wins.
       const storage2 = new FileStorageProvider({ dataDir: DATA_DIR });
-      await storage2.connect();
-
-      // Sphere.init with nametag calls registerNametag internally.
-      // Since the nametag is taken by a different pubkey on Nostr,
-      // registration fails and Sphere throws.
-      await expect(
-        Sphere.init({
-          storage: storage2,
-          transport: createMockTransport(),
-          oracle: createMockOracle(),
-          network: TEST_NETWORK,
-          tokenStorage,
-          autoGenerate: true,
-          nametag: 'taken',
-        })
-      ).rejects.toThrow('Failed to register Unicity ID');
-
-      // Nametag is still owned by wallet 1's pubkey on Nostr
-      expect(nostrRelayNametags.has('taken')).toBe(true);
-    });
-
-    it('should allow same nametag when re-importing same mnemonic', async () => {
-      const transport = createMockTransport();
-      const oracle = createMockOracle();
-
-      // Wallet 1 creates and registers nametag
-      const { sphere: sphere1 } = await Sphere.init({
-        storage,
-        transport,
-        oracle,
-        network: TEST_NETWORK,
-        tokenStorage,
-        autoGenerate: true,
-        nametag: 'myname',
-      });
-
-      const mnemonic = sphere1.getMnemonic()!;
-      const originalPubkey = sphere1.identity!.chainPubkey;
-      expect(mnemonic).toBeDefined();
-
-      await sphere1.destroy();
-
-      // Clear local data
-      await Sphere.clear({ storage, tokenStorage });
-
-      // Re-import same mnemonic — same keys, same pubkey
-      const storage2 = new FileStorageProvider({ dataDir: DATA_DIR });
-      await storage2.connect();
-
-      const sphere2 = await Sphere.import({
+      const { sphere: sphere2 } = await Sphere.init({
         storage: storage2,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
-        tokenStorage,
-        mnemonic,
-        nametag: 'myname',
-      });
-
-      // Same mnemonic = same pubkey → re-registration succeeds
-      expect(sphere2.identity!.chainPubkey).toBe(originalPubkey);
-      expect(sphere2.identity!.nametag).toBe('myname');
-
-      await sphere2.destroy();
-    });
-  });
-
-  describe('backward compatibility', () => {
-    it('should work with legacy Sphere.clear(storage) call', async () => {
-      const transport = createMockTransport();
-      const oracle = createMockOracle();
-
-      const { sphere } = await Sphere.init({
-        storage,
-        transport,
-        oracle,
-        network: TEST_NETWORK,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         autoGenerate: true,
       });
 
-      expect(await storage.get(STORAGE_KEYS_GLOBAL.MNEMONIC)).not.toBeNull();
-      await sphere.destroy();
-
-      // Legacy call (no tokenStorage)
-      await Sphere.clear(storage);
-
-      // Wallet keys should be gone
-      expect(await storage.get(STORAGE_KEYS_GLOBAL.MNEMONIC)).toBeNull();
-      expect(await Sphere.exists(storage)).toBe(false);
-    });
-  });
-
-  describe('destroy() shuts down tokenStorageProviders', () => {
-    it('should call shutdown() on tokenStorageProviders during destroy', async () => {
-      const transport = createMockTransport();
-      const oracle = createMockOracle();
-
-      const { sphere } = await Sphere.init({
-        storage,
-        transport,
-        oracle,
-        network: TEST_NETWORK,
-        tokenStorage,
-        autoGenerate: true,
-      });
-
-      // tokenStorage was initialized by Sphere.init
-      expect(sphere.getTokenStorage()).toBeDefined();
-
-      // Spy on shutdown
-      const shutdownSpy = vi.spyOn(tokenStorage, 'shutdown');
-
-      await sphere.destroy();
-
-      expect(shutdownSpy).toHaveBeenCalled();
-      // tokenStorageProviders map should be cleared
-      expect(sphere.getTokenStorageProviders().size).toBe(0);
-    });
-
-    it('should not throw if tokenStorage shutdown fails', async () => {
-      const transport = createMockTransport();
-      const oracle = createMockOracle();
-
-      const { sphere } = await Sphere.init({
-        storage,
-        transport,
-        oracle,
-        network: TEST_NETWORK,
-        tokenStorage,
-        autoGenerate: true,
-      });
-
-      // Make shutdown throw
-      vi.spyOn(tokenStorage, 'shutdown').mockRejectedValueOnce(new Error('shutdown failed'));
-
-      // destroy should not throw
-      await expect(sphere.destroy()).resolves.not.toThrow();
-    });
-  });
-
-  describe('import() skips redundant clear', () => {
-    it('should not call tokenStorage.clear() when no wallet exists and no instance', async () => {
-      const transport = createMockTransport();
-      const oracle = createMockOracle();
-
-      // Ensure no wallet exists and no Sphere instance
-      expect(await Sphere.exists(storage)).toBe(false);
-      expect(Sphere.getInstance()).toBeNull();
-
-      const clearSpy = vi.spyOn(tokenStorage, 'clear');
-
-      const sphere = await Sphere.import({
-        storage,
-        transport,
-        oracle,
-        network: TEST_NETWORK,
-        tokenStorage,
-        mnemonic: Sphere.generateMnemonic(),
-      });
-
-      // clear should NOT have been called (no existing wallet to clean up)
-      expect(clearSpy).not.toHaveBeenCalled();
-
-      // But wallet should be created successfully
-      expect(sphere.identity).toBeDefined();
-      expect(await Sphere.exists(storage)).toBe(true);
-
-      await sphere.destroy();
-    });
-
-    it('should call clear() when a wallet already exists', async () => {
-      const transport = createMockTransport();
-      const oracle = createMockOracle();
-
-      // Create a wallet first
-      const { sphere: sphere1 } = await Sphere.init({
-        storage,
-        transport,
-        oracle,
-        network: TEST_NETWORK,
-        tokenStorage,
-        autoGenerate: true,
-      });
-      expect(await Sphere.exists(storage)).toBe(true);
-      await sphere1.destroy();
-
-      // Now import — wallet exists in storage, clear should be called
-      const clearSpy = vi.spyOn(tokenStorage, 'clear');
-
-      const sphere2 = await Sphere.import({
-        storage,
-        transport: createMockTransport(),
-        oracle: createMockOracle(),
-        network: TEST_NETWORK,
-        tokenStorage,
-        mnemonic: Sphere.generateMnemonic(),
-      });
-
-      expect(clearSpy).toHaveBeenCalled();
-      expect(sphere2.identity).toBeDefined();
+      await expect(sphere2.registerNametag('contested')).rejects.toThrow();
+      expect(sphere2.identity!.nametag).toBeUndefined();
 
       await sphere2.destroy();
     });

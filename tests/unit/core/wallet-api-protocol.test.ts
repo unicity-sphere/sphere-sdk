@@ -6,11 +6,11 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { completeSignMessage, progressSignMessage } from '../../../wallet-api/intent-signing';
+import { completeSignMessage, progressSignMessage } from '../../../core/wallet-api-protocol';
 
 const TID = '00000000-0000-4000-8000-000000000000';
 
-describe('intent-signing message vectors (E.4/#87 cross-repo contract)', () => {
+describe('wallet-api protocol message vectors (E.4/#87 cross-repo contract)', () => {
   it('pins the progress-append message (sha256-hex of the exact envelope bytes)', () => {
     // sha256('enc1.AAAA') = 67ca…ff805 — byte-identical to the wallet-api M2.11 vector.
     expect(progressSignMessage(TID, 3, 'enc1.AAAA')).toBe(

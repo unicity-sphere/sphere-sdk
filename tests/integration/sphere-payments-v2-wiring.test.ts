@@ -1,20 +1,17 @@
 /**
- * P9 Sphere wiring for the OPT-IN `paymentsV2` init flag
+ * P11 Sphere wiring — the payments vertical is DEFAULT AND ONLY
  * (docs/PAYMENTS-V2-DESIGN.md §4/§7/§11 + core/payments-v2-wiring.ts).
  *
- * Flag OFF (default): ZERO behavior change — `paymentsV2` is null and the
- * legacy vertical works exactly as before (the full untouched suite is the
- * broader guarantee; this file spot-checks the lifecycle).
- *
- * Flag ON: the legacy `payments` getter throws the typed error (a stale call
- * site must fail loudly, never drain the mailbox beside the v2 vertical); the
- * facade is composed per address from Sphere-held pieces over the REAL
- * wallet-api-v2 fakes (FakeWalletApi + FakeWalletApiV2Client, the same pair
- * facade.test.ts proves the ports against) injected through the documented
- * `paymentsV2Transport` seam on the `walletApi` object; an address switch is
- * stop-then-start with §7 quiescence; destroy() stops the vertical;
- * setOracleApiKey swaps the engine via facade.setEngine with the old engine
- * disposed; facade events reach `sphere.on` subscribers.
+ * Defaults: `sphere.payments` IS the §4 facade; `sphere.paymentsV2` is the
+ * deprecated alias serving the SAME facade; init is fail-closed without a
+ * `walletApi` transport config; the retired `accounting`/`swap` options throw
+ * typed INVALID_CONFIG (the one sanctioned refusal fossil); `paymentsV2` is a
+ * tolerated no-op for one release. The facade is composed per address from
+ * Sphere-held pieces over the REAL wallet-api-v2 fakes injected through the
+ * documented `paymentsV2Transport` seam; an address switch is stop-then-start
+ * with §7 quiescence; destroy() stops the vertical; setOracleApiKey swaps the
+ * engine via facade.setEngine with the old engine disposed; facade events
+ * reach `sphere.on` subscribers.
  */
 
 import * as fs from 'fs';
@@ -22,7 +19,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { Sphere, type SphereWalletApiSession } from '../../core/Sphere';
+import { Sphere } from '../../core/Sphere';
 import { SphereError } from '../../core/errors';
 import { getPublicKey, hexToBytes } from '../../core/crypto';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
@@ -36,6 +33,7 @@ import type {
   PaymentsV2Transport,
   PaymentsV2TransportArgs,
   PaymentsV2WireClient,
+  WalletApiTransportConfig,
 } from '../../core/payments-v2-wiring';
 import { RealizationEngine, fakeDecodeBlobFor } from '../unit/payments-v2/machine-harness';
 import { FakeSession } from '../unit/payments-v2/support';
@@ -61,12 +59,6 @@ function createMockTransport(): TransportProvider {
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     sendMessage: vi.fn().mockResolvedValue('event-id'),
     onMessage: vi.fn().mockReturnValue(() => {}),
-    sendTokenTransfer: vi.fn().mockResolvedValue('transfer-id'),
-    onTokenTransfer: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequest: vi.fn().mockResolvedValue('request-id'),
-    onPaymentRequest: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequestResponse: vi.fn().mockResolvedValue('response-id'),
-    onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
     subscribeToBroadcast: vi.fn().mockReturnValue(() => {}),
     publishBroadcast: vi.fn().mockResolvedValue('broadcast-id'),
     onEvent: vi.fn().mockReturnValue(() => {}),
@@ -145,11 +137,8 @@ function makeWorld(network: string = NET) {
   const api = new FakeWalletApi({ decodeBlob });
   const transports: TransportRecord[] = [];
   const gates: Gates = {};
-  const walletApi = {
+  const walletApi: WalletApiTransportConfig = {
     network,
-    setIdentity: () => undefined,
-    signIn: async () => undefined,
-    logout: async () => undefined,
     paymentsV2Transport: (args: PaymentsV2TransportArgs): PaymentsV2Transport => {
       const session = new FakeSession();
       const caller: FakeCaller = { chainPubkey: args.identity.chainPubkey, network: args.network };
@@ -158,13 +147,7 @@ function makeWorld(network: string = NET) {
       return { session, client: gatedClient(client, gates) };
     },
   };
-  return {
-    realization,
-    api,
-    transports,
-    gates,
-    walletApi: walletApi as unknown as SphereWalletApiSession,
-  };
+  return { realization, api, transports, gates, walletApi };
 }
 
 type World = ReturnType<typeof makeWorld>;
@@ -194,11 +177,10 @@ afterEach(async () => {
 
 interface BuildOptions {
   paymentsV2?: boolean;
-  walletApi?: SphereWalletApiSession;
-  accounting?: boolean;
+  walletApi: WalletApiTransportConfig;
 }
 
-async function buildSphere(options: BuildOptions = {}): Promise<Sphere> {
+async function buildSphere(options: BuildOptions): Promise<Sphere> {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-wiring-'));
   const storage = new FileStorageProvider({ dataDir });
   const { sphere } = await Sphere.init({
@@ -208,9 +190,8 @@ async function buildSphere(options: BuildOptions = {}): Promise<Sphere> {
     mnemonic: MNEMONIC,
     // #728 single-network invariant: the Sphere network must equal walletApi.network.
     network: NET,
-    ...(options.walletApi ? { walletApi: options.walletApi } : {}),
+    walletApi: options.walletApi,
     ...(options.paymentsV2 !== undefined ? { paymentsV2: options.paymentsV2 } : {}),
-    ...(options.accounting !== undefined ? { accounting: options.accounting } : {}),
   });
   cleanups.push(async () => {
     await sphere.destroy();
@@ -219,33 +200,8 @@ async function buildSphere(options: BuildOptions = {}): Promise<Sphere> {
   return sphere;
 }
 
-describe('Sphere paymentsV2 wiring — flag OFF (default)', () => {
-  it('paymentsV2 is null and the legacy vertical works unchanged', async () => {
-    const sphere = await buildSphere();
-
-    expect(sphere.paymentsV2).toBeNull();
-    // Legacy getter serves the (initialized) module — no throw, empty wallet.
-    expect(sphere.payments.getBalance()).toEqual([]);
-    expect(sphere.payments.getTokens()).toEqual([]);
-    expect(sphere.payments.getHistory()).toEqual([]);
-    const unsubscribe = sphere.on('transfer:incoming', () => undefined);
-    unsubscribe();
-
-    await sphere.destroy();
-    expect(sphere.paymentsV2).toBeNull();
-  }, 20_000);
-
-  it('a flag explicitly false behaves identically to absent', async () => {
-    const world = makeWorld();
-    const sphere = await buildSphere({ paymentsV2: false, walletApi: world.walletApi });
-    expect(sphere.paymentsV2).toBeNull();
-    expect(world.transports).toHaveLength(0); // the v2 seam was never consulted
-    expect(() => sphere.payments).not.toThrow();
-  }, 20_000);
-});
-
-describe('Sphere paymentsV2 wiring — flag ON', () => {
-  it('fail-closed at init: no walletApi / accounting+swap combos throw INVALID_CONFIG before any write', async () => {
+describe('Sphere payments wiring — defaults (P11 flip: the vertical is default and only)', () => {
+  it('fail-closed at init: missing walletApi / retired accounting / retired swap throw INVALID_CONFIG before any write', async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-failclosed-'));
     cleanups.push(async () => fs.rmSync(dataDir, { recursive: true, force: true }));
     const storage = new FileStorageProvider({ dataDir });
@@ -257,14 +213,16 @@ describe('Sphere paymentsV2 wiring — flag ON', () => {
       network: NET,
     };
 
-    await expect(Sphere.init({ ...base, paymentsV2: true })).rejects.toMatchObject({
-      code: 'INVALID_CONFIG',
-    });
+    await expect(Sphere.init({ ...base })).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+    // The ONE sanctioned refusal fossil: retired module flags refuse loudly.
     await expect(
-      Sphere.init({ ...base, paymentsV2: true, walletApi: makeWorld().walletApi, accounting: true })
+      Sphere.init({ ...base, walletApi: makeWorld().walletApi, accounting: true })
+    ).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+    await expect(
+      Sphere.init({ ...base, walletApi: makeWorld().walletApi, swap: true })
     ).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
 
-    // Both rejections happened BEFORE the wallet record was created.
+    // All rejections happened BEFORE the wallet record was created.
     expect(await Sphere.exists(storage)).toBe(false);
   }, 20_000);
 
@@ -283,7 +241,6 @@ describe('Sphere paymentsV2 wiring — flag ON', () => {
         mnemonic: MNEMONIC,
         network: NET,
         walletApi: world.walletApi,
-        paymentsV2: true,
       });
     } catch (err) {
       caught = err;
@@ -313,7 +270,6 @@ describe('Sphere paymentsV2 wiring — flag ON', () => {
         mnemonic: MNEMONIC,
         network: NET,
         walletApi: world.walletApi,
-        paymentsV2: true,
       });
     } catch (err) {
       caught = err;
@@ -325,23 +281,12 @@ describe('Sphere paymentsV2 wiring — flag ON', () => {
     expect(world.transports).toHaveLength(0);
   }, 20_000);
 
-  it('payments getter throws the typed error; paymentsV2 is composed, started, and serves the record', async () => {
+  it('sphere.payments IS the facade; sphere.paymentsV2 is the deprecated alias to the SAME facade', async () => {
     const world = makeWorld();
-    const sphere = await buildSphere({ paymentsV2: true, walletApi: world.walletApi });
+    const sphere = await buildSphere({ walletApi: world.walletApi });
 
-    let caught: unknown;
-    try {
-      void sphere.payments;
-    } catch (err) {
-      caught = err;
-    }
-    expect(caught).toBeInstanceOf(SphereError);
-    expect((caught as SphereError).code).toBe('INVALID_CONFIG');
-    expect((caught as SphereError).message).toBe(
-      'payments (v1) is disabled by paymentsV2 — use sphere.paymentsV2'
-    );
-
-    expect(sphere.paymentsV2).not.toBeNull();
+    expect(sphere.payments).toBeDefined();
+    expect(sphere.paymentsV2).toBe(sphere.payments);
     expect(world.transports).toHaveLength(1);
     expect(world.transports[0]!.session.startCalls).toBe(1);
     // The vertical authenticates as the wallet's identity on the wallet-api network.
@@ -352,15 +297,28 @@ describe('Sphere paymentsV2 wiring — flag ON', () => {
     const seeded = await seedInventory(world, world.transports[0]!, 40n);
     world.transports[0]!.session.fire('inventory');
     await vi.waitFor(() => {
-      expect(sphere.paymentsV2!.tokens().map((t) => t.id)).toContain(seeded.blob.tokenId);
+      expect(sphere.payments.tokens().map((t) => t.id)).toContain(seeded.blob.tokenId);
     });
-    const assets = await sphere.paymentsV2!.assets(COIN);
+    const assets = await sphere.payments.assets(COIN);
     expect(assets[0]?.totalAmount).toBe('40');
   }, 20_000);
 
+  it('`paymentsV2: true` and `paymentsV2: false` are both tolerated no-ops (one release)', async () => {
+    const worldOn = makeWorld();
+    const sphereOn = await buildSphere({ walletApi: worldOn.walletApi, paymentsV2: true });
+    expect(sphereOn.payments).toBe(sphereOn.paymentsV2);
+    expect(worldOn.transports).toHaveLength(1);
+    await sphereOn.destroy();
+
+    const worldOff = makeWorld();
+    const sphereOff = await buildSphere({ walletApi: worldOff.walletApi, paymentsV2: false });
+    expect(sphereOff.payments).toBe(sphereOff.paymentsV2);
+    expect(worldOff.transports).toHaveLength(1);
+  }, 30_000);
+
   it('facade events reach sphere.on subscribers (the bus is the emit seam)', async () => {
     const world = makeWorld();
-    const sphere = await buildSphere({ paymentsV2: true, walletApi: world.walletApi });
+    const sphere = await buildSphere({ walletApi: world.walletApi });
 
     const statuses: unknown[] = [];
     const inventoryPings: unknown[] = [];
@@ -381,8 +339,8 @@ describe('Sphere paymentsV2 wiring — flag ON', () => {
 
   it('address switch: the old vertical stops with quiescence (in-flight op settles first), then a FRESH one starts', async () => {
     const world = makeWorld();
-    const sphere = await buildSphere({ paymentsV2: true, walletApi: world.walletApi });
-    const facade0 = sphere.paymentsV2!;
+    const sphere = await buildSphere({ walletApi: world.walletApi });
+    const facade0 = sphere.payments;
 
     // Hold an in-flight drain open across the switch.
     let gateEntered = false;
@@ -418,8 +376,7 @@ describe('Sphere paymentsV2 wiring — flag ON', () => {
     expect(world.transports).toHaveLength(2);
     expect(world.transports[0]!.session.stopCalls).toBe(1);
     expect(world.transports[1]!.session.startCalls).toBe(1);
-    expect(sphere.paymentsV2).not.toBeNull();
-    expect(sphere.paymentsV2).not.toBe(facade0);
+    expect(sphere.payments).not.toBe(facade0);
     expect(world.transports[1]!.args.identity.chainPubkey).toBe(sphere.identity!.chainPubkey);
 
     // Switching back composes a THIRD vertical (stop-then-start, never a restart).
@@ -427,18 +384,18 @@ describe('Sphere paymentsV2 wiring — flag ON', () => {
     expect(world.transports).toHaveLength(3);
     expect(world.transports[1]!.session.stopCalls).toBe(1);
     expect(world.transports[2]!.args.identity.chainPubkey).toBe(sphere.identity!.chainPubkey);
-    expect(sphere.paymentsV2).not.toBe(facade0);
+    expect(sphere.payments).not.toBe(facade0);
   }, 30_000);
 
   it('OVERLAPPING switches serialize: never two running verticals, no orphan left draining', async () => {
     const world = makeWorld();
-    const sphere = await buildSphere({ paymentsV2: true, walletApi: world.walletApi });
+    const sphere = await buildSphere({ walletApi: world.walletApi });
 
     // Hold the boot vertical's stop at quiescence while a second switch lands.
     let release!: () => void;
     const opened = new Promise<void>((resolve) => (release = resolve));
     world.gates.listMailbox = async () => opened;
-    const receiving = sphere.paymentsV2!.receive();
+    const receiving = sphere.payments.receive();
     const first = sphere.switchToAddress(1);
     const second = sphere.switchToAddress(2);
     await sleep(300);
@@ -457,21 +414,29 @@ describe('Sphere paymentsV2 wiring — flag ON', () => {
     expect(sphere.paymentsV2).not.toBeNull();
   }, 30_000);
 
-  it('destroy() stops the running vertical and nulls the getter', async () => {
+  it('destroy() stops the running vertical; payments throws NOT_INITIALIZED, the alias nulls', async () => {
     const world = makeWorld();
-    const sphere = await buildSphere({ paymentsV2: true, walletApi: world.walletApi });
+    const sphere = await buildSphere({ walletApi: world.walletApi });
     expect(sphere.paymentsV2).not.toBeNull();
 
     await sphere.destroy();
 
     expect(world.transports[0]!.session.stopCalls).toBe(1);
     expect(sphere.paymentsV2).toBeNull();
+    let caught: unknown;
+    try {
+      void sphere.payments;
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SphereError);
+    expect((caught as SphereError).code).toBe('NOT_INITIALIZED');
   }, 20_000);
 
   it('setOracleApiKey rebuilds the engine and swaps it via facade.setEngine; the replaced engine is disposed', async () => {
     const world = makeWorld();
-    const sphere = await buildSphere({ paymentsV2: true, walletApi: world.walletApi });
-    const facade = sphere.paymentsV2 as PaymentsFacade;
+    const sphere = await buildSphere({ walletApi: world.walletApi });
+    const facade = sphere.payments as PaymentsFacade;
     const setEngineSpy = vi.spyOn(facade, 'setEngine');
 
     const before = (sphere as unknown as { _tokenEngine?: ITokenEngine })._tokenEngine;
