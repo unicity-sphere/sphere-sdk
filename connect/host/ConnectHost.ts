@@ -48,6 +48,7 @@ import {
 } from '../permissions';
 import type { PermissionScope } from '../permissions';
 import type { SphereInstance, ConnectDirectMessage } from './SphereInstance';
+import { attachCompatEvent, sumFiatUsd } from './payments-compat';
 import {
   assertWalletTransition,
   gate,
@@ -946,28 +947,47 @@ export class ConnectHost {
     // 'live' before we get here, so this is defence in depth — and it is what makes the
     // nullable field compile without a single `!`.
     const sphere = this.requireSphere();
+    // §4 wire-compat (payments-compat.ts): on a v2-facade host the old query results are
+    // built from facade reads; sphere.payments is never touched (its getter throws under v2).
+    const v2 = sphere.paymentsV2 ?? null;
     switch (method) {
       case RPC_METHODS.GET_IDENTITY:
         return this.getPublicIdentity();
 
       case RPC_METHODS.GET_BALANCE:
-        return sphere.payments.getBalance(params.coinId as string | undefined);
+        return v2
+          ? v2.assets(params.coinId as string | undefined)
+          : sphere.payments.getBalance(params.coinId as string | undefined);
 
       case RPC_METHODS.GET_ASSETS:
-        return sphere.payments.getAssets(params.coinId as string | undefined);
+        return v2
+          ? v2.assets(params.coinId as string | undefined)
+          : sphere.payments.getAssets(params.coinId as string | undefined);
 
       case RPC_METHODS.GET_FIAT_BALANCE:
-        return { fiatBalance: await sphere.payments.getFiatBalance() };
+        return {
+          fiatBalance: v2 ? sumFiatUsd(await v2.assets()) : await sphere.payments.getFiatBalance(),
+        };
 
       case RPC_METHODS.GET_TOKENS:
         return this.stripTokenSdkData(
-          sphere.payments.getTokens(
-            params.coinId ? { coinId: params.coinId as string } : undefined,
-          ),
+          v2
+            ? v2.tokens(params.coinId ? { coinId: params.coinId as string } : undefined)
+            : sphere.payments.getTokens(
+                params.coinId ? { coinId: params.coinId as string } : undefined,
+              ),
         );
 
-      case RPC_METHODS.GET_HISTORY:
-        return sphere.payments.getHistory();
+      case RPC_METHODS.GET_HISTORY: {
+        if (!v2) return sphere.payments.getHistory();
+        // Flat entry array on the wire; entries already carry the consumed shape
+        // (`timestamp` mapped from the server's `ts`, plus symbol/tokenIds).
+        const limit = typeof params.limit === 'number' && Number.isFinite(params.limit)
+          ? params.limit
+          : undefined;
+        const page = await v2.history(limit === undefined ? undefined : { limit });
+        return page.entries;
+      }
 
       case RPC_METHODS.RESOLVE:
         if (!params.identifier) {
@@ -1133,7 +1153,23 @@ export class ConnectHost {
       return { subscribed: true, event: eventName };
     }
 
-    const unsub = this.requireSphere().on(eventName as SphereEventType, (data: unknown) => {
+    const sphere = this.requireSphere();
+
+    // §4 wire-compat (payments-compat.ts): on a v2-facade host the old event names have no
+    // bus emitter — re-emit them from the v2 events so nothing a dApp subscribes to silently
+    // stops firing. Keyed under the OLD name, so unsubscribe and the lock snapshot/replay
+    // bookkeeping work unchanged.
+    if (sphere.paymentsV2) {
+      const compatUnsub = attachCompatEvent(sphere, eventName, (data) =>
+        this.pushClientEvent(eventName, data),
+      );
+      if (compatUnsub) {
+        this.eventSubscriptions.set(eventName, compatUnsub);
+        return { subscribed: true, event: eventName };
+      }
+    }
+
+    const unsub = sphere.on(eventName as SphereEventType, (data: unknown) => {
       this.transport.send({
         ns: SPHERE_CONNECT_NAMESPACE,
         v: SPHERE_CONNECT_VERSION,

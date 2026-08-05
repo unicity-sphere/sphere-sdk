@@ -8,6 +8,7 @@
  */
 
 import type { SphereEventType, SphereEventHandler } from '../../types';
+import type { PaymentsV2 } from '../../modules/payments-v2/api';
 
 // Use a minimal interface for the Sphere dependency to avoid circular imports.
 // ConnectHost only needs these public methods from Sphere.
@@ -21,6 +22,10 @@ export interface SphereInstance {
     getTokens(filter?: { coinId?: string }): unknown[];
     getHistory(): unknown[];
   };
+  /** Non-null when this Sphere runs the payments-v2 facade — activates the §4 wire-compat
+   *  adapter (payments-compat.ts). The legacy `payments` member is then NEVER touched:
+   *  its getter throws under v2. */
+  readonly paymentsV2?: PaymentsV2 | null;
   signMessage(message: string): string;
   resolve(identifier: string): Promise<unknown>;
   on<T extends SphereEventType>(type: T, handler: SphereEventHandler<T>): () => void;
