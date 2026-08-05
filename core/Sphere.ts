@@ -11,12 +11,15 @@
  * const storage = createLocalStorageProvider();
  * const transport = createNostrTransportProvider();
  * const oracle = createUnicityAggregatorProvider({ url: '/rpc', network: 'testnet2' });
+ * // Money rides the wallet-api vertical — the transport config is REQUIRED:
+ * const walletApi = { network: 'testnet2', baseUrl: 'https://wallet-api...', deviceId: 'my-device' };
  *
  * // Option 1: Unified init (recommended)
  * const { sphere, created, generatedMnemonic } = await Sphere.init({
  *   storage,
  *   transport,
  *   oracle,
+ *   walletApi,
  *   network: 'testnet2', // required: selects registry/trustbase/aggregator
  *   mnemonic: 'your twelve words...', // optional - will load if wallet exists
  *   autoGenerate: true, // generate new mnemonic if needed
@@ -28,9 +31,9 @@
  *
  * // Option 2: Manual create/load
  * if (await Sphere.exists(storage)) {
- *   const sphere = await Sphere.load({ storage, transport, oracle, network: 'testnet2' });
+ *   const sphere = await Sphere.load({ storage, transport, oracle, walletApi, network: 'testnet2' });
  * } else {
- *   const sphere = await Sphere.create({ mnemonic, storage, transport, oracle, network: 'testnet2' });
+ *   const sphere = await Sphere.create({ mnemonic, storage, transport, oracle, walletApi, network: 'testnet2' });
  * }
  *
  * // Use the wallet
@@ -57,24 +60,17 @@ import type {
   TrackedAddressEntry,
 } from '../types';
 import { SphereError } from './errors';
-import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../storage';
+import type { StorageProvider } from '../storage';
 import type { TransportProvider, PeerInfo } from '../transport';
-import type { DeliveryProvider } from '../transport/delivery-provider';
 import { MultiAddressTransportMux, AddressTransportAdapter } from '../transport/MultiAddressTransportMux';
 import type { OracleProvider } from '../oracle';
 import type { PriceProvider } from '../price';
-import { PaymentsModule, createPaymentsModule } from '../modules/payments';
-import type { PaymentsWalletApiPort } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
 import type { CommunicationsModuleConfig } from '../modules/communications';
 import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
 import type { GroupChatModuleConfig } from '../modules/groupchat';
 import { MarketModule, createMarketModule } from '../modules/market';
 import type { MarketModuleConfig } from '../modules/market';
-import { AccountingModule, createAccountingModule } from '../modules/accounting';
-import type { AccountingModuleConfig } from '../modules/accounting';
-import { SwapModule, createSwapModule } from '../modules/swap/index.js';
-import type { SwapModuleConfig } from '../modules/swap/types.js';
 import {
   STORAGE_KEYS_GLOBAL,
   getAddressId,
@@ -116,9 +112,12 @@ import {
   composePaymentsV2,
   resolvePaymentsV2Composition,
   type PaymentsV2Composition,
+  type WalletApiTransportConfig,
 } from './payments-v2-wiring';
 import type { PaymentsV2 } from '../modules/payments-v2/api';
 import type { PaymentsFacade } from '../modules/payments-v2/PaymentsFacade';
+
+export type { WalletApiTransportConfig } from './payments-v2-wiring';
 import {
   isTextWalletEncrypted,
   isWalletTextFormat,
@@ -167,35 +166,23 @@ export type InitProgressCallback = (progress: InitProgress) => void;
 // =============================================================================
 
 /**
- * The wallet-api session surface Sphere drives (sdk-changes S4): the auth
- * lifecycle plus the PaymentsModule client slice. Structural — the S1
- * `WalletApiClient` satisfies it without importing it here.
+ * The wallet-api transport config every wallet needs (money moves only through
+ * the wallet-api vertical): `{ network, baseUrl, deviceId?, ... }` —
+ * `createWalletApiProviders` (impl/shared/wallet-api) builds it. Shared by all
+ * four init-option shapes below.
  */
-export interface SphereWalletApiSession extends PaymentsWalletApiPort {
-  /** Bind the active wallet identity (resets the session). */
-  setIdentity(identity: { privateKey: string; chainPubkey: string }): void;
-  /** Establish a session (refresh-first, challenge fallback) — sign-in on unlock. */
-  signIn(): Promise<void>;
-  /** Revoke the session — logout on account switch. */
-  logout(): Promise<void>;
-}
-
-/** Options for creating a new wallet */
-/**
- * Opt-in to the payments-v2 vertical (docs/PAYMENTS-V2-DESIGN.md §4).
- * Absent/false: nothing changes. When true: the legacy module is never
- * constructed/initialized/loaded (two verticals would double-drain the
- * mailbox), `sphere.payments` THROWS (INVALID_CONFIG) so stale call sites
- * fail loudly, and `sphere.paymentsV2` serves the §4 surface. Requires
- * `walletApi` (its baseUrl/network/deviceId are reused — see
- * core/payments-v2-wiring.ts); incompatible with `accounting`/`swap`.
- * The P11 flip makes this the only path.
- */
-export interface PaymentsV2OptIn {
+interface SphereWalletApiOptions {
+  /** Wallet-api transport config — REQUIRED (init throws INVALID_CONFIG without it). */
+  walletApi?: WalletApiTransportConfig;
+  /** @deprecated The payments-v2 vertical is the only path since the P11 flip — accepted as a no-op for one release. */
   paymentsV2?: boolean;
+  /** @deprecated REMOVED with the P11 flip — any truthy value throws INVALID_CONFIG (invoicing no longer exists in the SDK). */
+  accounting?: unknown;
+  /** @deprecated REMOVED with the P11 flip — any truthy value throws INVALID_CONFIG (swaps no longer exist in the SDK). */
+  swap?: unknown;
 }
 
-export interface SphereCreateOptions {
+export interface SphereCreateOptions extends SphereWalletApiOptions {
   /** BIP39 mnemonic (12 or 24 words) */
   mnemonic: string;
   /** Custom derivation path (default: m/44'/0'/0') */
@@ -204,26 +191,10 @@ export interface SphereCreateOptions {
   nametag?: string;
   /** Storage provider instance */
   storage: StorageProvider;
-  /** Optional token storage provider (for IPFS sync) */
-  tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Transport provider instance */
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /**
-   * Delivery port (sdk-changes S7). When provided, asset transfers ride it
-   * exclusively (wallet-api mailbox in the S4 presets); messaging, group chat
-   * and nametags stay on Nostr. Omit for the legacy relay asset path.
-   */
-  delivery?: DeliveryProvider;
-  /**
-   * wallet-api session (S4): the auth lifecycle (sign-in on unlock, logout on
-   * account switch, intent resume at sign-in) plus the E.3/§10 client slice
-   * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
-   */
-  walletApi?: SphereWalletApiSession;
-  /** See {@link PaymentsV2OptIn}. */
-  paymentsV2?: PaymentsV2OptIn['paymentsV2'];
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -236,10 +207,6 @@ export interface SphereCreateOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
-  /** Accounting module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
-  accounting?: AccountingModuleConfig | boolean;
-  /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
-  swap?: SwapModuleConfig | boolean;
   /** Communications module configuration. */
   communications?: CommunicationsModuleConfig;
   /** Optional password to encrypt the wallet. If omitted, mnemonic is stored as plaintext. */
@@ -263,29 +230,13 @@ export interface SphereCreateOptions {
 }
 
 /** Options for loading existing wallet */
-export interface SphereLoadOptions {
+export interface SphereLoadOptions extends SphereWalletApiOptions {
   /** Storage provider instance */
   storage: StorageProvider;
-  /** Optional token storage provider (for IPFS sync) */
-  tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Transport provider instance */
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /**
-   * Delivery port (sdk-changes S7). When provided, asset transfers ride it
-   * exclusively (wallet-api mailbox in the S4 presets); messaging, group chat
-   * and nametags stay on Nostr. Omit for the legacy relay asset path.
-   */
-  delivery?: DeliveryProvider;
-  /**
-   * wallet-api session (S4): the auth lifecycle (sign-in on unlock, logout on
-   * account switch, intent resume at sign-in) plus the E.3/§10 client slice
-   * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
-   */
-  walletApi?: SphereWalletApiSession;
-  /** See {@link PaymentsV2OptIn}. */
-  paymentsV2?: PaymentsV2OptIn['paymentsV2'];
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -298,10 +249,6 @@ export interface SphereLoadOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
-  /** Accounting module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
-  accounting?: AccountingModuleConfig | boolean;
-  /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
-  swap?: SwapModuleConfig | boolean;
   /** Communications module configuration. */
   communications?: CommunicationsModuleConfig;
   /** Optional password to decrypt the wallet. Must match the password used during creation. */
@@ -325,7 +272,7 @@ export interface SphereLoadOptions {
 }
 
 /** Options for importing a wallet */
-export interface SphereImportOptions {
+export interface SphereImportOptions extends SphereWalletApiOptions {
   /** BIP39 mnemonic to import */
   mnemonic?: string;
   /** Or master private key (hex) */
@@ -346,36 +293,16 @@ export interface SphereImportOptions {
   network?: NetworkType;
   /** Storage provider instance */
   storage: StorageProvider;
-  /** Optional token storage provider */
-  tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Transport provider instance */
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /**
-   * Delivery port (sdk-changes S7). When provided, asset transfers ride it
-   * exclusively (wallet-api mailbox in the S4 presets); messaging, group chat
-   * and nametags stay on Nostr. Omit for the legacy relay asset path.
-   */
-  delivery?: DeliveryProvider;
-  /**
-   * wallet-api session (S4): the auth lifecycle (sign-in on unlock, logout on
-   * account switch, intent resume at sign-in) plus the E.3/§10 client slice
-   * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
-   */
-  walletApi?: SphereWalletApiSession;
-  /** See {@link PaymentsV2OptIn}. */
-  paymentsV2?: PaymentsV2OptIn['paymentsV2'];
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
-  /** Accounting module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
-  accounting?: AccountingModuleConfig | boolean;
-  /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
-  swap?: SwapModuleConfig | boolean;
   /** Communications module configuration. */
   communications?: CommunicationsModuleConfig;
   /** Optional password to encrypt the wallet. If omitted, mnemonic/key is stored as plaintext. */
@@ -399,29 +326,13 @@ export interface SphereImportOptions {
 }
 
 /** Options for unified init (auto-create or load) */
-export interface SphereInitOptions {
+export interface SphereInitOptions extends SphereWalletApiOptions {
   /** Storage provider instance */
   storage: StorageProvider;
   /** Transport provider instance */
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /**
-   * Delivery port (sdk-changes S7). When provided, asset transfers ride it
-   * exclusively (wallet-api mailbox in the S4 presets); messaging, group chat
-   * and nametags stay on Nostr. Omit for the legacy relay asset path.
-   */
-  delivery?: DeliveryProvider;
-  /**
-   * wallet-api session (S4): the auth lifecycle (sign-in on unlock, logout on
-   * account switch, intent resume at sign-in) plus the E.3/§10 client slice
-   * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
-   */
-  walletApi?: SphereWalletApiSession;
-  /** See {@link PaymentsV2OptIn}. */
-  paymentsV2?: PaymentsV2OptIn['paymentsV2'];
-  /** Optional token storage provider (for IPFS sync) */
-  tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** BIP39 mnemonic - if wallet doesn't exist, use this to create */
   mnemonic?: string;
   /** Auto-generate mnemonic if wallet doesn't exist and no mnemonic provided */
@@ -447,10 +358,6 @@ export interface SphereInitOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
-  /** Accounting module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
-  accounting?: AccountingModuleConfig | boolean;
-  /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
-  swap?: SwapModuleConfig | boolean;
   /** Optional password to encrypt/decrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
   /**
@@ -533,32 +440,18 @@ type MutableFullIdentity = {
 /**
  * Holds all per-address module instances.
  * Each HD address gets its own set so modules can run independently in background.
+ * The payments vertical is NOT per-set: exactly one facade runs at a time
+ * (§7 stop-then-start on address switch) — see `_paymentsV2Active`.
  */
 export interface AddressModuleSet {
   index: number;
   identity: FullIdentity;
-  payments: PaymentsModule;
   communications: CommunicationsModule;
   groupChat: GroupChatModule | null;
   market: MarketModule | null;
   transportAdapter: AddressTransportAdapter | null;
-  tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
   /** v2 token engine for THIS address (bound to its signing key). */
   tokenEngine: ITokenEngine | undefined;
-  /**
-   * #583 per-address client isolation: this address's OWN delivery provider
-   * (cloned from the composition template, backed by its own identity-bound
-   * `WalletApiClient` + wake socket). Null in compositions without a delivery
-   * port, or when the composed provider can't isolate per address (no
-   * `createForAddress`) — then the shared template instance is reused.
-   */
-  delivery: DeliveryProvider | null;
-  /**
-   * #583: this address's OWN wallet-api session — the SAME client backing
-   * {@link delivery} (so the whole module set authenticates as one owner). Null
-   * in fully-local compositions or when isolation isn't available.
-   */
-  walletApi: SphereWalletApiSession | null;
   initialized: boolean;
 }
 
@@ -597,51 +490,21 @@ export class Sphere {
 
   // Providers
   private _storage: StorageProvider;
-  private _tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>> = new Map();
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
   private _priceProvider: PriceProvider | null;
-  /**
-   * Delivery port (S7) for the ACTIVE address — null = legacy transport adapter
-   * inside PaymentsModule. #583: this now tracks the active address's OWN
-   * (per-address-isolated) instance, not a single shared one.
-   */
-  private _delivery: DeliveryProvider | null = null;
-  /**
-   * wallet-api session (S4) for the ACTIVE address — null in fully-local
-   * compositions. #583: reflects the active address's OWN client (so
-   * `walletApiSessionStatus` is the active owner's session state).
-   */
-  private _walletApi: SphereWalletApiSession | null = null;
-  /**
-   * #583 per-address client isolation: the COMPOSITION-TIME delivery / wallet-api
-   * instances, retained as templates. Each HD address clones its OWN identity-
-   * bound delivery + session from these (via `createForAddress`) so an orphaned
-   * previous-address poll pump re-auths as ITS OWN owner — never driving a
-   * client re-bound to a different owner. Address 0 (the boot address) reuses
-   * the template instances directly; later addresses get clones.
-   */
-  private _deliveryTemplate: DeliveryProvider | null = null;
-  private _walletApiTemplate: SphereWalletApiSession | null = null;
-  /** S4 session state (#515 F3) — null until a wallet-api composition attempts sign-in. */
-  private _walletApiSessionStatus: 'online' | 'offline' | null = null;
   /** v2 token engine (built per active address from the oracle); injected into modules. */
   private _tokenEngine: ITokenEngine | undefined;
 
   // Modules (single-instance — backward compat, delegates to active address)
-  private _payments: PaymentsModule;
   private _communications: CommunicationsModule;
   private _groupChat: GroupChatModule | null = null;
   private _market: MarketModule | null = null;
-  private _accounting: AccountingModule | null = null;
-  private _swap: SwapModule | null = null;
 
-  // payments-v2 (P9 opt-in — see SphereInitOptions.paymentsV2)
-  /** True when init opted into the payments-v2 vertical; the legacy module is then inert. */
-  private _paymentsV2Enabled = false;
+  // The payments vertical (the ONLY money path since the P11 flip)
   /** The ACTIVE address's running vertical — §7: exactly one at a time, ever. */
   private _paymentsV2Active: { index: number; facade: PaymentsFacade } | null = null;
-  /** Resolved wallet-api transport composition (network + per-address factory). */
+  /** Resolved wallet-api transport composition (network + per-address factory); set at init, fail-closed. */
   private _paymentsV2Composition: PaymentsV2Composition | null = null;
   /**
    * §7 lifecycle mutex: every stop/start pair runs strictly serialized, so
@@ -684,44 +547,24 @@ export class Sphere {
     storage: StorageProvider,
     transport: TransportProvider,
     oracle: OracleProvider,
-    tokenStorage?: TokenStorageProvider<TxfStorageDataBase>,
     priceProvider?: PriceProvider,
     groupChatConfig?: GroupChatModuleConfig,
     marketConfig?: MarketModuleConfig,
-    accountingConfig?: AccountingModuleConfig,
-    swapConfig?: SwapModuleConfig,
     communicationsConfig?: CommunicationsModuleConfig,
-    delivery?: DeliveryProvider,
-    walletApi?: SphereWalletApiSession,
   ) {
     this._storage = storage;
     this._transport = transport;
     this._oracle = oracle;
     this._priceProvider = priceProvider ?? null;
-    // Active-address delivery/session start as the composition-time instances;
-    // they are retained as templates too (#583 — later addresses clone from
-    // them, address 0 / the boot address reuses them directly).
-    this._delivery = delivery ?? null;
-    this._walletApi = walletApi ?? null;
-    this._deliveryTemplate = delivery ?? null;
-    this._walletApiTemplate = walletApi ?? null;
-
-    // Initialize token storage providers map
-    if (tokenStorage) {
-      this._tokenStorageProviders.set(tokenStorage.id, tokenStorage);
-    }
 
     // Store configs for creating per-address modules
     this._groupChatConfig = groupChatConfig;
     this._marketConfig = marketConfig;
     this._communicationsConfig = communicationsConfig;
 
-    this._payments = createPaymentsModule({});
     this._communications = createCommunicationsModule(communicationsConfig);
     this._groupChat = groupChatConfig ? createGroupChatModule(groupChatConfig) : null;
     this._market = marketConfig ? createMarketModule(marketConfig) : null;
-    this._accounting = accountingConfig ? createAccountingModule(accountingConfig) : null;
-    this._swap = swapConfig ? createSwapModule(swapConfig) : null;
   }
 
   // ===========================================================================
@@ -789,6 +632,11 @@ export class Sphere {
     // Configure debug logging (also needed in main bundle context, same as TokenRegistry)
     if (options.debug) logger.configure({ debug: true });
 
+    // Fail-closed BEFORE any work: retired module options + the required
+    // wallet-api composition (create/load re-check for direct callers).
+    Sphere.refuseRetiredModuleOptions(options);
+    resolvePaymentsV2Composition(options.walletApi);
+
     // Configure TokenRegistry in the main bundle context.
     // Factory functions (createBrowserProviders/createNodeProviders) are built as
     // separate bundles by tsup, so their TokenRegistry.configure() call configures
@@ -798,8 +646,6 @@ export class Sphere {
     // Resolve groupChat config: true → use network-default relays
     const groupChat = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
     const market = Sphere.resolveMarketConfig(options.market);
-    const accounting = Sphere.resolveAccountingConfig(options.accounting);
-    const swap = Sphere.resolveSwapConfig(options.swap);
 
     const walletExists = await Sphere.exists(options.storage);
 
@@ -810,17 +656,10 @@ export class Sphere {
         storage: options.storage,
         transport: options.transport,
         oracle: options.oracle,
-        tokenStorage: options.tokenStorage,
-        // S4/S7 ports (#515): dropping these silently degraded a wallet-api
-        // composition to the legacy local-custody one — forward them always.
-        delivery: options.delivery,
         walletApi: options.walletApi,
-        paymentsV2: options.paymentsV2,
         price: options.price,
         groupChat,
         market,
-        accounting,
-        swap,
         communications: options.communications,
         password: options.password,
         discoverAddresses: options.discoverAddresses,
@@ -856,19 +695,12 @@ export class Sphere {
       storage: options.storage,
       transport: options.transport,
       oracle: options.oracle,
-      tokenStorage: options.tokenStorage,
-      // S4/S7 ports (#515): dropping these silently degraded a wallet-api
-      // composition to the legacy local-custody one — forward them always.
-      delivery: options.delivery,
       walletApi: options.walletApi,
-      paymentsV2: options.paymentsV2,
       derivationPath: options.derivationPath,
       nametag: options.nametag,
       price: options.price,
       groupChat,
       market,
-      accounting,
-      swap,
       communications: options.communications,
       password: options.password,
       discoverAddresses: options.discoverAddresses,
@@ -926,53 +758,25 @@ export class Sphere {
   }
 
   /**
-   * Resolve accounting module config from Sphere.init() options.
-   * - `true` → enable with defaults
-   * - `AccountingModuleConfig` → pass through
-   * - `false`/`undefined` → no accounting module
+   * The ONE sanctioned refusal fossil of the P11 flip (revisit-and-delete after
+   * one release): `accounting`/`swap` were public init flags — silently
+   * ignoring them would hide that invoices/swaps no longer exist in the SDK.
+   * `paymentsV2: true` stays an accepted no-op for the same one release (the
+   * live frontend passes it today).
    */
-  private static resolveAccountingConfig(
-    config: AccountingModuleConfig | boolean | undefined,
-  ): AccountingModuleConfig | undefined {
-    if (config === false || config === undefined) return undefined;
-    if (config === true) return {};
-    return config;
-  }
-
-  /**
-   * Resolve swap module config from Sphere.init() options.
-   * - `true` → enable with defaults
-   * - `SwapModuleConfig` → pass through
-   * - `false`/`undefined` → no swap module
-   */
-  private static resolveSwapConfig(
-    config: SwapModuleConfig | boolean | undefined,
-  ): SwapModuleConfig | undefined {
-    if (config === false || config === undefined) return undefined;
-    if (config === true) return {};
-    return config;
-  }
-
-  /**
-   * P9: validate + resolve the paymentsV2 opt-in BEFORE any storage writes —
-   * fail-closed at init, never a silently-degraded composition.
-   */
-  private static resolvePaymentsV2Flag(
-    flag: boolean | undefined,
-    accountingConfig: AccountingModuleConfig | undefined,
-    swapConfig: SwapModuleConfig | undefined,
-    walletApi: SphereWalletApiSession | undefined,
-  ): boolean {
-    if (flag !== true) return false;
-    if (accountingConfig || swapConfig) {
+  private static refuseRetiredModuleOptions(options: SphereWalletApiOptions): void {
+    if (options.accounting) {
       throw new SphereError(
-        'paymentsV2 is incompatible with the accounting/swap modules (both are built on the legacy PaymentsModule and are deleted with the P11 flip) — disable them or the flag.',
+        'The accounting/invoicing module was removed with the P11 flip — drop `accounting` from Sphere.init (invoices no longer exist in the SDK).',
         'INVALID_CONFIG'
       );
     }
-    // Throws INVALID_CONFIG when walletApi is absent or exposes no composition.
-    resolvePaymentsV2Composition(walletApi);
-    return true;
+    if (options.swap) {
+      throw new SphereError(
+        'The swap module was removed with the P11 flip — drop `swap` from Sphere.init (swaps no longer exist in the SDK).',
+        'INVALID_CONFIG'
+      );
+    }
   }
 
   /**
@@ -1002,6 +806,11 @@ export class Sphere {
   static async create(options: SphereCreateOptions): Promise<Sphere> {
     if (options.debug) logger.configure({ debug: true });
 
+    // Fail-closed BEFORE any storage write: retired module options + the
+    // required wallet-api composition.
+    Sphere.refuseRetiredModuleOptions(options);
+    const composition = resolvePaymentsV2Composition(options.walletApi);
+
     // Validate mnemonic
     if (!options.mnemonic || !Sphere.validateMnemonic(options.mnemonic)) {
       throw new SphereError('Invalid mnemonic', 'INVALID_IDENTITY');
@@ -1024,27 +833,18 @@ export class Sphere {
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
     const marketConfig = Sphere.resolveMarketConfig(options.market);
-    const accountingConfig = Sphere.resolveAccountingConfig(options.accounting);
-    const swapConfig = Sphere.resolveSwapConfig(options.swap);
 
     const sphere = new Sphere(
       options.storage,
       options.transport,
       options.oracle,
-      options.tokenStorage,
       options.price,
       groupChatConfig,
       marketConfig,
-      accountingConfig,
-      swapConfig,
       options.communications,
-      options.delivery,
-      options.walletApi,
     );
     sphere._verification = options.verification;
-    sphere._paymentsV2Enabled = Sphere.resolvePaymentsV2Flag(
-      options.paymentsV2, accountingConfig, swapConfig, options.walletApi,
-    );
+    sphere._paymentsV2Composition = composition;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
 
@@ -1116,6 +916,10 @@ export class Sphere {
   static async load(options: SphereLoadOptions): Promise<Sphere> {
     if (options.debug) logger.configure({ debug: true });
 
+    // Fail-closed first: retired module options + the required wallet-api composition.
+    Sphere.refuseRetiredModuleOptions(options);
+    const composition = resolvePaymentsV2Composition(options.walletApi);
+
     // Check if wallet exists
     if (!(await Sphere.exists(options.storage))) {
       throw new SphereError('No wallet found. Use Sphere.create() to create a new wallet.', 'NOT_INITIALIZED');
@@ -1128,27 +932,18 @@ export class Sphere {
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
     const marketConfig = Sphere.resolveMarketConfig(options.market);
-    const accountingConfig = Sphere.resolveAccountingConfig(options.accounting);
-    const swapConfig = Sphere.resolveSwapConfig(options.swap);
 
     const sphere = new Sphere(
       options.storage,
       options.transport,
       options.oracle,
-      options.tokenStorage,
       options.price,
       groupChatConfig,
       marketConfig,
-      accountingConfig,
-      swapConfig,
       options.communications,
-      options.delivery,
-      options.walletApi,
     );
     sphere._verification = options.verification;
-    sphere._paymentsV2Enabled = Sphere.resolvePaymentsV2Flag(
-      options.paymentsV2, accountingConfig, swapConfig, options.walletApi,
-    );
+    sphere._paymentsV2Composition = composition;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
 
@@ -1200,6 +995,11 @@ export class Sphere {
   static async import(options: SphereImportOptions): Promise<Sphere> {
     if (options.debug) logger.configure({ debug: true });
 
+    // Fail-closed BEFORE the destructive clear below: retired module options +
+    // the required wallet-api composition.
+    Sphere.refuseRetiredModuleOptions(options);
+    const composition = resolvePaymentsV2Composition(options.walletApi);
+
     if (!options.mnemonic && !options.masterKey) {
       throw new SphereError('Either mnemonic or masterKey is required', 'INVALID_CONFIG');
     }
@@ -1208,15 +1008,14 @@ export class Sphere {
 
     logger.debug('Sphere', 'Starting import...');
 
-    // Clear existing wallet if any (including token data).
-    // Skip if no active instance and wallet doesn't exist — avoids redundant
-    // tokenStorage.clear() which deletes/reopens IndexedDB and can race with
-    // a subsequent initialize().
+    // Clear existing wallet if any. Skip if no active instance and wallet
+    // doesn't exist — avoids a redundant IndexedDB delete/reopen that can race
+    // with a subsequent initialize().
     const needsClear = Sphere.instance !== null || await Sphere.exists(options.storage);
     if (needsClear) {
       progress?.({ step: 'clearing', message: 'Clearing previous wallet data...' });
       logger.debug('Sphere', 'Clearing existing wallet data...');
-      await Sphere.clear({ storage: options.storage, tokenStorage: options.tokenStorage });
+      await Sphere.clear({ storage: options.storage });
       logger.debug('Sphere', 'Clear done');
     } else {
       logger.debug('Sphere', 'No existing wallet — skipping clear');
@@ -1238,27 +1037,18 @@ export class Sphere {
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
     const marketConfig = Sphere.resolveMarketConfig(options.market);
-    const accountingConfig = Sphere.resolveAccountingConfig(options.accounting);
-    const swapConfig = Sphere.resolveSwapConfig(options.swap);
 
     const sphere = new Sphere(
       options.storage,
       options.transport,
       options.oracle,
-      options.tokenStorage,
       options.price,
       groupChatConfig,
       marketConfig,
-      accountingConfig,
-      swapConfig,
       options.communications,
-      options.delivery,
-      options.walletApi,
     );
     sphere._verification = options.verification;
-    sphere._paymentsV2Enabled = Sphere.resolvePaymentsV2Flag(
-      options.paymentsV2, accountingConfig, swapConfig, options.walletApi,
-    );
+    sphere._paymentsV2Composition = composition;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
 
@@ -1329,18 +1119,6 @@ export class Sphere {
       await sphere.registerNametag(options.nametag);
     }
 
-    // Auto-sync with token storage providers (e.g., IPFS) to recover tokens
-    // (legacy vertical only — under paymentsV2 the module is inert)
-    if (!sphere._paymentsV2Enabled && sphere._tokenStorageProviders.size > 0) {
-      progress?.({ step: 'syncing_tokens', message: 'Syncing tokens...' });
-      try {
-        const syncResult = await sphere._payments.sync();
-        logger.debug('Sphere', `Auto-sync: +${syncResult.added} -${syncResult.removed}`);
-      } catch (err) {
-        logger.warn('Sphere', 'Auto-sync failed (non-fatal):', err);
-      }
-    }
-
     // Auto-discover previously used HD addresses
     if (options.discoverAddresses !== false && sphere._transport.discoverAddresses) {
       progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
@@ -1364,33 +1142,23 @@ export class Sphere {
   }
 
   /**
-   * Clear all SDK-owned wallet data from storage.
+   * Clear all SDK-owned wallet data from storage: wallet keys, per-address
+   * data, and the payments vertical's `pv2:{network}:{pubkey}:*` scoped KV
+   * (refresh token, cursors, journals — all live in the plain StorageProvider,
+   * so the full KV wipe below removes them). Tokens are server-custody; the
+   * only local token artifacts are orphaned `sphere-token-storage-*` IndexedDB
+   * databases left by pre-flip versions, swept here as hygiene.
    *
-   * Removes wallet keys, per-address data, and optionally token storage.
    * Does NOT affect application-level data stored outside the SDK.
    *
-   * @param storageOrOptions - StorageProvider (backward compatible) or options object
-   *
    * @example
-   * // New usage (recommended) - clears wallet keys AND token data
-   * await Sphere.clear({
-   *   storage: providers.storage,
-   *   tokenStorage: providers.tokenStorage,
-   * });
-   *
-   * @example
-   * // Legacy usage - clears only wallet keys
-   * await Sphere.clear(storage);
+   * await Sphere.clear({ storage: providers.storage });
    */
-  static async clear(
-    storageOrOptions: StorageProvider | { storage: StorageProvider; tokenStorage?: TokenStorageProvider<TxfStorageDataBase> },
-  ): Promise<void> {
-    const storage = 'get' in storageOrOptions ? storageOrOptions as StorageProvider : storageOrOptions.storage;
-    const tokenStorage = 'get' in storageOrOptions ? undefined : storageOrOptions.tokenStorage;
+  static async clear(options: { storage: StorageProvider }): Promise<void> {
+    const storage = options.storage;
 
-    // 1. Destroy Sphere instance — flushes pending IPFS writes (saves good
-    //    state), then closes all connections. Awaited so IPFS completes
-    //    before we delete databases.
+    // 1. Destroy Sphere instance — stops the payments vertical (quiescence),
+    //    then closes all connections.
     if (Sphere.instance) {
       logger.debug('Sphere', 'Destroying Sphere instance...');
       await Sphere.instance.destroy();
@@ -1403,20 +1171,10 @@ export class Sphere {
     logger.debug('Sphere', 'Yielding 50ms for IDB transaction settlement...');
     await new Promise((r) => setTimeout(r, 50));
 
-    // 3. Delete token databases (sphere-token-storage-*)
-    if (tokenStorage?.clear) {
-      logger.debug('Sphere', 'Clearing token storage...');
-      try {
-        await tokenStorage.clear();
-        logger.debug('Sphere', 'Token storage cleared');
-      } catch (err) {
-        logger.warn('Sphere', 'Token storage clear failed:', err);
-      }
-    } else {
-      logger.debug('Sphere', 'No token storage provider to clear');
-    }
+    // 3. Sweep orphaned pre-flip token databases (sphere-token-storage-*).
+    await Sphere.sweepOrphanedTokenDatabases();
 
-    // 4. Delete KV database (sphere-storage)
+    // 4. Delete KV database (sphere-storage) — includes the pv2 scoped KV.
     logger.debug('Sphere', 'Clearing KV storage...');
     if (!storage.isConnected()) {
       try {
@@ -1436,6 +1194,26 @@ export class Sphere {
     Sphere.cleanupOrphanedVestingCache(false);
 
     logger.debug('Sphere', 'Done');
+  }
+
+  /**
+   * Raw `indexedDB.deleteDatabase` sweep of `sphere-token-storage-*` databases
+   * left by pre-flip versions (tokens are server-custody now). Browser-only,
+   * best-effort; loud log per deleted database.
+   */
+  private static async sweepOrphanedTokenDatabases(): Promise<void> {
+    try {
+      if (typeof indexedDB === 'undefined' || typeof indexedDB.databases !== 'function') return;
+      const dbs = await indexedDB.databases();
+      for (const db of dbs) {
+        if (db.name && db.name.startsWith('sphere-token-storage')) {
+          logger.warn('Sphere', `Deleting orphaned pre-flip token database: ${db.name}`);
+          indexedDB.deleteDatabase(db.name);
+        }
+      }
+    } catch (err) {
+      logger.warn('Sphere', 'Orphaned token-database sweep failed (non-fatal):', err);
+    }
   }
 
   /**
@@ -1489,21 +1267,17 @@ export class Sphere {
   // Public Properties - Modules
   // ===========================================================================
 
-  /** Payments module (L3) */
-  get payments(): PaymentsModule {
-    if (this._paymentsV2Enabled) {
-      // Checked BEFORE ensureReady so a stale call site fails with the typed
-      // reason at any lifecycle stage — never silently on a half-dead module.
-      throw new SphereError('payments (v1) is disabled by paymentsV2 — use sphere.paymentsV2', 'INVALID_CONFIG');
+  /** Payments (the §4 facade — the active address's running vertical). */
+  get payments(): PaymentsV2 {
+    const facade = this._paymentsV2Active?.facade;
+    if (!facade) {
+      // Not started yet (init in flight), mid address-switch, or destroyed.
+      throw new SphereError('Sphere not initialized', 'NOT_INITIALIZED');
     }
-    this.ensureReady();
-    return this._payments;
+    return facade;
   }
 
-  /**
-   * Payments-v2 vertical (P9, EXPERIMENTAL — `SphereInitOptions.paymentsV2`).
-   * Null when the flag is off; otherwise the active address's facade.
-   */
+  /** @deprecated Alias of {@link payments} kept for one release (the live frontend calls it). Null when no vertical runs. */
   get paymentsV2(): PaymentsV2 | null {
     return this._paymentsV2Active?.facade ?? null;
   }
@@ -1522,16 +1296,6 @@ export class Sphere {
   /** Market module (intent bulletin board). Null if not configured. */
   get market(): MarketModule | null {
     return this._market;
-  }
-
-  /** Accounting module (invoicing). Null if not configured. */
-  get accounting(): AccountingModule | null {
-    return this._accounting;
-  }
-
-  /** Swap module (atomic token swaps). Null if not configured. */
-  get swap(): SwapModule | null {
-    return this._swap;
   }
 
   // ===========================================================================
@@ -1594,79 +1358,12 @@ export class Sphere {
   }
 
   /**
-   * Get first token storage provider (for backward compatibility)
-   * @deprecated Use getTokenStorageProviders() for multiple providers
-   */
-  getTokenStorage(): TokenStorageProvider<TxfStorageDataBase> | undefined {
-    const providers = Array.from(this._tokenStorageProviders.values());
-    return providers.length > 0 ? providers[0] : undefined;
-  }
-
-  /**
-   * Get all token storage providers
-   */
-  getTokenStorageProviders(): Map<string, TokenStorageProvider<TxfStorageDataBase>> {
-    return new Map(this._tokenStorageProviders);
-  }
-
-  /**
-   * Add a token storage provider dynamically (e.g., from UI)
-   * Provider will be initialized and connected automatically
-   */
-  async addTokenStorageProvider(provider: TokenStorageProvider<TxfStorageDataBase>): Promise<void> {
-    if (this._tokenStorageProviders.has(provider.id)) {
-      throw new SphereError(`Token storage provider '${provider.id}' already exists`, 'INVALID_CONFIG');
-    }
-
-    // Set identity if wallet is initialized
-    if (this._identity) {
-      provider.setIdentity(this._identity);
-      await provider.initialize();
-    }
-
-    this._tokenStorageProviders.set(provider.id, provider);
-
-    // Update payments module with new providers
-    if (this._initialized) {
-      this._payments.updateTokenStorageProviders(this._tokenStorageProviders);
-    }
-  }
-
-  /**
-   * Remove a token storage provider dynamically
-   */
-  async removeTokenStorageProvider(providerId: string): Promise<boolean> {
-    const provider = this._tokenStorageProviders.get(providerId);
-    if (!provider) {
-      return false;
-    }
-
-    // Shutdown provider gracefully
-    await provider.shutdown();
-
-    this._tokenStorageProviders.delete(providerId);
-
-    // Update payments module
-    if (this._initialized) {
-      this._payments.updateTokenStorageProviders(this._tokenStorageProviders);
-    }
-
-    return true;
-  }
-
-  /**
-   * Check if a token storage provider is registered
-   */
-  hasTokenStorageProvider(providerId: string): boolean {
-    return this._tokenStorageProviders.has(providerId);
-  }
-
-  /**
-   * Set or update the price provider after initialization
+   * Set or update the price provider. Price is a composition-time property of
+   * the payments vertical — verticals composed after this call (the next
+   * address switch) pick it up.
    */
   setPriceProvider(provider: PriceProvider): void {
     this._priceProvider = provider;
-    this._payments.setPriceProvider(provider);
   }
 
   getTransport(): TransportProvider {
@@ -1708,16 +1405,15 @@ export class Sphere {
   async setOracleApiKey(apiKey: string): Promise<void> {
     this._oracle.setApiKey?.(apiKey);
     // Rebuild ONLY the token engine (buildTokenEngine reads getApiKey() fresh)
-    // and swap it into the live payments module — no transport/socket/storage
-    // teardown, unlike a full re-init.
+    // and swap it into the live facade — no transport/socket/storage teardown,
+    // unlike a full re-init.
     const active = this._addressModules.get(this._currentAddressIndex);
     const replaced = active?.tokenEngine ?? this._tokenEngine;
     this._tokenEngine = await this.buildTokenEngine();
     // Keep the active address's OWN record in step — it is what a later switch
     // back reads, and a stale entry would hand that address a disposed engine.
     if (active) active.tokenEngine = this._tokenEngine;
-    this._payments.setTokenEngine(this._tokenEngine);
-    // P9: the v2 facade snapshots its engine per operation — swap what FUTURE
+    // The facade snapshots its engine per operation — swap what FUTURE
     // operations use; in-flight ones finish on the old engine (disposed below,
     // which only tears down a verification worker pool).
     if (this._paymentsV2Active && this._tokenEngine) {
@@ -2464,15 +2160,6 @@ export class Sphere {
       return;
     }
 
-    // #583: per-address client isolation — each HD address binds its OWN
-    // identity-bound wallet-api client (delivery + session + token storage). A
-    // switch does NOT log out the previous address's session: its modules keep
-    // running on their OWN client (the per-address architecture's "old address
-    // keeps running" contract), and the new address signs in on its own client
-    // at module init. The previous logout-before-switch existed only to stop
-    // the SINGLE shared client serving the wrong owner — now obsolete (and it
-    // would needlessly drop the previous address's still-live wake socket).
-
     // Derive the address at the given index
     const addressInfo = this.deriveAddress(index, false);
 
@@ -2529,62 +2216,10 @@ export class Sphere {
       // storage keys.  Without this, modules would load the previous address's data.
       this._storage.setIdentity(newIdentity);
 
-      // #583: build THIS address's OWN delivery + wallet-api session FIRST (one
-      // fresh identity-bound client), so the wallet-api token storage can share
-      // that SAME client — all of an address's wallet-api artifacts then run on
-      // ONE client + ONE refresh-token lineage (siblings sharing owner+deviceId
-      // would otherwise trip the server's rotation-reuse revocation).
-      const { delivery, walletApi } = this.buildAddressDelivery(newIdentity);
-      const addressTokenProviders = this.buildAddressTokenProviders(newIdentity, walletApi);
-      for (const provider of addressTokenProviders.values()) {
-        await provider.initialize();
-      }
-
-      await this.initializeAddressModules({
-        index,
-        identity: newIdentity,
-        tokenStorageProviders: addressTokenProviders,
-        delivery,
-        walletApi,
-      });
-    } else {
-      // Modules already exist — update identity if nametag changed
-      const moduleSet = this._addressModules.get(index)!;
-      if (nametag !== moduleSet.identity.nametag) {
-        moduleSet.identity = newIdentity;
-        // Use per-address transport if available
-        const addressTransport: TransportProvider = moduleSet.transportAdapter ?? this._transport;
-        // #583: re-init with THIS address's OWN (isolated) delivery + session —
-        // never the currently-active address's instances. The signing key is
-        // unchanged (only the nametag label), so reuse this address's token
-        // engine; rebind the per-address delivery's identity (nametag may ride
-        // outgoing envelopes) before payments.initialize re-wires it.
-        moduleSet.delivery?.setIdentity?.({
-          privateKey: newIdentity.privateKey,
-          chainPubkey: newIdentity.chainPubkey,
-        });
-        // P9: the legacy module is inert under paymentsV2 — never re-init it.
-        if (!this._paymentsV2Enabled) {
-          moduleSet.payments.initialize({
-            identity: newIdentity,
-            storage: this._storage,
-            tokenStorageProviders: moduleSet.tokenStorageProviders,
-            transport: addressTransport,
-            oracle: this._oracle,
-            emitEvent: this.emitEvent.bind(this),
-            price: this._priceProvider ?? undefined,
-            tokenEngine: moduleSet.tokenEngine,
-            delivery: moduleSet.delivery ?? undefined,
-            walletApi: moduleSet.walletApi ?? undefined,
-            getCurrentNametag: () => this.getNametagForAddress(),
-          });
-        }
-      }
-      // No nametag change → no re-init needed. #583: this address already has
-      // its OWN identity-bound client (built at first visit); it never served
-      // another owner, so there is nothing to re-bind (the #580/#581 shared-
-      // client `rebindWalletApiIdentity` is retired). The pointer swap below
-      // just points the active references at this set's instances.
+      await this.initializeAddressModules({ index, identity: newIdentity });
+    } else if (nametag !== this._addressModules.get(index)!.identity.nametag) {
+      // Modules already exist — only the nametag label changed.
+      this._addressModules.get(index)!.identity = newIdentity;
     }
 
     // Switch the active pointer — instant, no destroy
@@ -2593,7 +2228,6 @@ export class Sphere {
 
     // Update active module references for backward compatibility
     const activeModules = this._addressModules.get(index)!;
-    this._payments = activeModules.payments;
     // The engine pointer MUST follow the active address: a re-visit does not
     // re-run initializeAddressModules, so leaving it behind means `_tokenEngine`
     // names a DIFFERENT address's engine — and anything acting on it
@@ -2602,34 +2236,13 @@ export class Sphere {
     this._communications = activeModules.communications;
     this._groupChat = activeModules.groupChat;
     this._market = activeModules.market;
-    // #583: point the active delivery/wallet-api references at THIS address's
-    // own instances so Sphere-level surfaces (walletApiSessionStatus, any
-    // delivery passthrough) reflect the ACTIVE owner — not whichever address
-    // was composed at boot. Previous addresses' instances keep running on their
-    // own clients in the background.
-    this._delivery = activeModules.delivery;
-    this._walletApi = activeModules.walletApi;
 
-    // #583: on a RE-VISIT (modules already existed, so initializeAddressModules
-    // did NOT run its sign-in), re-establish this address's session — re-sign-in
-    // (refresh-first, cheap + idempotent), refresh the Sphere-level
-    // walletApiSessionStatus to the ACTIVE owner's state (#515 F3), and re-run
-    // resumeOpenIntents (E.3) so an intent that failed to resume on an earlier
-    // visit retries. The retired rebindWalletApiIdentity used to cover this on
-    // the re-visit path; per-address isolation keeps the client itself bound,
-    // but these sign-in side effects still need re-running on each switch-back.
-    if (!this._paymentsV2Enabled && !firstVisit && activeModules.walletApi) {
-      await this.startWalletApiSession(activeModules.payments, activeModules.walletApi);
-    }
-
-    // P9 §7: an address switch is stop-then-start — the previous vertical fully
+    // §7: an address switch is stop-then-start — the previous vertical fully
     // stops (quiescence: its in-flight ops settle) BEFORE the new one starts,
     // so two verticals never write one per-address KV; the lifecycle mutex
     // serializes overlapping switches. Re-visits compose a FRESH vertical
     // (durable state lives in the scoped KV; a stopped session can't restart).
-    if (this._paymentsV2Enabled) {
-      await this.stopThenStartPaymentsV2(index, newIdentity);
-    }
+    await this.stopThenStartPaymentsV2(index, newIdentity);
 
     // Persist current index
     await this._storage.set(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX, index.toString());
@@ -2692,110 +2305,15 @@ export class Sphere {
   }
 
   /**
-   * #583 per-address client isolation: build THIS address's OWN delivery
-   * provider + wallet-api session, both backed by ONE fresh identity-bound
-   * `WalletApiClient` cloned from the composition template. An orphaned
-   * previous-address poll pump then drives ITS OWN client (re-auths as its own
-   * owner — harmless) instead of a single shared client re-bound to the new
-   * owner, which is what stranded incoming tokens, leaked wake sockets onto the
-   * wrong owner, and bled payment-requests across addresses.
-   *
-   * Returns the composition templates unchanged when the delivery provider
-   * can't isolate per address (no `createForAddress` — e.g. a stateless legacy
-   * transport adapter); the no-op-switch guard + per-address token storage still
-   * apply. The new delivery's identity is bound here so its first pull
-   * authenticates as this address; `PaymentsModule.initialize` re-binds it (and
-   * the engine's deliveryKeys) idempotently.
-   */
-  private buildAddressDelivery(
-    identity: FullIdentity,
-  ): { delivery: DeliveryProvider | null; walletApi: SphereWalletApiSession | null } {
-    const template = this._deliveryTemplate;
-    if (!template?.createForAddress) {
-      // No isolation available — reuse the composition templates as-is.
-      return { delivery: this._deliveryTemplate, walletApi: this._walletApiTemplate };
-    }
-    const delivery = template.createForAddress();
-    delivery.setIdentity?.({ privateKey: identity.privateKey, chainPubkey: identity.chainPubkey });
-    // The wallet-api session for this address is the SAME client backing its
-    // delivery provider (so intents/history/PRs authenticate as one owner). It
-    // MUST come from the isolated clone's own `walletApiClient` — never the
-    // shared `_walletApiTemplate`: re-binding the boot address's still-active
-    // session to this address would reintroduce the very cross-owner bleed (#580)
-    // this isolation removes. A provider that isolates delivery but exposes no
-    // own client gets a null session (its delivery still works; intents/history
-    // ride the active address's session) rather than a poisoned shared one.
-    const walletApi =
-      (delivery as { walletApiClient?: SphereWalletApiSession }).walletApiClient ?? null;
-    walletApi?.setIdentity({ privateKey: identity.privateKey, chainPubkey: identity.chainPubkey });
-    return { delivery, walletApi };
-  }
-
-  /**
-   * #583: build THIS address's token storage providers. A wallet-api provider
-   * (the only kind needing per-owner auth) is cloned to share the address's
-   * `perAddressClient` — the SAME client backing its delivery + walletApi
-   * session — so all its wallet-api artifacts use ONE client + ONE refresh-token
-   * lineage. Other providers either isolate via the generic arg-less
-   * `createForAddress`, or (stateless/local) reuse the single shared instance,
-   * re-bound to this address. Returns the new (uninitialized) provider map.
-   */
-  private buildAddressTokenProviders(
-    identity: FullIdentity,
-    perAddressClient: unknown,
-  ): Map<string, TokenStorageProvider<TxfStorageDataBase>> {
-    const out = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
-    for (const [providerId, provider] of this._tokenStorageProviders.entries()) {
-      if (provider.createForAddress) {
-        // `createForAddress(sharedClient?)` accepts an optional per-address
-        // context (the storage contract types it `unknown`): wallet-api
-        // providers reuse the address's already-built client; others ignore it.
-        const newProvider = provider.requiresWalletApi && perAddressClient
-          ? provider.createForAddress(perAddressClient)
-          : provider.createForAddress();
-        newProvider.setIdentity(identity);
-        out.set(providerId, newProvider);
-      } else {
-        // Stateless/local provider: it keys all state by identity internally —
-        // re-bind it to this address and reuse the single instance.
-        logger.warn('Sphere', `Token storage provider ${providerId} does not support createForAddress, reusing shared instance`);
-        provider.setIdentity(identity);
-        out.set(providerId, provider);
-      }
-    }
-    return out;
-  }
-
-  /**
    * Create a new set of per-address modules for the given index.
-   * Each address gets its own PaymentsModule, CommunicationsModule, etc.
-   * Modules are fully independent — they have their own token storage,
-   * and can sync/finalize/split in background regardless of active address.
-   *
-   * @param index - HD address index
-   * @param identity - Full identity for this address
-   * @param tokenStorageProviders - Token storage providers for this address
+   * Each address gets its own CommunicationsModule etc. and can run
+   * independently in background. The payments vertical is NOT created here —
+   * the caller starts it via stopThenStartPaymentsV2 (§7 single vertical).
    */
   private async initializeAddressModules(
-    spec: {
-      index: number;
-      identity: FullIdentity;
-      tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
-      delivery: DeliveryProvider | null;
-      walletApi: SphereWalletApiSession | null;
-    },
+    spec: { index: number; identity: FullIdentity },
   ): Promise<AddressModuleSet> {
-    const { index, identity, tokenStorageProviders, delivery, walletApi } = spec;
-    // Destroy swap before accounting — swap depends on accounting.
-    if (this._swap) {
-      await this._swap.destroy();
-    }
-    // W23 fix: Destroy the previous accounting module instance before re-init.
-    // This drains in-flight gated operations (auto-return, implicit close) that
-    // may hold stale ledger references from the previous address.
-    if (this._accounting) {
-      await this._accounting.destroy();
-    }
+    const { index, identity } = spec;
 
     const emitEvent = this.emitEvent.bind(this);
 
@@ -2812,37 +2330,12 @@ export class Sphere {
     }
 
     // Create fresh module instances for this address
-    const payments = createPaymentsModule({});
     const communications = createCommunicationsModule(this._communicationsConfig);
     const groupChat = this._groupChatConfig ? createGroupChatModule(this._groupChatConfig) : null;
     const market = this._marketConfig ? createMarketModule(this._marketConfig) : null;
 
     // v2 token engine for THIS address (bound to its signing key).
     const tokenEngine = await this.buildTokenEngine(identity);
-
-    // #583: `delivery` / `walletApi` are THIS address's OWN identity-bound
-    // instances (built by the caller via buildAddressDelivery, sharing one
-    // client with this address's token storage), so its pumps never share a
-    // client with another address.
-
-    // Initialize with address-specific identity and per-address transport.
-    // P9: with paymentsV2 on, the legacy module stays INERT for every address
-    // (see initializeModules) — switchToAddress starts this address's facade.
-    if (!this._paymentsV2Enabled) {
-      payments.initialize({
-        identity,
-        storage: this._storage,
-        tokenStorageProviders,
-        transport: addressTransport,
-        oracle: this._oracle,
-        emitEvent,
-        price: this._priceProvider ?? undefined,
-        tokenEngine,
-        delivery: delivery ?? undefined,
-        walletApi: walletApi ?? undefined,
-        getCurrentNametag: () => this.getNametagForAddress(),
-      });
-    }
 
     communications.initialize({
       identity,
@@ -2862,76 +2355,11 @@ export class Sphere {
       emitEvent,
     });
 
-    if (this._accounting) {
-      const accountingTokenStorage = tokenStorageProviders.values().next().value;
-      if (accountingTokenStorage) {
-        this._accounting.initialize({
-          payments,
-          tokenStorage: accountingTokenStorage,
-          oracle: this._oracle,
-          identity,
-          getActiveAddresses: () => this._getActiveAddressesInternal(),
-          emitEvent,
-          on: this.on.bind(this),
-          storage: this._storage,
-          communications,
-          tokenEngine,
-        });
-      } else {
-        logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
-        this._accounting = null;
-      }
-    }
-
-    if (this._swap) {
-      if (this._accounting) {
-        const acctForSwap = this._accounting;
-        const onForSwap = this.on.bind(this);
-        this._swap.initialize({
-          accounting: {
-            importInvoice: (token: unknown) => acctForSwap.importInvoice(token as Parameters<typeof acctForSwap.importInvoice>[0]),
-            getInvoice: (id: string) => acctForSwap.getInvoice(id),
-            getInvoiceStatus: (id: string) => acctForSwap.getInvoiceStatus(id),
-            payInvoice: (id: string, params: unknown) => acctForSwap.payInvoice(id, params as Parameters<typeof acctForSwap.payInvoice>[1]),
-            on: onForSwap,
-          },
-          payments: { validate: () => payments.validate() },
-          communications: {
-            sendDM: async (recipientPubkey: string, content: string) => {
-              const msg = await communications.sendDM(recipientPubkey, content);
-              return { eventId: msg.id };
-            },
-            onDirectMessage: (handler) => communications.onDirectMessage(handler),
-          },
-          storage: this._storage,
-          identity,
-          emitEvent,
-          resolve: (id) => this._transport.resolve?.(id) ?? Promise.resolve(null),
-          getActiveAddresses: () => this._getActiveAddressesInternal(),
-        });
-      } else {
-        logger.warn('Sphere', 'Swap module enabled but accounting module not available — disabling');
-        this._swap = null;
-      }
-    }
-
-    if (!this._paymentsV2Enabled) {
-      // payments.load() is critical — must succeed for wallet to be usable
-      await payments.load();
-
-      // S4 auth lifecycle: sign in as this address's identity and resume its
-      // open intents (E.3) — sign-in on unlock / after an account switch. Drives
-      // THIS address's OWN session (#583), never a shared one.
-      await this.startWalletApiSession(payments, walletApi);
-    }
-
     // Non-critical modules load in parallel — failures are non-fatal
     const results = await Promise.allSettled([
       communications.load(),
       groupChat?.load(),
       market?.load(),
-      this._accounting?.load(),
-      this._swap?.load(),
     ]);
     for (const r of results) {
       if (r.status === 'rejected') {
@@ -2942,27 +2370,16 @@ export class Sphere {
     const moduleSet: AddressModuleSet = {
       index,
       identity,
-      payments,
       communications,
       groupChat,
       market,
       transportAdapter: adapter,
-      tokenStorageProviders: new Map(tokenStorageProviders),
       tokenEngine,
-      delivery,
-      walletApi,
       initialized: true,
     };
 
     this._addressModules.set(index, moduleSet);
     logger.debug('Sphere', `Initialized per-address modules for address ${index} (transport: ${adapter ? 'mux adapter' : 'primary'})`);
-
-    // Background sync after initialization (legacy vertical only)
-    if (!this._paymentsV2Enabled) {
-      payments.sync().catch((err) => {
-        logger.warn('Sphere', `Post-init sync failed for address ${index}:`, err);
-      });
-    }
 
     return moduleSet;
   }
@@ -3020,14 +2437,6 @@ export class Sphere {
     // Register address in the mux (resolve delegated to original transport)
     const adapter = await this._transportMux.addAddress(index, identity, this._transport);
     return adapter;
-  }
-
-  /**
-   * Get per-address modules for any address index (creates lazily if needed).
-   * This allows accessing any address's modules without switching.
-   */
-  getAddressPayments(index: number): PaymentsModule | undefined {
-    return this._addressModules.get(index)?.payments;
   }
 
   /**
@@ -3307,9 +2716,8 @@ export class Sphere {
 
     return {
       storage: [mkInfo(this._storage, 'storage')],
-      tokenStorage: Array.from(this._tokenStorageProviders.values()).map(
-        (p) => mkInfo(p, 'token-storage'),
-      ),
+      // Token custody is server-side (wallet-api) — no local token-storage providers.
+      tokenStorage: [],
       transport: [mkInfo(this._transport, 'transport', transportMeta)],
       oracle: [mkInfo(this._oracle, 'oracle')],
       price: priceProviders,
@@ -3455,9 +2863,6 @@ export class Sphere {
     if (this._storage.id === providerId) return this._storage;
     if (this._transport.id === providerId) return this._transport;
     if (this._oracle.id === providerId) return this._oracle;
-    if (this._tokenStorageProviders.has(providerId)) {
-      return this._tokenStorageProviders.get(providerId)!;
-    }
     if (this._priceProvider && this._priceProviderId === providerId) {
       return this._priceProvider;
     }
@@ -3484,15 +2889,6 @@ export class Sphere {
   }
 
   // ===========================================================================
-  // Public Methods - Sync
-  // ===========================================================================
-
-  async sync(): Promise<void> {
-    this.ensureReady();
-    await this._payments.sync();
-  }
-
-  // ===========================================================================
   // Public Methods - Nametag
   // ===========================================================================
 
@@ -3513,7 +2909,7 @@ export class Sphere {
 
   /**
    * Resolve any identifier to full peer information.
-   * Accepts @nametag, bare nametag, DIRECT://, PROXY://, chain pubkey, or transport pubkey.
+   * Accepts @nametag, bare nametag, DIRECT://, chain pubkey, or transport pubkey.
    *
    * @example
    * ```ts
@@ -3536,7 +2932,7 @@ export class Sphere {
    * Useful before a batch of DM operations (e.g., sending hello_ack to
    * multiple tenants, or broadcasting to a list of agents).
    *
-   * @param address - Any valid Unicity address (@nametag, DIRECT://, PROXY://, hex pubkey)
+   * @param address - Any valid Unicity address (@nametag, DIRECT://, hex pubkey)
    * @throws SphereError if the address cannot be resolved
    */
   async preResolveDM(address: string): Promise<void> {
@@ -4003,42 +3399,21 @@ export class Sphere {
   async destroy(): Promise<void> {
     this.cleanupProviderEventSubscriptions();
 
-    // P9: stop the payments-v2 vertical FIRST — stop() awaits quiescence, so
+    // Stop the payments vertical FIRST — stop() awaits quiescence, so
     // in-flight facade ops settle before their engine is disposed below (and
     // the mutex orders this after any in-flight switch's stop/start pair).
     try {
       await this.queuePaymentsV2Op(() => this.stopPaymentsV2Inner());
     } catch (err) {
-      logger.warn('Sphere', 'paymentsV2 stop failed during destroy:', err);
-    }
-
-    // Destroy swap FIRST — it depends on accounting (which depends on payments)
-    try {
-      await this._swap?.destroy();
-    } catch (err) {
-      logger.warn('Sphere', 'Swap module destroy failed:', err);
-    }
-
-    // Destroy accounting — it may have in-flight operations using payments.send()
-    // Draining accounting gates before destroying payments prevents spurious pending entries
-    try {
-      await this._accounting?.destroy();
-    } catch (err) {
-      logger.warn('Sphere', 'Accounting module destroy failed:', err);
+      logger.warn('Sphere', 'payments vertical stop failed during destroy:', err);
     }
 
     // Destroy all per-address module sets
     for (const [idx, moduleSet] of this._addressModules.entries()) {
       try {
-        moduleSet.payments.destroy();
         moduleSet.communications.destroy();
         moduleSet.groupChat?.destroy();
         moduleSet.market?.destroy();
-        // Shutdown per-address token storage providers
-        for (const provider of moduleSet.tokenStorageProviders.values()) {
-          try { await provider.shutdown(); } catch { /* non-fatal */ }
-        }
-        moduleSet.tokenStorageProviders.clear();
         // Each address has its OWN engine, so each may own its own worker pool.
         moduleSet.tokenEngine?.dispose?.();
         logger.debug('Sphere', `Destroyed modules for address ${idx}`);
@@ -4050,7 +3425,6 @@ export class Sphere {
 
     // Also destroy the active module references (they may be the same as
     // address 0 modules, but destroy() is idempotent)
-    this._payments.destroy();
     this._communications.destroy();
     this._groupChat?.destroy();
     this._market?.destroy();
@@ -4068,16 +3442,6 @@ export class Sphere {
     await this._transport.disconnect();
     await this._storage.disconnect();
     await this._oracle.disconnect();
-
-    // Shutdown original token storage providers (close IndexedDB connections etc.)
-    for (const provider of this._tokenStorageProviders.values()) {
-      try {
-        await provider.shutdown();
-      } catch {
-        // Non-fatal — provider may already be closed
-      }
-    }
-    this._tokenStorageProviders.clear();
 
     this._initialized = false;
     this._trackedAddressesLoaded = false;
@@ -4370,11 +3734,6 @@ export class Sphere {
 
     await this._transport.setIdentity(this._identity!);
 
-    // Set identity on all token storage providers
-    for (const provider of this._tokenStorageProviders.values()) {
-      provider.setIdentity(this._identity!);
-    }
-
     // Connect providers (skip if already connected, e.g. after setIdentity reconnect)
     if (!this._storage.isConnected()) {
       await this._storage.connect();
@@ -4383,11 +3742,6 @@ export class Sphere {
       await this._transport.connect();
     }
     await this._oracle.initialize();
-
-    // Initialize all token storage providers in parallel
-    await Promise.all(
-      [...this._tokenStorageProviders.values()].map(p => p.initialize())
-    );
 
     // Subscribe to provider events and bridge to connection:changed
     this.subscribeToProviderEvents();
@@ -4523,27 +3877,6 @@ export class Sphere {
     const previousEngine = this._tokenEngine;
     this._tokenEngine = await this.buildTokenEngine();
     if (previousEngine && previousEngine !== this._tokenEngine) previousEngine.dispose?.();
-    const tokenEngine = this._tokenEngine;
-
-    // P9: with paymentsV2 on, the legacy module stays INERT for every address —
-    // never initialized/loaded (both verticals draining one mailbox would
-    // double-process incoming transfers). The facade starts below instead.
-    if (!this._paymentsV2Enabled) {
-      this._payments.initialize({
-        identity: this._identity!,
-        storage: this._storage,
-        tokenStorageProviders: this._tokenStorageProviders,
-        transport: moduleTransport,
-        oracle: this._oracle,
-        emitEvent,
-        price: this._priceProvider ?? undefined,
-        disabledProviderIds: this._disabledProviders,
-        tokenEngine,
-        delivery: this._delivery ?? undefined,
-        walletApi: this._walletApi ?? undefined,
-        getCurrentNametag: () => this.getNametagForAddress(),
-      });
-    }
 
     this._communications.initialize({
       identity: this._identity!,
@@ -4563,70 +3896,12 @@ export class Sphere {
       emitEvent,
     });
 
-    if (this._accounting) {
-      const accountingTokenStorage = this._tokenStorageProviders.values().next().value;
-      if (accountingTokenStorage) {
-        this._accounting.initialize({
-          payments: this._payments,
-          tokenStorage: accountingTokenStorage,
-          oracle: this._oracle,
-          identity: this._identity!,
-          getActiveAddresses: () => this._getActiveAddressesInternal(),
-          emitEvent,
-          on: this.on.bind(this),
-          storage: this._storage,
-          communications: this._communications,
-          tokenEngine,
-        });
-      } else {
-        logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
-        this._accounting = null;
-      }
-    }
-
-    if (this._swap) {
-      if (this._accounting) {
-        const acctForSwap = this._accounting;
-        const onForSwap = this.on.bind(this);
-        const paymentsForSwap = this._payments;
-        const commsForSwap = this._communications;
-        this._swap.initialize({
-          accounting: {
-            importInvoice: (token: unknown) => acctForSwap.importInvoice(token as Parameters<typeof acctForSwap.importInvoice>[0]),
-            getInvoice: (id: string) => acctForSwap.getInvoice(id),
-            getInvoiceStatus: (id: string) => acctForSwap.getInvoiceStatus(id),
-            payInvoice: (id: string, params: unknown) => acctForSwap.payInvoice(id, params as Parameters<typeof acctForSwap.payInvoice>[1]),
-            on: onForSwap,
-          },
-          payments: { validate: () => paymentsForSwap.validate() },
-          communications: {
-            sendDM: async (recipientPubkey: string, content: string) => {
-              const msg = await commsForSwap.sendDM(recipientPubkey, content);
-              return { eventId: msg.id };
-            },
-            onDirectMessage: (handler) => commsForSwap.onDirectMessage(handler),
-          },
-          storage: this._storage,
-          identity: this._identity!,
-          emitEvent,
-          resolve: (id) => this._transport.resolve?.(id) ?? Promise.resolve(null),
-          getActiveAddresses: () => this._getActiveAddressesInternal(),
-        });
-      } else {
-        logger.warn('Sphere', 'Swap module enabled but accounting module not available — disabling');
-        this._swap = null;
-      }
-    }
-
     // Load modules in parallel — they are independent of each other.
     // allSettled so one failing module doesn't block the rest.
     const results = await Promise.allSettled([
-      this._paymentsV2Enabled ? undefined : this._payments.load(),
       this._communications.load(),
       this._groupChat?.load(),
       this._market?.load(),
-      this._accounting?.load(),
-      this._swap?.load(),
     ]);
     for (const r of results) {
       if (r.status === 'rejected') {
@@ -4634,93 +3909,26 @@ export class Sphere {
       }
     }
 
-    // S4 auth lifecycle: sign in on unlock and resume open intents (E.3).
-    // P9: the v2 vertical owns its own auth + resume — the legacy session
-    // (and its resumeOpenIntents) must not run beside it.
-    if (!this._paymentsV2Enabled) {
-      await this.startWalletApiSession(this._payments);
-    }
-
-    // Register in per-address module map. #583: the boot address reuses the
-    // composition-time delivery/session instances directly (they ARE this
-    // address's isolated client); later addresses clone their own.
+    // Register in per-address module map.
     this._addressModules.set(this._currentAddressIndex, {
       index: this._currentAddressIndex,
       identity: this._identity!,
-      payments: this._payments,
       communications: this._communications,
       groupChat: this._groupChat,
       market: this._market,
       transportAdapter: adapter,
-      tokenStorageProviders: new Map(this._tokenStorageProviders),
       tokenEngine: this._tokenEngine,
-      delivery: this._delivery,
-      walletApi: this._walletApi,
       initialized: true,
     });
 
-    // P9 boot: start the payments-v2 vertical for the boot address (address
+    // Boot: start the payments vertical for the boot address (address
     // switches stop/start it in switchToAddress — §7 single active vertical).
-    if (this._paymentsV2Enabled) {
-      await this.stopThenStartPaymentsV2(this._currentAddressIndex, this._identity!);
-    }
+    await this.stopThenStartPaymentsV2(this._currentAddressIndex, this._identity!);
   }
 
   // ===========================================================================
   // Private: Helpers
   // ===========================================================================
-
-  /**
-   * The wallet-api session state (#515 F3): `'offline'` means the last
-   * sign-in failed and the wallet runs degraded (boot stays non-blocking);
-   * `'online'` after a successful sign-in; `null` when no wallet-api session
-   * is composed (fully-local) or before the first attempt. Changes are
-   * surfaced as `walletapi:session` events.
-   */
-  get walletApiSessionStatus(): 'online' | 'offline' | null {
-    return this._walletApiSessionStatus;
-  }
-
-  /** Record + surface a wallet-api session state change (#515 F3). */
-  private noteWalletApiSession(status: 'online' | 'offline', error?: string): void {
-    if (this._walletApiSessionStatus === status) return;
-    this._walletApiSessionStatus = status;
-    this.emitEvent('walletapi:session', { status, ...(error !== undefined ? { error } : {}) });
-  }
-
-  /**
-   * S4 auth lifecycle: establish the wallet-api session (sign-in on unlock —
-   * silent: the wallet key is available) and resume open intents at sign-in
-   * (E.3 — list + re-run via PaymentsModule, fire-and-forget). A failed
-   * sign-in degrades to offline operation; it never blocks the wallet — but
-   * it is RECORDED and surfaced (`walletApiSessionStatus` + the
-   * `walletapi:session` event), never log-only (#515 F3).
-   */
-  private async startWalletApiSession(
-    payments: PaymentsModule,
-    session: SphereWalletApiSession | null = this._walletApi,
-  ): Promise<void> {
-    if (!session) return;
-    try {
-      await session.signIn();
-    } catch (err) {
-      logger.warn('Sphere', 'wallet-api sign-in failed — wallet continues offline:', err);
-      this.noteWalletApiSession('offline', err instanceof Error ? err.message : String(err));
-      return;
-    }
-    this.noteWalletApiSession('online');
-    void payments
-      .resumeOpenIntents()
-      .then((outcome) => {
-        if (outcome.resumed.length > 0 || outcome.conflicted.length > 0) {
-          logger.warn(
-            'Sphere',
-            `Intent resume: ${outcome.resumed.length} completed, ${outcome.conflicted.length} conflicted (aborted), ${outcome.failed.length} still open`
-          );
-        }
-      })
-      .catch((err) => logger.warn('Sphere', 'Open-intent resume failed (retried next sign-in):', err));
-  }
 
   /** §7 mutex: run one stop/start lifecycle op after all queued ones settle. */
   private queuePaymentsV2Op<T>(op: () => Promise<T>): Promise<T> {
@@ -4732,7 +3940,7 @@ export class Sphere {
     return run;
   }
 
-  /** P9 switch/boot: stop whatever runs, then start `index`'s vertical — atomically vs other lifecycle ops. */
+  /** Switch/boot: stop whatever runs, then start `index`'s vertical — atomically vs other lifecycle ops. */
   private stopThenStartPaymentsV2(index: number, identity: FullIdentity): Promise<void> {
     return this.queuePaymentsV2Op(async () => {
       await this.stopPaymentsV2Inner();
@@ -4741,16 +3949,19 @@ export class Sphere {
   }
 
   /**
-   * P9: compose + start the payments-v2 vertical for ONE address (the §7 rule:
+   * Compose + start the payments vertical for ONE address (the §7 rule:
    * exactly one running vertical; callers stop the previous one first). The
    * facade REUSES this address's engine record — `engineRef` re-reads it so a
    * setOracleApiKey rebuild is what future operations snapshot.
    */
   private async startPaymentsV2Inner(index: number, identity: FullIdentity): Promise<void> {
-    this._paymentsV2Composition ??= resolvePaymentsV2Composition(this._walletApiTemplate);
+    if (!this._paymentsV2Composition) {
+      // Unreachable through init/create/load/import (all fail-closed on it).
+      throw new SphereError('wallet-api composition required for money', 'INVALID_CONFIG');
+    }
     if (!this._addressModules.get(index)?.tokenEngine) {
       throw new SphereError(
-        'paymentsV2 requires the v2 token engine — the oracle must supply a trust base + gateway URL (and API key where required).',
+        'payments requires the v2 token engine — the oracle must supply a trust base + gateway URL (and API key where required).',
         'INVALID_CONFIG'
       );
     }
