@@ -46,6 +46,12 @@ const REALTIME_STATUS: Record<ConnectionStatus['status'], string> = {
   offline: 'closed',
 };
 
+// The ONE view → legacy `IncomingPaymentRequest` mapping (incoming AND the per-status
+// rebuilds): symbol is registry-resolved when known, else '' — never absent on the wire.
+function toLegacyRequest(view: PaymentRequestView, status: string): Record<string, unknown> {
+  return { ...view, symbol: view.symbol ?? '', status };
+}
+
 // Rebuilds the old per-status `IncomingPaymentRequest` payload: full view from
 // `requests.list()` (processed requests stay listed until dismissProcessed()); if already
 // gone, id + status still carry the signal and unknowable fields are empty.
@@ -67,7 +73,7 @@ function legacyRequestPayload(
       status: update.status,
     };
   }
-  return { ...view, symbol: view.symbol ?? '', status: update.status };
+  return toLegacyRequest(view, update.status);
 }
 
 function requestStatusAttacher(status: 'paid' | 'rejected' | 'expired'): Attach {
@@ -109,6 +115,12 @@ const COMPAT_ATTACHERS: ReadonlyMap<string, Attach> = new Map<string, Attach>([
   ['transfer:failed', (sphere, forward) =>
     sphere.on('transfer:updated', (result: TransferResult) => {
       if (result.status === 'failed') forward(result);
+    })],
+  // Same name on both wires, different payload: the raw v2 view has optional `symbol`;
+  // legacy subscribers get the IncomingPaymentRequest shape via the shared mapping.
+  ['payment_request:incoming', (sphere, forward) =>
+    sphere.on('payment_request:incoming', (view: PaymentRequestView) => {
+      forward(toLegacyRequest(view, view.status));
     })],
   ['payment_request:paid', requestStatusAttacher('paid')],
   ['payment_request:rejected', requestStatusAttacher('rejected')],

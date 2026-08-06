@@ -468,6 +468,32 @@ describe('§4 compat event re-emission against a v2-facade host', () => {
     });
   });
 
+  describe('payment_request:incoming → legacy IncomingPaymentRequest shape', () => {
+    it('a v2 view without symbol reaches the subscriber with symbol \'\' and every legacy-required field', async () => {
+      const received: unknown[] = [];
+      await subscribe(h, 'payment_request:incoming', (d) => received.push(d));
+      sphere._emit('payment_request:incoming', REQUEST_VIEW_NO_SYMBOL);
+      const frames = eventsOfType(h.pair.hostSent, 'payment_request:incoming');
+      expect(frames).toHaveLength(1);
+      // The SAME mapping the paid/rejected/expired rebuilds use.
+      expect(frames[0].data).toEqual({ ...REQUEST_VIEW_NO_SYMBOL, symbol: '' });
+      const data = frames[0].data as Record<string, unknown>;
+      for (const field of ['id', 'requestId', 'senderPubkey', 'amount', 'coinId', 'symbol', 'timestamp', 'status'] as const) {
+        expect(data).toHaveProperty(field);
+      }
+      expect(typeof data.symbol).toBe('string');
+      expect(received).toEqual([{ ...REQUEST_VIEW_NO_SYMBOL, symbol: '' }]);
+    });
+
+    it('a registry-resolved symbol passes through unchanged', async () => {
+      await subscribe(h, 'payment_request:incoming');
+      sphere._emit('payment_request:incoming', REQUEST_VIEW);
+      const frames = eventsOfType(h.pair.hostSent, 'payment_request:incoming');
+      expect(frames).toHaveLength(1);
+      expect(frames[0].data).toEqual({ ...REQUEST_VIEW, symbol: 'UCT' });
+    });
+  });
+
   describe('transfer:attention → split:checkpoint-stuck / delivery:undeliverable / delivery:deferred', () => {
     it('re-emits split:checkpoint-stuck with the old {transferId, code, error} shape', async () => {
       await subscribe(h, 'split:checkpoint-stuck');
