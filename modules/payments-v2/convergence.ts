@@ -142,7 +142,9 @@ export class Converger {
   }
 
   private async resumePass(): Promise<boolean> {
-    const report = await resumeAll(this.filteredMachineDeps());
+    const report = await resumeAll(this.filteredMachineDeps(), {
+      isLocallyActive: (id) => this.deps.isActiveOp(id),
+    });
     const progress = report.resumed.length > 0 || report.conflicted.length > 0;
     await this.deps.reconcile({
       resumed: report.resumed,

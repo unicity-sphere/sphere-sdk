@@ -384,3 +384,83 @@ describe('PaymentsFacade — pendingTransfers() read surface', () => {
     expect(w.counters.listOpen).toBe(1);
   });
 });
+
+describe("resume GC — stale 'open' backstop entries (S1: not server-open, nothing owed)", () => {
+  it('tail crash after complete (intent completed, journal empty): the next pass sweeps the entry, pendingTransfers() empties, the heartbeat idles', async () => {
+    const w = makeWorld();
+    await w.seed(100n);
+    await w.facade.start();
+    await drain();
+    const result = await w.facade.send({ recipient: '@peer', amount: '100', coinId: COIN });
+    await drain(); // fire-and-forget close tail: completeIntent + backstop removal
+    expect(w.api.inspectIntent(ownCaller, result.id)?.status).toBe('completed');
+
+    // Simulate the crash window between completeIntent and backstop.removeByKey:
+    // re-insert the entry the dead tail never removed.
+    const entry: IntentBackstopEntry = {
+      transferId: result.id,
+      payloadEnvelope: 'sealed-crashed-tail',
+      requiresSeedClose: false,
+      disposition: 'open',
+      createdAt: 1,
+    };
+    await w.kv.set(STORE_KEYS.intentBackstop, [entry]);
+    expect(await w.facade.pendingTransfers()).toHaveLength(1); // the phantom row
+
+    await w.facade.resumeNow();
+
+    expect(await createMachineStores(w.kv).backstop.list()).toEqual([]);
+    expect(await w.facade.pendingTransfers()).toEqual([]);
+    const passes = w.counters.listOpen;
+    await tick(30 * 60_000);
+    expect(w.counters.listOpen).toBe(passes); // idle — no timer re-armed by the swept entry
+  });
+
+  it("an entry whose intent PUT never acked but with journal legs owed is KEPT (GC, not money logic — when in doubt, keep)", async () => {
+    const w = makeWorld();
+    await w.facade.start();
+    await drain();
+    const entry: IntentBackstopEntry = {
+      transferId: 'ghost-1',
+      payloadEnvelope: 'sealed-unacked',
+      requiresSeedClose: false,
+      disposition: 'open',
+      createdAt: 1,
+    };
+    await w.kv.set(STORE_KEYS.intentBackstop, [entry]);
+    await w.kv.set(STORE_KEYS.deliveryJournal, [
+      {
+        transferId: 'ghost-1',
+        opIndex: 0,
+        recipientPubkey: PEER_PUB,
+        blobHex: 'aa',
+        attempts: 6,
+        undeliverable: true,
+      },
+    ]);
+
+    await w.facade.resumeNow();
+
+    const kept = await createMachineStores(w.kv).backstop.list();
+    expect(kept.map((e) => e.transferId)).toEqual(['ghost-1']);
+  });
+
+  it('an in-process attempt parked BEFORE its intent PUT acked is never swept by a concurrent pass', async () => {
+    const w = makeWorld();
+    await w.seed(100n);
+    await w.facade.start();
+    await drain();
+
+    const gate = w.gate('putIntent');
+    const sending = w.facade.send({ recipient: '@peer', amount: '100', coinId: COIN });
+    await drain();
+    expect(gate.entered).toBe(true); // backstop written, PUT not acked, journal empty
+
+    await w.facade.resumeNow();
+    expect(await createMachineStores(w.kv).backstop.list()).toHaveLength(1);
+
+    gate.release();
+    const result = await sending;
+    expect(result.status).toBe('delivered');
+  });
+});

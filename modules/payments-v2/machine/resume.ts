@@ -22,7 +22,12 @@ interface ResumeJob {
   journaled: Map<number, DeliveryJournalEntry>;
 }
 
-export async function resumeAll(deps: MachineDeps): Promise<ResumeReport> {
+export interface ResumeAllOptions {
+  /** Ids with an in-process machine attempt — their backstop entries are never GC'd. */
+  isLocallyActive?: (transferId: string) => boolean;
+}
+
+export async function resumeAll(deps: MachineDeps, options: ResumeAllOptions = {}): Promise<ResumeReport> {
   const report: ResumeReport = { resumed: [], conflicted: [], failed: [] };
   const stores = createMachineStores(deps.kv);
   const open = await deps.intents.listOpen();
@@ -35,7 +40,12 @@ export async function resumeAll(deps: MachineDeps): Promise<ResumeReport> {
     // locally aborted, so resuming ANY would risk re-executing one. Defer all.
     return report;
   }
-  await dropStaleLocalAborts(stores, locals, new Set(open.map((i) => i.transferId)));
+  await dropStaleBackstops(
+    stores,
+    locals,
+    new Set(open.map((i) => i.transferId)),
+    options.isLocallyActive ?? (() => false)
+  );
 
   const jobs = await gateAndDecode(deps, stores, open, locals, report);
   const ctx: RunCtx = {
@@ -57,15 +67,30 @@ interface RunCtx {
   sources: Map<string, SphereToken>;
 }
 
-async function dropStaleLocalAborts(
+/**
+ * Reconciliation GC (never money logic — when in doubt, KEEP the entry).
+ * Non-'open' entries not server-open: stale local aborts, dropped as before.
+ * S1: an 'open' entry that is NOT server-open (= completed-or-never: tail
+ * crash after complete, or crash before the intent PUT was acked) with NO
+ * journal legs owed and no in-process attempt is pure residue — without this
+ * sweep it is a permanent phantom pendingTransfers() row and the heartbeat
+ * re-arms forever. Any journal leg or active op keeps the entry.
+ */
+async function dropStaleBackstops(
   stores: MachineStores,
   locals: Map<string, IntentBackstopEntry>,
-  openIds: Set<string>
+  openIds: Set<string>,
+  isLocallyActive: (transferId: string) => boolean
 ): Promise<void> {
   for (const entry of locals.values()) {
-    if (entry.disposition !== 'open' && !openIds.has(entry.transferId)) {
+    if (openIds.has(entry.transferId)) continue;
+    if (entry.disposition !== 'open') {
       await stores.backstop.removeByKey(entry.transferId);
+      continue;
     }
+    if (isLocallyActive(entry.transferId)) continue;
+    if ((await stores.deliveryJournal.byTransfer(entry.transferId)).size > 0) continue;
+    await stores.backstop.removeByKey(entry.transferId);
   }
 }
 
