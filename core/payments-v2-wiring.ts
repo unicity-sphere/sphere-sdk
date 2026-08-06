@@ -90,11 +90,9 @@ export interface PaymentsV2Composition {
   factory: PaymentsV2TransportFactory;
 }
 
-/**
- * Fail-closed at init: money moves only through a wallet-api composition.
- * #728 single-network invariant: `walletApi.network` must be a KNOWN network,
- * strictly equal to the Sphere network — asserted BEFORE any session/KV/provider.
- */
+// Fail-closed at init: money moves only through a wallet-api composition. #728:
+// walletApi.network must be KNOWN and equal the Sphere network — asserted BEFORE
+// any session/KV/provider is constructed.
 export function resolvePaymentsV2Composition(
   walletApi: unknown,
   sphereNetwork: string | undefined

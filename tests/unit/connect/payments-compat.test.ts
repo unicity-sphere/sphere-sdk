@@ -12,7 +12,6 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { SDK_VERSION } from '../../../connect/version';
 import { ConnectHost } from '../../../connect/host/ConnectHost';
 import { ConnectClient } from '../../../connect/client/ConnectClient';
 import type { ConnectTransport } from '../../../connect/types';
