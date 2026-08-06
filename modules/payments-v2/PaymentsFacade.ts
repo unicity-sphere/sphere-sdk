@@ -30,7 +30,7 @@ import type { ReservationLedger } from './select/ledger';
 import type { SpendQueue, PlannedSpend } from './select/queue';
 import type { MachineStores } from './machine/journal';
 import { buildOps, classifyError, type MachineDeps, type MachinePlan, type TransferMachine } from './machine/TransferMachine';
-import type { IntentPayload } from './machine/types';
+import { buildPayload, messageOf } from './machine/payload';
 import {
   composeFacadeParts,
   supportsDeterministicMint,
@@ -80,8 +80,7 @@ interface SendRun {
   settledShortfalls: string[];
   firstPartialId: string | undefined;
   pendingAny: boolean;
-  /** The latest attempt's transferId ('' before the first plan) — the id a clean-failure emission carries. */
-  lastTransferId: string;
+  lastTransferId: string; // latest attempt's id ('' pre-plan) — rides a clean-failure emission
 }
 
 export class PaymentsFacade implements PaymentsV2 {
@@ -799,32 +798,3 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 }
 
-function buildPayload(
-  recipientPubkey: string,
-  request: SendRequest,
-  spend: PlannedSpend,
-  spentStates: Record<string, { local: string; protocol: string }>
-): IntentPayload {
-  return {
-    v: 2,
-    recipient: recipientPubkey,
-    coinId: request.coinId,
-    amount: request.amount,
-    ...(request.memo !== undefined ? { memo: request.memo } : {}),
-    direct: [...spend.plan.direct],
-    ...(spend.plan.split !== undefined
-      ? {
-          split: {
-            tokenId: spend.plan.split.tokenId,
-            splitAmount: spend.plan.split.splitAmount.toString(),
-            remainderAmount: spend.plan.split.remainderAmount.toString(),
-          },
-        }
-      : {}),
-    spentStates,
-  };
-}
-
-function messageOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}

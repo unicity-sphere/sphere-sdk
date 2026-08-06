@@ -87,11 +87,8 @@ export interface PaymentsV2Composition {
 
 /**
  * Fail-closed: `paymentsV2: true` without a usable source throws at init.
- * #728 single-network invariant: `walletApi.network` must be a KNOWN network
- * and strictly equal the Sphere network the engine/registry run on — asserted
- * HERE, before any session/KV/provider is constructed, so a mismatched
- * composition can never journal spends under one network while certifying on
- * another.
+ * #728 single-network invariant: `walletApi.network` must be a KNOWN network,
+ * strictly equal to the Sphere network — asserted BEFORE any session/KV/provider.
  */
 export function resolvePaymentsV2Composition(
   walletApi: unknown,

@@ -43,7 +43,7 @@ import { FakeWalletApi, sha256Hex, type FakeCaller } from '../unit/payments-v2/f
 import { FakeWalletApiV2Client } from '../unit/payments-v2/fakes/fake-client';
 
 const MNEMONIC = 'test test test test test test test test test test test junk';
-const NET = 'testnet2';
+const NET = 'testnet2' as const;
 const COIN = 'aa'.repeat(32);
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
