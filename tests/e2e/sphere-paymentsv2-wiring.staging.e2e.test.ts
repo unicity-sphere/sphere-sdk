@@ -14,8 +14,10 @@
  *
  * Throttle reality: the shared testnet2 gateway rate-limits certification
  * submits per minute (429 = rejected BEFORE execution, Retry-After ~1 min).
- * Mint retries are safe (a refused submit certified nothing). A send that
- * lands keep-open (`isPossiblyCommittedSendOutcome`) is NEVER re-issued —
+ * A failed mint is NEVER re-called (§4 retry rule): the in-session heartbeat
+ * replays the SAME journaled mintId, driven here via resumeNow() — a fresh
+ * mint() would race that replay into a second token. A send that lands
+ * keep-open (`isPossiblyCommittedSendOutcome`) is NEVER re-issued —
  * convergence is a same-transferId resume, exercised here the way production
  * does it: re-init Sphere on the same storage and let `facade.start()` resume.
  * Assertions stay exact: one genesis, amount unchanged, exactly-once receipt.
@@ -174,19 +176,36 @@ async function diagnose(label: string): Promise<string> {
   );
 }
 
-/** Mint retries are SAFE: a 429-refused submit executed nothing server-side. */
-async function mintThroughThrottle(amount: bigint): Promise<string> {
-  for (let attempt = 1; attempt <= MAX_MINT_ATTEMPTS && !aborted; attempt++) {
-    const result = await sphere!.paymentsV2!.mint(HARNESS_COIN, amount);
-    if (result.success) {
-      logStep(`mint admitted on attempt ${attempt}: ${result.tokenId ?? ''}`);
-      return result.tokenId!;
-    }
-    if (!/certification unconfirmed/i.test(result.error ?? '')) {
-      throw new Error(`mint failed hard (attempt ${attempt}): ${result.error ?? 'unknown'}`);
-    }
-    if (attempt % 5 === 0) logStep(`mint still throttled after ${attempt} attempts`);
+const MINT_VALIDATION_ERROR = 'coinId must be even-length lowercase hex and amount positive';
+
+/**
+ * F13 posture (§4 retry rule — heartbeat era): mint() is called exactly ONCE.
+ * Any journaled failure (throttle refusal, keep-open certification) converges
+ * by replaying the SAME mintId — resumeNow() drives the in-session pass — and
+ * a fresh mint() re-call would race that replay into a SECOND token.
+ */
+async function mintConvergedOnce(amount: bigint): Promise<string> {
+  const result = await sphere!.paymentsV2!.mint(HARNESS_COIN, amount);
+  if (result.success) {
+    logStep(`mint admitted directly: ${result.tokenId ?? ''}`);
+    return result.tokenId!;
+  }
+  if (result.error === MINT_VALIDATION_ERROR) {
+    throw new Error(`mint failed pre-journal: ${result.error}`);
+  }
+  logStep(`mint keep-open (${(result.error ?? 'unknown').slice(0, 70)}…) — converging via same-mintId replay`);
+  for (let cycle = 1; cycle <= MAX_MINT_ATTEMPTS && !aborted; cycle++) {
     await sleep(THROTTLE_WAIT_MS);
+    await sphere!.paymentsV2!.resumeNow().catch(() => undefined);
+    const tokens = sphere!.paymentsV2!.tokens({ coinId: HARNESS_COIN });
+    if (tokens.length > 0) {
+      if (tokens.length !== 1 || totalOf(sphere!.paymentsV2!) !== amount) {
+        throw new Error(`mint replay must converge to exactly ONE token\n${await diagnose('mint-replay')}`);
+      }
+      logStep(`mint converged via replay on cycle ${cycle}: ${tokens[0]!.id}`);
+      return tokens[0]!.id;
+    }
+    if (cycle % 5 === 0) logStep(`mint replay still throttled after ${cycle} cycles`);
   }
   throw new Error(`mint never admitted by the gateway submit throttle\n${await diagnose('mint')}`);
 }
@@ -238,7 +257,7 @@ describe.runIf(RUN)('LIVE staging: Sphere paymentsV2 wiring (default transport p
     logStep(`wallet up: ${wallet.identity!.chainPubkey.slice(0, 12)}… on ${NETWORK}`);
 
     // 1. Mint 100 HARNESS on-chain via the engine; the record shows it.
-    const genesis = await mintThroughThrottle(100n);
+    const genesis = await mintConvergedOnce(100n);
     expect(genesis).toMatch(/^[0-9a-f]+$/);
     for (let i = 0; totalOf(sphere!.paymentsV2!) !== 100n && i < 30; i++) await sleep(2_000);
     expect(totalOf(sphere!.paymentsV2!)).toBe(100n);
