@@ -986,8 +986,17 @@ export class ConnectHost {
         const limit = typeof params.limit === 'number' && Number.isFinite(params.limit)
           ? params.limit
           : undefined;
-        const page = await v2.history(limit === undefined ? undefined : { limit });
-        return page.entries;
+        if (limit !== undefined) return (await v2.history({ limit })).entries;
+        // INVARIANT: the legacy wire has no cursor — completeness is the contract.
+        // Parameterless sphere_getHistory returned the ENTIRE ledger, so follow
+        // the facade's cursors until the record is exhausted.
+        let page = await v2.history(undefined);
+        const entries = [...page.entries];
+        while (page.more && page.cursor !== null) {
+          page = await v2.history({ before: page.cursor });
+          entries.push(...page.entries);
+        }
+        return entries;
       }
 
       case RPC_METHODS.RESOLVE:
