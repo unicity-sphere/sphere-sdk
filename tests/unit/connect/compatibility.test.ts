@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { checkCompatibility } from '../../../connect/compatibility';
+import { DEFAULT_MIN_CLIENT_SDK_VERSION } from '../../../connect/protocol';
 import { ERROR_CODES, SPHERE_CONNECT_VERSION } from '../../../connect/protocol';
 
 const W = SPHERE_CONNECT_VERSION;     // '2.0'
@@ -55,6 +56,22 @@ describe('checkCompatibility', () => {
   it('passes when the SDK floor is met', () => {
     expect(checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET, clientSdkVersion: '0.10.0', minSdkVersion: '0.10.0' }).ok).toBe(true);
   });
+  it('the P11 default floor 0.14.1-0 rejects every pre-flip client (0.13.x, 0.14.0) and unreported versions', () => {
+    for (const v of ['0.13.3', '0.14.0', '0.14.0-dev.9', undefined]) {
+      const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET, ...(v !== undefined ? { clientSdkVersion: v } : {}), minSdkVersion: DEFAULT_MIN_CLIENT_SDK_VERSION });
+      expect(r.ok, `expected reject for ${v ?? 'unreported'}`).toBe(false);
+    }
+  });
+
+  it('the P11 default floor admits the 0.14.1 prerelease track and everything newer', () => {
+    for (const v of ['0.14.1-dev.0', '0.14.1-dev.1', '0.14.1', '0.14.2', '0.15.0-dev.2', '1.0.0']) {
+      expect(
+        checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET, clientSdkVersion: v, minSdkVersion: DEFAULT_MIN_CLIENT_SDK_VERSION }).ok,
+        `expected accept for ${v}`
+      ).toBe(true);
+    }
+  });
+
   it('rejects when minSdkVersion is set but the client sends no sdkVersion', () => {
     const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET, minSdkVersion: '0.10.0' });
     expect(r.ok).toBe(false);

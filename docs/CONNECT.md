@@ -14,6 +14,12 @@ The current Connect protocol version is **`2.1`** (`SPHERE_CONNECT_VERSION = '2.
 
 ### Handshake fields
 
+> **SDK version floor (0.14.1, the P11 flip):** the host rejects any client whose handshake
+> `sdkVersion` is missing or below `0.14.1-0` (every 0.14.1 prerelease passes) with
+> `UNSUPPORTED_PROTOCOL_VERSION` (4007) and a message naming the required minimum — pre-flip
+> clients expect a wallet surface that no longer exists. Override via
+> `ConnectHostConfig.minSdkVersion`. The claim is compatibility hygiene, not security.
+
 Two new optional fields are sent in the handshake (added in v2; both fields are additive and carry no breaking change to the wire format):
 
 | Field | Direction | Type | Description |

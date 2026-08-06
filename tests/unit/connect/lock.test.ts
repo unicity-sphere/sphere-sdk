@@ -8,6 +8,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { SDK_VERSION } from '../../../connect/version';
 import { ConnectHost } from '../../../connect/host/ConnectHost';
 import { ConnectClient } from '../../../connect/client/ConnectClient';
 import { ConnectError } from '../../../connect';
@@ -208,6 +209,7 @@ function sendRawHandshake(pair: MockPair, extra: Record<string, unknown> = {}): 
   pair.client.send({
     ns: SPHERE_CONNECT_NAMESPACE,
     v: SPHERE_CONNECT_VERSION,
+    sdkVersion: SDK_VERSION,
     type: 'handshake',
     direction: 'request',
     permissions: [],

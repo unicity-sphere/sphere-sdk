@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { SDK_VERSION } from '../../../connect/version';
 import { ERROR_CODES, INTENT_ACTIONS, RPC_METHODS, SPHERE_CONNECT_VERSION, WALLET_EVENTS } from '../../../connect/protocol';
 import { PERMISSION_SCOPES } from '../../../connect/permissions';
 

@@ -6,6 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { SDK_VERSION } from '../../../connect/version';
 import { ERROR_CODES, RPC_METHODS, INTENT_ACTIONS } from '../../../connect/protocol';
 import type { WalletState } from '../../../connect/types';
 import {
