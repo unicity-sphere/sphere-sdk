@@ -151,9 +151,19 @@ export class Requests implements PaymentsRequestsApi {
     });
   }
 
+  /** Idempotent for a same-transferId re-write: committed only ratchets up, createdAt kept. */
   private writeLink(requestId: string, transferId: string, committed: boolean): Promise<void> {
     return this.mutateJournal((m) => {
-      m.set(requestId, { requestId, transferId, committed, createdAt: this.now() });
+      const prev = m.get(requestId);
+      const same = prev !== undefined && prev.transferId === transferId;
+      const next: SettlingLink = {
+        requestId,
+        transferId,
+        committed: committed || (same && prev.committed),
+        createdAt: same ? prev.createdAt : this.now(),
+      };
+      if (same && prev.committed === next.committed) return false;
+      m.set(requestId, next);
       return true;
     });
   }
@@ -334,28 +344,50 @@ export class Requests implements PaymentsRequestsApi {
         const transferId =
           error instanceof SphereError && error.transferId !== undefined ? error.transferId : undefined;
         if (transferId !== undefined) {
+          // Outcome unknown — link + 'settling', respond deferred to reconcile.
           const committed = error instanceof PartialSendConflictError;
-          // #441 — order is load-bearing: durable journal write, THEN the
-          // in-memory flip, THEN the rethrow. A crash in between leaves the
-          // link, so reload re-applies 'settling', never re-payable.
-          await this.writeLink(id, transferId, committed);
-          this.setStatus(id, 'settling');
+          await this.settle(id, transferId, { committed, respond: false });
         } else {
           logger.error('PaymentsV2', `possibly-committed send for ${id} carried no transferId — paid (fail-closed)`);
           this.setStatus(id, 'paid');
         }
       } else {
-        // Clean pre-commit failure: nothing left the wallet — stays payable, no link.
-        await this.clearLink(id);
-        this.setStatus(id, 'pending');
+        // Proven clean pre-commit failure — removal cause (b): payable, no link.
+        await this.revertPayable(id);
       }
       throw error;
     }
 
-    this.setStatus(id, 'paid');
-    await this.respondPaid(id, result.id);
-    await this.clearLink(id);
+    await this.settle(id, result.id, { committed: true, respond: true });
     return result;
+  }
+
+  /**
+   * THE settlement invariant (#441 + the failed-respond P1): a settling link is
+   * removed ONLY by (a) a CONFIRMED paid respond — a 2xx, or the 409
+   * already-resolved absorb — or (b) a proven clean pre-commit failure
+   * (revertPayable). Nothing else removes one: not a network error, not a 5xx,
+   * not a reload. Every path that binds a request to a transfer outcome funnels
+   * through here — pay()'s clean success (respond now), pay()'s
+   * possibly-committed throw (respond deferred), and reconcile's deferred arms
+   * — so a failed respond always leaves the link + 'settling' and the next
+   * reconcile pass (the committed-link override) retries the respond.
+   */
+  private async settle(
+    requestId: string,
+    transferId: string,
+    opts: { committed: boolean; respond: boolean }
+  ): Promise<void> {
+    // #441 — order is load-bearing: durable link BEFORE any flip, respond, or
+    // rethrow. A crash in between leaves the link, so reload re-applies
+    // 'settling', never re-payable.
+    await this.writeLink(requestId, transferId, opts.committed);
+    if (!(opts.respond && (await this.respondPaid(requestId, transferId)))) {
+      this.setStatus(requestId, 'settling');
+      return;
+    }
+    await this.clearLink(requestId);
+    this.setStatus(requestId, 'paid');
   }
 
   /** 'paid' respond leg: 409 = already resolved = idempotent success; other errors defer. */
@@ -403,13 +435,13 @@ export class Requests implements PaymentsRequestsApi {
     for (const [requestId, link] of [...this.journal!]) {
       if (link.committed || resumed.has(link.transferId)) {
         // Value left the wallet (or the transfer completed) → deferred paid.
-        await this.resolvePaid(requestId, link.transferId);
+        await this.resolvePaid(requestId, link);
       } else if (conflicted.has(link.transferId)) {
         await this.revertPayable(requestId);
       } else if (open.has(link.transferId)) {
         // Still settling — keep the link, retry next session.
       } else {
-        aborted = await this.reconcileUnaccounted(requestId, link.transferId, aborted);
+        aborted = await this.reconcileUnaccounted(requestId, link, aborted);
       }
     }
   }
@@ -418,25 +450,25 @@ export class Requests implements PaymentsRequestsApi {
   // a probe failure defers the link to the next session.
   private async reconcileUnaccounted(
     requestId: string,
-    transferId: string,
+    link: SettlingLink,
     aborted: Set<string> | null
   ): Promise<Set<string> | null> {
     try {
       aborted ??= new Set(await this.deps.listAbortedTransferIds());
-      if (aborted.has(transferId)) await this.revertPayable(requestId);
-      else await this.resolvePaid(requestId, transferId); // PAID-NEVER-RE-PAYABLE
+      if (aborted.has(link.transferId)) await this.revertPayable(requestId);
+      else await this.resolvePaid(requestId, link); // PAID-NEVER-RE-PAYABLE
     } catch (err) {
       logger.warn('PaymentsV2', `aborted-intent probe failed — ${requestId} deferred:`, err);
     }
     return aborted;
   }
 
-  private async resolvePaid(requestId: string, transferId: string): Promise<void> {
-    if (!(await this.respondPaid(requestId, transferId))) return; // keep link, retry next session
-    await this.clearLink(requestId);
-    this.setStatus(requestId, 'paid');
+  /** Deferred paid: the ONE settlement path again — a failed respond keeps the link. */
+  private resolvePaid(requestId: string, link: SettlingLink): Promise<void> {
+    return this.settle(requestId, link.transferId, { committed: link.committed, respond: true });
   }
 
+  /** Removal cause (b): a PROVEN clean outcome (pre-commit failure / server-aborted). */
   private async revertPayable(requestId: string): Promise<void> {
     await this.clearLink(requestId);
     this.setStatus(requestId, 'pending');

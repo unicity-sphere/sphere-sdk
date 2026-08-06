@@ -311,6 +311,46 @@ describe('payments-v2 Requests — pay() and the #441 settling journal', () => {
     expect(h.requests.list().find((r) => r.id === id2)!.status).toBe('paid');
   });
 
+  it('send-succeeds-respond-5xx: the link survives committed, settling everywhere (incl. reload), and the next reconcile responds and clears', async () => {
+    const kv = memoryKV();
+    const api = new FakeWalletApi();
+    let failResponds = 1;
+    const failingClient: RequestsWireClient = {
+      ...clientOf(api, payerCaller),
+      respondPaymentRequest: async (id, response) => {
+        if (failResponds > 0) {
+          failResponds -= 1;
+          throw Object.assign(new Error('bad gateway'), { statusCode: 502 });
+        }
+        return (await api.respondRequest(payerCaller, id, response)) as unknown as RequestWire;
+      },
+    };
+    const h1 = makeHarness({ api, kv, client: failingClient });
+    const id = await seedRequest(api);
+    await h1.requests.drainIncoming();
+    h1.sendImpl.mockResolvedValueOnce(transferResult('tx-5xx'));
+
+    // The SEND succeeded — pay() resolves — but the paid respond hit a 5xx.
+    await expect(h1.requests.pay(id)).resolves.toMatchObject({ id: 'tx-5xx' });
+    expect(settlingRecord(kv)[id]).toMatchObject({ transferId: 'tx-5xx', committed: true });
+    expect(h1.requests.list()[0]!.status).toBe('settling');
+
+    // Reload: the wire still says 'open', the surviving link holds it settling — never payable.
+    const h2 = makeHarness({ api, kv, client: failingClient });
+    await h2.requests.drainIncoming();
+    expect(h2.requests.list()[0]!.status).toBe('settling');
+    await expect(h2.requests.pay(id)).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    expect(h2.sendImpl).not.toHaveBeenCalled();
+
+    // Next reconcile: the committed-link override retries the respond and clears.
+    await h2.requests.reconcile({ resumed: [], conflicted: [], open: [] });
+    expect(settlingRecord(kv)[id]).toBeUndefined();
+    expect(h2.requests.list()[0]!.status).toBe('paid');
+    const wire = (await api.listRequests(payerCaller, { role: 'incoming', since: 0 })).requests[0]!;
+    expect(wire).toMatchObject({ status: 'paid', transferId: 'tx-5xx' });
+    expect(h2.probe).not.toHaveBeenCalled(); // committed override — no aborted-authority probe
+  });
+
   it('clean pre-commit failure leaves the request payable with NO link', async () => {
     const h = makeHarness();
     const id = await seedRequest(h.api);

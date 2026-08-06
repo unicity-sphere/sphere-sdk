@@ -365,7 +365,11 @@ wallet-api streams only. Incoming = gap-free `?since=` upsert-by-id stream (reco
 status change re-surfaces at higher seq); outgoing = backfill view, no tailing. `pay()` is
 per-request single-flight; the #441 settling journal is kept verbatim: durable request→transferId
 link **before** any possibly-committed throw; reconcile by the linked transfer's outcome; direction
-of error is always paid-never-re-payable. The 409 swallow-and-clear applies **only to the
+of error is always paid-never-re-payable. **The settlement invariant (one code path):** a settling
+link is removed ONLY by a CONFIRMED paid respond (2xx, or the 409 already-resolved absorb) or by a
+proven clean pre-commit failure — never by a network error, a 5xx, or a reload; a clean-success
+send whose respond fails keeps the link (status `settling`) and the next reconcile's
+committed-link override retries the respond. The 409 swallow-and-clear applies **only to the
 paid-respond leg** (the payment already succeeded — 409 means already resolved); `decline()`
 **propagates** 403/409 to the caller, as the frontend contract requires (a refused decline must
 never look like success). Requests memo encryption is the recipient-ECDH bundle shared with
