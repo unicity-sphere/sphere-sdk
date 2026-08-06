@@ -12,6 +12,13 @@ import { majorOf } from './semver';
 export const SPHERE_CONNECT_NAMESPACE = 'sphere-connect';
 export const SPHERE_CONNECT_VERSION = '2.1';   // Connect protocol version (semver MAJOR.MINOR)
 
+// Default npm-SDK floor a host enforces at the handshake (0.14.1 = the P11 flip:
+// the v1 payments era is gone; pre-flip ConnectClients expect a wallet that no
+// longer exists). '-0' admits every 0.14.1 prerelease (compareSemver: release >
+// prerelease). Override via ConnectHostConfig.minSdkVersion; the claim is
+// compatibility hygiene, not security — a hostile client can lie about it.
+export const DEFAULT_MIN_CLIENT_SDK_VERSION = '0.14.1-0';
+
 export { HOST_READY_TYPE, HOST_READY_TIMEOUT, SPHERE_NETWORKS } from '../constants';
 // Import for local use (e.g. SphereHandshake.network) AND re-export for connect consumers.
 // A bare `export type { NetworkInfo } from '../constants'` would re-export without bringing

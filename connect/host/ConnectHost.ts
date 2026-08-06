@@ -38,6 +38,7 @@ import {
   WALLET_EVENTS,
   createRequestId,
   isAutoPushedEvent,
+  DEFAULT_MIN_CLIENT_SDK_VERSION,
 } from '../protocol';
 import { checkCompatibility } from '../compatibility';
 import { SDK_VERSION } from '../version';
@@ -565,7 +566,7 @@ export class ConnectHost {
       walletNetworkId: this.snapshot.networkId ?? -1,
       minMinor: this.config.minMinorVersion,
       clientSdkVersion: msg.sdkVersion,
-      minSdkVersion: this.config.minSdkVersion,
+      minSdkVersion: this.config.minSdkVersion ?? DEFAULT_MIN_CLIENT_SDK_VERSION,
     });
     if (!result.ok) {
       logger.warn('ConnectHost', 'Rejected handshake', {
