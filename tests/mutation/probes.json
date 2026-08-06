@@ -43,16 +43,16 @@
     "name": "requests-441-order-swap",
     "note": "#441: the settling link is durable BEFORE the in-memory flip and the rethrow (requests.test.ts '#441 ordering')",
     "file": "modules/payments-v2/requests/Requests.ts",
-    "find": "    await this.writeLink(requestId, transferId, opts.committed);\n    if (!(opts.respond && (await this.respondPaid(requestId, transferId)))) {",
-    "replace": "    void this.writeLink(requestId, transferId, opts.committed).catch(() => undefined);\n    if (!(opts.respond && (await this.respondPaid(requestId, transferId)))) {",
+    "find": "      await this.writeLink(requestId, transferId, opts.committed);\n    } catch (err) {",
+    "replace": "      void this.writeLink(requestId, transferId, opts.committed).catch(() => undefined);\n    } catch (err) {",
     "tests": ["tests/unit/payments-v2/requests.test.ts"]
   },
   {
     "name": "requests-clear-link-on-failed-respond",
     "note": "the settlement invariant: a settling link is removed ONLY by a CONFIRMED paid respond or a proven clean pre-commit failure — clearing it on a failed respond makes a paid request payable again after reload (requests.test.ts 'send-succeeds-respond-5xx')",
     "file": "modules/payments-v2/requests/Requests.ts",
-    "find": "    if (!(opts.respond && (await this.respondPaid(requestId, transferId)))) {\n      this.setStatus(requestId, 'settling');\n      return;\n    }\n    await this.clearLink(requestId);",
-    "replace": "    const confirmed = opts.respond && (await this.respondPaid(requestId, transferId));\n    await this.clearLink(requestId);\n    if (!confirmed) {\n      this.setStatus(requestId, 'settling');\n      return;\n    }",
+    "find": "    if (!(opts.respond && (await this.respondPaid(requestId, transferId)))) {\n      this.setStatus(requestId, journalDown ? 'paid' : 'settling');\n      return;\n    }",
+    "replace": "    const confirmed = opts.respond && (await this.respondPaid(requestId, transferId));\n    await this.clearLink(requestId).catch(() => undefined);\n    if (!confirmed) {\n      this.setStatus(requestId, journalDown ? 'paid' : 'settling');\n      return;\n    }",
     "tests": ["tests/unit/payments-v2/requests.test.ts"]
   },
   {

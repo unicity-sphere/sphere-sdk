@@ -381,12 +381,23 @@ export class Requests implements PaymentsRequestsApi {
     // #441 — order is load-bearing: durable link BEFORE any flip, respond, or
     // rethrow. A crash in between leaves the link, so reload re-applies
     // 'settling', never re-payable.
-    await this.writeLink(requestId, transferId, opts.committed);
+    let journalDown = false;
+    try {
+      await this.writeLink(requestId, transferId, opts.committed);
+    } catch (err) {
+      if (!opts.respond) throw err; // deferred-respond arm: the link IS the outcome
+      // Respond-now arm fails CLOSED on a dead journal: the server record
+      // becomes the anchor — never leave a completed send re-payable silently.
+      journalDown = true;
+      logger.error('PaymentsV2', `settling link write failed for ${requestId} — responding fail-closed:`, err);
+    }
     if (!(opts.respond && (await this.respondPaid(requestId, transferId)))) {
-      this.setStatus(requestId, 'settling');
+      this.setStatus(requestId, journalDown ? 'paid' : 'settling');
       return;
     }
-    await this.clearLink(requestId);
+    // A failed removal is safe (paid-never-re-payable holds); surface() drops
+    // the stale link once the wire shows the terminal state.
+    if (!journalDown) await this.clearLink(requestId).catch(() => undefined);
     this.setStatus(requestId, 'paid');
   }
 

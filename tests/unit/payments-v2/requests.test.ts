@@ -351,6 +351,29 @@ describe('payments-v2 Requests — pay() and the #441 settling journal', () => {
     expect(h2.probe).not.toHaveBeenCalled(); // committed override — no aborted-authority probe
   });
 
+  it('send-succeeds-journal-down: the paid respond still lands server-side (fail closed — never silently re-payable)', async () => {
+    const kv = memoryKV();
+    const brokenKv: ScopedKV = {
+      get: (k) => kv.get(k),
+      set: async (k, v) => {
+        if (k === SETTLING_KEY) throw new Error('disk full');
+        await kv.set(k, v);
+      },
+      remove: (k) => kv.remove(k),
+    };
+    const api = new FakeWalletApi();
+    const h = makeHarness({ api, kv: Object.assign(brokenKv, { map: kv.map }) as unknown as MemoryKV });
+    const id = await seedRequest(api);
+    await h.requests.drainIncoming();
+    h.sendImpl.mockResolvedValueOnce(transferResult('tx-jd'));
+
+    await expect(h.requests.pay(id)).resolves.toMatchObject({ id: 'tx-jd' });
+    expect(h.requests.list()[0]!.status).toBe('paid');
+    // The server record is the anchor: wire resolved paid with the transferId.
+    const wire = (await h.api.listRequests(payerCaller, { role: 'incoming', since: 0 })).requests[0]!;
+    expect(wire).toMatchObject({ status: 'paid', transferId: 'tx-jd' });
+  });
+
   it('clean pre-commit failure leaves the request payable with NO link', async () => {
     const h = makeHarness();
     const id = await seedRequest(h.api);
