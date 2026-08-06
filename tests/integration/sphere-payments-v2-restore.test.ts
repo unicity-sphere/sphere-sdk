@@ -205,7 +205,8 @@ async function buildSphere(world: World) {
     transport: createMockTransport(),
     oracle: createEngineOracle(),
     mnemonic: MNEMONIC,
-    network: 'testnet',
+    // #728 single-network invariant: the Sphere network must equal walletApi.network.
+    network: NET,
     walletApi: world.walletApi,
     paymentsV2: true,
   });

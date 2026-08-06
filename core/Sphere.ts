@@ -955,24 +955,28 @@ export class Sphere {
 
   /**
    * P9: validate + resolve the paymentsV2 opt-in BEFORE any storage writes —
-   * fail-closed at init, never a silently-degraded composition.
+   * fail-closed at init, never a silently-degraded composition. Returns the
+   * resolved composition (null = flag off); #728: resolving here also asserts
+   * the single-network invariant (walletApi.network known + equal to the
+   * Sphere network) before any session/KV/provider exists.
    */
   private static resolvePaymentsV2Flag(
     flag: boolean | undefined,
     accountingConfig: AccountingModuleConfig | undefined,
     swapConfig: SwapModuleConfig | undefined,
     walletApi: SphereWalletApiSession | undefined,
-  ): boolean {
-    if (flag !== true) return false;
+    network: NetworkType | undefined,
+  ): PaymentsV2Composition | null {
+    if (flag !== true) return null;
     if (accountingConfig || swapConfig) {
       throw new SphereError(
         'paymentsV2 is incompatible with the accounting/swap modules (both are built on the legacy PaymentsModule and are deleted with the P11 flip) — disable them or the flag.',
         'INVALID_CONFIG'
       );
     }
-    // Throws INVALID_CONFIG when walletApi is absent or exposes no composition.
-    resolvePaymentsV2Composition(walletApi);
-    return true;
+    // Throws INVALID_CONFIG when walletApi is absent, exposes no composition,
+    // or its network is unknown / differs from the Sphere network.
+    return resolvePaymentsV2Composition(walletApi, network);
   }
 
   /**
@@ -1042,9 +1046,10 @@ export class Sphere {
       options.walletApi,
     );
     sphere._verification = options.verification;
-    sphere._paymentsV2Enabled = Sphere.resolvePaymentsV2Flag(
-      options.paymentsV2, accountingConfig, swapConfig, options.walletApi,
+    sphere._paymentsV2Composition = Sphere.resolvePaymentsV2Flag(
+      options.paymentsV2, accountingConfig, swapConfig, options.walletApi, options.network,
     );
+    sphere._paymentsV2Enabled = sphere._paymentsV2Composition !== null;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
 
@@ -1146,9 +1151,10 @@ export class Sphere {
       options.walletApi,
     );
     sphere._verification = options.verification;
-    sphere._paymentsV2Enabled = Sphere.resolvePaymentsV2Flag(
-      options.paymentsV2, accountingConfig, swapConfig, options.walletApi,
+    sphere._paymentsV2Composition = Sphere.resolvePaymentsV2Flag(
+      options.paymentsV2, accountingConfig, swapConfig, options.walletApi, options.network,
     );
+    sphere._paymentsV2Enabled = sphere._paymentsV2Composition !== null;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
 
@@ -1256,9 +1262,10 @@ export class Sphere {
       options.walletApi,
     );
     sphere._verification = options.verification;
-    sphere._paymentsV2Enabled = Sphere.resolvePaymentsV2Flag(
-      options.paymentsV2, accountingConfig, swapConfig, options.walletApi,
+    sphere._paymentsV2Composition = Sphere.resolvePaymentsV2Flag(
+      options.paymentsV2, accountingConfig, swapConfig, options.walletApi, options.network,
     );
+    sphere._paymentsV2Enabled = sphere._paymentsV2Composition !== null;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
 
@@ -4747,7 +4754,10 @@ export class Sphere {
    * setOracleApiKey rebuild is what future operations snapshot.
    */
   private async startPaymentsV2Inner(index: number, identity: FullIdentity): Promise<void> {
-    this._paymentsV2Composition ??= resolvePaymentsV2Composition(this._walletApiTemplate);
+    // Resolved (and network-asserted, #728) once at init by resolvePaymentsV2Flag.
+    if (this._paymentsV2Composition === null) {
+      throw new SphereError('paymentsV2: composition unresolved — init never ran the flag gate', 'INVALID_CONFIG');
+    }
     if (!this._addressModules.get(index)?.tokenEngine) {
       throw new SphereError(
         'paymentsV2 requires the v2 token engine — the oracle must supply a trust base + gateway URL (and API key where required).',

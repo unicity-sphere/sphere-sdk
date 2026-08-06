@@ -139,14 +139,14 @@ interface TransportRecord {
 }
 
 /** One in-process wallet-api world + the documented `paymentsV2Transport` seam. */
-function makeWorld() {
+function makeWorld(network: string = NET) {
   const realization = new RealizationEngine({ chainPubkey: hexToBytes(getPublicKey('11'.repeat(32))) });
   const decodeBlob = fakeDecodeBlobFor(realization);
   const api = new FakeWalletApi({ decodeBlob });
   const transports: TransportRecord[] = [];
   const gates: Gates = {};
   const walletApi = {
-    network: NET,
+    network,
     setIdentity: () => undefined,
     signIn: async () => undefined,
     logout: async () => undefined,
@@ -206,7 +206,8 @@ async function buildSphere(options: BuildOptions = {}): Promise<Sphere> {
     transport: createMockTransport(),
     oracle: createEngineOracle(),
     mnemonic: MNEMONIC,
-    network: 'testnet',
+    // #728 single-network invariant: the Sphere network must equal walletApi.network.
+    network: NET,
     ...(options.walletApi ? { walletApi: options.walletApi } : {}),
     ...(options.paymentsV2 !== undefined ? { paymentsV2: options.paymentsV2 } : {}),
     ...(options.accounting !== undefined ? { accounting: options.accounting } : {}),
@@ -253,7 +254,7 @@ describe('Sphere paymentsV2 wiring — flag ON', () => {
       transport: createMockTransport(),
       oracle: createEngineOracle(),
       mnemonic: MNEMONIC,
-      network: 'testnet' as const,
+      network: NET,
     };
 
     await expect(Sphere.init({ ...base, paymentsV2: true })).rejects.toMatchObject({
@@ -265,6 +266,63 @@ describe('Sphere paymentsV2 wiring — flag ON', () => {
 
     // Both rejections happened BEFORE the wallet record was created.
     expect(await Sphere.exists(storage)).toBe(false);
+  }, 20_000);
+
+  it('#728 single-network: walletApi.network ≠ Sphere network → INVALID_CONFIG naming both, before any wallet write or transport construction', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-xnet-'));
+    cleanups.push(async () => fs.rmSync(dataDir, { recursive: true, force: true }));
+    const storage = new FileStorageProvider({ dataDir });
+    const world = makeWorld('testnet'); // wallet-api on testnet, Sphere on testnet2
+
+    let caught: unknown;
+    try {
+      await Sphere.init({
+        storage,
+        transport: createMockTransport(),
+        oracle: createEngineOracle(),
+        mnemonic: MNEMONIC,
+        network: NET,
+        walletApi: world.walletApi,
+        paymentsV2: true,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SphereError);
+    expect((caught as SphereError).code).toBe('INVALID_CONFIG');
+    // The error names BOTH networks.
+    expect((caught as SphereError).message).toContain('"testnet"');
+    expect((caught as SphereError).message).toContain('"testnet2"');
+    // Rejected BEFORE any wallet write and BEFORE any session/KV/provider was built.
+    expect(await Sphere.exists(storage)).toBe(false);
+    expect(world.transports).toHaveLength(0);
+  }, 20_000);
+
+  it('#728 single-network: an unknown walletApi.network string → INVALID_CONFIG, zero fake-server construction', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-unknownnet-'));
+    cleanups.push(async () => fs.rmSync(dataDir, { recursive: true, force: true }));
+    const storage = new FileStorageProvider({ dataDir });
+    const world = makeWorld('betanet');
+
+    let caught: unknown;
+    try {
+      await Sphere.init({
+        storage,
+        transport: createMockTransport(),
+        oracle: createEngineOracle(),
+        mnemonic: MNEMONIC,
+        network: NET,
+        walletApi: world.walletApi,
+        paymentsV2: true,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SphereError);
+    expect((caught as SphereError).code).toBe('INVALID_CONFIG');
+    expect((caught as SphereError).message).toContain('"betanet"');
+    expect(await Sphere.exists(storage)).toBe(false);
+    expect(world.transports).toHaveLength(0);
   }, 20_000);
 
   it('payments getter throws the typed error; paymentsV2 is composed, started, and serves the record', async () => {

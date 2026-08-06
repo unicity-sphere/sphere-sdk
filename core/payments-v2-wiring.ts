@@ -6,6 +6,7 @@
 
 import { signMessage } from './crypto';
 import { SphereError } from './errors';
+import { NETWORKS } from '../constants';
 import { completeSignMessage } from './wallet-api-protocol';
 import { deriveFieldEncryptionKey } from './field-encryption';
 import {
@@ -84,13 +85,35 @@ export interface PaymentsV2Composition {
   factory: PaymentsV2TransportFactory;
 }
 
-/** Fail-closed: `paymentsV2: true` without a usable source throws at init. */
-export function resolvePaymentsV2Composition(walletApi: unknown): PaymentsV2Composition {
+/**
+ * Fail-closed: `paymentsV2: true` without a usable source throws at init.
+ * #728 single-network invariant: `walletApi.network` must be a KNOWN network
+ * and strictly equal the Sphere network the engine/registry run on — asserted
+ * HERE, before any session/KV/provider is constructed, so a mismatched
+ * composition can never journal spends under one network while certifying on
+ * another.
+ */
+export function resolvePaymentsV2Composition(
+  walletApi: unknown,
+  sphereNetwork: string | undefined
+): PaymentsV2Composition {
   const source = walletApi as Partial<PaymentsV2TransportSource> | null | undefined;
   const network = typeof source?.network === 'string' && source.network !== '' ? source.network : null;
   if (!source || network === null) {
     throw new SphereError(
       'paymentsV2 requires a wallet-api composition: pass `walletApi` (the S4 WalletApiClient — its baseUrl/network/deviceId are reused, no new env) to Sphere.init.',
+      'INVALID_CONFIG'
+    );
+  }
+  if (!(network in NETWORKS)) {
+    throw new SphereError(
+      `paymentsV2: walletApi.network "${network}" is not a known network (${Object.keys(NETWORKS).join('/')}) — a payments composition is single-network (Sphere network "${String(sphereNetwork)}").`,
+      'INVALID_CONFIG'
+    );
+  }
+  if (network !== sphereNetwork) {
+    throw new SphereError(
+      `paymentsV2: walletApi.network "${network}" does not match the Sphere network "${String(sphereNetwork)}" the engine/registry run on — a payments composition is single-network.`,
       'INVALID_CONFIG'
     );
   }
