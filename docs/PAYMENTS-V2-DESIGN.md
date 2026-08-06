@@ -117,7 +117,14 @@ replays the SAME intent. The heartbeat emits no tick events: the UI polls `pendi
 refreshes on `transfer:updated` / `connection:status`.
 
 **Events (8):** `transfer:incoming` (kept verbatim — most-consumed, dApp-visible),
-`transfer:updated` (replaces `:confirmed`/`:delivery_pending`/`:failed`/`send:partial-remainder`),
+`transfer:updated` (replaces `:confirmed`/`:delivery_pending`/`:failed`/`send:partial-remainder` —
+it also carries failed outcomes: a send() that rejects with a CLEAN failure (classifyError `other`,
+nothing certified — insufficient balance, invalid recipient, pre-commit validation) emits
+`transfer:updated` with `status: 'failed'` (`id` = the attempt's transferId when one existed, else
+`''`; empty `tokens`/`tokenTransfers`; `error`) before the rejection surfaces; keep-open / partial /
+conflict-with-committed outcomes NEVER emit `failed` — they are pending/converging, and a `failed`
+label invites a dApp re-send = double-pay. The P11 Connect adapter re-emits legacy `transfer:failed`
+from `transfer:updated{status:'failed'}`),
 `transfer:attention` `{transferId, code, detail?}` (replaces `split:checkpoint-stuck`,
 `delivery:undeliverable`, `delivery:deferred`), `inventory:updated`, `history:updated`
 (carries the just-recorded client-shaped `HistoryEntry` — the same mapping `history()` serves),

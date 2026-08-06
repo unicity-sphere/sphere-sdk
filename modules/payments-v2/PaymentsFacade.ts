@@ -80,6 +80,8 @@ interface SendRun {
   settledShortfalls: string[];
   firstPartialId: string | undefined;
   pendingAny: boolean;
+  /** The latest attempt's transferId ('' before the first plan) — the id a clean-failure emission carries. */
+  lastTransferId: string;
 }
 
 export class PaymentsFacade implements PaymentsV2 {
@@ -220,7 +222,7 @@ export class PaymentsFacade implements PaymentsV2 {
   // ── money movement ─────────────────────────────────────────────────────────
 
   send(request: SendRequest): Promise<TransferResult> {
-    return this.track(this.sendWithPolicy(request));
+    return this.track(this.sendOutcome(request));
   }
 
   async receive(): Promise<{ transfers: IncomingTransfer[] }> {
@@ -262,8 +264,9 @@ export class PaymentsFacade implements PaymentsV2 {
 
   // ── send policy (§5.5 + old-loop parity; the machine stays policy-free) ────
 
-  private async sendWithPolicy(request: SendRequest): Promise<TransferResult> {
-    const recipient = await this.requireSameNetworkRecipient(request.recipient);
+  /** The ONE place a send() outcome is shaped: success emits in finishSend, a
+   *  CLEAN rejection emits `transfer:updated{status:'failed'}` here (§4). */
+  private async sendOutcome(request: SendRequest): Promise<TransferResult> {
     const run: SendRun = {
       amount: request.amount,
       delivered: [],
@@ -272,11 +275,37 @@ export class PaymentsFacade implements PaymentsV2 {
       settledShortfalls: [],
       firstPartialId: undefined,
       pendingAny: false,
+      lastTransferId: '',
     };
+    try {
+      return await this.sendWithPolicy(request, run);
+    } catch (err) {
+      this.emitCleanFailure(err, run.lastTransferId);
+      throw err;
+    }
+  }
+
+  /** Only a CLEAN failure (nothing certified, classifyError 'other') is 'failed'.
+   *  Keep-open/partial/conflict outcomes are pending/converging — labelling them
+   *  'failed' invites a dApp re-send, i.e. a double-pay (#631/#676). */
+  private emitCleanFailure(err: unknown, transferId: string): void {
+    if (isPossiblyCommittedSendOutcome(err) || classifyError(err) !== 'other') return;
+    const failed: TransferResult = {
+      id: transferId,
+      status: 'failed',
+      tokens: [],
+      tokenTransfers: [],
+      error: messageOf(err),
+    };
+    this.deps.emit('transfer:updated', failed);
+  }
+
+  private async sendWithPolicy(request: SendRequest, run: SendRun): Promise<TransferResult> {
+    const recipient = await this.requireSameNetworkRecipient(request.recipient);
     for (let attempt = 0; ; attempt++) {
       let ctx: AttemptCtx;
       try {
-        ctx = await this.planAndMaterialize(recipient.chainPubkey, { ...request, amount: run.amount });
+        ctx = await this.planAndMaterialize(recipient.chainPubkey, { ...request, amount: run.amount }, run);
       } catch (err) {
         throw this.partialize(err, run);
       }
@@ -412,8 +441,9 @@ export class PaymentsFacade implements PaymentsV2 {
     return { kind: 'rethrow', error: err };
   }
 
-  private async planAndMaterialize(recipientPubkey: string, request: SendRequest): Promise<AttemptCtx> {
+  private async planAndMaterialize(recipientPubkey: string, request: SendRequest, run: SendRun): Promise<AttemptCtx> {
     const transferId = this.newId();
+    run.lastTransferId = transferId;
     const planned = this.queue.plan(transferId, { coinId: request.coinId, amount: request.amount });
     const spend = planned.kind === 'planned' ? planned.spend : await planned.settled;
     const sourceIds = this.markPlanned(transferId, request.coinId, spend);

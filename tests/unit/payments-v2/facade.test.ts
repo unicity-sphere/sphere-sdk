@@ -112,6 +112,54 @@ describe('PaymentsFacade — send policy', () => {
     expect(ok.status).toBe('delivered');
   });
 
+  it('a CLEAN failure emits transfer:updated{status:failed} BEFORE the rejection surfaces (§4 — transfer:updated replaces transfer:failed)', async () => {
+    const world = makeWorld();
+    await world.facade.start();
+
+    // Insufficient balance (empty wallet): a transferId was allocated → it rides the emission.
+    let atRejection: unknown[] = [];
+    let caught: unknown;
+    try {
+      await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN });
+    } catch (err) {
+      caught = err;
+      atRejection = [...eventsOf(world, 'transfer:updated')]; // snapshot AT rejection time
+    }
+    expect(caught).toBeInstanceOf(SphereError);
+    expect((caught as SphereError).code).toBe('SEND_INSUFFICIENT_BALANCE');
+    expect(atRejection).toEqual([
+      {
+        id: 'tid-1',
+        status: 'failed',
+        tokens: [],
+        tokenTransfers: [],
+        error: expect.stringContaining('Insufficient balance') as unknown,
+      },
+    ]);
+
+    // Pre-plan refusal (unresolvable recipient): no transferId ever existed → id ''.
+    await expect(
+      world.facade.send({ recipient: '@nobody', amount: '100', coinId: COIN })
+    ).rejects.toMatchObject({ code: 'INVALID_RECIPIENT' });
+    const updates = eventsOf(world, 'transfer:updated') as { id: string; status: string }[];
+    expect(updates).toHaveLength(2);
+    expect(updates[1]).toMatchObject({ id: '', status: 'failed' });
+  });
+
+  it('a keep-open rejection NEVER emits status:failed — the intent is converging, a failed label invites a dApp re-send', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await world.facade.start();
+    world.engine.afterOp = (_key, kind) =>
+      kind === 'direct' ? new ProofUnconfirmedError('proof fetch inconclusive') : null;
+
+    await expect(
+      world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN })
+    ).rejects.toMatchObject({ code: 'CERTIFICATION_UNCONFIRMED' });
+
+    expect(eventsOf(world, 'transfer:updated')).toEqual([]);
+  });
+
   it('re-plan loop is bounded at MAX_RESELECT with a demote per retried attempt', async () => {
     const world = makeWorld();
     const tokens: SphereToken[] = [];

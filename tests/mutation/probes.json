@@ -160,6 +160,14 @@
     "tests": ["tests/unit/payments-v2/heartbeat.test.ts"]
   },
   {
+    "name": "facade-swallow-clean-failure-emit",
+    "note": "§4/#728: a CLEAN send failure emits transfer:updated{status:'failed'} before the rejection surfaces (facade.test.ts 'a CLEAN failure emits transfer:updated{status:failed}')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    this.deps.emit('transfer:updated', failed);",
+    "replace": "    void failed;",
+    "tests": ["tests/unit/payments-v2/facade.test.ts"]
+  },
+  {
     "name": "resume-reissues-fresh-transferid",
     "note": "the retry path converges under the SAME transferId — a fresh id is a re-issued send and double-pays (#631/#676) (heartbeat.test.ts no-reissue asserts)",
     "file": "modules/payments-v2/machine/resume.ts",
