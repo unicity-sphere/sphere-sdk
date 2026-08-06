@@ -58,7 +58,6 @@ export interface PaymentsV2TransportArgs {
   /** Per-(network, address) scoped KV — refresh token, cursors, seen-set live here. */
   kv: ScopedKV;
   emitStatus: (status: ConnectionStatus) => void;
-  onEpochChange: (epoch: string) => Promise<void>;
 }
 
 export type PaymentsV2TransportFactory = (args: PaymentsV2TransportArgs) => PaymentsV2Transport;
@@ -183,7 +182,6 @@ export function defaultPaymentsV2Transport(
       kv: args.kv,
       webSocketFactory,
       emitStatus: args.emitStatus,
-      onEpochChange: args.onEpochChange,
     });
     return { session, client: authedWireClient(session, client) };
   };
@@ -296,7 +294,6 @@ export function composePaymentsV2(spec: ComposePaymentsV2Spec): PaymentsFacade {
     network,
     kv,
     emitStatus: (status) => host.emit('connection:status', { status }),
-    onEpochChange: async () => undefined,
   });
   const deps: PaymentsFacadeDeps = {
     session: transport.session,
@@ -327,6 +324,9 @@ export function composePaymentsV2(spec: ComposePaymentsV2Spec): PaymentsFacade {
     ownPubkey: identity.chainPubkey,
     ownNametag: host.nametag,
     requestMemo: requestMemoCodec(identity.privateKey),
+    // §5.1: the session is the epoch authority — the facade registers its
+    // restore hook on the session itself (FacadeSession.subscribeEpochChange).
+    syncEpoch: () => transport.session.currentEpoch(),
   };
   return new PaymentsFacade(deps);
 }

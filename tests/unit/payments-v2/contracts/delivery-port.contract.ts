@@ -36,6 +36,8 @@ export interface DeliveryPortHarness {
   counterpartyPort: DeliveryPort;
   counterpartyPubkey: string;
   makeBlob(toPubkey: string, opts?: DeliveryBlobOptions): DeliveryContractBlob;
+  /** The server's CURRENT syncEpoch — what incomingEpoch() must surface. */
+  currentEpoch(): string;
 }
 
 export function expectedDeliveryId(tokenIdHex: string, stateHashHex: string): string {
@@ -132,6 +134,14 @@ export function describeDeliveryPortContract(
       const incoming = await collect(h.counterpartyPort.incoming());
       const ids = incoming.map((d) => d.deliveryId);
       expect(ids).toContain(expectedDeliveryId(fresh.tokenId, fresh.stateHash));
+    });
+
+    it('incomingEpoch() surfaces the listed page syncEpoch — null before any page, the server epoch after (§5.7 restore self-detection source)', async () => {
+      const h = await makeHarness();
+      const port = h.makePort();
+      expect(port.incomingEpoch()).toBeNull();
+      await collect(port.incoming());
+      expect(port.incomingEpoch()).toBe(h.currentEpoch());
     });
 
     it('incoming yields the delivery and fetchBlob returns bytes whose derived keys match the entry id', async () => {

@@ -116,21 +116,33 @@ export class Receive {
     const engine = deps.engine();
     const stored: IncomingTransfer[] = [];
     const pending: PendingAck[] = [];
-    let epoch = '';
+    // The port's page epoch is the honest source for the persisted record.
+    const pageEpoch = (): string => deps.delivery.incomingEpoch() ?? deps.syncEpoch();
     try {
-      epoch = deps.syncEpoch();
       const record = await deps.kv.get<StreamCursor>(STORE_KEYS.streamCursor('mailbox'));
-      const since = record !== null && record.syncEpoch === epoch ? String(record.cursor) : undefined;
-      for await (const entry of deps.delivery.incoming(since)) {
-        await this.processEntry(deps, engine, entry, pending, stored);
-        if (pending.length >= ACK_BATCH_SIZE) await flushAcks(deps, pending, epoch);
+      // Cursor continuity holds only within one syncEpoch (§6); the session
+      // latch gates the resume decision.
+      let basis = record !== null && record.syncEpoch === deps.syncEpoch() ? record : null;
+      for (let pass = 0; pass < 2; pass++) {
+        for await (const entry of deps.delivery.incoming(basis === null ? undefined : String(basis.cursor))) {
+          await this.processEntry(deps, engine, entry, pending, stored);
+          if (pending.length >= ACK_BATCH_SIZE) await flushAcks(deps, pending, pageEpoch);
+        }
+        await flushAcks(deps, pending, pageEpoch);
+        const served = deps.delivery.incomingEpoch();
+        if (basis === null || served === null || served === basis.syncEpoch) break;
+        // §5.7 restore self-detection: the page reports a different epoch than
+        // the cursor record's — post-restore seqs restart, so the resumed
+        // listing may have SKIPPED entries. Void the continuity record and
+        // re-list from the start (dedup: seen-set + (tokenId, stateHash)).
+        await deps.kv.remove(STORE_KEYS.streamCursor('mailbox'));
+        basis = null;
       }
-      await flushAcks(deps, pending, epoch);
     } catch (err) {
       // Infra failure (engine/blob/view/ack): the failed entry stays UNACKED and
       // re-lists next drain; the fully-processed prefix still flushes below.
       logger.warn('PaymentsV2', 'receive drain interrupted — unacked entries retry next drain:', err);
-      await flushAcks(deps, pending, epoch).catch((flushErr: unknown) => {
+      await flushAcks(deps, pending, pageEpoch).catch((flushErr: unknown) => {
         logger.warn('PaymentsV2', 'receive ack flush failed — cursor holds at the acked prefix:', flushErr);
       });
     }
@@ -219,7 +231,7 @@ async function announce(
   };
 }
 
-async function flushAcks(deps: ReceiveDeps, pending: PendingAck[], epoch: string): Promise<void> {
+async function flushAcks(deps: ReceiveDeps, pending: PendingAck[], epochOf: () => string): Promise<void> {
   let lastAcked: string | null = null;
   try {
     while (pending.length > 0) {
@@ -230,7 +242,7 @@ async function flushAcks(deps: ReceiveDeps, pending: PendingAck[], epoch: string
     }
   } finally {
     if (lastAcked !== null) {
-      const record: StreamCursor = { cursor: lastAcked, syncEpoch: epoch };
+      const record: StreamCursor = { cursor: lastAcked, syncEpoch: epochOf() };
       await deps.kv.set(STORE_KEYS.streamCursor('mailbox'), record);
     }
   }

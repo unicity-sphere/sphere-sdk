@@ -131,7 +131,6 @@ export async function makeVerticalWallet(tag: string, options: MakeOptions = {})
     kv,
     webSocketFactory: nodeWsFactory,
     emitStatus: () => undefined,
-    onEpochChange: async () => undefined,
     timing: { pullIntervalMs: 5_000 },
   });
   const api = authedClient(session, client);
@@ -176,6 +175,7 @@ export async function makeVerticalWallet(tag: string, options: MakeOptions = {})
     network: NETWORK,
     ownPubkey: identity.chainPubkey,
     requestMemo: requestMemoCodec(identity.privateKey),
+    syncEpoch: () => session.currentEpoch(),
   });
   await session.ensureAuthenticated();
   await facade.start();

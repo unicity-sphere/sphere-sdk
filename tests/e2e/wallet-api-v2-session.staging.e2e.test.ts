@@ -44,7 +44,6 @@ function makeHarness(): Harness {
     kv: memoryKV(),
     webSocketFactory: nodeWsFactory,
     emitStatus: () => undefined,
-    onEpochChange: async () => undefined,
   });
   const h = { session, client, pubkey: id.chainPubkey };
   open.push(h);

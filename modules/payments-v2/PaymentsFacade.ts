@@ -17,8 +17,9 @@ import { TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
 import type { HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest } from './api';
-import { SingleFlight } from './async';
+import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
+import { reseedAndReset } from './restore';
 import type { MintJournalEntry, ShortfallEntry } from './stores';
 import type { History } from './history/History';
 import type { InventoryView } from './inventory/InventoryView';
@@ -101,6 +102,8 @@ export class PaymentsFacade implements PaymentsV2 {
   private readonly converger: Converger;
   /** Resume single-flight (§7): ticks, start() and resumeNow() coalesce onto ONE pass. */
   private readonly resumeFlight = new SingleFlight<void>();
+  /** §5.1/§7: restore and convergence passes SERIALIZE — a restore never interleaves a pass. */
+  private readonly passChain = new SerialChain();
   /** §7 ownership: ids with an in-process machine attempt — the pass never adopts one. */
   private readonly activeMoneyOps = new Set<string>();
 
@@ -144,8 +147,10 @@ export class PaymentsFacade implements PaymentsV2 {
     if (this.started) return;
     this.started = true;
     this.heartbeat.start();
-    await this.deps.session.start();
+    // Subscriptions BEFORE session.start(): an epoch frame (or nudge) can never
+    // slip between the socket opening and the restore hook being registered.
     this.unsubscribers.push(
+      this.deps.session.subscribeEpochChange((epoch) => this.handleEpochChange(epoch)),
       this.deps.session.subscribeStream('mailbox', () => {
         this.trackTail(this.receiveLoop.drainOnce());
       }),
@@ -160,6 +165,7 @@ export class PaymentsFacade implements PaymentsV2 {
       if (status === 'connected') this.heartbeat.recovered();
     });
     if (statusUnsub !== undefined) this.unsubscribers.push(statusUnsub);
+    await this.deps.session.start();
     // §7 start posture: never awaited; the heartbeat re-runs this same pass.
     this.trackTail(this.runConvergencePass());
     this.trackTail(this.seedHeldStates());
@@ -229,13 +235,44 @@ export class PaymentsFacade implements PaymentsV2 {
     await this.track(this.runConvergencePass());
   }
 
+  /**
+   * §5.1 restore protocol, called (and awaited) by the session's epoch latch
+   * BEFORE any stream nudge resumes: re-seed the server from the §6 backstops,
+   * void every stream cursor, reconciling full re-pull, then a convergence
+   * pass — all on the pass chain, so it never interleaves a resume pass.
+   */
+  async handleEpochChange(_newEpoch: string): Promise<void> {
+    await this.passChain.enqueue(() =>
+      reseedAndReset({
+        stores: this.machineStores,
+        kv: this.deps.kv,
+        reput: (transferId, envelope, requiresSeedClose) =>
+          this.machineDeps.intents.put(transferId, envelope, requiresSeedClose),
+        reseedCheckpoint: (transferId, opIndex) =>
+          this.deps.checkpointStore.reseedCheckpoint(transferId, opIndex),
+        decryptPayload: this.machineDeps.decryptPayload,
+        fullRePull: () => this.view.onEpochReset(),
+        attention: (transferId, code, detail) => {
+          this.deps.emit(
+            'transfer:attention',
+            detail === undefined ? { transferId, code } : { transferId, code, detail }
+          );
+        },
+      })
+    );
+    // Unconditionally post-restore (never coalesced onto a pre-restore pass).
+    await this.passChain.enqueue(() => this.convergeBody());
+  }
+
   /** One single-flighted pass + its reschedule: concurrent callers coalesce. */
   private runConvergencePass(): Promise<void> {
-    return this.resumeFlight.run(async () => {
-      const outcome = await this.converger.convergeOnce();
-      const pending = await this.converger.pendingWork().catch(() => true);
-      this.heartbeat.settle(outcome, pending);
-    });
+    return this.resumeFlight.run(() => this.passChain.enqueue(() => this.convergeBody()));
+  }
+
+  private async convergeBody(): Promise<void> {
+    const outcome = await this.converger.convergeOnce();
+    const pending = await this.converger.pendingWork().catch(() => true);
+    this.heartbeat.settle(outcome, pending);
   }
 
   private nowMs(): number {

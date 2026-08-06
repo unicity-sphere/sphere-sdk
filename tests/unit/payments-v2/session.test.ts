@@ -147,9 +147,10 @@ function createHarness(opts: { seedRefresh?: boolean } = {}) {
       return ws;
     },
     emitStatus: (s) => statusEvents.push(s),
-    onEpochChange,
     random: () => 0,
   });
+  // §5.1 restore hook rides the subscription surface (FacadeSession contract).
+  session.subscribeEpochChange(onEpochChange);
 
   const count = (path: string): number => calls.filter((c) => c.path === path).length;
   return { kv, cell, signer, calls, sockets, statusEvents, onEpochChange, routes, http, client, session, count };
@@ -435,6 +436,26 @@ describe('session: F12 — epoch latch', () => {
     ws.wake('mailbox', 7);
     await flush();
     expect(h.onEpochChange).not.toHaveBeenCalled();
+  });
+
+  it('a rejected restore hook reverts the latch (currentEpoch + kv) so the SAME epoch retries the re-seed', async () => {
+    const h = createHarness({ seedRefresh: true });
+    await h.kv.set(STORE_KEYS.epochLatch, '1');
+    h.onEpochChange.mockRejectedValueOnce(new Error('reseed failed'));
+    const ws = await startConnected(h);
+    expect(h.session.currentEpoch()).toBe('1');
+
+    ws.wake('inventory', 2);
+    await flush();
+    expect(h.onEpochChange).toHaveBeenCalledTimes(1);
+    expect(h.session.currentEpoch()).toBe('1'); // reverted — the restore never ran to completion
+    expect(await h.kv.get(STORE_KEYS.epochLatch)).toBe('1');
+
+    ws.wake('inventory', 2);
+    await flush();
+    expect(h.onEpochChange).toHaveBeenCalledTimes(2); // same epoch retried
+    expect(h.session.currentEpoch()).toBe('2');
+    expect(await h.kv.get(STORE_KEYS.epochLatch)).toBe('2');
   });
 });
 

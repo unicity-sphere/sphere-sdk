@@ -48,12 +48,29 @@ export interface FacadeSession {
     stream: 'inventory' | 'mailbox' | 'payment_requests',
     handler: () => void
   ): () => void;
+  /** §5.1: the latched server syncEpoch ('' before first server contact). */
+  currentEpoch(): string;
+  /**
+   * §5.1 restore hook — REQUIRED so an unwired restore protocol is a COMPILE
+   * ERROR: handlers run and are AWAITED on a syncEpoch change BEFORE any
+   * stream nudge resumes. The facade registers handleEpochChange here.
+   */
+  subscribeEpochChange(handler: (epoch: string) => Promise<void>): () => void;
   /**
    * Optional connection-status feed (same wiring pattern as the streams; the
    * emission point is the session's existing `connection:status` transition).
    * The facade's heartbeat resets its backoff on a 'connected' recovery.
    */
   subscribeStatus?(handler: (status: 'connected' | 'degraded' | 'offline') => void): () => void;
+}
+
+/**
+ * §5.1/§6 restore surface of the checkpoint store: re-POST the slot's cached
+ * encrypt-once ciphertext byte-identical after a server restore (insert-once,
+ * first-write-wins server-side). Returns false when no ciphertext is cached.
+ */
+export interface CheckpointReseeder {
+  reseedCheckpoint(transferId: string, opIndex: number): Promise<boolean>;
 }
 
 interface IntentWireLike {
@@ -75,7 +92,8 @@ export interface PaymentsFacadeDeps {
   client: FacadeClient;
   storagePort: StoragePort;
   deliveryPort: DeliveryPort;
-  checkpointStore: SplitCheckpointStore;
+  /** Reseeder REQUIRED: the restore protocol re-POSTs cached ciphertexts (§5.1). */
+  checkpointStore: SplitCheckpointStore & CheckpointReseeder;
   /** Initial engine source; setEngine() swaps what FUTURE operations snapshot. */
   engineRef: () => ITokenEngine;
   kv: ScopedKV;
@@ -91,7 +109,8 @@ export interface PaymentsFacadeDeps {
   ownPubkey: string;
   ownNametag?: () => string | undefined;
   requestMemo: RequestMemoCodec;
-  syncEpoch?: () => string;
+  /** REQUIRED (§5.1): reads the session's current epoch — never a default. */
+  syncEpoch: () => string;
   now?: () => number;
   newId?: () => string;
   workBudget?: number;
@@ -221,7 +240,7 @@ function buildReceive(
         detail === undefined ? { transferId, code } : { transferId, code, detail }
       );
     },
-    syncEpoch: deps.syncEpoch ?? (() => ''),
+    syncEpoch: deps.syncEpoch,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
 }

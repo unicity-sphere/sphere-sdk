@@ -39,7 +39,7 @@ export class WalletApiSplitCheckpointStore implements SplitCheckpointStore {
   }
 
   async put(transferId: string, opIndex: number, bytes: Uint8Array): Promise<Uint8Array> {
-    const { client, kv, fieldKey, signProgress } = this.config;
+    const { kv, fieldKey } = this.config;
     const aad = this.aad(transferId, opIndex);
     const cacheKey = this.cacheKey(transferId, opIndex);
     let envelope = await kv.get<string>(cacheKey);
@@ -47,9 +47,30 @@ export class WalletApiSplitCheckpointStore implements SplitCheckpointStore {
       envelope = encryptFieldBytes(fieldKey, bytes, aad);
       await kv.set(cacheKey, envelope);
     }
-    const signature = await signProgress(progressSignMessage(transferId, opIndex, envelope));
-    const record = await client.postProgress(transferId, opIndex, envelope, signature);
+    const record = await this.post(transferId, opIndex, envelope);
     return this.open(record.payload, aad);
+  }
+
+  /**
+   * §5.1 restore (CheckpointReseeder): re-POST the slot's cached encrypt-once
+   * ciphertext byte-identical — the server slot is insert-once, so this is a
+   * no-op when the record survived. False = no ciphertext cached locally.
+   */
+  async reseedCheckpoint(transferId: string, opIndex: number): Promise<boolean> {
+    const envelope = await this.config.kv.get<string>(this.cacheKey(transferId, opIndex));
+    if (envelope === null) return false;
+    await this.post(transferId, opIndex, envelope);
+    return true;
+  }
+
+  /** The ONE signed progress-append path put() and reseedCheckpoint() share. */
+  private async post(
+    transferId: string,
+    opIndex: number,
+    envelope: string
+  ): Promise<{ opIndex: number; payload: string; createdAt: string }> {
+    const signature = await this.config.signProgress(progressSignMessage(transferId, opIndex, envelope));
+    return this.config.client.postProgress(transferId, opIndex, envelope, signature);
   }
 
   async get(transferId: string, opIndex: number): Promise<Uint8Array | null> {

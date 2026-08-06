@@ -318,6 +318,7 @@ describe.runIf(RUN)('LIVE staging: payments-v2 vertical (facade over real ports 
           return inner.deliverBatch!(recipient, blobs, options);
         },
         incoming: (since) => inner.incoming(since),
+        incomingEpoch: () => inner.incomingEpoch(),
         ack: (id, disposition, reason) => inner.ack(id, disposition, reason),
         ...(inner.onWake !== undefined ? { onWake: inner.onWake.bind(inner) } : {}),
       };

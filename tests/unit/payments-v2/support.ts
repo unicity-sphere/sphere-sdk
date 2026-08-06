@@ -5,6 +5,7 @@
  */
 
 import type { FacadeSession } from '../../../modules/payments-v2/PaymentsFacade';
+import type { CheckpointReseeder } from '../../../modules/payments-v2/compose';
 import type { RegistryReader } from '../../../modules/payments-v2/inventory/InventoryView';
 import type { RequestMemoCodec } from '../../../modules/payments-v2/requests/Requests';
 import type { ScopedKV } from '../../../modules/payments-v2/stores';
@@ -45,7 +46,7 @@ export function memoryKV(opts: { seed?: Record<string, unknown>; failKeys?: stri
 }
 
 /** Insert-once slot map with first-write-wins reads (the E.4 store contract). */
-export function memoryCheckpoints(): SplitCheckpointStore {
+export function memoryCheckpoints(): SplitCheckpointStore & CheckpointReseeder {
   const slots = new Map<string, Uint8Array>();
   return {
     async put(transferId, opIndex, bytes) {
@@ -58,12 +59,19 @@ export function memoryCheckpoints(): SplitCheckpointStore {
     async get(transferId, opIndex) {
       return slots.get(`${transferId}:${String(opIndex)}`) ?? null;
     },
+    // The in-memory store IS the slot table — it holds no separate ciphertext
+    // cache to re-POST, so a reseed honestly reports "nothing cached".
+    async reseedCheckpoint() {
+      return false;
+    },
   };
 }
 
 export class FakeSession implements FacadeSession {
   private readonly handlers = new Map<string, Set<() => void>>();
   private readonly statusHandlers = new Set<(status: 'connected' | 'degraded' | 'offline') => void>();
+  private readonly epochHandlers = new Set<(epoch: string) => Promise<void>>();
+  epoch = '1';
   startCalls = 0;
   stopCalls = 0;
   async start(): Promise<void> {
@@ -81,12 +89,26 @@ export class FakeSession implements FacadeSession {
     set.add(handler);
     return () => set!.delete(handler);
   }
+  currentEpoch(): string {
+    return this.epoch;
+  }
+  subscribeEpochChange(handler: (epoch: string) => Promise<void>): () => void {
+    this.epochHandlers.add(handler);
+    return () => this.epochHandlers.delete(handler);
+  }
   subscribeStatus(handler: (status: 'connected' | 'degraded' | 'offline') => void): () => void {
     this.statusHandlers.add(handler);
     return () => this.statusHandlers.delete(handler);
   }
   fire(stream: string): void {
     for (const handler of this.handlers.get(stream) ?? []) handler();
+  }
+  /** Test driver mirroring WalletApiSession.noteEpoch: restore hooks AWAITED, then every stream nudged. */
+  async noteEpoch(epoch: string): Promise<void> {
+    if (this.epoch === epoch) return;
+    this.epoch = epoch;
+    for (const handler of [...this.epochHandlers]) await handler(epoch);
+    for (const stream of ['inventory', 'mailbox', 'payment_requests']) this.fire(stream);
   }
   /** Test hook: push a connection-status transition to subscribers. */
   setStatus(status: 'connected' | 'degraded' | 'offline'): void {

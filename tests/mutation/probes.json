@@ -80,6 +80,14 @@
     "tests": ["tests/unit/payments-v2/history.test.ts"]
   },
   {
+    "name": "receive-ignores-epoch-bump",
+    "note": "§5.1/§5.7: the mailbox cursor must never survive a server restore — keeping it across an epoch bump silently loses every deposit whose post-restore seq is below the stale cursor (sphere-payments-v2-restore.test.ts missed-wake case + receive.test.ts self-detection)",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "        const served = deps.delivery.incomingEpoch();\n        if (basis === null || served === null || served === basis.syncEpoch) break;",
+    "replace": "        const served = deps.delivery.incomingEpoch();\n        void served;\n        break;",
+    "tests": ["tests/integration/sphere-payments-v2-restore.test.ts", "tests/unit/payments-v2/receive.test.ts"]
+  },
+  {
     "name": "receive-ack-before-store",
     "note": "#724 outcome: the view store precedes the claimed ack (receive.test.ts 'a claimed ack is issued only after the view store succeeds')",
     "file": "modules/payments-v2/receive/Receive.ts",

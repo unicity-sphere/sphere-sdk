@@ -345,6 +345,9 @@ function makeDelivery(w: WorldState): DeliveryPort {
     incoming() {
       return emptyAsyncIterable();
     },
+    incomingEpoch() {
+      return null; // this fake never lists a page
+    },
     async ack() {
       /* not exercised by the machine */
     },

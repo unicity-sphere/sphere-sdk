@@ -108,8 +108,6 @@ export interface WalletApiSessionDeps {
   kv: ScopedKV;
   webSocketFactory: WebSocketFactory;
   emitStatus: (status: ConnectionStatus) => void;
-  /** Runs the syncEpoch re-seed protocol BEFORE any stream resumes. */
-  onEpochChange: (epoch: string) => Promise<void>;
   timing?: Partial<SessionTiming>;
   timers?: SessionTimers;
   random?: () => number;
@@ -159,6 +157,7 @@ export class WalletApiSession {
   private epochLatch: string | null = null;
   private reseedChain: Promise<void> = Promise.resolve();
   private reseedsPending = 0;
+  private readonly epochHandlers = new Set<(epoch: string) => Promise<void>>();
 
   private readonly handlers = new Map<WakeStream, Set<() => void>>();
   private readonly statusHandlers = new Set<(status: ConnectionStatus) => void>();
@@ -283,6 +282,20 @@ export class WalletApiSession {
 
   // ── epoch latch (F12) ─────────────────────────────────────────────────────
 
+  /** §5.1: the latched server syncEpoch ('' before first server contact). */
+  currentEpoch(): string {
+    return this.epochLatch ?? '';
+  }
+
+  /**
+   * §5.1 restore hook (FacadeSession contract): handlers are AWAITED inside
+   * the reseed chain, BEFORE any stream nudge resumes.
+   */
+  subscribeEpochChange(handler: (epoch: string) => Promise<void>): () => void {
+    this.epochHandlers.add(handler);
+    return () => this.epochHandlers.delete(handler);
+  }
+
   noteEpoch(epoch: string): void {
     if (this.epochLatch === epoch) return;
     const previous = this.epochLatch;
@@ -297,7 +310,7 @@ export class WalletApiSession {
 
   private async runReseed(epoch: string, previous: string): Promise<void> {
     try {
-      await this.deps.onEpochChange(epoch);
+      for (const handler of [...this.epochHandlers]) await handler(epoch);
       await this.deps.kv.set(STORE_KEYS.epochLatch, epoch);
     } catch {
       if (this.epochLatch === epoch) this.epochLatch = previous;

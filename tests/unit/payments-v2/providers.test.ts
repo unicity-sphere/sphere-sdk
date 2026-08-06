@@ -114,6 +114,7 @@ function deliveryHarness(): DeliveryPortHarness {
     counterpartyPort,
     counterpartyPubkey: SENDER_PUB,
     makeBlob: (toPubkey, opts = {}) => fabricateBlob(toPubkey, opts),
+    currentEpoch: () => String(fake.syncEpoch),
   };
 }
 

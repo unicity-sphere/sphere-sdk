@@ -128,6 +128,9 @@ class FakeDelivery implements DeliveryPort {
   sinceLog: (string | undefined)[] = [];
   acksUntilFail = Infinity;
   claimConflicts = new Set<string>();
+  /** The epoch the next listed page reports (the S7 incomingEpoch surface). */
+  pageEpoch = 'e1';
+  private lastEpoch: string | null = null;
   private seq = 0;
   private wakeCbs = new Set<() => void>();
 
@@ -156,6 +159,7 @@ class FakeDelivery implements DeliveryPort {
 
   async *incoming(sinceCursor?: string): AsyncGenerator<IncomingDelivery> {
     this.sinceLog.push(sinceCursor);
+    this.lastEpoch = this.pageEpoch;
     const since = sinceCursor === undefined ? 0 : Number(sinceCursor);
     for (const entry of [...this.entries].sort((a, b) => a.seq - b.seq)) {
       if (entry.seq <= since || entry.status !== 'unacked') continue;
@@ -172,6 +176,10 @@ class FakeDelivery implements DeliveryPort {
         },
       };
     }
+  }
+
+  incomingEpoch(): string | null {
+    return this.lastEpoch;
   }
 
   async ack(
@@ -563,6 +571,34 @@ describe('payments-v2 Receive drain', () => {
     await fresh.receive.drainOnce();
     expect(fresh.delivery.sinceLog).toEqual(['1']);
     expect(fresh.view.storeCalls).toEqual([]);
+  });
+
+  it('§5.7 restore self-detection: a page-epoch mismatch voids the cursor record and re-lists from the start — a post-restore deposit with a LOWER seq than the stale cursor still arrives (missed-wake case: the session latch never moved)', async () => {
+    // Latch AND record agree on e1 — the resume looks legitimate — but the
+    // server restored to e2 and seqs restarted: the deposit sits at seq 1 < 5.
+    const h = makeHarness({ epoch: 'e1', kvSeed: { [CURSOR_KEY]: { cursor: '5', syncEpoch: 'e1' } } });
+    h.delivery.pageEpoch = 'e2';
+    h.delivery.add(meta(T(1), 'S1', { amount: '700' }));
+
+    const transfers = await h.receive.drainOnce();
+
+    expect(h.delivery.sinceLog).toEqual(['5', undefined]); // resume, void, full re-list
+    expect(transfers).toHaveLength(1);
+    expect(transfers[0]!.id).toBe(T(1));
+    expect(h.delivery.claimed().map((a) => a.deliveryId)).toEqual([`d:${T(1)}:S1`]);
+    // The record is re-established under the PAGE epoch (the honest source).
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '1', syncEpoch: 'e2' });
+  });
+
+  it('§5.7 restore self-detection with an EMPTY resumed listing: the voided record alone is durable progress (next drain starts from scratch)', async () => {
+    const h = makeHarness({ epoch: 'e1', kvSeed: { [CURSOR_KEY]: { cursor: '5', syncEpoch: 'e1' } } });
+    h.delivery.pageEpoch = 'e2';
+
+    const transfers = await h.receive.drainOnce();
+
+    expect(transfers).toEqual([]);
+    expect(h.delivery.sinceLog).toEqual(['5', undefined]);
+    expect(h.kv.map.get(CURSOR_KEY)).toBeUndefined(); // continuity voided, nothing re-written
   });
 
   it('receive() facade shape: drainOnce resolves with the IncomingTransfer[] it stored, enriched from the registry and the delivery envelope', async () => {

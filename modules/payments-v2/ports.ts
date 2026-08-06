@@ -75,6 +75,14 @@ export interface DeliveryPort {
   ): Promise<DeliveryReceipt[]>;
   // At-least-once; the impl owns the persistent seen-set (S7).
   incoming(sinceCursor?: string): AsyncIterable<IncomingDelivery>;
+  /**
+   * The syncEpoch of the most recent incoming() page — updated per page, null
+   * before the first. §5.7 restore self-detection: the mailbox page is the
+   * honest epoch source, so Receive voids its (cursor, epoch) continuity on a
+   * mismatch even when the wake socket missed a server restore. (Pinned by the
+   * S7 contract suite; wallet-api#119's S7 text carries the same sentence.)
+   */
+  incomingEpoch(): string | null;
   ack(
     deliveryId: string,
     disposition: 'claimed' | 'rejected',

@@ -357,7 +357,14 @@ claim), so no retry counter exists (zero client state); `transfer:attention`
 keeps its consumed shape: sender
 nametag resolved via transport, token display fields (`symbol`, `decimals`, `iconUrl`) enriched
 from the registry, memo decrypted from the ECDH bundle. Wake-driven with the 30 s poll as the
-correctness backstop.
+correctness backstop. **Restore self-detection (S7 port shape):** the mailbox page response
+carries `syncEpoch`, and the DeliveryPort surfaces it — `incomingEpoch(): string | null`, the
+epoch of the most recent `incoming()` page, updated per page — so Receive persists its
+`(cursor, epoch)` record from the page-honest epoch and, when a listed page reports an epoch
+different from the record's, voids the record and re-lists from the start (post-restore seqs
+restart, so a resumed listing may have skipped entries) even when the wake socket missed the
+server restore. Pinned by the S7 delivery-port contract suite; wallet-api#119's S7 text carries
+the same sentence.
 
 ### 5.8 `Requests`
 
@@ -488,7 +495,8 @@ verify per entry, batched acks.
   delivery-journal-ignored, conflicted-leg-as-spent, restore-certified-to-confirmed,
   skip-putIntent, removeToken-arg-swap, plus one per new machine transition.
 - **Contract tests** for the storage and delivery interfaces keep "swappable" enforceable with
-  wallet-api as sole shipped implementation.
+  wallet-api as sole shipped implementation; the delivery contract pins `incomingEpoch()` — the
+  per-page syncEpoch surface Receive's restore self-detection keys on (§5.7).
 - **Adversarial fakes:** the fake gateway returns `SUCCESS` for duplicates AND conflicts (the
   observed M7 reality — status carries no signal); unknown statuses on re-submit; the fake
   wallet-api enforces wire shapes, evidenced-tombstone 409s, first-write-wins checkpoint slots,

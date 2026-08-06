@@ -124,6 +124,7 @@ function hookedDelivery(inner: DeliveryPort, hooks: Hooks): DeliveryPort {
       return inner.deliver(recipient, blob, options);
     },
     incoming: (since) => inner.incoming(since),
+    incomingEpoch: () => inner.incomingEpoch(),
     ack: (id, disposition, reason) => inner.ack(id, disposition, reason),
   };
 }
@@ -225,6 +226,7 @@ export function makeWorld(options: { engine?: RealizationEngine } = {}): World {
     network: NET,
     ownPubkey: OWN_PUB,
     requestMemo: stubRequestMemoCodec,
+    syncEpoch: () => session.currentEpoch(),
     newId: () => `tid-${String(++ids)}`,
     receivePollMs: 60 * 60 * 1000,
   });

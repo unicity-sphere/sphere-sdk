@@ -103,6 +103,7 @@ export class WalletApiDeliveryPort implements DeliveryPort {
   private readonly wake: WakeSource | null;
   private deriveFn: ((blob: Uint8Array) => Promise<{ tokenId: string; stateHash: string }>) | null;
   private readonly seenChain = new SerialChain();
+  private lastIncomingEpoch: string | null = null;
 
   constructor(config: WalletApiDeliveryPortConfig) {
     this.client = config.client;
@@ -213,6 +214,7 @@ export class WalletApiDeliveryPort implements DeliveryPort {
     const seen = await this.readSeen();
     let page = await this.client.listMailbox(sinceCursor === undefined ? 0 : Number(sinceCursor));
     for (;;) {
+      this.lastIncomingEpoch = String(page.syncEpoch);
       for (const entry of page.entries) {
         if (entry.status !== 'unclaimed') continue;
         if (seen.has(entry.entryId)) continue;
@@ -221,6 +223,11 @@ export class WalletApiDeliveryPort implements DeliveryPort {
       if (!page.more) return;
       page = await this.client.listMailbox(page.cursor);
     }
+  }
+
+  /** §5.7: the page-honest epoch — the restore-detection source Receive keys on. */
+  incomingEpoch(): string | null {
+    return this.lastIncomingEpoch;
   }
 
   private toIncoming(entry: MailboxEntryWire): IncomingDelivery {
