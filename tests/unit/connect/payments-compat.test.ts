@@ -323,6 +323,41 @@ describe('§4 compat queries against a v2-facade host', () => {
     expect(v2.history).toHaveBeenCalledWith({ limit: 5 });
   });
 
+  /** 3-page facade history fake: h1 → c1 → h2 → c2 → h3 (exhausted). */
+  function threePageSphere() {
+    const sphere = createV2MockSphere();
+    sphere.paymentsV2.history = vi.fn((page?: { before?: string; limit?: number }) => {
+      if (page?.before === 'c1') {
+        return Promise.resolve({ entries: [{ ...HISTORY_ENTRY, id: 'h2' }], more: true, cursor: 'c2' });
+      }
+      if (page?.before === 'c2') {
+        return Promise.resolve({ entries: [{ ...HISTORY_ENTRY, id: 'h3' }], more: false, cursor: null });
+      }
+      return Promise.resolve({ entries: [HISTORY_ENTRY], more: true, cursor: 'c1' });
+    }) as never;
+    return sphere;
+  }
+
+  it('parameterless sphere_getHistory follows cursors to the COMPLETE flat array (legacy wire has no cursor)', async () => {
+    const sphere = threePageSphere();
+    const h2 = await connectHarness(sphere);
+    const result = (await h2.client.query(RPC_METHODS.GET_HISTORY)) as HistoryEntry[];
+    expect(result.map((entry) => entry.id)).toEqual(['h1', 'h2', 'h3']);
+    expect(sphere.paymentsV2.history).toHaveBeenCalledTimes(3);
+    expect(sphere.paymentsV2.history).toHaveBeenNthCalledWith(1, undefined);
+    expect(sphere.paymentsV2.history).toHaveBeenNthCalledWith(2, { before: 'c1' });
+    expect(sphere.paymentsV2.history).toHaveBeenNthCalledWith(3, { before: 'c2' });
+  });
+
+  it('an explicit limit keeps the single-page read — no cursor walk', async () => {
+    const sphere = threePageSphere();
+    const h2 = await connectHarness(sphere);
+    const result = (await h2.client.query(RPC_METHODS.GET_HISTORY, { limit: 1 })) as HistoryEntry[];
+    expect(result.map((entry) => entry.id)).toEqual(['h1']);
+    expect(sphere.paymentsV2.history).toHaveBeenCalledTimes(1);
+    expect(sphere.paymentsV2.history).toHaveBeenCalledWith({ limit: 1 });
+  });
+
   it('legacy host is untouched: queries still hit sphere.payments', async () => {
     const legacy = createLegacyMockSphere();
     const h2 = await connectHarness(legacy);
