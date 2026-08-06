@@ -51,8 +51,8 @@ interface MirrorEntry {
   updatedAt: number;
 }
 
-const SUSPECTED_KEY = 'suspected-spent';
-const KNOWN_SPENDS_KEY = 'known-spends';
+const SUSPECTED_KEY = STORE_KEYS.suspectedSpent;
+const KNOWN_SPENDS_KEY = STORE_KEYS.knownSpends;
 const CURSOR_KEY = STORE_KEYS.streamCursor('inventory');
 
 function stateKey(tokenId: string, stateHash: string): string {

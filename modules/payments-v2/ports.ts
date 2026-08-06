@@ -30,6 +30,9 @@ export interface StoragePort {
   getBlobs(tokenIds: string[]): Promise<Map<string, Uint8Array>>;
   uploadBlobs(blobs: { sha256: string; bytes: Uint8Array }[]): Promise<Map<string, string>>;
   // The one authoritative spend write; runs after the deposit ATTEMPT (§5.5).
+  // Rejects with DeltaConflictError (code 'DELTA_CONFLICT', lineage 409) or
+  // DeltaValidationError (code 'DELTA_VALIDATION', 422) — defined by the impl
+  // (impl/wallet-api-v2/storage.ts); consumers match on `code`, never instanceof.
   applyDelta(delta: {
     transferId: string;
     spent: string[];

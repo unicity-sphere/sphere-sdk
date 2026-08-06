@@ -26,6 +26,31 @@
 | P10 | Live-staging e2e parity + soak + request-count budgets | 🔄 **6/6 money matrix live-green on testnet2** (mint / whole-token / split w/ signed seed-close / self-send / A→B→A / crash-resume paid-once) + 5/5 session e2e + **cross-version interop live-green** (old-module ↔ v2 vertical both directions incl. splits + payment request, 4/4). Still owed: exact-combination + E.4-stage interruption cells, soak, request-count budgets |
 | P11 | Flip PR: wire Sphere + Connect adapter, delete old vertical, frontend migration, re-pin | ⬜ owner-gated |
 
+## Residue ledger
+
+Every deferred-work admission from a lane report is tracked here (full audit: 37 admissions, 22
+discharged, the rest below). **Standing rule: lane-report deferred-work admissions land in this
+ledger in the same integration commit that consumes the lane.** The two formerly in-flight items
+are closed: the §5.1 restore/epoch latch (IF1) landed in 35a8d89c and the settling-link clearing
+semantics (IF2) in ce7372f2; the #728 α/β P1s (cross-network composition assert; failed-outcome
+emission on `transfer:updated`) are fixed in this integration series.
+
+| # | Item (one line) | Disposition |
+|---|---|---|
+| S1 | Stale-`'open'` backstop entry after a tail crash: phantom pending row + heartbeat never idles | **Fixed here** — resume GC sweep (not-server-open ∧ no journal legs ∧ no active op), heartbeat-idle pinned |
+| S2 | No public verb revokes the server-side wallet-api session row on wallet deletion | #729 |
+| S3 | Dual `spentStates {local, protocol}`, always identical (wire compat kept past the flip) | Flip fast-follow — collapse to one field, coordinate wallet-api payload readers |
+| S4 | `ports.ts` didn't name the typed applyDelta errors (`DeltaConflictError`/`DeltaValidationError`) | **Fixed here** — port doc names both, matched duck-typed by `code` |
+| S5 | InventoryView's `'suspected-spent'`/`'known-spends'` KV keys were local, not in `STORE_KEYS` | **Fixed here** — absorbed into `STORE_KEYS` (values unchanged) |
+| S6 | `isNetworkScopedAddressKey` full cut not taken (flip judgment call #10) | #730 |
+| S7 | `git mv` rename wave (`modules/payments-v2` → `modules/payments`) never executed; `check-removed-refs` unconfirmed | Confirm with flip owner before the flip PR merges |
+| S8 | Text-backup writer surface survives (`exportToTxt`/`downloadWalletBackup` + wallet-text.ts) | Owner decision; recorded in LEGACY-INVENTORY |
+| S9 | TransactionHistoryModal fetches exactly one page (cursor already surfaced by `history()`) | sphere PR #473 |
+| S10 | Undeliverable toast lost the `attempts` count (not in the `transfer:attention` payload) | sphere PR #473 |
+| S11 | fake-client auth endpoints throw 501 NOT_MODELED; session suite mocks fetch instead | Accepted — model auth in FakeWalletApi only if a lane needs it |
+| S12 | FakeTokenEngine lacks E.1 realization semantics; the private RealizationEngine harness compensates | Accepted — fold into FakeTokenEngine or promote RealizationEngine to shared support later |
+| S13 | FakeWalletApi doesn't model retention/`blobCollected`/non-lane quotas | Accepted — noted so future lanes don't assume coverage |
+
 ---
 
 ## 1. Why a rewrite

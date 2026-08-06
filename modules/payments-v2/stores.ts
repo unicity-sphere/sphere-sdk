@@ -98,4 +98,7 @@ export const STORE_KEYS = {
   settlingLinks: 'settling',
   streamCursor: (s: StreamName) => `cursor:${s}`,
   epochLatch: 'epoch-latch',
+  // §5.2 InventoryView durable overlays (#625/#679).
+  suspectedSpent: 'suspected-spent',
+  knownSpends: 'known-spends',
 } as const;
