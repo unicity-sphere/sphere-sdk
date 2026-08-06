@@ -112,7 +112,8 @@ export interface PaymentsV2Events {
   'transfer:updated': TransferResult;
   'transfer:attention': { transferId: string; code: string; detail?: string };
   'inventory:updated': Record<string, never>;
-  'history:updated': Record<string, never>;
+  /** The just-recorded entry, client-shaped (the same mapping history() serves). */
+  'history:updated': HistoryEntry;
   'payment_request:incoming': PaymentRequestView;
   'payment_request:updated': { id: string; status: PaymentRequestStatus };
   'connection:status': { status: 'connected' | 'degraded' | 'offline' };

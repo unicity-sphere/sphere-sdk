@@ -13,6 +13,7 @@ import { History, type HistoryClient } from './history/History';
 import { InventoryView, type PriceReader, type RegistryReader } from './inventory/InventoryView';
 import { Receive, type ReceivedRecord, type StoredIncoming } from './receive/Receive';
 import { Requests, type RequestMemoCodec, type RequestsWireClient } from './requests/Requests';
+import type { RestoreDeps } from './restore';
 import { ReservationLedger } from './select/ledger';
 import { SpendQueue } from './select/queue';
 import { createMachineStores, type MachineStores } from './machine/journal';
@@ -137,6 +138,7 @@ export interface FacadeParts {
   heldStates: HeldStateCache;
   receiveLoop: Receive;
   requests: Requests;
+  restoreDeps: RestoreDeps;
 }
 
 export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks): FacadeParts {
@@ -157,11 +159,12 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     client: deps.client,
     fieldKey: deps.fieldKey,
     registry: deps.registry,
-    emit: (event) => deps.emit(event, {}),
+    emit: (event, entry) => deps.emit(event, entry),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
     ...(deps.newId !== undefined ? { newId: deps.newId } : {}),
   });
   const machineDeps = buildMachineDeps(deps, hooks, historyStore);
+  const machineStores = createMachineStores(deps.kv);
   const heldStates: HeldStateCache = new Map();
 
   return {
@@ -170,12 +173,37 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     ledger,
     queue,
     historyStore,
-    machineStores: createMachineStores(deps.kv),
+    machineStores,
     machineDeps,
     machine: new TransferMachine(machineDeps),
     heldStates,
     receiveLoop: buildReceive(deps, hooks, historyStore, heldStates),
     requests: buildRequests(deps, hooks),
+    restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view),
+  };
+}
+
+/** §5.1 restore protocol wiring (reseedAndReset's deps) — policy stays in the facade. */
+function buildRestoreDeps(
+  deps: PaymentsFacadeDeps,
+  machineDeps: MachineDeps,
+  machineStores: MachineStores,
+  view: InventoryView
+): RestoreDeps {
+  return {
+    stores: machineStores,
+    kv: deps.kv,
+    reput: (transferId, envelope, requiresSeedClose) =>
+      machineDeps.intents.put(transferId, envelope, requiresSeedClose),
+    reseedCheckpoint: (transferId, opIndex) => deps.checkpointStore.reseedCheckpoint(transferId, opIndex),
+    decryptPayload: machineDeps.decryptPayload,
+    fullRePull: () => view.onEpochReset(),
+    attention: (transferId, code, detail) => {
+      deps.emit(
+        'transfer:attention',
+        detail === undefined ? { transferId, code } : { transferId, code, detail }
+      );
+    },
   };
 }
 
@@ -203,11 +231,13 @@ function buildMachineDeps(
     ownPubkey: hexToBytes(deps.ownPubkey),
     emit: deps.emit,
     now: deps.now ?? Date.now,
-    recordHistory: async ({ transferId, payload }) => {
+    recordHistory: async ({ transferId, payload, committedAmount }) => {
       await historyStore.recordSent({
         transferId,
         coinId: payload.coinId,
-        amount: payload.amount,
+        // §5.9: the SETTLED amount (machine-computed from the certified
+        // recipient blobs), never payload.amount — the plan.
+        amount: committedAmount,
         recipientPubkey: payload.recipient,
         ...(payload.memo !== undefined ? { memo: payload.memo } : {}),
       });

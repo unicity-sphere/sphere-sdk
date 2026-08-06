@@ -119,7 +119,8 @@ refreshes on `transfer:updated` / `connection:status`.
 **Events (8):** `transfer:incoming` (kept verbatim — most-consumed, dApp-visible),
 `transfer:updated` (replaces `:confirmed`/`:delivery_pending`/`:failed`/`send:partial-remainder`),
 `transfer:attention` `{transferId, code, detail?}` (replaces `split:checkpoint-stuck`,
-`delivery:undeliverable`, `delivery:deferred`), `inventory:updated`, `history:updated`,
+`delivery:undeliverable`, `delivery:deferred`), `inventory:updated`, `history:updated`
+(carries the just-recorded client-shaped `HistoryEntry` — the same mapping `history()` serves),
 `payment_request:incoming`, `payment_request:updated`, `connection:status`
 (`connected|degraded|offline`; replaces `realtime:status` + `storage:degraded` — the server IS
 storage).
@@ -386,7 +387,10 @@ Delivery (`core/delivery-envelope.ts`). Expiry is server-owned.
 
 History: server read-through (`GET /v1/history` keyset pages) + client POSTs with the dedup keys —
 SENT by `transferId` (resume re-POST is a server no-op), RECEIVED by `(type, tokenId, stateHash)`,
-**MINT by `('MINT', tokenId)`** (a resumed mint must not double-POST); a failed POST never fails
+**MINT by `('MINT', tokenId)`** (a resumed mint must not double-POST); **a SENT record's amount is
+what SETTLED — the machine computes it from the certified recipient blobs (summarize()'s committed
+set), never the planned amount**, so a partial records the delivered portion and the remainder's
+re-plan records its own under the new transferId; a failed POST never fails
 the money path; server wire shape pinned (`ts` ISO+offset; genesis-stable lowercase `tokenId`),
 client-facing entries keep the consumed `timestamp` name via the read-through mapping. History
 `memo`/`counterparty_nametag` are **self-scoped encrypted** (`sphere-fieldenc-v1`), owned here.

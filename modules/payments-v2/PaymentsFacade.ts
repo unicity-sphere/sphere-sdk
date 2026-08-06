@@ -19,10 +19,11 @@ import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResul
 import type { HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
-import { reseedAndReset } from './restore';
+import { reseedAndReset, type RestoreDeps } from './restore';
 import type { MintJournalEntry, ShortfallEntry } from './stores';
 import type { History } from './history/History';
 import type { InventoryView } from './inventory/InventoryView';
+import { toToken } from './inventory/presentation';
 import type { Receive } from './receive/Receive';
 import type { Requests } from './requests/Requests';
 import type { ReservationLedger } from './select/ledger';
@@ -40,12 +41,14 @@ import {
 
 export {
   supportsDeterministicMint,
+  type CheckpointReseeder,
   type DeterministicMintCapable,
   type FacadeClient,
   type FacadeSession,
   type PaymentsFacadeDeps,
   type RecipientInfo,
 } from './compose';
+export { ATTENTION_RESEED_REJECTED } from './restore';
 
 /** Max re-plans after a conflicted attempt (#625/#677 parity with the old send loop). */
 export const MAX_RESELECT = 8;
@@ -90,6 +93,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private readonly receiveLoop: Receive;
   private readonly heldStates: HeldStateCache;
   private readonly ownPubkeyBytes: Uint8Array;
+  private readonly restoreDeps: RestoreDeps;
   readonly requests: Requests;
 
   private currentEngine: ITokenEngine | null = null;
@@ -102,7 +106,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private readonly converger: Converger;
   /** Resume single-flight (§7): ticks, start() and resumeNow() coalesce onto ONE pass. */
   private readonly resumeFlight = new SingleFlight<void>();
-  /** §5.1/§7: restore and convergence passes SERIALIZE — a restore never interleaves a pass. */
+  /** §5.1/§7: restore + convergence passes SERIALIZE here. */
   private readonly passChain = new SerialChain();
   /** §7 ownership: ids with an in-process machine attempt — the pass never adopts one. */
   private readonly activeMoneyOps = new Set<string>();
@@ -122,6 +126,7 @@ export class PaymentsFacade implements PaymentsV2 {
     this.receiveLoop = parts.receiveLoop;
     this.heldStates = parts.heldStates;
     this.ownPubkeyBytes = parts.ownPubkeyBytes;
+    this.restoreDeps = parts.restoreDeps;
     this.requests = parts.requests;
     deps.deliveryPort.bindDeliveryKeys((blob) => this.engine().deliveryKeys(blob));
     this.heartbeat = new ConvergenceHeartbeat({
@@ -147,8 +152,7 @@ export class PaymentsFacade implements PaymentsV2 {
     if (this.started) return;
     this.started = true;
     this.heartbeat.start();
-    // Subscriptions BEFORE session.start(): an epoch frame (or nudge) can never
-    // slip between the socket opening and the restore hook being registered.
+    // Subscriptions BEFORE session.start(): no frame can beat the restore hook.
     this.unsubscribers.push(
       this.deps.session.subscribeEpochChange((epoch) => this.handleEpochChange(epoch)),
       this.deps.session.subscribeStream('mailbox', () => {
@@ -235,32 +239,9 @@ export class PaymentsFacade implements PaymentsV2 {
     await this.track(this.runConvergencePass());
   }
 
-  /**
-   * §5.1 restore protocol, called (and awaited) by the session's epoch latch
-   * BEFORE any stream nudge resumes: re-seed the server from the §6 backstops,
-   * void every stream cursor, reconciling full re-pull, then a convergence
-   * pass — all on the pass chain, so it never interleaves a resume pass.
-   */
+  /** §5.1 restore — awaited by the session latch BEFORE streams resume; never coalesced onto a pre-restore pass. */
   async handleEpochChange(_newEpoch: string): Promise<void> {
-    await this.passChain.enqueue(() =>
-      reseedAndReset({
-        stores: this.machineStores,
-        kv: this.deps.kv,
-        reput: (transferId, envelope, requiresSeedClose) =>
-          this.machineDeps.intents.put(transferId, envelope, requiresSeedClose),
-        reseedCheckpoint: (transferId, opIndex) =>
-          this.deps.checkpointStore.reseedCheckpoint(transferId, opIndex),
-        decryptPayload: this.machineDeps.decryptPayload,
-        fullRePull: () => this.view.onEpochReset(),
-        attention: (transferId, code, detail) => {
-          this.deps.emit(
-            'transfer:attention',
-            detail === undefined ? { transferId, code } : { transferId, code, detail }
-          );
-        },
-      })
-    );
-    // Unconditionally post-restore (never coalesced onto a pre-restore pass).
+    await this.passChain.enqueue(() => reseedAndReset(this.restoreDeps));
     await this.passChain.enqueue(() => this.convergeBody());
   }
 
@@ -343,11 +324,8 @@ export class PaymentsFacade implements PaymentsV2 {
     }
   }
 
-  /**
-   * Partial outcome (#677/#690): the shortfall is already durable (written by
-   * the machine BEFORE complete). Accumulate the settled set, then re-plan ONLY
-   * the remainder under a NEW transferId — never the full amount.
-   */
+  /** Partial (#677/#690): shortfall already durable (machine wrote it BEFORE
+   *  complete); accumulate settled, re-plan ONLY the remainder, NEW transferId. */
   private async consumePartial(
     ctx: AttemptCtx,
     disposition: { entry: ShortfallEntry; deliveryPending: boolean },
@@ -379,11 +357,8 @@ export class PaymentsFacade implements PaymentsV2 {
     return null;
   }
 
-  /**
-   * One attempt's failure disposition: possibly-committed → rethrow UNWRAPPED;
-   * backstop still 'open' (committed>0) → converge via the same machine's
-   * resumeIntent; clean conflict with a demoted source → bounded full re-plan.
-   */
+  /** Failure disposition: possibly-committed → rethrow UNWRAPPED; backstop
+   *  'open' → converge via resumeIntent; clean demoted conflict → full re-plan. */
   private async disposeFailedAttempt(ctx: AttemptCtx, err: unknown): Promise<AttemptDisposition> {
     if (isPossiblyCommittedSendOutcome(err)) {
       this.settleKeepOpen(ctx);
@@ -591,11 +566,7 @@ export class PaymentsFacade implements PaymentsV2 {
     return result;
   }
 
-  /**
-   * With nothing delivered the error passes UNWRAPPED (identity + cause kept);
-   * after ≥1 delivered leg EVERY failure surfaces as PartialSendConflictError
-   * over the accumulated settled set — never bare, never a full-amount retry.
-   */
+  /** Nothing delivered → UNWRAPPED; after ≥1 delivered leg every failure surfaces as PartialSendConflictError over the settled set. */
   private partialize(err: unknown, run: SendRun): unknown {
     if (run.delivered.length === 0) return err;
     return new PartialSendConflictError(
@@ -773,22 +744,14 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   private toUiToken(tokenId: string, coinId: string, amount: bigint): Token {
-    const registry = this.deps.registry;
-    const iconUrl = registry.getIconUrl(coinId);
     const now = this.nowMs();
-    return {
-      id: tokenId,
-      coinId,
-      symbol: registry.getSymbol(coinId),
-      name: registry.getName(coinId),
-      decimals: registry.getDecimals(coinId),
-      ...(iconUrl !== null ? { iconUrl } : {}),
-      amount: amount.toString(),
-      status: 'transferring',
-      createdAt: now,
-      updatedAt: now,
-      lazy: true,
-    };
+    return toToken(
+      tokenId,
+      { assets: [], createdAt: now, updatedAt: now },
+      { coinId, amount: amount.toString() },
+      this.deps.registry,
+      { transferring: true, suspectedSpent: false }
+    );
   }
 
   private track<T>(op: Promise<T>): Promise<T> {

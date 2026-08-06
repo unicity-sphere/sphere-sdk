@@ -8,6 +8,7 @@ import { bytesToHex, hexToBytes } from '../../../core/crypto';
 import { SphereError } from '../../../core/errors';
 import type { ITokenEngine, SplitCheckpointStore } from '../../../token-engine/engine';
 import type { SphereToken } from '../../../token-engine/types';
+import { TOKEN_BLOB_VERSION } from '../../../token-engine/token-blob';
 import {
   CheckpointPersistFailedError,
   CheckpointTrustbaseMismatchError,
@@ -59,7 +60,13 @@ export interface MachineDeps {
   ownPubkey: Uint8Array;
   emit: (event: string, payload: unknown) => void;
   now: () => number;
-  recordHistory?: (info: { transferId: string; payload: IntentPayload; phase: 'sent' | 'resumed' }) => Promise<void>;
+  /** `committedAmount` = what SETTLED (the certified recipient blobs' value), never the plan. */
+  recordHistory?: (info: {
+    transferId: string;
+    payload: IntentPayload;
+    phase: 'sent' | 'resumed';
+    committedAmount: string;
+  }) => Promise<void>;
 }
 
 export interface MachinePlan {
@@ -186,7 +193,7 @@ export class TransferMachine {
     }
     if (cls === null) {
       await this.applyCommitted(engine, plan.transferId, committed);
-      this.closeTail(plan.transferId, plan.payload);
+      this.closeTail(engine, plan.transferId, plan.payload, committed);
       return { committed, deliveryPending };
     }
     if (cls === 'conflict' && committed.length > 0) {
@@ -214,10 +221,10 @@ export class TransferMachine {
     }
     await this.applyCommitted(engine, r.transferId, committed);
     if (conflicts.length > 0) {
-      return { deliveryPending, partial: await this.settlePartial(r, committed, conflicts) };
+      return { deliveryPending, partial: await this.settlePartial(engine, r, committed, conflicts) };
     }
     await this.completeIntent(r.transferId, r.payload);
-    await this.finishBookkeeping(r.transferId, r.payload, 'resumed');
+    await this.finishBookkeeping(engine, r.transferId, r.payload, 'resumed', committed);
     return { deliveryPending, partial: null };
   }
 
@@ -450,6 +457,7 @@ export class TransferMachine {
   }
 
   private async settlePartial(
+    engine: ITokenEngine,
     r: RehydratedIntent,
     committed: OpOutcome[],
     conflicts: ResumeConflict[]
@@ -467,18 +475,18 @@ export class TransferMachine {
     // and no resume could ever rebuild the remainder the app never saw.
     await this.stores.shortfalls.upsert(entry);
     await this.completeIntent(r.transferId, r.payload);
-    await this.finishBookkeeping(r.transferId, r.payload, 'resumed');
+    await this.finishBookkeeping(engine, r.transferId, r.payload, 'resumed', committed);
     return entry;
   }
 
-  private closeTail(transferId: string, payload: IntentPayload): void {
+  private closeTail(engine: ITokenEngine, transferId: string, payload: IntentPayload, committed: OpOutcome[]): void {
     void (async () => {
       try {
         await this.completeIntent(transferId, payload);
       } catch {
         return; // idempotent backstop — resume converges the unevidenced edge
       }
-      await this.finishBookkeeping(transferId, payload, 'sent');
+      await this.finishBookkeeping(engine, transferId, payload, 'sent', committed);
     })();
   }
 
@@ -487,9 +495,16 @@ export class TransferMachine {
     await this.deps.intents.complete(transferId, signature);
   }
 
-  private async finishBookkeeping(transferId: string, payload: IntentPayload, phase: 'sent' | 'resumed'): Promise<void> {
+  private async finishBookkeeping(
+    engine: ITokenEngine,
+    transferId: string,
+    payload: IntentPayload,
+    phase: 'sent' | 'resumed',
+    committed: OpOutcome[]
+  ): Promise<void> {
     try {
-      await this.deps.recordHistory?.({ transferId, payload, phase });
+      const committedAmount = await this.settledAmount(engine, payload.coinId, committed);
+      await this.deps.recordHistory?.({ transferId, payload, phase, committedAmount });
     } catch {
       /* a history failure never fails the money path */
     }
@@ -498,6 +513,27 @@ export class TransferMachine {
     } catch {
       /* stale 'open' backstops are inert — resume lists server-open only */
     }
+  }
+
+  /**
+   * §5.9: SENT history records what SETTLED, never the plan — the value of the
+   * certified recipient blobs (summarize()'s committed set is the only source;
+   * a journal-rehydrated resume leg has no source token, but every committed
+   * leg carries its recipient blob, so the outcome-derived rule is uniform).
+   */
+  private async settledAmount(engine: ITokenEngine, coinId: string, committed: OpOutcome[]): Promise<string> {
+    let total = 0n;
+    for (const outcome of committed) {
+      if (outcome.recipientBlob === undefined) continue;
+      const token = await engine.decodeToken({
+        v: TOKEN_BLOB_VERSION,
+        network: 0,
+        tokenId: '',
+        token: outcome.recipientBlob,
+      });
+      total += engine.balanceOf(token, coinId);
+    }
+    return total.toString();
   }
 
   private async disposeOnFailure(transferId: string, committed: OpOutcome[], cls: OutcomeClass): Promise<void> {

@@ -594,10 +594,12 @@ export interface SphereEventMap {
   'groupchat:connection': { connected: boolean };
   'groupchat:ready': { groupCount: number };
   'communications:ready': { conversationCount: number };
-  // NOTE (paymentsV2): the v2 History emits 'history:updated' with an EMPTY
-  // payload ({} — "re-read via history()"); the legacy entry payload below is
+  // NOTE (paymentsV2): the v2 History emits 'history:updated' with the
+  // just-recorded client-shaped HistoryEntry; the legacy entry payload is
   // unchanged for the default (flag-off) vertical.
-  'history:updated': import('../modules/payments/PaymentsModule').TransactionHistoryEntry;
+  'history:updated':
+    | import('../modules/payments/PaymentsModule').TransactionHistoryEntry
+    | import('../modules/payments-v2/api').HistoryEntry;
   // payments-v2 events (§4) — fired only when `paymentsV2: true` (P9 opt-in).
   /** Replaces transfer:confirmed / :delivery_pending / :failed on the v2 vertical. */
   'transfer:updated': TransferResult;

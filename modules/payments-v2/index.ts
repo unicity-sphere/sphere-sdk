@@ -6,6 +6,7 @@ export {
   PaymentsFacade,
   MAX_RESELECT,
   ATTENTION_MINT_UNRESOLVED,
+  ATTENTION_RESEED_REJECTED,
   supportsDeterministicMint,
 } from './PaymentsFacade';
 export { HEARTBEAT_SEED_MS, HEARTBEAT_CAP_MS } from './convergence';
@@ -13,6 +14,7 @@ export type {
   PaymentsFacadeDeps,
   FacadeSession,
   FacadeClient,
+  CheckpointReseeder,
   RecipientInfo,
   DeterministicMintCapable,
 } from './PaymentsFacade';

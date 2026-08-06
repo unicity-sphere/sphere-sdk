@@ -45,7 +45,8 @@ export interface HistoryDeps {
   /** S6 self-scoped field-encryption key (core/field-encryption, `enc1.`). */
   readonly fieldKey: Uint8Array;
   readonly registry: HistoryRegistryReader;
-  readonly emit: (event: 'history:updated') => void;
+  /** §4: the event carries the recorded entry, client-shaped (never `{}`). */
+  readonly emit: (event: 'history:updated', entry: HistoryEntry) => void;
   readonly log?: (message: string, error?: unknown) => void;
   readonly now?: () => number;
   readonly newId?: () => string;
@@ -145,13 +146,16 @@ export class History {
   // ── internals ────────────────────────────────────────────────────────────────
 
   private async post(build: () => HistoryWireRecord): Promise<void> {
+    const record = build();
     try {
-      await this.deps.client.postHistory([build()]);
+      await this.deps.client.postHistory([record]);
     } catch (err) {
       this.deps.log?.('history POST failed (dedupKey makes retry safe)', err);
       return;
     }
-    this.deps.emit('history:updated');
+    // The recorded entry is in hand — emit it through the SAME read-through
+    // mapping page() serves (decrypted memo/nametag, `timestamp` name).
+    this.deps.emit('history:updated', this.toEntry(record));
   }
 
   private ts(timestamp?: number): string {

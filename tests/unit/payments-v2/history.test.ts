@@ -253,13 +253,45 @@ describe('History §5.9 — client POSTs and dedup keys', () => {
     expect(h.emit).not.toHaveBeenCalled();
   });
 
-  it('emits history:updated after each successful POST', async () => {
+  it('emits history:updated after each successful POST, carrying the recorded client-shaped entry', async () => {
     const h = makeHarness();
     await h.history.recordSent({ transferId: 'c3333333-3333-4333-8333-333333333333', coinId: COIN, amount: '1' });
     await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, coinId: COIN, amount: '1' });
     await h.history.recordMint({ tokenId: TOKEN, coinId: COIN, amount: '1' });
     expect(h.emit).toHaveBeenCalledTimes(3);
-    expect(h.emit).toHaveBeenCalledWith('history:updated');
+    expect(h.emit.mock.calls.map((c) => [c[0], (c[1] as { type: string }).type])).toEqual([
+      ['history:updated', 'SENT'],
+      ['history:updated', 'RECEIVED'],
+      ['history:updated', 'MINT'],
+    ]);
+  });
+
+  it('a typed subscriber receives an entry it can dereference: decrypted memo/nametag, symbol, epoch-ms timestamp — the same mapping page() serves', async () => {
+    const h = makeHarness();
+    await h.history.recordSent({
+      transferId: 'f6666666-6666-4666-8666-666666666666',
+      coinId: COIN,
+      amount: '450',
+      memo: 'lunch',
+      recipientPubkey: PEER,
+      recipientNametag: 'bob',
+    });
+    const [event, entry] = h.emit.mock.calls[0] as [string, Record<string, unknown>];
+    expect(event).toBe('history:updated');
+    expect(entry).toMatchObject({
+      type: 'SENT',
+      coinId: COIN,
+      amount: '450',
+      symbol: 'UCT',
+      timestamp: NOW,
+      transferId: 'f6666666-6666-4666-8666-666666666666',
+      memo: 'lunch', // decrypted — never the enc1. wire envelope
+      recipientPubkey: PEER,
+      recipientNametag: 'bob',
+    });
+    // Identical to what the read-through serves for the same record.
+    const [paged] = (await h.history.page()).entries;
+    expect(entry).toEqual(paged);
   });
 
   it('encrypts memo and counterparty nametag before POST (enc1. on the wire, decrypted on read-through)', async () => {

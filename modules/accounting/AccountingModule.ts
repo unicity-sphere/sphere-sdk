@@ -19,6 +19,7 @@ import type {
 } from '../../types/index.js';
 import type { TxfToken } from '../../types/txf.js';
 import type { DirectMessage, Token } from '../../types/index.js';
+import type { HistoryRecord } from '../../storage/index.js';
 import type {
   AccountingModuleConfig,
   AccountingModuleDependencies,
@@ -4328,6 +4329,10 @@ export class AccountingModule {
     const unsubHistory = deps.on(
       'history:updated',
       (entry: SphereEventMap['history:updated']) => {
+        // Legacy payload only: accounting cannot run beside paymentsV2 (the
+        // init guard refuses the combination), and the v2 HistoryEntry
+        // carries no dedupKey — narrow the union once, at this boundary.
+        if (!('dedupKey' in entry)) return;
         this._handleHistoryUpdated(entry).catch((err) => {
           logger.warn(LOG_TAG, 'Error handling history:updated event:', err);
         });
@@ -4846,7 +4851,7 @@ export class AccountingModule {
    * @param entry - HistoryRecord payload from 'history:updated' event.
    */
   private async _handleHistoryUpdated(
-    entry: SphereEventMap['history:updated'],
+    entry: HistoryRecord,
   ): Promise<void> {
     if (this.destroyed) return;
 
@@ -5484,7 +5489,7 @@ export class AccountingModule {
    * @param confirmed        - Whether the transfer is confirmed.
    */
   private async _processInvoiceHistoryEvent(
-    entry: SphereEventMap['history:updated'],
+    entry: HistoryRecord,
     invoiceId: string,
     paymentDirection: 'forward' | 'back' | 'return_closed' | 'return_cancelled',
     confirmed: boolean,
@@ -6042,7 +6047,7 @@ export class AccountingModule {
    * @returns Synthetic InvoiceTransferRef for event payloads.
    */
   private _buildSyntheticTransferRefFromHistory(
-    entry: SphereEventMap['history:updated'],
+    entry: HistoryRecord,
     _invoiceId: string,
     paymentDirection: 'forward' | 'back' | 'return_closed' | 'return_cancelled',
     confirmed: boolean,

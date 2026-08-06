@@ -51,11 +51,7 @@ export class WalletApiSplitCheckpointStore implements SplitCheckpointStore {
     return this.open(record.payload, aad);
   }
 
-  /**
-   * §5.1 restore (CheckpointReseeder): re-POST the slot's cached encrypt-once
-   * ciphertext byte-identical — the server slot is insert-once, so this is a
-   * no-op when the record survived. False = no ciphertext cached locally.
-   */
+  /** §5.1 restore (CheckpointReseeder): re-POST the cached ciphertext byte-identical; false = none cached. */
   async reseedCheckpoint(transferId: string, opIndex: number): Promise<boolean> {
     const envelope = await this.config.kv.get<string>(this.cacheKey(transferId, opIndex));
     if (envelope === null) return false;

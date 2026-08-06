@@ -179,6 +179,43 @@ describe('PaymentsFacade — send policy', () => {
     expect(shortfalls.some((s) => s.remainingAmount === '150')).toBe(true);
   });
 
+  it('SENT history records what SETTLED, never the plan: partial 600 + remainder re-plan 400 → two SENT rows totalling exactly the send, each under its own transferId', async () => {
+    const world = makeWorld();
+    const a = await world.seed(600n);
+    const b = await world.seed(400n);
+    await world.seed(250n);
+    await world.seed(150n);
+    await world.engine.foreignSpend(b); // the 400 leg conflicts → partial on attempt 1
+    await world.facade.start();
+
+    const result = await world.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN });
+    expect(result.tokens.map((t) => t.id)).toContain(a.blob.tokenId);
+    await flushTail(); // the clean remainder's history POST rides the fire-and-forget tail
+
+    const { entries } = await world.facade.history({ limit: 50 });
+    const sent = entries.filter((e) => e.type === 'SENT');
+    expect(sent.map((e) => e.amount).sort()).toEqual(['400', '600']); // settled, never 1000
+    expect(new Set(sent.map((e) => e.transferId)).size).toBe(2);
+    expect(sent.reduce((sum, e) => sum + BigInt(e.amount), 0n)).toBe(1000n);
+  });
+
+  it('an unrecovered remainder leaves SENT at the settled 600 — never the planned 1000', async () => {
+    const world = makeWorld();
+    await world.seed(600n);
+    const b = await world.seed(400n);
+    await world.engine.foreignSpend(b);
+    await world.facade.start();
+
+    await expect(
+      world.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN })
+    ).rejects.toBeInstanceOf(PartialSendConflictError);
+    await flushTail();
+
+    const { entries } = await world.facade.history({ limit: 50 });
+    const sent = entries.filter((e) => e.type === 'SENT');
+    expect(sent.map((e) => e.amount)).toEqual(['600']);
+  });
+
   it('keep-open family is rethrown UNWRAPPED: same instance, cause preserved, transferId stamped', async () => {
     const world = makeWorld();
     await world.seed(100n);
