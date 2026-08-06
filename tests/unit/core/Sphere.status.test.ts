@@ -11,7 +11,8 @@ import type { SphereEventMap } from '../../../types';
 import type { PricePlatform, TokenPrice } from '../../../price';
 import { makeMockProviders, type MockProviders } from './support/mock-providers';
 
-const TEST_NETWORK = 'testnet' as const;
+// #728 single-network invariant: must equal the mock walletApi's network (testnet2).
+const TEST_NETWORK = 'testnet2' as const;
 
 describe('Sphere Status & Provider Management', () => {
   let providers: MockProviders;

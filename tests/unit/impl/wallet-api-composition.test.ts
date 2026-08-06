@@ -68,19 +68,19 @@ describe('createWalletApiProviders — the transport CONFIG preset', () => {
 
   it('resolvePaymentsV2Composition accepts the produced config (the Sphere.init duck)', () => {
     const out = createWalletApiProviders(base(), CONFIG);
-    const composition = resolvePaymentsV2Composition(out.walletApi);
+    const composition = resolvePaymentsV2Composition(out.walletApi, 'testnet2');
     expect(composition.network).toBe('testnet2');
     expect(typeof composition.factory).toBe('function');
   });
 
   it('resolvePaymentsV2Composition rejects a config with neither baseUrl nor seam', () => {
-    expect(() => resolvePaymentsV2Composition({ network: 'testnet2' })).toThrowError(
+    expect(() => resolvePaymentsV2Composition({ network: 'testnet2' }, 'testnet2')).toThrowError(
       /neither `baseUrl`.*nor the `paymentsV2Transport\(\)` seam/
     );
   });
 
   it('resolvePaymentsV2Composition fails closed on a missing config', () => {
-    expect(() => resolvePaymentsV2Composition(undefined)).toThrowError(
+    expect(() => resolvePaymentsV2Composition(undefined, 'testnet2')).toThrowError(
       /requires a wallet-api composition/
     );
   });

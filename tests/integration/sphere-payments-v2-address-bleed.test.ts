@@ -76,7 +76,8 @@ async function buildSphere(world: Pv2World): Promise<Sphere> {
     transport: createMockTransport(),
     oracle: createEngineOracle(),
     mnemonic: MNEMONIC,
-    network: 'testnet',
+    // #728 single-network invariant: must equal the Pv2World walletApi network.
+    network: 'testnet2',
     walletApi: world.walletApi,
   });
   cleanups.push(async () => {

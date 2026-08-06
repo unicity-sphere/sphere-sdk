@@ -23,7 +23,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { Sphere, type SphereWalletApiSession } from '../../core/Sphere';
+import { Sphere } from '../../core/Sphere';
 import {
   deriveKeyAtPath,
   getPublicKey,
@@ -46,6 +46,7 @@ import type { PaymentsFacade } from '../../modules/payments-v2/PaymentsFacade';
 import type {
   PaymentsV2Transport,
   PaymentsV2TransportArgs,
+  WalletApiTransportConfig,
 } from '../../core/payments-v2-wiring';
 import { createScopedKV, STORE_KEYS, type IntentBackstopEntry } from '../../modules/payments-v2/stores';
 import type { StreamCursor } from '../../modules/payments-v2/stores';
@@ -128,11 +129,8 @@ function makeWorld() {
     verifySeedSignature: (check) => verifySignedMessage(check.message, check.signature, check.chainPubkey),
   });
   const transports: TransportRecord[] = [];
-  const walletApi = {
+  const walletApi: WalletApiTransportConfig = {
     network: NET,
-    setIdentity: () => undefined,
-    signIn: async () => undefined,
-    logout: async () => undefined,
     paymentsV2Transport: (args: PaymentsV2TransportArgs): PaymentsV2Transport => {
       const session = new FakeSession();
       const caller: FakeCaller = { chainPubkey: args.identity.chainPubkey, network: args.network };
@@ -158,7 +156,7 @@ function makeWorld() {
     ownCaller,
     peerCaller,
     peerPort,
-    walletApi: walletApi as unknown as SphereWalletApiSession,
+    walletApi,
   };
 }
 
@@ -208,7 +206,6 @@ async function buildSphere(world: World) {
     // #728 single-network invariant: the Sphere network must equal walletApi.network.
     network: NET,
     walletApi: world.walletApi,
-    paymentsV2: true,
   });
   cleanups.push(async () => {
     await sphere.destroy();
