@@ -158,8 +158,11 @@ describe('wallet-api wake reconnect converges a window whose socket went dark (�
     await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 1, 'wake socket connected');
 
     // B's wake socket dies (proxy/idle/network kill) — unobserved by the bare handle.
+    // The drop itself is the observable — NOT the transient zero. The supervisor
+    // reconnects with full-jitter backoff, so `socketCount === 0` can close before
+    // any poll observes it; waiting for it made this test fail on loaded runners
+    // (main run 31192808625) while the product behaved correctly.
     expect(fake.dropSockets(OWNER.chainPubkey)).toBe(1);
-    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 0, 'wake socket gone');
 
     // While B is DARK, window A tops up the shared inventory (+ the wake that
     // fires now reaches nobody — B has no socket; the server does not replay it).
@@ -184,8 +187,7 @@ describe('wallet-api wake reconnect converges a window whose socket went dark (�
     payer.module.onPaymentRequest((r) => surfaced.push(r));
 
     // The payer's socket dies.
-    fake.dropSockets(OWNER.chainPubkey);
-    await waitFor(() => fake.socketCount(OWNER.chainPubkey) === 0, 'wake socket gone');
+    expect(fake.dropSockets(OWNER.chainPubkey)).toBe(1);
 
     // The requester creates a PR while the payer is dark — its `payment_requests`
     // wake reaches no socket.
