@@ -1,6 +1,6 @@
 {
   "name": "@unicitylabs/sphere-sdk",
-  "version": "0.13.3-dev.2",
+  "version": "0.14.0-dev.7",
   "description": "Modular TypeScript SDK for Unicity wallet operations",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -61,6 +61,26 @@
         "default": "./dist/token-engine/index.cjs"
       }
     },
+    "./payments-v2": {
+      "import": {
+        "types": "./dist/modules/payments-v2/index.d.ts",
+        "default": "./dist/modules/payments-v2/index.js"
+      },
+      "require": {
+        "types": "./dist/modules/payments-v2/index.d.cts",
+        "default": "./dist/modules/payments-v2/index.cjs"
+      }
+    },
+    "./impl/wallet-api-v2": {
+      "import": {
+        "types": "./dist/impl/wallet-api-v2/index.d.ts",
+        "default": "./dist/impl/wallet-api-v2/index.js"
+      },
+      "require": {
+        "types": "./dist/impl/wallet-api-v2/index.d.cts",
+        "default": "./dist/impl/wallet-api-v2/index.cjs"
+      }
+    },
     "./wallet-api": {
       "import": {
         "types": "./dist/wallet-api/index.d.ts",
@@ -119,6 +139,7 @@
     "test:relay": "vitest run --config vitest.relay.config.ts",
     "test:harness": "vitest run --config vitest.harness.config.ts",
     "test:e2e:live": "vitest run --config vitest.live.config.ts",
+    "test:mutation": "node scripts/test-mutation.mjs",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "typecheck:tests": "tsc --noEmit -p tsconfig.tests.json",

@@ -10,6 +10,9 @@
  * SDK objects are injected via `EngineDeps` (built by the factory in A4, or by
  * test wiring around TestAggregatorClient), keeping the engine logic independent
  * of how the aggregator/trust base are constructed.
+ *
+ * Advertises `deterministicMint` (F13): a same-seed `mint` re-call recovers an
+ * existing certification instead of minting a second token.
  */
 
 import { SphereError, type SphereErrorCode } from '../core/errors';
@@ -181,6 +184,9 @@ interface SplitContext {
 }
 
 export class SphereTokenEngine implements ITokenEngine {
+  /** F13 advertisement: mint under a (transferId, opIndex) seed is idempotent-recoverable — a same-seed re-call converges, never double-mints. */
+  public readonly deterministicMint = true;
+
   /** Hex form of the wallet key — deriveRealization's ikm input (Part E.1). */
   private readonly privateKeyHex: string;
 
@@ -241,22 +247,32 @@ export class SphereTokenEngine implements ITokenEngine {
   public async mint(params: MintParams, options?: EngineOpOptions): Promise<SphereToken> {
     const recipient = SignaturePredicate.create(params.recipientPubkey);
     const data = params.value ? await SpherePaymentData.fromValue(params.value).encode() : null;
+    const transferId = this.resolveTransferId(options);
+    const opIndex = this.resolveOpIndex(options);
 
-    const mintTx = await MintTransaction.create(this.deps.networkId, recipient, data);
+    // #692 F13 — E.1: HKDF-derived salt (→ tokenId → stateId) + tokenType make a
+    // re-call with the same transferId rebuild the byte-identical mint. The salt
+    // gets its own 'mint' field domain: 'salt' is indexed by split-OUTPUT ordinal
+    // under the same transferId, so ('salt', opIndex) would collide with output
+    // #opIndex of a sibling split (see RealizationField).
+    const mintTx = await MintTransaction.create(
+      this.deps.networkId,
+      recipient,
+      data,
+      new TokenType(deriveRealization(this.privateKeyHex, transferId, opIndex, 'tokenType')),
+      TokenSalt.fromBytes(deriveRealization(this.privateKeyHex, transferId, opIndex, 'mint')),
+    );
     const certificationData = await CertificationData.fromMintTransaction(mintTx);
 
-    const response = await this.deps.client.submitCertificationRequest(certificationData);
-    if (response.status !== CertificationStatus.SUCCESS) {
-      throw new SphereError(`Mint certification failed: ${response.status}`, 'AGGREGATOR_ERROR');
-    }
-
-    const proof = await waitInclusionProof(
-      this.deps.client,
-      this.deps.trustBase,
-      this.deps.predicateVerifier,
+    // The same idempotent submit-then-always-probe primitive as transfer/split (E.2):
+    // OK-match = mine (resume), mismatch = typed conflict, clean reject = submit error,
+    // inconclusive = ProofUnconfirmedError (keep-open) — never inferred from the status.
+    const proof = await this.submitAndAwaitProof(
+      certificationData,
       mintTx,
-      options?.signal,
-      this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS, // #683 finer poll cadence
+      'Mint certification failed',
+      'AGGREGATOR_ERROR',
+      options,
     );
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
     const token = await Token.mint(certified, this.deps.verificationContext);
@@ -272,18 +288,14 @@ export class SphereTokenEngine implements ITokenEngine {
     const mintTx = await MintTransaction.create(this.deps.networkId, recipient, params.data, tokenType, salt);
     const certificationData = await CertificationData.fromMintTransaction(mintTx);
 
-    const response = await this.deps.client.submitCertificationRequest(certificationData);
-    if (response.status !== CertificationStatus.SUCCESS) {
-      throw new SphereError(`Data-token mint failed: ${response.status}`, 'AGGREGATOR_ERROR');
-    }
-
-    const proof = await waitInclusionProof(
-      this.deps.client,
-      this.deps.trustBase,
-      this.deps.predicateVerifier,
+    // #692 F13: the caller's deterministic salt already makes the re-call byte-identical;
+    // routing through the probe primitive makes the re-call actually RECOVER (E.2).
+    const proof = await this.submitAndAwaitProof(
+      certificationData,
       mintTx,
-      options?.signal,
-      this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS, // #683 finer poll cadence
+      'Data-token mint failed',
+      'AGGREGATOR_ERROR',
+      options,
     );
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
     const token = await Token.mint(certified, this.deps.verificationContext);

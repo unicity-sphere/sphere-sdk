@@ -96,6 +96,46 @@ export const configs = [
       'ws',
     ],
   },
+  // payments-v2 vertical (docs/PAYMENTS-V2-DESIGN.md) — platform-neutral
+  {
+    entry: { 'modules/payments-v2/index': 'modules/payments-v2/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'node',
+    target: 'es2022',
+    noExternal: [/^@noble\//],
+    external: [
+      /^@unicitylabs\//,
+      'bip39',
+      'buffer',
+      'crypto-js',
+      'elliptic',
+      'ws',
+    ],
+  },
+  // wallet-api-v2 session/client/ports (payments-v2 impl) — platform-neutral (fetch/WS injected)
+  {
+    entry: { 'impl/wallet-api-v2/index': 'impl/wallet-api-v2/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'node',
+    target: 'es2022',
+    noExternal: [/^@noble\//],
+    external: [
+      /^@unicitylabs\//,
+      'bip39',
+      'buffer',
+      'crypto-js',
+      'elliptic',
+      'ws',
+    ],
+  },
   // Browser implementation
   {
     entry: { 'impl/browser/index': 'impl/browser/index.ts' },

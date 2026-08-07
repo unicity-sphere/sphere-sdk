@@ -14,17 +14,42 @@
 | Phase | Scope | Status |
 |---|---|---|
 | P0 | Spec edits (wallet-api PR): S7 own-storage rescind, contract pins, topology fix | 🔄 wallet-api#119 open |
-| P1 | Skeleton, interfaces, adversarial fakes, contract-test + `test:mutation` harness | ⬜ |
-| P2 | `WalletApiSession` — auth cell, wake socket, syncEpoch latch | ⬜ |
-| P3 | `InventoryView` — cursor pull, overlay, recovery, reads (`assets`/`tokens`) | ⬜ |
-| P4 | `CoinSelector` + `Reservations` + queue | ⬜ |
-| P5 | `TransferMachine` — send happy path, latency rules, first probes | ⬜ |
-| P6 | `TransferMachine` — resume = same machine; conflict/keep-open/partial; E.4 | ⬜ |
-| P7 | `Receive` drain + seen-set + claim + RECEIVED history | ⬜ |
-| P8 | `Requests` (streams + settling journal); `Mint` (+ engine F13 fix) | ⬜ |
-| P9 | `History` read-through; events; Connect adapter; facade assembly | ⬜ |
-| P10 | Live-staging e2e parity + soak + request-count budgets | ⬜ |
-| P11 | Flip PR: wire Sphere, delete old vertical, frontend migration, re-pin | ⬜ |
+| P1 | Skeleton, interfaces, adversarial fakes, contract-test harness | ✅ contracts + FakeWalletApi (61 pins) + FakeGateway; `test:mutation` runner in δ |
+| P2 | `WalletApiSession` — auth cell, wake socket, syncEpoch latch | ✅ F8/F12/F14 mutation-verified + **5/5 live staging e2e** |
+| P3 | `InventoryView` + wallet-api port implementations + S7 contract suites | ✅ F6/F7 closed by schema/construction; providers mutation-verified |
+| P4 | `CoinSelector` + `Reservations` + queue | ✅ work-budget search; fragmented-wallet cliff is a named RED case |
+| P5 | `TransferMachine` — send path | ✅ 5/5 mutation probes; apply-gating amendment (§5.5) found here |
+| P6 | `TransferMachine` — resume = same machine | ✅ #676/#631/#634/audit#4/#690 pinned; 29 tests total with P5 |
+| P7 | `Receive` drain + seen-set + claim + RECEIVED history | ✅ 20 tests; store-before-ack crash window pinned |
+| P8 | `Requests` (streams + settling journal); `Mint` (+ engine F13 fix) | ✅ requests 19 tests; journal-first mint; F13 fixed + fake de-lied (124/124 engine) |
+| P9 | `History` read-through; events; facade assembly | ✅ facade 16 tests over real ports; `test:mutation` standing (16/16 KILLED). Connect adapter → P11. **2026-08:** §4 gained `pendingTransfers()`/`resumeNow()` + the §7 in-session heartbeat (owner UX add; 9 heartbeat tests, 19/19 probes) |
+| P10 | Live-staging e2e parity + soak + request-count budgets | 🔄 **6/6 money matrix live-green on testnet2** (mint / whole-token / split w/ signed seed-close / self-send / A→B→A / crash-resume paid-once) + 5/5 session e2e + **cross-version interop live-green** (old-module ↔ v2 vertical both directions incl. splits + payment request, 4/4). Still owed: exact-combination + E.4-stage interruption cells, soak, request-count budgets |
+| P11 | Flip PR: wire Sphere + Connect adapter, delete old vertical, frontend migration, re-pin | ⬜ owner-gated |
+
+## Residue ledger
+
+Every deferred-work admission from a lane report is tracked here (full audit: 37 admissions, 22
+discharged, the rest below). **Standing rule: lane-report deferred-work admissions land in this
+ledger in the same integration commit that consumes the lane.** The two formerly in-flight items
+are closed: the §5.1 restore/epoch latch (IF1) landed in 35a8d89c and the settling-link clearing
+semantics (IF2) in ce7372f2; the #728 α/β P1s (cross-network composition assert; failed-outcome
+emission on `transfer:updated`) are fixed in this integration series.
+
+| # | Item (one line) | Disposition |
+|---|---|---|
+| S1 | Stale-`'open'` backstop entry after a tail crash: phantom pending row + heartbeat never idles | **Fixed here** — resume GC sweep (not-server-open ∧ no journal legs ∧ no active op), heartbeat-idle pinned |
+| S2 | No public verb revokes the server-side wallet-api session row on wallet deletion | #729 |
+| S3 | Dual `spentStates {local, protocol}`, always identical (wire compat kept past the flip) | Flip fast-follow — collapse to one field, coordinate wallet-api payload readers |
+| S4 | `ports.ts` didn't name the typed applyDelta errors (`DeltaConflictError`/`DeltaValidationError`) | **Fixed here** — port doc names both, matched duck-typed by `code` |
+| S5 | InventoryView's `'suspected-spent'`/`'known-spends'` KV keys were local, not in `STORE_KEYS` | **Fixed here** — absorbed into `STORE_KEYS` (values unchanged) |
+| S6 | `isNetworkScopedAddressKey` full cut not taken (flip judgment call #10) | #730 |
+| S7 | `git mv` rename wave (`modules/payments-v2` → `modules/payments`) never executed; `check-removed-refs` unconfirmed | Confirm with flip owner before the flip PR merges |
+| S8 | Text-backup writer surface survives (`exportToTxt`/`downloadWalletBackup` + wallet-text.ts) | Owner decision; recorded in LEGACY-INVENTORY |
+| S9 | TransactionHistoryModal fetches exactly one page (cursor already surfaced by `history()`) | sphere PR #473 |
+| S10 | Undeliverable toast lost the `attempts` count (not in the `transfer:attention` payload) | sphere PR #473 |
+| S11 | fake-client auth endpoints throw 501 NOT_MODELED; session suite mocks fetch instead | Accepted — model auth in FakeWalletApi only if a lane needs it |
+| S12 | FakeTokenEngine lacks E.1 realization semantics; the private RealizationEngine harness compensates | Accepted — fold into FakeTokenEngine or promote RealizationEngine to shared support later |
+| S13 | FakeWalletApi doesn't model retention/`blobCollected`/non-lane quotas | Accepted — noted so future lanes don't assume coverage |
 
 ---
 
@@ -87,14 +112,18 @@ over wallet-api. No client-store lifecycle (`sync`/`validate`) in the API.
 ```ts
 interface Payments {
   // reads — views over the wallet-api record
-  assets(coinId?: string): Promise<Asset[]>;       // balances + registry metadata + fiat
+  assets(coinId?: string): Promise<Asset[]>;       // inventory-mirror aggregation + registry metadata + fiat
   tokens(filter?: { coinId?: string }): Token[];   // sync read of the inventory view
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage>;
 
   // money movement
   send(req: { recipient: string; amount: string; coinId: string; memo?: string }): Promise<TransferResult>;
   mint(coinId: string, amount: bigint): Promise<MintResult>;
-  receive(): Promise<{ transfers: IncomingTransfer[] }>;   // explicit drain-now
+  receive(): Promise<{ transfers: IncomingTransfer[] }>;
+
+  // convergence (§7 heartbeat surface; owner UX add 2026-08)
+  pendingTransfers(): Promise<PendingTransfer[]>; // on-read view over the intent backstop + delivery journal (+ #690 shortfalls, surfaced distinctly) — never a cached mirror
+  resumeNow(): Promise<void>;                     // immediate resume pass; coalesces with a running one and reschedules the heartbeat from its outcome   // explicit drain-now
 
   // payment requests (wallet-api S4 streams only)
   requests: {
@@ -107,10 +136,23 @@ interface Payments {
 }
 ```
 
+**Retry rule:** a UI retry button calls `resumeNow()`, **NEVER** `send()` — a re-issued send is a
+fresh `transferId` over different sources and double-pays the recipient (#631/#676); `resumeNow()`
+replays the SAME intent. The heartbeat emits no tick events: the UI polls `pendingTransfers()` or
+refreshes on `transfer:updated` / `connection:status`.
+
 **Events (8):** `transfer:incoming` (kept verbatim — most-consumed, dApp-visible),
-`transfer:updated` (replaces `:confirmed`/`:delivery_pending`/`:failed`/`send:partial-remainder`),
+`transfer:updated` (replaces `:confirmed`/`:delivery_pending`/`:failed`/`send:partial-remainder` —
+it also carries failed outcomes: a send() that rejects with a CLEAN failure (classifyError `other`,
+nothing certified — insufficient balance, invalid recipient, pre-commit validation) emits
+`transfer:updated` with `status: 'failed'` (`id` = the attempt's transferId when one existed, else
+`''`; empty `tokens`/`tokenTransfers`; `error`) before the rejection surfaces; keep-open / partial /
+conflict-with-committed outcomes NEVER emit `failed` — they are pending/converging, and a `failed`
+label invites a dApp re-send = double-pay. The P11 Connect adapter re-emits legacy `transfer:failed`
+from `transfer:updated{status:'failed'}`),
 `transfer:attention` `{transferId, code, detail?}` (replaces `split:checkpoint-stuck`,
-`delivery:undeliverable`, `delivery:deferred`), `inventory:updated`, `history:updated`,
+`delivery:undeliverable`, `delivery:deferred`), `inventory:updated`, `history:updated`
+(carries the just-recorded client-shaped `HistoryEntry` — the same mapping `history()` serves),
 `payment_request:incoming`, `payment_request:updated`, `connection:status`
 (`connected|degraded|offline`; replaces `realtime:status` + `storage:degraded` — the server IS
 storage).
@@ -189,15 +231,20 @@ Emits `connection:status`.
 Owns the in-memory mirror of the server inventory — a *view*, never a store of record. Pull
 protocol: paginated full pull finished with an immediate `?since=<page-1 cursor>` delta (pulls
 span snapshots); `?since=` deltas include tombstones and the view applies them; `more`-loops
-always run to completion. Mutations to the mirror are per-key; **there is no clear-and-repopulate,
-so the #724 shape cannot be written.** The `suspectedSpent` overlay is durable and its
+always run to completion. The cursor is live: `delta()` pulls incrementally from the persisted §6
+`(cursor, syncEpoch)` inventory record — one atomic record, advanced after every completed pull; a
+stale epoch voids continuity and falls back to a reconciling full re-pull. Mutations to the mirror
+are per-key; **there is no clear-and-repopulate, so the #724 shape cannot be written.** The
+`suspectedSpent` overlay is durable and its
 prune/apply runs inside the same critical section as the view mutation it reads (kills F7).
 `recoverRemoved()`: knownSpends are **state-scoped `(tokenId, stateHash)` by schema** — a bare
 tokenId record is unrepresentable (kills F6); an evidenced-tombstone 409 on re-add means "actually
 spent", keep the tombstone. Empty-import protection: never push a removal before the first
 successful inventory read; a token is removed only against a confirmed on-chain spend. Serves
-`assets()` (with registry + price), `tokens()` (elements enriched from the registry; status set
-is `'confirmed' | 'transferring'`), and the selector's metadata pool. **In-flight exclusion
+`assets()` (aggregated from the mirror, with registry + price — the server `/v1/balances`
+endpoint has no client consumer and the StoragePort exposes no balances member), `tokens()`
+(elements enriched from the registry; status set is `'confirmed' | 'transferring'`), and the
+selector's metadata pool. **In-flight exclusion
 (#517/#32, re-homed):** sources reserved by an open transfer — including keep-open intents whose
 spend may be on-chain — are excluded from the selector pool AND reported outside the spendable
 total (`transferring*` fields, never `totalAmount`) until their machine settles or resume adopts
@@ -286,6 +333,12 @@ Normative behaviors bound into the transitions (not call sites):
   deposit **attempt** of the same `transferId` — delivered, deferred (429), or failed-and-journaled
   alike; a deferred deposit must not leave spent sources listed active on every device (the S3
   rule). Post-commit mirror failure is `SEND_SYNC_PENDING`, never `transfer:failed` (#665).
+  **Amendment (found during P5 build, test-pinned):** apply is *skipped* — deferred to resume —
+  exactly when a keep-open or unjournaled-committed leg exists in the same intent: the server
+  completes an unflagged intent on ANY apply, which would close the only exit (same-`transferId`
+  resume) for the indeterminate leg. Balances converge at resume; the alternative strands funds.
+  Likewise the #690 shortfall record is durable **before** `complete` (the reverse order has a
+  lost-shortfall window while the intent is already unlistable).
 - **Resolution point (latency):** the awaited path of `send()` ends after **APPLYING** — spend
   committed, delivery journaled/attempted, `applyDelta` applied (its failure is the thrown
   `SEND_SYNC_PENDING`, which therefore can surface). `TransferResult.deliveryPending` is `true`
@@ -328,12 +381,23 @@ property, never a call-site option — the port contract's rule) → RECEIVED hi
 contract** (the contract suite asserts it); it records an entry **only after its ack succeeded**
 — a crash mid-drain leaves entries unacked and re-listed. Verification failure →
 `mailbox/reject` (terminal for discovery, not for the asset — never wedges the read pointer). A
-claim that lands in the server's `failed[]` bucket (`CONFLICT`) gets bounded retries, then
-`mailbox/reject` (`reason:'other'`) so it becomes terminal for discovery instead of re-processing
-every drain forever. The emitted `transfer:incoming` payload keeps its consumed shape: sender
+claim that lands in the server's `failed[]` bucket (`CONFLICT`) is `mailbox/reject`ed
+(`reason:'other'`) immediately and the drain continues: a lineage CONFLICT is not transient by
+construction — another owner holds equal-or-newer state, the delivery is stale — and reject is
+non-destructive server-side (terminal for discovery only; blob retained; never downgrades a
+claim), so no retry counter exists (zero client state); `transfer:attention`
+`{code:'claim:conflict'}` makes it operator-visible. The emitted `transfer:incoming` payload
+keeps its consumed shape: sender
 nametag resolved via transport, token display fields (`symbol`, `decimals`, `iconUrl`) enriched
 from the registry, memo decrypted from the ECDH bundle. Wake-driven with the 30 s poll as the
-correctness backstop.
+correctness backstop. **Restore self-detection (S7 port shape):** the mailbox page response
+carries `syncEpoch`, and the DeliveryPort surfaces it — `incomingEpoch(): string | null`, the
+epoch of the most recent `incoming()` page, updated per page — so Receive persists its
+`(cursor, epoch)` record from the page-honest epoch and, when a listed page reports an epoch
+different from the record's, voids the record and re-lists from the start (post-restore seqs
+restart, so a resumed listing may have skipped entries) even when the wake socket missed the
+server restore. Pinned by the S7 delivery-port contract suite; wallet-api#119's S7 text carries
+the same sentence.
 
 ### 5.8 `Requests`
 
@@ -341,7 +405,11 @@ wallet-api streams only. Incoming = gap-free `?since=` upsert-by-id stream (reco
 status change re-surfaces at higher seq); outgoing = backfill view, no tailing. `pay()` is
 per-request single-flight; the #441 settling journal is kept verbatim: durable request→transferId
 link **before** any possibly-committed throw; reconcile by the linked transfer's outcome; direction
-of error is always paid-never-re-payable. The 409 swallow-and-clear applies **only to the
+of error is always paid-never-re-payable. **The settlement invariant (one code path):** a settling
+link is removed ONLY by a CONFIRMED paid respond (2xx, or the 409 already-resolved absorb) or by a
+proven clean pre-commit failure — never by a network error, a 5xx, or a reload; a clean-success
+send whose respond fails keeps the link (status `settling`) and the next reconcile's
+committed-link override retries the respond. The 409 swallow-and-clear applies **only to the
 paid-respond leg** (the payment already succeeded — 409 means already resolved); `decline()`
 **propagates** 403/409 to the caller, as the frontend contract requires (a refused decline must
 never look like success). Requests memo encryption is the recipient-ECDH bundle shared with
@@ -351,7 +419,10 @@ Delivery (`core/delivery-envelope.ts`). Expiry is server-owned.
 
 History: server read-through (`GET /v1/history` keyset pages) + client POSTs with the dedup keys —
 SENT by `transferId` (resume re-POST is a server no-op), RECEIVED by `(type, tokenId, stateHash)`,
-**MINT by `('MINT', tokenId)`** (a resumed mint must not double-POST); a failed POST never fails
+**MINT by `('MINT', tokenId)`** (a resumed mint must not double-POST); **a SENT record's amount is
+what SETTLED — the machine computes it from the certified recipient blobs (summarize()'s committed
+set), never the planned amount**, so a partial records the delivered portion and the remainder's
+re-plan records its own under the new transferId; a failed POST never fails
 the money path; server wire shape pinned (`ts` ISO+offset; genesis-stable lowercase `tokenId`),
 client-facing entries keep the consumed `timestamp` name via the read-through mapping. History
 `memo`/`counterparty_nametag` are **self-scoped encrypted** (`sphere-fieldenc-v1`), owned here.
@@ -359,10 +430,12 @@ Mint: engine self-mint routed through the **same idempotent submit-then-probe pr
 transfer/split** — the #692 F13 fix lands in `token-engine` (P8); the fake aggregator models
 duplicate-submit adversarially so the contract test stops lying. **Mint durability:** the
 submit-probe primitive fixes idempotency within a process, not crash durability — so mint gets a
-**durable pre-submit journal record** (deterministic seed: coinId, amount, tokenId derived before
-submit), replayed at `start()` exactly like the delivery journal, closing the
+**durable pre-submit journal record** (seed: coinId, amount, mintId; tokenId recorded once the
+mint returns), replayed at `start()` exactly like the delivery journal, closing the
 certification→`applyDelta` window; removed only after the mint is applied to inventory. Without
 it, a crash there mints a token on-chain with zero client record — the mint-path twin of #621.
+Replay converges by an idempotent `mint` re-call under the same journaled `(transferId, opIndex)`
+seed (F13 recovers the existing certification); pre-derivation of the tokenId is dropped.
 
 ## 6. Durable client state — the complete inventory
 
@@ -374,7 +447,7 @@ can lose money.** Each row exists because of a documented server non-guarantee.
 | Intent backstop (open intents, encrypted payloads) | intents not rebuildable after server DB restore — re-PUT on `syncEpoch` change | TransferMachine |
 | E.4 checkpoint ciphertext (encrypt-once bytes) | same, re-POST byte-identical | TransferMachine |
 | Delivery journal (`(transferId, opIndex)` → blob) | certification→deposit window is client-only | Delivery |
-| Mint journal (pre-submit seed: coinId, amount, derived tokenId) | mint certification→`applyDelta` window is client-only (mint has no intent row) | Mint |
+| Mint journal (pre-submit seed: coinId, amount, mintId) | mint certification→`applyDelta` window is client-only (mint has no intent row) | Mint |
 | Partial-shortfall record (`remainingAmount` + delivered set) | the delivered legs' intent completes — resume cannot recover a shortfall the app never saw (#690/#692); written before the partial surfaces, cleared on re-plan/ack | TransferMachine |
 | Seen-set `(tokenId, stateHash)` | mailbox is at-least-once; claimed entries stay listable | delivery impl (S7 port contract) |
 | `suspectedSpent` overlay | server never checks unspentness | InventoryView |
@@ -404,6 +477,13 @@ carries over: a testnet journal must never act on another network).
   critical path — `start()` never awaits them (the old `load()` contract; awaiting can deadlock
   and regresses startup) — and resume batches its cross-intent reads rather than going
   per-intent-serial. Pinned by a startup request-count test.
+- **In-session convergence heartbeat:** between `start()` and `stop()`, while open intents exist
+  or the delivery/mint journals are non-empty, the facade re-runs the SAME single-flighted resume
+  pass on an exponential backoff — seed 5 s, ×2, cap 120 s; reset on progress (any leg converging)
+  and on `connection:status` recovery; a surfaced wallet-api `Retry-After` floors the next pass;
+  the pass never adopts an intent whose machine is still running in-process (facade ownership).
+  State is an in-memory timer handle + backoff value only — the pending set is re-read from the
+  §6 stores at every tick, and `stop()` clears the timer (quiescence unchanged).
 - **Address switch** = stop the vertical, start a new one. **`stop()` awaits quiescence** —
   in-flight machines and the drain complete or park before `start()` for the same address may
   run, because both instances would otherwise write the same per-address durable stores (this is
@@ -451,7 +531,8 @@ verify per entry, batched acks.
   delivery-journal-ignored, conflicted-leg-as-spent, restore-certified-to-confirmed,
   skip-putIntent, removeToken-arg-swap, plus one per new machine transition.
 - **Contract tests** for the storage and delivery interfaces keep "swappable" enforceable with
-  wallet-api as sole shipped implementation.
+  wallet-api as sole shipped implementation; the delivery contract pins `incomingEpoch()` — the
+  per-page syncEpoch surface Receive's restore self-detection keys on (§5.7).
 - **Adversarial fakes:** the fake gateway returns `SUCCESS` for duplicates AND conflicts (the
   observed M7 reality — status carries no signal); unknown statuses on re-submit; the fake
   wallet-api enforces wire shapes, evidenced-tombstone 409s, first-write-wins checkpoint slots,
@@ -552,8 +633,9 @@ its own keep-open error, never a silent re-burn; absent checkpoint + any certifi
 `SplitCheckpointLostError` before any re-burn; progress append signature-gated with shared
 cross-repo vectors; on `SplitCheckpointLostError` never complete/abort/record-foreign-spent.
 Receive: verify + isOwnedBy before balance; `(tokenId, stateHash)` dedup + isSpent gate;
-storage-rejected emits nothing; state-gated removal (never destroy an advanced state); seen-set
-only after successful ack; drain single-flight. Cross-cutting: owner/address guards on every
+claim-CONFLICT terminally rejected('other') — cursor advances, never re-processed; state-gated
+removal (never destroy an advanced state); seen-set only after successful ack; drain
+single-flight. Cross-cutting: owner/address guards on every
 hydration surface; network+address-scoped keys; history dedup keys (SENT/transferId,
 RECEIVED/(type,tokenId,stateHash), MINT/(MINT,tokenId)); amounts as decimal strings/BigInt
 end-to-end; challenge-template verification incl. network; no concurrent refresh; resume

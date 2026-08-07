@@ -392,6 +392,13 @@ export type SphereEventType =
   | 'transfer:failed'
   | 'transfer:delivery_pending'
   | 'transfer:invalid'
+  // payments-v2 events (§4 of docs/PAYMENTS-V2-DESIGN.md) — emitted only when
+  // the opt-in `paymentsV2` init flag is on (P9); additive until the P11 flip.
+  | 'transfer:updated'
+  | 'transfer:attention'
+  | 'inventory:updated'
+  | 'payment_request:updated'
+  | 'connection:status'
   | 'payment_request:incoming'
   | 'payment_request:rejected'
   | 'payment_request:paid'
@@ -587,7 +594,22 @@ export interface SphereEventMap {
   'groupchat:connection': { connected: boolean };
   'groupchat:ready': { groupCount: number };
   'communications:ready': { conversationCount: number };
-  'history:updated': import('../modules/payments/PaymentsModule').TransactionHistoryEntry;
+  // NOTE (paymentsV2): the v2 History emits 'history:updated' with the
+  // just-recorded client-shaped HistoryEntry; the legacy entry payload is
+  // unchanged for the default (flag-off) vertical.
+  'history:updated':
+    | import('../modules/payments/PaymentsModule').TransactionHistoryEntry
+    | import('../modules/payments-v2/api').HistoryEntry;
+  // payments-v2 events (§4) — fired only when `paymentsV2: true` (P9 opt-in).
+  /** Replaces transfer:confirmed / :delivery_pending / :failed on the v2 vertical. */
+  'transfer:updated': TransferResult;
+  /** Replaces split:checkpoint-stuck / delivery:undeliverable / delivery:deferred (by code). */
+  'transfer:attention': { transferId: string; code: string; detail?: string };
+  /** The wallet-api inventory mirror changed — re-read tokens()/assets(). */
+  'inventory:updated': Record<string, never>;
+  'payment_request:updated': { id: string; status: 'pending' | 'settling' | 'paid' | 'rejected' | 'expired' };
+  /** wallet-api session connectivity (replaces realtime:status + storage:degraded). */
+  'connection:status': { status: 'connected' | 'degraded' | 'offline' };
   // Invoice / Accounting event payloads
   'invoice:created': { invoiceId: string; confirmed: boolean };
   'invoice:payment': {

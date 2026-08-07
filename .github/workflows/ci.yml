@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, feat/wallet-api-integration]
+    branches: [main, feat/wallet-api-integration, feat/payments-v2]
   pull_request:
-    branches: [main, feat/wallet-api-integration]
+    branches: [main, feat/wallet-api-integration, feat/payments-v2]
 
 jobs:
   build:
@@ -57,3 +57,27 @@ jobs:
 
       - name: Test
         run: npm run test:run
+
+  # Mutation probes (#725): each probe re-applies a hand-verified money bug and
+  # the named payments-v2 suite must go RED — a probe that stays green is a
+  # hollow test and fails the job. Runner: scripts/test-mutation.mjs over
+  # tests/mutation/probes.json.
+  test-mutation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          npm install --include=optional --ignore-scripts
+          npm rebuild
+
+      - name: Mutation probes
+        run: npm run test:mutation

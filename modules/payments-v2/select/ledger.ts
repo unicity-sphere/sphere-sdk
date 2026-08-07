@@ -1,0 +1,55 @@
+// §5.4 Reservations — whole-token set semantics, fully synchronous. The queue
+// reserves whole tokens only (doc §5.4), so a token is either free or held by
+// exactly one reservation; partial-amount arithmetic was dead surface (#727).
+
+export interface ReservationRequest {
+  readonly tokenId: string;
+}
+
+export class ReservationLedger {
+  private readonly reservations = new Map<string, ReadonlySet<string>>();
+  private readonly tokenHolder = new Map<string, string>();
+
+  // All-or-nothing: every entry is validated before any state mutates.
+  reserve(reservationId: string, entries: readonly ReservationRequest[]): void {
+    if (entries.length === 0) throw new Error('EMPTY_RESERVATION');
+    if (this.reservations.has(reservationId)) throw new Error('DUPLICATE_RESERVATION_ID');
+    const tokenIds = new Set(entries.map((e) => e.tokenId));
+    for (const tokenId of tokenIds) {
+      if (this.tokenHolder.has(tokenId)) throw new Error('INSUFFICIENT_FREE_AMOUNT');
+    }
+    this.reservations.set(reservationId, tokenIds);
+    for (const tokenId of tokenIds) this.tokenHolder.set(tokenId, reservationId);
+  }
+
+  commit(reservationId: string): void {
+    this.release(reservationId);
+  }
+
+  cancel(reservationId: string): void {
+    this.release(reservationId);
+  }
+
+  cancelForToken(tokenId: string, excludeReservationId?: string): string[] {
+    const holder = this.tokenHolder.get(tokenId);
+    if (holder === undefined || holder === excludeReservationId) return [];
+    this.release(holder);
+    return [holder];
+  }
+
+  getFreeAmount(tokenId: string, tokenAmount: bigint): bigint {
+    return this.tokenHolder.has(tokenId) ? 0n : tokenAmount;
+  }
+
+  clear(): void {
+    this.reservations.clear();
+    this.tokenHolder.clear();
+  }
+
+  private release(reservationId: string): void {
+    const tokenIds = this.reservations.get(reservationId);
+    if (!tokenIds) return;
+    this.reservations.delete(reservationId);
+    for (const tokenId of tokenIds) this.tokenHolder.delete(tokenId);
+  }
+}

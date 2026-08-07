@@ -287,6 +287,29 @@ export class WalletApiClient {
     return new WalletApiClient(this.config);
   }
 
+  /**
+   * P9 payments-v2 wiring seam (core/payments-v2-wiring.ts,
+   * `resolvePaymentsV2Composition`): the transport composition this client was
+   * built with, so the opt-in v2 vertical reuses the SAME
+   * baseUrl/deviceId/fetch/WebSocket source of truth — no new env — while
+   * building its OWN client + auth lineage (the wiring suffixes the deviceId).
+   */
+  paymentsV2CompositionConfig(): {
+    baseUrl: string;
+    deviceId: string;
+    fetchFn?: FetchLike;
+    webSocketFactory?: WebSocketFactoryLike;
+  } {
+    return {
+      baseUrl: this.baseUrl,
+      deviceId: this.deviceId,
+      ...(this.config.fetchFn !== undefined ? { fetchFn: this.config.fetchFn } : {}),
+      ...(this.config.webSocketFactory !== undefined
+        ? { webSocketFactory: this.config.webSocketFactory }
+        : {}),
+    };
+  }
+
   /** Bind the wallet identity this client authenticates as. Resets the session. */
   setIdentity(identity: WalletApiIdentity): void {
     this.identity = identity;
