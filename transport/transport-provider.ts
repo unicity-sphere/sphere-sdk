@@ -314,6 +314,12 @@ export interface PeerInfo {
   chainPubkey: string;
   /** L3 DIRECT address (DIRECT://...) */
   directAddress: string;
+  /**
+   * Network the peer's identity binding DECLARES ('testnet2', …) — absent when
+   * the binding carries none, which is every binding published so far. Parsed
+   * only, never invented: money refuses a PROVEN foreign network (§5.6).
+   */
+  network?: string;
   /** Event timestamp */
   timestamp: number;
 }

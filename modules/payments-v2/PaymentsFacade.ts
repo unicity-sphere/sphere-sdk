@@ -19,6 +19,7 @@ import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResul
 import type { ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
+import { requireSameNetworkRecipient } from './recipient';
 import { reseedAndReset, type RestoreDeps } from './restore';
 import type { MintJournalEntry, ShortfallEntry } from './stores';
 import type { History } from './history/History';
@@ -36,7 +37,6 @@ import {
   supportsDeterministicMint,
   type HeldStateCache,
   type PaymentsFacadeDeps,
-  type RecipientInfo,
 } from './compose';
 
 export {
@@ -49,6 +49,7 @@ export {
   type RecipientInfo,
 } from './compose';
 export { ATTENTION_RESEED_REJECTED } from './restore';
+export { ATTENTION_RECIPIENT_NETWORK_UNVERIFIED } from './recipient';
 
 /** Max re-plans after a conflicted attempt (#625/#677 parity with the old send loop). */
 export const MAX_RESELECT = 8;
@@ -305,7 +306,7 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   private async sendWithPolicy(request: SendRequest, run: SendRun): Promise<TransferResult> {
-    const recipient = await this.requireSameNetworkRecipient(request.recipient);
+    const recipient = await requireSameNetworkRecipient(this.deps, request.recipient);
     for (let attempt = 0; ; attempt++) {
       let ctx: AttemptCtx;
       try {
@@ -327,21 +328,6 @@ export class PaymentsFacade implements PaymentsV2 {
       const surfaced = await this.consumePartial(ctx, disposition, run, attempt);
       if (surfaced !== null) return surfaced;
     }
-  }
-
-  /** §5.6 cross-network deposit trap: refused BEFORE any reserve/certification. */
-  private async requireSameNetworkRecipient(identifier: string): Promise<RecipientInfo> {
-    const recipient = await this.deps.resolveRecipient(identifier);
-    if (recipient === null || recipient.chainPubkey === '') {
-      throw new SphereError(`Recipient ${identifier} has no published chain pubkey`, 'INVALID_RECIPIENT');
-    }
-    if (recipient.network !== this.deps.network) {
-      throw new SphereError(
-        `Recipient ${identifier} is on network "${recipient.network}" but this session is on "${this.deps.network}" — a cross-network deposit is unrecoverable`,
-        'INVALID_RECIPIENT'
-      );
-    }
-    return recipient;
   }
 
   private async runAttempt(ctx: AttemptCtx): Promise<AttemptDisposition> {

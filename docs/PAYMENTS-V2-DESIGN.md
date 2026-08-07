@@ -373,11 +373,35 @@ content-derived `hex(SHA-256(tokenId ‖ stateHash))` via the engine's `delivery
 never a server row id or seq. Two more Delivery-owned rules: **cross-network misdirection is the
 sender's to prevent** — a deposit keys the recipient under the *sender's* network, the server
 does not remap, and it returns 200 for an entry the recipient will never query; so the
-recipient's network is pinned at resolve time and a recipient not verifiably on the session
-network is refused **before certification** (deposit 200 ≠ reachability — otherwise the journal
-entry is removed while the recipient never sees the entry). And **memo encryption is owned
-here**: the delivery memo is the recipient-ECDH `sphere-deliveryenc-v1` bundle
-(`core/delivery-envelope.ts`, shared with Requests); the server rejects non-`enc1.` envelopes.
+recipient's network is settled at resolve time, **before certification** (deposit 200 ≠
+reachability — otherwise the journal entry is removed while the recipient never sees the entry).
+And **memo encryption is owned here**: the delivery memo is the recipient-ECDH
+`sphere-deliveryenc-v1` bundle (`core/delivery-envelope.ts`, shared with Requests); the server
+rejects non-`enc1.` envelopes.
+
+**Proving the recipient's network (#733/#734).** `RecipientInfo.network` is `string | null` and
+carries only what the identifier **proves**: a bare chain pubkey is session-stamped (typing one
+into this session *is* the caller asserting a recipient on it), a resolved peer reports
+`PeerInfo.network ?? null` — never a local stamp. That distinction is the whole guard: until
+#733 the resolver stamped the session network onto *every* recipient, so
+`requireSameNetworkRecipient` compared the session network with a copy of itself and could not
+fire, and its only test injected a fake resolver, proving nothing about the shipped path.
+Guard posture, both outcomes ahead of any reserve/intent/engine work:
+
+| recipient network | outcome |
+|---|---|
+| proves a different network | refuse, `INVALID_RECIPIENT` naming both networks |
+| proves the session network | proceed |
+| proves nothing (`null`) | **proceed**, `transfer:attention { code: 'recipient:network-unverified' }` |
+
+The third row is a deliberate **transition** posture, not the target. No identity binding
+published so far declares a network — the nostr-js-sdk binding builders whitelist the content
+fields (`public_key`/`l1_address`/`direct_address`/`proxy_address`), so a `network` claim cannot
+ride today's publish API at all, and the transport layer (relays are shared across networks) does
+not know its own network either. Refusing every unproven recipient would therefore refuse every
+nametag/`DIRECT://` send between current wallets. Sphere parses the claim wherever a binding
+carries one and invents it nowhere; **#734** tracks putting it on the publish side and then
+tightening this row to a hard refusal.
 
 ### 5.7 `Receive`
 

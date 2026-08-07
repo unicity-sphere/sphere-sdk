@@ -251,15 +251,14 @@ export interface PaymentsV2Host {
 
 const CHAIN_PUBKEY_RE = /^0[23][0-9a-f]{64}$/i;
 
-/**
- * Non-pubkey identifiers ride the same transport resolution the old send path
- * used; the recipient's network is pinned to the SESSION network (§5.6).
- */
-async function resolveRecipientInfo(
+/** §5.6: the recipient's network is what the identifier PROVES, else `null`
+ *  — stamping the session network made the guard compare it with itself (#733). */
+export async function resolveRecipientInfo(
   identifier: string,
   network: string,
   resolvePeer: (identifier: string) => Promise<PeerInfo | null>
 ): Promise<RecipientInfo | null> {
+  // Typing a bare pubkey into THIS session is the caller asserting it — stamped.
   if (CHAIN_PUBKEY_RE.test(identifier)) {
     return { chainPubkey: identifier.toLowerCase(), network };
   }
@@ -267,7 +266,8 @@ async function resolveRecipientInfo(
   if (!peer?.chainPubkey) return null;
   return {
     chainPubkey: peer.chainPubkey,
-    network,
+    // Only what the binding declares (blank declares nothing) — never a local stamp.
+    network: peer.network || null,
     ...(peer.nametag !== undefined ? { nametag: peer.nametag } : {}),
   };
 }

@@ -95,6 +95,19 @@ const TIMESTAMP_RANDOMIZATION = 2 * 24 * 60 * 60;
 // Alias for backward compatibility
 const EVENT_KINDS = NOSTR_EVENT_KINDS;
 
+/**
+ * The network an identity binding DECLARES, or undefined — read-if-present,
+ * never invented (a stamped guess is what made the §5.6 money guard dead, #733).
+ * No publisher emits one yet: nostr-js-sdk's binding builders whitelist the
+ * content fields (`public_key`/`l1_address`/`direct_address`/`proxy_address`),
+ * so a `network` claim cannot ride today's publish API — hence sends to an
+ * unproven peer are SIGNALLED, not refused, until upstream carries it (#734).
+ */
+function declaredNetwork(content: unknown): string | undefined {
+  const value = (content as { network?: unknown } | null | undefined)?.network;
+  return typeof value === 'string' && value !== '' ? value : undefined;
+}
+
 // =============================================================================
 // Implementation
 // =============================================================================
@@ -741,11 +754,13 @@ export class NostrTransportProvider implements TransportProvider {
    * Convert a BindingInfo (from nostr-js-sdk) to PeerInfo (sphere-sdk type).
    */
   private async bindingInfoToPeerInfo(binding: BindingInfo, nametag?: string): Promise<PeerInfo> {
+    const network = declaredNetwork(binding);
     return {
       nametag: nametag || binding.nametag,
       transportPubkey: binding.transportPubkey,
       chainPubkey: binding.publicKey || '',
       directAddress: binding.directAddress || '',
+      ...(network !== undefined ? { network } : {}),
       timestamp: binding.timestamp,
     };
   }
@@ -771,12 +786,14 @@ export class NostrTransportProvider implements TransportProvider {
 
     try {
       const content = JSON.parse(bindingEvent.content);
+      const network = declaredNetwork(content);
 
       return {
         nametag: content.nametag || undefined,
         transportPubkey: bindingEvent.pubkey,
         chainPubkey: content.public_key || '',
         directAddress: content.direct_address || '',
+        ...(network !== undefined ? { network } : {}),
         timestamp: bindingEvent.created_at * 1000,
       };
     } catch {
@@ -819,11 +836,13 @@ export class NostrTransportProvider implements TransportProvider {
     for (const [pubkey, event] of byAuthor) {
       try {
         const content = JSON.parse(event.content);
+        const network = declaredNetwork(content);
         results.push({
           nametag: content.nametag || undefined,
           transportPubkey: pubkey,
           chainPubkey: content.public_key || '',
           directAddress: content.direct_address || '',
+          ...(network !== undefined ? { network } : {}),
           timestamp: event.created_at * 1000,
         });
       } catch {

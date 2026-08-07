@@ -38,7 +38,8 @@ export function supportsDeterministicMint(
 
 export interface RecipientInfo {
   chainPubkey: string;
-  network: string;
+  /** The recipient's PROVEN network — `null` when nothing proved one (§5.6). */
+  network: string | null;
   nametag?: string;
 }
 
