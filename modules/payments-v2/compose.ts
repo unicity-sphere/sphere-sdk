@@ -6,7 +6,7 @@ import { decryptField, encryptField } from '../../core/field-encryption';
 import type { ITokenEngine, SplitCheckpointStore } from '../../token-engine/engine';
 import type { TransferResult } from '../../types';
 
-import type { SendRequest } from './api';
+import type { ConnectionStatus, SendRequest } from './api';
 import type { DeliveryPort, StoragePort } from './ports';
 import type { ScopedKV } from './stores';
 import { History, type HistoryClient } from './history/History';
@@ -58,11 +58,16 @@ export interface FacadeSession {
    */
   subscribeEpochChange(handler: (epoch: string) => Promise<void>): () => void;
   /**
+   * The session's CURRENT status — REQUIRED, and the ONE source `connectionStatus()`
+   * and `connection:status` both come from ('offline' before first contact).
+   */
+  status(): ConnectionStatus;
+  /**
    * Optional connection-status feed (same wiring pattern as the streams; the
    * emission point is the session's existing `connection:status` transition).
    * The facade's heartbeat resets its backoff on a 'connected' recovery.
    */
-  subscribeStatus?(handler: (status: 'connected' | 'degraded' | 'offline') => void): () => void;
+  subscribeStatus?(handler: (status: ConnectionStatus) => void): () => void;
 }
 
 /**

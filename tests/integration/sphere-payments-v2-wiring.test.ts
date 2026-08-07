@@ -141,6 +141,8 @@ function makeWorld(network: string = NET) {
     network,
     paymentsV2Transport: (args: PaymentsV2TransportArgs): PaymentsV2Transport => {
       const session = new FakeSession();
+      // As WalletApiSession does: ONE transition writes the status cell and feeds the bus.
+      session.emitStatus = args.emitStatus;
       const caller: FakeCaller = { chainPubkey: args.identity.chainPubkey, network: args.network };
       const client = new FakeWalletApiV2Client(api, caller, { decodeBlob });
       transports.push({ session, client, args });
@@ -325,9 +327,11 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     sphere.on('connection:status', (payload) => statuses.push(payload));
     sphere.on('inventory:updated', (payload) => inventoryPings.push(payload));
 
-    // connection:status rides the emitStatus plumbing wired into the session.
-    world.transports[0]!.args.emitStatus('degraded');
+    // connection:status rides the emitStatus plumbing wired into the session,
+    // and sphere.payments.connectionStatus() reads that same value (sphere#473).
+    world.transports[0]!.session.setStatus('degraded');
     expect(statuses).toEqual([{ status: 'degraded' }]);
+    expect(sphere.payments.connectionStatus()).toBe('degraded');
 
     // inventory:updated fires when the view applies a server delta.
     await seedInventory(world, world.transports[0]!, 15n);

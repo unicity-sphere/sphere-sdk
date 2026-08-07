@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `payments.connectionStatus()` (sphere#473 P1)
+
+The current wallet-api connection status is now readable at any time, not only observable at
+transition: `sphere.payments.connectionStatus()` returns `'connected' | 'degraded' | 'offline'`
+(never null; `'offline'` while the vertical is unstarted). `connection:status` stays the change
+notification — a component mounting after a transition (the header indicator vs. an `offline`
+sign-in during `Sphere.init`, where a persistent outage produces no further transition) seeds from
+the getter. Both read the session's one status value (`FacadeSession.status()` is now REQUIRED),
+so the getter and the event cannot disagree. This replaces the pre-flip `sphere.walletApiSessionStatus`
+getter, which the flip deleted without a replacement.
+
 ### Changed — P11 flip (BREAKING): the payments-v2 vertical is the ONLY money path
 
 `sphere.payments` now IS the §4 facade (`assets()`, `tokens()`, `history()`, `send()`, `mint()`,

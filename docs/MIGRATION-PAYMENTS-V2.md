@@ -57,6 +57,7 @@ sphere.payments.send({ recipient: '@bob', amount: '1000', coinId: 'UCT' });
 | `rejectPaymentRequest(id)` | `requests.decline(id)` — 403/409 now propagate |
 | `clearProcessedPaymentRequests()` | `requests.dismissProcessed()` |
 | `sync()` / `validate()` | gone — the server is the record; nothing to flush |
+| `sphere.walletApiSessionStatus` (getter, deleted at the flip) | `payments.connectionStatus()` — readable at any time; `connection:status` stays the change notification (sphere#473) |
 | ~25 further members | gone (zero consumers existed; see design doc §4) |
 
 Events: `transfer:incoming` unchanged. `transfer:confirmed` +

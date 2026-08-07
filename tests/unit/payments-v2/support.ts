@@ -72,6 +72,8 @@ export class FakeSession implements FacadeSession {
   private readonly statusHandlers = new Set<(status: 'connected' | 'degraded' | 'offline') => void>();
   private readonly epochHandlers = new Set<(epoch: string) => Promise<void>>();
   epoch = '1';
+  /** The one status cell: status() reads it, setStatus() writes it then notifies (as the real session does). */
+  private lastStatus: 'connected' | 'degraded' | 'offline' = 'offline';
   startCalls = 0;
   stopCalls = 0;
   async start(): Promise<void> {
@@ -100,6 +102,9 @@ export class FakeSession implements FacadeSession {
     this.statusHandlers.add(handler);
     return () => this.statusHandlers.delete(handler);
   }
+  status(): 'connected' | 'degraded' | 'offline' {
+    return this.lastStatus;
+  }
   fire(stream: string): void {
     for (const handler of this.handlers.get(stream) ?? []) handler();
   }
@@ -110,8 +115,13 @@ export class FakeSession implements FacadeSession {
     for (const handler of [...this.epochHandlers]) await handler(epoch);
     for (const stream of ['inventory', 'mailbox', 'payment_requests']) this.fire(stream);
   }
-  /** Test hook: push a connection-status transition to subscribers. */
+  /** Bus sink, wired as core/payments-v2-wiring.ts does: session transition → `connection:status`. */
+  emitStatus: ((status: 'connected' | 'degraded' | 'offline') => void) | null = null;
+  /** Test hook: push a connection-status transition (status cell first, then the feeds). */
   setStatus(status: 'connected' | 'degraded' | 'offline'): void {
+    if (this.lastStatus === status) return;
+    this.lastStatus = status;
+    this.emitStatus?.(status);
     for (const handler of this.statusHandlers) handler(status);
   }
 }

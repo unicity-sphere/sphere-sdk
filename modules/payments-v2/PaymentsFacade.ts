@@ -16,7 +16,7 @@ import type { MintParams, SphereToken } from '../../token-engine/types';
 import { TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
-import type { HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest } from './api';
+import type { ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { reseedAndReset, type RestoreDeps } from './restore';
@@ -211,6 +211,11 @@ export class PaymentsFacade implements PaymentsV2 {
 
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage> {
     return this.historyStore.page(page ?? {});
+  }
+
+  /** §4: read through to the session — the same value `connection:status` carries (sphere#473). No session ⇒ 'offline'. */
+  connectionStatus(): ConnectionStatus {
+    return this.started ? this.deps.session.status() : 'offline';
   }
 
   /** §4 pending-transfers UI surface — derived on read, never cached (convergence.ts). */
@@ -774,20 +779,13 @@ export class PaymentsFacade implements PaymentsV2 {
 
   private toUiToken(tokenId: string, coinId: string, amount: bigint): Token {
     const now = this.nowMs();
-    return toToken(
-      tokenId,
-      { assets: [], createdAt: now, updatedAt: now },
-      { coinId, amount: amount.toString() },
-      this.deps.registry,
-      { transferring: true, suspectedSpent: false }
-    );
+    const snapshot = { assets: [], createdAt: now, updatedAt: now };
+    const flags = { transferring: true, suspectedSpent: false };
+    return toToken(tokenId, snapshot, { coinId, amount: amount.toString() }, this.deps.registry, flags);
   }
 
   private track<T>(op: Promise<T>): Promise<T> {
-    const settled = op.then(
-      () => undefined,
-      () => undefined
-    );
+    const settled = op.then(() => undefined, () => undefined);
     this.pendingOps.add(settled);
     void settled.finally(() => this.pendingOps.delete(settled));
     return op;

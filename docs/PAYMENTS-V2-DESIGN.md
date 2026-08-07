@@ -125,6 +125,9 @@ interface Payments {
   pendingTransfers(): Promise<PendingTransfer[]>; // on-read view over the intent backstop + delivery journal (+ #690 shortfalls, surfaced distinctly) — never a cached mirror
   resumeNow(): Promise<void>;                     // immediate resume pass; coalesces with a running one and reschedules the heartbeat from its outcome   // explicit drain-now
 
+  // connection (sphere#473)
+  connectionStatus(): 'connected' | 'degraded' | 'offline'; // the session's CURRENT status, read through — never null, 'offline' while unstarted
+
   // payment requests (wallet-api S4 streams only)
   requests: {
     create(to: string, terms: { coinId: string; amount: string; memo?: string }): Promise<PaymentRequest>;
@@ -156,6 +159,13 @@ from `transfer:updated{status:'failed'}`),
 `payment_request:incoming`, `payment_request:updated`, `connection:status`
 (`connected|degraded|offline`; replaces `realtime:status` + `storage:degraded` — the server IS
 storage).
+
+**Connection-status invariant:** the current status is **readable at any time** via
+`connectionStatus()`; `connection:status` is only the CHANGE notification. A component mounting
+after a transition (the header indicator vs. an offline sign-in during init, sphere#473 — during a
+persistent outage no further transition ever comes) seeds from the getter. Both read the session's
+one status value, so they can never disagree; unstarted reads 'offline' (no session, no
+connectivity claim), never null.
 
 **Kept verbatim (consumed contracts, not legacy):** the typed error family and exact codes —
 `CERTIFICATION_UNCONFIRMED`, `SEND_SYNC_PENDING`, `CHECKPOINT_PERSIST_FAILED`,
