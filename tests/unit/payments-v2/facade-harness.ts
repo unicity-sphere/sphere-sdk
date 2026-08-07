@@ -170,7 +170,16 @@ export function peerBinding(overrides: Partial<PeerInfo> = {}): PeerInfo {
 }
 
 export function makeWorld(
-  options: { engine?: RealizationEngine; peers?: Record<string, PeerInfo | null> } = {}
+  options: {
+    engine?: RealizationEngine;
+    peers?: Record<string, PeerInfo | null>;
+    /**
+     * Replaces the in-memory `peers` directory with a real peer lookup — used by
+     * the transport-driven §5.6 tests, which run identifiers through a real
+     * NostrTransportProvider over a fake relay instead of an injected PeerInfo.
+     */
+    resolvePeer?: (identifier: string) => Promise<PeerInfo | null>;
+  } = {}
 ): World {
   const engine = options.engine ?? new RealizationEngine({ chainPubkey: hexToBytes(OWN_PUB) });
   const engines = [engine];
@@ -230,7 +239,11 @@ export function makeWorld(
       events.push({ event, payload });
     },
     resolveRecipient: (identifier) =>
-      resolveRecipientInfo(identifier, NET, async (id) => peers.get(id) ?? null),
+      resolveRecipientInfo(
+        identifier,
+        NET,
+        options.resolvePeer ?? (async (id) => peers.get(id) ?? null)
+      ),
     signComplete: async (transferId) => fakeSeedSignature(OWN_PUB, completeMessageFor(transferId)),
     fieldKey: new Uint8Array(32).fill(7),
     network: NET,

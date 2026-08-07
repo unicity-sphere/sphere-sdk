@@ -318,6 +318,13 @@ export interface PeerInfo {
    * Network the peer's identity binding DECLARES ('testnet2', …) — absent when
    * the binding carries none, which is every binding published so far. Parsed
    * only, never invented: money refuses a PROVEN foreign network (§5.6).
+   *
+   * Absent is also the STRUCTURAL answer on the `@nametag` and `DIRECT://`
+   * routes of the Nostr transport, whichever binding is out there: those two
+   * resolve through nostr-js-sdk's `queryBindingBy*`, whose parser drops every
+   * content field outside its whitelist and never hands back the signed event
+   * (#734 tracks the upstream fix). Only routes that parse the raw event —
+   * `resolveTransportPubkeyInfo`, `discoverAddresses` — can populate it today.
    */
   network?: string;
   /** Event timestamp */

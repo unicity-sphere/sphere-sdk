@@ -96,15 +96,30 @@ const TIMESTAMP_RANDOMIZATION = 2 * 24 * 60 * 60;
 const EVENT_KINDS = NOSTR_EVENT_KINDS;
 
 /**
- * The network an identity binding DECLARES, or undefined — read-if-present,
- * never invented (a stamped guess is what made the §5.6 money guard dead, #733).
- * No publisher emits one yet: nostr-js-sdk's binding builders whitelist the
- * content fields (`public_key`/`l1_address`/`direct_address`/`proxy_address`),
- * so a `network` claim cannot ride today's publish API — hence sends to an
- * unproven peer are SIGNALLED, not refused, until upstream carries it (#734).
+ * The network a RAW SIGNED binding event declares in its content, or undefined —
+ * read-if-present, never invented (a stamped guess is what made the §5.6 money
+ * guard dead, #733).
+ *
+ * It takes the EVENT, not a parsed shape, and the parameter type is the point:
+ * nostr-js-sdk's `parseBindingInfo` whitelists the binding content
+ * (`public_key`/`l1_address`/`direct_address`/`proxy_address`/`nametag`) and
+ * drops everything else, so a `BindingInfo` can never carry a network — handing
+ * one to this function would compile into a value that is `undefined` for all
+ * time, which is exactly the dead read the #735 review caught. A `BindingInfo`
+ * is not a `NostrEvent`; that mistake is now a type error, not a comment.
+ *
+ * Nothing declares a network yet either: the publish side
+ * (`IdentityBindingParams` + `createBindingEvent`/`createIdentityBindingEvent`)
+ * whitelists the same fields, so the claim cannot ride today's publish API at
+ * all — hence sends to an unproven peer are SIGNALLED, not refused (#734).
  */
-function declaredNetwork(content: unknown): string | undefined {
-  const value = (content as { network?: unknown } | null | undefined)?.network;
+function declaredNetwork(event: NostrEvent): string | undefined {
+  let value: unknown;
+  try {
+    value = (JSON.parse(event.content) as { network?: unknown } | null)?.network;
+  } catch {
+    return undefined;
+  }
   return typeof value === 'string' && value !== '' ? value : undefined;
 }
 
@@ -752,15 +767,33 @@ export class NostrTransportProvider implements TransportProvider {
 
   /**
    * Convert a BindingInfo (from nostr-js-sdk) to PeerInfo (sphere-sdk type).
+   *
+   * `network` IS DELIBERATELY ABSENT HERE — a live limitation, not an oversight
+   * (#734). `queryBindingByNametag`/`queryBindingByAddress` are the whole public
+   * resolution API for `@nametag` and `DIRECT://`, and both hardcode
+   * `parseBindingInfo` inside the SDK's PRIVATE `queryWithFirstSeenWins`: the
+   * caller never sees the signed event that resolution selected, and the parse
+   * has already dropped every content field outside its whitelist. Re-querying
+   * raw would mean re-deriving UNIP-01 ownership ourselves (marker preference,
+   * cross-author first-seen-wins, ambiguity→null, multi-relay settle — all
+   * private), and a second resolver that can disagree with the SDK's is worse
+   * than a missing field on a MONEY guard. Nothing can declare a network today
+   * regardless: the publish builders whitelist the same fields.
+   *
+   * CONSEQUENCE, stated plainly: for `@nametag` and `DIRECT://` recipients the
+   * §5.6 cross-network guard can only SIGNAL (`recipient:network-unverified`),
+   * never refuse. Upstream #734 must add `network` to the binding builders AND
+   * to `BindingInfo`; the tripwire in
+   * tests/unit/payments-v2/recipient-network.transport.test.ts fails the day it
+   * lands, so this wiring cannot be forgotten. Do not "fix" this by inventing a
+   * value — a stamped network is what made the guard unfalsifiable (#733).
    */
   private async bindingInfoToPeerInfo(binding: BindingInfo, nametag?: string): Promise<PeerInfo> {
-    const network = declaredNetwork(binding);
     return {
       nametag: nametag || binding.nametag,
       transportPubkey: binding.transportPubkey,
       chainPubkey: binding.publicKey || '',
       directAddress: binding.directAddress || '',
-      ...(network !== undefined ? { network } : {}),
       timestamp: binding.timestamp,
     };
   }
@@ -786,7 +819,9 @@ export class NostrTransportProvider implements TransportProvider {
 
     try {
       const content = JSON.parse(bindingEvent.content);
-      const network = declaredNetwork(content);
+      // This route parses the signed event itself, so a declared network is
+      // readable here — unlike the SDK-parsed @nametag/DIRECT:// routes above.
+      const network = declaredNetwork(bindingEvent);
 
       return {
         nametag: content.nametag || undefined,
@@ -836,7 +871,7 @@ export class NostrTransportProvider implements TransportProvider {
     for (const [pubkey, event] of byAuthor) {
       try {
         const content = JSON.parse(event.content);
-        const network = declaredNetwork(content);
+        const network = declaredNetwork(event);
         results.push({
           nametag: content.nametag || undefined,
           transportPubkey: pubkey,

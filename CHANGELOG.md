@@ -31,6 +31,15 @@ wallets. An unproven recipient therefore **proceeds** and emits
 `ATTENTION_RECIPIENT_NETWORK_UNVERIFIED`). #734 tracks putting the field on the publish side and
 tightening this to a hard refusal.
 
+Reading the claim is **per-route**, and the limitation is stated where it bites: sphere parses it
+off the raw signed event on the routes that own the parse (`resolveTransportPubkeyInfo`,
+`discoverAddresses`), where a proven foreign network is refused end to end. `@nametag` and
+`DIRECT://` resolve through nostr-js-sdk's `queryBindingBy*`, whose `parseBindingInfo` whitelists
+the network away and never returns the selected signed event, so those two recipients can only be
+SIGNALLED until #734 lands upstream — `bindingInfoToPeerInfo` carries no network at all rather
+than a read that cannot fire, and `tests/unit/payments-v2/recipient-network.transport.test.ts`
+drives relay → transport → resolver → gate per route to keep both halves honest.
+
 ### Added — `payments.connectionStatus()` (sphere#473 P1)
 
 The current wallet-api connection status is now readable at any time, not only observable at

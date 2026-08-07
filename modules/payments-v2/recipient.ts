@@ -1,7 +1,6 @@
-// §5.6 recipient gate (facade policy in its own file, like restore.ts): the
-// cross-network deposit trap — a deposit keys the recipient under the SENDER's
-// network and the server 200s an entry the recipient never queries. TRANSITION
-// (#734): unproven is not foreign — see docs/PAYMENTS-V2-DESIGN.md §5.6.
+// §5.6 recipient gate: the cross-network deposit trap — a deposit keys the
+// recipient under the SENDER's network and the server 200s an entry the
+// recipient never queries. TRANSITION (#734) — docs/PAYMENTS-V2-DESIGN.md §5.6.
 
 import { SphereError } from '../../core/errors';
 
@@ -31,6 +30,7 @@ export async function requireSameNetworkRecipient(
     });
     return recipient;
   }
+  // #734 owes this compare a canonical name (`testnet` aliases `testnet2`) — §5.6.
   if (recipient.network !== deps.network) {
     throw new SphereError(
       `Recipient ${identifier} is on network "${recipient.network}" but this session is on "${deps.network}" — a cross-network deposit is unrecoverable`,

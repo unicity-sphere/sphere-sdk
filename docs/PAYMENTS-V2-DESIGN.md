@@ -401,7 +401,25 @@ ride today's publish API at all, and the transport layer (relays are shared acro
 not know its own network either. Refusing every unproven recipient would therefore refuse every
 nametag/`DIRECT://` send between current wallets. Sphere parses the claim wherever a binding
 carries one and invents it nowhere; **#734** tracks putting it on the publish side and then
-tightening this row to a hard refusal.
+tightening this row to a hard refusal. It also owes the comparison a **canonical network name**
+before any publisher ships: row 1 is an exact string compare, and this repo already aliases
+`testnet` → `testnet2`, so an alias or case mismatch between the word a binding declares and the
+session's would refuse a *same-network* send. Normalize both sides when the publish side lands —
+never by loosening the compare afterwards.
+
+**Reading it is per-route, and two routes cannot (#734).** `resolveTransportPubkeyInfo` and
+`discoverAddresses` parse the raw signed binding event, so a declaration there IS read and row 1
+fires end to end. `@nametag` and `DIRECT://` resolve through nostr-js-sdk's
+`queryBindingByNametag`/`queryBindingByAddress`, which hardcode `parseBindingInfo` inside a
+**private** resolver: sphere never sees the signed event that UNIP-01 resolution selected, and the
+parse has already dropped every content field outside its whitelist. Re-querying raw would mean
+re-deriving ownership ourselves (marker preference, cross-author first-seen-wins, ambiguity→null,
+multi-relay settle — all private), and a second resolver that can disagree with the SDK's is worse
+than a missing field on a money guard. So for those two routes §5.6 can only ever land on row 3
+today; `bindingInfoToPeerInfo` therefore carries **no** network at all rather than a value that
+merely looks read. The limitation is pinned by
+`tests/unit/payments-v2/recipient-network.transport.test.ts` (relay → transport → resolver →
+gate, per route), which goes red the day upstream carries the field.
 
 ### 5.7 `Receive`
 
