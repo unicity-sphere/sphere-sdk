@@ -35,18 +35,9 @@ import type {
   TransportProvider,
   MessageHandler,
   ComposingHandler,
-  TokenTransferHandler,
   BroadcastHandler,
-  PaymentRequestHandler,
-  PaymentRequestResponseHandler,
   IncomingMessage,
-  IncomingTokenTransfer,
   IncomingBroadcast,
-  IncomingPaymentRequest,
-  IncomingPaymentRequestResponse,
-  TokenTransferPayload,
-  PaymentRequestPayload,
-  PaymentRequestResponsePayload,
   TransportEvent,
   TransportEventCallback,
   PeerInfo,
@@ -139,9 +130,6 @@ export class NostrTransportProvider implements TransportProvider {
   // Event handlers
   private processedEventIds = new Set<string>();
   private messageHandlers: Set<MessageHandler> = new Set();
-  private transferHandlers: Set<TokenTransferHandler> = new Set();
-  private paymentRequestHandlers: Set<PaymentRequestHandler> = new Set();
-  private paymentRequestResponseHandlers: Set<PaymentRequestResponseHandler> = new Set();
   private readReceiptHandlers: Set<ReadReceiptHandler> = new Set();
   private typingIndicatorHandlers: Set<TypingIndicatorHandler> = new Set();
   private composingHandlers: Set<ComposingHandler> = new Set();
@@ -604,139 +592,6 @@ export class NostrTransportProvider implements TransportProvider {
     return () => this.messageHandlers.delete(handler);
   }
 
-  async sendTokenTransfer(
-    recipientPubkey: string,
-    payload: TokenTransferPayload
-  ): Promise<string> {
-    this.ensureReady();
-
-    // Create encrypted token transfer event
-    // Content must have "token_transfer:" prefix for nostr-js-sdk compatibility
-    const content = 'token_transfer:' + JSON.stringify(payload);
-
-    // IMPORTANT: kind 31113 is a Parameterized Replaceable Event (NIP-01).
-    // The relay keeps only the LATEST event per (pubkey, kind, d-tag).
-    // A static d-tag like 'token-transfer' caused subsequent sends to OVERWRITE
-    // previous ones on the relay — the recipient only saw the last token sent.
-    // Fix: use a unique d-tag per event so each transfer is its own slot.
-    const uniqueD = `token-transfer-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-    const event = await this.createEncryptedEvent(
-      EVENT_KINDS.TOKEN_TRANSFER,
-      content,
-      [
-        ['p', recipientPubkey],
-        ['d', uniqueD],
-        ['type', 'token_transfer'],
-      ]
-    );
-
-    await this.publishWithVerification(event, 3, 'token_transfer');
-
-    this.emitEvent({
-      type: 'transfer:sent',
-      timestamp: Date.now(),
-      data: { recipient: recipientPubkey },
-    });
-
-    return event.id;
-  }
-
-  onTokenTransfer(handler: TokenTransferHandler): () => void {
-    this.transferHandlers.add(handler);
-    return () => this.transferHandlers.delete(handler);
-  }
-
-  async sendPaymentRequest(
-    recipientPubkey: string,
-    payload: PaymentRequestPayload
-  ): Promise<string> {
-    this.ensureReady();
-
-    const requestId = this.config.generateUUID();
-    const amount = typeof payload.amount === 'bigint' ? payload.amount.toString() : payload.amount;
-
-    // Build request content matching nostr-js-sdk format
-    const requestContent = {
-      requestId,
-      amount,
-      coinId: payload.coinId,
-      message: payload.message,
-      recipientNametag: payload.recipientNametag,
-      deadline: Date.now() + 5 * 60 * 1000, // 5 minutes default
-    };
-
-    // Content must have "payment_request:" prefix for nostr-js-sdk compatibility
-    const content = 'payment_request:' + JSON.stringify(requestContent);
-
-    // Build tags matching nostr-js-sdk format
-    const tags: string[][] = [
-      ['p', recipientPubkey],
-      ['type', 'payment_request'],
-      ['amount', amount],
-    ];
-    if (payload.recipientNametag) {
-      tags.push(['recipient', payload.recipientNametag]);
-    }
-
-    const event = await this.createEncryptedEvent(
-      EVENT_KINDS.PAYMENT_REQUEST,
-      content,
-      tags
-    );
-
-    await this.publishEvent(event);
-
-    logger.debug('Nostr', 'Sent payment request:', event.id);
-
-    return event.id;
-  }
-
-  onPaymentRequest(handler: PaymentRequestHandler): () => void {
-    this.paymentRequestHandlers.add(handler);
-    return () => this.paymentRequestHandlers.delete(handler);
-  }
-
-  async sendPaymentRequestResponse(
-    recipientPubkey: string,
-    payload: PaymentRequestResponsePayload
-  ): Promise<string> {
-    this.ensureReady();
-
-    // Build response content
-    const responseContent = {
-      requestId: payload.requestId,
-      responseType: payload.responseType,
-      message: payload.message,
-      transferId: payload.transferId,
-    };
-
-    // Create encrypted payment request response event
-    // Content must have "payment_response:" prefix for nostr-js-sdk compatibility
-    const content = 'payment_response:' + JSON.stringify(responseContent);
-    const event = await this.createEncryptedEvent(
-      EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
-      content,
-      [
-        ['p', recipientPubkey],
-        ['e', payload.requestId], // Reference to original request
-        ['d', 'payment-request-response'],
-        ['type', 'payment_response'],
-      ]
-    );
-
-    await this.publishEvent(event);
-
-    logger.debug('Nostr', 'Sent payment request response:', event.id, 'type:', payload.responseType);
-
-    return event.id;
-  }
-
-  onPaymentRequestResponse(handler: PaymentRequestResponseHandler): () => void {
-    this.paymentRequestResponseHandlers.add(handler);
-    return () => this.paymentRequestResponseHandlers.delete(handler);
-  }
-
   // ===========================================================================
   // Read Receipts
   // ===========================================================================
@@ -829,8 +684,8 @@ export class NostrTransportProvider implements TransportProvider {
       return this.resolveNametagInfo(identifier.slice(1));
     }
 
-    // DIRECT:// or PROXY:// address
-    if (identifier.startsWith('DIRECT:') || identifier.startsWith('PROXY:')) {
+    // DIRECT:// address
+    if (identifier.startsWith('DIRECT:')) {
       return this.resolveAddressInfo(identifier);
     }
 
@@ -870,7 +725,7 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   /**
-   * Resolve a DIRECT:// or PROXY:// address to full peer info.
+   * Resolve a DIRECT:// address to full peer info.
    * Performs reverse lookup via nostr-js-sdk (UNIP-01 marker-preferring resolution).
    */
   async resolveAddressInfo(address: string): Promise<PeerInfo | null> {
@@ -1169,15 +1024,6 @@ export class NostrTransportProvider implements TransportProvider {
           logger.debug('Nostr', 'Handling gift wrap (NIP-17 DM)');
           await this.handleGiftWrap(event);
           break;
-        case EVENT_KINDS.TOKEN_TRANSFER:
-          await this.handleTokenTransfer(event);
-          break;
-        case EVENT_KINDS.PAYMENT_REQUEST:
-          await this.handlePaymentRequest(event);
-          break;
-        case EVENT_KINDS.PAYMENT_REQUEST_RESPONSE:
-          await this.handlePaymentRequestResponse(event);
-          break;
         case EVENT_KINDS.BROADCAST:
           this.handleBroadcast(event);
           break;
@@ -1186,13 +1032,7 @@ export class NostrTransportProvider implements TransportProvider {
       // Persist the latest event timestamp for resumption on reconnect.
       // Only update for wallet event kinds (not chat/broadcast).
       if (event.created_at && this.storage && this.keyManager) {
-        const kind = event.kind;
-        if (
-          kind === EVENT_KINDS.DIRECT_MESSAGE ||
-          kind === EVENT_KINDS.TOKEN_TRANSFER ||
-          kind === EVENT_KINDS.PAYMENT_REQUEST ||
-          kind === EVENT_KINDS.PAYMENT_REQUEST_RESPONSE
-        ) {
+        if (event.kind === EVENT_KINDS.DIRECT_MESSAGE) {
           this.updateLastEventTimestamp(event.created_at);
         }
       }
@@ -1393,114 +1233,6 @@ export class NostrTransportProvider implements TransportProvider {
     } catch (err) {
       // Expected for gift wraps meant for other recipients
       logger.debug('Nostr', 'Gift wrap decrypt failed (expected if not for us):', (err as Error)?.message?.slice(0, 50));
-    }
-  }
-
-  private async handleTokenTransfer(event: NostrEvent): Promise<void> {
-    if (!this.identity) return;
-
-    // Decrypt content
-    const content = await this.decryptContent(event.content, event.pubkey);
-    const payload = JSON.parse(content) as TokenTransferPayload;
-
-    const transfer: IncomingTokenTransfer = {
-      id: event.id,
-      senderTransportPubkey: event.pubkey,
-      payload,
-      timestamp: event.created_at * 1000,
-    };
-
-    this.emitEvent({ type: 'transfer:received', timestamp: Date.now() });
-
-    for (const handler of this.transferHandlers) {
-      try {
-        await handler(transfer);
-      } catch (error) {
-        logger.debug('Nostr', 'Transfer handler error:', error);
-      }
-    }
-  }
-
-  private async handlePaymentRequest(event: NostrEvent): Promise<void> {
-    if (!this.identity) return;
-
-    try {
-      // Decrypt content
-      const content = await this.decryptContent(event.content, event.pubkey);
-      const requestData = JSON.parse(content) as {
-        requestId: string;
-        amount: string;
-        coinId: string;
-        message?: string;
-        recipientNametag?: string;
-        metadata?: Record<string, unknown>;
-      };
-
-      const request: IncomingPaymentRequest = {
-        id: event.id,
-        senderTransportPubkey: event.pubkey,
-        senderNametag: requestData.recipientNametag,
-        request: {
-          requestId: requestData.requestId,
-          amount: requestData.amount,
-          coinId: requestData.coinId,
-          message: requestData.message,
-          recipientNametag: requestData.recipientNametag,
-          metadata: requestData.metadata,
-        },
-        timestamp: event.created_at * 1000,
-      };
-
-      logger.debug('Nostr', 'Received payment request:', request.id);
-
-      for (const handler of this.paymentRequestHandlers) {
-        try {
-          handler(request);
-        } catch (error) {
-          logger.debug('Nostr', 'Payment request handler error:', error);
-        }
-      }
-    } catch (error) {
-      logger.debug('Nostr', 'Failed to handle payment request:', error);
-    }
-  }
-
-  private async handlePaymentRequestResponse(event: NostrEvent): Promise<void> {
-    if (!this.identity) return;
-
-    try {
-      // Decrypt content
-      const content = await this.decryptContent(event.content, event.pubkey);
-      const responseData = JSON.parse(content) as {
-        requestId: string;
-        responseType: 'accepted' | 'rejected' | 'paid';
-        message?: string;
-        transferId?: string;
-      };
-
-      const response: IncomingPaymentRequestResponse = {
-        id: event.id,
-        responderTransportPubkey: event.pubkey,
-        response: {
-          requestId: responseData.requestId,
-          responseType: responseData.responseType,
-          message: responseData.message,
-          transferId: responseData.transferId,
-        },
-        timestamp: event.created_at * 1000,
-      };
-
-      logger.debug('Nostr', 'Received payment request response:', response.id, 'type:', responseData.responseType);
-
-      for (const handler of this.paymentRequestResponseHandlers) {
-        try {
-          handler(response);
-        } catch (error) {
-          logger.debug('Nostr', 'Payment request response handler error:', error);
-        }
-      }
-    } catch (error) {
-      logger.debug('Nostr', 'Failed to handle payment request response:', error);
     }
   }
 
@@ -1728,10 +1460,7 @@ export class NostrTransportProvider implements TransportProvider {
     const walletFilter = new Filter();
     walletFilter.kinds = [
       EVENT_KINDS.DIRECT_MESSAGE,
-      EVENT_KINDS.TOKEN_TRANSFER,
-      EVENT_KINDS.PAYMENT_REQUEST,
-      EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
-      EventKinds.GIFT_WRAP, // NIP-17 gift-wrapped DMs (swap proposals, invoice receipts, etc.)
+      EventKinds.GIFT_WRAP, // NIP-17 gift-wrapped DMs
     ];
     walletFilter['#p'] = [nostrPubkey];
     // NIP-17 gift wraps have randomized created_at (±172800 s).  Extend the
@@ -1932,13 +1661,10 @@ export class NostrTransportProvider implements TransportProvider {
       logger.debug('Nostr', 'No storage adapter, using 24h fallback');
     }
 
-    // Subscribe to wallet events (token transfers, payment requests) with since filter
+    // Subscribe to wallet events (legacy kind-4 DMs) with since filter
     const walletFilter = new Filter();
     walletFilter.kinds = [
       EVENT_KINDS.DIRECT_MESSAGE,
-      EVENT_KINDS.TOKEN_TRANSFER,
-      EVENT_KINDS.PAYMENT_REQUEST,
-      EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
     ];
     walletFilter['#p'] = [nostrPubkey];
     walletFilter.since = since;

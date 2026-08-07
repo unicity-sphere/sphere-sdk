@@ -12,6 +12,13 @@ import { majorOf } from './semver';
 export const SPHERE_CONNECT_NAMESPACE = 'sphere-connect';
 export const SPHERE_CONNECT_VERSION = '2.1';   // Connect protocol version (semver MAJOR.MINOR)
 
+// Default npm-SDK floor a host enforces at the handshake (0.14.1 = the P11 flip:
+// the v1 payments era is gone; pre-flip ConnectClients expect a wallet that no
+// longer exists). '-0' admits every 0.14.1 prerelease (compareSemver: release >
+// prerelease). Override via ConnectHostConfig.minSdkVersion; the claim is
+// compatibility hygiene, not security — a hostile client can lie about it.
+export const DEFAULT_MIN_CLIENT_SDK_VERSION = '0.14.1-0';
+
 export { HOST_READY_TYPE, HOST_READY_TIMEOUT, SPHERE_NETWORKS } from '../constants';
 // Import for local use (e.g. SphereHandshake.network) AND re-export for connect consumers.
 // A bare `export type { NetworkInfo } from '../constants'` would re-export without bringing
@@ -38,8 +45,6 @@ export const RPC_METHODS = {
   GET_MESSAGES: 'sphere_getMessages',
   GET_DM_UNREAD_COUNT: 'sphere_getDMUnreadCount',
   MARK_AS_READ: 'sphere_markAsRead',
-  GET_INVOICES: 'sphere_getInvoices',
-  GET_INVOICE_STATUS: 'sphere_getInvoiceStatus',
 } as const;
 
 export type RpcMethod = (typeof RPC_METHODS)[keyof typeof RPC_METHODS];
@@ -54,15 +59,6 @@ export const INTENT_ACTIONS = {
   PAYMENT_REQUEST: 'payment_request',
   RECEIVE: 'receive',
   SIGN_MESSAGE: 'sign_message',
-  CREATE_INVOICE: 'create_invoice',
-  CLOSE_INVOICE: 'close_invoice',
-  CANCEL_INVOICE: 'cancel_invoice',
-  PAY_INVOICE: 'pay_invoice',
-  RETURN_INVOICE_PAYMENT: 'return_invoice_payment',
-  IMPORT_INVOICE: 'import_invoice',
-  SEND_INVOICE_RECEIPTS: 'send_invoice_receipts',
-  SEND_CANCELLATION_NOTICES: 'send_cancellation_notices',
-  SET_AUTO_RETURN: 'set_auto_return',
   MINT: 'mint',
 } as const;
 

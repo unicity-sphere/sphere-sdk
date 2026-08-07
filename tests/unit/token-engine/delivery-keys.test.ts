@@ -14,7 +14,7 @@ import { TestAggregatorClient } from './support/TestAggregatorClient';
 import { SigningService } from '../../../token-engine/sdk';
 import { HexConverter, Token } from '../../../token-engine/sdk';
 import { decodeTokenBlob, encodeTokenBlob } from '../../../token-engine/token-blob';
-import { composeDeliveryKeys, computeDeliveryId } from '../../../transport/delivery-provider';
+import { computeDeliveryId } from '../../../impl/wallet-api-v2/mailbox';
 
 const COIN = 'aa'.repeat(10);
 
@@ -42,9 +42,8 @@ describe('SphereTokenEngine.deliveryKeys (the backend entry_id derivation)', () 
 
     // entry_id composition = SHA-256(tokenId bytes ‖ stateHash bytes), hex —
     // identical to wallet-api's entryIdFor (src/mailbox/service.ts).
-    const composed = composeDeliveryKeys(keys);
-    expect(composed.deliveryId).toBe(computeDeliveryId(keys.tokenId, keys.stateHash));
-    expect(composed.deliveryId).toMatch(/^[0-9a-f]{64}$/);
+    const deliveryId = computeDeliveryId(keys.tokenId, keys.stateHash);
+    expect(deliveryId).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('opIndex enters the realization: same transferId, different opIndex => different transaction', async () => {

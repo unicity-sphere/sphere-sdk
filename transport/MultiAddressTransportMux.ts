@@ -6,7 +6,7 @@
  * that implements TransportProvider but shares the single WebSocket connection.
  *
  * Event routing:
- * - Wallet events (kind 4, 31113, 31115, 31116): routed by #p tag (recipient pubkey)
+ * - Wallet events (kind 4): routed by #p tag (recipient pubkey)
  * - Chat events (kind 1059 gift wrap): try decrypt with each address keyManager
  *
  * Sending: each adapter delegates to the inner transport with its own keyManager.
@@ -33,17 +33,8 @@ import type {
   TransportProvider,
   MessageHandler,
   ComposingHandler,
-  TokenTransferHandler,
   BroadcastHandler,
-  PaymentRequestHandler,
-  PaymentRequestResponseHandler,
   IncomingMessage,
-  IncomingTokenTransfer,
-  IncomingPaymentRequest,
-  IncomingPaymentRequestResponse,
-  TokenTransferPayload,
-  PaymentRequestPayload,
-  PaymentRequestResponsePayload,
   TransportEvent,
   TransportEventCallback,
   PeerInfo,
@@ -55,7 +46,7 @@ import type {
 import type { WebSocketFactory, UUIDGenerator } from './websocket';
 import { defaultUUIDGenerator } from './websocket';
 import { NostrTransportProvider } from './NostrTransportProvider';
-import type { TransportStorageAdapter, NostrTransportProviderConfig } from './NostrTransportProvider';
+import type { TransportStorageAdapter } from './NostrTransportProvider';
 import {
   DEFAULT_NOSTR_RELAYS,
   NOSTR_EVENT_KINDS,
@@ -601,9 +592,6 @@ export class MultiAddressTransportMux {
     const filter = new Filter();
     filter.kinds = [
       EVENT_KINDS.DIRECT_MESSAGE,
-      EVENT_KINDS.TOKEN_TRANSFER,
-      EVENT_KINDS.PAYMENT_REQUEST,
-      EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
       EventKinds.GIFT_WRAP,
     ];
     filter['#p'] = allPubkeys;
@@ -776,9 +764,6 @@ export class MultiAddressTransportMux {
     const walletFilter = new Filter();
     walletFilter.kinds = [
       EVENT_KINDS.DIRECT_MESSAGE,
-      EVENT_KINDS.TOKEN_TRANSFER,
-      EVENT_KINDS.PAYMENT_REQUEST,
-      EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
     ];
     walletFilter['#p'] = allPubkeys;
     walletFilter.since = globalSince;
@@ -1129,89 +1114,11 @@ export class MultiAddressTransportMux {
       case EVENT_KINDS.DIRECT_MESSAGE:
         // NIP-04 kind 4 is deprecated for DMs, ignore
         break;
-
-      case EVENT_KINDS.TOKEN_TRANSFER:
-        await this.handleTokenTransfer(entry, event);
-        break;
-
-      case EVENT_KINDS.PAYMENT_REQUEST:
-        await this.handlePaymentRequest(entry, event);
-        break;
-
-      case EVENT_KINDS.PAYMENT_REQUEST_RESPONSE:
-        await this.handlePaymentRequestResponse(entry, event);
-        break;
     }
 
     // Update last event timestamp for this address
     if (event.created_at) {
       this.updateLastEventTimestamp(entry, event.created_at);
-    }
-  }
-
-  private async handleTokenTransfer(entry: AddressEntry, event: NostrEvent): Promise<void> {
-    try {
-      const content = await this.decryptContent(entry, event.content, event.pubkey);
-      const payload = JSON.parse(content) as TokenTransferPayload;
-
-      const transfer: IncomingTokenTransfer = {
-        id: event.id,
-        senderTransportPubkey: event.pubkey,
-        payload,
-        timestamp: event.created_at * 1000,
-      };
-
-      entry.adapter.dispatchTokenTransfer(transfer);
-    } catch (err) {
-      logger.debug('Mux', `Token transfer decrypt failed for address ${entry.index}:`, (err as Error)?.message?.slice(0, 50));
-    }
-  }
-
-  private async handlePaymentRequest(entry: AddressEntry, event: NostrEvent): Promise<void> {
-    try {
-      const content = await this.decryptContent(entry, event.content, event.pubkey);
-      const requestData = JSON.parse(content);
-
-      const request: IncomingPaymentRequest = {
-        id: event.id,
-        senderTransportPubkey: event.pubkey,
-        request: {
-          requestId: requestData.requestId,
-          amount: requestData.amount,
-          coinId: requestData.coinId,
-          message: requestData.message,
-          recipientNametag: requestData.recipientNametag,
-          metadata: requestData.metadata,
-        },
-        timestamp: event.created_at * 1000,
-      };
-
-      entry.adapter.dispatchPaymentRequest(request);
-    } catch (err) {
-      logger.debug('Mux', `Payment request decrypt failed for address ${entry.index}:`, (err as Error)?.message?.slice(0, 50));
-    }
-  }
-
-  private async handlePaymentRequestResponse(entry: AddressEntry, event: NostrEvent): Promise<void> {
-    try {
-      const content = await this.decryptContent(entry, event.content, event.pubkey);
-      const responseData = JSON.parse(content);
-
-      const response: IncomingPaymentRequestResponse = {
-        id: event.id,
-        responderTransportPubkey: event.pubkey,
-        response: {
-          requestId: responseData.requestId,
-          responseType: responseData.responseType,
-          message: responseData.message,
-          transferId: responseData.transferId,
-        },
-        timestamp: event.created_at * 1000,
-      };
-
-      entry.adapter.dispatchPaymentRequestResponse(response);
-    } catch (err) {
-      logger.debug('Mux', `Payment response decrypt failed for address ${entry.index}:`, (err as Error)?.message?.slice(0, 50));
     }
   }
 
@@ -1629,9 +1536,6 @@ export class AddressTransportAdapter implements TransportProvider {
 
   // Per-address handler sets
   private messageHandlers: Set<MessageHandler> = new Set();
-  private transferHandlers: Set<TokenTransferHandler> = new Set();
-  private paymentRequestHandlers: Set<PaymentRequestHandler> = new Set();
-  private paymentRequestResponseHandlers: Set<PaymentRequestResponseHandler> = new Set();
   private readReceiptHandlers: Set<ReadReceiptHandler> = new Set();
   private typingIndicatorHandlers: Set<TypingIndicatorHandler> = new Set();
   private composingHandlers: Set<ComposingHandler> = new Set();
@@ -1699,59 +1603,6 @@ export class AddressTransportAdapter implements TransportProvider {
     return this.mux.sendGiftWrap(this.addressIndex, recipientPubkey, wrappedContent);
   }
 
-  async sendTokenTransfer(recipientPubkey: string, payload: TokenTransferPayload): Promise<string> {
-    const content = 'token_transfer:' + JSON.stringify(payload);
-    const uniqueD = `token-transfer-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    return this.mux.createAndPublishEncryptedEvent(
-      this.addressIndex,
-      EVENT_KINDS.TOKEN_TRANSFER,
-      content,
-      [['p', recipientPubkey], ['d', uniqueD], ['type', 'token_transfer']],
-      { verify: true, maxAttempts: 3, label: 'token_transfer' }
-    );
-  }
-
-  async sendPaymentRequest(recipientPubkey: string, payload: PaymentRequestPayload): Promise<string> {
-    const requestId = this.mux.getUUIDGenerator()();
-    const amount = typeof payload.amount === 'bigint' ? payload.amount.toString() : payload.amount;
-    const requestContent = {
-      requestId,
-      amount,
-      coinId: payload.coinId,
-      message: payload.message,
-      recipientNametag: payload.recipientNametag,
-      deadline: Date.now() + 5 * 60 * 1000,
-    };
-    const content = 'payment_request:' + JSON.stringify(requestContent);
-    const tags: string[][] = [
-      ['p', recipientPubkey],
-      ['type', 'payment_request'],
-      ['amount', amount],
-    ];
-    if (payload.recipientNametag) {
-      tags.push(['recipient', payload.recipientNametag]);
-    }
-    return this.mux.createAndPublishEncryptedEvent(
-      this.addressIndex,
-      EVENT_KINDS.PAYMENT_REQUEST,
-      content,
-      tags
-    );
-  }
-
-  async sendPaymentRequestResponse(
-    recipientPubkey: string,
-    response: PaymentRequestResponsePayload
-  ): Promise<string> {
-    const content = 'payment_response:' + JSON.stringify(response);
-    return this.mux.createAndPublishEncryptedEvent(
-      this.addressIndex,
-      EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
-      content,
-      [['p', recipientPubkey], ['type', 'payment_response']]
-    );
-  }
-
   async sendReadReceipt(recipientPubkey: string, messageEventId: string): Promise<void> {
     // Read receipts must use NIP-17 kind 15 (not regular gift wrap kind 14)
     await this.mux.sendReadReceipt(this.addressIndex, recipientPubkey, messageEventId);
@@ -1786,21 +1637,6 @@ export class AddressTransportAdapter implements TransportProvider {
       }
     }
     return () => this.messageHandlers.delete(handler);
-  }
-
-  onTokenTransfer(handler: TokenTransferHandler): () => void {
-    this.transferHandlers.add(handler);
-    return () => this.transferHandlers.delete(handler);
-  }
-
-  onPaymentRequest(handler: PaymentRequestHandler): () => void {
-    this.paymentRequestHandlers.add(handler);
-    return () => this.paymentRequestHandlers.delete(handler);
-  }
-
-  onPaymentRequestResponse(handler: PaymentRequestResponseHandler): () => void {
-    this.paymentRequestResponseHandlers.add(handler);
-    return () => this.paymentRequestResponseHandlers.delete(handler);
   }
 
   onReadReceipt(handler: ReadReceiptHandler): () => void {
@@ -1915,24 +1751,6 @@ export class AddressTransportAdapter implements TransportProvider {
     }
     for (const handler of this.messageHandlers) {
       try { handler(message); } catch (e) { logger.debug('MuxAdapter', 'Message handler error:', e); }
-    }
-  }
-
-  dispatchTokenTransfer(transfer: IncomingTokenTransfer): void {
-    for (const handler of this.transferHandlers) {
-      try { handler(transfer); } catch (e) { logger.debug('MuxAdapter', 'Transfer handler error:', e); }
-    }
-  }
-
-  dispatchPaymentRequest(request: IncomingPaymentRequest): void {
-    for (const handler of this.paymentRequestHandlers) {
-      try { handler(request); } catch (e) { logger.debug('MuxAdapter', 'Payment request handler error:', e); }
-    }
-  }
-
-  dispatchPaymentRequestResponse(response: IncomingPaymentRequestResponse): void {
-    for (const handler of this.paymentRequestResponseHandlers) {
-      try { handler(response); } catch (e) { logger.debug('MuxAdapter', 'Payment response handler error:', e); }
     }
   }
 

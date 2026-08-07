@@ -9,7 +9,6 @@
  */
 
 import { logger } from '../../core/logger';
-import { SphereError } from '../../core/errors';
 import type { ConnectTransport, ConnectClientConfig, ConnectResult, ConnectEventHandler } from '../types';
 import type {
   SphereConnectMessage,

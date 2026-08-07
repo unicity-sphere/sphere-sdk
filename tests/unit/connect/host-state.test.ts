@@ -6,6 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { SDK_VERSION } from '../../../connect/version';
 import { ERROR_CODES, RPC_METHODS, INTENT_ACTIONS } from '../../../connect/protocol';
 import type { WalletState } from '../../../connect/types';
 import {
@@ -109,7 +110,7 @@ describe('gate() — locked', () => {
   it('refuses every other query with 4009 and data.reason', () => {
     for (const m of [
       RPC_METHODS.GET_BALANCE, RPC_METHODS.GET_TOKENS, RPC_METHODS.GET_HISTORY,
-      RPC_METHODS.GET_FIAT_BALANCE, RPC_METHODS.RESOLVE, RPC_METHODS.GET_INVOICES,
+      RPC_METHODS.GET_FIAT_BALANCE, RPC_METHODS.RESOLVE, RPC_METHODS.GET_CONVERSATIONS,
     ]) {
       expect(gate('locked', true, 'query', m), m).toEqual({
         kind: 'refuse',

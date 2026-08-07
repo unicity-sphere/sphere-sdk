@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { ConnectClient, ConnectError } from '../../../connect/client/ConnectClient';
 import { ConnectHost } from '../../../connect/host/ConnectHost';
 import type { ConnectTransport, SphereConnectMessage } from '../../../connect/types';
+import { SDK_VERSION } from '../../../connect/version';
 import { ERROR_CODES, SPHERE_CONNECT_NAMESPACE, SPHERE_CONNECT_VERSION } from '../../../connect/protocol';
 import { PERMISSION_SCOPES } from '../../../connect/permissions';
 
@@ -119,16 +120,28 @@ describe('ConnectHost gate', () => {
     expect(handshakeResponses(h.sent)[0].v).toBe('1.0');
   });
 
+  it('P11 floor is the DEFAULT: a hello with no sdkVersion (any pre-0.14.1 client) is rejected naming the minimum', async () => {
+    const h = makeHostHarness();
+    h.send({ v: SPHERE_CONNECT_VERSION, dapp: { name: 'old-app', url: 'https://old-app' }, network: { id: WALLET_NET } });
+    await Promise.resolve();
+    const resp = handshakeResponses(h.sent)[0];
+    const err = resp.error as { code: number; message: string };
+    expect(err.code).toBe(ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION);
+    expect(err.message).toContain('0.14.1-0');
+    expect(err.message).toContain('unknown (not reported)');
+    expect(h.onConnectionRequest).not.toHaveBeenCalled();
+  });
+
   it('rejects a wrong network with INCOMPATIBLE_NETWORK', async () => {
     const h = makeHostHarness();
-    h.send({ v: SPHERE_CONNECT_VERSION, dapp: { name: 'd', url: 'https://d' }, network: { id: 1 } });
+    h.send({ v: SPHERE_CONNECT_VERSION, sdkVersion: SDK_VERSION, dapp: { name: 'd', url: 'https://d' }, network: { id: 1 } });
     await Promise.resolve();
     expect((handshakeResponses(h.sent)[0].error as { code: number }).code).toBe(ERROR_CODES.INCOMPATIBLE_NETWORK);
   });
 
   it('accepts a same-MAJOR newer MINOR client and includes wallet network/sdkVersion', async () => {
     const h = makeHostHarness();
-    h.send({ v: '2.1', dapp: { name: 'd', url: 'https://d' }, network: { id: WALLET_NET } });
+    h.send({ v: '2.1', sdkVersion: SDK_VERSION, dapp: { name: 'd', url: 'https://d' }, network: { id: WALLET_NET } });
     // onConnectionRequest is async, so the success path settles on a macrotask — flush it.
     // (The rejection tests above are synchronous and only need a microtask.)
     await new Promise((r) => setTimeout(r, 0));

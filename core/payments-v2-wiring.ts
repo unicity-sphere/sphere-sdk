@@ -1,12 +1,13 @@
 /**
- * Composition of the opt-in payments-v2 vertical (P9 — PAYMENTS-V2-DESIGN.md
- * §4/§7/§11), kept out of core/Sphere.ts. The wallet-api transport reuses the
- * old S4 client's composition config (see PaymentsV2TransportSource).
+ * Composition of the payments vertical (PAYMENTS-V2-DESIGN.md §4/§7/§11), kept
+ * out of core/Sphere.ts. The wallet-api transport is built from the plain
+ * `walletApi` config passed to `Sphere.init` ({@link WalletApiTransportConfig}).
  */
 
 import { signMessage } from './crypto';
 import { SphereError } from './errors';
 import { NETWORKS } from '../constants';
+import { randomUUID } from './uuid';
 import { completeSignMessage } from './wallet-api-protocol';
 import { deriveFieldEncryptionKey } from './field-encryption';
 import {
@@ -64,20 +65,24 @@ export interface PaymentsV2TransportArgs {
 export type PaymentsV2TransportFactory = (args: PaymentsV2TransportArgs) => PaymentsV2Transport;
 
 /**
- * Read (duck-typed) off `Sphere.init({ walletApi })`: `network` is required;
- * exactly one of the two optional members supplies the transport.
+ * The `Sphere.init({ walletApi })` transport config — built by
+ * `createWalletApiProviders` (impl/shared/wallet-api). `network` is required;
+ * either `baseUrl` (default HTTP+WS wire) or the `paymentsV2Transport` DI
+ * seam supplies the transport.
  */
-export interface PaymentsV2TransportSource {
+export interface WalletApiTransportConfig {
+  /** Network name (e.g. 'testnet2') — required end-to-end. */
   network: string;
+  /** Backend base URL — required unless `paymentsV2Transport` is supplied. */
+  baseUrl?: string;
+  /** Stable per-device label (the refresh-token row's key); omitting it means a fresh challenge sign-in per run. */
+  deviceId?: string;
+  /** Injectable fetch (defaults to `globalThis.fetch`). */
+  fetchFn?: unknown;
+  /** Injectable WebSocket factory (defaults to `globalThis.WebSocket`). */
+  webSocketFactory?: unknown;
   /** DI seam: supply the whole per-address bundle (offline tests, custom hosts). */
   paymentsV2Transport?(args: PaymentsV2TransportArgs): PaymentsV2Transport;
-  /** Default path: the old S4 client's construction config. */
-  paymentsV2CompositionConfig?(): {
-    baseUrl: string;
-    deviceId: string;
-    fetchFn?: unknown;
-    webSocketFactory?: unknown;
-  };
 }
 
 export interface PaymentsV2Composition {
@@ -85,53 +90,50 @@ export interface PaymentsV2Composition {
   factory: PaymentsV2TransportFactory;
 }
 
-/**
- * Fail-closed: `paymentsV2: true` without a usable source throws at init.
- * #728 single-network invariant: `walletApi.network` must be a KNOWN network,
- * strictly equal to the Sphere network — asserted BEFORE any session/KV/provider.
- */
+// Fail-closed at init: money moves only through a wallet-api composition. #728:
+// walletApi.network must be KNOWN and equal the Sphere network — asserted BEFORE
+// any session/KV/provider is constructed.
 export function resolvePaymentsV2Composition(
   walletApi: unknown,
   sphereNetwork: string | undefined
 ): PaymentsV2Composition {
-  const source = walletApi as Partial<PaymentsV2TransportSource> | null | undefined;
+  const source = walletApi as Partial<WalletApiTransportConfig> | null | undefined;
   const network = typeof source?.network === 'string' && source.network !== '' ? source.network : null;
   if (!source || network === null) {
     throw new SphereError(
-      'paymentsV2 requires a wallet-api composition: pass `walletApi` (the S4 WalletApiClient — its baseUrl/network/deviceId are reused, no new env) to Sphere.init.',
+      'Sphere requires a wallet-api composition for money: pass `walletApi` ({ network, baseUrl, deviceId? } — createWalletApiProviders builds it) to Sphere.init.',
       'INVALID_CONFIG'
     );
   }
   if (!(network in NETWORKS)) {
     throw new SphereError(
-      `paymentsV2: walletApi.network "${network}" is not a known network (${Object.keys(NETWORKS).join('/')}) — a payments composition is single-network (Sphere network "${String(sphereNetwork)}").`,
+      `payments: walletApi.network "${network}" is not a known network (${Object.keys(NETWORKS).join('/')}) — a payments composition is single-network (Sphere network "${String(sphereNetwork)}").`,
       'INVALID_CONFIG'
     );
   }
   if (network !== sphereNetwork) {
     throw new SphereError(
-      `paymentsV2: walletApi.network "${network}" does not match the Sphere network "${String(sphereNetwork)}" the engine/registry run on — a payments composition is single-network.`,
+      `payments: walletApi.network "${network}" does not match the Sphere network "${String(sphereNetwork)}" the engine/registry run on — a payments composition is single-network.`,
       'INVALID_CONFIG'
     );
   }
   if (typeof source.paymentsV2Transport === 'function') {
     return { network, factory: source.paymentsV2Transport.bind(source) };
   }
-  if (typeof source.paymentsV2CompositionConfig === 'function') {
-    const cfg = source.paymentsV2CompositionConfig();
+  if (typeof source.baseUrl === 'string' && source.baseUrl !== '') {
     return {
       network,
       factory: defaultPaymentsV2Transport({
-        baseUrl: cfg.baseUrl,
+        baseUrl: source.baseUrl,
         network,
-        deviceId: cfg.deviceId,
-        fetchFn: cfg.fetchFn,
-        webSocketFactory: cfg.webSocketFactory,
+        deviceId: typeof source.deviceId === 'string' && source.deviceId !== '' ? source.deviceId : `sphere-${randomUUID()}`,
+        fetchFn: source.fetchFn,
+        webSocketFactory: source.webSocketFactory,
       }),
     };
   }
   throw new SphereError(
-    'paymentsV2: the `walletApi` object exposes neither paymentsV2CompositionConfig() (WalletApiClient does) nor the paymentsV2Transport() seam.',
+    'walletApi config supplies neither `baseUrl` (default wallet-api transport) nor the `paymentsV2Transport()` seam.',
     'INVALID_CONFIG'
   );
 }
@@ -140,16 +142,14 @@ export interface PaymentsV2DefaultTransportConfig {
   baseUrl: string;
   network: string;
   deviceId: string;
-  /** Old-client `FetchLike` (structurally compatible); default `globalThis.fetch`. */
   fetchFn?: unknown;
-  /** Old-client WS factory (structurally compatible); default `globalThis.WebSocket`. */
   webSocketFactory?: unknown;
 }
 
 function adaptFetch(fetchFn: unknown): V2FetchLike {
   if (typeof fetchFn === 'function') return fetchFn as V2FetchLike;
   if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
-    throw new SphereError('paymentsV2: no fetch available — inject fetchFn into the wallet-api client.', 'INVALID_CONFIG');
+    throw new SphereError('payments: no fetch available — inject fetchFn into the walletApi config.', 'INVALID_CONFIG');
   }
   // Through globalThis so browser fetch keeps its receiver (Illegal invocation).
   return (url, init) =>
@@ -157,13 +157,12 @@ function adaptFetch(fetchFn: unknown): V2FetchLike {
 }
 
 function adaptWebSocketFactory(factory: unknown): WebSocketFactory {
-  // The old wallet-api WebSocketLike is a structural superset of the v2 one.
   if (typeof factory === 'function') return factory as WebSocketFactory;
   return (url: string): WebSocketLike => {
     const Ctor = (globalThis as { WebSocket?: new (url: string) => WebSocketLike }).WebSocket;
     if (!Ctor) {
       throw new SphereError(
-        'paymentsV2: no global WebSocket — inject webSocketFactory into the wallet-api client (e.g. the "ws" package on Node < 22).',
+        'payments: no global WebSocket — inject webSocketFactory into the walletApi config (e.g. the "ws" package on Node < 22).',
         'INVALID_CONFIG'
       );
     }
@@ -196,8 +195,8 @@ export function defaultPaymentsV2Transport(
         network: args.network,
         sign: (message: string) => signMessage(args.identity.privateKey, message),
       },
-      // ':pv2': a distinct lineage — sharing the old S4 client's (owner,
-      // device) session row would let refresh rotations revoke each other.
+      // ':pv2' kept across the flip: deployed refresh-token rows are keyed
+      // `<deviceId>:pv2` — dropping it would force re-sign-ins for zero gain.
       deviceId: `${config.deviceId}:pv2`,
       kv: args.kv,
       webSocketFactory,

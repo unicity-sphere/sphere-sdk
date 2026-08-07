@@ -1,7 +1,7 @@
 /**
  * Reusable mock provider factory for Sphere core unit tests.
  *
- * The concrete mock bodies (storage / transport / oracle / token storage) are
+ * The concrete mock bodies (storage / transport / oracle) are
  * copied verbatim from tests/unit/core/Sphere.status.test.ts so behavior matches
  * the long-standing harness those tests rely on. The only addition is the
  * `walletExists` knob, which seeds the exact storage key Sphere.exists() reads
@@ -10,12 +10,14 @@
  */
 
 import { vi } from 'vitest';
-import type { InventoryView, StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../../storage';
-import type { TokenBlob } from '../../../../token-engine';
+import type { StorageProvider } from '../../../../storage';
 import type { TransportProvider } from '../../../../transport';
 import type { OracleProvider } from '../../../../oracle';
 import type { ProviderStatus } from '../../../../types';
+import type { WalletApiTransportConfig } from '../../../../core/payments-v2-wiring';
+import { TRUSTBASE_TESTNET2 } from '../../../../assets/trustbase';
 import { STORAGE_KEYS_GLOBAL } from '../../../../constants';
+import { makePv2World, type Pv2World } from '../../../support/pv2-world';
 
 /**
  * A valid BIP39 test mnemonic (well-known abandon×11 + about vector). Stored as
@@ -67,12 +69,6 @@ function createMockTransport(): TransportProvider {
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     sendMessage: vi.fn().mockResolvedValue('event-id'),
     onMessage: vi.fn().mockReturnValue(() => {}),
-    sendTokenTransfer: vi.fn().mockResolvedValue('transfer-id'),
-    onTokenTransfer: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequest: vi.fn().mockResolvedValue('request-id'),
-    onPaymentRequest: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequestResponse: vi.fn().mockResolvedValue('response-id'),
-    onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
     publishIdentityBinding: vi.fn().mockResolvedValue(true),
     recoverNametag: vi.fn().mockResolvedValue(null),
     resolve: vi.fn().mockResolvedValue(null),
@@ -101,10 +97,11 @@ function createMockOracle(): OracleProvider {
     isConnected: vi.fn().mockReturnValue(true),
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     initialize: vi.fn().mockResolvedValue(undefined),
-    submitCommitment: vi.fn().mockResolvedValue({ requestId: 'test-id' }),
-    getProof: vi.fn().mockResolvedValue(null),
-    waitForProof: vi.fn().mockResolvedValue({ proof: 'mock' }),
-    validateToken: vi.fn().mockResolvedValue({ valid: true }),
+    // Engine config surface: a REAL trust base so Sphere builds a REAL engine offline.
+    getTrustBaseJson: vi.fn(() => TRUSTBASE_TESTNET2),
+    getAggregatorUrl: vi.fn(() => 'https://gateway.testnet2.unicity.network'),
+    getApiKey: vi.fn(() => 'test-key'),
+    setApiKey: vi.fn(),
     onEvent: vi.fn((callback: (event: unknown) => void) => {
       eventCallbacks.add(callback);
       return () => eventCallbacks.delete(callback);
@@ -115,42 +112,6 @@ function createMockOracle(): OracleProvider {
   } as unknown as OracleProvider & { _simulateEvent: (e: unknown) => void };
 }
 
-function createMockTokenStorage(id: string, name: string): TokenStorageProvider<TxfStorageDataBase> {
-  return {
-    id,
-    name,
-    type: 'cloud' as const,
-    setIdentity: vi.fn(),
-    initialize: vi.fn(async () => true),
-    shutdown: vi.fn(async () => {}),
-    connect: vi.fn(async () => {}),
-    disconnect: vi.fn(async () => {}),
-    isConnected: vi.fn(() => true),
-    getStatus: vi.fn((): ProviderStatus => 'connected'),
-    load: vi.fn(async () => ({
-      success: true,
-      data: { _meta: { version: 1, address: '', formatVersion: '2.0', updatedAt: Date.now() } },
-      source: 'local' as const,
-      timestamp: Date.now(),
-    })),
-    save: vi.fn(async () => ({ success: true, timestamp: Date.now() })),
-    sync: vi.fn(async (localData: TxfStorageDataBase) => ({
-      success: true,
-      merged: localData,
-      added: 0,
-      removed: 0,
-      conflicts: 0,
-    })),
-    // S2 lazy-inventory surface: present so the mock really satisfies the
-    // contract. An empty view and a loud getToken are the honest stand-ins.
-    listInventory: vi.fn(async (): Promise<InventoryView> => ({ items: [], cursor: 0n, syncEpoch: 0n, more: false })),
-    getToken: vi.fn(async (tokenId: string): Promise<TokenBlob> => {
-      throw new Error(`mock token storage: no blob for ${tokenId}`);
-    }),
-    applyDelta: vi.fn(async (): Promise<void> => undefined),
-  };
-}
-
 // =============================================================================
 // Combined factory
 // =============================================================================
@@ -159,7 +120,10 @@ export interface MockProviders {
   storage: StorageProvider & { _data: Map<string, string> };
   transport: TransportProvider & { _simulateEvent: (e: unknown) => void };
   oracle: OracleProvider & { _simulateEvent: (e: unknown) => void };
-  tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
+  /** Wallet-api transport config over the FakeWalletApi world (fail-closed init needs it). */
+  walletApi: WalletApiTransportConfig;
+  /** The backing fake wallet-api world (transports, server state). */
+  pv2: Pv2World;
 }
 
 export interface MakeMockProvidersOptions {
@@ -186,10 +150,12 @@ export function makeMockProviders(options: MakeMockProvidersOptions = {}): MockP
     storage._data.set(STORAGE_KEYS_GLOBAL.MNEMONIC, TEST_MNEMONIC);
   }
 
+  const pv2 = makePv2World();
   return {
     storage,
     transport: createMockTransport() as TransportProvider & { _simulateEvent: (e: unknown) => void },
     oracle: createMockOracle() as OracleProvider & { _simulateEvent: (e: unknown) => void },
-    tokenStorage: createMockTokenStorage('indexeddb-tokens', 'IndexedDB'),
+    walletApi: pv2.walletApi,
+    pv2,
   };
 }

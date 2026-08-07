@@ -14,6 +14,12 @@ The current Connect protocol version is **`2.1`** (`SPHERE_CONNECT_VERSION = '2.
 
 ### Handshake fields
 
+> **SDK version floor (0.14.1, the P11 flip):** the host rejects any client whose handshake
+> `sdkVersion` is missing or below `0.14.1-0` (every 0.14.1 prerelease passes) with
+> `UNSUPPORTED_PROTOCOL_VERSION` (4007) and a message naming the required minimum — pre-flip
+> clients expect a wallet surface that no longer exists. Override via
+> `ConnectHostConfig.minSdkVersion`. The claim is compatibility hygiene, not security.
+
 Two new optional fields are sent in the handshake (added in v2; both fields are additive and carry no breaking change to the wire format):
 
 | Field | Direction | Type | Description |
@@ -271,12 +277,12 @@ useEffect(() => {
 }, [sphere, isLoading]);
 ```
 
-While locked, a host that HOLDS a session answers exactly four of the sixteen `RPC_METHODS`:
+While locked, a host that HOLDS a session answers exactly four of the fourteen `RPC_METHODS`:
 `sphere_getIdentity` (from an immutable snapshot), `sphere_subscribe`, `sphere_unsubscribe` and
-`sphere_disconnect`. The other **twelve, and every intent**, are refused `WALLET_LOCKED` (4009):
+`sphere_disconnect`. The other **ten, and every intent**, are refused `WALLET_LOCKED` (4009):
 the five money reads (`getBalance`, `getAssets`, `getFiatBalance`, `getTokens`, `getHistory`),
-`sphere_resolve`, **all four DM reads** (`getConversations`, `getMessages`, `getDMUnreadCount`,
-`markAsRead`) and both invoice reads. Nothing is served from a cache — a dApp holding a stale
+`sphere_resolve`, and **all four DM reads** (`getConversations`, `getMessages`, `getDMUnreadCount`,
+`markAsRead`). Nothing is served from a cache — a dApp holding a stale
 balance is about to offer an unpayable spend — and **messaging does not keep working while
 locked**, so a dApp must stop polling and wait rather than collect refusals.
 
@@ -487,8 +493,9 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `sphere_unsubscribe` | `event` | `{ unsubscribed, event }` |
 | `sphere_disconnect` | — | `{ disconnected }` |
 
-> Invoice queries (`sphere_getInvoices`, `sphere_getInvoiceStatus`) exist in the protocol but
-> are experimental and not enabled in the Sphere wallet — see [Experimental](#experimental--not-supported-by-the-sphere-wallet).
+> The money queries (`sphere_getBalance`/`getAssets`/`getFiatBalance`/`getTokens`/`getHistory`)
+> keep their pre-flip result shapes: on a payments-v2 host they are served through the host's
+> wire-compat adapter (see [Compatibility](#compatibility-the-old-wire-contract-on-a-v2-host)).
 
 ## Intent Actions (require user confirmation)
 
@@ -502,14 +509,10 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `mint` | `coinId` (lowercase hex), `amount` (smallest units) | `{ tokenId, coinId, amount }` |
 
 > **Amount units:** `amount` is always in **base units** (the smallest indivisible unit), as a
-> string — the same convention as `mint`, the token engine (`mintFungibleToken(coinId, amount: bigint)`)
-> and the SDK's `payments.send`. Convert from a human amount at the dApp edge with the SDK's
+> string — the same convention as the SDK's `payments.mint(coinId, amount: bigint)`
+> and `payments.send`. Convert from a human amount at the dApp edge with the SDK's
 > `parseTokenAmount('1.5', decimals)` (or ethers/viem `parseUnits`); display with `formatAmount`.
 > `coinId` is always the canonical lowercase 64-hex id (a symbol like `UCT` is rejected).
->
-> Invoice/accounting intents (`create_invoice` … `set_auto_return`) exist in the protocol but
-> are experimental and not enabled in the Sphere wallet — see
-> [Experimental](#experimental--not-supported-by-the-sphere-wallet).
 
 ### send Intent Result — delivery semantics
 
@@ -529,9 +532,8 @@ The `send` result distinguishes **on-chain finality** from **recipient-side deli
 - The SDK's `TransferResult` also carries `deliveryState` (`'landed' | 'pending-delivery'`), but the wallet does **not** forward it over Connect — `deliveryPending` is the only delivery signal a dApp receives.
 
 > **Server-side (Node.js) recipients:** a wallet built with bare `createNodeProviders` has no
-> delivery rail at all and can neither send nor receive assets — `send()` and `receive()` fail
-> with `INVALID_CONFIG`. Compose the wallet-api rail — `createWalletApiProviders(...)` or
-> `createOwnStorageWalletApiProviders(...)` — see
+> money rail at all — `Sphere.init` refuses with `INVALID_CONFIG`. Attach the wallet-api
+> transport config with `createWalletApiProviders(...)` — see
 > [QUICKSTART-NODEJS.md](QUICKSTART-NODEJS.md). Deposits made before the recipient composes the
 > rail stay claimable in the mailbox.
 
@@ -582,27 +584,22 @@ Requires the `mint:request` permission scope. Minting only succeeds on networks 
 
 When the wallet runs with **subscriptions enabled**, a `mint` is rejected with `INTERNAL_ERROR` and the message `Subscription is still being set up — try again in a moment` until the wallet's per-wallet subscription key reaches the oracle. This is transient — treat it as a retry, not a failure. It never occurs on wallets running without subscriptions.
 
-## Experimental — not supported by the Sphere wallet
+## Removed: the invoice surface (P11 flip)
 
-Invoicing/accounting is **defined in the protocol** for forward-compatibility but is
-**experimental and not enabled in the Sphere wallet**: it is implemented in the SDK and
-unit-tested, but has no live/e2e verification and is not wired into the wallet. The wallet
-rejects these intents with `METHOD_NOT_FOUND`, and the invoice queries error with
-`MODULE_NOT_AVAILABLE`. **Do not use them yet.**
-
-- **Intents** (scope `invoice:write`, or `transfer:request` for the paying ones):
-  `create_invoice`, `close_invoice`, `cancel_invoice`, `pay_invoice`,
-  `return_invoice_payment`, `import_invoice`, `send_invoice_receipts`,
-  `send_cancellation_notices`, `set_auto_return`.
-- **Queries** (scope `invoice:read`): `sphere_getInvoices`, `sphere_getInvoiceStatus`.
+The experimental invoice surface — 2 queries (`sphere_getInvoices`, `sphere_getInvoiceStatus`),
+9 intents (`create_invoice` … `set_auto_return`) and 2 scopes (`invoice:read`, `invoice:write`)
+— was **removed from the protocol** when the SDK's accounting module was deleted. It was never
+enabled in any wallet host (every call answered `MODULE_NOT_AVAILABLE`), and the protocol
+version stays 2.1. A removed method or intent now answers the standard `METHOD_NOT_FOUND` path;
+requesting the removed scopes fails permission validation.
 
 ## Events (wallet → dApp push)
 
 | Event | Payload | Delivery |
 |-------|---------|----------|
 | `transfer:incoming` | token transfer received | via `sphere_subscribe` |
-| `transfer:confirmed` | transfer confirmed on chain | via `sphere_subscribe` |
-| `transfer:failed` | transfer failed | via `sphere_subscribe` |
+| `transfer:confirmed` | transfer confirmed on chain | via `sphere_subscribe` (compat adapter) |
+| `transfer:failed` | transfer failed | via `sphere_subscribe` (compat adapter) |
 | `wallet:locked` | wallet locked — **the session is alive** | auto-pushed (no subscribe) |
 | `wallet:unlocked` | wallet unlocked, carries the current identity | auto-pushed (no subscribe) |
 | `wallet:disconnected` | the session is GONE — re-handshake to continue | auto-pushed (no subscribe) |
@@ -611,6 +608,29 @@ rejects these intents with `METHOD_NOT_FOUND`, and the invoice queries error wit
 > The four wallet events are pushed unconditionally and **cannot** be subscribed —
 > `sphere_subscribe` refuses them. `Sphere.on()` accepts any string and would silently never
 > emit for them, so the subscribe used to succeed and deliver nothing forever.
+
+## Compatibility: the old wire contract on a v2 host
+
+The SDK's payments vertical (P11 flip) replaced the old module's events and read methods, but
+**the Connect wire contract is unchanged — dApps change nothing.** A host running the v2 facade
+serves the old contract through a built-in adapter (`connect/host/payments-compat.ts`):
+
+- **Queries:** `sphere_getBalance` and `sphere_getAssets` are served from `payments.assets()`
+  (the Asset shape is unchanged; `unconfirmed*` fields are pinned `'0'`/`0`),
+  `sphere_getFiatBalance` sums the priced assets (still `null` when no price data),
+  `sphere_getTokens` from `payments.tokens()`, `sphere_getHistory` from `payments.history()`
+  (the flat entry array, entries keep `timestamp`/`symbol`/`tokenIds`).
+- **Events:** every old dApp-subscribable name keeps firing with its old payload shape,
+  re-emitted from the 8 v2 events: `transfer:confirmed` / `transfer:delivery_pending` /
+  `transfer:failed` from `transfer:updated` (by `status`/`deliveryPending`);
+  `payment_request:paid|rejected|expired` from `payment_request:updated`;
+  `split:checkpoint-stuck` / `delivery:undeliverable` / `delivery:deferred` from
+  `transfer:attention` (by code); `realtime:status` / `storage:degraded` from
+  `connection:status`; `sync:completed` / `sync:remote-update` from `inventory:updated`.
+  (`send:partial-remainder` is not re-emitted — folded by design, no consumer existed.)
+- **Subscribing to the new v2 names** (`transfer:updated`, `transfer:attention`,
+  `inventory:updated`, `connection:status`, `payment_request:updated`, …) also works — they are
+  ordinary `Sphere.on()` events.
 
 > Session expiry is **not** an event — the next request after the TTL is rejected with
 > error `4004 SESSION_EXPIRED`.
@@ -757,8 +777,6 @@ Permissions are requested during handshake and checked on every request:
 | `payment:request` | `payment_request` intent |
 | `sign:request` | `sign_message` intent |
 | `mint:request` | `mint` intent (self-mint a fungible token) |
-| `invoice:read` | invoice queries (experimental — see above) |
-| `invoice:write` | invoice intents (experimental — see above) |
 
 ---
 

@@ -1,6 +1,6 @@
 {
   "name": "@unicitylabs/sphere-sdk",
-  "version": "0.14.0",
+  "version": "0.14.1-dev.2",
   "description": "Modular TypeScript SDK for Unicity wallet operations",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -81,16 +81,6 @@
         "default": "./dist/impl/wallet-api-v2/index.cjs"
       }
     },
-    "./wallet-api": {
-      "import": {
-        "types": "./dist/wallet-api/index.d.ts",
-        "default": "./dist/wallet-api/index.js"
-      },
-      "require": {
-        "types": "./dist/wallet-api/index.d.cts",
-        "default": "./dist/wallet-api/index.cjs"
-      }
-    },
     "./connect": {
       "import": {
         "types": "./dist/connect/index.d.ts",
@@ -132,13 +122,11 @@
     "build": "node scripts/build.mjs",
     "build:watch": "tsup --watch",
     "clean": "rm -rf dist",
-    "prepublishOnly": "node -e \"const fs=require('fs');const must=['dist/index.d.ts','dist/core/index.d.ts','dist/token-engine/index.d.ts','dist/wallet-api/index.d.ts','dist/token-engine/index.js','dist/wallet-api/index.js'];const missing=must.filter(f=>!fs.existsSync(f));if(missing.length){console.error('prepublishOnly: dist is stale or incomplete — run npm run build first. Missing: '+missing.join(', '));process.exit(1)}\"",
+    "prepublishOnly": "node -e \"const fs=require('fs');const must=['dist/index.d.ts','dist/core/index.d.ts','dist/token-engine/index.d.ts','dist/modules/payments-v2/index.d.ts','dist/impl/wallet-api-v2/index.d.ts','dist/token-engine/index.js','dist/modules/payments-v2/index.js','dist/impl/wallet-api-v2/index.js'];const missing=must.filter(f=>!fs.existsSync(f));if(missing.length){console.error('prepublishOnly: dist is stale or incomplete — run npm run build first. Missing: '+missing.join(', '));process.exit(1)}\"",
     "test": "vitest",
     "test:run": "vitest run",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:relay": "vitest run --config vitest.relay.config.ts",
-    "test:harness": "vitest run --config vitest.harness.config.ts",
-    "test:e2e:live": "vitest run --config vitest.live.config.ts",
     "test:mutation": "node scripts/test-mutation.mjs",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",

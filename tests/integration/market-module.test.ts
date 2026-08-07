@@ -14,13 +14,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Sphere } from '../../core/Sphere';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
-import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenStorageProvider';
 import { createBrowserProviders } from '../../impl/browser';
 import { createNodeProviders } from '../../impl/nodejs';
 import type { TransportProvider, OracleProvider } from '../../index';
 import type { ProviderStatus } from '../../types';
 import type { MarketModuleConfig } from '../../modules/market';
 import { TEST_NETWORK } from '../test-network';
+import { makePv2World } from '../support/pv2-world';
+import { TRUSTBASE_TESTNET2 } from '../../assets/trustbase';
 
 // =============================================================================
 // Test directories
@@ -47,12 +48,6 @@ function createMockTransport(): TransportProvider {
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     sendMessage: vi.fn().mockResolvedValue('event-id'),
     onMessage: vi.fn().mockReturnValue(() => {}),
-    sendTokenTransfer: vi.fn().mockResolvedValue('transfer-id'),
-    onTokenTransfer: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequest: vi.fn().mockResolvedValue('request-id'),
-    onPaymentRequest: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequestResponse: vi.fn().mockResolvedValue('response-id'),
-    onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
     subscribeToBroadcast: vi.fn().mockReturnValue(() => {}),
     publishBroadcast: vi.fn().mockResolvedValue('broadcast-id'),
     onEvent: vi.fn().mockReturnValue(() => {}),
@@ -73,12 +68,11 @@ function createMockOracle(): OracleProvider {
     isConnected: vi.fn().mockReturnValue(true),
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     initialize: vi.fn().mockResolvedValue(undefined),
-    // The v2 config surface is the whole oracle contract post-cutover. No trust
-    // base → Sphere skips building the token engine, which is what these
-    // market-only tests exercise (no money movement).
-    getTrustBaseJson: vi.fn().mockReturnValue(null),
-    getAggregatorUrl: vi.fn().mockReturnValue('https://mock-aggregator.invalid'),
-    getApiKey: vi.fn().mockReturnValue(undefined),
+    // Post-flip the payments vertical is mandatory: a REAL trust base lets
+    // Sphere build a REAL engine offline (money never moves in these tests).
+    getTrustBaseJson: vi.fn().mockReturnValue(TRUSTBASE_TESTNET2),
+    getAggregatorUrl: vi.fn().mockReturnValue('https://gateway.testnet2.unicity.network'),
+    getApiKey: vi.fn().mockReturnValue('test-key'),
   };
 }
 
@@ -140,7 +134,7 @@ describe('MarketModule integration with Sphere', () => {
     it('should create market module when market: true', async () => {
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -157,7 +151,7 @@ describe('MarketModule integration with Sphere', () => {
     it('should not create market module when market not specified', async () => {
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -173,7 +167,7 @@ describe('MarketModule integration with Sphere', () => {
       // market: false should be treated as falsy
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -189,7 +183,7 @@ describe('MarketModule integration with Sphere', () => {
     it('should use custom API URL in market config', async () => {
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -216,7 +210,7 @@ describe('MarketModule integration with Sphere', () => {
     it('should use custom timeout in market config', async () => {
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -232,7 +226,7 @@ describe('MarketModule integration with Sphere', () => {
     it('should allow both apiUrl and timeout in market config', async () => {
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -258,7 +252,7 @@ describe('MarketModule integration with Sphere', () => {
       // First create wallet
       const { sphere: initial } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -269,7 +263,7 @@ describe('MarketModule integration with Sphere', () => {
       // Then load with market enabled
       const sphere = await Sphere.load({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -285,7 +279,7 @@ describe('MarketModule integration with Sphere', () => {
       // First create wallet
       const { sphere: initial } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -296,7 +290,7 @@ describe('MarketModule integration with Sphere', () => {
       // Then load without market
       const sphere = await Sphere.load({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -311,7 +305,7 @@ describe('MarketModule integration with Sphere', () => {
       // First create wallet
       const { sphere: initial } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -322,7 +316,7 @@ describe('MarketModule integration with Sphere', () => {
       // Then load with custom market config
       const sphere = await Sphere.load({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -347,7 +341,7 @@ describe('MarketModule integration with Sphere', () => {
       const sphere = await Sphere.import({
         mnemonic,
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -366,7 +360,7 @@ describe('MarketModule integration with Sphere', () => {
       const sphere = await Sphere.import({
         mnemonic,
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -387,7 +381,7 @@ describe('MarketModule integration with Sphere', () => {
     it('sphere.market getter should be nullable', async () => {
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -406,7 +400,7 @@ describe('MarketModule integration with Sphere', () => {
     it('should allow safe optional chaining on market', async () => {
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -431,7 +425,7 @@ describe('MarketModule integration with Sphere', () => {
 
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -455,7 +449,7 @@ describe('MarketModule integration with Sphere', () => {
     it('should maintain market module on address switch', async () => {
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -489,7 +483,7 @@ describe('MarketModule integration with Sphere', () => {
 
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -544,7 +538,7 @@ describe('MarketModule integration with Sphere', () => {
     it('should initialize market module on Sphere creation', async () => {
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -568,7 +562,7 @@ describe('MarketModule integration with Sphere', () => {
     it('should destroy market module on Sphere.destroy()', async () => {
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -586,7 +580,7 @@ describe('MarketModule integration with Sphere', () => {
       // Create and destroy first wallet
       let { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -598,7 +592,7 @@ describe('MarketModule integration with Sphere', () => {
       // Reload with market enabled
       sphere = await Sphere.load({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -662,7 +656,6 @@ describe('MarketModule integration with Sphere', () => {
         network: 'testnet',
         market: true,
         dataDir: DATA_DIR,
-        tokensDir: TOKENS_DIR,
       });
 
       expect(providers.market).toBeDefined();
@@ -673,7 +666,6 @@ describe('MarketModule integration with Sphere', () => {
       const providers = createNodeProviders({
         network: 'testnet',
         dataDir: DATA_DIR,
-        tokensDir: TOKENS_DIR,
       });
 
       expect(providers.market).toBeUndefined();
@@ -683,7 +675,6 @@ describe('MarketModule integration with Sphere', () => {
       const providers = createNodeProviders({
         network: 'testnet',
         dataDir: DATA_DIR,
-        tokensDir: TOKENS_DIR,
         market: { apiUrl: 'https://node-custom.market.api' },
       });
 
@@ -695,7 +686,6 @@ describe('MarketModule integration with Sphere', () => {
       const providers = createNodeProviders({
         network: 'testnet',
         dataDir: DATA_DIR,
-        tokensDir: TOKENS_DIR,
         market: true,
       });
 
@@ -707,7 +697,6 @@ describe('MarketModule integration with Sphere', () => {
       const providers = createNodeProviders({
         network: 'testnet',
         dataDir: DATA_DIR,
-        tokensDir: TOKENS_DIR,
         market: { timeout: 60000 },
       });
 
@@ -728,7 +717,7 @@ describe('MarketModule integration with Sphere', () => {
 
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -773,7 +762,6 @@ describe('MarketModule integration with Sphere', () => {
       const providers = createNodeProviders({
         network: 'testnet',
         dataDir: DATA_DIR,
-        tokensDir: TOKENS_DIR,
         market: { apiUrl: 'https://test-node-market.api' },
       });
 
@@ -817,7 +805,7 @@ describe('MarketModule integration with Sphere', () => {
 
         const { sphere } = await Sphere.init({
           storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-          tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+          walletApi: makePv2World().walletApi,
           transport: createMockTransport(),
           oracle: createMockOracle(),
           network: TEST_NETWORK,
@@ -865,7 +853,7 @@ describe('MarketModule integration with Sphere', () => {
 
         const { sphere } = await Sphere.init({
           storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-          tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+          walletApi: makePv2World().walletApi,
           transport: createMockTransport(),
           oracle: createMockOracle(),
           network: TEST_NETWORK,
@@ -923,7 +911,7 @@ describe('MarketModule integration with Sphere', () => {
 
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
-        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,

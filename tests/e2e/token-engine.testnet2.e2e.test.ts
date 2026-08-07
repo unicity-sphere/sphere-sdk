@@ -83,7 +83,7 @@ describe.runIf(!!API_KEY)('token-engine e2e — live testnet2 (networkId 4)', ()
     const engine = await makeEngine();
     const self = engine.getIdentity().chainPubkey;
 
-    // Self-mint (the top-up primitive PaymentsModule.mintFungibleToken uses).
+    // Self-mint (the top-up primitive sphere.payments.mint uses).
     const minted = await engine.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 250n }] } });
     expect(engine.balanceOf(minted, COIN)).toBe(250n);
     expect((await engine.verify(minted)).ok).toBe(true);

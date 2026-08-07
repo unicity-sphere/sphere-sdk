@@ -6,6 +6,7 @@
 
 import { WebSocket as NodeWebSocket } from 'ws';
 
+import { getPublicKey } from '../../../core/crypto';
 import type { ScopedKV } from '../../../modules/payments-v2/stores';
 
 export const STAGING_API_KEY = process.env.STAGING_AGGREGATOR_KEY;
@@ -63,3 +64,20 @@ export function memoryKV(): ScopedKV {
     remove: async (k) => void m.delete(k),
   };
 }
+
+/** A fresh random secp256k1 identity — every test isolates by owner. */
+export function randomIdentity(): { privateKey: string; chainPubkey: string } {
+  for (;;) {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    const privateKey = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    try {
+      return { privateKey, chainPubkey: getPublicKey(privateKey) };
+    } catch {
+      // out-of-range scalar (probability ~2^-128) — draw again
+    }
+  }
+}
+
+/** The harness coin (64-hex canonical AssetId, like the model suites). */
+export const HARNESS_COIN = '11'.repeat(32);

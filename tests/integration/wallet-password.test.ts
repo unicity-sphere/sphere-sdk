@@ -16,20 +16,20 @@ import { fileURLToPath } from 'url';
 import { Sphere } from '../../core/Sphere';
 import { DEFAULT_ENCRYPTION_KEY, STORAGE_KEYS_GLOBAL } from '../../constants';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
-import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenStorageProvider';
 import { createNodeProviders } from '../../impl/nodejs';
 import { encryptSimple } from '../../core/encryption';
 import { validateMnemonic as validateBip39Mnemonic } from '../../core/crypto';
 import type { TransportProvider, OracleProvider } from '../../index';
 import type { ProviderStatus } from '../../types';
 import { TEST_NETWORK } from '../test-network';
+import { makePv2World } from '../support/pv2-world';
+import { TRUSTBASE_TESTNET2 } from '../../assets/trustbase';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const TEST_DIR = path.join(__dirname, '.test-wallet-password');
 const DATA_DIR = path.join(TEST_DIR, 'data');
-const TOKENS_DIR = path.join(TEST_DIR, 'tokens');
 
 const TEST_MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 const TEST_PASSWORD = 'my-secret-password';
@@ -51,12 +51,6 @@ function createMockTransport(): TransportProvider {
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     sendMessage: vi.fn().mockResolvedValue('event-id'),
     onMessage: vi.fn().mockReturnValue(() => {}),
-    sendTokenTransfer: vi.fn().mockResolvedValue('transfer-id'),
-    onTokenTransfer: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequest: vi.fn().mockResolvedValue('request-id'),
-    onPaymentRequest: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequestResponse: vi.fn().mockResolvedValue('response-id'),
-    onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
     subscribeToBroadcast: vi.fn().mockReturnValue(() => {}),
     publishBroadcast: vi.fn().mockResolvedValue('broadcast-id'),
     onEvent: vi.fn().mockReturnValue(() => {}),
@@ -76,11 +70,9 @@ function createMockOracle(): OracleProvider {
     isConnected: vi.fn().mockReturnValue(true),
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     initialize: vi.fn().mockResolvedValue(undefined),
-    submitCommitment: vi.fn().mockResolvedValue({ requestId: 'test-id' }),
-    getProof: vi.fn().mockResolvedValue(null),
-    waitForProof: vi.fn().mockResolvedValue({ proof: 'mock' }),
-    validateToken: vi.fn().mockResolvedValue({ valid: true }),
-    mintToken: vi.fn().mockResolvedValue({ success: true, token: { id: 'mock-token' } }),
+    getTrustBaseJson: () => TRUSTBASE_TESTNET2,
+    getAggregatorUrl: () => 'https://gateway.testnet2.unicity.network',
+    getApiKey: () => 'test-key',
   } as unknown as OracleProvider;
 }
 
@@ -113,11 +105,10 @@ async function createAndDestroy(options: {
 }): Promise<void> {
   const dataDir = options.dataDir ?? DATA_DIR;
   const storage = new FileStorageProvider({ dataDir, fileName: options.fileName });
-  const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
   const { sphere } = await Sphere.init({
     storage,
-    tokenStorage,
+    walletApi: makePv2World().walletApi,
     transport: createMockTransport(),
     oracle: createMockOracle(),
     network: TEST_NETWORK,
@@ -155,11 +146,10 @@ describe('Wallet password encryption', () => {
       await createAndDestroy({});
 
       const storage = new FileStorageProvider({ dataDir: DATA_DIR });
-      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       const { sphere } = await Sphere.init({
         storage,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -185,11 +175,10 @@ describe('Wallet password encryption', () => {
       await createAndDestroy({ password: TEST_PASSWORD });
 
       const storage = new FileStorageProvider({ dataDir: DATA_DIR });
-      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       const { sphere } = await Sphere.init({
         storage,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -204,12 +193,11 @@ describe('Wallet password encryption', () => {
       await createAndDestroy({ password: TEST_PASSWORD });
 
       const storage = new FileStorageProvider({ dataDir: DATA_DIR });
-      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       await expect(
         Sphere.init({
           storage,
-          tokenStorage,
+          walletApi: makePv2World().walletApi,
           transport: createMockTransport(),
           oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -242,12 +230,11 @@ describe('Wallet password encryption', () => {
       });
 
       const storage = new FileStorageProvider({ dataDir: DATA_DIR });
-      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       await expect(
         Sphere.init({
           storage,
-          tokenStorage,
+          walletApi: makePv2World().walletApi,
           transport: createMockTransport(),
           oracle: createMockOracle(),
           network: TEST_NETWORK,
@@ -260,13 +247,12 @@ describe('Wallet password encryption', () => {
       await createAndDestroy({ password: TEST_PASSWORD });
 
       const storage = new FileStorageProvider({ dataDir: DATA_DIR });
-      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       // No password — decrypt tries plaintext (fails), then default key (fails)
       await expect(
         Sphere.init({
           storage,
-          tokenStorage,
+          walletApi: makePv2World().walletApi,
           transport: createMockTransport(),
           oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -286,11 +272,10 @@ describe('Wallet password encryption', () => {
       });
 
       const storage = new FileStorageProvider({ dataDir: DATA_DIR });
-      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       const { sphere } = await Sphere.init({
         storage,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -310,11 +295,10 @@ describe('Wallet password encryption', () => {
       });
 
       const storage = new FileStorageProvider({ dataDir: DATA_DIR });
-      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       const { sphere } = await Sphere.init({
         storage,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -338,11 +322,10 @@ describe('Wallet password encryption', () => {
 
       // Load back with same custom name
       const storage = new FileStorageProvider({ dataDir: DATA_DIR, fileName: customFileName });
-      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       const { sphere } = await Sphere.init({
         storage,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -357,7 +340,6 @@ describe('Wallet password encryption', () => {
       const providers = createNodeProviders({
         network: 'testnet',
         dataDir: DATA_DIR,
-        tokensDir: TOKENS_DIR,
         walletFileName: customFileName,
       });
 
@@ -366,6 +348,7 @@ describe('Wallet password encryption', () => {
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
+        walletApi: makePv2World().walletApi,
         mnemonic: TEST_MNEMONIC,
       });
 
@@ -390,11 +373,10 @@ describe('Wallet password encryption', () => {
 
       // Load back with password + custom file
       const storage = new FileStorageProvider({ dataDir: DATA_DIR, fileName: customFileName });
-      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       const { sphere } = await Sphere.init({
         storage,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -413,11 +395,10 @@ describe('Wallet password encryption', () => {
       fs.writeFileSync(path.join(DATA_DIR, 'mnemonic.txt'), TEST_MNEMONIC);
 
       const storage = new FileStorageProvider({ dataDir: DATA_DIR, fileName: 'mnemonic.txt' });
-      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       const { sphere } = await Sphere.init({
         storage,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -434,11 +415,10 @@ describe('Wallet password encryption', () => {
       fs.writeFileSync(path.join(DATA_DIR, 'wallet.txt'), encrypted);
 
       const storage = new FileStorageProvider({ dataDir: DATA_DIR, fileName: 'wallet.txt' });
-      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       const { sphere } = await Sphere.init({
         storage,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,
@@ -467,11 +447,10 @@ describe('Wallet password encryption', () => {
 
       // Should load back with password
       const storage = new FileStorageProvider({ dataDir: DATA_DIR, fileName: 'encrypted.txt' });
-      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
 
       const { sphere } = await Sphere.init({
         storage,
-        tokenStorage,
+        walletApi: makePv2World().walletApi,
         transport: createMockTransport(),
         oracle: createMockOracle(),
         network: TEST_NETWORK,

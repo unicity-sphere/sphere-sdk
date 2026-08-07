@@ -23,7 +23,7 @@
 import { ConnectClient } from '../../../connect/client/ConnectClient';
 import { HOST_READY_TYPE, HOST_READY_TIMEOUT } from '../../../connect/protocol';
 import type { ConnectTransport, ConnectResult, ConnectClientConfig } from '../../../connect/types';
-import type { DAppMetadata, SphereConnectMessage, NetworkInfo } from '../../../connect/protocol';
+import type { DAppMetadata, NetworkInfo } from '../../../connect/protocol';
 import type { PermissionScope } from '../../../connect/permissions';
 import { PostMessageTransport } from './PostMessageTransport';
 import { ExtensionTransport } from './ExtensionTransport';
@@ -250,7 +250,7 @@ async function connectViaPopup(config: AutoConnectConfig): Promise<AutoConnectRe
 // Helpers
 // =============================================================================
 
-function waitForHostReady(popup: Window, walletOrigin: string): Promise<void> {
+function waitForHostReady(popup: Window, _walletOrigin: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       window.removeEventListener('message', listener);

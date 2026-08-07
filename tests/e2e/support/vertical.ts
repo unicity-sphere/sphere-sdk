@@ -36,9 +36,10 @@ import { createSphereTokenEngine } from '../../../token-engine/factory';
 import type { ITokenEngine } from '../../../token-engine/engine';
 import type { HistoryEntry } from '../../../modules/payments-v2/api';
 import type { TransferResult } from '../../../types';
-import { HARNESS_COIN, randomIdentity } from '../../harness/support/stack';
 import { registryStub } from '../../unit/payments-v2/support';
 import {
+  HARNESS_COIN,
+  randomIdentity,
   AGGREGATOR_URL,
   BASE_URL,
   memoryKV,

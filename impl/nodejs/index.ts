@@ -29,10 +29,10 @@ export type {
 import { logger as sdkLogger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { assertNetworkConsistency } from '../shared/network';
-import { createFileStorageProvider, createFileTokenStorageProvider } from './storage';
+import { createFileStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
-import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
+import type { StorageProvider } from '../../storage';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { PriceProvider } from '../../price';
@@ -84,8 +84,6 @@ export interface NodeProvidersConfig {
   dataDir?: string;
   /** Wallet file name (default: 'wallet.json') */
   walletFileName?: string;
-  /** Directory for token files */
-  tokensDir?: string;
   /** Transport (Nostr) configuration */
   transport?: NodeTransportConfig;
   /** Oracle (Aggregator) configuration */
@@ -100,7 +98,6 @@ export interface NodeProvidersConfig {
 
 export interface NodeProviders {
   storage: StorageProvider;
-  tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
   transport: TransportProvider;
   oracle: OracleProvider;
   /** Price provider (optional — enables fiat value display) */
@@ -123,14 +120,12 @@ export interface NodeProviders {
  * // Simple - testnet with defaults
  * const providers = createNodeProviders({
  *   network: 'testnet',
- *   tokensDir: './tokens',
  * });
  *
  * // Full configuration
  * const providers = createNodeProviders({
  *   network: 'testnet',
  *   dataDir: './wallet-data',
- *   tokensDir: './tokens',
  *   transport: {
  *     additionalRelays: ['wss://my-relay.com'],
  *     debug: true,
@@ -210,10 +205,6 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     storage,
     groupChat,
     market,
-    tokenStorage: createFileTokenStorageProvider({
-      tokensDir: config?.tokensDir ?? './sphere-tokens',
-      network,
-    }),
     transport: createNostrTransportProvider({
       relays: transportConfig.relays,
       timeout: transportConfig.timeout,

@@ -1,8 +1,8 @@
 /**
  * Wallet-binding FSM + the single total gate decision.
  *
- * PURE: no I/O, no timers, no Sphere reference, no `await`. Same idiom as
- * modules/swap/state-machine.ts (transition table + assertTransition).
+ * PURE: no I/O, no timers, no Sphere reference, no `await` — a transition
+ * table + assertTransition.
  *
  * Nothing here is re-exported from connect/index.ts — it is host-internal.
  */
@@ -87,7 +87,7 @@ export function assertWalletTransition(from: WalletState, to: WalletState): void
  *                          never fires.
  *
  * WHAT IS BLOCKED — the honest count, because an enumeration of only the money reads reads as
- * if messaging still works. RPC_METHODS has SIXTEEN entries; four are above. The other TWELVE,
+ * if messaging still works. RPC_METHODS has FOURTEEN entries; four are above. The other TEN,
  * and EVERY intent, are refused:
  *
  *   sphere_getBalance, sphere_getAssets, sphere_getFiatBalance, sphere_getTokens,
@@ -98,8 +98,6 @@ export function assertWalletTransition(from: WalletState, to: WalletState): void
  *   sphere_getConversations, sphere_getMessages, sphere_getDMUnreadCount, sphere_markAsRead
  *                          — DMs are decrypted with keys that left memory. Messaging does NOT
  *                            keep working while locked; a dApp must stop polling and wait.
- *   sphere_getInvoices, sphere_getInvoiceStatus
- *                          — invoice state is money state.
  *
  * AND THE CASE WITH NO 4009 AT ALL. Everything above assumes a host that HOLDS a session. A
  * wallet that COLD-STARTS locked (a page reload, a fresh popup — the password is memory-only,

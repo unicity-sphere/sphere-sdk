@@ -14,14 +14,13 @@ import * as path from 'path';
 import type { ITokenEngine } from '../../../token-engine';
 import { Sphere } from '../../../core/Sphere';
 import { FileStorageProvider } from '../../../impl/nodejs/storage/FileStorageProvider';
-import { FileTokenStorageProvider } from '../../../impl/nodejs/storage/FileTokenStorageProvider';
 import type { TransportProvider, OracleProvider } from '../../../index';
 import type { ProviderStatus } from '../../../types';
 import { TEST_NETWORK } from '../../test-network';
+import { makePv2World } from '../../support/pv2-world';
 
 const TEST_DIR = path.join(__dirname, '.test-register-nametag');
 const DATA_DIR = path.join(TEST_DIR, 'data');
-const TOKENS_DIR = path.join(TEST_DIR, 'tokens');
 
 function createMockTransport(): TransportProvider {
   return {
@@ -36,12 +35,6 @@ function createMockTransport(): TransportProvider {
     getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
     sendMessage: vi.fn().mockResolvedValue('event-id'),
     onMessage: vi.fn().mockReturnValue(() => {}),
-    sendTokenTransfer: vi.fn().mockResolvedValue('transfer-id'),
-    onTokenTransfer: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequest: vi.fn().mockResolvedValue('request-id'),
-    onPaymentRequest: vi.fn().mockReturnValue(() => {}),
-    sendPaymentRequestResponse: vi.fn().mockResolvedValue('response-id'),
-    onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
     subscribeToBroadcast: vi.fn().mockReturnValue(() => {}),
     publishBroadcast: vi.fn().mockResolvedValue('broadcast-id'),
     onEvent: vi.fn().mockReturnValue(() => {}),
@@ -92,7 +85,6 @@ function cleanTestDir(): void {
 
 describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)', () => {
   let storage: FileStorageProvider;
-  let tokenStorage: FileTokenStorageProvider;
 
   beforeEach(() => {
     cleanTestDir();
@@ -100,7 +92,6 @@ describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)
       (Sphere as unknown as { instance: null }).instance = null;
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
-    tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
   });
 
   afterEach(() => {
@@ -116,7 +107,7 @@ describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)
       storage,
       transport,
       oracle,
-      tokenStorage,
+      walletApi: makePv2World().walletApi,
       network: TEST_NETWORK,
       autoGenerate: true,
     });
@@ -157,7 +148,7 @@ describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)
       storage,
       transport,
       oracle,
-      tokenStorage,
+      walletApi: makePv2World().walletApi,
       network: TEST_NETWORK,
       autoGenerate: true,
     });

@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — P11 flip (BREAKING): the payments-v2 vertical is the ONLY money path
+
+`sphere.payments` now IS the §4 facade (`assets()`, `tokens()`, `history()`, `send()`, `mint()`,
+`receive()`, `requests`); `sphere.paymentsV2` remains as a deprecated alias of the same facade for
+one release. `Sphere.init` is fail-closed on the wallet-api composition: pass
+`walletApi: { network, baseUrl, deviceId?, fetchFn?, webSocketFactory? }` (built by
+`createWalletApiProviders` from `impl/shared/wallet-api`) or init throws `INVALID_CONFIG`. The
+`paymentsV2` init flag is accepted as a no-op for one release.
+
+Removed wholesale: the legacy `PaymentsModule` stack (`modules/payments`), the accounting/invoicing
+module (`modules/accounting`), the swap module (`modules/swap`), the S1 `WalletApiClient` stack
+(`wallet-api/` and its `./wallet-api` subpath — the §4 challenge-template contract strings live on
+in `core/wallet-api-protocol`, still exported from the root), the own-storage token custody
+(`TokenStorageProvider` port, `IndexedDBTokenStorageProvider`, `FileTokenStorageProvider`,
+`WalletApiTokenStorageProvider`, `tokenStorage`/`tokensDir` composition options), the S7
+`DeliveryProvider` port, the Nostr asset/payment-request rail (event kinds 31113/31115/31116 and
+every `sendTokenTransfer`/`sendPaymentRequest*` transport member), `types/v2-transfer`, the TXF
+type/serializer pair (`types/txf`, `serialization/txf-serializer`), `validation/`
+(`TokenValidator`), the old-module events (`transfer:confirmed/failed/delivery_pending/invalid`,
+`payment_request:paid/rejected/expired/settling/response`, `sync:*`, `storage:degraded`,
+`split:checkpoint-stuck`, `send:partial-remainder`, `delivery:*`, `walletapi:session`,
+`realtime:status`, all `invoice:*`, all `swap:*` — dApps keep receiving the old wire names through
+the ConnectHost §4 compat adapter), `sphere.sync()`, `startWalletApiSession`/`resumeOpenIntents`
+(resume runs inside `facade.start()`), `walletApiSessionStatus`, and the dead storage-key
+constants whose writers died with the modules. `Sphere.clear` collapses to `{ storage }`, wipes
+the `pv2:{network}:{pubkey}:*` scoped KV with the KV store, and sweeps orphaned pre-flip
+`sphere-token-storage-*` IndexedDB databases.
+
+**The Connect invoice surface is removed from the protocol:** the 2 invoice queries
+(`sphere_getInvoices`, `sphere_getInvoiceStatus`), all 9 invoice intents and the
+`invoice:read`/`invoice:write` scopes — the wire surface is now 14 queries / 6 intents /
+13 scopes. The protocol version stays 2.1 by owner decision: the surface was experimental,
+never enabled in any wallet host (every call answered `MODULE_NOT_AVAILABLE`), and the
+consumer gate found zero dApp users; a removed method now answers the standard
+`METHOD_NOT_FOUND` path. Everything else on the wire is preserved by the §4 compat adapter —
+dApps change nothing.
+
+**The ONE sanctioned refusal fossil (revisit-and-delete after one release):** `accounting: true` /
+`swap: true` in init options throw a typed `INVALID_CONFIG` with a pointing message — both were
+public API, and silently ignoring them would hide that invoices/swaps no longer exist in the SDK.
+
+**Scale (per the flip manifest):** old modules deleted 23,905 lines (`modules/payments` 8,231 ×12
+files; `modules/accounting` 9,315 ×7; `modules/swap` 6,359 ×7) + `wallet-api/` 2,657 ×8 + the old
+`impl/shared/wallet-api` providers 1,756 ×5 + both platform token-storage providers 976 + ports,
+rails, types, serializers and constants; test estate: ≈113 old-stack test files (≈52,000 lines)
+deleted, ~12 rewritten onto the flip contract, the v2 suite (19 files / 8,485 lines + port
+contracts + 17 mutation probes) stands. Docs rewritten to the v2 reality: CLAUDE.md, README,
+QUICKSTART-BROWSER/NODEJS, INTEGRATION (invoice section deleted), CONNECT (compat adapter
+documented), API, MIGRATION-PAYMENTS-V2 (flip-release note), LEGACY-INVENTORY (CLOSED-BY-P11
+reconciliation), PAYMENTS-V2-DESIGN (P11 progress). Directory names deliberately stay
+`modules/payments-v2` / `impl/wallet-api-v2` (subpath exports were keeping those names anyway —
+the §5 `git mv` is deferred, zero consumer impact).
+
+### Fixed — CHANGELOG prose for the `wallet.dat` importer removal (#722)
+
+The entry below previously claimed `Sphere.importFromLegacyFile`, `Sphere.detectLegacyFileType`,
+`Sphere.isLegacyFileEncrypted` and the `LegacyFileType`/`DecryptionProgressCallback` types were
+removed. The code kept them (the live frontend onboarding calls all three for `.txt`/JSON/mnemonic
+backups); only the `.dat` (Bitcoin Core) arm was removed. The prose below is corrected — code is
+authoritative.
+
 ### Removed — the Bitcoin Core `wallet.dat` importer
 
 `serialization/wallet-dat.ts` is gone in full: the SQLite byte-scan, the `mkey`/CMasterKey
@@ -15,10 +76,11 @@ extraction, the iterated-SHA512 (PBKDF2-style) key derivation, and every export 
 `decryptCMasterKey`, `decryptPrivateKey`, `CMasterKeyData`, `WalletDatInfo`). The wallet has been
 L3-only since #604 — there is no Bitcoin Core wallet to import from.
 
-Gone with it, because they existed only to route files into that importer:
-`Sphere.importFromLegacyFile`, `Sphere.detectLegacyFileType`, `Sphere.isLegacyFileEncrypted`, and
-the `LegacyFileType` / `LegacyFileInfo` / `LegacyFileImportOptions` / `DecryptionProgressCallback`
-types (plus the `.dat`-only `encryptionInfo` field on `LegacyFileParseResult`).
+`Sphere.importFromLegacyFile`, `Sphere.detectLegacyFileType` and `Sphere.isLegacyFileEncrypted`
+were KEPT — their `.txt` / flat-JSON / bare-mnemonic arms are the live onboarding path — with the
+`.dat` arm deleted (a `wallet.dat` file now reports "Unknown file format"). The
+`LegacyFileType`/`DecryptionProgressCallback` types stay with them; only the `.dat`-specific
+`LegacyFileInfo`/`LegacyFileImportOptions` shapes and the `encryptionInfo` field went.
 
 **The text backup path is NOT removed.** `sphere.exportToTxt()` (and the browser
 `downloadWalletBackup` helper) still writes password-encrypted `UNICITY WALLET DETAILS` files, so

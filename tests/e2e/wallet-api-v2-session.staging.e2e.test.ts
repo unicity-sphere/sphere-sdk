@@ -12,7 +12,7 @@ import { signMessage } from '../../core/crypto';
 import { createWalletApiHttp, isWalletApiHttpError } from '../../impl/wallet-api-v2/http';
 import { WalletApiV2Client } from '../../impl/wallet-api-v2/client';
 import { JwtGenerationCell, WalletApiSession } from '../../impl/wallet-api-v2/session';
-import { randomIdentity } from '../harness/support/stack';
+import { randomIdentity } from './support/staging';
 import { BASE_URL, memoryKV, NETWORK, nodeWsFactory, RUN_STAGING as RUN } from './support/staging';
 
 interface Harness {

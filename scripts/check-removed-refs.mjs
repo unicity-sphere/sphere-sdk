@@ -18,7 +18,7 @@ import { execSync } from 'node:child_process';
 const base = process.argv[2] ?? 'origin/main';
 
 /** Files whose job is to talk about removed things. */
-const EXPECTED_TO_MENTION = /^(CHANGELOG\.md|docs\/PAYMENTS-ANALYSIS\.md|docs\/PAYMENTS-REFACTOR\.md|docs\/CODE-STANDARDS\.md|scripts\/check-removed-refs\.mjs)$/;
+const EXPECTED_TO_MENTION = /^(CHANGELOG\.md|docs\/PAYMENTS-ANALYSIS\.md|docs\/PAYMENTS-REFACTOR\.md|docs\/PAYMENTS-V2-DESIGN\.md|docs\/MIGRATION-PAYMENTS-V2\.md|docs\/LEGACY-INVENTORY\.md|docs\/CODE-STANDARDS\.md|scripts\/check-removed-refs\.mjs)$/;
 
 const sh = (cmd) => execSync(cmd, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 
