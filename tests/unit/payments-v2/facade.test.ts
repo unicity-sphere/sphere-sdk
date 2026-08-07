@@ -13,6 +13,7 @@ import { STORE_KEYS, type MintJournalEntry } from '../../../modules/payments-v2/
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
 import {
   ATTENTION_MINT_UNRESOLVED,
+  ATTENTION_RECIPIENT_NETWORK_UNVERIFIED,
   type DeterministicMintCapable,
 } from '../../../modules/payments-v2/PaymentsFacade';
 import { RealizationEngine } from './machine-harness';
@@ -25,6 +26,7 @@ import {
   flushTail,
   makeWorld,
   ownCaller,
+  peerBinding,
   peerCaller,
 } from './facade-harness';
 
@@ -95,14 +97,21 @@ describe('PaymentsFacade — send policy', () => {
     expect(assets[0]?.totalAmount).toBe('300');
   });
 
-  it('cross-network recipient is refused BEFORE any reserve (no putIntent, no engine op, pool untouched)', async () => {
-    const world = makeWorld();
+  // §5.6 network guard — through the PRODUCTION resolveRecipientInfo over a fake
+  // transport directory. The pre-#733 guard stamped the session network onto
+  // every recipient and compared it with itself, so an injected-fake test proved
+  // nothing about the shipped path.
+  it('a peer whose binding declares a DIFFERENT network is refused BEFORE any reserve (no putIntent, no engine op, pool untouched)', async () => {
+    const world = makeWorld({ peers: { '@mars': peerBinding({ network: 'mars' }) } });
     await world.seed(100n);
     await world.facade.start();
 
     await expect(
       world.facade.send({ recipient: '@mars', amount: '100', coinId: COIN })
-    ).rejects.toMatchObject({ code: 'INVALID_RECIPIENT' });
+    ).rejects.toMatchObject({
+      code: 'INVALID_RECIPIENT',
+      message: expect.stringContaining('is on network "mars" but this session is on "testnet2"') as unknown,
+    });
 
     expect(world.counters.putIntent).toBe(0);
     expect(world.engine.transferCalls).toHaveLength(0);
@@ -110,6 +119,54 @@ describe('PaymentsFacade — send policy', () => {
     // The full balance is still plannable — nothing stayed reserved.
     const ok = await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN });
     expect(ok.status).toBe('delivered');
+  });
+
+  it('a peer whose binding declares the SESSION network proceeds, unsignalled', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await world.facade.start();
+
+    const result = await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN });
+
+    expect(result.status).toBe('delivered');
+    expect(eventsOf(world, 'transfer:attention')).toEqual([]);
+  });
+
+  it('#734 transition: a binding declaring NO network — or a blank one — proceeds AND is signalled', async () => {
+    const world = makeWorld({
+      peers: { '@peer': peerBinding(), '@blank': peerBinding({ network: '' }) },
+    });
+    await world.seed(50n);
+    await world.seed(50n);
+    await world.facade.start();
+
+    const first = await world.facade.send({ recipient: '@peer', amount: '50', coinId: COIN });
+    const second = await world.facade.send({ recipient: '@blank', amount: '50', coinId: COIN });
+
+    expect([first.status, second.status]).toEqual(['delivered', 'delivered']);
+    expect(eventsOf(world, 'transfer:attention')).toEqual([
+      {
+        transferId: '',
+        code: ATTENTION_RECIPIENT_NETWORK_UNVERIFIED,
+        detail: expect.stringContaining('could not verify the network of recipient @peer') as unknown,
+      },
+      {
+        transferId: '',
+        code: ATTENTION_RECIPIENT_NETWORK_UNVERIFIED,
+        detail: expect.stringContaining('recipient @blank') as unknown,
+      },
+    ]);
+  });
+
+  it('a raw chain pubkey is the caller asserting THIS session — it proceeds unsignalled', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await world.facade.start();
+
+    const result = await world.facade.send({ recipient: PEER_PUB, amount: '100', coinId: COIN });
+
+    expect(result.status).toBe('delivered');
+    expect(eventsOf(world, 'transfer:attention')).toEqual([]);
   });
 
   it('a CLEAN failure emits transfer:updated{status:failed} BEFORE the rejection surfaces (§4 — transfer:updated replaces transfer:failed)', async () => {

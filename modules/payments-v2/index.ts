@@ -6,6 +6,7 @@ export {
   PaymentsFacade,
   MAX_RESELECT,
   ATTENTION_MINT_UNRESOLVED,
+  ATTENTION_RECIPIENT_NETWORK_UNVERIFIED,
   ATTENTION_RESEED_REJECTED,
   supportsDeterministicMint,
 } from './PaymentsFacade';

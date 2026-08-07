@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (BREAKING, money) — the cross-network recipient guard was unfalsifiable (#733)
+
+`resolveRecipientInfo` stamped the LOCAL session network onto every `RecipientInfo`, so
+`PaymentsFacade`'s §5.6 guard compared the session network with a copy of itself and could never
+fire; its only test injected a fake resolver. All networks share Nostr relays, so a
+foreign-network peer resolves fine, the deposit is keyed under the SENDER's network, the server
+answers 200, and the delivery-journal row — the sender's only copy of the obligation — is dropped
+while the recipient never sees the entry.
+
+`RecipientInfo.network` is now `string | null` (**breaking** for anyone constructing one) and
+carries only what the identifier proves: a bare chain pubkey stays session-stamped (typing one
+into this session is the caller asserting it), a resolved peer reports `PeerInfo.network ?? null`.
+`PeerInfo` gains an optional `network`, parsed from the identity binding wherever one declares it
+and invented nowhere. The guard refuses a PROVEN foreign network with `INVALID_RECIPIENT` before
+any reserve/intent/engine work.
+
+Transition posture (#734): no identity binding published so far declares a network — nostr-js-sdk's
+binding builders whitelist the content fields, so the claim cannot ride today's publish API at all
+— and refusing every unproven recipient would stop nametag/`DIRECT://` sends between current
+wallets. An unproven recipient therefore **proceeds** and emits
+`transfer:attention { code: 'recipient:network-unverified' }` (exported as
+`ATTENTION_RECIPIENT_NETWORK_UNVERIFIED`). #734 tracks putting the field on the publish side and
+tightening this to a hard refusal.
+
+Reading the claim is **per-route**, and the limitation is stated where it bites: sphere parses it
+off the raw signed event on the routes that own the parse (`resolveTransportPubkeyInfo`,
+`discoverAddresses`), where a proven foreign network is refused end to end. `@nametag` and
+`DIRECT://` resolve through nostr-js-sdk's `queryBindingBy*`, whose `parseBindingInfo` whitelists
+the network away and never returns the selected signed event, so those two recipients can only be
+SIGNALLED until #734 lands upstream — `bindingInfoToPeerInfo` carries no network at all rather
+than a read that cannot fire, and `tests/unit/payments-v2/recipient-network.transport.test.ts`
+drives relay → transport → resolver → gate per route to keep both halves honest.
+
 ### Added — `payments.connectionStatus()` (sphere#473 P1)
 
 The current wallet-api connection status is now readable at any time, not only observable at

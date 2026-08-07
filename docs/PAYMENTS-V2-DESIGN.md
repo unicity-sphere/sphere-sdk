@@ -373,11 +373,53 @@ content-derived `hex(SHA-256(tokenId ‖ stateHash))` via the engine's `delivery
 never a server row id or seq. Two more Delivery-owned rules: **cross-network misdirection is the
 sender's to prevent** — a deposit keys the recipient under the *sender's* network, the server
 does not remap, and it returns 200 for an entry the recipient will never query; so the
-recipient's network is pinned at resolve time and a recipient not verifiably on the session
-network is refused **before certification** (deposit 200 ≠ reachability — otherwise the journal
-entry is removed while the recipient never sees the entry). And **memo encryption is owned
-here**: the delivery memo is the recipient-ECDH `sphere-deliveryenc-v1` bundle
-(`core/delivery-envelope.ts`, shared with Requests); the server rejects non-`enc1.` envelopes.
+recipient's network is settled at resolve time, **before certification** (deposit 200 ≠
+reachability — otherwise the journal entry is removed while the recipient never sees the entry).
+And **memo encryption is owned here**: the delivery memo is the recipient-ECDH
+`sphere-deliveryenc-v1` bundle (`core/delivery-envelope.ts`, shared with Requests); the server
+rejects non-`enc1.` envelopes.
+
+**Proving the recipient's network (#733/#734).** `RecipientInfo.network` is `string | null` and
+carries only what the identifier **proves**: a bare chain pubkey is session-stamped (typing one
+into this session *is* the caller asserting a recipient on it), a resolved peer reports
+`PeerInfo.network ?? null` — never a local stamp. That distinction is the whole guard: until
+#733 the resolver stamped the session network onto *every* recipient, so
+`requireSameNetworkRecipient` compared the session network with a copy of itself and could not
+fire, and its only test injected a fake resolver, proving nothing about the shipped path.
+Guard posture, both outcomes ahead of any reserve/intent/engine work:
+
+| recipient network | outcome |
+|---|---|
+| proves a different network | refuse, `INVALID_RECIPIENT` naming both networks |
+| proves the session network | proceed |
+| proves nothing (`null`) | **proceed**, `transfer:attention { code: 'recipient:network-unverified' }` |
+
+The third row is a deliberate **transition** posture, not the target. No identity binding
+published so far declares a network — the nostr-js-sdk binding builders whitelist the content
+fields (`public_key`/`l1_address`/`direct_address`/`proxy_address`), so a `network` claim cannot
+ride today's publish API at all, and the transport layer (relays are shared across networks) does
+not know its own network either. Refusing every unproven recipient would therefore refuse every
+nametag/`DIRECT://` send between current wallets. Sphere parses the claim wherever a binding
+carries one and invents it nowhere; **#734** tracks putting it on the publish side and then
+tightening this row to a hard refusal. It also owes the comparison a **canonical network name**
+before any publisher ships: row 1 is an exact string compare, and this repo already aliases
+`testnet` → `testnet2`, so an alias or case mismatch between the word a binding declares and the
+session's would refuse a *same-network* send. Normalize both sides when the publish side lands —
+never by loosening the compare afterwards.
+
+**Reading it is per-route, and two routes cannot (#734).** `resolveTransportPubkeyInfo` and
+`discoverAddresses` parse the raw signed binding event, so a declaration there IS read and row 1
+fires end to end. `@nametag` and `DIRECT://` resolve through nostr-js-sdk's
+`queryBindingByNametag`/`queryBindingByAddress`, which hardcode `parseBindingInfo` inside a
+**private** resolver: sphere never sees the signed event that UNIP-01 resolution selected, and the
+parse has already dropped every content field outside its whitelist. Re-querying raw would mean
+re-deriving ownership ourselves (marker preference, cross-author first-seen-wins, ambiguity→null,
+multi-relay settle — all private), and a second resolver that can disagree with the SDK's is worse
+than a missing field on a money guard. So for those two routes §5.6 can only ever land on row 3
+today; `bindingInfoToPeerInfo` therefore carries **no** network at all rather than a value that
+merely looks read. The limitation is pinned by
+`tests/unit/payments-v2/recipient-network.transport.test.ts` (relay → transport → resolver →
+gate, per route), which goes red the day upstream carries the field.
 
 ### 5.7 `Receive`
 

@@ -24,7 +24,7 @@ import { SphereError } from '../../core/errors';
 import { getPublicKey, hexToBytes } from '../../core/crypto';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { TRUSTBASE_TESTNET2 } from '../../assets/trustbase';
-import type { TransportProvider } from '../../transport';
+import type { PeerInfo, TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { ProviderStatus } from '../../types';
 import type { ITokenEngine } from '../../token-engine';
@@ -46,7 +46,7 @@ const COIN = 'aa'.repeat(32);
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-function createMockTransport(): TransportProvider {
+function createMockTransport(peers: Record<string, PeerInfo> = {}): TransportProvider {
   return {
     id: 'mock-transport',
     name: 'Mock Transport',
@@ -62,7 +62,7 @@ function createMockTransport(): TransportProvider {
     subscribeToBroadcast: vi.fn().mockReturnValue(() => {}),
     publishBroadcast: vi.fn().mockResolvedValue('broadcast-id'),
     onEvent: vi.fn().mockReturnValue(() => {}),
-    resolve: vi.fn().mockResolvedValue(null),
+    resolve: vi.fn(async (identifier: string) => peers[identifier] ?? null),
     resolveNametag: vi.fn().mockResolvedValue(null),
     publishIdentityBinding: vi.fn().mockResolvedValue(true),
     recoverNametag: vi.fn().mockResolvedValue(null),
@@ -170,6 +170,19 @@ async function seedInventory(world: World, record: TransportRecord, amount: bigi
   return token;
 }
 
+const PEER_PUB = getPublicKey('22'.repeat(32));
+
+/** A resolved Nostr identity binding; `network` omitted = the binding declares none. */
+function peerBinding(overrides: Partial<PeerInfo> = {}): PeerInfo {
+  return {
+    transportPubkey: PEER_PUB.slice(2),
+    chainPubkey: PEER_PUB,
+    directAddress: 'DIRECT://peer',
+    timestamp: 0,
+    ...overrides,
+  };
+}
+
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) {
@@ -180,6 +193,7 @@ afterEach(async () => {
 interface BuildOptions {
   paymentsV2?: boolean;
   walletApi: WalletApiTransportConfig;
+  peers?: Record<string, PeerInfo>;
 }
 
 async function buildSphere(options: BuildOptions): Promise<Sphere> {
@@ -187,7 +201,7 @@ async function buildSphere(options: BuildOptions): Promise<Sphere> {
   const storage = new FileStorageProvider({ dataDir });
   const { sphere } = await Sphere.init({
     storage,
-    transport: createMockTransport(),
+    transport: createMockTransport(options.peers),
     oracle: createEngineOracle(),
     mnemonic: MNEMONIC,
     // #728 single-network invariant: the Sphere network must equal walletApi.network.
@@ -303,6 +317,43 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     });
     const assets = await sphere.payments.assets(COIN);
     expect(assets[0]?.totalAmount).toBe('40');
+  }, 20_000);
+
+  // #733: proves composePaymentsV2 wires the resolver that reports the PEER's
+  // network — a session stamp anywhere on this path makes the §5.6 guard dead.
+  it('#733 cross-network guard on the composed path: a peer declaring another network is refused, one declaring none is signalled', async () => {
+    const world = makeWorld();
+    const sphere = await buildSphere({
+      walletApi: world.walletApi,
+      peers: { '@mars': peerBinding({ network: 'mars' }), '@ghost': peerBinding() },
+    });
+    await seedInventory(world, world.transports[0]!, 40n);
+    world.transports[0]!.session.fire('inventory');
+    await vi.waitFor(() => {
+      expect(sphere.payments.tokens()).toHaveLength(1);
+    });
+    const attention: unknown[] = [];
+    sphere.on('transfer:attention', (payload) => attention.push(payload));
+
+    await expect(
+      sphere.payments.send({ recipient: '@mars', amount: '10', coinId: COIN })
+    ).rejects.toMatchObject({ code: 'INVALID_RECIPIENT' });
+    expect(attention).toEqual([]);
+
+    // A binding declaring nothing is every wallet in the fleet today: signalled, not
+    // refused — the send gets PAST the guard (and then dies materializing this world's
+    // fake-minted blob against the REAL engine, which is not the guard's business).
+    const outcome = await sphere.payments
+      .send({ recipient: '@ghost', amount: '10', coinId: COIN })
+      .catch((err: unknown) => err);
+    expect((outcome as SphereError).code).not.toBe('INVALID_RECIPIENT');
+    expect(attention).toEqual([
+      {
+        transferId: '',
+        code: 'recipient:network-unverified',
+        detail: expect.stringContaining('@ghost') as unknown,
+      },
+    ]);
   }, 20_000);
 
   it('`paymentsV2: true` and `paymentsV2: false` are both tolerated no-ops (one release)', async () => {

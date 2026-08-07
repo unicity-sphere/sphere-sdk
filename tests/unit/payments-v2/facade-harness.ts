@@ -5,15 +5,13 @@
  */
 
 import { getPublicKey, hexToBytes } from '../../../core/crypto';
+import { resolveRecipientInfo } from '../../../core/payments-v2-wiring';
+import type { PeerInfo } from '../../../transport';
 import type { SphereToken } from '../../../token-engine';
 import { WalletApiStoragePort } from '../../../impl/wallet-api-v2/storage';
 import { WalletApiDeliveryPort } from '../../../impl/wallet-api-v2/mailbox';
 import type { DeliveryPort, StoragePort } from '../../../modules/payments-v2/ports';
-import {
-  PaymentsFacade,
-  type FacadeClient,
-  type RecipientInfo,
-} from '../../../modules/payments-v2/PaymentsFacade';
+import { PaymentsFacade, type FacadeClient } from '../../../modules/payments-v2/PaymentsFacade';
 import { RealizationEngine, fakeDecodeBlobFor } from './machine-harness';
 import {
   FakeSession,
@@ -143,7 +141,8 @@ export interface World {
   counters: Counters;
   events: { event: string; payload: unknown }[];
   gates: Gate[];
-  resolveMap: Map<string, RecipientInfo | null>;
+  /** The fake transport directory the production resolver reads (identifier → binding). */
+  peers: Map<string, PeerInfo | null>;
   seed(amount: bigint): Promise<SphereToken>;
   peerDeliver(token: SphereToken, transferId: string): Promise<void>;
   gate(name: 'putIntent' | 'deliver' | 'listOpen' | 'applyDelta'): Gate;
@@ -159,7 +158,29 @@ export async function cleanupWorlds(): Promise<void> {
   }
 }
 
-export function makeWorld(options: { engine?: RealizationEngine } = {}): World {
+/** A Nostr identity binding as PeerInfo; `network` omitted = the binding declares none. */
+export function peerBinding(overrides: Partial<PeerInfo> = {}): PeerInfo {
+  return {
+    transportPubkey: PEER_PUB.slice(2),
+    chainPubkey: PEER_PUB,
+    directAddress: 'DIRECT://peer',
+    timestamp: 0,
+    ...overrides,
+  };
+}
+
+export function makeWorld(
+  options: {
+    engine?: RealizationEngine;
+    peers?: Record<string, PeerInfo | null>;
+    /**
+     * Replaces the in-memory `peers` directory with a real peer lookup — used by
+     * the transport-driven §5.6 tests, which run identifiers through a real
+     * NostrTransportProvider over a fake relay instead of an injected PeerInfo.
+     */
+    resolvePeer?: (identifier: string) => Promise<PeerInfo | null>;
+  } = {}
+): World {
   const engine = options.engine ?? new RealizationEngine({ chainPubkey: hexToBytes(OWN_PUB) });
   const engines = [engine];
   const decodeBlob = (bytes: Uint8Array): FakeBlobMeta => {
@@ -191,10 +212,10 @@ export function makeWorld(options: { engine?: RealizationEngine } = {}): World {
   const events: { event: string; payload: unknown }[] = [];
   session.emitStatus = (status) => events.push({ event: 'connection:status', payload: { status } });
   const gates: Gate[] = [];
-  const resolveMap = new Map<string, RecipientInfo | null>([
-    ['@peer', { chainPubkey: PEER_PUB, network: NET }],
-    ['@mars', { chainPubkey: PEER_PUB, network: 'mars' }],
-  ]);
+  // Fake only the TRANSPORT lookup; recipient resolution is the PRODUCTION
+  // resolveRecipientInfo, so the §5.6 guard can never be proven by a fake (#733).
+  const peers = new Map<string, PeerInfo | null>([['@peer', peerBinding({ network: NET })]]);
+  Object.entries(options.peers ?? {}).forEach(([id, peer]) => peers.set(id, peer));
 
   let ids = 0;
   const facade = new PaymentsFacade({
@@ -217,11 +238,12 @@ export function makeWorld(options: { engine?: RealizationEngine } = {}): World {
     emit: (event, payload) => {
       events.push({ event, payload });
     },
-    resolveRecipient: async (identifier) => {
-      if (resolveMap.has(identifier)) return resolveMap.get(identifier)!;
-      if (/^0[23][0-9a-f]{64}$/.test(identifier)) return { chainPubkey: identifier, network: NET };
-      return null;
-    },
+    resolveRecipient: (identifier) =>
+      resolveRecipientInfo(
+        identifier,
+        NET,
+        options.resolvePeer ?? (async (id) => peers.get(id) ?? null)
+      ),
     signComplete: async (transferId) => fakeSeedSignature(OWN_PUB, completeMessageFor(transferId)),
     fieldKey: new Uint8Array(32).fill(7),
     network: NET,
@@ -244,7 +266,7 @@ export function makeWorld(options: { engine?: RealizationEngine } = {}): World {
     counters,
     events,
     gates,
-    resolveMap,
+    peers,
     seed: async (amount: bigint) => {
       const token = await engine.mint({
         recipientPubkey: hexToBytes(OWN_PUB),

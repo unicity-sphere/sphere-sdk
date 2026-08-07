@@ -174,5 +174,29 @@
     "find": "    await ctx.machine.resumeIntent({\n      transferId: job.transferId,",
     "replace": "    await ctx.machine.resumeIntent({\n      transferId: `${job.transferId}:reissued`,",
     "tests": ["tests/unit/payments-v2/heartbeat.test.ts"]
+  },
+  {
+    "name": "wiring-stamps-session-network-on-peer",
+    "note": "#733: the peer branch reports only what the binding PROVES — stamping the session network makes the §5.6 guard compare it with itself, i.e. unfalsifiable (facade.test.ts network-guard asserts)",
+    "file": "core/payments-v2-wiring.ts",
+    "find": "    network: peer.network || null,",
+    "replace": "    network,",
+    "tests": ["tests/unit/payments-v2/facade.test.ts"]
+  },
+  {
+    "name": "transport-drops-network-from-raw-event",
+    "note": "#735 review: the transport-pubkey route is the ONE recipient route that can prove a network today — it must read the raw signed event, not lose it (recipient-network.transport.test.ts refuses a relay-declared foreign network end to end)",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "      const network = declaredNetwork(bindingEvent);",
+    "replace": "      const network = undefined as string | undefined;",
+    "tests": ["tests/unit/payments-v2/recipient-network.transport.test.ts"]
+  },
+  {
+    "name": "transport-invents-network-on-parsed-binding",
+    "note": "#735 review: the SDK-parsed @nametag/DIRECT:// routes cannot prove a network (parseBindingInfo whitelists it away) and must NOT invent one — a stamp silences the recipient:network-unverified signal, which is the #733 bug wearing a new hat (recipient-network.transport.test.ts LIMITATION asserts)",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "    return {\n      nametag: nametag || binding.nametag,",
+    "replace": "    return {\n      network: 'testnet2',\n      nametag: nametag || binding.nametag,",
+    "tests": ["tests/unit/payments-v2/recipient-network.transport.test.ts"]
   }
 ]
