@@ -89,6 +89,8 @@ export interface PendingTransfer {
   createdAt: number;
 }
 
+export type ConnectionStatus = 'connected' | 'degraded' | 'offline';
+
 export interface PaymentsV2 {
   assets(coinId?: string): Promise<Asset[]>;
   tokens(filter?: { coinId?: string }): Token[];
@@ -103,6 +105,10 @@ export interface PaymentsV2 {
   pendingTransfers(): Promise<PendingTransfer[]>;
   resumeNow(): Promise<void>;
 
+  // Readable at ANY time (a late-mounting indicator seeds it, sphere#473);
+  // `connection:status` is only the change notification. 'offline' unstarted.
+  connectionStatus(): ConnectionStatus;
+
   readonly requests: PaymentsRequestsApi;
 }
 
@@ -116,5 +122,5 @@ export interface PaymentsV2Events {
   'history:updated': HistoryEntry;
   'payment_request:incoming': PaymentRequestView;
   'payment_request:updated': { id: string; status: PaymentRequestStatus };
-  'connection:status': { status: 'connected' | 'degraded' | 'offline' };
+  'connection:status': { status: ConnectionStatus };
 }

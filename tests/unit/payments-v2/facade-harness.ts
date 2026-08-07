@@ -189,6 +189,7 @@ export function makeWorld(options: { engine?: RealizationEngine } = {}): World {
   const hooks: Hooks = {};
   const counters: Counters = { putIntent: 0, listOpen: 0 };
   const events: { event: string; payload: unknown }[] = [];
+  session.emitStatus = (status) => events.push({ event: 'connection:status', payload: { status } });
   const gates: Gate[] = [];
   const resolveMap = new Map<string, RecipientInfo | null>([
     ['@peer', { chainPubkey: PEER_PUB, network: NET }],

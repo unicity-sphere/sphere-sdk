@@ -1,4 +1,4 @@
-export type { PaymentsV2, PaymentsV2Events, SendRequest, MintResult, HistoryEntry, HistoryPage, PaymentRequestView, PaymentRequestStatus, PaymentsRequestsApi, PendingTransfer } from './api';
+export type { PaymentsV2, PaymentsV2Events, ConnectionStatus, SendRequest, MintResult, HistoryEntry, HistoryPage, PaymentRequestView, PaymentRequestStatus, PaymentsRequestsApi, PendingTransfer } from './api';
 export type { StoragePort, DeliveryPort, InventoryItem, InventoryPage, InventoryAsset, ApplyDeltaResult, DeliveryReceipt, IncomingDelivery, DeliverOptions } from './ports';
 export type { IntentPayload, PlannedOp, OpOutcome, OutcomeClass } from './machine/types';
 export * from './stores';
