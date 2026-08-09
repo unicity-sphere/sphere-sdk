@@ -60,7 +60,9 @@ function makePort(script: PageSource[]): {
 
 const registry: RegistryReader = {
   getSymbol: (coinId) => (coinId === COIN ? 'UCT' : '???'),
-  getName: (coinId) => (coinId === COIN ? 'unicity' : 'unknown'),
+  // Mirrors the real TokenRegistry: getName() is the DISPLAY name (capitalized).
+  // A lowercase stub here would mask the price-key bug this shape guards.
+  getName: (coinId) => (coinId === COIN ? 'Unicity' : 'Unknown'),
   getDecimals: () => 6,
   getIconUrl: (coinId) => (coinId === COIN ? 'https://icons/uct.png' : null),
 };
@@ -371,17 +373,26 @@ describe('InventoryView in-flight registry', () => {
     const [token] = view.tokens(registry);
     expect(token).toMatchObject({
       symbol: 'UCT',
-      name: 'unicity',
+      name: 'Unicity',
       decimals: 6,
       iconUrl: 'https://icons/uct.png',
       status: 'confirmed',
       amount: '100',
     });
+    // Prices are keyed by the price-platform id — the registry's RAW lowercase
+    // name — NOT the capitalized display name. CoinGecko answers under the
+    // canonical lowercase id, so a capitalized key would miss and zero the asset.
+    const asked: string[][] = [];
     const [asset] = await view.assets(registry, {
-      getPrices: async () => new Map([['unicity', { priceUsd: 2, priceEur: 1.5, change24h: -3 }]]),
+      getPrices: async (ids) => {
+        asked.push(ids);
+        return new Map([['unicity', { priceUsd: 2, priceEur: 1.5, change24h: -3 }]]);
+      },
     });
+    expect(asked).toEqual([['unicity']]);
     expect(asset).toMatchObject({
       symbol: 'UCT',
+      name: 'Unicity',
       priceUsd: 2,
       priceEur: 1.5,
       change24h: -3,

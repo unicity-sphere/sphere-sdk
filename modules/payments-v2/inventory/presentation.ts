@@ -114,15 +114,30 @@ function toAsset(coinId: string, totals: CoinTotals, registry: RegistryReader): 
   };
 }
 
+/**
+ * The price-platform id for a coin.
+ *
+ * `RegistryReader.getName()` returns the DISPLAY name — the registry's raw name
+ * with its first letter capitalized ("Bitcoin", "Unicity"). Price platform ids
+ * (CoinGecko) are the raw lowercase names, and CoinGecko answers under the
+ * canonical lowercase id even when asked with a capitalized one — so a
+ * capitalized key MISSES on the way back and every asset silently prices at 0.
+ * Lowercasing recovers the raw registry name exactly (a coinId fallback is hex,
+ * already lowercase). Display keeps using getName(); only the price key differs.
+ */
+function priceIdOf(registry: RegistryReader, coinId: string): string {
+  return registry.getName(coinId).toLowerCase();
+}
+
 export async function withPrices(
   raw: Asset[],
   registry: RegistryReader,
   price: PriceReader
 ): Promise<Asset[]> {
   try {
-    const names = [...new Set(raw.map((a) => registry.getName(a.coinId)))];
-    const quotes = await price.getPrices(names);
-    return raw.map((a) => priceOne(a, quotes.get(registry.getName(a.coinId))));
+    const ids = [...new Set(raw.map((a) => priceIdOf(registry, a.coinId)))];
+    const quotes = await price.getPrices(ids);
+    return raw.map((a) => priceOne(a, quotes.get(priceIdOf(registry, a.coinId))));
   } catch {
     return raw;
   }
