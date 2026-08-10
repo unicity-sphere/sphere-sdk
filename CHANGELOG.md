@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — base SDK pinned to `@unicitylabs/state-transition-sdk@2.0.3`
+
+2.0.3 carries the upstream fix for the lost-abort hang reported as
+state-transition-sdk-js#140: `waitInclusionProof` now checks `aborted` before
+subscribing, races each poll against the signal, and cancels the in-flight
+request, so the wait always settles at its deadline.
+
+With the root cause fixed upstream, the local workaround shipped in 0.14.4 is
+**removed**: `token-engine/proof-wait.ts` no longer wraps the signal in a
+late-delivering proxy, nor races the wait itself. What stays is the part that is
+genuinely ours — a bounded, configurable deadline (`proofTimeoutMs`, validated
+positive). `tests/unit/token-engine/proof-deadline.test.ts` keeps all three
+termination cases and now guards the upstream behaviour instead of our shim; it
+will fail loudly at the next bump if that behaviour regresses.
+
+### Fixed — a transient gateway answer no longer fails a certification (#741)
+
+The poll loop tolerates only HTTP 404 ("not finalized yet"). Any other answer —
+429 from rate limiting, 502/503 from a restarting or loaded gateway — aborted the
+whole wait on its **first** occurrence, turning a certification that would have
+landed seconds later into an open intent with its sources pinned. Transient
+statuses (408, 425, 429, 500, 502, 503, 504) are now retried **within the deadline
+we already own**, so the wait stays bounded either way and only the classification
+of a blip changes. A non-transient error still fails fast, and a gateway that is
+transient forever still ends at the deadline.
+
+Measured while resolving #741: across a full live money matrix, individual
+inclusion-proof waits ran **978–1789 ms (median 1581 ms)**. The 10 s default is
+per wait — a split's burn and each mint leg get their own — so the slowest
+observed wait used 18% of its budget. The default is unchanged.
+
 ### Fixed (money-visibility) — pinned tokens were advertised as spendable, and the refusal lied (#737)
 
 A wallet whose gateway stopped confirming certifications reported ~1M UCT **confirmed** while every

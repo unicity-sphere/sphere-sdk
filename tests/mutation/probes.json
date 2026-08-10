@@ -332,21 +332,11 @@
     ]
   },
   {
-    "name": "proof-wait-drops-owned-deadline",
-    "note": "#739: delegating the deadline to the SDK default loses it when it fires mid-fetch \u2014 the op then never settles and stop() wedges behind it.",
+    "name": "proof-deadline-not-enforced",
+    "note": "#739: the deadline must be ours; falling back to the SDK default leaves every wait unbounded by our config.",
     "file": "token-engine/proof-wait.ts",
-    "find": "    return await Promise.race([wait, rejectOnAbort(controller.signal)]);",
-    "replace": "    return await wait;",
-    "tests": [
-      "tests/unit/token-engine/proof-deadline.test.ts"
-    ]
-  },
-  {
-    "name": "proof-wait-leaks-poller",
-    "note": "#739: without late abort delivery the SDK loop never exits, leaving a permanent poller hammering the gateway every interval.",
-    "file": "token-engine/proof-wait.ts",
-    "find": "    lateDeliveringSignal(controller.signal),",
-    "replace": "    controller.signal,",
+    "find": "          controller.signal,\n          deps.intervalMs",
+    "replace": "          undefined,\n          deps.intervalMs",
     "tests": [
       "tests/unit/token-engine/proof-deadline.test.ts"
     ]
@@ -367,6 +357,26 @@
     "file": "token-engine/proof-wait.ts",
     "find": "  if (!Number.isFinite(configured) || configured <= 0) {",
     "replace": "  if (false) {",
+    "tests": [
+      "tests/unit/token-engine/proof-deadline.test.ts"
+    ]
+  },
+  {
+    "name": "proof-wait-ignores-transient",
+    "note": "#741: a 429/5xx blip must be retried within the deadline, not reported as a failed certification.",
+    "file": "token-engine/proof-wait.ts",
+    "find": "        if (!isTransientGatewayError(err)) throw err;",
+    "replace": "        throw err;",
+    "tests": [
+      "tests/unit/token-engine/proof-deadline.test.ts"
+    ]
+  },
+  {
+    "name": "proof-wait-retries-everything",
+    "note": "#741: tolerance must be scoped to transient statuses \u2014 retrying a genuine 4xx hides a real error until the deadline.",
+    "file": "token-engine/proof-wait.ts",
+    "find": "  return err instanceof JsonRpcNetworkError && TRANSIENT_HTTP_STATUSES.has(err.status);",
+    "replace": "  return err instanceof JsonRpcNetworkError;",
     "tests": [
       "tests/unit/token-engine/proof-deadline.test.ts"
     ]
