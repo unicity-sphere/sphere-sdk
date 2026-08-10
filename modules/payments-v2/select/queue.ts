@@ -44,6 +44,8 @@ interface FreeView {
   /** Held by a reservation — an open intent's sources stay pinned until it converges. */
   readonly pinnedTotal: bigint;
   readonly pinnedBy: number;
+  /** #738: non-null = the held-set is unproven, so NOTHING in this view is free. */
+  readonly unproven: string | null;
 }
 
 /**
@@ -52,6 +54,7 @@ interface FreeView {
  * intent still converging. When something is pinned, the message says so.
  */
 function insufficientBalance(view: FreeView, amount: bigint): SphereError {
+  if (view.unproven !== null) return new SphereError(view.unproven, 'SEND_INSUFFICIENT_BALANCE');
   const message =
     view.pinnedTotal > 0n
       ? `Insufficient spendable balance: need ${amount.toString()}, ${view.freeTotal.toString()} free, ` +
@@ -72,9 +75,6 @@ export class SpendQueue {
     if (this.destroyed) {
       throw new SphereError('Module has been destroyed', 'MODULE_DESTROYED');
     }
-    // #738: the ledger says whether its held-set is proven. Unproven = refuse.
-    const unproven = this.deps.ledger.unprovenReason();
-    if (unproven !== null) throw new SphereError(unproven, 'SEND_INSUFFICIENT_BALANCE');
     const amount = parseAmount(request.amount);
     const view = this.freeView(request.coinId);
     const { freeView, freeTotal } = view;
@@ -191,9 +191,14 @@ export class SpendQueue {
     let freeTotal = 0n;
     let pinnedTotal = 0n;
     const holders = new Set<string>();
+    // #738: the same rule the reporter applies — while the held-set is unproven
+    // nothing is free. Placed here because freeView() is what plan() AND the
+    // queued path (tryServe) both go through; gating only plan() left a queued
+    // entry servable through a closed gate.
+    const unproven = this.deps.ledger.unprovenReason();
     for (const entry of this.deps.getPool(coinId)) {
       if (entry.amount <= 0n) continue;
-      const holder = this.deps.ledger.holderOf(entry.tokenId);
+      const holder = unproven === null ? this.deps.ledger.holderOf(entry.tokenId) : entry.tokenId;
       if (holder === undefined) {
         freeView.push(entry);
         freeTotal += entry.amount;
@@ -202,7 +207,7 @@ export class SpendQueue {
         holders.add(holder);
       }
     }
-    return { freeView, freeTotal, pinnedTotal, pinnedBy: holders.size };
+    return { freeView, freeTotal, pinnedTotal, pinnedBy: holders.size, unproven };
   }
 
   private expectedChangeTotal(coinId: string): bigint {

@@ -312,12 +312,13 @@
   },
   {
     "name": "queue-plan-ignores-unproven-heldset",
-    "note": "#738: planning must refuse while the held-set is unproven.",
+    "note": "#738: the gate lives in freeView() because plan() AND the queued path (tryServe) both go through it; gating only plan() lets a queued entry be served through a closed gate.",
     "file": "modules/payments-v2/select/queue.ts",
-    "find": "    const unproven = this.deps.ledger.unprovenReason();\n    if (unproven !== null) throw new SphereError(unproven, 'SEND_INSUFFICIENT_BALANCE');",
-    "replace": "    const unproven: string | null = null;\n    if (unproven !== null) throw new SphereError(unproven, 'SEND_INSUFFICIENT_BALANCE');",
+    "find": "      const holder = unproven === null ? this.deps.ledger.holderOf(entry.tokenId) : entry.tokenId;",
+    "replace": "      const holder = this.deps.ledger.holderOf(entry.tokenId);",
     "tests": [
-      "tests/unit/payments-v2/pinned-balance.test.ts"
+      "tests/unit/payments-v2/pinned-balance.test.ts",
+      "tests/unit/payments-v2/select.test.ts"
     ]
   },
   {
