@@ -20,6 +20,9 @@ export { CertificationResponse, CertificationStatus } from '@unicitylabs/state-t
 export { StateId } from '@unicitylabs/state-transition-sdk/lib/api/StateId.js';
 export { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProof.js';
 export { InclusionProofResponse } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProofResponse.js';
+// #739: the 'not yet certified' answer the proof loop tolerates; tests model the
+// pre-finalization window with it, which is how the deadline path is reachable.
+export { JsonRpcNetworkError } from '@unicitylabs/state-transition-sdk/lib/api/json-rpc/JsonRpcNetworkError.js';
 export { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/api/bft/RootTrustBase.js';
 export { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils.js';
 export { InclusionProofVerificationStatus } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/rule/InclusionProofVerificationRule.js';
