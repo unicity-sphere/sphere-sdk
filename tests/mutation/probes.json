@@ -254,7 +254,7 @@
     "name": "inventory-pinned-counts-as-confirmed",
     "note": "#737: a token pinned by an open intent is reported transferring, never confirmed/spendable \u2014 the reporter reads the reservation, not just this session's in-flight set",
     "file": "modules/payments-v2/compose.ts",
-    "find": "    isPinned: (tokenId) => ledger.holderOf(tokenId) !== undefined,",
+    "find": "    isPinned: (tokenId) => ledger.unprovenReason() !== null || ledger.holderOf(tokenId) !== undefined,",
     "replace": "    isPinned: () => false,",
     "tests": [
       "tests/unit/payments-v2/pinned-balance.test.ts"
