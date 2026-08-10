@@ -169,6 +169,8 @@ export function peerBinding(overrides: Partial<PeerInfo> = {}): PeerInfo {
   };
 }
 
+let restarts = 0;
+
 export function makeWorld(
   options: {
     engine?: RealizationEngine;
@@ -179,10 +181,18 @@ export function makeWorld(
      * NostrTransportProvider over a fake relay instead of an injected PeerInfo.
      */
     resolvePeer?: (identifier: string) => Promise<PeerInfo | null>;
+    /**
+     * A process RESTART over the same server + durable stores: a brand-new facade
+     * (empty in-memory state) on the given world's FakeWalletApi, kv and engine.
+     * Its transferIds carry their own prefix so they can never collide with the
+     * ids the previous facade already wrote.
+     */
+    restartOf?: World;
   } = {}
 ): World {
-  const engine = options.engine ?? new RealizationEngine({ chainPubkey: hexToBytes(OWN_PUB) });
-  const engines = [engine];
+  const prior = options.restartOf;
+  const engine = options.engine ?? prior?.engine ?? new RealizationEngine({ chainPubkey: hexToBytes(OWN_PUB) });
+  const engines = prior?.engines ?? [engine];
   const decodeBlob = (bytes: Uint8Array): FakeBlobMeta => {
     let last: unknown;
     for (const candidate of engines) {
@@ -203,9 +213,9 @@ export function makeWorld(
     const withLineage = metas.find((meta) => meta.consumedStates.length > 0 || meta.splitEvidence !== undefined);
     return withLineage ?? metas[0] ?? decodeBlob(bytes);
   };
-  const api = new FakeWalletApi({ decodeBlob: combined });
+  const api = prior?.api ?? new FakeWalletApi({ decodeBlob: combined });
   const innerClient = new FakeWalletApiV2Client(api, ownCaller, { decodeBlob: combined });
-  const kv = memoryKV();
+  const kv = prior?.kv ?? memoryKV();
   const session = new FakeSession();
   const hooks: Hooks = {};
   const counters: Counters = { putIntent: 0, listOpen: 0 };
@@ -214,9 +224,10 @@ export function makeWorld(
   const gates: Gate[] = [];
   // Fake only the TRANSPORT lookup; recipient resolution is the PRODUCTION
   // resolveRecipientInfo, so the §5.6 guard can never be proven by a fake (#733).
-  const peers = new Map<string, PeerInfo | null>([['@peer', peerBinding({ network: NET })]]);
+  const peers = prior?.peers ?? new Map<string, PeerInfo | null>([['@peer', peerBinding({ network: NET })]]);
   Object.entries(options.peers ?? {}).forEach(([id, peer]) => peers.set(id, peer));
 
+  const idPrefix = prior === undefined ? '' : `r${String(++restarts)}-`;
   let ids = 0;
   const facade = new PaymentsFacade({
     session,
@@ -250,7 +261,7 @@ export function makeWorld(
     ownPubkey: OWN_PUB,
     requestMemo: stubRequestMemoCodec,
     syncEpoch: () => session.currentEpoch(),
-    newId: () => `tid-${String(++ids)}`,
+    newId: () => `tid-${idPrefix}${String(++ids)}`,
     receivePollMs: 60 * 60 * 1000,
   });
 

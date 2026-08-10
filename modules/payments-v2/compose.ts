@@ -13,8 +13,10 @@ import { History, type HistoryClient } from './history/History';
 import { InventoryView, type PriceReader, type RegistryReader } from './inventory/InventoryView';
 import { Receive, type ReceivedRecord, type StoredIncoming } from './receive/Receive';
 import { Requests, type RequestMemoCodec, type RequestsWireClient } from './requests/Requests';
+import { deriveOpenIntentHolds } from './convergence';
 import type { RestoreDeps } from './restore';
 import { ReservationLedger } from './select/ledger';
+import { IntentPins } from './select/pins';
 import { SpendQueue } from './select/queue';
 import { createMachineStores, type MachineStores } from './machine/journal';
 import { TransferMachine, type MachineDeps } from './machine/TransferMachine';
@@ -130,12 +132,15 @@ export type HeldStateCache = Map<string, string>;
 export interface FacadeHooks {
   engine(): ITokenEngine;
   send(request: SendRequest): Promise<TransferResult>;
+  /** §7 ownership — an attempt running in-process owns its own reservation (#737). */
+  isActiveOp(transferId: string): boolean;
 }
 
 export interface FacadeParts {
   ownPubkeyBytes: Uint8Array;
   view: InventoryView;
   ledger: ReservationLedger;
+  pins: IntentPins;
   queue: SpendQueue;
   historyStore: History;
   machineStores: MachineStores;
@@ -149,13 +154,17 @@ export interface FacadeParts {
 
 export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks): FacadeParts {
   const ownPubkeyBytes = hexToBytes(deps.ownPubkey);
+  const ledger = new ReservationLedger();
   const view = new InventoryView({
     port: deps.storagePort,
     kv: deps.kv,
     emit: (event) => deps.emit(event, {}),
+    // #737: a reserved token is unselectable, so it is never confirmed balance.
+    // #738: while the held-set is unproven, EVERY token reads pinned — the report
+    // must not call a token spendable that the queue is about to refuse to spend.
+    isPinned: (tokenId) => ledger.unprovenReason() !== null || ledger.holderOf(tokenId) !== undefined,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
-  const ledger = new ReservationLedger();
   const queue = new SpendQueue({
     ledger,
     getPool: (coinId) => view.pool(coinId),
@@ -177,6 +186,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     ownPubkeyBytes,
     view,
     ledger,
+    pins: buildPins(deps, hooks, { ledger, view, machineStores, machineDeps }),
     queue,
     historyStore,
     machineStores,
@@ -187,6 +197,28 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     requests: buildRequests(deps, hooks),
     restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view),
   };
+}
+
+/** #737 pin lifecycle wiring (see select/pins.ts); the facade owns when it runs. */
+function buildPins(
+  deps: PaymentsFacadeDeps,
+  hooks: FacadeHooks,
+  parts: {
+    ledger: ReservationLedger;
+    view: InventoryView;
+    machineStores: MachineStores;
+    machineDeps: MachineDeps;
+  }
+): IntentPins {
+  return new IntentPins({
+    ledger: parts.ledger,
+    openIntents: () => deriveOpenIntentHolds(parts.machineStores, parts.machineDeps.decryptPayload),
+    isActive: (transferId) => hooks.isActiveOp(transferId),
+    release: (tokenId) => {
+      parts.view.release(tokenId);
+    },
+    changed: () => deps.emit('inventory:updated', {}),
+  });
 }
 
 /** §5.1 restore protocol wiring (reseedAndReset's deps) — policy stays in the facade. */

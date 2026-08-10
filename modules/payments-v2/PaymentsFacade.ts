@@ -28,6 +28,7 @@ import { toToken } from './inventory/presentation';
 import type { Receive } from './receive/Receive';
 import type { Requests } from './requests/Requests';
 import type { ReservationLedger } from './select/ledger';
+import type { IntentPins } from './select/pins';
 import type { SpendQueue, PlannedSpend } from './select/queue';
 import type { MachineStores } from './machine/journal';
 import { buildOps, classifyError, type MachineDeps, type MachinePlan, type TransferMachine } from './machine/TransferMachine';
@@ -112,11 +113,14 @@ export class PaymentsFacade implements PaymentsV2 {
   private readonly passChain = new SerialChain();
   /** §7 ownership: ids with an in-process machine attempt — the pass never adopts one. */
   private readonly activeMoneyOps = new Set<string>();
+  /** #737: the ledger holds exactly the sources of the still-open intents. */
+  private readonly pins: IntentPins;
 
   constructor(private readonly deps: PaymentsFacadeDeps) {
     const parts = composeFacadeParts(deps, {
       engine: () => this.engine(),
       send: (request) => this.send(request),
+      isActiveOp: (id) => this.activeMoneyOps.has(id),
     });
     this.view = parts.view;
     this.ledger = parts.ledger;
@@ -130,6 +134,7 @@ export class PaymentsFacade implements PaymentsV2 {
     this.ownPubkeyBytes = parts.ownPubkeyBytes;
     this.restoreDeps = parts.restoreDeps;
     this.requests = parts.requests;
+    this.pins = parts.pins;
     deps.deliveryPort.bindDeliveryKeys((blob) => this.engine().deliveryKeys(blob));
     this.heartbeat = new ConvergenceHeartbeat({
       now: () => this.nowMs(),
@@ -172,6 +177,10 @@ export class PaymentsFacade implements PaymentsV2 {
     });
     if (statusUnsub !== undefined) this.unsubscribers.push(statusUnsub);
     await this.deps.session.start();
+    // BEFORE the first pass and before any send can plan: a source pinned by an
+    // intent left open by the previous session must not be re-offered (#737).
+    // A rejection leaves the ledger unproven: reads keep working, spending does not (#738).
+    await this.pins.sync().catch(() => undefined);
     // §7 start posture: never awaited; the heartbeat re-runs this same pass.
     this.trackTail(this.runConvergencePass());
     this.trackTail(this.seedHeldStates());
@@ -259,6 +268,10 @@ export class PaymentsFacade implements PaymentsV2 {
 
   private async convergeBody(): Promise<void> {
     const outcome = await this.converger.convergeOnce();
+    // After the pass refreshed the mirror: an intent that stopped being open
+    // stops pinning, one still open keeps pinning (#737).
+    // A rejection leaves the ledger unproven: reads keep working, spending does not (#738).
+    await this.pins.sync().catch(() => undefined);
     const pending = await this.converger.pendingWork().catch(() => true);
     this.heartbeat.settle(outcome, pending);
   }
@@ -531,6 +544,8 @@ export class PaymentsFacade implements PaymentsV2 {
   /** Open intent: sources stay reserved + in-flight (§5.2) until resume adopts them. */
   private settleKeepOpen(ctx: AttemptCtx): void {
     this.queue.clearExpectedChange(ctx.transferId);
+    // The reservation is now the intent's pin, and lives and dies with it (#737).
+    this.pins.adopt(ctx.transferId);
     this.heartbeat.arm(); // the parked intent converges in-session — no restart
   }
 

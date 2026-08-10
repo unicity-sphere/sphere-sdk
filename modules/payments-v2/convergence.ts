@@ -211,6 +211,41 @@ export async function derivePendingTransfers(
   return out;
 }
 
+/**
+ * #737: the source tokenIds each still-open intent pins, derived ON READ from the
+ * same §6 backstop `derivePendingTransfers` reads — the pin needs no store of its
+ * own, so a restart re-derives it instead of re-offering the tokens as spendable.
+ */
+export async function deriveOpenIntentHolds(
+  stores: MachineStores,
+  decryptPayload: (envelope: string) => Promise<unknown>
+): Promise<{ open: Map<string, string[]>; complete: boolean }> {
+  const holds = new Map<string, string[]>();
+  let complete = true;
+  for (const entry of await stores.backstop.list()) {
+    if (entry.disposition !== 'open') continue;
+    let payload: Partial<IntentPayload> | null = null;
+    try {
+      const raw = await decryptPayload(entry.payloadEnvelope);
+      if (raw !== null && typeof raw === 'object') payload = raw as Partial<IntentPayload>;
+    } catch {
+      // Undecodable envelope on a STILL-OPEN intent: its sources are unknown, so
+      // they cannot be proven safe. Report incompleteness — the caller fails
+      // closed rather than treating "unknown sources" as "no sources" (#738).
+      complete = false;
+      continue;
+    }
+    if (payload === null) {
+      complete = false;
+      continue;
+    }
+    const direct = Array.isArray(payload?.direct) ? payload.direct.filter((id) => typeof id === 'string') : [];
+    const split = typeof payload?.split?.tokenId === 'string' ? [payload.split.tokenId] : [];
+    holds.set(entry.transferId, [...direct, ...split]);
+  }
+  return { open: holds, complete };
+}
+
 function groupJournal(journal: DeliveryJournalEntry[]): Map<string, DeliveryJournalEntry[]> {
   const byTransfer = new Map<string, DeliveryJournalEntry[]>();
   for (const entry of journal) {

@@ -9,6 +9,24 @@ export interface ReservationRequest {
 export class ReservationLedger {
   private readonly reservations = new Map<string, ReadonlySet<string>>();
   private readonly tokenHolder = new Map<string, string>();
+  // #738: the held-set is RECONSTRUCTED from the open intents, so until
+  // IntentPins proves every one of them "no holder" means unknown, not free.
+  private authoritative = false;
+
+  /** Sole writer: IntentPins.sync(), true only if it reconstructed every open intent.
+   *  Returns whether the gate actually moved, so callers signal transitions, not passes. */
+  setAuthoritative(value: boolean): boolean {
+    const moved = this.authoritative !== value;
+    this.authoritative = value;
+    return moved;
+  }
+
+  /** Non-null while the held-set is unproven: nothing plans, nothing reads free. */
+  unprovenReason(): string | null {
+    return this.authoritative
+      ? null
+      : 'Cannot yet verify which tokens are held by transfers still converging — spending is paused until that check succeeds';
+  }
 
   // All-or-nothing: every entry is validated before any state mutates.
   reserve(reservationId: string, entries: readonly ReservationRequest[]): void {
@@ -39,6 +57,15 @@ export class ReservationLedger {
 
   getFreeAmount(tokenId: string, tokenAmount: bigint): bigint {
     return this.tokenHolder.has(tokenId) ? 0n : tokenAmount;
+  }
+
+  /** #737: who pins this token — the reporting side reads it so a held token is never called spendable. */
+  holderOf(tokenId: string): string | undefined {
+    return this.tokenHolder.get(tokenId);
+  }
+
+  tokensOf(reservationId: string): readonly string[] {
+    return [...(this.reservations.get(reservationId) ?? [])];
   }
 
   clear(): void {

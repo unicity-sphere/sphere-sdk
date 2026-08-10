@@ -350,6 +350,9 @@ function makeHarness(initial: Array<[string, bigint]> = []): Harness {
   const pools = new Map<string, PoolEntry[]>();
   pools.set(COIN, initial.map(([tokenId, amount]) => ({ tokenId, amount })));
   const ledger = new ReservationLedger();
+  // #738: a fresh ledger's held-set is unproven and refuses every plan. These
+  // cases exercise selection on a ledger IntentPins has already reconstructed.
+  ledger.setAuthoritative(true);
   const queue = new SpendQueue({ ledger, getPool: (coinId) => pools.get(coinId) ?? [] });
   return {
     ledger,
@@ -448,6 +451,30 @@ describe('SpendQueue', () => {
     expect(h.ledger.getFreeAmount('t-change', 400n)).toBe(0n);
   });
 
+  it('#738: a queued entry is NOT served while the gate is closed, and IS served once it reopens', async () => {
+    const h = makeHarness([]);
+    h.queue.declareExpectedChange('f1', COIN, 100n);
+    const settled = asQueued(h.queue.plan('r1', { coinId: COIN, amount: '100' }));
+    let served = false;
+    settled.then(() => (served = true)).catch(() => (served = true));
+
+    // The change arrives, but a later pins.sync() could not reconstruct the
+    // open-intent holds, so the held-set went unproven while this entry waited.
+    h.addToken('t1', 100n);
+    h.ledger.setAuthoritative(false);
+    h.queue.notifyChange(COIN);
+    await Promise.resolve();
+    await Promise.resolve();
+    // Paused, not served — serving here would spend through a closed gate.
+    expect(served).toBe(false);
+
+    // The next sync reconstructs the holds; the paused entry now goes through.
+    h.ledger.setAuthoritative(true);
+    h.queue.notifyChange(COIN);
+    const spend = await settled;
+    expect(spend.plan.direct).toEqual(['t1']);
+  });
+
   it('skip-ahead: a small entry passes a blocked head without unblocking it', async () => {
     const h = track(makeHarness([['t1', 1000n]]));
     h.ledger.reserve('inflight', [{ tokenId: 't1' }]);
@@ -542,6 +569,7 @@ describe('SpendQueue', () => {
       ['coin-b', []],
     ]);
     const ledger = new ReservationLedger();
+    ledger.setAuthoritative(true); // #738: reconstructed ledger; see makeHarness
     const queue = new SpendQueue({ ledger, getPool: (coinId) => pools.get(coinId) ?? [] });
     queue.declareExpectedChange('fa', COIN, 100n);
     queue.declareExpectedChange('fb', 'coin-b', 100n);

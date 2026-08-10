@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (money-visibility) — pinned tokens were advertised as spendable, and the refusal lied (#737)
+
+A wallet whose gateway stopped confirming certifications reported ~1M UCT **confirmed** while every
+`send()` was refused with `SEND_INSUFFICIENT_BALANCE`, for five days, on two SDK versions. The
+certification outage was upstream; two SDK defects turned it into an unexplainable permanent
+lockout:
+
+- **The confirmed balance lied.** A send that ends keep-open deliberately RETAINS its source
+  reservation (releasing risks double-paying a spend that may be on-chain), but `assets()` keyed
+  its transferring/confirmed split on `InventoryView`'s own in-flight set, which knows only about
+  the attempt still running in this session. After a restart the ledger was empty, the still-open
+  intent's sources were re-offered by `pool()` and counted as confirmed again. Reporting now reads
+  the reservation itself (`isPinned`), and `IntentPins` (`select/pins.ts`) re-derives the pins from
+  the §6 intent backstop at `start()` and after every convergence pass — so a pinned source reads
+  as `transferring` across a restart, and an intent that stops being open stops pinning. No new
+  durable state, no reservation released while its intent is open.
+- **The refusal misled.** `SEND_INSUFFICIENT_BALANCE` keeps its code (dApps key on it) but the
+  message now names the pin: free total, pinned total, how many transfers hold it, a pointer to
+  `payments.pendingTransfers()` and "do not re-send". With nothing pinned the wording is unchanged.
+
 ### Fixed (BREAKING, money) — the cross-network recipient guard was unfalsifiable (#733)
 
 `resolveRecipientInfo` stamped the LOCAL session network onto every `RecipientInfo`, so
