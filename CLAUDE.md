@@ -34,7 +34,11 @@ This repo is part of the wallet-api program (process: `../wallet-api/development
   current line **`0.14.0-dev.#`**, dist-tag `dev`. Consumers (wallet-api backend, sphere frontend)
   pin exact dev versions. The backend consumes ONLY the `./token-engine` subpath (must stay
   browser/Nostr-free — keep `token-engine/` clean).
-- Pinned base SDK: `@unicitylabs/state-transition-sdk@2.0.2` (stable release; bump only via PR).
+- Pinned base SDK: `@unicitylabs/state-transition-sdk@2.0.3` (stable release; bump only via PR).
+  2.0.3 fixes the lost-abort hang in `waitInclusionProof` (state-transition-sdk-js#140/#141):
+  its poll loop now checks `aborted` before subscribing, races each poll against the
+  signal, and cancels the in-flight request. `tests/unit/token-engine/proof-deadline.test.ts`
+  is the guard that it keeps doing so — do not delete it on a future bump.
 
 ## Quick Start (Using SDK as Dependency)
 
@@ -400,7 +404,7 @@ Subpath exports: `.` (root), `./core`, `./token-engine`, `./payments-v2` (the fa
 
 ### Token Engine (v2) — the only chain-op path
 
-The canonical package name resolves to the **v2 SDK, pinned `2.0.2`** (stable).
+The canonical package name resolves to the **v2 SDK, pinned `2.0.3`** (stable).
 
 - The SDK is imported in exactly ONE file: `token-engine/sdk.ts`. An ESLint
   `no-restricted-imports` rule blocks any other import of
@@ -416,7 +420,7 @@ The canonical package name resolves to the **v2 SDK, pinned `2.0.2`** (stable).
   source of truth for the network id (`RootTrustBase.networkId`, e.g. testnet2 = 4).
 - `SphereToken.sdkToken` is an OPAQUE handle — callers store it and hand it back
   to the engine, never call methods on it.
-- **Verification is sequential by default; parallel is opt-in** (2.0.2). Pass
+- **Verification is sequential by default; parallel is opt-in** (2.0.2+). Pass
   `verification: { createWorker, poolSize? }` to `Sphere.init` (or `EngineConfig`)
   and `engine.verify` fans per-transfer work out to a worker pool. The entry
   script is the CONSUMER's (only their bundler can emit a worker) and its
@@ -695,7 +699,7 @@ Key test areas:
 ## Dependencies
 
 **Core (from package.json):**
-- `@unicitylabs/state-transition-sdk` — **pinned `2.0.2`** (v2 engine; imported only via `token-engine/sdk.ts`)
+- `@unicitylabs/state-transition-sdk` — **pinned `2.0.3`** (v2 engine; imported only via `token-engine/sdk.ts`)
 - `@unicitylabs/nostr-js-sdk` `^0.5.0` — Nostr protocol
 - `@noble/hashes` `^2`, `@noble/curves` `^2` — cryptography
 - `bip39`, `elliptic`, `crypto-js`, `canonicalize`, `buffer`

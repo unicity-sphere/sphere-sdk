@@ -1,8 +1,10 @@
-// #739: one inclusion-proof wait, with the deadline OWNED here — the SDK's own
-// deadline is lost when it fires mid-fetch, and the loop then polls forever.
+// One inclusion-proof wait: bounded by a deadline we own, and tolerant of a
+// gateway that blips (#739, #741). state-transition-sdk >= 2.0.3 terminates its
+// own poll loop on abort; proof-deadline.test.ts is the guard that it still does.
 
 import {
   type InclusionProof,
+  JsonRpcNetworkError,
   type PredicateVerifierService,
   type RootTrustBase,
   type StateTransitionClient,
@@ -12,12 +14,8 @@ import { SphereError } from '../core/errors';
 
 export const DEFAULT_PROOF_TIMEOUT_MS = 10_000;
 
-/**
- * A proof wait is ALWAYS bounded — an uncapped one is the #739 hang, which wedges
- * stop() and with it teardown, lock and address switch. So there is no "no cap"
- * setting: a non-positive value is refused loudly rather than read as forever
- * (or, worse, as a zero-delay deadline that fails every op instantly).
- */
+/** Always bounded: an uncapped wait is the #739 hang, so there is no "no cap"
+ *  value — non-positive is refused, never read as forever or as zero delay. */
 export function resolveProofTimeoutMs(configured: number | undefined): number {
   if (configured === undefined) return DEFAULT_PROOF_TIMEOUT_MS;
   if (!Number.isFinite(configured) || configured <= 0) {
@@ -30,45 +28,23 @@ export function resolveProofTimeoutMs(configured: number | undefined): number {
   return configured;
 }
 
-/** Delivers `abort` to a listener attached after the fact — what lets the SDK's
- *  per-sleep listener still fire, so its loop exits instead of polling forever. */
-function lateDeliveringSignal(signal: AbortSignal): AbortSignal {
-  return new Proxy(signal, {
-    get(target, prop): unknown {
-      if (prop === 'addEventListener') {
-        return (
-          type: string,
-          listener: EventListener,
-          options?: AddEventListenerOptions | boolean
-        ): void => {
-          if (type === 'abort' && target.aborted) {
-            queueMicrotask(() => {
-              listener.call(target, new Event('abort'));
-            });
-            return;
-          }
-          target.addEventListener(type, listener, options);
-        };
-      }
-      const value: unknown = Reflect.get(target, prop, target);
-      return typeof value === 'function'
-        ? (value as (...args: unknown[]) => unknown).bind(target)
-        : value;
-    },
-  });
+/** "Ask again", not "this certification failed" — the loop itself tolerates only
+ *  404, so without this one blip strands a certification that would land (#741). */
+const TRANSIENT_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+function isTransientGatewayError(err: unknown): boolean {
+  return err instanceof JsonRpcNetworkError && TRANSIENT_HTTP_STATUSES.has(err.status);
 }
 
-/** Rejects as soon as the signal aborts — bounds our wait even if the fetch never settles. */
-function rejectOnAbort(signal: AbortSignal): Promise<never> {
-  return new Promise<never>((_resolve, reject) => {
-    if (signal.aborted) {
-      reject(signal.reason as Error);
-      return;
-    }
+/** Resolves on elapse OR abort; the caller re-checks the signal. */
+function pause(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
     signal.addEventListener(
       'abort',
       () => {
-        reject(signal.reason as Error);
+        clearTimeout(timer);
+        resolve();
       },
       { once: true }
     );
@@ -106,18 +82,25 @@ export async function awaitProofBounded(
       )
     );
   }, deps.timeoutMs);
-  const wait = waitInclusionProof(
-    deps.client,
-    deps.trustBase,
-    deps.predicateVerifier,
-    transaction,
-    lateDeliveringSignal(controller.signal),
-    deps.intervalMs
-  );
-  // The race may settle first; keep a late rejection from going unhandled.
-  wait.catch(() => undefined);
+
   try {
-    return await Promise.race([wait, rejectOnAbort(controller.signal)]);
+    for (;;) {
+      try {
+        return await waitInclusionProof(
+          deps.client,
+          deps.trustBase,
+          deps.predicateVerifier,
+          transaction,
+          controller.signal,
+          deps.intervalMs
+        );
+      } catch (err) {
+        // The deadline (or the caller) ended it: that outcome is final.
+        if (controller.signal.aborted) throw err;
+        if (!isTransientGatewayError(err)) throw err;
+        await pause(deps.intervalMs, controller.signal);
+      }
+    }
   } finally {
     clearTimeout(timer);
     external?.removeEventListener('abort', relayAbort);

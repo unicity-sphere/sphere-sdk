@@ -31,15 +31,20 @@ class SlowProofClient implements IAggregatorClient {
   public proofCalls = 0;
 
   constructor(
-    private readonly inner: TestAggregatorClient,
+    protected readonly inner: TestAggregatorClient,
     private readonly delayMs: () => number
   ) {}
 
 
   async submitCertificationRequest(
-    ...args: Parameters<IAggregatorClient['submitCertificationRequest']>
+    certificationData: Parameters<IAggregatorClient['submitCertificationRequest']>[0]
   ): ReturnType<IAggregatorClient['submitCertificationRequest']> {
-    return this.inner.submitCertificationRequest(...args);
+    return this.inner.submitCertificationRequest(certificationData);
+  }
+
+  /** The aggregator's genuine answer — used by cases that recover after a blip. */
+  protected realProof(stateId: StateId): Promise<InclusionProofResponse> {
+    return this.inner.getInclusionProof(stateId);
   }
 
   async getInclusionProof(_stateId: StateId): Promise<InclusionProofResponse> {
@@ -144,5 +149,89 @@ describe('#739 the inclusion-proof wait always terminates', () => {
     await new Promise((resolve) => setTimeout(resolve, 600));
     // At most the one request already in flight when the deadline fired may land.
     expect(wireClient.proofCalls - afterSettle).toBeLessThanOrEqual(1);
+  }, 30_000);
+
+  it('#741: a transient gateway blip is retried, not treated as a failed certification', async () => {
+    // Pre-#741 the loop tolerated only 404, so ONE 503 mid-poll turned a
+    // certification that was about to land into an open intent.
+    for (const status of [429, 502, 503]) {
+      const aggregator = TestAggregatorClient.create();
+      let polls = 0;
+      const engine = createTestEngine({
+        aggregator,
+        wireClient: new (class extends SlowProofClient {
+          override async getInclusionProof(
+            stateId: Parameters<TestAggregatorClient['getInclusionProof']>[0]
+          ): Promise<InclusionProofResponse> {
+            polls += 1;
+            if (polls <= 2) throw new JsonRpcNetworkError(status, 'blip');
+            return this.realProof(stateId);
+          }
+        })(aggregator, () => 0),
+        proofTimeoutMs: 5_000,
+        proofPollIntervalMs: 20,
+      });
+
+      const token = await engine.mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: COIN, amount: 1000n }] },
+      });
+      expect(engine.balanceOf(token, COIN)).toBe(1000n);
+      expect(polls).toBeGreaterThan(2);
+    }
+  }, 60_000);
+
+  it('#741: a NON-transient error still fails fast — tolerance must not swallow a real one', async () => {
+    const aggregator = TestAggregatorClient.create();
+    let polls = 0;
+    const engine = createTestEngine({
+      aggregator,
+      wireClient: new (class extends SlowProofClient {
+        override async getInclusionProof(): Promise<never> {
+          polls += 1;
+          throw new JsonRpcNetworkError(400, 'malformed');
+        }
+      })(aggregator, () => 0),
+      proofTimeoutMs: 5_000,
+      proofPollIntervalMs: 20,
+    });
+
+    const started = Date.now();
+    await engine
+      .mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: COIN, amount: 1000n }] },
+      })
+      .catch(() => undefined);
+
+    // Surfaced immediately, not retried to the 5s deadline.
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(polls).toBe(1);
+  }, 30_000);
+
+  it('#741: a gateway transient FOREVER still ends at the deadline, never unbounded', async () => {
+    const aggregator = TestAggregatorClient.create();
+    const engine = createTestEngine({
+      aggregator,
+      wireClient: new (class extends SlowProofClient {
+        override async getInclusionProof(): Promise<never> {
+          throw new JsonRpcNetworkError(503, 'down');
+        }
+      })(aggregator, () => 0),
+      proofTimeoutMs: 300,
+      proofPollIntervalMs: 20,
+    });
+
+    const started = Date.now();
+    const err = await engine
+      .mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: COIN, amount: 1000n }] },
+      })
+      .then(() => null)
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ProofUnconfirmedError);
+    expect(Date.now() - started).toBeLessThan(3_000);
   }, 30_000);
 });
