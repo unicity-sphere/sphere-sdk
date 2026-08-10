@@ -41,6 +41,15 @@ export class ReservationLedger {
     return this.tokenHolder.has(tokenId) ? 0n : tokenAmount;
   }
 
+  /** #737: who pins this token — the reporting side reads it so a held token is never called spendable. */
+  holderOf(tokenId: string): string | undefined {
+    return this.tokenHolder.get(tokenId);
+  }
+
+  tokensOf(reservationId: string): readonly string[] {
+    return [...(this.reservations.get(reservationId) ?? [])];
+  }
+
   clear(): void {
     this.reservations.clear();
     this.tokenHolder.clear();

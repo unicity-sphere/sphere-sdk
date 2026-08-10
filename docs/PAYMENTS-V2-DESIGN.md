@@ -258,7 +258,10 @@ selector's metadata pool. **In-flight exclusion
 (#517/#32, re-homed):** sources reserved by an open transfer — including keep-open intents whose
 spend may be on-chain — are excluded from the selector pool AND reported outside the spendable
 total (`transferring*` fields, never `totalAmount`) until their machine settles or resume adopts
-them. Emits `inventory:updated`.
+them. The reporting side reads the **§5.4 reservation** (`isPinned`), not the in-session in-flight
+set alone, so a pin outlives the attempt that created it and a restart cannot re-advertise a
+pinned source as confirmed (#737). A pinned entry stays IN `pool()` — the queue applies the ledger
+filter itself and needs the entry to quantify the pin in its refusal. Emits `inventory:updated`.
 
 ### 5.3 `CoinSelector` (pure)
 
@@ -279,6 +282,18 @@ critical section (no `await` between free-view read and `reserve`); whole-token 
 send queues when total coverage (free + expected change) suffices but the free view doesn't;
 skip-ahead; 30 s timeout; 100-entry cap. Dropped: the four zero-caller members
 (`getReservation`, `hasActiveReservation`, `getSize`, external `getTotalReserved`).
+
+**Pin lifecycle (`select/pins.ts`, #737).** The ledger holds exactly the sources of the intents the
+§6 backstop still calls OPEN: `IntentPins.sync()` runs in `start()` (before the first pass, so a
+send cannot plan against a source a dead session left pinned) and after every convergence pass
+(so an intent that stopped being open stops pinning). The set is **derived, never stored** — the
+open intents and their sources come from the backstop, decrypted on read like
+`pendingTransfers()`. An attempt running in-process owns its own reservation and is never touched.
+
+**Refusal wording.** `SEND_INSUFFICIENT_BALANCE` keeps its code (dApps key on it) but names the pin
+when there is one: free total, pinned total, and how many transfers hold it, plus "do not
+re-send". "Insufficient balance" alone reads as *you are broke* and sent #737 auditing a treasury
+that was never short.
 
 ### 5.5 `TransferMachine` — one machine for send AND resume
 

@@ -38,6 +38,29 @@ interface ExpectedChange {
   readonly amount: bigint;
 }
 
+interface FreeView {
+  readonly freeView: PoolEntry[];
+  readonly freeTotal: bigint;
+  /** Held by a reservation — an open intent's sources stay pinned until it converges. */
+  readonly pinnedTotal: bigint;
+  readonly pinnedBy: number;
+}
+
+/**
+ * #737: the CODE is load-bearing (dApps key on it) but "insufficient balance" sent
+ * a user auditing a treasury that was never short — every token was pinned by an
+ * intent still converging. When something is pinned, the message says so.
+ */
+function insufficientBalance(view: FreeView, amount: bigint): SphereError {
+  const message =
+    view.pinnedTotal > 0n
+      ? `Insufficient spendable balance: need ${amount.toString()}, ${view.freeTotal.toString()} free, ` +
+        `${view.pinnedTotal.toString()} pinned by ${String(view.pinnedBy)} transfer(s) still converging — ` +
+        'see payments.pendingTransfers(); do not re-send.'
+      : 'Insufficient balance for this transaction';
+  return new SphereError(message, 'SEND_INSUFFICIENT_BALANCE');
+}
+
 export class SpendQueue {
   private readonly queues = new Map<string, QueueEntry[]>();
   private readonly expectedChange = new Map<string, ExpectedChange>();
@@ -50,12 +73,10 @@ export class SpendQueue {
       throw new SphereError('Module has been destroyed', 'MODULE_DESTROYED');
     }
     const amount = parseAmount(request.amount);
-    const { freeView, freeTotal } = this.freeView(request.coinId);
+    const view = this.freeView(request.coinId);
+    const { freeView, freeTotal } = view;
     if (freeTotal + this.expectedChangeTotal(request.coinId) < amount) {
-      throw new SphereError(
-        'Insufficient balance for this transaction',
-        'SEND_INSUFFICIENT_BALANCE'
-      );
+      throw insufficientBalance(view, amount);
     }
     const plan = selectCoins(freeView, amount, { workBudget: this.deps.workBudget });
     if (plan !== null) {
@@ -110,11 +131,10 @@ export class SpendQueue {
       entry.reject(new SphereError('Send queue timeout', 'SEND_QUEUE_TIMEOUT'));
       return 'rejected';
     }
-    const { freeView, freeTotal } = this.freeView(entry.coinId);
+    const view = this.freeView(entry.coinId);
+    const { freeView, freeTotal } = view;
     if (freeTotal + this.expectedChangeTotal(entry.coinId) < entry.amount) {
-      entry.reject(
-        new SphereError('Insufficient balance for this transaction', 'SEND_INSUFFICIENT_BALANCE')
-      );
+      entry.reject(insufficientBalance(view, entry.amount));
       return 'rejected';
     }
     const plan = selectCoins(freeView, entry.amount, { workBudget: this.deps.workBudget });
@@ -161,18 +181,25 @@ export class SpendQueue {
     if (entries.length === 0) this.queues.delete(coinId);
   }
 
-  // Whole-token semantics: only fully-free tokens enter the selector pool.
-  private freeView(coinId: string): { freeView: PoolEntry[]; freeTotal: bigint } {
+  // Whole-token semantics: only fully-free tokens enter the selector pool. What
+  // the reservations hold back is counted too — the refusal has to name it (#737).
+  private freeView(coinId: string): FreeView {
     const freeView: PoolEntry[] = [];
     let freeTotal = 0n;
+    let pinnedTotal = 0n;
+    const holders = new Set<string>();
     for (const entry of this.deps.getPool(coinId)) {
       if (entry.amount <= 0n) continue;
-      if (this.deps.ledger.getFreeAmount(entry.tokenId, entry.amount) === entry.amount) {
+      const holder = this.deps.ledger.holderOf(entry.tokenId);
+      if (holder === undefined) {
         freeView.push(entry);
         freeTotal += entry.amount;
+      } else {
+        pinnedTotal += entry.amount;
+        holders.add(holder);
       }
     }
-    return { freeView, freeTotal };
+    return { freeView, freeTotal, pinnedTotal, pinnedBy: holders.size };
   }
 
   private expectedChangeTotal(coinId: string): bigint {

@@ -40,6 +40,13 @@ export interface InventoryViewDeps {
   readonly kv: ScopedKV;
   readonly emit: (event: 'inventory:updated') => void;
   readonly now?: () => number;
+  /**
+   * #737: tokens pinned by a §5.4 reservation — an open intent keeps its sources
+   * reserved, and a token the selector cannot pick is NOT spendable balance. The
+   * reporting side reads the pin instead of guessing from `inFlight` alone, which
+   * only knows about the attempt still running in THIS session.
+   */
+  readonly isPinned?: (tokenId: string) => boolean;
 }
 
 interface MirrorEntry {
@@ -134,10 +141,23 @@ export class InventoryView {
     if (this.inFlight.delete(tokenId)) this.deps.emit('inventory:updated');
   }
 
+  private pinned(tokenId: string): boolean {
+    return this.deps.isPinned?.(tokenId) ?? false;
+  }
+
+  /** In flight here OR pinned by a reservation: either way not spendable (#737). */
+  private held(tokenId: string): boolean {
+    return this.inFlight.has(tokenId) || this.pinned(tokenId);
+  }
+
+  // A PINNED token stays in the pool: the queue applies the ledger filter itself
+  // and needs the entry to say how much is pinned when it refuses (#737). In
+  // flight without a pin (spent, awaiting the mirror refresh) stays out.
   pool(coinId: string): PoolEntry[] {
     const out: PoolEntry[] = [];
     for (const [tokenId, entry] of this.mirror) {
-      if (entry.status !== 'active' || this.inFlight.has(tokenId)) continue;
+      if (entry.status !== 'active') continue;
+      if (this.inFlight.has(tokenId) && !this.pinned(tokenId)) continue;
       if (this.suspected.has(stateKey(tokenId, entry.stateHash))) continue;
       const asset = entry.assets.find((a) => a.coinId === coinId);
       if (asset) out.push({ tokenId, amount: BigInt(asset.amount) });
@@ -154,7 +174,7 @@ export class InventoryView {
       if (filter?.coinId !== undefined && asset.coinId !== filter.coinId) continue;
       out.push(
         toToken(tokenId, entry, asset, registry, {
-          transferring: this.inFlight.has(tokenId),
+          transferring: this.held(tokenId),
           suspectedSpent: this.suspected.has(stateKey(tokenId, entry.stateHash)),
         })
       );
@@ -163,7 +183,7 @@ export class InventoryView {
   }
 
   async assets(registry: RegistryReader, price?: PriceReader): Promise<Asset[]> {
-    const raw = aggregateAssets(this.activeEntries(), (tokenId) => this.inFlight.has(tokenId), registry);
+    const raw = aggregateAssets(this.activeEntries(), (tokenId) => this.held(tokenId), registry);
     if (!price || raw.length === 0) return raw;
     return withPrices(raw, registry, price);
   }
