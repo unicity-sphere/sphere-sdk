@@ -12,6 +12,24 @@ import { SphereError } from '../core/errors';
 
 export const DEFAULT_PROOF_TIMEOUT_MS = 10_000;
 
+/**
+ * A proof wait is ALWAYS bounded — an uncapped one is the #739 hang, which wedges
+ * stop() and with it teardown, lock and address switch. So there is no "no cap"
+ * setting: a non-positive value is refused loudly rather than read as forever
+ * (or, worse, as a zero-delay deadline that fails every op instantly).
+ */
+export function resolveProofTimeoutMs(configured: number | undefined): number {
+  if (configured === undefined) return DEFAULT_PROOF_TIMEOUT_MS;
+  if (!Number.isFinite(configured) || configured <= 0) {
+    throw new SphereError(
+      `proofTimeoutMs must be a positive number of milliseconds (got ${String(configured)}); ` +
+        'an unbounded inclusion-proof wait is not supported',
+      'INVALID_CONFIG'
+    );
+  }
+  return configured;
+}
+
 /** Delivers `abort` to a listener attached after the fact — what lets the SDK's
  *  per-sleep listener still fire, so its loop exits instead of polling forever. */
 function lateDeliveringSignal(signal: AbortSignal): AbortSignal {

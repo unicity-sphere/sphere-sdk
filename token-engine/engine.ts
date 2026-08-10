@@ -230,7 +230,11 @@ export interface EngineConfig {
   readonly trustBaseJson: unknown;
   /** Inclusion-proof poll cadence in ms (engine owns the await policy; Spike S1). */
   readonly proofPollIntervalMs?: number;
-  /** Inclusion-proof overall timeout in ms (0/undefined = no engine-side cap). */
+  /**
+   * Deadline for ONE inclusion-proof wait, in ms. Undefined → 10s. Must be
+   * positive: an unbounded wait hangs the op and with it teardown (#739), so
+   * there is no "no cap" value — 0 or negative throws INVALID_CONFIG.
+   */
   readonly proofTimeoutMs?: number;
   /**
    * Opt in to parallel verification. Omitted → the sequential verifier, i.e. the

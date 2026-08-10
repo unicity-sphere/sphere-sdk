@@ -117,6 +117,20 @@ describe('#739 the inclusion-proof wait always terminates', () => {
     expect(Date.now() - started).toBeLessThan(3_000);
   }, 30_000);
 
+  it('a non-positive deadline is refused at construction, not honoured as "no cap" or as zero', () => {
+    // engine.ts once documented 0 as "no engine-side cap". Read literally that is
+    // the #739 hang as a setting; read as a timeout it aborts every wait on the
+    // next timer turn, reporting healthy sends as unconfirmed. Neither is a
+    // behaviour worth having, so it is refused where it is configured.
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => createTestEngine({ proofTimeoutMs: bad })).toThrow(
+        /proofTimeoutMs must be a positive number/i
+      );
+    }
+    expect(() => createTestEngine({ proofTimeoutMs: 1 })).not.toThrow();
+    expect(() => createTestEngine()).not.toThrow();
+  });
+
   it('the abandoned loop STOPS polling — a lost deadline must not leak a permanent poller', async () => {
     const { engine, wireClient } = slowEngine(() => 60, 120);
     await engine
