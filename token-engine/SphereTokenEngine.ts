@@ -16,6 +16,7 @@
  */
 
 import { SphereError, type SphereErrorCode } from '../core/errors';
+import { awaitProofBounded, resolveProofTimeoutMs } from './proof-wait';
 import { randomUUID } from '../core/uuid';
 import {
   CheckpointPersistFailedError,
@@ -104,15 +105,10 @@ export interface EngineDeps {
    */
   readonly privateKey: Uint8Array;
   readonly networkId: NetworkId;
-  /**
-   * Inclusion-proof poll cadence in ms (#683). The aggregator finalizes in ~1-1.5s,
-   * but the state-transition-sdk's waitInclusionProof default is 1000ms, so the proof
-   * is only caught at ~2s (poll granularity). A finer interval catches it ~0.5-0.75s
-   * sooner PER proof round with zero correctness impact (waitInclusionProof returns
-   * only an OK-verified proof regardless of poll frequency). Undefined → the tuned
-   * default below.
-   */
+  /** Inclusion-proof poll cadence in ms (#683); undefined → the tuned default below. */
   readonly proofPollIntervalMs?: number;
+  /** Deadline for one inclusion-proof wait; defaults to DEFAULT_PROOF_TIMEOUT_MS (#739). */
+  readonly proofTimeoutMs?: number;
 }
 
 /**
@@ -190,8 +186,12 @@ export class SphereTokenEngine implements ITokenEngine {
   /** Hex form of the wallet key — deriveRealization's ikm input (Part E.1). */
   private readonly privateKeyHex: string;
 
+  private readonly proofTimeoutMs: number;
+
   public constructor(private readonly deps: EngineDeps) {
     this.privateKeyHex = HexConverter.encode(deps.privateKey);
+    // Refused here, not per op: a bad deadline must not surface as a money error.
+    this.proofTimeoutMs = resolveProofTimeoutMs(deps.proofTimeoutMs);
   }
 
   // ── identity ────────────────────────────────────────────────────────────────
@@ -695,13 +695,16 @@ export class SphereTokenEngine implements ITokenEngine {
     }
 
     try {
-      return await waitInclusionProof(
-        this.deps.client,
-        this.deps.trustBase,
-        this.deps.predicateVerifier,
+      return await awaitProofBounded(
+        {
+          client: this.deps.client,
+          trustBase: this.deps.trustBase,
+          predicateVerifier: this.deps.predicateVerifier,
+          timeoutMs: this.proofTimeoutMs,
+          intervalMs: this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS, // #683
+        },
         transaction,
         options?.signal,
-        this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS, // #683 finer poll cadence
       );
     } catch (err) {
       // The SDK surfaces a match-verify mismatch as a generic Error whose
@@ -735,6 +738,13 @@ export class SphereTokenEngine implements ITokenEngine {
     }
   }
 
+  /**
+   * One inclusion-proof wait, with the deadline OWNED here (#739). The SDK's own
+   * default deadline is unreliable — see lateDeliveringSignal — and a lost one
+   * means an op that never settles, which also wedges PaymentsFacade.stop().
+   * A deadline hit throws, and the caller maps that to ProofUnconfirmedError
+   * (keep-open), which is the correct posture: the spend may be on-chain.
+   */
   /** Fail fast if this engine's key does not own the token's current state. */
   private assertOwned(token: SphereToken): void {
     if (!this.isOwnedBy(token, this.deps.signingService.publicKey)) {

@@ -36,6 +36,9 @@ export interface TestEngineOptions {
    * (e.g. a submit that throws). Trust base still comes from `aggregator`.
    */
   wireClient?: IAggregatorClient;
+  /** #739: shorten the inclusion-proof deadline so deadline behaviour is testable. */
+  proofTimeoutMs?: number;
+  proofPollIntervalMs?: number;
 }
 
 /**
@@ -69,6 +72,8 @@ export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngin
     signingService: new SigningService(privateKey),
     privateKey,
     networkId: opts.networkId ?? NetworkId.LOCAL,
+    ...(opts.proofTimeoutMs !== undefined ? { proofTimeoutMs: opts.proofTimeoutMs } : {}),
+    ...(opts.proofPollIntervalMs !== undefined ? { proofPollIntervalMs: opts.proofPollIntervalMs } : {}),
   };
   return new SphereTokenEngine(deps);
 }

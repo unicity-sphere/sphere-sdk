@@ -330,5 +330,45 @@
     "tests": [
       "tests/unit/payments-v2/pinned-balance.test.ts"
     ]
+  },
+  {
+    "name": "proof-wait-drops-owned-deadline",
+    "note": "#739: delegating the deadline to the SDK default loses it when it fires mid-fetch \u2014 the op then never settles and stop() wedges behind it.",
+    "file": "token-engine/proof-wait.ts",
+    "find": "    return await Promise.race([wait, rejectOnAbort(controller.signal)]);",
+    "replace": "    return await wait;",
+    "tests": [
+      "tests/unit/token-engine/proof-deadline.test.ts"
+    ]
+  },
+  {
+    "name": "proof-wait-leaks-poller",
+    "note": "#739: without late abort delivery the SDK loop never exits, leaving a permanent poller hammering the gateway every interval.",
+    "file": "token-engine/proof-wait.ts",
+    "find": "    lateDeliveringSignal(controller.signal),",
+    "replace": "    controller.signal,",
+    "tests": [
+      "tests/unit/token-engine/proof-deadline.test.ts"
+    ]
+  },
+  {
+    "name": "proof-timeout-config-ignored",
+    "note": "#739: proofTimeoutMs was declared but never wired; ignoring it hard-pins every wait to the default.",
+    "file": "token-engine/proof-wait.ts",
+    "find": "  if (configured === undefined) return DEFAULT_PROOF_TIMEOUT_MS;",
+    "replace": "  if (configured !== undefined) return DEFAULT_PROOF_TIMEOUT_MS;",
+    "tests": [
+      "tests/unit/token-engine/proof-deadline.test.ts"
+    ]
+  },
+  {
+    "name": "proof-timeout-zero-becomes-instant-deadline",
+    "note": "#739 review: 0 was documented as 'no cap'; passing it through schedules a zero-delay abort that reports every healthy send as unconfirmed. Non-positive must be refused.",
+    "file": "token-engine/proof-wait.ts",
+    "find": "  if (!Number.isFinite(configured) || configured <= 0) {",
+    "replace": "  if (false) {",
+    "tests": [
+      "tests/unit/token-engine/proof-deadline.test.ts"
+    ]
   }
 ]

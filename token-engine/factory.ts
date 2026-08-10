@@ -101,6 +101,7 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
     networkId: trustBase.networkId,
     // #683: forward the (optional) proof-poll cadence; undefined → the engine default.
     proofPollIntervalMs: config.proofPollIntervalMs,
+    proofTimeoutMs: config.proofTimeoutMs, // #739: was declared but never wired
     // Opt-in parallel verification (2.0.2). Absent → the sequential verifier.
     ...(config.verification ? { tokenVerifier: createWorkerTokenVerifier(config.verification) } : {}),
   };
