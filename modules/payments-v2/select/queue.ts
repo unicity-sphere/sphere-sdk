@@ -72,6 +72,9 @@ export class SpendQueue {
     if (this.destroyed) {
       throw new SphereError('Module has been destroyed', 'MODULE_DESTROYED');
     }
+    // #738: the ledger says whether its held-set is proven. Unproven = refuse.
+    const unproven = this.deps.ledger.unprovenReason();
+    if (unproven !== null) throw new SphereError(unproven, 'SEND_INSUFFICIENT_BALANCE');
     const amount = parseAmount(request.amount);
     const view = this.freeView(request.coinId);
     const { freeView, freeTotal } = view;

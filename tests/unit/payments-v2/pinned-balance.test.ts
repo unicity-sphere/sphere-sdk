@@ -6,6 +6,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { ProofUnconfirmedError } from '../../../token-engine/errors';
+import { IntentPins, type IntentPinsDeps } from '../../../modules/payments-v2/select/pins';
+import { SpendQueue } from '../../../modules/payments-v2/select/queue';
+import { ReservationLedger } from '../../../modules/payments-v2/select/ledger';
 import { COIN, cleanupWorlds, flushTail, makeWorld, ownCaller, type World } from './facade-harness';
 
 afterEach(cleanupWorlds);
@@ -122,5 +125,82 @@ describe('#737 pinned tokens are not spendable balance', () => {
       .catch((e: unknown) => e);
     expect(err).toMatchObject({ code: 'SEND_INSUFFICIENT_BALANCE' });
     expect((err as Error).message).toContain('100 pinned by 1 transfer(s) still converging');
+  });
+});
+
+describe('#738 review: the held-set gate fails CLOSED', () => {
+  function makePins(openIntents: IntentPinsDeps['openIntents']): {
+    pins: IntentPins;
+    ledger: ReservationLedger;
+  } {
+    const ledger = new ReservationLedger();
+    const pins = new IntentPins({
+      ledger,
+      openIntents,
+      isActive: () => false,
+      release: () => undefined,
+      changed: () => undefined,
+    });
+    return { pins, ledger };
+  }
+
+  it('a fresh ledger is unproven: nothing plans and nothing reports free', () => {
+    const ledger = new ReservationLedger();
+    expect(ledger.unprovenReason()).not.toBeNull();
+    const queue = new SpendQueue({ ledger, getPool: () => [{ tokenId: 't1', amount: 100n }] });
+    expect(() => queue.plan('r1', { coinId: COIN, amount: '100' })).toThrow(
+      /spending is paused/i
+    );
+  });
+
+  it('a backstop read failure leaves the ledger unproven instead of re-offering held sources', async () => {
+    const { pins, ledger } = makePins(async () => {
+      throw new Error('IndexedDB unavailable');
+    });
+    await pins.sync().catch(() => undefined);
+    // Never resolves into "no holder, therefore free".
+    expect(ledger.unprovenReason()).not.toBeNull();
+  });
+
+  it('an undecodable OPEN intent keeps the ledger unproven rather than counting as zero sources', async () => {
+    const { pins, ledger } = makePins(async () => ({ open: new Map(), complete: false }));
+    await pins.sync();
+    expect(ledger.unprovenReason()).not.toBeNull();
+  });
+
+  it('an unreadable open intent across a RESTART: the report and the refusal AGREE — nothing free, nothing spendable', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await world.facade.start();
+    await parkKeepOpen(world, '100');
+    await world.facade.stop();
+
+    // Corrupt the still-open intent's envelope so its sources cannot be
+    // reconstructed. The pre-#738 bug read that as "holds nothing".
+    const intentsKey = [...world.kv.map.keys()].find((k) => k.endsWith('intents'));
+    expect(intentsKey).toBeDefined();
+    const rows = world.kv.map.get(intentsKey!) as { payloadEnvelope: string }[];
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) row.payloadEnvelope = 'not-decryptable';
+
+    const restarted = makeWorld({ restartOf: world });
+    await restarted.facade.start();
+    await flushTail();
+
+    // The REPORT must not call it confirmed...
+    const [asset] = await restarted.facade.assets(COIN);
+    expect(asset.confirmedAmount).toBe('0');
+    // ...and the SPEND path must refuse. Disagreement between these two is the
+    // #737 complaint; a permissive answer from EITHER is the #738 double-spend.
+    const err = await restarted.facade
+      .send({ recipient: '@peer', amount: '100', coinId: COIN })
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: 'SEND_INSUFFICIENT_BALANCE' });
+  });
+
+  it('a pass that reconstructs every open intent makes the ledger authoritative', async () => {
+    const { pins, ledger } = makePins(async () => ({ open: new Map(), complete: true }));
+    await pins.sync();
+    expect(ledger.unprovenReason()).toBeNull();
   });
 });

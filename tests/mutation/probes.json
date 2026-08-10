@@ -269,5 +269,55 @@
     "tests": [
       "tests/unit/payments-v2/pinned-balance.test.ts"
     ]
+  },
+  {
+    "name": "ledger-authoritative-default-open",
+    "note": "#738: a fresh ledger must fail CLOSED. Defaulting to authoritative re-offers sources held by intents whose spend may be on-chain (double-spend).",
+    "file": "modules/payments-v2/select/ledger.ts",
+    "find": "  private authoritative = false;",
+    "replace": "  private authoritative = true;",
+    "tests": [
+      "tests/unit/payments-v2/pinned-balance.test.ts"
+    ]
+  },
+  {
+    "name": "pins-sync-ignores-incompleteness",
+    "note": "#738: only a pass that reconstructed EVERY open intent may make the ledger authoritative; an unreadable envelope must keep it closed.",
+    "file": "modules/payments-v2/select/pins.ts",
+    "find": "    this.deps.ledger.setAuthoritative(complete);",
+    "replace": "    this.deps.ledger.setAuthoritative(true);",
+    "tests": [
+      "tests/unit/payments-v2/pinned-balance.test.ts"
+    ]
+  },
+  {
+    "name": "derive-holds-swallows-undecodable",
+    "note": "#738: an undecodable open-intent envelope must report incompleteness, not silently mean 'holds nothing'.",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "      complete = false;\n      continue;\n    }\n    if (payload === null) {",
+    "replace": "      continue;\n    }\n    if (payload === null) {",
+    "tests": [
+      "tests/unit/payments-v2/pinned-balance.test.ts"
+    ]
+  },
+  {
+    "name": "report-ignores-unproven-heldset",
+    "note": "#738: while the held-set is unproven the REPORT must agree with the refusal \u2014 otherwise a treasury reads fully spendable while every send is refused (#737's complaint).",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "    isPinned: (tokenId) => ledger.unprovenReason() !== null || ledger.holderOf(tokenId) !== undefined,",
+    "replace": "    isPinned: (tokenId) => ledger.holderOf(tokenId) !== undefined,",
+    "tests": [
+      "tests/unit/payments-v2/pinned-balance.test.ts"
+    ]
+  },
+  {
+    "name": "queue-plan-ignores-unproven-heldset",
+    "note": "#738: planning must refuse while the held-set is unproven.",
+    "file": "modules/payments-v2/select/queue.ts",
+    "find": "    const unproven = this.deps.ledger.unprovenReason();\n    if (unproven !== null) throw new SphereError(unproven, 'SEND_INSUFFICIENT_BALANCE');",
+    "replace": "    const unproven: string | null = null;\n    if (unproven !== null) throw new SphereError(unproven, 'SEND_INSUFFICIENT_BALANCE');",
+    "tests": [
+      "tests/unit/payments-v2/pinned-balance.test.ts"
+    ]
   }
 ]

@@ -7,7 +7,8 @@ import type { ReservationLedger } from './ledger';
 export interface IntentPinsDeps {
   readonly ledger: ReservationLedger;
   /** Open intents → their source tokenIds, re-derived from the backstop per call. */
-  readonly openIntents: () => Promise<Map<string, string[]>>;
+  /** `complete: false` when any open intent's sources could not be reconstructed. */
+  readonly openIntents: () => Promise<{ open: Map<string, string[]>; complete: boolean }>;
   readonly isActive: (transferId: string) => boolean;
   readonly release: (tokenId: string) => void;
   readonly changed: () => void;
@@ -24,7 +25,9 @@ export class IntentPins {
   }
 
   async sync(): Promise<void> {
-    const open = await this.deps.openIntents();
+    // A throw here leaves the ledger UNPROVEN (its fail-closed default) — a read
+    // failure must never resolve into an empty held-set that reads as all-free.
+    const { open, complete } = await this.deps.openIntents();
     let changed = false;
     for (const transferId of [...this.pinned]) {
       if (open.has(transferId) || this.deps.isActive(transferId)) continue;
@@ -38,7 +41,9 @@ export class IntentPins {
       this.pinned.add(transferId);
       changed = this.pin(transferId, tokenIds) || changed;
     }
-    if (changed) this.deps.changed();
+    // Only a pass that reconstructed EVERY open intent makes the ledger authoritative.
+    this.deps.ledger.setAuthoritative(complete);
+    if (changed || complete) this.deps.changed();
   }
 
   /** Every pass, not just on adoption; the free subset, since a partial pin beats none. */

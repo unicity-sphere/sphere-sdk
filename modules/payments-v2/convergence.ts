@@ -219,8 +219,9 @@ export async function derivePendingTransfers(
 export async function deriveOpenIntentHolds(
   stores: MachineStores,
   decryptPayload: (envelope: string) => Promise<unknown>
-): Promise<Map<string, string[]>> {
+): Promise<{ open: Map<string, string[]>; complete: boolean }> {
   const holds = new Map<string, string[]>();
+  let complete = true;
   for (const entry of await stores.backstop.list()) {
     if (entry.disposition !== 'open') continue;
     let payload: Partial<IntentPayload> | null = null;
@@ -228,13 +229,21 @@ export async function deriveOpenIntentHolds(
       const raw = await decryptPayload(entry.payloadEnvelope);
       if (raw !== null && typeof raw === 'object') payload = raw as Partial<IntentPayload>;
     } catch {
-      payload = null; // undecodable envelope: the intent is still open, its sources unknown
+      // Undecodable envelope on a STILL-OPEN intent: its sources are unknown, so
+      // they cannot be proven safe. Report incompleteness — the caller fails
+      // closed rather than treating "unknown sources" as "no sources" (#738).
+      complete = false;
+      continue;
+    }
+    if (payload === null) {
+      complete = false;
+      continue;
     }
     const direct = Array.isArray(payload?.direct) ? payload.direct.filter((id) => typeof id === 'string') : [];
     const split = typeof payload?.split?.tokenId === 'string' ? [payload.split.tokenId] : [];
     holds.set(entry.transferId, [...direct, ...split]);
   }
-  return holds;
+  return { open: holds, complete };
 }
 
 function groupJournal(journal: DeliveryJournalEntry[]): Map<string, DeliveryJournalEntry[]> {

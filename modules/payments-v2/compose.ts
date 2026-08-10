@@ -160,7 +160,9 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     kv: deps.kv,
     emit: (event) => deps.emit(event, {}),
     // #737: a reserved token is unselectable, so it is never confirmed balance.
-    isPinned: (tokenId) => ledger.holderOf(tokenId) !== undefined,
+    // #738: while the held-set is unproven, EVERY token reads pinned — the report
+    // must not call a token spendable that the queue is about to refuse to spend.
+    isPinned: (tokenId) => ledger.unprovenReason() !== null || ledger.holderOf(tokenId) !== undefined,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
   const queue = new SpendQueue({

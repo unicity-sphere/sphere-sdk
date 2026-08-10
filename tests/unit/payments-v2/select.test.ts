@@ -350,6 +350,9 @@ function makeHarness(initial: Array<[string, bigint]> = []): Harness {
   const pools = new Map<string, PoolEntry[]>();
   pools.set(COIN, initial.map(([tokenId, amount]) => ({ tokenId, amount })));
   const ledger = new ReservationLedger();
+  // #738: a fresh ledger's held-set is unproven and refuses every plan. These
+  // cases exercise selection on a ledger IntentPins has already reconstructed.
+  ledger.setAuthoritative(true);
   const queue = new SpendQueue({ ledger, getPool: (coinId) => pools.get(coinId) ?? [] });
   return {
     ledger,
@@ -542,6 +545,7 @@ describe('SpendQueue', () => {
       ['coin-b', []],
     ]);
     const ledger = new ReservationLedger();
+    ledger.setAuthoritative(true); // #738: reconstructed ledger; see makeHarness
     const queue = new SpendQueue({ ledger, getPool: (coinId) => pools.get(coinId) ?? [] });
     queue.declareExpectedChange('fa', COIN, 100n);
     queue.declareExpectedChange('fb', 'coin-b', 100n);
