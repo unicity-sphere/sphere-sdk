@@ -739,11 +739,10 @@ export class SphereTokenEngine implements ITokenEngine {
   }
 
   /**
-   * One inclusion-proof wait, with the deadline OWNED here (#739). The SDK's own
-   * default deadline is unreliable — see lateDeliveringSignal — and a lost one
-   * means an op that never settles, which also wedges PaymentsFacade.stop().
-   * A deadline hit throws, and the caller maps that to ProofUnconfirmedError
-   * (keep-open), which is the correct posture: the spend may be on-chain.
+   * One inclusion-proof wait, with the deadline OWNED here (#739) so it is bounded
+   * and configurable rather than the SDK's fixed default. A hit throws, and the
+   * caller maps it to ProofUnconfirmedError (keep-open) — the correct posture,
+   * since the spend may be on-chain.
    */
   /** Fail fast if this engine's key does not own the token's current state. */
   private assertOwned(token: SphereToken): void {
