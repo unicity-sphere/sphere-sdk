@@ -39,8 +39,8 @@ export class IntentPins {
       this.pinned.add(transferId);
       changed = this.pin(transferId, tokenIds) || changed;
     }
-    this.deps.ledger.setAuthoritative(complete);
-    if (changed || complete) this.deps.changed();
+    const gateMoved = this.deps.ledger.setAuthoritative(complete);
+    if (changed || gateMoved) this.deps.changed();
   }
 
   /** Every pass, not just on adoption; the free subset, since a partial pin beats none. */

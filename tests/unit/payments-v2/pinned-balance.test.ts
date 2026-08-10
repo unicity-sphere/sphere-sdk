@@ -204,3 +204,23 @@ describe('#738 review: the held-set gate fails CLOSED', () => {
     expect(ledger.unprovenReason()).toBeNull();
   });
 });
+
+describe('#738: the gate signals transitions, not passes', () => {
+  it('a repeated complete sync emits once — the heartbeat must not spam inventory:updated', async () => {
+    let emits = 0;
+    const ledger = new ReservationLedger();
+    const pins = new IntentPins({
+      ledger,
+      openIntents: async () => ({ open: new Map(), complete: true }),
+      isActive: () => false,
+      release: () => undefined,
+      changed: () => {
+        emits += 1;
+      },
+    });
+    await pins.sync();
+    await pins.sync();
+    await pins.sync();
+    expect(emits).toBe(1);
+  });
+});

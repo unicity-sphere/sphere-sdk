@@ -284,8 +284,8 @@
     "name": "pins-sync-ignores-incompleteness",
     "note": "#738: only a pass that reconstructed EVERY open intent may make the ledger authoritative; an unreadable envelope must keep it closed.",
     "file": "modules/payments-v2/select/pins.ts",
-    "find": "    this.deps.ledger.setAuthoritative(complete);",
-    "replace": "    this.deps.ledger.setAuthoritative(true);",
+    "find": "    const gateMoved = this.deps.ledger.setAuthoritative(complete);",
+    "replace": "    const gateMoved = this.deps.ledger.setAuthoritative(true);",
     "tests": [
       "tests/unit/payments-v2/pinned-balance.test.ts"
     ]
@@ -316,6 +316,16 @@
     "file": "modules/payments-v2/select/queue.ts",
     "find": "    const unproven = this.deps.ledger.unprovenReason();\n    if (unproven !== null) throw new SphereError(unproven, 'SEND_INSUFFICIENT_BALANCE');",
     "replace": "    const unproven: string | null = null;\n    if (unproven !== null) throw new SphereError(unproven, 'SEND_INSUFFICIENT_BALANCE');",
+    "tests": [
+      "tests/unit/payments-v2/pinned-balance.test.ts"
+    ]
+  },
+  {
+    "name": "gate-emits-every-pass",
+    "note": "#738: the gate signals a TRANSITION; emitting on every complete sync spams inventory:updated once per convergence heartbeat.",
+    "file": "modules/payments-v2/select/pins.ts",
+    "find": "    if (changed || gateMoved) this.deps.changed();",
+    "replace": "    if (changed || gateMoved || true) this.deps.changed();",
     "tests": [
       "tests/unit/payments-v2/pinned-balance.test.ts"
     ]

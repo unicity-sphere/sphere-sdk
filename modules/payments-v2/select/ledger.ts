@@ -13,9 +13,12 @@ export class ReservationLedger {
   // IntentPins proves every one of them "no holder" means unknown, not free.
   private authoritative = false;
 
-  /** Sole writer: IntentPins.sync(), true only if it reconstructed every open intent. */
-  setAuthoritative(value: boolean): void {
+  /** Sole writer: IntentPins.sync(), true only if it reconstructed every open intent.
+   *  Returns whether the gate actually moved, so callers signal transitions, not passes. */
+  setAuthoritative(value: boolean): boolean {
+    const moved = this.authoritative !== value;
     this.authoritative = value;
+    return moved;
   }
 
   /** Non-null while the held-set is unproven: nothing plans, nothing reads free. */
