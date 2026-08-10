@@ -6,8 +6,7 @@ import type { ReservationLedger } from './ledger';
 
 export interface IntentPinsDeps {
   readonly ledger: ReservationLedger;
-  /** Open intents → their source tokenIds, re-derived from the backstop per call. */
-  /** `complete: false` when any open intent's sources could not be reconstructed. */
+  /** Open intents → source tokenIds, re-derived per call; `complete: false` if any could not be. */
   readonly openIntents: () => Promise<{ open: Map<string, string[]>; complete: boolean }>;
   readonly isActive: (transferId: string) => boolean;
   readonly release: (tokenId: string) => void;
@@ -25,8 +24,7 @@ export class IntentPins {
   }
 
   async sync(): Promise<void> {
-    // A throw here leaves the ledger UNPROVEN (its fail-closed default) — a read
-    // failure must never resolve into an empty held-set that reads as all-free.
+    // A throw leaves the ledger unproven — never an empty held-set (#738).
     const { open, complete } = await this.deps.openIntents();
     let changed = false;
     for (const transferId of [...this.pinned]) {
@@ -41,7 +39,6 @@ export class IntentPins {
       this.pinned.add(transferId);
       changed = this.pin(transferId, tokenIds) || changed;
     }
-    // Only a pass that reconstructed EVERY open intent makes the ledger authoritative.
     this.deps.ledger.setAuthoritative(complete);
     if (changed || complete) this.deps.changed();
   }

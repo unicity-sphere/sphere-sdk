@@ -179,9 +179,7 @@ export class PaymentsFacade implements PaymentsV2 {
     await this.deps.session.start();
     // BEFORE the first pass and before any send can plan: a source pinned by an
     // intent left open by the previous session must not be re-offered (#737).
-    // A rejection here leaves IntentPins in its fail-closed state, so sends are
-    // refused until a later pass reconstructs the holds — start() still resolves
-    // (reads/receive must keep working), but nothing can spend blind (#738).
+    // A rejection leaves the ledger unproven: reads keep working, spending does not (#738).
     await this.pins.sync().catch(() => undefined);
     // §7 start posture: never awaited; the heartbeat re-runs this same pass.
     this.trackTail(this.runConvergencePass());
@@ -272,9 +270,7 @@ export class PaymentsFacade implements PaymentsV2 {
     const outcome = await this.converger.convergeOnce();
     // After the pass refreshed the mirror: an intent that stopped being open
     // stops pinning, one still open keeps pinning (#737).
-    // A rejection here leaves IntentPins in its fail-closed state, so sends are
-    // refused until a later pass reconstructs the holds — start() still resolves
-    // (reads/receive must keep working), but nothing can spend blind (#738).
+    // A rejection leaves the ledger unproven: reads keep working, spending does not (#738).
     await this.pins.sync().catch(() => undefined);
     const pending = await this.converger.pendingWork().catch(() => true);
     this.heartbeat.settle(outcome, pending);

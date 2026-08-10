@@ -9,22 +9,16 @@ export interface ReservationRequest {
 export class ReservationLedger {
   private readonly reservations = new Map<string, ReadonlySet<string>>();
   private readonly tokenHolder = new Map<string, string>();
-  /**
-   * #738: the held-set is a RECONSTRUCTION of what still-open intents hold, so a
-   * fresh ledger is not yet a complete picture — "no holder" does not mean
-   * "free", it means "unknown". Until IntentPins proves every open intent,
-   * everything reads as held: the report shows it pinned and the queue refuses.
-   * Spending a source whose spend may already be on-chain is a double-spend;
-   * refusing is downtime. Explicit so the unsafe state can only be LEFT on purpose.
-   */
+  // #738: the held-set is RECONSTRUCTED from the open intents, so until
+  // IntentPins proves every one of them "no holder" means unknown, not free.
   private authoritative = false;
 
-  /** Sole writer: IntentPins.sync(), with whether it reconstructed every open intent. */
+  /** Sole writer: IntentPins.sync(), true only if it reconstructed every open intent. */
   setAuthoritative(value: boolean): void {
     this.authoritative = value;
   }
 
-  /** Non-null while the held-set is unproven — nothing is spendable, nothing reads free. */
+  /** Non-null while the held-set is unproven: nothing plans, nothing reads free. */
   unprovenReason(): string | null {
     return this.authoritative
       ? null
