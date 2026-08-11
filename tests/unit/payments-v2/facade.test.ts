@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { hexToBytes } from '../../../core/crypto';
 import { PartialSendConflictError, SphereError } from '../../../core/errors';
 import { ProofUnconfirmedError } from '../../../token-engine/errors';
+import type { TransferResult } from '../../../types';
 import type { EngineOpOptions, MintParams, SphereToken } from '../../../token-engine';
 import { STORE_KEYS, type MintJournalEntry } from '../../../modules/payments-v2/stores';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
@@ -61,6 +62,28 @@ class DetMintEngine extends RealizationEngine implements DeterministicMintCapabl
 afterEach(cleanupWorlds);
 
 describe('PaymentsFacade — send policy', () => {
+  it('a multi-token send reports each leg as it certifies, so the UI can show real progress', async () => {
+    const world = makeWorld();
+    const sources = [];
+    for (let i = 0; i < 4; i += 1) sources.push(await world.seed(100n));
+    await world.facade.start();
+
+    const result = await world.facade.send({ recipient: '@peer', amount: '400', coinId: COIN });
+
+    expect(result.tokenTransfers).toHaveLength(4);
+    const updates = eventsOf(world, 'transfer:updated') as TransferResult[];
+    const progress = updates.filter((u) => u.status === 'submitted');
+
+    // One report per leg, each carrying the legs certified SO FAR — a strictly
+    // growing 1..4 is what lets the UI render "n of 4" instead of a spinner.
+    expect(progress.map((p) => p.tokenTransfers.length)).toEqual([1, 2, 3, 4]);
+    // Every reported leg is a real source, and the last report covers them all.
+    const reported = progress.at(-1)?.tokenTransfers.map((d) => d.sourceTokenId) ?? [];
+    expect([...reported].sort()).toEqual(sources.map((s) => s.blob.tokenId).sort());
+    // Progress is never mistaken for the outcome.
+    expect(updates.at(-1)?.status).toBe('delivered');
+  });
+
   it('happy direct send: §4 result shape, transfer:updated, mailbox deposit, completed intent', async () => {
     const world = makeWorld();
     const token = await world.seed(100n);
@@ -72,7 +95,13 @@ describe('PaymentsFacade — send policy', () => {
     expect(result.deliveryPending).toBe(false);
     expect(result.tokens.map((t) => t.id)).toEqual([token.blob.tokenId]);
     expect(result.tokenTransfers).toEqual([{ sourceTokenId: token.blob.tokenId, method: 'direct' }]);
-    expect(eventsOf(world, 'transfer:updated')).toHaveLength(1);
+    // One in-flight progress report per certified leg, then exactly one
+    // terminal outcome. Consumers key on `status`, which is what tells the two
+    // apart; the compat adapter forwards only settled/failed.
+    const updates = eventsOf(world, 'transfer:updated') as TransferResult[];
+    expect(updates.filter((u) => u.status === 'submitted')).toHaveLength(1);
+    expect(updates.filter((u) => u.status !== 'submitted')).toHaveLength(1);
+    expect(updates.at(-1)?.status).toBe('delivered');
 
     const mailbox = await world.api.listMailbox(peerCaller, 0);
     expect(mailbox.entries.map((e) => e.tokenId)).toEqual([token.blob.tokenId]);

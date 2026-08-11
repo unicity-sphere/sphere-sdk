@@ -430,5 +430,15 @@
     "tests": [
       "tests/unit/token-engine/proof-deadline.test.ts"
     ]
+  },
+  {
+    "name": "send-reports-no-progress",
+    "note": "A multi-token send must report each leg as it certifies; without it the UI can only show a spinner (per-leg, not per-wave \u2014 a <=CERTIFY_WIDTH send is one wave).",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "            if (o.certified) {\n              certified.push(o);\n              this.emitProgress(plan, certified);\n            }",
+    "replace": "            if (o.certified) {\n              certified.push(o);\n            }",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
   }
 ]
