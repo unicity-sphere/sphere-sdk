@@ -129,6 +129,46 @@ describe('TransferMachine resume path (§5.5 P6 — same machine, rehydrated)', 
     expect(w.api.inspectIntent(w.caller, 'partial-1')?.status).toBe('completed');
   });
 
+  it('#745 review: a conflict does NOT license settling when another leg failed ordinarily', async () => {
+    // summarize ranks conflict above 'other', so an intent holding BOTH used to
+    // read as merely-conflicted and settle. The ordinarily-failed leg is in
+    // neither committed[] nor conflicts[], so its amount vanished from the
+    // shortfall and the recipient was quietly underpaid on a CLOSED intent.
+    const w = makeWorld();
+    const tokenA = await w.seed(500n);
+    const tokenB = await w.seed(300n);
+    const tokenC = await w.seed(200n);
+    const plan = await w.plan({
+      tokens: [tokenA, tokenB, tokenC],
+      amount: '1000',
+      transferId: 'masked-1',
+    });
+    const pue = new ProofUnconfirmedError('submit lost in transit');
+    // Both B and C must stay UNjournaled, so resume re-certifies them (a
+    // journaled leg is replayed from the journal and never re-run).
+    w.engine.beforeOp = (key) => {
+      if (key === 'masked-1:1' || key === 'masked-1:2') throw pue;
+    };
+    w.overrides.deliver = fail500;
+    await expect(w.machine().run(plan)).rejects.toBe(pue);
+    w.engine.beforeOp = null;
+    delete w.overrides.deliver;
+
+    // On resume: B is a clean conflict, C fails with an ordinary error.
+    await w.engine.foreignSpend(tokenB);
+    w.engine.afterOp = (key) => (key === 'masked-1:2' ? new Error('storage exploded') : null);
+
+    await resumeAll(w.deps);
+    w.engine.afterOp = null;
+
+    // The intent must stay OPEN — nothing settled, no shortfall claiming the
+    // transfer is finished, and C's source is untouched.
+    expect(w.api.inspectIntent(w.caller, 'masked-1')?.status).toBe('open');
+    expect(await createMachineStores(w.kv).shortfalls.getByKey('masked-1')).toBeUndefined();
+    expect(w.completes.map((c) => c.transferId)).not.toContain('masked-1');
+    expect(w.api.inspectInventoryRow(w.caller, tokenC.blob.tokenId)?.status).toBe('active');
+  });
+
   it('#690: the shortfall record is durable BEFORE complete fires — a crash between complete and the surface finds it on reload', async () => {
     const w = makeWorld();
     const tokenA = await w.seed(600n);

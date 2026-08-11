@@ -60,14 +60,18 @@ export async function retryTransient<T>(
   attempt: () => Promise<T>,
   signal: AbortSignal,
   intervalMs: number
-): Promise<T> {
+): Promise<{ value: T; retried: boolean }> {
+  let retried = false;
   for (;;) {
+    // `pause` resolves on abort too, so recheck before attempting (#747 review).
+    if (signal.aborted) throw signal.reason as Error;
     try {
-      return await attempt();
+      return { value: await attempt(), retried };
     } catch (err) {
       // The deadline (or the caller) ended it: that outcome is final.
       if (signal.aborted) throw err;
       if (!isTransientGatewayError(err)) throw err;
+      retried = true;
       await pause(intervalMs, signal);
     }
   }
@@ -113,7 +117,7 @@ export async function awaitProofBounded(
   transaction: Parameters<typeof waitInclusionProof>[3],
   signal: AbortSignal
 ): Promise<InclusionProof> {
-  return retryTransient(
+  const { value } = await retryTransient(
     () =>
       waitInclusionProof(
         deps.client,
@@ -126,4 +130,5 @@ export async function awaitProofBounded(
     signal,
     deps.intervalMs
   );
+  return value;
 }

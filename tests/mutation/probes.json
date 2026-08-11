@@ -385,20 +385,50 @@
     "name": "submit-429-not-retried",
     "note": "#746: the metered call is the SUBMIT. Without retry a 429 falls through to a proof wait for a request the gateway never accepted, burning the whole deadline per op \u2014 which is what made raising CERTIFY_WIDTH unsafe.",
     "file": "token-engine/SphereTokenEngine.ts",
-    "find": "      const response = await retryTransient(\n        () => this.deps.client.submitCertificationRequest(certificationData),\n        signal,\n        this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS,\n      );",
-    "replace": "      const response = await this.deps.client.submitCertificationRequest(certificationData);",
+    "find": "      const { value: response, retried } = await retryTransient(\n        () => this.deps.client.submitCertificationRequest(certificationData),\n        signal,\n        this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS,\n      );",
+    "replace": "      const response = await this.deps.client.submitCertificationRequest(certificationData);\n      const retried = false;",
     "tests": [
       "tests/unit/token-engine/proof-deadline.test.ts"
     ]
   },
   {
     "name": "resume-closes-on-unjournaled-leg",
-    "note": "#744: an intent may close only when every op settled cleanly. Dropping the shared gate lets resume complete with a certified-but-unjournaled leg, spending the source and destroying the recipient blob.",
+    "note": "#744: an intent may close only when every op settled cleanly; the gate now tests EVERY outcome (#745 review), not the aggregate class.",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    if (cls !== null && cls !== 'conflict') throw firstError;",
-    "replace": "    if (cls !== null && cls !== 'conflict' && false) throw firstError;",
+    "find": "    const blocking = firstNonConflictError(outcomes);\n    if (blocking !== undefined) throw blocking.error;",
+    "replace": "    const blocking = undefined as OpOutcome | undefined;\n    if (blocking !== undefined) throw blocking.error;",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-masks-ordinary-failure",
+    "note": "#745 review: summarize ranks conflict above 'other', so gating on the aggregate class let a conflict license settlement while an ordinarily-failed leg was in neither committed[] nor conflicts[] \u2014 understated shortfall on a closed intent.",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    const blocking = firstNonConflictError(outcomes);\n    if (blocking !== undefined) throw blocking.error;",
+    "replace": "    const { cls, firstError } = summarize(outcomes);\n    if (cls !== null && cls !== 'conflict') throw firstError;",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "submit-retry-forgets-ambiguity",
+    "note": "#747 review: once any submit attempt ends ambiguously the spend may be on-chain; letting a later attempt's clean-reject status stand would abort the intent and restore a spent source.",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "        submitRejectedCleanly = !retried && CLEAN_REJECT_STATUSES.has(response.status);",
+    "replace": "        submitRejectedCleanly = CLEAN_REJECT_STATUSES.has(response.status);",
+    "tests": [
+      "tests/unit/token-engine/proof-deadline.test.ts"
+    ]
+  },
+  {
+    "name": "retry-attempts-after-abort",
+    "note": "#747 review: pause() resolves on abort too, so without a pre-attempt signal check the loop issues one more request past the deadline \u2014 and a hanging one un-bounds the operation.",
+    "file": "token-engine/proof-wait.ts",
+    "find": "    if (signal.aborted) throw signal.reason as Error;\n    try {",
+    "replace": "    try {",
+    "tests": [
+      "tests/unit/token-engine/proof-deadline.test.ts"
     ]
   }
 ]

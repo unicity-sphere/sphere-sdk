@@ -15,6 +15,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  CertificationStatus,
   type IAggregatorClient,
   type InclusionProofResponse,
   JsonRpcNetworkError,
@@ -323,5 +324,75 @@ describe('#739 the inclusion-proof wait always terminates', () => {
 
     expect(err).toBeInstanceOf(ProofUnconfirmedError);
     expect(Date.now() - started).toBeLessThan(3_000);
+  }, 30_000);
+
+  it('#747 review: a clean-reject on a RETRY cannot erase an earlier ambiguous submit', async () => {
+    // The first POST fails ambiguously (503) — it may already have been
+    // processed. A retry then answers with a clean-reject status. Reading that
+    // as "provably never certified" would abort the intent and restore a source
+    // whose spend may be on-chain; the outcome must stay keep-open.
+    const aggregator = TestAggregatorClient.create();
+    let submits = 0;
+    const engine = createTestEngine({
+      aggregator,
+      wireClient: new (class extends SlowProofClient {
+        override async submitCertificationRequest(
+          data: Parameters<TestAggregatorClient['submitCertificationRequest']>[0]
+        ): ReturnType<TestAggregatorClient['submitCertificationRequest']> {
+          submits += 1;
+          if (submits === 1) throw new JsonRpcNetworkError(503, 'ambiguous');
+          // A clean-reject STATUS (not a throw) is what could restore the
+          // "provably never certified" reading and license an abort.
+          const real = await this.inner.submitCertificationRequest(data);
+          return { ...real, status: CertificationStatus.STATE_ID_MISMATCH } as typeof real;
+        }
+      })(aggregator, () => 0),
+      proofTimeoutMs: 400,
+      proofPollIntervalMs: 20,
+    });
+
+    const err = await engine
+      .mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: COIN, amount: 1000n }] },
+      })
+      .then(() => null)
+      .catch((e: unknown) => e);
+
+    expect(submits).toBeGreaterThan(1);
+    expect(err).toBeInstanceOf(ProofUnconfirmedError);
+  }, 30_000);
+
+  it('#747 review: no attempt STARTS after the deadline has already fired', async () => {
+    // `pause` resolves on abort as well as on elapse, so the loop must recheck
+    // the signal BEFORE attempting again — otherwise one extra POST goes out
+    // past the deadline, and a hanging one un-bounds the whole operation.
+    // Timeline: attempt 100ms, pause 200ms, deadline 500ms — so a correct loop
+    // last STARTS at ~300ms, while the bug starts one at ~500ms.
+    const aggregator = TestAggregatorClient.create();
+    const startedAt: number[] = [];
+    const t0 = Date.now();
+    const engine = createTestEngine({
+      aggregator,
+      wireClient: new (class extends SlowProofClient {
+        override async submitCertificationRequest(): Promise<never> {
+          startedAt.push(Date.now() - t0);
+          await new Promise((r) => setTimeout(r, 100));
+          throw new JsonRpcNetworkError(503, 'down');
+        }
+      })(aggregator, () => 0),
+      proofTimeoutMs: 500,
+      proofPollIntervalMs: 200,
+    });
+
+    await engine
+      .mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: COIN, amount: 1000n }] },
+      })
+      .catch(() => undefined);
+
+    expect(startedAt.length).toBeGreaterThan(1);
+    expect(Math.max(...startedAt)).toBeLessThan(450);
   }, 30_000);
 });

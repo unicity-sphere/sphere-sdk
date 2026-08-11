@@ -148,6 +148,12 @@ export function classifyError(e: unknown): OutcomeClass {
 }
 
 /** Precedence keep-open > conflict > other; committed = certified regardless of error (#441). */
+/** Settlement tolerates conflicts and nothing else; `cls` cannot say that, because
+ *  it ranks conflict ABOVE 'other' and so hides an ordinary failure (#745 review). */
+export function firstNonConflictError(outcomes: OpOutcome[]): OpOutcome | undefined {
+  return outcomes.find((o) => o.error !== undefined && classifyError(o.error) !== 'conflict');
+}
+
 export function summarize(outcomes: OpOutcome[]): {
   committed: OpOutcome[];
   cls: OutcomeClass | null;
@@ -217,7 +223,7 @@ export class TransferMachine {
       ...(r.payload.memo !== undefined ? { memo: r.payload.memo } : {}),
     };
     const outcomes = await this.resumeOps(ctx, engine, r);
-    const { committed, cls, firstError } = summarize(outcomes);
+    const { committed } = summarize(outcomes);
     const conflicts = this.toConflicts(engine, r, outcomes);
     if (committed.length === 0 && conflicts.length > 0) throw conflicts[0].error;
 
@@ -225,11 +231,11 @@ export class TransferMachine {
     if (committed.length > 0) {
       deliveryPending = await this.deliverSet(r.transferId, r.payload.recipient, r.payload.memo, committed);
     }
-    // #744: an intent may close only when every op settled cleanly. A leg that
-    // certified but could not be journaled is `certified` WITH an error — its
-    // blob lives only in memory, so closing here would spend the source and
-    // destroy the payment. Same gate the send path applies at run().
-    if (cls !== null && cls !== 'conflict') throw firstError;
+    // An intent closes only when every op settled cleanly (#744) — judged per
+    // outcome, since a conflict outranks and would hide an ordinary failure whose
+    // amount is in neither committed[] nor conflicts[] (#745 review).
+    const blocking = firstNonConflictError(outcomes);
+    if (blocking !== undefined) throw blocking.error;
 
     await this.applyCommitted(engine, r.transferId, committed);
     if (conflicts.length > 0) {
