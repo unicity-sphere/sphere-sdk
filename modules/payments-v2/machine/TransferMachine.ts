@@ -30,7 +30,11 @@ import {
   type MachineStores,
 } from './journal';
 
-const CERTIFY_WIDTH = 8;
+// #746: measured live, a 4-op wave cost the same as an 8-op wave — at 8 we were
+// latency-bound, so each wave paid a proof round-trip and the barrier multiplied
+// it. Safe to widen only because a rate-limited submit now retries instead of
+// burning a full deadline per op (proof-wait.retryTransient).
+const CERTIFY_WIDTH = 20;
 
 const KEEP_OPEN_CODES = new Set([
   'CERTIFICATION_UNCONFIRMED',
