@@ -61,6 +61,41 @@ describe('TransferMachine resume path (§5.5 P6 — same machine, rehydrated)', 
     expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('completed');
   });
 
+  it('#744: a resume whose journal write fails keeps the intent OPEN — the certified blob is never destroyed', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    const pue = new ProofUnconfirmedError('proof fetch inconclusive');
+    w.engine.afterOp = (key) => (key === `${plan.transferId}:0` ? pue : null);
+    await expect(w.machine().run(plan)).rejects.toBe(pue);
+    w.engine.afterOp = null;
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('open');
+    expect(await w.stores().deliveryJournal.list()).toHaveLength(0);
+
+    // The op now certifies, but its #621 journal entry cannot be written
+    // (quota, aborted transaction, torn-down storage). The blob exists only in
+    // memory: closing the intent here would spend the source and destroy it.
+    w.kv.failWriteKeys.add(STORE_KEYS.deliveryJournal);
+
+    const report = await resumeAll(w.deps);
+
+    // NOT reported as resumed, and above all not settled.
+    expect(report.resumed).not.toContain(plan.transferId);
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('open');
+    expect(w.completes.map((c) => c.transferId)).not.toContain(plan.transferId);
+    expect(w.applied.map((a) => a.transferId)).not.toContain(plan.transferId);
+    expect((await w.api.listMailbox(w.recipientCaller)).entries).toHaveLength(0);
+
+    // Storage recovers: the SAME transferId converges, paying the recipient once.
+    w.kv.failWriteKeys.delete(STORE_KEYS.deliveryJournal);
+    const recovered = await resumeAll(w.deps);
+
+    expect(recovered.resumed).toEqual([plan.transferId]);
+    expect((await w.api.listMailbox(w.recipientCaller)).entries).toHaveLength(1);
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('completed');
+    expect(w.applied.at(-1)?.spent).toEqual([token.blob.tokenId]);
+  });
+
   it('audit#4: a conflicted resume leg is never in spent[]; the delivered leg completes with the remainder-only shortfall', async () => {
     const w = makeWorld();
     const tokenA = await w.seed(600n);
