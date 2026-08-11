@@ -372,21 +372,12 @@ export class SphereTokenEngine implements ITokenEngine {
     //    already-checkpointed burn (step 1, outside this fan-out — E.4 burn-before-mint
     //    is unchanged), so they carry no ordering constraint among themselves.
     //
-    //    MONEY-SAFETY (identical semantics to the prior sequential loop):
-    //    - `allSettled` waits for EVERY leg (never short-circuits) so an in-flight leg is
-    //      not abandoned mid-submit; then we throw the LOWEST-index rejection's error —
-    //      exactly the error the sequential loop would have surfaced (it failed at the
-    //      first failing index and never attempted later legs). So the caller's keep-open
-    //      classification (ProofUnconfirmedError / SplitCheckpointLostError / …) is byte-for-
-    //      byte unchanged.
-    //    - On any failure the intent stays OPEN (the burn is certified + checkpointed) and
-    //      resume re-runs ALL legs from the durable checkpoint. A leg this fan-out already
-    //      certified is recovered idempotently on resume (its stateId is HKDF-derived and
-    //      deterministic; re-submit → the aggregator already holds it → waitInclusionProof
-    //      returns the existing proof — the #631/E.2 resume contract). So legs the sequential
-    //      loop would NOT have submitted, but this one did, are never lost — only recovered.
-    //    Bounded concurrency (MAX_MINT_CONCURRENCY) paces the fan-out so a large split
-    //    can't storm the gateway; a typical K=2 split runs in a single fully-parallel batch.
+    //    MONEY-SAFETY, identical to the prior sequential loop: `allSettled` waits for
+    //    EVERY leg (no leg abandoned mid-submit) and rethrows the LOWEST-index rejection,
+    //    which is the error the sequential loop surfaced — so keep-open classification is
+    //    unchanged. On failure the intent stays OPEN and resume re-runs all legs from the
+    //    durable checkpoint; an already-certified leg is recovered idempotently (#631/E.2),
+    //    so legs this fan-out submitted early are never lost. MAX_MINT_CONCURRENCY paces it.
     const settled: PromiseSettledResult<SphereToken>[] = [];
     for (let start = 0; start < split.tokens.length; start += MAX_MINT_CONCURRENCY) {
       const batch = split.tokens.slice(start, start + MAX_MINT_CONCURRENCY);
@@ -706,29 +697,20 @@ export class SphereTokenEngine implements ITokenEngine {
     signal: AbortSignal,
   ): Promise<InclusionProof> {
     let submitError: unknown = null;
-    // true ONLY for a KNOWN validation-reject status — a PROVEN clean pre-certification
-    // reject (nothing on-chain). Status-agnostic otherwise (E.2): an UNKNOWN/transitional
-    // non-SUCCESS status may have certified, and a THROWN submit POST may have been
-    // processed server-side — both stay INDETERMINATE (keep-open, #631).
+    // True ONLY for a KNOWN validation-reject status: a PROVEN clean pre-certification
+    // reject. Everything else stays INDETERMINATE (keep-open, #631) — including any
+    // submit that was RETRIED, since the earlier POST may already have been processed
+    // server-side, which is what sawAmbiguousAttempt latches (#747 review).
     let submitRejectedCleanly = false;
-    // #747 review: a retried POST may ALREADY have been processed server-side.
-    // Once any attempt ends ambiguously the whole submit is indeterminate, and
-    // no later attempt's clean-reject status may restore the clean reading —
-    // aborting on that would restore a source whose spend is on-chain.
-    let sawAmbiguousAttempt = false;
     try {
-      const response = await retryTransient(
+      const { value: response, retried } = await retryTransient(
         () => this.deps.client.submitCertificationRequest(certificationData),
         signal,
         this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS,
-        () => {
-          sawAmbiguousAttempt = true;
-        },
       );
       if (response.status !== CertificationStatus.SUCCESS) {
         submitError = new SphereError(`${failLabel}: ${response.status}`, failCode);
-        submitRejectedCleanly =
-          !sawAmbiguousAttempt && CLEAN_REJECT_STATUSES.has(response.status);
+        submitRejectedCleanly = !retried && CLEAN_REJECT_STATUSES.has(response.status);
       }
     } catch (err) {
       submitError = err ?? new SphereError(`${failLabel}: submit failed`, failCode);

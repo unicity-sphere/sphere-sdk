@@ -15,6 +15,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  CertificationStatus,
   type IAggregatorClient,
   type InclusionProofResponse,
   JsonRpcNetworkError,
@@ -335,10 +336,15 @@ describe('#739 the inclusion-proof wait always terminates', () => {
     const engine = createTestEngine({
       aggregator,
       wireClient: new (class extends SlowProofClient {
-        override async submitCertificationRequest(): Promise<never> {
+        override async submitCertificationRequest(
+          data: Parameters<TestAggregatorClient['submitCertificationRequest']>[0]
+        ): ReturnType<TestAggregatorClient['submitCertificationRequest']> {
           submits += 1;
           if (submits === 1) throw new JsonRpcNetworkError(503, 'ambiguous');
-          throw new JsonRpcNetworkError(400, 'clean reject after the fact');
+          // A clean-reject STATUS (not a throw) is what could restore the
+          // "provably never certified" reading and license an abort.
+          const real = await this.inner.submitCertificationRequest(data);
+          return { ...real, status: CertificationStatus.STATE_ID_MISMATCH } as typeof real;
         }
       })(aggregator, () => 0),
       proofTimeoutMs: 400,
@@ -357,23 +363,26 @@ describe('#739 the inclusion-proof wait always terminates', () => {
     expect(err).toBeInstanceOf(ProofUnconfirmedError);
   }, 30_000);
 
-  it('#747 review: no attempt is issued after the deadline has already fired', async () => {
+  it('#747 review: no attempt STARTS after the deadline has already fired', async () => {
     // `pause` resolves on abort as well as on elapse, so the loop must recheck
     // the signal BEFORE attempting again — otherwise one extra POST goes out
     // past the deadline, and a hanging one un-bounds the whole operation.
+    // Timeline: attempt 100ms, pause 200ms, deadline 500ms — so a correct loop
+    // last STARTS at ~300ms, while the bug starts one at ~500ms.
     const aggregator = TestAggregatorClient.create();
-    let submits = 0;
+    const startedAt: number[] = [];
+    const t0 = Date.now();
     const engine = createTestEngine({
       aggregator,
       wireClient: new (class extends SlowProofClient {
         override async submitCertificationRequest(): Promise<never> {
-          submits += 1;
-          await new Promise((r) => setTimeout(r, 60));
+          startedAt.push(Date.now() - t0);
+          await new Promise((r) => setTimeout(r, 100));
           throw new JsonRpcNetworkError(503, 'down');
         }
       })(aggregator, () => 0),
-      proofTimeoutMs: 200,
-      proofPollIntervalMs: 40,
+      proofTimeoutMs: 500,
+      proofPollIntervalMs: 200,
     });
 
     await engine
@@ -383,8 +392,7 @@ describe('#739 the inclusion-proof wait always terminates', () => {
       })
       .catch(() => undefined);
 
-    const settled = submits;
-    await new Promise((r) => setTimeout(r, 400));
-    expect(submits).toBe(settled); // nothing issued after the deadline
+    expect(startedAt.length).toBeGreaterThan(1);
+    expect(Math.max(...startedAt)).toBeLessThan(450);
   }, 30_000);
 });
