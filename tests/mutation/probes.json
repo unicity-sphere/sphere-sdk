@@ -21,10 +21,10 @@
   },
   {
     "name": "machine-conflicted-leg-as-spent",
-    "note": "audit#4: a conflicted resume leg is never in applyDelta.spent[] (machine-resume.test.ts)",
+    "note": "audit#4: a conflicted resume leg is never in applyDelta.spent[]. Re-pointed at the shared decision (#744 unified send+resume onto summarize), where 'what counts as committed' now lives.",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "      conflicts.push({ op, error: outcome.error, amount: conflictAmount(engine, r.payload, op, source) });",
-    "replace": "      committed.push({ op, certified: true });\n      conflicts.push({ op, error: outcome.error, amount: conflictAmount(engine, r.payload, op, source) });",
+    "find": "  const committed = outcomes.filter((o) => o.certified);",
+    "replace": "  const committed = outcomes.filter((o) => o.certified || classifyError(o.error) === 'conflict');",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
