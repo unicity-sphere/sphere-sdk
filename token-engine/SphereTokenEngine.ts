@@ -711,15 +711,24 @@ export class SphereTokenEngine implements ITokenEngine {
     // non-SUCCESS status may have certified, and a THROWN submit POST may have been
     // processed server-side — both stay INDETERMINATE (keep-open, #631).
     let submitRejectedCleanly = false;
+    // #747 review: a retried POST may ALREADY have been processed server-side.
+    // Once any attempt ends ambiguously the whole submit is indeterminate, and
+    // no later attempt's clean-reject status may restore the clean reading —
+    // aborting on that would restore a source whose spend is on-chain.
+    let sawAmbiguousAttempt = false;
     try {
       const response = await retryTransient(
         () => this.deps.client.submitCertificationRequest(certificationData),
         signal,
         this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS,
+        () => {
+          sawAmbiguousAttempt = true;
+        },
       );
       if (response.status !== CertificationStatus.SUCCESS) {
         submitError = new SphereError(`${failLabel}: ${response.status}`, failCode);
-        submitRejectedCleanly = CLEAN_REJECT_STATUSES.has(response.status);
+        submitRejectedCleanly =
+          !sawAmbiguousAttempt && CLEAN_REJECT_STATUSES.has(response.status);
       }
     } catch (err) {
       submitError = err ?? new SphereError(`${failLabel}: submit failed`, failCode);

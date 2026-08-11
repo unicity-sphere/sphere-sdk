@@ -324,4 +324,67 @@ describe('#739 the inclusion-proof wait always terminates', () => {
     expect(err).toBeInstanceOf(ProofUnconfirmedError);
     expect(Date.now() - started).toBeLessThan(3_000);
   }, 30_000);
+
+  it('#747 review: a clean-reject on a RETRY cannot erase an earlier ambiguous submit', async () => {
+    // The first POST fails ambiguously (503) — it may already have been
+    // processed. A retry then answers with a clean-reject status. Reading that
+    // as "provably never certified" would abort the intent and restore a source
+    // whose spend may be on-chain; the outcome must stay keep-open.
+    const aggregator = TestAggregatorClient.create();
+    let submits = 0;
+    const engine = createTestEngine({
+      aggregator,
+      wireClient: new (class extends SlowProofClient {
+        override async submitCertificationRequest(): Promise<never> {
+          submits += 1;
+          if (submits === 1) throw new JsonRpcNetworkError(503, 'ambiguous');
+          throw new JsonRpcNetworkError(400, 'clean reject after the fact');
+        }
+      })(aggregator, () => 0),
+      proofTimeoutMs: 400,
+      proofPollIntervalMs: 20,
+    });
+
+    const err = await engine
+      .mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: COIN, amount: 1000n }] },
+      })
+      .then(() => null)
+      .catch((e: unknown) => e);
+
+    expect(submits).toBeGreaterThan(1);
+    expect(err).toBeInstanceOf(ProofUnconfirmedError);
+  }, 30_000);
+
+  it('#747 review: no attempt is issued after the deadline has already fired', async () => {
+    // `pause` resolves on abort as well as on elapse, so the loop must recheck
+    // the signal BEFORE attempting again — otherwise one extra POST goes out
+    // past the deadline, and a hanging one un-bounds the whole operation.
+    const aggregator = TestAggregatorClient.create();
+    let submits = 0;
+    const engine = createTestEngine({
+      aggregator,
+      wireClient: new (class extends SlowProofClient {
+        override async submitCertificationRequest(): Promise<never> {
+          submits += 1;
+          await new Promise((r) => setTimeout(r, 60));
+          throw new JsonRpcNetworkError(503, 'down');
+        }
+      })(aggregator, () => 0),
+      proofTimeoutMs: 200,
+      proofPollIntervalMs: 40,
+    });
+
+    await engine
+      .mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: COIN, amount: 1000n }] },
+      })
+      .catch(() => undefined);
+
+    const settled = submits;
+    await new Promise((r) => setTimeout(r, 400));
+    expect(submits).toBe(settled); // nothing issued after the deadline
+  }, 30_000);
 });

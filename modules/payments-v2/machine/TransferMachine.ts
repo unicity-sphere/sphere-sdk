@@ -152,6 +152,8 @@ export function summarize(outcomes: OpOutcome[]): {
   committed: OpOutcome[];
   cls: OutcomeClass | null;
   firstError: unknown;
+  /** First error that a conflict may NOT stand in for — settlement must refuse it. */
+  blockingError: { present: boolean; error: unknown };
 } {
   const committed = outcomes.filter((o) => o.certified);
   const rank: Record<OutcomeClass, number> = { 'keep-open': 3, conflict: 2, other: 1 };
@@ -165,7 +167,15 @@ export function summarize(outcomes: OpOutcome[]): {
       firstError = o.error;
     }
   }
-  return { committed, cls, firstError };
+  const blocking = outcomes.find(
+    (o) => o.error !== undefined && classifyError(o.error) !== 'conflict'
+  );
+  return {
+    committed,
+    cls,
+    firstError,
+    blockingError: { present: blocking !== undefined, error: blocking?.error },
+  };
 }
 
 export class TransferMachine {
@@ -217,7 +227,7 @@ export class TransferMachine {
       ...(r.payload.memo !== undefined ? { memo: r.payload.memo } : {}),
     };
     const outcomes = await this.resumeOps(ctx, engine, r);
-    const { committed, cls, firstError } = summarize(outcomes);
+    const { committed, blockingError } = summarize(outcomes);
     const conflicts = this.toConflicts(engine, r, outcomes);
     if (committed.length === 0 && conflicts.length > 0) throw conflicts[0].error;
 
@@ -228,8 +238,13 @@ export class TransferMachine {
     // #744: an intent may close only when every op settled cleanly. A leg that
     // certified but could not be journaled is `certified` WITH an error — its
     // blob lives only in memory, so closing here would spend the source and
-    // destroy the payment. Same gate the send path applies at run().
-    if (cls !== null && cls !== 'conflict') throw firstError;
+    // destroy the payment.
+    // #745 review: test EVERY outcome, not the aggregate class. `cls` ranks
+    // conflict above 'other', so a conflict alongside an ordinary failure used
+    // to read as merely-conflicted and settle — and that op is in neither
+    // `committed` nor `toConflicts`, so the shortfall understated it and the
+    // recipient was quietly underpaid.
+    if (blockingError.present) throw blockingError.error;
 
     await this.applyCommitted(engine, r.transferId, committed);
     if (conflicts.length > 0) {

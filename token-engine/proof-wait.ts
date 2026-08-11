@@ -59,15 +59,21 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
 export async function retryTransient<T>(
   attempt: () => Promise<T>,
   signal: AbortSignal,
-  intervalMs: number
+  intervalMs: number,
+  onTransient?: (err: unknown) => void
 ): Promise<T> {
   for (;;) {
+    // #747 review: recheck BEFORE attempting. `pause` also resolves on abort,
+    // so without this the loop issued one more request after the deadline —
+    // and if that one hung, the bounded operation hung with it.
+    if (signal.aborted) throw signal.reason as Error;
     try {
       return await attempt();
     } catch (err) {
       // The deadline (or the caller) ended it: that outcome is final.
       if (signal.aborted) throw err;
       if (!isTransientGatewayError(err)) throw err;
+      onTransient?.(err);
       await pause(intervalMs, signal);
     }
   }
