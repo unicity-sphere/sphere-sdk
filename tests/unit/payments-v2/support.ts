@@ -18,23 +18,30 @@ export interface MemoryKV extends ScopedKV {
   readonly sets: { key: string; value: unknown }[];
   /** Fault injection: get() of any of these keys throws. */
   readonly failKeys: Set<string>;
+  /** Fault injection: set() of any of these keys throws — the durable-write axis. */
+  readonly failWriteKeys: Set<string>;
 }
 
 /** In-memory ScopedKV: JSON round-trips both writes and reads (storage fidelity). */
-export function memoryKV(opts: { seed?: Record<string, unknown>; failKeys?: string[] } = {}): MemoryKV {
+export function memoryKV(
+  opts: { seed?: Record<string, unknown>; failKeys?: string[]; failWriteKeys?: string[] } = {}
+): MemoryKV {
   const map = new Map<string, unknown>(Object.entries(opts.seed ?? {}));
   const sets: { key: string; value: unknown }[] = [];
   const failKeys = new Set<string>(opts.failKeys ?? []);
+  const failWriteKeys = new Set<string>(opts.failWriteKeys ?? []);
   return {
     map,
     sets,
     failKeys,
+    failWriteKeys,
     async get<T>(key: string): Promise<T | null> {
       if (failKeys.has(key)) throw new Error(`injected kv read failure: ${key}`);
       if (!map.has(key)) return null;
       return JSON.parse(JSON.stringify(map.get(key))) as T;
     },
     async set<T>(key: string, value: T): Promise<void> {
+      if (failWriteKeys.has(key)) throw new Error(`injected kv write failure: ${key}`);
       const cloned = JSON.parse(JSON.stringify(value)) as unknown;
       sets.push({ key, value: cloned });
       map.set(key, cloned);

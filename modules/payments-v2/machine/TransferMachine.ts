@@ -216,13 +216,21 @@ export class TransferMachine {
       payload: r.payload,
       ...(r.payload.memo !== undefined ? { memo: r.payload.memo } : {}),
     };
-    const { committed, conflicts } = await this.resumeOps(ctx, engine, r);
+    const outcomes = await this.resumeOps(ctx, engine, r);
+    const { committed, cls, firstError } = summarize(outcomes);
+    const conflicts = this.toConflicts(engine, r, outcomes);
     if (committed.length === 0 && conflicts.length > 0) throw conflicts[0].error;
 
     let deliveryPending = false;
     if (committed.length > 0) {
       deliveryPending = await this.deliverSet(r.transferId, r.payload.recipient, r.payload.memo, committed);
     }
+    // #744: an intent may close only when every op settled cleanly. A leg that
+    // certified but could not be journaled is `certified` WITH an error — its
+    // blob lives only in memory, so closing here would spend the source and
+    // destroy the payment. Same gate the send path applies at run().
+    if (cls !== null && cls !== 'conflict') throw firstError;
+
     await this.applyCommitted(engine, r.transferId, committed);
     if (conflicts.length > 0) {
       return { deliveryPending, partial: await this.settlePartial(engine, r, committed, conflicts) };
@@ -325,31 +333,39 @@ export class TransferMachine {
     return { recipientBlob: outputs[0].blob.token, changeBlob: outputs[1].blob.token };
   }
 
+  /** Raw outcomes; `summarize` alone decides what they mean — same as the send path. */
   private async resumeOps(
     ctx: CertifyCtx,
     engine: ITokenEngine,
     r: RehydratedIntent
-  ): Promise<{ committed: OpOutcome[]; conflicts: ResumeConflict[] }> {
-    const committed: OpOutcome[] = [];
-    const conflicts: ResumeConflict[] = [];
+  ): Promise<OpOutcome[]> {
+    const outcomes: OpOutcome[] = [];
     for (const op of buildOps(r.payload)) {
       // #621 direct legs re-deliver from the journal, never re-certify; a split
       // ALWAYS re-runs through its E.4 checkpoint to recover the change (#634).
       const journaled = op.kind === 'direct' ? r.journaled.get(op.opIndex) : undefined;
       if (journaled !== undefined) {
-        committed.push({ op, certified: true, recipientBlob: hexToBytes(journaled.blobHex) });
+        outcomes.push({ op, certified: true, recipientBlob: hexToBytes(journaled.blobHex) });
         continue;
       }
-      const source = r.sources.get(op.sourceTokenId);
-      const outcome = await this.certifyOne(ctx, engine, op, source);
-      if (outcome.certified) {
-        committed.push(outcome);
-        continue;
-      }
-      if (classifyError(outcome.error) !== 'conflict') throw outcome.error;
-      conflicts.push({ op, error: outcome.error, amount: conflictAmount(engine, r.payload, op, source) });
+      outcomes.push(await this.certifyOne(ctx, engine, op, r.sources.get(op.sourceTokenId)));
+      // Fail-fast on anything but a conflict, as before — but the outcome is
+      // RECORDED, so the shared decision below sees it (#744).
+      const last = outcomes[outcomes.length - 1];
+      if (last.error !== undefined && classifyError(last.error) !== 'conflict') break;
     }
-    return { committed, conflicts };
+    return outcomes;
+  }
+
+  /** Conflicted ops with the amount each leaves undelivered (#690 shortfall math). */
+  private toConflicts(engine: ITokenEngine, r: RehydratedIntent, outcomes: OpOutcome[]): ResumeConflict[] {
+    return outcomes
+      .filter((o) => !o.certified && classifyError(o.error) === 'conflict')
+      .map((o) => ({
+        op: o.op,
+        error: o.error,
+        amount: conflictAmount(engine, r.payload, o.op, r.sources.get(o.op.sourceTokenId)),
+      }));
   }
 
   private async deliverSet(
