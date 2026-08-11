@@ -51,21 +51,34 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-export interface ProofWaitDeps {
-  readonly client: StateTransitionClient;
-  readonly trustBase: RootTrustBase;
-  readonly predicateVerifier: PredicateVerifierService;
-  readonly timeoutMs: number;
-  readonly intervalMs: number;
+/**
+ * Runs `attempt` until it succeeds, a non-transient error surfaces, or the
+ * signal ends it. The metered call is the SUBMIT, so this policy has to be
+ * reusable by both — a copy per call site is how the two drift.
+ */
+export async function retryTransient<T>(
+  attempt: () => Promise<T>,
+  signal: AbortSignal,
+  intervalMs: number
+): Promise<T> {
+  for (;;) {
+    try {
+      return await attempt();
+    } catch (err) {
+      // The deadline (or the caller) ended it: that outcome is final.
+      if (signal.aborted) throw err;
+      if (!isTransientGatewayError(err)) throw err;
+      await pause(intervalMs, signal);
+    }
+  }
 }
 
-/** Await one inclusion proof, always terminating; a deadline hit throws and the
- *  caller maps it to ProofUnconfirmedError (keep-open — the spend may be on-chain). */
-export async function awaitProofBounded(
-  deps: ProofWaitDeps,
-  transaction: Parameters<typeof waitInclusionProof>[3],
-  external: AbortSignal | undefined
-): Promise<InclusionProof> {
+/** A deadline for ONE certification attempt: submit retries and proof share it. */
+export function certificationDeadline(
+  timeoutMs: number,
+  external: AbortSignal | undefined,
+  label: string
+): { signal: AbortSignal; dispose: () => void } {
   const controller = new AbortController();
   const relayAbort = (): void => {
     controller.abort(external?.reason);
@@ -75,34 +88,42 @@ export async function awaitProofBounded(
     else external.addEventListener('abort', relayAbort, { once: true });
   }
   const timer = setTimeout(() => {
-    controller.abort(
-      new SphereError(
-        `inclusion proof not confirmed within ${String(deps.timeoutMs)} ms`,
-        'AGGREGATOR_ERROR'
-      )
-    );
-  }, deps.timeoutMs);
+    controller.abort(new SphereError(`${label} within ${String(timeoutMs)} ms`, 'AGGREGATOR_ERROR'));
+  }, timeoutMs);
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      external?.removeEventListener('abort', relayAbort);
+    },
+  };
+}
 
-  try {
-    for (;;) {
-      try {
-        return await waitInclusionProof(
-          deps.client,
-          deps.trustBase,
-          deps.predicateVerifier,
-          transaction,
-          controller.signal,
-          deps.intervalMs
-        );
-      } catch (err) {
-        // The deadline (or the caller) ended it: that outcome is final.
-        if (controller.signal.aborted) throw err;
-        if (!isTransientGatewayError(err)) throw err;
-        await pause(deps.intervalMs, controller.signal);
-      }
-    }
-  } finally {
-    clearTimeout(timer);
-    external?.removeEventListener('abort', relayAbort);
-  }
+export interface ProofWaitDeps {
+  readonly client: StateTransitionClient;
+  readonly trustBase: RootTrustBase;
+  readonly predicateVerifier: PredicateVerifierService;
+  readonly intervalMs: number;
+}
+
+/** Await one inclusion proof, always terminating; a deadline hit throws and the
+ *  caller maps it to ProofUnconfirmedError (keep-open — the spend may be on-chain). */
+export async function awaitProofBounded(
+  deps: ProofWaitDeps,
+  transaction: Parameters<typeof waitInclusionProof>[3],
+  signal: AbortSignal
+): Promise<InclusionProof> {
+  return retryTransient(
+    () =>
+      waitInclusionProof(
+        deps.client,
+        deps.trustBase,
+        deps.predicateVerifier,
+        transaction,
+        signal,
+        deps.intervalMs
+      ),
+    signal,
+    deps.intervalMs
+  );
 }

@@ -16,7 +16,13 @@
  */
 
 import { SphereError, type SphereErrorCode } from '../core/errors';
-import { awaitProofBounded, resolveProofTimeoutMs } from './proof-wait';
+import {
+  awaitProofBounded,
+  certificationDeadline,
+  resolveProofTimeoutMs,
+  retryTransient,
+} from './proof-wait';
+import { certificationFailure } from './certification-outcome';
 import { randomUUID } from '../core/uuid';
 import {
   CheckpointPersistFailedError,
@@ -678,6 +684,27 @@ export class SphereTokenEngine implements ITokenEngine {
     failCode: SphereErrorCode,
     options?: EngineOpOptions,
   ): Promise<InclusionProof> {
+    const deadline = certificationDeadline(
+      this.proofTimeoutMs,
+      options?.signal,
+      `${failLabel}: not certified`
+    );
+    try {
+      return await this.submitThenProve(certificationData, transaction, failLabel, failCode, deadline.signal);
+    } finally {
+      deadline.dispose();
+    }
+  }
+
+  /** One certification attempt under one deadline: the metered submit retries
+   *  transient answers instead of falling through to a proof that cannot exist. */
+  private async submitThenProve(
+    certificationData: CertificationData,
+    transaction: ITransaction,
+    failLabel: string,
+    failCode: SphereErrorCode,
+    signal: AbortSignal,
+  ): Promise<InclusionProof> {
     let submitError: unknown = null;
     // true ONLY for a KNOWN validation-reject status — a PROVEN clean pre-certification
     // reject (nothing on-chain). Status-agnostic otherwise (E.2): an UNKNOWN/transitional
@@ -685,7 +712,11 @@ export class SphereTokenEngine implements ITokenEngine {
     // processed server-side — both stay INDETERMINATE (keep-open, #631).
     let submitRejectedCleanly = false;
     try {
-      const response = await this.deps.client.submitCertificationRequest(certificationData);
+      const response = await retryTransient(
+        () => this.deps.client.submitCertificationRequest(certificationData),
+        signal,
+        this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS,
+      );
       if (response.status !== CertificationStatus.SUCCESS) {
         submitError = new SphereError(`${failLabel}: ${response.status}`, failCode);
         submitRejectedCleanly = CLEAN_REJECT_STATUSES.has(response.status);
@@ -700,43 +731,16 @@ export class SphereTokenEngine implements ITokenEngine {
           client: this.deps.client,
           trustBase: this.deps.trustBase,
           predicateVerifier: this.deps.predicateVerifier,
-          timeoutMs: this.proofTimeoutMs,
           intervalMs: this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS, // #683
         },
         transaction,
-        options?.signal,
+        signal,
       );
     } catch (err) {
-      // The SDK surfaces a match-verify mismatch as a generic Error whose
-      // message embeds the verification status. Mapping that fragile string is
-      // done HERE — in the anti-corruption layer — and nowhere else; a test
-      // pins the exact SDK message so an upstream change fails loudly.
-      if (
-        err instanceof Error &&
-        err.message === `Invalid inclusion proof status: ${InclusionProofVerificationStatus.TRANSACTION_HASH_MISMATCH}`
-      ) {
-        throw new TransferConflictError(
-          `${failLabel}: the source state was already consumed by a different transaction ` +
-            '(lost race — abort this intent and re-plan under a new transferId)',
-          err,
-        );
-      }
-      // A PROVEN clean pre-certification reject (well-formed non-SUCCESS status)
-      // → the state was genuinely never certified; surface the original error so
-      // the caller aborts + restores the untouched source.
-      if (submitRejectedCleanly) throw submitError;
-      // Otherwise INDETERMINATE (#631): the submit returned SUCCESS (submitError
-      // === null) and the proof fetch threw, OR the submit POST itself threw (may
-      // have been processed server-side). The source spend MAY be on-chain under
-      // THIS transferId — surface a typed keep-open signal so the caller keeps the
-      // intent OPEN and resumes under the same transferId instead of aborting.
-      throw new ProofUnconfirmedError(
-        `${failLabel}: certification unconfirmed — the source spend may be on-chain; ` +
-          'keep the intent open and resume under the same transferId',
-        submitError ?? err,
-      );
+      throw certificationFailure(err, failLabel, submitError, submitRejectedCleanly);
     }
   }
+
 
   /**
    * One inclusion-proof wait, with the deadline OWNED here (#739) so it is bounded

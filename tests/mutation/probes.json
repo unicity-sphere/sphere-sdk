@@ -334,9 +334,9 @@
   {
     "name": "proof-deadline-not-enforced",
     "note": "#739: the deadline must be ours; falling back to the SDK default leaves every wait unbounded by our config.",
-    "file": "token-engine/proof-wait.ts",
-    "find": "          controller.signal,\n          deps.intervalMs",
-    "replace": "          undefined,\n          deps.intervalMs",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "      this.proofTimeoutMs,\n      options?.signal,",
+    "replace": "      2_000_000_000,\n      options?.signal,",
     "tests": [
       "tests/unit/token-engine/proof-deadline.test.ts"
     ]
@@ -365,8 +365,8 @@
     "name": "proof-wait-ignores-transient",
     "note": "#741: a 429/5xx blip must be retried within the deadline, not reported as a failed certification.",
     "file": "token-engine/proof-wait.ts",
-    "find": "        if (!isTransientGatewayError(err)) throw err;",
-    "replace": "        throw err;",
+    "find": "      if (!isTransientGatewayError(err)) throw err;",
+    "replace": "      throw err;",
     "tests": [
       "tests/unit/token-engine/proof-deadline.test.ts"
     ]
@@ -377,6 +377,16 @@
     "file": "token-engine/proof-wait.ts",
     "find": "  return err instanceof JsonRpcNetworkError && TRANSIENT_HTTP_STATUSES.has(err.status);",
     "replace": "  return err instanceof JsonRpcNetworkError;",
+    "tests": [
+      "tests/unit/token-engine/proof-deadline.test.ts"
+    ]
+  },
+  {
+    "name": "submit-429-not-retried",
+    "note": "#746: the metered call is the SUBMIT. Without retry a 429 falls through to a proof wait for a request the gateway never accepted, burning the whole deadline per op \u2014 which is what made raising CERTIFY_WIDTH unsafe.",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "      const response = await retryTransient(\n        () => this.deps.client.submitCertificationRequest(certificationData),\n        signal,\n        this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS,\n      );",
+    "replace": "      const response = await this.deps.client.submitCertificationRequest(certificationData);",
     "tests": [
       "tests/unit/token-engine/proof-deadline.test.ts"
     ]

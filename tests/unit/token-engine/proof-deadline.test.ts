@@ -234,4 +234,94 @@ describe('#739 the inclusion-proof wait always terminates', () => {
     expect(err).toBeInstanceOf(ProofUnconfirmedError);
     expect(Date.now() - started).toBeLessThan(3_000);
   }, 30_000);
+
+  it('#746: a rate-limited SUBMIT is retried, not turned into a doomed 10s proof wait', async () => {
+    // The 429 the gateway actually emits lands on submitCertificationRequest —
+    // the metered call. Before #746 it was swallowed into submitError and the
+    // code then polled for a proof of a request the gateway never accepted,
+    // burning the entire deadline and leaving the intent open.
+    const aggregator = TestAggregatorClient.create();
+    let submits = 0;
+    const engine = createTestEngine({
+      aggregator,
+      wireClient: new (class extends SlowProofClient {
+        override async submitCertificationRequest(
+          data: Parameters<TestAggregatorClient['submitCertificationRequest']>[0]
+        ): ReturnType<TestAggregatorClient['submitCertificationRequest']> {
+          submits += 1;
+          if (submits <= 2) throw new JsonRpcNetworkError(429, 'slow down');
+          return this.inner.submitCertificationRequest(data);
+        }
+        override async getInclusionProof(
+          stateId: Parameters<TestAggregatorClient['getInclusionProof']>[0]
+        ): Promise<InclusionProofResponse> {
+          return this.realProof(stateId);
+        }
+      })(aggregator, () => 0),
+      proofTimeoutMs: 5_000,
+      proofPollIntervalMs: 20,
+    });
+
+    const started = Date.now();
+    const token = await engine.mint({
+      recipientPubkey: engine.getIdentity().chainPubkey,
+      value: { assets: [{ coinId: COIN, amount: 1000n }] },
+    });
+
+    expect(engine.balanceOf(token, COIN)).toBe(1000n);
+    expect(submits).toBe(3);
+    // Retried in poll-interval time, nowhere near the 5s deadline it used to burn.
+    expect(Date.now() - started).toBeLessThan(2_000);
+  }, 30_000);
+
+  it('#746: a NON-transient submit rejection is not retried', async () => {
+    const aggregator = TestAggregatorClient.create();
+    let submits = 0;
+    const engine = createTestEngine({
+      aggregator,
+      wireClient: new (class extends SlowProofClient {
+        override async submitCertificationRequest(): Promise<never> {
+          submits += 1;
+          throw new JsonRpcNetworkError(400, 'malformed');
+        }
+      })(aggregator, () => 0),
+      proofTimeoutMs: 400,
+      proofPollIntervalMs: 20,
+    });
+
+    await engine
+      .mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: COIN, amount: 1000n }] },
+      })
+      .catch(() => undefined);
+
+    expect(submits).toBe(1);
+  }, 30_000);
+
+  it('#746: submit retries and the proof share ONE deadline — the attempt stays bounded', async () => {
+    const aggregator = TestAggregatorClient.create();
+    const engine = createTestEngine({
+      aggregator,
+      wireClient: new (class extends SlowProofClient {
+        override async submitCertificationRequest(): Promise<never> {
+          throw new JsonRpcNetworkError(503, 'down');
+        }
+      })(aggregator, () => 0),
+      proofTimeoutMs: 300,
+      proofPollIntervalMs: 20,
+    });
+
+    const started = Date.now();
+    const err = await engine
+      .mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: COIN, amount: 1000n }] },
+      })
+      .then(() => null)
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ProofUnconfirmedError);
+    expect(Date.now() - started).toBeLessThan(3_000);
+  }, 30_000);
 });
