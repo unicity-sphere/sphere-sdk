@@ -6,6 +6,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 
 import { bytesToHex, hexToBytes } from '../../../core/crypto';
 import { SphereError } from '../../../core/errors';
+import type { TransferResult } from '../../../types';
 import type { ITokenEngine, SplitCheckpointStore } from '../../../token-engine/engine';
 import type { SphereToken } from '../../../token-engine/types';
 import { TOKEN_BLOB_VERSION } from '../../../token-engine/token-blob';
@@ -266,15 +267,40 @@ export class TransferMachine {
       ...(plan.memo !== undefined ? { memo: plan.memo } : {}),
     };
     const outcomes: OpOutcome[] = [];
+    const certified: OpOutcome[] = [];
     for (let at = 0; at < plan.ops.length; at += CERTIFY_WIDTH) {
       const batch = plan.ops.slice(at, at + CERTIFY_WIDTH);
       const settled = await Promise.all(
-        batch.map((op) => this.certifyOne(ctx, engine, op, plan.sources.get(op.sourceTokenId)))
+        batch.map((op) =>
+          this.certifyOne(ctx, engine, op, plan.sources.get(op.sourceTokenId)).then((o) => {
+            // Report each leg as it lands, not each wave: a <=CERTIFY_WIDTH send is
+            // one wave, so per-wave reporting would jump 0% -> 100%. Rides the
+            // existing transfer:updated / tokenTransfers surface — nothing new.
+            if (o.certified) {
+              certified.push(o);
+              this.emitProgress(plan, certified);
+            }
+            return o;
+          })
+        )
       );
       outcomes.push(...settled);
       if (settled.some((o) => o.error !== undefined && !o.certified)) break;
     }
     return outcomes;
+  }
+
+  /** In-flight snapshot: `tokenTransfers` holds the legs certified SO FAR. */
+  private emitProgress(plan: MachinePlan, certified: readonly OpOutcome[]): void {
+    this.deps.emit('transfer:updated', {
+      id: plan.transferId,
+      status: 'submitted',
+      tokens: [],
+      tokenTransfers: certified.map((o) => ({
+        sourceTokenId: o.op.sourceTokenId,
+        method: o.op.kind,
+      })),
+    } satisfies TransferResult);
   }
 
   private async certifyOne(
