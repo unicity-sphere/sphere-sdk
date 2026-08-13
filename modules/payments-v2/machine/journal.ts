@@ -154,6 +154,35 @@ export interface ReplayDeps {
   readonly delivery: DeliveryPort;
   readonly now: () => number;
   readonly attention: AttentionEmitter;
+  /** sphere#487 — see {@link senderNametagOption}. */
+  readonly ownNametag?: () => string | undefined;
+}
+
+/**
+ * sphere#487: the recipient learns the sender's Unicity ID from the delivery
+ * envelope and NOWHERE else (no lookup, no second rail) — so every deliver
+ * carries it, or the recipient renders "Someone".
+ *
+ * Read LIVE at deliver time, never snapshotted into the plan or the journal:
+ * registration (or an address switch) can land between a send and the replay
+ * of one of its deferred legs, and the wallet's name today is the honest one.
+ * A wallet with no Unicity ID omits the field — `''` is not a name.
+ *
+ * A throwing getter degrades to no name: by the time a leg is delivered its
+ * token is already CERTIFIED, so raising here would replay the journaled blob
+ * into the poison budget and end at `delivery:undeliverable`. A display name
+ * must never cost a settled transfer its delivery.
+ */
+export function senderNametagOption(
+  ownNametag?: () => string | undefined
+): { senderNametag?: string } {
+  let nametag: string | undefined;
+  try {
+    nametag = ownNametag?.();
+  } catch {
+    return {};
+  }
+  return nametag === undefined || nametag === '' ? {} : { senderNametag: nametag };
 }
 
 export class DeliveryJournal extends ListStore<DeliveryJournalEntry> {
@@ -214,6 +243,7 @@ export class DeliveryJournal extends ListStore<DeliveryJournalEntry> {
       await deps.delivery.deliver(entry.recipientPubkey, hexToBytes(entry.blobHex), {
         transferId: entry.transferId,
         ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
+        ...senderNametagOption(deps.ownNametag),
       });
       await this.remove(entry.transferId, entry.opIndex);
       stats.delivered += 1;

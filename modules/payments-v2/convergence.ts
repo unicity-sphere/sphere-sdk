@@ -171,6 +171,11 @@ export class Converger {
     return {
       delivery: this.deps.delivery,
       now: () => this.deps.now(),
+      // sphere#487: a replayed leg carries the sender's name too — the machine
+      // deps hold the one live getter, so replay can never drift from a send.
+      ...(this.deps.machineDeps.ownNametag !== undefined
+        ? { ownNametag: this.deps.machineDeps.ownNametag }
+        : {}),
       attention: (transferId, code, detail) => {
         this.deps.emit(
           'transfer:attention',

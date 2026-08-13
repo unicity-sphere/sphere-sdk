@@ -78,6 +78,68 @@ describe('TransferMachine send path (§5.5)', () => {
     expect(mailbox.entries).toHaveLength(1);
   });
 
+  // sphere#487: the wallet's own Unicity ID is a per-deliver option, read from
+  // the LIVE getter (registration can land between a send and its replay), and
+  // the journal replay must carry it too — a crash must not cost the recipient
+  // the sender's name.
+  it('#487 every deliver carries the sender nametag — on the send path and on a journal replay', async () => {
+    const w = makeWorld();
+    w.nametag.value = 'alice';
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000', memo: 'hi' });
+
+    await w.machine().run(plan);
+    expect(w.delivered).toEqual([{ transferId: plan.transferId, memo: 'hi', senderNametag: 'alice' }]);
+
+    // Now a deferred leg replayed from the journal, after the name changed.
+    const journaled = await w.seed(1000n);
+    const second = await w.plan({ tokens: [journaled], amount: '1000' });
+    w.overrides.deliver = async () => {
+      throw new FakeApiError(500, 'INTERNAL', 'S3 down');
+    };
+    await w.machine().run(second);
+    delete w.overrides.deliver;
+    w.nametag.value = 'alice2';
+    w.delivered.length = 0;
+
+    await w.stores().deliveryJournal.replay({
+      delivery: w.deps.delivery,
+      now: () => w.clock.t,
+      attention: () => undefined,
+      ownNametag: () => w.nametag.value,
+    });
+
+    expect(w.delivered).toEqual([{ transferId: second.transferId, senderNametag: 'alice2' }]);
+  });
+
+  // The leg is already certified when the name is read: a throwing getter must
+  // degrade to an anonymous delivery, never replay the blob into the poison
+  // budget and strand a settled transfer at delivery:undeliverable.
+  it('a throwing nametag getter costs the name, never the delivery', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    w.deps.ownNametag = () => {
+      throw new Error('address registry unavailable');
+    };
+
+    const result = await w.machine().run(plan);
+
+    expect(result.deliveryPending).toBe(false);
+    expect(w.delivered).toEqual([{ transferId: plan.transferId }]);
+    expect(await w.stores().deliveryJournal.list()).toHaveLength(0);
+  });
+
+  it('a sender with no Unicity ID delivers without a nametag (the field is omitted, never empty)', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+
+    await w.machine().run(plan);
+
+    expect(w.delivered).toEqual([{ transferId: plan.transferId }]);
+  });
+
   it('journals the recipient blob BEFORE the deposit attempt (#621 journal-before-deliver)', async () => {
     const w = makeWorld();
     const token = await w.seed(1000n);

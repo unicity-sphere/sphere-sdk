@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — incoming payments show the sender's Unicity ID again (sphere#487)
+
+A recipient rendered "Someone" instead of `@alice` for every incoming transfer.
+The delivery envelope is the recipient's ONLY source for the sender's name — the
+mailbox wire carries `senderPubkey` but no name, because the backend is
+operator-blind — and the payments-v2 send path put nothing in it. The pre-flip
+module threaded the nametag into every `deliver` call (#547); the rewrite lost
+that and nothing caught it: the port's `options.senderNametag ??
+this.identity.nametag` fallback read as wired while **no composition ever set
+the second operand**. On a memo-less send the bundle was empty, so no envelope
+was deposited at all.
+
+Every deliver — send, resume, and the delivery-journal replay — now carries the
+wallet's own Unicity ID, read live per call (registration does not restart the
+facade, so a compose-time snapshot would go stale) and scoped to the sending
+address. The dead `DeliveryIdentity.nametag` fallback is removed: the deliver
+option is the one source, enforceable by the `DeliveryPort` contract suite.
+
+Both wallets must run this version — the name is written by the sender.
+Received-history rows written before the fix stay nameless; nothing backfills.
+
 ### Changed — base SDK pinned to `@unicitylabs/state-transition-sdk@2.0.3`
 
 2.0.3 carries the upstream fix for the lost-abort hang reported as
