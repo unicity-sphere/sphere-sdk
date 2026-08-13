@@ -210,7 +210,7 @@ function makeDeliveryPair(
   const senderPort = new WalletApiDeliveryPort({
     client: new FakeWalletApiV2Client(fake, SENDER),
     kv: memoryKV(),
-    identity: { privateKey: SENDER_PRIV, chainPubkey: SENDER_PUB, nametag: 'sender-tag' },
+    identity: { privateKey: SENDER_PRIV, chainPubkey: SENDER_PUB },
     custody: 'inventory',
   });
   senderPort.bindDeliveryKeys(deriveFromFakeBlob);
@@ -268,16 +268,31 @@ describe('WalletApiDeliveryPort — targeted', () => {
     expect(page.entries[0]?.memo).not.toContain('secret coffee');
   });
 
-  it('the sender identity nametag is bundled when options carry none, and the recipient decrypts it', async () => {
+  // sphere#487: the deliver OPTION is the one source of the wire nametag. The
+  // port used to fall back to a construction-time `identity.nametag` that no
+  // composition ever set — a decoy that made the missing caller plumbing read
+  // as wired. A caller that supplies nothing must now yield nothing.
+  it('the wire nametag comes from the deliver options and from nowhere else', async () => {
     const fake = new FakeWalletApi();
     const { ownerPort, senderPort } = makeDeliveryPair(fake, 'inventory');
-    const blob = fabricateBlob(OWNER_PUB);
-    await senderPort.deliver(OWNER_PUB, blob.bytes, { transferId: 'tag-fallback', memo: 'hi' });
+    const named = fabricateBlob(OWNER_PUB);
+    const anonymous = fabricateBlob(OWNER_PUB);
+
+    await senderPort.deliver(OWNER_PUB, named.bytes, {
+      transferId: 'tag-1',
+      memo: 'hi',
+      senderNametag: 'sender-tag',
+    });
+    await senderPort.deliver(OWNER_PUB, anonymous.bytes, { transferId: 'tag-2', memo: 'hi' });
+
     const deliveries = [];
     for await (const d of ownerPort.incoming()) deliveries.push(d);
-    expect(deliveries[0]?.senderNametag).toBe('sender-tag');
-    expect(deliveries[0]?.memo).toBe('hi');
-    expect(deliveries[0]?.senderPubkey).toBe(SENDER_PUB);
+    const byId = new Map(deliveries.map((d) => [d.deliveryId, d]));
+    const first = byId.get(expectedDeliveryId(named.tokenId, named.stateHash));
+    expect(first?.senderNametag).toBe('sender-tag');
+    expect(first?.memo).toBe('hi');
+    expect(first?.senderPubkey).toBe(SENDER_PUB);
+    expect(byId.get(expectedDeliveryId(anonymous.tokenId, anonymous.stateHash))?.senderNametag).toBeUndefined();
   });
 
   it('incoming pages through more-pages from the caller cursor', async () => {

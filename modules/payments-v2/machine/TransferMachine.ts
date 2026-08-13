@@ -17,7 +17,7 @@ import {
   SplitCheckpointLostError,
   TransferConflictError,
 } from '../../../token-engine/errors';
-import type { DeliveryPort, StoragePort } from '../ports';
+import type { DeliverOptions, DeliveryPort, StoragePort } from '../ports';
 import type { DeliveryJournalEntry, ScopedKV, ShortfallEntry } from '../stores';
 import type { IntentPayload, OpOutcome, OutcomeClass, PlannedOp } from './types';
 import {
@@ -27,6 +27,7 @@ import {
   createMachineStores,
   isRateLimited,
   isValidationReject,
+  senderNametagOption,
   type AttentionEmitter,
   type MachineStores,
 } from './journal';
@@ -63,6 +64,8 @@ export interface MachineDeps {
   decryptPayload: (envelope: string) => Promise<unknown>;
   signComplete: (transferId: string) => Promise<string>;
   ownPubkey: Uint8Array;
+  /** sphere#487: the wallet's own Unicity ID — see {@link senderNametagOption}. */
+  ownNametag?: () => string | undefined;
   emit: (event: string, payload: unknown) => void;
   now: () => number;
   /** `committedAmount` = what SETTLED (the certified recipient blobs' value), never the plan. */
@@ -409,7 +412,11 @@ export class TransferMachine {
     const journaled = committed.filter((o) => o.error === undefined && o.recipientBlob !== undefined);
     let pending = journaled.length < committed.length;
     if (journaled.length === 0) return pending;
-    const options = { transferId, ...(memo !== undefined ? { memo } : {}) };
+    const options = {
+      transferId,
+      ...(memo !== undefined ? { memo } : {}),
+      ...senderNametagOption(this.deps.ownNametag),
+    };
     if (await this.tryBatchDeposit(recipientPubkey, journaled, options)) return pending;
     for (const outcome of journaled) {
       const stillPending = await this.deliverOne(recipientPubkey, outcome, options);
@@ -421,7 +428,7 @@ export class TransferMachine {
   private async tryBatchDeposit(
     recipientPubkey: string,
     journaled: OpOutcome[],
-    options: { transferId: string; memo?: string }
+    options: DeliverOptions
   ): Promise<boolean> {
     const batch = this.deps.delivery.deliverBatch?.bind(this.deps.delivery);
     if (batch === undefined) return false;
@@ -437,7 +444,7 @@ export class TransferMachine {
   private async deliverOne(
     recipientPubkey: string,
     outcome: OpOutcome,
-    options: { transferId: string; memo?: string }
+    options: DeliverOptions
   ): Promise<boolean> {
     try {
       await this.deps.delivery.deliver(recipientPubkey, outcome.recipientBlob!, options);

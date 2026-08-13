@@ -22,6 +22,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Sphere } from '../../core/Sphere';
 import { SphereError } from '../../core/errors';
 import { getPublicKey, hexToBytes } from '../../core/crypto';
+import { decryptDeliveryBundle, deriveDeliveryEncryptionKey } from '../../core/delivery-envelope';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { TRUSTBASE_TESTNET2 } from '../../assets/trustbase';
 import type { PeerInfo, TransportProvider } from '../../transport';
@@ -170,7 +171,8 @@ async function seedInventory(world: World, record: TransportRecord, amount: bigi
   return token;
 }
 
-const PEER_PUB = getPublicKey('22'.repeat(32));
+const PEER_PRIV = '22'.repeat(32);
+const PEER_PUB = getPublicKey(PEER_PRIV);
 
 /** A resolved Nostr identity binding; `network` omitted = the binding declares none. */
 function peerBinding(overrides: Partial<PeerInfo> = {}): PeerInfo {
@@ -194,6 +196,7 @@ interface BuildOptions {
   paymentsV2?: boolean;
   walletApi: WalletApiTransportConfig;
   peers?: Record<string, PeerInfo>;
+  nametag?: string;
 }
 
 async function buildSphere(options: BuildOptions): Promise<Sphere> {
@@ -207,6 +210,7 @@ async function buildSphere(options: BuildOptions): Promise<Sphere> {
     // #728 single-network invariant: the Sphere network must equal walletApi.network.
     network: NET,
     walletApi: options.walletApi,
+    ...(options.nametag !== undefined ? { nametag: options.nametag } : {}),
     ...(options.paymentsV2 !== undefined ? { paymentsV2: options.paymentsV2 } : {}),
   });
   cleanups.push(async () => {
@@ -354,6 +358,36 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
         detail: expect.stringContaining('@ghost') as unknown,
       },
     ]);
+  }, 20_000);
+
+  // sphere#487: the whole chain Sphere → PaymentsV2Host.nametag → composePaymentsV2
+  // → facade was unguarded — deleting any link restores "Someone" on the
+  // recipient's screen with every unit suite still green (they all inject their
+  // own getter). Asserted on the request rail because it needs no chain op, but
+  // it is the SAME `ownNametag` seam the delivery envelope now rides.
+  it('#487 the wallet Unicity ID reaches the composed vertical and rides the S6 envelope', async () => {
+    const world = makeWorld();
+    const sphere = await buildSphere({
+      walletApi: world.walletApi,
+      peers: { '@peer': peerBinding({ network: NET }) },
+      nametag: 'alice',
+    });
+    expect(sphere.identity?.nametag).toBe('alice');
+
+    const created = await sphere.payments.requests.create('@peer', {
+      coinId: COIN,
+      amount: '10',
+      memo: 'pay me',
+    });
+    expect(created.success).toBe(true);
+
+    const peerCaller: FakeCaller = { chainPubkey: PEER_PUB, network: NET };
+    const [wire] = (await world.api.listRequests(peerCaller, { role: 'incoming' })).requests;
+    const bundle = decryptDeliveryBundle(
+      deriveDeliveryEncryptionKey(PEER_PRIV, sphere.identity!.chainPubkey),
+      wire?.memo ?? ''
+    );
+    expect(bundle).toEqual({ senderNametag: 'alice', memo: 'pay me' });
   }, 20_000);
 
   it('`paymentsV2: true` and `paymentsV2: false` are both tolerated no-ops (one release)', async () => {

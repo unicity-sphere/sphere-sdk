@@ -73,7 +73,6 @@ export const DELIVERY_SEEN_KEY = 'delivery:seen';
 export interface DeliveryIdentity {
   privateKey: string;
   chainPubkey: string;
-  nametag?: string;
 }
 
 export interface WalletApiDeliveryPortConfig {
@@ -170,10 +169,14 @@ export class WalletApiDeliveryPort implements DeliveryPort {
     };
   }
 
+  // sphere#487: the nametag is a per-call option and NOT port config — a
+  // construction-time copy would silently go stale on registration, and only a
+  // caller-supplied value is enforceable by the port contract suite (which any
+  // swapped DeliveryPort must pass).
   private buildEnvelope(recipientPubkey: string, options: DeliverOptions): string | undefined {
     const key = deriveDeliveryEncryptionKey(this.identity.privateKey, recipientPubkey);
     return encryptDeliveryBundle(key, {
-      senderNametag: options.senderNametag ?? this.identity.nametag,
+      senderNametag: options.senderNametag,
       memo: options.memo,
     });
   }

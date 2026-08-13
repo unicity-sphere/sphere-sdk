@@ -3966,6 +3966,8 @@ export class Sphere {
         'INVALID_CONFIG'
       );
     }
+    const facadeAddressId =
+      identity.directAddress === undefined ? undefined : getAddressId(identity.directAddress);
     const facade = composePaymentsV2({
       identity,
       composition: this._paymentsV2Composition,
@@ -3980,7 +3982,12 @@ export class Sphere {
         emit: (event, payload) =>
           this.emitEvent(event as SphereEventType, payload as SphereEventMap[SphereEventType]),
         resolvePeer: (identifier) => this._transport.resolve?.(identifier) ?? Promise.resolve(null),
-        nametag: () => this.getNametagForAddress(),
+        // Scoped to THIS facade's address, never "whichever is active":
+        // switchToAddress moves _currentAddressIndex BEFORE stopping this
+        // vertical, so the argument-less getter would hand an in-flight
+        // deliver the NEXT address's Unicity ID — a name the sending key does
+        // not own (sphere#487 review).
+        nametag: () => this.getNametagForAddress(facadeAddressId),
       },
     });
     this._paymentsV2Active = { index, facade };

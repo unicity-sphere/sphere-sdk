@@ -267,6 +267,9 @@ function buildMachineDeps(
     decryptPayload: async (envelope) => JSON.parse(decryptField(deps.fieldKey, envelope)) as unknown,
     signComplete: deps.signComplete,
     ownPubkey: hexToBytes(deps.ownPubkey),
+    // sphere#487: the same live getter Requests uses — the delivery envelope is
+    // the recipient's ONLY source for the sender's Unicity ID.
+    ...(deps.ownNametag !== undefined ? { ownNametag: deps.ownNametag } : {}),
     emit: deps.emit,
     now: deps.now ?? Date.now,
     recordHistory: async ({ transferId, payload, committedAmount }) => {

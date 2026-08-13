@@ -440,5 +440,35 @@
     "tests": [
       "tests/unit/payments-v2/facade.test.ts"
     ]
+  },
+  {
+    "name": "compose-drops-sender-nametag",
+    "note": "sphere#487: buildMachineDeps forwards the live ownNametag getter, so every deliver puts the sender's Unicity ID on the wire (facade.test.ts '#487 the delivered envelope carries the sender @nametag'). Dropping it IS the regression the payments-v2 rewrite shipped: the recipient renders 'Someone'.",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "    // sphere#487: the same live getter Requests uses \u2014 the delivery envelope is\n    // the recipient's ONLY source for the sender's Unicity ID.\n    ...(deps.ownNametag !== undefined ? { ownNametag: deps.ownNametag } : {}),\n",
+    "replace": "    // mutant: the machine no longer learns the wallet's own Unicity ID\n",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "replay-drops-sender-nametag",
+    "note": "sphere#487: a leg delivered from the journal (after a crash or a 429 defer) carries the sender nametag too \u2014 machine.test.ts '#487 every deliver carries the sender nametag'. Without it a deferred transfer arrives anonymous while a direct one does not.",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "        ...senderNametagOption(deps.ownNametag),\n",
+    "replace": "        // mutant: a replayed leg arrives anonymous\n",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-host-nametag-dropped",
+    "note": "sphere#487: the last link \u2014 Sphere hands the vertical the wallet's own Unicity ID (address-scoped, since switchToAddress moves _currentAddressIndex before stopping this facade). Every unit suite injects its own getter, so only the composed integration test sees this one.",
+    "file": "core/Sphere.ts",
+    "find": "        nametag: () => this.getNametagForAddress(facadeAddressId),",
+    "replace": "        nametag: () => undefined, // mutant: the vertical never learns its own name",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
   }
 ]

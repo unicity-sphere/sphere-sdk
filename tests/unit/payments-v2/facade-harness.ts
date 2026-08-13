@@ -188,6 +188,8 @@ export function makeWorld(
      * ids the previous facade already wrote.
      */
     restartOf?: World;
+    /** The wallet's own Unicity ID, as Sphere supplies it (a live getter, never a snapshot). */
+    ownNametag?: () => string | undefined;
   } = {}
 ): World {
   const prior = options.restartOf;
@@ -259,6 +261,7 @@ export function makeWorld(
     fieldKey: new Uint8Array(32).fill(7),
     network: NET,
     ownPubkey: OWN_PUB,
+    ...(options.ownNametag !== undefined ? { ownNametag: options.ownNametag } : {}),
     requestMemo: stubRequestMemoCodec,
     syncEpoch: () => session.currentEpoch(),
     newId: () => `tid-${idPrefix}${String(++ids)}`,

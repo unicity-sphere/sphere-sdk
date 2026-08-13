@@ -169,6 +169,10 @@ export interface World {
   events: { event: string; payload: unknown }[];
   applied: { transferId: string; spent: string[]; added: { tokenId: string; key: string }[] }[];
   deposits: { transferId: string; tokenId: string }[];
+  /** Every DeliverOptions the machine (or a journal replay) handed the port. */
+  delivered: DeliverOptions[];
+  /** The wallet's own Unicity ID at deliver time — mutable, as registration is. */
+  nametag: { value: string | undefined };
   completes: { transferId: string; signature?: string }[];
   signCalls: string[];
   clock: { t: number };
@@ -211,6 +215,8 @@ export function makeWorld(): World {
     events: [] as { event: string; payload: unknown }[],
     applied: [] as { transferId: string; spent: string[]; added: { tokenId: string; key: string }[] }[],
     deposits: [] as { transferId: string; tokenId: string }[],
+    delivered: [] as DeliverOptions[],
+    nametag: { value: undefined as string | undefined },
     completes: [] as { transferId: string; signature?: string }[],
     signCalls: [] as string[],
     clock: { t: 1_000_000 },
@@ -237,6 +243,7 @@ export function makeWorld(): World {
       return fakeSeedSignature(senderHex, completeMessageFor(transferId));
     },
     ownPubkey: SENDER_PUBKEY,
+    ownNametag: () => world.nametag.value,
     emit: (event, payload) => {
       world.events.push({ event, payload });
     },
@@ -265,6 +272,7 @@ interface WorldState {
   log: string[];
   applied: { transferId: string; spent: string[]; added: { tokenId: string; key: string }[] }[];
   deposits: { transferId: string; tokenId: string }[];
+  delivered: DeliverOptions[];
   completes: { transferId: string; signature?: string }[];
   overrides: Overrides;
   blobByTokenId: Map<string, Uint8Array>;
@@ -317,6 +325,7 @@ function makeDelivery(w: WorldState): DeliveryPort {
   let derive: ((blob: Uint8Array) => Promise<{ tokenId: string; stateHash: string }>) | null = null;
   const depositOne = async (recipientPubkey: string, blob: Uint8Array, options: DeliverOptions) => {
     w.log.push('deliver');
+    w.delivered.push(options);
     if (w.overrides.deliver) await w.overrides.deliver();
     const keys = derive !== null ? await derive(blob) : await w.engine.deliveryKeys(blob);
     const digest = sha256Hex(blob);

@@ -6,6 +6,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { hexToBytes } from '../../../core/crypto';
+import { decryptDeliveryBundle, deriveDeliveryEncryptionKey } from '../../../core/delivery-envelope';
 import { PartialSendConflictError, SphereError } from '../../../core/errors';
 import { ProofUnconfirmedError } from '../../../token-engine/errors';
 import type { TransferResult } from '../../../types';
@@ -21,6 +22,7 @@ import { RealizationEngine } from './machine-harness';
 import {
   COIN,
   OWN_PUB,
+  PEER_PRIV,
   PEER_PUB,
   cleanupWorlds,
   eventsOf,
@@ -108,6 +110,81 @@ describe('PaymentsFacade — send policy', () => {
     await flushTail();
     expect(world.api.inspectIntent(ownCaller, result.id)?.status).toBe('completed');
     expect(world.facade.tokens().filter((t) => t.status === 'confirmed')).toHaveLength(0);
+  });
+
+  // sphere#487: the recipient rendered "Someone" because the send put no sender
+  // nametag on the wire. The envelope is the ONLY channel that carries it (the
+  // recipient does no lookup), so this asserts it exactly as the recipient
+  // reads it: ECDH-decrypt the deposited entry with the RECIPIENT's key.
+  it('#487 the delivered envelope carries the sender @nametag alongside the memo', async () => {
+    const world = makeWorld({ ownNametag: () => 'alice' });
+    await world.seed(100n);
+    await world.facade.start();
+
+    await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN, memo: 'for the coffee' });
+
+    const [entry] = (await world.api.listMailbox(peerCaller, 0)).entries;
+    expect(entry?.senderPubkey).toBe(OWN_PUB);
+    const bundle = decryptDeliveryBundle(
+      deriveDeliveryEncryptionKey(PEER_PRIV, OWN_PUB),
+      entry?.memo ?? ''
+    );
+    expect(bundle).toEqual({ senderNametag: 'alice', memo: 'for the coffee' });
+  });
+
+  // The common send carries no memo at all — and a bundle with neither field
+  // encrypts to `undefined`, so before #487 those deposits had no envelope
+  // whatsoever. The nametag alone must now be enough to produce one.
+  it('#487 a memo-less send still deposits an envelope, carrying the nametag alone', async () => {
+    const world = makeWorld({ ownNametag: () => 'alice' });
+    await world.seed(100n);
+    await world.facade.start();
+
+    await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN });
+
+    const [entry] = (await world.api.listMailbox(peerCaller, 0)).entries;
+    expect(entry?.memo).toBeDefined();
+    expect(
+      decryptDeliveryBundle(deriveDeliveryEncryptionKey(PEER_PRIV, OWN_PUB), entry?.memo ?? '')
+    ).toEqual({ senderNametag: 'alice' });
+  });
+
+  // The Converger owns a SECOND deliver call site. A fix that reaches only the
+  // send path leaves every crash-resumed or rate-limit-deferred leg anonymous,
+  // so the name a recipient sees would depend on whether the sender's first
+  // deposit attempt happened to succeed.
+  it('#487 a leg delivered by the Converger replay carries the nametag too', async () => {
+    const world = makeWorld({ ownNametag: () => 'alice' });
+    await world.seed(100n);
+    await world.facade.start();
+    world.hooks.deliver = () => Promise.reject(new SphereError('S3 down', 'NETWORK_ERROR'));
+
+    const result = await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN });
+    expect(result.deliveryPending).toBe(true);
+    expect((await world.api.listMailbox(peerCaller, 0)).entries).toHaveLength(0);
+    delete world.hooks.deliver;
+
+    await world.facade.resumeNow();
+
+    const [entry] = (await world.api.listMailbox(peerCaller, 0)).entries;
+    expect(
+      decryptDeliveryBundle(deriveDeliveryEncryptionKey(PEER_PRIV, OWN_PUB), entry?.memo ?? '')
+    ).toEqual({ senderNametag: 'alice' });
+  });
+
+  // A wallet with no Unicity ID must still deliver — the bundle just omits `n`.
+  it('#487 a sender without a nametag still delivers; the envelope carries the memo alone', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await world.facade.start();
+
+    const result = await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN, memo: 'anon' });
+
+    expect(result.status).toBe('delivered');
+    const [entry] = (await world.api.listMailbox(peerCaller, 0)).entries;
+    expect(
+      decryptDeliveryBundle(deriveDeliveryEncryptionKey(PEER_PRIV, OWN_PUB), entry?.memo ?? '')
+    ).toEqual({ memo: 'anon' });
   });
 
   it('split send: change is uploaded/applied and re-enters the pool after the refresh tail', async () => {
