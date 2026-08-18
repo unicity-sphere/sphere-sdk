@@ -42,6 +42,10 @@ import {
   StateMask,
   TransferTransaction,
   waitInclusionProof,
+  Secp256k1SignatureVerifier,
+  UnicityCertificateVerifier,
+  UnicitySealQuorumSignaturesVerificationRule,
+  VerifiedSealCache,
 } from '../../../token-engine/sdk';
 import { TestAggregatorClient } from './support/TestAggregatorClient';
 import { createTestEngine, freshPubkey } from './test-engine';
@@ -776,6 +780,9 @@ describe('recoverable engine (Part E) — real adapter over in-memory aggregator
       new StateTransitionClient(aggregator),
       aggregator.rootTrustBase,
       PredicateVerifierService.create(),
+      new UnicityCertificateVerifier(
+        new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), new VerifiedSealCache(256)),
+      ),
       foreignTx,
       AbortSignal.timeout(2000),
     ).then(

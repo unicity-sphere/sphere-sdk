@@ -14,6 +14,10 @@ import {
   TokenIssuanceVerifierService,
   VerificationContext,
   waitInclusionProof,
+  Secp256k1SignatureVerifier,
+  UnicityCertificateVerifier,
+  UnicitySealQuorumSignaturesVerificationRule,
+  VerifiedSealCache,
 } from '../../../token-engine/sdk';
 import { TestAggregatorClient } from './support/TestAggregatorClient';
 
@@ -26,6 +30,9 @@ describe('TestAggregatorClient (vendored) — real v2 mint round-trip', () => {
     const client = new StateTransitionClient(aggregator);
     const trustBase = aggregator.rootTrustBase;
     const predicateVerifier = PredicateVerifierService.create();
+    const unicityCertificateVerifier = new UnicityCertificateVerifier(
+      new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), new VerifiedSealCache(256)),
+    );
     const mintJustificationVerifier = new MintJustificationVerifierService();
 
     const owner = SigningService.generate();
@@ -37,11 +44,11 @@ describe('TestAggregatorClient (vendored) — real v2 mint round-trip', () => {
     const response = await client.submitCertificationRequest(certData);
     expect(response.status).toBe(CertificationStatus.SUCCESS);
 
-    const proof = await waitInclusionProof(client, trustBase, predicateVerifier, mintTx);
-    const certified = await mintTx.toCertifiedTransaction(trustBase, predicateVerifier, proof);
+    const proof = await waitInclusionProof(client, trustBase, predicateVerifier, unicityCertificateVerifier, mintTx);
+    const certified = await mintTx.toCertifiedTransaction(trustBase, predicateVerifier, unicityCertificateVerifier, proof);
     const token = await Token.mint(
       certified,
-      new VerificationContext(trustBase, predicateVerifier, mintJustificationVerifier, new TokenIssuanceVerifierService(false)),
+      new VerificationContext(trustBase, predicateVerifier, unicityCertificateVerifier, mintJustificationVerifier, new TokenIssuanceVerifierService(false)),
     );
 
     expect(token).toBeInstanceOf(Token);

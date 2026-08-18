@@ -21,6 +21,7 @@ import {
   InclusionProof,
   InclusionProofVerificationStatus,
   type PredicateVerifierService,
+  type UnicityCertificateVerifier,
   type RootTrustBase,
   Token,
   type TransferTransaction,
@@ -38,6 +39,7 @@ const CHECKPOINT_SDK_VERSION = '@unicitylabs/state-transition-sdk@2.0.2';
 export interface CheckpointDeps {
   readonly trustBase: RootTrustBase;
   readonly predicateVerifier: PredicateVerifierService;
+  readonly unicityCertificateVerifier: UnicityCertificateVerifier;
   readonly verificationContext: VerificationContext;
 }
 
@@ -141,7 +143,7 @@ export async function burntTokenFromCheckpoint(
   }
   let burnCertified;
   try {
-    burnCertified = await reDerivedBurnTx.toCertifiedTransaction(deps.trustBase, deps.predicateVerifier, burnProof);
+    burnCertified = await reDerivedBurnTx.toCertifiedTransaction(deps.trustBase, deps.predicateVerifier, deps.unicityCertificateVerifier, burnProof);
   } catch (err) {
     if (isTrustbaseFailure(err)) {
       throw new CheckpointTrustbaseMismatchError(

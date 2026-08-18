@@ -14,6 +14,10 @@ import {
   StateTransitionClient,
   TokenIssuanceVerifierService,
   VerificationContext,
+  Secp256k1SignatureVerifier,
+  UnicityCertificateVerifier,
+  UnicitySealQuorumSignaturesVerificationRule,
+  VerifiedSealCache,
 } from '../../../token-engine/sdk';
 import { decodeSpherePaymentData } from '../../../token-engine/SpherePaymentData';
 import { type EngineDeps, SphereTokenEngine } from '../../../token-engine/SphereTokenEngine';
@@ -53,6 +57,9 @@ export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngin
   const aggregator = opts.aggregator ?? TestAggregatorClient.create();
   const trustBase = aggregator.rootTrustBase;
   const predicateVerifier = PredicateVerifierService.create();
+  const unicityCertificateVerifier = new UnicityCertificateVerifier(
+    new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), new VerifiedSealCache(256)),
+  );
   const mintJustificationVerifier = new MintJustificationVerifierService();
   mintJustificationVerifier.register(
       new SplitMintJustificationVerifier(decodeSpherePaymentData),
@@ -62,10 +69,12 @@ export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngin
     client: new StateTransitionClient(opts.wireClient ?? new AdversarialResubmitClient(aggregator)),
     trustBase,
     predicateVerifier,
+    unicityCertificateVerifier,
     mintJustificationVerifier,
     verificationContext: new VerificationContext(
       trustBase,
       predicateVerifier,
+      unicityCertificateVerifier,
       mintJustificationVerifier,
       new TokenIssuanceVerifierService(false),
     ),

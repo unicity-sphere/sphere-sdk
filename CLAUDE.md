@@ -34,7 +34,7 @@ This repo is part of the wallet-api program (process: `../wallet-api/development
   current line **`0.14.0-dev.#`**, dist-tag `dev`. Consumers (wallet-api backend, sphere frontend)
   pin exact dev versions. The backend consumes ONLY the `./token-engine` subpath (must stay
   browser/Nostr-free — keep `token-engine/` clean).
-- Pinned base SDK: `@unicitylabs/state-transition-sdk@2.0.3` (stable release; bump only via PR).
+- Pinned base SDK: `@unicitylabs/state-transition-sdk@2.1.0` (stable release; bump only via PR).
   2.0.3 fixes the lost-abort hang in `waitInclusionProof` (state-transition-sdk-js#140/#141):
   its poll loop now checks `aborted` before subscribing, races each poll against the
   signal, and cancels the in-flight request. `tests/unit/token-engine/proof-deadline.test.ts`
