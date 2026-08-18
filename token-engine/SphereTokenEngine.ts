@@ -49,6 +49,7 @@ import {
   type NetworkId,
   PaymentAssetCollection,
   type PredicateVerifierService,
+  type UnicityCertificateVerifier,
   type RootTrustBase,
   SignaturePredicate,
   SignaturePredicateUnlockScript,
@@ -96,6 +97,7 @@ export interface EngineDeps {
   readonly client: StateTransitionClient;
   readonly trustBase: RootTrustBase;
   readonly predicateVerifier: PredicateVerifierService;
+  readonly unicityCertificateVerifier: UnicityCertificateVerifier;
   readonly mintJustificationVerifier: MintJustificationVerifierService;
   readonly verificationContext: VerificationContext;
   /**
@@ -280,7 +282,7 @@ export class SphereTokenEngine implements ITokenEngine {
       'AGGREGATOR_ERROR',
       options,
     );
-    const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
+    const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
     const token = await Token.mint(certified, this.deps.verificationContext);
     return this.wrapToken(token);
   }
@@ -303,7 +305,7 @@ export class SphereTokenEngine implements ITokenEngine {
       'AGGREGATOR_ERROR',
       options,
     );
-    const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
+    const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
     const token = await Token.mint(certified, this.deps.verificationContext);
     return this.wrapToken(token);
   }
@@ -329,7 +331,7 @@ export class SphereTokenEngine implements ITokenEngine {
       'TRANSFER_FAILED',
       options,
     );
-    const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
+    const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
     const transferred = await params.token.sdkToken.transfer(certified, this.deps.verificationContext);
     return this.wrapToken(transferred);
   }
@@ -476,7 +478,7 @@ export class SphereTokenEngine implements ITokenEngine {
     const burnUnlock = await SignaturePredicateUnlockScript.create(burnTx, this.deps.signingService);
     const burnCert = await CertificationData.fromTransaction(burnTx, burnUnlock);
     const burnProof = await this.submitAndAwaitProof(burnCert, burnTx, 'Split burn failed', 'TRANSFER_FAILED', ctx.options);
-    const burnCertified = await burnTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, burnProof);
+    const burnCertified = await burnTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, burnProof);
     const burntToken = await ctx.params.token.sdkToken.transfer(burnCertified, this.deps.verificationContext);
     return { burntToken, burnProof };
   }
@@ -529,7 +531,7 @@ export class SphereTokenEngine implements ITokenEngine {
     );
     const certData = await CertificationData.fromMintTransaction(mintTx);
     const proof = await this.submitSplitMintLeg(certData, mintTx, options);
-    const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
+    const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
     const token = await Token.mint(certified, this.deps.verificationContext);
     return this.wrapToken(token);
   }
@@ -722,6 +724,7 @@ export class SphereTokenEngine implements ITokenEngine {
           client: this.deps.client,
           trustBase: this.deps.trustBase,
           predicateVerifier: this.deps.predicateVerifier,
+          unicityCertificateVerifier: this.deps.unicityCertificateVerifier,
           intervalMs: this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS, // #683
         },
         transaction,

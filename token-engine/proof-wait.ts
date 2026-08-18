@@ -6,6 +6,7 @@ import {
   type InclusionProof,
   JsonRpcNetworkError,
   type PredicateVerifierService,
+  type UnicityCertificateVerifier,
   type RootTrustBase,
   type StateTransitionClient,
   waitInclusionProof,
@@ -107,6 +108,7 @@ export interface ProofWaitDeps {
   readonly client: StateTransitionClient;
   readonly trustBase: RootTrustBase;
   readonly predicateVerifier: PredicateVerifierService;
+  readonly unicityCertificateVerifier: UnicityCertificateVerifier;
   readonly intervalMs: number;
 }
 
@@ -114,7 +116,7 @@ export interface ProofWaitDeps {
  *  caller maps it to ProofUnconfirmedError (keep-open — the spend may be on-chain). */
 export async function awaitProofBounded(
   deps: ProofWaitDeps,
-  transaction: Parameters<typeof waitInclusionProof>[3],
+  transaction: Parameters<typeof waitInclusionProof>[4],
   signal: AbortSignal
 ): Promise<InclusionProof> {
   const { value } = await retryTransient(
@@ -123,6 +125,7 @@ export async function awaitProofBounded(
         deps.client,
         deps.trustBase,
         deps.predicateVerifier,
+        deps.unicityCertificateVerifier,
         transaction,
         signal,
         deps.intervalMs

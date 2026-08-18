@@ -41,6 +41,10 @@ export { StateMask } from '@unicitylabs/state-transition-sdk/lib/transaction/Sta
 export { MintJustificationVerifierService } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/MintJustificationVerifierService.js';
 export { TokenIssuanceVerifierService } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/TokenIssuanceVerifierService.js';
 export { VerificationContext } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/VerificationContext.js';
+export { UnicityCertificateVerifier } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/UnicityCertificateVerifier.js';
+export { UnicitySealQuorumSignaturesVerificationRule } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/rule/UnicitySealQuorumSignaturesVerificationRule.js';
+export { VerifiedSealCache } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/VerifiedSealCache.js';
+export { Secp256k1SignatureVerifier } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/Secp256k1SignatureVerifier.js';
 export type { ITokenVerifier } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/ITokenVerifier.js';
 export { WorkerTokenVerifier } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/worker/WorkerTokenVerifier.js';
 export type { IWorker } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/worker/IWorker.js';

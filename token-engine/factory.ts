@@ -20,11 +20,15 @@ import {
   MintJustificationVerifierService,
   PredicateVerifierService,
   RootTrustBase,
+  Secp256k1SignatureVerifier,
   SigningService,
   SplitMintJustificationVerifier,
   StateTransitionClient,
   TokenIssuanceVerifierService,
+  UnicityCertificateVerifier,
+  UnicitySealQuorumSignaturesVerificationRule,
   VerificationContext,
+  VerifiedSealCache,
   WorkerTokenVerifier,
   type IWorker,
 } from './sdk';
@@ -76,6 +80,12 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
 
   const trustBase = RootTrustBase.fromJSON(config.trustBaseJson);
   const predicateVerifier = PredicateVerifierService.create();
+  // st-sdk 2.1.0: seal verification is memoised per rule instance. Every leaf
+  // certified in one aggregator round shares a seal, so a multi-token send's
+  // proofs collapse onto a handful of seals instead of re-verifying each.
+  const unicityCertificateVerifier = new UnicityCertificateVerifier(
+    new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), new VerifiedSealCache(256)),
+  );
   const mintJustificationVerifier = new MintJustificationVerifierService();
   mintJustificationVerifier.register(
       new SplitMintJustificationVerifier(decodeSpherePaymentData),
@@ -85,10 +95,12 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
     client: new StateTransitionClient(new AggregatorClient(config.aggregatorUrl, config.apiKey ?? null)),
     trustBase,
     predicateVerifier,
+    unicityCertificateVerifier,
     mintJustificationVerifier,
     verificationContext: new VerificationContext(
       trustBase,
       predicateVerifier,
+      unicityCertificateVerifier,
       mintJustificationVerifier,
       new TokenIssuanceVerifierService(false),
     ),
