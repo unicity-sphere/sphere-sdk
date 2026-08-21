@@ -5,13 +5,29 @@ import type { SpendQueue } from './select/queue';
 /** Source blobs fetched ahead of a send, scoped to the state each token sat at (F6). */
 export class PrewarmCache {
   private readonly entries = new Map<string, Uint8Array>();
+  private generation = 0;
 
   private static key(tokenId: string, stateHash: string): string {
     return `${tokenId}:${stateHash}`;
   }
 
-  put(tokenId: string, stateHash: string, bytes: Uint8Array): void {
-    this.entries.set(PrewarmCache.key(tokenId, stateHash), bytes);
+  /** Claim the cache for a warm about to start; supersedes any warm already running. */
+  begin(): number {
+    this.entries.clear();
+    this.generation += 1;
+    return this.generation;
+  }
+
+  /**
+   * Publish a warm's result, unless it was cancelled or superseded while its
+   * fetch was in flight — a cancel that only cleared what had landed so far
+   * would be undone by the continuation of the very warm it cancelled.
+   */
+  commit(generation: number, warmed: readonly (readonly [string, string, Uint8Array])[]): void {
+    if (generation !== this.generation) return;
+    for (const [tokenId, stateHash, bytes] of warmed) {
+      this.entries.set(PrewarmCache.key(tokenId, stateHash), bytes);
+    }
   }
 
   get(tokenId: string, stateHash: string | undefined): Uint8Array | undefined {
@@ -21,6 +37,7 @@ export class PrewarmCache {
 
   clear(): void {
     this.entries.clear();
+    this.generation += 1;
   }
 
   get size(): number {
@@ -42,6 +59,7 @@ export async function warmSendSources(
 ): Promise<void> {
   const ids = deps.queue.previewSelection(request);
   if (ids.length === 0) return;
+  const generation = deps.cache.begin();
   const at = new Map(ids.map((id) => [id, deps.view.stateHashOf(id)]));
   let blobs: Map<string, Uint8Array>;
   try {
@@ -49,11 +67,12 @@ export async function warmSendSources(
   } catch {
     return;
   }
-  deps.cache.clear();
+  const warmed: (readonly [string, string, Uint8Array])[] = [];
   for (const [tokenId, bytes] of blobs) {
     const stateHash = at.get(tokenId);
-    if (stateHash !== undefined) deps.cache.put(tokenId, stateHash, bytes);
+    if (stateHash !== undefined) warmed.push([tokenId, stateHash, bytes]);
   }
+  deps.cache.commit(generation, warmed);
 }
 
 /**

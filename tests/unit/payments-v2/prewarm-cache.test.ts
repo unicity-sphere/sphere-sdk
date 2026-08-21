@@ -4,15 +4,20 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { PrewarmCache, takeSourceBlobs } from '../../../modules/payments-v2/prewarm-cache';
+import { PrewarmCache, takeSourceBlobs, warmSendSources } from '../../../modules/payments-v2/prewarm-cache';
 
 const A = new Uint8Array([1, 2, 3]);
 const B = new Uint8Array([4, 5, 6]);
 
+/** Publish entries the way a completed warm does. */
+function warm(cache: PrewarmCache, ...entries: (readonly [string, string, Uint8Array])[]): void {
+  cache.commit(cache.begin(), entries);
+}
+
 describe('PrewarmCache — state-scoped by construction (F6)', () => {
   it('returns a blob only for the state it was warmed at', () => {
     const cache = new PrewarmCache();
-    cache.put('T', 'S1', A);
+    warm(cache, ['T', 'S1', A]);
 
     expect(cache.get('T', 'S1')).toBe(A);
     // The token advanced (incoming claim, another device). Reusing the S1 blob
@@ -22,7 +27,7 @@ describe('PrewarmCache — state-scoped by construction (F6)', () => {
 
   it('treats an unknown state as a miss, never as a wildcard', () => {
     const cache = new PrewarmCache();
-    cache.put('T', 'S1', A);
+    warm(cache, ['T', 'S1', A]);
     // stateHashOf returns undefined for a tombstoned or unseen token; that must
     // not degrade into "any state will do".
     expect(cache.get('T', undefined)).toBeUndefined();
@@ -30,14 +35,13 @@ describe('PrewarmCache — state-scoped by construction (F6)', () => {
 
   it('misses on a token that was never warmed', () => {
     const cache = new PrewarmCache();
-    cache.put('T', 'S1', A);
+    warm(cache, ['T', 'S1', A]);
     expect(cache.get('OTHER', 'S1')).toBeUndefined();
   });
 
   it('keeps distinct states of the same token apart', () => {
     const cache = new PrewarmCache();
-    cache.put('T', 'S1', A);
-    cache.put('T', 'S2', B);
+    warm(cache, ['T', 'S1', A], ['T', 'S2', B]);
 
     expect(cache.get('T', 'S1')).toBe(A);
     expect(cache.get('T', 'S2')).toBe(B);
@@ -46,7 +50,7 @@ describe('PrewarmCache — state-scoped by construction (F6)', () => {
 
   it('clear drops everything, so a cancelled send leaves nothing behind', () => {
     const cache = new PrewarmCache();
-    cache.put('T', 'S1', A);
+    warm(cache, ['T', 'S1', A]);
     cache.clear();
 
     expect(cache.get('T', 'S1')).toBeUndefined();
@@ -74,7 +78,7 @@ describe('takeSourceBlobs — freshness comes from the server, not the mirror', 
 
   it('re-fetches a token the server already advanced, even though the mirror still shows the warmed state', async () => {
     const cache = new PrewarmCache();
-    cache.put('T', 'S1', A);
+    warm(cache, ['T', 'S1', A]);
     const mirror = staleMirror('S2');
     const fetched: string[][] = [];
     const storagePort = {
@@ -95,7 +99,7 @@ describe('takeSourceBlobs — freshness comes from the server, not the mirror', 
 
   it('serves the warm blob when the refresh confirms the token has not moved', async () => {
     const cache = new PrewarmCache();
-    cache.put('T', 'S1', A);
+    warm(cache, ['T', 'S1', A]);
     const mirror = staleMirror('S1');
     const storagePort = {
       getBlobs: async (): Promise<Map<string, Uint8Array>> => {
@@ -111,7 +115,7 @@ describe('takeSourceBlobs — freshness comes from the server, not the mirror', 
 
   it('falls back to fetching everything when the refresh itself fails', async () => {
     const cache = new PrewarmCache();
-    cache.put('T', 'S1', A);
+    warm(cache, ['T', 'S1', A]);
     const fetched: string[][] = [];
     const view = {
       stateHashOf: () => 'S1',
@@ -140,5 +144,65 @@ describe('takeSourceBlobs — freshness comes from the server, not the mirror', 
     await takeSourceBlobs({ view: mirror.view, storagePort, cache }, ['T']);
 
     expect(mirror.pulled()).toBe(0); // an unwarmed send must not pay for a delta
+  });
+});
+
+describe('warmSendSources — a warm in flight loses to a cancel', () => {
+  /** Deps whose blob fetch is held open until the test releases it. */
+  function heldWarm(cache: PrewarmCache) {
+    let release: (v: Map<string, Uint8Array>) => void = () => undefined;
+    const gate = new Promise<Map<string, Uint8Array>>((r) => {
+      release = r;
+    });
+    return {
+      release,
+      deps: {
+        cache,
+        queue: { previewSelection: () => ['T'] } as never,
+        view: { stateHashOf: () => 'S1', delta: async (): Promise<void> => undefined },
+        storagePort: { getBlobs: () => gate },
+      },
+    };
+  }
+
+  it('drops the result of a warm that was discarded while its fetch was in flight', async () => {
+    const cache = new PrewarmCache();
+    const warm = heldWarm(cache);
+    const running = warmSendSources(warm.deps, { coinId: 'c', amount: '1' });
+
+    cache.clear(); // the user cancelled confirm before the blobs came back
+    warm.release(new Map([['T', A]]));
+    await running;
+
+    // Pre-fix the continuation ran clear()+put() and republished the very set
+    // the cancel had just thrown away.
+    expect(cache.get('T', 'S1')).toBeUndefined();
+    expect(cache.size).toBe(0);
+  });
+
+  it('drops a superseded warm, keeping only the newest', async () => {
+    const cache = new PrewarmCache();
+    const first = heldWarm(cache);
+    const running = warmSendSources(first.deps, { coinId: 'c', amount: '1' });
+
+    const second = heldWarm(cache);
+    const secondRunning = warmSendSources(second.deps, { coinId: 'c', amount: '2' });
+    second.release(new Map([['T', B]]));
+    await secondRunning;
+
+    first.release(new Map([['T', A]])); // the older fetch lands last
+    await running;
+
+    expect(cache.get('T', 'S1')).toBe(B);
+  });
+
+  it('publishes normally when nothing intervened', async () => {
+    const cache = new PrewarmCache();
+    const warm = heldWarm(cache);
+    const running = warmSendSources(warm.deps, { coinId: 'c', amount: '1' });
+    warm.release(new Map([['T', A]]));
+    await running;
+
+    expect(cache.get('T', 'S1')).toBe(A);
   });
 });
