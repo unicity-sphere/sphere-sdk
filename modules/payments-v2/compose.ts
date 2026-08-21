@@ -193,7 +193,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     machineDeps,
     machine: new TransferMachine(machineDeps),
     heldStates,
-    receiveLoop: buildReceive(deps, hooks, historyStore, heldStates),
+    receiveLoop: buildReceive(deps, hooks, historyStore, heldStates, view),
     requests: buildRequests(deps, hooks),
     restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view),
   };
@@ -290,7 +290,8 @@ function buildReceive(
   deps: PaymentsFacadeDeps,
   hooks: FacadeHooks,
   historyStore: History,
-  heldStates: HeldStateCache
+  heldStates: HeldStateCache,
+  view: InventoryView
 ): Receive {
   return new Receive({
     delivery: deps.deliveryPort,
@@ -305,6 +306,11 @@ function buildReceive(
     registry: deps.registry,
     recordReceived: (record) => recordReceived(historyStore, record),
     emit: (event, transfer) => deps.emit(event, transfer),
+    // The mirror is the balance the wallet renders; refresh it as the drain runs
+    // so a multi-token receive lands progressively instead of all at the end.
+    refreshView: () => {
+      void view.delta().catch(() => undefined);
+    },
     attention: (transferId, code, detail) => {
       deps.emit(
         'transfer:attention',
