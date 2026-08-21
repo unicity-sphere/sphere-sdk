@@ -237,8 +237,12 @@ interface Harness {
   receive: Receive;
   epoch: string;
   historyFail: boolean;
-  /** Mirror refreshes asked for DURING the drain (§5.7 progressive balance). */
-  refreshes: number;
+  /**
+   * One entry per mirror refresh asked for DURING the drain, recording how many
+   * claimed acks had reached the server by then — a refresh that sees no acks
+   * shows the user nothing new (§5.7 progressive balance).
+   */
+  refreshes: number[];
   /** Clock the drain reads; tests advance it to cross the refresh throttle. */
   clock: number;
 }
@@ -263,7 +267,7 @@ function makeHarness(
     historyLog,
     epoch: opts.epoch ?? 'e1',
     historyFail: false,
-    refreshes: 0,
+    refreshes: [],
     clock: 1_700_000_000_000,
     receive: null as unknown as Receive,
   };
@@ -285,7 +289,7 @@ function makeHarness(
     },
     syncEpoch: () => harness.epoch,
     refreshView: () => {
-      harness.refreshes += 1;
+      harness.refreshes.push(delivery.ackLog.filter((a) => a.disposition === 'claimed').length);
     },
     // Each read advances the clock when the test asks for it, so a multi-entry
     // drain crosses the refresh throttle the way a real one does.
@@ -699,7 +703,7 @@ describe('payments-v2 Receive drain', () => {
   });
 });
 
-describe('payments-v2 Receive — the balance moves while the drain runs (#491)', () => {
+describe('payments-v2 Receive — the balance moves while the drain runs (#755)', () => {
   it('refreshes the inventory mirror DURING a multi-token drain, not only when it finishes', async () => {
     // The mirror is what assets()/tokens() render. Acks flush every 200 entries
     // and the facade refreshes once the drain returns, so a 54-token receive used
@@ -712,17 +716,39 @@ describe('payments-v2 Receive — the balance moves while the drain runs (#491)'
     expect(transfers).toHaveLength(5);
     // Every refresh here happened inside drainOnce — the facade's own post-drain
     // refresh is a separate call it makes after this resolves.
-    expect(h.refreshes).toBeGreaterThan(1);
+    expect(h.refreshes.length).toBeGreaterThan(1);
+    // The property that actually matters. A `claimed` ack is what puts a token in
+    // SERVER inventory, and acks otherwise queue until ACK_BATCH_SIZE (200), so a
+    // refresh fired before the flush would read an inventory with none of the
+    // accepted tokens in it — progressive in form, frozen balance in fact.
+    expect(h.refreshes[0]).toBeGreaterThan(0);
+    // ...and each later refresh sees strictly more than the one before it.
+    for (let i = 1; i < h.refreshes.length; i += 1) {
+      expect(h.refreshes[i]).toBeGreaterThan(h.refreshes[i - 1]);
+    }
   });
 
-  it('throttles: a burst arriving inside one interval refreshes once, not per token', async () => {
-    // A refresh is a server round trip. Progressive must not mean 54 of them.
+  it('a drain that finishes inside one interval refreshes nothing mid-flight', async () => {
+    // A refresh is a server round trip, and an early flush costs a cursor write.
+    // A fast drain is already covered by the facade's single post-drain refresh,
+    // so it must keep the old behaviour exactly: batch at 200, refresh at the end.
     const h = makeHarness({ advancePerEntryMs: 0 });
     for (let i = 1; i <= 10; i += 1) h.delivery.add(meta(T(i), 'S1'));
 
     await h.receive.drainOnce();
 
-    expect(h.refreshes).toBe(1);
+    expect(h.refreshes).toEqual([]);
+  });
+
+  it('throttles a slow drain to one refresh per interval, not one per token', async () => {
+    // 6 tokens arriving a third of an interval apart: 2 intervals, not 6 refreshes.
+    const h = makeHarness({ advancePerEntryMs: Math.ceil(REFRESH_INTERVAL_MS / 3) });
+    for (let i = 1; i <= 6; i += 1) h.delivery.add(meta(T(i), 'S1'));
+
+    await h.receive.drainOnce();
+
+    expect(h.refreshes.length).toBeGreaterThan(0);
+    expect(h.refreshes.length).toBeLessThan(6);
   });
 
   it('never refreshes for a drain that stored nothing', async () => {
@@ -731,7 +757,7 @@ describe('payments-v2 Receive — the balance moves while the drain runs (#491)'
 
     await h.receive.drainOnce();
 
-    expect(h.refreshes).toBe(0);
+    expect(h.refreshes).toEqual([]);
   });
 
   it('a rejected entry alone does not trigger a refresh — nothing entered the balance', async () => {
@@ -741,6 +767,21 @@ describe('payments-v2 Receive — the balance moves while the drain runs (#491)'
 
     await h.receive.drainOnce();
 
-    expect(h.refreshes).toBe(0);
+    expect(h.refreshes).toEqual([]);
+  });
+
+  it('a rejection AFTER an accepted token does not buy itself a refresh', async () => {
+    // stored.length > 0 stays true for the rest of the drain, so gating on the
+    // running total would let every later rejection pay for a round trip.
+    const h = makeHarness({ advancePerEntryMs: REFRESH_INTERVAL_MS });
+    h.delivery.add(meta(T(1), 'S1'));
+    h.engine.badProof.add(`${T(2)}:S1`);
+    h.delivery.add(meta(T(2), 'S1'));
+    h.engine.badProof.add(`${T(3)}:S1`);
+    h.delivery.add(meta(T(3), 'S1'));
+
+    await h.receive.drainOnce();
+
+    expect(h.refreshes).toHaveLength(1); // the accepted one only
   });
 });
