@@ -63,12 +63,12 @@ export interface ReceiveDeps {
 
 export const ACK_BATCH_SIZE = 200;
 /**
- * How often a drain refreshes the inventory mirror mid-flight. A 54-token
- * receive drains for ~10 s, and the mirror is what assets()/tokens() read — a
- * single refresh at the end leaves the wallet showing a stale balance for the
- * whole drain while the per-token transfer:incoming events stream past.
+ * Mid-drain mirror refresh cadence. Coarse because a refresh flushes acks and
+ * costs an inventory round trip, both on the drain's critical path: at 750 ms,
+ * shorter than the ~1 s a token takes, every token paid for one and a 54-token
+ * receive stretched from ~20 s to ~58 s.
  */
-export const REFRESH_INTERVAL_MS = 750;
+export const REFRESH_INTERVAL_MS = 2500;
 export const POLL_INTERVAL_MS = 30_000;
 export const ATTENTION_CLAIM_CONFLICT = 'claim:conflict';
 
