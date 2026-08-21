@@ -30,7 +30,7 @@ export class PrewarmCache {
 
 export interface WarmDeps {
   readonly queue: SpendQueue;
-  readonly view: InventoryView;
+  readonly view: Pick<InventoryView, 'stateHashOf' | 'delta'>;
   readonly storagePort: Pick<StoragePort, 'getBlobs'>;
   readonly cache: PrewarmCache;
 }
@@ -56,15 +56,28 @@ export async function warmSendSources(
   }
 }
 
-/** Warm where the token still sits at its warmed state; single-use. */
+/**
+ * Warm where the token still sits at its warmed state; single-use. Refreshes the
+ * mirror FIRST — warming and consuming both read `stateHashOf`, so they agree
+ * even when the server has moved on, and the uncached path reads the server's
+ * current blob. Unverifiable freshness re-fetches instead.
+ */
 export async function takeSourceBlobs(
   deps: Pick<WarmDeps, 'view' | 'storagePort' | 'cache'>,
   sourceIds: readonly string[]
 ): Promise<Map<string, Uint8Array>> {
   const blobs = new Map<string, Uint8Array>();
   const missing: string[] = [];
+  let trustCache = deps.cache.size > 0;
+  if (trustCache) {
+    try {
+      await deps.view.delta();
+    } catch {
+      trustCache = false;
+    }
+  }
   for (const tokenId of sourceIds) {
-    const warm = deps.cache.get(tokenId, deps.view.stateHashOf(tokenId));
+    const warm = trustCache ? deps.cache.get(tokenId, deps.view.stateHashOf(tokenId)) : undefined;
     if (warm === undefined) missing.push(tokenId);
     else blobs.set(tokenId, warm);
   }

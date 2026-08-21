@@ -92,6 +92,8 @@ export interface PendingTransfer {
 export type ConnectionStatus = 'connected' | 'degraded' | 'offline';
 
 export interface PaymentsV2 {
+  prewarmSend(request: SendRequest): Promise<void>;
+  discardPrewarm(): void;
   assets(coinId?: string): Promise<Asset[]>;
   tokens(filter?: { coinId?: string }): Token[];
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage>;
