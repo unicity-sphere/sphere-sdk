@@ -54,7 +54,7 @@ export interface ReceiveDeps {
   readonly registry: RegistryReader;
   readonly recordReceived: (record: ReceivedRecord) => Promise<void>;
   readonly emit: (event: 'transfer:incoming', transfer: IncomingTransfer) => void;
-  /** Refresh the inventory mirror mid-drain; fire-and-forget, throttled by the caller. */
+  /** Refresh the inventory mirror mid-drain; fire-and-forget. Receive throttles the calls. */
   readonly refreshView?: () => void;
   readonly attention: AttentionEmitter;
   readonly syncEpoch: () => string;
@@ -121,17 +121,33 @@ export class Receive {
     this.unsubscribeWake = null;
   }
 
-  /** Ask for a mirror refresh at most once per REFRESH_INTERVAL_MS. */
-  private maybeRefresh(deps: ReceiveDeps): void {
+  /**
+   * Flush what has been accepted, then ask for a mirror refresh — at most once
+   * per REFRESH_INTERVAL_MS.
+   *
+   * The flush is not incidental. A `claimed` ack is what materializes a token
+   * into SERVER inventory, and acks otherwise sit queued until ACK_BATCH_SIZE
+   * (200) — so for any ordinary drain, including the 54-token case this exists
+   * for, refreshing before the flush would query an inventory holding none of
+   * the tokens just accepted, and the balance would still only move at the end.
+   * Ordering is preserved: store() still precedes the ack (§5.7).
+   */
+  private async maybeRefresh(deps: ReceiveDeps, pending: PendingAck[], epochOf: () => string): Promise<void> {
     if (deps.refreshView === undefined) return;
     const now = deps.now?.() ?? Date.now();
     if (now - this.lastRefreshAt < REFRESH_INTERVAL_MS) return;
     this.lastRefreshAt = now;
+    await flushAcks(deps, pending, epochOf);
     deps.refreshView();
   }
 
   private async doDrain(): Promise<IncomingTransfer[]> {
     const deps = this.deps;
+    // Start the clock at the drain, so a drain that finishes inside one interval
+    // behaves exactly as before — acks batch at ACK_BATCH_SIZE and the mirror is
+    // refreshed once, at the end. Only a drain slow enough for the user to sit
+    // watching a stale balance pays for mid-flight refreshes.
+    this.lastRefreshAt = deps.now?.() ?? Date.now();
     const engine = deps.engine();
     const stored: IncomingTransfer[] = [];
     const pending: PendingAck[] = [];
@@ -144,13 +160,12 @@ export class Receive {
       let basis = record !== null && record.syncEpoch === deps.syncEpoch() ? record : null;
       for (let pass = 0; pass < 2; pass++) {
         for await (const entry of deps.delivery.incoming(basis === null ? undefined : String(basis.cursor))) {
+          const storedBefore = stored.length;
           await this.processEntry(deps, engine, entry, pending, stored);
           if (pending.length >= ACK_BATCH_SIZE) await flushAcks(deps, pending, pageEpoch);
-          // Acks flush every ACK_BATCH_SIZE (200) and the mirror is refreshed once
-          // the whole drain returns, so without this a large receive shows nothing
-          // in the balance until it finishes. Throttled by time, not entry count:
-          // what matters is that the wallet moves while the user is watching.
-          if (stored.length > 0) this.maybeRefresh(deps);
+          // Only when THIS entry entered the balance: a rejected one changes
+          // nothing to show, and refreshing for it is a wasted round trip.
+          if (stored.length > storedBefore) await this.maybeRefresh(deps, pending, pageEpoch);
         }
         await flushAcks(deps, pending, pageEpoch);
         const served = deps.delivery.incomingEpoch();
