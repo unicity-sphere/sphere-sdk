@@ -152,6 +152,19 @@ export interface FacadeParts {
   restoreDeps: RestoreDeps;
 }
 
+function makeSingleFlightRefresh(refresh: () => Promise<void>): () => void {
+  let inFlight = false;
+  return () => {
+    if (inFlight) return;
+    inFlight = true;
+    void refresh()
+      .catch(() => undefined)
+      .finally(() => {
+        inFlight = false;
+      });
+  };
+}
+
 export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks): FacadeParts {
   const ownPubkeyBytes = hexToBytes(deps.ownPubkey);
   const ledger = new ReservationLedger();
@@ -306,11 +319,10 @@ function buildReceive(
     registry: deps.registry,
     recordReceived: (record) => recordReceived(historyStore, record),
     emit: (event, transfer) => deps.emit(event, transfer),
-    // The mirror is the balance the wallet renders; refresh it as the drain runs
-    // so a multi-token receive lands progressively instead of all at the end.
-    refreshView: () => {
-      void view.delta().catch(() => undefined);
-    },
+    // Single-flight: view.delta() enqueues on a strict-FIFO SerialChain, so
+    // firing per throttle tick regardless of the last one builds a queue that
+    // drains in a burst at the END — a slower version of the bug being fixed.
+    refreshView: makeSingleFlightRefresh(() => view.delta()),
     attention: (transferId, code, detail) => {
       deps.emit(
         'transfer:attention',

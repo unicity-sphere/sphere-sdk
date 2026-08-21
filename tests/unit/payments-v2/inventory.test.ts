@@ -450,3 +450,33 @@ describe('stateHashOf — the freshness key for warmed blobs (#prewarm)', () => 
     expect(view.stateHashOf('never-seen')).toBeUndefined();
   });
 });
+
+describe('releaseMany — one event for one logical change (#755)', () => {
+  it('emits once for a whole released set, not once per token', async () => {
+    const { view, events } = makeView([
+      page([item('A', { seq: 1 }), item('B', { seq: 2 }), item('C', { seq: 3 })], 3),
+      page([], 3),
+    ]);
+    await view.fullPull();
+    view.markInFlight('A');
+    view.markInFlight('B');
+    view.markInFlight('C');
+    const before = events.filter((e) => e === 'inventory:updated').length;
+
+    view.releaseMany(['A', 'B', 'C']);
+
+    // Per-token release emitted 54 events in a few ms for one send's worth of
+    // sources; consumers debounce them away and real changes get lost in them.
+    expect(events.filter((e) => e === 'inventory:updated').length).toBe(before + 1);
+  });
+
+  it('emits nothing when the set released nothing', async () => {
+    const { view, events } = makeView([page([item('A', { seq: 1 })], 1), page([], 1)]);
+    await view.fullPull();
+    const before = events.filter((e) => e === 'inventory:updated').length;
+
+    view.releaseMany(['A', 'never-held']);
+
+    expect(events.filter((e) => e === 'inventory:updated').length).toBe(before);
+  });
+});
