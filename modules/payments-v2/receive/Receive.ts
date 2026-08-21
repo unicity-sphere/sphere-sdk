@@ -54,12 +54,21 @@ export interface ReceiveDeps {
   readonly registry: RegistryReader;
   readonly recordReceived: (record: ReceivedRecord) => Promise<void>;
   readonly emit: (event: 'transfer:incoming', transfer: IncomingTransfer) => void;
+  /** Refresh the inventory mirror mid-drain; fire-and-forget, throttled by the caller. */
+  readonly refreshView?: () => void;
   readonly attention: AttentionEmitter;
   readonly syncEpoch: () => string;
   readonly now?: () => number;
 }
 
 export const ACK_BATCH_SIZE = 200;
+/**
+ * How often a drain refreshes the inventory mirror mid-flight. A 54-token
+ * receive drains for ~10 s, and the mirror is what assets()/tokens() read — a
+ * single refresh at the end leaves the wallet showing a stale balance for the
+ * whole drain while the per-token transfer:incoming events stream past.
+ */
+export const REFRESH_INTERVAL_MS = 750;
 export const POLL_INTERVAL_MS = 30_000;
 export const ATTENTION_CLAIM_CONFLICT = 'claim:conflict';
 
@@ -87,6 +96,7 @@ export class Receive {
   private readonly drainFlight = new SingleFlight<IncomingTransfer[]>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private unsubscribeWake: (() => void) | null = null;
+  private lastRefreshAt = 0;
 
   constructor(private readonly deps: ReceiveDeps) {}
 
@@ -111,6 +121,15 @@ export class Receive {
     this.unsubscribeWake = null;
   }
 
+  /** Ask for a mirror refresh at most once per REFRESH_INTERVAL_MS. */
+  private maybeRefresh(deps: ReceiveDeps): void {
+    if (deps.refreshView === undefined) return;
+    const now = deps.now?.() ?? Date.now();
+    if (now - this.lastRefreshAt < REFRESH_INTERVAL_MS) return;
+    this.lastRefreshAt = now;
+    deps.refreshView();
+  }
+
   private async doDrain(): Promise<IncomingTransfer[]> {
     const deps = this.deps;
     const engine = deps.engine();
@@ -127,6 +146,11 @@ export class Receive {
         for await (const entry of deps.delivery.incoming(basis === null ? undefined : String(basis.cursor))) {
           await this.processEntry(deps, engine, entry, pending, stored);
           if (pending.length >= ACK_BATCH_SIZE) await flushAcks(deps, pending, pageEpoch);
+          // Acks flush every ACK_BATCH_SIZE (200) and the mirror is refreshed once
+          // the whole drain returns, so without this a large receive shows nothing
+          // in the balance until it finishes. Throttled by time, not entry count:
+          // what matters is that the wallet moves while the user is watching.
+          if (stored.length > 0) this.maybeRefresh(deps);
         }
         await flushAcks(deps, pending, pageEpoch);
         const served = deps.delivery.incomingEpoch();
