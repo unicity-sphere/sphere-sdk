@@ -419,3 +419,34 @@ describe('InventoryView epoch reset', () => {
     expect(view.pool(COIN).map((p) => p.tokenId)).toEqual(['A']);
   });
 });
+
+describe('stateHashOf — the freshness key for warmed blobs (#prewarm)', () => {
+  it('follows the token as its state advances, so a blob warmed at the old state stops matching', async () => {
+    const { view } = makeView([
+      page([item('T', { seq: 1, state: 'S1' })], 1),
+      page([], 1),
+      page([item('T', { seq: 2, state: 'S2' })], 2),
+    ]);
+    await view.fullPull();
+    expect(view.stateHashOf('T')).toBe('S1');
+
+    // An incoming claim advances the row in place (#70). A blob fetched while the
+    // token sat at S1 must no longer be reachable under the current key — that is
+    // what stops a spent state reaching a payload's spentStates.
+    await view.delta();
+    expect(view.stateHashOf('T')).toBe('S2');
+  });
+
+  it('reports nothing for a tombstoned or unknown token, so neither can be served warm', async () => {
+    const { view } = makeView([
+      page([item('T', { seq: 1, state: 'S1' })], 1),
+      page([], 1),
+      page([item('T', { seq: 2, state: 'S1', status: 'removed' })], 2),
+    ]);
+    await view.fullPull();
+    expect(view.stateHashOf('T')).toBe('S1');
+    await view.delta();
+    expect(view.stateHashOf('T')).toBeUndefined();
+    expect(view.stateHashOf('never-seen')).toBeUndefined();
+  });
+});

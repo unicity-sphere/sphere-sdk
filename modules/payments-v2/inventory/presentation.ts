@@ -156,3 +156,18 @@ function priceOne(asset: Asset, quote: PriceQuote | undefined): Asset {
     fiatValueEur: quote.priceEur != null ? human * quote.priceEur : null,
   };
 }
+
+/** A source token as it appears mid-send: no snapshot yet, flagged transferring. */
+export function transferringToken(
+  tokenId: string,
+  coinId: string,
+  amount: bigint,
+  registry: RegistryReader,
+  now: number
+): Token {
+  const snapshot = { assets: [], createdAt: now, updatedAt: now };
+  return toToken(tokenId, snapshot, { coinId, amount: amount.toString() }, registry, {
+    transferring: true,
+    suspectedSpent: false,
+  });
+}

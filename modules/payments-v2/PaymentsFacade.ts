@@ -12,7 +12,7 @@ import {
 } from '../../core/errors';
 import { randomUUID } from '../../core/uuid';
 import type { ITokenEngine } from '../../token-engine/engine';
-import type { MintParams, SphereToken } from '../../token-engine/types';
+import type { SphereToken } from '../../token-engine/types';
 import { TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
@@ -21,10 +21,12 @@ import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { requireSameNetworkRecipient } from './recipient';
 import { reseedAndReset, type RestoreDeps } from './restore';
+import { mintParams } from './mint-params';
+import { PrewarmCache, takeSourceBlobs, warmSendSources, type WarmDeps } from './prewarm-cache';
 import type { MintJournalEntry, ShortfallEntry } from './stores';
 import type { History } from './history/History';
 import type { InventoryView } from './inventory/InventoryView';
-import { toToken } from './inventory/presentation';
+import { transferringToken } from './inventory/presentation';
 import type { Receive } from './receive/Receive';
 import type { Requests } from './requests/Requests';
 import type { ReservationLedger } from './select/ledger';
@@ -86,6 +88,7 @@ interface SendRun {
 }
 
 export class PaymentsFacade implements PaymentsV2 {
+  private readonly prewarmed = new PrewarmCache();
   private readonly view: InventoryView;
   private readonly ledger: ReservationLedger;
   private readonly queue: SpendQueue;
@@ -234,6 +237,18 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   // ── money movement ─────────────────────────────────────────────────────────
+
+  async prewarmSend(request: SendRequest): Promise<void> {
+    await warmSendSources(this.warmDeps(), request);
+  }
+
+  discardPrewarm(): void {
+    this.prewarmed.clear();
+  }
+
+  private warmDeps(): WarmDeps {
+    return { queue: this.queue, view: this.view, storagePort: this.deps.storagePort, cache: this.prewarmed };
+  }
 
   send(request: SendRequest): Promise<TransferResult> {
     return this.track(this.sendOutcome(request));
@@ -479,7 +494,7 @@ export class PaymentsFacade implements PaymentsV2 {
     sourceIds: readonly string[]
   ): Promise<AttemptCtx> {
     const engine = this.engine();
-    const blobs = await this.deps.storagePort.getBlobs([...sourceIds]);
+    const blobs = await takeSourceBlobs(this.warmDeps(), sourceIds);
     const sources = new Map<string, SphereToken>();
     const sourceTokens: Token[] = [];
     const spentStates: Record<string, { local: string; protocol: string }> = {};
@@ -493,7 +508,7 @@ export class PaymentsFacade implements PaymentsV2 {
       // local === protocol by construction; the dual field is wire compat (types.ts).
       spentStates[tokenId] = { local: keys.stateHash, protocol: keys.stateHash };
       sources.set(tokenId, token);
-      sourceTokens.push(this.toUiToken(tokenId, request.coinId, engine.balanceOf(token, request.coinId)));
+      sourceTokens.push(transferringToken(tokenId, request.coinId, engine.balanceOf(token, request.coinId), this.deps.registry, this.nowMs()));
     }
     const payload = buildPayload(recipientPubkey, request, spend, spentStates);
     const plan: MachinePlan = {
@@ -657,7 +672,7 @@ export class PaymentsFacade implements PaymentsV2 {
     await this.machineStores.mintJournal.upsert(entry);
     let token: SphereToken;
     try {
-      token = await engine.mint(this.mintParams(coinId, amount), { transferId: mintId });
+      token = await engine.mint(mintParams(this.ownPubkeyBytes, coinId, amount), { transferId: mintId });
     } catch (err) {
       // Entry retained: the heartbeat / start() replay resolves it (inventory check / F13 seed).
       this.heartbeat.arm();
@@ -728,7 +743,7 @@ export class PaymentsFacade implements PaymentsV2 {
       });
       return false; // held, not resolved — never counts as heartbeat progress
     }
-    const token = await engine.mint(this.mintParams(entry.coinId, BigInt(entry.amount)), {
+    const token = await engine.mint(mintParams(this.ownPubkeyBytes, entry.coinId, BigInt(entry.amount)), {
       transferId: entry.mintId,
     });
     if (token.blob.tokenId !== entry.tokenId) {
@@ -736,13 +751,6 @@ export class PaymentsFacade implements PaymentsV2 {
     }
     await this.finalizeMint(engine, entry.mintId, token, entry.coinId, entry.amount);
     return true;
-  }
-
-  private mintParams(coinId: string, amount: bigint): MintParams {
-    return {
-      recipientPubkey: this.ownPubkeyBytes,
-      value: { assets: [{ coinId, amount }] },
-    };
   }
 
   private async tokenInServerInventory(tokenId: string): Promise<boolean> {
@@ -776,13 +784,6 @@ export class PaymentsFacade implements PaymentsV2 {
       if (!page.more) return;
       page = await this.deps.storagePort.listInventory(page.cursor);
     }
-  }
-
-  private toUiToken(tokenId: string, coinId: string, amount: bigint): Token {
-    const now = this.nowMs();
-    const snapshot = { assets: [], createdAt: now, updatedAt: now };
-    const flags = { transferring: true, suspectedSpent: false };
-    return toToken(tokenId, snapshot, { coinId, amount: amount.toString() }, this.deps.registry, flags);
   }
 
   private track<T>(op: Promise<T>): Promise<T> {

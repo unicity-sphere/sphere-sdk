@@ -62,6 +62,8 @@ export function makeGate(): Gate {
 }
 
 export interface Hooks {
+  /** Runs before every source-blob read — throw to prove a read did NOT happen. */
+  getBlobs?: (ids: string[]) => Promise<void>;
   putIntent?: () => Promise<void>;
   listOpen?: () => Promise<void>;
   complete?: (transferId: string) => Promise<void>;
@@ -104,7 +106,10 @@ function hookedClient(inner: FakeWalletApiV2Client, hooks: Hooks, counters: Coun
 function hookedStorage(inner: StoragePort, hooks: Hooks): StoragePort {
   return {
     listInventory: (since) => inner.listInventory(since),
-    getBlobs: (ids) => inner.getBlobs(ids),
+    getBlobs: async (ids) => {
+      if (hooks.getBlobs) await hooks.getBlobs(ids);
+      return inner.getBlobs(ids);
+    },
     uploadBlobs: (blobs) => inner.uploadBlobs(blobs),
     applyDelta: async (delta) => {
       if (hooks.applyDelta) await hooks.applyDelta();

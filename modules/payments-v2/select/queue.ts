@@ -89,6 +89,32 @@ export class SpendQueue {
     return { kind: 'queued', settled: this.enqueue(reservationId, request.coinId, amount) };
   }
 
+  /**
+   * The sources `plan()` WOULD pick right now, reserving nothing and queueing
+   * nothing — a read-only probe used to warm blobs while the user is still
+   * looking at the confirm screen.
+   *
+   * Deliberately side-effect free: reserving here would pin the user's balance
+   * across think-time and strand it if they never press send. The consequence is
+   * that the real `plan()` may pick differently (inventory moves, another send
+   * reserves first); callers must treat the result as a HINT and tolerate a miss,
+   * never as a commitment that these sources will be spent.
+   */
+  previewSelection(request: { coinId: string; amount: string }): readonly string[] {
+    if (this.destroyed) return [];
+    let amount: bigint;
+    try {
+      amount = parseAmount(request.amount);
+    } catch {
+      return []; // a malformed amount is the caller's problem at plan() time, not here
+    }
+    const { freeView, freeTotal } = this.freeView(request.coinId);
+    if (freeTotal < amount) return []; // would throw or queue — nothing worth warming
+    const plan = selectCoins(freeView, amount, { workBudget: this.deps.workBudget });
+    if (plan === null) return [];
+    return [...plan.direct, ...(plan.split !== undefined ? [plan.split.tokenId] : [])];
+  }
+
   // Coverage math: free + Σ declared expected change of in-flight sends —
   // never the full amount of in-flight sources (§5.3).
   declareExpectedChange(transferId: string, coinId: string, amount: bigint): void {

@@ -165,6 +165,16 @@ export class InventoryView {
     return out;
   }
 
+  /**
+   * Current mirrored state of an ACTIVE token, or undefined when it is unknown
+   * or tombstoned. Exists so a cached blob can be state-scoped (F6): a blob is
+   * only reusable while the token still sits at the state it was fetched at.
+   */
+  stateHashOf(tokenId: string): string | undefined {
+    const entry = this.mirror.get(tokenId);
+    return entry !== undefined && entry.status === 'active' ? entry.stateHash : undefined;
+  }
+
   tokens(registry: RegistryReader, filter?: { coinId?: string }): Token[] {
     const out: Token[] = [];
     for (const [tokenId, entry] of this.mirror) {
