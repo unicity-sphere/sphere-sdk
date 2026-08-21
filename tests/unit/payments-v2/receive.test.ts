@@ -4,6 +4,7 @@ import type { RegistryReader } from '../../../modules/payments-v2/inventory/Inve
 import type { DeliveryPort, IncomingDelivery } from '../../../modules/payments-v2/ports';
 import {
   ACK_BATCH_SIZE,
+  REFRESH_INTERVAL_MS,
   Receive,
   receivedDedupKey,
   type ReceiveDeps,
@@ -236,9 +237,15 @@ interface Harness {
   receive: Receive;
   epoch: string;
   historyFail: boolean;
+  /** Mirror refreshes asked for DURING the drain (§5.7 progressive balance). */
+  refreshes: number;
+  /** Clock the drain reads; tests advance it to cross the refresh throttle. */
+  clock: number;
 }
 
-function makeHarness(opts: { epoch?: string; kvSeed?: Record<string, unknown> } = {}): Harness {
+function makeHarness(
+  opts: { epoch?: string; kvSeed?: Record<string, unknown>; advancePerEntryMs?: number } = {}
+): Harness {
   const engine = new StubEngine();
   const view = new FakeView();
   const delivery = new FakeDelivery(view);
@@ -256,6 +263,8 @@ function makeHarness(opts: { epoch?: string; kvSeed?: Record<string, unknown> } 
     historyLog,
     epoch: opts.epoch ?? 'e1',
     historyFail: false,
+    refreshes: 0,
+    clock: 1_700_000_000_000,
     receive: null as unknown as Receive,
   };
   const deps: ReceiveDeps = {
@@ -275,7 +284,15 @@ function makeHarness(opts: { epoch?: string; kvSeed?: Record<string, unknown> } 
       attentions.push({ transferId, code, ...(detail !== undefined ? { detail } : {}) });
     },
     syncEpoch: () => harness.epoch,
-    now: () => 1_700_000_000_000,
+    refreshView: () => {
+      harness.refreshes += 1;
+    },
+    // Each read advances the clock when the test asks for it, so a multi-entry
+    // drain crosses the refresh throttle the way a real one does.
+    now: () => {
+      harness.clock += opts.advancePerEntryMs ?? 0;
+      return harness.clock;
+    },
   };
   harness.receive = new Receive(deps);
   return harness;
@@ -679,5 +696,51 @@ describe('payments-v2 Receive drain', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('payments-v2 Receive — the balance moves while the drain runs (#491)', () => {
+  it('refreshes the inventory mirror DURING a multi-token drain, not only when it finishes', async () => {
+    // The mirror is what assets()/tokens() render. Acks flush every 200 entries
+    // and the facade refreshes once the drain returns, so a 54-token receive used
+    // to stream transfer:incoming (toasts moved) while the balance sat still.
+    const h = makeHarness({ advancePerEntryMs: REFRESH_INTERVAL_MS });
+    for (let i = 1; i <= 5; i += 1) h.delivery.add(meta(T(i), 'S1'));
+
+    const transfers = await h.receive.drainOnce();
+
+    expect(transfers).toHaveLength(5);
+    // Every refresh here happened inside drainOnce — the facade's own post-drain
+    // refresh is a separate call it makes after this resolves.
+    expect(h.refreshes).toBeGreaterThan(1);
+  });
+
+  it('throttles: a burst arriving inside one interval refreshes once, not per token', async () => {
+    // A refresh is a server round trip. Progressive must not mean 54 of them.
+    const h = makeHarness({ advancePerEntryMs: 0 });
+    for (let i = 1; i <= 10; i += 1) h.delivery.add(meta(T(i), 'S1'));
+
+    await h.receive.drainOnce();
+
+    expect(h.refreshes).toBe(1);
+  });
+
+  it('never refreshes for a drain that stored nothing', async () => {
+    // An empty poll every 30 s must not pull the inventory each time.
+    const h = makeHarness({ advancePerEntryMs: REFRESH_INTERVAL_MS });
+
+    await h.receive.drainOnce();
+
+    expect(h.refreshes).toBe(0);
+  });
+
+  it('a rejected entry alone does not trigger a refresh — nothing entered the balance', async () => {
+    const h = makeHarness({ advancePerEntryMs: REFRESH_INTERVAL_MS });
+    h.engine.badProof.add(`${T(1)}:S1`);
+    h.delivery.add(meta(T(1), 'S1'));
+
+    await h.receive.drainOnce();
+
+    expect(h.refreshes).toBe(0);
   });
 });
