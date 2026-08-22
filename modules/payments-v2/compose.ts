@@ -152,6 +152,33 @@ export interface FacadeParts {
   restoreDeps: RestoreDeps;
 }
 
+/**
+ * One refresh in flight, one queued behind it. The trailing re-run is required:
+ * an in-flight delta may already have read past the change that re-triggered it.
+ */
+export function makeCoalescedRefresh(refresh: () => Promise<void>): () => void {
+  let inFlight = false;
+  let queued = false;
+  const run = (): void => {
+    inFlight = true;
+    void refresh()
+      .catch(() => undefined)
+      .finally(() => {
+        inFlight = false;
+        if (!queued) return;
+        queued = false;
+        run();
+      });
+  };
+  return () => {
+    if (inFlight) {
+      queued = true;
+      return;
+    }
+    run();
+  };
+}
+
 export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks): FacadeParts {
   const ownPubkeyBytes = hexToBytes(deps.ownPubkey);
   const ledger = new ReservationLedger();
@@ -193,7 +220,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     machineDeps,
     machine: new TransferMachine(machineDeps),
     heldStates,
-    receiveLoop: buildReceive(deps, hooks, historyStore, heldStates),
+    receiveLoop: buildReceive(deps, hooks, historyStore, heldStates, view),
     requests: buildRequests(deps, hooks),
     restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view),
   };
@@ -290,7 +317,8 @@ function buildReceive(
   deps: PaymentsFacadeDeps,
   hooks: FacadeHooks,
   historyStore: History,
-  heldStates: HeldStateCache
+  heldStates: HeldStateCache,
+  view: InventoryView
 ): Receive {
   return new Receive({
     delivery: deps.deliveryPort,
@@ -305,6 +333,8 @@ function buildReceive(
     registry: deps.registry,
     recordReceived: (record) => recordReceived(historyStore, record),
     emit: (event, transfer) => deps.emit(event, transfer),
+    // Coalesced — see makeCoalescedRefresh.
+    refreshView: makeCoalescedRefresh(() => view.delta()),
     attention: (transferId, code, detail) => {
       deps.emit(
         'transfer:attention',

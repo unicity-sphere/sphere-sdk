@@ -39,8 +39,7 @@ import {
   composeFacadeParts,
   supportsDeterministicMint,
   type HeldStateCache,
-  type PaymentsFacadeDeps,
-} from './compose';
+  type PaymentsFacadeDeps, makeCoalescedRefresh } from './compose';
 
 export {
   supportsDeterministicMint,
@@ -88,6 +87,7 @@ interface SendRun {
 }
 
 export class PaymentsFacade implements PaymentsV2 {
+  private readonly wakeRefresh: () => void;
   private readonly prewarmed = new PrewarmCache();
   private readonly view: InventoryView;
   private readonly ledger: ReservationLedger;
@@ -126,6 +126,7 @@ export class PaymentsFacade implements PaymentsV2 {
       isActiveOp: (id) => this.activeMoneyOps.has(id),
     });
     this.view = parts.view;
+    this.wakeRefresh = makeCoalescedRefresh(() => this.view.delta());
     this.ledger = parts.ledger;
     this.queue = parts.queue;
     this.machine = parts.machine;
@@ -168,9 +169,7 @@ export class PaymentsFacade implements PaymentsV2 {
       this.deps.session.subscribeStream('mailbox', () => {
         this.trackTail(this.receiveLoop.drainOnce());
       }),
-      this.deps.session.subscribeStream('inventory', () => {
-        this.trackTail(this.view.delta());
-      }),
+      this.deps.session.subscribeStream('inventory', this.wakeRefresh),
       this.deps.session.subscribeStream('payment_requests', () => {
         this.trackTail(this.requests.drainIncoming());
       })
@@ -552,7 +551,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private settleFailure(transferId: string, coinId: string, releaseIds: readonly string[]): void {
     this.ledger.cancel(transferId);
     this.queue.clearExpectedChange(transferId);
-    for (const tokenId of releaseIds) this.view.release(tokenId);
+    this.view.releaseMany(releaseIds);
     this.queue.notifyChange(coinId);
   }
 
@@ -582,7 +581,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private async refreshThenRelease(coinId: string, spentIds: readonly string[]): Promise<void> {
     try {
       await this.view.delta();
-      for (const tokenId of spentIds) this.view.release(tokenId);
+      this.view.releaseMany(spentIds);
     } finally {
       this.queue.notifyChange(coinId);
     }
