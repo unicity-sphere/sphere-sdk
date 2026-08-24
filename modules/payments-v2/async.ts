@@ -27,3 +27,27 @@ export class SerialChain {
     return run;
   }
 }
+
+/** Fire-and-forget sibling of {@link SingleFlight}: one in flight, one queued behind it. */
+export function coalesced(run: () => Promise<unknown>): () => void {
+  let inFlight = false;
+  let queued = false;
+  const start = (): void => {
+    inFlight = true;
+    void run()
+      .catch(() => undefined)
+      .finally(() => {
+        inFlight = false;
+        if (!queued) return;
+        queued = false;
+        start();
+      });
+  };
+  return () => {
+    if (inFlight) {
+      queued = true;
+      return;
+    }
+    start();
+  };
+}

@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { makeCoalescedRefresh } from '../../../modules/payments-v2/compose';
+import { coalesced } from '../../../modules/payments-v2/async';
 
 /** A refresh whose completion the test controls. */
 function gated() {
@@ -26,10 +26,10 @@ function gated() {
   };
 }
 
-describe('makeCoalescedRefresh', () => {
+describe('coalesced', () => {
   it('collapses a burst arriving during one in-flight refresh into ONE re-run', async () => {
     const g = gated();
-    const trigger = makeCoalescedRefresh(g.refresh);
+    const trigger = coalesced(g.refresh);
 
     trigger();
     expect(g.calls()).toBe(1);
@@ -48,7 +48,7 @@ describe('makeCoalescedRefresh', () => {
 
   it('always re-runs after a trigger seen mid-flight — dropping it would leave the mirror stale', async () => {
     const g = gated();
-    const trigger = makeCoalescedRefresh(g.refresh);
+    const trigger = coalesced(g.refresh);
 
     trigger();
     // This wake reports a change the in-flight read may already have passed, so
@@ -62,7 +62,7 @@ describe('makeCoalescedRefresh', () => {
 
   it('runs immediately when nothing is in flight', async () => {
     const g = gated();
-    const trigger = makeCoalescedRefresh(g.refresh);
+    const trigger = coalesced(g.refresh);
 
     trigger();
     await g.releaseNext();
@@ -74,7 +74,7 @@ describe('makeCoalescedRefresh', () => {
 
   it('keeps accepting triggers after the refresh rejects', async () => {
     let calls = 0;
-    const trigger = makeCoalescedRefresh(() => {
+    const trigger = coalesced(() => {
       calls += 1;
       return Promise.reject(new Error('offline'));
     });

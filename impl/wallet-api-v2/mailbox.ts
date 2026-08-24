@@ -318,7 +318,7 @@ export class WalletApiDeliveryPort implements DeliveryPort {
     } else {
       await this.client.reject([deliveryId], reason);
     }
-    await this.addSeen(deliveryId);
+    await this.addSeenAll([deliveryId]);
   }
 
   /**
@@ -390,21 +390,12 @@ export class WalletApiDeliveryPort implements DeliveryPort {
     return new Set(raw ?? []);
   }
 
-  /** One read-modify-write for a whole settled set — addSeen per token is a JSON round trip each. */
+  /** SerialChain settles-not-fulfills: a rejected write never bricks later acks. */
   private addSeenAll(deliveryIds: readonly string[]): Promise<void> {
     if (deliveryIds.length === 0) return Promise.resolve();
     return this.seenChain.enqueue(async () => {
       const seen = await this.readSeen();
       for (const id of deliveryIds) seen.add(id);
-      await this.kv.set(DELIVERY_SEEN_KEY, [...seen]);
-    });
-  }
-
-  private addSeen(deliveryId: string): Promise<void> {
-    // SerialChain settles-not-fulfills: a rejected write never bricks later acks.
-    return this.seenChain.enqueue(async () => {
-      const seen = await this.readSeen();
-      seen.add(deliveryId);
       await this.kv.set(DELIVERY_SEEN_KEY, [...seen]);
     });
   }

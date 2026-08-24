@@ -1,6 +1,7 @@
 // Composition helper for PaymentsFacade: the injected-deps surface and the
 // wiring of every built component (§5 layout). Policy stays in PaymentsFacade.
 
+import { coalesced } from './async';
 import { hexToBytes } from '../../core/crypto';
 import { decryptField, encryptField } from '../../core/field-encryption';
 import type { ITokenEngine, SplitCheckpointStore } from '../../token-engine/engine';
@@ -150,33 +151,6 @@ export interface FacadeParts {
   receiveLoop: Receive;
   requests: Requests;
   restoreDeps: RestoreDeps;
-}
-
-/**
- * One refresh in flight, one queued behind it. The trailing re-run is required:
- * an in-flight delta may already have read past the change that re-triggered it.
- */
-export function makeCoalescedRefresh(refresh: () => Promise<void>): () => void {
-  let inFlight = false;
-  let queued = false;
-  const run = (): void => {
-    inFlight = true;
-    void refresh()
-      .catch(() => undefined)
-      .finally(() => {
-        inFlight = false;
-        if (!queued) return;
-        queued = false;
-        run();
-      });
-  };
-  return () => {
-    if (inFlight) {
-      queued = true;
-      return;
-    }
-    run();
-  };
 }
 
 export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks): FacadeParts {
@@ -333,8 +307,7 @@ function buildReceive(
     registry: deps.registry,
     recordReceived: (record) => recordReceived(historyStore, record),
     emit: (event, transfer) => deps.emit(event, transfer),
-    // Coalesced — see makeCoalescedRefresh.
-    refreshView: makeCoalescedRefresh(() => view.delta()),
+    refreshView: coalesced(() => view.delta()),
     attention: (transferId, code, detail) => {
       deps.emit(
         'transfer:attention',

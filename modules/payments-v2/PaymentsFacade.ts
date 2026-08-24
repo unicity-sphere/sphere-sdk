@@ -17,7 +17,7 @@ import { TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
 import type { ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest } from './api';
-import { SerialChain, SingleFlight } from './async';
+import { SerialChain, SingleFlight, coalesced } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { requireSameNetworkRecipient } from './recipient';
 import { reseedAndReset, type RestoreDeps } from './restore';
@@ -39,7 +39,8 @@ import {
   composeFacadeParts,
   supportsDeterministicMint,
   type HeldStateCache,
-  type PaymentsFacadeDeps, makeCoalescedRefresh } from './compose';
+  type PaymentsFacadeDeps,
+} from './compose';
 
 export {
   supportsDeterministicMint,
@@ -126,7 +127,7 @@ export class PaymentsFacade implements PaymentsV2 {
       isActiveOp: (id) => this.activeMoneyOps.has(id),
     });
     this.view = parts.view;
-    this.wakeRefresh = makeCoalescedRefresh(() => this.view.delta());
+    this.wakeRefresh = coalesced(() => this.view.delta());
     this.ledger = parts.ledger;
     this.queue = parts.queue;
     this.machine = parts.machine;
