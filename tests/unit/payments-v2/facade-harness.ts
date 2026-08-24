@@ -118,7 +118,12 @@ function hookedStorage(inner: StoragePort, hooks: Hooks): StoragePort {
   };
 }
 
-// deliverBatch is intentionally omitted so every deposit routes through the hook.
+/**
+ * deliverBatch is intentionally omitted so every deposit routes through the hook.
+ * Everything else must be forwarded, or the facade silently exercises a fallback
+ * production never takes — ackBatch was the third optional method to go missing
+ * here by default.
+ */
 function hookedDelivery(inner: DeliveryPort, hooks: Hooks): DeliveryPort {
   return {
     bindDeliveryKeys: (derive) => inner.bindDeliveryKeys(derive),
@@ -129,6 +134,8 @@ function hookedDelivery(inner: DeliveryPort, hooks: Hooks): DeliveryPort {
     incoming: (since) => inner.incoming(since),
     incomingEpoch: () => inner.incomingEpoch(),
     ack: (id, disposition, reason) => inner.ack(id, disposition, reason),
+    ...(inner.ackBatch !== undefined ? { ackBatch: (acks) => inner.ackBatch!(acks) } : {}),
+    ...(inner.onWake !== undefined ? { onWake: (cb) => inner.onWake!(cb) } : {}),
   };
 }
 

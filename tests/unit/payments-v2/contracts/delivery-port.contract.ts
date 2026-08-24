@@ -208,7 +208,9 @@ export function describeDeliveryPortContract(
     it('settles a whole batch and never re-yields any of it', async () => {
       const h = await makeHarness();
       const port = h.makePort();
-      if (port.ackBatch === undefined) return; // a provider may legitimately omit it
+      // Optional on the interface, REQUIRED of this provider — a bare `return`
+      // here would pass green against a port that implements nothing.
+      expect(port.ackBatch).toBeDefined();
       const blobs = [h.makeBlob(h.ownerPubkey), h.makeBlob(h.ownerPubkey), h.makeBlob(h.ownerPubkey)];
       for (const b of blobs) {
         await h.counterpartyPort.deliver(h.ownerPubkey, b.bytes, { transferId: 't-batch' });
@@ -216,7 +218,9 @@ export function describeDeliveryPortContract(
       const ids = blobs.map((b) => expectedDeliveryId(b.tokenId, b.stateHash));
       expect((await collect(port.incoming())).map((d) => d.deliveryId)).toEqual(expect.arrayContaining(ids));
 
-      const outcomes = await port.ackBatch(ids.map((deliveryId) => ({ deliveryId, disposition: 'claimed' })));
+      const outcomes = await port.ackBatch!(
+        ids.map((deliveryId) => ({ deliveryId, disposition: 'claimed' as const }))
+      );
 
       // One outcome per requested id, no more.
       expect(outcomes).toHaveLength(ids.length);
@@ -229,7 +233,7 @@ export function describeDeliveryPortContract(
     it('an id it does not settle stays re-yielded — no outcome means NOT settled', async () => {
       const h = await makeHarness();
       const port = h.makePort();
-      if (port.ackBatch === undefined) return;
+      expect(port.ackBatch).toBeDefined();
       const ok = h.makeBlob(h.ownerPubkey);
       const stale = h.makeBlob(h.ownerPubkey);
       await h.counterpartyPort.deliver(h.ownerPubkey, ok.bytes, { transferId: 't-ok' });
@@ -242,7 +246,7 @@ export function describeDeliveryPortContract(
 
       let outcomes: readonly { deliveryId: string; status: string }[] = [];
       try {
-        outcomes = await port.ackBatch([
+        outcomes = await port.ackBatch!([
           { deliveryId: okId, disposition: 'claimed' },
           { deliveryId: staleId, disposition: 'claimed' },
         ]);
