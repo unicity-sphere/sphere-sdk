@@ -135,6 +135,8 @@ export interface FacadeHooks {
   send(request: SendRequest): Promise<TransferResult>;
   /** §7 ownership — an attempt running in-process owns its own reservation (#737). */
   isActiveOp(transferId: string): boolean;
+  /** Register a background op so stop() cannot return while it is still writing. */
+  track(op: Promise<unknown>): void;
 }
 
 export interface FacadeParts {
@@ -185,7 +187,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
   const machineStores = createMachineStores(deps.kv);
   const heldStates: HeldStateCache = new Map();
 
-  const refreshView = coalesced(() => view.delta());
+  const refreshView = coalesced(() => view.delta(), hooks.track);
   return {
     ownPubkeyBytes,
     view,

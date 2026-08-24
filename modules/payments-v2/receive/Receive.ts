@@ -89,6 +89,15 @@ interface PendingAck {
 
 type Screened = { kind: 'ack'; ack: PendingAck } | { kind: 'accept'; record: StoredIncoming };
 
+/** The mutable state one listing pass threads through (max-params ≤ 5). */
+interface DrainPass {
+  readonly deps: ReceiveDeps;
+  readonly engine: ReceiveEngine;
+  readonly pending: PendingAck[];
+  readonly stored: IncomingTransfer[];
+  readonly pageEpoch: () => string;
+}
+
 function isClaimConflict(err: unknown): boolean {
   const e = err !== null && typeof err === 'object' ? (err as { code?: unknown; failureCode?: unknown }) : null;
   return e !== null && e.code === 'MAILBOX_CLAIM_FAILED' && e.failureCode === 'CONFLICT';
@@ -143,6 +152,20 @@ export class Receive {
     deps.refreshView();
   }
 
+  /** One listing pass: process each entry, flushing and refreshing as it goes. */
+  private async drainPages(ctx: DrainPass, basis: StreamCursor | null): Promise<void> {
+    const { deps, engine, pending, stored, pageEpoch } = ctx;
+    for await (const entry of deps.delivery.incoming(basis === null ? undefined : String(basis.cursor))) {
+      const storedBefore = stored.length;
+      await this.processEntry(deps, engine, entry, pending, stored);
+      if (pending.length >= ACK_BATCH_SIZE) await flushAcks(deps, pending, pageEpoch);
+      // Only when THIS entry entered the balance: a rejected one changes nothing
+      // to show, and refreshing for it is a wasted round trip.
+      if (stored.length > storedBefore) await this.maybeRefresh(deps, pending, pageEpoch);
+    }
+    await flushAcks(deps, pending, pageEpoch);
+  }
+
   private async doDrain(): Promise<IncomingTransfer[]> {
     const deps = this.deps;
     // Start the clock at the drain, so a drain that finishes inside one interval
@@ -161,15 +184,7 @@ export class Receive {
       // latch gates the resume decision.
       let basis = record !== null && record.syncEpoch === deps.syncEpoch() ? record : null;
       for (let pass = 0; pass < 2; pass++) {
-        for await (const entry of deps.delivery.incoming(basis === null ? undefined : String(basis.cursor))) {
-          const storedBefore = stored.length;
-          await this.processEntry(deps, engine, entry, pending, stored);
-          if (pending.length >= ACK_BATCH_SIZE) await flushAcks(deps, pending, pageEpoch);
-          // Only when THIS entry entered the balance: a rejected one changes
-          // nothing to show, and refreshing for it is a wasted round trip.
-          if (stored.length > storedBefore) await this.maybeRefresh(deps, pending, pageEpoch);
-        }
-        await flushAcks(deps, pending, pageEpoch);
+        await this.drainPages({ deps, engine, pending, stored, pageEpoch }, basis);
         const served = deps.delivery.incomingEpoch();
         if (basis === null || served === null || served === basis.syncEpoch) break;
         // §5.7 restore self-detection: the page reports a different epoch than
@@ -190,6 +205,11 @@ export class Receive {
         logger.warn('PaymentsV2', 'receive ack flush failed — cursor holds at the acked prefix:', flushErr);
       });
     }
+    // Automatic drains (§9 mailbox wake, 30 s poll) never call receive(), and a
+    // drain shorter than REFRESH_INTERVAL_MS takes no mid-drain refresh — so
+    // without this their only refresh is the inventory wake, which §5.7 declares
+    // best-effort. Coalesced, so it costs at most one delta.
+    if (stored.length > 0) deps.refreshView?.();
     return stored;
   }
 

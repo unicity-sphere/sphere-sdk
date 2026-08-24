@@ -761,22 +761,28 @@ describe('payments-v2 Receive — the balance moves while the drain runs (#755)'
     // refresh fired before the flush would read an inventory with none of the
     // accepted tokens in it — progressive in form, frozen balance in fact.
     expect(h.refreshes[0]).toBeGreaterThan(0);
-    // ...and each later refresh sees strictly more than the one before it.
+    // Each refresh sees at least what the previous one saw, and the last sees
+    // everything. Not strictly increasing: the end-of-drain refresh can land on
+    // the same acks as the final mid-drain one, which is a redundant delta the
+    // shared coalescer collapses in production.
     for (let i = 1; i < h.refreshes.length; i += 1) {
-      expect(h.refreshes[i]).toBeGreaterThan(h.refreshes[i - 1]);
+      expect(h.refreshes[i]).toBeGreaterThanOrEqual(h.refreshes[i - 1]);
     }
+    expect(h.refreshes.at(-1)).toBe(5);
   });
 
-  it('a drain that finishes inside one interval refreshes nothing mid-flight', async () => {
-    // A refresh is a server round trip, and an early flush costs a cursor write.
-    // A fast drain is already covered by the facade's single post-drain refresh,
-    // so it must keep the old behaviour exactly: batch at 200, refresh at the end.
+  it('a drain that finishes inside one interval refreshes ONCE, at the end', async () => {
+    // A refresh is a server round trip and an early flush costs a cursor write,
+    // so a fast drain must not pay per token. It still gets exactly one refresh
+    // — the end-of-drain one — because automatic drains never call receive() and
+    // the §9 inventory wake that would otherwise cover them is best-effort.
     const h = makeHarness({ advancePerEntryMs: 0 });
     for (let i = 1; i <= 10; i += 1) h.delivery.add(meta(T(i), 'S1'));
 
     await h.receive.drainOnce();
 
-    expect(h.refreshes).toEqual([]);
+    expect(h.refreshes).toHaveLength(1);
+    expect(h.refreshes[0]).toBe(10); // fired after every ack, so it sees them all
   });
 
   it('throttles a slow drain to one refresh per interval, not one per token', async () => {
@@ -821,7 +827,9 @@ describe('payments-v2 Receive — the balance moves while the drain runs (#755)'
 
     await h.receive.drainOnce();
 
-    expect(h.refreshes).toHaveLength(1); // the accepted one only
+    // Two refreshes fire (one mid-drain, one at the end) but BOTH see the single
+    // accepted token: no refresh was bought by a rejection.
+    expect(new Set(h.refreshes)).toEqual(new Set([1]));
   });
 });
 
@@ -960,5 +968,39 @@ describe('payments-v2 Receive — batched acks (#757)', () => {
     // The whole point: 12 tokens, one settle round trip.
     expect(h.delivery.batchCalls).toHaveLength(1);
     expect(h.delivery.batchCalls[0]).toHaveLength(12);
+  });
+});
+
+describe('payments-v2 Receive — every drain refreshes, not just the explicit one (#756 review)', () => {
+  it('refreshes after an automatic drain short enough to take no mid-drain refresh', async () => {
+    // The §9 mailbox wake and the 30 s poll call drainOnce() directly — never
+    // receive() — so nothing else schedules a post-drain delta for them. Their
+    // only other cover is the inventory wake, which §5.7 declares best-effort:
+    // miss it and the balance stays stale while the claims are already committed.
+    const h = makeHarness({ advancePerEntryMs: 0 });
+    h.delivery.add(meta(T(1), 'S1'));
+
+    await h.receive.drainOnce();
+
+    expect(h.refreshes).toHaveLength(1);
+    expect(h.refreshes[0]).toBe(1); // after the ack, so the mirror has something to read
+  });
+
+  it('does not refresh a drain that stored nothing', async () => {
+    const h = makeHarness({ advancePerEntryMs: 0 });
+
+    await h.receive.drainOnce();
+
+    expect(h.refreshes).toEqual([]);
+  });
+
+  it('does not refresh a drain that only rejected', async () => {
+    const h = makeHarness({ advancePerEntryMs: 0 });
+    h.engine.badProof.add(`${T(1)}:S1`);
+    h.delivery.add(meta(T(1), 'S1'));
+
+    await h.receive.drainOnce();
+
+    expect(h.refreshes).toEqual([]);
   });
 });

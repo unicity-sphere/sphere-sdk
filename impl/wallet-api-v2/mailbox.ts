@@ -336,6 +336,11 @@ export class WalletApiDeliveryPort implements DeliveryPort {
       await this.settleClaims(acks, settled, outcomes);
       await this.settleRejects(acks, settled);
     } catch (err) {
+      // Chunks that DID commit are acked server-side; the seen-set must record
+      // them even though the batch as a whole failed, or a §5.4 restore that
+      // rebuilds the rows re-yields deliveries this wallet already claimed.
+      // The caller is still told nothing settled, which is what makes it safe.
+      await this.addSeenAll(settled).catch(() => undefined);
       throw asRetryable(err);
     }
     await this.addSeenAll(settled);

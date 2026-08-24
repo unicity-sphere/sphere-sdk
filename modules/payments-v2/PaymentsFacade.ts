@@ -125,6 +125,7 @@ export class PaymentsFacade implements PaymentsV2 {
       engine: () => this.engine(),
       send: (request) => this.send(request),
       isActiveOp: (id) => this.activeMoneyOps.has(id),
+      track: (op) => this.trackTail(op),
     });
     this.view = parts.view;
     this.wakeRefresh = parts.refreshView;
@@ -256,7 +257,6 @@ export class PaymentsFacade implements PaymentsV2 {
 
   async receive(): Promise<{ transfers: IncomingTransfer[] }> {
     const transfers = await this.track(this.receiveLoop.drainOnce());
-    if (transfers.length > 0) this.trackTail(this.view.delta());
     return { transfers };
   }
 
