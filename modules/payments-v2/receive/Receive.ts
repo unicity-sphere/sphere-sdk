@@ -65,9 +65,10 @@ export interface ReceiveDeps {
 export const ACK_BATCH_SIZE = 200;
 /**
  * Mid-drain mirror refresh cadence. Coarse because a refresh flushes acks and
- * costs an inventory round trip, both on the drain's critical path: at 750 ms,
- * shorter than the ~1 s a token takes, every token paid for one and a 54-token
- * receive stretched from ~20 s to ~58 s.
+ * costs an inventory round trip, both on the drain's critical path. It shipped
+ * at 750 ms first, which is SHORTER than the ~1 s a token takes, so the throttle
+ * never throttled: every token paid for one and a 54-token receive stretched to
+ * ~58 s. Any value below the per-token cost has that effect.
  */
 export const REFRESH_INTERVAL_MS = 2500;
 export const POLL_INTERVAL_MS = 30_000;

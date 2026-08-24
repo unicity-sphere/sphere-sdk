@@ -34,7 +34,16 @@ export function coalesced(run: () => Promise<unknown>): () => void {
   let queued = false;
   const start = (): void => {
     inFlight = true;
-    void run()
+    // A synchronous throw would escape before .catch attaches and strand
+    // inFlight, wedging every later trigger. Started eagerly, not on a
+    // microtask, so a caller can rely on the first run having begun.
+    let running: Promise<unknown>;
+    try {
+      running = run();
+    } catch {
+      running = Promise.resolve();
+    }
+    void running
       .catch(() => undefined)
       .finally(() => {
         inFlight = false;
