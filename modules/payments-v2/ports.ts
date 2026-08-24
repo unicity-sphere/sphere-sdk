@@ -88,5 +88,26 @@ export interface DeliveryPort {
     disposition: 'claimed' | 'rejected',
     reason?: 'invalid' | 'not-owned' | 'storage-rejected' | 'other'
   ): Promise<void>;
+  /** Settle many acks at once (#757). Contract pinned by the delivery-port contract suite. */
+  ackBatch?(acks: readonly AckRequest[]): Promise<readonly AckOutcome[]>;
   onWake?(cb: () => void): () => void;
+}
+
+export interface AckRequest {
+  readonly deliveryId: string;
+  readonly disposition: 'claimed' | 'rejected';
+  readonly reason?: 'invalid' | 'not-owned' | 'storage-rejected' | 'other';
+}
+
+export type AckOutcome =
+  | { readonly deliveryId: string; readonly status: 'settled' }
+  | { readonly deliveryId: string; readonly status: 'conflict' };
+
+/** ackBatch failed in a way a per-entry retry would hit too — do not fall back. */
+export interface RetryableAckError extends Error {
+  readonly retryable: true;
+}
+
+export function isRetryableAckError(err: unknown): err is RetryableAckError {
+  return err !== null && typeof err === 'object' && (err as { retryable?: unknown }).retryable === true;
 }

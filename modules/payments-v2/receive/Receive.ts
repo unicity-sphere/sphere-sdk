@@ -9,7 +9,8 @@ import type { IncomingTransfer, Token } from '../../../types';
 import { SingleFlight } from '../async';
 import type { RegistryReader } from '../inventory/InventoryView';
 import type { AttentionEmitter } from '../machine/journal';
-import type { DeliveryPort, IncomingDelivery } from '../ports';
+import { isRetryableAckError } from '../ports';
+import type { AckOutcome, AckRequest, DeliveryPort, IncomingDelivery } from '../ports';
 import { STORE_KEYS, type ScopedKV, type StreamCursor } from '../stores';
 
 export type ReceiveEngine = Pick<
@@ -86,6 +87,15 @@ interface PendingAck {
 }
 
 type Screened = { kind: 'ack'; ack: PendingAck } | { kind: 'accept'; record: StoredIncoming };
+
+/** The flush settled a prefix but not everything; the rest re-list next drain. */
+export class AckIncompleteError extends Error {
+  readonly code = 'ACK_INCOMPLETE';
+  constructor(readonly deliveryId: string) {
+    super(`mailbox ack did not settle ${deliveryId} — cursor holds at the acked prefix`);
+    this.name = 'AckIncompleteError';
+  }
+}
 
 function isClaimConflict(err: unknown): boolean {
   const e = err !== null && typeof err === 'object' ? (err as { code?: unknown; failureCode?: unknown }) : null;
@@ -181,6 +191,9 @@ export class Receive {
       // Infra failure (engine/blob/view/ack): the failed entry stays UNACKED and
       // re-lists next drain; the fully-processed prefix still flushes below.
       logger.warn('PaymentsV2', 'receive drain interrupted — unacked entries retry next drain:', err);
+      // A retryable ack failure means the wall is still up; re-flushing here just
+      // spends another rate-limit slot on it. The entries re-list next drain.
+      if (isRetryableAckError(err)) return stored;
       await flushAcks(deps, pending, pageEpoch).catch((flushErr: unknown) => {
         logger.warn('PaymentsV2', 'receive ack flush failed — cursor holds at the acked prefix:', flushErr);
       });
@@ -270,21 +283,97 @@ async function announce(
   };
 }
 
+/**
+ * The cursor means "everything at or before this is done", so it may only reach
+ * the last CONSECUTIVE success — a gap would skip entries permanently. Hence the
+ * prefix walk over the untouched, seq-ascending `pending`.
+ */
 async function flushAcks(deps: ReceiveDeps, pending: PendingAck[], epochOf: () => string): Promise<void> {
+  if (pending.length === 0) return;
   let lastAcked: string | null = null;
   try {
-    while (pending.length > 0) {
-      const next = pending[0];
-      await ackOne(deps, next);
-      lastAcked = next.cursor;
-      pending.shift();
+    const settled = await settleAcks(deps, pending);
+    let i = 0;
+    while (i < pending.length && settled.has(pending[i].deliveryId)) {
+      lastAcked = pending[i].cursor;
+      i += 1;
     }
+    // Drop every settled entry, not just the prefix: a later flush must never
+    // re-ack one that already settled.
+    const stuck = pending.filter((p) => !settled.has(p.deliveryId));
+    pending.length = 0;
+    pending.push(...stuck);
+    if (pending.length > 0) throw new AckIncompleteError(pending[0].deliveryId);
   } finally {
     if (lastAcked !== null) {
       const record: StreamCursor = { cursor: lastAcked, syncEpoch: epochOf() };
       await deps.kv.set(STORE_KEYS.streamCursor('mailbox'), record);
     }
   }
+}
+
+/** Batched when the port offers it, one at a time otherwise; never reorders `pending`. */
+async function settleAcks(deps: ReceiveDeps, pending: readonly PendingAck[]): Promise<Set<string>> {
+  const batch = deps.delivery.ackBatch?.bind(deps.delivery);
+  if (batch === undefined) return settleOneByOne(deps, pending);
+  let outcomes: readonly AckOutcome[];
+  try {
+    outcomes = await batch(pending.map(toAckRequest));
+  } catch (err) {
+    // A wall a per-entry retry would hit too (429, outage): falling back turns
+    // one transient failure into N of them.
+    if (isRetryableAckError(err)) throw err;
+    logger.warn('PaymentsV2', 'batched mailbox ack failed — settling one at a time:', err);
+    return settleOneByOne(deps, pending);
+  }
+  const settled = new Set(outcomes.filter((o) => o.status === 'settled').map((o) => o.deliveryId));
+  const conflicts = outcomes.filter((o) => o.status === 'conflict').map((o) => o.deliveryId);
+  if (conflicts.length > 0) await resolveConflicts(deps, pending, conflicts, settled);
+  return settled;
+}
+
+/** §5.7 stale claim: terminal for discovery, and settled only once the reject succeeds. */
+async function resolveConflicts(
+  deps: ReceiveDeps,
+  pending: readonly PendingAck[],
+  conflicts: readonly string[],
+  settled: Set<string>
+): Promise<void> {
+  for (const deliveryId of conflicts) {
+    logger.warn('PaymentsV2', `mailbox claim CONFLICT for ${deliveryId} — rejected('other') as stale`);
+    try {
+      await deps.delivery.ack(deliveryId, 'rejected', 'other');
+    } catch (err) {
+      logger.warn('PaymentsV2', `stale-reject failed for ${deliveryId} — cursor holds here:`, err);
+      continue;
+    }
+    settled.add(deliveryId);
+    const entry = pending.find((p) => p.deliveryId === deliveryId);
+    deps.attention(entry?.transferId ?? '', ATTENTION_CLAIM_CONFLICT, deliveryId);
+  }
+}
+
+/** Today's loop, in seq order, stopping at the first failure. */
+async function settleOneByOne(deps: ReceiveDeps, pending: readonly PendingAck[]): Promise<Set<string>> {
+  const settled = new Set<string>();
+  for (const ack of pending) {
+    try {
+      await ackOne(deps, ack);
+    } catch (err) {
+      logger.warn('PaymentsV2', `mailbox ack failed for ${ack.deliveryId} — cursor holds here:`, err);
+      break;
+    }
+    settled.add(ack.deliveryId);
+  }
+  return settled;
+}
+
+function toAckRequest(ack: PendingAck): AckRequest {
+  return {
+    deliveryId: ack.deliveryId,
+    disposition: ack.disposition,
+    ...(ack.reason !== undefined ? { reason: ack.reason } : {}),
+  };
 }
 
 async function ackOne(deps: ReceiveDeps, ack: PendingAck): Promise<void> {

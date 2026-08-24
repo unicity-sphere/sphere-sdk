@@ -203,4 +203,59 @@ export function describeDeliveryPortContract(
       expect((await collect(h.makePort().incoming())).map((d) => d.deliveryId)).toContain(id);
     });
   });
+
+  describe('ackBatch (optional, #757)', () => {
+    it('settles a whole batch and never re-yields any of it', async () => {
+      const h = await makeHarness();
+      const port = h.makePort();
+      if (port.ackBatch === undefined) return; // a provider may legitimately omit it
+      const blobs = [h.makeBlob(h.ownerPubkey), h.makeBlob(h.ownerPubkey), h.makeBlob(h.ownerPubkey)];
+      for (const b of blobs) {
+        await h.counterpartyPort.deliver(h.ownerPubkey, b.bytes, { transferId: 't-batch' });
+      }
+      const ids = blobs.map((b) => expectedDeliveryId(b.tokenId, b.stateHash));
+      expect((await collect(port.incoming())).map((d) => d.deliveryId)).toEqual(expect.arrayContaining(ids));
+
+      const outcomes = await port.ackBatch(ids.map((deliveryId) => ({ deliveryId, disposition: 'claimed' })));
+
+      // One outcome per requested id, no more.
+      expect(outcomes).toHaveLength(ids.length);
+      expect(new Set(outcomes.map((o) => o.deliveryId))).toEqual(new Set(ids));
+      expect(outcomes.every((o) => o.status === 'settled')).toBe(true);
+      const after = (await collect(h.makePort().incoming())).map((d) => d.deliveryId);
+      for (const id of ids) expect(after).not.toContain(id);
+    });
+
+    it('an id it does not settle stays re-yielded — no outcome means NOT settled', async () => {
+      const h = await makeHarness();
+      const port = h.makePort();
+      if (port.ackBatch === undefined) return;
+      const ok = h.makeBlob(h.ownerPubkey);
+      const stale = h.makeBlob(h.ownerPubkey);
+      await h.counterpartyPort.deliver(h.ownerPubkey, ok.bytes, { transferId: 't-ok' });
+      await h.counterpartyPort.deliver(h.ownerPubkey, stale.bytes, { transferId: 't-stale' });
+      // Make the second one unclaimable, the way a lost lineage race does.
+      await supersede(h, stale);
+      const okId = expectedDeliveryId(ok.tokenId, ok.stateHash);
+      const staleId = expectedDeliveryId(stale.tokenId, stale.stateHash);
+      await collect(port.incoming());
+
+      let outcomes: readonly { deliveryId: string; status: string }[] = [];
+      try {
+        outcomes = await port.ackBatch([
+          { deliveryId: okId, disposition: 'claimed' },
+          { deliveryId: staleId, disposition: 'claimed' },
+        ]);
+      } catch {
+        // A provider that cannot report per-entry detail MUST throw rather than
+        // claim everything settled — that is a conforming outcome too.
+        const relisted = (await collect(h.makePort().incoming())).map((d) => d.deliveryId);
+        expect(relisted).toContain(staleId);
+        return;
+      }
+      // If it returned, the stale id must NOT be reported settled.
+      const settled = outcomes.filter((o) => o.status === 'settled').map((o) => o.deliveryId);
+      expect(settled).not.toContain(staleId);
+    });
+  });
 }

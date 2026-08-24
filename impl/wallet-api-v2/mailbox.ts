@@ -7,6 +7,8 @@ import { sha256 } from '@noble/hashes/sha2.js';
 
 import { SerialChain } from '../../modules/payments-v2/async';
 import type {
+  AckOutcome,
+  AckRequest,
   DeliverOptions,
   DeliveryPort,
   DeliveryReceipt,
@@ -20,8 +22,13 @@ import {
   encryptDeliveryBundle,
   type DeliveryBundle,
 } from '../../core/delivery-envelope';
-import { isWalletApiHttpError } from './http';
-import type { MailboxDepositEntry, MailboxEntryWire, WalletApiV2Client } from './client';
+import { isWalletApiHttpError, WalletApiHttpError } from './http';
+import type {
+  MailboxDepositEntry,
+  MailboxEntryWire,
+  MailboxRejectReason,
+  WalletApiV2Client,
+} from './client';
 import { uploadViaPresigned } from './storage';
 
 export type DeliveryPortClient = Pick<
@@ -91,6 +98,32 @@ interface PreparedDelivery {
   readonly stateHash: string;
   readonly deliveryId: string;
   readonly sha: string;
+}
+
+/**
+ * Entries per claim/reject call. The server caps at 1000, but each entry costs
+ * its own S3 read and transaction there, so a huge batch is a multi-second
+ * request against an idle timeout with nothing learned about what committed.
+ * 50 keeps almost all of the round-trip amortisation.
+ */
+const ACK_CHUNK = 50;
+
+function chunked<T>(items: readonly T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+/** Retryable = a per-entry retry would hit the same wall, so the caller must NOT fall back. */
+const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
+
+function asRetryable(err: unknown): unknown {
+  const transport = !(err instanceof WalletApiHttpError);
+  if (!transport && !RETRYABLE_STATUSES.has((err as WalletApiHttpError).status)) return err;
+  if (err !== null && typeof err === 'object') {
+    (err as { retryable?: boolean }).retryable = true;
+  }
+  return err;
 }
 
 export class WalletApiDeliveryPort implements DeliveryPort {
@@ -288,6 +321,63 @@ export class WalletApiDeliveryPort implements DeliveryPort {
     await this.addSeen(deliveryId);
   }
 
+  /**
+   * §5.7/#757 batched settle. Claims go out grouped, rejects grouped by reason
+   * (the endpoint takes one reason per call), and the seen-set is written ONCE
+   * after every HTTP call has succeeded — never on a throw, so an aborted batch
+   * re-lists rather than being silently forgotten.
+   */
+  async ackBatch(acks: readonly AckRequest[]): Promise<readonly AckOutcome[]> {
+    const settled: string[] = [];
+    const outcomes: AckOutcome[] = [];
+    try {
+      await this.settleClaims(acks, settled, outcomes);
+      await this.settleRejects(acks, settled);
+    } catch (err) {
+      throw asRetryable(err);
+    }
+    await this.addSeenAll(settled);
+    return [...outcomes, ...settled.map((deliveryId): AckOutcome => ({ deliveryId, status: 'settled' }))];
+  }
+
+  private async settleClaims(
+    acks: readonly AckRequest[],
+    settled: string[],
+    outcomes: AckOutcome[]
+  ): Promise<void> {
+    const ids = acks.filter((a) => a.disposition === 'claimed').map((a) => a.deliveryId);
+    for (const chunk of chunked(ids, ACK_CHUNK)) {
+      const result = await this.client.claim(chunk, this.custody === 'inventory');
+      settled.push(...result.claimed);
+      // Idempotent re-delivery is SETTLED; treating it as unsettled stalls the
+      // caller's cursor behind an entry that can never change (§6).
+      settled.push(...result.alreadyClaimed.map((e) => e.entryId));
+      for (const f of result.failed) {
+        if (f.code === 'CONFLICT') outcomes.push({ deliveryId: f.entryId, status: 'conflict' });
+        else throw new MailboxClaimFailedError(f.entryId, f.code);
+      }
+    }
+  }
+
+  private async settleRejects(acks: readonly AckRequest[], settled: string[]): Promise<void> {
+    const byReason = new Map<string, string[]>();
+    for (const a of acks) {
+      if (a.disposition !== 'rejected') continue;
+      const key = a.reason ?? '';
+      const group = byReason.get(key) ?? [];
+      group.push(a.deliveryId);
+      byReason.set(key, group);
+    }
+    for (const [reason, group] of byReason) {
+      for (const chunk of chunked(group, ACK_CHUNK)) {
+        await this.client.reject(chunk, reason === '' ? undefined : (reason as MailboxRejectReason));
+        // A 200 settles the whole requested group: reject runs in ONE server
+        // transaction, and an id it skips was already claimed — terminal too.
+        settled.push(...chunk);
+      }
+    }
+  }
+
   onWake(cb: () => void): () => void {
     if (this.wake === null) return () => undefined;
     return this.wake.subscribeStream('mailbox', cb);
@@ -298,6 +388,16 @@ export class WalletApiDeliveryPort implements DeliveryPort {
   private async readSeen(): Promise<Set<string>> {
     const raw = await this.kv.get<string[]>(DELIVERY_SEEN_KEY);
     return new Set(raw ?? []);
+  }
+
+  /** One read-modify-write for a whole settled set — addSeen per token is a JSON round trip each. */
+  private addSeenAll(deliveryIds: readonly string[]): Promise<void> {
+    if (deliveryIds.length === 0) return Promise.resolve();
+    return this.seenChain.enqueue(async () => {
+      const seen = await this.readSeen();
+      for (const id of deliveryIds) seen.add(id);
+      await this.kv.set(DELIVERY_SEEN_KEY, [...seen]);
+    });
   }
 
   private addSeen(deliveryId: string): Promise<void> {

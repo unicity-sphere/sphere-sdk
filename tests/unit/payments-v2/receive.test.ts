@@ -13,6 +13,7 @@ import {
   type ReceivedRecord,
   type StoredIncoming,
 } from '../../../modules/payments-v2/receive/Receive';
+import type { AckOutcome, AckRequest } from '../../../modules/payments-v2/ports';
 import type { StreamCursor } from '../../../modules/payments-v2/stores';
 import type { EngineVerifyResult, SphereToken, TokenBlob } from '../../../token-engine';
 import type { IncomingTransfer } from '../../../types';
@@ -204,6 +205,44 @@ class FakeDelivery implements DeliveryPort {
     });
     const entry = this.entries.find((e) => e.deliveryId === deliveryId && e.status === 'unacked');
     if (entry) entry.status = disposition;
+  }
+
+  // Optional on the port, so it stays undefined until a test opts in — that is
+  // also how the "provider without ackBatch" path gets exercised.
+  ackBatch?: (acks: readonly AckRequest[]) => Promise<readonly AckOutcome[]>;
+  batchCalls: string[][] = [];
+  /** Ids the batch returns NO outcome for — the caller must treat them as unsettled. */
+  unsettled = new Set<string>();
+  batchFailure: 'none' | 'retryable' | 'hard' = 'none';
+
+  enableBatch(): void {
+    this.ackBatch = (acks) => this.doBatch(acks);
+  }
+
+  private async doBatch(acks: readonly AckRequest[]): Promise<readonly AckOutcome[]> {
+    this.batchCalls.push(acks.map((a) => a.deliveryId));
+    if (this.batchFailure === 'retryable') {
+      throw Object.assign(new Error('rate limited'), { retryable: true });
+    }
+    if (this.batchFailure === 'hard') throw new Error('batch endpoint down');
+    const out: AckOutcome[] = [];
+    for (const a of acks) {
+      if (this.unsettled.has(a.deliveryId)) continue;
+      if (a.disposition === 'claimed' && this.claimConflicts.has(a.deliveryId)) {
+        out.push({ deliveryId: a.deliveryId, status: 'conflict' });
+        continue;
+      }
+      this.ackLog.push({
+        deliveryId: a.deliveryId,
+        disposition: a.disposition,
+        ...(a.reason !== undefined ? { reason: a.reason } : {}),
+        storesAtAck: this.view.storeCalls.length,
+      });
+      const entry = this.entries.find((e) => e.deliveryId === a.deliveryId && e.status === 'unacked');
+      if (entry) entry.status = a.disposition;
+      out.push({ deliveryId: a.deliveryId, status: 'settled' });
+    }
+    return out;
   }
 
   onWake(cb: () => void): () => void {
@@ -783,5 +822,143 @@ describe('payments-v2 Receive — the balance moves while the drain runs (#755)'
     await h.receive.drainOnce();
 
     expect(h.refreshes).toHaveLength(1); // the accepted one only
+  });
+});
+
+describe('payments-v2 Receive — batched acks (#757)', () => {
+  it('advances the cursor only to the last CONSECUTIVE settle, not the last one', async () => {
+    // The cursor means "everything at or before this is done". Jumping it to the
+    // furthest settled id would skip entry 3 permanently — it never re-lists.
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    for (let i = 1; i <= 5; i += 1) h.delivery.add(meta(T(i), 'S1'));
+    h.delivery.unsettled.add(`d:${T(3)}:S1`);
+
+    await h.receive.drainOnce();
+
+    const cursor = h.kv.map.get(CURSOR_KEY) as StreamCursor | undefined;
+    expect(cursor?.cursor).toBe('2');
+  });
+
+  it('re-lists exactly the unsettled entry on the next drain, and nothing already settled', async () => {
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    for (let i = 1; i <= 5; i += 1) h.delivery.add(meta(T(i), 'S1'));
+    h.delivery.unsettled.add(`d:${T(3)}:S1`);
+    await h.receive.drainOnce();
+
+    h.delivery.unsettled.clear();
+    h.delivery.batchCalls.length = 0;
+    await h.receive.drainOnce();
+
+    // Entries 4 and 5 settled in the first drain; only 3 may come back.
+    const relisted = h.delivery.batchCalls.flat();
+    expect(relisted).toEqual([`d:${T(3)}:S1`]);
+  });
+
+  it('rejects a conflicting entry mid-batch and still settles the rest', async () => {
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    for (let i = 1; i <= 5; i += 1) h.delivery.add(meta(T(i), 'S1'), { transferId: `tx-${String(i)}` });
+    h.delivery.claimConflicts.add(`d:${T(3)}:S1`);
+
+    await h.receive.drainOnce();
+
+    // The stale one is rejected, terminally, rather than wedging the batch...
+    expect(h.delivery.ackLog).toContainEqual(
+      expect.objectContaining({ deliveryId: `d:${T(3)}:S1`, disposition: 'rejected', reason: 'other' })
+    );
+    // ...the other four are claimed...
+    for (const i of [1, 2, 4, 5]) {
+      expect(h.delivery.ackLog).toContainEqual(
+        expect.objectContaining({ deliveryId: `d:${T(i)}:S1`, disposition: 'claimed' })
+      );
+    }
+    // ...the cursor clears the whole run, since every entry settled...
+    expect((h.kv.map.get(CURSOR_KEY) as StreamCursor | undefined)?.cursor).toBe('5');
+    // ...and the conflict is surfaced, after the reject, with its transferId.
+    expect(h.attentions).toContainEqual({
+      transferId: 'tx-3',
+      code: 'claim:conflict',
+      detail: `d:${T(3)}:S1`,
+    });
+  });
+
+  it('holds the cursor when the stale-reject itself fails', async () => {
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    for (let i = 1; i <= 3; i += 1) h.delivery.add(meta(T(i), 'S1'));
+    h.delivery.claimConflicts.add(`d:${T(2)}:S1`);
+    // The follow-up reject goes through ack(), which is failing.
+    h.delivery.acksUntilFail = 0;
+
+    await h.receive.drainOnce();
+
+    // Entry 2 never settled, so the prefix stops at 1 and 2 re-lists.
+    expect((h.kv.map.get(CURSOR_KEY) as StreamCursor | undefined)?.cursor).toBe('1');
+  });
+
+  it('stores every token before its claimed ack, batched as well (#724)', async () => {
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    for (let i = 1; i <= 4; i += 1) h.delivery.add(meta(T(i), 'S1'));
+
+    await h.receive.drainOnce();
+
+    const claimed = h.delivery.ackLog.filter((a) => a.disposition === 'claimed');
+    expect(claimed).toHaveLength(4);
+    // A claimed/acked token can never be absent from the view: all four stores
+    // precede the batch that acks them.
+    for (const a of claimed) expect(a.storesAtAck).toBe(4);
+  });
+
+  it('does NOT fall back per entry when the batch failure is retryable', async () => {
+    // Falling back would turn one 429 into N of them — the swap-incident shape.
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    for (let i = 1; i <= 4; i += 1) h.delivery.add(meta(T(i), 'S1'));
+    h.delivery.batchFailure = 'retryable';
+
+    await h.receive.drainOnce();
+
+    expect(h.delivery.batchCalls).toHaveLength(1);
+    expect(h.delivery.ackLog).toEqual([]); // nothing acked one at a time
+    expect(h.kv.map.get(CURSOR_KEY)).toBeUndefined(); // cursor holds
+  });
+
+  it('falls back to one-at-a-time when the batch fails for any other reason', async () => {
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    for (let i = 1; i <= 4; i += 1) h.delivery.add(meta(T(i), 'S1'));
+    h.delivery.batchFailure = 'hard';
+
+    await h.receive.drainOnce();
+
+    // A broken batch endpoint must not strand the receive.
+    expect(h.delivery.ackLog).toHaveLength(4);
+    expect((h.kv.map.get(CURSOR_KEY) as StreamCursor | undefined)?.cursor).toBe('4');
+  });
+
+  it('settles one at a time when the port offers no batch at all', async () => {
+    const h = makeHarness(); // ackBatch left undefined
+    for (let i = 1; i <= 3; i += 1) h.delivery.add(meta(T(i), 'S1'));
+
+    await h.receive.drainOnce();
+
+    expect(h.delivery.batchCalls).toEqual([]);
+    expect(h.delivery.ackLog).toHaveLength(3);
+    expect((h.kv.map.get(CURSOR_KEY) as StreamCursor | undefined)?.cursor).toBe('3');
+  });
+
+  it('issues ONE batch for a run instead of one call per token', async () => {
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    for (let i = 1; i <= 12; i += 1) h.delivery.add(meta(T(i), 'S1'));
+
+    await h.receive.drainOnce();
+
+    // The whole point: 12 tokens, one settle round trip.
+    expect(h.delivery.batchCalls).toHaveLength(1);
+    expect(h.delivery.batchCalls[0]).toHaveLength(12);
   });
 });
