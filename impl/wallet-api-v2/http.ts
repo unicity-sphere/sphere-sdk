@@ -31,6 +31,13 @@ export class WalletApiHttpError extends Error {
   }
 }
 
+/** Asking again may work; escalating will not. 0 is fetchRaw's NETWORK wrapper. */
+const RETRYABLE_STATUSES = new Set([0, 408, 425, 429, 500, 502, 503, 504]);
+
+export function isRetryableStatus(err: unknown): boolean {
+  return err instanceof WalletApiHttpError && RETRYABLE_STATUSES.has(err.status);
+}
+
 export function isWalletApiHttpError(err: unknown, status?: number): err is WalletApiHttpError {
   return err instanceof WalletApiHttpError && (status === undefined || err.status === status);
 }

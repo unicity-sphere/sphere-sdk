@@ -22,7 +22,7 @@ import {
   encryptDeliveryBundle,
   type DeliveryBundle,
 } from '../../core/delivery-envelope';
-import { isWalletApiHttpError, WalletApiHttpError } from './http';
+import { isRetryableStatus, isWalletApiHttpError } from './http';
 import type {
   MailboxDepositEntry,
   MailboxEntryWire,
@@ -114,16 +114,18 @@ function chunked<T>(items: readonly T[], size: number): T[][] {
   return out;
 }
 
-/** Retryable = a per-entry retry would hit the same wall, so the caller must NOT fall back. */
-const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
+/** Retryable = a per-entry retry hits the same wall, so the caller must NOT fall back. */
+class RetryableAckFailure extends Error {
+  readonly retryable = true;
+  constructor(cause: unknown) {
+    super(`mailbox ack batch could not be attempted: ${String(cause)}`);
+    this.name = 'RetryableAckFailure';
+    this.cause = cause;
+  }
+}
 
 function asRetryable(err: unknown): unknown {
-  const transport = !(err instanceof WalletApiHttpError);
-  if (!transport && !RETRYABLE_STATUSES.has((err as WalletApiHttpError).status)) return err;
-  if (err !== null && typeof err === 'object') {
-    (err as { retryable?: boolean }).retryable = true;
-  }
-  return err;
+  return isRetryableStatus(err) ? new RetryableAckFailure(err) : err;
 }
 
 export class WalletApiDeliveryPort implements DeliveryPort {

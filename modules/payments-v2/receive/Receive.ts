@@ -88,15 +88,6 @@ interface PendingAck {
 
 type Screened = { kind: 'ack'; ack: PendingAck } | { kind: 'accept'; record: StoredIncoming };
 
-/** The flush settled a prefix but not everything; the rest re-list next drain. */
-export class AckIncompleteError extends Error {
-  readonly code = 'ACK_INCOMPLETE';
-  constructor(readonly deliveryId: string) {
-    super(`mailbox ack did not settle ${deliveryId} — cursor holds at the acked prefix`);
-    this.name = 'AckIncompleteError';
-  }
-}
-
 function isClaimConflict(err: unknown): boolean {
   const e = err !== null && typeof err === 'object' ? (err as { code?: unknown; failureCode?: unknown }) : null;
   return e !== null && e.code === 'MAILBOX_CLAIM_FAILED' && e.failureCode === 'CONFLICT';
@@ -283,11 +274,7 @@ async function announce(
   };
 }
 
-/**
- * The cursor means "everything at or before this is done", so it may only reach
- * the last CONSECUTIVE success — a gap would skip entries permanently. Hence the
- * prefix walk over the untouched, seq-ascending `pending`.
- */
+/** The cursor may only reach the last CONSECUTIVE success — a gap skips entries forever. */
 async function flushAcks(deps: ReceiveDeps, pending: PendingAck[], epochOf: () => string): Promise<void> {
   if (pending.length === 0) return;
   let lastAcked: string | null = null;
@@ -303,7 +290,6 @@ async function flushAcks(deps: ReceiveDeps, pending: PendingAck[], epochOf: () =
     const stuck = pending.filter((p) => !settled.has(p.deliveryId));
     pending.length = 0;
     pending.push(...stuck);
-    if (pending.length > 0) throw new AckIncompleteError(pending[0].deliveryId);
   } finally {
     if (lastAcked !== null) {
       const record: StreamCursor = { cursor: lastAcked, syncEpoch: epochOf() };
@@ -332,7 +318,7 @@ async function settleAcks(deps: ReceiveDeps, pending: readonly PendingAck[]): Pr
   return settled;
 }
 
-/** §5.7 stale claim: terminal for discovery, and settled only once the reject succeeds. */
+/** Settled only once its reject succeeded, so a failed reject holds the cursor. */
 async function resolveConflicts(
   deps: ReceiveDeps,
   pending: readonly PendingAck[],
@@ -340,17 +326,22 @@ async function resolveConflicts(
   settled: Set<string>
 ): Promise<void> {
   for (const deliveryId of conflicts) {
-    logger.warn('PaymentsV2', `mailbox claim CONFLICT for ${deliveryId} — rejected('other') as stale`);
+    const entry = pending.find((p) => p.deliveryId === deliveryId);
     try {
-      await deps.delivery.ack(deliveryId, 'rejected', 'other');
+      await rejectStaleClaim(deps, deliveryId, entry?.transferId);
     } catch (err) {
       logger.warn('PaymentsV2', `stale-reject failed for ${deliveryId} — cursor holds here:`, err);
       continue;
     }
     settled.add(deliveryId);
-    const entry = pending.find((p) => p.deliveryId === deliveryId);
-    deps.attention(entry?.transferId ?? '', ATTENTION_CLAIM_CONFLICT, deliveryId);
   }
+}
+
+/** §5.7: a stale claim is terminal for discovery, or the entry re-processes forever. */
+async function rejectStaleClaim(deps: ReceiveDeps, deliveryId: string, transferId?: string): Promise<void> {
+  logger.warn('PaymentsV2', `mailbox claim CONFLICT for ${deliveryId} — rejected('other') as stale`);
+  await deps.delivery.ack(deliveryId, 'rejected', 'other');
+  deps.attention(transferId ?? '', ATTENTION_CLAIM_CONFLICT, deliveryId);
 }
 
 /** Today's loop, in seq order, stopping at the first failure. */
@@ -381,12 +372,7 @@ async function ackOne(deps: ReceiveDeps, ack: PendingAck): Promise<void> {
     await deps.delivery.ack(ack.deliveryId, ack.disposition, ack.reason);
   } catch (err) {
     if (ack.disposition !== 'claimed' || !isClaimConflict(err)) throw err;
-    // §5.7: a lineage CONFLICT on claim is stale by construction (another owner
-    // holds equal-or-newer state) and reject is non-destructive server-side —
-    // terminal for discovery immediately, or this entry re-processes forever.
-    logger.warn('PaymentsV2', `mailbox claim CONFLICT for ${ack.deliveryId} — rejected('other') as stale`);
-    await deps.delivery.ack(ack.deliveryId, 'rejected', 'other');
-    deps.attention(ack.transferId ?? '', ATTENTION_CLAIM_CONFLICT, ack.deliveryId);
+    await rejectStaleClaim(deps, ack.deliveryId, ack.transferId);
   }
 }
 

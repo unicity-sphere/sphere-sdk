@@ -148,6 +148,8 @@ export interface FacadeParts {
   machineDeps: MachineDeps;
   machine: TransferMachine;
   heldStates: HeldStateCache;
+  /** ONE coalescer over view.delta(), shared by the §9 wake and the receive drain. */
+  refreshView: () => void;
   receiveLoop: Receive;
   requests: Requests;
   restoreDeps: RestoreDeps;
@@ -183,9 +185,11 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
   const machineStores = createMachineStores(deps.kv);
   const heldStates: HeldStateCache = new Map();
 
+  const refreshView = coalesced(() => view.delta());
   return {
     ownPubkeyBytes,
     view,
+    refreshView,
     ledger,
     pins: buildPins(deps, hooks, { ledger, view, machineStores, machineDeps }),
     queue,
@@ -194,7 +198,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     machineDeps,
     machine: new TransferMachine(machineDeps),
     heldStates,
-    receiveLoop: buildReceive(deps, hooks, historyStore, heldStates, view),
+    receiveLoop: buildReceive(deps, hooks, historyStore, heldStates, refreshView),
     requests: buildRequests(deps, hooks),
     restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view),
   };
@@ -292,7 +296,7 @@ function buildReceive(
   hooks: FacadeHooks,
   historyStore: History,
   heldStates: HeldStateCache,
-  view: InventoryView
+  refreshView: () => void
 ): Receive {
   return new Receive({
     delivery: deps.deliveryPort,
@@ -307,7 +311,7 @@ function buildReceive(
     registry: deps.registry,
     recordReceived: (record) => recordReceived(historyStore, record),
     emit: (event, transfer) => deps.emit(event, transfer),
-    refreshView: coalesced(() => view.delta()),
+    refreshView,
     attention: (transferId, code, detail) => {
       deps.emit(
         'transfer:attention',

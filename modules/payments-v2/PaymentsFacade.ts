@@ -17,7 +17,7 @@ import { TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
 import type { ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest } from './api';
-import { SerialChain, SingleFlight, coalesced } from './async';
+import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { requireSameNetworkRecipient } from './recipient';
 import { reseedAndReset, type RestoreDeps } from './restore';
@@ -127,7 +127,7 @@ export class PaymentsFacade implements PaymentsV2 {
       isActiveOp: (id) => this.activeMoneyOps.has(id),
     });
     this.view = parts.view;
-    this.wakeRefresh = coalesced(() => this.view.delta());
+    this.wakeRefresh = parts.refreshView;
     this.ledger = parts.ledger;
     this.queue = parts.queue;
     this.machine = parts.machine;
@@ -479,7 +479,7 @@ export class PaymentsFacade implements PaymentsV2 {
       ...spend.plan.direct,
       ...(spend.plan.split !== undefined ? [spend.plan.split.tokenId] : []),
     ];
-    for (const tokenId of sourceIds) this.view.markInFlight(tokenId);
+    this.view.markInFlightMany(sourceIds);
     if (spend.plan.split !== undefined) {
       this.queue.declareExpectedChange(transferId, coinId, spend.plan.split.remainderAmount);
     }
