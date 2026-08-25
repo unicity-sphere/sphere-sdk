@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.14.11] - 2026-08-25
+
+### Added — `DeliveryPort.ackBatch()`: one settle call per drain, not one per entry (#757)
+
+A 54-token receive settled its mailbox entries one HTTP call at a time. The port
+may now implement an optional `ackBatch`, which groups claims into one call and
+rejects into one call per reason (the endpoint takes a single reason per call).
+A port that does not implement it, or a batch that fails for an ordinary reason,
+still settles one at a time — nothing regresses for existing ports.
+
+A **retryable** failure (429, gateway outage) deliberately does NOT fall back:
+per-entry retries would hit the same wall and turn one transient failure into N
+of them, which is the shape that wedged the mailbox in the June swap incident.
+`isRetryableAckError` is the signal, and it is exported so a custom port can
+raise it: the request/outcome types (`AckRequest`, `AckOutcome`,
+`RetryableAckError`) are re-exported from the `payments-v2` barrel, since a
+method on an exported interface is not implementable while its contract is not.
+
+Committed chunks are recorded in the port's seen-set before the failure is
+rethrown, so a §5.4 restore that rebuilds those rows cannot re-yield deliveries
+this wallet already claimed. Spec: `wallet-api/docs/sdk-changes.md` S7.
+
+### Fixed — the balance moves while a receive drains, instead of at the end (#755)
+
+The mirror refreshed once, when the drain finished, so a multi-token receive sat
+on its old balance for the whole drain — tens of seconds for 54 tokens. The drain
+now refreshes as it goes, throttled to one per `REFRESH_INTERVAL_MS` (2500 ms)
+and coalesced so concurrent asks cost one delta.
+
+The interval is deliberately coarse. It shipped at 750 ms first, which is SHORTER
+than the ~1 s a token takes, so the throttle never throttled: every token paid for
+a refresh and a 54-token receive stretched to ~58 s. Any value below the per-token
+cost has that effect.
+
+A drain refreshes when an entry became **claimable** — stored, or re-listed as a
+held-state claim retry after an earlier ack failed. Rejects refresh nothing. The
+signal is counted where the entry becomes claimable rather than derived from what
+later settled, because every downstream proxy had a path that destroyed it: an
+early return, a blocked flush, a retry that stores nothing, a flush that throws
+mid-batch.
+
+### Fixed — a blocked ack no longer costs one request per remaining entry (#756 review)
+
+One-at-a-time settling stops at the first failing ack, which left the queue at the
+batch threshold — so the next entry flushed the same blocked head again, and the
+one after that, for the rest of the drain. Measured: 240 entries produced 42 ack
+attempts. The listing pass now ends when a flush settles nothing, preserving the
+settled prefix and its cursor; the blocked entries re-list on the next drain,
+which was already the recovery path.
+
+### Added — `payments.prewarmSend()` / `payments.discardPrewarm()` (#754)
+
+A send opens by reading every source blob it will spend — 3.4 s of a 43.8 s
+54-token send, all of it after the user clicks. A host can now warm those reads
+while the confirm screen is idle on the wire, so they land on think-time instead.
+It reserves nothing, so a send the user abandons cannot pin their balance, and a
+warm that fails costs only the latency it meant to save: `send()` reads the
+sources itself when nothing was warmed.
+
+## [0.14.10] and earlier
+
+> Entries below predate versioned sections in this file and shipped in 0.14.10 or
+> earlier; they are left unsliced rather than retroactively attributed.
+
+
 ### Fixed — incoming payments show the sender's Unicity ID again (sphere#487)
 
 A recipient rendered "Someone" instead of `@alice` for every incoming transfer.
