@@ -969,6 +969,21 @@ describe('payments-v2 Receive — batched acks (#757)', () => {
     expect(h.refreshes.length).toBeGreaterThan(afterFirst);
   });
 
+  it('refreshes mid-drain while retrying held-state claims, not only at the end', async () => {
+    // The frozen balance this PR exists to fix, in its retry form: every entry is
+    // already held, so nothing is stored, yet each claim materializes as it flushes.
+    const h = makeHarness({ advancePerEntryMs: REFRESH_INTERVAL_MS + 1 });
+    for (let i = 1; i <= 4; i += 1) h.delivery.add(meta(T(i), 'S1'));
+    h.delivery.acksUntilFail = 0;
+    await h.receive.drainOnce(); // stores four, acks none
+    h.delivery.acksUntilFail = Infinity;
+    const afterFirst = h.refreshes.length;
+
+    await h.receive.drainOnce(); // all four re-list as held-state claims
+
+    expect(h.refreshes.length - afterFirst).toBeGreaterThan(1);
+  });
+
   it('refreshes a retry drain that ends retryably, though it stored nothing', async () => {
     // The combination the earlier two fixes each missed: a drain of held-state
     // RETRIES (so `stored` is empty) whose batch commits an earlier chunk and then

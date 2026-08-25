@@ -157,9 +157,9 @@ export class Receive {
 
   /** One listing pass: process each entry, flushing and refreshing as it goes. */
   private async drainPages(ctx: DrainPass, basis: StreamCursor | null): Promise<void> {
-    const { deps, pending, stored, pageEpoch } = ctx;
+    const { deps, pending, pageEpoch, claimable } = ctx;
     for await (const entry of deps.delivery.incoming(basis === null ? undefined : String(basis.cursor))) {
-      const storedBefore = stored.length;
+      const claimableBefore = claimable.n;
       await this.processEntry(ctx, entry);
       if (pending.length >= ACK_BATCH_SIZE) {
         // Nothing settled = the head is blocked; continuing re-flushes it once per
@@ -167,7 +167,9 @@ export class Receive {
         if (!(await flushAcks(deps, pending, pageEpoch)).progressed) return;
       }
       // Only when THIS entry entered the balance: a rejected one changes nothing.
-      if (stored.length > storedBefore) await this.maybeRefresh(ctx);
+      // Keyed on claimable, not stored — a held-state RETRY claims without storing,
+      // and a long retry drain is the frozen balance this PR exists to fix.
+      if (claimable.n > claimableBefore) await this.maybeRefresh(ctx);
     }
     await flushAcks(deps, pending, pageEpoch);
   }
@@ -232,8 +234,8 @@ export class Receive {
       return;
     }
     await deps.view.store(screened.record);
-    claimable.n += 1;
     pending.push(claimAck(entry));
+    claimable.n += 1;
     const transfer = await announce(deps, entry, screened.record);
     stored.push(transfer);
     deps.emit('transfer:incoming', transfer);
