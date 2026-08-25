@@ -184,11 +184,15 @@ class FakeDelivery implements DeliveryPort {
     return this.lastEpoch;
   }
 
+  /** Every call, successful or not — what an amplification test has to count. */
+  ackAttempts = 0;
+
   async ack(
     deliveryId: string,
     disposition: 'claimed' | 'rejected',
     reason?: 'invalid' | 'not-owned' | 'storage-rejected' | 'other'
   ): Promise<void> {
+    this.ackAttempts += 1;
     if (this.ackLog.length >= this.acksUntilFail) throw new Error('ack flush failed');
     if (disposition === 'claimed' && this.claimConflicts.has(deliveryId)) {
       // Server failed[] bucket shape: the lineage CONFLICT surfaced by the port.
@@ -947,6 +951,20 @@ describe('payments-v2 Receive — batched acks (#757)', () => {
     await h.receive.drainOnce();
 
     expect(h.refreshes).toHaveLength(1);
+  });
+
+  it('stops the drain when an ack settles nothing, instead of retrying it per entry', async () => {
+    // One-at-a-time acking stops at the first failure, so `pending` stays AT the
+    // threshold — and without bailing out, the next entry flushes the same blocked
+    // head again. One backend failure then costs one request per remaining entry:
+    // the amplification shape that wedged the mailbox in the swap incident.
+    const h = makeHarness(); // no enableBatch(): the one-at-a-time port
+    h.delivery.acksUntilFail = 0; // every ack throws
+    for (let i = 1; i <= ACK_BATCH_SIZE + 40; i += 1) h.delivery.add(meta(T(i), 'S1'));
+
+    await h.receive.drainOnce();
+
+    expect(h.delivery.ackAttempts).toBeLessThanOrEqual(2);
   });
 
   it('falls back to one-at-a-time when the batch fails for any other reason', async () => {

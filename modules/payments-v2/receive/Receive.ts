@@ -158,7 +158,9 @@ export class Receive {
     for await (const entry of deps.delivery.incoming(basis === null ? undefined : String(basis.cursor))) {
       const storedBefore = stored.length;
       await this.processEntry(deps, engine, entry, pending, stored);
-      if (pending.length >= ACK_BATCH_SIZE) await flushAcks(deps, pending, pageEpoch);
+      // Nothing settled = the head is blocked; continuing re-flushes it once per
+      // remaining entry, amplifying one failure into hundreds.
+      if (pending.length >= ACK_BATCH_SIZE && !(await flushAcks(deps, pending, pageEpoch))) return;
       // Only when THIS entry entered the balance: a rejected one changes nothing
       // to show, and refreshing for it is a wasted round trip.
       if (stored.length > storedBefore) await this.maybeRefresh(deps, pending, pageEpoch);
@@ -296,9 +298,10 @@ async function announce(
   };
 }
 
-/** The cursor may only reach the last CONSECUTIVE success — a gap skips entries forever. */
-async function flushAcks(deps: ReceiveDeps, pending: PendingAck[], epochOf: () => string): Promise<void> {
-  if (pending.length === 0) return;
+/** Cursor reaches only the last CONSECUTIVE success. Returns false when nothing settled. */
+async function flushAcks(deps: ReceiveDeps, pending: PendingAck[], epochOf: () => string): Promise<boolean> {
+  if (pending.length === 0) return true;
+  const before = pending.length;
   let lastAcked: string | null = null;
   try {
     const settled = await settleAcks(deps, pending);
@@ -318,6 +321,7 @@ async function flushAcks(deps: ReceiveDeps, pending: PendingAck[], epochOf: () =
       await deps.kv.set(STORE_KEYS.streamCursor('mailbox'), record);
     }
   }
+  return pending.length < before;
 }
 
 /** Batched when the port offers it, one at a time otherwise; never reorders `pending`. */
