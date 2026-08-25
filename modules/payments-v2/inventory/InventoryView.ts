@@ -137,8 +137,26 @@ export class InventoryView {
     this.deps.emit('inventory:updated');
   }
 
+  /** Reserve a whole plan as ONE change — per token emitted 54 events per send. */
+  markInFlightMany(tokenIds: Iterable<string>): void {
+    let changed = false;
+    for (const tokenId of tokenIds) {
+      if (this.inFlight.has(tokenId)) continue;
+      this.inFlight.add(tokenId);
+      changed = true;
+    }
+    if (changed) this.deps.emit('inventory:updated');
+  }
+
   release(tokenId: string): void {
     if (this.inFlight.delete(tokenId)) this.deps.emit('inventory:updated');
+  }
+
+  /** Release a whole set as ONE change (per-token emitted 54 events per send). */
+  releaseMany(tokenIds: Iterable<string>): void {
+    let changed = false;
+    for (const tokenId of tokenIds) if (this.inFlight.delete(tokenId)) changed = true;
+    if (changed) this.deps.emit('inventory:updated');
   }
 
   private pinned(tokenId: string): boolean {

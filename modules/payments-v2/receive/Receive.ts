@@ -9,7 +9,8 @@ import type { IncomingTransfer, Token } from '../../../types';
 import { SingleFlight } from '../async';
 import type { RegistryReader } from '../inventory/InventoryView';
 import type { AttentionEmitter } from '../machine/journal';
-import type { DeliveryPort, IncomingDelivery } from '../ports';
+import { isRetryableAckError } from '../ports';
+import type { AckOutcome, AckRequest, DeliveryPort, IncomingDelivery } from '../ports';
 import { STORE_KEYS, type ScopedKV, type StreamCursor } from '../stores';
 
 export type ReceiveEngine = Pick<
@@ -54,12 +55,22 @@ export interface ReceiveDeps {
   readonly registry: RegistryReader;
   readonly recordReceived: (record: ReceivedRecord) => Promise<void>;
   readonly emit: (event: 'transfer:incoming', transfer: IncomingTransfer) => void;
+  /** Refresh the inventory mirror mid-drain; fire-and-forget. Receive throttles the calls. */
+  readonly refreshView?: () => void;
   readonly attention: AttentionEmitter;
   readonly syncEpoch: () => string;
   readonly now?: () => number;
 }
 
 export const ACK_BATCH_SIZE = 200;
+/**
+ * Mid-drain mirror refresh cadence. Coarse because a refresh flushes acks and
+ * costs an inventory round trip, both on the drain's critical path. It shipped
+ * at 750 ms first, which is SHORTER than the ~1 s a token takes, so the throttle
+ * never throttled: every token paid for one and a 54-token receive stretched to
+ * ~58 s. Any value below the per-token cost has that effect.
+ */
+export const REFRESH_INTERVAL_MS = 2500;
 export const POLL_INTERVAL_MS = 30_000;
 export const ATTENTION_CLAIM_CONFLICT = 'claim:conflict';
 
@@ -78,6 +89,17 @@ interface PendingAck {
 
 type Screened = { kind: 'ack'; ack: PendingAck } | { kind: 'accept'; record: StoredIncoming };
 
+/** The mutable state one listing pass threads through (max-params ≤ 5). */
+interface DrainPass {
+  readonly deps: ReceiveDeps;
+  readonly engine: ReceiveEngine;
+  readonly pending: PendingAck[];
+  readonly stored: IncomingTransfer[];
+  readonly pageEpoch: () => string;
+  /** Entries this drain made claimable — stored, or a held-state claim retry. */
+  readonly claimable: { n: number };
+}
+
 function isClaimConflict(err: unknown): boolean {
   const e = err !== null && typeof err === 'object' ? (err as { code?: unknown; failureCode?: unknown }) : null;
   return e !== null && e.code === 'MAILBOX_CLAIM_FAILED' && e.failureCode === 'CONFLICT';
@@ -87,6 +109,7 @@ export class Receive {
   private readonly drainFlight = new SingleFlight<IncomingTransfer[]>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private unsubscribeWake: (() => void) | null = null;
+  private lastRefreshAt = 0;
 
   constructor(private readonly deps: ReceiveDeps) {}
 
@@ -111,24 +134,71 @@ export class Receive {
     this.unsubscribeWake = null;
   }
 
+  /**
+   * Flush what has been accepted, then ask for a mirror refresh — at most once
+   * per REFRESH_INTERVAL_MS.
+   *
+   * The flush is not incidental. A `claimed` ack is what materializes a token
+   * into SERVER inventory, and acks otherwise sit queued until ACK_BATCH_SIZE
+   * (200) — so for any ordinary drain, including the 54-token case this exists
+   * for, refreshing before the flush would query an inventory holding none of
+   * the tokens just accepted, and the balance would still only move at the end.
+   * Ordering is preserved: store() still precedes the ack (§5.7).
+   */
+  private async maybeRefresh(ctx: DrainPass): Promise<void> {
+    const { deps, pending, pageEpoch } = ctx;
+    if (deps.refreshView === undefined) return;
+    const now = deps.now?.() ?? Date.now();
+    if (now - this.lastRefreshAt < REFRESH_INTERVAL_MS) return;
+    this.lastRefreshAt = now;
+    // A blocked flush materialized nothing, so the delta would show today's balance.
+    if ((await flushAcks(deps, pending, pageEpoch)).progressed) deps.refreshView();
+  }
+
+  /** One listing pass: process each entry, flushing and refreshing as it goes. */
+  private async drainPages(ctx: DrainPass, basis: StreamCursor | null): Promise<void> {
+    const { deps, pending, pageEpoch, claimable } = ctx;
+    for await (const entry of deps.delivery.incoming(basis === null ? undefined : String(basis.cursor))) {
+      const claimableBefore = claimable.n;
+      await this.processEntry(ctx, entry);
+      if (pending.length >= ACK_BATCH_SIZE) {
+        // Nothing settled = the head is blocked; continuing re-flushes it once per
+        // remaining entry, amplifying one failure into hundreds.
+        if (!(await flushAcks(deps, pending, pageEpoch)).progressed) return;
+      }
+      // Only when THIS entry entered the balance: a rejected one changes nothing.
+      // Keyed on claimable, not stored — a held-state RETRY claims without storing,
+      // and a long retry drain is the frozen balance this PR exists to fix.
+      if (claimable.n > claimableBefore) await this.maybeRefresh(ctx);
+    }
+    await flushAcks(deps, pending, pageEpoch);
+  }
+
   private async doDrain(): Promise<IncomingTransfer[]> {
     const deps = this.deps;
+    // Clock starts at the drain: one finishing inside an interval refreshes once,
+    // at the end, exactly as before. Only a slow drain pays for mid-flight ones.
+    this.lastRefreshAt = deps.now?.() ?? Date.now();
     const engine = deps.engine();
     const stored: IncomingTransfer[] = [];
     const pending: PendingAck[] = [];
     // The port's page epoch is the honest source for the persisted record.
     const pageEpoch = (): string => deps.delivery.incomingEpoch() ?? deps.syncEpoch();
+    // Every exit refreshes (automatic drains never call receive(), and the §5.7
+    // wake is best-effort), counted where the entry becomes claimable — every
+    // downstream proxy had a path that destroyed it.
+    const claimable = { n: 0 };
+    const finish = (): IncomingTransfer[] => {
+      if (claimable.n > 0) deps.refreshView?.();
+      return stored;
+    };
     try {
       const record = await deps.kv.get<StreamCursor>(STORE_KEYS.streamCursor('mailbox'));
       // Cursor continuity holds only within one syncEpoch (§6); the session
       // latch gates the resume decision.
       let basis = record !== null && record.syncEpoch === deps.syncEpoch() ? record : null;
       for (let pass = 0; pass < 2; pass++) {
-        for await (const entry of deps.delivery.incoming(basis === null ? undefined : String(basis.cursor))) {
-          await this.processEntry(deps, engine, entry, pending, stored);
-          if (pending.length >= ACK_BATCH_SIZE) await flushAcks(deps, pending, pageEpoch);
-        }
-        await flushAcks(deps, pending, pageEpoch);
+        await this.drainPages({ deps, engine, pending, stored, pageEpoch, claimable }, basis);
         const served = deps.delivery.incomingEpoch();
         if (basis === null || served === null || served === basis.syncEpoch) break;
         // §5.7 restore self-detection: the page reports a different epoch than
@@ -142,27 +212,30 @@ export class Receive {
       // Infra failure (engine/blob/view/ack): the failed entry stays UNACKED and
       // re-lists next drain; the fully-processed prefix still flushes below.
       logger.warn('PaymentsV2', 'receive drain interrupted — unacked entries retry next drain:', err);
+      // Retryable = the wall is still up; re-flushing spends another slot. Exits
+      // via finish() because ackBatch kept its committed chunks, which never re-list.
+      if (isRetryableAckError(err)) return finish();
       await flushAcks(deps, pending, pageEpoch).catch((flushErr: unknown) => {
         logger.warn('PaymentsV2', 'receive ack flush failed — cursor holds at the acked prefix:', flushErr);
+        return { progressed: false };
       });
     }
-    return stored;
+    return finish();
   }
 
-  private async processEntry(
-    deps: ReceiveDeps,
-    engine: ReceiveEngine,
-    entry: IncomingDelivery,
-    pending: PendingAck[],
-    stored: IncomingTransfer[]
-  ): Promise<void> {
+  private async processEntry(ctx: DrainPass, entry: IncomingDelivery): Promise<void> {
+    const { deps, engine, pending, stored, claimable } = ctx;
     const screened = await screen(deps, engine, entry);
     if (screened.kind === 'ack') {
       pending.push(screened.ack);
+      // A held-state re-list is the retry after a failed ack: nothing to store,
+      // but it still materializes server-side.
+      if (screened.ack.disposition === 'claimed') claimable.n += 1;
       return;
     }
     await deps.view.store(screened.record);
     pending.push(claimAck(entry));
+    claimable.n += 1;
     const transfer = await announce(deps, entry, screened.record);
     stored.push(transfer);
     deps.emit('transfer:incoming', transfer);
@@ -231,21 +304,103 @@ async function announce(
   };
 }
 
-async function flushAcks(deps: ReceiveDeps, pending: PendingAck[], epochOf: () => string): Promise<void> {
+/** Cursor reaches only the last CONSECUTIVE success. progressed=false means nothing settled. */
+async function flushAcks(
+  deps: ReceiveDeps,
+  pending: PendingAck[],
+  epochOf: () => string
+): Promise<{ progressed: boolean }> {
+  if (pending.length === 0) return { progressed: true };
+  const before = pending.length;
   let lastAcked: string | null = null;
   try {
-    while (pending.length > 0) {
-      const next = pending[0];
-      await ackOne(deps, next);
-      lastAcked = next.cursor;
-      pending.shift();
+    const settled = await settleAcks(deps, pending);
+    let i = 0;
+    while (i < pending.length && settled.has(pending[i].deliveryId)) {
+      lastAcked = pending[i].cursor;
+      i += 1;
     }
+    // Drop every settled entry, not just the prefix: a later flush must never
+    // re-ack one that already settled.
+    const stuck = pending.filter((p) => !settled.has(p.deliveryId));
+    pending.length = 0;
+    pending.push(...stuck);
   } finally {
     if (lastAcked !== null) {
       const record: StreamCursor = { cursor: lastAcked, syncEpoch: epochOf() };
       await deps.kv.set(STORE_KEYS.streamCursor('mailbox'), record);
     }
   }
+  return { progressed: pending.length < before };
+}
+
+/** Batched when the port offers it, one at a time otherwise; never reorders `pending`. */
+async function settleAcks(deps: ReceiveDeps, pending: readonly PendingAck[]): Promise<Set<string>> {
+  const batch = deps.delivery.ackBatch?.bind(deps.delivery);
+  if (batch === undefined) return settleOneByOne(deps, pending);
+  let outcomes: readonly AckOutcome[];
+  try {
+    outcomes = await batch(pending.map(toAckRequest));
+  } catch (err) {
+    // A wall a per-entry retry would hit too (429, outage): falling back turns
+    // one transient failure into N of them.
+    if (isRetryableAckError(err)) throw err;
+    logger.warn('PaymentsV2', 'batched mailbox ack failed — settling one at a time:', err);
+    return settleOneByOne(deps, pending);
+  }
+  const settled = new Set(outcomes.filter((o) => o.status === 'settled').map((o) => o.deliveryId));
+  const conflicts = outcomes.filter((o) => o.status === 'conflict').map((o) => o.deliveryId);
+  if (conflicts.length > 0) await resolveConflicts(deps, pending, conflicts, settled);
+  return settled;
+}
+
+/** Settled only once its reject succeeded, so a failed reject holds the cursor. */
+async function resolveConflicts(
+  deps: ReceiveDeps,
+  pending: readonly PendingAck[],
+  conflicts: readonly string[],
+  settled: Set<string>
+): Promise<void> {
+  for (const deliveryId of conflicts) {
+    const entry = pending.find((p) => p.deliveryId === deliveryId);
+    try {
+      await rejectStaleClaim(deps, deliveryId, entry?.transferId);
+    } catch (err) {
+      logger.warn('PaymentsV2', `stale-reject failed for ${deliveryId} — cursor holds here:`, err);
+      continue;
+    }
+    settled.add(deliveryId);
+  }
+}
+
+/** §5.7: a stale claim is terminal for discovery, or the entry re-processes forever. */
+async function rejectStaleClaim(deps: ReceiveDeps, deliveryId: string, transferId?: string): Promise<void> {
+  logger.warn('PaymentsV2', `mailbox claim CONFLICT for ${deliveryId} — rejected('other') as stale`);
+  await deps.delivery.ack(deliveryId, 'rejected', 'other');
+  deps.attention(transferId ?? '', ATTENTION_CLAIM_CONFLICT, deliveryId);
+}
+
+/** Today's loop, in seq order, stopping at the first failure. */
+async function settleOneByOne(deps: ReceiveDeps, pending: readonly PendingAck[]): Promise<Set<string>> {
+  const settled = new Set<string>();
+  for (const ack of pending) {
+    try {
+      await ackOne(deps, ack);
+    } catch (err) {
+      logger.warn('PaymentsV2', `mailbox ack failed for ${ack.deliveryId} — cursor holds here:`, err);
+      break;
+    }
+    settled.add(ack.deliveryId);
+  }
+  return settled;
+}
+
+function toAckRequest(ack: PendingAck): AckRequest {
+  return {
+    deliveryId: ack.deliveryId,
+    disposition: ack.disposition,
+    ...(ack.reason !== undefined ? { reason: ack.reason } : {}),
+  };
 }
 
 async function ackOne(deps: ReceiveDeps, ack: PendingAck): Promise<void> {
@@ -253,12 +408,7 @@ async function ackOne(deps: ReceiveDeps, ack: PendingAck): Promise<void> {
     await deps.delivery.ack(ack.deliveryId, ack.disposition, ack.reason);
   } catch (err) {
     if (ack.disposition !== 'claimed' || !isClaimConflict(err)) throw err;
-    // §5.7: a lineage CONFLICT on claim is stale by construction (another owner
-    // holds equal-or-newer state) and reject is non-destructive server-side —
-    // terminal for discovery immediately, or this entry re-processes forever.
-    logger.warn('PaymentsV2', `mailbox claim CONFLICT for ${ack.deliveryId} — rejected('other') as stale`);
-    await deps.delivery.ack(ack.deliveryId, 'rejected', 'other');
-    deps.attention(ack.transferId ?? '', ATTENTION_CLAIM_CONFLICT, ack.deliveryId);
+    await rejectStaleClaim(deps, ack.deliveryId, ack.transferId);
   }
 }
 

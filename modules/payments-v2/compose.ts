@@ -1,6 +1,7 @@
 // Composition helper for PaymentsFacade: the injected-deps surface and the
 // wiring of every built component (§5 layout). Policy stays in PaymentsFacade.
 
+import { coalesced } from './async';
 import { hexToBytes } from '../../core/crypto';
 import { decryptField, encryptField } from '../../core/field-encryption';
 import type { ITokenEngine, SplitCheckpointStore } from '../../token-engine/engine';
@@ -134,6 +135,8 @@ export interface FacadeHooks {
   send(request: SendRequest): Promise<TransferResult>;
   /** §7 ownership — an attempt running in-process owns its own reservation (#737). */
   isActiveOp(transferId: string): boolean;
+  /** Register a background op so stop() cannot return while it is still writing. */
+  track(op: Promise<unknown>): void;
 }
 
 export interface FacadeParts {
@@ -147,6 +150,8 @@ export interface FacadeParts {
   machineDeps: MachineDeps;
   machine: TransferMachine;
   heldStates: HeldStateCache;
+  /** ONE coalescer over view.delta(), shared by the §9 wake and the receive drain. */
+  refreshView: () => void;
   receiveLoop: Receive;
   requests: Requests;
   restoreDeps: RestoreDeps;
@@ -182,9 +187,11 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
   const machineStores = createMachineStores(deps.kv);
   const heldStates: HeldStateCache = new Map();
 
+  const refreshView = coalesced(() => view.delta(), hooks.track);
   return {
     ownPubkeyBytes,
     view,
+    refreshView,
     ledger,
     pins: buildPins(deps, hooks, { ledger, view, machineStores, machineDeps }),
     queue,
@@ -193,7 +200,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     machineDeps,
     machine: new TransferMachine(machineDeps),
     heldStates,
-    receiveLoop: buildReceive(deps, hooks, historyStore, heldStates),
+    receiveLoop: buildReceive(deps, hooks, historyStore, heldStates, refreshView),
     requests: buildRequests(deps, hooks),
     restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view),
   };
@@ -290,7 +297,8 @@ function buildReceive(
   deps: PaymentsFacadeDeps,
   hooks: FacadeHooks,
   historyStore: History,
-  heldStates: HeldStateCache
+  heldStates: HeldStateCache,
+  refreshView: () => void
 ): Receive {
   return new Receive({
     delivery: deps.deliveryPort,
@@ -305,6 +313,7 @@ function buildReceive(
     registry: deps.registry,
     recordReceived: (record) => recordReceived(historyStore, record),
     emit: (event, transfer) => deps.emit(event, transfer),
+    refreshView,
     attention: (transferId, code, detail) => {
       deps.emit(
         'transfer:attention',

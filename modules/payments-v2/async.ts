@@ -27,3 +27,40 @@ export class SerialChain {
     return run;
   }
 }
+
+/** Fire-and-forget sibling of {@link SingleFlight}: one in flight, one queued behind it. */
+export function coalesced(
+  run: () => Promise<unknown>,
+  observe?: (op: Promise<unknown>) => void
+): () => void {
+  let inFlight = false;
+  let queued = false;
+  const start = (): void => {
+    inFlight = true;
+    // A synchronous throw would escape before .catch attaches and strand
+    // inFlight, wedging every later trigger. Started eagerly, not on a
+    // microtask, so a caller can rely on the first run having begun.
+    let running: Promise<unknown>;
+    try {
+      running = run();
+    } catch {
+      running = Promise.resolve();
+    }
+    observe?.(running);
+    void running
+      .catch(() => undefined)
+      .finally(() => {
+        inFlight = false;
+        if (!queued) return;
+        queued = false;
+        start();
+      });
+  };
+  return () => {
+    if (inFlight) {
+      queued = true;
+      return;
+    }
+    start();
+  };
+}

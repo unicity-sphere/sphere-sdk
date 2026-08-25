@@ -3,6 +3,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 
 import {
   createWalletApiHttp,
+  isRetryableStatus,
   WalletApiHttpError,
   type FetchLike,
   type HttpRequestInit,
@@ -583,5 +584,28 @@ describe('session: bearer plumbing', () => {
     expect(jwt).toBe('jwt-v1');
     expect(h.signer.sign).toHaveBeenCalledTimes(1);
     expect(await h.kv.get(refreshTokenKey(DEVICE))).toBe('v1.s.v1');
+  });
+});
+
+describe('isRetryableStatus — what must NOT be retried per entry (#757)', () => {
+  it('classifies a transport failure as retryable', () => {
+    // fetchRaw wraps EVERY network failure as WalletApiHttpError(0, 'NETWORK'),
+    // so a classifier that only knows 429/5xx sees an offline connection as a
+    // per-entry problem and retries it once per entry — the amplification shape
+    // batching exists to avoid.
+    expect(isRetryableStatus(new WalletApiHttpError(0, 'NETWORK', 'connection reset'))).toBe(true);
+  });
+
+  it('classifies rate limiting and gateway failures as retryable', () => {
+    for (const status of [408, 425, 429, 500, 502, 503, 504]) {
+      expect(isRetryableStatus(new WalletApiHttpError(status, 'X', 'x'))).toBe(true);
+    }
+  });
+
+  it('leaves a per-entry problem alone, so the caller isolates the poison entry', () => {
+    for (const status of [400, 403, 404, 409, 422]) {
+      expect(isRetryableStatus(new WalletApiHttpError(status, 'X', 'x'))).toBe(false);
+    }
+    expect(isRetryableStatus(new Error('not an http error'))).toBe(false);
   });
 });

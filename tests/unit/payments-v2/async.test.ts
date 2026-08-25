@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { SerialChain, SingleFlight } from '../../../modules/payments-v2/async';
+import { SerialChain, SingleFlight, coalesced } from '../../../modules/payments-v2/async';
 import { deferred } from './support';
 
 describe('SingleFlight', () => {
@@ -89,5 +89,108 @@ describe('SerialChain', () => {
       ran.push(2);
     });
     expect(ran).toEqual([1, 2]);
+  });
+});
+
+/** A refresh whose completion the test controls. */
+function gated() {
+  const releases: (() => void)[] = [];
+  let calls = 0;
+  const refresh = (): Promise<void> => {
+    calls += 1;
+    return new Promise<void>((resolve) => releases.push(resolve));
+  };
+  return {
+    refresh,
+    calls: () => calls,
+    releaseNext: async (): Promise<void> => {
+      releases.shift()?.();
+      await Promise.resolve();
+      await Promise.resolve();
+    },
+  };
+}
+
+describe('coalesced', () => {
+  it('collapses a burst arriving during one in-flight refresh into ONE re-run', async () => {
+    const g = gated();
+    const trigger = coalesced(g.refresh);
+
+    trigger();
+    expect(g.calls()).toBe(1);
+
+    // 53 more wakes while the first is still in flight — the receive's shape.
+    for (let i = 0; i < 53; i += 1) trigger();
+    expect(g.calls()).toBe(1);
+
+    await g.releaseNext();
+    // Exactly one trailing re-run, not 53.
+    expect(g.calls()).toBe(2);
+
+    await g.releaseNext();
+    expect(g.calls()).toBe(2);
+  });
+
+  it('always re-runs after a trigger seen mid-flight — dropping it would leave the mirror stale', async () => {
+    const g = gated();
+    const trigger = coalesced(g.refresh);
+
+    trigger();
+    // This wake reports a change the in-flight read may already have passed, so
+    // discarding it (a plain single-flight) can strand the mirror until some
+    // unrelated event fires.
+    trigger();
+
+    await g.releaseNext();
+    expect(g.calls()).toBe(2);
+  });
+
+  it('runs immediately when nothing is in flight', async () => {
+    const g = gated();
+    const trigger = coalesced(g.refresh);
+
+    trigger();
+    await g.releaseNext();
+    expect(g.calls()).toBe(1);
+
+    trigger();
+    expect(g.calls()).toBe(2);
+  });
+
+  it('keeps accepting triggers after the refresh rejects', async () => {
+    let calls = 0;
+    const trigger = coalesced(() => {
+      calls += 1;
+      return Promise.reject(new Error('offline'));
+    });
+
+    trigger();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    trigger();
+    await Promise.resolve();
+
+    // A failed refresh must not wedge the refresher permanently.
+    expect(calls).toBe(2);
+  });
+  it('survives a run that throws synchronously — a wedged refresher stops the wallet updating', async () => {
+    let calls = 0;
+    const trigger = coalesced(() => {
+      calls += 1;
+      if (calls === 1) throw new Error('sync boom');
+      return Promise.resolve();
+    });
+
+    trigger();
+    expect(calls).toBe(1);
+
+    // Pre-fix the throw escaped before .catch attached and stranded inFlight, so
+    // every later trigger was silently dropped and the caller never refreshed again.
+    await Promise.resolve();
+    await Promise.resolve();
+    trigger();
+
+    expect(calls).toBe(2);
   });
 });
