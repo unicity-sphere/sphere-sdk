@@ -178,6 +178,12 @@ export class Receive {
     const pending: PendingAck[] = [];
     // The port's page epoch is the honest source for the persisted record.
     const pageEpoch = (): string => deps.delivery.incomingEpoch() ?? deps.syncEpoch();
+    // Every exit refreshes: automatic drains never call receive(), so their only
+    // other refresh is the §5.7 inventory wake, which is best-effort. Coalesced.
+    const finish = (): IncomingTransfer[] => {
+      if (stored.length > 0) deps.refreshView?.();
+      return stored;
+    };
     try {
       const record = await deps.kv.get<StreamCursor>(STORE_KEYS.streamCursor('mailbox'));
       // Cursor continuity holds only within one syncEpoch (§6); the session
@@ -198,19 +204,14 @@ export class Receive {
       // Infra failure (engine/blob/view/ack): the failed entry stays UNACKED and
       // re-lists next drain; the fully-processed prefix still flushes below.
       logger.warn('PaymentsV2', 'receive drain interrupted — unacked entries retry next drain:', err);
-      // A retryable ack failure means the wall is still up; re-flushing here just
-      // spends another rate-limit slot on it. The entries re-list next drain.
-      if (isRetryableAckError(err)) return stored;
+      // Retryable = the wall is still up; re-flushing spends another slot. Exits
+      // via finish() because ackBatch kept its committed chunks, which never re-list.
+      if (isRetryableAckError(err)) return finish();
       await flushAcks(deps, pending, pageEpoch).catch((flushErr: unknown) => {
         logger.warn('PaymentsV2', 'receive ack flush failed — cursor holds at the acked prefix:', flushErr);
       });
     }
-    // Automatic drains (§9 mailbox wake, 30 s poll) never call receive(), and a
-    // drain shorter than REFRESH_INTERVAL_MS takes no mid-drain refresh — so
-    // without this their only refresh is the inventory wake, which §5.7 declares
-    // best-effort. Coalesced, so it costs at most one delta.
-    if (stored.length > 0) deps.refreshView?.();
-    return stored;
+    return finish();
   }
 
   private async processEntry(

@@ -934,6 +934,21 @@ describe('payments-v2 Receive — batched acks (#757)', () => {
     expect(h.kv.map.get(CURSOR_KEY)).toBeUndefined(); // cursor holds
   });
 
+  it('still refreshes the mirror when the drain ends on a retryable ack failure', async () => {
+    // ackBatch persists the chunks it DID commit before rethrowing (§5.7), and
+    // those claims materialized on the server, so they never re-list. Bailing out
+    // without a refresh leaves them out of the balance until some later drain
+    // happens to run — a stale balance with nothing scheduled to fix it.
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    for (let i = 1; i <= 4; i += 1) h.delivery.add(meta(T(i), 'S1'));
+    h.delivery.batchFailure = 'retryable';
+
+    await h.receive.drainOnce();
+
+    expect(h.refreshes).toHaveLength(1);
+  });
+
   it('falls back to one-at-a-time when the batch fails for any other reason', async () => {
     const h = makeHarness();
     h.delivery.enableBatch();
