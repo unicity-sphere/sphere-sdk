@@ -953,6 +953,22 @@ describe('payments-v2 Receive — batched acks (#757)', () => {
     expect(h.refreshes).toHaveLength(1);
   });
 
+  it('refreshes when a retried claim settles, though nothing new was stored', async () => {
+    // The first drain stores the entry and fails to ack it. On the retry, screen()
+    // sees the held state and returns a claim ack ONLY — so `stored` is empty while
+    // the claim really does materialize the token in server inventory.
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.acksUntilFail = 0;
+    await h.receive.drainOnce();
+    const afterFirst = h.refreshes.length;
+
+    h.delivery.acksUntilFail = Infinity;
+    await h.receive.drainOnce();
+
+    expect(h.refreshes.length).toBeGreaterThan(afterFirst);
+  });
+
   it('stops the drain when an ack settles nothing, instead of retrying it per entry', async () => {
     // One-at-a-time acking stops at the first failure, so `pending` stays AT the
     // threshold — and without bailing out, the next entry flushes the same blocked
