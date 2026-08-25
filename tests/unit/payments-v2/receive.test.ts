@@ -969,6 +969,23 @@ describe('payments-v2 Receive — batched acks (#757)', () => {
     expect(h.refreshes.length).toBeGreaterThan(afterFirst);
   });
 
+  it('refreshes a retry drain that ends retryably, though it stored nothing', async () => {
+    // The combination the earlier two fixes each missed: a drain of held-state
+    // RETRIES (so `stored` is empty) whose batch commits an earlier chunk and then
+    // fails retryably (so no flush result comes back to count). The claims really
+    // did materialize server-side and never re-list.
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.batchFailure = 'retryable';
+    await h.receive.drainOnce(); // stores, cannot ack
+    const afterFirst = h.refreshes.length;
+
+    await h.receive.drainOnce(); // re-lists as a held-state claim: nothing to store
+
+    expect(h.refreshes.length).toBeGreaterThan(afterFirst);
+  });
+
   it('stops the drain when an ack settles nothing, instead of retrying it per entry', async () => {
     // One-at-a-time acking stops at the first failure, so `pending` stays AT the
     // threshold — and without bailing out, the next entry flushes the same blocked

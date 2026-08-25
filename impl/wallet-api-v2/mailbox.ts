@@ -16,6 +16,7 @@ import type {
 } from '../../modules/payments-v2/ports';
 import type { ScopedKV } from '../../modules/payments-v2/stores';
 import { bytesToHex, hexToBytes } from '../../core/crypto';
+import { logger } from '../../core/logger';
 import {
   decryptDeliveryBundle,
   deriveDeliveryEncryptionKey,
@@ -336,11 +337,14 @@ export class WalletApiDeliveryPort implements DeliveryPort {
       await this.settleClaims(acks, settled, outcomes);
       await this.settleRejects(acks, settled);
     } catch (err) {
-      // Chunks that DID commit are acked server-side; the seen-set must record
-      // them even though the batch as a whole failed, or a §5.4 restore that
-      // rebuilds the rows re-yields deliveries this wallet already claimed.
-      // The caller is still told nothing settled, which is what makes it safe.
-      await this.addSeenAll(settled).catch(() => undefined);
+      // Chunks that DID commit are acked server-side, so the seen-set must record
+      // them or a §5.4 restore re-yields deliveries this wallet already claimed.
+      // A failed write is logged, not swallowed: the loss is bounded (a re-yield
+      // screens against the view's durable held state and returns a claim ack, so
+      // it costs a redundant ack, not a duplicate credit) but silence is not.
+      await this.addSeenAll(settled).catch((seenErr: unknown) => {
+        logger.warn('WalletApiDelivery', `seen-set write failed for ${String(settled.length)} committed acks:`, seenErr);
+      });
       throw asRetryable(err);
     }
     await this.addSeenAll(settled);
