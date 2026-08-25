@@ -14,10 +14,16 @@ _Nothing yet._
 ### Added — `DeliveryPort.ackBatch()`: one settle call per drain, not one per entry (#757)
 
 A 54-token receive settled its mailbox entries one HTTP call at a time. The port
-may now implement an optional `ackBatch`, which groups claims into one call and
-rejects into one call per reason (the endpoint takes a single reason per call).
-A port that does not implement it, or a batch that fails for an ordinary reason,
-still settles one at a time — nothing regresses for existing ports.
+may now implement an optional `ackBatch`, which groups claims together and rejects
+together per reason (the endpoint takes a single reason per call). The built-in
+`WalletApiDeliveryPort` sends them in chunks of **50** (`ACK_CHUNK`): the server
+caps at 1000, but each entry costs an S3 read and a transaction there, so a huge
+batch is a multi-second request against an idle timeout that tells you nothing
+about what committed. A 54-token receive therefore goes from **54 calls to 2**,
+not to 1 — 50 keeps almost all of the round-trip amortisation without the tail
+risk. A port that does not implement `ackBatch`, or a batch that fails for an
+ordinary reason, still settles one at a time — nothing regresses for existing
+ports.
 
 A **retryable** failure (429, gateway outage) deliberately does NOT fall back:
 per-entry retries would hit the same wall and turn one transient failure into N
