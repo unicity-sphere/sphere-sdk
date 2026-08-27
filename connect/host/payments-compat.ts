@@ -59,8 +59,9 @@ function legacyRequestPayload(
   sphere: SphereInstance,
   update: PaymentRequestUpdated,
 ): Record<string, unknown> {
-  const view: PaymentRequestView | undefined = sphere.paymentsV2
-    ?.requests.list().find((request) => request.id === update.id);
+  const view: PaymentRequestView | undefined = sphere.payments.requests
+    .list()
+    .find((request) => request.id === update.id);
   if (!view) {
     return {
       id: update.id,
@@ -155,7 +156,7 @@ const COMPAT_ATTACHERS: ReadonlyMap<string, Attach> = new Map<string, Attach>([
     })],
   ['sync:completed', (sphere, forward) =>
     sphere.on('inventory:updated', () => {
-      forward({ source: 'payments', count: sphere.paymentsV2?.tokens().length ?? 0 });
+      forward({ source: 'payments', count: sphere.payments.tokens().length });
     })],
   ['sync:remote-update', remoteUpdateAttacher],
 ]);

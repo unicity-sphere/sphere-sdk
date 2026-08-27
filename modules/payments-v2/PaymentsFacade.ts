@@ -13,7 +13,6 @@ import {
 import { randomUUID } from '../../core/uuid';
 import type { ITokenEngine } from '../../token-engine/engine';
 import type { SphereToken } from '../../token-engine/types';
-import { TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
 import type { ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest } from './api';
@@ -503,7 +502,7 @@ export class PaymentsFacade implements PaymentsV2 {
       if (bytes === undefined) {
         throw new SphereError(`Selected source ${tokenId} has no blob in storage`, 'STORAGE_ERROR');
       }
-      const token = await engine.decodeToken({ v: TOKEN_BLOB_VERSION, network: 0, tokenId, token: bytes });
+      const token = await engine.decodeToken({ tokenId, token: bytes });
       const keys = await engine.deliveryKeys(bytes);
       // local === protocol by construction; the dual field is wire compat (types.ts).
       spentStates[tokenId] = { local: keys.stateHash, protocol: keys.stateHash };

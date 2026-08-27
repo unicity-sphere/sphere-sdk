@@ -1,6 +1,6 @@
 // One inclusion-proof wait: bounded by a deadline we own, and tolerant of a
-// gateway that blips (#739, #741). state-transition-sdk >= 2.0.3 terminates its
-// own poll loop on abort; proof-deadline.test.ts is the guard that it still does.
+// gateway that blips (#739, #741). state-transition-sdk terminates its own poll
+// loop on abort since 2.0.3; proof-deadline.test.ts guards that it still does.
 
 import {
   type InclusionProof,
@@ -33,7 +33,16 @@ export function resolveProofTimeoutMs(configured: number | undefined): number {
  *  404, so without this one blip strands a certification that would land (#741). */
 const TRANSIENT_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
+/** A submit ANSWER meaning "ask again" — SERVICE_NOT_READY is a 503 in a 200 body. */
+export class TransientSubmitAnswer extends Error {
+  public constructor(public readonly status: string) {
+    super(`gateway is not ready to certify yet (${status})`);
+    this.name = 'TransientSubmitAnswer';
+  }
+}
+
 function isTransientGatewayError(err: unknown): boolean {
+  if (err instanceof TransientSubmitAnswer) return true;
   return err instanceof JsonRpcNetworkError && TRANSIENT_HTTP_STATUSES.has(err.status);
 }
 

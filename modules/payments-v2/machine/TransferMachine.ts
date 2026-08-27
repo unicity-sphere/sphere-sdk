@@ -9,7 +9,6 @@ import { SphereError } from '../../../core/errors';
 import type { TransferResult } from '../../../types';
 import type { ITokenEngine, SplitCheckpointStore } from '../../../token-engine/engine';
 import type { SphereToken } from '../../../token-engine/types';
-import { TOKEN_BLOB_VERSION } from '../../../token-engine/token-blob';
 import {
   CheckpointPersistFailedError,
   CheckpointTrustbaseMismatchError,
@@ -584,12 +583,7 @@ export class TransferMachine {
     let total = 0n;
     for (const outcome of committed) {
       if (outcome.recipientBlob === undefined) continue;
-      const token = await engine.decodeToken({
-        v: TOKEN_BLOB_VERSION,
-        network: 0,
-        tokenId: '',
-        token: outcome.recipientBlob,
-      });
+      const token = await engine.decodeToken({ tokenId: '', token: outcome.recipientBlob });
       total += engine.balanceOf(token, coinId);
     }
     return total.toString();

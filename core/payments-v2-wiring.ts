@@ -28,7 +28,7 @@ import {
   type PaymentsFacadeDeps,
   type RecipientInfo,
 } from '../modules/payments-v2/PaymentsFacade';
-import { createScopedKV, type ScopedKV } from '../modules/payments-v2/stores';
+import { createScopedKV, sweepSupersededState, type ScopedKV } from '../modules/payments-v2/stores';
 import type { RequestMemoCodec } from '../modules/payments-v2/requests/Requests';
 import { createWalletApiHttp, type FetchLike as V2FetchLike } from '../impl/wallet-api-v2/http';
 import { WalletApiV2Client } from '../impl/wallet-api-v2/client';
@@ -307,6 +307,8 @@ export function composePaymentsV2(spec: ComposePaymentsV2Spec): PaymentsFacade {
   const network = spec.composition.network;
   const identitySlice = { privateKey: identity.privateKey, chainPubkey: identity.chainPubkey };
   const kv = createScopedKV(host.storage, network, identity.chainPubkey);
+  // Fire-and-forget: nothing reads the superseded keys, so don't block on the scan.
+  void sweepSupersededState(host.storage);
   const fieldKey = deriveFieldEncryptionKey(identity.privateKey);
   const transport = spec.composition.factory({
     identity: identitySlice,

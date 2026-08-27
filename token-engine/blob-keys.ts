@@ -13,7 +13,6 @@
  * rule, see ./sdk.ts).
  */
 import { HexConverter, Token } from './sdk';
-import { unwrapTokenBlobBytes } from './token-blob';
 
 export interface DeliveryKeys {
   /** Genesis-stable 64-hex token id (TokenBlob.tokenId). */
@@ -24,13 +23,12 @@ export interface DeliveryKeys {
 
 /**
  * Derive the backend-true (tokenId, stateHash) for a finished token blob.
- * Accepts BOTH byte forms — the sphere envelope (the cross-port blob format)
- * and raw wallet-api wire bytes (what the §16 API serves — §5.2/§8.2). Both
- * keys come from the DECODED token (never trusted from an envelope field), so
- * the pair is identical for either form of the same token.
+ * The input is the raw wallet-api wire form — `Token.toCBOR()` bytes, what the
+ * §16 API serves (§5.2/§8.2). Both keys come from the DECODED token, never
+ * from a field alongside it, so they cannot disagree with the token itself.
  */
 export async function deriveDeliveryKeys(blobBytes: Uint8Array): Promise<DeliveryKeys> {
-  const token = await Token.fromCBOR(unwrapTokenBlobBytes(blobBytes));
+  const token = await Token.fromCBOR(blobBytes);
   const stateHash = HexConverter.encode((await token.latestTransaction.calculateStateHash()).imprint);
   return { tokenId: HexConverter.encode(token.id.bytes), stateHash };
 }

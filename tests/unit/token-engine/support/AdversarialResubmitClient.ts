@@ -50,14 +50,15 @@ export class AdversarialResubmitClient implements IAggregatorClient {
     const stateIdHex = HexConverter.encode(stateId.data);
     const transactionHashHex = HexConverter.encode(certificationData.transactionHash.data);
     // Prior inclusion read from the SHARED inner tree — adversarial across engines too.
-    const prior = (await this.inner.getInclusionProof(stateId)).inclusionProof.certificationData;
+    // v3: a null proof IS "no prior leaf"; a present one always carries certification data.
+    const prior = (await this.inner.getInclusionProof(stateId)).inclusionProof;
     const response = await this.inner.submitCertificationRequest(certificationData);
 
     let kind: ResubmitRecord['kind'];
     let wire: CertificationResponse;
     if (prior !== null) {
       kind =
-        HexConverter.encode(prior.transactionHash.data) === transactionHashHex
+        HexConverter.encode(prior.certificationData.transactionHash.data) === transactionHashHex
           ? 'resubmit-duplicate'
           : 'resubmit-conflict';
       wire =

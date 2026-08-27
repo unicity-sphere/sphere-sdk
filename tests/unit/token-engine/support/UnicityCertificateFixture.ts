@@ -1,10 +1,16 @@
 /**
- * VENDORED (test-only) from @unicitylabs/state-transition-sdk v2
- * tests/utils/UnicityCertificateFixture.ts. Copied verbatim with imports
- * re-pointed at the installed lib/ (the package ships only lib/, not tests/).
- * Faithful relocation, not reimplemented logic — orchestrates installed SDK
- * classes to build a single-node BFT unicity certificate for the in-memory
- * aggregator. Keep in sync with upstream.
+ * VENDORED (test-only) from @unicitylabs/state-transition-sdk
+ * tests/utils/UnicityCertificateFixture.ts. Copied with imports re-pointed at
+ * the installed lib/ (the package ships only lib/, not tests/). Faithful
+ * relocation, not reimplemented logic — orchestrates installed SDK classes to
+ * build a single-node BFT unicity certificate for the in-memory aggregator.
+ *
+ * `timestamp` is ours, not upstream's. v3 verification rejects a leaf whose
+ * reference time postdates the round that certified it
+ * (REFERENCE_TIME_AFTER_ROUND), so a certificate stuck at `0n` fails every
+ * proof the moment the aggregator records a non-zero reference time. The
+ * caller supplies the round's own clock; TestAggregatorClient passes its
+ * current reference time.
  */
 
 import { numberToBytesBE } from '@noble/curves/utils.js';
@@ -25,8 +31,9 @@ import { CborSerializer } from '@unicitylabs/state-transition-sdk/lib/serializat
 export async function createUnicityCertificate(
   rootHash: DataHash,
   signingService: SigningService,
+  timestamp = 0n,
 ): Promise<UnicityCertificate> {
-  const inputRecord = new InputRecord(0n, 0n, null, rootHash.data, new Uint8Array(0), 0n, null, 0n, null);
+  const inputRecord = new InputRecord(0n, 0n, null, rootHash.data, new Uint8Array(0), timestamp, null, 0n, null);
   const technicalRecordHash = null;
   const shardConfigurationHash = new Uint8Array(32);
   const shardTreeCertificate = new ShardTreeCertificate(ShardId.decode(new Uint8Array([0b10000000])), []);
@@ -55,7 +62,7 @@ export async function createUnicityCertificate(
     NetworkId.LOCAL,
     0n,
     0n,
-    0n,
+    timestamp,
     null,
     unicitySealHash.data,
     new Map([['NODE', signingService]]),

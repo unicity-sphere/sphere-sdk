@@ -62,15 +62,14 @@ function createMockSphere() {
     },
     networkId: 4,
     payments: {
-      getBalance: vi.fn().mockReturnValue([{ coinId: 'UCT', totalAmount: '1000000' }]),
-      getAssets: vi.fn().mockResolvedValue([{ coinId: 'UCT', symbol: 'UCT', totalAmount: '1000000' }]),
-      getFiatBalance: vi.fn().mockResolvedValue(10.5),
-      getTokens: vi.fn().mockReturnValue([
+      assets: vi.fn().mockResolvedValue([
+        { coinId: 'UCT', symbol: 'UCT', totalAmount: '1000000', fiatValueUsd: 10.5 },
+      ]),
+      tokens: vi.fn().mockReturnValue([
         { id: 'tok1', coinId: 'UCT', amount: '1000000', sdkData: { internal: true } },
       ]),
-      getHistory: vi.fn().mockReturnValue([
-        { type: 'sent', amount: '500', coinId: 'UCT', timestamp: 1700000000 },
-      ]),
+      history: vi.fn().mockResolvedValue({ entries: [{ type: 'sent', amount: '500', coinId: 'UCT', timestamp: 1700000000 }], more: false, cursor: null }),
+      requests: { list: vi.fn(() => []) },
     },
     resolve: vi.fn().mockResolvedValue({
       nametag: 'bob',
@@ -202,13 +201,13 @@ describe('Sphere Connect Integration', () => {
 
     it('gets balance', async () => {
       const balance = await client.query(RPC_METHODS.GET_BALANCE, { coinId: 'UCT' });
-      expect(mockSphere.payments.getBalance).toHaveBeenCalledWith('UCT');
-      expect(balance).toEqual([{ coinId: 'UCT', totalAmount: '1000000' }]);
+      expect(mockSphere.payments.assets).toHaveBeenCalledWith('UCT');
+      expect(balance).toEqual([{ coinId: 'UCT', symbol: 'UCT', totalAmount: '1000000', fiatValueUsd: 10.5 }]);
     });
 
     it('gets assets', async () => {
       const _assets = await client.query(RPC_METHODS.GET_ASSETS);
-      expect(mockSphere.payments.getAssets).toHaveBeenCalled();
+      expect(mockSphere.payments.assets).toHaveBeenCalled();
     });
 
     it('gets fiat balance', async () => {

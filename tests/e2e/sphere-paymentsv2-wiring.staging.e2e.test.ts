@@ -152,7 +152,7 @@ afterAll(async () => {
 }, 240_000);
 
 async function diagnose(label: string): Promise<string> {
-  const pv2 = sphere?.paymentsV2;
+  const pv2 = sphere?.payments;
   if (!pv2) return `${label}: no active vertical`;
   const history = await pv2.history({ limit: 50 }).catch(() => ({ entries: [] }));
   return JSON.stringify(
@@ -176,7 +176,7 @@ const MINT_VALIDATION_ERROR = 'coinId must be even-length lowercase hex and amou
  * a fresh mint() re-call would race that replay into a SECOND token.
  */
 async function mintConvergedOnce(amount: bigint): Promise<string> {
-  const result = await sphere!.paymentsV2!.mint(HARNESS_COIN, amount);
+  const result = await sphere!.payments.mint(HARNESS_COIN, amount);
   if (result.success) {
     logStep(`mint admitted directly: ${result.tokenId ?? ''}`);
     return result.tokenId!;
@@ -187,10 +187,10 @@ async function mintConvergedOnce(amount: bigint): Promise<string> {
   logStep(`mint keep-open (${(result.error ?? 'unknown').slice(0, 70)}…) — converging via same-mintId replay`);
   for (let cycle = 1; cycle <= MAX_MINT_ATTEMPTS && !aborted; cycle++) {
     await sleep(THROTTLE_WAIT_MS);
-    await sphere!.paymentsV2!.resumeNow().catch(() => undefined);
-    const tokens = sphere!.paymentsV2!.tokens({ coinId: HARNESS_COIN });
+    await sphere!.payments.resumeNow().catch(() => undefined);
+    const tokens = sphere!.payments.tokens({ coinId: HARNESS_COIN });
     if (tokens.length > 0) {
-      if (tokens.length !== 1 || totalOf(sphere!.paymentsV2!) !== amount) {
+      if (tokens.length !== 1 || totalOf(sphere!.payments) !== amount) {
         throw new Error(`mint replay must converge to exactly ONE token\n${await diagnose('mint-replay')}`);
       }
       logStep(`mint converged via replay on cycle ${cycle}: ${tokens[0]!.id}`);
@@ -213,7 +213,7 @@ async function sendConvergedThroughThrottle(
   settled: () => Promise<boolean>
 ): Promise<TransferResult | null> {
   try {
-    const result = await sphere!.paymentsV2!.send({ recipient, amount, coinId: HARNESS_COIN });
+    const result = await sphere!.payments.send({ recipient, amount, coinId: HARNESS_COIN });
     logStep(`send admitted directly: ${result.id}`);
     return result;
   } catch (err) {
@@ -225,7 +225,7 @@ async function sendConvergedThroughThrottle(
     await sphere!.destroy();
     await bootSphere(); // facade.start() resumes the open intent, same transferId
     for (let i = 0; i < 10 && !aborted; i++) {
-      await sphere!.paymentsV2!.receive().catch(() => undefined);
+      await sphere!.payments.receive().catch(() => undefined);
       if (await settled()) {
         logStep(`send converged via resume on cycle ${cycle}`);
         return null;
@@ -243,17 +243,16 @@ describe.runIf(RUN)('LIVE staging: Sphere payments wiring (default transport pat
     trustBaseJson = await trustbase();
 
     const wallet = await bootSphere();
-    // Post-flip: `payments` IS the facade; `paymentsV2` is the deprecated alias.
-    expect(wallet.payments).toBe(wallet.paymentsV2);
-    expect(wallet.paymentsV2).not.toBeNull();
+    // Post-flip: `payments` IS the facade; the `paymentsV2` alias is gone in 0.15.
+    expect(wallet.payments).toBeTruthy();
     logStep(`wallet up: ${wallet.identity!.chainPubkey.slice(0, 12)}… on ${NETWORK}`);
 
     // 1. Mint 100 HARNESS on-chain via the engine; the record shows it.
     const genesis = await mintConvergedOnce(100n);
     expect(genesis).toMatch(/^[0-9a-f]+$/);
-    for (let i = 0; totalOf(sphere!.paymentsV2!) !== 100n && i < 30; i++) await sleep(2_000);
-    expect(totalOf(sphere!.paymentsV2!)).toBe(100n);
-    const assets = await sphere!.paymentsV2!.assets(HARNESS_COIN);
+    for (let i = 0; totalOf(sphere!.payments) !== 100n && i < 30; i++) await sleep(2_000);
+    expect(totalOf(sphere!.payments)).toBe(100n);
+    const assets = await sphere!.payments.assets(HARNESS_COIN);
     expect(assets).toHaveLength(1);
     expect(assets[0]?.totalAmount).toBe('100');
 
@@ -261,8 +260,8 @@ describe.runIf(RUN)('LIVE staging: Sphere payments wiring (default transport pat
     //    the self-output rides our own mailbox back at a NEW state.
     const own = sphere!.identity!.chainPubkey;
     const settled = async (): Promise<boolean> => {
-      if (totalOf(sphere!.paymentsV2!) !== 100n) return false;
-      const { entries } = await sphere!.paymentsV2!.history({ limit: 100 });
+      if (totalOf(sphere!.payments) !== 100n) return false;
+      const { entries } = await sphere!.payments.history({ limit: 100 });
       return entries.some((e) => e.type === 'RECEIVED' && e.tokenId === genesis.toLowerCase());
     };
     const direct = await sendConvergedThroughThrottle(own, '100', settled);
@@ -277,10 +276,10 @@ describe.runIf(RUN)('LIVE staging: Sphere payments wiring (default transport pat
       if (Date.now() > deadline) {
         throw new Error(`self-send did not settle\n${await diagnose('settle')}`);
       }
-      await sphere!.paymentsV2!.receive().catch(() => undefined);
+      await sphere!.payments.receive().catch(() => undefined);
       await sleep(3_000);
     }
-    expect(sphere!.paymentsV2!.tokens().map((t) => ({ id: t.id, amount: t.amount }))).toEqual([
+    expect(sphere!.payments.tokens().map((t) => ({ id: t.id, amount: t.amount }))).toEqual([
       { id: genesis, amount: '100' },
     ]);
     expect(incoming.length).toBeGreaterThanOrEqual(1);
@@ -288,14 +287,16 @@ describe.runIf(RUN)('LIVE staging: Sphere payments wiring (default transport pat
 
     // 4. Balance unchanged after a further drain window (no phantom, no double).
     await sleep(5_000);
-    await sphere!.paymentsV2!.receive().catch(() => undefined);
-    expect(totalOf(sphere!.paymentsV2!)).toBe(100n);
-    const finalAssets = await sphere!.paymentsV2!.assets(HARNESS_COIN);
+    await sphere!.payments.receive().catch(() => undefined);
+    expect(totalOf(sphere!.payments)).toBe(100n);
+    const finalAssets = await sphere!.payments.assets(HARNESS_COIN);
     expect(finalAssets[0]?.totalAmount).toBe('100');
 
     // 5. Clean teardown.
     await sphere!.destroy();
-    expect(sphere!.paymentsV2).toBeNull();
+    // The alias returned null here; `payments` refuses instead, which is the
+    // post-destroy contract a caller can actually act on.
+    expect(() => sphere!.payments).toThrow();
     sphere = null;
     logStep('done: mint → self-send → drain → balance 100, clean destroy');
   }, 2_700_000);

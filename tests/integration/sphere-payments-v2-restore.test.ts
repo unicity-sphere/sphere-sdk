@@ -213,7 +213,7 @@ async function buildSphere(world: World) {
   });
   // Receive decodes fake-world blobs — swap in the realization engine via the
   // documented public seam (the same one the api-key hot swap uses).
-  (sphere.paymentsV2 as PaymentsFacade).setEngine(world.realization as unknown as ITokenEngine);
+  (sphere.payments as unknown as PaymentsFacade).setEngine(world.realization as unknown as ITokenEngine);
   const kv = createScopedKV(storage, NET, sphere.identity!.chainPubkey);
   return { sphere, storage, kv };
 }
@@ -227,7 +227,7 @@ describe('Sphere paymentsV2 — §5.1 restore protocol conformance (FakeWalletAp
     await seedInventory(world, record, 40n);
     record.session.fire('inventory');
     await vi.waitFor(() => {
-      expect(sphere.paymentsV2!.tokens().map((t) => t.amount)).toContain('40');
+      expect(sphere.payments.tokens().map((t) => t.amount)).toContain('40');
     });
 
     // ── pre-restore durable state ────────────────────────────────────────────
@@ -306,11 +306,11 @@ describe('Sphere paymentsV2 — §5.1 restore protocol conformance (FakeWalletAp
     // The backstop survives (re-seeded, not consumed).
     expect(await kv.get(STORE_KEYS.intentBackstop)).toEqual([backstop]);
     // The seeded token survived the restore (rebuilt server-side, re-pulled).
-    expect(sphere.paymentsV2!.tokens().map((t) => t.amount)).toContain('40');
+    expect(sphere.payments.tokens().map((t) => t.amount)).toContain('40');
 
     // ── the P1 arrival leg: a deposit made AFTER the restore reaches the app ─
     const fresh = await peerDeposit(world, world.own.chainPubkey, 5n, 'post-restore-transfer');
-    const { transfers } = await sphere.paymentsV2!.receive();
+    const { transfers } = await sphere.payments.receive();
     expect(transfers.map((t) => t.id)).toContain(fresh.blob.tokenId);
   }, 30_000);
 
@@ -338,7 +338,7 @@ describe('Sphere paymentsV2 — §5.1 restore protocol conformance (FakeWalletAp
         transferId: `noise-${i}`,
       });
     }
-    await sphere.paymentsV2!.receive();
+    await sphere.payments.receive();
     expect(await kv.get<StreamCursor>(STORE_KEYS.streamCursor('mailbox'))).toEqual({
       cursor: '5',
       syncEpoch: '1',
@@ -351,7 +351,7 @@ describe('Sphere paymentsV2 — §5.1 restore protocol conformance (FakeWalletAp
     world.api.bumpEpoch();
     const fresh = await peerDeposit(world, world.own.chainPubkey, 9n, 'below-cursor-transfer');
 
-    const { transfers } = await sphere.paymentsV2!.receive();
+    const { transfers } = await sphere.payments.receive();
     expect(transfers.map((t) => t.id)).toContain(fresh.blob.tokenId);
     // The record was voided and re-established under the page-honest epoch.
     expect(await kv.get<StreamCursor>(STORE_KEYS.streamCursor('mailbox'))).toEqual({

@@ -44,7 +44,6 @@ import type {
 import { sha256 } from '@noble/hashes/sha2.js';
 
 import { SpherePaymentData } from '../../../token-engine/SpherePaymentData';
-import { TOKEN_BLOB_VERSION, decodeTokenBlob } from '../../../token-engine/token-blob';
 
 const DEFAULT_PUBKEY = new Uint8Array([0x02, ...new Array<number>(32).fill(0)]); // 33 bytes
 
@@ -201,13 +200,9 @@ export class FakeTokenEngine implements ITokenEngine {
    * in delivery-keys.test.ts and, end-to-end, by the cross-repo harness.
    */
   public deliveryKeys(blobBytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }> {
-    // Tolerant like the real derivation (blob-keys.ts): the cross-port blob
-    // is the sphere envelope, the wallet-api WIRE carries raw inner bytes
-    // (§5.2/§8.2). Both forms of the same token derive the identical pair.
-    try {
-      const blob = decodeTokenBlob(blobBytes);
-      return Promise.resolve({ tokenId: blob.tokenId, stateHash: bytesToHexLocal(sha256(blob.token)) });
-    } catch {
+    // One byte form, same as the real derivation (blob-keys.ts): the wallet-api
+    // WIRE bytes (§5.2/§8.2). The sphere envelope that used to wrap them is gone.
+    {
       const state = decodeFakeState(blobBytes);
       return Promise.resolve({
         tokenId: HexConverter.encode(state.tokenId),
@@ -217,11 +212,11 @@ export class FakeTokenEngine implements ITokenEngine {
   }
 
   public decodeToken(blob: TokenBlob): Promise<SphereToken> {
-    // Normalize like the real engine's wrapToken: tokenId/network come from
-    // the decoded token, never from the (possibly placeholder) envelope
-    // fields of a raw wire wrap.
+    // Normalize like the real engine's wrapToken: the tokenId comes from the
+    // decoded token, never from the (possibly placeholder) field the caller
+    // passed alongside the bytes.
     const state = decodeFakeState(blob.token);
-    const normalized: TokenBlob = { ...blob, network: this.network, tokenId: HexConverter.encode(state.tokenId) };
+    const normalized: TokenBlob = { ...blob, tokenId: HexConverter.encode(state.tokenId) };
     return Promise.resolve({ sdkToken: handleFor(blob.token), blob: normalized, value: valueOf(state) });
   }
 
@@ -240,8 +235,6 @@ export class FakeTokenEngine implements ITokenEngine {
   private async makeToken(state: FakeState): Promise<SphereToken> {
     const stateBytes = encodeFakeState(state);
     const blob: TokenBlob = {
-      v: TOKEN_BLOB_VERSION,
-      network: this.network,
       tokenId: HexConverter.encode(state.tokenId),
       token: stateBytes,
     };

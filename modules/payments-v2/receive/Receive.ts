@@ -1,10 +1,8 @@
 // §5.7 of docs/PAYMENTS-V2-DESIGN.md — the single-flighted receive drain.
-// Entry order is money-load-bearing: the view store precedes the claimed ack,
-// so a claimed/acked token can never be absent from the view (#724 outcome).
+// Entry order is money-load-bearing: the view store precedes the claimed ack (#724).
 
 import { logger } from '../../../core/logger';
 import type { ITokenEngine, SphereToken } from '../../../token-engine';
-import { TOKEN_BLOB_VERSION } from '../../../token-engine/token-blob';
 import type { IncomingTransfer, Token } from '../../../types';
 import { SingleFlight } from '../async';
 import type { RegistryReader } from '../inventory/InventoryView';
@@ -246,13 +244,9 @@ async function screen(deps: ReceiveDeps, engine: ReceiveEngine, entry: IncomingD
   const blobBytes = await entry.fetchBlob();
   let token: SphereToken;
   try {
-    token = await engine.decodeToken({
-      v: TOKEN_BLOB_VERSION,
-      network: 0,
-      tokenId: '',
-      token: blobBytes,
-    });
-  } catch {
+    token = await engine.decodeToken({ tokenId: '', token: blobBytes });
+  } catch (err) {
+    logger.warn('PaymentsV2', `receive: undecodable blob rejected — ${String(err)}`);
     return { kind: 'ack', ack: rejectAck(entry, 'invalid') };
   }
   const verdict = await engine.verify(token);

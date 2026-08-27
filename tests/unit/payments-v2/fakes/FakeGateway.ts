@@ -110,7 +110,7 @@ export class FakeGateway implements IAggregatorClient {
    */
   private async churn(): Promise<void> {
     const throwawayPubkey = new SigningService(SigningService.generatePrivateKey()).publicKey;
-    const mintTx = await MintTransaction.create(this.networkId, SignaturePredicate.create(throwawayPubkey), null);
+    const mintTx = await MintTransaction.create(this.networkId, SignaturePredicate.create(throwawayPubkey));
     await this.inner.submitCertificationRequest(await CertificationData.fromMintTransaction(mintTx));
   }
 }

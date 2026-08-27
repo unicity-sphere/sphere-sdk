@@ -774,7 +774,6 @@ describe('recoverable engine (Part E) — real adapter over in-memory aggregator
       src.sdkToken,
       SignaturePredicate.create(freshPubkey()),
       StateMask.fromBytes(new Uint8Array(32).fill(7)),
-      null,
     );
     const err = await waitInclusionProof(
       new StateTransitionClient(aggregator),

@@ -145,14 +145,6 @@
       "count": 1
     }
   },
-  "core/async-gate.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
-    "budget/no-long-comment-block": {
-      "count": 1
-    }
-  },
   "core/crypto.ts": {
     "budget/comment-ratio": {
       "count": 1
@@ -551,7 +543,7 @@
       "count": 1
     },
     "budget/no-long-comment-block": {
-      "count": 5
+      "count": 4
     },
     "max-lines-per-function": {
       "count": 1
@@ -627,14 +619,6 @@
     }
   },
   "token-engine/split-checkpoint.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
-    "budget/no-long-comment-block": {
-      "count": 1
-    }
-  },
-  "token-engine/token-blob.ts": {
     "budget/comment-ratio": {
       "count": 1
     },

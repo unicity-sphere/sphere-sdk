@@ -3,7 +3,7 @@
 // cross-intent source reads, and {resumed, conflicted, failed} classification.
 
 import { SphereError } from '../../../core/errors';
-import { TOKEN_BLOB_VERSION } from '../../../token-engine/token-blob';
+import { logger } from '../../../core/logger';
 import type { SphereToken } from '../../../token-engine/types';
 import type { DeliveryJournalEntry, IntentBackstopEntry } from '../stores';
 import type { IntentPayload } from './types';
@@ -151,9 +151,9 @@ async function fetchSources(deps: MachineDeps, jobs: ResumeJob[]): Promise<Map<s
   const engine = deps.engine();
   for (const [tokenId, bytes] of blobs) {
     try {
-      decoded.set(tokenId, await engine.decodeToken({ v: TOKEN_BLOB_VERSION, network: 0, tokenId, token: bytes }));
-    } catch {
-      /* undecodable source: the needing job fails closed below */
+      decoded.set(tokenId, await engine.decodeToken({ tokenId, token: bytes }));
+    } catch (err) {
+      logger.warn('PaymentsV2', `resume: source ${tokenId} did not decode — ${String(err)}`);
     }
   }
   return decoded;

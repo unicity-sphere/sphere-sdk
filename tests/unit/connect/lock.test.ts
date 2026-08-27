@@ -93,13 +93,14 @@ function createMockSphere(overrides?: { chainPubkey?: string; networkId?: number
     } as MockSphereIdentity,
     networkId: overrides?.networkId ?? 4,
     payments: {
-      getBalance: vi.fn().mockReturnValue([{ coinId: 'UCT', totalAmount: '1000000' }]),
-      getAssets: vi.fn().mockResolvedValue([{ coinId: 'UCT', symbol: 'UCT', totalAmount: '1000000' }]),
-      getFiatBalance: vi.fn().mockResolvedValue(10.5),
-      getTokens: vi.fn().mockReturnValue([
+      assets: vi.fn().mockResolvedValue([
+        { coinId: 'UCT', symbol: 'UCT', totalAmount: '1000000', fiatValueUsd: 10.5 },
+      ]),
+      tokens: vi.fn().mockReturnValue([
         { id: 'tok1', coinId: 'UCT', amount: '1000000', sdkData: { internal: true } },
       ]),
-      getHistory: vi.fn().mockReturnValue([]),
+      history: vi.fn().mockResolvedValue({ entries: [], more: false, cursor: null }),
+      requests: { list: vi.fn(() => []) },
     },
     signMessage: vi.fn(),
     resolve: vi.fn().mockResolvedValue({ nametag: 'bob', chainPubkey: '03def456' }),
@@ -300,13 +301,14 @@ describe('ConnectHost wallet-binding axis', () => {
     const h = await connectHarness();
 
     await expect(h.client.query(RPC_METHODS.GET_BALANCE))
-      .resolves.toEqual([{ coinId: 'UCT', totalAmount: '1000000' }]);
+      .resolves.toEqual([{ coinId: 'UCT', symbol: 'UCT', totalAmount: '1000000', fiatValueUsd: 10.5 }]);
     await expect(h.client.query(RPC_METHODS.GET_FIAT_BALANCE))
       .resolves.toEqual({ fiatBalance: 10.5 });
     // stripTokenSdkData still removes the internal field.
     await expect(h.client.query(RPC_METHODS.GET_TOKENS))
       .resolves.toEqual([{ id: 'tok1', coinId: 'UCT', amount: '1000000' }]);
-    expect(h.sphere.payments.getBalance).toHaveBeenCalledTimes(1);
+    // Twice: GET_BALANCE and GET_FIAT_BALANCE are both served from assets() now.
+    expect(h.sphere.payments.assets).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -406,7 +408,7 @@ describe('ConnectHost.setLocked()', () => {
     const err = await h.client.query(RPC_METHODS.GET_BALANCE).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ConnectError);
     expect((err as ConnectError).code).toBe(ERROR_CODES.WALLET_LOCKED);
-    expect(h.sphere.payments.getBalance).not.toHaveBeenCalled();
+    expect(h.sphere.payments.assets).not.toHaveBeenCalled();
   });
 });
 
@@ -599,9 +601,9 @@ describe('locked gate — queries', () => {
       const err = await h.client.query(method).catch((e: unknown) => e);
       expect((err as ConnectError).code, `method ${method}`).toBe(ERROR_CODES.WALLET_LOCKED);
     }
-    expect(h.sphere.payments.getBalance).not.toHaveBeenCalled();
-    expect(h.sphere.payments.getTokens).not.toHaveBeenCalled();
-    expect(h.sphere.payments.getHistory).not.toHaveBeenCalled();
+    expect(h.sphere.payments.assets).not.toHaveBeenCalled();
+    expect(h.sphere.payments.tokens).not.toHaveBeenCalled();
+    expect(h.sphere.payments.history).not.toHaveBeenCalled();
   });
 
   it('answers SESSION_EXPIRED 4004 rather than 4009 for a session that expired while locked', async () => {
@@ -922,7 +924,7 @@ describe('in-flight requests at lock time', () => {
     const h = await connectHarness();
     // getAssets is the only async payments call — hold it open across the lock.
     let release!: (v: unknown[]) => void;
-    h.sphere.payments.getAssets.mockReturnValue(new Promise((r) => { release = r; }));
+    h.sphere.payments.assets.mockReturnValue(new Promise((r) => { release = r; }));
 
     const pending = h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
     await tick();
@@ -939,7 +941,7 @@ describe('in-flight requests at lock time', () => {
   it('never sends a second frame for an id the lock already settled', async () => {
     const h = await connectHarness();
     let release!: (v: unknown[]) => void;
-    h.sphere.payments.getAssets.mockReturnValue(new Promise((r) => { release = r; }));
+    h.sphere.payments.assets.mockReturnValue(new Promise((r) => { release = r; }));
 
     const pending = h.client.query(RPC_METHODS.GET_ASSETS).catch(() => undefined);
     await tick();
@@ -1017,7 +1019,7 @@ describe('in-flight requests at lock time', () => {
   it('settles in-flight work with 4001 on revokeSession()', async () => {
     const h = await connectHarness();
     let release!: (v: unknown[]) => void;
-    h.sphere.payments.getAssets.mockReturnValue(new Promise((r) => { release = r; }));
+    h.sphere.payments.assets.mockReturnValue(new Promise((r) => { release = r; }));
 
     const pending = h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
     await tick();
@@ -1032,7 +1034,7 @@ describe('in-flight requests at lock time', () => {
   it('settles in-flight work with 4001 on destroy()', async () => {
     const h = await connectHarness();
     let release!: (v: unknown[]) => void;
-    h.sphere.payments.getAssets.mockReturnValue(new Promise((r) => { release = r; }));
+    h.sphere.payments.assets.mockReturnValue(new Promise((r) => { release = r; }));
 
     const pending = h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
     await tick();
@@ -1094,7 +1096,7 @@ describe('host deadlines', () => {
 
   it('answers an unanswered query with a fixed INTERNAL_ERROR at its deadline', async () => {
     const h = await connectHarness({ requestDeadlineMs: 40 });
-    h.sphere.payments.getAssets.mockReturnValue(new Promise(() => {}));
+    h.sphere.payments.assets.mockReturnValue(new Promise(() => {}));
 
     const err = await h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
 
@@ -1147,7 +1149,7 @@ describe('unhandled failures still answer the dApp', () => {
 
   it('replaces a NON-SphereError message with a fixed string', async () => {
     const h = await connectHarness();
-    h.sphere.payments.getAssets.mockRejectedValue(new TypeError('registry.internals is not a function'));
+    h.sphere.payments.assets.mockRejectedValue(new TypeError('registry.internals is not a function'));
 
     const err = await h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
 
@@ -1186,7 +1188,7 @@ describe('unhandled failures still answer the dApp', () => {
 
   it('does not double-answer an id the inner catch already settled', async () => {
     const h = await connectHarness();
-    h.sphere.payments.getAssets.mockRejectedValue(new Error('inner'));
+    h.sphere.payments.assets.mockRejectedValue(new Error('inner'));
 
     await h.client.query(RPC_METHODS.GET_ASSETS).catch(() => undefined);
     await tick();
@@ -1225,7 +1227,7 @@ describe('updateSphere() re-arm after a lock', () => {
     h.host.updateSphere(createMockSphere());
 
     await expect(h.client.query(RPC_METHODS.GET_BALANCE))
-      .resolves.toEqual([{ coinId: 'UCT', totalAmount: '1000000' }]);
+      .resolves.toEqual([{ coinId: 'UCT', symbol: 'UCT', totalAmount: '1000000', fiatValueUsd: 10.5 }]);
   });
 
   it('restores every suspended sphere_subscribe stream BEFORE pushing wallet:unlocked', async () => {
@@ -1256,16 +1258,19 @@ describe('updateSphere() re-arm after a lock', () => {
 
     // ConnectClient.on() is fire-and-forget and never retries, so refusing this would kill
     // the event stream forever after one lock.
-    await expect(h.client.query(RPC_METHODS.SUBSCRIBE, { event: 'transfer:confirmed' }))
-      .resolves.toEqual({ subscribed: true, event: 'transfer:confirmed' });
+    // A NATIVE facade event, not a compat-translated one: the subject here is the
+    // subscribe-while-locked bookkeeping, and `transfer:confirmed` is now synthesised
+    // by the compat adapter from `transfer:updated` rather than emitted on the bus.
+    await expect(h.client.query(RPC_METHODS.SUBSCRIBE, { event: 'transfer:incoming' }))
+      .resolves.toEqual({ subscribed: true, event: 'transfer:incoming' });
 
     const handler = vi.fn();
-    h.client.on('transfer:confirmed', handler);
+    h.client.on('transfer:incoming', handler);
     const next = createMockSphere();
     h.host.updateSphere(next);
     await tick();
 
-    next._emit('transfer:confirmed', { id: 'tx1' });
+    next._emit('transfer:incoming', { id: 'tx1' });
     await tick();
     expect(handler).toHaveBeenCalledWith({ id: 'tx1' });
   });
@@ -1400,7 +1405,7 @@ describe('updateSphere() re-arm after a lock', () => {
   it('settles anything in flight with 4001 when the unlock revokes', async () => {
     const h = await connectHarness();
     let release!: (v: unknown[]) => void;
-    h.sphere.payments.getAssets.mockReturnValue(new Promise((r) => { release = r; }));
+    h.sphere.payments.assets.mockReturnValue(new Promise((r) => { release = r; }));
     const pending = h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
     await tick();
 
@@ -1698,7 +1703,7 @@ describe('lifecycle logging', () => {
 
   it('warns when a host deadline answers on the wallet behalf', async () => {
     const h = await connectHarness({ requestDeadlineMs: 30 });
-    h.sphere.payments.getAssets.mockReturnValue(new Promise(() => {}));
+    h.sphere.payments.assets.mockReturnValue(new Promise(() => {}));
 
     await h.client.query(RPC_METHODS.GET_ASSETS).catch(() => undefined);
 
@@ -1853,7 +1858,7 @@ describe('ConnectClient and the auto-pushed lifecycle events', () => {
 
   it('rejects pending requests with a TYPED error when the session goes away', async () => {
     const h = await connectHarness();
-    h.sphere.payments.getAssets.mockReturnValue(new Promise(() => {}));
+    h.sphere.payments.assets.mockReturnValue(new Promise(() => {}));
     const pending = h.client.query(RPC_METHODS.GET_ASSETS).catch((e: unknown) => e);
     await tick();
 
@@ -1991,7 +1996,7 @@ describe('intent outcome contract (money safety)', () => {
     const h = await connectHarness({
       sphere: (() => {
         const s = createMockSphere();
-        s.payments.getBalance = vi.fn(() => new Promise(() => {}));
+        s.payments.assets = vi.fn(() => new Promise(() => {}));
         return s;
       })(),
     });
