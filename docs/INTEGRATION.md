@@ -5,21 +5,120 @@
 > - [Node.js Quick Start](./QUICKSTART-NODEJS.md) - Server-side / CLI
 > - [Connect Protocol](./CONNECT.md) - Wallet ↔ dApp communication
 >
-> This document covers advanced integration patterns, the v2 wallet composition model, custom provider implementations, and production custody patterns.
+> This document covers advanced integration patterns, the wallet composition model, custom provider implementations, and production custody patterns.
+
+> **Upgrading to 0.15.0?** Read [Upgrading to 0.15.0](#upgrading-to-0150) first — the base-SDK
+> pin moved to `@unicitylabs/state-transition-sdk@3.0.1`, which is a wire break no client can
+> straddle, and `sphere.paymentsV2` is gone.
 
 ## Table of Contents
 
-1. [Setup](#setup)
-2. [Wallet Composition](#wallet-composition)
-3. [Custody Model](#custody-model)
-4. [Wallet Operations](#wallet-operations)
-5. [L3 Payments](#l3-payments)
-6. [Payment Requests](#payment-requests)
-7. [Communications](#communications)
-8. [Custom Providers](#custom-providers)
-9. [Events](#events)
-10. [Error Handling](#error-handling)
-11. [Testing](#testing)
+1. [Upgrading to 0.15.0](#upgrading-to-0150)
+2. [Setup](#setup)
+3. [Wallet Composition](#wallet-composition)
+4. [Custody Model](#custody-model)
+5. [Wallet Operations](#wallet-operations)
+6. [L3 Payments](#l3-payments)
+7. [Payment Requests](#payment-requests)
+8. [Communications](#communications)
+9. [Custom Providers](#custom-providers)
+10. [Events](#events)
+11. [Error Handling](#error-handling)
+12. [Testing](#testing)
+
+---
+
+## Upgrading to 0.15.0
+
+Two things change for an integrator: the base SDK pin, and the removal of the `paymentsV2`
+alias. Everything else on this page — composition, custody, the facade surface, the 8 events,
+the error contract — is unchanged.
+
+### The base-SDK pin: 2.1.0 → 3.0.1 (a flag day)
+
+`@unicitylabs/state-transition-sdk` is pinned **exactly**, and 0.15.0 moves that pin to
+`3.0.1`. v3 threads one new concept through the protocol: every transaction carries `expiresAt`,
+an exclusive request deadline in Unix seconds, and every inclusion proof carries the
+`referenceTime` of the round that certified it. The sparse-Merkle leaf value became
+`H(transactionHash, referenceTime)` instead of the bare transaction hash, and the wire versions
+of `Token`, `MintTransaction`, `TransferTransaction` and `CertificationData` all moved with it.
+
+**Nothing a 2.x client wrote decodes, and nothing a 2.x client writes is accepted by the
+upgraded gateway.** There is no straddle window and no compatibility shim, because the forcing
+function is the aggregator, which hard-rejects `CertificationDataVersion = 1`. Concretely:
+
+- **Bump the wallet-api backend in lockstep.** Both repos pin the base SDK exactly, so bumping
+  one alone cannot be deduped by npm and leaves two mutually unintelligible realms live. The
+  release is accompanied by a testnet + wallet-api backend reset.
+- **A 2.x token blob no longer decodes.** Incoming blobs that fail to decode are logged and
+  acked as invalid by the receive drain rather than silently dropped — they never enter the
+  balance.
+- **Stored split checkpoints from 2.x are unreadable by design.** `CHECKPOINT_VERSION` is 2 and
+  `CHECKPOINT_SDK_VERSION` names the 3.0.1 pin, so a stale record is refused by *name* rather
+  than by a byte comparison that would blame "derivation drift".
+- **Nothing to run for the client's durable KV.** The scoped prefix moved from
+  `pv2:{network}:{chainPubkey}:` to `pv2g2:{network}:{chainPubkey}:`, and the superseded `pv2:`
+  keys are swept once when the vertical is composed. The rename IS the migration: the sync-epoch
+  latch lives in that KV, and a latch that survived a backend reset would make the session see a
+  changed epoch and re-PUT every locally-open intent into a freshly wiped backend — intents
+  referencing tokens that no longer exist, which can never complete and hold their sources
+  reserved forever. Under the new prefix the latch reads null and no restore fires.
+  `Sphere.clear()` is not the fix for this (it clears with no prefix and takes the mnemonic
+  with it) and is not needed.
+
+**Sphere sets no request deadline, anywhere.** Every mint, transfer, split burn and split mint
+omits `expiresAt`, so the Unicity Service assigns one from consensus time and does not record
+it. That is a deliberate policy, not an oversight: this is a browser wallet with an untrusted
+clock, where a skewed wallet pinning a past deadline is a wallet-wide payment outage, and an
+absolute deadline is unrecoverable across downtime longer than the window — every resume would
+rebuild an already-expired transaction and the intent would sit open forever with its sources
+reserved. The policy is also load-bearing rather than cosmetic: `expiresAt` is committed by the
+transaction hash but is NOT part of the StateId, so two attempts that disagree about it address
+the same leaf with different hashes, and the verification rule compares the hash before the
+certification data — the disagreement surfaces as `TRANSACTION_HASH_MISMATCH`, i.e. as a foreign
+spend, which the engine maps to a `TransferConflictError` abort. A clock-derived deadline would
+therefore make every crash-resume abort an intent whose spend is already on chain.
+
+**The error contract is unchanged.** v3's two new certification statuses do not become clean
+rejects: `REQUEST_EXPIRED` and `SERVICE_NOT_READY` each report only that *this* submit was not
+admitted, never that no earlier attempt certified, so neither is treated as a proven abort.
+`SERVICE_NOT_READY` (a 503 in a 200 body — a booting gateway) is retried at the submit call
+site; `REQUEST_EXPIRED` is never retried. `TRANSACTION_HASH_MISMATCH` remains the only conflict
+signal, and `CERTIFICATION_UNCONFIRMED` /
+[`isPossiblyCommittedSendOutcome()`](#send-error-handling) keep exactly the meaning they had.
+
+### `sphere.paymentsV2` is removed
+
+The deprecated alias, and the `paymentsV2: true` init flag that had already become a no-op, are
+both gone. `sphere.payments` is the same facade the alias returned. The one behavioural
+difference is the migration step a consumer will otherwise discover in production:
+
+| | `sphere.paymentsV2` (removed) | `sphere.payments` |
+|---|---|---|
+| No vertical running (init in flight, mid address-switch, destroyed) | evaluated to `null` | **throws** `SphereError` with `code: 'NOT_INITIALIZED'` |
+
+```typescript
+// BEFORE — the alias absorbed "not ready yet"
+const tokens = sphere.paymentsV2?.tokens() ?? [];
+
+// AFTER — the throw IS the readiness signal
+let tokens: Token[] = [];
+try {
+  tokens = sphere.payments.tokens();
+} catch (err) {
+  if (!isSphereError(err) || err.code !== 'NOT_INITIALIZED') throw err;
+}
+```
+
+`Sphere.init()` resolves with the vertical started, so ordinary call sites read
+`sphere.payments` directly; the guard is only for code that can run while the wallet is between
+states. `accounting:` / `swap:` are **not** part of this cleanup — they still throw a typed
+`INVALID_CONFIG`, deliberately, through 0.15.0.
+
+Wallet hosts embedding `ConnectHost` have one more change to make: the host's `SphereInstance`
+contract now declares `readonly payments: PaymentsV2` and dropped both the legacy `payments`
+read shape and the optional `paymentsV2`. The Connect **wire** is untouched — see
+[ConnectHost: the `SphereInstance` contract](./CONNECT.md#connecthost-the-sphereinstance-contract).
 
 ---
 
@@ -61,8 +160,13 @@ const baseProviders = createNodeProviders({
 
 ### Networks (Post v1-Cutover)
 
-- **testnet / testnet2**: v2 state-transition gateway network. `testnet` is an alias for `testnet2`. Both resolve to `gateway.testnet2.unicity.network`.
-- **mainnet / dev**: Still point at v1-era aggregators. The v2 token engine **cannot** operate against them and will fail loudly with `AGGREGATOR_ERROR` until these gateways are cut over.
+- **testnet / testnet2**: the v2 state-transition gateway network. `testnet` is an alias for `testnet2`. Both resolve to `gateway.testnet2.unicity.network`.
+- **mainnet / dev**: Still point at v1-era aggregators. The token engine **cannot** operate against them and will fail loudly with `AGGREGATOR_ERROR` until these gateways are cut over.
+
+The **"v2" in testnet2 is the gateway network, not the base-SDK major.** They are separate axes:
+testnet2 is still testnet2 after the 0.15.0 bump to state-transition-sdk 3.0.1, and it is not
+renamed "testnet3". What the pin governs is the bytes on that network — a gateway serving the v3
+protocol accepts nothing a 2.x client writes.
 
 ### Aggregator API Key
 
@@ -71,7 +175,7 @@ The SDK does **not** ship a default aggregator API key. Pass it explicitly via `
 - **testnet / testnet2 keys are NOT secret** — safe to commit in `.env.example` and show in docs.
 - **mainnet keys ARE secret** — keep them only in your deploy environment, never committed.
 
-If no `apiKey` is provided, the v2 token engine still constructs, but its gateway requests are unauthenticated and the SDK logs a `TokenEngine` warning. On testnet2, an explicit key is **required** for `send()` and `mint()` operations.
+If no `apiKey` is provided, the token engine still constructs, but its gateway requests are unauthenticated and the SDK logs a `TokenEngine` warning. On testnet2, an explicit key is **required** for `send()` and `mint()` operations.
 
 ---
 
@@ -131,9 +235,10 @@ if (created && generatedMnemonic) {
 console.log('Address:', sphere.identity?.directAddress);  // DIRECT://... (L3)
 ```
 
-**Removed init options (P11 flip):** `accounting: true` / `swap: true` **throw** typed
-`INVALID_CONFIG` (invoicing and swaps no longer exist in the SDK); `paymentsV2: true` is a
-deprecated no-op for one release; `tokenStorage` / `delivery` no longer exist.
+**Removed init options:** `accounting: true` / `swap: true` **throw** typed `INVALID_CONFIG`
+(invoicing and swaps no longer exist in the SDK) — a refusal kept deliberately through 0.15.0.
+`paymentsV2: true` was a deprecated no-op and is **gone in 0.15.0**; `tokenStorage` / `delivery`
+no longer exist.
 
 ### Complete Node.js Example
 
@@ -184,8 +289,9 @@ const { transfers } = await sphere.payments.receive();
 Token custody is **server-side**: the wallet-api backend holds the token inventory, transfer
 intents, delivery mailbox, history and payment requests. The client holds the keys (nothing
 money-critical can happen without the wallet's signatures) plus a small per-address durable KV
-(`pv2:{network}:{chainPubkey}:*` in the plain `StorageProvider`) — refresh token, sync cursors,
-receive seen-set, and the intent/delivery/mint journals.
+(`pv2g2:{network}:{chainPubkey}:*` in the plain `StorageProvider`) — refresh token, sync cursors,
+receive seen-set, and the intent/delivery/mint journals. The `g2` generation arrived with
+0.15.0; see [Upgrading to 0.15.0](#upgrading-to-0150) for why the rename is the migration.
 
 - **Multi-device**: inventory is server-backed, so a second device signs in (challenge → JWT)
   and sees the same funds. `deviceId` keys the per-device refresh-token row.
@@ -246,13 +352,17 @@ console.log('Nametag:', identity.nametag);            // e.g., 'alice'
 
 ```typescript
 await Sphere.clear({ storage: providers.storage });
-// Clears the KV store (keys + pv2:* payment journals); in the browser it also
+// Clears the KV store (keys + pv2g2:* payment journals); in the browser it also
 // sweeps orphaned pre-flip sphere-token-storage-* databases.
 ```
 
+This is a wipe, not a maintenance step: it clears the store with no prefix, so the mnemonic goes
+with it. It is not the way to migrate the 0.15.0 scoped-KV generation — that needs nothing from
+you.
+
 ### Multi-Address Derivation
 
-SDK2 supports HD (Hierarchical Deterministic) address derivation following BIP32/BIP44 standards.
+The SDK supports HD (Hierarchical Deterministic) address derivation following BIP32/BIP44 standards.
 
 ```typescript
 // Derive additional receiving addresses
@@ -332,7 +442,7 @@ sphere.on('address:hidden', ({ index, addressId }) => {
 
 ## L3 Payments
 
-L3 is the primary payment layer. Transfers are **sender-driven** (v2): the sender's token engine
+L3 is the primary payment layer. Transfers are **sender-driven**: the sender's token engine
 certifies the transfer on-chain via the gateway and delivers a **finished** token to the
 recipient over the wallet-api mailbox — the recipient verifies it and stores it as `'confirmed'` immediately.
 
@@ -562,8 +672,10 @@ When you call `send()`, the transfer runs as a durable server-side intent:
 2. **Engine spends** the source token (or splits it when the exact amount is unavailable);
    each op posts a signed, field-encrypted progress checkpoint.
 3. **Certification** — submitted to the gateway; the inclusion proof finishes the token.
-4. **Mailbox deposit** — the finished token blob (raw `Token.toCBOR()`) is deposited into
-   the recipient's wallet-api mailbox, and the intent is closed with a signed complete.
+4. **Mailbox deposit** — the finished token blob is deposited into the recipient's wallet-api
+   mailbox, and the intent is closed with a signed complete. The blob is the base SDK's own
+   `Token.toCBOR()` bytes with no sphere-private envelope around them — the same form on the
+   wire, in the mailbox and in server storage.
 
 The recipient verifies it (`engine.verify` + ownership check) and stores it as `'confirmed'` —
 there is no receiver-side commitment submission, proof polling, or finalization phase.
@@ -740,7 +852,7 @@ interface TransportProvider {
 
 ### Oracle Provider Interface
 
-Post v1-cutover the oracle is a thin **network-config provider** for the v2 token engine: it
+Post v1-cutover the oracle is a thin **network-config provider** for the token engine: it
 loads the root trust base (JSON) and exposes the gateway URL + API key. The engine builds its
 own clients from these — custom implementations MUST provide the three config accessors.
 
@@ -754,7 +866,7 @@ interface OracleProvider {
   /** Loads the trust base JSON (via the platform loader when not passed explicitly). */
   initialize(trustBaseJson?: unknown): Promise<void>;
 
-  // v2 token-engine config surface (REQUIRED)
+  // Token-engine config surface (REQUIRED)
   getTrustBaseJson(): unknown | null;   // raw trust-base JSON (networkId comes from it)
   getAggregatorUrl(): string;           // gateway (aggregator) base URL
   getApiKey(): string | undefined;      // gateway API key, when required (e.g. testnet2)
@@ -1129,18 +1241,18 @@ npm test -- --coverage
 
 ### Test Coverage
 
-The suite spans ~170 test files. Major areas:
+The suite spans 128 test files. Major areas:
 
 | Area | Description |
 |------|-------------|
 | `tests/unit/core` | Crypto (BIP39/BIP32), currency, encryption, Sphere lifecycle |
-| `tests/unit/token-engine` | v2 engine adapter: mint, transfer, split, verify, Unicity ID mint |
+| `tests/unit/token-engine` | The engine adapter: mint, transfer, split, verify, spent-check, the `expiresAt` policy, wire-version pins, and the golden `DIRECT://` derivation |
 | `tests/unit/payments-v2` | The payments vertical: TransferMachine send/resume, receive drain, requests, mint journal, history, facade, port contracts, adversarial fakes |
 | `tests/unit/modules` | Communications, GroupChat, Market |
 | `tests/unit/serialization` | Wallet text backups |
 | `tests/unit/transport` | Nostr P2P messaging, event timestamp persistence |
 | `tests/unit/impl` | Storage providers (IndexedDB, file), config resolvers |
-| `tests/mutation` | 17 mutation probes over the payments vertical (`npm run test:mutation`, all must be KILLED) |
+| `tests/mutation` | Mutation probes over the payments vertical, the token engine and the wallet-api wire (`tests/mutation/probes.json`; `npm run test:mutation`, all must be KILLED) |
 | `tests/integration` | Sphere payments wiring, per-address bleed invariants, wallet import/export, nametag round-trips |
 | `tests/e2e` | Live staging/testnet2 flows (gated behind `.env` keys; skipped otherwise) |
 
@@ -1152,7 +1264,7 @@ Tests follow the structure:
 tests/
 ├── unit/
 │   ├── core/            # crypto, currency, encryption, Sphere.*
-│   ├── token-engine/    # v2 engine adapter
+│   ├── token-engine/    # engine adapter
 │   ├── payments-v2/     # the vertical: machine, receive, requests, fakes, contracts/
 │   ├── modules/         # Communications*, GroupChat*, Market*
 │   ├── price/

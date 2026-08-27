@@ -8,6 +8,16 @@
 > open #713/#716/#717), the coin-selection implementation, and the defect ledger (#692, #724, #694,
 > #725 + every recent review P1). The essentials are carried in the appendices — this file is
 > self-contained.
+>
+> **Amended 2026-08-27 (#760 — base SDK `@unicitylabs/state-transition-sdk` 3.0.1, shipping as
+> sphere-sdk 0.15.0).** v3 threads a request deadline (`expiresAt`) and a per-round `referenceTime`
+> through the protocol and moves every wire version under a token, so 2.x ↔ 3.x is a fleet-wide flag
+> day rather than a compatible upgrade. What that forced into this design is local and lives where
+> it belongs: the E.1 determinism inventory now carries the deadline policy and §5.5 gains the two
+> new submit statuses (E.2 classification unchanged), the E.4 checkpoint payload moved to version 2,
+> and the durable client state moved to a new key generation (§6). Everything dated in this file —
+> the progress rows below, the P10 interop run above all — is a record of the day it was taken, not
+> a standing claim.
 
 ## Progress
 
@@ -23,8 +33,8 @@
 | P7 | `Receive` drain + seen-set + claim + RECEIVED history | ✅ 20 tests; store-before-ack crash window pinned |
 | P8 | `Requests` (streams + settling journal); `Mint` (+ engine F13 fix) | ✅ requests 19 tests; journal-first mint; F13 fixed + fake de-lied (124/124 engine) |
 | P9 | `History` read-through; events; facade assembly | ✅ facade 16 tests over real ports; `test:mutation` standing (16/16 KILLED). Connect adapter → P11. **2026-08:** §4 gained `pendingTransfers()`/`resumeNow()` + the §7 in-session heartbeat (owner UX add; 9 heartbeat tests, 19/19 probes) |
-| P10 | Live-staging e2e parity + soak + request-count budgets | 🔄 **6/6 money matrix live-green on testnet2** (mint / whole-token / split w/ signed seed-close / self-send / A→B→A / crash-resume paid-once) + 5/5 session e2e + **cross-version interop live-green** (old-module ↔ v2 vertical both directions incl. splits + payment request, 4/4). Still owed: exact-combination + E.4-stage interruption cells, soak, request-count budgets |
-| P11 | Flip PR: wire Sphere + Connect adapter, delete old vertical, frontend migration, re-pin | 🔄 **SDK side COMPLETE on `feat/payments-v2-flip`** (per the flip manifest + its 26-repo consumer-gate record): §4 Connect wire-compat adapter (34 conformance tests, old wire names/payloads held); `sphere.payments` IS the facade (`paymentsV2` deprecated alias, one release); init fail-closed on the `walletApi` transport config; old money stack deleted wholesale (modules/payments + accounting + swap, S1 wallet-api client + `./wallet-api` subpath, own-storage token custody + `TokenStorageProvider`/`DeliveryProvider` ports, Nostr asset/PR rail, TXF types/serializer, validation/, old events; Connect invoice surface: 14/6/13 counts, protocol stays 2.1); ~113 old test files deleted, kept suites on the flip contract; docs rewritten (CLAUDE/README/QUICKSTARTs/INTEGRATION/CONNECT/API + LEGACY-INVENTORY reconciliation). **Deferred by owner decision:** the `git mv` dir renames (`modules/payments-v2`/`impl/wallet-api-v2` keep their names — subpath exports were staying `./payments-v2`/`./impl/wallet-api-v2` regardless; zero consumer impact). **Still owed for done-when:** dev-version publish → sphere frontend migration PR + re-pin → sphere staging on v2 with old code gone. P10 leftovers (exact-combination + E.4-stage interruption cells, soak, request budgets) remain open — flipping with them open was the owner's call. |
+| P10 | Live-staging e2e parity + soak + request-count budgets | 🔄 **6/6 money matrix live-green on testnet2** (mint / whole-token / split w/ signed seed-close / self-send / A→B→A / crash-resume paid-once) + 5/5 session e2e + **cross-version interop live-green** (old-module ↔ v2 vertical both directions incl. splits + payment request, 4/4). Still owed: exact-combination + E.4-stage interruption cells, soak, request-count budgets. **Dated record (2026-08-05, on the st-sdk 2.x wire):** the interop cell recorded an old-module client and the v2 vertical on the SAME wire major; its suite (`tests/e2e/cross-version-interop.staging.e2e.test.ts`) was deleted with the P11 test estate, and the 3.0.1 bump voids the result — there is no 2.x ↔ 3.x interop in either direction (`docs/MIGRATION-PAYMENTS-V2.md` §5) |
+| P11 | Flip PR: wire Sphere + Connect adapter, delete old vertical, frontend migration, re-pin | 🔄 **SDK side COMPLETE on `feat/payments-v2-flip`** (per the flip manifest + its 26-repo consumer-gate record): §4 Connect wire-compat adapter (34 conformance tests, old wire names/payloads held); `sphere.payments` IS the facade (`paymentsV2` deprecated alias, one release); init fail-closed on the `walletApi` transport config; old money stack deleted wholesale (modules/payments + accounting + swap, S1 wallet-api client + `./wallet-api` subpath, own-storage token custody + `TokenStorageProvider`/`DeliveryProvider` ports, Nostr asset/PR rail, TXF types/serializer, validation/, old events; Connect invoice surface: 14/6/13 counts, protocol stays 2.1); ~113 old test files deleted, kept suites on the flip contract; docs rewritten (CLAUDE/README/QUICKSTARTs/INTEGRATION/CONNECT/API + LEGACY-INVENTORY reconciliation). **Deferred by owner decision:** the `git mv` dir renames (`modules/payments-v2`/`impl/wallet-api-v2` keep their names — subpath exports were staying `./payments-v2`/`./impl/wallet-api-v2` regardless; zero consumer impact). **Still owed for done-when:** dev-version publish → sphere frontend migration PR + re-pin → sphere staging on v2 with old code gone. P10 leftovers (exact-combination + E.4-stage interruption cells, soak, request budgets) remain open — flipping with them open was the owner's call. **Amended by 0.15.0 (#760):** the one-release deprecation is served — the `paymentsV2` alias and the `paymentsV2:` init flag are deleted, `sphere.payments` is the only accessor, and it THROWS `NOT_INITIALIZED` where the alias returned `null`. `SphereInstance` (`connect/host/SphereInstance.ts`) therefore declares `readonly payments: PaymentsV2`, read lazily per query branch so `sphere_getIdentity` still answers while no vertical runs, and the legacy-host fallbacks (dead since the flip) are gone — `sphere_getBalance`/`sphere_getAssets` are now one call and `sphere_getFiatBalance` is summed from `assets()`. The Connect WIRE is unchanged; only the wallet-host-side object shape moved. The `accounting:`/`swap:` `INVALID_CONFIG` refusal fossil is deliberately KEPT through 0.15.0. |
 
 ## Residue ledger
 
@@ -314,6 +324,24 @@ Normative behaviors bound into the transitions (not call sites):
   field)`; `opIndex` is **plan-derived** — the op's position in the intent's `direct[]` array,
   split = `direct.length`; output-scoped fields (`salt`, `tokenType`) use the output ordinal.
   Resume iterates `direct[]` in stored order — a different order manufactures a false conflict.
+  **The request deadline belongs to this inventory (#760).** v3 hashes an `expiresAt` — an
+  exclusive deadline in Unix seconds — into every transaction, and sphere sets one **nowhere**:
+  mint, transfer, the split burn and every split mint leg all omit it, so the Unicity Service
+  assigns one from consensus time and records nothing the client must reproduce. Not because
+  determinism forbids it — a deadline persisted on the durable intent would rebuild
+  byte-identically — but because (a) this is a browser wallet with an untrusted clock, where one
+  skewed device pinning a past deadline is a wallet-wide payment outage, and (b) an absolute
+  deadline is unrecoverable across downtime longer than the window: every resume would rebuild an
+  already-expired transaction, the intent would sit open forever with its sources reserved, and
+  there is no attempt budget anywhere on the certify/resume path to end it. The policy is
+  load-bearing rather than cosmetic: `expiresAt` is committed by the transaction HASH but is NOT
+  part of the StateId, so two attempts that disagree about it address the SAME leaf with DIFFERENT
+  hashes; the verification rule compares the hash BEFORE the certification data, so the
+  disagreement surfaces as `TRANSACTION_HASH_MISMATCH` — i.e. as a foreign spend — which
+  `token-engine/certification-outcome.ts` maps to `TransferConflictError` (abort + re-plan). A
+  clock-derived deadline would therefore make every crash-resume abort an intent whose spend is
+  already on chain. Pinned by `tests/unit/token-engine/expires-at.test.ts`, including a 24-hour
+  clock jump between two attempts.
 - **E.3:** the intent PUT is awaited **before any engine submit** and doubles as the pre-spend
   liveness gate (stated and test-covered — it replaces the old `save({critical})` probe). Local
   backstop copy kept for syncEpoch re-seed. The #670 rule is **scoped to the pre-submit PUT
@@ -372,6 +400,43 @@ Normative behaviors bound into the transitions (not call sites):
   path the evidenced apply already completed the intent server-side (whole-token applies complete
   unflagged intents unconditionally; a split's change blob in `added` is seed evidence) — the
   explicit call converges the rare unevidenced edge via resume, so fire-and-forget is safe.
+
+**The E.2 outcome table, with v3's statuses (classification unchanged — #760).** Two statuses
+joined `CertificationStatus` (submit answers) and two joined
+`InclusionProofVerificationStatus` (match-verify verdicts); `INCLUSION_CERTIFICATE_MISSING` and
+`MISSING_CERTIFICATION_DATA` left the verifier, because `InclusionProofResponse.inclusionProof` is
+now `InclusionProof | null` and **null IS "not certified yet"** — a present proof always describes
+a real leaf, so `isSpent` and the E.4 leaf pre-flight read the response instead of digging for
+certification data that can no longer be absent.
+
+| Status | Where | Disposition |
+|---|---|---|
+| `SUCCESS` then proof `OK` | submit → verify | apply (send and resume alike) |
+| `TRANSACTION_HASH_MISMATCH` | verify | the **only** conflict signal — `TransferConflictError` (transfer/burn leg) / `SplitCheckpointLostError` (mint leg); unchanged |
+| `REQUEST_EXPIRED` | submit | **not** a clean reject — keep-open (`ProofUnconfirmedError`), and **never retried**: a round's reference time only advances, so bytes it has already judged late can never be admitted in this round or a later one (the deadline is the service's own, held on its request record — omitting `expiresAt` does not make a re-submit a different transaction). An attempt made before that deadline may still have certified, which is why the probe runs regardless |
+| `SERVICE_NOT_READY` | submit | retried in place (`TransientSubmitAnswer`, `token-engine/proof-wait.ts`) under the same certification deadline; if it never clears, keep-open. A retried submit can never be a clean reject afterwards — the earlier POST may already have been processed |
+| `REQUEST_EXPIRED` / `REFERENCE_TIME_AFTER_ROUND` | verify | keep-open, like every non-`OK` verdict that is not the hash mismatch |
+| any other non-`SUCCESS`, known or unknown | submit | unchanged: `CLEAN_REJECT_STATUSES` holds exactly the eight known validation rejects; everything else is possibly-certified → keep open |
+
+Neither new status entered `CLEAN_REJECT_STATUSES`, and the names are the trap: each reports only
+that THIS submit was not admitted, never that no earlier attempt certified. `SERVICE_NOT_READY` is
+a 503 in a 200 body — left alone it surfaced `CERTIFICATION_UNCONFIRMED` for a merely booting
+gateway, which is why it is retried at the submit call site rather than reclassified.
+
+**E.4 checkpoints across the 3.x break (#760).** `CHECKPOINT_VERSION` moved 1 → 2 and
+`CHECKPOINT_SDK_VERSION` to `@unicitylabs/state-transition-sdk@3.0.1`
+(`token-engine/split-checkpoint.ts`): the stored burn transaction and its inclusion proof are both
+SDK CBOR and every wire version under them moved, so no v1 record can be replayed. Without the
+bump a stale record still fails — the byte-equality comparison catches it — but it fails blaming
+"derivation drift" and sends the reader hunting a realization bug that is not there; the version
+check names the real cause. **The disposition of a split left in flight across the cutover, stated
+plainly: it is not recovered.** A pre-bump checkpoint decodes to `SplitCheckpointLostError`
+(`split checkpoint version 1 is not supported`), which is keep-open by contract — never complete,
+never abort, never record the source as foreign-spent — while the burn it recorded is certified
+on chain under the old wire major and its mint legs can never be built. The intent stays open with
+a burnt, unrecoverable source and no client-side exit. That is tolerable only because the release
+ships with a testnet and wallet-api backend reset: no data migration was ever in scope (§1
+non-goals), and the durable client state moves generation rather than converting (§6).
 
 ### 5.6 `Delivery`
 
@@ -521,8 +586,26 @@ can lose money.** Each row exists because of a documented server non-guarantee.
 | Settling journal (request → transferId) | #441 — a possibly-committed pay must survive reload | Requests |
 | Stream cursors + syncEpoch (atomic `(cursor, epoch)` record per stream + one global epoch latch) | wakes are lossy; epoch guards restores | Session/owners |
 
-All keyed per-network **and** per-address (the old `isNetworkScopedAddressKey` discipline
-carries over: a testnet journal must never act on another network).
+All keyed per-network **and** per-address: the scope prefix is `pv2g2:{network}:{chainPubkey}:`,
+self-scoping, so the old `isNetworkScopedAddressKey` mechanism is not involved — but its discipline
+carries over (a testnet journal must never act on another network).
+
+**Key generation — renaming IS the 3.x migration (#760).** Generation 2 (`pv2g2:`) replaced the
+original `pv2:` prefix with the SDK bump, and `sweepSupersededState()` clears the superseded prefix
+at composition (`core/payments-v2-wiring.ts`; fire-and-forget, idempotent, and never
+`storage.clear()` with no prefix — that would take the mnemonic). Nothing under `pv2:` is readable
+any more: intents, checkpoints and journals all reference a token wire format the network no longer
+accepts. Leaving them readable is worse than losing them, and the reason is one row of the table
+above — **the epoch latch**. A surviving latch makes the session see a CHANGED `syncEpoch` after
+the backend reset that accompanies the release, which runs the §5.1 restore protocol
+(`modules/payments-v2/restore.ts`) and re-PUTs every locally-open intent into the freshly wiped
+backend. Those intents reference tokens that no longer exist, so they can never complete; the
+server now calls them open, so nothing can drop them — a permanent `pendingTransfers()` row holding
+its sources reserved, with no error surface and no operator verb to clear it. `Sphere.clear()` is
+not a mitigation: it wipes the whole KV, mnemonic included. Under the new prefix the latch reads
+null, `noteEpoch` takes its `previous === null` early return, and no restore fires. Pinned by
+`tests/unit/payments-v2/kv-generation.test.ts` and a case in
+`tests/integration/sphere-payments-v2-wiring.test.ts`.
 
 ## 7. Concurrency model
 
@@ -588,7 +671,9 @@ verify per entry, batched acks.
 - **Ported invariant tests** (verified-RED pedigree): the gated-engine contention trio; the
   wallet-api-delivery suite's load-bearing tests (#621 re-deliver-never-re-certify; #631
   keep-open pair; audit#4 false-paid guards; #676 double-pay guards; #634 checkpoint resume +
-  v:1 refusal; #677 remainder family; the delivery-journal lifecycle; putIntent-before-engine;
+  the pre-E.4 `v:1` INTENT-payload refusal (unrelated to the split-checkpoint version, which the
+  3.x bump moved to 2 — §5.5); #677 remainder family; the delivery-journal lifecycle;
+  putIntent-before-engine;
   #715 provider pinning; the #724 test ported as its **outcome** — "a claimed/acked incoming
   token is never subsequently absent from the view + server inventory", asserted under a
   concurrent drain and delta-pull, since v2 has no load/mutex for a "never overlap" phrasing to
@@ -690,7 +775,8 @@ pay single-flight; settling journal durable-before-throw; post-commit mirror fai
 pre-submit 422 intent rejection drops backstop (re-seed rejection keeps it), never aborts;
 suspectedSpent demotion durable + re-plan bounded; remainder-only re-plan under new transferId +
 durable shortfall record; provider pinning; fail-closed composition; recipient network pinned at
-resolve (deposit 200 ≠ reachability); mint journaled pre-submit, replayed at start.
+resolve (deposit 200 ≠ reachability); mint journaled pre-submit, replayed at start; no request
+deadline on any submitted transaction, so every rebuild is clock-independent (#760).
 E.4 checkpoint: no mint submit before the checkpoint is server-acked and read back
 (`CheckpointPersistFailedError` with zero mints otherwise); encrypt once — ciphertext persisted
 locally before the first POST, retries byte-identical; adopt the slot winner's bytes; stored
@@ -719,6 +805,8 @@ first-write-wins returning the stored record; mailbox deposit is entry_id-idempo
 key-variant 409; claim is per-entry transactional (partial success normal) and may precede the
 sender's apply (handoff commutes); reject never downgrades a claim and never blocks the asset;
 wakes are post-commit best-effort lossy; reads are un-throttled but page-capped; `syncEpoch`
-changes only on DB restore; blob wire format is raw `Token.toCBOR()` (the sphere `TokenBlob`
-envelope 422s); presigned PUTs pin signed headers (`x-amz-checksum-sha256`, `If-None-Match: *`);
+changes only on DB restore; blob wire format is raw `Token.toCBOR()` — the sphere-private
+`TokenBlob` envelope that used to 422 here was deleted with the 3.x bump, and `TokenBlob` is now
+just `{ tokenId, token }` over those same bytes; presigned PUTs pin signed headers
+(`x-amz-checksum-sha256`, `If-None-Match: *`);
 S3 412 on upload = blob exists = success.

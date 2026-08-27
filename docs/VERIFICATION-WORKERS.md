@@ -10,6 +10,16 @@ fanned out to a pool of workers. Sphere exposes that as **opt-in configuration**
 `verification` to `Sphere.init()` (or to `EngineConfig` if you build the engine yourself)
 and the engine verifies through the pool instead.
 
+The entry-script contract is **unchanged by sphere-sdk 0.15.0's bump to state-transition-sdk
+3.0.1**: across 2.1.0 and 3.0.1 the base SDK's `IWorker`, `WorkerTokenVerifier` and the two
+`*TransferTransactionVerifierWorker` bases declare the same members with the same signatures
+(the whole `.d.ts` diff is one doc-comment link), and only the main-thread side of the engine
+moved. The scripts below did change, because they were
+incomplete before — the worker base has required **two** verifiers since 2.1.0, and an entry
+script supplying only `predicateVerifier` does not compile (`TS2515`). Read [Same major on both
+sides](#same-major-on-both-sides) as well: the bump makes an already-latent version mismatch
+produce a wrong verdict rather than an error.
+
 **When it is worth it:** long provenance chains — a token that has changed hands many
 times — and batch receives, where several such tokens verify at once. A freshly minted
 token has nothing to parallelise; leave the option off and nothing changes.
@@ -19,23 +29,64 @@ token has nothing to parallelise; leave the option off and nothing changes.
 The entry script is yours to author and bundle, because only your bundler knows how to emit
 a worker. Sphere never spawns one for you.
 
-> **The predicate verifier on both sides must match.** The worker builds its own, and the
-> engine builds its own. If they differ, the transfers verified in the worker and the
-> genesis verified on the main thread are judged under different rules, and the token
-> verdict silently diverges from the sequential one. `PredicateVerifierService.create()` on
-> both sides is the safe default.
+A worker entry script supplies **two** verifiers, because verifier instances cannot cross the
+worker boundary and each side therefore builds its own:
+
+> **Both must be equivalent to the engine's.** The worker builds its `predicateVerifier` and its
+> `unicityCertificateVerifier`; the engine builds its own. If either differs, the transfers
+> verified in the worker and the genesis verified on the main thread are judged under different
+> rules, and the token verdict silently diverges from the sequential one — a wrong **verdict**,
+> not an error. `PredicateVerifierService.create()` matches what the engine builds; for the
+> certificate verifier, mirror the engine's construction as shown below (the seal cache is a
+> per-instance memo, not a rule, so its size is yours to choose and omitting it only costs
+> speed).
+
+### Same major on both sides
+
+`tsup` marks `/^@unicitylabs\//` **external** in every sphere-sdk bundle, so the engine resolves
+*your* copy of `@unicitylabs/state-transition-sdk` at runtime — and so does your worker entry
+script, which imports it directly. Normally that is the point: one copy, one set of rules.
+
+It becomes a trap when the two resolve to different majors. sphere-sdk 0.15.0 pins `3.0.1`
+exactly, and v3 changed what a sparse-Merkle leaf commits to — the leaf value is
+`H(transactionHash, referenceTime)` where 2.x used the bare transaction hash. **A 2.x worker
+paired with a 3.x engine does not throw. It returns a verdict computed under the old rule**, and
+the pool path then disagrees with the sequential path on real tokens.
+
+So: keep exactly one `@unicitylabs/state-transition-sdk` in the tree, on the major sphere-sdk
+pins, and make sure your worker bundle resolves that same copy (check `npm ls
+@unicitylabs/state-transition-sdk` for a duplicate nested under another dependency, and check
+that your bundler's worker entry is not aliasing a second copy). If you cannot guarantee it,
+leave `verification` unset — the sequential verifier runs inside the engine and cannot diverge
+from itself.
 
 ### Node
 
 ```ts
 // verification-worker.mjs — its own module; spawned as a worker thread.
 import { PredicateVerifierService } from '@unicitylabs/state-transition-sdk/lib/predicate/verification/PredicateVerifierService.js';
+import { UnicityCertificateVerifier } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/UnicityCertificateVerifier.js';
+import { UnicitySealQuorumSignaturesVerificationRule } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/rule/UnicitySealQuorumSignaturesVerificationRule.js';
+import { VerifiedSealCache } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/VerifiedSealCache.js';
+import { Secp256k1SignatureVerifier } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/Secp256k1SignatureVerifier.js';
 import { NodeTransferTransactionVerifierWorker } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/worker/NodeTransferTransactionVerifierWorker.js';
 
 class Worker extends NodeTransferTransactionVerifierWorker {
-  #verifier = PredicateVerifierService.create();
+  #predicates = PredicateVerifierService.create();
+  // Mirrors what the engine builds (token-engine/factory.ts).
+  #certificates = new UnicityCertificateVerifier(
+    new UnicitySealQuorumSignaturesVerificationRule(
+      new Secp256k1SignatureVerifier(),
+      new VerifiedSealCache(256), // omit to verify every seal afresh
+    ),
+  );
+
   get predicateVerifier() {
-    return this.#verifier;
+    return this.#predicates;
+  }
+
+  get unicityCertificateVerifier() {
+    return this.#certificates;
   }
 }
 
@@ -61,12 +112,28 @@ const { sphere } = await Sphere.init({
 ```ts
 // verification-worker.ts — bundled as a worker entry by your build.
 import { PredicateVerifierService } from '@unicitylabs/state-transition-sdk/lib/predicate/verification/PredicateVerifierService.js';
+import { UnicityCertificateVerifier } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/UnicityCertificateVerifier.js';
+import { UnicitySealQuorumSignaturesVerificationRule } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/rule/UnicitySealQuorumSignaturesVerificationRule.js';
+import { VerifiedSealCache } from '@unicitylabs/state-transition-sdk/lib/api/bft/verification/VerifiedSealCache.js';
+import { Secp256k1SignatureVerifier } from '@unicitylabs/state-transition-sdk/lib/crypto/secp256k1/Secp256k1SignatureVerifier.js';
 import { BrowserTransferTransactionVerifierWorker } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/worker/BrowserTransferTransactionVerifierWorker.js';
 
 class Worker extends BrowserTransferTransactionVerifierWorker {
-  private readonly verifier = PredicateVerifierService.create();
+  private readonly predicates = PredicateVerifierService.create();
+  // Mirrors what the engine builds (token-engine/factory.ts).
+  private readonly certificates = new UnicityCertificateVerifier(
+    new UnicitySealQuorumSignaturesVerificationRule(
+      new Secp256k1SignatureVerifier(),
+      new VerifiedSealCache(256), // omit to verify every seal afresh
+    ),
+  );
+
   protected get predicateVerifier(): PredicateVerifierService {
-    return this.verifier;
+    return this.predicates;
+  }
+
+  protected get unicityCertificateVerifier(): UnicityCertificateVerifier {
+    return this.certificates;
   }
 }
 
@@ -96,8 +163,11 @@ for the engine being replaced. If you drive `createSphereTokenEngine` yourself, 
 
 ## What is guaranteed
 
-- **Same verdict.** Both verifiers produce the same aggregated result; only the placement of
-  the work differs. The worker path is upstream's implementation, tested there.
+- **Same verdict — given the same rules on both sides.** Both verifiers produce the same
+  aggregated result; only the placement of the work differs. The worker path is upstream's
+  implementation, tested there. The guarantee is conditional on the two verifiers matching and
+  on both sides resolving the same base-SDK major — see [Same major on both
+  sides](#same-major-on-both-sides).
 - **No effect when unset.** Omit `verification` and the engine runs the sequential verifier
   it always did. No worker module enters your bundle — Sphere imports only the base SDK
   paths it already used.

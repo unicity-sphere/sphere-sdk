@@ -2,6 +2,45 @@
 
 A modular TypeScript SDK for Unicity wallet operations (Unicity state transition network).
 
+## 0.15.0 — the state-transition-sdk 3.0.1 flag day
+
+`0.15.0` pins `@unicitylabs/state-transition-sdk` at **3.0.1** (exact). v3 threads one new
+concept through the protocol — every transaction carries `expiresAt`, an exclusive request
+deadline, and every inclusion proof carries the `referenceTime` of the round that certified it —
+and the sparse-Merkle leaf value became `H(transactionHash, referenceTime)` instead of the bare
+transaction hash. Every wire version underneath moved with it (`Token`, `MintTransaction`,
+`TransferTransaction`, `CertificationData`): **nothing a 2.x client wrote decodes, and nothing a
+2.x client writes is accepted by the upgraded gateway.** There is no straddle window and no
+compatibility shim — the forcing function is the aggregator itself, which rejects
+`CertificationDataVersion = 1`, so the gateway cutover is a fleet-wide flag day.
+
+What an integrator has to do:
+
+- **Bump sphere-sdk and your wallet-api deployment together.** Both repos pin the base SDK
+  exactly, so a one-sided bump leaves two mutually unintelligible realms live. A 0.15.0 wallet
+  cannot transact against a pre-cutover gateway, and a 0.14.x wallet cannot transact against the
+  cut-over one. The release is accompanied by a testnet + wallet-api backend reset.
+- **Drop `sphere.paymentsV2`.** The deprecated alias and the `paymentsV2: true` init flag are
+  both removed; `sphere.payments` is the only accessor — and it **throws** `NOT_INITIALIZED`
+  where the alias returned `null`. See [Migrating off `sphere.paymentsV2`](#migrating-off-spherepaymentsv2).
+- **Nothing to run for stored state.** The durable client KV moved generation — the scoped
+  prefix is now `pv2g2:{network}:{chainPubkey}:` and the superseded `pv2:` keys are swept once
+  when the vertical is composed. The rename IS the migration; `Sphere.clear()` is not required
+  (and is not a substitute — it takes the mnemonic with it).
+- **Stored 2.x split checkpoints are unreadable by design.** `CHECKPOINT_VERSION` is 2 and the
+  version check names the cause, instead of the byte comparison blaming "derivation drift".
+
+Deliberately unchanged: the `DIRECT://` address derivation, the `SpherePaymentData` value
+envelope (CBOR tag 39050), the Connect protocol version (still `2.1` — the wire is untouched,
+see [docs/CONNECT.md](docs/CONNECT.md)), and the consumer-authored worker verification entry
+script ([docs/VERIFICATION-WORKERS.md](docs/VERIFICATION-WORKERS.md), which gains one hard
+requirement: the worker and the engine must resolve the SAME base-SDK major).
+
+> **"v2" in this README is the gateway network, not the SDK major.** `testnet` is an alias of
+> **testnet2** — the v2 state-transition gateway network, trust-base networkId 4 — and that name
+> is a different axis from the base SDK's version. testnet2 stays testnet2 on
+> state-transition-sdk 3.x; it is not renamed to "testnet3".
+
 ## Features
 
 - **Wallet Management** - BIP39/BIP32 key derivation; optional password encryption (PBKDF2)
@@ -110,7 +149,7 @@ A wallet is composed from **swappable ports**, layered in two steps:
 - **The rail is wallet-api, not Nostr.** Transfers are certified on-chain by the token engine and the finished token is deposited into the recipient's **wallet-api mailbox**. Nostr carries messaging/nametags — **it does not move payments.**
 - **Custody is server-side.** The wallet-api backend holds your token inventory; your keys never leave the client. (Own-storage custody was rescinded — there is no local token store.)
 - **The money ports are contract-enforced.** `StoragePort`/`DeliveryPort` (`modules/payments-v2/ports.ts`) have wallet-api implementations; the `paymentsV2Transport` seam in the `walletApi` config lets tests/custom hosts inject a whole replacement bundle.
-- **`network` placement.** Required on `createBrowserProviders`/`createNodeProviders` AND in the `walletApi` config (init throws `INVALID_CONFIG` without either); optional/informational on `Sphere.init`.
+- **`network` placement.** Required on `createBrowserProviders`/`createNodeProviders`, in the `walletApi` config, AND on `Sphere.init` — the three must agree. `Sphere.init` resolves the payments composition and the token registry from its own `network`, so omitting it or letting it disagree with `walletApi.network` throws `INVALID_CONFIG` before any storage write.
 
 For manual/advanced provider wiring, see [Custom Providers Configuration](#custom-providers-configuration). For the deeper integration guide, see [docs/INTEGRATION.md](docs/INTEGRATION.md).
 
@@ -148,6 +187,46 @@ try {
 }
 ```
 
+## Migrating off `sphere.paymentsV2`
+
+`sphere.paymentsV2` was a deprecated alias of `sphere.payments`, kept one release for the live
+frontend. It is **removed** in 0.15.0, along with the `paymentsV2: true` init flag (which had
+already been a no-op). `sphere.payments` is the only accessor, and it is the same facade the
+alias returned.
+
+The one behavioural difference is the part a consumer will otherwise discover in production:
+
+| | `sphere.paymentsV2` (removed) | `sphere.payments` |
+|---|---|---|
+| No vertical running (init in flight, mid address-switch, destroyed) | returned `null` | **throws** `SphereError` with `code: 'NOT_INITIALIZED'` |
+
+Any call site that leaned on the nullish alias — `sphere.paymentsV2?.tokens()`,
+`sphere.paymentsV2 ?? fallback`, `if (sphere.paymentsV2)` as a readiness probe — silently
+degraded to "no payments" before and now throws. Rewrite those to read the facade only once you
+know a vertical is running, or guard the read:
+
+```ts
+// BEFORE — the alias absorbed "not ready yet"
+const tokens = sphere.paymentsV2?.tokens() ?? [];
+
+// AFTER — the throw is the readiness signal; catch it where you used to check for null
+let tokens: Token[] = [];
+try {
+  tokens = sphere.payments.tokens();
+} catch (err) {
+  if (!isSphereError(err) || err.code !== 'NOT_INITIALIZED') throw err;
+}
+```
+
+`Sphere.init()` resolves with the vertical started, so code that runs after `await Sphere.init(…)`
+and before `destroy()` — everything in this README — reads `sphere.payments` directly. The guard
+is only for code that can run while the wallet is between states.
+
+The `accounting:` / `swap:` init options are **not** part of this cleanup: they still throw a
+typed `INVALID_CONFIG`, deliberately, through 0.15.0 — a silent no-op would hide that invoicing
+and swaps no longer exist in the SDK, and 0.15.0 is precisely the release where consumers
+re-integrate.
+
 ## Network Configuration
 
 The SDK ships network presets that configure all services automatically. `network` is **required** — there is no default:
@@ -159,7 +238,9 @@ The SDK ships network presets that configure all services automatically. `networ
 | `mainnet` | aggregator.unicity.network (v1-era) | relay.unicity.network (+ public relays) |
 | `dev` | dev-aggregator.dyndns.org (v1-era) | nostr-relay.testnet.unicity.network |
 
-> **v1 → v2 cutover:** `testnet` now points at **testnet2**, the v2 state-transition gateway network (network id 4, taken from the trust base; own testnet2 token registry). The old `goggregator-test` testnet spoke the removed v1 protocol and is gone. `mainnet` and `dev` still point at v1-era aggregators — wallet operations that move money (`send`, `mint`) **fail loudly** (`AGGREGATOR_ERROR`) on those networks until their gateways are cut over to the v2 protocol. The transfer wire payload is the finished v2 token blob (raw `Token.toCBOR()`), deposited into the recipient's wallet-api mailbox.
+> **v1 → v2 cutover:** `testnet` now points at **testnet2**, the v2 state-transition gateway network (network id 4, taken from the trust base; own testnet2 token registry). The old `goggregator-test` testnet spoke the removed v1 protocol and is gone. `mainnet` and `dev` still point at v1-era aggregators — wallet operations that move money (`send`, `mint`) **fail loudly** (`AGGREGATOR_ERROR`) on those networks until their gateways are cut over. The transfer wire payload is the finished token blob — the base SDK's own `Token.toCBOR()` bytes, with no sphere envelope around them — deposited into the recipient's wallet-api mailbox.
+>
+> The **network** name (testnet2) and the **base-SDK major** (3.x since 0.15.0) are separate axes: testnet2 is still testnet2 after the 3.0.1 bump. What the bump changes is the bytes on that network — a gateway serving the v3 protocol accepts nothing a 2.x client writes, and vice versa.
 
 ```typescript
 // Use testnet for all services
@@ -168,7 +249,7 @@ const providers = createBrowserProviders({ network: 'testnet' });
 // Override specific services while using network preset
 const providers = createBrowserProviders({
   network: 'testnet',
-  oracle: { url: 'https://custom-gateway.example.com' }, // custom v2 gateway
+  oracle: { url: 'https://custom-gateway.example.com' }, // custom testnet2 gateway
 });
 ```
 
@@ -199,7 +280,7 @@ The `testnet` preset wires most of these automatically — you only pass `networ
 | **Group-chat relay** (NIP-29) | `wss://sphere-relay.unicity.network` |
 | **Token registry** | `https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json` |
 
-The aggregator key above is the **testnet2** key only and is safe in client code; a **mainnet** key is a real secret. `mainnet`/`dev` still point at v1-era aggregators and cannot serve the v2 engine yet (`AGGREGATOR_ERROR`).
+The aggregator key above is the **testnet2** key only and is safe in client code; a **mainnet** key is a real secret. `mainnet`/`dev` still point at v1-era aggregators and cannot serve the engine (`AGGREGATOR_ERROR`).
 
 ## Price Provider (Optional)
 
@@ -243,7 +324,7 @@ sphere.setPriceProvider(createPriceProvider({
 
 ## Test Tokens on Testnet (Self-Mint)
 
-There is no faucet. On testnet you top up your wallet by **self-minting** fungible tokens via the v2 token engine — `mint(coinIdHex, amount)` mints a finished token directly to this wallet (journal-first: crash-safe, a replay converges idempotently):
+There is no faucet. On testnet you top up your wallet by **self-minting** fungible tokens via the token engine — `mint(coinIdHex, amount)` mints a finished token directly to this wallet (journal-first: crash-safe, a replay converges idempotently):
 
 ```typescript
 import { getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
@@ -259,7 +340,7 @@ if (result.success) {
 }
 ```
 
-> **Note:** Minting requires a working v2 oracle config (trust base + gateway URL + API key) — it fails with an error result otherwise. See [API Key](#api-key) above.
+> **Note:** Minting requires a working oracle config (trust base + gateway URL + API key) — it fails with an error result otherwise. See [API Key](#api-key) above.
 
 ## Multi-Address Support
 
@@ -596,7 +677,7 @@ const transport = createNostrTransportProvider({
   relays: ['wss://nostr-relay.testnet.unicity.network'],
 });
 // `network` (or `trustBaseUrl`) is required — it selects the trust base the
-// v2 token engine is built from. The apiKey authenticates gateway requests.
+// token engine is built from. The apiKey authenticates gateway requests.
 const oracle = createUnicityAggregatorProvider({
   url: 'https://gateway.testnet2.unicity.network',
   apiKey: 'sk_...',
@@ -722,7 +803,16 @@ import {
 
 ## Token format & verification
 
-Tokens are opaque **v2 CBOR blobs** (`Token.sdkData` carries the hex when a blob is loaded). Inventory lives in the wallet-api backend; the SDK downloads blobs on demand (lazy tokens carry value metadata only until selected for a spend). Every incoming token is engine-verified (full trust-base proof check) and ownership-checked **before it enters the balance** — there is no separate validate step to run.
+Tokens are opaque CBOR blobs — the base SDK's own `Token.toCBOR()` bytes, with no sphere-private
+envelope wrapped around them (`Token.sdkData` carries the hex when a blob is loaded). That is the
+same form on the wire, in the wallet-api mailbox and in server storage. Since 0.15.0 those bytes
+are **state-transition-sdk 3.x** CBOR; a 2.x blob does not decode and is rejected on receipt (the
+drain warns and acks it as invalid rather than silently dropping it).
+
+Inventory lives in the wallet-api backend; the SDK downloads blobs on demand (lazy tokens carry
+value metadata only until selected for a spend). Every incoming token is engine-verified (full
+trust-base proof check) and ownership-checked **before it enters the balance** — there is no
+separate validate step to run.
 
 ## Architecture
 
@@ -742,7 +832,7 @@ mnemonic → master key → BIP32 derivation → identity
               ↓                  ↓                  ↓
          L3 (Unicity)        Group Chat           Nostr
        sphere.payments    sphere.groupChat  sphere.communications
-      Tokens, v2 engine   NIP-29 messaging    P2P messaging
+       Tokens, engine     NIP-29 messaging    P2P messaging
 ```
 
 ```
@@ -761,14 +851,14 @@ Payments vertical (modules/payments-v2/ — docs/PAYMENTS-V2-DESIGN.md)
     `walletApi` transport config (core/payments-v2-wiring.ts).
 
 Token Engine (token-engine/)
-└── The wallet's boundary to the v2 state-transition SDK: all mint /
-    transfer / split / verify / spent-check operations go through the
-    ITokenEngine port. Sphere builds the engine from the oracle's config
+└── The wallet's boundary to the base state-transition SDK (pinned 3.0.1):
+    all mint / transfer / split / verify / spent-check operations go through
+    the ITokenEngine port. Sphere builds the engine from the oracle's config
     (trust base JSON + gateway URL + API key); no state-transition SDK
     objects cross this boundary.
 
 Providers (injectable)
-├── StorageProvider      - Key-value persistence: keys/identity + the pv2:* scoped KV
+├── StorageProvider      - Key-value persistence: keys/identity + the pv2g2:* scoped KV
 ├── TransportProvider    - Messaging (Nostr) — NOT the payment rail
 ├── OracleProvider       - Token-engine config (trust base JSON + gateway URL + API key)
 └── walletApi (config)   - WalletApiTransportConfig — the wallet-api wire the
@@ -841,8 +931,19 @@ type NodeOracleConfig = BaseOracleConfig & NodeOracleExtensions;
 
 ## Documentation
 
-- [Integration Guide](./docs/INTEGRATION.md)
-- [API Reference](./docs/API.md)
+Consumer-facing:
+
+- [API Reference](./docs/API.md) — the full surface of `Sphere` and the payments facade
+- [Integration Guide](./docs/INTEGRATION.md) — composition, custody, custom providers, events
+- [Browser Quick Start](./docs/QUICKSTART-BROWSER.md) / [Node.js Quick Start](./docs/QUICKSTART-NODEJS.md)
+- [Connect Protocol](./docs/CONNECT.md) — dApp ↔ wallet RPC (protocol version `2.1`)
+- [Parallel token verification](./docs/VERIFICATION-WORKERS.md) — the opt-in worker pool
+- [CHANGELOG](./CHANGELOG.md) — per-release notes (versioned sections start at `0.14.11`)
+
+Design and migration references:
+
+- [Payments vertical design](./docs/PAYMENTS-V2-DESIGN.md) — the authoritative money design
+- [Payments migration guide](./docs/MIGRATION-PAYMENTS-V2.md) — what the P11 flip moved
 
 ## Browser Providers
 
@@ -852,7 +953,7 @@ The SDK includes browser-ready provider implementations:
 |----------|-------------|
 | `LocalStorageProvider` | Browser localStorage with SSR fallback |
 | `NostrTransportProvider` | Nostr relay messaging with NIP-04 |
-| `UnicityAggregatorProvider` | Network config for the v2 token engine (trust base + gateway URL + API key) |
+| `UnicityAggregatorProvider` | Network config for the token engine (trust base + gateway URL + API key) |
 
 ## Node.js Providers
 
@@ -1070,7 +1171,7 @@ Nametags provide human-readable addresses (e.g., `@alice`) for receiving payment
 
 **How registration works:** registering a nametag publishes a **Nostr identity binding** (name ↔ chain pubkey). Uniqueness is first-seen-wins — a name is available iff no binding already resolves for it (`sphere.isNametagAvailable(name)`). Runtime name resolution is binding-only; payments always go to the recipient's key-based `DIRECT://` address (there are no PROXY addresses).
 
-In addition, a self-issued v2 `UnicityIdToken` (the on-chain claim) is minted and stored **best-effort** at registration — a gateway outage or missing v2 oracle config never fails registration; the mint is retried on the next load, and the token is not consumed anywhere at runtime yet.
+Registration is **Nostr-binding-only**. The self-issued `UnicityIdToken` on-chain claim was removed with the 2.0.0 state-transition-sdk bump (upstream deleted the unicity-id primitive) — nothing is minted at registration, and nothing on chain is consulted to resolve a name.
 
 ### Registering a Nametag
 

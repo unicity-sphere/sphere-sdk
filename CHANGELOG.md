@@ -9,6 +9,168 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.15.0] - 2026-08-27
+
+### Changed (BREAKING) — base SDK pinned to `@unicitylabs/state-transition-sdk@3.0.1` (was 2.1.0) (#760)
+
+v3 threads one new concept through the protocol: every transaction carries `expiresAt`, an
+exclusive request deadline in Unix seconds, and every inclusion proof carries the `referenceTime`
+of the round that certified it. The sparse-Merkle leaf value is now
+`H(transactionHash, referenceTime)` rather than the bare transaction hash, and the wire versions
+under `Token`, `MintTransaction`, `TransferTransaction` and `CertificationData` all moved:
+**nothing 2.x wrote decodes, and nothing 2.x writes is accepted by the upgraded gateway.**
+
+That makes the cutover a fleet-wide flag day nothing can straddle. The forcing function is
+`aggregator-go`, whose main already carries `CertificationDataVersion = 2` and hard-rejects
+version 1 on the way in, so there is no window in which both wire forms are served. **A testnet
+reset and a wallet-api backend reset accompany this release**, and `wallet-api` bumps its pin in
+LOCKSTEP: both repos pin the base SDK exactly, so bumping sphere-sdk alone makes npm dedupe
+impossible and two SDK realms run live in one process — they cross at that repo's
+`src/validation/verifier.ts`, where the backend verifies what this SDK produced.
+
+The network reset does not clear a browser's IndexedDB, so a 2.x-encoded token can still reach a
+decode path. It is refused with a `CborError` naming the version rather than skipped silently
+([`tests/unit/token-engine/wire-version.test.ts`](tests/unit/token-engine/wire-version.test.ts),
+pinned against a real 2.1.0-encoded fixture — capturable only while the previous pin exists).
+
+The engine-facing API moved with the pin, which matters to anyone building against `token-engine/`
+internals or a custom `ITokenEngine`: `MintTransaction.create(networkId, recipient, options?)`,
+`TransferTransaction.create(token, recipient, stateMask, options?)` and
+`TokenSplit.split(token, decode, requests, options?)` take an options object where they took
+positionals; `InclusionProofResponse.inclusionProof` is `InclusionProof | null` and **null IS "not
+certified yet"** (the RESPONSE's constructor is private — build one with
+`InclusionProofResponse.certified()` / `.notCertified()`), so `isSpent` and the split pre-flight
+now read the response instead of digging for certification data, and a proof that IS present
+always describes a real leaf with non-nullable fields;
+`InclusionProofVerificationRule.verify` gained `expiresAt` and the predicate verifiers gained
+`referenceTime` as positional #2; `InclusionProofVerificationStatus` DROPPED
+`INCLUSION_CERTIFICATE_MISSING` and `MISSING_CERTIFICATION_DATA` and ADDED `REQUEST_EXPIRED` and
+`REFERENCE_TIME_AFTER_ROUND`; `CertificationStatus` added `REQUEST_EXPIRED` and
+`SERVICE_NOT_READY`.
+
+Unchanged by the bump, stated so nobody re-checks it: the `DIRECT://` derivation
+([`token-engine/identity.ts`](token-engine/identity.ts) — external systems key user identity on
+it), the `SpherePaymentData` value envelope (CBOR tag 39050), the Connect protocol version (stays
+`2.1`), and the worker verification entry-script contract in
+[`docs/VERIFICATION-WORKERS.md`](docs/VERIFICATION-WORKERS.md) — the SDK's `IWorker` /
+`WorkerTokenVerifier` declarations carry the same members and signatures across the major (the
+whole `.d.ts` diff is one doc-comment link), only the main-thread side moved.
+
+### Changed (BREAKING, money) — sphere sets no request deadline, anywhere (#760)
+
+Every mint, transfer, split burn and split mint leg omits `expiresAt`, so the Unicity Service
+assigns one from consensus time and does not record it. The reason is NOT determinism — a deadline
+persisted on the durable intent would rebuild byte-identically on resume. It is that (a) this is a
+browser wallet with an untrusted clock, and one skewed wallet pinning a past deadline is a
+wallet-wide payment outage; and (b) an absolute deadline is unrecoverable across downtime longer
+than the window — every resume rebuilds an already-expired transaction, the intent sits open
+forever with its sources reserved, and nothing on the certify/resume path budgets attempts, so
+nothing ever gives up.
+
+The policy is load-bearing rather than a matter of taste, because of where `expiresAt` sits: it is
+committed by the transaction HASH but is NOT part of the StateId, so two attempts that disagree
+about it address the SAME leaf with DIFFERENT hashes. `InclusionProofVerificationRule` compares
+the transaction hash BEFORE the certification data, so the disagreement surfaces as
+`TRANSACTION_HASH_MISMATCH` — i.e. as a foreign spend — which
+[`token-engine/certification-outcome.ts`](token-engine/certification-outcome.ts) maps to
+`TransferConflictError`: abort and re-plan. A clock-derived deadline would therefore make every
+crash-resume abort an intent whose spend is already on chain.
+[`tests/unit/token-engine/expires-at.test.ts`](tests/unit/token-engine/expires-at.test.ts) pins
+both halves, including a 24-hour clock jump between two attempts at the same transfer.
+
+### Changed — submit-status classification is unchanged; `SERVICE_NOT_READY` is retried (#760)
+
+Neither new `CertificationStatus` is a clean reject. `REQUEST_EXPIRED` and `SERVICE_NOT_READY`
+stay OUT of `CLEAN_REJECT_STATUSES` despite their names: each reports only that THIS submit was
+not admitted, never that no earlier attempt certified — so both keep the status-agnostic treatment
+(always `getInclusionProof`, match-verify) and an indeterminate outcome still surfaces as
+`CERTIFICATION_UNCONFIRMED` with the intent OPEN. `TRANSACTION_HASH_MISMATCH` remains the ONLY
+conflict signal. Callers keep their PENDING_COMMIT handling exactly as before; nothing in the
+error contract moved.
+
+`SERVICE_NOT_READY` is instead RETRIED at the submit call site — a new `TransientSubmitAnswer` in
+[`token-engine/proof-wait.ts`](token-engine/proof-wait.ts) joins the existing transient-HTTP set,
+because the status is a 503 in a 200 body and left alone it surfaced `CERTIFICATION_UNCONFIRMED`
+for nothing worse than a booting gateway. `REQUEST_EXPIRED` must never be retried and is not.
+
+### Removed (BREAKING) — `token-engine/token-blob.ts`, and `TokenBlob` is now `{ tokenId, token }` (#760)
+
+The sphere blob envelope is gone: `encodeTokenBlob`, `decodeTokenBlob`, `unwrapTokenBlobBytes` and
+`TOKEN_BLOB_VERSION` no longer exist (they were internal to `token-engine/`; only the `TokenBlob`
+TYPE was ever exported). `TokenBlob` drops `v` and `network` — neither was read anywhere — leaving
+`{ tokenId, token }`, and the wire/storage form of `token` is the SDK's own `Token.toCBOR()` bytes,
+which is what the wallet-api §16 API already serves. `deriveDeliveryKeys` decodes those bytes
+directly and takes both keys from the decoded token, so they cannot disagree with the token beside
+them. Anyone constructing a `TokenBlob` by hand drops the two fields; anyone who was handing the
+engine an enveloped blob now hands it raw `Token.toCBOR()` bytes.
+
+### Changed (BREAKING) — split checkpoints are version 2 (#760)
+
+`CHECKPOINT_VERSION` is 2 and `CHECKPOINT_SDK_VERSION` is
+`@unicitylabs/state-transition-sdk@3.0.1`
+([`token-engine/split-checkpoint.ts`](token-engine/split-checkpoint.ts)). Every checkpoint stored
+by a 2.x build is unreadable — the burn transaction and its inclusion proof are both SDK CBOR and
+every wire version under them moved. A stale record failed the byte-comparison guard before this
+bump too, but it failed blaming "derivation drift", which sends the reader hunting a realization
+bug that is not there; the version check now names the real cause.
+
+### Changed (BREAKING, money) — the durable client state moved generation: `pv2:` → `pv2g2:` (#760)
+
+The per-(network, address) scoped KV is now prefixed `pv2g2:{network}:{chainPubkey}:`
+([`modules/payments-v2/stores.ts`](modules/payments-v2/stores.ts)), and composing the vertical
+clears the old `pv2:` prefix through `sweepSupersededState()`
+([`core/payments-v2-wiring.ts`](core/payments-v2-wiring.ts)) — fire-and-forget and idempotent,
+since nothing reads the superseded keys. Renaming IS the migration: nothing is read across, and
+what the old prefix held is dropped rather than carried.
+
+That is a money decision, not tidiness. The §6 KV holds intents, checkpoints and journals built
+against a token wire form the network no longer accepts — but the hazard is the sync-epoch latch
+that lives beside them. A SURVIVING latch makes the session see a CHANGED epoch after the backend
+reset and run the §5.1 restore protocol
+([`modules/payments-v2/restore.ts`](modules/payments-v2/restore.ts)), which re-PUTs every
+locally-open intent into the freshly wiped backend. Those intents reference tokens that no longer
+exist, so they can never complete — and the server now calls them open, so nothing can drop them:
+a permanent `pendingTransfers()` row holding its sources reserved, with no error surface.
+`Sphere.clear()` is NOT a mitigation — it calls `storage.clear()` with no prefix and takes the
+mnemonic with it. Under the new prefix the latch reads null, `noteEpoch` takes its
+`previous === null` early return, and no restore fires at all. Pinned by
+[`tests/unit/payments-v2/kv-generation.test.ts`](tests/unit/payments-v2/kv-generation.test.ts)
+(including that the sweep never touches keys outside the payments prefixes) and a case in
+[`tests/integration/sphere-payments-v2-wiring.test.ts`](tests/integration/sphere-payments-v2-wiring.test.ts).
+
+### Removed (BREAKING) — `sphere.paymentsV2` and the `paymentsV2:` init flag (#760)
+
+The deprecated alias and the no-op init flag both end here, one release after the P11 flip:
+`sphere.payments` is the only accessor and `walletApi` is the only composition switch. **The
+behavioural difference consumers must handle:** the alias returned `null` when no vertical was
+running, `sphere.payments` THROWS `NOT_INITIALIZED` (init in flight, mid address-switch,
+destroyed). An `if (sphere.paymentsV2)` guard becomes a try/catch or a lifecycle check — a
+straight rename turns a quiet null branch into a thrown error.
+
+The `accounting:` / `swap:` refusal fossil is DELIBERATELY KEPT through 0.15.0: both were public
+init flags, and a silent no-op is worst precisely in the release where consumers are
+re-integrating across a wire break — a truthy value still throws a typed `INVALID_CONFIG` that
+says invoices and swaps no longer exist in the SDK.
+
+### Changed (BREAKING, wallet hosts) — `SphereInstance.payments` is the v2 facade (#760)
+
+**The Connect WIRE is unchanged — dApps see exactly what they saw before.** What moved is the
+object a wallet host hands `ConnectHost`. [`connect/host/SphereInstance.ts`](connect/host/SphereInstance.ts)
+dropped its legacy `payments: { getBalance / getAssets / getFiatBalance / getTokens / getHistory }`
+shape and its optional `paymentsV2`, and now declares `readonly payments: PaymentsV2`. A real
+`Sphere` satisfies that as-is; a host that hands `ConnectHost` a hand-rolled object supplies the
+facade as `payments` instead of the five legacy getters — and since `ConnectHostConfig.sphere` is
+declared `unknown` and `SphereInstance` is internal, that object is checked when a money query
+arrives, not by the host's compiler.
+
+`payments` is read LAZILY, per query branch, never once at the top of the dispatcher — the getter
+throws while no vertical runs, and `sphere_getIdentity` must still answer there. The legacy-host
+fallbacks in `ConnectHost` are gone (dead since the P11 flip), so `sphere_getBalance` and
+`sphere_getAssets` are now literally the same call and `sphere_getFiatBalance` is summed from
+`assets()`; the §4 compat adapter that re-emits the old event names is likewise unconditional
+rather than gated on a nullable `paymentsV2`. The protocol version stays `2.1` and the surface
+stays 14 queries / 6 intents / 13 scopes.
+
 ## [0.14.11] - 2026-08-25
 
 ### Added — `DeliveryPort.ackBatch()`: settle a drain in batches, not one call per entry (#757)
@@ -1043,5 +1205,6 @@ consumed exclusively through the `token-engine/` port. Consequences:
      version tags past v0.9.x, so a tag-compare link would 404. -->
 
 [Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/main...HEAD
+[0.15.0]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.15.0
 [0.14.11]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.14.11
 [0.14.10]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.14.10

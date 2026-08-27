@@ -6,6 +6,22 @@ Sphere Connect is a secure wallet-dApp communication protocol. It allows web app
 
 The current Connect protocol version is **`2.1`** (`SPHERE_CONNECT_VERSION = '2.1'`).
 
+> **sphere-sdk 0.15.0 does NOT bump it.** That release pins the base
+> `@unicitylabs/state-transition-sdk` at `3.0.1` — a hard wire break on the *state-transition*
+> protocol that no client can straddle — but Connect messages carry no state-transition bytes.
+> The token blob never crosses this wire (`sphere_getTokens` strips the internal `sdkData` field
+> before answering, as it always has), so **no dApp changes anything**: the method list, params,
+> result shapes, events, scopes and error codes are all byte-identical to 0.14.x. Do not bump
+> `SPHERE_CONNECT_VERSION` for the base-SDK pin — the versioning rules below key on the *wire*
+> surface, and `tests/unit/connect/protocol-surface.test.ts` snapshots exactly that.
+>
+> The `minSdkVersion` floor a host enforces is likewise unchanged (`0.14.1-0`, see below). It is
+> a Connect-era hygiene check, not a money-compatibility check: a 0.14.x dApp still handshakes
+> with a 0.15.0 wallet, and the wallet is the only party that touches the chain.
+>
+> What *does* change is wallet-host-side, not dApp-side — see
+> [ConnectHost: the `SphereInstance` contract](#connecthost-the-sphereinstance-contract).
+
 ### Compatibility policy
 
 - **Same MAJOR = compatible.** A dApp on 2.0 and a wallet on 2.1 connect fine — MINOR versions within the same MAJOR interoperate.
@@ -249,6 +265,44 @@ host.updateSphere(sphere);
 // Destroy host and clean up transport
 host.destroy();
 ```
+
+### ConnectHost: the `SphereInstance` contract
+
+`ConnectHost` does not require a real `Sphere` — it works against anything shaped like
+`SphereInstance` (`connect/host/SphereInstance.ts`), which is how wallet hosts and tests inject
+their own object. The type is deliberately internal: `ConnectHostConfig.sphere` is declared
+`unknown` and `SphereInstance` is not re-exported from `connect/`, so a hand-rolled host object
+is checked at RUNTIME, never by your compiler. **That shape changed in 0.15.0**, in step with the
+SDK dropping the `sphere.paymentsV2` alias:
+
+```typescript
+export interface SphereInstance {
+  readonly identity: { chainPubkey: string; directAddress?: string; nametag?: string } | null;
+  readonly networkId?: number;
+  /** The payments facade. Read LAZILY, per query branch — see below. */
+  readonly payments: PaymentsV2;
+  signMessage(message: string): string;
+  resolve(identifier: string): Promise<unknown>;
+  on<T extends SphereEventType>(type: T, handler: SphereEventHandler<T>): () => void;
+  // …
+}
+```
+
+- The legacy `payments: { getBalance/getAssets/getFiatBalance/getTokens/getHistory }` shape and
+  the optional `paymentsV2` member are **both gone**. A host that supplies only the legacy read
+  shape no longer satisfies the contract — hand over the facade as `payments` instead. Extra
+  members on your object stay harmless; a missing `payments` is what breaks, and because the
+  config field is `unknown` it breaks on the first money query, not at build time.
+- The host's legacy fallbacks went with them (they had been dead since the P11 flip), which is
+  why `sphere_getBalance` and `sphere_getAssets` are now literally the same call and
+  `sphere_getFiatBalance` is summed from `assets()`.
+- **`payments` is read per query branch, never once up front.** A real `Sphere`'s getter
+  **throws** `NOT_INITIALIZED` while no vertical runs — init in flight, mid address-switch,
+  destroyed — and `sphere_getIdentity` must still answer in that window. If you implement
+  `SphereInstance` yourself, make `payments` a getter with the same semantics rather than a
+  field captured at construction.
+
+None of this reaches a dApp: the wire is unchanged.
 
 ### The lifecycle verbs
 
@@ -494,8 +548,12 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `sphere_disconnect` | — | `{ disconnected }` |
 
 > The money queries (`sphere_getBalance`/`getAssets`/`getFiatBalance`/`getTokens`/`getHistory`)
-> keep their pre-flip result shapes: on a payments-v2 host they are served through the host's
+> keep their pre-flip result shapes: they are served from the payments facade through the host's
 > wire-compat adapter (see [Compatibility](#compatibility-the-old-wire-contract-on-a-v2-host)).
+> `sphere_getBalance` and `sphere_getAssets` are the same call and return the same array —
+> the two names are a fossil of the pre-flip module, kept because dApps call both.
+> `sphere_getTokens` strips the internal `sdkData` field from every token before answering, so
+> the raw token CBOR never crosses the Connect wire.
 
 ## Intent Actions (require user confirmation)
 
@@ -612,14 +670,19 @@ requesting the removed scopes fails permission validation.
 ## Compatibility: the old wire contract on a v2 host
 
 The SDK's payments vertical (P11 flip) replaced the old module's events and read methods, but
-**the Connect wire contract is unchanged — dApps change nothing.** A host running the v2 facade
-serves the old contract through a built-in adapter (`connect/host/payments-compat.ts`):
+**the Connect wire contract is unchanged — dApps change nothing.** The host serves the old
+contract through a built-in adapter (`connect/host/payments-compat.ts`). As of 0.15.0 this is the
+only path: the host's pre-flip fallbacks were removed along with the `sphere.paymentsV2` alias,
+so the adapter is no longer conditional on which stack the wallet runs.
 
-- **Queries:** `sphere_getBalance` and `sphere_getAssets` are served from `payments.assets()`
-  (the Asset shape is unchanged; `unconfirmed*` fields are pinned `'0'`/`0`),
-  `sphere_getFiatBalance` sums the priced assets (still `null` when no price data),
-  `sphere_getTokens` from `payments.tokens()`, `sphere_getHistory` from `payments.history()`
-  (the flat entry array, entries keep `timestamp`/`symbol`/`tokenIds`).
+- **Queries:** `sphere_getBalance` and `sphere_getAssets` are both served from
+  `payments.assets()` — the same call, the same array (the Asset shape is unchanged;
+  `unconfirmed*` fields are pinned `'0'`/`0`). `sphere_getFiatBalance` sums the priced assets
+  (still `null` when no price data), `sphere_getTokens` comes from `payments.tokens()` with the
+  internal `sdkData` field stripped, and `sphere_getHistory` from `payments.history()` — the flat
+  entry array, entries keeping `timestamp`/`symbol`/`tokenIds`. Parameterless `sphere_getHistory`
+  still walks the facade's cursors to exhaustion, because the legacy wire has no cursor and
+  completeness is the contract.
 - **Events:** every old dApp-subscribable name keeps firing with its old payload shape,
   re-emitted from the 8 v2 events: `transfer:confirmed` / `transfer:delivery_pending` /
   `transfer:failed` from `transfer:updated` (by `status`/`deliveryPending`);
