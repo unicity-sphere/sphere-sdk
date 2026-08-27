@@ -11,7 +11,7 @@ _Nothing yet._
 
 ## [0.14.11] - 2026-08-25
 
-### Added — `DeliveryPort.ackBatch()`: one settle call per drain, not one per entry (#757)
+### Added — `DeliveryPort.ackBatch()`: settle a drain in batches, not one call per entry (#757)
 
 A 54-token receive settled its mailbox entries one HTTP call at a time. The port
 may now implement an optional `ackBatch`, which groups claims together and rejects
@@ -19,11 +19,19 @@ together per reason (the endpoint takes a single reason per call). The built-in
 `WalletApiDeliveryPort` sends them in chunks of **50** (`ACK_CHUNK`): the server
 caps at 1000, but each entry costs an S3 read and a transaction there, so a huge
 batch is a multi-second request against an idle timeout that tells you nothing
-about what committed. A 54-token receive therefore goes from **54 calls to 2**,
-not to 1 — 50 keeps almost all of the round-trip amortisation without the tail
-risk. A port that does not implement `ackBatch`, or a batch that fails for an
-ordinary reason, still settles one at a time — nothing regresses for existing
-ports.
+about what committed. 50 keeps almost all of the round-trip amortisation without
+the tail risk.
+
+What that saves depends on how often the drain flushes, because a flush is what
+sends a batch. A drain that finishes inside one refresh interval settles 54 claims
+in **2** calls (50 + 4). A slow one does not: the mid-drain refresh below flushes
+what has been accepted every 2500 ms, so a 54-token drain at ~1 s per token flushes
+about 20 times and carries 2–3 claims per call — **~20 calls rather than 54**, and
+a balance that moves while it drains. The flush cadence bounds the batch, not the
+other way round; a host with no mirror to refresh gets the undivided 2.
+
+A port that does not implement `ackBatch`, or a batch that fails for an ordinary
+reason, still settles one at a time — nothing regresses for existing ports.
 
 A **retryable** failure (429, gateway outage) deliberately does NOT fall back:
 per-entry retries would hit the same wall and turn one transient failure into N
@@ -34,8 +42,12 @@ raise it: the request/outcome types (`AckRequest`, `AckOutcome`,
 method on an exported interface is not implementable while its contract is not.
 
 Committed chunks are recorded in the port's seen-set before the failure is
-rethrown, so a §5.4 restore that rebuilds those rows cannot re-yield deliveries
-this wallet already claimed. Spec: `wallet-api/docs/sdk-changes.md` S7.
+rethrown, so a server restore — the `syncEpoch` change that makes a client discard
+its cursors and re-list — cannot re-yield deliveries this wallet already claimed.
+The port contract is [`modules/payments-v2/ports.ts`](modules/payments-v2/ports.ts),
+enforced by
+[`tests/unit/payments-v2/contracts/delivery-port.contract.ts`](tests/unit/payments-v2/contracts/delivery-port.contract.ts);
+seen-set ownership is [`docs/PAYMENTS-V2-DESIGN.md`](docs/PAYMENTS-V2-DESIGN.md) §5.7.
 
 ### Fixed — the balance moves while a receive drains, instead of at the end (#755)
 
@@ -1027,4 +1039,9 @@ consumed exclusively through the `token-engine/` port. Consequences:
 - `PaymentsModule.destroy()` now cleans up storage event subscriptions and debounce timers
 - `IpfsStorageProvider.shutdown()` now disconnects the subscription client
 
-[Unreleased]: https://github.com/unicitynetwork/sphere-sdk/compare/main...HEAD
+<!-- Released versions link to the published package: this repo carries no
+     version tags past v0.9.x, so a tag-compare link would 404. -->
+
+[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/main...HEAD
+[0.14.11]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.14.11
+[0.14.10]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.14.10
