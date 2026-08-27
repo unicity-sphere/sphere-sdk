@@ -66,26 +66,13 @@ function is the aggregator, which hard-rejects `CertificationDataVersion = 1`. C
   `Sphere.clear()` is not the fix for this (it clears with no prefix and takes the mnemonic
   with it) and is not needed.
 
-**Sphere sets no request deadline, anywhere.** Every mint, transfer, split burn and split mint
-omits `expiresAt`, so the Unicity Service assigns one from consensus time and does not record
-it. That is a deliberate policy, not an oversight: this is a browser wallet with an untrusted
-clock, where a skewed wallet pinning a past deadline is a wallet-wide payment outage, and an
-absolute deadline is unrecoverable across downtime longer than the window — every resume would
-rebuild an already-expired transaction and the intent would sit open forever with its sources
-reserved. The policy is also load-bearing rather than cosmetic: `expiresAt` is committed by the
-transaction hash but is NOT part of the StateId, so two attempts that disagree about it address
-the same leaf with different hashes, and the verification rule compares the hash before the
-certification data — the disagreement surfaces as `TRANSACTION_HASH_MISMATCH`, i.e. as a foreign
-spend, which the engine maps to a `TransferConflictError` abort. A clock-derived deadline would
-therefore make every crash-resume abort an intent whose spend is already on chain.
-
-**The error contract is unchanged.** v3's two new certification statuses do not become clean
-rejects: `REQUEST_EXPIRED` and `SERVICE_NOT_READY` each report only that *this* submit was not
-admitted, never that no earlier attempt certified, so neither is treated as a proven abort.
-`SERVICE_NOT_READY` (a 503 in a 200 body — a booting gateway) is retried at the submit call
-site; `REQUEST_EXPIRED` is never retried. `TRANSACTION_HASH_MISMATCH` remains the only conflict
-signal, and `CERTIFICATION_UNCONFIRMED` /
-[`isPossiblyCommittedSendOutcome()`](#send-error-handling) keep exactly the meaning they had.
+**The error contract is unchanged, and nothing in your integration moves.** Sphere sets no
+request deadline on any transaction (`expiresAt` is left for the service to assign), and v3's two
+new certification statuses are not clean rejects — `REQUEST_EXPIRED` and `SERVICE_NOT_READY` each
+report only that *this* submit was not admitted, never that no earlier attempt certified.
+`TRANSACTION_HASH_MISMATCH` remains the only conflict signal, and `CERTIFICATION_UNCONFIRMED` /
+[`isPossiblyCommittedSendOutcome()`](#send-error-handling) keep exactly the meaning they had. The
+reasoning behind the deadline policy is in the CHANGELOG entry for 0.15.0.
 
 ### `sphere.paymentsV2` is removed
 

@@ -466,21 +466,11 @@ sphere-domain type that moved is `TokenBlob` (two never-read fields dropped — 
   `readValue`, `balanceOf`, `readMemo`, `readTokenData`, `mint`, `mintDataToken`,
   `transfer`, `split`, `verify`, `isSpent`, `isOwnedBy`, `encodeToken`,
   `decodeToken`, `deliveryKeys`, and the optional `dispose` (worker-pool teardown).
-- **The 3.x SDK surface** (visible only inside `token-engine/`): `MintTransaction.create(networkId,
-  recipient, options?)`, `TransferTransaction.create(token, recipient, stateMask, options?)` and
-  `TokenSplit.split(token, decode, requests, options?)` take one options OBJECT (`IMintOptions` /
-  `ITransferOptions` / `ISplitOptions`) where 2.x took trailing positionals — order-independent,
-  so a later field costs no call-site churn. `InclusionProofResponse.inclusionProof` is
-  `InclusionProof | null` and **null IS "not certified yet"**: `isSpent` and the split pre-flight
-  read the response itself, never a field inside the proof (a present proof always describes a
-  real leaf, its fields non-nullable; it is the RESPONSE whose constructor is private, built via
-  `InclusionProofResponse.certified()` / `.notCertified()`).
-  `InclusionProofVerificationStatus` dropped `INCLUSION_CERTIFICATE_MISSING`
-  and `MISSING_CERTIFICATION_DATA` and added `REQUEST_EXPIRED` / `REFERENCE_TIME_AFTER_ROUND`;
-  `CertificationStatus` added `REQUEST_EXPIRED` / `SERVICE_NOT_READY`.
-  `InclusionProofVerificationRule.verify` gained an `expiresAt` parameter, and the predicate
-  verifiers gained `referenceTime` as positional #2 — relevant to anyone wiring a custom verifier
-  (a worker entry script above all: its verifier must still match the engine's).
+- **The 3.x SDK surface** (visible only inside `token-engine/`): the three `create`/`split`
+  builders take an options object where 2.x took trailing positionals, and
+  `InclusionProofResponse.inclusionProof` is `InclusionProof | null` where **null IS "not certified
+  yet"** — `isSpent` and the split pre-flight read the response, never a field inside the proof.
+  Exact signatures are in the types; the CHANGELOG 0.15.0 entry lists the status-enum moves.
 - **No request deadline is set on anything** (see the program bullet above for WHY it is
   money-critical): `expiresAt` is omitted on every mint, transfer, split burn and split mint leg.
 - **Submit-status classification did NOT change.** `CLEAN_REJECT_STATUSES` — the proven

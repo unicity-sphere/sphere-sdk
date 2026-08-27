@@ -33,28 +33,20 @@ decode path. It is refused with a `CborError` naming the version rather than ski
 ([`tests/unit/token-engine/wire-version.test.ts`](tests/unit/token-engine/wire-version.test.ts),
 pinned against a real 2.1.0-encoded fixture — capturable only while the previous pin exists).
 
-The engine-facing API moved with the pin, which matters to anyone building against `token-engine/`
-internals or a custom `ITokenEngine`: `MintTransaction.create(networkId, recipient, options?)`,
-`TransferTransaction.create(token, recipient, stateMask, options?)` and
-`TokenSplit.split(token, decode, requests, options?)` take an options object where they took
-positionals; `InclusionProofResponse.inclusionProof` is `InclusionProof | null` and **null IS "not
-certified yet"** (the RESPONSE's constructor is private — build one with
-`InclusionProofResponse.certified()` / `.notCertified()`), so `isSpent` and the split pre-flight
-now read the response instead of digging for certification data, and a proof that IS present
-always describes a real leaf with non-nullable fields;
-`InclusionProofVerificationRule.verify` gained `expiresAt` and the predicate verifiers gained
-`referenceTime` as positional #2; `InclusionProofVerificationStatus` DROPPED
-`INCLUSION_CERTIFICATE_MISSING` and `MISSING_CERTIFICATION_DATA` and ADDED `REQUEST_EXPIRED` and
-`REFERENCE_TIME_AFTER_ROUND`; `CertificationStatus` added `REQUEST_EXPIRED` and
-`SERVICE_NOT_READY`.
+The engine-facing API moved with the pin, which matters only to code building against
+`token-engine/` internals or a custom `ITokenEngine`: `MintTransaction.create`,
+`TransferTransaction.create` and `TokenSplit.split` take an options object where they took
+trailing positionals; `InclusionProofVerificationRule.verify` gained `expiresAt` and the predicate
+verifiers gained `referenceTime` as positional #2; `InclusionProofVerificationStatus` dropped
+`INCLUSION_CERTIFICATE_MISSING` / `MISSING_CERTIFICATION_DATA` and added `REQUEST_EXPIRED` /
+`REFERENCE_TIME_AFTER_ROUND`; `CertificationStatus` added `REQUEST_EXPIRED` / `SERVICE_NOT_READY`.
+Most consequential: `InclusionProofResponse.inclusionProof` is `InclusionProof | null` and **null
+IS "not certified yet"** (build one with `InclusionProofResponse.certified()` / `.notCertified()`),
+so `isSpent` and the split pre-flight read the response instead of digging for certification data.
 
-Unchanged by the bump, stated so nobody re-checks it: the `DIRECT://` derivation
-([`token-engine/identity.ts`](token-engine/identity.ts) — external systems key user identity on
-it), the `SpherePaymentData` value envelope (CBOR tag 39050), the Connect protocol version (stays
-`2.1`), and the worker verification entry-script contract in
-[`docs/VERIFICATION-WORKERS.md`](docs/VERIFICATION-WORKERS.md) — the SDK's `IWorker` /
-`WorkerTokenVerifier` declarations carry the same members and signatures across the major (the
-whole `.d.ts` diff is one doc-comment link), only the main-thread side moved.
+Unchanged by the bump: the `DIRECT://` derivation, the `SpherePaymentData` envelope (CBOR tag
+39050), the Connect protocol version (`2.1`), and the worker entry-script contract in
+[`docs/VERIFICATION-WORKERS.md`](docs/VERIFICATION-WORKERS.md).
 
 ### Changed (BREAKING, money) — sphere sets no request deadline, anywhere (#760)
 
@@ -155,20 +147,14 @@ says invoices and swaps no longer exist in the SDK.
 ### Changed (BREAKING, wallet hosts) — `SphereInstance.payments` is the v2 facade (#760)
 
 **The Connect WIRE is unchanged — dApps see exactly what they saw before.** What moved is the
-object a wallet host hands `ConnectHost`. [`connect/host/SphereInstance.ts`](connect/host/SphereInstance.ts)
-dropped its legacy `payments: { getBalance / getAssets / getFiatBalance / getTokens / getHistory }`
-shape and its optional `paymentsV2`, and now declares `readonly payments: PaymentsV2`. A real
-`Sphere` satisfies that as-is; a host that hands `ConnectHost` a hand-rolled object supplies the
-facade as `payments` instead of the five legacy getters — and since `ConnectHostConfig.sphere` is
-declared `unknown` and `SphereInstance` is internal, that object is checked when a money query
-arrives, not by the host's compiler.
-
-`payments` is read LAZILY, per query branch, never once at the top of the dispatcher — the getter
-throws while no vertical runs, and `sphere_getIdentity` must still answer there. The legacy-host
-fallbacks in `ConnectHost` are gone (dead since the P11 flip), so `sphere_getBalance` and
-`sphere_getAssets` are now literally the same call and `sphere_getFiatBalance` is summed from
-`assets()`; the §4 compat adapter that re-emits the old event names is likewise unconditional
-rather than gated on a nullable `paymentsV2`. The protocol version stays `2.1` and the surface
+object a wallet host hands `ConnectHost`: [`connect/host/SphereInstance.ts`](connect/host/SphereInstance.ts)
+dropped its legacy `payments: { getBalance / getAssets / … }` shape and its optional `paymentsV2`
+for `readonly payments: PaymentsV2`. A real `Sphere` satisfies that as-is; a hand-rolled host
+object supplies the facade as `payments`, and because `ConnectHostConfig.sphere` is `unknown` that
+is checked when a money query arrives, not by your compiler. Implement `payments` as a getter, not
+a captured field: it is read lazily per query branch because it throws while no vertical runs and
+`sphere_getIdentity` must still answer there. The now-dead legacy fallbacks are gone, so
+`sphere_getBalance` and `sphere_getAssets` are the same call. Protocol stays `2.1`; the surface
 stays 14 queries / 6 intents / 13 scopes.
 
 ## [0.14.11] - 2026-08-25

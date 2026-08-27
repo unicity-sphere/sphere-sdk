@@ -2,45 +2,6 @@
 
 A modular TypeScript SDK for Unicity wallet operations (Unicity state transition network).
 
-## 0.15.0 — the state-transition-sdk 3.0.1 flag day
-
-`0.15.0` pins `@unicitylabs/state-transition-sdk` at **3.0.1** (exact). v3 threads one new
-concept through the protocol — every transaction carries `expiresAt`, an exclusive request
-deadline, and every inclusion proof carries the `referenceTime` of the round that certified it —
-and the sparse-Merkle leaf value became `H(transactionHash, referenceTime)` instead of the bare
-transaction hash. Every wire version underneath moved with it (`Token`, `MintTransaction`,
-`TransferTransaction`, `CertificationData`): **nothing a 2.x client wrote decodes, and nothing a
-2.x client writes is accepted by the upgraded gateway.** There is no straddle window and no
-compatibility shim — the forcing function is the aggregator itself, which rejects
-`CertificationDataVersion = 1`, so the gateway cutover is a fleet-wide flag day.
-
-What an integrator has to do:
-
-- **Bump sphere-sdk and your wallet-api deployment together.** Both repos pin the base SDK
-  exactly, so a one-sided bump leaves two mutually unintelligible realms live. A 0.15.0 wallet
-  cannot transact against a pre-cutover gateway, and a 0.14.x wallet cannot transact against the
-  cut-over one. The release is accompanied by a testnet + wallet-api backend reset.
-- **Drop `sphere.paymentsV2`.** The deprecated alias and the `paymentsV2: true` init flag are
-  both removed; `sphere.payments` is the only accessor — and it **throws** `NOT_INITIALIZED`
-  where the alias returned `null`. See [Migrating off `sphere.paymentsV2`](#migrating-off-spherepaymentsv2).
-- **Nothing to run for stored state.** The durable client KV moved generation — the scoped
-  prefix is now `pv2g2:{network}:{chainPubkey}:` and the superseded `pv2:` keys are swept once
-  when the vertical is composed. The rename IS the migration; `Sphere.clear()` is not required
-  (and is not a substitute — it takes the mnemonic with it).
-- **Stored 2.x split checkpoints are unreadable by design.** `CHECKPOINT_VERSION` is 2 and the
-  version check names the cause, instead of the byte comparison blaming "derivation drift".
-
-Deliberately unchanged: the `DIRECT://` address derivation, the `SpherePaymentData` value
-envelope (CBOR tag 39050), the Connect protocol version (still `2.1` — the wire is untouched,
-see [docs/CONNECT.md](docs/CONNECT.md)), and the consumer-authored worker verification entry
-script ([docs/VERIFICATION-WORKERS.md](docs/VERIFICATION-WORKERS.md), which gains one hard
-requirement: the worker and the engine must resolve the SAME base-SDK major).
-
-> **"v2" in this README is the gateway network, not the SDK major.** `testnet` is an alias of
-> **testnet2** — the v2 state-transition gateway network, trust-base networkId 4 — and that name
-> is a different axis from the base SDK's version. testnet2 stays testnet2 on
-> state-transition-sdk 3.x; it is not renamed to "testnet3".
-
 ## Features
 
 - **Wallet Management** - BIP39/BIP32 key derivation; optional password encryption (PBKDF2)
@@ -189,43 +150,19 @@ try {
 
 ## Migrating off `sphere.paymentsV2`
 
-`sphere.paymentsV2` was a deprecated alias of `sphere.payments`, kept one release for the live
-frontend. It is **removed** in 0.15.0, along with the `paymentsV2: true` init flag (which had
-already been a no-op). `sphere.payments` is the only accessor, and it is the same facade the
-alias returned.
+The deprecated `sphere.paymentsV2` alias and the `paymentsV2: true` init flag are **removed** in
+0.15.0. `sphere.payments` is the only accessor, and it is the same facade the alias returned.
 
-The one behavioural difference is the part a consumer will otherwise discover in production:
+One behavioural difference matters: while no vertical is running (init in flight, mid
+address-switch, destroyed) the alias returned `null` and `sphere.payments` **throws**
+`SphereError` with `code: 'NOT_INITIALIZED'`. Call sites that leaned on the nullish alias —
+`sphere.paymentsV2?.tokens()`, `?? fallback`, `if (sphere.paymentsV2)` as a readiness probe —
+silently degraded to "no payments" before and now throw, so catch `NOT_INITIALIZED` where you
+used to check for null. Code that runs after `await Sphere.init(…)` and before `destroy()` —
+everything else in this README — reads `sphere.payments` directly.
 
-| | `sphere.paymentsV2` (removed) | `sphere.payments` |
-|---|---|---|
-| No vertical running (init in flight, mid address-switch, destroyed) | returned `null` | **throws** `SphereError` with `code: 'NOT_INITIALIZED'` |
-
-Any call site that leaned on the nullish alias — `sphere.paymentsV2?.tokens()`,
-`sphere.paymentsV2 ?? fallback`, `if (sphere.paymentsV2)` as a readiness probe — silently
-degraded to "no payments" before and now throws. Rewrite those to read the facade only once you
-know a vertical is running, or guard the read:
-
-```ts
-// BEFORE — the alias absorbed "not ready yet"
-const tokens = sphere.paymentsV2?.tokens() ?? [];
-
-// AFTER — the throw is the readiness signal; catch it where you used to check for null
-let tokens: Token[] = [];
-try {
-  tokens = sphere.payments.tokens();
-} catch (err) {
-  if (!isSphereError(err) || err.code !== 'NOT_INITIALIZED') throw err;
-}
-```
-
-`Sphere.init()` resolves with the vertical started, so code that runs after `await Sphere.init(…)`
-and before `destroy()` — everything in this README — reads `sphere.payments` directly. The guard
-is only for code that can run while the wallet is between states.
-
-The `accounting:` / `swap:` init options are **not** part of this cleanup: they still throw a
-typed `INVALID_CONFIG`, deliberately, through 0.15.0 — a silent no-op would hide that invoicing
-and swaps no longer exist in the SDK, and 0.15.0 is precisely the release where consumers
-re-integrate.
+The `accounting:` / `swap:` options are **not** part of this cleanup: they still throw a typed
+`INVALID_CONFIG`, deliberately, because 0.15.0 is the release where consumers re-integrate.
 
 ## Network Configuration
 

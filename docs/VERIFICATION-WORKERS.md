@@ -10,15 +10,12 @@ fanned out to a pool of workers. Sphere exposes that as **opt-in configuration**
 `verification` to `Sphere.init()` (or to `EngineConfig` if you build the engine yourself)
 and the engine verifies through the pool instead.
 
-The entry-script contract is **unchanged by sphere-sdk 0.15.0's bump to state-transition-sdk
-3.0.1**: across 2.1.0 and 3.0.1 the base SDK's `IWorker`, `WorkerTokenVerifier` and the two
-`*TransferTransactionVerifierWorker` bases declare the same members with the same signatures
-(the whole `.d.ts` diff is one doc-comment link), and only the main-thread side of the engine
-moved. The scripts below did change, because they were
-incomplete before — the worker base has required **two** verifiers since 2.1.0, and an entry
-script supplying only `predicateVerifier` does not compile (`TS2515`). Read [Same major on both
-sides](#same-major-on-both-sides) as well: the bump makes an already-latent version mismatch
-produce a wrong verdict rather than an error.
+The entry-script contract is **unchanged** by the 3.0.1 bump — the base SDK's worker declarations
+carry the same members and signatures across the major. The scripts below did change, because they
+were incomplete: the worker base has required **two** verifiers since 2.1.0, and a script
+supplying only `predicateVerifier` does not compile (`TS2515`). Also read [Same major on both
+sides](#same-major-on-both-sides) — the bump turns an already-latent version mismatch into a wrong
+verdict rather than an error.
 
 **When it is worth it:** long provenance chains — a token that has changed hands many
 times — and batch receives, where several such tokens verify at once. A freshly minted
