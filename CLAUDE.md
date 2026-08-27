@@ -278,7 +278,7 @@ See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.m
 - **L3 (Unicity state transition network)** - Token transfers via the **v2 state-transition SDK**, consumed exclusively through the `token-engine/` port. Wallets are L3-only.
 - **Money custody:** wallet-api backend (server inventory + mailbox delivery). Nostr carries DMs, group chat and nametag bindings ONLY — no asset or payment-request traffic.
 
-**Version:** `0.14.0-dev.#` line — see `package.json` for the exact current version (post P11 flip; see CHANGELOG `[Unreleased]`)
+**Version:** `0.14.x` — see `package.json` for the exact current version. Releases ship from `main` under the npm `latest` tag; `-dev.#` builds are published from a branch and land under `dev`. Per-release notes: CHANGELOG (versioned sections start at `0.14.11`; older entries are pooled under `[0.14.10] and earlier`)
 **License:** MIT
 **Target:** Node.js >= 22.0.0, Browser (ESM/CJS)
 **CLI:** moved out to `@unicity-sphere/cli` (`npm run cli` only prints a pointer)
