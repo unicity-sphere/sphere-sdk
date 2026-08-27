@@ -1140,7 +1140,7 @@ export class Sphere {
 
   /**
    * Clear all SDK-owned wallet data from storage: wallet keys, per-address
-   * data, and the payments vertical's `pv2:{network}:{pubkey}:*` scoped KV
+   * data, and the payments vertical's `pv2g2:{network}:{pubkey}:*` scoped KV
    * (refresh token, cursors, journals — all live in the plain StorageProvider,
    * so the full KV wipe below removes them). Tokens are server-custody; the
    * only local token artifacts are orphaned `sphere-token-storage-*` IndexedDB

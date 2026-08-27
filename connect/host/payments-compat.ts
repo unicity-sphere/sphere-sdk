@@ -1,7 +1,7 @@
-// docs/PAYMENTS-V2-DESIGN.md §4 "Compatibility": with a v2-facade Sphere bound
-// (`sphere.paymentsV2` non-null), old wire queries are served from facade reads and every
-// old event name a dApp can `sphere_subscribe` to is re-emitted from the v2 bus events —
-// dApps change NOTHING. Dormant on an old-stack Sphere (its module emits the old names).
+// docs/PAYMENTS-V2-DESIGN.md §4 "Compatibility": old wire queries are served from
+// `sphere.payments` reads, and every old event name a dApp can `sphere_subscribe` to is
+// re-emitted from the facade's bus events — dApps change NOTHING. The old-stack host this
+// used to stay dormant for no longer exists; the facade is the only shape now.
 // Old names stay plain string literals here: post-flip this wire surface is their only home.
 
 import type { TransferResult } from '../../types';
