@@ -20,6 +20,7 @@ import { RPC_METHODS } from '../../../connect/protocol';
 import { PERMISSION_SCOPES } from '../../../connect/permissions';
 import type { PaymentsV2Events, PaymentRequestView, HistoryEntry } from '../../../modules/payments-v2/api';
 import type { TransferResult } from '../../../types';
+import { SphereError } from '../../../core/errors';
 
 // ===========================================================================
 // Mock transport pair (records both directions)
@@ -383,6 +384,22 @@ describe('§4 compat event re-emission against a v2-facade host', () => {
     });
   });
 
+  describe('reads that happen while the facade is being torn down', () => {
+    it('sync:completed still fires, reporting no tokens rather than nothing at all', async () => {
+      await subscribe(h, 'sync:completed');
+      Object.defineProperty(sphere, 'payments', {
+        configurable: true,
+        get(): never {
+          throw new SphereError('Sphere not initialized', 'NOT_INITIALIZED');
+        },
+      });
+      sphere._emit('inventory:updated', {});
+      const frames = eventsOfType(h.pair.hostSent, 'sync:completed');
+      expect(frames).toHaveLength(1);
+      expect(frames[0].data).toEqual({ source: 'payments', count: 0 });
+    });
+  });
+
   describe('payment_request:updated → :paid / :rejected / :expired', () => {
     it.each(['paid', 'rejected', 'expired'] as const)(
       're-emits payment_request:%s with the old IncomingPaymentRequest shape',
@@ -400,6 +417,26 @@ describe('§4 compat event re-emission against a v2-facade host', () => {
       sphere._emit('payment_request:updated', { id: REQUEST_VIEW_NO_SYMBOL.id, status: 'paid' });
       const frames = eventsOfType(h.pair.hostSent, 'payment_request:paid');
       expect(frames[0].data).toEqual({ ...REQUEST_VIEW_NO_SYMBOL, symbol: '', status: 'paid' });
+    });
+
+    it('still fires while the facade is mid-teardown, when reading it would throw', async () => {
+      // An address switch clears the active facade BEFORE awaiting its stop(), and stop()
+      // is where in-flight ops settle and emit — so `sphere.payments` throws right here.
+      // emitEvent swallows a throwing handler, so an unguarded read loses a terminal
+      // payment_request event with no trace. Degrade to the id + status payload instead.
+      await subscribe(h, 'payment_request:paid');
+      Object.defineProperty(sphere, 'payments', {
+        configurable: true,
+        get(): never {
+          throw new SphereError('Sphere not initialized', 'NOT_INITIALIZED');
+        },
+      });
+      sphere._emit('payment_request:updated', { id: REQUEST_VIEW.id, status: 'paid' });
+      const frames = eventsOfType(h.pair.hostSent, 'payment_request:paid');
+      expect(frames).toHaveLength(1);
+      const data = frames[0].data as Record<string, unknown>;
+      expect(data.id).toBe(REQUEST_VIEW.id);
+      expect(data.status).toBe('paid');
     });
 
     it('still fires (id + status) when the view is no longer listed', async () => {
