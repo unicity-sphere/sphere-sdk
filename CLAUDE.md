@@ -769,8 +769,8 @@ pre-flip `sphere-token-storage-*` databases.
 **Framework:** Vitest
 **Run:** `npm run test:run` (unit/integration), `npm run test:mutation` (probes must be KILLED),
 `npm run test:e2e` (live staging/testnet2, needs `.env`), `npm run test:relay`,
-`npm run test:aggregator` (a REAL aggregator-go; skips unless `AGGREGATOR_URL` +
-`AGGREGATOR_TRUSTBASE` are set)
+`npm run test:aggregator` (a REAL aggregator-go, stood up by Testcontainers — needs Docker,
+no manual setup and no local build)
 
 **Know what each layer can and cannot prove.** Everything else that exercises the chain runs
 against `TestAggregatorClient`, which orchestrates the SDK's OWN smt / CertificationData /
@@ -785,9 +785,13 @@ Key test areas:
   rename (`kv-generation.test.ts`), adversarial fakes (`fakes/FakeWalletApi` — 61 behavior pins —
   + FakeGateway), port contract suites
   (`contracts/{storage,delivery}-port.contract.ts` — swappability enforced)
-- `tests/aggregator/aggregator-v3.test.ts` — the real engine against a REAL aggregator-go v3
-  (`cd ../aggregator-go && make docker-run-clean`, then `AGGREGATOR_URL=http://localhost:3000
-  AGGREGATOR_TRUSTBASE=../aggregator-go/data/genesis/trust-base.json npm run test:aggregator`).
+- `tests/aggregator/` — the real engine against a REAL aggregator-go v3, stood up by
+  Testcontainers (`npm run test:aggregator`; ~1m45s cold). `docker/docker-compose.yml` is copied
+  from state-transition-sdk-js, which the Java SDK mirrors too — keep the three in step, or
+  "passes against a real aggregator" means something different in each repo. It pins a prebuilt
+  `ghcr.io/unicitynetwork/aggregator-go` image rather than building rocksdb locally.
+  `support/aggregatorStack.ts` waits for consensus to CERTIFY A ROUND, not merely for health:
+  until it has a reference time the service answers every request `SERVICE_NOT_READY`.
   Mint / transfer / split / same-transferId resume, each verified against the service's own
   generated trust base. `verify()` passing is the assertion no fake can make: the leaf value this
   client computes — `H(transactionHash, referenceTime)` since 3.x — reproduces the leaf the Go
