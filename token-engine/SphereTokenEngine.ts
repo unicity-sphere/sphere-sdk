@@ -21,6 +21,7 @@ import {
   certificationDeadline,
   resolveProofTimeoutMs,
   retryTransient,
+  TransientSubmitAnswer,
 } from './proof-wait';
 import { certificationFailure } from './certification-outcome';
 import { randomUUID } from '../core/uuid';
@@ -71,7 +72,6 @@ import {
   type ITokenVerifier,
 } from './sdk';
 import { decodeSpherePaymentData, SpherePaymentData, sphereAssetToSdk } from './SpherePaymentData';
-import { TOKEN_BLOB_VERSION } from './token-blob';
 import type { EngineOpOptions, ITokenEngine } from './engine';
 import type {
   CoinId,
@@ -164,6 +164,10 @@ const TRANSFER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
  * `STATE_ID_EXISTS`) means "a certification for this state MAY already exist" — it must be
  * treated as possibly-certified (keep the intent OPEN — #631), NEVER a clean abort. Any
  * status outside this set therefore falls through to `ProofUnconfirmedError`.
+ *
+ * v3's REQUEST_EXPIRED and SERVICE_NOT_READY stay OUT despite their names: each
+ * reports only that THIS submit was not admitted, never that no earlier attempt
+ * certified. Pinned by expires-at.test.ts.
  */
 const CLEAN_REJECT_STATUSES: ReadonlySet<string> = new Set([
   CertificationStatus.STATE_ID_MISMATCH,
@@ -263,13 +267,11 @@ export class SphereTokenEngine implements ITokenEngine {
     // gets its own 'mint' field domain: 'salt' is indexed by split-OUTPUT ordinal
     // under the same transferId, so ('salt', opIndex) would collide with output
     // #opIndex of a sibling split (see RealizationField).
-    const mintTx = await MintTransaction.create(
-      this.deps.networkId,
-      recipient,
+    const mintTx = await MintTransaction.create(this.deps.networkId, recipient, {
       data,
-      new TokenType(deriveRealization(this.privateKeyHex, transferId, opIndex, 'tokenType')),
-      TokenSalt.fromBytes(deriveRealization(this.privateKeyHex, transferId, opIndex, 'mint')),
-    );
+      tokenType: new TokenType(deriveRealization(this.privateKeyHex, transferId, opIndex, 'tokenType')),
+      salt: TokenSalt.fromBytes(deriveRealization(this.privateKeyHex, transferId, opIndex, 'mint')),
+    });
     const certificationData = await CertificationData.fromMintTransaction(mintTx);
 
     // The same idempotent submit-then-always-probe primitive as transfer/split (E.2):
@@ -293,7 +295,7 @@ export class SphereTokenEngine implements ITokenEngine {
     // A deterministic salt yields a stable, terms-derived tokenId (TokenId.fromSalt).
     const salt = params.salt ? TokenSalt.fromBytes(params.salt) : TokenSalt.generate();
 
-    const mintTx = await MintTransaction.create(this.deps.networkId, recipient, params.data, tokenType, salt);
+    const mintTx = await MintTransaction.create(this.deps.networkId, recipient, { data: params.data, tokenType, salt });
     const certificationData = await CertificationData.fromMintTransaction(mintTx);
 
     // #692 F13: the caller's deterministic salt already makes the re-call byte-identical;
@@ -320,7 +322,9 @@ export class SphereTokenEngine implements ITokenEngine {
       deriveRealization(this.privateKeyHex, transferId, this.resolveOpIndex(options), 'stateMask'),
     );
 
-    const transferTx = await TransferTransaction.create(params.token.sdkToken, recipient, stateMask, params.data ?? null);
+    const transferTx = await TransferTransaction.create(params.token.sdkToken, recipient, stateMask, {
+      data: params.data ?? null,
+    });
     const unlockScript = await SignaturePredicateUnlockScript.create(transferTx, this.deps.signingService);
     const certificationData = await CertificationData.fromTransaction(transferTx, unlockScript);
 
@@ -357,12 +361,11 @@ export class SphereTokenEngine implements ITokenEngine {
     // Value conservation is enforced inside the SDK split (root.value === source value).
     // E.1: the burn state mask is HKDF-derived, so the whole split — burn leg
     // included — is rebuildable from the wallet key + transferId (crash resume).
-    const split = await TokenSplit.split(
-      params.token.sdkToken,
-      decodeSpherePaymentData,
-      requests,
-      StateMask.fromBytes(deriveRealization(this.privateKeyHex, transferId, this.resolveOpIndex(options), 'burn')),
-    );
+    const split = await TokenSplit.split(params.token.sdkToken, decodeSpherePaymentData, requests, {
+      burnStateMask: StateMask.fromBytes(
+        deriveRealization(this.privateKeyHex, transferId, this.resolveOpIndex(options), 'burn'),
+      ),
+    });
 
     // 1. Resolve the burnt token: from a durable checkpoint on resume, else burn now and persist
     //    the checkpoint BEFORE any mint submit (E.4 — the burn proof is the one non-re-derivable
@@ -497,14 +500,16 @@ export class SphereTokenEngine implements ITokenEngine {
     await Promise.all(
       ctx.split.tokens.map(async (leg) => {
         const data = await leg.paymentData.encode();
-        const probe = await MintTransaction.create(leg.networkId, leg.recipient, data, leg.tokenType, leg.salt, null);
+        const probe = await MintTransaction.create(leg.networkId, leg.recipient, {
+          data,
+          tokenType: leg.tokenType,
+          salt: leg.salt,
+          justification: null,
+        });
         const response = await this.deps.client.getInclusionProof(await StateId.fromTransaction(probe));
-        // Inclusion (leaf certified on-chain) is discriminated by `certificationData`, NOT
-        // by the certificate bytes: the aggregator's non-inclusion response carries a
-        // certificate too (an ExclusionCert once non-inclusion proofs ship), so
-        // `inclusionCertificate` is not a reliable "certified" signal (aggregator
-        // types.go: CertificationData != nil ⟺ inclusion).
-        if (response.inclusionProof.certificationData !== null) {
+        // v3: a null `inclusionProof` IS "not certified yet"; a present one always
+        // describes a real leaf, so there is no longer a field to misread here.
+        if (response.inclusionProof !== null) {
           throw new SplitCheckpointLostError(
             'a split mint leaf is certified on-chain but no burn checkpoint exists — outputs are unrecoverable',
           );
@@ -521,14 +526,12 @@ export class SphereTokenEngine implements ITokenEngine {
   ): Promise<SphereToken> {
     const data = await splitToken.paymentData.encode();
     const justification = SplitMintJustification.create(burntToken, splitToken.proofs).toCBOR();
-    const mintTx = await MintTransaction.create(
-      splitToken.networkId,
-      splitToken.recipient,
+    const mintTx = await MintTransaction.create(splitToken.networkId, splitToken.recipient, {
       data,
-      splitToken.tokenType,
-      splitToken.salt,
+      tokenType: splitToken.tokenType,
+      salt: splitToken.salt,
       justification,
-    );
+    });
     const certData = await CertificationData.fromMintTransaction(mintTx);
     const proof = await this.submitSplitMintLeg(certData, mintTx, options);
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
@@ -589,14 +592,9 @@ export class SphereTokenEngine implements ITokenEngine {
     );
     const stateId = await StateId.fromTransaction(probe);
     const response = await this.deps.client.getInclusionProof(stateId);
-    // A state is consumed on-chain iff the aggregator returns CERTIFICATION DATA for its
-    // stateId — that is the aggregator's own inclusion/non-inclusion discriminator
-    // (types.go: `CertificationData != nil` ⟺ inclusion). Do NOT test
-    // `inclusionCertificate`: a non-inclusion response also carries a certificate (an
-    // ExclusionCert, once non-inclusion proofs are implemented), so a non-null certificate
-    // does NOT imply the state was spent — testing it would report an UNSPENT state as
-    // spent and (via the fail-closed resume/recovery gates) destroy a live token.
-    return response.inclusionProof.certificationData !== null;
+    // Consumed iff the aggregator answers with a PROOF. Reporting an UNSPENT state
+    // as spent destroys a live token via the fail-closed recovery gates.
+    return response.inclusionProof !== null;
   }
 
   // ── serialization ────────────────────────────────────────────────────────────
@@ -706,7 +704,16 @@ export class SphereTokenEngine implements ITokenEngine {
     let submitRejectedCleanly = false;
     try {
       const { value: response, retried } = await retryTransient(
-        () => this.deps.client.submitCertificationRequest(certificationData),
+        async () => {
+          const answer = await this.deps.client.submitCertificationRequest(certificationData);
+          // A booting gateway is "ask again", not a certification failure — see
+          // TransientSubmitAnswer. Everything else, known or unknown, keeps the
+          // status-agnostic treatment below.
+          if (String(answer.status) === String(CertificationStatus.SERVICE_NOT_READY)) {
+            throw new TransientSubmitAnswer(String(answer.status));
+          }
+          return answer;
+        },
         signal,
         this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS,
       );
@@ -766,8 +773,6 @@ export class SphereTokenEngine implements ITokenEngine {
       }
     }
     const blob: TokenBlob = {
-      v: TOKEN_BLOB_VERSION,
-      network: sdkToken.genesis.networkId.id,
       tokenId: HexConverter.encode(sdkToken.id.bytes),
       token: sdkToken.toCBOR(),
     };

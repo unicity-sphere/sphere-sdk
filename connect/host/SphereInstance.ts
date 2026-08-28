@@ -15,17 +15,10 @@ import type { PaymentsV2 } from '../../modules/payments-v2/api';
 export interface SphereInstance {
   readonly identity: { chainPubkey: string; directAddress?: string; nametag?: string } | null;
   readonly networkId?: number;
-  readonly payments: {
-    getBalance(coinId?: string): unknown[];
-    getAssets(coinId?: string): Promise<unknown[]>;
-    getFiatBalance(): Promise<number | null>;
-    getTokens(filter?: { coinId?: string }): unknown[];
-    getHistory(): unknown[];
-  };
-  /** Non-null when this Sphere runs the payments-v2 facade — activates the §4 wire-compat
-   *  adapter (payments-compat.ts). The legacy `payments` member is then NEVER touched:
-   *  its getter throws under v2. */
-  readonly paymentsV2?: PaymentsV2 | null;
+  /** The §4 facade. Read LAZILY: a real Sphere's getter throws while no vertical
+   *  runs (init in flight, mid address-switch, destroyed), and the methods that
+   *  need no payments — sphere_getIdentity above all — must still answer. */
+  readonly payments: PaymentsV2;
   signMessage(message: string): string;
   resolve(identifier: string): Promise<unknown>;
   on<T extends SphereEventType>(type: T, handler: SphereEventHandler<T>): () => void;

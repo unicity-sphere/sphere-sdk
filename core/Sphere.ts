@@ -174,8 +174,6 @@ export type InitProgressCallback = (progress: InitProgress) => void;
 interface SphereWalletApiOptions {
   /** Wallet-api transport config — REQUIRED (init throws INVALID_CONFIG without it). */
   walletApi?: WalletApiTransportConfig;
-  /** @deprecated The payments-v2 vertical is the only path since the P11 flip — accepted as a no-op for one release. */
-  paymentsV2?: boolean;
   /** @deprecated REMOVED with the P11 flip — any truthy value throws INVALID_CONFIG (invoicing no longer exists in the SDK). */
   accounting?: unknown;
   /** @deprecated REMOVED with the P11 flip — any truthy value throws INVALID_CONFIG (swaps no longer exist in the SDK). */
@@ -758,11 +756,10 @@ export class Sphere {
   }
 
   /**
-   * The ONE sanctioned refusal fossil of the P11 flip (revisit-and-delete after
-   * one release): `accounting`/`swap` were public init flags — silently
-   * ignoring them would hide that invoices/swaps no longer exist in the SDK.
-   * `paymentsV2: true` stays an accepted no-op for the same one release (the
-   * live frontend passes it today).
+   * The ONE sanctioned refusal fossil of the P11 flip: `accounting`/`swap` were
+   * public init flags — silently ignoring them would hide that invoices/swaps no
+   * longer exist in the SDK. Kept through 0.15.0, where consumers re-integrate
+   * across the wire break and a silent no-op would be worst.
    */
   private static refuseRetiredModuleOptions(options: SphereWalletApiOptions): void {
     if (options.accounting) {
@@ -1143,7 +1140,7 @@ export class Sphere {
 
   /**
    * Clear all SDK-owned wallet data from storage: wallet keys, per-address
-   * data, and the payments vertical's `pv2:{network}:{pubkey}:*` scoped KV
+   * data, and the payments vertical's `pv2g2:{network}:{pubkey}:*` scoped KV
    * (refresh token, cursors, journals — all live in the plain StorageProvider,
    * so the full KV wipe below removes them). Tokens are server-custody; the
    * only local token artifacts are orphaned `sphere-token-storage-*` IndexedDB
@@ -1275,11 +1272,6 @@ export class Sphere {
       throw new SphereError('Sphere not initialized', 'NOT_INITIALIZED');
     }
     return facade;
-  }
-
-  /** @deprecated Alias of {@link payments} kept for one release (the live frontend calls it). Null when no vertical runs. */
-  get paymentsV2(): PaymentsV2 | null {
-    return this._paymentsV2Active?.facade ?? null;
   }
 
   /** Communications module */

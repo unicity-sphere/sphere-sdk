@@ -13,7 +13,6 @@ import { createTestEngine } from './test-engine';
 import { TestAggregatorClient } from './support/TestAggregatorClient';
 import { SigningService } from '../../../token-engine/sdk';
 import { HexConverter, Token } from '../../../token-engine/sdk';
-import { decodeTokenBlob, encodeTokenBlob } from '../../../token-engine/token-blob';
 import { computeDeliveryId } from '../../../impl/wallet-api-v2/mailbox';
 
 const COIN = 'aa'.repeat(10);
@@ -27,12 +26,12 @@ describe('SphereTokenEngine.deliveryKeys (the backend entry_id derivation)', () 
     const self = engine.getIdentity().chainPubkey;
     const minted = await engine.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 5n }] } });
 
-    const blobBytes = encodeTokenBlob(engine.encodeToken(minted));
+    const blob = engine.encodeToken(minted);
+    const blobBytes = blob.token;
     const keys = await engine.deliveryKeys(blobBytes);
 
     // Independent recomputation straight through the SDK:
-    const blob = decodeTokenBlob(blobBytes);
-    const sdkToken = await Token.fromCBOR(blob.token);
+    const sdkToken = await Token.fromCBOR(blobBytes);
     const expected = HexConverter.encode((await sdkToken.latestTransaction.calculateStateHash()).imprint);
 
     expect(keys.tokenId).toBe(blob.tokenId);

@@ -834,8 +834,19 @@ describe('FakeGateway — observed M7 gateway semantics (CLAUDE.md E.2 note, 202
     const salt = TokenSalt.fromBytes(Uint8Array.from(Buffer.from('22'.repeat(32), 'hex')));
     const recipientA = SignaturePredicate.create(new SigningService(SigningService.generatePrivateKey()).publicKey);
     const recipientB = SignaturePredicate.create(new SigningService(SigningService.generatePrivateKey()).publicKey);
-    const txA = await MintTransaction.create(NetworkId.LOCAL, recipientA, new TextEncoder().encode('A'), tokenType, salt);
-    const txB = await MintTransaction.create(NetworkId.LOCAL, recipientB, new TextEncoder().encode('B'), tokenType, salt);
+    // Same salt + tokenType, different recipient: one stateId, two transaction hashes.
+    // Both carry expiresAt = null, which is what keeps the stateId shared — the
+    // deadline is committed by the transaction HASH, never by the StateId.
+    const txA = await MintTransaction.create(NetworkId.LOCAL, recipientA, {
+      data: new TextEncoder().encode('A'),
+      tokenType,
+      salt,
+    });
+    const txB = await MintTransaction.create(NetworkId.LOCAL, recipientB, {
+      data: new TextEncoder().encode('B'),
+      tokenType,
+      salt,
+    });
     const certA = await CertificationData.fromMintTransaction(txA);
     const certB = await CertificationData.fromMintTransaction(txB);
     const stateIdA = await StateId.fromCertificationData(certA);
@@ -860,8 +871,9 @@ describe('FakeGateway — observed M7 gateway semantics (CLAUDE.md E.2 note, 202
     await gateway.submitCertificationRequest(certA);
     await gateway.submitCertificationRequest(certB);
     const proof = await gateway.getInclusionProof(stateId);
-    expect(proof.inclusionProof.certificationData).not.toBeNull();
-    expect(proof.inclusionProof.certificationData?.toCBOR()).toEqual(certA.toCBOR());
+    // v3: a non-null inclusionProof IS the "certified" answer.
+    expect(proof.inclusionProof).not.toBeNull();
+    expect(proof.inclusionProof!.certificationData.toCBOR()).toEqual(certA.toCBOR());
   });
 
   it('re-encodes refetched proofs byte-unstably: same certificationData, different proof bytes', async () => {
@@ -870,9 +882,18 @@ describe('FakeGateway — observed M7 gateway semantics (CLAUDE.md E.2 note, 202
     await gateway.submitCertificationRequest(certA);
     const first = await gateway.getInclusionProof(stateId);
     const second = await gateway.getInclusionProof(stateId);
-    expect(Buffer.from(first.inclusionProof.toCBOR()).equals(Buffer.from(second.inclusionProof.toCBOR()))).toBe(false);
-    expect(first.inclusionProof.certificationData?.toCBOR()).toEqual(second.inclusionProof.certificationData?.toCBOR());
-    expect(first.inclusionProof.certificationData?.toCBOR()).toEqual(certA.toCBOR());
+    expect(first.inclusionProof).not.toBeNull();
+    expect(second.inclusionProof).not.toBeNull();
+    expect(Buffer.from(first.inclusionProof!.toCBOR()).equals(Buffer.from(second.inclusionProof!.toCBOR()))).toBe(
+      false,
+    );
+    expect(first.inclusionProof!.certificationData.toCBOR()).toEqual(
+      second.inclusionProof!.certificationData.toCBOR(),
+    );
+    expect(first.inclusionProof!.certificationData.toCBOR()).toEqual(certA.toCBOR());
+    // v3: the leaf value binds the reference time, so a refetch must serve the
+    // SAME one — recomputing it per fetch would fail the SMT path instead.
+    expect(first.inclusionProof!.referenceTime).toBe(second.inclusionProof!.referenceTime);
   });
 
   it('unknown-status mode certifies the request but answers a status outside CertificationStatus', async () => {
@@ -884,7 +905,7 @@ describe('FakeGateway — observed M7 gateway semantics (CLAUDE.md E.2 note, 202
     expect(Object.values(CertificationStatus)).not.toContain(response.status);
     gateway.setSubmitMode('normal');
     const proof = await gateway.getInclusionProof(stateId);
-    expect(proof.inclusionProof.certificationData?.toCBOR()).toEqual(certA.toCBOR());
+    expect(proof.inclusionProof!.certificationData.toCBOR()).toEqual(certA.toCBOR());
   });
 
   it('timeout mode rejects the proof fetch (the ProofUnconfirmed keep-open path)', async () => {

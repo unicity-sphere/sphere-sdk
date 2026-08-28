@@ -28,13 +28,22 @@ import {
   type VerificationContext,
 } from './sdk';
 
-/** Checkpoint payload version (the CBOR array's first element). */
-const CHECKPOINT_VERSION = 1;
+/**
+ * Checkpoint payload version (the CBOR array's first element).
+ *
+ * 2 since the state-transition-sdk 3.x bump: the burn transaction and its
+ * inclusion proof are both stored as SDK CBOR, and every wire version under
+ * them moved, so no v1 record can be replayed. Without this bump a stale record
+ * still fails — the byte-comparison below catches it — but it fails blaming
+ * "derivation drift", which sends the reader hunting a realization bug that
+ * isn't there. The version check names the real cause.
+ */
+const CHECKPOINT_VERSION = 2;
 /**
  * The base-SDK pin whose CBOR wire form governs byte-stability — recorded for a LOUD drift
  * diagnosis only (byte-inequality of the stored burn tx is the actual guard). Bump with the pin.
  */
-const CHECKPOINT_SDK_VERSION = '@unicitylabs/state-transition-sdk@2.0.2';
+const CHECKPOINT_SDK_VERSION = '@unicitylabs/state-transition-sdk@3.0.1';
 
 export interface CheckpointDeps {
   readonly trustBase: RootTrustBase;

@@ -53,10 +53,6 @@ export interface SphereValue {
  * `token`, so it is NOT stored — only cached at runtime on SphereToken.value.
  */
 export interface TokenBlob {
-  /** Blob format version (sphere storage migrations; independent of SDK CBOR). */
-  readonly v: number;
-  /** NetworkId.id the token belongs to (mainnet=1 / testnet=2 / local=3). */
-  readonly network: number;
   /**
    * Genesis-stable token id — 64-char lowercase hex of the v2 `TokenId.bytes`
    * (same across every state of the token). Stored on the blob so dedup / listing

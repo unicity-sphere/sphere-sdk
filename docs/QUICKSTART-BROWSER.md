@@ -1,5 +1,13 @@
 # Sphere SDK - Browser Quick Start
 
+> **On 0.15.0.** The base SDK pin moved to `@unicitylabs/state-transition-sdk@3.0.1` — a wire
+> break that no client can straddle, so your wallet-api deployment has to bump with you (see the
+> [flag-day section](../README.md#0150--the-state-transition-sdk-301-flag-day)). What that
+> changes in this guide is `sphere.paymentsV2` — the alias is **removed**, and `sphere.payments`
+> **throws** `NOT_INITIALIZED` where the alias returned `null` while no vertical was running —
+> plus the payment-journal key prefix below (`pv2:` → `pv2g2:`, swept for you). Everything else
+> is untouched, and everything below already uses `sphere.payments`.
+
 Get up and running with Sphere SDK in web applications in under 5 minutes.
 
 ## Installation
@@ -16,7 +24,7 @@ npm install @unicitylabs/sphere-sdk
 
 > **Note:** No API key is bundled with the SDK. The `testnet` gateway (testnet2, see below) requires one — inject it via `oracle: { apiKey: '...' }`. The testnet2 key is **not a secret** (see `.env.example`): `sk_ddc3cfcc001e4a28ac3fad7407f99590`. A mainnet key, by contrast, IS a secret — keep it in your deploy environment only.
 >
-> **Networks:** since the v1→v2 cutover, `network: 'testnet'` points at the **testnet2 v2 gateway** (`https://gateway.testnet2.unicity.network`; the network id comes from the trust base). `'testnet2'` is an alias of the same configuration. `mainnet`/`dev` still point at v1-era aggregators and cannot serve the v2 engine yet — wallet operations there fail with `AGGREGATOR_ERROR`.
+> **Networks:** since the v1→v2 cutover, `network: 'testnet'` points at the **testnet2 gateway network** (`https://gateway.testnet2.unicity.network`; the network id comes from the trust base). `'testnet2'` is an alias of the same configuration. `mainnet`/`dev` still point at v1-era aggregators and cannot serve the engine — wallet operations there fail with `AGGREGATOR_ERROR`. The "2" in testnet2 names the **gateway network**, not the base-SDK major: testnet2 is still testnet2 on state-transition-sdk 3.x.
 
 ## Framework Setup
 
@@ -250,12 +258,14 @@ Where the wallet's data lives:
 
 | Data | Storage | Persistence | Role |
 |------|---------|-------------|------|
-| Wallet (mnemonic, nametag) + payment journals (`pv2:*`) | `localStorage` / `IndexedDB` | Per-domain, survives refresh | Local secrets + durable payment state |
+| Wallet (mnemonic, nametag) + payment journals (`pv2g2:*`) | `localStorage` / `IndexedDB` | Per-domain, survives refresh | Local secrets + durable payment state |
 | Token inventory + transfer intents + mailbox + history | Wallet API | Server-backed, cross-device | Custody + delivery + record |
 
 **SSR Note:** If `localStorage` is unavailable (SSR), an in-memory fallback is used.
 
 **Wallet-API delivery:** incoming certified transfers land in your wallet-api mailbox; the SDK drains it continuously while running (wake WebSocket + poll) and verifies every token against the trust base before it enters the balance. Nostr is messaging only, not the payment rail.
+
+**Payment-journal keys:** the `pv2g2:` prefix is 0.15.0's generation of the scoped KV (it was `pv2:` through 0.14.x). The rename is the migration — the superseded keys are swept once when the wallet composes its payments vertical, and there is nothing for you to run.
 
 ## Configuration Options
 
@@ -266,8 +276,8 @@ import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wa
 // Step 1: Base providers (required for network, oracle, transport)
 const base = createBrowserProviders({
   // Network: 'mainnet' | 'testnet' | 'testnet2' | 'dev'
-  // ('testnet' IS testnet2 — the v2 gateway; mainnet/dev are still v1-era and
-  //  cannot serve the v2 engine yet)
+  // ('testnet' IS testnet2 — the v2 gateway network; mainnet/dev are still
+  //  v1-era and cannot serve the engine)
   network: 'testnet',
 
   // Transport options
@@ -344,7 +354,7 @@ document.getElementById('balance').textContent = `$${totalUsd.toFixed(2)}`;
 
 ### Top Up (Testnet Self-Mint)
 
-There is no faucet — on testnet you top up by **self-minting** tokens via the v2 token engine:
+There is no faucet — on testnet you top up by **self-minting** tokens via the token engine:
 
 ```typescript
 import { TokenRegistry } from '@unicitylabs/sphere-sdk';
@@ -848,5 +858,7 @@ logger.setTagDebug('Nostr', true);
 ## Next Steps
 
 - [API Reference](./API.md) - Full API documentation
-- [Integration Guide](./INTEGRATION.md) - Advanced integration patterns
+- [Integration Guide](./INTEGRATION.md) - Advanced integration patterns, and [Upgrading to 0.15.0](./INTEGRATION.md#upgrading-to-0150)
+- [Connect Protocol](./CONNECT.md) - dApp ↔ wallet RPC (protocol version `2.1`)
+- [Parallel token verification](./VERIFICATION-WORKERS.md) - The opt-in worker pool
 - [Node.js Quick Start](./QUICKSTART-NODEJS.md) - For server-side usage

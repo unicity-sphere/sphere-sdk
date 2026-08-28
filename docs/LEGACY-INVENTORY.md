@@ -32,6 +32,21 @@ entry by grepping its backticked symbol, not by its address.
   storage-key constants, and the Connect invoice surface (2 queries + 9 intents +
   2 scopes; protocol stays 2.1 — never enabled in any host). The `unconfirmed` Asset
   fields KEEP their shape — the v2 presentation pins them `'0'`/`0`.
+- **#760 — the state-transition-sdk 3.x bump (0.15.0).** CLOSED-BY-3.x, and note WHY:
+  these entries were correctly refuted as unremovable below, and the bump changed the
+  facts rather than the reasoning. `token-engine/token-blob.ts` in full —
+  `TOKEN_BLOB_VERSION`, `TokenBlob.v`, `encodeTokenBlob`/`decodeTokenBlob`, and
+  `unwrapTokenBlobBytes` with its tolerant dual-form decode — plus `TokenBlob.network`.
+  The envelope's last mirroring decodes died with the P11 deletion wave, leaving
+  `encodeTokenBlob` with no production writer at all; the pass-through arm the refutation
+  rested on IS still live, and it survives as the plain `Token.fromCBOR(blobBytes)` in
+  `deriveDeliveryKeys`. `TokenBlob` is now `{ tokenId, token }`. Also gone: the
+  `sphere.paymentsV2` alias and the `paymentsV2:` init flag, and `SphereInstance`'s legacy
+  `payments: { getBalance/getAssets/getFiatBalance/getTokens/getHistory }` shape with the
+  ConnectHost fallbacks that read it (dead since P11 — no Sphere has provided those
+  methods since the flip). The `accounting:`/`swap:` `INVALID_CONFIG` refusal STAYS
+  through 0.15.0: a breaking release is when consumers re-integrate, which is exactly
+  when a silently-ignored flag would be worst.
   - **CLOSURE RULE for the sections below:** every entry whose anchor file died in the
     flip is CLOSED-BY-P11 — that covers every entry under `modules/payments/*`,
     `modules/accounting/*`, `modules/swap/*`, `wallet-api/*`, the old

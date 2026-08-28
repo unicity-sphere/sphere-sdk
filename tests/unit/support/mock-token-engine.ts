@@ -5,7 +5,7 @@ import type {
 
 /** Build a SphereToken stand-in for interaction tests (sdkToken/blob are inert). */
 export function mockSphereToken(value: SphereValue | null = { assets: [] }): SphereToken {
-  const blob: TokenBlob = { v: 1, network: 2, tokenId: '00'.repeat(32), token: new Uint8Array() };
+  const blob: TokenBlob = { tokenId: '00'.repeat(32), token: new Uint8Array() };
   return { sdkToken: {} as SphereToken['sdkToken'], blob, value };
 }
 

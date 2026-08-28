@@ -66,7 +66,7 @@ export const STORAGE_KEYS_GLOBAL = {
  * Example: sphere_DIRECT_abc123_xyz789_pending_transfers
  *
  * Note: Token data is server custody (wallet-api backend), not here; the
- * payments vertical's durable client state self-prefixes `pv2:{network}:{pubkey}:`.
+ * payments vertical's durable client state self-prefixes `pv2g2:{network}:{pubkey}:`.
  */
 export const STORAGE_KEYS_ADDRESS = {
   /** Transfer outbox for this address (pre-flip key name; kept as the network-scoping witness) */
@@ -95,7 +95,7 @@ export const STORAGE_KEYS_ADDRESS = {
  * Per-address keys that are ALSO per-network: token/payment operational state. Mixing these
  * across networks is unsafe. Chat/identity per-address keys (CONVERSATIONS/MESSAGES/
  * GROUP_CHAT_*) are network-AGNOSTIC and deliberately NOT listed. The payments vertical
- * self-prefixes `pv2:{network}:{pubkey}:` and never rides this mechanism; the entries left
+ * self-prefixes `pv2g2:{network}:{pubkey}:` and never rides this mechanism; the entries left
  * here are the pre-flip key names the network-isolation tests pin the provider behavior
  * with (P11 stage-2 note: the full isNetworkScopedAddressKey cut needs an owner call on
  * those tests first).

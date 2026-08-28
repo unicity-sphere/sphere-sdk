@@ -1,5 +1,13 @@
 # Sphere SDK API Reference
 
+> **0.15.0 surface changes.** `sphere.paymentsV2` and the `paymentsV2: true` init flag are
+> **removed** — `sphere.payments` is the only accessor, and it **throws**
+> `SphereError('NOT_INITIALIZED')` where the alias returned `null` (see
+> [Payments](#payments-spherepayments--the-paymentsv2-facade)). The base SDK pin moved to
+> `@unicitylabs/state-transition-sdk@3.0.1`, a wire break that no 2.x client can straddle —
+> README's [flag-day section](../README.md#0150--the-state-transition-sdk-301-flag-day) has the
+> operational consequences. Nothing on this page's method signatures changed with the pin.
+
 ## Sphere
 
 Main entry point for all SDK operations. The constructor is **private** — use static methods to create/load wallets.
@@ -28,10 +36,12 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
 });
 ```
 
-**Removed options (P11 flip):** `accounting: true` / `swap: true` **throw** a typed
-`INVALID_CONFIG` — invoicing and swaps no longer exist in the SDK. `paymentsV2: true` is
-accepted as a deprecated no-op for one release. `tokenStorage` / `delivery` no longer exist
-(token custody is the wallet-api backend).
+**Removed options:** `accounting: true` / `swap: true` **throw** a typed `INVALID_CONFIG` —
+invoicing and swaps no longer exist in the SDK, and that refusal is kept deliberately through
+0.15.0 (a silent no-op would hide the removal in exactly the release where consumers
+re-integrate). `paymentsV2: true` was a deprecated no-op and is **gone in 0.15.0** — passing it
+is an excess-property error against `SphereInitOptions`, not a runtime refusal. `tokenStorage` /
+`delivery` no longer exist (token custody is the wallet-api backend).
 
 **Password encryption behavior:**
 - **No password (default):** Mnemonic stored as plaintext in storage.
@@ -53,9 +63,13 @@ Load existing wallet from storage (low-level; prefer `Sphere.init()`).
 
 #### `Sphere.clear(options: { storage: StorageProvider }): Promise<void>`
 
-Delete all SDK-owned wallet data: the KV store (keys, identity, and the `pv2:*` payment
+Delete all SDK-owned wallet data: the KV store (keys, identity, and the `pv2g2:*` payment
 journals). In the browser it also sweeps orphaned pre-flip `sphere-token-storage-*`
 IndexedDB databases.
+
+This is a wipe, not a migration step: it clears the store with no prefix, so it takes the
+mnemonic with it. The 0.15.0 scoped-KV generation bump needs nothing from you — the superseded
+`pv2:` keys are swept once when the vertical is composed.
 
 ```typescript
 await Sphere.clear({ storage: providers.storage });
@@ -66,8 +80,7 @@ await Sphere.clear({ storage: providers.storage });
 | Property | Type | Description |
 |----------|------|-------------|
 | `identity` | `FullIdentity \| null` | Current wallet identity (after init/load) |
-| `payments` | `PaymentsV2` | The payments facade (assets/tokens/history/send/mint/receive/requests) |
-| `paymentsV2` | `PaymentsV2 \| null` | **Deprecated** alias of `payments`, kept one release |
+| `payments` | `PaymentsV2` | The payments facade (assets/tokens/history/send/mint/receive/requests). **Throws** `NOT_INITIALIZED` while no vertical runs — init in flight, mid address-switch, or destroyed |
 | `communications` | `CommunicationsModule` | Messaging operations |
 | `groupChat` | `GroupChatModule \| null` | NIP-29 group chat (null unless enabled) |
 | `market` | `MarketModule \| null` | Market intents (null unless enabled) |
@@ -219,9 +232,17 @@ interface PeerInfo {
 The payments vertical (design: `docs/PAYMENTS-V2-DESIGN.md`). Money custody is the
 wallet-api backend: token inventory, transfer intents, the delivery mailbox, history and
 payment requests live server-side; the client holds keys and a small per-address durable
-KV (`pv2:{network}:{chainPubkey}:*` — refresh token, cursors, seen-set, journals).
+KV (`pv2g2:{network}:{chainPubkey}:*` — refresh token, cursors, seen-set, journals). The `g2`
+generation is 0.15.0's: the prefix rename IS the migration across the base-SDK wire break, and
+the superseded `pv2:` keys are swept once at composition.
 
-`sphere.paymentsV2` is a **deprecated alias** of the same facade, kept one release.
+**`sphere.paymentsV2` is removed** (0.15.0), together with the `paymentsV2: true` init flag.
+`sphere.payments` is the same facade the alias returned, with one behavioural difference that
+matters at the call site: where the alias evaluated to `null` while no vertical was running, the
+getter **throws** `SphereError` with `code: 'NOT_INITIALIZED'`. Code written as
+`sphere.paymentsV2?.tokens() ?? []` silently degraded before and now throws — rewrite it to read
+the facade only after `Sphere.init()` resolves, or catch that one code where you used to check
+for `null`.
 
 ### How Transfers Work (sender-driven)
 
@@ -243,7 +264,7 @@ KV (`pv2:{network}:{chainPubkey}:*` — refresh token, cursors, seen-set, journa
 - A certified-but-undelivered blob is journaled locally (#621) and re-deposited with a bounded
   poison budget (#517) — `deliveryPending: true` on the result, `transfer:attention` when
   deferred/undeliverable.
-- **Requirements:** the token engine must be available (oracle supplies a v2 trust base +
+- **Requirements:** the token engine must be available (oracle supplies a trust base +
   gateway URL; otherwise `AGGREGATOR_ERROR`), and the recipient must have a published chain
   pubkey (otherwise `INVALID_RECIPIENT`).
 
@@ -686,7 +707,7 @@ interface SphereEventMap {
   'transfer:updated': TransferResult;                 // read status / deliveryPending
   'transfer:attention': { transferId: string; code: string; detail?: string };
   'inventory:updated': Record<string, never>;
-  'history:updated': Record<string, never>;
+  'history:updated': HistoryEntry;                    // the just-recorded entry
   'payment_request:incoming': PaymentRequestView;
   'payment_request:updated': { id: string; status: 'pending' | 'settling' | 'paid' | 'rejected' | 'expired' };
   'connection:status': { status: 'connected' | 'degraded' | 'offline' };
@@ -732,13 +753,13 @@ const available = await sphere.isNametagAvailable('alice');
 ### Storage
 
 Registration is **Nostr-binding-only**. The self-issued `UnicityIdToken` on-chain claim was
-removed with the 2.0.0 state-transition-sdk bump (upstream deleted the unicity-id primitive);
+removed back at the 2.0.0 state-transition-sdk bump (upstream deleted the unicity-id primitive);
 `NametagData` relics from older versions are no longer readable — the Nostr binding is the
 registration, and it is recovered from Nostr on wallet import.
 
 ---
 
-## Provider Setup (v2)
+## Provider Setup
 
 ### Base Providers (Platform-Specific)
 
@@ -792,7 +813,7 @@ package on Node < 22), and `paymentsV2Transport(args)` — a DI seam that replac
 per-address transport bundle (`{ session, client }`) for tests or custom hosts; when supplied,
 `baseUrl` is not required.
 
-### Full Initialization Example (Node.js v2)
+### Full Initialization Example (Node.js)
 
 ```typescript
 import { Sphere } from '@unicitylabs/sphere-sdk';
@@ -841,7 +862,7 @@ console.log('received', transfers.length, 'transfers');
 
 ## OracleProvider (Network-Config Provider)
 
-The oracle is a **thin network-config provider** for the v2 token engine: it loads the root trust base (JSON) and exposes the gateway URL + API key. The engine (`token-engine/`) builds its own SDK clients from these — no state-transition SDK objects cross this boundary.
+The oracle is a **thin network-config provider** for the token engine: it loads the root trust base (JSON) and exposes the gateway URL + API key. The engine (`token-engine/`) builds its own SDK clients from these — no state-transition SDK objects cross this boundary.
 
 ```typescript
 interface OracleProvider extends BaseProvider {
@@ -868,6 +889,5 @@ interface OracleProvider extends BaseProvider {
 Network configuration:
 
 - **testnet2:** `https://gateway.testnet2.unicity.network` (networkId 4)
-- **mainnet/dev:** v1 aggregators (no v2 ops; use testnet2 for v2 testing)
+- **mainnet/dev:** v1-era aggregators — the engine cannot operate against them (`AGGREGATOR_ERROR`); use testnet2
 
-<SendUserFile files=["/tmp/claude-1000/-home-pavelg-unicity-wallet-api/1e32e555-19ef-4bb4-b860-9f3a6a90260f/scratchpad/API.md"] status="normal" caption="Complete rewritten API.md for sphere-sdk v2" />

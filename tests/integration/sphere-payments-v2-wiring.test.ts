@@ -2,7 +2,7 @@
  * P11 Sphere wiring — the payments vertical is DEFAULT AND ONLY
  * (docs/PAYMENTS-V2-DESIGN.md §4/§7/§11 + core/payments-v2-wiring.ts).
  *
- * Defaults: `sphere.payments` IS the §4 facade; `sphere.paymentsV2` is the
+ * Defaults: `sphere.payments` IS the §4 facade; `sphere.payments` is the
  * deprecated alias serving the SAME facade; init is fail-closed without a
  * `walletApi` transport config; the retired `accounting`/`swap` options throw
  * typed INVALID_CONFIG (the one sanctioned refusal fossil); `paymentsV2` is a
@@ -193,7 +193,6 @@ afterEach(async () => {
 }, 30_000);
 
 interface BuildOptions {
-  paymentsV2?: boolean;
   walletApi: WalletApiTransportConfig;
   peers?: Record<string, PeerInfo>;
   nametag?: string;
@@ -211,7 +210,6 @@ async function buildSphere(options: BuildOptions): Promise<Sphere> {
     network: NET,
     walletApi: options.walletApi,
     ...(options.nametag !== undefined ? { nametag: options.nametag } : {}),
-    ...(options.paymentsV2 !== undefined ? { paymentsV2: options.paymentsV2 } : {}),
   });
   cleanups.push(async () => {
     await sphere.destroy();
@@ -221,6 +219,36 @@ async function buildSphere(options: BuildOptions): Promise<Sphere> {
 }
 
 describe('Sphere payments wiring — defaults (P11 flip: the vertical is default and only)', () => {
+  it('composing the vertical sweeps the superseded pv2: state left by a 2.x wallet', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-sweep-'));
+    const storage = new FileStorageProvider({ dataDir });
+    // What a wallet upgraded across the wire break still has on disk. The epoch
+    // latch is the dangerous one: surviving, it makes a backend reset look like a
+    // server restore and re-PUTs these dead intents into the fresh backend.
+    await storage.set(`pv2:${NET}:stale-pubkey:intents`, '["a 2.x open intent"]');
+    await storage.set(`pv2:${NET}:stale-pubkey:epoch-latch`, '"epoch-7"');
+
+    const { sphere } = await Sphere.init({
+      storage,
+      transport: createMockTransport(),
+      oracle: createEngineOracle(),
+      mnemonic: MNEMONIC,
+      network: NET,
+      walletApi: makeWorld().walletApi,
+    });
+    cleanups.push(async () => {
+      await sphere.destroy();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    });
+
+    await vi.waitFor(async () => {
+      expect(await storage.get(`pv2:${NET}:stale-pubkey:intents`)).toBeNull();
+      expect(await storage.get(`pv2:${NET}:stale-pubkey:epoch-latch`)).toBeNull();
+    });
+    // The wallet itself survives the sweep — this is not Sphere.clear().
+    expect(sphere.identity!.chainPubkey).toBeTruthy();
+  });
+
   it('fail-closed at init: missing walletApi / retired accounting / retired swap throw INVALID_CONFIG before any write', async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-failclosed-'));
     cleanups.push(async () => fs.rmSync(dataDir, { recursive: true, force: true }));
@@ -301,12 +329,12 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     expect(world.transports).toHaveLength(0);
   }, 20_000);
 
-  it('sphere.payments IS the facade; sphere.paymentsV2 is the deprecated alias to the SAME facade', async () => {
+  it('sphere.payments IS the facade; sphere.payments is the deprecated alias to the SAME facade', async () => {
     const world = makeWorld();
     const sphere = await buildSphere({ walletApi: world.walletApi });
 
     expect(sphere.payments).toBeDefined();
-    expect(sphere.paymentsV2).toBe(sphere.payments);
+    expect(sphere.payments).toBe(sphere.payments);
     expect(world.transports).toHaveLength(1);
     expect(world.transports[0]!.session.startCalls).toBe(1);
     // The vertical authenticates as the wallet's identity on the wallet-api network.
@@ -390,17 +418,19 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     expect(bundle).toEqual({ senderNametag: 'alice', memo: 'pay me' });
   }, 20_000);
 
-  it('`paymentsV2: true` and `paymentsV2: false` are both tolerated no-ops (one release)', async () => {
-    const worldOn = makeWorld();
-    const sphereOn = await buildSphere({ walletApi: worldOn.walletApi, paymentsV2: true });
-    expect(sphereOn.payments).toBe(sphereOn.paymentsV2);
-    expect(worldOn.transports).toHaveLength(1);
-    await sphereOn.destroy();
-
-    const worldOff = makeWorld();
-    const sphereOff = await buildSphere({ walletApi: worldOff.walletApi, paymentsV2: false });
-    expect(sphereOff.payments).toBe(sphereOff.paymentsV2);
-    expect(worldOff.transports).toHaveLength(1);
+  it('the retired `paymentsV2` alias and init flag are gone from the public surface', async () => {
+    const world = makeWorld();
+    const sphere = await buildSphere({ walletApi: world.walletApi });
+    expect('paymentsV2' in sphere).toBe(false);
+    // The flag is no longer declared, so a stale caller reaches init through a cast.
+    // It must stay INERT — unlike accounting/swap it never meant anything.
+    const stale = makeWorld();
+    const withFlag = await buildSphere({
+      walletApi: stale.walletApi,
+      ...({ paymentsV2: true } as Record<string, unknown>),
+    });
+    expect(withFlag.payments).toBeTruthy();
+    expect(stale.transports).toHaveLength(1);
   }, 30_000);
 
   it('facade events reach sphere.on subscribers (the bus is the emit seam)', async () => {
@@ -500,18 +530,19 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     );
     expect(running).toHaveLength(1);
     expect(world.transports.filter((t) => t.session.stopCalls === 1)).toHaveLength(2);
-    expect(sphere.paymentsV2).not.toBeNull();
+    expect(sphere.payments).not.toBeNull();
   }, 30_000);
 
-  it('destroy() stops the running vertical; payments throws NOT_INITIALIZED, the alias nulls', async () => {
+  it('destroy() stops the running vertical and payments then refuses with NOT_INITIALIZED', async () => {
     const world = makeWorld();
     const sphere = await buildSphere({ walletApi: world.walletApi });
-    expect(sphere.paymentsV2).not.toBeNull();
+    expect(sphere.payments).toBeTruthy();
 
     await sphere.destroy();
 
     expect(world.transports[0]!.session.stopCalls).toBe(1);
-    expect(sphere.paymentsV2).toBeNull();
+    // Refusing beats the alias's old `null`: a caller cannot accidentally treat a
+    // destroyed wallet as merely empty.
     let caught: unknown;
     try {
       void sphere.payments;

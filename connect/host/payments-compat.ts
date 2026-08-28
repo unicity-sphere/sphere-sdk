@@ -1,11 +1,10 @@
-// docs/PAYMENTS-V2-DESIGN.md §4 "Compatibility": with a v2-facade Sphere bound
-// (`sphere.paymentsV2` non-null), old wire queries are served from facade reads and every
-// old event name a dApp can `sphere_subscribe` to is re-emitted from the v2 bus events —
-// dApps change NOTHING. Dormant on an old-stack Sphere (its module emits the old names).
-// Old names stay plain string literals here: post-flip this wire surface is their only home.
+// docs/PAYMENTS-V2-DESIGN.md §4 "Compatibility": old wire queries are served from
+// `sphere.payments`, and every old dApp-subscribable event name is re-emitted from the
+// facade's bus — dApps change NOTHING. Old names stay plain string literals: post-flip
+// this wire surface is their only home.
 
 import type { TransferResult } from '../../types';
-import type { PaymentRequestView } from '../../modules/payments-v2/api';
+import type { PaymentRequestView, PaymentsV2 } from '../../modules/payments-v2/api';
 import type { SphereInstance } from './SphereInstance';
 
 type Forward = (data: unknown) => void;
@@ -55,12 +54,23 @@ function toLegacyRequest(view: PaymentRequestView, status: string): Record<strin
 // Rebuilds the old per-status `IncomingPaymentRequest` payload: full view from
 // `requests.list()` (processed requests stay listed until dismissProcessed()); if already
 // gone, id + status still carry the signal and unknowable fields are empty.
+/** The facade, or null while none runs — `sphere.payments` throws between verticals.
+ *  Callers here are EVENT callbacks, whose throw Sphere's dispatcher swallows. */
+function paymentsOrNull(sphere: SphereInstance): PaymentsV2 | null {
+  try {
+    return sphere.payments;
+  } catch {
+    return null;
+  }
+}
+
 function legacyRequestPayload(
   sphere: SphereInstance,
   update: PaymentRequestUpdated,
 ): Record<string, unknown> {
-  const view: PaymentRequestView | undefined = sphere.paymentsV2
-    ?.requests.list().find((request) => request.id === update.id);
+  const view: PaymentRequestView | undefined = paymentsOrNull(sphere)
+    ?.requests.list()
+    .find((request) => request.id === update.id);
   if (!view) {
     return {
       id: update.id,
@@ -155,7 +165,7 @@ const COMPAT_ATTACHERS: ReadonlyMap<string, Attach> = new Map<string, Attach>([
     })],
   ['sync:completed', (sphere, forward) =>
     sphere.on('inventory:updated', () => {
-      forward({ source: 'payments', count: sphere.paymentsV2?.tokens().length ?? 0 });
+      forward({ source: 'payments', count: paymentsOrNull(sphere)?.tokens().length ?? 0 });
     })],
   ['sync:remote-update', remoteUpdateAttacher],
 ]);

@@ -948,52 +948,39 @@ export class ConnectHost {
     // 'live' before we get here, so this is defence in depth — and it is what makes the
     // nullable field compile without a single `!`.
     const sphere = this.requireSphere();
-    // §4 wire-compat (payments-compat.ts): on a v2-facade host the old query results are
-    // built from facade reads; sphere.payments is never touched (its getter throws under v2).
-    const v2 = sphere.paymentsV2 ?? null;
+    // §4 wire-compat (payments-compat.ts): the old query results are built from
+    // facade reads. `sphere.payments` is read per branch, never up here — the
+    // getter throws while no vertical runs and GET_IDENTITY must still answer.
     switch (method) {
       case RPC_METHODS.GET_IDENTITY:
         return this.getPublicIdentity();
 
       case RPC_METHODS.GET_BALANCE:
-        return v2
-          ? v2.assets(params.coinId as string | undefined)
-          : sphere.payments.getBalance(params.coinId as string | undefined);
-
       case RPC_METHODS.GET_ASSETS:
-        return v2
-          ? v2.assets(params.coinId as string | undefined)
-          : sphere.payments.getAssets(params.coinId as string | undefined);
+        return sphere.payments.assets(params.coinId as string | undefined);
 
       case RPC_METHODS.GET_FIAT_BALANCE:
-        return {
-          fiatBalance: v2 ? sumFiatUsd(await v2.assets()) : await sphere.payments.getFiatBalance(),
-        };
+        return { fiatBalance: sumFiatUsd(await sphere.payments.assets()) };
 
       case RPC_METHODS.GET_TOKENS:
         return this.stripTokenSdkData(
-          v2
-            ? v2.tokens(params.coinId ? { coinId: params.coinId as string } : undefined)
-            : sphere.payments.getTokens(
-                params.coinId ? { coinId: params.coinId as string } : undefined,
-              ),
+          sphere.payments.tokens(params.coinId ? { coinId: params.coinId as string } : undefined),
         );
 
       case RPC_METHODS.GET_HISTORY: {
-        if (!v2) return sphere.payments.getHistory();
         // Flat entry array on the wire; entries already carry the consumed shape
         // (`timestamp` mapped from the server's `ts`, plus symbol/tokenIds).
         const limit = typeof params.limit === 'number' && Number.isFinite(params.limit)
           ? params.limit
           : undefined;
-        if (limit !== undefined) return (await v2.history({ limit })).entries;
+        if (limit !== undefined) return (await sphere.payments.history({ limit })).entries;
         // INVARIANT: the legacy wire has no cursor — completeness is the contract.
         // Parameterless sphere_getHistory returned the ENTIRE ledger, so follow
         // the facade's cursors until the record is exhausted.
-        let page = await v2.history(undefined);
+        let page = await sphere.payments.history(undefined);
         const entries = [...page.entries];
         while (page.more && page.cursor !== null) {
-          page = await v2.history({ before: page.cursor });
+          page = await sphere.payments.history({ before: page.cursor });
           entries.push(...page.entries);
         }
         return entries;
@@ -1144,7 +1131,7 @@ export class ConnectHost {
     // bus emitter — re-emit them from the v2 events so nothing a dApp subscribes to silently
     // stops firing. Keyed under the OLD name, so unsubscribe and the lock snapshot/replay
     // bookkeeping work unchanged.
-    if (sphere.paymentsV2) {
+    {
       const compatUnsub = attachCompatEvent(sphere, eventName, (data) =>
         this.pushClientEvent(eventName, data),
       );

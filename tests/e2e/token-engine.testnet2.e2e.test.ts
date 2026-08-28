@@ -12,7 +12,6 @@ import { describe, expect, it } from 'vitest';
 
 import { createSphereTokenEngine } from '../../token-engine/factory';
 import { SigningService } from '../../token-engine/sdk';
-import { decodeTokenBlob, encodeTokenBlob } from '../../token-engine/token-blob';
 import { bytesToHex, hexToBytes } from '../../core/crypto';
 
 const GATEWAY = process.env.TESTNET2_GATEWAY ?? 'https://gateway.testnet2.unicity.network';
@@ -89,9 +88,9 @@ describe.runIf(!!API_KEY)('token-engine e2e — live testnet2 (networkId 4)', ()
     expect((await engine.verify(minted)).ok).toBe(true);
     expect(await engine.isSpent(minted)).toBe(false);
 
-    // Exactly the wallet's storage codec: blob hex -> decode -> balance preserved.
-    const sdkData = bytesToHex(encodeTokenBlob(engine.encodeToken(minted)));
-    const restored = await engine.decodeToken(decodeTokenBlob(hexToBytes(sdkData)));
+    // Exactly the wallet's wire form: token CBOR hex -> decode -> balance preserved.
+    const sdkData = bytesToHex(engine.encodeToken(minted).token);
+    const restored = await engine.decodeToken({ tokenId: '', token: hexToBytes(sdkData) });
     expect(engine.tokenId(restored)).toBe(engine.tokenId(minted));
     expect(engine.balanceOf(restored, COIN)).toBe(250n);
   });

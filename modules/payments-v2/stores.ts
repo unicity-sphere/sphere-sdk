@@ -1,6 +1,25 @@
 // The complete §6 durable-state inventory. One writer per store.
 
+import { logger } from '../../core/logger';
 import type { StorageProvider } from '../../storage';
+
+/** Generation 2 of the durable client state; renaming IS the 3.x migration
+ *  (kv-generation.test.ts). Must not START with a superseded prefix — the sweep
+ *  below matches by `startsWith`. */
+const KV_PREFIX = 'pv2g2:';
+
+const SUPERSEDED_KV_PREFIXES = ['pv2:'] as const;
+
+/** Never `storage.clear()` — that takes the keys too. */
+export async function sweepSupersededState(storage: StorageProvider): Promise<void> {
+  for (const prefix of SUPERSEDED_KV_PREFIXES) {
+    try {
+      await storage.clear(prefix);
+    } catch (err) {
+      logger.warn('PaymentsV2', `could not clear superseded state under "${prefix}": ${String(err)}`);
+    }
+  }
+}
 
 export interface ScopedKV {
   get<T>(key: string): Promise<T | null>;
@@ -13,7 +32,7 @@ export function createScopedKV(
   network: string,
   chainPubkey: string
 ): ScopedKV {
-  const prefix = `pv2:${network}:${chainPubkey}:`;
+  const prefix = `${KV_PREFIX}${network}:${chainPubkey}:`;
   return {
     async get<T>(key: string): Promise<T | null> {
       const raw = await storage.get(prefix + key);

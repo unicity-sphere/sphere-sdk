@@ -42,3 +42,6 @@ docs/superpowers/
 
 # Test runner artifacts
 .vitest-result.json
+
+# Testcontainers writes the aggregator stack's genesis here (see tests/aggregator/support)
+tests/aggregator/docker/data/

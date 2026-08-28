@@ -20,6 +20,7 @@ import { RPC_METHODS } from '../../../connect/protocol';
 import { PERMISSION_SCOPES } from '../../../connect/permissions';
 import type { PaymentsV2Events, PaymentRequestView, HistoryEntry } from '../../../modules/payments-v2/api';
 import type { TransferResult } from '../../../types';
+import { SphereError } from '../../../core/errors';
 
 // ===========================================================================
 // Mock transport pair (records both directions)
@@ -118,13 +119,13 @@ const FAILED: TransferResult = {
 // Mock Spheres
 // ===========================================================================
 
-/** A Sphere running the v2 facade: `payments` THROWS (as the real getter does under v2);
- *  `paymentsV2` serves reads; the 8 facade events ride the bus via _emit. */
+/** A Sphere running the v2 facade: `payments` IS the facade (the alias is gone in
+ *  0.15); the 8 facade events ride the bus via _emit. */
 function createV2MockSphere(overrides?: { assets?: unknown[] }) {
   const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
   const assets = overrides?.assets ?? [ASSET_UCT, ASSET_ALT];
 
-  const paymentsV2 = {
+  const payments = {
     assets: vi.fn((coinId?: string) =>
       Promise.resolve(coinId ? assets.filter((a) => (a as { coinId: string }).coinId === coinId) : assets)),
     tokens: vi.fn((filter?: { coinId?: string }) =>
@@ -145,10 +146,7 @@ function createV2MockSphere(overrides?: { assets?: unknown[] }) {
   return {
     identity: { chainPubkey: '02abc123', directAddress: 'DIRECT://test', nametag: 'alice' },
     networkId: 4,
-    get payments(): never {
-      throw new Error('payments (v1) is disabled by paymentsV2 — use sphere.paymentsV2');
-    },
-    paymentsV2,
+    payments,
     signMessage: vi.fn(),
     resolve: vi.fn().mockResolvedValue(null),
     on: vi.fn((type: string, handler: (data: unknown) => void) => {
@@ -166,33 +164,6 @@ function createV2MockSphere(overrides?: { assets?: unknown[] }) {
   };
 }
 
-/** An old-stack Sphere: `payments` works, no `paymentsV2` — the adapter must stay dormant. */
-function createLegacyMockSphere() {
-  const eventHandlers = new Map<string, Set<(data: unknown) => void>>();
-  return {
-    identity: { chainPubkey: '02abc123', directAddress: 'DIRECT://test', nametag: 'alice' },
-    networkId: 4,
-    payments: {
-      getBalance: vi.fn().mockReturnValue([{ coinId: COIN, totalAmount: '1000000' }]),
-      getAssets: vi.fn().mockResolvedValue([ASSET_UCT]),
-      getFiatBalance: vi.fn().mockResolvedValue(10.5),
-      getTokens: vi.fn().mockReturnValue(TOKENS),
-      getHistory: vi.fn().mockReturnValue([]),
-    },
-    signMessage: vi.fn(),
-    resolve: vi.fn().mockResolvedValue(null),
-    on: vi.fn((type: string, handler: (data: unknown) => void) => {
-      if (!eventHandlers.has(type)) eventHandlers.set(type, new Set());
-      eventHandlers.get(type)!.add(handler);
-      return () => eventHandlers.get(type)?.delete(handler);
-    }),
-    _emit(type: string, data: unknown) {
-      for (const h of eventHandlers.get(type) ?? []) h(data);
-    },
-    communications: undefined as unknown,
-  };
-}
-
 // ===========================================================================
 // Harness
 // ===========================================================================
@@ -201,7 +172,7 @@ const DAPP = { name: 'Compat dApp', url: 'https://compat.app' };
 
 interface Harness {
   pair: MockPair;
-  sphere: ReturnType<typeof createV2MockSphere> | ReturnType<typeof createLegacyMockSphere>;
+  sphere: ReturnType<typeof createV2MockSphere>;
   host: ConnectHost;
   client: ConnectClient;
 }
@@ -253,11 +224,11 @@ async function subscribe(h: Harness, event: string, handler: (data: unknown) => 
 
 describe('§4 compat queries against a v2-facade host', () => {
   let h: Harness;
-  let v2: ReturnType<typeof createV2MockSphere>['paymentsV2'];
+  let v2: ReturnType<typeof createV2MockSphere>['payments'];
 
   beforeEach(async () => {
     const sphere = createV2MockSphere();
-    v2 = sphere.paymentsV2;
+    v2 = sphere.payments;
     h = await connectHarness(sphere);
   });
 
@@ -302,7 +273,7 @@ describe('§4 compat queries against a v2-facade host', () => {
 
   it('sphere_getTokens still strips sdkData from the wire', async () => {
     const sphere = createV2MockSphere();
-    sphere.paymentsV2.tokens = vi.fn(() => [
+    sphere.payments.tokens = vi.fn(() => [
       { id: 'tok9', coinId: COIN, amount: '1', sdkData: { internal: true } },
     ]) as never;
     const h2 = await connectHarness(sphere);
@@ -325,7 +296,7 @@ describe('§4 compat queries against a v2-facade host', () => {
   /** 3-page facade history fake: h1 → c1 → h2 → c2 → h3 (exhausted). */
   function threePageSphere() {
     const sphere = createV2MockSphere();
-    sphere.paymentsV2.history = vi.fn((page?: { before?: string; limit?: number }) => {
+    sphere.payments.history = vi.fn((page?: { before?: string; limit?: number }) => {
       if (page?.before === 'c1') {
         return Promise.resolve({ entries: [{ ...HISTORY_ENTRY, id: 'h2' }], more: true, cursor: 'c2' });
       }
@@ -342,10 +313,10 @@ describe('§4 compat queries against a v2-facade host', () => {
     const h2 = await connectHarness(sphere);
     const result = (await h2.client.query(RPC_METHODS.GET_HISTORY)) as HistoryEntry[];
     expect(result.map((entry) => entry.id)).toEqual(['h1', 'h2', 'h3']);
-    expect(sphere.paymentsV2.history).toHaveBeenCalledTimes(3);
-    expect(sphere.paymentsV2.history).toHaveBeenNthCalledWith(1, undefined);
-    expect(sphere.paymentsV2.history).toHaveBeenNthCalledWith(2, { before: 'c1' });
-    expect(sphere.paymentsV2.history).toHaveBeenNthCalledWith(3, { before: 'c2' });
+    expect(sphere.payments.history).toHaveBeenCalledTimes(3);
+    expect(sphere.payments.history).toHaveBeenNthCalledWith(1, undefined);
+    expect(sphere.payments.history).toHaveBeenNthCalledWith(2, { before: 'c1' });
+    expect(sphere.payments.history).toHaveBeenNthCalledWith(3, { before: 'c2' });
   });
 
   it('an explicit limit keeps the single-page read — no cursor walk', async () => {
@@ -353,17 +324,10 @@ describe('§4 compat queries against a v2-facade host', () => {
     const h2 = await connectHarness(sphere);
     const result = (await h2.client.query(RPC_METHODS.GET_HISTORY, { limit: 1 })) as HistoryEntry[];
     expect(result.map((entry) => entry.id)).toEqual(['h1']);
-    expect(sphere.paymentsV2.history).toHaveBeenCalledTimes(1);
-    expect(sphere.paymentsV2.history).toHaveBeenCalledWith({ limit: 1 });
+    expect(sphere.payments.history).toHaveBeenCalledTimes(1);
+    expect(sphere.payments.history).toHaveBeenCalledWith({ limit: 1 });
   });
 
-  it('legacy host is untouched: queries still hit sphere.payments', async () => {
-    const legacy = createLegacyMockSphere();
-    const h2 = await connectHarness(legacy);
-    const result = await h2.client.query(RPC_METHODS.GET_BALANCE);
-    expect(result).toEqual([{ coinId: COIN, totalAmount: '1000000' }]);
-    expect((legacy as ReturnType<typeof createLegacyMockSphere>).payments.getBalance).toHaveBeenCalled();
-  });
 });
 
 // ===========================================================================
@@ -420,6 +384,22 @@ describe('§4 compat event re-emission against a v2-facade host', () => {
     });
   });
 
+  describe('reads that happen while the facade is being torn down', () => {
+    it('sync:completed still fires, reporting no tokens rather than nothing at all', async () => {
+      await subscribe(h, 'sync:completed');
+      Object.defineProperty(sphere, 'payments', {
+        configurable: true,
+        get(): never {
+          throw new SphereError('Sphere not initialized', 'NOT_INITIALIZED');
+        },
+      });
+      sphere._emit('inventory:updated', {});
+      const frames = eventsOfType(h.pair.hostSent, 'sync:completed');
+      expect(frames).toHaveLength(1);
+      expect(frames[0].data).toEqual({ source: 'payments', count: 0 });
+    });
+  });
+
   describe('payment_request:updated → :paid / :rejected / :expired', () => {
     it.each(['paid', 'rejected', 'expired'] as const)(
       're-emits payment_request:%s with the old IncomingPaymentRequest shape',
@@ -437,6 +417,26 @@ describe('§4 compat event re-emission against a v2-facade host', () => {
       sphere._emit('payment_request:updated', { id: REQUEST_VIEW_NO_SYMBOL.id, status: 'paid' });
       const frames = eventsOfType(h.pair.hostSent, 'payment_request:paid');
       expect(frames[0].data).toEqual({ ...REQUEST_VIEW_NO_SYMBOL, symbol: '', status: 'paid' });
+    });
+
+    it('still fires while the facade is mid-teardown, when reading it would throw', async () => {
+      // An address switch clears the active facade BEFORE awaiting its stop(), and stop()
+      // is where in-flight ops settle and emit — so `sphere.payments` throws right here.
+      // emitEvent swallows a throwing handler, so an unguarded read loses a terminal
+      // payment_request event with no trace. Degrade to the id + status payload instead.
+      await subscribe(h, 'payment_request:paid');
+      Object.defineProperty(sphere, 'payments', {
+        configurable: true,
+        get(): never {
+          throw new SphereError('Sphere not initialized', 'NOT_INITIALIZED');
+        },
+      });
+      sphere._emit('payment_request:updated', { id: REQUEST_VIEW.id, status: 'paid' });
+      const frames = eventsOfType(h.pair.hostSent, 'payment_request:paid');
+      expect(frames).toHaveLength(1);
+      const data = frames[0].data as Record<string, unknown>;
+      expect(data.id).toBe(REQUEST_VIEW.id);
+      expect(data.status).toBe('paid');
     });
 
     it('still fires (id + status) when the view is no longer listed', async () => {
@@ -605,15 +605,6 @@ describe('§4 compat event re-emission against a v2-facade host', () => {
       expect(eventsOfType(h.pair.hostSent, 'transfer:confirmed')).toHaveLength(0);
     });
 
-    it('old names still pass through directly on a legacy host (adapter dormant)', async () => {
-      const legacy = createLegacyMockSphere();
-      const h2 = await connectHarness(legacy);
-      await subscribe(h2, 'transfer:confirmed');
-      (legacy as ReturnType<typeof createLegacyMockSphere>)._emit('transfer:confirmed', DELIVERED);
-      const frames = eventsOfType(h2.pair.hostSent, 'transfer:confirmed');
-      expect(frames).toHaveLength(1);
-      expect(frames[0].data).toEqual(DELIVERED);
-    });
 
     it('a compat subscription survives a lock/unlock cycle (suspended-key replay)', async () => {
       await subscribe(h, 'transfer:confirmed');

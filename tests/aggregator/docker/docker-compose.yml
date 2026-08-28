@@ -1,0 +1,196 @@
+# The local aggregator stack the `test:aggregator` suite runs against.
+#
+# Copied from state-transition-sdk-js `tests/integration/docker/docker-compose.yml`,
+# which the Java SDK also mirrors. Keep the three in step: if each repo exercised a
+# different service build, "passes against a real aggregator" would mean something
+# different in each one.
+#
+# Mirrors aggregator-go's own docker-compose.yml with two deliberate differences:
+# the aggregator runs from a pinned prebuilt image rather than a local rocksdb
+# build, and DEFAULT_REQUEST_TTL is short enough that the service-assigned request
+# deadline can be observed inside a test.
+#
+# Testcontainers drives it, from ../support/aggregatorStack.ts: that creates the
+# writable genesis directories this file mounts, publishes the aggregator on an
+# ephemeral port, and waits for consensus to produce a reference time before any
+# test runs.
+
+x-bft: &bft-base
+  platform: linux/amd64
+  user: "${USER_UID:-1001}:${USER_GID:-1001}"
+  # https://github.com/unicitynetwork/bft-core/pkgs/container/bft-core
+  image: ghcr.io/unicitynetwork/bft-core:ceceacd11b7a735de74ce17884a3a45e0db1748d
+
+services:
+  bft-root:
+    <<: *bft-base
+    volumes:
+      - ./data/genesis-root:/genesis/root
+      - ./data/genesis:/genesis
+    healthcheck:
+      test: ["CMD", "nc", "-zv", "bft-root", "8002"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    entrypoint: ["/busybox/sh", "-c"]
+    command:
+      - |
+        if [ -f /genesis/root/node-info.json ] && [ -f /genesis/trust-base.json ] && [ -f /genesis/root/trust-base-signed.json ]; then
+          echo "Genesis files already exist, skipping initialization."
+        else
+          echo "Creating root genesis..." &&
+          ubft root-node init --home /genesis/root -g &&
+          echo "Creating root trust base..." &&
+          ubft trust-base generate --home /genesis --network-id 3 --node-info /genesis/root/node-info.json &&
+          echo "Signing root trust base..." &&
+          ubft trust-base sign --home /genesis/root --trust-base /genesis/trust-base.json
+        fi
+        echo "Starting root node..." &&
+        exec ubft root-node run --home /genesis/root --address "/ip4/$(hostname -i)/tcp/8000" --trust-base /genesis/trust-base.json --rpc-server-address "$(hostname -i):8002"
+
+  bft-aggregator-genesis-gen:
+    <<: *bft-base
+    volumes:
+      - ./data/genesis-root:/genesis/root
+      - ./data/genesis:/genesis
+    depends_on:
+      bft-root:
+        condition: service_healthy
+    entrypoint: ["/busybox/sh", "-c"]
+    command:
+      - |
+        if [ -f /genesis/aggregator/node-info.json ] && [ -f /genesis/shard-conf-7_0.json ]; then
+          echo "Aggregator genesis and config already exist, skipping initialization."
+        else
+          echo "Creating aggregator genesis..." &&
+          ubft shard-node init --home /genesis/aggregator --generate &&
+          echo "Creating aggregator partition configuration..." &&
+          ubft shard-conf generate --home /genesis --t2-timeout 5000 --network-id 3 --partition-id 7 --partition-type-id 7 --epoch-start 10 --node-info=/genesis/aggregator/node-info.json
+        fi
+        chmod -R 755 /genesis/aggregator
+        chmod 644 /genesis/shard-conf-7_0.json
+        chmod 644 /genesis/trust-base.json
+        chmod -R 755 /genesis/root
+        echo "Genesis ready."
+
+  upload-configurations:
+    image: curlimages/curl:8.13.0
+    user: "${USER_UID:-1001}:${USER_GID:-1001}"
+    depends_on:
+      bft-root:
+        condition: service_healthy
+      bft-aggregator-genesis-gen:
+        condition: service_completed_successfully
+    restart: on-failure
+    volumes:
+      - ./data/genesis:/genesis
+    command: |
+      /bin/sh -c "
+        echo Uploading aggregator configuration &&
+        curl -sf -X PUT -H 'Content-Type: application/json' -d @/genesis/shard-conf-7_0.json http://bft-root:8002/api/v1/configurations
+      "
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  mongodb:
+    image: mongo:7.0
+    command: ["--replSet", "rs0", "--bind_ip_all", "--noauth"]
+    healthcheck:
+      # Initiates the replica set on the first probe, then reports healthy only
+      # once this node has actually been elected primary — rs.status() answers
+      # well before the set can accept writes, and the aggregator's storage
+      # init times out against a set that is still electing.
+      test: ["CMD", "mongosh", "--quiet", "--eval", "try { rs.status() } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongodb:27017'}]}) } if (!db.hello().isWritablePrimary) { quit(1) }"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  aggregator:
+    image: ghcr.io/unicitynetwork/aggregator-go:${AGGREGATOR_IMAGE_TAG:-sha-ae08165}
+    restart: on-failure
+    ports:
+      - "${AGGREGATOR_PORT:-3000}:3000"
+    volumes:
+      - ./data/genesis:/app/bft-config
+    environment:
+      PORT: "3000"
+      HOST: "0.0.0.0"
+      CONCURRENCY_LIMIT: "1000"
+      ENABLE_CORS: "true"
+
+      MONGODB_URI: "mongodb://mongodb:27017/aggregator?replicaSet=rs0&directConnection=true"
+      MONGODB_DATABASE: "aggregator"
+      # Generous enough to ride out the replica-set election on a cold start.
+      # The aggregator creates its indexes during storage init and exits if that
+      # times out; the defaults give up while the fresh set is still electing.
+      MONGODB_CONNECT_TIMEOUT: "30s"
+      MONGODB_SERVER_SELECTION_TIMEOUT: "30s"
+
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+
+      USE_REDIS_FOR_COMMITMENTS: "true"
+      REDIS_FLUSH_INTERVAL: "50ms"
+
+      SMT_BACKEND: "memory"
+
+      # Deadline the service assigns to a request that omits expiresAt. Short
+      # enough that a test can watch such a request expire; the aggregator
+      # rejects anything below one whole second.
+      DEFAULT_REQUEST_TTL: "${DEFAULT_REQUEST_TTL:-30s}"
+
+      DISABLE_HIGH_AVAILABILITY: "false"
+      LOCK_TTL_SECONDS: "30"
+      LEADER_HEARTBEAT_INTERVAL: "10s"
+      LEADER_ELECTION_POLLING_INTERVAL: "5s"
+      BLOCK_SYNC_INTERVAL: "1s"
+
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      LOG_FORMAT: "json"
+      LOG_ENABLE_JSON: "true"
+
+      BATCH_LIMIT: "1000"
+      MAX_COMMITMENTS_PER_ROUND: "10000"
+
+      SIGNING_KEY_FILE: "/app/bft-config/aggregator/keys.json"
+
+      BFT_ENABLED: "true"
+      BFT_SHARD_CONF_FILE: "/app/bft-config/shard-conf-7_0.json"
+      BFT_TRUST_BASE_FILES: "/app/bft-config/trust-base.json"
+      BFT_RPC_ADDRESS: "http://127.0.0.1:8002"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ROOT_NODE_ID=$$(grep -o '"nodeId": "[^"]*"' /app/bft-config/trust-base.json | head -1 | cut -d'"' -f4)
+        if [ -z "$$ROOT_NODE_ID" ]; then
+          echo "Error: could not read root nodeId from /app/bft-config/trust-base.json"
+          exit 1
+        fi
+        export BFT_BOOTSTRAP_ADDRESSES="/dns4/bft-root/tcp/8000/p2p/$$ROOT_NODE_ID"
+        exec /app/aggregator
+    depends_on:
+      bft-aggregator-genesis-gen:
+        condition: service_completed_successfully
+      upload-configurations:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      # A real GET, not --spider: busybox wget spiders with HEAD, and /health is
+      # registered GET-only, so the image's own HEALTHCHECK never passes.
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--output-document=/dev/null", "http://localhost:3000/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 45
+      start_period: 5s
