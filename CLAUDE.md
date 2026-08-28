@@ -768,7 +768,16 @@ pre-flip `sphere-token-storage-*` databases.
 
 **Framework:** Vitest
 **Run:** `npm run test:run` (unit/integration), `npm run test:mutation` (probes must be KILLED),
-`npm run test:e2e` (live staging/testnet2, needs `.env`), `npm run test:relay`
+`npm run test:e2e` (live staging/testnet2, needs `.env`), `npm run test:relay`,
+`npm run test:aggregator` (a REAL aggregator-go; skips unless `AGGREGATOR_URL` +
+`AGGREGATOR_TRUSTBASE` are set)
+
+**Know what each layer can and cannot prove.** Everything else that exercises the chain runs
+against `TestAggregatorClient`, which orchestrates the SDK's OWN smt / CertificationData /
+verification rule — so it proves this client is self-consistent, never that the client and the
+SERVICE agree. `tests/integration/sphere-payments-v2-*` prove less about the wire still: they
+swap a fake engine in via `setEngine`, so they pin facade orchestration and would pass with the
+CBOR wrong. Only `tests/aggregator/` closes that gap.
 
 Key test areas:
 - `tests/unit/payments-v2/` — the vertical: TransferMachine send/resume, receive drain,
@@ -776,6 +785,14 @@ Key test areas:
   rename (`kv-generation.test.ts`), adversarial fakes (`fakes/FakeWalletApi` — 61 behavior pins —
   + FakeGateway), port contract suites
   (`contracts/{storage,delivery}-port.contract.ts` — swappability enforced)
+- `tests/aggregator/aggregator-v3.test.ts` — the real engine against a REAL aggregator-go v3
+  (`cd ../aggregator-go && make docker-run-clean`, then `AGGREGATOR_URL=http://localhost:3000
+  AGGREGATOR_TRUSTBASE=../aggregator-go/data/genesis/trust-base.json npm run test:aggregator`).
+  Mint / transfer / split / same-transferId resume, each verified against the service's own
+  generated trust base. `verify()` passing is the assertion no fake can make: the leaf value this
+  client computes — `H(transactionHash, referenceTime)` since 3.x — reproduces the leaf the Go
+  service inserted. Guard against it going vacuous: with a well-formed but WRONG root key it must
+  fail `INVALID_TRUSTBASE`.
 - `tests/mutation/probes.json` — mutation probes over `modules/payments-v2/*`,
   `token-engine/{proof-wait,SphereTokenEngine}.ts`, `impl/wallet-api-v2/*`, the `core/` wiring and
   `transport/NostrTransportProvider.ts`; `npm run test:mutation` must report every one KILLED

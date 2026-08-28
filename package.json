@@ -127,6 +127,7 @@
     "test:run": "vitest run",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:relay": "vitest run --config vitest.relay.config.ts",
+    "test:aggregator": "vitest run --config vitest.aggregator.config.ts",
     "test:mutation": "node scripts/test-mutation.mjs",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
