@@ -56,15 +56,17 @@ describe('checkCompatibility', () => {
   it('passes when the SDK floor is met', () => {
     expect(checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET, clientSdkVersion: '0.10.0', minSdkVersion: '0.10.0' }).ok).toBe(true);
   });
-  it('the P11 default floor 0.14.1-0 rejects every pre-flip client (0.13.x, 0.14.0) and unreported versions', () => {
-    for (const v of ['0.13.3', '0.14.0', '0.14.0-dev.9', undefined]) {
+  it('the 3.x default floor rejects every 2.x-line client — they cannot decode a v3 token — and unreported versions', () => {
+    for (const v of ['0.13.3', '0.14.0', '0.14.0-dev.9', '0.14.1', '0.14.11', '0.14.11-dev.8', undefined]) {
       const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET, ...(v !== undefined ? { clientSdkVersion: v } : {}), minSdkVersion: DEFAULT_MIN_CLIENT_SDK_VERSION });
       expect(r.ok, `expected reject for ${v ?? 'unreported'}`).toBe(false);
     }
   });
 
-  it('the P11 default floor admits the 0.14.1 prerelease track and everything newer', () => {
-    for (const v of ['0.14.1-dev.0', '0.14.1-dev.1', '0.14.1', '0.14.2', '0.15.0-dev.2', '1.0.0']) {
+  it('the 3.x default floor admits the 0.15.0 prerelease track and everything newer', () => {
+    // 0.15.0-dev.* pin state-transition-sdk 3.x, so they can decode what this
+    // wallet serves; the floor is about the SDK line, not about being a release.
+    for (const v of ['0.15.0-dev.1', '0.15.0-dev.2', '0.15.0', '0.15.1', '0.16.0', '1.0.0']) {
       expect(
         checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET, clientSdkVersion: v, minSdkVersion: DEFAULT_MIN_CLIENT_SDK_VERSION }).ok,
         `expected accept for ${v}`

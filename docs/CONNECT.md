@@ -9,8 +9,9 @@ The current Connect protocol version is **`2.1`** (`SPHERE_CONNECT_VERSION = '2.
 > **sphere-sdk 0.15.0 does NOT bump it.** That release is a hard wire break on the
 > *state-transition* protocol, but Connect messages carry no state-transition bytes — the token
 > blob never crosses this wire (`sphere_getTokens` strips `sdkData`, as it always has). Method
-> list, params, result shapes, events, scopes and error codes are byte-identical to 0.14.x, and
-> the `minSdkVersion` floor stays `0.14.1-0`. What changed is wallet-host-side: see
+> list, params, result shapes, events, scopes and error codes are byte-identical to 0.14.x.
+> The `minSdkVersion` floor DOES move, to `0.15.0-0` — see below. What else changed is
+> wallet-host-side: see
 > [ConnectHost: the `SphereInstance` contract](#connecthost-the-sphereinstance-contract).
 
 ### Compatibility policy
@@ -21,11 +22,15 @@ The current Connect protocol version is **`2.1`** (`SPHERE_CONNECT_VERSION = '2.
 
 ### Handshake fields
 
-> **SDK version floor (0.14.1, the P11 flip):** the host rejects any client whose handshake
-> `sdkVersion` is missing or below `0.14.1-0` (every 0.14.1 prerelease passes) with
-> `UNSUPPORTED_PROTOCOL_VERSION` (4007) and a message naming the required minimum — pre-flip
-> clients expect a wallet surface that no longer exists. Override via
-> `ConnectHostConfig.minSdkVersion`. The claim is compatibility hygiene, not security.
+> **SDK version floor (`0.15.0-0`, the state-transition-sdk 3.x line):** the host rejects any
+> client whose handshake `sdkVersion` is missing or below `0.15.0-0` (every 0.15.0 prerelease
+> passes — those pin the 3.x SDK too) with `UNSUPPORTED_PROTOCOL_VERSION` (4007) and a message
+> naming the required minimum. The Connect wire did not change, but `sphere_getTokens` hands raw
+> token CBOR across it and a client on the 2.x line cannot decode a 3.x token — it fails with
+> `Unsupported Token version`. Such a client is already non-functional against this wallet, so
+> the floor turns a cryptic decode failure deep in the dApp into one legible refusal at the
+> handshake. Override via `ConnectHostConfig.minSdkVersion`. The claim is compatibility hygiene,
+> not security — a hostile client can lie about it.
 
 Two new optional fields are sent in the handshake (added in v2; both fields are additive and carry no breaking change to the wire format):
 

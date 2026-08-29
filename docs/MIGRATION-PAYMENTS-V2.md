@@ -176,11 +176,13 @@ which such clients never read; across the 3.x break they are simply gone.
 The Connect wire contract is preserved by the host adapter: `sphere_getBalance`,
 `sphere_getFiatBalance`, `sphere_getHistory` and the old event names keep
 working against a v2 host. dApp builders need ONE change: bump
-`@unicitylabs/sphere-sdk` to **≥ 0.14.1** — 0.14.1+ wallet hosts enforce an SDK
-version floor at the handshake (`UNSUPPORTED_PROTOCOL_VERSION` with a message
-naming the minimum; pre-0.14.1 clients don't report a version and are rejected
-as such — the floor is still `0.14.1-0` in 0.15.0). Invoice-surface consumers
-additionally see §4.
+`@unicitylabs/sphere-sdk` to **≥ 0.15.0** — wallet hosts enforce an SDK version
+floor at the handshake (`UNSUPPORTED_PROTOCOL_VERSION` with a message naming the
+minimum; clients that report no version are rejected as such). The floor MOVED
+to `0.15.0-0` with the 3.x bump: the wire is unchanged, but `sphere_getTokens`
+hands raw token CBOR across it and a 2.x-line client cannot decode a 3.x token,
+so it is already non-functional against a 0.15.x wallet. Invoice-surface
+consumers additionally see §4.
 
 **Wallet hosts (not dApps) see one shape change in 0.15.0.** With the
 `paymentsV2` alias gone, the `SphereInstance` a `ConnectHost` is constructed

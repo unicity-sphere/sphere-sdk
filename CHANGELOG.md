@@ -7,7 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed (BREAKING, Connect hosts) — the default SDK floor moves to the 3.x line
+
+`DEFAULT_MIN_CLIENT_SDK_VERSION` goes from `0.14.1-0` to **`0.15.0-0`**, so a wallet host refuses
+any dApp whose handshake reports an older `@unicitylabs/sphere-sdk` — or reports none — with
+`UNSUPPORTED_PROTOCOL_VERSION` (4007) naming the minimum.
+
+The Connect wire itself is still unchanged. What changed is underneath it: `sphere_getTokens`
+hands raw token CBOR across the wire, and a client on the 2.x SDK line cannot decode a 3.x token —
+it fails with `Unsupported Token version`. Such a dApp is already non-functional against a 0.15.x
+wallet, so this does not break anything that worked; it turns a cryptic decode failure deep inside
+the dApp into one legible refusal at the handshake.
+
+`-0` admits the whole `0.15.0` prerelease track, which is deliberate: those pin
+state-transition-sdk 3.x too, so they can decode what the wallet serves. The floor is about the
+SDK line, not about being a released version.
+
+Hosts that set `ConnectHostConfig.minSdkVersion` explicitly are unaffected. The claim remains
+compatibility hygiene rather than security — a hostile client can misreport its version.
 
 ## [0.15.0] - 2026-08-27
 

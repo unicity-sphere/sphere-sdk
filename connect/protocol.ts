@@ -12,12 +12,17 @@ import { majorOf } from './semver';
 export const SPHERE_CONNECT_NAMESPACE = 'sphere-connect';
 export const SPHERE_CONNECT_VERSION = '2.1';   // Connect protocol version (semver MAJOR.MINOR)
 
-// Default npm-SDK floor a host enforces at the handshake (0.14.1 = the P11 flip:
-// the v1 payments era is gone; pre-flip ConnectClients expect a wallet that no
-// longer exists). '-0' admits every 0.14.1 prerelease (compareSemver: release >
-// prerelease). Override via ConnectHostConfig.minSdkVersion; the claim is
-// compatibility hygiene, not security — a hostile client can lie about it.
-export const DEFAULT_MIN_CLIENT_SDK_VERSION = '0.14.1-0';
+// Default npm-SDK floor a host enforces at the handshake. 0.15.0 is the
+// state-transition-sdk 3.x line: the Connect WIRE did not change, but
+// `sphere_getTokens` hands raw token CBOR across it, and a client on the 2.x line
+// cannot decode a 3.x token — it fails with "Unsupported Token version". Such a
+// client is already non-functional against this wallet, so the floor turns a
+// cryptic decode failure deep in the dApp into one legible refusal at the
+// handshake. '-0' admits every 0.15.0 prerelease (compareSemver: release >
+// prerelease), which is what we want: those pin the 3.x SDK too.
+// Override via ConnectHostConfig.minSdkVersion; the claim is compatibility
+// hygiene, not security — a hostile client can lie about it.
+export const DEFAULT_MIN_CLIENT_SDK_VERSION = '0.15.0-0';
 
 export { HOST_READY_TYPE, HOST_READY_TIMEOUT, SPHERE_NETWORKS } from '../constants';
 // Import for local use (e.g. SphereHandshake.network) AND re-export for connect consumers.

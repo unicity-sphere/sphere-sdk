@@ -120,14 +120,14 @@ describe('ConnectHost gate', () => {
     expect(handshakeResponses(h.sent)[0].v).toBe('1.0');
   });
 
-  it('P11 floor is the DEFAULT: a hello with no sdkVersion (any pre-0.14.1 client) is rejected naming the minimum', async () => {
+  it('the 3.x floor is the DEFAULT: a hello with no sdkVersion (any pre-0.15.0 client) is rejected naming the minimum', async () => {
     const h = makeHostHarness();
     h.send({ v: SPHERE_CONNECT_VERSION, dapp: { name: 'old-app', url: 'https://old-app' }, network: { id: WALLET_NET } });
     await Promise.resolve();
     const resp = handshakeResponses(h.sent)[0];
     const err = resp.error as { code: number; message: string };
     expect(err.code).toBe(ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION);
-    expect(err.message).toContain('0.14.1-0');
+    expect(err.message).toContain('0.15.0-0');
     expect(err.message).toContain('unknown (not reported)');
     expect(h.onConnectionRequest).not.toHaveBeenCalled();
   });
