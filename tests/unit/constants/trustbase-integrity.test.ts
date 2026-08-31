@@ -57,10 +57,10 @@ describe('embedded mainnet trust base', () => {
   });
 
   it('is NOT the testnet2 trust base', () => {
-    // assets/trustbase.ts already aliases one network onto another
-    // (TRUSTBASE_DEV = TRUSTBASE_TESTNET), so this is a live mistake, not a
-    // hypothetical one. A shared reference here would verify mainnet money
-    // against testnet2's root nodes.
+    // assets/trustbase.ts used to alias one network's base onto another
+    // (TRUSTBASE_DEV = TRUSTBASE_TESTNET, removed with the v1 cleanup), so this is
+    // a mistake the file has actually made. A shared reference here would verify
+    // mainnet money against testnet2's root nodes.
     expect(TRUSTBASE_MAINNET).not.toBe(TRUSTBASE_TESTNET2);
     expect(TRUSTBASE_MAINNET.networkId).not.toBe(TRUSTBASE_TESTNET2.networkId);
     expect(TRUSTBASE_MAINNET.rootNodes.map((n) => n.sigKey)).not.toEqual(

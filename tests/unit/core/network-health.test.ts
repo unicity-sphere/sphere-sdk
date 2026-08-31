@@ -302,19 +302,6 @@ describe('checkNetworkHealth', () => {
       expect(result.totalTimeMs).toBeGreaterThanOrEqual(0);
     });
 
-    it('should use dev network URLs', async () => {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({}), { status: 200 }),
-      );
-
-      const result = await checkNetworkHealth('dev', { services: ['oracle'] });
-
-      expect(result.services.oracle).toBeDefined();
-      const calledUrl = fetchSpy.mock.calls[0][0] as string;
-      // Dev uses dev-aggregator URL
-      expect(calledUrl).toContain('dev-aggregator');
-    });
-
     it('should include responseTimeMs for non-ok HTTP responses', async () => {
       fetchSpy.mockResolvedValueOnce(
         new Response('Bad Request', { status: 400, statusText: 'Bad Request' }),

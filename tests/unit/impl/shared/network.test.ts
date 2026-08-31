@@ -54,10 +54,9 @@ describe('resolveNetworkConfig', () => {
 });
 
 describe('assertNetworkConsistency', () => {
-  it('passes for testnet / testnet2 / dev (non-null trust base, matching networkId)', () => {
+  it('passes for testnet / testnet2 (non-null trust base, matching networkId)', () => {
     expect(() => assertNetworkConsistency('testnet')).not.toThrow();
     expect(() => assertNetworkConsistency('testnet2')).not.toThrow();
-    expect(() => assertNetworkConsistency('dev')).not.toThrow();
   });
 
   it('passes for mainnet — embedded trust base carries networkId 1', () => {

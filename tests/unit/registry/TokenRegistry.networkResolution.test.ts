@@ -176,13 +176,14 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 5. OPTIONAL network cross-check: fetch the LEGACY v1 registry (still used
-  //    by dev/mainnet) and the testnet2 registry, and prove they define
-  //    DIFFERENT coinIds for the same symbol — the premise behind the
-  //    wrong-registry → missing-icon mechanism. Skips (does not fail) if the
-  //    network is unavailable, so the suite stays deterministic.
+  // 5. OPTIONAL network cross-check: fetch the mainnet and testnet2 registries and
+  //    prove they define DIFFERENT coinIds for the same symbol — the premise behind
+  //    the wrong-registry → missing-icon mechanism, and the reason a network may
+  //    never borrow another's registry. Skips (does not fail) when a file is
+  //    unavailable, so the suite stays deterministic — which is also why this goes
+  //    quiet, rather than red, until unicity-ids.mainnet.json is published.
   // ---------------------------------------------------------------------------
-  it('[network] legacy (dev) vs testnet2 registry JSON define different coinIds for the same symbol', async () => {
+  it('[network] mainnet vs testnet2 registry JSON define different coinIds for the same symbol', async () => {
     const fetchJson = async (url: string): Promise<TokenDefinition[] | null> => {
       try {
         const controller = new AbortController();
@@ -196,12 +197,12 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
       }
     };
 
-    const [legacy, testnet2] = await Promise.all([
-      fetchJson(NETWORKS.dev.tokenRegistryUrl), // dev still points at the v1 testnet registry
+    const [mainnet, testnet2] = await Promise.all([
+      fetchJson(NETWORKS.mainnet.tokenRegistryUrl),
       fetchJson(NETWORKS.testnet2.tokenRegistryUrl),
     ]);
 
-    if (!legacy || !testnet2) {
+    if (!mainnet || !testnet2) {
       console.warn('[network] registry fetch unavailable — skipping real-JSON cross-check');
       return; // graceful skip, keeps the deterministic core green
     }
@@ -211,15 +212,15 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
 
     // Find at least one symbol present in BOTH with a DIFFERENT id.
     const symbols = new Set<string>();
-    for (const d of [...legacy, ...testnet2]) if (d.symbol) symbols.add(d.symbol.toUpperCase());
+    for (const d of [...mainnet, ...testnet2]) if (d.symbol) symbols.add(d.symbol.toUpperCase());
 
     let foundDivergentSymbol = false;
     for (const sym of symbols) {
-      const a = idForSymbol(legacy, sym);
+      const a = idForSymbol(mainnet, sym);
       const b = idForSymbol(testnet2, sym);
       if (a && b && a !== b) {
         foundDivergentSymbol = true;
-        console.info(`[network] symbol ${sym}: legacy=${a} testnet2=${b} (different)`);
+        console.info(`[network] symbol ${sym}: mainnet=${a} testnet2=${b} (different)`);
         break;
       }
     }

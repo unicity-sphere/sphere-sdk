@@ -275,9 +275,9 @@ import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wa
 
 // Step 1: Base providers (required for network, oracle, transport)
 const base = createBrowserProviders({
-  // Network: 'mainnet' | 'testnet' | 'testnet2' | 'dev'
-  // ('testnet' IS testnet2 — the v2 gateway network; mainnet/dev are still
-  //  v1-era and cannot serve the engine)
+  // Network: 'mainnet' | 'testnet' | 'testnet2'
+  // ('testnet' IS testnet2 — the v2 gateway network. 'mainnet' is live on-chain
+  //  but has no wallet-api deployment yet, so its money path is unreachable.)
   network: 'testnet',
 
   // Transport options

@@ -172,10 +172,9 @@ The SDK ships network presets that configure all services automatically. `networ
 |---------|----------------------|-------------|
 | `testnet` | gateway.testnet2.unicity.network (v2) | nostr-relay.testnet.unicity.network |
 | `testnet2` | alias of `testnet` (same configuration) | nostr-relay.testnet.unicity.network |
-| `mainnet` | aggregator.unicity.network (v1-era) | relay.unicity.network (+ public relays) |
-| `dev` | dev-aggregator.dyndns.org (v1-era) | nostr-relay.testnet.unicity.network |
+| `mainnet` | gateway.mainnet.unicity.network (v3) | nostr-relay.testnet.unicity.network (shared until mainnet has its own) |
 
-> **v1 → v2 cutover:** `testnet` now points at **testnet2**, the v2 state-transition gateway network (network id 4, taken from the trust base; own testnet2 token registry). The old `goggregator-test` testnet spoke the removed v1 protocol and is gone. `mainnet` and `dev` still point at v1-era aggregators — wallet operations that move money (`send`, `mint`) **fail loudly** (`AGGREGATOR_ERROR`) on those networks until their gateways are cut over. The transfer wire payload is the finished token blob — the base SDK's own `Token.toCBOR()` bytes, with no sphere envelope around them — deposited into the recipient's wallet-api mailbox.
+> **Live networks are testnet2 and mainnet.** `testnet` is an alias of **testnet2** (network id 4, taken from the trust base; own testnet2 token registry); `mainnet` is network id 1. The v1 network is discontinued — the old `goggregator-test` testnet spoke the removed v1 protocol, and the `dev` network that aliased its trust base has been removed along with every other v1 pointer. Mainnet has no wallet-api deployment yet, so its money path is not reachable even though the chain and gateway are live. The transfer wire payload is the finished token blob — the base SDK's own `Token.toCBOR()` bytes, with no sphere envelope around them — deposited into the recipient's wallet-api mailbox.
 >
 > The **network** name (testnet2) and the **base-SDK major** (3.x since 0.15.0) are separate axes: testnet2 is still testnet2 after the 3.0.1 bump. What the bump changes is the bytes on that network — a gateway serving the v3 protocol accepts nothing a 2.x client writes, and vice versa.
 
@@ -217,7 +216,7 @@ The `testnet` preset wires most of these automatically — you only pass `networ
 | **Group-chat relay** (NIP-29) | `wss://sphere-relay.unicity.network` |
 | **Token registry** | `https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json` |
 
-The aggregator key above is the **testnet2** key only and is safe in client code; a **mainnet** key is a real secret. `mainnet`/`dev` still point at v1-era aggregators and cannot serve the engine (`AGGREGATOR_ERROR`).
+The aggregator key above is the **testnet2** key only and is safe in client code; a **mainnet** key is a real secret and must never be committed.
 
 ## Price Provider (Optional)
 
@@ -829,7 +828,7 @@ import type {
 
 // Resolver utilities (impl/shared/resolvers.ts)
 import {
-  getNetworkConfig,        // Get mainnet/testnet/dev config
+  getNetworkConfig,        // Get mainnet/testnet2 config
   resolveTransportConfig,  // Apply extend/override pattern for relays
   resolveOracleConfig,     // Resolve oracle URL with fallback
   resolveArrayConfig,      // Generic array merge helper

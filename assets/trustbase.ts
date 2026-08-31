@@ -1,29 +1,8 @@
 /**
- * Embedded Trust Base Data
- * Pre-loaded trust base for different networks
+ * Embedded trust bases — one per LIVE network. These literals ARE the root of trust:
+ * RootTrustBase.fromJSON validates structure only, never a base's own signatures.
+ * Pinned to the published files by tests/unit/constants/trustbase-integrity.test.ts.
  */
-
-export const TRUSTBASE_TESTNET = {
-  version: 1,
-  networkId: 3,
-  epoch: 1,
-  epochStartRound: 1,
-  rootNodes: [
-    {
-      nodeId: '16Uiu2HAkyQRiA7pMgzgLj9GgaBJEJa8zmx9dzqUDa6WxQPJ82ghU',
-      sigKey: '0x039afb2acb65f5fbc272d8907f763d0a5d189aadc9b97afdcc5897ea4dd112e68b',
-      stake: 1,
-    },
-  ],
-  quorumThreshold: 1,
-  stateHash: '',
-  changeRecordHash: '',
-  previousEntryHash: '',
-  signatures: {
-    '16Uiu2HAkyQRiA7pMgzgLj9GgaBJEJa8zmx9dzqUDa6WxQPJ82ghU':
-      '0xf157c9fdd8a378e3ca70d354ccc4475ab2cd8de360127bc46b0aeab4b453a80f07fd9136a5843b60a8babaff23e20acc8879861f7651440a5e2829f7541b31f100',
-  },
-};
 
 // Testnet2 (networkId 4) — embedded copy of bft-trustbase.testnet2.json
 export const TRUSTBASE_TESTNET2 = {
@@ -113,6 +92,3 @@ export const TRUSTBASE_MAINNET = {
       '0xda13c777b832425e5cbd8d6e49eb08ddbde35c1e4a9bee8bd495c3883f039e434b64560865c3bc52b68d65780932b1f2bf8971f245d2244face822af5984945c00',
   },
 };
-
-// Dev trust base (same as testnet for now)
-export const TRUSTBASE_DEV = TRUSTBASE_TESTNET;

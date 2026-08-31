@@ -45,7 +45,7 @@ export interface TokenDefinition {
 /**
  * Network type for registry lookup
  */
-export type RegistryNetwork = 'testnet' | 'mainnet' | 'dev';
+export type RegistryNetwork = 'testnet' | 'testnet2' | 'mainnet';
 
 /**
  * Configuration options for remote registry refresh
@@ -91,7 +91,7 @@ const FETCH_TIMEOUT_MS = 10_000;
  *
  * // Usually called automatically by createBrowserProviders / createNodeProviders
  * TokenRegistry.configure({
- *   remoteUrl: 'https://raw.githubusercontent.com/.../unicity-ids.testnet.json',
+ *   remoteUrl: 'https://raw.githubusercontent.com/.../unicity-ids.testnet2.json',
  *   storage: myStorageProvider,
  * });
  *

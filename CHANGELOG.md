@@ -29,11 +29,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   testnet2 base by reference or by key material. `RootTrustBase.fromJSON` never verifies a trust
   base's own signatures, so the embedded bytes *are* the root of trust.
 
-Not yet usable for money on mainnet, and unchanged by this release: there is no mainnet wallet-api
-deployment, so `Sphere.init` cannot complete a mainnet money path. `NETWORKS.mainnet.tokenRegistryUrl`
-still points at the v1 testnet registry pending a published `unicity-ids.mainnet.json` (presentation
-only — the money path treats `coinId` as an opaque byte string), and mainnet shares testnet's Nostr
-relay until a dedicated one is stood up.
+### Removed (BREAKING) — every v1 pointer, and the `dev` network
+
+The v1 network is discontinued; only testnet2 and mainnet are live. Everything still aimed at
+v1 infrastructure is gone rather than left dangling:
+
+- **`NETWORKS.dev` removed.** It was v1 end to end: the `dev-aggregator.dyndns.org/rpc` v1
+  aggregator, the v1 token registry, and a `networkId: 3` trust base aliased straight off the old
+  testnet. **This narrows the exported `NetworkType`** to `'mainnet' | 'testnet' | 'testnet2'` —
+  a compile break for any consumer that declares its own wider union and assigns it into
+  `createBrowserProviders` / `createNodeProviders`. No known consumer passes `'dev'` at runtime.
+- **`TRUSTBASE_TESTNET` (networkId 3) and `TRUSTBASE_DEV` removed** from `assets/trustbase.ts`,
+  which now holds exactly the two live bases. `getEmbeddedTrustBase` loses its `'dev'` case.
+- **`TOKEN_REGISTRY_URL`, `DEFAULT_AGGREGATOR_URL` and `DEV_AGGREGATOR_URL` removed** (all
+  internal, none was exported). Every network now names its registry file inline, so no network
+  can silently inherit another's. `DEFAULT_AGGREGATOR_URL` pointed at `aggregator.unicity.network`,
+  which no longer resolves.
+- **`relay.unicity.network` dropped from `DEFAULT_NOSTR_RELAYS`** — the v1 relay, NXDOMAIN, and it
+  sat at index 0 of the fallback list every unconfigured transport uses.
+- **`RegistryNetwork`** is now `'testnet' | 'testnet2' | 'mainnet'` (was `'testnet' | 'mainnet' |
+  'dev'`, which never listed testnet2 at all).
+
+The `networks.consistency` CI test's `EXPECTED_FAILURES` set is now **empty**: every network in
+`NETWORKS` is fully configured. Its guard that no network may point at the discontinued v1 registry
+stays.
+
+Not yet usable for money on mainnet: there is no mainnet wallet-api deployment, so `Sphere.init`
+cannot complete a mainnet money path. `NETWORKS.mainnet.tokenRegistryUrl` names
+`unicity-ids.mainnet.json`, which is not published yet — until it is, the fetch 404s and every
+mainnet coin misses the registry (`decimals` 0, symbol falls back to six hex chars). That is
+presentation only: the money path treats `coinId` as an opaque byte string. Mainnet also shares
+testnet's Nostr relay until a dedicated one is stood up, which means nametag bindings for both
+networks share one namespace.
 
 ## [0.15.0] - 2026-08-27
 

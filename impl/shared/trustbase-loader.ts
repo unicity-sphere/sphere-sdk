@@ -3,7 +3,7 @@
  * Common embedded trustbase data and base loader
  */
 
-import { TRUSTBASE_TESTNET2, TRUSTBASE_MAINNET, TRUSTBASE_DEV } from '../../assets/trustbase';
+import { TRUSTBASE_TESTNET2, TRUSTBASE_MAINNET } from '../../assets/trustbase';
 import type { NetworkType } from '../../constants';
 import { SphereError } from '../../core/errors';
 
@@ -24,8 +24,6 @@ export function getEmbeddedTrustBase(network: NetworkType): unknown | null {
     case 'testnet':
     case 'testnet2':
       return TRUSTBASE_TESTNET2;
-    case 'dev':
-      return TRUSTBASE_DEV;
     default:
       // Fail loud: an unknown network must not silently resolve to the testnet trust base.
       throw new SphereError(`getEmbeddedTrustBase: unknown network "${network}"`, 'INVALID_CONFIG');

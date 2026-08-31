@@ -27,6 +27,7 @@ import type { NetworkType } from '../../../constants';
 import { getEmbeddedTrustBase } from '../../../impl/shared/trustbase-loader';
 
 /** v1 testnet token registry — only testnet itself may legitimately point here. */
+/** The v1 testnet registry file. The v1 network is discontinued — nothing may point here. */
 const V1_TESTNET_REGISTRY_FILE = 'unicity-ids.testnet.json';
 
 /**
@@ -45,22 +46,18 @@ const EXPECTED_NETWORK_ID: Partial<Record<NetworkType, number>> = {
 type Check = 'urls' | 'registry' | 'trustbase';
 
 /**
- * (network, check) pairs that are EXPECTED-TO-FAIL until that network is
- * onboarded (plan Phase 4); flip the entry to a real it() — i.e. remove it from
- * this set — when its registry + trustbase are real.
+ * (network, check) pairs that are EXPECTED-TO-FAIL until that network is onboarded.
+ * EMPTY as of the mainnet onboarding: every network in NETWORKS is fully configured.
  *
- * Verified against constants.ts / assets/trustbase.ts as of this writing:
- *  - mainnet.tokenRegistryUrl === TOKEN_REGISTRY_URL (the v1 testnet.json)  → 'registry' fails
- *    (waiting on a published unicity-ids.mainnet.json; mainnet 'urls' and
- *     'trustbase' now pass — the trust base is embedded and pinned to id 1.)
- *  - dev.tokenRegistryUrl === TOKEN_REGISTRY_URL (the v1 testnet.json)      → 'registry' fails
- *    (dev 'urls' and 'trustbase' already pass: TRUSTBASE_DEV aliases testnet,
- *     and dev has no pinned expected networkId.)
+ * The mechanism is self-correcting in BOTH directions and that is the point — an
+ * entry here uses it.fails(), so the moment its check starts passing the wrapper
+ * FAILS and forces the row to be retired deliberately. Add a row only for a network
+ * that is genuinely half-configured, never to silence a check.
+ *
+ * Note this set does not gate the registry check below: nothing may point at the
+ * discontinued v1 registry, for any network, ever.
  */
-const EXPECTED_FAILURES = new Set<`${NetworkType}:${Check}`>([
-  'mainnet:registry',
-  'dev:registry',
-]);
+const EXPECTED_FAILURES = new Set<`${NetworkType}:${Check}`>([]);
 
 describe.each(Object.keys(NETWORKS) as NetworkType[])('network "%s" config', (net) => {
   const config = NETWORKS[net];

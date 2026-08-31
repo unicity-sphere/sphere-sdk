@@ -162,9 +162,12 @@ export function getAddressId(directAddress: string): string {
 // Nostr Defaults
 // =============================================================================
 
-/** Default Nostr relays */
+/**
+ * Fallback Nostr relays, used only when no relay list is configured
+ * (NostrTransportProvider / MultiAddressTransportMux). `relay.unicity.network`
+ * was the v1 relay and no longer resolves, so it is not listed here.
+ */
 export const DEFAULT_NOSTR_RELAYS = [
-  'wss://relay.unicity.network',
   'wss://relay.damus.io',
   'wss://nos.lol',
   'wss://relay.nostr.band',
@@ -224,16 +227,11 @@ export const NIP29_KINDS = {
 // =============================================================================
 
 /**
- * Default aggregator URL
+ * Default aggregator request timeout (ms)
  * Note: The aggregator is conceptually an oracle - a trusted service that provides
  * verifiable truth about token state through cryptographic inclusion proofs.
+ * There is no default aggregator URL: every live network names its own gateway.
  */
-export const DEFAULT_AGGREGATOR_URL = 'https://aggregator.unicity.network/rpc' as const;
-
-/** Dev aggregator URL */
-export const DEV_AGGREGATOR_URL = 'https://dev-aggregator.dyndns.org/rpc' as const;
-
-/** Default aggregator request timeout (ms) */
 export const DEFAULT_AGGREGATOR_TIMEOUT = 30000;
 
 
@@ -256,10 +254,6 @@ export const COIN_TYPES = {
 // =============================================================================
 // Token Registry Defaults
 // =============================================================================
-
-/** Remote token registry URL (GitHub raw) */
-export const TOKEN_REGISTRY_URL =
-  'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet.json' as const;
 
 /** Default token registry refresh interval (ms) — 1 hour */
 export const TOKEN_REGISTRY_REFRESH_INTERVAL = 3_600_000;
@@ -308,10 +302,11 @@ export const NETWORKS = {
     // since bindings carry no network the cross-network recipient guard can only signal (#734).
     nostrRelays: TEST_NOSTR_RELAYS,
     groupRelays: DEFAULT_GROUP_RELAYS,
-    // TODO: point at unicity-ids.mainnet.json once published — this is still the v1 testnet
-    // registry, so mainnet coin metadata (symbol/decimals) is wrong until then. Presentation
-    // only: the money path treats coinId as an opaque byte string.
-    tokenRegistryUrl: TOKEN_REGISTRY_URL,
+    // Not published yet — until it is, a fetch 404s and every mainnet coin misses the
+    // registry (decimals 0, symbol falls back to six hex chars). Presentation only:
+    // the money path treats coinId as an opaque byte string.
+    tokenRegistryUrl:
+      'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.mainnet.json',
   },
   // v1 cutover: 'testnet' now POINTS AT TESTNET2 (the v2 gateway network). The
   // old goggregator testnet spoke the removed v1 protocol — a v2 engine cannot
@@ -335,16 +330,6 @@ export const NETWORKS = {
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
-  },
-  // NOTE: mainnet/dev still point at v1-era aggregators. The v2 engine cannot
-  // operate against them until their gateways are cut over to the v2 protocol —
-  // wallet operations on these networks fail loudly (AGGREGATOR_ERROR) until then.
-  dev: {
-    name: 'Development',
-    aggregatorUrl: DEV_AGGREGATOR_URL,
-    nostrRelays: TEST_NOSTR_RELAYS,
-    groupRelays: DEFAULT_GROUP_RELAYS,
-    tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
 } as const satisfies Record<string, NetworkConfig>;
 

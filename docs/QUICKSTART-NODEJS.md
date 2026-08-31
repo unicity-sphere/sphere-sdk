@@ -217,9 +217,9 @@ payments vertical, and there is nothing for you to run or delete.
 ```typescript
 // Step 1: Create base providers
 const base = createNodeProviders({
-  // Network: 'mainnet' | 'testnet' | 'testnet2' | 'dev'
-  // ('testnet' IS testnet2 — the v2 gateway network; mainnet/dev are still
-  //  v1-era and cannot serve the engine)
+  // Network: 'mainnet' | 'testnet' | 'testnet2'
+  // ('testnet' IS testnet2 — the v2 gateway network. 'mainnet' is live on-chain
+  //  but has no wallet-api deployment yet, so its money path is unreachable.)
   network: 'testnet',
 
   // Storage directory (required)
