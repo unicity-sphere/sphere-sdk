@@ -30,11 +30,13 @@ import { getEmbeddedTrustBase } from '../../../impl/shared/trustbase-loader';
 const V1_TESTNET_REGISTRY_FILE = 'unicity-ids.testnet.json';
 
 /**
- * Known expected trust-base networkId per network. mainnet's real id is unknown
- * until it exists; dev currently aliases the old testnet, so neither is pinned
- * here. Since the v1 cutover 'testnet' is an alias of testnet2 (networkId 4).
+ * Known expected trust-base networkId per network. Must stay in step with
+ * EXPECTED_NETWORK_ID in impl/shared/network.ts — that is the runtime guard, this
+ * is the CI one. dev still aliases the old v1 testnet base, so it is not pinned.
+ * Since the v1 cutover 'testnet' is an alias of testnet2 (networkId 4).
  */
 const EXPECTED_NETWORK_ID: Partial<Record<NetworkType, number>> = {
+  mainnet: 1,
   testnet: 4,
   testnet2: 4,
 };
@@ -49,15 +51,14 @@ type Check = 'urls' | 'registry' | 'trustbase';
  *
  * Verified against constants.ts / assets/trustbase.ts as of this writing:
  *  - mainnet.tokenRegistryUrl === TOKEN_REGISTRY_URL (the v1 testnet.json)  → 'registry' fails
- *  - TRUSTBASE_MAINNET === null                                            → 'trustbase' fails
- *    (mainnet 'urls' already passes: all URL fields are truthy today.)
+ *    (waiting on a published unicity-ids.mainnet.json; mainnet 'urls' and
+ *     'trustbase' now pass — the trust base is embedded and pinned to id 1.)
  *  - dev.tokenRegistryUrl === TOKEN_REGISTRY_URL (the v1 testnet.json)      → 'registry' fails
  *    (dev 'urls' and 'trustbase' already pass: TRUSTBASE_DEV aliases testnet,
  *     and dev has no pinned expected networkId.)
  */
 const EXPECTED_FAILURES = new Set<`${NetworkType}:${Check}`>([
   'mainnet:registry',
-  'mainnet:trustbase',
   'dev:registry',
 ]);
 

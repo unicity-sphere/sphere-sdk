@@ -299,9 +299,18 @@ export interface NetworkConfig {
 export const NETWORKS = {
   mainnet: {
     name: 'Mainnet',
-    aggregatorUrl: DEFAULT_AGGREGATOR_URL,
-    nostrRelays: DEFAULT_NOSTR_RELAYS,
+    networkId: 1,
+    // v3 state-transition gateway (networkId 1 comes from the trust base). apiKey is env-injected;
+    // unlike testnet2's, a mainnet gateway key is a SECRET — never commit one.
+    aggregatorUrl: 'https://gateway.mainnet.unicity.network',
+    // Mainnet has no relay of its own yet — it shares the testnet relay until one is stood up.
+    // Consequence while shared: nametag bindings for both networks live in ONE namespace, and
+    // since bindings carry no network the cross-network recipient guard can only signal (#734).
+    nostrRelays: TEST_NOSTR_RELAYS,
     groupRelays: DEFAULT_GROUP_RELAYS,
+    // TODO: point at unicity-ids.mainnet.json once published — this is still the v1 testnet
+    // registry, so mainnet coin metadata (symbol/decimals) is wrong until then. Presentation
+    // only: the money path treats coinId as an opaque byte string.
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
   // v1 cutover: 'testnet' now POINTS AT TESTNET2 (the v2 gateway network). The
@@ -359,6 +368,7 @@ export interface NetworkInfo {
  * the legacy `testnet` alias is intentionally not surfaced.
  */
 export const SPHERE_NETWORKS = {
+  mainnet: { id: NETWORKS.mainnet.networkId as number, name: 'mainnet' },
   testnet2: { id: NETWORKS.testnet2.networkId as number, name: 'testnet2' },
 } as const satisfies Record<string, NetworkInfo>;
 

@@ -122,7 +122,10 @@ describe('checkNetworkHealth', () => {
 
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       const calledUrl = fetchSpy.mock.calls[0][0] as string;
-      expect(calledUrl).toContain('aggregator.unicity.network');
+      expect(calledUrl).toContain('gateway.mainnet.unicity.network');
+      // the v1-era host carried an /rpc path; a copy-paste of it must not creep back
+      expect(calledUrl).not.toContain('/rpc');
+      expect(calledUrl).not.toContain('testnet');
     });
   });
 

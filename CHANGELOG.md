@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added — mainnet is a runnable network
+
+`network: 'mainnet'` now constructs and verifies. Previously the provider factories refused it
+(`INVALID_CONFIG`) because `TRUSTBASE_MAINNET` was `null`.
+
+- **Embedded the published mainnet root trust base** (`assets/trustbase.ts`): networkId 1, 4 root
+  nodes, quorum 3, transcribed from `bft-trustbase.mainnet.json`
+  (sha256 `346c217b3f0f5debb906781a49c29791f8dcbba63f24615e5a78fcd9b79b43f8`). The engine takes its
+  `NetworkId` from the trust base via `NetworkId.fromId`, so id 1 needs no enum work — the same
+  mechanism that already carries testnet2's id 4.
+- **`NETWORKS.mainnet`**: `aggregatorUrl` → `https://gateway.mainnet.unicity.network` (the v3
+  gateway; the old `aggregator.unicity.network/rpc` is a v1-era host that no longer resolves), plus
+  `networkId: 1`. `SPHERE_NETWORKS.mainnet` is added so a mainnet Connect handshake can match —
+  the gate compares numeric ids and is fail-closed.
+- **`EXPECTED_NETWORK_ID` pins `mainnet: 1`** (`impl/shared/network.ts`). Without a row there the
+  networkId cross-check is skipped for that network, so embedding a trust base would otherwise have
+  removed the null-check and left *nothing* validating that mainnet's trust base is mainnet's.
+- **`tests/unit/constants/trustbase-integrity.test.ts`** pins the embedded literal to the published
+  file: sha256 over the raw fixture bytes, deep-equality against it, and a check that it is not the
+  testnet2 base by reference or by key material. `RootTrustBase.fromJSON` never verifies a trust
+  base's own signatures, so the embedded bytes *are* the root of trust.
+
+Not yet usable for money on mainnet, and unchanged by this release: there is no mainnet wallet-api
+deployment, so `Sphere.init` cannot complete a mainnet money path. `NETWORKS.mainnet.tokenRegistryUrl`
+still points at the v1 testnet registry pending a published `unicity-ids.mainnet.json` (presentation
+only — the money path treats `coinId` as an opaque byte string), and mainnet shares testnet's Nostr
+relay until a dedicated one is stood up.
 
 ## [0.15.0] - 2026-08-27
 
