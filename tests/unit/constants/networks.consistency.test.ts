@@ -33,7 +33,7 @@ const V1_TESTNET_REGISTRY_FILE = 'unicity-ids.testnet.json';
 /**
  * Known expected trust-base networkId per network. Must stay in step with
  * EXPECTED_NETWORK_ID in impl/shared/network.ts — that is the runtime guard, this
- * is the CI one. dev still aliases the old v1 testnet base, so it is not pinned.
+ * is the CI one. Every network is pinned — an unpinned one would be unchecked at runtime.
  * Since the v1 cutover 'testnet' is an alias of testnet2 (networkId 4).
  */
 const EXPECTED_NETWORK_ID: Partial<Record<NetworkType, number>> = {
