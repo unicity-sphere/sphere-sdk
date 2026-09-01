@@ -122,7 +122,10 @@ describe('checkNetworkHealth', () => {
 
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       const calledUrl = fetchSpy.mock.calls[0][0] as string;
-      expect(calledUrl).toContain('aggregator.unicity.network');
+      expect(calledUrl).toContain('gateway.mainnet.unicity.network');
+      // the v1-era host carried an /rpc path; a copy-paste of it must not creep back
+      expect(calledUrl).not.toContain('/rpc');
+      expect(calledUrl).not.toContain('testnet');
     });
   });
 
@@ -297,19 +300,6 @@ describe('checkNetworkHealth', () => {
       expect(result.services.relay).toBeUndefined();
       expect(result.services.oracle).toBeUndefined();
       expect(result.totalTimeMs).toBeGreaterThanOrEqual(0);
-    });
-
-    it('should use dev network URLs', async () => {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({}), { status: 200 }),
-      );
-
-      const result = await checkNetworkHealth('dev', { services: ['oracle'] });
-
-      expect(result.services.oracle).toBeDefined();
-      const calledUrl = fetchSpy.mock.calls[0][0] as string;
-      // Dev uses dev-aggregator URL
-      expect(calledUrl).toContain('dev-aggregator');
     });
 
     it('should include responseTimeMs for non-ok HTTP responses', async () => {

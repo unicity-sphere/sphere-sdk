@@ -148,7 +148,7 @@ const baseProviders = createNodeProviders({
 ### Networks (Post v1-Cutover)
 
 - **testnet / testnet2**: the v2 state-transition gateway network. `testnet` is an alias for `testnet2`. Both resolve to `gateway.testnet2.unicity.network`.
-- **mainnet / dev**: Still point at v1-era aggregators. The token engine **cannot** operate against them and will fail loudly with `AGGREGATOR_ERROR` until these gateways are cut over.
+- **mainnet**: Live v3 gateway (`gateway.mainnet.unicity.network`, network id 1) with an embedded trust base. The engine works against it; the money path additionally needs a mainnet wallet-api deployment, which does not exist yet. The **dev** preset was removed with the discontinued v1 network.
 
 The **"v2" in testnet2 is the gateway network, not the base-SDK major.** They are separate axes:
 testnet2 is still testnet2 after the 0.15.0 bump to state-transition-sdk 3.0.1, and it is not

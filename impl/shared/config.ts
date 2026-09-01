@@ -113,7 +113,7 @@ export interface BaseMarketConfig {
  * Extended by platform-specific configs
  */
 export interface BaseProvidersConfig {
-  /** Network preset: mainnet, testnet, or dev. Sets default URLs for all services */
+  /** Network preset: mainnet, testnet or testnet2. Sets default URLs for all services */
   network?: NetworkType;
   /** Enable debug logging globally for all providers (default: false). Per-provider debug flags override this. */
   debug?: boolean;

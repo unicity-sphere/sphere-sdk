@@ -14,9 +14,12 @@ import { SphereError } from '../../core/errors';
  * Known trust-base networkId per network. The embedded trust base for a network
  * MUST carry this id; a mismatch means the wrong trust base is wired to a network
  * (e.g. the testnet trust base under testnet2), which would verify tokens against
- * the wrong chain. mainnet/dev have no pinned id yet (mainnet is not onboarded).
+ * the wrong chain. Typed as a COMPLETE Record, so adding a network without pinning its id is
+ * a compile error rather than a silently unchecked network — that gap is what made mainnet
+ * dangerous to enable: with no row, embedding a trust base removed the only gate.
  */
-const EXPECTED_NETWORK_ID: Partial<Record<NetworkType, number>> = {
+const EXPECTED_NETWORK_ID: Record<NetworkType, number> = {
+  mainnet: 1,
   // v1 cutover: 'testnet' is an alias of testnet2 (the v2 gateway network),
   // so both expect the testnet2 trust base (networkId 4).
   testnet: 4,
@@ -40,11 +43,12 @@ export function resolveNetworkConfig(network: NetworkType): ResolvedNetworkConfi
 
 /**
  * Fail loud if a network is unsafe to run. Conservative on purpose: it rejects
- * only provably-broken configs, so currently-valid networks (testnet/testnet2/dev)
- * keep working while mainnet — which has no embedded trust base — is blocked until
- * onboarded (otherwise it would silently accept unverified tokens). The stricter
- * hygiene checks (e.g. no cross-network registry reuse) live in the per-network CI
- * test, not at runtime, so they can't break a valid deployment.
+ * only provably-broken configs: a null trust base (tokens would go unverified) or one
+ * whose networkId contradicts EXPECTED_NETWORK_ID (the wrong chain's trust base wired
+ * to this network). Both checks now apply to EVERY network — there is no unpinned
+ * network left to skip. The stricter hygiene checks (e.g. no cross-network registry
+ * reuse) live in the per-network CI test, not at runtime, so they can't break a valid
+ * deployment.
  */
 export function assertNetworkConsistency(network: NetworkType): void {
   const { trustBase, networkId } = resolveNetworkConfig(network);
@@ -55,7 +59,7 @@ export function assertNetworkConsistency(network: NetworkType): void {
     );
   }
   const expected = EXPECTED_NETWORK_ID[network];
-  if (expected !== undefined && networkId !== expected) {
+  if (networkId !== expected) {
     throw new SphereError(
       `Network "${network}" trust base networkId ${networkId} does not match expected ${expected} (wrong trust base wired to this network).`,
       'INVALID_CONFIG',

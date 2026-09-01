@@ -35,10 +35,10 @@ describe('getNetworkConfig', () => {
     expect(config.aggregatorUrl).toBe(NETWORKS.testnet2.aggregatorUrl);
   });
 
-  it('should return dev config when specified', () => {
-    const config = getNetworkConfig('dev');
-    expect(config.name).toBe('Development');
-    expect(config.aggregatorUrl).toBe(NETWORKS.dev.aggregatorUrl);
+  it('should return mainnet config when specified', () => {
+    const config = getNetworkConfig('mainnet');
+    expect(config.name).toBe('Mainnet');
+    expect(config.aggregatorUrl).toBe(NETWORKS.mainnet.aggregatorUrl);
   });
 });
 
@@ -145,11 +145,10 @@ describe('resolveOracleConfig', () => {
     it('should use different defaults for different networks', () => {
       const mainnet = resolveOracleConfig('mainnet');
       const testnet = resolveOracleConfig('testnet');
-      const dev = resolveOracleConfig('dev');
 
       expect(mainnet.url).toBe(NETWORKS.mainnet.aggregatorUrl);
       expect(testnet.url).toBe(NETWORKS.testnet.aggregatorUrl);
-      expect(dev.url).toBe(NETWORKS.dev.aggregatorUrl);
+      expect(mainnet.url).not.toBe(testnet.url);
     });
   });
 

@@ -45,7 +45,7 @@ export interface TokenDefinition {
 /**
  * Network type for registry lookup
  */
-export type RegistryNetwork = 'testnet' | 'mainnet' | 'dev';
+export type RegistryNetwork = 'testnet' | 'testnet2' | 'mainnet';
 
 /**
  * Configuration options for remote registry refresh
@@ -91,7 +91,7 @@ const FETCH_TIMEOUT_MS = 10_000;
  *
  * // Usually called automatically by createBrowserProviders / createNodeProviders
  * TokenRegistry.configure({
- *   remoteUrl: 'https://raw.githubusercontent.com/.../unicity-ids.testnet.json',
+ *   remoteUrl: 'https://raw.githubusercontent.com/.../unicity-ids.testnet2.json',
  *   storage: myStorageProvider,
  * });
  *
@@ -115,6 +115,8 @@ export class TokenRegistry {
   private lastRefreshAt: number = 0;
   private refreshPromise: Promise<boolean> | null = null;
   private initialLoadPromise: Promise<boolean> | null = null;
+  /** Bumped on every remoteUrl change; loads started in an older generation are discarded. */
+  private generation = 0;
 
   private constructor() {
     this.definitionsById = new Map();
@@ -149,6 +151,20 @@ export class TokenRegistry {
     const instance = TokenRegistry.getInstance();
 
     if (options.remoteUrl !== undefined) {
+      // A network switch must not leave the old network's definitions resolvable:
+      // applyDefinitions() is the only clear site and runs on a SUCCESSFUL fetch, so a
+      // failed load would keep serving foreign coinIds — wrong decimals, silently.
+      // lastRefreshAt resets too, else loadFromCache refuses the new network's snapshot
+      // as older than the stale timestamp.
+      const previous = instance.remoteUrl;
+      if (previous && previous !== options.remoteUrl) {
+        instance.applyDefinitions([]);
+        instance.lastRefreshAt = 0;
+        // Abandon any in-flight load: it fetched the OLD url, so its result must neither
+        // be applied nor cached, and the next caller must not dedupe onto it.
+        instance.generation++;
+        instance.refreshPromise = null;
+      }
       instance.remoteUrl = options.remoteUrl;
     }
     if (options.storage !== undefined) {
@@ -267,6 +283,7 @@ export class TokenRegistry {
   private async loadFromCache(): Promise<boolean> {
     if (!this.storage) return false;
 
+    const gen = this.generation;
     try {
       const { data: dataKey, ts: tsKey } = this.cacheKeys();
       const [cached, cachedTs] = await Promise.all([
@@ -288,6 +305,8 @@ export class TokenRegistry {
 
       const data: unknown = JSON.parse(cached);
       if (!this.isValidDefinitionsArray(data)) return false;
+      // A switch landed while we were reading — this snapshot is the old network's.
+      if (gen !== this.generation) return false;
 
       this.applyDefinitions(data as TokenDefinition[]);
       this.lastRefreshAt = ts;
@@ -362,22 +381,32 @@ export class TokenRegistry {
       return this.refreshPromise;
     }
 
-    this.refreshPromise = this.doRefresh();
+    // Track this attempt locally: configure() may drop the shared field mid-flight and a
+    // later caller install its own. Clearing unconditionally here would erase THAT promise
+    // and let a second concurrent fetch start for the same network, whose responses could
+    // then apply out of order — the older one landing last.
+    const attempt = this.doRefresh();
+    this.refreshPromise = attempt;
     try {
-      return await this.refreshPromise;
+      return await attempt;
     } finally {
-      this.refreshPromise = null;
+      if (this.refreshPromise === attempt) this.refreshPromise = null;
     }
   }
 
   private async doRefresh(): Promise<boolean> {
+    // Pin the url and generation for this attempt. configure() may swap networks while the
+    // fetch is in flight; applying or caching the result afterwards would reinstate the old
+    // network's definitions and write them under the NEW url's cache key.
+    const url = this.remoteUrl!;
+    const gen = this.generation;
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
       let response: Response;
       try {
-        response = await fetch(this.remoteUrl!, {
+        response = await fetch(url, {
           headers: { Accept: 'application/json' },
           signal: controller.signal,
         });
@@ -394,6 +423,11 @@ export class TokenRegistry {
 
       if (!this.isValidDefinitionsArray(data)) {
         logger.warn('TokenRegistry', 'Remote data is not a valid token definitions array');
+        return false;
+      }
+
+      if (gen !== this.generation) {
+        logger.debug('TokenRegistry', `Discarding stale refresh for ${url} (network changed)`);
         return false;
       }
 

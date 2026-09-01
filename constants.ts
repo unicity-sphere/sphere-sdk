@@ -162,9 +162,12 @@ export function getAddressId(directAddress: string): string {
 // Nostr Defaults
 // =============================================================================
 
-/** Default Nostr relays */
+/**
+ * Fallback Nostr relays, used only when no relay list is configured
+ * (NostrTransportProvider / MultiAddressTransportMux). `relay.unicity.network`
+ * was the v1 relay and no longer resolves, so it is not listed here.
+ */
 export const DEFAULT_NOSTR_RELAYS = [
-  'wss://relay.unicity.network',
   'wss://relay.damus.io',
   'wss://nos.lol',
   'wss://relay.nostr.band',
@@ -224,16 +227,11 @@ export const NIP29_KINDS = {
 // =============================================================================
 
 /**
- * Default aggregator URL
+ * Default aggregator request timeout (ms)
  * Note: The aggregator is conceptually an oracle - a trusted service that provides
  * verifiable truth about token state through cryptographic inclusion proofs.
+ * There is no default aggregator URL: every live network names its own gateway.
  */
-export const DEFAULT_AGGREGATOR_URL = 'https://aggregator.unicity.network/rpc' as const;
-
-/** Dev aggregator URL */
-export const DEV_AGGREGATOR_URL = 'https://dev-aggregator.dyndns.org/rpc' as const;
-
-/** Default aggregator request timeout (ms) */
 export const DEFAULT_AGGREGATOR_TIMEOUT = 30000;
 
 
@@ -256,10 +254,6 @@ export const COIN_TYPES = {
 // =============================================================================
 // Token Registry Defaults
 // =============================================================================
-
-/** Remote token registry URL (GitHub raw) */
-export const TOKEN_REGISTRY_URL =
-  'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet.json' as const;
 
 /** Default token registry refresh interval (ms) — 1 hour */
 export const TOKEN_REGISTRY_REFRESH_INTERVAL = 3_600_000;
@@ -299,10 +293,20 @@ export interface NetworkConfig {
 export const NETWORKS = {
   mainnet: {
     name: 'Mainnet',
-    aggregatorUrl: DEFAULT_AGGREGATOR_URL,
-    nostrRelays: DEFAULT_NOSTR_RELAYS,
+    networkId: 1,
+    // v3 state-transition gateway (networkId 1 comes from the trust base). apiKey is env-injected;
+    // unlike testnet2's, a mainnet gateway key is a SECRET — never commit one.
+    aggregatorUrl: 'https://gateway.mainnet.unicity.network',
+    // Mainnet has no relay of its own yet — it shares the testnet relay until one is stood up.
+    // Consequence while shared: nametag bindings for both networks live in ONE namespace, and
+    // since bindings carry no network the cross-network recipient guard can only signal (#734).
+    nostrRelays: TEST_NOSTR_RELAYS,
     groupRelays: DEFAULT_GROUP_RELAYS,
-    tokenRegistryUrl: TOKEN_REGISTRY_URL,
+    // Published, but currently only the non-fungible base token type — no fungible
+    // coins yet, so those still miss the registry (decimals 0, symbol falls back to
+    // six hex chars). Presentation only: the money path treats coinId as opaque bytes.
+    tokenRegistryUrl:
+      'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.mainnet.json',
   },
   // v1 cutover: 'testnet' now POINTS AT TESTNET2 (the v2 gateway network). The
   // old goggregator testnet spoke the removed v1 protocol — a v2 engine cannot
@@ -327,16 +331,6 @@ export const NETWORKS = {
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
   },
-  // NOTE: mainnet/dev still point at v1-era aggregators. The v2 engine cannot
-  // operate against them until their gateways are cut over to the v2 protocol —
-  // wallet operations on these networks fail loudly (AGGREGATOR_ERROR) until then.
-  dev: {
-    name: 'Development',
-    aggregatorUrl: DEV_AGGREGATOR_URL,
-    nostrRelays: TEST_NOSTR_RELAYS,
-    groupRelays: DEFAULT_GROUP_RELAYS,
-    tokenRegistryUrl: TOKEN_REGISTRY_URL,
-  },
 } as const satisfies Record<string, NetworkConfig>;
 
 export type NetworkType = keyof typeof NETWORKS;
@@ -359,6 +353,7 @@ export interface NetworkInfo {
  * the legacy `testnet` alias is intentionally not surfaced.
  */
 export const SPHERE_NETWORKS = {
+  mainnet: { id: NETWORKS.mainnet.networkId as number, name: 'mainnet' },
   testnet2: { id: NETWORKS.testnet2.networkId as number, name: 'testnet2' },
 } as const satisfies Record<string, NetworkInfo>;
 

@@ -28,6 +28,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { TokenRegistry } from '../../../registry';
 import type { TokenDefinition } from '../../../registry';
+import type { StorageProvider } from '../../../storage';
 import { NETWORKS } from '../../../constants';
 
 // =============================================================================
@@ -81,13 +82,29 @@ const TESTNET_DEFINITIONS: TokenDefinition[] = [
  * Mirrors how Sphere.configureTokenRegistry feeds a remoteUrl's JSON into the
  * registry, but injected directly so the test is deterministic.
  */
-async function configureFromDefinitions(definitions: TokenDefinition[]): Promise<void> {
+async function configureFromDefinitions(
+  definitions: TokenDefinition[],
+  remoteUrl = 'https://example.com/registry.json',
+): Promise<void> {
   const json = JSON.stringify(definitions);
   const fetchSpy = (input: unknown) => Promise.resolve(new Response(json, { status: 200 }));
   const original = globalThis.fetch;
   globalThis.fetch = fetchSpy as typeof globalThis.fetch;
   try {
-    TokenRegistry.configure({ remoteUrl: 'https://example.com/registry.json', autoRefresh: true });
+    TokenRegistry.configure({ remoteUrl, autoRefresh: true });
+    await TokenRegistry.waitForReady();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+/** Configure a NEW remoteUrl whose fetch fails, as an offline/blip switch would. */
+async function configureWithFailingFetch(remoteUrl: string): Promise<void> {
+  const original = globalThis.fetch;
+  globalThis.fetch = (() =>
+    Promise.resolve(new Response('unavailable', { status: 503 }))) as typeof globalThis.fetch;
+  try {
+    TokenRegistry.configure({ remoteUrl, autoRefresh: true });
     await TokenRegistry.waitForReady();
   } finally {
     globalThis.fetch = original;
@@ -174,56 +191,102 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
     expect(registry.getIconUrl(BTC_COIN_ID_TESTNET2)).toBeNull();
     expect(registry.isKnown(BTC_COIN_ID_TESTNET2)).toBe(false);
   });
-
   // ---------------------------------------------------------------------------
-  // 5. OPTIONAL network cross-check: fetch the LEGACY v1 registry (still used
-  //    by dev/mainnet) and the testnet2 registry, and prove they define
-  //    DIFFERENT coinIds for the same symbol — the premise behind the
-  //    wrong-registry → missing-icon mechanism. Skips (does not fail) if the
-  //    network is unavailable, so the suite stays deterministic.
+  // 5. Switching networks must not leave the previous network's definitions
+  //    resolvable. applyDefinitions() is the only clear site and it runs on a
+  //    SUCCESSFUL fetch, so without an explicit clear a failed load leaves the old
+  //    network's coinIds answering — wrong decimals/symbols for real assets, silently.
   // ---------------------------------------------------------------------------
-  it('[network] legacy (dev) vs testnet2 registry JSON define different coinIds for the same symbol', async () => {
-    const fetchJson = async (url: string): Promise<TokenDefinition[] | null> => {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 8000);
-        const res = await fetch(url, { signal: controller.signal });
-        clearTimeout(timer);
-        if (!res.ok) return null;
-        return (await res.json()) as TokenDefinition[];
-      } catch {
-        return null;
+  it('a network switch drops the previous definitions even when the new fetch FAILS', async () => {
+    await configureFromDefinitions(TESTNET2_DEFINITIONS, 'https://example.com/testnet2.json');
+    const registry = TokenRegistry.getInstance();
+    expect(registry.isKnown(BTC_COIN_ID_TESTNET2)).toBe(true);
+    expect(registry.getDecimals(BTC_COIN_ID_TESTNET2)).toBe(8);
+
+    // Switch to another network; its fetch fails (offline, 5xx, DNS blip).
+    await configureWithFailingFetch('https://example.com/mainnet.json');
+
+    // The previous network's coinId must no longer resolve, by ANY accessor.
+    expect(registry.isKnown(BTC_COIN_ID_TESTNET2)).toBe(false);
+    expect(registry.getIconUrl(BTC_COIN_ID_TESTNET2)).toBeNull();
+    expect(registry.getDecimals(BTC_COIN_ID_TESTNET2)).toBe(0);
+    // getCoinIdBySymbol is public and would otherwise hand back a foreign-network id.
+    expect(registry.getCoinIdBySymbol('BTC')).toBeUndefined();
+  });
+
+  it('re-configuring the SAME url keeps its definitions (only a real switch clears)', async () => {
+    await configureFromDefinitions(TESTNET2_DEFINITIONS, 'https://example.com/testnet2.json');
+    const registry = TokenRegistry.getInstance();
+
+    // Sphere and the provider factories both configure, often with the same url —
+    // that must not wipe a good registry and leave a window resolving nothing.
+    await configureWithFailingFetch('https://example.com/testnet2.json');
+
+    expect(registry.isKnown(BTC_COIN_ID_TESTNET2)).toBe(true);
+    expect(registry.getDecimals(BTC_COIN_ID_TESTNET2)).toBe(8);
+  });
+  // ---------------------------------------------------------------------------
+  // 6. The in-flight race: a switch while the PREVIOUS network's fetch is pending.
+  //    refreshFromRemote() dedupes onto a shared refreshPromise, and doRefresh()
+  //    resolved cacheKeys() only AFTER its await — so a late response could apply the
+  //    old network's definitions and persist them under the NEW url's cache key,
+  //    defeating the per-url cache namespacing entirely.
+  // ---------------------------------------------------------------------------
+  it('a fetch in flight when the network switches is neither applied nor cached', async () => {
+    const store = new Map<string, string>();
+    const storage = {
+      get: async (k: string) => store.get(k) ?? null,
+      set: async (k: string, v: string) => { store.set(k, v); },
+      remove: async (k: string) => { store.delete(k); },
+      has: async (k: string) => store.has(k),
+      clear: async () => { store.clear(); },
+      setIdentity: () => {},
+    } as unknown as StorageProvider;
+
+    const URL_A = 'https://example.com/testnet2.json';
+    const URL_B = 'https://example.com/mainnet.json';
+
+    // A's fetch hangs until we release it. B's FAILS — deliberately, so that B can never
+    // apply or cache anything, and A's late response is provably the LAST write. With B
+    // succeeding, the two could land in either order and the test would pass without the
+    // guard whenever B happened to finish second and clear the maps again.
+    let releaseA!: (r: Response) => void;
+    let aRequested = false;
+    const pendingA = new Promise<Response>((resolve) => { releaseA = resolve; });
+    const original = globalThis.fetch;
+    globalThis.fetch = ((input: unknown) => {
+      if (String(input) === URL_A) { aRequested = true; return pendingA; }
+      return Promise.resolve(new Response('unavailable', { status: 503 }));
+    }) as typeof globalThis.fetch;
+
+    try {
+      TokenRegistry.configure({ remoteUrl: URL_A, storage, autoRefresh: true });
+      // The switch must land while A's fetch is genuinely IN FLIGHT. configure() kicks off
+      // an async cache read first, so A's fetch has not started on the synchronous path —
+      // without this wait the race is never set up and the test passes either way.
+      for (let i = 0; i < 200 && !aRequested; i++) await new Promise((r) => setTimeout(r, 1));
+      expect(aRequested).toBe(true); // the test is vacuous if this is ever false
+
+      // Switch to B while A is still in flight, then release A.
+      TokenRegistry.configure({ remoteUrl: URL_B, storage, autoRefresh: true });
+      releaseA(new Response(JSON.stringify(TESTNET2_DEFINITIONS), { status: 200 }));
+      await new Promise((r) => setTimeout(r, 50));
+      // Deliberately NOT awaiting waitForReady(): without the guard B dedupes onto A's
+      // pending promise, so that await deadlocks until A's 10s fetch timeout and the
+      // assertions below are never reached. Since B only ever FAILS it applies nothing,
+      // so A is the sole possible writer and the check is order-independent regardless.
+
+      const registry = TokenRegistry.getInstance();
+      // A's definitions must NOT be resolvable — we are on B now.
+      expect(registry.isKnown(BTC_COIN_ID_TESTNET2)).toBe(false);
+      expect(registry.getDecimals(BTC_COIN_ID_TESTNET2)).toBe(0);
+
+      // ...and must NOT have been persisted under B's cache key.
+      for (const [k, v] of store) {
+        if (k.includes(URL_B)) expect(v).not.toContain(BTC_COIN_ID_TESTNET2);
       }
-    };
-
-    const [legacy, testnet2] = await Promise.all([
-      fetchJson(NETWORKS.dev.tokenRegistryUrl), // dev still points at the v1 testnet registry
-      fetchJson(NETWORKS.testnet2.tokenRegistryUrl),
-    ]);
-
-    if (!legacy || !testnet2) {
-      console.warn('[network] registry fetch unavailable — skipping real-JSON cross-check');
-      return; // graceful skip, keeps the deterministic core green
+    } finally {
+      globalThis.fetch = original;
     }
-
-    const idForSymbol = (defs: TokenDefinition[], symbol: string): string | undefined =>
-      defs.find((d) => d.symbol?.toUpperCase() === symbol)?.id?.toLowerCase();
-
-    // Find at least one symbol present in BOTH with a DIFFERENT id.
-    const symbols = new Set<string>();
-    for (const d of [...legacy, ...testnet2]) if (d.symbol) symbols.add(d.symbol.toUpperCase());
-
-    let foundDivergentSymbol = false;
-    for (const sym of symbols) {
-      const a = idForSymbol(legacy, sym);
-      const b = idForSymbol(testnet2, sym);
-      if (a && b && a !== b) {
-        foundDivergentSymbol = true;
-        console.info(`[network] symbol ${sym}: legacy=${a} testnet2=${b} (different)`);
-        break;
-      }
-    }
-
-    expect(foundDivergentSymbol).toBe(true);
   });
 });

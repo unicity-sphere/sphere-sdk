@@ -24,7 +24,7 @@ npm install @unicitylabs/sphere-sdk
 
 > **Note:** No API key is bundled with the SDK. The `testnet` gateway (testnet2, see below) requires one — inject it via `oracle: { apiKey: '...' }`. The testnet2 key is **not a secret** (see `.env.example`): `sk_ddc3cfcc001e4a28ac3fad7407f99590`. A mainnet key, by contrast, IS a secret — keep it in your deploy environment only.
 >
-> **Networks:** since the v1→v2 cutover, `network: 'testnet'` points at the **testnet2 gateway network** (`https://gateway.testnet2.unicity.network`; the network id comes from the trust base). `'testnet2'` is an alias of the same configuration. `mainnet`/`dev` still point at v1-era aggregators and cannot serve the engine — wallet operations there fail with `AGGREGATOR_ERROR`. The "2" in testnet2 names the **gateway network**, not the base-SDK major: testnet2 is still testnet2 on state-transition-sdk 3.x.
+> **Networks:** the live networks are **testnet2** and **mainnet**. `network: 'testnet'` is an alias of testnet2 (`https://gateway.testnet2.unicity.network`; the network id comes from the trust base). `mainnet` runs against `https://gateway.mainnet.unicity.network` (network id 1) — the chain and gateway are live, but there is no mainnet wallet-api deployment yet, so `Sphere.init` cannot complete a mainnet money path. The v1 network is discontinued and the `dev` preset has been removed — passing it is now a type error. The "2" in testnet2 names the **gateway network**, not the base-SDK major: testnet2 is still testnet2 on state-transition-sdk 3.x.
 
 ## Framework Setup
 
@@ -275,9 +275,9 @@ import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wa
 
 // Step 1: Base providers (required for network, oracle, transport)
 const base = createBrowserProviders({
-  // Network: 'mainnet' | 'testnet' | 'testnet2' | 'dev'
-  // ('testnet' IS testnet2 — the v2 gateway network; mainnet/dev are still
-  //  v1-era and cannot serve the engine)
+  // Network: 'mainnet' | 'testnet' | 'testnet2'
+  // ('testnet' IS testnet2 — the v2 gateway network. 'mainnet' is live on-chain
+  //  but has no wallet-api deployment yet, so its money path is unreachable.)
   network: 'testnet',
 
   // Transport options

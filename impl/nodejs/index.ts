@@ -76,7 +76,7 @@ export type NodeOracleConfig = BaseOracleConfig & NodeOracleExtensions;
 // =============================================================================
 
 export interface NodeProvidersConfig {
-  /** Network preset: mainnet, testnet, or dev */
+  /** Network preset: mainnet, testnet or testnet2 */
   network?: NetworkType;
   /** Enable debug logging globally for all providers (default: false). Per-provider debug flags override this. */
   debug?: boolean;

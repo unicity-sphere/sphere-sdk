@@ -98,7 +98,7 @@ describe('checkNetworkHealth — live testnet', () => {
     });
 
     expect(result.services.oracle).toBeDefined();
-    expect(result.services.oracle!.url).toContain('aggregator.unicity.network');
+    expect(result.services.oracle!.url).toContain('gateway.mainnet.unicity.network');
     expect(typeof result.services.oracle!.healthy).toBe('boolean');
   }, 20000);
 });
