@@ -889,5 +889,5 @@ interface OracleProvider extends BaseProvider {
 Network configuration:
 
 - **testnet2:** `https://gateway.testnet2.unicity.network` (networkId 4)
-- **mainnet/dev:** v1-era aggregators — the engine cannot operate against them (`AGGREGATOR_ERROR`); use testnet2
+- **mainnet:** live v3 gateway (`gateway.mainnet.unicity.network`, network id 1). The chain is live; there is no mainnet wallet-api deployment yet, so the money path is not reachable. The `dev` preset was removed with the v1 network.
 

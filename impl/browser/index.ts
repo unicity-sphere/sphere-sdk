@@ -83,7 +83,7 @@ export type OracleConfig = BaseOracleConfig;
 // =============================================================================
 
 export interface BrowserProvidersConfig {
-  /** Network preset: mainnet, testnet, or dev. Sets default URLs for all services */
+  /** Network preset: mainnet, testnet or testnet2. Sets default URLs for all services */
   network?: NetworkType;
   /** Enable debug logging globally for all providers (default: false). Per-provider debug flags override this. */
   debug?: boolean;
@@ -130,7 +130,7 @@ export interface BrowserProviders {
  * Create all browser providers with default configuration
  *
  * Supports extend/override pattern for flexible configuration:
- * - Use `network` preset for quick setup (mainnet/testnet/dev)
+ * - Use `network` preset for quick setup (mainnet/testnet/testnet2)
  * - Override specific values (e.g., `oracle.url` replaces default)
  * - Extend arrays with `additional*` (e.g., `additionalRelays` adds to defaults)
  *

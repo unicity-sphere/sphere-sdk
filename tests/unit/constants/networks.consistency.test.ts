@@ -18,7 +18,7 @@
  * choice is made PER (network, check) — a network may have some checks already
  * passing (real it) and others still failing (it.fails). See EXPECTED_FAILURES.
  *
- * Do NOT weaken these assertions to make mainnet/dev pass, and do NOT skip them.
+ * Do NOT weaken these assertions to make a network pass, and do NOT skip them.
  */
 
 import { describe, it, expect } from 'vitest';

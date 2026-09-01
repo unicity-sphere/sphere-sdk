@@ -115,6 +115,8 @@ export class TokenRegistry {
   private lastRefreshAt: number = 0;
   private refreshPromise: Promise<boolean> | null = null;
   private initialLoadPromise: Promise<boolean> | null = null;
+  /** Bumped on every remoteUrl change; loads started in an older generation are discarded. */
+  private generation = 0;
 
   private constructor() {
     this.definitionsById = new Map();
@@ -158,6 +160,10 @@ export class TokenRegistry {
       if (previous && previous !== options.remoteUrl) {
         instance.applyDefinitions([]);
         instance.lastRefreshAt = 0;
+        // Abandon any in-flight load: it fetched the OLD url, so its result must neither
+        // be applied nor cached, and the next caller must not dedupe onto it.
+        instance.generation++;
+        instance.refreshPromise = null;
       }
       instance.remoteUrl = options.remoteUrl;
     }
@@ -277,6 +283,7 @@ export class TokenRegistry {
   private async loadFromCache(): Promise<boolean> {
     if (!this.storage) return false;
 
+    const gen = this.generation;
     try {
       const { data: dataKey, ts: tsKey } = this.cacheKeys();
       const [cached, cachedTs] = await Promise.all([
@@ -298,6 +305,8 @@ export class TokenRegistry {
 
       const data: unknown = JSON.parse(cached);
       if (!this.isValidDefinitionsArray(data)) return false;
+      // A switch landed while we were reading — this snapshot is the old network's.
+      if (gen !== this.generation) return false;
 
       this.applyDefinitions(data as TokenDefinition[]);
       this.lastRefreshAt = ts;
@@ -381,13 +390,18 @@ export class TokenRegistry {
   }
 
   private async doRefresh(): Promise<boolean> {
+    // Pin the url and generation for this attempt. configure() may swap networks while the
+    // fetch is in flight; applying or caching the result afterwards would reinstate the old
+    // network's definitions and write them under the NEW url's cache key.
+    const url = this.remoteUrl!;
+    const gen = this.generation;
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
       let response: Response;
       try {
-        response = await fetch(this.remoteUrl!, {
+        response = await fetch(url, {
           headers: { Accept: 'application/json' },
           signal: controller.signal,
         });
@@ -404,6 +418,11 @@ export class TokenRegistry {
 
       if (!this.isValidDefinitionsArray(data)) {
         logger.warn('TokenRegistry', 'Remote data is not a valid token definitions array');
+        return false;
+      }
+
+      if (gen !== this.generation) {
+        logger.debug('TokenRegistry', `Discarding stale refresh for ${url} (network changed)`);
         return false;
       }
 

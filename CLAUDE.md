@@ -598,7 +598,7 @@ Custom `OracleProvider` implementations MUST provide the three config accessors.
 |---------|--------------------|--------|
 | `testnet` | `https://gateway.testnet2.unicity.network` | ⭐ **Alias of testnet2** (the current gateway, trust-base networkId 4, testnet2 token registry) |
 | `testnet2` | `https://gateway.testnet2.unicity.network` | Same config as `testnet` |
-| `mainnet` | `gateway.mainnet.unicity.network` | Live v3 gateway; embedded trust base, **networkId 1** (pinned in `EXPECTED_NETWORK_ID`). No mainnet wallet-api yet, so the money path is unreachable; registry URL still the v1 testnet file; shares testnet's Nostr relay |
+| `mainnet` | `gateway.mainnet.unicity.network` | Live v3 gateway; embedded trust base, **networkId 1** (pinned in `EXPECTED_NETWORK_ID`); own `unicity-ids.mainnet.json` registry (currently only the non-fungible base type). No mainnet wallet-api yet, so the money path is unreachable; shares testnet's Nostr relay until one is stood up |
 
 All networks share Nostr relays (`nostr-relay.testnet.unicity.network` for test
 nets) and group relays per `NETWORKS`.

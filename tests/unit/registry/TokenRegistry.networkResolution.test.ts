@@ -28,6 +28,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { TokenRegistry } from '../../../registry';
 import type { TokenDefinition } from '../../../registry';
+import type { StorageProvider } from '../../../storage';
 import { NETWORKS } from '../../../constants';
 
 // =============================================================================
@@ -223,5 +224,68 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
 
     expect(registry.isKnown(BTC_COIN_ID_TESTNET2)).toBe(true);
     expect(registry.getDecimals(BTC_COIN_ID_TESTNET2)).toBe(8);
+  });
+  // ---------------------------------------------------------------------------
+  // 6. The in-flight race: a switch while the PREVIOUS network's fetch is pending.
+  //    refreshFromRemote() dedupes onto a shared refreshPromise, and doRefresh()
+  //    resolved cacheKeys() only AFTER its await — so a late response could apply the
+  //    old network's definitions and persist them under the NEW url's cache key,
+  //    defeating the per-url cache namespacing entirely.
+  // ---------------------------------------------------------------------------
+  it('a fetch in flight when the network switches is neither applied nor cached', async () => {
+    const store = new Map<string, string>();
+    const storage = {
+      get: async (k: string) => store.get(k) ?? null,
+      set: async (k: string, v: string) => { store.set(k, v); },
+      remove: async (k: string) => { store.delete(k); },
+      has: async (k: string) => store.has(k),
+      clear: async () => { store.clear(); },
+      setIdentity: () => {},
+    } as unknown as StorageProvider;
+
+    const URL_A = 'https://example.com/testnet2.json';
+    const URL_B = 'https://example.com/mainnet.json';
+
+    // Network A's fetch hangs until we release it.
+    let releaseA!: (r: Response) => void;
+    let aRequested = false;
+    const pendingA = new Promise<Response>((resolve) => { releaseA = resolve; });
+    const original = globalThis.fetch;
+    globalThis.fetch = ((input: unknown) => {
+      if (String(input) === URL_A) { aRequested = true; return pendingA; }
+      return Promise.resolve(new Response('[]', { status: 200 }));
+    }) as typeof globalThis.fetch;
+
+    try {
+      TokenRegistry.configure({ remoteUrl: URL_A, storage, autoRefresh: true });
+      // The switch must land while A's fetch is genuinely IN FLIGHT. configure() kicks off
+      // an async cache read first, so A's fetch has not started on the synchronous path —
+      // without this wait the race is never set up and the test passes either way.
+      for (let i = 0; i < 200 && !aRequested; i++) await new Promise((r) => setTimeout(r, 1));
+      expect(aRequested).toBe(true); // the test is vacuous if this is ever false
+
+      // Switch to B while A is still in flight.
+      TokenRegistry.configure({ remoteUrl: URL_B, storage, autoRefresh: true });
+      // Now let A's response land, carrying A's definitions.
+      releaseA(new Response(JSON.stringify(TESTNET2_DEFINITIONS), { status: 200 }));
+      await TokenRegistry.waitForReady();
+      await new Promise((r) => setTimeout(r, 10)); // let the abandoned promise settle
+
+      const registry = TokenRegistry.getInstance();
+      // A's definitions must NOT be resolvable — we are on B now.
+      expect(registry.isKnown(BTC_COIN_ID_TESTNET2)).toBe(false);
+
+      // ...and must NOT have been persisted under B's cache key.
+      const bKey = [...store.keys()].find((k) => k.includes(URL_B));
+      if (bKey) {
+        expect(store.get(bKey)).not.toContain(BTC_COIN_ID_TESTNET2);
+      }
+      // Nothing may have been written under B's key that came from A.
+      for (const [k, v] of store) {
+        if (k.includes(URL_B)) expect(v).not.toContain(BTC_COIN_ID_TESTNET2);
+      }
+    } finally {
+      globalThis.fetch = original;
+    }
   });
 });
