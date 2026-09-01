@@ -381,11 +381,16 @@ export class TokenRegistry {
       return this.refreshPromise;
     }
 
-    this.refreshPromise = this.doRefresh();
+    // Track this attempt locally: configure() may drop the shared field mid-flight and a
+    // later caller install its own. Clearing unconditionally here would erase THAT promise
+    // and let a second concurrent fetch start for the same network, whose responses could
+    // then apply out of order — the older one landing last.
+    const attempt = this.doRefresh();
+    this.refreshPromise = attempt;
     try {
-      return await this.refreshPromise;
+      return await attempt;
     } finally {
-      this.refreshPromise = null;
+      if (this.refreshPromise === attempt) this.refreshPromise = null;
     }
   }
 

@@ -246,14 +246,17 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
     const URL_A = 'https://example.com/testnet2.json';
     const URL_B = 'https://example.com/mainnet.json';
 
-    // Network A's fetch hangs until we release it.
+    // A's fetch hangs until we release it. B's FAILS — deliberately, so that B can never
+    // apply or cache anything, and A's late response is provably the LAST write. With B
+    // succeeding, the two could land in either order and the test would pass without the
+    // guard whenever B happened to finish second and clear the maps again.
     let releaseA!: (r: Response) => void;
     let aRequested = false;
     const pendingA = new Promise<Response>((resolve) => { releaseA = resolve; });
     const original = globalThis.fetch;
     globalThis.fetch = ((input: unknown) => {
       if (String(input) === URL_A) { aRequested = true; return pendingA; }
-      return Promise.resolve(new Response('[]', { status: 200 }));
+      return Promise.resolve(new Response('unavailable', { status: 503 }));
     }) as typeof globalThis.fetch;
 
     try {
@@ -264,23 +267,21 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
       for (let i = 0; i < 200 && !aRequested; i++) await new Promise((r) => setTimeout(r, 1));
       expect(aRequested).toBe(true); // the test is vacuous if this is ever false
 
-      // Switch to B while A is still in flight.
+      // Switch to B while A is still in flight, then release A.
       TokenRegistry.configure({ remoteUrl: URL_B, storage, autoRefresh: true });
-      // Now let A's response land, carrying A's definitions.
       releaseA(new Response(JSON.stringify(TESTNET2_DEFINITIONS), { status: 200 }));
-      await TokenRegistry.waitForReady();
-      await new Promise((r) => setTimeout(r, 10)); // let the abandoned promise settle
+      await new Promise((r) => setTimeout(r, 50));
+      // Deliberately NOT awaiting waitForReady(): without the guard B dedupes onto A's
+      // pending promise, so that await deadlocks until A's 10s fetch timeout and the
+      // assertions below are never reached. Since B only ever FAILS it applies nothing,
+      // so A is the sole possible writer and the check is order-independent regardless.
 
       const registry = TokenRegistry.getInstance();
       // A's definitions must NOT be resolvable — we are on B now.
       expect(registry.isKnown(BTC_COIN_ID_TESTNET2)).toBe(false);
+      expect(registry.getDecimals(BTC_COIN_ID_TESTNET2)).toBe(0);
 
       // ...and must NOT have been persisted under B's cache key.
-      const bKey = [...store.keys()].find((k) => k.includes(URL_B));
-      if (bKey) {
-        expect(store.get(bKey)).not.toContain(BTC_COIN_ID_TESTNET2);
-      }
-      // Nothing may have been written under B's key that came from A.
       for (const [k, v] of store) {
         if (k.includes(URL_B)) expect(v).not.toContain(BTC_COIN_ID_TESTNET2);
       }

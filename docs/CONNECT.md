@@ -67,7 +67,7 @@ const result = await autoConnect({ /* ... */, network: SPHERE_NETWORKS.testnet2 
 
 `SPHERE_NETWORKS` is also importable by backend services from `@unicitylabs/sphere-sdk/connect` — this entry point has no browser-only deps, so it is safe to use in Node.js and `sphere-api` without pulling in DOM APIs.
 
-The registry currently exposes exactly one entry: `SPHERE_NETWORKS.testnet2` = `{ id: 4, name: 'testnet2' }`. Richer descriptor fields (`gatewayUrl`, `symbol`, `explorer`, `icon`) and runtime switch/add-network are deferred to a future multi-network effort. The legacy `testnet` alias is intentionally absent from `SPHERE_NETWORKS`.
+The registry exposes two entries: `SPHERE_NETWORKS.mainnet` = `{ id: 1, name: 'mainnet' }` and `SPHERE_NETWORKS.testnet2` = `{ id: 4, name: 'testnet2' }`. A dApp must declare the one it targets — the handshake gate compares network ids numerically and is fail-closed, so a testnet2 dApp is refused by a mainnet wallet and vice versa (`INCOMPATIBLE_NETWORK`). Note that adding an entry only helps dApps that re-pin the SDK; one on an older version must declare `{ id: 1 }` by hand. Richer descriptor fields (`gatewayUrl`, `symbol`, `explorer`, `icon`) and runtime switch/add-network are deferred to a future multi-network effort. The legacy `testnet` alias is intentionally absent from `SPHERE_NETWORKS`.
 
 ### NetworkInfo
 
