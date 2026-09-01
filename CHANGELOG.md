@@ -55,12 +55,11 @@ The `networks.consistency` CI test's `EXPECTED_FAILURES` set is now **empty**: e
 stays.
 
 Not yet usable for money on mainnet: there is no mainnet wallet-api deployment, so `Sphere.init`
-cannot complete a mainnet money path. `NETWORKS.mainnet.tokenRegistryUrl` names
-`unicity-ids.mainnet.json`, which is not published yet — until it is, the fetch 404s and every
-mainnet coin misses the registry (`decimals` 0, symbol falls back to six hex chars). That is
-presentation only: the money path treats `coinId` as an opaque byte string. Mainnet also shares
-testnet's Nostr relay until a dedicated one is stood up, which means nametag bindings for both
-networks share one namespace.
+cannot complete a mainnet money path. `unicity-ids.mainnet.json` is published and wired up, but so
+far defines only the non-fungible base token type — fungible mainnet coins therefore still miss the
+registry (`decimals` 0, symbol falls back to six hex chars). That is presentation only: the money
+path treats `coinId` as an opaque byte string. Mainnet also shares testnet's Nostr relay until a
+dedicated one is stood up, which means nametag bindings for both networks share one namespace.
 
 ## [0.15.0] - 2026-08-27
 

@@ -302,9 +302,9 @@ export const NETWORKS = {
     // since bindings carry no network the cross-network recipient guard can only signal (#734).
     nostrRelays: TEST_NOSTR_RELAYS,
     groupRelays: DEFAULT_GROUP_RELAYS,
-    // Not published yet — until it is, a fetch 404s and every mainnet coin misses the
-    // registry (decimals 0, symbol falls back to six hex chars). Presentation only:
-    // the money path treats coinId as an opaque byte string.
+    // Published, but currently only the non-fungible base token type — no fungible
+    // coins yet, so those still miss the registry (decimals 0, symbol falls back to
+    // six hex chars). Presentation only: the money path treats coinId as opaque bytes.
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.mainnet.json',
   },

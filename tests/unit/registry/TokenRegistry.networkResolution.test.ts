@@ -177,13 +177,12 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
 
   // ---------------------------------------------------------------------------
   // 5. OPTIONAL network cross-check: fetch the mainnet and testnet2 registries and
-  //    prove they define DIFFERENT coinIds for the same symbol — the premise behind
-  //    the wrong-registry → missing-icon mechanism, and the reason a network may
-  //    never borrow another's registry. Skips (does not fail) when a file is
-  //    unavailable, so the suite stays deterministic — which is also why this goes
-  //    quiet, rather than red, until unicity-ids.mainnet.json is published.
+  //    prove their coinId spaces are DISJOINT, and that one shared name resolves to
+  //    different ids — the premise behind the wrong-registry → missing-icon mechanism,
+  //    and the reason a network may never borrow another's registry. Skips (does not
+  //    fail) when a file is unavailable, so the suite stays deterministic offline.
   // ---------------------------------------------------------------------------
-  it('[network] mainnet vs testnet2 registry JSON define different coinIds for the same symbol', async () => {
+  it('[network] mainnet and testnet2 registry JSON have disjoint coinIds', async () => {
     const fetchJson = async (url: string): Promise<TokenDefinition[] | null> => {
       try {
         const controller = new AbortController();
@@ -207,24 +206,33 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
       return; // graceful skip, keeps the deterministic core green
     }
 
-    const idForSymbol = (defs: TokenDefinition[], symbol: string): string | undefined =>
-      defs.find((d) => d.symbol?.toUpperCase() === symbol)?.id?.toLowerCase();
+    const ids = (defs: TokenDefinition[]): Set<string> =>
+      new Set(defs.map((d) => d.id?.toLowerCase()).filter((id): id is string => !!id));
 
-    // Find at least one symbol present in BOTH with a DIFFERENT id.
-    const symbols = new Set<string>();
-    for (const d of [...mainnet, ...testnet2]) if (d.symbol) symbols.add(d.symbol.toUpperCase());
+    // The invariant that actually matters: NO id is defined by both networks, so a
+    // coinId minted on one can never resolve against the other's registry. Asserted on
+    // ids rather than symbols because the two files need not define the same coins —
+    // mainnet currently ships only the non-fungible base type, with no symbols at all.
+    const shared = [...ids(mainnet)].filter((id) => ids(testnet2).has(id));
+    expect(shared).toEqual([]);
 
-    let foundDivergentSymbol = false;
-    for (const sym of symbols) {
-      const a = idForSymbol(mainnet, sym);
-      const b = idForSymbol(testnet2, sym);
+    // And the mechanism itself: the SAME human-readable name resolves to a DIFFERENT
+    // id per network, which is exactly how a borrowed registry yields a silent miss.
+    const idForName = (defs: TokenDefinition[], name: string): string | undefined =>
+      defs.find((d) => d.name?.toLowerCase() === name)?.id?.toLowerCase();
+    const names = new Set<string>();
+    for (const d of [...mainnet, ...testnet2]) if (d.name) names.add(d.name.toLowerCase());
+
+    let foundDivergentName = false;
+    for (const name of names) {
+      const a = idForName(mainnet, name);
+      const b = idForName(testnet2, name);
       if (a && b && a !== b) {
-        foundDivergentSymbol = true;
-        console.info(`[network] symbol ${sym}: mainnet=${a} testnet2=${b} (different)`);
+        foundDivergentName = true;
+        console.info(`[network] name ${name}: mainnet=${a} testnet2=${b} (different)`);
         break;
       }
     }
-
-    expect(foundDivergentSymbol).toBe(true);
+    expect(foundDivergentName).toBe(true);
   });
 });
