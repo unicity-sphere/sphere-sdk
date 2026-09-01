@@ -149,6 +149,18 @@ export class TokenRegistry {
     const instance = TokenRegistry.getInstance();
 
     if (options.remoteUrl !== undefined) {
+      // Switching networks must not leave the previous network's definitions resolvable.
+      // applyDefinitions() is the ONLY clear site and it runs on a SUCCESSFUL fetch, so a
+      // failed or slow load would otherwise serve the old network's coinIds — wrong
+      // decimals and symbols for real assets, silently. Dropping them here makes the
+      // window resolve to nothing instead (isKnown false, decimals 0), which is visible.
+      // lastRefreshAt resets too: loadFromCache refuses a snapshot older than it, so a
+      // stale timestamp from the previous network would block the new one's cache.
+      const previous = instance.remoteUrl;
+      if (previous && previous !== options.remoteUrl) {
+        instance.applyDefinitions([]);
+        instance.lastRefreshAt = 0;
+      }
       instance.remoteUrl = options.remoteUrl;
     }
     if (options.storage !== undefined) {

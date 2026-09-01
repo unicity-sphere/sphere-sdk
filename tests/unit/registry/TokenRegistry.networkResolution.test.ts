@@ -81,13 +81,29 @@ const TESTNET_DEFINITIONS: TokenDefinition[] = [
  * Mirrors how Sphere.configureTokenRegistry feeds a remoteUrl's JSON into the
  * registry, but injected directly so the test is deterministic.
  */
-async function configureFromDefinitions(definitions: TokenDefinition[]): Promise<void> {
+async function configureFromDefinitions(
+  definitions: TokenDefinition[],
+  remoteUrl = 'https://example.com/registry.json',
+): Promise<void> {
   const json = JSON.stringify(definitions);
   const fetchSpy = (input: unknown) => Promise.resolve(new Response(json, { status: 200 }));
   const original = globalThis.fetch;
   globalThis.fetch = fetchSpy as typeof globalThis.fetch;
   try {
-    TokenRegistry.configure({ remoteUrl: 'https://example.com/registry.json', autoRefresh: true });
+    TokenRegistry.configure({ remoteUrl, autoRefresh: true });
+    await TokenRegistry.waitForReady();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+/** Configure a NEW remoteUrl whose fetch fails, as an offline/blip switch would. */
+async function configureWithFailingFetch(remoteUrl: string): Promise<void> {
+  const original = globalThis.fetch;
+  globalThis.fetch = (() =>
+    Promise.resolve(new Response('unavailable', { status: 503 }))) as typeof globalThis.fetch;
+  try {
+    TokenRegistry.configure({ remoteUrl, autoRefresh: true });
     await TokenRegistry.waitForReady();
   } finally {
     globalThis.fetch = original;
@@ -173,5 +189,39 @@ describe('TokenRegistry network resolution (Top-Up icon mechanism)', () => {
     // wrong (testnet) registry is loaded for a testnet2-minted Top-Up token.
     expect(registry.getIconUrl(BTC_COIN_ID_TESTNET2)).toBeNull();
     expect(registry.isKnown(BTC_COIN_ID_TESTNET2)).toBe(false);
+  });
+  // ---------------------------------------------------------------------------
+  // 5. Switching networks must not leave the previous network's definitions
+  //    resolvable. applyDefinitions() is the only clear site and it runs on a
+  //    SUCCESSFUL fetch, so without an explicit clear a failed load leaves the old
+  //    network's coinIds answering — wrong decimals/symbols for real assets, silently.
+  // ---------------------------------------------------------------------------
+  it('a network switch drops the previous definitions even when the new fetch FAILS', async () => {
+    await configureFromDefinitions(TESTNET2_DEFINITIONS, 'https://example.com/testnet2.json');
+    const registry = TokenRegistry.getInstance();
+    expect(registry.isKnown(BTC_COIN_ID_TESTNET2)).toBe(true);
+    expect(registry.getDecimals(BTC_COIN_ID_TESTNET2)).toBe(8);
+
+    // Switch to another network; its fetch fails (offline, 5xx, DNS blip).
+    await configureWithFailingFetch('https://example.com/mainnet.json');
+
+    // The previous network's coinId must no longer resolve, by ANY accessor.
+    expect(registry.isKnown(BTC_COIN_ID_TESTNET2)).toBe(false);
+    expect(registry.getIconUrl(BTC_COIN_ID_TESTNET2)).toBeNull();
+    expect(registry.getDecimals(BTC_COIN_ID_TESTNET2)).toBe(0);
+    // getCoinIdBySymbol is public and would otherwise hand back a foreign-network id.
+    expect(registry.getCoinIdBySymbol('BTC')).toBeUndefined();
+  });
+
+  it('re-configuring the SAME url keeps its definitions (only a real switch clears)', async () => {
+    await configureFromDefinitions(TESTNET2_DEFINITIONS, 'https://example.com/testnet2.json');
+    const registry = TokenRegistry.getInstance();
+
+    // Sphere and the provider factories both configure, often with the same url —
+    // that must not wipe a good registry and leave a window resolving nothing.
+    await configureWithFailingFetch('https://example.com/testnet2.json');
+
+    expect(registry.isKnown(BTC_COIN_ID_TESTNET2)).toBe(true);
+    expect(registry.getDecimals(BTC_COIN_ID_TESTNET2)).toBe(8);
   });
 });
