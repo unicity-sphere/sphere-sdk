@@ -458,8 +458,12 @@ export interface AddressModuleSet {
 // =============================================================================
 
 export class Sphere {
-  // Singleton
-  private static instance: Sphere | null = null;
+  // Live Spheres, keyed by the StorageProvider whose data they own. NOT a liveness API:
+  // it exists only so clear()/import() tear down the instances that actually use the
+  // storage they were handed, instead of whichever Sphere was constructed last. Keyed by
+  // object identity, so Spheres on different providers never see each other. Two
+  // providers over one dataDir/DB are still distinct keys — see #766.
+  private static readonly _liveByStorage = new WeakMap<StorageProvider, Set<Sphere>>();
 
   // One-time best-effort cleanup of the orphaned vesting cache (prior versions).
   private static _orphanCacheCleaned = false;
@@ -630,7 +634,10 @@ export class Sphere {
    */
   static async init(options: SphereInitOptions): Promise<SphereInitResult> {
     // Configure debug logging (also needed in main bundle context, same as TokenRegistry)
-    if (options.debug) logger.configure({ debug: true });
+    // `undefined` leaves whatever the provider factory or consumer set; an explicit
+    // `false` MUST turn debug off. A truthy-only check made this process-global flag
+    // one-way — no second init could ever quieten it (#766).
+    if (options.debug !== undefined) logger.configure({ debug: options.debug });
 
     // Fail-closed BEFORE any work: retired module options + the required
     // wallet-api composition (create/load re-check for direct callers).
@@ -662,6 +669,7 @@ export class Sphere {
         market,
         communications: options.communications,
         password: options.password,
+        verification: options.verification,
         discoverAddresses: options.discoverAddresses,
         onProgress: options.onProgress,
       });
@@ -703,6 +711,7 @@ export class Sphere {
       market,
       communications: options.communications,
       password: options.password,
+      verification: options.verification,
       discoverAddresses: options.discoverAddresses,
       onProgress: options.onProgress,
     });
@@ -807,8 +816,8 @@ export class Sphere {
   /**
    * Own a registry for the duration of `bringUp`, disposing it if any of that rejects.
    *
-   * `bringUp` must cover EVERY fallible step from here until the Sphere is published to
-   * `Sphere.instance` — until then the caller receives nothing it could destroy, so a
+   * `bringUp` must cover EVERY fallible step from here until the Sphere is returned to
+   * its caller — until then nobody holds anything they could destroy, so a
    * registry left behind is unreachable and its hourly fetch runs for the life of the
    * process. Guarding a named subset of the steps is what failed twice: the guarded region
    * and the fallible region were separate things, and drifted.
@@ -848,7 +857,10 @@ export class Sphere {
    * Create new wallet with mnemonic
    */
   static async create(options: SphereCreateOptions): Promise<Sphere> {
-    if (options.debug) logger.configure({ debug: true });
+    // `undefined` leaves whatever the provider factory or consumer set; an explicit
+    // `false` MUST turn debug off. A truthy-only check made this process-global flag
+    // one-way — no second init could ever quieten it (#766).
+    if (options.debug !== undefined) logger.configure({ debug: options.debug });
 
     // Fail-closed BEFORE any storage write: retired module options + the
     // required wallet-api composition.
@@ -953,7 +965,7 @@ export class Sphere {
       progress?.({ step: 'complete', message: 'Wallet created' });
     });
 
-    Sphere.instance = sphere;
+    Sphere.registerLive(sphere);
     return sphere;
   }
 
@@ -961,7 +973,10 @@ export class Sphere {
    * Load existing wallet from storage
    */
   static async load(options: SphereLoadOptions): Promise<Sphere> {
-    if (options.debug) logger.configure({ debug: true });
+    // `undefined` leaves whatever the provider factory or consumer set; an explicit
+    // `false` MUST turn debug off. A truthy-only check made this process-global flag
+    // one-way — no second init could ever quieten it (#766).
+    if (options.debug !== undefined) logger.configure({ debug: options.debug });
 
     // Fail-closed first: retired module options + the required wallet-api composition.
     Sphere.refuseRetiredModuleOptions(options);
@@ -1035,7 +1050,7 @@ export class Sphere {
       progress?.({ step: 'complete', message: 'Wallet loaded' });
     });
 
-    Sphere.instance = sphere;
+    Sphere.registerLive(sphere);
     return sphere;
   }
 
@@ -1043,7 +1058,10 @@ export class Sphere {
    * Import wallet from mnemonic or master key
    */
   static async import(options: SphereImportOptions): Promise<Sphere> {
-    if (options.debug) logger.configure({ debug: true });
+    // `undefined` leaves whatever the provider factory or consumer set; an explicit
+    // `false` MUST turn debug off. A truthy-only check made this process-global flag
+    // one-way — no second init could ever quieten it (#766).
+    if (options.debug !== undefined) logger.configure({ debug: options.debug });
 
     // Fail-closed BEFORE the destructive clear below: retired module options +
     // the required wallet-api composition.
@@ -1061,7 +1079,7 @@ export class Sphere {
     // Clear existing wallet if any. Skip if no active instance and wallet
     // doesn't exist — avoids a redundant IndexedDB delete/reopen that can race
     // with a subsequent initialize().
-    const needsClear = Sphere.instance !== null || await Sphere.exists(options.storage);
+    const needsClear = Sphere.liveOn(options.storage).length > 0 || (await Sphere.exists(options.storage));
     if (needsClear) {
       progress?.({ step: 'clearing', message: 'Clearing previous wallet data...' });
       logger.debug('Sphere', 'Clearing existing wallet data...');
@@ -1189,7 +1207,7 @@ export class Sphere {
       logger.debug('Sphere', 'Import complete');
     });
 
-    Sphere.instance = sphere;
+    Sphere.registerLive(sphere);
     return sphere;
   }
 
@@ -1211,9 +1229,12 @@ export class Sphere {
 
     // 1. Destroy Sphere instance — stops the payments vertical (quiescence),
     //    then closes all connections.
-    if (Sphere.instance) {
-      logger.debug('Sphere', 'Destroying Sphere instance...');
-      await Sphere.instance.destroy();
+    // Scoped on purpose: destroying whichever Sphere was constructed last silently
+    // killed a live wallet on an unrelated provider, dropping every sphere.on() handler
+    // with no event and no error (#766). A Sphere on other storage is not our business.
+    for (const live of Sphere.liveOn(storage)) {
+      logger.debug('Sphere', 'Destroying Sphere instance on this storage...');
+      await live.destroy();
       logger.debug('Sphere', 'Sphere instance destroyed');
     }
 
@@ -1286,18 +1307,23 @@ export class Sphere {
     } catch { /* ignore — cleanup is best-effort */ }
   }
 
-  /**
-   * Get current instance
-   */
-  static getInstance(): Sphere | null {
-    return Sphere.instance;
+  /** Record a fully-built Sphere against the storage it owns. See `_liveByStorage`. */
+  private static registerLive(sphere: Sphere): void {
+    let live = Sphere._liveByStorage.get(sphere._storage);
+    if (!live) {
+      live = new Set();
+      Sphere._liveByStorage.set(sphere._storage, live);
+    }
+    live.add(sphere);
   }
 
-  /**
-   * Check if initialized
-   */
-  static isInitialized(): boolean {
-    return Sphere.instance?._initialized ?? false;
+  private static unregisterLive(sphere: Sphere): void {
+    Sphere._liveByStorage.get(sphere._storage)?.delete(sphere);
+  }
+
+  /** Snapshot — callers iterate this while destroy() mutates the underlying Set. */
+  private static liveOn(storage: StorageProvider): Sphere[] {
+    return Array.from(Sphere._liveByStorage.get(storage) ?? []);
   }
 
   /**
@@ -1576,8 +1602,7 @@ export class Sphere {
         });
 
         if (result.success) {
-          const sphere = Sphere.getInstance();
-          return { success: true, sphere: sphere!, mnemonic: result.mnemonic };
+          return { success: true, sphere: result.sphere, mnemonic: result.mnemonic };
         }
 
         if (!password && result.error?.includes('Password required')) {
@@ -1971,7 +1996,7 @@ export class Sphere {
   static async importFromJSON(options: Omit<SphereImportOptions, 'mnemonic' | 'masterKey' | 'chainCode' | 'derivationPath' | 'basePath' | 'derivationMode'> & {
     jsonContent: string;
     password?: string;
-  }): Promise<{ success: boolean; mnemonic?: string; error?: string }> {
+  }): Promise<{ success: boolean; sphere?: Sphere; mnemonic?: string; error?: string }> {
     const { jsonContent, password, ...baseOptions } = options;
 
     try {
@@ -2011,20 +2036,20 @@ export class Sphere {
 
       // Import using mnemonic if available (preferred)
       if (mnemonic) {
-        await Sphere.import({ ...baseOptions, mnemonic, basePath });
-        return { success: true, mnemonic };
+        const sphere = await Sphere.import({ ...baseOptions, mnemonic, basePath });
+        return { success: true, sphere, mnemonic };
       }
 
       // Otherwise import using master key
       if (masterKey) {
-        await Sphere.import({
+        const sphere = await Sphere.import({
           ...baseOptions,
           masterKey,
           chainCode: data.wallet.chainCode,
           basePath,
           derivationMode: data.derivationMode || (data.wallet.isBIP32 ? 'bip32' : 'wif_hmac'),
         });
-        return { success: true };
+        return { success: true, sphere };
       }
 
       return { success: false, error: 'No mnemonic or master key in wallet data' };
@@ -2156,7 +2181,11 @@ export class Sphere {
     }
     if (entry.hidden === hidden) return;
 
-    (entry as { hidden: boolean }).hidden = hidden;
+    // `updatedAt` moves with `hidden`: the registry merge (#766 item 5) resolves a
+    // conflicting entry by the greater `updatedAt`, so a stale flag left with its old
+    // timestamp would let another Sphere's snapshot win and silently undo this change.
+    (entry as { hidden: boolean; updatedAt: number }).hidden = hidden;
+    (entry as { hidden: boolean; updatedAt: number }).updatedAt = Date.now();
     await this.persistTrackedAddresses();
 
     const eventType = hidden ? 'address:hidden' : 'address:unhidden';
@@ -2643,7 +2672,11 @@ export class Sphere {
       }
 
       if (tracked.hidden !== hidden) {
-        (tracked as { hidden: boolean }).hidden = hidden;
+        // Bump `updatedAt` with `hidden` — the registry merge (#766 item 5) breaks a
+        // conflict by the greater `updatedAt`, so an unbumped flag can be overwritten
+        // by another Sphere's older snapshot.
+        (tracked as { hidden: boolean; updatedAt: number }).hidden = hidden;
+        (tracked as { hidden: boolean; updatedAt: number }).updatedAt = Date.now();
       }
     }
 
@@ -3537,9 +3570,7 @@ export class Sphere {
     this._disabledProviders.clear();
     this.eventHandlers.clear();
 
-    if (Sphere.instance === this) {
-      Sphere.instance = null;
-    }
+    Sphere.unregisterLive(this);
   }
 
   // ===========================================================================
@@ -4147,5 +4178,4 @@ export const createSphere = Sphere.create.bind(Sphere);
 export const loadSphere = Sphere.load.bind(Sphere);
 export const importSphere = Sphere.import.bind(Sphere);
 export const initSphere = Sphere.init.bind(Sphere);
-export const getSphere = Sphere.getInstance.bind(Sphere);
 export const sphereExists = Sphere.exists.bind(Sphere);

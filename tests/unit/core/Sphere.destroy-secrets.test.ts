@@ -35,6 +35,12 @@ function secrets(sphere: Sphere): SphereSecrets {
   return sphere as unknown as SphereSecrets;
 }
 
+/**
+ * The Sphere the current test built, so afterEach can tear it down. There is no
+ * process-global instance to look it up from (#766) — hold the reference.
+ */
+let live: Sphere | null = null;
+
 async function initWallet(password?: string): Promise<Sphere> {
   const { storage, transport, oracle, walletApi } = makeMockProviders({ walletExists: false });
   const { sphere } = await Sphere.init({
@@ -46,26 +52,22 @@ async function initWallet(password?: string): Promise<Sphere> {
     mnemonic: TEST_MNEMONIC,
     ...(password ? { password } : {}),
   });
+  live = sphere;
   return sphere;
-}
-
-function resetSingleton(): void {
-  (Sphere as unknown as { instance: Sphere | null }).instance = null;
 }
 
 describe('Sphere.destroy() secret hygiene', () => {
   beforeEach(() => {
     TokenRegistry.resetInstance();
     stubFetch();
-    resetSingleton();
+    live = null;
   });
 
   afterEach(async () => {
-    const live = Sphere.getInstance();
     if (live) {
       try { await live.destroy(); } catch { /* ignore */ }
     }
-    resetSingleton();
+    live = null;
     TokenRegistry.destroy();
     vi.unstubAllGlobals();
   });
@@ -105,15 +107,14 @@ describe('Sphere.encrypt() fails closed', () => {
   beforeEach(() => {
     TokenRegistry.resetInstance();
     stubFetch();
-    resetSingleton();
+    live = null;
   });
 
   afterEach(async () => {
-    const live = Sphere.getInstance();
     if (live) {
       try { await live.destroy(); } catch { /* ignore */ }
     }
-    resetSingleton();
+    live = null;
     TokenRegistry.destroy();
     vi.unstubAllGlobals();
   });

@@ -48,19 +48,21 @@ function stubFetchRecording(): string[] {
 }
 
 describe('Sphere.init network → TokenRegistry delegation (regression guard)', () => {
+  // The Sphere the current test built, so afterEach can tear it down. There is no
+  // process-global instance to look it up from (#766) — hold the reference.
+  let live: Sphere | null = null;
+
   beforeEach(() => {
     // Fresh registry singleton per test so a prior test's remoteUrl can't leak.
     TokenRegistry.resetInstance();
-    if (Sphere.getInstance()) {
-      (Sphere as unknown as { instance: null }).instance = null;
-    }
+    live = null;
   });
 
   afterEach(async () => {
-    if (Sphere.getInstance()) {
-      try { await Sphere.getInstance()!.destroy(); } catch { /* ignore */ }
+    if (live) {
+      try { await live.destroy(); } catch { /* ignore */ }
     }
-    (Sphere as unknown as { instance: null }).instance = null;
+    live = null;
     TokenRegistry.destroy();
     vi.unstubAllGlobals();
   });
@@ -77,6 +79,7 @@ describe('Sphere.init network → TokenRegistry delegation (regression guard)', 
       network: TEST_NETWORK,
       autoGenerate: true,
     });
+    live = sphere;
 
     // Sanity: this went through the create branch.
     expect(created).toBe(true);
@@ -104,6 +107,7 @@ describe('Sphere.init network → TokenRegistry delegation (regression guard)', 
       walletApi,
       network: TEST_NETWORK,
     });
+    live = sphere;
 
     // Sanity: this went through the load branch.
     expect(created).toBe(false);

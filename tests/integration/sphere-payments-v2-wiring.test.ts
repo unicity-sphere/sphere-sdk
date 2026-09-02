@@ -347,7 +347,7 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
     // The guard now covers everything up to publication, not a named subset of steps.
     // Twice I widened it one step and the next step along was still unguarded; this pins
     // the far end — a failure at 'finalizing', after providers AND modules are up, still
-    // happens before Sphere.instance is assigned, so the caller gets nothing to destroy.
+    // happens before the Sphere is published, so the caller gets nothing to destroy.
     const create = vi.spyOn(TokenRegistry, 'create');
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-late2-'));
     const storage = new FileStorageProvider({ dataDir });
@@ -376,10 +376,11 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
 
   it('disposes the registry when the LAST init step rejects, after publication would have been', async () => {
     // Publication used to happen mid-init, and the guard ended there on the premise that a
-    // published Sphere is recoverable via Sphere.getInstance(). That premise fails under
-    // concurrent inits — a second one overwrites the static — so the guard now runs to the
-    // end and publication is the last thing before the return. 'complete' is the final
-    // progress step in create(), so a throw here is past every other fallible operation.
+    // published Sphere is still recoverable by the caller. It is not: publication only
+    // records the Sphere in the private per-storage registry clear()/import() tear down
+    // (#766) — there is no lookup API at all — so the guard runs to the end and publication
+    // is the last thing before the return. 'complete' is the final progress step in
+    // create(), so a throw here is past every other fallible operation.
     const create = vi.spyOn(TokenRegistry, 'create');
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-last-'));
     const storage = new FileStorageProvider({ dataDir });
@@ -401,11 +402,10 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
 
       expect(create).toHaveBeenCalledTimes(1);
       expect((create.mock.results[0]!.value as TokenRegistry).isDisposed).toBe(true);
-      // And the failed init published nothing, so no half-built Sphere is reachable.
-      expect(Sphere.getInstance()).toBeNull();
+      // The failed init published nothing, so no half-built Sphere is reachable by anyone.
       // Precisely because nothing is reachable, the failure path must tear the whole
-      // Sphere down — providers are connected and the vertical is running by now, and
-      // disposing only the registry would strand all of it with no owner.
+      // Sphere down itself — providers are connected and the vertical is running by now,
+      // and disposing only the registry would strand all of it with no owner.
       expect(transport.disconnect).toHaveBeenCalled();
       expect(storage.isConnected()).toBe(false);
     } finally {

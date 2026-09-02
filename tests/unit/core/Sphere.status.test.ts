@@ -16,19 +16,20 @@ const TEST_NETWORK = 'testnet2' as const;
 
 describe('Sphere Status & Provider Management', () => {
   let providers: MockProviders;
+  // The Sphere the current test built, so afterEach can tear it down. There is no
+  // process-global instance to look it up from (#766) — hold the reference.
+  let live: Sphere | null = null;
 
   beforeEach(() => {
-    if (Sphere.getInstance()) {
-      (Sphere as unknown as { instance: null }).instance = null;
-    }
+    live = null;
     providers = makeMockProviders();
   });
 
   afterEach(async () => {
-    if (Sphere.getInstance()) {
-      try { await Sphere.getInstance()!.destroy(); } catch { /* ignore */ }
+    if (live) {
+      try { await live.destroy(); } catch { /* ignore */ }
     }
-    (Sphere as unknown as { instance: null }).instance = null;
+    live = null;
   });
 
   async function initSphere(options?: { price?: { platform: PricePlatform } }) {
@@ -49,6 +50,7 @@ describe('Sphere Status & Provider Management', () => {
       };
     }
     const { sphere } = await Sphere.init(initOpts);
+    live = sphere;
     return sphere;
   }
 

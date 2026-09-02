@@ -88,14 +88,10 @@ describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)
 
   beforeEach(() => {
     cleanTestDir();
-    if (Sphere.getInstance()) {
-      (Sphere as unknown as { instance: null }).instance = null;
-    }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
   });
 
   afterEach(() => {
-    (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
   });
 
