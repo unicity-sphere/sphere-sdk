@@ -254,12 +254,9 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
     }
   });
 
-  it('an init that REJECTS leaves no registry behind', async () => {
-    // The registry is built late, after the fallible validation. Built early, a rejected
-    // mnemonic would strand an unreachable registry fetching hourly with no owner to
-    // destroy it — the caller never receives a Sphere.
+  it('never builds a registry when init rejects BEFORE provider bring-up', async () => {
     const create = vi.spyOn(TokenRegistry, 'create');
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-fail-'));
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-early-'));
     const storage = new FileStorageProvider({ dataDir });
     try {
       await expect(
@@ -273,10 +270,43 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
         })
       ).rejects.toMatchObject({ code: 'INVALID_IDENTITY' });
 
-      // Either never built, or built and disposed — never left running.
-      for (const r of create.mock.results) {
-        expect((r.value as TokenRegistry).isDisposed).toBe(true);
-      }
+      // Built late, so a rejection this early never creates one at all.
+      expect(create).not.toHaveBeenCalled();
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('disposes the registry when provider bring-up itself rejects', async () => {
+    // The case the previous test CANNOT reach: the registry is built, and then init
+    // fails. Without cleanup it is stranded — the caller never receives a Sphere, so
+    // nothing can ever destroy it, and its hourly fetch runs for the life of the process.
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-late-'));
+    const storage = new FileStorageProvider({ dataDir });
+    const transport = createMockTransport();
+    (transport as unknown as { connect: ReturnType<typeof vi.fn> }).connect = vi
+      .fn()
+      .mockRejectedValue(new Error('transport refused to connect'));
+    (transport as unknown as { isConnected: ReturnType<typeof vi.fn> }).isConnected = vi
+      .fn()
+      .mockReturnValue(false);
+    try {
+      await expect(
+        Sphere.init({
+          storage,
+          transport,
+          oracle: createEngineOracle(),
+          mnemonic: MNEMONIC,
+          network: NET,
+          walletApi: makeWorld().walletApi,
+        })
+      ).rejects.toThrow();
+
+      expect(create).toHaveBeenCalledTimes(1);
+      const stranded = create.mock.results[0]!.value as TokenRegistry;
+      expect(stranded.isDisposed).toBe(true);
     } finally {
       create.mockRestore();
       fs.rmSync(dataDir, { recursive: true, force: true });
