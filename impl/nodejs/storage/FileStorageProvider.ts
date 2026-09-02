@@ -42,16 +42,20 @@ export class FileStorageProvider implements StorageProvider {
   private _identity: FullIdentity | null = null;
 
   constructor(config: FileStorageProviderConfig | string) {
+    // Resolved once, at construction: a later process.chdir() would otherwise make this
+    // provider read and write a DIFFERENT file while still reporting the backingStoreId
+    // computed from the old cwd — so clear() would empty one store and destroy the
+    // liveness bucket of another.
     if (typeof config === 'string') {
-      this.dataDir = config;
-      this.filePath = path.join(config, 'wallet.json');
+      this.dataDir = path.resolve(config);
+      this.filePath = path.join(this.dataDir, 'wallet.json');
     } else {
-      this.dataDir = config.dataDir;
-      this.filePath = path.join(config.dataDir, config.fileName ?? 'wallet.json');
+      this.dataDir = path.resolve(config.dataDir);
+      this.filePath = path.join(this.dataDir, config.fileName ?? 'wallet.json');
       this.network = config.network;
     }
     this.isTxtMode = this.filePath.endsWith('.txt');
-    this.backingStoreId = `file:${path.resolve(this.filePath)}`;
+    this.backingStoreId = `file:${this.filePath}`;
   }
 
   setIdentity(identity: FullIdentity): void {

@@ -231,31 +231,24 @@ export class IndexedDBStorageProvider implements StorageProvider {
     }
   }
 
-  /** Serializes the read-merge-write below, per provider instance. */
-  private trackedWrites: Promise<unknown> = Promise.resolve();
-
   /**
    * Persist the tracked-address registry by MERGING, never replacing.
    *
    * Every Sphere over this storage holds its own snapshot and writes it in
    * full, so a wholesale write drops the addresses this writer never saw
-   * (#766 item 5 — a lost update, reproducible on one network). Concurrent
-   * calls are serialized on `trackedWrites` so a read can never interleave
-   * with another call's write.
+   * (#766 item 5 — a lost update, reproducible on one network). The read, the
+   * merge and the write share ONE transaction: a lock on this object would
+   * order only this object's calls, and `backingStoreId` exists precisely
+   * because two provider objects — or two TABS — can address one database.
+   * IndexedDB serializes overlapping readwrite transactions across every
+   * connection, so both are covered.
    */
   async saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void> {
-    const run = this.trackedWrites.then(async () => {
-      const onDisk = parseTrackedAddresses(await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES));
-      const file: TrackedAddressesFile = {
-        version: 1,
-        addresses: mergeTrackedAddresses(onDisk, entries),
-      };
-      await this.set(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES, JSON.stringify(file));
-    });
-    // The chain tail swallows the rejection so one failed write cannot brick
-    // every later one; the caller still sees the error by awaiting `run`.
-    this.trackedWrites = run.then(() => undefined, () => undefined);
-    await run;
+    this.ensureConnected();
+    await this.idbMergeTrackedAddresses(
+      this.getFullKey(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES),
+      entries,
+    );
   }
 
   async loadTrackedAddresses(): Promise<TrackedAddressEntry[]> {
@@ -404,6 +397,29 @@ export class IndexedDBStorageProvider implements StorageProvider {
       const request = store.getAll();
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result ?? []);
+    });
+  }
+
+  private idbMergeTrackedAddresses(key: string, entries: TrackedAddressEntry[]): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const tx = this.db!.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const read = store.get(key);
+      read.onerror = () => reject(read.error);
+      read.onsuccess = () => {
+        const onDisk = parseTrackedAddresses((read.result as { v?: string } | undefined)?.v ?? null);
+        const file: TrackedAddressesFile = {
+          version: 1,
+          addresses: mergeTrackedAddresses(onDisk, entries),
+        };
+        store.put({ k: key, v: JSON.stringify(file) });
+      };
+      // Resolve on the TRANSACTION, not the put: only completion means durable.
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      // A throw inside onsuccess aborts the transaction: this is what stops such a save
+      // from resolving with nothing written.
+      tx.onabort = () => reject(tx.error ?? new Error('tracked-address write aborted'));
     });
   }
 

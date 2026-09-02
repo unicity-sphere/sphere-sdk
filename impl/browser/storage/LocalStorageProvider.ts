@@ -54,6 +54,29 @@ function storageObjectTag(storage: Storage): string {
   return tag;
 }
 
+/**
+ * One write chain per BACKING STORE, not per provider object: `backingStoreId` exists
+ * because two providers may address the same localStorage + prefix, and two per-instance
+ * chains both read the old registry before either writes — the lost update again, one
+ * level up. This coordinates a single JS realm only; a SECOND TAB writing the same store
+ * is genuinely not covered, and no in-process lock can cover it.
+ */
+const trackedWriteChains = new Map<string, Promise<unknown>>();
+
+function serializeTrackedWrite(storeId: string, task: () => Promise<void>): Promise<void> {
+  const previous = trackedWriteChains.get(storeId) ?? Promise.resolve();
+  const run = previous.then(task);
+  // Carried forward, one transient error would reject every later write without running it.
+  const tail = run.then(() => undefined, () => undefined);
+  trackedWriteChains.set(storeId, tail);
+  // Drop the entry once nothing is queued behind it, so a per-request SSR storage does
+  // not leave a chain behind forever.
+  void tail.then(() => {
+    if (trackedWriteChains.get(storeId) === tail) trackedWriteChains.delete(storeId);
+  });
+  return run;
+}
+
 export class LocalStorageProvider implements StorageProvider {
   readonly id = 'localStorage';
   readonly name = 'Local Storage';
@@ -177,20 +200,17 @@ export class LocalStorageProvider implements StorageProvider {
     }
   }
 
-  /** Serializes the read-merge-write below, per provider instance. */
-  private trackedWrites: Promise<unknown> = Promise.resolve();
-
   /**
    * Persist the tracked-address registry by MERGING, never replacing.
    *
    * Every Sphere over this storage holds its own snapshot and writes it in
    * full, so a wholesale write drops the addresses this writer never saw
-   * (#766 item 5 — a lost update, reproducible on one network). Concurrent
-   * calls are serialized on `trackedWrites` so a read can never interleave
-   * with another call's write.
+   * (#766 item 5 — a lost update, reproducible on one network). localStorage
+   * offers no transaction, so the read-merge-write is serialized by BACKING
+   * STORE — see `serializeTrackedWrite`, and the realm limit stated there.
    */
   async saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void> {
-    const run = this.trackedWrites.then(async () => {
+    await serializeTrackedWrite(this.backingStoreId, async () => {
       const onDisk = parseTrackedAddresses(await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES));
       const file: TrackedAddressesFile = {
         version: 1,
@@ -198,10 +218,6 @@ export class LocalStorageProvider implements StorageProvider {
       };
       await this.set(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES, JSON.stringify(file));
     });
-    // The chain tail swallows the rejection so one failed write cannot brick
-    // every later one; the caller still sees the error by awaiting `run`.
-    this.trackedWrites = run.then(() => undefined, () => undefined);
-    await run;
   }
 
   async loadTrackedAddresses(): Promise<TrackedAddressEntry[]> {

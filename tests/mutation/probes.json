@@ -673,10 +673,10 @@
   },
   {
     "name": "tracked-addresses-merge-drop-idb",
-    "note": "#766 item 5: the browser IDB provider keeps its OWN copy of the read-merge-write; a wholesale write here is the same lost update the Node provider's probe guards",
+    "note": "#766 item 5: the browser IDB provider keeps its OWN copy of the read-merge-write (now inside the single transaction); a wholesale write here is the same lost update the Node provider's probe guards",
     "file": "impl/browser/storage/IndexedDBStorageProvider.ts",
-    "find": "        addresses: mergeTrackedAddresses(onDisk, entries),",
-    "replace": "        addresses: entries,",
+    "find": "          addresses: mergeTrackedAddresses(onDisk, entries),",
+    "replace": "          addresses: entries,",
     "tests": [
       "tests/unit/storage/tracked-addresses-providers.test.ts"
     ]
@@ -769,6 +769,46 @@
     "replace": "  return typeof value === 'number' && Number.isInteger(value) && value <= 0xffffffff;",
     "tests": [
       "tests/unit/storage/tracked-addresses.test.ts"
+    ]
+  },
+  {
+    "name": "idb-tracked-write-not-atomic",
+    "note": "#766 round 4: the IDB read-merge-write must share ONE transaction. Split back into get() then set() and two provider objects over one database - which backingStoreId exists to permit - both read the old registry before either writes, losing an address (tracked-addresses-providers.test.ts cross-object cases)",
+    "file": "impl/browser/storage/IndexedDBStorageProvider.ts",
+    "find": "    this.ensureConnected();\n    await this.idbMergeTrackedAddresses(\n      this.getFullKey(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES),\n      entries,\n    );",
+    "replace": "    const onDisk = parseTrackedAddresses(await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES));\n    await this.set(\n      STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES,\n      JSON.stringify({ version: 1, addresses: mergeTrackedAddresses(onDisk, entries) }),\n    );",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "idb-tracked-write-abort-unswallowed",
+    "note": "#766 round 4: a throw inside the transaction's success handler ABORTS it, so the abort is the only path that can settle the save. Drop the handler and an unserializable registry hangs saveTrackedAddresses forever instead of rejecting - switchToAddress never returns (tracked-addresses-providers.test.ts 'rejects a registry it cannot serialize')",
+    "file": "impl/browser/storage/IndexedDBStorageProvider.ts",
+    "find": "      tx.onabort = () => reject(tx.error ?? new Error('tracked-address write aborted'));",
+    "replace": "      tx.onabort = () => undefined;",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "localstorage-tracked-chain-not-shared",
+    "note": "#766 round 4: localStorage has no transaction, so the write chain must be keyed by the BACKING STORE. Key it per call (or per object) and two providers over one storage each read the old registry - the lost update, one level up (tracked-addresses-providers.test.ts cross-object cases)",
+    "file": "impl/browser/storage/LocalStorageProvider.ts",
+    "find": "    await serializeTrackedWrite(this.backingStoreId, async () => {",
+    "replace": "    await serializeTrackedWrite(`${this.backingStoreId}:${String(Math.random())}`, async () => {",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "localstorage-tracked-chain-carries-rejection",
+    "note": "#766 round 4: the shared-by-store chain must swallow a rejection - carried forward it is now WORSE than the per-instance version it replaced, freezing the registry for every provider object over that store, not just the one that failed",
+    "file": "impl/browser/storage/LocalStorageProvider.ts",
+    "find": "  const tail = run.then(() => undefined, () => undefined);",
+    "replace": "  const tail = run;",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
     ]
   },
   {
