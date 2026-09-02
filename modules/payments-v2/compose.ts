@@ -321,6 +321,8 @@ function buildReceive(
       );
     },
     syncEpoch: deps.syncEpoch,
+    // #770: the poll/wake drains Receive spawns itself must hold stop() too.
+    track: hooks.track,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
 }

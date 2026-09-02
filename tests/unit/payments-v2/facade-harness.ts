@@ -69,6 +69,8 @@ export interface Hooks {
   complete?: (transferId: string) => Promise<void>;
   applyDelta?: () => Promise<void>;
   deliver?: () => Promise<void>;
+  /** Runs before the mailbox listing yields — gates a drain mid-flight. */
+  incoming?: () => Promise<void>;
 }
 
 export interface Counters {
@@ -131,7 +133,10 @@ function hookedDelivery(inner: DeliveryPort, hooks: Hooks): DeliveryPort {
       if (hooks.deliver) await hooks.deliver();
       return inner.deliver(recipient, blob, options);
     },
-    incoming: (since) => inner.incoming(since),
+    incoming: async function* incoming(since) {
+      if (hooks.incoming) await hooks.incoming();
+      yield* inner.incoming(since);
+    },
     incomingEpoch: () => inner.incomingEpoch(),
     ack: (id, disposition, reason) => inner.ack(id, disposition, reason),
     ...(inner.ackBatch !== undefined ? { ackBatch: (acks) => inner.ackBatch!(acks) } : {}),
@@ -157,7 +162,7 @@ export interface World {
   peers: Map<string, PeerInfo | null>;
   seed(amount: bigint): Promise<SphereToken>;
   peerDeliver(token: SphereToken, transferId: string): Promise<void>;
-  gate(name: 'putIntent' | 'deliver' | 'listOpen' | 'applyDelta'): Gate;
+  gate(name: 'putIntent' | 'deliver' | 'listOpen' | 'applyDelta' | 'incoming'): Gate;
 }
 
 const worlds: World[] = [];
@@ -202,6 +207,8 @@ export function makeWorld(
     restartOf?: World;
     /** The wallet's own Unicity ID, as Sphere supplies it (a live getter, never a snapshot). */
     ownNametag?: () => string | undefined;
+    /** Receive's poll backstop; the default parks it far outside any test's clock. */
+    receivePollMs?: number;
   } = {}
 ): World {
   const prior = options.restartOf;
@@ -277,7 +284,7 @@ export function makeWorld(
     requestMemo: stubRequestMemoCodec,
     syncEpoch: () => session.currentEpoch(),
     newId: () => `tid-${idPrefix}${String(++ids)}`,
-    receivePollMs: 60 * 60 * 1000,
+    receivePollMs: options.receivePollMs ?? 60 * 60 * 1000,
   });
 
   const world: World = {
