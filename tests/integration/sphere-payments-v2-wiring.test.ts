@@ -374,6 +374,40 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
     }
   });
 
+  it('disposes the registry when the LAST init step rejects, after publication would have been', async () => {
+    // Publication used to happen mid-init, and the guard ended there on the premise that a
+    // published Sphere is recoverable via Sphere.getInstance(). That premise fails under
+    // concurrent inits — a second one overwrites the static — so the guard now runs to the
+    // end and publication is the last thing before the return. 'complete' is the final
+    // progress step in create(), so a throw here is past every other fallible operation.
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-last-'));
+    const storage = new FileStorageProvider({ dataDir });
+    try {
+      await expect(
+        Sphere.init({
+          storage,
+          transport: createMockTransport(),
+          oracle: createEngineOracle(),
+          mnemonic: MNEMONIC,
+          network: NET,
+          walletApi: makeWorld().walletApi,
+          onProgress: (p: { step: string }) => {
+            if (p.step === 'complete') throw new Error('progress callback exploded at the end');
+          },
+        })
+      ).rejects.toThrow();
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect((create.mock.results[0]!.value as TokenRegistry).isDisposed).toBe(true);
+      // And the failed init published nothing, so no half-built Sphere is reachable.
+      expect(Sphere.getInstance()).toBeNull();
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('destroy() disposes the registry even when teardown throws', async () => {
     const create = vi.spyOn(TokenRegistry, 'create');
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-throw-'));

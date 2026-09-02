@@ -906,48 +906,49 @@ export class Sphere {
       await sphere.finalizeWalletCreation();
 
       sphere._initialized = true;
-    });
-    Sphere.instance = sphere;
 
-    // Track address 0 in the registry
-    await sphere.ensureAddressTracked(0);
+      // Track address 0 in the registry
+      await sphere.ensureAddressTracked(0);
 
-    // Register nametag if provided, otherwise try recovery then publish
-    if (options.nametag) {
-      progress?.({ step: 'registering_nametag', message: 'Registering nametag...' });
-      // registerNametag publishes identity binding WITH nametag atomically
-      // (calling syncIdentityWithTransport before this would race — both replaceable
-      // events get the same created_at second and relay keeps the one without nametag)
-      await sphere.registerNametag(options.nametag);
-    } else {
-      // Try to recover nametag BEFORE publishing — publishIdentityBinding uses
-      // kind 30078 (replaceable event), so a bare binding would overwrite the
-      // existing one that contains encrypted_nametag, making recovery impossible.
-      progress?.({ step: 'recovering_nametag', message: 'Recovering nametag...' });
-      await sphere.recoverNametagFromTransport();
-      // Now publish identity binding (with recovered nametag if found)
-      progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
-      await sphere.syncIdentityWithTransport();
-    }
-
-    // Auto-discover previously used HD addresses
-    if (options.discoverAddresses !== false && sphere._transport.discoverAddresses) {
-      progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
-      try {
-        const discoverOpts: DiscoverAddressesOptions =
-          typeof options.discoverAddresses === 'object'
-            ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
-            : { autoTrack: true };
-        const result = await sphere.discoverAddresses(discoverOpts);
-        if (result.addresses.length > 0) {
-          logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
-        }
-      } catch (err) {
-        logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
+      // Register nametag if provided, otherwise try recovery then publish
+      if (options.nametag) {
+        progress?.({ step: 'registering_nametag', message: 'Registering nametag...' });
+        // registerNametag publishes identity binding WITH nametag atomically
+        // (calling syncIdentityWithTransport before this would race — both replaceable
+        // events get the same created_at second and relay keeps the one without nametag)
+        await sphere.registerNametag(options.nametag);
+      } else {
+        // Try to recover nametag BEFORE publishing — publishIdentityBinding uses
+        // kind 30078 (replaceable event), so a bare binding would overwrite the
+        // existing one that contains encrypted_nametag, making recovery impossible.
+        progress?.({ step: 'recovering_nametag', message: 'Recovering nametag...' });
+        await sphere.recoverNametagFromTransport();
+        // Now publish identity binding (with recovered nametag if found)
+        progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
+        await sphere.syncIdentityWithTransport();
       }
-    }
 
-    progress?.({ step: 'complete', message: 'Wallet created' });
+      // Auto-discover previously used HD addresses
+      if (options.discoverAddresses !== false && sphere._transport.discoverAddresses) {
+        progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
+        try {
+          const discoverOpts: DiscoverAddressesOptions =
+            typeof options.discoverAddresses === 'object'
+              ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
+              : { autoTrack: true };
+          const result = await sphere.discoverAddresses(discoverOpts);
+          if (result.addresses.length > 0) {
+            logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
+          }
+        } catch (err) {
+          logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
+        }
+      }
+
+      progress?.({ step: 'complete', message: 'Wallet created' });
+    });
+
+    Sphere.instance = sphere;
     return sphere;
   }
 
@@ -1008,27 +1009,28 @@ export class Sphere {
       await sphere.syncIdentityWithTransport();
 
       sphere._initialized = true;
-    });
-    Sphere.instance = sphere;
 
-    // Auto-discover previously used HD addresses
-    if (options.discoverAddresses !== false && sphere._transport.discoverAddresses && sphere._masterKey) {
-      progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
-      try {
-        const discoverOpts: DiscoverAddressesOptions =
-          typeof options.discoverAddresses === 'object'
-            ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
-            : { autoTrack: true };
-        const result = await sphere.discoverAddresses(discoverOpts);
-        if (result.addresses.length > 0) {
-          logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
+      // Auto-discover previously used HD addresses
+      if (options.discoverAddresses !== false && sphere._transport.discoverAddresses && sphere._masterKey) {
+        progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
+        try {
+          const discoverOpts: DiscoverAddressesOptions =
+            typeof options.discoverAddresses === 'object'
+              ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
+              : { autoTrack: true };
+          const result = await sphere.discoverAddresses(discoverOpts);
+          if (result.addresses.length > 0) {
+            logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
+          }
+        } catch (err) {
+          logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
         }
-      } catch (err) {
-        logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
       }
-    }
 
-    progress?.({ step: 'complete', message: 'Wallet loaded' });
+      progress?.({ step: 'complete', message: 'Wallet loaded' });
+    });
+
+    Sphere.instance = sphere;
     return sphere;
   }
 
@@ -1149,39 +1151,40 @@ export class Sphere {
       await sphere.finalizeWalletCreation();
 
       sphere._initialized = true;
-    });
-    Sphere.instance = sphere;
 
-    // Track address 0 in the registry
-    logger.debug('Sphere', 'Tracking address 0...');
-    await sphere.ensureAddressTracked(0);
+      // Track address 0 in the registry
+      logger.debug('Sphere', 'Tracking address 0...');
+      await sphere.ensureAddressTracked(0);
 
-    // Register nametag if provided (this overrides any recovered nametag)
-    if (options.nametag) {
-      progress?.({ step: 'registering_nametag', message: 'Registering nametag...' });
-      logger.debug('Sphere', 'Registering Unicity ID...');
-      await sphere.registerNametag(options.nametag);
-    }
-
-    // Auto-discover previously used HD addresses
-    if (options.discoverAddresses !== false && sphere._transport.discoverAddresses) {
-      progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
-      try {
-        const discoverOpts: DiscoverAddressesOptions =
-          typeof options.discoverAddresses === 'object'
-            ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
-            : { autoTrack: true };
-        const result = await sphere.discoverAddresses(discoverOpts);
-        if (result.addresses.length > 0) {
-          logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
-        }
-      } catch (err) {
-        logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
+      // Register nametag if provided (this overrides any recovered nametag)
+      if (options.nametag) {
+        progress?.({ step: 'registering_nametag', message: 'Registering nametag...' });
+        logger.debug('Sphere', 'Registering Unicity ID...');
+        await sphere.registerNametag(options.nametag);
       }
-    }
 
-    progress?.({ step: 'complete', message: 'Import complete' });
-    logger.debug('Sphere', 'Import complete');
+      // Auto-discover previously used HD addresses
+      if (options.discoverAddresses !== false && sphere._transport.discoverAddresses) {
+        progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
+        try {
+          const discoverOpts: DiscoverAddressesOptions =
+            typeof options.discoverAddresses === 'object'
+              ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
+              : { autoTrack: true };
+          const result = await sphere.discoverAddresses(discoverOpts);
+          if (result.addresses.length > 0) {
+            logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
+          }
+        } catch (err) {
+          logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
+        }
+      }
+
+      progress?.({ step: 'complete', message: 'Import complete' });
+      logger.debug('Sphere', 'Import complete');
+    });
+
+    Sphere.instance = sphere;
     return sphere;
   }
 
