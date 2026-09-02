@@ -528,6 +528,8 @@ export class Sphere {
    * the rebuild after an api-key change share one pool configuration.
    */
   private _verification: VerificationWorkerConfig | undefined;
+  /** This Sphere's OWN token registry. Disposed by destroy(); never the process global. */
+  private _registry: TokenRegistry | null = null;
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
@@ -798,6 +800,51 @@ export class Sphere {
   }
 
   /**
+   * Build the registry THIS Sphere owns, so its metadata cannot be repointed by another
+   * Sphere's init. The global is still configured above for consumers that read it
+   * directly; this instance is what the payments facade presents from.
+   */
+  /**
+   * Own a registry for the duration of `bringUp`, disposing it if any of that rejects.
+   *
+   * `bringUp` must cover EVERY fallible step from here until the Sphere is published to
+   * `Sphere.instance` — until then the caller receives nothing it could destroy, so a
+   * registry left behind is unreachable and its hourly fetch runs for the life of the
+   * process. Guarding a named subset of the steps is what failed twice: the guarded region
+   * and the fallible region were separate things, and drifted.
+   */
+  private static async withOwnedRegistry(
+    sphere: Sphere,
+    storage: StorageProvider,
+    network: NetworkType | undefined,
+    bringUp: () => Promise<void>,
+  ): Promise<void> {
+    sphere._registry = Sphere.createOwnedRegistry(storage, network);
+    try {
+      await bringUp();
+    } catch (err) {
+      // Tear down the WHOLE half-built Sphere, not just its registry. By this point
+      // providers may be connected and the payments vertical running, and publication
+      // happens AFTER this guard — so the caller receives nothing that could destroy
+      // them. destroy() disposes the registry as its first act, so this subsumes it.
+      await sphere.destroy().catch((teardownErr) => {
+        logger.warn('Sphere', 'teardown after failed initialization also failed:', teardownErr);
+      });
+      throw err;
+    }
+  }
+
+  private static createOwnedRegistry(storage: StorageProvider, network?: NetworkType): TokenRegistry {
+    if (!network) {
+      throw new SphereError(
+        'network is required to build the token registry. Every Sphere entry point must forward options.network.',
+        'INVALID_CONFIG',
+      );
+    }
+    return TokenRegistry.create({ remoteUrl: NETWORKS[network].tokenRegistryUrl, storage });
+  }
+
+  /**
    * Create new wallet with mnemonic
    */
   static async create(options: SphereCreateOptions): Promise<Sphere> {
@@ -854,56 +901,59 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    await sphere.initializeProviders();
-    await sphere.initializeModules();
+    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, async () => {
+      await sphere.initializeProviders();
+      await sphere.initializeModules();
 
-    // Mark wallet as created only after successful initialization
-    // This prevents "Wallet already exists" errors if init fails partway through
-    progress?.({ step: 'finalizing', message: 'Finalizing wallet...' });
-    await sphere.finalizeWalletCreation();
+      // Mark wallet as created only after successful initialization
+      // This prevents "Wallet already exists" errors if init fails partway through
+      progress?.({ step: 'finalizing', message: 'Finalizing wallet...' });
+      await sphere.finalizeWalletCreation();
 
-    sphere._initialized = true;
-    Sphere.instance = sphere;
+      sphere._initialized = true;
 
-    // Track address 0 in the registry
-    await sphere.ensureAddressTracked(0);
+      // Track address 0 in the registry
+      await sphere.ensureAddressTracked(0);
 
-    // Register nametag if provided, otherwise try recovery then publish
-    if (options.nametag) {
-      progress?.({ step: 'registering_nametag', message: 'Registering nametag...' });
-      // registerNametag publishes identity binding WITH nametag atomically
-      // (calling syncIdentityWithTransport before this would race — both replaceable
-      // events get the same created_at second and relay keeps the one without nametag)
-      await sphere.registerNametag(options.nametag);
-    } else {
-      // Try to recover nametag BEFORE publishing — publishIdentityBinding uses
-      // kind 30078 (replaceable event), so a bare binding would overwrite the
-      // existing one that contains encrypted_nametag, making recovery impossible.
-      progress?.({ step: 'recovering_nametag', message: 'Recovering nametag...' });
-      await sphere.recoverNametagFromTransport();
-      // Now publish identity binding (with recovered nametag if found)
-      progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
-      await sphere.syncIdentityWithTransport();
-    }
-
-    // Auto-discover previously used HD addresses
-    if (options.discoverAddresses !== false && sphere._transport.discoverAddresses) {
-      progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
-      try {
-        const discoverOpts: DiscoverAddressesOptions =
-          typeof options.discoverAddresses === 'object'
-            ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
-            : { autoTrack: true };
-        const result = await sphere.discoverAddresses(discoverOpts);
-        if (result.addresses.length > 0) {
-          logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
-        }
-      } catch (err) {
-        logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
+      // Register nametag if provided, otherwise try recovery then publish
+      if (options.nametag) {
+        progress?.({ step: 'registering_nametag', message: 'Registering nametag...' });
+        // registerNametag publishes identity binding WITH nametag atomically
+        // (calling syncIdentityWithTransport before this would race — both replaceable
+        // events get the same created_at second and relay keeps the one without nametag)
+        await sphere.registerNametag(options.nametag);
+      } else {
+        // Try to recover nametag BEFORE publishing — publishIdentityBinding uses
+        // kind 30078 (replaceable event), so a bare binding would overwrite the
+        // existing one that contains encrypted_nametag, making recovery impossible.
+        progress?.({ step: 'recovering_nametag', message: 'Recovering nametag...' });
+        await sphere.recoverNametagFromTransport();
+        // Now publish identity binding (with recovered nametag if found)
+        progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
+        await sphere.syncIdentityWithTransport();
       }
-    }
 
-    progress?.({ step: 'complete', message: 'Wallet created' });
+      // Auto-discover previously used HD addresses
+      if (options.discoverAddresses !== false && sphere._transport.discoverAddresses) {
+        progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
+        try {
+          const discoverOpts: DiscoverAddressesOptions =
+            typeof options.discoverAddresses === 'object'
+              ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
+              : { autoTrack: true };
+          const result = await sphere.discoverAddresses(discoverOpts);
+          if (result.addresses.length > 0) {
+            logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
+          }
+        } catch (err) {
+          logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
+        }
+      }
+
+      progress?.({ step: 'complete', message: 'Wallet created' });
+    });
+
+    Sphere.instance = sphere;
     return sphere;
   }
 
@@ -955,34 +1005,37 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    await sphere.initializeProviders();
-    await sphere.initializeModules();
+    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, async () => {
+      await sphere.initializeProviders();
+      await sphere.initializeModules();
 
-    // Publish identity binding via transport
-    progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
-    await sphere.syncIdentityWithTransport();
+      // Publish identity binding via transport
+      progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
+      await sphere.syncIdentityWithTransport();
 
-    sphere._initialized = true;
-    Sphere.instance = sphere;
+      sphere._initialized = true;
 
-    // Auto-discover previously used HD addresses
-    if (options.discoverAddresses !== false && sphere._transport.discoverAddresses && sphere._masterKey) {
-      progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
-      try {
-        const discoverOpts: DiscoverAddressesOptions =
-          typeof options.discoverAddresses === 'object'
-            ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
-            : { autoTrack: true };
-        const result = await sphere.discoverAddresses(discoverOpts);
-        if (result.addresses.length > 0) {
-          logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
+      // Auto-discover previously used HD addresses
+      if (options.discoverAddresses !== false && sphere._transport.discoverAddresses && sphere._masterKey) {
+        progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
+        try {
+          const discoverOpts: DiscoverAddressesOptions =
+            typeof options.discoverAddresses === 'object'
+              ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
+              : { autoTrack: true };
+          const result = await sphere.discoverAddresses(discoverOpts);
+          if (result.addresses.length > 0) {
+            logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
+          }
+        } catch (err) {
+          logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
         }
-      } catch (err) {
-        logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
       }
-    }
 
-    progress?.({ step: 'complete', message: 'Wallet loaded' });
+      progress?.({ step: 'complete', message: 'Wallet loaded' });
+    });
+
+    Sphere.instance = sphere;
     return sphere;
   }
 
@@ -1081,60 +1134,62 @@ export class Sphere {
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
     logger.debug('Sphere', 'Initializing providers...');
-    await sphere.initializeProviders();
-    logger.debug('Sphere', 'Providers initialized. Initializing modules...');
-    await sphere.initializeModules();
-    logger.debug('Sphere', 'Modules initialized');
+    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, async () => {
+      await sphere.initializeProviders();
+      await sphere.initializeModules();
+      logger.debug('Sphere', 'Modules initialized');
 
-    // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
-    if (!options.nametag) {
-      progress?.({ step: 'recovering_nametag', message: 'Recovering nametag...' });
-      logger.debug('Sphere', 'Recovering Unicity ID from transport...');
-      await sphere.recoverNametagFromTransport();
-      logger.debug('Sphere', 'Unicity ID recovery done');
-      // Publish identity binding (with recovered nametag if found)
-      progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
-      await sphere.syncIdentityWithTransport();
-    }
-
-    // Mark wallet as created only after successful initialization
-    progress?.({ step: 'finalizing', message: 'Finalizing wallet...' });
-    logger.debug('Sphere', 'Finalizing wallet creation...');
-    await sphere.finalizeWalletCreation();
-
-    sphere._initialized = true;
-    Sphere.instance = sphere;
-
-    // Track address 0 in the registry
-    logger.debug('Sphere', 'Tracking address 0...');
-    await sphere.ensureAddressTracked(0);
-
-    // Register nametag if provided (this overrides any recovered nametag)
-    if (options.nametag) {
-      progress?.({ step: 'registering_nametag', message: 'Registering nametag...' });
-      logger.debug('Sphere', 'Registering Unicity ID...');
-      await sphere.registerNametag(options.nametag);
-    }
-
-    // Auto-discover previously used HD addresses
-    if (options.discoverAddresses !== false && sphere._transport.discoverAddresses) {
-      progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
-      try {
-        const discoverOpts: DiscoverAddressesOptions =
-          typeof options.discoverAddresses === 'object'
-            ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
-            : { autoTrack: true };
-        const result = await sphere.discoverAddresses(discoverOpts);
-        if (result.addresses.length > 0) {
-          logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
-        }
-      } catch (err) {
-        logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
+      // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
+      if (!options.nametag) {
+        progress?.({ step: 'recovering_nametag', message: 'Recovering nametag...' });
+        logger.debug('Sphere', 'Recovering Unicity ID from transport...');
+        await sphere.recoverNametagFromTransport();
+        logger.debug('Sphere', 'Unicity ID recovery done');
+        // Publish identity binding (with recovered nametag if found)
+        progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
+        await sphere.syncIdentityWithTransport();
       }
-    }
 
-    progress?.({ step: 'complete', message: 'Import complete' });
-    logger.debug('Sphere', 'Import complete');
+      // Mark wallet as created only after successful initialization
+      progress?.({ step: 'finalizing', message: 'Finalizing wallet creation...' });
+      logger.debug('Sphere', 'Finalizing wallet creation...');
+      await sphere.finalizeWalletCreation();
+
+      sphere._initialized = true;
+
+      // Track address 0 in the registry
+      logger.debug('Sphere', 'Tracking address 0...');
+      await sphere.ensureAddressTracked(0);
+
+      // Register nametag if provided (this overrides any recovered nametag)
+      if (options.nametag) {
+        progress?.({ step: 'registering_nametag', message: 'Registering nametag...' });
+        logger.debug('Sphere', 'Registering Unicity ID...');
+        await sphere.registerNametag(options.nametag);
+      }
+
+      // Auto-discover previously used HD addresses
+      if (options.discoverAddresses !== false && sphere._transport.discoverAddresses) {
+        progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
+        try {
+          const discoverOpts: DiscoverAddressesOptions =
+            typeof options.discoverAddresses === 'object'
+              ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
+              : { autoTrack: true };
+          const result = await sphere.discoverAddresses(discoverOpts);
+          if (result.addresses.length > 0) {
+            logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
+          }
+        } catch (err) {
+          logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
+        }
+      }
+
+      progress?.({ step: 'complete', message: 'Import complete' });
+      logger.debug('Sphere', 'Import complete');
+    });
+
+    Sphere.instance = sphere;
     return sphere;
   }
 
@@ -3388,7 +3443,39 @@ export class Sphere {
   // Public Methods - Lifecycle
   // ===========================================================================
 
+  /**
+   * Disconnect transport, storage and oracle, attempting each even if an earlier one
+   * rejects. They are separate resources, and one failure must not skip the rest — that
+   * is how a partial teardown leaves connections open, which is exactly the state the
+   * failed-initialization path calls destroy() in.
+   */
+  private async disconnectProvidersIndependently(): Promise<void> {
+    const steps: ReadonlyArray<readonly [string, () => Promise<void>]> = [
+      ['transport', () => this._transport.disconnect()],
+      ['storage', () => this._storage.disconnect()],
+      ['oracle', () => this._oracle.disconnect()],
+    ];
+    for (const [what, disconnect] of steps) {
+      await Sphere.safeDisconnect(what, disconnect);
+    }
+  }
+
+  /** Run one teardown step, logging rather than propagating so the next one still runs. */
+  private static async safeDisconnect(what: string, run: () => Promise<void>): Promise<void> {
+    try {
+      await run();
+    } catch (err) {
+      logger.warn('Sphere', `${what} disconnect failed during destroy:`, err);
+    }
+  }
+
   async destroy(): Promise<void> {
+    // FIRST, before anything that can throw. Module teardown and
+    // MultiAddressTransportMux.disconnect() propagate, so any later placement would let a
+    // single failure leave this Sphere's registry fetching forever. Nothing below needs it.
+    this._registry?.dispose();
+    this._registry = null;
+
     this.cleanupProviderEventSubscriptions();
 
     // Stop the payments vertical FIRST — stop() awaits quiescence, so
@@ -3423,7 +3510,8 @@ export class Sphere {
 
     // Disconnect transport mux if present
     if (this._transportMux) {
-      await this._transportMux.disconnect();
+      const mux = this._transportMux;
+      await Sphere.safeDisconnect('transport mux', () => mux.disconnect());
       this._transportMux = null;
     }
 
@@ -3431,9 +3519,7 @@ export class Sphere {
     // above (dispose is idempotent, so an overlap is harmless).
     this._tokenEngine?.dispose?.();
 
-    await this._transport.disconnect();
-    await this._storage.disconnect();
-    await this._oracle.disconnect();
+    await this.disconnectProvidersIndependently();
 
     this._initialized = false;
     this._trackedAddressesLoaded = false;
@@ -3971,6 +4057,7 @@ export class Sphere {
       host: {
         storage: this._storage,
         price: this._priceProvider,
+        registry: this._registry ?? TokenRegistry.getInstance(),
         emit: (event, payload) =>
           this.emitEvent(event as SphereEventType, payload as SphereEventMap[SphereEventType]),
         resolvePeer: (identifier) => this._transport.resolve?.(identifier) ?? Promise.resolve(null),

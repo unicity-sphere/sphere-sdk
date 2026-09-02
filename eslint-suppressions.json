@@ -122,7 +122,7 @@
       "count": 2
     },
     "complexity": {
-      "count": 9
+      "count": 6
     },
     "max-depth": {
       "count": 8
@@ -292,9 +292,6 @@
       "count": 1
     },
     "complexity": {
-      "count": 1
-    },
-    "max-lines-per-function": {
       "count": 1
     }
   },

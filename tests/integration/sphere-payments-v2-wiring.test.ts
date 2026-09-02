@@ -25,6 +25,7 @@ import { getPublicKey, hexToBytes } from '../../core/crypto';
 import { decryptDeliveryBundle, deriveDeliveryEncryptionKey } from '../../core/delivery-envelope';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { TRUSTBASE_TESTNET2 } from '../../assets/trustbase';
+import { TokenRegistry } from '../../registry';
 import type { PeerInfo, TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { ProviderStatus } from '../../types';
@@ -217,6 +218,261 @@ async function buildSphere(options: BuildOptions): Promise<Sphere> {
   });
   return sphere;
 }
+
+describe('Sphere payments wiring — the token registry is OWNED, not the process global', () => {
+  // #766: the global's configure() is repointed by every other Sphere's init, which is how
+  // a mainnet init silently flipped a live testnet2 wallet's decimals to 0. A Sphere must
+  // build and hold its own, and must stop it on destroy — nothing in registry/ calls
+  // unref(), so a surviving interval outlives the wallet and keeps Node's loop alive.
+  it('builds its own registry on init and disposes it on destroy', async () => {
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-'));
+    const storage = new FileStorageProvider({ dataDir });
+    try {
+      const { sphere } = await Sphere.init({
+        storage,
+        transport: createMockTransport(),
+        oracle: createEngineOracle(),
+        mnemonic: MNEMONIC,
+        network: NET,
+        walletApi: makeWorld().walletApi,
+      });
+
+      expect(create).toHaveBeenCalledTimes(1);
+      const owned = create.mock.results[0]!.value as TokenRegistry;
+      // It is a real instance, and NOT the process global.
+      expect(owned).not.toBe(TokenRegistry.getInstance());
+      expect(owned.isDisposed).toBe(false);
+
+      await sphere.destroy();
+      expect(owned.isDisposed).toBe(true);
+      // The global is deliberately left running — other code still reads it.
+      expect(TokenRegistry.getInstance().isDisposed).toBe(false);
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('never builds a registry when init rejects BEFORE provider bring-up', async () => {
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-early-'));
+    const storage = new FileStorageProvider({ dataDir });
+    try {
+      await expect(
+        Sphere.import({
+          storage,
+          transport: createMockTransport(),
+          oracle: createEngineOracle(),
+          mnemonic: 'clearly not a valid bip39 mnemonic phrase at all',
+          network: NET,
+          walletApi: makeWorld().walletApi,
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_IDENTITY' });
+
+      // Built late, so a rejection this early never creates one at all.
+      expect(create).not.toHaveBeenCalled();
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('disposes the registry when provider bring-up itself rejects', async () => {
+    // The case the previous test CANNOT reach: the registry is built, and then init
+    // fails. Without cleanup it is stranded — the caller never receives a Sphere, so
+    // nothing can ever destroy it, and its hourly fetch runs for the life of the process.
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-late-'));
+    const storage = new FileStorageProvider({ dataDir });
+    const transport = createMockTransport();
+    (transport as unknown as { connect: ReturnType<typeof vi.fn> }).connect = vi
+      .fn()
+      .mockRejectedValue(new Error('transport refused to connect'));
+    (transport as unknown as { isConnected: ReturnType<typeof vi.fn> }).isConnected = vi
+      .fn()
+      .mockReturnValue(false);
+    try {
+      await expect(
+        Sphere.init({
+          storage,
+          transport,
+          oracle: createEngineOracle(),
+          mnemonic: MNEMONIC,
+          network: NET,
+          walletApi: makeWorld().walletApi,
+        })
+      ).rejects.toThrow();
+
+      expect(create).toHaveBeenCalledTimes(1);
+      const stranded = create.mock.results[0]!.value as TokenRegistry;
+      expect(stranded.isDisposed).toBe(true);
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('disposes the registry when MODULE bring-up rejects, not just provider bring-up', async () => {
+    // Guarding only initializeProviders was not enough: initializeModules runs after it and
+    // is fallible too. An oracle that connects but exposes no trust base makes
+    // buildTokenEngine return undefined, and startPaymentsV2Inner then throws INVALID_CONFIG
+    // — past the provider guard, with the registry already built.
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-modules-'));
+    const storage = new FileStorageProvider({ dataDir });
+    const oracle = createEngineOracle();
+    (oracle as unknown as { getTrustBaseJson: () => unknown }).getTrustBaseJson = () => null;
+    try {
+      await expect(
+        Sphere.init({
+          storage,
+          transport: createMockTransport(),
+          oracle,
+          mnemonic: MNEMONIC,
+          network: NET,
+          walletApi: makeWorld().walletApi,
+        })
+      ).rejects.toThrow();
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect((create.mock.results[0]!.value as TokenRegistry).isDisposed).toBe(true);
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('disposes the registry when a step AFTER module bring-up rejects', async () => {
+    // The guard now covers everything up to publication, not a named subset of steps.
+    // Twice I widened it one step and the next step along was still unguarded; this pins
+    // the far end — a failure at 'finalizing', after providers AND modules are up, still
+    // happens before Sphere.instance is assigned, so the caller gets nothing to destroy.
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-late2-'));
+    const storage = new FileStorageProvider({ dataDir });
+    try {
+      await expect(
+        Sphere.init({
+          storage,
+          transport: createMockTransport(),
+          oracle: createEngineOracle(),
+          mnemonic: MNEMONIC,
+          network: NET,
+          walletApi: makeWorld().walletApi,
+          onProgress: (p: { step: string }) => {
+            if (p.step === 'finalizing') throw new Error('progress callback exploded');
+          },
+        })
+      ).rejects.toThrow();
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect((create.mock.results[0]!.value as TokenRegistry).isDisposed).toBe(true);
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('disposes the registry when the LAST init step rejects, after publication would have been', async () => {
+    // Publication used to happen mid-init, and the guard ended there on the premise that a
+    // published Sphere is recoverable via Sphere.getInstance(). That premise fails under
+    // concurrent inits — a second one overwrites the static — so the guard now runs to the
+    // end and publication is the last thing before the return. 'complete' is the final
+    // progress step in create(), so a throw here is past every other fallible operation.
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-last-'));
+    const storage = new FileStorageProvider({ dataDir });
+    const transport = createMockTransport();
+    try {
+      await expect(
+        Sphere.init({
+          storage,
+          transport,
+          oracle: createEngineOracle(),
+          mnemonic: MNEMONIC,
+          network: NET,
+          walletApi: makeWorld().walletApi,
+          onProgress: (p: { step: string }) => {
+            if (p.step === 'complete') throw new Error('progress callback exploded at the end');
+          },
+        })
+      ).rejects.toThrow();
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect((create.mock.results[0]!.value as TokenRegistry).isDisposed).toBe(true);
+      // And the failed init published nothing, so no half-built Sphere is reachable.
+      expect(Sphere.getInstance()).toBeNull();
+      // Precisely because nothing is reachable, the failure path must tear the whole
+      // Sphere down — providers are connected and the vertical is running by now, and
+      // disposing only the registry would strand all of it with no owner.
+      expect(transport.disconnect).toHaveBeenCalled();
+      expect(storage.isConnected()).toBe(false);
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('destroy() keeps disconnecting after one teardown step rejects', async () => {
+    // The steps are independent resources. A transport disconnect that rejects must not
+    // skip storage and oracle — that is how a partial teardown failure leaves connections
+    // open, which is exactly the state the failed-init path calls destroy() in.
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-teardown-partial-'));
+    const storage = new FileStorageProvider({ dataDir });
+    const transport = createMockTransport();
+    const oracle = createEngineOracle();
+    try {
+      const { sphere } = await Sphere.init({
+        storage,
+        transport,
+        oracle,
+        mnemonic: MNEMONIC,
+        network: NET,
+        walletApi: makeWorld().walletApi,
+      });
+
+      vi.spyOn(transport, 'disconnect').mockRejectedValue(new Error('transport refused'));
+      const oracleDisconnect = vi.spyOn(oracle, 'disconnect');
+
+      await sphere.destroy().catch(() => undefined);
+
+      // The two steps AFTER the failing one still ran.
+      expect(storage.isConnected()).toBe(false);
+      expect(oracleDisconnect).toHaveBeenCalled();
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('destroy() disposes the registry even when teardown throws', async () => {
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-throw-'));
+    const storage = new FileStorageProvider({ dataDir });
+    const transport = createMockTransport();
+    try {
+      const { sphere } = await Sphere.init({
+        storage,
+        transport,
+        oracle: createEngineOracle(),
+        mnemonic: MNEMONIC,
+        network: NET,
+        walletApi: makeWorld().walletApi,
+      });
+      const owned = create.mock.results[0]!.value as TokenRegistry;
+
+      // Teardown below the disposal point propagates (the transport mux disconnect has
+      // no catch), so disposal must not sit behind it.
+      vi.spyOn(transport, 'disconnect').mockRejectedValue(new Error('teardown exploded'));
+
+      await sphere.destroy().catch(() => undefined);
+      expect(owned.isDisposed).toBe(true);
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('Sphere payments wiring — defaults (P11 flip: the vertical is default and only)', () => {
   it('composing the vertical sweeps the superseded pv2: state left by a 2.x wallet', async () => {

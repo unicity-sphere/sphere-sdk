@@ -391,7 +391,17 @@ console.log(uct?.name, uct?.decimals);  // 'Unicity Token', 8
 const coinId = registry.getCoinIdBySymbol('UCT');
 ```
 
-> **Note:** The registry is configured automatically by `createBrowserProviders()` and `Sphere.init()`. Data is fetched from the network and cached in `localStorage`.
+> **Note:** The registry is configured automatically by `Sphere.init()`. `createBrowserProviders()` does **not** configure it — if you build providers without initialising a Sphere and then read the registry directly, configure it yourself:
+>
+> ```ts
+> import { TokenRegistry, NETWORKS } from '@unicitylabs/sphere-sdk';
+>
+> TokenRegistry.configure({
+>   remoteUrl: NETWORKS.testnet2.tokenRegistryUrl,
+>   storage: providers.storage,
+> });
+> ```
+> Data is fetched from the network and cached in `localStorage`.
 
 ### Send Tokens
 

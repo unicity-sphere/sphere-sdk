@@ -13,6 +13,10 @@ export {
   type RegistryNetwork,
   type TokenRegistryConfig,
   // Convenience functions
+} from './TokenRegistry';
+
+// Singleton-bound convenience readers (see global-readers.ts).
+export {
   getTokenDefinition,
   getTokenSymbol,
   getTokenName,
@@ -23,4 +27,4 @@ export {
   getCoinIdByName,
   normalizeCoinId,
   coinIdsMatch,
-} from './TokenRegistry';
+} from './global-readers';

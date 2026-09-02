@@ -117,6 +117,10 @@ export class TokenRegistry {
   private initialLoadPromise: Promise<boolean> | null = null;
   /** Bumped on every remoteUrl change; loads started in an older generation are discarded. */
   private generation = 0;
+  /** Set by dispose(). A disposed registry starts no work and applies no late result. */
+  private disposed = false;
+  /** Cancels the in-flight fetch (and its abort timer) when the registry is disposed. */
+  private inFlight: { abort: () => void } | null = null;
 
   private constructor() {
     this.definitionsById = new Map();
@@ -148,7 +152,26 @@ export class TokenRegistry {
    * @param options.autoRefresh - Start auto-refresh immediately (default: true)
    */
   static configure(options: TokenRegistryConfig): void {
-    const instance = TokenRegistry.getInstance();
+    TokenRegistry.getInstance().applyConfig(options);
+  }
+
+  /**
+   * Create an INDEPENDENT registry, not the process-global singleton.
+   *
+   * One Sphere owns one of these, so two Spheres on different networks cannot wipe each
+   * other's definitions — the singleton's `configure()` reaches into whatever instance
+   * exists and repoints it, which is how a mainnet init silently retargeted a live
+   * testnet2 wallet's decimals. Dispose it when the owner is destroyed.
+   */
+  static create(options: TokenRegistryConfig): TokenRegistry {
+    const registry = new TokenRegistry();
+    registry.applyConfig(options);
+    return registry;
+  }
+
+  /** The body of configure(), on the instance, so owned registries share it exactly. */
+  private applyConfig(options: TokenRegistryConfig): void {
+    if (this.disposed) return;
 
     if (options.remoteUrl !== undefined) {
       // A network switch must not leave the old network's definitions resolvable:
@@ -156,29 +179,78 @@ export class TokenRegistry {
       // failed load would keep serving foreign coinIds — wrong decimals, silently.
       // lastRefreshAt resets too, else loadFromCache refuses the new network's snapshot
       // as older than the stale timestamp.
-      const previous = instance.remoteUrl;
+      const previous = this.remoteUrl;
       if (previous && previous !== options.remoteUrl) {
-        instance.applyDefinitions([]);
-        instance.lastRefreshAt = 0;
+        this.applyDefinitions([]);
+        this.lastRefreshAt = 0;
         // Abandon any in-flight load: it fetched the OLD url, so its result must neither
         // be applied nor cached, and the next caller must not dedupe onto it.
-        instance.generation++;
-        instance.refreshPromise = null;
+        this.generation++;
+        this.refreshPromise = null;
       }
-      instance.remoteUrl = options.remoteUrl;
+      this.remoteUrl = options.remoteUrl;
     }
     if (options.storage !== undefined) {
-      instance.storage = options.storage;
+      this.storage = options.storage;
     }
     if (options.refreshIntervalMs !== undefined) {
-      instance.refreshIntervalMs = options.refreshIntervalMs;
+      this.refreshIntervalMs = options.refreshIntervalMs;
     }
 
     const autoRefresh = options.autoRefresh ?? true;
 
     // Perform initial load (cache → remote fallback) and store the promise
     // so consumers can await readiness via TokenRegistry.waitForReady()
-    instance.initialLoadPromise = instance.performInitialLoad(autoRefresh);
+    this.initialLoadPromise = this.performInitialLoad(autoRefresh);
+  }
+
+  /**
+   * Stop this registry for good: no timer, no late apply, no late cache write.
+   *
+   * Sphere.destroy() calls this on the registry it owns. Without it a discarded Sphere
+   * leaves an hourly fetch running forever — nothing in this file calls unref(), so in
+   * Node it also keeps the event loop alive.
+   */
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.stopAutoRefresh();
+    // Cancel any request already in the air, not just future ones.
+    this.inFlight?.abort();
+    this.inFlight = null;
+    // Any in-flight load belongs to a generation that no longer exists.
+    this.generation++;
+    this.refreshPromise = null;
+    this.initialLoadPromise = null;
+  }
+
+  /** Whether dispose() has been called. Reads still work; they are simply frozen. */
+  get isDisposed(): boolean {
+    return this.disposed;
+  }
+
+  /** Per-instance readiness — the same contract as the static, for an owned registry. */
+  async waitForReady(timeoutMs: number = 10_000): Promise<boolean> {
+    if (!this.initialLoadPromise) {
+      return this.definitionsById.size > 0;
+    }
+    if (timeoutMs <= 0) {
+      return this.initialLoadPromise;
+    }
+    // Clear the losing timer: a race leaves it scheduled, and an unreferenced timeout
+    // still holds Node's event loop open for its full duration — here up to 10s after
+    // the registry has been disposed.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        this.initialLoadPromise,
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   /**
@@ -206,17 +278,7 @@ export class TokenRegistry {
    * @param timeoutMs - Maximum wait time in ms (default: 10s). Set to 0 for no timeout.
    */
   static async waitForReady(timeoutMs: number = 10_000): Promise<boolean> {
-    const instance = TokenRegistry.getInstance();
-    if (!instance.initialLoadPromise) {
-      return instance.definitionsById.size > 0;
-    }
-    if (timeoutMs <= 0) {
-      return instance.initialLoadPromise;
-    }
-    return Promise.race([
-      instance.initialLoadPromise,
-      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
-    ]);
+    return TokenRegistry.getInstance().waitForReady(timeoutMs);
   }
 
   // ===========================================================================
@@ -228,6 +290,7 @@ export class TokenRegistry {
    * After initial data is available, start periodic auto-refresh if configured.
    */
   private async performInitialLoad(autoRefresh: boolean): Promise<boolean> {
+    if (this.disposed) return false;
     // Step 1: Try loading from cache
     let loaded = false;
     if (this.storage) {
@@ -245,6 +308,9 @@ export class TokenRegistry {
     // Step 2: Cache miss — wait for first remote fetch (only when auto-refresh is enabled)
     if (autoRefresh && this.remoteUrl) {
       loaded = await this.refreshFromRemote();
+      // Re-check: dispose() may have run during the await, and the entry guard above no
+      // longer holds. Arming here would outlive the owner that asked to be torn down.
+      if (this.disposed) return loaded;
       // Start periodic refresh (skip immediate since we just fetched)
       this.stopAutoRefresh();
       this.refreshTimer = setInterval(() => {
@@ -372,7 +438,7 @@ export class TokenRegistry {
    * Concurrent calls are deduplicated — only one fetch runs at a time.
    */
   async refreshFromRemote(): Promise<boolean> {
-    if (!this.remoteUrl) {
+    if (this.disposed || !this.remoteUrl) {
       return false;
     }
 
@@ -394,6 +460,33 @@ export class TokenRegistry {
     }
   }
 
+  /**
+   * Fetch with a bounded timeout, exposing a cancel hook to dispose().
+   *
+   * Both the request and its abort timer keep Node's event loop alive for the full
+   * FETCH_TIMEOUT_MS, so a registry disposed mid-flight must cancel them rather than
+   * merely ignore the result.
+   */
+  private async fetchCancellable(url: string): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    this.inFlight = {
+      abort: () => {
+        clearTimeout(timer);
+        controller.abort();
+      },
+    };
+    try {
+      return await fetch(url, {
+        headers: { Accept: 'application/json' },
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+      this.inFlight = null;
+    }
+  }
+
   private async doRefresh(): Promise<boolean> {
     // Pin the url and generation for this attempt. configure() may swap networks while the
     // fetch is in flight; applying or caching the result afterwards would reinstate the old
@@ -401,18 +494,7 @@ export class TokenRegistry {
     const url = this.remoteUrl!;
     const gen = this.generation;
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-      let response: Response;
-      try {
-        response = await fetch(url, {
-          headers: { Accept: 'application/json' },
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
+      const response = await this.fetchCancellable(url);
 
       if (!response.ok) {
         logger.warn('TokenRegistry', `Remote fetch failed: HTTP ${response.status} ${response.statusText}`);
@@ -451,6 +533,9 @@ export class TokenRegistry {
    * Does an immediate fetch, then repeats at the configured interval.
    */
   startAutoRefresh(intervalMs?: number): void {
+    // A disposed registry must never hold an interval. The callback would no-op via the
+    // disposed guard, but the TIMER ITSELF is the leak — it keeps Node's loop alive.
+    if (this.disposed) return;
     this.stopAutoRefresh();
 
     if (intervalMs !== undefined) {
@@ -626,138 +711,4 @@ export class TokenRegistry {
     const def = this.getDefinitionByName(name);
     return def?.id;
   }
-}
-
-// =============================================================================
-// Convenience Functions
-// =============================================================================
-
-/**
- * Get token definition by coin ID
- * @param coinId - 64-character hex string
- * @returns Token definition or undefined
- */
-export function getTokenDefinition(coinId: string): TokenDefinition | undefined {
-  return TokenRegistry.getInstance().getDefinition(coinId);
-}
-
-/**
- * Get token symbol by coin ID
- * @param coinId - 64-character hex string
- * @returns Symbol or truncated ID
- */
-export function getTokenSymbol(coinId: string): string {
-  return TokenRegistry.getInstance().getSymbol(coinId);
-}
-
-/**
- * Get token name by coin ID
- * @param coinId - 64-character hex string
- * @returns Name or coin ID
- */
-export function getTokenName(coinId: string): string {
-  return TokenRegistry.getInstance().getName(coinId);
-}
-
-/**
- * Get token decimals by coin ID
- * @param coinId - 64-character hex string
- * @returns Decimals or 0
- */
-export function getTokenDecimals(coinId: string): number {
-  return TokenRegistry.getInstance().getDecimals(coinId);
-}
-
-/**
- * Get token icon URL by coin ID
- * @param coinId - 64-character hex string
- * @param preferPng - Prefer PNG over SVG
- * @returns Icon URL or null
- */
-export function getTokenIconUrl(coinId: string, preferPng = true): string | null {
-  return TokenRegistry.getInstance().getIconUrl(coinId, preferPng);
-}
-
-/**
- * Check if coin ID is in registry
- * @param coinId - 64-character hex string
- * @returns true if known
- */
-export function isKnownToken(coinId: string): boolean {
-  return TokenRegistry.getInstance().isKnown(coinId);
-}
-
-/**
- * Get coin ID by symbol
- * @param symbol - Token symbol (e.g., "UCT")
- * @returns Coin ID or undefined
- */
-export function getCoinIdBySymbol(symbol: string): string | undefined {
-  return TokenRegistry.getInstance().getCoinIdBySymbol(symbol);
-}
-
-/**
- * Get coin ID by name
- * @param name - Token name (e.g., "bitcoin")
- * @returns Coin ID or undefined
- */
-export function getCoinIdByName(name: string): string | undefined {
-  return TokenRegistry.getInstance().getCoinIdByName(name);
-}
-
-/**
- * Normalize a coin identifier to its canonical hash coinId.
- *
- * Accepts both symbolic names ("BTC", "ETH") and hash coinIds (64-char hex).
- * If the input is a short symbol, resolves it via the TokenRegistry.
- * Returns the input unchanged if it's already a hash coinId or unknown.
- *
- * @public
- *
- * @remarks
- * Heuristic: inputs matching `length <= 20 && /^[A-Za-z0-9]+$/` are treated
- * as symbolic names and looked up in the registry. Long inputs, hyphenated
- * inputs ("TOKEN-123"), or dotted inputs ("BTC.CASH") pass through unchanged.
- *
- * **Stability:** This function depends on `TokenRegistry` content. Adding a
- * new symbol that shadows a previously-unknown short alphanumeric coinId
- * changes normalization semantics retroactively. Consumers building stable
- * keys against this output should be aware that registry growth is a
- * non-breaking change *for unknown inputs* but a breaking change *for inputs
- * that newly resolve*.
- *
- * @param coinId - A symbolic name or hash coinId.
- * @returns The canonical hash coinId, or the original string if not resolvable.
- */
-export function normalizeCoinId(coinId: string): string {
-  // Short alphanumeric strings are likely symbolic names (BTC, ETH, USDU, etc.)
-  if (coinId.length <= 20 && /^[A-Za-z0-9]+$/.test(coinId)) {
-    const resolved = getCoinIdBySymbol(coinId);
-    if (resolved) return resolved;
-  }
-  return coinId;
-}
-
-/**
- * Compare two coin identifiers for equality, normalizing both sides.
- *
- * Handles mixed-format comparisons: "BTC" vs hash coinId, or two hash coinIds.
- * Both values are normalized to hash coinIds via the TokenRegistry before comparison.
- *
- * @public
- *
- * @remarks
- * Reflexive byte-equality short-circuit comes first; otherwise both sides
- * are normalized via {@link normalizeCoinId} and compared. Inherits the
- * registry-dependence caveat from `normalizeCoinId`. Two distinct symbols
- * that both fail to resolve will compare unequal even if they're semantic
- * aliases — register them as aliases in `TokenRegistry` for matching.
- *
- * @param a - First coin identifier (symbol or hash coinId).
- * @param b - Second coin identifier (symbol or hash coinId).
- * @returns true if both resolve to the same canonical coinId.
- */
-export function coinIdsMatch(a: string, b: string): boolean {
-  if (a === b) return true;
-  return normalizeCoinId(a) === normalizeCoinId(b);
 }
