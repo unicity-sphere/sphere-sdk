@@ -119,6 +119,8 @@ export class TokenRegistry {
   private generation = 0;
   /** Set by dispose(). A disposed registry starts no work and applies no late result. */
   private disposed = false;
+  /** Cancels the in-flight fetch (and its abort timer) when the registry is disposed. */
+  private inFlight: { abort: () => void } | null = null;
 
   private constructor() {
     this.definitionsById = new Map();
@@ -213,6 +215,9 @@ export class TokenRegistry {
     if (this.disposed) return;
     this.disposed = true;
     this.stopAutoRefresh();
+    // Cancel any request already in the air, not just future ones.
+    this.inFlight?.abort();
+    this.inFlight = null;
     // Any in-flight load belongs to a generation that no longer exists.
     this.generation++;
     this.refreshPromise = null;
@@ -455,6 +460,33 @@ export class TokenRegistry {
     }
   }
 
+  /**
+   * Fetch with a bounded timeout, exposing a cancel hook to dispose().
+   *
+   * Both the request and its abort timer keep Node's event loop alive for the full
+   * FETCH_TIMEOUT_MS, so a registry disposed mid-flight must cancel them rather than
+   * merely ignore the result.
+   */
+  private async fetchCancellable(url: string): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    this.inFlight = {
+      abort: () => {
+        clearTimeout(timer);
+        controller.abort();
+      },
+    };
+    try {
+      return await fetch(url, {
+        headers: { Accept: 'application/json' },
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+      this.inFlight = null;
+    }
+  }
+
   private async doRefresh(): Promise<boolean> {
     // Pin the url and generation for this attempt. configure() may swap networks while the
     // fetch is in flight; applying or caching the result afterwards would reinstate the old
@@ -462,18 +494,7 @@ export class TokenRegistry {
     const url = this.remoteUrl!;
     const gen = this.generation;
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-      let response: Response;
-      try {
-        response = await fetch(url, {
-          headers: { Accept: 'application/json' },
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
+      const response = await this.fetchCancellable(url);
 
       if (!response.ok) {
         logger.warn('TokenRegistry', `Remote fetch failed: HTTP ${response.status} ${response.statusText}`);

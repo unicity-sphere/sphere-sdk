@@ -414,6 +414,37 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
     }
   });
 
+  it('destroy() keeps disconnecting after one teardown step rejects', async () => {
+    // The steps are independent resources. A transport disconnect that rejects must not
+    // skip storage and oracle — that is how a partial teardown failure leaves connections
+    // open, which is exactly the state the failed-init path calls destroy() in.
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-teardown-partial-'));
+    const storage = new FileStorageProvider({ dataDir });
+    const transport = createMockTransport();
+    const oracle = createEngineOracle();
+    try {
+      const { sphere } = await Sphere.init({
+        storage,
+        transport,
+        oracle,
+        mnemonic: MNEMONIC,
+        network: NET,
+        walletApi: makeWorld().walletApi,
+      });
+
+      vi.spyOn(transport, 'disconnect').mockRejectedValue(new Error('transport refused'));
+      const oracleDisconnect = vi.spyOn(oracle, 'disconnect');
+
+      await sphere.destroy().catch(() => undefined);
+
+      // The two steps AFTER the failing one still ran.
+      expect(storage.isConnected()).toBe(false);
+      expect(oracleDisconnect).toHaveBeenCalled();
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('destroy() disposes the registry even when teardown throws', async () => {
     const create = vi.spyOn(TokenRegistry, 'create');
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-throw-'));

@@ -257,4 +257,32 @@ describe('TokenRegistry#dispose', () => {
       f.restore();
     }
   });
+  it('dispose ABORTS an in-flight fetch rather than merely ignoring its result', async () => {
+    // Discarding the promise reference is not enough: the request and its 10s abort timer
+    // both keep Node's event loop alive until the timeout elapses, long after teardown.
+    const { storage } = makeStorage();
+    let aborted = false;
+    let requested = false;
+    const original = globalThis.fetch;
+    globalThis.fetch = ((_input: unknown, init?: { signal?: AbortSignal }) => {
+      requested = true;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          aborted = true;
+          reject(new Error('aborted'));
+        });
+      });
+    }) as typeof globalThis.fetch;
+    try {
+      const owned = TokenRegistry.create({ remoteUrl: URL_A, storage, autoRefresh: true });
+      for (let i = 0; i < 200 && !requested; i++) await new Promise((r) => setTimeout(r, 1));
+      expect(requested).toBe(true); // vacuous if the fetch never started
+
+      owned.dispose();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(aborted).toBe(true);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
 });

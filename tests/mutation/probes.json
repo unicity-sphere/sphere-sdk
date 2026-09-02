@@ -580,5 +580,25 @@
     "tests": [
       "tests/unit/registry/TokenRegistry.instances.test.ts"
     ]
+  },
+  {
+    "name": "dispose-ignores-inflight-fetch",
+    "note": "#767 review: dispose() must ABORT the request already in the air \u2014 the fetch and its abort timer each hold Node's event loop open for FETCH_TIMEOUT_MS after teardown",
+    "file": "registry/TokenRegistry.ts",
+    "find": "    this.inFlight?.abort();",
+    "replace": "    void this.inFlight;",
+    "tests": [
+      "tests/unit/registry/TokenRegistry.instances.test.ts"
+    ]
+  },
+  {
+    "name": "teardown-stops-at-first-failure",
+    "note": "#767 review: destroy()'s disconnects are independent resources \u2014 one rejecting must not skip the rest, or a partial teardown failure leaves connections open",
+    "file": "core/Sphere.ts",
+    "find": "      await Sphere.safeDisconnect(what, disconnect);",
+    "replace": "      await disconnect();",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
   }
 ]

@@ -3443,6 +3443,32 @@ export class Sphere {
   // Public Methods - Lifecycle
   // ===========================================================================
 
+  /**
+   * Disconnect transport, storage and oracle, attempting each even if an earlier one
+   * rejects. They are separate resources, and one failure must not skip the rest — that
+   * is how a partial teardown leaves connections open, which is exactly the state the
+   * failed-initialization path calls destroy() in.
+   */
+  private async disconnectProvidersIndependently(): Promise<void> {
+    const steps: ReadonlyArray<readonly [string, () => Promise<void>]> = [
+      ['transport', () => this._transport.disconnect()],
+      ['storage', () => this._storage.disconnect()],
+      ['oracle', () => this._oracle.disconnect()],
+    ];
+    for (const [what, disconnect] of steps) {
+      await Sphere.safeDisconnect(what, disconnect);
+    }
+  }
+
+  /** Run one teardown step, logging rather than propagating so the next one still runs. */
+  private static async safeDisconnect(what: string, run: () => Promise<void>): Promise<void> {
+    try {
+      await run();
+    } catch (err) {
+      logger.warn('Sphere', `${what} disconnect failed during destroy:`, err);
+    }
+  }
+
   async destroy(): Promise<void> {
     // FIRST, before anything that can throw. Module teardown and
     // MultiAddressTransportMux.disconnect() propagate, so any later placement would let a
@@ -3484,7 +3510,8 @@ export class Sphere {
 
     // Disconnect transport mux if present
     if (this._transportMux) {
-      await this._transportMux.disconnect();
+      const mux = this._transportMux;
+      await Sphere.safeDisconnect('transport mux', () => mux.disconnect());
       this._transportMux = null;
     }
 
@@ -3492,9 +3519,7 @@ export class Sphere {
     // above (dispose is idempotent, so an overlap is harmless).
     this._tokenEngine?.dispose?.();
 
-    await this._transport.disconnect();
-    await this._storage.disconnect();
-    await this._oracle.disconnect();
+    await this.disconnectProvidersIndependently();
 
     this._initialized = false;
     this._trackedAddressesLoaded = false;
