@@ -293,9 +293,6 @@
     },
     "complexity": {
       "count": 1
-    },
-    "max-lines-per-function": {
-      "count": 1
     }
   },
   "impl/browser/oracle/index.ts": {
