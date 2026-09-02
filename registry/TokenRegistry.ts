@@ -303,6 +303,9 @@ export class TokenRegistry {
     // Step 2: Cache miss — wait for first remote fetch (only when auto-refresh is enabled)
     if (autoRefresh && this.remoteUrl) {
       loaded = await this.refreshFromRemote();
+      // Re-check: dispose() may have run during the await, and the entry guard above no
+      // longer holds. Arming here would outlive the owner that asked to be torn down.
+      if (this.disposed) return loaded;
       // Start periodic refresh (skip immediate since we just fetched)
       this.stopAutoRefresh();
       this.refreshTimer = setInterval(() => {
@@ -509,6 +512,9 @@ export class TokenRegistry {
    * Does an immediate fetch, then repeats at the configured interval.
    */
   startAutoRefresh(intervalMs?: number): void {
+    // A disposed registry must never hold an interval. The callback would no-op via the
+    // disposed guard, but the TIMER ITSELF is the leak — it keeps Node's loop alive.
+    if (this.disposed) return;
     this.stopAutoRefresh();
 
     if (intervalMs !== undefined) {

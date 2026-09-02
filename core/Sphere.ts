@@ -858,7 +858,6 @@ export class Sphere {
       options.communications,
     );
     sphere._verification = options.verification;
-    sphere._registry = Sphere.createOwnedRegistry(options.storage, options.network);
     sphere._paymentsV2Composition = composition;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
@@ -872,7 +871,16 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    await sphere.initializeProviders();
+    // Built here, not at construction: an earlier failure (a rejected mnemonic, a bad
+    // password) would otherwise leave an unreachable registry fetching hourly forever.
+    sphere._registry = Sphere.createOwnedRegistry(options.storage, options.network);
+    try {
+      await sphere.initializeProviders();
+    } catch (err) {
+      sphere._registry?.dispose();
+      sphere._registry = null;
+      throw err;
+    }
     await sphere.initializeModules();
 
     // Mark wallet as created only after successful initialization
@@ -958,7 +966,6 @@ export class Sphere {
       options.communications,
     );
     sphere._verification = options.verification;
-    sphere._registry = Sphere.createOwnedRegistry(options.storage, options.network);
     sphere._paymentsV2Composition = composition;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
@@ -974,7 +981,16 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    await sphere.initializeProviders();
+    // Built here, not at construction: an earlier failure (a rejected mnemonic, a bad
+    // password) would otherwise leave an unreachable registry fetching hourly forever.
+    sphere._registry = Sphere.createOwnedRegistry(options.storage, options.network);
+    try {
+      await sphere.initializeProviders();
+    } catch (err) {
+      sphere._registry?.dispose();
+      sphere._registry = null;
+      throw err;
+    }
     await sphere.initializeModules();
 
     // Publish identity binding via transport
@@ -1064,7 +1080,6 @@ export class Sphere {
       options.communications,
     );
     sphere._verification = options.verification;
-    sphere._registry = Sphere.createOwnedRegistry(options.storage, options.network);
     sphere._paymentsV2Composition = composition;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
@@ -1101,7 +1116,16 @@ export class Sphere {
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
     logger.debug('Sphere', 'Initializing providers...');
-    await sphere.initializeProviders();
+    // Built here, not at construction: an earlier failure (a rejected mnemonic, a bad
+    // password) would otherwise leave an unreachable registry fetching hourly forever.
+    sphere._registry = Sphere.createOwnedRegistry(options.storage, options.network);
+    try {
+      await sphere.initializeProviders();
+    } catch (err) {
+      sphere._registry?.dispose();
+      sphere._registry = null;
+      throw err;
+    }
     logger.debug('Sphere', 'Providers initialized. Initializing modules...');
     await sphere.initializeModules();
     logger.debug('Sphere', 'Modules initialized');
@@ -3409,6 +3433,12 @@ export class Sphere {
   // ===========================================================================
 
   async destroy(): Promise<void> {
+    // FIRST, before anything that can throw. Module teardown and
+    // MultiAddressTransportMux.disconnect() propagate, so any later placement would let a
+    // single failure leave this Sphere's registry fetching forever. Nothing below needs it.
+    this._registry?.dispose();
+    this._registry = null;
+
     this.cleanupProviderEventSubscriptions();
 
     // Stop the payments vertical FIRST — stop() awaits quiescence, so
@@ -3450,13 +3480,6 @@ export class Sphere {
     // The active engine, when it is not one of the per-address engines disposed
     // above (dispose is idempotent, so an overlap is harmless).
     this._tokenEngine?.dispose?.();
-
-    // Stop this Sphere's own registry: its hourly fetch would otherwise outlive the
-    // wallet that created it (nothing in registry/ calls unref(), so in Node it also
-    // keeps the event loop alive). The process-global is deliberately left alone —
-    // other code still reads it.
-    this._registry?.dispose();
-    this._registry = null;
 
     await this._transport.disconnect();
     await this._storage.disconnect();

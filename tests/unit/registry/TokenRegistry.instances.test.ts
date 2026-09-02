@@ -56,6 +56,11 @@ function stubFetch(): { calls: string[]; restore: () => void } {
   return { calls, restore: () => { globalThis.fetch = original; } };
 }
 
+/** The private timer handle IS the leak, so assert on it directly. */
+function hasLiveInterval(r: TokenRegistry): boolean {
+  return (r as unknown as { refreshTimer: unknown }).refreshTimer !== null;
+}
+
 afterEach(() => {
   TokenRegistry.destroy();
   vi.useRealTimers();
@@ -194,6 +199,44 @@ describe('TokenRegistry#dispose', () => {
 
       expect(await owned.refreshFromRemote()).toBe(false);
       expect(f.calls.length).toBe(after);
+    } finally {
+      f.restore();
+    }
+  });
+  it('dispose DURING the initial load leaves no interval armed', async () => {
+    // The entry guard in performInitialLoad has already passed by the time the fetch
+    // resolves, and the continuation arms the interval. The callback would no-op via the
+    // disposed flag, but the TIMER is the leak.
+    const { storage } = makeStorage();
+    let release!: (r: Response) => void;
+    let requested = false;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    const original = globalThis.fetch;
+    globalThis.fetch = (() => { requested = true; return pending; }) as typeof globalThis.fetch;
+    try {
+      const owned = TokenRegistry.create({ remoteUrl: URL_A, storage, autoRefresh: true });
+      for (let i = 0; i < 200 && !requested; i++) await new Promise((r) => setTimeout(r, 1));
+      expect(requested).toBe(true);
+
+      owned.dispose();
+      release(new Response(JSON.stringify(defsA), { status: 200 }));
+      await new Promise((r) => setTimeout(r, 50));
+
+      // If the continuation armed an interval, the process now holds a live timer.
+      expect(hasLiveInterval(owned)).toBe(false);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('startAutoRefresh after dispose arms nothing', async () => {
+    const { storage } = makeStorage();
+    const f = stubFetch();
+    try {
+      const owned = TokenRegistry.create({ remoteUrl: URL_A, storage, autoRefresh: false });
+      owned.dispose();
+      owned.startAutoRefresh(1000);
+      expect(hasLiveInterval(owned)).toBe(false);
     } finally {
       f.restore();
     }

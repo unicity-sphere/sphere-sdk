@@ -520,5 +520,35 @@
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
     ]
+  },
+  {
+    "name": "registry-arms-interval-after-dispose",
+    "note": "#766 review: performInitialLoad's entry guard has already passed by the time the fetch resolves \u2014 without the re-check the continuation arms an interval on a disposed registry. The callback no-ops, but the TIMER is the leak.",
+    "file": "registry/TokenRegistry.ts",
+    "find": "      if (this.disposed) return loaded;",
+    "replace": "      if (false) return loaded;",
+    "tests": [
+      "tests/unit/registry/TokenRegistry.instances.test.ts"
+    ]
+  },
+  {
+    "name": "start-autorefresh-ignores-dispose",
+    "note": "#766 review: startAutoRefresh is public and must arm nothing on a disposed registry",
+    "file": "registry/TokenRegistry.ts",
+    "find": "    if (this.disposed) return;\n    this.stopAutoRefresh();",
+    "replace": "    this.stopAutoRefresh();",
+    "tests": [
+      "tests/unit/registry/TokenRegistry.instances.test.ts"
+    ]
+  },
+  {
+    "name": "init-failure-strands-registry",
+    "note": "#766 review: a rejected init must not leave an unreachable registry fetching hourly \u2014 the caller never receives a Sphere to destroy",
+    "file": "core/Sphere.ts",
+    "find": "      sphere._registry?.dispose();\n      sphere._registry = null;\n      throw err;",
+    "replace": "      throw err;",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
   }
 ]

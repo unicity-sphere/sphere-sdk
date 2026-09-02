@@ -253,6 +253,63 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
       fs.rmSync(dataDir, { recursive: true, force: true });
     }
   });
+
+  it('an init that REJECTS leaves no registry behind', async () => {
+    // The registry is built late, after the fallible validation. Built early, a rejected
+    // mnemonic would strand an unreachable registry fetching hourly with no owner to
+    // destroy it — the caller never receives a Sphere.
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-fail-'));
+    const storage = new FileStorageProvider({ dataDir });
+    try {
+      await expect(
+        Sphere.import({
+          storage,
+          transport: createMockTransport(),
+          oracle: createEngineOracle(),
+          mnemonic: 'clearly not a valid bip39 mnemonic phrase at all',
+          network: NET,
+          walletApi: makeWorld().walletApi,
+        })
+      ).rejects.toMatchObject({ code: 'INVALID_IDENTITY' });
+
+      // Either never built, or built and disposed — never left running.
+      for (const r of create.mock.results) {
+        expect((r.value as TokenRegistry).isDisposed).toBe(true);
+      }
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('destroy() disposes the registry even when teardown throws', async () => {
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-throw-'));
+    const storage = new FileStorageProvider({ dataDir });
+    const transport = createMockTransport();
+    try {
+      const { sphere } = await Sphere.init({
+        storage,
+        transport,
+        oracle: createEngineOracle(),
+        mnemonic: MNEMONIC,
+        network: NET,
+        walletApi: makeWorld().walletApi,
+      });
+      const owned = create.mock.results[0]!.value as TokenRegistry;
+
+      // Teardown below the disposal point propagates (the transport mux disconnect has
+      // no catch), so disposal must not sit behind it.
+      vi.spyOn(transport, 'disconnect').mockRejectedValue(new Error('teardown exploded'));
+
+      await sphere.destroy().catch(() => undefined);
+      expect(owned.isDisposed).toBe(true);
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('Sphere payments wiring — defaults (P11 flip: the vertical is default and only)', () => {
