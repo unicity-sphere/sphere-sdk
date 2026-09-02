@@ -835,7 +835,7 @@
     "name": "file-backing-store-id-is-a-class-constant",
     "note": "#766 review: backingStoreId identifies the STORE. A constant (what `id` is) makes every FileStorageProvider in the process one store, so clear() on one wallet tears down every live Sphere - the exact cross-wallet kill #766 removed.",
     "file": "impl/nodejs/storage/FileStorageProvider.ts",
-    "find": "    this.backingStoreId = `file:${path.resolve(this.filePath)}`;",
+    "find": "    this.backingStoreId = `file:${this.filePath}`;",
     "replace": "    this.backingStoreId = 'file:'; // mutant: a class constant, every wallet collides",
     "tests": [
       "tests/unit/impl/backing-store-id.test.ts",
