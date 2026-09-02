@@ -304,14 +304,10 @@ export class NostrTransportProvider implements TransportProvider {
       });
 
       // Connect to all relays (with timeout to prevent indefinite hang)
-      await Promise.race([
-        this.nostrClient.connect(...this.config.relays),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(
-            `Transport connection timed out after ${this.config.timeout}ms`
-          )), this.config.timeout)
-        ),
-      ]);
+      await this.connectWithDeadline(
+        this.nostrClient,
+        `Transport connection timed out after ${this.config.timeout}ms`
+      );
 
       // Need at least one successful connection
       if (!this.nostrClient.isConnected()) {
@@ -329,6 +325,28 @@ export class NostrTransportProvider implements TransportProvider {
     } catch (error) {
       this.status = 'error';
       throw error;
+    }
+  }
+
+  /**
+   * Race one client's relay connect against the configured timeout.
+   *
+   * The timer is cleared in a `finally` on EVERY path. `Promise.race` does not
+   * cancel the loser: an un-cleared `setTimeout` keeps Node's event loop pinned
+   * for the whole `config.timeout` after the call has already returned (and
+   * then rejects a promise nobody is listening to any more).
+   */
+  private async connectWithDeadline(client: NostrClient, timeoutMessage: string): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        client.connect(...this.config.relays),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(timeoutMessage)), this.config.timeout);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
 
@@ -496,8 +514,12 @@ export class NostrTransportProvider implements TransportProvider {
       logger.debug('Nostr', 'Identity changed while connected - recreating NostrClient');
       const oldClient = this.nostrClient;
 
-      // Create new client with real identity
-      this.nostrClient = new NostrClient(this.keyManager, {
+      // Build the replacement into a LOCAL: the field must not move until the
+      // new client is connected. Swapping first and then failing the connect
+      // orphans `oldClient` — socket open but unreachable from the provider, so
+      // `disconnect()` cannot reach it either — and setIdentity never touches
+      // `status`, so the caller's next retry re-enters here and leaks another.
+      const nextClient = new NostrClient(this.keyManager, {
         autoReconnect: this.config.autoReconnect,
         reconnectIntervalMs: this.config.reconnectDelay,
         maxReconnectIntervalMs: this.config.reconnectDelay * 16,
@@ -506,7 +528,7 @@ export class NostrTransportProvider implements TransportProvider {
       });
 
       // Add connection event listener
-      this.nostrClient.addConnectionListener({
+      nextClient.addConnectionListener({
         onConnect: (url) => {
           logger.debug('Nostr', 'NostrClient connected to relay:', url);
         },
@@ -521,17 +543,29 @@ export class NostrTransportProvider implements TransportProvider {
         },
       });
 
-      // Connect with new identity, set up subscriptions, then disconnect old client
-      await Promise.race([
-        this.nostrClient.connect(...this.config.relays),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(
-            `Transport reconnection timed out after ${this.config.timeout}ms`
-          )), this.config.timeout)
-        ),
-      ]);
-      await this.subscribeToEvents();
-      oldClient.disconnect();
+      try {
+        await this.connectWithDeadline(
+          nextClient,
+          `Transport reconnection timed out after ${this.config.timeout}ms`
+        );
+      } catch (error) {
+        // Dispose ONLY the replacement; the provider stays on the working
+        // `oldClient`. NOT both: MultiAddressTransportMux SHARES this client
+        // (ensureTransportMux suppresses subscriptions and reuses the socket),
+        // so killing it over a transient relay timeout kills the mux's too.
+        try { nextClient.disconnect(); } catch { /* best-effort cleanup */ }
+        throw error;
+      }
+
+      // The swap is committed. From here on `oldClient` is unreachable from the
+      // provider, so it must be disposed on EVERY path out — including a
+      // throwing `subscribeToEvents()`.
+      this.nostrClient = nextClient;
+      try {
+        await this.subscribeToEvents();
+      } finally {
+        try { oldClient.disconnect(); } catch { /* best-effort cleanup */ }
+      }
     } else if (this.isConnected()) {
       // Already connected with right key, just subscribe
       await this.subscribeToEvents();
