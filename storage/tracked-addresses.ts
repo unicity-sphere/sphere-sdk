@@ -10,12 +10,12 @@ function num(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
-/** Repair rather than drop — dropping an odd row deletes one of the user's addresses.
- *  A missing timestamp reads as 0, so a timeless observation loses every conflict. */
+/** Repair, don't drop — except the index: deriveKeyAtPath parseInt()s it, so 1.5
+ *  would alias index 1's real address (see the port docstring). */
 function toEntry(value: unknown): TrackedAddressEntry | null {
   if (typeof value !== 'object' || value === null) return null;
   const e = value as Record<string, unknown>;
-  if (typeof e.index !== 'number' || !Number.isFinite(e.index)) return null;
+  if (typeof e.index !== 'number' || !Number.isInteger(e.index) || e.index < 0) return null;
   return {
     ...e,
     index: e.index,

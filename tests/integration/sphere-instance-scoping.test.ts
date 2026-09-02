@@ -69,6 +69,8 @@ interface Wallet {
 }
 
 const wallets: Wallet[] = [];
+/** Spheres a test built outside `makeWallet`'s one-per-wallet slot. */
+const extraSpheres: Sphere[] = [];
 
 function makeWallet(label: string): Wallet {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), `sphere-scope-${label}-`));
@@ -112,6 +114,9 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
   });
 
   afterEach(async () => {
+    for (const sphere of extraSpheres.splice(0)) {
+      try { await sphere.destroy(); } catch { /* already torn down by the test */ }
+    }
     for (const wallet of wallets.splice(0)) {
       try {
         await wallet.sphere?.destroy();
@@ -209,5 +214,157 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
     // ...and B, which was NOT cleared, is still alive.
     expect(b.sphere!.isReady).toBe(true);
     expect(() => b.sphere!.payments).not.toThrow();
+  });
+
+  it('clear() destroys EVERY Sphere on that storage, not merely one of them', async () => {
+    // The registry maps a provider to a SET, because more than one Sphere can be built
+    // over one provider — the second one LOADS the wallet the first created. Tracking a
+    // single instance per storage would leave the other running over an emptied KV: the
+    // exact silent-death the scoping fix exists to prevent, just one level in.
+    const a = makeWallet('multi');
+    const first = await initWallet(a, MNEMONIC_A);
+
+    const { sphere: second, created } = await Sphere.init({
+      storage: a.storage,
+      transport: createMockTransport(),
+      oracle: a.oracle,
+      walletApi: makePv2World(NET).walletApi,
+      network: NET,
+    });
+    extraSpheres.push(second);
+    expect(created, 'the second init must LOAD the same wallet, not create another').toBe(false);
+    expect(second).not.toBe(first);
+    expect(first.isReady).toBe(true);
+    expect(second.isReady).toBe(true);
+
+    await Sphere.clear({ storage: a.storage });
+
+    expect(first.isReady).toBe(false);
+    expect(second.isReady).toBe(false);
+    expect(() => first.payments).toThrow();
+    expect(() => second.payments).toThrow();
+  });
+});
+
+/**
+ * #766: `importFromLegacyFile` / `importFromJSON` return the Sphere they built.
+ *
+ * importFromJSON used to DISCARD it, so importFromLegacyFile reached for the
+ * process-global instead — which held whichever Sphere was constructed last, not the
+ * one imported into the storage the caller supplied. Threading the instance out is
+ * what removed the global's last reader, and nothing failed when it was dropped: both
+ * call sites returned a `success: true` result either way.
+ */
+describe('the legacy-import entry points return the Sphere on the SUPPLIED storage (#766)', () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => [],
+        text: async () => '[]',
+      } as unknown as Response)),
+    );
+  });
+
+  afterEach(async () => {
+    for (const sphere of extraSpheres.splice(0)) {
+      try { await sphere.destroy(); } catch { /* already torn down by the test */ }
+    }
+    for (const wallet of wallets.splice(0)) {
+      try { await wallet.sphere?.destroy(); } catch { /* already torn down by the test */ }
+      fs.rmSync(wallet.dataDir, { recursive: true, force: true });
+    }
+    vi.unstubAllGlobals();
+  });
+
+  /** A real `sphere-wallet` backup of MNEMONIC_C, plus the identity it must restore. */
+  async function backupOfWalletC(): Promise<{ chainPubkey: string; withMnemonic: string; masterKeyOnly: string }> {
+    const c = makeWallet('c');
+    const sphereC = await initWallet(c, MNEMONIC_C);
+    const chainPubkey = sphereC.identity!.chainPubkey;
+    const withMnemonic = JSON.stringify(sphereC.exportToJSON());
+    const masterKeyOnly = JSON.stringify(sphereC.exportToJSON({ includeMnemonic: false }));
+    await sphereC.destroy();
+    c.sphere = undefined;
+    return { chainPubkey, withMnemonic, masterKeyOnly };
+  }
+
+  it('importFromLegacyFile threads the imported Sphere out, past a live one elsewhere', async () => {
+    const backup = await backupOfWalletC();
+
+    const b = makeWallet('b');
+    // A is built LAST, so it is exactly the instance the deleted process-global held.
+    const a = makeWallet('a');
+    const sphereA = await initWallet(a, MNEMONIC_A);
+
+    const result = await Sphere.importFromLegacyFile({
+      fileContent: backup.withMnemonic,
+      fileName: 'sphere-wallet-backup.json',
+      storage: b.storage,
+      transport: b.transport,
+      oracle: b.oracle,
+      walletApi: b.world.walletApi,
+      network: NET,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.sphere, 'the imported Sphere must reach the caller').toBeDefined();
+    b.sphere = result.sphere;
+
+    // It is the wallet that was imported, not the other live one.
+    expect(result.sphere).not.toBe(sphereA);
+    expect(result.sphere!.identity!.chainPubkey).toBe(backup.chainPubkey);
+    expect(result.sphere!.identity!.chainPubkey).not.toBe(sphereA.identity!.chainPubkey);
+
+    // ...and it is bound to the storage the CALLER supplied: clearing B tears it down
+    // (which an instance belonging to A's storage would survive), and A is untouched.
+    await Sphere.clear({ storage: b.storage });
+    expect(result.sphere!.isReady).toBe(false);
+    expect(sphereA.isReady).toBe(true);
+  });
+
+  it('importFromJSON returns the Sphere for the mnemonic branch', async () => {
+    const backup = await backupOfWalletC();
+    const b = makeWallet('b');
+
+    const result = await Sphere.importFromJSON({
+      jsonContent: backup.withMnemonic,
+      storage: b.storage,
+      transport: b.transport,
+      oracle: b.oracle,
+      walletApi: b.world.walletApi,
+      network: NET,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.mnemonic).toBe(MNEMONIC_C);
+    expect(result.sphere).toBeDefined();
+    b.sphere = result.sphere;
+    expect(result.sphere!.identity!.chainPubkey).toBe(backup.chainPubkey);
+  });
+
+  it('importFromJSON returns the Sphere for the master-key branch too', async () => {
+    // A backup with no mnemonic takes the OTHER return site — a second place the
+    // instance can be dropped, with the mnemonic branch still green.
+    const backup = await backupOfWalletC();
+    expect(JSON.parse(backup.masterKeyOnly).mnemonic).toBeUndefined();
+    const b = makeWallet('b');
+
+    const result = await Sphere.importFromJSON({
+      jsonContent: backup.masterKeyOnly,
+      storage: b.storage,
+      transport: b.transport,
+      oracle: b.oracle,
+      walletApi: b.world.walletApi,
+      network: NET,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.sphere).toBeDefined();
+    b.sphere = result.sphere;
+    expect(result.sphere!.identity!.chainPubkey).toBe(backup.chainPubkey);
   });
 });

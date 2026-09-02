@@ -286,3 +286,74 @@ describe('TokenRegistry#dispose', () => {
     }
   });
 });
+
+/**
+ * The STATIC teardown path. `resetInstance()` used to call only `stopAutoRefresh()`,
+ * which clears the interval but leaves `disposed` unset, the generation unchanged and
+ * the request already in the air still running — so a load past its entry guard re-armed
+ * the interval on an instance `getInstance()` could no longer return, and the fetch plus
+ * its 10s abort timer went on holding Node's event loop open. Clearing the timer is the
+ * half the old code got right, so the timer assertion alone cannot see the defect: the
+ * abort, the disposed flag and the refusal to re-arm are what separate the two.
+ */
+describe('TokenRegistry.resetInstance', () => {
+  it('disposes the outgoing singleton: interval cleared, in-flight fetch aborted, no re-arm', async () => {
+    vi.useFakeTimers();
+    const { storage } = makeStorage();
+    // The first fetch answers at once (so the interval really gets armed); every later
+    // one hangs until aborted, so a request is genuinely in the air at teardown.
+    const calls: string[] = [];
+    let aborted = 0;
+    const original = globalThis.fetch;
+    globalThis.fetch = ((input: unknown, init?: { signal?: AbortSignal }) => {
+      calls.push(String(input));
+      if (calls.length === 1) {
+        return Promise.resolve(new Response(JSON.stringify(defsA), { status: 200 }));
+      }
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          aborted++;
+          reject(new Error('aborted'));
+        });
+      });
+    }) as typeof globalThis.fetch;
+
+    try {
+      TokenRegistry.configure({ remoteUrl: URL_A, storage, autoRefresh: true, refreshIntervalMs: 1000 });
+      const registry = TokenRegistry.getInstance();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(hasLiveInterval(registry)).toBe(true);
+
+      // One interval tick later a second fetch is in the air and never settles.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(calls.length).toBe(2);
+      const timersBefore = vi.getTimerCount();
+      expect(timersBefore).toBeGreaterThan(0);
+
+      TokenRegistry.resetInstance();
+
+      expect(registry.isDisposed).toBe(true);
+      expect(hasLiveInterval(registry)).toBe(false);
+      expect(aborted).toBe(1);
+      expect(vi.getTimerCount()).toBeLessThan(timersBefore);
+
+      // Several intervals on, the discarded instance issues nothing.
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(calls.length).toBe(2);
+
+      // ...and nothing can re-arm it — the caller that still holds this reference is the
+      // one getInstance() can no longer hand back, so its timer would be unstoppable.
+      registry.startAutoRefresh(1000);
+      expect(hasLiveInterval(registry)).toBe(false);
+      expect(await registry.refreshFromRemote()).toBe(false);
+      expect(calls.length).toBe(2);
+
+      // Sanity: the singleton really was replaced, so this is not "reset did nothing".
+      const next = TokenRegistry.getInstance();
+      expect(next).not.toBe(registry);
+      expect(next.isDisposed).toBe(false);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});

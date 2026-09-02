@@ -1981,7 +1981,8 @@ export class Sphere {
   /**
    * Import wallet from JSON backup
    *
-   * @returns Object with success status and optionally recovered mnemonic
+   * @returns `{ success, sphere?, mnemonic?, error? }`. `sphere` is the instance built
+   *   on the SUPPLIED storage — hold it, there is no global to look it up from (#766).
    *
    * @example
    * ```ts

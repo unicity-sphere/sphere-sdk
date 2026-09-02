@@ -70,6 +70,10 @@ export interface StorageProvider extends BaseProvider {
    *  - a failed write must not brick later writes, and must still reject to its
    *    own caller.
    *
+   * A stored `index` must be a NON-NEGATIVE INTEGER. `deriveKeyAtPath` parseInt()s
+   * that path segment, so `1.5` derives index 1's keys and the row aliases a real
+   * address; such rows are dropped on read rather than repaired.
+   *
    * A union is safe because there is no delete path: entries are only ever added,
    * and wiping the wallet removes the key itself (`Sphere.clear()`). Adding a
    * per-entry delete would require revisiting this contract.

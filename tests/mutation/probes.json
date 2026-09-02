@@ -610,5 +610,105 @@
     "tests": [
       "tests/integration/tracked-addresses-concurrent.test.ts"
     ]
+  },
+  {
+    "name": "init-verification-not-forwarded-to-load",
+    "note": "#769.2: Sphere.init() forwards `verification` to load() - dropped, a consumer opting into the worker pool at the documented entry point silently gets the sequential verifier",
+    "file": "core/Sphere.ts",
+    "find": "\n        verification: options.verification,",
+    "replace": "\n        // mutant: verification dropped on the load branch",
+    "tests": [
+      "tests/unit/core/Sphere.init-verification.test.ts"
+    ]
+  },
+  {
+    "name": "init-verification-not-forwarded-to-create",
+    "note": "#769.2: the SAME forwarding on the create branch - each call site lists its options by hand, so one can be dropped with the other intact",
+    "file": "core/Sphere.ts",
+    "find": "\n      verification: options.verification,",
+    "replace": "\n      // mutant: verification dropped on the create branch",
+    "tests": [
+      "tests/unit/core/Sphere.init-verification.test.ts"
+    ]
+  },
+  {
+    "name": "live-registry-tracks-one-sphere-per-storage",
+    "note": "#766: _liveByStorage maps a provider to a SET - two Spheres can share one provider (the second LOADS the wallet the first created), and clear() must destroy both or one keeps running over an emptied KV",
+    "file": "core/Sphere.ts",
+    "find": "    let live = Sphere._liveByStorage.get(sphere._storage);\n    if (!live) {\n      live = new Set();\n      Sphere._liveByStorage.set(sphere._storage, live);\n    }\n    live.add(sphere);",
+    "replace": "    Sphere._liveByStorage.set(sphere._storage, new Set([sphere]));",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "importfromjson-discards-imported-sphere",
+    "note": "#766: importFromJSON must RETURN the Sphere it built - discarding it is what made importFromLegacyFile reach for the process-global and hand back the wrong instance",
+    "file": "core/Sphere.ts",
+    "find": "      // Import using mnemonic if available (preferred)\n      if (mnemonic) {\n        const sphere = await Sphere.import({ ...baseOptions, mnemonic, basePath });\n        return { success: true, sphere, mnemonic };",
+    "replace": "      // Import using mnemonic if available (preferred)\n      if (mnemonic) {\n        await Sphere.import({ ...baseOptions, mnemonic, basePath });\n        return { success: true, mnemonic };",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "importfromlegacyfile-drops-threaded-sphere",
+    "note": "#766: the sphere-wallet JSON branch threads importFromJSON's instance out to the caller - dropping it returns success with no Sphere at all",
+    "file": "core/Sphere.ts",
+    "find": "          return { success: true, sphere: result.sphere, mnemonic: result.mnemonic };",
+    "replace": "          return { success: true, mnemonic: result.mnemonic };",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "registry-resetinstance-skips-dispose",
+    "note": "#770.5: resetInstance() must DISPOSE the outgoing singleton, not merely stop its timer - stopAutoRefresh leaves `disposed` unset, the generation unchanged and the in-flight fetch (plus its 10s abort timer) running on an instance getInstance() can no longer return",
+    "file": "registry/TokenRegistry.ts",
+    "find": "    TokenRegistry.instance?.dispose();",
+    "replace": "    TokenRegistry.instance?.stopAutoRefresh();",
+    "tests": [
+      "tests/unit/registry/TokenRegistry.instances.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-addresses-merge-drop-idb",
+    "note": "#766 item 5: the browser IDB provider keeps its OWN copy of the read-merge-write; a wholesale write here is the same lost update the Node provider's probe guards",
+    "file": "impl/browser/storage/IndexedDBStorageProvider.ts",
+    "find": "        addresses: mergeTrackedAddresses(onDisk, entries),",
+    "replace": "        addresses: entries,",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-addresses-merge-drop-localstorage",
+    "note": "#766 item 5: and again in LocalStorageProvider - three implementations, three chances to regress to a wholesale write",
+    "file": "impl/browser/storage/LocalStorageProvider.ts",
+    "find": "        addresses: mergeTrackedAddresses(onDisk, entries),",
+    "replace": "        addresses: entries,",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-addresses-failed-write-bricks-chain",
+    "note": "#766 item 5: the serializing chain must swallow a rejection - carried forward, one transient write error freezes the registry for the life of the provider while every later caller still sees the ORIGINAL error",
+    "file": "impl/nodejs/storage/FileStorageProvider.ts",
+    "find": "    this.trackedWrites = run.then(() => undefined, () => undefined);",
+    "replace": "    this.trackedWrites = run;",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-address-index-aliases-real-address",
+    "note": "#766 review: the stored index must be a non-negative INTEGER - deriveKeyAtPath parseInt()s the path segment, so a 1.5 row derives index 1's keys and aliases a real address; Number.isFinite let 1.5 and negatives through",
+    "file": "storage/tracked-addresses.ts",
+    "find": "  if (typeof e.index !== 'number' || !Number.isInteger(e.index) || e.index < 0) return null;",
+    "replace": "  if (typeof e.index !== 'number' || !Number.isFinite(e.index)) return null;",
+    "tests": [
+      "tests/unit/storage/tracked-addresses.test.ts"
+    ]
   }
 ]

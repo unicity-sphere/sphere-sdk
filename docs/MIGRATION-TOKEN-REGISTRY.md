@@ -92,9 +92,12 @@ rather than a large one.
 
 ## Not fixed by this release
 
-`Sphere` still holds a process-global `static instance`, so `Sphere.getInstance()` and
-`isInitialized()` describe whichever Sphere was created last, and `Sphere.clear()` /
-`Sphere.import()` destroy whichever instance holds that static **regardless of which storage
-they were given**. Two `FileStorageProvider`s pointed at one `dataDir` also clobber each
-other's wallet file. Those are tracked in [#766](https://github.com/unicity-sphere/sphere-sdk/issues/766)
-and are the remainder of "create new ones at the same time".
+`Sphere.getInstance()`, `Sphere.isInitialized()` and the `getSphere` export are **removed**
+(see [#766](https://github.com/unicity-sphere/sphere-sdk/issues/766)); hold the instance the
+entry point returns, and use `sphere.isReady`. `Sphere.clear()` / `Sphere.import()` now
+destroy only Spheres built on the storage they are given.
+
+What remains: two `FileStorageProvider` objects pointed at one `dataDir` still clobber each
+other's wallet file — that provider caches the whole store in memory and rewrites the entire
+file on every `set()`, so it affects every key, not just one. Tracked as
+[#771](https://github.com/unicity-sphere/sphere-sdk/issues/771).
