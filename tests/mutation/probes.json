@@ -841,5 +841,95 @@
       "tests/unit/impl/backing-store-id.test.ts",
       "tests/integration/sphere-instance-scoping.test.ts"
     ]
+  },
+  {
+    "name": "transport-orphans-old-client-on-failed-swap",
+    "note": "#770.1: a failed setIdentity connect must dispose ONLY the replacement; without it the half-built client leaks one socket per retry",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "        try { nextClient.disconnect(); } catch { /* best-effort cleanup */ }\n        throw error;",
+    "replace": "        throw error;",
+    "tests": [
+      "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
+  },
+  {
+    "name": "transport-swaps-client-before-connect",
+    "note": "#770.1: the field must not move until the new client is connected, or a failed swap orphans the old client beyond disconnect()'s reach",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "      try {\n        await this.connectWithDeadline(\n          nextClient,",
+    "replace": "      this.nostrClient = nextClient;\n      try {\n        await this.connectWithDeadline(\n          nextClient,",
+    "tests": [
+      "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
+  },
+  {
+    "name": "transport-keeps-old-client-when-subscribe-throws",
+    "note": "#770.1: after the swap the old client is unreachable, so it must be disposed on EVERY path out of subscribeToEvents",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "      try {\n        await this.subscribeToEvents();\n      } finally {\n        try { oldClient.disconnect(); } catch { /* best-effort cleanup */ }\n      }",
+    "replace": "      await this.subscribeToEvents();\n      try { oldClient.disconnect(); } catch { /* best-effort cleanup */ }",
+    "tests": [
+      "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
+  },
+  {
+    "name": "transport-leaves-connect-deadline-timer-pending",
+    "note": "#770.1: Promise.race does not cancel the loser \u2014 an un-cleared setTimeout pins Node's event loop for config.timeout",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "      if (timer !== undefined) clearTimeout(timer);",
+    "replace": "      if (timer === undefined) clearTimeout(timer);",
+    "tests": [
+      "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
+  },
+  {
+    "name": "verifier-dispose-no-cancel",
+    "note": "#770.4: dispose() terminates the workers but the SDK pool never settles their tasks; without the race, verify() hangs forever and stop()/destroy() hang with it",
+    "file": "token-engine/factory.ts",
+    "find": "    return Promise.race([super.verify(...args), this.cancelSignal()]);",
+    "replace": "    return super.verify(...args);",
+    "tests": [
+      "tests/unit/token-engine/worker-verification.test.ts"
+    ]
+  },
+  {
+    "name": "verifier-cancel-resolves-not-rejects",
+    "note": "#770.4 MONEY: a cancelled verification must REJECT. Resolving a falsy verdict makes Receive.screen() rejectAck(entry,'invalid') \u2014 a VALID incoming token destroyed because an api-key change landed mid-drain",
+    "file": "token-engine/factory.ts",
+    "find": "      const promise = new Promise<never>((_resolve, rejectFn) => {\n        reject = rejectFn;\n      });",
+    "replace": "      const promise = new Promise<never>((resolveFn) => {\n        reject = resolveFn as unknown as (error: unknown) => void;\n      });",
+    "tests": [
+      "tests/unit/token-engine/worker-verification.test.ts"
+    ]
+  },
+  {
+    "name": "verifier-post-dispose-gate",
+    "note": "#770.4: a verify() started after dispose() must reject \u2014 a token needing no worker would otherwise be answered by a torn-down engine",
+    "file": "token-engine/factory.ts",
+    "find": "    if (this.disposed) return Promise.reject(disposedError());",
+    "replace": "    // probe",
+    "tests": [
+      "tests/unit/token-engine/worker-verification.test.ts"
+    ]
+  },
+  {
+    "name": "verifier-pool-resurrection",
+    "note": "#770.4: the SDK leaves workers/idle populated after dispose(), so an unguarded createWorker() resurrects the pool or hands back a terminated worker",
+    "file": "token-engine/factory.ts",
+    "find": "    if (this.disposed) throw disposedError();",
+    "replace": "    // probe",
+    "tests": [
+      "tests/unit/token-engine/worker-verification.test.ts"
+    ]
+  },
+  {
+    "name": "factory-networkid-not-from-trustbase",
+    "note": "#764/#765: the trust base is the SINGLE source of the engine's NetworkId. Hardcoding it (here: mainnet 1) makes a wallet verify money against the wrong chain \u2014 factory.test.ts decodes a real token to read the derived id offline",
+    "file": "token-engine/factory.ts",
+    "find": "    networkId: trustBase.networkId,",
+    "replace": "    networkId: trustBase.networkId.constructor.fromId(1),",
+    "tests": [
+      "tests/unit/token-engine/factory.test.ts"
+    ]
   }
 ]
