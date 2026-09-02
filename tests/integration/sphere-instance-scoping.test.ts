@@ -13,6 +13,12 @@
  * pinned — clearing an unrelated storage must NOT destroy A (tests 1 and 2), and
  * clearing A's OWN storage still MUST (test 3). Scoping that forgot the second half
  * would leave a Sphere alive on a KV that was just emptied under it.
+ *
+ * The scope is the BACKING STORE, not the provider object: two FileStorageProviders over
+ * one `dataDir` are distinct objects addressing one wallet.json, and object-identity
+ * keying made `clear()` through either of them destroy NEITHER of their Spheres — worse
+ * than the process-global it replaced, which at least destroyed one. `backingStoreId` is
+ * what they share; a provider that declares none keeps per-object scoping.
  */
 
 import * as fs from 'fs';
@@ -24,7 +30,8 @@ import { Sphere } from '../../core/Sphere';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
-import type { ProviderStatus } from '../../types';
+import type { StorageProvider } from '../../storage';
+import type { ProviderStatus, TrackedAddressEntry } from '../../types';
 import { makePv2World, createEngineOracle, type Pv2World } from '../support/pv2-world';
 
 const NET = 'testnet2' as const;
@@ -56,6 +63,50 @@ function createMockTransport(): TransportProvider {
     publishIdentityBinding: vi.fn().mockResolvedValue(true),
     recoverNametag: vi.fn().mockResolvedValue(null),
   } as unknown as TransportProvider;
+}
+
+/**
+ * A StorageProvider with NO `backingStoreId`, so liveness falls back to object identity.
+ * Two of these over one `shared` Map are the same store as far as the DATA is concerned —
+ * exactly the case the port member exists to declare, and this one declines to.
+ */
+class SharedMemoryStorage implements StorageProvider {
+  readonly id = 'shared-memory';
+  readonly name = 'Shared Memory Storage';
+  readonly type = 'local' as const;
+  private connected = false;
+
+  constructor(private readonly shared: Map<string, string>) {}
+
+  async connect(): Promise<void> { this.connected = true; }
+  async disconnect(): Promise<void> { this.connected = false; }
+  isConnected(): boolean { return this.connected; }
+  getStatus(): ProviderStatus { return this.connected ? 'connected' : 'disconnected'; }
+  setIdentity(): void {}
+  async get(key: string): Promise<string | null> { return this.shared.get(key) ?? null; }
+  async set(key: string, value: string): Promise<void> { this.shared.set(key, value); }
+  async remove(key: string): Promise<void> { this.shared.delete(key); }
+  async has(key: string): Promise<boolean> { return this.shared.has(key); }
+  async keys(prefix?: string): Promise<string[]> {
+    const all = Array.from(this.shared.keys());
+    return prefix ? all.filter((k) => k.startsWith(prefix)) : all;
+  }
+  async clear(prefix?: string): Promise<void> {
+    for (const k of await this.keys(prefix)) this.shared.delete(k);
+  }
+  async saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void> {
+    this.shared.set('__tracked_addresses', JSON.stringify(entries));
+  }
+  async loadTrackedAddresses(): Promise<TrackedAddressEntry[]> {
+    const raw = this.shared.get('__tracked_addresses');
+    return raw ? (JSON.parse(raw) as TrackedAddressEntry[]) : [];
+  }
+}
+
+/** The private live registry — keys are stores, so two providers over one share an entry. */
+function liveStoreKeys(): string[] {
+  const registry = (Sphere as unknown as { _liveByStorage: Map<string, Set<Sphere>> })._liveByStorage;
+  return Array.from(registry.keys());
 }
 
 /** One wallet's worth of independent providers — its own dataDir, storage, transport. */
@@ -243,6 +294,95 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
     expect(second.isReady).toBe(false);
     expect(() => first.payments).toThrow();
     expect(() => second.payments).toThrow();
+  });
+
+  it('clear() through one provider destroys the Spheres of every provider on that STORE', async () => {
+    // Two provider OBJECTS over one dataDir address one wallet.json. Keyed by object
+    // identity they are unrelated, so clear() through `a.storage` destroyed neither the
+    // twin's Sphere nor anything else — it just emptied the file under a live wallet.
+    const a = makeWallet('twin');
+    const first = await initWallet(a, MNEMONIC_A);
+
+    const twin = new FileStorageProvider({ dataDir: a.dataDir });
+    expect(twin).not.toBe(a.storage);
+    expect(twin.backingStoreId).toBe(a.storage.backingStoreId);
+
+    const { sphere: second, created } = await Sphere.init({
+      storage: twin,
+      transport: createMockTransport(),
+      oracle: a.oracle,
+      walletApi: makePv2World(NET).walletApi,
+      network: NET,
+    });
+    extraSpheres.push(second);
+    expect(created, 'the twin provider must LOAD the wallet the first created').toBe(false);
+    expect(second.identity!.chainPubkey).toBe(first.identity!.chainPubkey);
+
+    await Sphere.clear({ storage: a.storage });
+
+    expect(first.isReady).toBe(false);
+    expect(second.isReady, 'the twin addresses the KV clear() just emptied').toBe(false);
+    expect(() => second.payments).toThrow();
+  });
+
+  it('the live registry drops a store entry once its last Sphere is destroyed', async () => {
+    // The map is keyed by STRING now, so nothing collects an emptied Set for us: every
+    // dataDir a process ever opened would be retained, with a dead Sphere inside it.
+    const before = liveStoreKeys().length;
+
+    const a = makeWallet('bounded');
+    const first = await initWallet(a, MNEMONIC_A);
+    const { sphere: second } = await Sphere.init({
+      storage: new FileStorageProvider({ dataDir: a.dataDir }),
+      transport: createMockTransport(),
+      oracle: a.oracle,
+      walletApi: makePv2World(NET).walletApi,
+      network: NET,
+    });
+    extraSpheres.push(second);
+
+    expect(liveStoreKeys().length, 'both providers share ONE entry').toBe(before + 1);
+
+    await first.destroy();
+    expect(liveStoreKeys().length, 'the second Sphere still holds the entry').toBe(before + 1);
+
+    await second.destroy();
+    expect(liveStoreKeys().length, 'the emptied Set must be removed, not left behind').toBe(before);
+  });
+
+  it('a provider that declares no backing store keeps object-identity scoping', async () => {
+    // The documented fallback for custom implementations: without `backingStoreId` the
+    // SDK cannot know two objects share data, so it scopes each one to itself — the
+    // pre-existing behaviour, and it must not degrade into one shared bucket for all.
+    const shared = new Map<string, string>();
+    const memA: StorageProvider = new SharedMemoryStorage(shared);
+    const memB: StorageProvider = new SharedMemoryStorage(shared);
+    expect(memA.backingStoreId).toBeUndefined();
+
+    const { sphere: sphereA } = await Sphere.init({
+      storage: memA,
+      transport: createMockTransport(),
+      oracle: createEngineOracle(),
+      walletApi: makePv2World(NET).walletApi,
+      network: NET,
+      mnemonic: MNEMONIC_A,
+    });
+    extraSpheres.push(sphereA);
+
+    const { sphere: sphereB, created } = await Sphere.init({
+      storage: memB,
+      transport: createMockTransport(),
+      oracle: createEngineOracle(),
+      walletApi: makePv2World(NET).walletApi,
+      network: NET,
+    });
+    extraSpheres.push(sphereB);
+    expect(created, 'memB reads the same Map, so it LOADS').toBe(false);
+
+    await Sphere.clear({ storage: memA });
+
+    expect(sphereA.isReady).toBe(false);
+    expect(sphereB.isReady, 'undeclared stores stay scoped per object').toBe(true);
   });
 });
 

@@ -22,10 +22,16 @@ Not deprecated, because the defect survives deprecation: after a second Sphere w
 Both keyed off the removed static rather than the storage they were handed, so
 `Sphere.import({ storage: B })` destroyed a live wallet on storage **A**: identity nulled,
 `payments` throwing `NOT_INITIALIZED`, providers disconnected, and every `sphere.on()`
-handler dropped with no event and no error. They are now scoped by provider object identity
-(`StorageProvider.id` is a class constant, so comparing it would still have hit the wrong
-instance). The `exists(storage)` disjunct is preserved — that is the storage-wipe contract
-consumers actually depend on.
+handler dropped with no event and no error. They are now scoped by the **backing store** the
+provider addresses, reported by a new optional `StorageProvider.backingStoreId` — the resolved
+wallet path for `FileStorageProvider`, `dbName` + key prefix for `IndexedDBStorageProvider`,
+the `Storage` object + prefix for `LocalStorageProvider`. Neither of the two obvious keys
+works: `StorageProvider.id` is a class constant, so it collides every wallet in the process;
+provider *object* identity is too narrow the other way — two providers over one `dataDir` are
+distinct objects addressing one wallet.json, so it would have destroyed NEITHER of their
+Spheres, leaving a live wallet over a KV that was just emptied. A custom provider that declares
+no `backingStoreId` keeps per-object scoping, unchanged. The `exists(storage)` disjunct is
+preserved — that is the storage-wipe contract consumers actually depend on.
 
 `importFromLegacyFile` returned the wrong Sphere under an interleaved init, because
 `importFromJSON` discarded the one it built; it is now threaded out (additive).

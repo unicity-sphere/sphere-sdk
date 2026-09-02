@@ -30,6 +30,8 @@ export class FileStorageProvider implements StorageProvider {
   readonly id = 'file-storage';
   readonly name = 'File Storage';
   readonly type = 'local' as const;
+  /** The resolved wallet file — two providers over one path share erasure (#766). */
+  readonly backingStoreId: string;
 
   private dataDir: string;
   private filePath: string;
@@ -49,6 +51,7 @@ export class FileStorageProvider implements StorageProvider {
       this.network = config.network;
     }
     this.isTxtMode = this.filePath.endsWith('.txt');
+    this.backingStoreId = `file:${path.resolve(this.filePath)}`;
   }
 
   setIdentity(identity: FullIdentity): void {

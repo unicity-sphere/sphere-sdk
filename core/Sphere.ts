@@ -458,12 +458,16 @@ export interface AddressModuleSet {
 // =============================================================================
 
 export class Sphere {
-  // Live Spheres, keyed by the StorageProvider whose data they own. NOT a liveness API:
-  // it exists only so clear()/import() tear down the instances that actually use the
-  // storage they were handed, instead of whichever Sphere was constructed last. Keyed by
-  // object identity, so Spheres on different providers never see each other. Two
-  // providers over one dataDir/DB are still distinct keys — see #766.
-  private static readonly _liveByStorage = new WeakMap<StorageProvider, Set<Sphere>>();
+  // Live Spheres, keyed by the BACKING STORE their provider addresses. NOT a liveness
+  // API: it exists only so clear()/import() tear down the instances whose data they
+  // really erase. Object identity was too narrow — two providers over one dataDir/DB
+  // are different objects but the same file, so clearing through one left the other's
+  // Sphere live over an emptied KV (#766).
+  private static readonly _liveByStorage = new Map<string, Set<Sphere>>();
+
+  /** Fallback keys for providers that declare no `backingStoreId` — one per object. */
+  private static readonly _objectStoreKeys = new WeakMap<StorageProvider, string>();
+  private static _objectStoreSeq = 0;
 
   // One-time best-effort cleanup of the orphaned vesting cache (prior versions).
   private static _orphanCacheCleaned = false;
@@ -1307,23 +1311,46 @@ export class Sphere {
     } catch { /* ignore — cleanup is best-effort */ }
   }
 
+  /**
+   * The key a provider registers under: the store it addresses, so every provider
+   * over one dataDir/DB shares an entry. A provider that declares no store keeps a
+   * private key, leaving custom implementations scoped by object identity.
+   */
+  private static storeKeyOf(storage: StorageProvider): string {
+    const declared = storage.backingStoreId;
+    if (declared) return `store:${declared}`;
+    let key = Sphere._objectStoreKeys.get(storage);
+    if (!key) {
+      key = `object:${++Sphere._objectStoreSeq}`;
+      Sphere._objectStoreKeys.set(storage, key);
+    }
+    return key;
+  }
+
   /** Record a fully-built Sphere against the storage it owns. See `_liveByStorage`. */
   private static registerLive(sphere: Sphere): void {
-    let live = Sphere._liveByStorage.get(sphere._storage);
+    const key = Sphere.storeKeyOf(sphere._storage);
+    let live = Sphere._liveByStorage.get(key);
     if (!live) {
       live = new Set();
-      Sphere._liveByStorage.set(sphere._storage, live);
+      Sphere._liveByStorage.set(key, live);
     }
     live.add(sphere);
   }
 
   private static unregisterLive(sphere: Sphere): void {
-    Sphere._liveByStorage.get(sphere._storage)?.delete(sphere);
+    const key = Sphere.storeKeyOf(sphere._storage);
+    const live = Sphere._liveByStorage.get(key);
+    if (!live) return;
+    live.delete(sphere);
+    // String keys mean the map holds them strongly: an emptied Set must go, or every
+    // store ever opened is retained for the life of the process.
+    if (live.size === 0) Sphere._liveByStorage.delete(key);
   }
 
   /** Snapshot — callers iterate this while destroy() mutates the underlying Set. */
   private static liveOn(storage: StorageProvider): Sphere[] {
-    return Array.from(Sphere._liveByStorage.get(storage) ?? []);
+    return Array.from(Sphere._liveByStorage.get(Sphere.storeKeyOf(storage)) ?? []);
   }
 
   /**

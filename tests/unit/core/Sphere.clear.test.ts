@@ -76,12 +76,15 @@ describe('Sphere.clear()', () => {
       const storage = createMockStorage();
 
       // A live Sphere registered against THIS storage. clear() must tear it down before
-      // wiping the KV out from under it. Seeded straight into the private per-storage
-      // registry that replaced the process-global singleton (#766); the mock's destroy()
-      // deregisters itself the way the real Sphere.destroy() does.
-      const liveByStorage = (Sphere as unknown as {
-        _liveByStorage: WeakMap<object, Set<unknown>>;
-      })._liveByStorage;
+      // wiping the KV out from under it. Seeded straight into the private registry that
+      // replaced the process-global singleton (#766) — under the key the provider itself
+      // resolves to, since that registry is keyed by BACKING STORE, not by object. The
+      // mock's destroy() deregisters itself the way the real Sphere.destroy() does.
+      const sphereStatics = Sphere as unknown as {
+        _liveByStorage: Map<string, Set<unknown>>;
+        storeKeyOf(storage: StorageProvider): string;
+      };
+      const liveByStorage = sphereStatics._liveByStorage;
       const registered = new Set<unknown>();
       const mockInstance = {
         destroy: vi.fn(async () => {
@@ -89,7 +92,7 @@ describe('Sphere.clear()', () => {
         }),
       };
       registered.add(mockInstance);
-      liveByStorage.set(storage, registered);
+      liveByStorage.set(sphereStatics.storeKeyOf(storage), registered);
 
       await Sphere.clear({ storage });
 

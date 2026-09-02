@@ -633,10 +633,10 @@
   },
   {
     "name": "live-registry-tracks-one-sphere-per-storage",
-    "note": "#766: _liveByStorage maps a provider to a SET - two Spheres can share one provider (the second LOADS the wallet the first created), and clear() must destroy both or one keeps running over an emptied KV",
+    "note": "#766: _liveByStorage maps a STORE to a SET - more than one Sphere can run over one store (a second provider LOADS the wallet the first created), and clear() must destroy all of them or one keeps running over an emptied KV",
     "file": "core/Sphere.ts",
-    "find": "    let live = Sphere._liveByStorage.get(sphere._storage);\n    if (!live) {\n      live = new Set();\n      Sphere._liveByStorage.set(sphere._storage, live);\n    }\n    live.add(sphere);",
-    "replace": "    Sphere._liveByStorage.set(sphere._storage, new Set([sphere]));",
+    "find": "    const key = Sphere.storeKeyOf(sphere._storage);\n    let live = Sphere._liveByStorage.get(key);\n    if (!live) {\n      live = new Set();\n      Sphere._liveByStorage.set(key, live);\n    }\n    live.add(sphere);",
+    "replace": "    Sphere._liveByStorage.set(Sphere.storeKeyOf(sphere._storage), new Set([sphere]));",
     "tests": [
       "tests/integration/sphere-instance-scoping.test.ts"
     ]
@@ -769,6 +769,37 @@
     "replace": "  return typeof value === 'number' && Number.isInteger(value) && value <= 0xffffffff;",
     "tests": [
       "tests/unit/storage/tracked-addresses.test.ts"
+    ]
+  },
+  {
+    "name": "live-registry-keyed-by-object-not-store",
+    "note": "#766 review: liveness must key on the BACKING STORE, not the provider object. Two FileStorageProviders over one dataDir are distinct objects addressing one wallet.json, so object keying makes clear() through either destroy NEITHER Sphere - worse than the process-global it replaced, which destroyed one.",
+    "file": "core/Sphere.ts",
+    "find": "    const declared = storage.backingStoreId;",
+    "replace": "    const declared: string | undefined = undefined; // mutant: object identity again",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "live-registry-entry-never-released",
+    "note": "#766 review: the map is keyed by STRING now, so nothing collects an emptied Set - every store the process ever opened would be retained, each holding a destroyed Sphere",
+    "file": "core/Sphere.ts",
+    "find": "    if (live.size === 0) Sphere._liveByStorage.delete(key);",
+    "replace": "    void live.size; // mutant: the emptied Set stays and the map grows forever",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "file-backing-store-id-is-a-class-constant",
+    "note": "#766 review: backingStoreId identifies the STORE. A constant (what `id` is) makes every FileStorageProvider in the process one store, so clear() on one wallet tears down every live Sphere - the exact cross-wallet kill #766 removed.",
+    "file": "impl/nodejs/storage/FileStorageProvider.ts",
+    "find": "    this.backingStoreId = `file:${path.resolve(this.filePath)}`;",
+    "replace": "    this.backingStoreId = 'file:'; // mutant: a class constant, every wallet collides",
+    "tests": [
+      "tests/unit/impl/backing-store-id.test.ts",
+      "tests/integration/sphere-instance-scoping.test.ts"
     ]
   }
 ]

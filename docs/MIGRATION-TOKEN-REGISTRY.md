@@ -102,14 +102,25 @@ They could not be safely deprecated: after a second Sphere is created *and destr
 note does not stop a wrong answer being consumed.
 
 `Sphere.clear()` and `Sphere.import()` now destroy only Spheres built on the storage they are
-given, compared by object identity. Previously they destroyed whichever Sphere was constructed
-last — so `Sphere.import({ storage: B })` killed a live wallet on storage A, dropping every
-`sphere.on()` handler with no event and no error. The `exists(storage)` behaviour that callers
-actually depend on is unchanged.
+given — scoped by the **backing store** that storage addresses, not by the provider object.
+Previously they destroyed whichever Sphere was constructed last, so `Sphere.import({ storage: B })`
+killed a live wallet on storage A, dropping every `sphere.on()` handler with no event and no
+error. The `exists(storage)` behaviour that callers actually depend on is unchanged.
+
+The store is reported by a new optional `StorageProvider.backingStoreId`: the resolved wallet
+path for `FileStorageProvider`, `dbName` + key prefix for `IndexedDBStorageProvider`, the
+`Storage` object + prefix for `LocalStorageProvider`. Custom providers need not implement it —
+without it, each object is scoped to itself, as before.
 
 ## Not fixed by this release
 
 Two `FileStorageProvider` objects pointed at one `dataDir` still clobber each other's wallet
-file — that provider caches the whole store in memory and rewrites the entire file on every
-`set()`, so it affects every key, money journals included, not just one. Tracked as
+file while both are live: that provider caches the whole store in memory and rewrites the
+entire file on every `set()`, so a stale in-memory copy overwrites every key, money journals
+included, not just the one being written. Tracked as
 [#771](https://github.com/unicity-sphere/sphere-sdk/issues/771).
+
+Only the **concurrent-write** half is still open. The **teardown** half is fixed above: the two
+objects report the same `backingStoreId`, so `Sphere.clear()` through either one destroys every
+live Sphere on that file instead of leaving one running over a wallet that was just emptied
+underneath it.

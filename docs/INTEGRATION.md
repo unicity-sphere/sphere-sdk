@@ -798,6 +798,14 @@ interface StorageProvider {
   isConnected(): boolean;
   getStatus(): ProviderStatus;
 
+  /**
+   * Optional, but supply it if two provider objects can address one store: two
+   * instances returning the same value share erasure, so `Sphere.clear()` tears
+   * down the live Spheres of both. Identify the STORE (path / database + prefix),
+   * never the class. Omitted, liveness falls back to per-object identity.
+   */
+  readonly backingStoreId?: string;
+
   setIdentity(identity: FullIdentity): void;
   get(key: string): Promise<string | null>;
   set(key: string, value: string): Promise<void>;

@@ -36,11 +36,31 @@ export interface LocalStorageProviderConfig {
 // Implementation
 // =============================================================================
 
+/**
+ * Per-`Storage` tags for `backingStoreId`. The prefix alone does not identify the
+ * store: an SSR fallback mints a private in-memory `Storage` per provider, so two
+ * providers with the same prefix over different objects hold unrelated data. Weak,
+ * lazily assigned, and process-local — it is only ever compared with itself.
+ */
+const storageObjectTags = new WeakMap<Storage, string>();
+let storageObjectSeq = 0;
+
+function storageObjectTag(storage: Storage): string {
+  let tag = storageObjectTags.get(storage);
+  if (!tag) {
+    tag = String(++storageObjectSeq);
+    storageObjectTags.set(storage, tag);
+  }
+  return tag;
+}
+
 export class LocalStorageProvider implements StorageProvider {
   readonly id = 'localStorage';
   readonly name = 'Local Storage';
   readonly type = 'local' as const;
   readonly description = 'Browser localStorage for single-device persistence';
+  /** The `Storage` object + prefix — two providers over one pair share erasure (#766). */
+  readonly backingStoreId: string;
 
   private config: Required<Pick<LocalStorageProviderConfig, 'prefix' | 'debug'>> & {
     storage: Storage;
@@ -59,6 +79,8 @@ export class LocalStorageProvider implements StorageProvider {
       debug: config?.debug ?? false,
     };
     this.network = config?.network;
+    this.backingStoreId =
+      `localstorage:${storageObjectTag(storage)}:${encodeURIComponent(this.config.prefix)}`;
   }
 
   // ===========================================================================

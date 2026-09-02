@@ -15,6 +15,26 @@ import type { BaseProvider, FullIdentity, TrackedAddressEntry } from '../types';
  */
 export interface StorageProvider extends BaseProvider {
   /**
+   * Stable identity of the BACKING STORE this provider addresses — not of this
+   * object, and not of the class (`id` is a class constant like `'file-storage'`,
+   * which is exactly the wrong granularity).
+   *
+   * Two providers that return the SAME value address the same data, so erasing
+   * through one erases through the other: `Sphere.clear({ storage })` tears down
+   * the live Spheres of every provider sharing this value, not merely those built
+   * on this object. Compose it from everything that selects the store (file path,
+   * database name, key prefix) behind a scheme prefix, so two kinds of store can
+   * never collide on one string.
+   *
+   * It must not change over the provider's lifetime — it is read again on teardown,
+   * and a value that moved would strand the entry it was registered under.
+   *
+   * Optional: omit it and liveness falls back to per-object identity, i.e. a
+   * second provider over the same data is treated as unrelated.
+   */
+  readonly backingStoreId?: string;
+
+  /**
    * Set identity for scoped storage
    */
   setIdentity(identity: FullIdentity): void;

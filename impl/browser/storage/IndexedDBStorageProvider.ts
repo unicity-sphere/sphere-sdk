@@ -48,6 +48,8 @@ export class IndexedDBStorageProvider implements StorageProvider {
   readonly name = 'IndexedDB Storage';
   readonly type = 'local' as const;
   readonly description = 'Browser IndexedDB for large-capacity persistence';
+  /** The database + prefix pair — two providers over one pair share erasure (#766). */
+  readonly backingStoreId: string;
 
   private prefix: string;
   private dbName: string;
@@ -64,6 +66,8 @@ export class IndexedDBStorageProvider implements StorageProvider {
     this.dbName = config?.dbName ?? DB_NAME;
     this.network = config?.network;
     this.debug = config?.debug ?? false;
+    this.backingStoreId =
+      `indexeddb:${encodeURIComponent(this.dbName)}:${encodeURIComponent(this.prefix)}`;
   }
 
   // ===========================================================================
