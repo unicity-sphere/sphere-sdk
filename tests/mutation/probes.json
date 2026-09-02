@@ -61,7 +61,7 @@
   },
   {
     "name": "requests-clear-link-on-failed-respond",
-    "note": "the settlement invariant: a settling link is removed ONLY by a CONFIRMED paid respond or a proven clean pre-commit failure — clearing it on a failed respond makes a paid request payable again after reload (requests.test.ts 'send-succeeds-respond-5xx')",
+    "note": "the settlement invariant: a settling link is removed ONLY by a CONFIRMED paid respond or a proven clean pre-commit failure \u2014 clearing it on a failed respond makes a paid request payable again after reload (requests.test.ts 'send-succeeds-respond-5xx')",
     "file": "modules/payments-v2/requests/Requests.ts",
     "find": "    if (!(opts.respond && (await this.respondPaid(requestId, transferId)))) {\n      this.setStatus(requestId, journalDown ? 'paid' : 'settling');\n      return;\n    }",
     "replace": "    const confirmed = opts.respond && (await this.respondPaid(requestId, transferId));\n    await this.clearLink(requestId).catch(() => undefined);\n    if (!confirmed) {\n      this.setStatus(requestId, journalDown ? 'paid' : 'settling');\n      return;\n    }",
@@ -101,7 +101,7 @@
   },
   {
     "name": "receive-ignores-epoch-bump",
-    "note": "§5.1/§5.7: the mailbox cursor must never survive a server restore — keeping it across an epoch bump silently loses every deposit whose post-restore seq is below the stale cursor (sphere-payments-v2-restore.test.ts missed-wake case + receive.test.ts self-detection)",
+    "note": "\u00a75.1/\u00a75.7: the mailbox cursor must never survive a server restore \u2014 keeping it across an epoch bump silently loses every deposit whose post-restore seq is below the stale cursor (sphere-payments-v2-restore.test.ts missed-wake case + receive.test.ts self-detection)",
     "file": "modules/payments-v2/receive/Receive.ts",
     "find": "        const served = deps.delivery.incomingEpoch();\n        if (basis === null || served === null || served === basis.syncEpoch) break;",
     "replace": "        const served = deps.delivery.incomingEpoch();\n        void served;\n        break;",
@@ -122,7 +122,7 @@
   },
   {
     "name": "receive-claim-conflict-swallow",
-    "note": "§5.7: a CONFLICT-bucket claim is terminally rejected('other') so the cursor advances — reverting to the swallow re-processes the entry every drain forever (receive.test.ts 'a CONFLICT-bucket claim is terminally rejected')",
+    "note": "\u00a75.7: a CONFLICT-bucket claim is terminally rejected('other') so the cursor advances \u2014 reverting to the swallow re-processes the entry every drain forever (receive.test.ts 'a CONFLICT-bucket claim is terminally rejected')",
     "file": "modules/payments-v2/receive/Receive.ts",
     "find": "    if (ack.disposition !== 'claimed' || !isClaimConflict(err)) throw err;",
     "replace": "    throw err;",
@@ -132,7 +132,7 @@
   },
   {
     "name": "receive-genesis-only-dedup",
-    "note": "dedup is (tokenId, stateHash), a re-acquired token at a new state is accepted (receive.test.ts 'A→B→A')",
+    "note": "dedup is (tokenId, stateHash), a re-acquired token at a new state is accepted (receive.test.ts 'A\u2192B\u2192A')",
     "file": "modules/payments-v2/receive/Receive.ts",
     "find": "  if (held === keys.stateHash) return { kind: 'ack', ack: claimAck(entry) };",
     "replace": "  if (held !== null) return { kind: 'ack', ack: claimAck(entry) };",
@@ -162,7 +162,7 @@
   },
   {
     "name": "providers-deliveryid-from-seq",
-    "note": "deliveryId is content-derived hex(SHA-256(tokenId ‖ stateHash)), never a server seq (providers.test.ts delivery-port contract)",
+    "note": "deliveryId is content-derived hex(SHA-256(tokenId \u2016 stateHash)), never a server seq (providers.test.ts delivery-port contract)",
     "file": "impl/wallet-api-v2/mailbox.ts",
     "find": "      deliveryId: entry.entryId,",
     "replace": "      deliveryId: String(entry.seq),",
@@ -192,7 +192,7 @@
   },
   {
     "name": "heartbeat-never-scheduled",
-    "note": "§7 in-session convergence: the heartbeat must actually schedule ticks — a keep-open send would otherwise sit half-done until app restart (heartbeat.test.ts in-session test)",
+    "note": "\u00a77 in-session convergence: the heartbeat must actually schedule ticks \u2014 a keep-open send would otherwise sit half-done until app restart (heartbeat.test.ts in-session test)",
     "file": "modules/payments-v2/convergence.ts",
     "find": "  private schedule(delayMs: number): void {\n    this.clearTimer();\n    if (!this.running) return;",
     "replace": "  private schedule(delayMs: number): void {\n    this.clearTimer();\n    if (delayMs >= 0) return;\n    if (!this.running) return;",
@@ -202,7 +202,7 @@
   },
   {
     "name": "facade-swallow-clean-failure-emit",
-    "note": "§4/#728: a CLEAN send failure emits transfer:updated{status:'failed'} before the rejection surfaces (facade.test.ts 'a CLEAN failure emits transfer:updated{status:failed}')",
+    "note": "\u00a74/#728: a CLEAN send failure emits transfer:updated{status:'failed'} before the rejection surfaces (facade.test.ts 'a CLEAN failure emits transfer:updated{status:failed}')",
     "file": "modules/payments-v2/PaymentsFacade.ts",
     "find": "    this.deps.emit('transfer:updated', failed);",
     "replace": "    void failed;",
@@ -212,7 +212,7 @@
   },
   {
     "name": "resume-reissues-fresh-transferid",
-    "note": "the retry path converges under the SAME transferId — a fresh id is a re-issued send and double-pays (#631/#676) (heartbeat.test.ts no-reissue asserts)",
+    "note": "the retry path converges under the SAME transferId \u2014 a fresh id is a re-issued send and double-pays (#631/#676) (heartbeat.test.ts no-reissue asserts)",
     "file": "modules/payments-v2/machine/resume.ts",
     "find": "    await ctx.machine.resumeIntent({\n      transferId: job.transferId,",
     "replace": "    await ctx.machine.resumeIntent({\n      transferId: `${job.transferId}:reissued`,",
@@ -222,7 +222,7 @@
   },
   {
     "name": "wiring-stamps-session-network-on-peer",
-    "note": "#733: the peer branch reports only what the binding PROVES — stamping the session network makes the §5.6 guard compare it with itself, i.e. unfalsifiable (facade.test.ts network-guard asserts)",
+    "note": "#733: the peer branch reports only what the binding PROVES \u2014 stamping the session network makes the \u00a75.6 guard compare it with itself, i.e. unfalsifiable (facade.test.ts network-guard asserts)",
     "file": "core/payments-v2-wiring.ts",
     "find": "    network: peer.network || null,",
     "replace": "    network,",
@@ -232,7 +232,7 @@
   },
   {
     "name": "transport-drops-network-from-raw-event",
-    "note": "#735 review: the transport-pubkey route is the ONE recipient route that can prove a network today — it must read the raw signed event, not lose it (recipient-network.transport.test.ts refuses a relay-declared foreign network end to end)",
+    "note": "#735 review: the transport-pubkey route is the ONE recipient route that can prove a network today \u2014 it must read the raw signed event, not lose it (recipient-network.transport.test.ts refuses a relay-declared foreign network end to end)",
     "file": "transport/NostrTransportProvider.ts",
     "find": "      const network = declaredNetwork(bindingEvent);",
     "replace": "      const network = undefined as string | undefined;",
@@ -242,7 +242,7 @@
   },
   {
     "name": "transport-invents-network-on-parsed-binding",
-    "note": "#735 review: the SDK-parsed @nametag/DIRECT:// routes cannot prove a network (parseBindingInfo whitelists it away) and must NOT invent one — a stamp silences the recipient:network-unverified signal, which is the #733 bug wearing a new hat (recipient-network.transport.test.ts LIMITATION asserts)",
+    "note": "#735 review: the SDK-parsed @nametag/DIRECT:// routes cannot prove a network (parseBindingInfo whitelists it away) and must NOT invent one \u2014 a stamp silences the recipient:network-unverified signal, which is the #733 bug wearing a new hat (recipient-network.transport.test.ts LIMITATION asserts)",
     "file": "transport/NostrTransportProvider.ts",
     "find": "    return {\n      nametag: nametag || binding.nametag,",
     "replace": "    return {\n      network: 'testnet2',\n      nametag: nametag || binding.nametag,",
@@ -252,7 +252,7 @@
   },
   {
     "name": "inventory-pinned-counts-as-confirmed",
-    "note": "#737: a token pinned by an open intent is reported transferring, never confirmed/spendable — the reporter reads the reservation, not just this session's in-flight set",
+    "note": "#737: a token pinned by an open intent is reported transferring, never confirmed/spendable \u2014 the reporter reads the reservation, not just this session's in-flight set",
     "file": "modules/payments-v2/compose.ts",
     "find": "    isPinned: (tokenId) => ledger.unprovenReason() !== null || ledger.holderOf(tokenId) !== undefined,",
     "replace": "    isPinned: () => false,",
@@ -262,7 +262,7 @@
   },
   {
     "name": "queue-refusal-hides-the-pin",
-    "note": "#737: SEND_INSUFFICIENT_BALANCE must name the pinned amount and the transfers holding it — 'insufficient balance' alone sent a user auditing a treasury that was never short",
+    "note": "#737: SEND_INSUFFICIENT_BALANCE must name the pinned amount and the transfers holding it \u2014 'insufficient balance' alone sent a user auditing a treasury that was never short",
     "file": "modules/payments-v2/select/queue.ts",
     "find": "    view.pinnedTotal > 0n",
     "replace": "    (false as boolean)",
@@ -302,7 +302,7 @@
   },
   {
     "name": "report-ignores-unproven-heldset",
-    "note": "#738: while the held-set is unproven the REPORT must agree with the refusal — otherwise a treasury reads fully spendable while every send is refused (#737's complaint).",
+    "note": "#738: while the held-set is unproven the REPORT must agree with the refusal \u2014 otherwise a treasury reads fully spendable while every send is refused (#737's complaint).",
     "file": "modules/payments-v2/compose.ts",
     "find": "    isPinned: (tokenId) => ledger.unprovenReason() !== null || ledger.holderOf(tokenId) !== undefined,",
     "replace": "    isPinned: (tokenId) => ledger.holderOf(tokenId) !== undefined,",
@@ -373,7 +373,7 @@
   },
   {
     "name": "proof-wait-retries-everything",
-    "note": "#741: tolerance must be scoped to transient statuses — retrying a genuine 4xx hides a real error until the deadline.",
+    "note": "#741: tolerance must be scoped to transient statuses \u2014 retrying a genuine 4xx hides a real error until the deadline.",
     "file": "token-engine/proof-wait.ts",
     "find": "  return err instanceof JsonRpcNetworkError && TRANSIENT_HTTP_STATUSES.has(err.status);",
     "replace": "  return err instanceof JsonRpcNetworkError;",
@@ -383,9 +383,9 @@
   },
   {
     "name": "submit-429-not-retried",
-    "note": "#746: the metered call is the SUBMIT. Without retry a 429 falls through to a proof wait for a request the gateway never accepted, burning the whole deadline per op — which is what made raising CERTIFY_WIDTH unsafe.",
+    "note": "#746: the metered call is the SUBMIT. Without retry a 429 falls through to a proof wait for a request the gateway never accepted, burning the whole deadline per op \u2014 which is what made raising CERTIFY_WIDTH unsafe.",
     "file": "token-engine/SphereTokenEngine.ts",
-    "find": "      const { value: response, retried } = await retryTransient(\n        async () => {\n          const answer = await this.deps.client.submitCertificationRequest(certificationData);\n          // A booting gateway is \"ask again\", not a certification failure — see\n          // TransientSubmitAnswer. Everything else, known or unknown, keeps the\n          // status-agnostic treatment below.\n          if (String(answer.status) === String(CertificationStatus.SERVICE_NOT_READY)) {\n            throw new TransientSubmitAnswer(String(answer.status));\n          }\n          return answer;\n        },\n        signal,\n        this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS,\n      );",
+    "find": "      const { value: response, retried } = await retryTransient(\n        async () => {\n          const answer = await this.deps.client.submitCertificationRequest(certificationData);\n          // A booting gateway is \"ask again\", not a certification failure \u2014 see\n          // TransientSubmitAnswer. Everything else, known or unknown, keeps the\n          // status-agnostic treatment below.\n          if (String(answer.status) === String(CertificationStatus.SERVICE_NOT_READY)) {\n            throw new TransientSubmitAnswer(String(answer.status));\n          }\n          return answer;\n        },\n        signal,\n        this.deps.proofPollIntervalMs ?? DEFAULT_PROOF_POLL_INTERVAL_MS,\n      );",
     "replace": "      const response = await this.deps.client.submitCertificationRequest(certificationData);\n      const retried = false;",
     "tests": [
       "tests/unit/token-engine/proof-deadline.test.ts"
@@ -403,7 +403,7 @@
   },
   {
     "name": "resume-conflict-masks-ordinary-failure",
-    "note": "#745 review: summarize ranks conflict above 'other', so gating on the aggregate class let a conflict license settlement while an ordinarily-failed leg was in neither committed[] nor conflicts[] — understated shortfall on a closed intent.",
+    "note": "#745 review: summarize ranks conflict above 'other', so gating on the aggregate class let a conflict license settlement while an ordinarily-failed leg was in neither committed[] nor conflicts[] \u2014 understated shortfall on a closed intent.",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
     "find": "    const blocking = firstNonConflictError(outcomes);\n    if (blocking !== undefined) throw blocking.error;",
     "replace": "    const { cls, firstError } = summarize(outcomes);\n    if (cls !== null && cls !== 'conflict') throw firstError;",
@@ -423,7 +423,7 @@
   },
   {
     "name": "retry-attempts-after-abort",
-    "note": "#747 review: pause() resolves on abort too, so without a pre-attempt signal check the loop issues one more request past the deadline — and a hanging one un-bounds the operation.",
+    "note": "#747 review: pause() resolves on abort too, so without a pre-attempt signal check the loop issues one more request past the deadline \u2014 and a hanging one un-bounds the operation.",
     "file": "token-engine/proof-wait.ts",
     "find": "    if (signal.aborted) throw signal.reason as Error;\n    try {",
     "replace": "    try {",
@@ -433,7 +433,7 @@
   },
   {
     "name": "send-reports-no-progress",
-    "note": "A multi-token send must report each leg as it certifies; without it the UI can only show a spinner (per-leg, not per-wave — a <=CERTIFY_WIDTH send is one wave).",
+    "note": "A multi-token send must report each leg as it certifies; without it the UI can only show a spinner (per-leg, not per-wave \u2014 a <=CERTIFY_WIDTH send is one wave).",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
     "find": "            if (o.certified) {\n              certified.push(o);\n              this.emitProgress(plan, certified);\n            }",
     "replace": "            if (o.certified) {\n              certified.push(o);\n            }",
@@ -445,7 +445,7 @@
     "name": "compose-drops-sender-nametag",
     "note": "sphere#487: buildMachineDeps forwards the live ownNametag getter, so every deliver puts the sender's Unicity ID on the wire (facade.test.ts '#487 the delivered envelope carries the sender @nametag'). Dropping it IS the regression the payments-v2 rewrite shipped: the recipient renders 'Someone'.",
     "file": "modules/payments-v2/compose.ts",
-    "find": "    // sphere#487: the same live getter Requests uses — the delivery envelope is\n    // the recipient's ONLY source for the sender's Unicity ID.\n    ...(deps.ownNametag !== undefined ? { ownNametag: deps.ownNametag } : {}),\n",
+    "find": "    // sphere#487: the same live getter Requests uses \u2014 the delivery envelope is\n    // the recipient's ONLY source for the sender's Unicity ID.\n    ...(deps.ownNametag !== undefined ? { ownNametag: deps.ownNametag } : {}),\n",
     "replace": "    // mutant: the machine no longer learns the wallet's own Unicity ID\n",
     "tests": [
       "tests/unit/payments-v2/facade.test.ts"
@@ -453,7 +453,7 @@
   },
   {
     "name": "replay-drops-sender-nametag",
-    "note": "sphere#487: a leg delivered from the journal (after a crash or a 429 defer) carries the sender nametag too — machine.test.ts '#487 every deliver carries the sender nametag'. Without it a deferred transfer arrives anonymous while a direct one does not.",
+    "note": "sphere#487: a leg delivered from the journal (after a crash or a 429 defer) carries the sender nametag too \u2014 machine.test.ts '#487 every deliver carries the sender nametag'. Without it a deferred transfer arrives anonymous while a direct one does not.",
     "file": "modules/payments-v2/machine/journal.ts",
     "find": "        ...senderNametagOption(deps.ownNametag),\n",
     "replace": "        // mutant: a replayed leg arrives anonymous\n",
@@ -463,7 +463,7 @@
   },
   {
     "name": "sphere-host-nametag-dropped",
-    "note": "sphere#487: the last link — Sphere hands the vertical the wallet's own Unicity ID (address-scoped, since switchToAddress moves _currentAddressIndex before stopping this facade). Every unit suite injects its own getter, so only the composed integration test sees this one.",
+    "note": "sphere#487: the last link \u2014 Sphere hands the vertical the wallet's own Unicity ID (address-scoped, since switchToAddress moves _currentAddressIndex before stopping this facade). Every unit suite injects its own getter, so only the composed integration test sees this one.",
     "file": "core/Sphere.ts",
     "find": "        nametag: () => this.getNametagForAddress(facadeAddressId),",
     "replace": "        nametag: () => undefined, // mutant: the vertical never learns its own name",
@@ -483,12 +483,42 @@
   },
   {
     "name": "kv-generation-not-renamed",
-    "note": "The scoped-KV prefix rename IS the 3.x local migration. Left on `pv2:`, the sync-epoch latch survives a backend reset, so noteEpoch sees a CHANGED epoch, runs the restore protocol, and re-PUTs every locally-open intent into the freshly wiped backend — permanent pendingTransfers() rows holding their sources reserved, with no error surface.",
+    "note": "The scoped-KV prefix rename IS the 3.x local migration. Left on `pv2:`, the sync-epoch latch survives a backend reset, so noteEpoch sees a CHANGED epoch, runs the restore protocol, and re-PUTs every locally-open intent into the freshly wiped backend \u2014 permanent pendingTransfers() rows holding their sources reserved, with no error surface.",
     "file": "modules/payments-v2/stores.ts",
     "find": "  const prefix = `${KV_PREFIX}${network}:${chainPubkey}:`;",
     "replace": "  const prefix = `pv2:${network}:${chainPubkey}:`;",
     "tests": [
       "tests/unit/payments-v2/kv-generation.test.ts"
+    ]
+  },
+  {
+    "name": "registry-create-returns-global",
+    "note": "#766: TokenRegistry.create() must build an INDEPENDENT instance \u2014 returning the singleton reinstates the cross-Sphere metadata clobber (a mainnet init flipping a live testnet2 wallet's decimals to 0)",
+    "file": "registry/TokenRegistry.ts",
+    "find": "    const registry = new TokenRegistry();",
+    "replace": "    const registry = TokenRegistry.getInstance();",
+    "tests": [
+      "tests/unit/registry/TokenRegistry.instances.test.ts"
+    ]
+  },
+  {
+    "name": "registry-dispose-noop",
+    "note": "#766: dispose() must actually stop the registry \u2014 nothing in registry/ calls unref(), so a surviving interval outlives the Sphere that created it and keeps Node's event loop alive",
+    "file": "registry/TokenRegistry.ts",
+    "find": "    this.disposed = true;\n    this.stopAutoRefresh();",
+    "replace": "    this.disposed = true;",
+    "tests": [
+      "tests/unit/registry/TokenRegistry.instances.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-destroy-leaks-registry",
+    "note": "#766: Sphere.destroy() must dispose the registry it owns; without it every discarded wallet leaves an hourly fetch running",
+    "file": "core/Sphere.ts",
+    "find": "    this._registry?.dispose();",
+    "replace": "    void this._registry;",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
     ]
   }
 ]

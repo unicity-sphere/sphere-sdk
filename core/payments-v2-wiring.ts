@@ -20,7 +20,7 @@ import type { PeerInfo } from '../transport';
 import type { StorageProvider } from '../storage';
 import type { PriceProvider } from '../price';
 import type { ITokenEngine } from '../token-engine/engine';
-import { TokenRegistry } from '../registry';
+import type { RegistryReader } from '../modules/payments-v2/inventory/presentation';
 import {
   PaymentsFacade,
   type FacadeClient,
@@ -242,6 +242,7 @@ export function authedWireClient(session: WalletApiSession, client: WalletApiV2C
 export interface PaymentsV2Host {
   storage: StorageProvider;
   price: PriceProvider | null;
+  registry: RegistryReader;
   /** The Sphere event bus (`emitEvent`) — the facade's 8 events ride it directly. */
   emit: (event: string, payload: unknown) => void;
   /** Transport resolve — the same lookup the old send path used. */
@@ -334,7 +335,7 @@ export function composePaymentsV2(spec: ComposePaymentsV2Spec): PaymentsFacade {
     }),
     engineRef: spec.engineRef,
     kv,
-    registry: TokenRegistry.getInstance(),
+    registry: host.registry,
     ...(host.price !== null ? { price: host.price } : {}),
     emit: host.emit,
     resolveRecipient: (identifier) => resolveRecipientInfo(identifier, network, host.resolvePeer),

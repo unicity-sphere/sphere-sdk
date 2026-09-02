@@ -25,6 +25,7 @@ import { getPublicKey, hexToBytes } from '../../core/crypto';
 import { decryptDeliveryBundle, deriveDeliveryEncryptionKey } from '../../core/delivery-envelope';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { TRUSTBASE_TESTNET2 } from '../../assets/trustbase';
+import { TokenRegistry } from '../../registry';
 import type { PeerInfo, TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { ProviderStatus } from '../../types';
@@ -217,6 +218,42 @@ async function buildSphere(options: BuildOptions): Promise<Sphere> {
   });
   return sphere;
 }
+
+describe('Sphere payments wiring — the token registry is OWNED, not the process global', () => {
+  // #766: the global's configure() is repointed by every other Sphere's init, which is how
+  // a mainnet init silently flipped a live testnet2 wallet's decimals to 0. A Sphere must
+  // build and hold its own, and must stop it on destroy — nothing in registry/ calls
+  // unref(), so a surviving interval outlives the wallet and keeps Node's loop alive.
+  it('builds its own registry on init and disposes it on destroy', async () => {
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-'));
+    const storage = new FileStorageProvider({ dataDir });
+    try {
+      const { sphere } = await Sphere.init({
+        storage,
+        transport: createMockTransport(),
+        oracle: createEngineOracle(),
+        mnemonic: MNEMONIC,
+        network: NET,
+        walletApi: makeWorld().walletApi,
+      });
+
+      expect(create).toHaveBeenCalledTimes(1);
+      const owned = create.mock.results[0]!.value as TokenRegistry;
+      // It is a real instance, and NOT the process global.
+      expect(owned).not.toBe(TokenRegistry.getInstance());
+      expect(owned.isDisposed).toBe(false);
+
+      await sphere.destroy();
+      expect(owned.isDisposed).toBe(true);
+      // The global is deliberately left running — other code still reads it.
+      expect(TokenRegistry.getInstance().isDisposed).toBe(false);
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('Sphere payments wiring — defaults (P11 flip: the vertical is default and only)', () => {
   it('composing the vertical sweeps the superseded pv2: state left by a 2.x wallet', async () => {

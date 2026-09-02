@@ -528,6 +528,8 @@ export class Sphere {
    * the rebuild after an api-key change share one pool configuration.
    */
   private _verification: VerificationWorkerConfig | undefined;
+  /** This Sphere's OWN token registry. Disposed by destroy(); never the process global. */
+  private _registry: TokenRegistry | null = null;
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
@@ -798,6 +800,21 @@ export class Sphere {
   }
 
   /**
+   * Build the registry THIS Sphere owns, so its metadata cannot be repointed by another
+   * Sphere's init. The global is still configured above for consumers that read it
+   * directly; this instance is what the payments facade presents from.
+   */
+  private static createOwnedRegistry(storage: StorageProvider, network?: NetworkType): TokenRegistry {
+    if (!network) {
+      throw new SphereError(
+        'network is required to build the token registry. Every Sphere entry point must forward options.network.',
+        'INVALID_CONFIG',
+      );
+    }
+    return TokenRegistry.create({ remoteUrl: NETWORKS[network].tokenRegistryUrl, storage });
+  }
+
+  /**
    * Create new wallet with mnemonic
    */
   static async create(options: SphereCreateOptions): Promise<Sphere> {
@@ -841,6 +858,7 @@ export class Sphere {
       options.communications,
     );
     sphere._verification = options.verification;
+    sphere._registry = Sphere.createOwnedRegistry(options.storage, options.network);
     sphere._paymentsV2Composition = composition;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
@@ -940,6 +958,7 @@ export class Sphere {
       options.communications,
     );
     sphere._verification = options.verification;
+    sphere._registry = Sphere.createOwnedRegistry(options.storage, options.network);
     sphere._paymentsV2Composition = composition;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
@@ -1045,6 +1064,7 @@ export class Sphere {
       options.communications,
     );
     sphere._verification = options.verification;
+    sphere._registry = Sphere.createOwnedRegistry(options.storage, options.network);
     sphere._paymentsV2Composition = composition;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
@@ -3431,6 +3451,13 @@ export class Sphere {
     // above (dispose is idempotent, so an overlap is harmless).
     this._tokenEngine?.dispose?.();
 
+    // Stop this Sphere's own registry: its hourly fetch would otherwise outlive the
+    // wallet that created it (nothing in registry/ calls unref(), so in Node it also
+    // keeps the event loop alive). The process-global is deliberately left alone —
+    // other code still reads it.
+    this._registry?.dispose();
+    this._registry = null;
+
     await this._transport.disconnect();
     await this._storage.disconnect();
     await this._oracle.disconnect();
@@ -3971,6 +3998,7 @@ export class Sphere {
       host: {
         storage: this._storage,
         price: this._priceProvider,
+        registry: this._registry ?? TokenRegistry.getInstance(),
         emit: (event, payload) =>
           this.emitEvent(event as SphereEventType, payload as SphereEventMap[SphereEventType]),
         resolvePeer: (identifier) => this._transport.resolve?.(identifier) ?? Promise.resolve(null),

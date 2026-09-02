@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — a Sphere owns its token registry, and destroy() disposes it (#766)
+
+`TokenRegistry` is a process-global singleton whose `configure()` repoints whatever instance
+exists, and every `Sphere.init()` calls it. So a second Sphere silently rewrote the first one's
+metadata. Observed with two Spheres on **separate storage providers**: initialising a mainnet
+Sphere flipped a live testnet2 wallet's own asset from `{symbol:'TCOIN', decimals:8}` to
+`{symbol:'AAAAAA', decimals:0}` — the registry-miss fallbacks. Nothing restored it.
+
+Inside the SDK that is presentation only (the money path treats `coinId` as opaque bytes), but
+not at the consumer boundary: code that takes `decimals` or a `coinId` from the registry and
+feeds it to an amount conversion or to `send()`/`mint()` gets a 10ⁿ scale error or the wrong
+coin. See [docs/MIGRATION-TOKEN-REGISTRY.md](docs/MIGRATION-TOKEN-REGISTRY.md).
+
+- A `Sphere` now builds and owns its own registry, and the payments facade presents from it.
+  Two Spheres on different networks no longer disturb each other.
+- `Sphere.destroy()` disposes that registry. Previously `destroy()` never touched it, so every
+  discarded Sphere left an hourly fetch running — and nothing in `registry/` calls `unref()`,
+  so under Node it kept the event loop alive too.
+- New: `TokenRegistry.create(options)`, plus instance `dispose()`, `isDisposed` and
+  `waitForReady()`. The statics are unchanged and still drive the global.
+- `createBrowserProviders` / `createNodeProviders` no longer call `TokenRegistry.configure()`.
+  In the published package those bundles carry their own inlined copy that no consumer can
+  reach (`tsup` inlines `registry/` per entry with `splitting: false`), so the call was writing
+  to an unreadable object and holding an unstoppable interval. Removing it is a no-op for
+  package consumers; if you use a provider factory WITHOUT `Sphere.init()` and read the global,
+  configure it yourself — the migration guide has the two lines.
+- The ten singleton-bound free functions moved to `registry/global-readers.ts`, re-exported
+  unchanged. The public surface is identical: same 126 root exports, same signatures.
+
+Not fixed here: `Sphere`'s own `static instance`, and `Sphere.clear()`/`import()` destroying
+whichever instance holds it regardless of the storage they were given. Tracked in #766.
+
 ### Added — mainnet is a runnable network
 
 `network: 'mainnet'` now constructs and verifies. Previously the provider factories refused it

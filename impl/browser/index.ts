@@ -43,7 +43,6 @@ import type { GroupChatModuleConfig } from '../../modules/groupchat';
 import type { MarketModuleConfig } from '../../modules/market';
 import type { PriceProvider } from '../../price';
 import { createPriceProvider } from '../../price';
-import { TokenRegistry } from '../../registry';
 import {
   type BaseTransportConfig,
   type BaseOracleConfig,
@@ -53,7 +52,6 @@ import {
   resolveTransportConfig,
   resolveOracleConfig,
   resolvePriceConfig,
-  getNetworkConfig,
   resolveGroupChatConfig,
   resolveMarketConfig,
 } from '../shared';
@@ -196,10 +194,6 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
 
   // Resolve market config
   const market = resolveMarketConfig(config?.market);
-
-  // Configure token registry remote refresh with persistent cache
-  const networkConfig = getNetworkConfig(network);
-  TokenRegistry.configure({ remoteUrl: networkConfig.tokenRegistryUrl, storage });
 
   return {
     storage,
