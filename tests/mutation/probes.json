@@ -543,20 +543,20 @@
   },
   {
     "name": "init-failure-strands-registry",
-    "note": "#766 review: a rejected init must not leave an unreachable registry fetching hourly \u2014 the caller never receives a Sphere to destroy",
+    "note": "#767: a rejection inside the guarded bring-up must actually reach the catch \u2014 swallowing it would leave a half-built Sphere published and reported as success",
     "file": "core/Sphere.ts",
-    "find": "      sphere._registry?.dispose();\n      sphere._registry = null;\n      throw err;",
-    "replace": "      throw err;",
+    "find": "    try {\n      await bringUp();\n    } catch (err) {",
+    "replace": "    try {\n      await bringUp().catch(() => undefined);\n    } catch (err) {",
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
     ]
   },
   {
-    "name": "registry-cleanup-not-total",
-    "note": "#767 review: the dispose-on-failure guard must cover EVERY step from registry creation until Sphere.instance is published \u2014 twice it covered a named subset and the next step along was unguarded",
+    "name": "init-failure-swallows-error",
+    "note": "#767: the guard must RETHROW after teardown \u2014 swallowing turns a failed init into a resolved one returning a destroyed Sphere",
     "file": "core/Sphere.ts",
-    "find": "    } catch (err) {\n      sphere._registry?.dispose();\n      sphere._registry = null;\n      throw err;\n    }",
-    "replace": "    } catch (err) {\n      throw err;\n    }",
+    "find": "      });\n      throw err;\n    }\n  }",
+    "replace": "      });\n    }\n  }",
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
     ]
@@ -569,6 +569,16 @@
     "replace": "      await Promise.resolve().catch((teardownErr) => {",
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "waitforready-leaks-timeout",
+    "note": "#767 local-codex review: Promise.race does not cancel the loser \u2014 an uncleared readiness timeout holds Node's event loop open for its full duration, up to 10s after dispose",
+    "file": "registry/TokenRegistry.ts",
+    "find": "      if (timer !== undefined) clearTimeout(timer);",
+    "replace": "      void timer;",
+    "tests": [
+      "tests/unit/registry/TokenRegistry.instances.test.ts"
     ]
   }
 ]

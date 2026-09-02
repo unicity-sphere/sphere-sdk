@@ -241,4 +241,20 @@ describe('TokenRegistry#dispose', () => {
       f.restore();
     }
   });
+  it('waitForReady leaves no timer behind when the load wins the race', async () => {
+    // Promise.race does not cancel the loser. An unreferenced setTimeout still holds
+    // Node's event loop open for its full duration — with the 10s default, well past
+    // the point the registry has been disposed.
+    vi.useFakeTimers();
+    const { storage } = makeStorage();
+    const f = stubFetch();
+    try {
+      const owned = TokenRegistry.create({ remoteUrl: URL_A, storage, autoRefresh: false });
+      const before = vi.getTimerCount();
+      await owned.waitForReady(10_000);
+      expect(vi.getTimerCount()).toBe(before);
+    } finally {
+      f.restore();
+    }
+  });
 });

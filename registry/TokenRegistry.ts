@@ -232,10 +232,20 @@ export class TokenRegistry {
     if (timeoutMs <= 0) {
       return this.initialLoadPromise;
     }
-    return Promise.race([
-      this.initialLoadPromise,
-      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
-    ]);
+    // Clear the losing timer: a race leaves it scheduled, and an unreferenced timeout
+    // still holds Node's event loop open for its full duration — here up to 10s after
+    // the registry has been disposed.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        this.initialLoadPromise,
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   /**
@@ -263,17 +273,7 @@ export class TokenRegistry {
    * @param timeoutMs - Maximum wait time in ms (default: 10s). Set to 0 for no timeout.
    */
   static async waitForReady(timeoutMs: number = 10_000): Promise<boolean> {
-    const instance = TokenRegistry.getInstance();
-    if (!instance.initialLoadPromise) {
-      return instance.definitionsById.size > 0;
-    }
-    if (timeoutMs <= 0) {
-      return instance.initialLoadPromise;
-    }
-    return Promise.race([
-      instance.initialLoadPromise,
-      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
-    ]);
+    return TokenRegistry.getInstance().waitForReady(timeoutMs);
   }
 
   // ===========================================================================
