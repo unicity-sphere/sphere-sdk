@@ -141,11 +141,18 @@ describe('TokenRegistry#dispose', () => {
       await vi.advanceTimersByTimeAsync(0);
       const before = f.calls.length;
       expect(before).toBeGreaterThan(0);
+      const timersBefore = vi.getTimerCount();
+      expect(timersBefore).toBeGreaterThan(0);
 
       owned.dispose();
       expect(owned.isDisposed).toBe(true);
 
-      // Well past several intervals: a live timer would have fetched again.
+      // The interval must be CLEARED, not merely made inert by the disposed flag: an
+      // un-cleared interval is the leak — it keeps Node's event loop alive on its own,
+      // whether or not its callback still fetches.
+      expect(vi.getTimerCount()).toBeLessThan(timersBefore);
+
+      // ...and well past several intervals, no further fetch either.
       await vi.advanceTimersByTimeAsync(5000);
       expect(f.calls.length).toBe(before);
     } finally {
