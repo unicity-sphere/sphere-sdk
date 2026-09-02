@@ -560,5 +560,15 @@
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
     ]
+  },
+  {
+    "name": "init-failure-leaks-whole-sphere",
+    "note": "#767 review: a failed init must tear down the WHOLE Sphere \u2014 publication happens after the guard, so providers/vertical/engine would otherwise be unreachable with no owner",
+    "file": "core/Sphere.ts",
+    "find": "      await sphere.destroy().catch((teardownErr) => {",
+    "replace": "      await Promise.resolve().catch((teardownErr) => {",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
   }
 ]

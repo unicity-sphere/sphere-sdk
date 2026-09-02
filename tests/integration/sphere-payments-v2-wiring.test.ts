@@ -383,11 +383,12 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
     const create = vi.spyOn(TokenRegistry, 'create');
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-last-'));
     const storage = new FileStorageProvider({ dataDir });
+    const transport = createMockTransport();
     try {
       await expect(
         Sphere.init({
           storage,
-          transport: createMockTransport(),
+          transport,
           oracle: createEngineOracle(),
           mnemonic: MNEMONIC,
           network: NET,
@@ -402,6 +403,11 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
       expect((create.mock.results[0]!.value as TokenRegistry).isDisposed).toBe(true);
       // And the failed init published nothing, so no half-built Sphere is reachable.
       expect(Sphere.getInstance()).toBeNull();
+      // Precisely because nothing is reachable, the failure path must tear the whole
+      // Sphere down — providers are connected and the vertical is running by now, and
+      // disposing only the registry would strand all of it with no owner.
+      expect(transport.disconnect).toHaveBeenCalled();
+      expect(storage.isConnected()).toBe(false);
     } finally {
       create.mockRestore();
       fs.rmSync(dataDir, { recursive: true, force: true });

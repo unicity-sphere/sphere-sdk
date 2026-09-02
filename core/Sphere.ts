@@ -823,8 +823,13 @@ export class Sphere {
     try {
       await bringUp();
     } catch (err) {
-      sphere._registry?.dispose();
-      sphere._registry = null;
+      // Tear down the WHOLE half-built Sphere, not just its registry. By this point
+      // providers may be connected and the payments vertical running, and publication
+      // happens AFTER this guard — so the caller receives nothing that could destroy
+      // them. destroy() disposes the registry as its first act, so this subsumes it.
+      await sphere.destroy().catch((teardownErr) => {
+        logger.warn('Sphere', 'teardown after failed initialization also failed:', teardownErr);
+      });
       throw err;
     }
   }
