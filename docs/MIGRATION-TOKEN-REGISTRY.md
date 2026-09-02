@@ -90,14 +90,26 @@ You can get ahead of it now:
 Nothing above is required in this release. It is what will make the removal a small change
 rather than a large one.
 
-## Not fixed by this release
+## Also removed: the Sphere lifecycle globals
 
 `Sphere.getInstance()`, `Sphere.isInitialized()` and the `getSphere` export are **removed**
-(see [#766](https://github.com/unicity-sphere/sphere-sdk/issues/766)); hold the instance the
-entry point returns, and use `sphere.isReady`. `Sphere.clear()` / `Sphere.import()` now
-destroy only Spheres built on the storage they are given.
+([#766](https://github.com/unicity-sphere/sphere-sdk/issues/766)). Hold the instance the entry
+point returns, and use `sphere.isReady`. Nothing in the fleet used them — the consumer gate
+found zero call sites across every sibling repo.
 
-What remains: two `FileStorageProvider` objects pointed at one `dataDir` still clobber each
-other's wallet file — that provider caches the whole store in memory and rewrites the entire
-file on every `set()`, so it affects every key, not just one. Tracked as
+They could not be safely deprecated: after a second Sphere is created *and destroyed*,
+`getInstance()` returned `null` while the first was alive and serving money, and a deprecation
+note does not stop a wrong answer being consumed.
+
+`Sphere.clear()` and `Sphere.import()` now destroy only Spheres built on the storage they are
+given, compared by object identity. Previously they destroyed whichever Sphere was constructed
+last — so `Sphere.import({ storage: B })` killed a live wallet on storage A, dropping every
+`sphere.on()` handler with no event and no error. The `exists(storage)` behaviour that callers
+actually depend on is unchanged.
+
+## Not fixed by this release
+
+Two `FileStorageProvider` objects pointed at one `dataDir` still clobber each other's wallet
+file — that provider caches the whole store in memory and rewrites the entire file on every
+`set()`, so it affects every key, money journals included, not just one. Tracked as
 [#771](https://github.com/unicity-sphere/sphere-sdk/issues/771).

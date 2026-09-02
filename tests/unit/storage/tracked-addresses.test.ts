@@ -91,3 +91,58 @@ describe('parseTrackedAddresses — the index must be a non-negative integer', (
     ]);
   });
 });
+
+/**
+ * The ceiling half of the same guard. `deriveChildKey` (core/crypto.ts) serializes the
+ * child number as `index.toString(16).padStart(8, '0')` — and `padStart` only ever ADDS
+ * characters. An index above 0xffffffff therefore emits MORE than eight hex digits and
+ * pushes extra bytes into the HMAC input: the derivation silently stops being BIP32, with
+ * no error and no log, producing a key no other wallet implementation can reproduce.
+ * (2**53-1 survives a JSON round-trip intact, so this is reachable from stored data.)
+ *
+ * Each clause is pinned on its own so a regression names itself: dropping `<= 0xffffffff`
+ * must red only the over-range row, dropping `>= 0` only the negative one.
+ */
+describe('parseTrackedAddresses — the index must fit a BIP32 child number (uint32)', () => {
+  it('keeps 0xffffffff — the largest child number BIP32 can express', () => {
+    const parsed = parseTrackedAddresses(
+      stored({ index: 0xffffffff, hidden: false, createdAt: 1, updatedAt: 1 }),
+    );
+
+    expect(parsed.map((e) => e.index)).toEqual([4294967295]);
+  });
+
+  it('keeps 0x80000000 — a hardened index is legal, not out of range', () => {
+    // deriveChildKey treats >= 0x80000000 as hardened derivation; the whole hardened
+    // half of the range is valid, so a ceiling set at the threshold would delete
+    // addresses the wallet can perfectly well derive.
+    const parsed = parseTrackedAddresses(
+      stored({ index: 0x80000000, hidden: false, createdAt: 1, updatedAt: 1 }),
+    );
+
+    expect(parsed.map((e) => e.index)).toEqual([2147483648]);
+  });
+
+  it('drops 0x100000000 — one past the ceiling, where the child number grows a 9th digit', () => {
+    // (0x100000000).toString(16) === '100000000': nine hex digits, one whole byte more
+    // than BIP32's serialization allows.
+    expect((0x100000000).toString(16).padStart(8, '0')).toHaveLength(9);
+
+    const parsed = parseTrackedAddresses(
+      stored(
+        { index: 0, hidden: false, createdAt: 1, updatedAt: 1 },
+        { index: 0x100000000, hidden: false, createdAt: 2, updatedAt: 2 },
+      ),
+    );
+
+    expect(parsed.map((e) => e.index)).toEqual([0]);
+  });
+
+  it('keeps 0 — the floor is inclusive, and the ceiling check must not swallow it', () => {
+    const parsed = parseTrackedAddresses(
+      stored({ index: 0, hidden: false, createdAt: 1, updatedAt: 1 }),
+    );
+
+    expect(parsed.map((e) => e.index)).toEqual([0]);
+  });
+});

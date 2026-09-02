@@ -703,10 +703,70 @@
   },
   {
     "name": "tracked-address-index-aliases-real-address",
-    "note": "#766 review: the stored index must be a non-negative INTEGER - deriveKeyAtPath parseInt()s the path segment, so a 1.5 row derives index 1's keys and aliases a real address; Number.isFinite let 1.5 and negatives through",
+    "note": "#766 review: the stored index must be a non-negative INTEGER - deriveKeyAtPath parseInt()s the path segment, so a 1.5 row derives index 1's keys and aliases a real address; Number.isFinite let 1.5 and negatives through. Re-pointed at isDerivableIndex(), where the check now lives.",
     "file": "storage/tracked-addresses.ts",
-    "find": "  if (typeof e.index !== 'number' || !Number.isInteger(e.index) || e.index < 0) return null;",
-    "replace": "  if (typeof e.index !== 'number' || !Number.isFinite(e.index)) return null;",
+    "find": "  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;",
+    "replace": "  return typeof value === 'number' && Number.isFinite(value);",
+    "tests": [
+      "tests/unit/storage/tracked-addresses.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-debug-flag-one-way-init",
+    "note": "#766: the logger's state lives on globalThis, so `debug` is a PROCESS-global flag. Truthy-only made it ONE-WAY \u2014 once anything turned debug on, no later Sphere.init({ debug: false }) could quieten it. init() does NOT forward `debug` to the create/load it dispatches to, so this site is the only one the documented entry point uses.",
+    "file": "core/Sphere.ts",
+    "find": "    // Configure debug logging (also needed in main bundle context, same as TokenRegistry)\n    // `undefined` leaves whatever the provider factory or consumer set; an explicit\n    // `false` MUST turn debug off. A truthy-only check made this process-global flag\n    // one-way \u2014 no second init could ever quieten it (#766).\n    if (options.debug !== undefined) logger.configure({ debug: options.debug });",
+    "replace": "    // Configure debug logging (also needed in main bundle context, same as TokenRegistry)\n    // `undefined` leaves whatever the provider factory or consumer set; an explicit\n    // `false` MUST turn debug off. A truthy-only check made this process-global flag\n    // one-way \u2014 no second init could ever quieten it (#766).\n    if (options.debug) logger.configure({ debug: true }); // mutant: truthy-only, the flag goes one-way again",
+    "tests": [
+      "tests/unit/core/Sphere.debug-logging.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-debug-flag-one-way-create",
+    "note": "#766: the SAME guard on the direct create() entry point \u2014 all four sites are written out by hand, so one can regress with the other three intact.",
+    "file": "core/Sphere.ts",
+    "find": "    if (options.debug !== undefined) logger.configure({ debug: options.debug });\n\n    // Fail-closed BEFORE any storage write:",
+    "replace": "    if (options.debug) logger.configure({ debug: true }); // mutant: truthy-only, the flag goes one-way again\n\n    // Fail-closed BEFORE any storage write:",
+    "tests": [
+      "tests/unit/core/Sphere.debug-logging.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-debug-flag-one-way-load",
+    "note": "#766: the SAME guard on the direct load() entry point.",
+    "file": "core/Sphere.ts",
+    "find": "    if (options.debug !== undefined) logger.configure({ debug: options.debug });\n\n    // Fail-closed first: retired module options",
+    "replace": "    if (options.debug) logger.configure({ debug: true }); // mutant: truthy-only, the flag goes one-way again\n\n    // Fail-closed first: retired module options",
+    "tests": [
+      "tests/unit/core/Sphere.debug-logging.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-debug-flag-one-way-import",
+    "note": "#766: the SAME guard on the direct import() entry point.",
+    "file": "core/Sphere.ts",
+    "find": "    if (options.debug !== undefined) logger.configure({ debug: options.debug });\n\n    // Fail-closed BEFORE the destructive clear below:",
+    "replace": "    if (options.debug) logger.configure({ debug: true }); // mutant: truthy-only, the flag goes one-way again\n\n    // Fail-closed BEFORE the destructive clear below:",
+    "tests": [
+      "tests/unit/core/Sphere.debug-logging.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-address-index-above-uint32",
+    "note": "#766 review: a BIP32 child number is a uint32. deriveChildKey does index.toString(16).padStart(8,'0') and padStart only ADDS characters, so an index above 0xffffffff emits a 9th hex digit and pushes an extra byte into the HMAC input \u2014 off-standard derivation, silently. 0xffffffff itself and the hardened threshold 0x80000000 must SURVIVE.",
+    "file": "storage/tracked-addresses.ts",
+    "find": "  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;",
+    "replace": "  return typeof value === 'number' && Number.isInteger(value) && value >= 0;",
+    "tests": [
+      "tests/unit/storage/tracked-addresses.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-address-index-negative-allowed",
+    "note": "#766 review: the floor clause on its own \u2014 a negative index has no BIP32 derivation at all. Probed apart from the integer and ceiling clauses so a regression names which one went.",
+    "file": "storage/tracked-addresses.ts",
+    "find": "  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;",
+    "replace": "  return typeof value === 'number' && Number.isInteger(value) && value <= 0xffffffff;",
     "tests": [
       "tests/unit/storage/tracked-addresses.test.ts"
     ]

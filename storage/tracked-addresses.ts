@@ -6,16 +6,20 @@ export interface TrackedAddressesFile {
   addresses: TrackedAddressEntry[];
 }
 
+/** A BIP32 child number is a uint32 — see the port docstring for why. */
+function isDerivableIndex(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
+}
+
 function num(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
-/** Repair, don't drop — except the index: deriveKeyAtPath parseInt()s it, so 1.5
- *  would alias index 1's real address (see the port docstring). */
+/** Repair, don't drop — except an underivable index, which would alias a real address. */
 function toEntry(value: unknown): TrackedAddressEntry | null {
   if (typeof value !== 'object' || value === null) return null;
   const e = value as Record<string, unknown>;
-  if (typeof e.index !== 'number' || !Number.isInteger(e.index) || e.index < 0) return null;
+  if (!isDerivableIndex(e.index)) return null;
   return {
     ...e,
     index: e.index,

@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed (BREAKING) — the Sphere lifecycle globals (#766)
+
+`Sphere.getInstance()`, `Sphere.isInitialized()` and the root export `getSphere` are gone
+(root exports 126 → 125). Hold the instance the entry point returns; `sphere.isReady`
+answers the instance-level question. The consumer gate found zero users across every
+sibling repo.
+
+Not deprecated, because the defect survives deprecation: after a second Sphere was created
+*and destroyed*, `getInstance()` returned `null` while the first was alive and serving money.
+
+### Fixed — `clear()`/`import()` no longer destroy an unrelated wallet (#766)
+
+Both keyed off the removed static rather than the storage they were handed, so
+`Sphere.import({ storage: B })` destroyed a live wallet on storage **A**: identity nulled,
+`payments` throwing `NOT_INITIALIZED`, providers disconnected, and every `sphere.on()`
+handler dropped with no event and no error. They are now scoped by provider object identity
+(`StorageProvider.id` is a class constant, so comparing it would still have hit the wrong
+instance). The `exists(storage)` disjunct is preserved — that is the storage-wipe contract
+consumers actually depend on.
+
+`importFromLegacyFile` returned the wrong Sphere under an interleaved init, because
+`importFromJSON` discarded the one it built; it is now threaded out (additive).
+
+### Fixed — tracked addresses are merged, not clobbered (#766)
+
+Every persist wrote the instance's whole snapshot, so a second Sphere's address switch
+erased the first's entry from disk while its in-memory view still showed it. Now
+read-merge-write, serialized per provider: union by index, greater `updatedAt` wins
+`hidden`. Safe because there is no delete path. Deliberately **not** network-scoped — the
+payload is network-agnostic (`deriveDirectAddress` takes no network) and the bug reproduces
+with both Spheres on one network.
+
+A stored `index` must now be a uint32. `deriveKeyAtPath` `parseInt()`s the path segment, so
+a row with index `1.5` derived index `1`'s keys and impersonated a real address; and
+`deriveChildKey` pads the child number to 8 hex digits, so anything above `0xffffffff`
+emitted extra bytes. Such rows are dropped on read.
+
+### Fixed — the `debug` flag was one-way, and `verification` was dropped (#766, #769)
+
+`if (options.debug)` meant no later init could turn debug off; all four entry points now
+honour an explicit `false`. `createNodeProviders` had the mirror-image bug — `?? false`
+silently disabled a flag the consumer had set — and now only overrides when told to.
+
+`Sphere.init` also never forwarded `verification` to `create`/`load`, so opting into the
+worker pool at the documented entry point silently gave you the sequential verifier.
+
+The logger stays process-global by design: most of its 370 call sites are in providers
+constructed before any Sphere exists and shared between them.
+
+### Fixed — `TokenRegistry.resetInstance()` now disposes (#770)
+
+It called only `stopAutoRefresh()`, leaving `disposed` unset, the generation unchanged and
+the in-flight fetch running — so a load past its entry guard re-armed the interval on an
+instance `getInstance()` could no longer return.
+
 ### Changed — a Sphere owns its token registry, and destroy() disposes it (#766)
 
 `TokenRegistry` is a process-global singleton whose `configure()` repoints whatever instance
