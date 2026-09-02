@@ -204,7 +204,8 @@ export class PaymentsFacade implements PaymentsV2 {
     }
   }
 
-  /** Swaps what FUTURE operations snapshot; in-flight ops finish on the old engine. */
+  /** Swaps what FUTURE operations snapshot. Chain ops finish on the old engine, but it is
+   *  DISPOSED here, so one mid-`verify()` is cancelled — MODULE_DESTROYED, #770(4). */
   setEngine(next: ITokenEngine): void {
     const previous = this.currentEngine ?? this.deps.engineRef();
     this.currentEngine = next;

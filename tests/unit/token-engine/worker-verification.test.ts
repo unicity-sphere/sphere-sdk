@@ -12,11 +12,13 @@
  * (WorkerTokenVerifierTest there); reproducing it would need a real token with
  * real inclusion proofs, i.e. the live e2e path.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { createSphereTokenEngine, createWorkerTokenVerifier } from '../../../token-engine/factory';
 import type { SphereToken, VerificationWorker } from '../../../token-engine';
 import { SigningService, VerificationStatus, WorkerTokenVerifier } from '../../../token-engine/sdk';
+import { TestAggregatorClient } from './support/TestAggregatorClient';
+import { createTestEngine, freshPubkey } from './test-engine';
 
 /** Parses fine, touches no network (AggregatorClient connects on first request). */
 const TRUST_BASE_JSON = {
@@ -136,4 +138,211 @@ describe('engine.verify routing', () => {
     const engine = await createSphereTokenEngine(engineConfig);
     expect(() => engine.dispose?.()).not.toThrow();
   });
+});
+
+/**
+ * #770 item 4 — `dispose()` must SETTLE the in-flight verification batch.
+ *
+ * The SDK's `WorkerPool.dispose()` (3.0.1) calls `worker.terminate()` on every
+ * worker and nothing else. A dispatched batch resolves ONLY from
+ * `worker.onmessage`, which a terminated worker never posts, and queued batches
+ * are never drained — so `WorkerTokenVerifier.verify`, which awaits
+ * `Promise.all(pool.run(...))`, hangs FOREVER. `pool` is `private readonly`
+ * upstream, so the settle lives in our subclass (`token-engine/factory.ts`).
+ *
+ * Production trigger: `Sphere.setOracleApiKey` → `PaymentsFacade.setEngine`
+ * disposes the engine it replaced, and a receive drain may be mid-`verify()`.
+ *
+ * These tests use a REAL certified token (in-memory aggregator) because the pool
+ * is only reached after the genesis verifies on the calling thread — a fake token
+ * never gets that far, so it could not observe the hang at all.
+ */
+describe('dispose() during an in-flight verification (#770 item 4)', () => {
+  const COIN = 'a'.repeat(64);
+
+  /** Accepts a batch and NEVER answers — exactly what a terminated worker does. */
+  class SilentWorker implements VerificationWorker {
+    onerror: ((event: { message: string }) => void) | null = null;
+    onmessage: ((event: { data: unknown }) => void) | null = null;
+    terminated = false;
+    posted = 0;
+    /** Runs inside `WorkerPool.dispatch()`, before it acquires the NEXT worker. */
+    onPost: (() => void) | null = null;
+
+    postMessage(): void {
+      this.posted += 1;
+      this.onPost?.();
+    }
+
+    terminate(): void {
+      this.terminated = true;
+    }
+  }
+
+  type Settled =
+    | { state: 'fulfilled'; value: unknown }
+    | { state: 'rejected'; reason: unknown }
+    | { state: 'pending' };
+
+  /** Never waits unboundedly: a hang reports as `pending` instead of a suite timeout. */
+  async function settleWithin(promise: Promise<unknown>, ms: number): Promise<Settled> {
+    return Promise.race<Settled>([
+      promise.then(
+        (value): Settled => ({ state: 'fulfilled', value }),
+        (reason): Settled => ({ state: 'rejected', reason })
+      ),
+      new Promise<Settled>((resolve) => setTimeout(() => resolve({ state: 'pending' }), ms)),
+    ]);
+  }
+
+  async function until(predicate: () => boolean, what: string, ms = 5000): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+  }
+
+  /** One real chain: a token with 1 transfer, one with 2, and the trust base that certified them. */
+  let trustBaseJson: unknown;
+  let mintedOnly: SphereToken;
+  let oneTransfer: SphereToken;
+  let twoTransfers: SphereToken;
+
+  beforeAll(async () => {
+    const aggregator = TestAggregatorClient.create();
+    const alice = createTestEngine({ aggregator });
+    const bob = createTestEngine({ aggregator });
+    mintedOnly = await alice.mint({
+      recipientPubkey: alice.getIdentity().chainPubkey,
+      value: { assets: [{ coinId: COIN, amount: 100n }] },
+    });
+    oneTransfer = await alice.transfer({ token: mintedOnly, recipientPubkey: bob.getIdentity().chainPubkey });
+    twoTransfers = await bob.transfer({ token: oneTransfer, recipientPubkey: freshPubkey() });
+    trustBaseJson = aggregator.rootTrustBase.toJSON();
+  }, 30000);
+
+  const buildEngine = async (
+    createWorker: () => VerificationWorker,
+    poolSize?: number
+  ): ReturnType<typeof createSphereTokenEngine> =>
+    createSphereTokenEngine({
+      aggregatorUrl: 'http://localhost:3000',
+      privateKey: SigningService.generatePrivateKey(),
+      trustBaseJson,
+      verification: { createWorker, ...(poolSize !== undefined ? { poolSize } : {}) },
+    });
+
+  it('settles the in-flight verification instead of hanging forever', async () => {
+    const spawned: SilentWorker[] = [];
+    const engine = await buildEngine(() => {
+      const worker = new SilentWorker();
+      spawned.push(worker);
+      return worker;
+    });
+
+    const verifying = engine.verify(oneTransfer);
+    await until(() => spawned.some((w) => w.posted > 0), 'the pool to dispatch a batch');
+
+    engine.dispose?.();
+
+    // Without the cancellation this never settles: the batch's only resolver is
+    // the onmessage of a worker that was just terminated.
+    const outcome = await settleWithin(verifying, 3000);
+    expect(outcome.state).not.toBe('pending');
+  }, 30000);
+
+  it('REJECTS the cancelled verification — never resolves { ok: false }', async () => {
+    const spawned: SilentWorker[] = [];
+    const engine = await buildEngine(() => {
+      const worker = new SilentWorker();
+      spawned.push(worker);
+      return worker;
+    });
+
+    const verifying = engine.verify(oneTransfer);
+    await until(() => spawned.some((w) => w.posted > 0), 'the pool to dispatch a batch');
+    engine.dispose?.();
+
+    const outcome = await settleWithin(verifying, 3000);
+    // THE money pin. The only engine.verify caller in the vertical is
+    // modules/payments-v2/receive/Receive.ts `screen()`:
+    //
+    //   const verdict = await engine.verify(token);
+    //   if (!verdict.ok) return { kind: 'ack', ack: rejectAck(entry, 'invalid') };
+    //
+    // A cancellation that RESOLVED `{ ok: false }` would PERMANENTLY reject a
+    // valid incoming token at the mailbox, just because an api-key change landed
+    // mid-drain. Rejecting instead reaches the drain's catch, which leaves the
+    // entry unacked so it re-lists on the next drain.
+    expect(outcome.state).toBe('rejected');
+    expect(outcome).not.toMatchObject({ state: 'fulfilled' });
+    expect(outcome).toMatchObject({ reason: { code: 'MODULE_DESTROYED' } });
+  }, 30000);
+
+  it('terminates every spawned worker, and a later verify() rejects without spawning one', async () => {
+    const spawned: SilentWorker[] = [];
+    const createWorker = vi.fn(() => {
+      const worker = new SilentWorker();
+      spawned.push(worker);
+      return worker;
+    });
+    const engine = await buildEngine(createWorker);
+
+    const verifying = engine.verify(oneTransfer);
+    await until(() => spawned.some((w) => w.posted > 0), 'the pool to dispatch a batch');
+    engine.dispose?.();
+    await settleWithin(verifying, 3000);
+
+    expect(spawned.length).toBeGreaterThan(0);
+    expect(spawned.every((w) => w.terminated)).toBe(true);
+
+    const spawnsBeforeSecondVerify = createWorker.mock.calls.length;
+    const afterDispose = await settleWithin(engine.verify(oneTransfer), 3000);
+    expect(afterDispose.state).toBe('rejected');
+    expect(afterDispose).toMatchObject({ reason: { code: 'MODULE_DESTROYED' } });
+    // The SDK's dispose() leaves its `workers` array populated but its `idle` list
+    // holding TERMINATED workers, so a post-dispose task would happily call
+    // createWorker() and resurrect the pool it just tore down.
+    expect(createWorker).toHaveBeenCalledTimes(spawnsBeforeSecondVerify);
+  }, 30000);
+
+  it('rejects a post-dispose verify even for a token that needs no worker at all', async () => {
+    const createWorker = vi.fn(() => new SilentWorker());
+    const engine = await buildEngine(createWorker);
+    engine.dispose?.();
+
+    // A 0-transfer token never reaches the pool, so no other guard can notice the
+    // teardown: without the `disposed` gate on verify(), a torn-down engine keeps
+    // handing out verdicts as if it were live.
+    const outcome = await settleWithin(engine.verify(mintedOnly), 3000);
+    expect(outcome.state).toBe('rejected');
+    expect(outcome).toMatchObject({ reason: { code: 'MODULE_DESTROYED' } });
+    expect(createWorker).not.toHaveBeenCalled();
+  }, 30000);
+
+  it('a batch dispatched AFTER dispose() cannot resurrect the pool', async () => {
+    // Deterministic ordering, no timing guess: two transfers + poolSize 2 means
+    // WorkerPool.dispatch() loops twice. The FIRST worker calls dispose() from
+    // inside postMessage — i.e. mid-loop, before acquire() runs for the second
+    // batch. Without the createWorker() guard, that acquire spawns a live worker
+    // that dispose() has already walked past, leaking a thread per api-key change.
+    const spawned: SilentWorker[] = [];
+    let engineRef: { dispose?: () => void } | null = null;
+    const createWorker = vi.fn(() => {
+      const worker = new SilentWorker();
+      if (spawned.length === 0) worker.onPost = (): void => engineRef?.dispose?.();
+      spawned.push(worker);
+      return worker;
+    });
+
+    const engine = await buildEngine(createWorker, 2);
+    engineRef = engine;
+
+    const outcome = await settleWithin(engine.verify(twoTransfers), 5000);
+    expect(outcome.state).toBe('rejected');
+    expect(createWorker).toHaveBeenCalledTimes(1);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0].terminated).toBe(true);
+  }, 30000);
 });
