@@ -804,6 +804,26 @@ export class Sphere {
    * Sphere's init. The global is still configured above for consumers that read it
    * directly; this instance is what the payments facade presents from.
    */
+  /**
+   * Build this Sphere's registry, then bring up its providers — disposing the registry if
+   * that fails. Built here rather than at construction so an earlier rejection (a bad
+   * mnemonic, a wrong password) never strands one: the caller gets no Sphere to destroy.
+   */
+  private static async buildRegistryAndInitProviders(
+    sphere: Sphere,
+    storage: StorageProvider,
+    network?: NetworkType,
+  ): Promise<void> {
+    sphere._registry = Sphere.createOwnedRegistry(storage, network);
+    try {
+      await sphere.initializeProviders();
+    } catch (err) {
+      sphere._registry?.dispose();
+      sphere._registry = null;
+      throw err;
+    }
+  }
+
   private static createOwnedRegistry(storage: StorageProvider, network?: NetworkType): TokenRegistry {
     if (!network) {
       throw new SphereError(
@@ -871,16 +891,7 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    // Built here, not at construction: an earlier failure (a rejected mnemonic, a bad
-    // password) would otherwise leave an unreachable registry fetching hourly forever.
-    sphere._registry = Sphere.createOwnedRegistry(options.storage, options.network);
-    try {
-      await sphere.initializeProviders();
-    } catch (err) {
-      sphere._registry?.dispose();
-      sphere._registry = null;
-      throw err;
-    }
+    await Sphere.buildRegistryAndInitProviders(sphere, options.storage, options.network);
     await sphere.initializeModules();
 
     // Mark wallet as created only after successful initialization
@@ -981,16 +992,7 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    // Built here, not at construction: an earlier failure (a rejected mnemonic, a bad
-    // password) would otherwise leave an unreachable registry fetching hourly forever.
-    sphere._registry = Sphere.createOwnedRegistry(options.storage, options.network);
-    try {
-      await sphere.initializeProviders();
-    } catch (err) {
-      sphere._registry?.dispose();
-      sphere._registry = null;
-      throw err;
-    }
+    await Sphere.buildRegistryAndInitProviders(sphere, options.storage, options.network);
     await sphere.initializeModules();
 
     // Publish identity binding via transport
@@ -1116,16 +1118,7 @@ export class Sphere {
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
     logger.debug('Sphere', 'Initializing providers...');
-    // Built here, not at construction: an earlier failure (a rejected mnemonic, a bad
-    // password) would otherwise leave an unreachable registry fetching hourly forever.
-    sphere._registry = Sphere.createOwnedRegistry(options.storage, options.network);
-    try {
-      await sphere.initializeProviders();
-    } catch (err) {
-      sphere._registry?.dispose();
-      sphere._registry = null;
-      throw err;
-    }
+    await Sphere.buildRegistryAndInitProviders(sphere, options.storage, options.network);
     logger.debug('Sphere', 'Providers initialized. Initializing modules...');
     await sphere.initializeModules();
     logger.debug('Sphere', 'Modules initialized');
