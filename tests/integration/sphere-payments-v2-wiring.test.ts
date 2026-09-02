@@ -313,6 +313,36 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
     }
   });
 
+  it('disposes the registry when MODULE bring-up rejects, not just provider bring-up', async () => {
+    // Guarding only initializeProviders was not enough: initializeModules runs after it and
+    // is fallible too. An oracle that connects but exposes no trust base makes
+    // buildTokenEngine return undefined, and startPaymentsV2Inner then throws INVALID_CONFIG
+    // — past the provider guard, with the registry already built.
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-modules-'));
+    const storage = new FileStorageProvider({ dataDir });
+    const oracle = createEngineOracle();
+    (oracle as unknown as { getTrustBaseJson: () => unknown }).getTrustBaseJson = () => null;
+    try {
+      await expect(
+        Sphere.init({
+          storage,
+          transport: createMockTransport(),
+          oracle,
+          mnemonic: MNEMONIC,
+          network: NET,
+          walletApi: makeWorld().walletApi,
+        })
+      ).rejects.toThrow();
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect((create.mock.results[0]!.value as TokenRegistry).isDisposed).toBe(true);
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('destroy() disposes the registry even when teardown throws', async () => {
     const create = vi.spyOn(TokenRegistry, 'create');
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-throw-'));

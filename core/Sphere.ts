@@ -805,11 +805,13 @@ export class Sphere {
    * directly; this instance is what the payments facade presents from.
    */
   /**
-   * Build this Sphere's registry, then bring up its providers — disposing the registry if
-   * that fails. Built here rather than at construction so an earlier rejection (a bad
-   * mnemonic, a wrong password) never strands one: the caller gets no Sphere to destroy.
+   * Build this Sphere's registry, then bring up providers AND modules — disposing the
+   * registry if any of it fails. Built here rather than at construction so an earlier
+   * rejection (a bad mnemonic, a wrong password) never strands one: the caller gets no
+   * Sphere to destroy. Module bring-up is inside the guard because it is fallible too —
+   * an oracle with no trust base makes startPaymentsV2Inner throw INVALID_CONFIG.
    */
-  private static async buildRegistryAndInitProviders(
+  private static async buildRegistryAndBringUp(
     sphere: Sphere,
     storage: StorageProvider,
     network?: NetworkType,
@@ -817,6 +819,7 @@ export class Sphere {
     sphere._registry = Sphere.createOwnedRegistry(storage, network);
     try {
       await sphere.initializeProviders();
+      await sphere.initializeModules();
     } catch (err) {
       sphere._registry?.dispose();
       sphere._registry = null;
@@ -891,8 +894,7 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    await Sphere.buildRegistryAndInitProviders(sphere, options.storage, options.network);
-    await sphere.initializeModules();
+    await Sphere.buildRegistryAndBringUp(sphere, options.storage, options.network);
 
     // Mark wallet as created only after successful initialization
     // This prevents "Wallet already exists" errors if init fails partway through
@@ -992,8 +994,7 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    await Sphere.buildRegistryAndInitProviders(sphere, options.storage, options.network);
-    await sphere.initializeModules();
+    await Sphere.buildRegistryAndBringUp(sphere, options.storage, options.network);
 
     // Publish identity binding via transport
     progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
@@ -1118,9 +1119,7 @@ export class Sphere {
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
     logger.debug('Sphere', 'Initializing providers...');
-    await Sphere.buildRegistryAndInitProviders(sphere, options.storage, options.network);
-    logger.debug('Sphere', 'Providers initialized. Initializing modules...');
-    await sphere.initializeModules();
+    await Sphere.buildRegistryAndBringUp(sphere, options.storage, options.network);
     logger.debug('Sphere', 'Modules initialized');
 
     // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
