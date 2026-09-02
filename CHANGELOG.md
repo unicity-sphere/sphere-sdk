@@ -97,8 +97,8 @@ coin. See [docs/MIGRATION-TOKEN-REGISTRY.md](docs/MIGRATION-TOKEN-REGISTRY.md).
 - The ten singleton-bound free functions moved to `registry/global-readers.ts`, re-exported
   unchanged. The public surface is identical: same 126 root exports, same signatures.
 
-Not fixed here: `Sphere`'s own `static instance`, and `Sphere.clear()`/`import()` destroying
-whichever instance holds it regardless of the storage they were given. Tracked in #766.
+`Sphere`'s own `static instance` and the `clear()`/`import()` cross-wallet kill were still
+open when that shipped; both are fixed above in this release.
 
 ### Added — mainnet is a runnable network
 
