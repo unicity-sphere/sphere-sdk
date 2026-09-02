@@ -805,21 +805,23 @@ export class Sphere {
    * directly; this instance is what the payments facade presents from.
    */
   /**
-   * Build this Sphere's registry, then bring up providers AND modules — disposing the
-   * registry if any of it fails. Built here rather than at construction so an earlier
-   * rejection (a bad mnemonic, a wrong password) never strands one: the caller gets no
-   * Sphere to destroy. Module bring-up is inside the guard because it is fallible too —
-   * an oracle with no trust base makes startPaymentsV2Inner throw INVALID_CONFIG.
+   * Own a registry for the duration of `bringUp`, disposing it if any of that rejects.
+   *
+   * `bringUp` must cover EVERY fallible step from here until the Sphere is published to
+   * `Sphere.instance` — until then the caller receives nothing it could destroy, so a
+   * registry left behind is unreachable and its hourly fetch runs for the life of the
+   * process. Guarding a named subset of the steps is what failed twice: the guarded region
+   * and the fallible region were separate things, and drifted.
    */
-  private static async buildRegistryAndBringUp(
+  private static async withOwnedRegistry(
     sphere: Sphere,
     storage: StorageProvider,
-    network?: NetworkType,
+    network: NetworkType | undefined,
+    bringUp: () => Promise<void>,
   ): Promise<void> {
     sphere._registry = Sphere.createOwnedRegistry(storage, network);
     try {
-      await sphere.initializeProviders();
-      await sphere.initializeModules();
+      await bringUp();
     } catch (err) {
       sphere._registry?.dispose();
       sphere._registry = null;
@@ -894,14 +896,17 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    await Sphere.buildRegistryAndBringUp(sphere, options.storage, options.network);
+    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, async () => {
+      await sphere.initializeProviders();
+      await sphere.initializeModules();
 
-    // Mark wallet as created only after successful initialization
-    // This prevents "Wallet already exists" errors if init fails partway through
-    progress?.({ step: 'finalizing', message: 'Finalizing wallet...' });
-    await sphere.finalizeWalletCreation();
+      // Mark wallet as created only after successful initialization
+      // This prevents "Wallet already exists" errors if init fails partway through
+      progress?.({ step: 'finalizing', message: 'Finalizing wallet...' });
+      await sphere.finalizeWalletCreation();
 
-    sphere._initialized = true;
+      sphere._initialized = true;
+    });
     Sphere.instance = sphere;
 
     // Track address 0 in the registry
@@ -994,13 +999,16 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    await Sphere.buildRegistryAndBringUp(sphere, options.storage, options.network);
+    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, async () => {
+      await sphere.initializeProviders();
+      await sphere.initializeModules();
 
-    // Publish identity binding via transport
-    progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
-    await sphere.syncIdentityWithTransport();
+      // Publish identity binding via transport
+      progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
+      await sphere.syncIdentityWithTransport();
 
-    sphere._initialized = true;
+      sphere._initialized = true;
+    });
     Sphere.instance = sphere;
 
     // Auto-discover previously used HD addresses
@@ -1119,26 +1127,29 @@ export class Sphere {
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
     logger.debug('Sphere', 'Initializing providers...');
-    await Sphere.buildRegistryAndBringUp(sphere, options.storage, options.network);
-    logger.debug('Sphere', 'Modules initialized');
+    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, async () => {
+      await sphere.initializeProviders();
+      await sphere.initializeModules();
+      logger.debug('Sphere', 'Modules initialized');
 
-    // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
-    if (!options.nametag) {
-      progress?.({ step: 'recovering_nametag', message: 'Recovering nametag...' });
-      logger.debug('Sphere', 'Recovering Unicity ID from transport...');
-      await sphere.recoverNametagFromTransport();
-      logger.debug('Sphere', 'Unicity ID recovery done');
-      // Publish identity binding (with recovered nametag if found)
-      progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
-      await sphere.syncIdentityWithTransport();
-    }
+      // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
+      if (!options.nametag) {
+        progress?.({ step: 'recovering_nametag', message: 'Recovering nametag...' });
+        logger.debug('Sphere', 'Recovering Unicity ID from transport...');
+        await sphere.recoverNametagFromTransport();
+        logger.debug('Sphere', 'Unicity ID recovery done');
+        // Publish identity binding (with recovered nametag if found)
+        progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
+        await sphere.syncIdentityWithTransport();
+      }
 
-    // Mark wallet as created only after successful initialization
-    progress?.({ step: 'finalizing', message: 'Finalizing wallet...' });
-    logger.debug('Sphere', 'Finalizing wallet creation...');
-    await sphere.finalizeWalletCreation();
+      // Mark wallet as created only after successful initialization
+      progress?.({ step: 'finalizing', message: 'Finalizing wallet creation...' });
+      logger.debug('Sphere', 'Finalizing wallet creation...');
+      await sphere.finalizeWalletCreation();
 
-    sphere._initialized = true;
+      sphere._initialized = true;
+    });
     Sphere.instance = sphere;
 
     // Track address 0 in the registry

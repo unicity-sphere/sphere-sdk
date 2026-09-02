@@ -343,6 +343,37 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
     }
   });
 
+  it('disposes the registry when a step AFTER module bring-up rejects', async () => {
+    // The guard now covers everything up to publication, not a named subset of steps.
+    // Twice I widened it one step and the next step along was still unguarded; this pins
+    // the far end — a failure at 'finalizing', after providers AND modules are up, still
+    // happens before Sphere.instance is assigned, so the caller gets nothing to destroy.
+    const create = vi.spyOn(TokenRegistry, 'create');
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-late2-'));
+    const storage = new FileStorageProvider({ dataDir });
+    try {
+      await expect(
+        Sphere.init({
+          storage,
+          transport: createMockTransport(),
+          oracle: createEngineOracle(),
+          mnemonic: MNEMONIC,
+          network: NET,
+          walletApi: makeWorld().walletApi,
+          onProgress: (p: { step: string }) => {
+            if (p.step === 'finalizing') throw new Error('progress callback exploded');
+          },
+        })
+      ).rejects.toThrow();
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect((create.mock.results[0]!.value as TokenRegistry).isDisposed).toBe(true);
+    } finally {
+      create.mockRestore();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('destroy() disposes the registry even when teardown throws', async () => {
     const create = vi.spyOn(TokenRegistry, 'create');
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-throw-'));

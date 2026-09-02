@@ -552,11 +552,11 @@
     ]
   },
   {
-    "name": "registry-cleanup-misses-module-bringup",
-    "note": "#767 review: the dispose-on-failure guard must cover module bring-up too \u2014 an oracle with no trust base makes startPaymentsV2Inner throw INVALID_CONFIG after providers are up, stranding the registry",
+    "name": "registry-cleanup-not-total",
+    "note": "#767 review: the dispose-on-failure guard must cover EVERY step from registry creation until Sphere.instance is published \u2014 twice it covered a named subset and the next step along was unguarded",
     "file": "core/Sphere.ts",
-    "find": "      await sphere.initializeProviders();\n      await sphere.initializeModules();",
-    "replace": "      await sphere.initializeProviders();\n      const _m = sphere.initializeModules(); await _m.catch(() => undefined);",
+    "find": "    } catch (err) {\n      sphere._registry?.dispose();\n      sphere._registry = null;\n      throw err;\n    }",
+    "replace": "    } catch (err) {\n      throw err;\n    }",
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
     ]
