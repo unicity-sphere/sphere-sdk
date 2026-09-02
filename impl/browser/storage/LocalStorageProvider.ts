@@ -8,6 +8,11 @@ import { SphereError } from '../../../core/errors';
 import type { ProviderStatus, FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, isNetworkScopedAddressKey, type NetworkType } from '../../../constants';
+import {
+  mergeTrackedAddresses,
+  parseTrackedAddresses,
+  type TrackedAddressesFile,
+} from '../../../storage/tracked-addresses';
 
 // =============================================================================
 // Configuration
@@ -150,19 +155,35 @@ export class LocalStorageProvider implements StorageProvider {
     }
   }
 
+  /** Serializes the read-merge-write below, per provider instance. */
+  private trackedWrites: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Persist the tracked-address registry by MERGING, never replacing.
+   *
+   * Every Sphere over this storage holds its own snapshot and writes it in
+   * full, so a wholesale write drops the addresses this writer never saw
+   * (#766 item 5 — a lost update, reproducible on one network). Concurrent
+   * calls are serialized on `trackedWrites` so a read can never interleave
+   * with another call's write.
+   */
   async saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void> {
-    await this.set(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES, JSON.stringify({ version: 1, addresses: entries }));
+    const run = this.trackedWrites.then(async () => {
+      const onDisk = parseTrackedAddresses(await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES));
+      const file: TrackedAddressesFile = {
+        version: 1,
+        addresses: mergeTrackedAddresses(onDisk, entries),
+      };
+      await this.set(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES, JSON.stringify(file));
+    });
+    // The chain tail swallows the rejection so one failed write cannot brick
+    // every later one; the caller still sees the error by awaiting `run`.
+    this.trackedWrites = run.then(() => undefined, () => undefined);
+    await run;
   }
 
   async loadTrackedAddresses(): Promise<TrackedAddressEntry[]> {
-    const data = await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES);
-    if (!data) return [];
-    try {
-      const parsed = JSON.parse(data);
-      return parsed.addresses ?? [];
-    } catch {
-      return [];
-    }
+    return parseTrackedAddresses(await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES));
   }
 
   // ===========================================================================

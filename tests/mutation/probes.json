@@ -600,5 +600,15 @@
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
     ]
+  },
+  {
+    "name": "tracked-addresses-merge-drop",
+    "note": "#766 item 5: saveTrackedAddresses MERGES the on-disk registry with the writer's snapshot; writing the snapshot verbatim is the lost update that erases another Sphere's address (tracked-addresses-concurrent.test.ts)",
+    "file": "impl/nodejs/storage/FileStorageProvider.ts",
+    "find": "        addresses: mergeTrackedAddresses(onDisk, entries),",
+    "replace": "        addresses: (onDisk, entries),",
+    "tests": [
+      "tests/integration/tracked-addresses-concurrent.test.ts"
+    ]
   }
 ]

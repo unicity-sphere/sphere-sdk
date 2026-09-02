@@ -50,12 +50,35 @@ export interface StorageProvider extends BaseProvider {
   clear(prefix?: string): Promise<void>;
 
   /**
-   * Save tracked addresses (only user state: index, hidden, timestamps)
+   * Save tracked addresses (only user state: index, hidden, timestamps).
+   *
+   * MUST MERGE, NEVER REPLACE (#766 item 5). `entries` is ONE writer's snapshot,
+   * not the whole truth: every Sphere sharing this storage keeps its own copy of
+   * the registry and persists all of it, so writing the argument verbatim is a
+   * lost update — A activates index 1, B (whose snapshot predates that) activates
+   * index 2, and B's write erases index 1 while A still reports it. This happens
+   * on a single network with a single provider; do NOT "fix" it by renaming or
+   * network-scoping the key.
+   *
+   * The contract, implemented by `storage/tracked-addresses.ts` — reuse those
+   * helpers rather than re-deriving this:
+   *  - read the stored registry, union it with `entries` BY `index`;
+   *  - on a conflicting index, the entry with the greater `updatedAt` supplies
+   *    `hidden`, and `createdAt` keeps the earlier value;
+   *  - serialize concurrent calls on the provider instance, so one call's read
+   *    cannot interleave with another's write;
+   *  - a failed write must not brick later writes, and must still reject to its
+   *    own caller.
+   *
+   * A union is safe because there is no delete path: entries are only ever added,
+   * and wiping the wallet removes the key itself (`Sphere.clear()`). Adding a
+   * per-entry delete would require revisiting this contract.
    */
   saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void>;
 
   /**
-   * Load tracked addresses
+   * Load tracked addresses. Tolerant: unusable/corrupt storage reads as `[]`
+   * (see `parseTrackedAddresses` in `storage/tracked-addresses.ts`).
    */
   loadTrackedAddresses(): Promise<TrackedAddressEntry[]>;
 }
