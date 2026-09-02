@@ -26,14 +26,15 @@ describe('checkNetworkHealth — live testnet', () => {
 
     expect(result.services.oracle).toBeDefined();
     expect(result.services.oracle!.url).toContain('gateway.testnet2.unicity.network');
-    expect(typeof result.services.oracle!.healthy).toBe('boolean');
 
-    if (result.services.oracle!.healthy) {
-      expect(result.services.oracle!.responseTimeMs).toBeGreaterThanOrEqual(0);
-      expect(result.services.oracle!.responseTimeMs).toBeLessThan(15000);
-    } else {
-      expect(result.services.oracle!.error).toBeDefined();
-    }
+    // #769.1: assert HEALTHY, not `typeof healthy === 'boolean'`. The old shape passed
+    // for two years while the probe reported every live gateway unhealthy — a live check
+    // that accepts both answers checks nothing. The error is in the message so a genuine
+    // outage says which one.
+    expect(result.services.oracle!.error ?? 'healthy').toBe('healthy');
+    expect(result.services.oracle!.healthy).toBe(true);
+    expect(result.services.oracle!.responseTimeMs).toBeGreaterThanOrEqual(0);
+    expect(result.services.oracle!.responseTimeMs).toBeLessThan(15000);
 
     expect(result.totalTimeMs).toBeGreaterThanOrEqual(0);
   }, 20000);
@@ -99,6 +100,10 @@ describe('checkNetworkHealth — live testnet', () => {
 
     expect(result.services.oracle).toBeDefined();
     expect(result.services.oracle!.url).toContain('gateway.mainnet.unicity.network');
-    expect(typeof result.services.oracle!.healthy).toBe('boolean');
+
+    // The mainnet gateway is live (verified 2026-09-03, block height ~268k). This is the
+    // one check that would catch a mainnet gateway outage, so it asserts the answer.
+    expect(result.services.oracle!.error ?? 'healthy').toBe('healthy');
+    expect(result.services.oracle!.healthy).toBe(true);
   }, 20000);
 });

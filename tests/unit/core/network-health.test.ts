@@ -15,11 +15,15 @@ describe('checkNetworkHealth', () => {
     vi.restoreAllMocks();
   });
 
+  /** What the live gateway actually answers a well-formed probe (verified 2026-09-03). */
+  const blockHeightBody = (n = '40932') =>
+    new Response(JSON.stringify({ jsonrpc: '2.0', result: { blockNumber: n }, id: 1 }), {
+      status: 200,
+    });
+
   describe('oracle check', () => {
-    it('should report oracle healthy on HTTP 200', async () => {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({ jsonrpc: '2.0', result: 42 }), { status: 200 }),
-      );
+    it('should report oracle healthy when the aggregator returns a block height', async () => {
+      fetchSpy.mockResolvedValueOnce(blockHeightBody());
 
       const result = await checkNetworkHealth('testnet', { services: ['oracle'] });
 
@@ -27,6 +31,55 @@ describe('checkNetworkHealth', () => {
       expect(result.services.oracle!.healthy).toBe(true);
       expect(result.services.oracle!.responseTimeMs).toBeGreaterThanOrEqual(0);
       expect(result.healthy).toBe(true);
+    });
+
+    it('sends a probe the gateway can route: get_block_height carrying a 32-byte stateId', async () => {
+      // #769.1 — the bug this replaces. The gateway is a routing layer and refuses
+      // ANY call without a stateId/shardId ("JSON-RPC requests must include either
+      // stateId or shardId", HTTP 400) before it looks at the method, so the old
+      // `get_round_number` + `params:{}` probe reported every HEALTHY gateway as
+      // unhealthy. Asserting only on the response would not catch a regression here:
+      // the mock answers whatever we send.
+      fetchSpy.mockResolvedValueOnce(blockHeightBody());
+
+      await checkNetworkHealth('testnet', { services: ['oracle'] });
+
+      const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+      const sent = JSON.parse(String(init.body)) as {
+        method: string;
+        params: { stateId?: string };
+      };
+      expect(sent.method).toBe('get_block_height');
+      expect(sent.params.stateId).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it('reports unhealthy when a 200 carries a JSON-RPC error instead of a height', async () => {
+      // The falsification pin for keying off `response.ok`: JSON-RPC puts application
+      // errors in a 200. Only a numeric result.blockNumber proves the aggregator answered.
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify({ jsonrpc: '2.0', error: { code: -32601, message: 'no such method' }, id: 1 }), {
+          status: 200,
+        }),
+      );
+
+      const result = await checkNetworkHealth('testnet', { services: ['oracle'] });
+
+      expect(result.services.oracle!.healthy).toBe(false);
+      expect(result.services.oracle!.error).toContain('no such method');
+    });
+
+    it("surfaces the gateway's own error string from a 400 rather than a bare status", async () => {
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: 'Shard ID not found: 0' }), {
+          status: 400,
+          statusText: 'Bad Request',
+        }),
+      );
+
+      const result = await checkNetworkHealth('testnet', { services: ['oracle'] });
+
+      expect(result.services.oracle!.healthy).toBe(false);
+      expect(result.services.oracle!.error).toBe('Shard ID not found: 0');
     });
 
     it('should report oracle unhealthy on HTTP error', async () => {
@@ -64,9 +117,7 @@ describe('checkNetworkHealth', () => {
 
   describe('service filtering', () => {
     it('should only check specified services', async () => {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({ jsonrpc: '2.0', result: 1 }), { status: 200 }),
-      );
+      fetchSpy.mockResolvedValueOnce(blockHeightBody('1'));
 
       const result = await checkNetworkHealth('testnet', { services: ['oracle'] });
 
@@ -77,9 +128,7 @@ describe('checkNetworkHealth', () => {
 
   describe('result shape', () => {
     it('should include totalTimeMs', async () => {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({}), { status: 200 }),
-      );
+      fetchSpy.mockResolvedValueOnce(blockHeightBody());
 
       const result = await checkNetworkHealth('testnet', { services: ['oracle'] });
 
@@ -88,9 +137,7 @@ describe('checkNetworkHealth', () => {
     });
 
     it('should include url in service results', async () => {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({}), { status: 200 }),
-      );
+      fetchSpy.mockResolvedValueOnce(blockHeightBody());
 
       const result = await checkNetworkHealth('testnet', { services: ['oracle'] });
 
@@ -101,9 +148,7 @@ describe('checkNetworkHealth', () => {
 
   describe('network selection', () => {
     it('should use testnet URLs by default', async () => {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({}), { status: 200 }),
-      );
+      fetchSpy.mockResolvedValueOnce(blockHeightBody());
 
       await checkNetworkHealth('testnet', { services: ['oracle'] });
 
@@ -114,9 +159,7 @@ describe('checkNetworkHealth', () => {
     });
 
     it('should use mainnet URLs when specified', async () => {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({}), { status: 200 }),
-      );
+      fetchSpy.mockResolvedValueOnce(blockHeightBody());
 
       await checkNetworkHealth('mainnet', { services: ['oracle'] });
 
@@ -253,9 +296,7 @@ describe('checkNetworkHealth', () => {
       };
 
       // Mock fetch for oracle
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({ jsonrpc: '2.0', result: 1 }), { status: 200 }),
-      );
+      fetchSpy.mockResolvedValueOnce(blockHeightBody('1'));
 
       const result = await checkNetworkHealth('testnet', {
         services: ['relay', 'oracle'],
@@ -324,9 +365,7 @@ describe('checkNetworkHealth', () => {
     });
 
     it('should use custom oracle URL from urls option', async () => {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({}), { status: 200 }),
-      );
+      fetchSpy.mockResolvedValueOnce(blockHeightBody());
 
       const result = await checkNetworkHealth('testnet', {
         services: ['oracle'],
@@ -372,9 +411,7 @@ describe('checkNetworkHealth', () => {
         close() {}
       };
 
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({}), { status: 200 }),
-      );
+      fetchSpy.mockResolvedValueOnce(blockHeightBody());
 
       const result = await checkNetworkHealth('testnet', {
         services: ['relay', 'oracle'],
@@ -478,9 +515,7 @@ describe('checkNetworkHealth', () => {
     });
 
     it('should run custom checks in parallel with built-in', async () => {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({}), { status: 200 }),
-      );
+      fetchSpy.mockResolvedValueOnce(blockHeightBody());
 
       const result = await checkNetworkHealth('testnet', {
         services: ['oracle'],
@@ -544,9 +579,7 @@ describe('checkNetworkHealth', () => {
         close() {}
       };
 
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify({}), { status: 200 }),
-      );
+      fetchSpy.mockResolvedValueOnce(blockHeightBody());
 
       const result = await checkNetworkHealth('testnet');
 

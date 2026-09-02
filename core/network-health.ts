@@ -242,6 +242,42 @@ async function checkWebSocket(url: string, timeoutMs: number): Promise<ServiceHe
 }
 
 /**
+ * The gateway is a routing layer: every JSON-RPC call must carry a `stateId` or a
+ * `shardId` or it is refused with HTTP 400 before the method is even looked at.
+ * An all-zero state id routes like any other and reads as what it is — a probe.
+ */
+const HEALTH_PROBE_STATE_ID = '00'.repeat(32);
+
+/**
+ * Pull the block number out of a JSON-RPC body.
+ *
+ * The HTTP status alone cannot answer this. A healthy gateway answers a routing
+ * mistake with HTTP 400 *and* a JSON body, and JSON-RPC puts application errors in
+ * a 200 response — so both directions of "trust the status code" are wrong. Only
+ * a numeric `result.blockNumber` proves the aggregator answered.
+ */
+function readBlockNumber(body: unknown): string | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const result = (body as { result?: unknown }).result;
+  if (typeof result !== 'object' || result === null) return null;
+  const n = (result as { blockNumber?: unknown }).blockNumber;
+  return typeof n === 'string' || typeof n === 'number' ? String(n) : null;
+}
+
+/** The `error` member of a JSON-RPC body, or the gateway's bare `{"error": "..."}`. */
+function readRpcError(body: unknown): string | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const err = (body as { error?: unknown }).error;
+  if (typeof err === 'string') return err;
+  if (typeof err === 'object' && err !== null) {
+    const message = (err as { message?: unknown }).message;
+    if (typeof message === 'string') return message;
+    return JSON.stringify(err);
+  }
+  return null;
+}
+
+/**
  * Check oracle (aggregator) endpoint via HTTP POST.
  */
 async function checkOracle(url: string, timeoutMs: number): Promise<ServiceHealthResult> {
@@ -254,22 +290,33 @@ async function checkOracle(url: string, timeoutMs: number): Promise<ServiceHealt
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'get_round_number', params: {} }),
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'get_block_height',
+        params: { stateId: HEALTH_PROBE_STATE_ID },
+      }),
       signal: controller.signal,
     });
 
     clearTimeout(timer);
     const responseTimeMs = Date.now() - startTime;
 
-    if (response.ok) {
+    const body: unknown = await response.json().catch(() => null);
+    if (readBlockNumber(body) !== null) {
       return { healthy: true, url, responseTimeMs };
     }
 
+    const rpcError = readRpcError(body);
     return {
       healthy: false,
       url,
       responseTimeMs,
-      error: `HTTP ${response.status} ${response.statusText}`,
+      error:
+        rpcError ??
+        (response.ok
+          ? 'aggregator answered without a block height'
+          : `HTTP ${String(response.status)} ${response.statusText}`),
     };
   } catch (err) {
     return {
