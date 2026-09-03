@@ -87,8 +87,12 @@ export class FileStorageProvider implements StorageProvider {
       this.network = config.network;
     }
     this.isTxtMode = this.filePath.endsWith('.txt');
-    // Canonical, not merely resolved: aliases of one file must share an id.
-    this.backingStoreId = `file:${canonicalPath(this.filePath)}`;
+    // Canonicalise the DIRECTORY, keep the final entry: a directory symlink is a
+    // true alias, but save() renames a .tmp OVER filePath, which REPLACES a
+    // final-component symlink rather than writing through it — so those two
+    // paths diverge on the first save and must not share a bucket.
+    this.backingStoreId =
+      `file:${path.join(canonicalPath(this.dataDir), path.basename(this.filePath))}`;
   }
 
   setIdentity(identity: FullIdentity): void {

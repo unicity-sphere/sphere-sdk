@@ -25,9 +25,11 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import 'fake-indexeddb/auto';
 
 import { Sphere } from '../../core/Sphere';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
+import { IndexedDBStorageProvider } from '../../impl/browser/storage/IndexedDBStorageProvider';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { StorageProvider } from '../../storage';
@@ -621,4 +623,49 @@ describe('the legacy-import entry points return the Sphere on the SUPPLIED stora
     b.sphere = result.sphere;
     expect(result.sphere!.identity!.chainPubkey).toBe(backup.chainPubkey);
   });
+
+  it('import() into an UNUSED prefix does not wipe a live wallet sharing the database', async () => {
+    // backingStoreId names the unit of ERASURE, so an IndexedDB database is ONE
+    // bucket however many prefixes it holds — clear() empties the whole object
+    // store. That makes the bucket wider than the EXISTENCE scope, and deciding
+    // "does this import need to clear?" on the bucket destroyed a live wallet
+    // under a sibling prefix that nobody asked to touch.
+    const dbName = `scope-idb-${Date.now()}`;
+    const liveStorage = new IndexedDBStorageProvider({ dbName, prefix: 'q_' });
+    const targetStorage = new IndexedDBStorageProvider({ dbName, prefix: 'p_' });
+    const liveWorld = makePv2World(NET);
+    const targetWorld = makePv2World(NET);
+
+    const { sphere: liveSphere } = await Sphere.init({
+      storage: liveStorage,
+      transport: createMockTransport(),
+      oracle: createEngineOracle(),
+      walletApi: liveWorld.walletApi,
+      network: NET,
+      mnemonic: MNEMONIC_A,
+    });
+
+    // Same database, so ONE bucket — and the target prefix holds no wallet.
+    expect(targetStorage.backingStoreId).toBe(liveStorage.backingStoreId);
+    expect(await Sphere.exists(targetStorage)).toBe(false);
+
+    const imported = await Sphere.import({
+      storage: targetStorage,
+      transport: createMockTransport(),
+      oracle: createEngineOracle(),
+      walletApi: targetWorld.walletApi,
+      network: NET,
+      mnemonic: MNEMONIC_C,
+    });
+
+    // The untouched wallet is still live AND still has its data.
+    expect(liveSphere.isReady).toBe(true);
+    expect(liveSphere.identity?.chainPubkey).toBeDefined();
+    expect(await Sphere.exists(liveStorage)).toBe(true);
+
+    await imported.destroy();
+    await liveSphere.destroy();
+    await targetStorage.disconnect();
+    await liveStorage.disconnect();
+  }, 30_000);
 });

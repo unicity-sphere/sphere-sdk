@@ -1136,10 +1136,12 @@ export class Sphere {
 
     logger.debug('Sphere', 'Starting import...');
 
-    // Clear existing wallet if any. Skip if no active instance and wallet
-    // doesn't exist — avoids a redundant IndexedDB delete/reopen that can race
-    // with a subsequent initialize().
-    const needsClear = Sphere.liveOn(options.storage).length > 0 || (await Sphere.exists(options.storage));
+    // Clear THIS storage's wallet if it has one — not the liveness bucket's, which
+    // names the unit of ERASURE (an IndexedDB clear() empties the whole database).
+    // A sibling prefix's live Sphere lands in that bucket, so deciding on it made
+    // an import into an UNUSED prefix wipe a wallet nobody asked to touch.
+    const liveHere = Sphere.liveOn(options.storage).some((s) => s._storage === options.storage);
+    const needsClear = liveHere || (await Sphere.exists(options.storage));
     if (needsClear) {
       progress?.({ step: 'clearing', message: 'Clearing previous wallet data...' });
       logger.debug('Sphere', 'Clearing existing wallet data...');

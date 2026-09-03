@@ -835,8 +835,8 @@
     "name": "file-backing-store-id-is-a-class-constant",
     "note": "#766 review: backingStoreId identifies the STORE. A constant (what `id` is) makes every FileStorageProvider in the process one store, so clear() on one wallet tears down every live Sphere - the exact cross-wallet kill #766 removed.",
     "file": "impl/nodejs/storage/FileStorageProvider.ts",
-    "find": "    this.backingStoreId = `file:${canonicalPath(this.filePath)}`;",
-    "replace": "    this.backingStoreId = 'file:'; // mutant: a class constant, every wallet collides",
+    "find": "      `file:${path.join(canonicalPath(this.dataDir), path.basename(this.filePath))}`;",
+    "replace": "      'file:'; // mutant: a class constant, every wallet collides",
     "tests": [
       "tests/unit/impl/backing-store-id.test.ts",
       "tests/integration/sphere-instance-scoping.test.ts"
@@ -1189,8 +1189,28 @@
     "name": "file-store-id-not-canonical",
     "note": "#772 codex P2: path.resolve is lexical, so a symlinked dataDir and the real one give different ids for ONE wallet.json \u2014 clear() through one alias then misses the Sphere registered through the other",
     "file": "impl/nodejs/storage/FileStorageProvider.ts",
-    "find": "    this.backingStoreId = `file:${canonicalPath(this.filePath)}`;",
-    "replace": "    this.backingStoreId = `file:${this.filePath}`;",
+    "find": "      `file:${path.join(canonicalPath(this.dataDir), path.basename(this.filePath))}`;",
+    "replace": "      `file:${this.filePath}`;",
+    "tests": [
+      "tests/unit/impl/backing-store-id.test.ts"
+    ]
+  },
+  {
+    "name": "import-clears-on-the-widened-bucket",
+    "note": "#772 codex round 2: the liveness bucket names the unit of ERASURE and is therefore wider than the EXISTENCE scope. Deciding needsClear on it made an import into an unused IndexedDB prefix wipe the whole database and destroy a live wallet under a sibling prefix",
+    "file": "core/Sphere.ts",
+    "find": "    const liveHere = Sphere.liveOn(options.storage).some((s) => s._storage === options.storage);",
+    "replace": "    const liveHere = Sphere.liveOn(options.storage).length > 0;",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "file-store-id-resolves-the-final-symlink",
+    "note": "#772 codex round 2: save() renames a .tmp OVER filePath, REPLACING a final-component symlink rather than writing through it \u2014 so two paths differing only in that link diverge on the first save and must not share a bucket",
+    "file": "impl/nodejs/storage/FileStorageProvider.ts",
+    "find": "      `file:${path.join(canonicalPath(this.dataDir), path.basename(this.filePath))}`;",
+    "replace": "      `file:${canonicalPath(this.filePath)}`;",
     "tests": [
       "tests/unit/impl/backing-store-id.test.ts"
     ]

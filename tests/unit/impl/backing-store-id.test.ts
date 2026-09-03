@@ -124,6 +124,28 @@ describe('FileStorageProvider.backingStoreId — aliases of one file', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it('SEPARATES two paths differing only in a final-component symlink', () => {
+    // A directory symlink is a true alias; the FILE NAME is not. save() writes
+    // `${filePath}.tmp` and renames it OVER filePath, which replaces a
+    // final-component symlink rather than writing through it — so the two paths
+    // diverge on the first save and must not share a lifecycle bucket. Clearing
+    // through the link would otherwise destroy the target's Sphere while the
+    // target file stayed intact.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bsid-'));
+    fs.writeFileSync(path.join(root, 'real.json'), '{}');
+    try {
+      fs.symlinkSync(path.join(root, 'real.json'), path.join(root, 'link.json'));
+    } catch {
+      return; // no symlink privilege
+    }
+
+    const viaReal = new FileStorageProvider({ dataDir: root, fileName: 'real.json' });
+    const viaLink = new FileStorageProvider({ dataDir: root, fileName: 'link.json' });
+
+    expect(viaReal.backingStoreId).not.toBe(viaLink.backingStoreId);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
   it('still separates genuinely different directories', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bsid-'));
     const a = new FileStorageProvider({ dataDir: path.join(root, 'a') });
