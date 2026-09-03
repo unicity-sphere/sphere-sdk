@@ -26,6 +26,38 @@ export interface FileStorageProviderConfig {
   network?: NetworkType;
 }
 
+/**
+ * The canonical path of `p`, for identity rather than for I/O.
+ *
+ * `path.resolve` is purely lexical, so a directory reached through a symlink and
+ * the same directory reached directly produce DIFFERENT strings for ONE file.
+ * Two providers would then report different `backingStoreId`s, and
+ * `Sphere.clear()` through one alias would miss the Sphere registered through
+ * the other — wiping its wallet.json and leaving it isReady over the remains.
+ *
+ * `realpathSync` needs the path to exist, and a fresh `dataDir` legitimately
+ * does not yet. So the deepest EXISTING ancestor is canonicalised and the
+ * not-yet-created tail appended lexically: two providers agree whether or not
+ * the directory has been created, as long as the symlinked part of the path
+ * exists — which is the case that causes the aliasing in the first place.
+ */
+function canonicalPath(p: string): string {
+  const resolved = path.resolve(p);
+  const tail: string[] = [];
+  let cursor = resolved;
+  while (!fs.existsSync(cursor)) {
+    const parent = path.dirname(cursor);
+    if (parent === cursor) return resolved; // hit the root without finding anything
+    tail.unshift(path.basename(cursor));
+    cursor = parent;
+  }
+  try {
+    return path.join(fs.realpathSync(cursor), ...tail);
+  } catch {
+    return resolved; // unreadable ancestor — lexical is the honest fallback
+  }
+}
+
 export class FileStorageProvider implements StorageProvider {
   readonly id = 'file-storage';
   readonly name = 'File Storage';
@@ -55,7 +87,8 @@ export class FileStorageProvider implements StorageProvider {
       this.network = config.network;
     }
     this.isTxtMode = this.filePath.endsWith('.txt');
-    this.backingStoreId = `file:${this.filePath}`;
+    // Canonical, not merely resolved: aliases of one file must share an id.
+    this.backingStoreId = `file:${canonicalPath(this.filePath)}`;
   }
 
   setIdentity(identity: FullIdentity): void {

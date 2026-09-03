@@ -10,6 +10,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
+import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -70,20 +71,80 @@ describe('IndexedDBStorageProvider.backingStoreId', () => {
     expect(a.backingStoreId, 'those ARE the defaults').toBe(b.backingStoreId);
   });
 
-  it('differs on the database name and on the key prefix independently', () => {
+  it('differs on the database name', () => {
     const base = new IndexedDBStorageProvider({ dbName: 'db-a', prefix: 'p_' });
     const otherDb = new IndexedDBStorageProvider({ dbName: 'db-b', prefix: 'p_' });
-    const otherPrefix = new IndexedDBStorageProvider({ dbName: 'db-a', prefix: 'q_' });
 
     expect(base.backingStoreId).not.toBe(otherDb.backingStoreId);
-    expect(base.backingStoreId).not.toBe(otherPrefix.backingStoreId);
   });
 
-  it('cannot be forged across the dbName/prefix boundary', () => {
-    // Unencoded concatenation would make ('a:b','c') and ('a','b:c') one store.
-    const left = new IndexedDBStorageProvider({ dbName: 'a:b', prefix: 'c' });
-    const right = new IndexedDBStorageProvider({ dbName: 'a', prefix: 'b:c' });
-    expect(left.backingStoreId).not.toBe(right.backingStoreId);
+  it('IGNORES the key prefix — clear() erases the whole database', () => {
+    // This used to assert the opposite, and that was the bug: clear() with no
+    // prefix calls idbClear(), which empties the entire `kv` object store. Two
+    // prefixed wallets in one database therefore share an ERASURE fate, and
+    // backingStoreId names the unit of erasure. Split them into separate
+    // liveness buckets and clearing either wipes the other's data while leaving
+    // its Sphere isReady over an emptied store — #766, one dimension over.
+    const p = new IndexedDBStorageProvider({ dbName: 'db-a', prefix: 'p_' });
+    const q = new IndexedDBStorageProvider({ dbName: 'db-a', prefix: 'q_' });
+
+    expect(p.backingStoreId).toBe(q.backingStoreId);
+  });
+
+  it('still encodes the database name rather than concatenating it raw', () => {
+    // Narrower than before (there is one field now), but a dbName carrying the
+    // scheme delimiter must not be able to impersonate another store.
+    const odd = new IndexedDBStorageProvider({ dbName: 'a:b' });
+    const plain = new IndexedDBStorageProvider({ dbName: 'a' });
+    expect(odd.backingStoreId).not.toBe(plain.backingStoreId);
+    expect(odd.backingStoreId).not.toContain('a:b');
+  });
+});
+
+describe('FileStorageProvider.backingStoreId — aliases of one file', () => {
+  it('is equal through a symlinked directory and the real one', () => {
+    // path.resolve is LEXICAL: it leaves a symlink alias and the real path as
+    // different strings for ONE wallet.json. Split, Sphere.clear() through one
+    // alias misses the Sphere registered through the other — wiping its file
+    // and leaving it isReady over the remains.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bsid-'));
+    const real = path.join(root, 'real');
+    const link = path.join(root, 'link');
+    fs.mkdirSync(real);
+    try {
+      fs.symlinkSync(real, link, 'dir');
+    } catch {
+      return; // no symlink privilege (Windows CI) — nothing to assert
+    }
+
+    const viaReal = new FileStorageProvider({ dataDir: real });
+    const viaLink = new FileStorageProvider({ dataDir: link });
+
+    expect(viaReal.backingStoreId).toBe(viaLink.backingStoreId);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('still separates genuinely different directories', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bsid-'));
+    const a = new FileStorageProvider({ dataDir: path.join(root, 'a') });
+    const b = new FileStorageProvider({ dataDir: path.join(root, 'b') });
+
+    expect(a.backingStoreId).not.toBe(b.backingStoreId);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('agrees before the directory exists and after it is created', () => {
+    // The canonicalisation walks up to the deepest EXISTING ancestor, so a
+    // provider built against a not-yet-created dataDir must not disagree with
+    // one built after connect() made it.
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bsid-')));
+    const dir = path.join(root, 'not-yet');
+    const before = new FileStorageProvider({ dataDir: dir });
+    fs.mkdirSync(dir);
+    const after = new FileStorageProvider({ dataDir: dir });
+
+    expect(before.backingStoreId).toBe(after.backingStoreId);
+    fs.rmSync(root, { recursive: true, force: true });
   });
 });
 

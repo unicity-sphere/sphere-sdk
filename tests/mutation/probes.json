@@ -835,7 +835,7 @@
     "name": "file-backing-store-id-is-a-class-constant",
     "note": "#766 review: backingStoreId identifies the STORE. A constant (what `id` is) makes every FileStorageProvider in the process one store, so clear() on one wallet tears down every live Sphere - the exact cross-wallet kill #766 removed.",
     "file": "impl/nodejs/storage/FileStorageProvider.ts",
-    "find": "    this.backingStoreId = `file:${this.filePath}`;",
+    "find": "    this.backingStoreId = `file:${canonicalPath(this.filePath)}`;",
     "replace": "    this.backingStoreId = 'file:'; // mutant: a class constant, every wallet collides",
     "tests": [
       "tests/unit/impl/backing-store-id.test.ts",
@@ -1173,6 +1173,26 @@
     "replace": "      if (false) {",
     "tests": [
       "tests/unit/connect/lock.test.ts"
+    ]
+  },
+  {
+    "name": "idb-store-id-splits-on-prefix",
+    "note": "#772 codex P1: backingStoreId must name the unit of ERASURE. clear() with no prefix empties the whole object store, so two prefixed wallets in one database share a fate \u2014 splitting them lets a clear wipe one wallet's data and leave the other's Sphere isReady over the remains",
+    "file": "impl/browser/storage/IndexedDBStorageProvider.ts",
+    "find": "    this.backingStoreId = `indexeddb:${encodeURIComponent(this.dbName)}`;",
+    "replace": "    this.backingStoreId = `indexeddb:${encodeURIComponent(this.dbName)}:${encodeURIComponent(this.prefix)}`;",
+    "tests": [
+      "tests/unit/impl/backing-store-id.test.ts"
+    ]
+  },
+  {
+    "name": "file-store-id-not-canonical",
+    "note": "#772 codex P2: path.resolve is lexical, so a symlinked dataDir and the real one give different ids for ONE wallet.json \u2014 clear() through one alias then misses the Sphere registered through the other",
+    "file": "impl/nodejs/storage/FileStorageProvider.ts",
+    "find": "    this.backingStoreId = `file:${canonicalPath(this.filePath)}`;",
+    "replace": "    this.backingStoreId = `file:${this.filePath}`;",
+    "tests": [
+      "tests/unit/impl/backing-store-id.test.ts"
     ]
   }
 ]

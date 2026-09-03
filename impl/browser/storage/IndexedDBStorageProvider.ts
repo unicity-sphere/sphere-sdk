@@ -48,7 +48,7 @@ export class IndexedDBStorageProvider implements StorageProvider {
   readonly name = 'IndexedDB Storage';
   readonly type = 'local' as const;
   readonly description = 'Browser IndexedDB for large-capacity persistence';
-  /** The database + prefix pair — two providers over one pair share erasure (#766). */
+  /** The DATABASE — the unit clear() erases, so the unit that shares a fate (#766). */
   readonly backingStoreId: string;
 
   private prefix: string;
@@ -66,8 +66,11 @@ export class IndexedDBStorageProvider implements StorageProvider {
     this.dbName = config?.dbName ?? DB_NAME;
     this.network = config?.network;
     this.debug = config?.debug ?? false;
-    this.backingStoreId =
-      `indexeddb:${encodeURIComponent(this.dbName)}:${encodeURIComponent(this.prefix)}`;
+    // The DATABASE, not the prefix: backingStoreId names the unit of ERASURE, and
+    // clear() with no prefix calls idbClear(), which empties the whole object
+    // store. Splitting prefixes into separate liveness buckets let a clear wipe
+    // another wallet's data and leave its Sphere isReady over the remains.
+    this.backingStoreId = `indexeddb:${encodeURIComponent(this.dbName)}`;
   }
 
   // ===========================================================================
