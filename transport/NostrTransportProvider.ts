@@ -491,25 +491,36 @@ export class NostrTransportProvider implements TransportProvider {
   // ===========================================================================
 
   async setIdentity(identity: FullIdentity): Promise<void> {
-    this.identity = identity;
-
-    // Clear per-address state so stale dedup entries from previous address
-    // don't block legitimate events for the new address.
-    this.processedEventIds.clear();
-    this.lastEventTs = 0;
-    this.lastDmEventTs = 0;
-    this.fallbackDmSince = null;
-
-    // Create NostrKeyManager from private key
+    // Staged, NOT applied: the key material belongs to the client that will
+    // carry it. Applying it up front left a FAILED swap running the old client
+    // and its old-address subscriptions under the NEW key — gift wraps for the
+    // old address decrypted with the wrong key, the new address subscribed
+    // nowhere, and no error path that could put either back.
     const secretKey = Buffer.from(identity.privateKey, 'hex');
-    this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
+    const nextKeyManager = NostrKeyManager.fromPrivateKey(secretKey);
 
-    // Use Nostr-format pubkey (32 bytes / 64 hex chars) from keyManager
-    const nostrPubkey = this.keyManager.getPublicKeyHex();
-    logger.debug('Nostr', 'Identity set, Nostr pubkey:', nostrPubkey.slice(0, 16) + '...');
+    // Nostr-format pubkey (32 bytes / 64 hex chars)
+    const nostrPubkey = nextKeyManager.getPublicKeyHex();
+    logger.debug('Nostr', 'Identity staged, Nostr pubkey:', nostrPubkey.slice(0, 16) + '...');
 
-    // If we already have a NostrClient with a temp key, we need to reconnect with the real key
-    // NostrClient doesn't support changing key at runtime
+    /**
+     * Commit the staged identity — always together with the client it belongs
+     * to, never before it. The per-address dedup window is reset here for the
+     * same reason: stale entries from the previous address must not block the
+     * new address's events, and wiping them for a swap that then FAILS would
+     * re-admit already-processed events on the address still subscribed.
+     */
+    const applyStagedIdentity = (): void => {
+      this.identity = identity;
+      this.keyManager = nextKeyManager;
+      this.processedEventIds.clear();
+      this.lastEventTs = 0;
+      this.lastDmEventTs = 0;
+      this.fallbackDmSince = null;
+    };
+
+    // NostrClient cannot swap its key at runtime, so an identity change while
+    // connected means building a replacement client and handing it the socket.
     if (this.nostrClient && this.status === 'connected') {
       logger.debug('Nostr', 'Identity changed while connected - recreating NostrClient');
       const oldClient = this.nostrClient;
@@ -519,7 +530,7 @@ export class NostrTransportProvider implements TransportProvider {
       // orphans `oldClient` — socket open but unreachable from the provider, so
       // `disconnect()` cannot reach it either — and setIdentity never touches
       // `status`, so the caller's next retry re-enters here and leaks another.
-      const nextClient = new NostrClient(this.keyManager, {
+      const nextClient = new NostrClient(nextKeyManager, {
         autoReconnect: this.config.autoReconnect,
         reconnectIntervalMs: this.config.reconnectDelay,
         maxReconnectIntervalMs: this.config.reconnectDelay * 16,
@@ -557,18 +568,38 @@ export class NostrTransportProvider implements TransportProvider {
         throw error;
       }
 
+      // A `disconnect()` (or a competing swap) during the await above already
+      // tore this provider down: installing a freshly connected client now
+      // resurrects it — live socket plus subscriptions, owned by nobody, with
+      // the caller told the identity took. Dispose the replacement and reject,
+      // because neither the client nor the identity was applied.
+      if (this.nostrClient !== oldClient || this.status !== 'connected') {
+        try { nextClient.disconnect(); } catch { /* best-effort cleanup */ }
+        throw new SphereError(
+          'Transport client changed or left the connected state during setIdentity'
+            + ' - identity not applied',
+          'TRANSPORT_ERROR'
+        );
+      }
+
       // The swap is committed. From here on `oldClient` is unreachable from the
       // provider, so it must be disposed on EVERY path out — including a
       // throwing `subscribeToEvents()`.
       this.nostrClient = nextClient;
+      applyStagedIdentity();
       try {
         await this.subscribeToEvents();
       } finally {
         try { oldClient.disconnect(); } catch { /* best-effort cleanup */ }
       }
     } else if (this.isConnected()) {
-      // Already connected with right key, just subscribe
+      // No client swap needed — commit first, since subscribeToEvents() reads
+      // `identity`/`keyManager` to build its filters.
+      applyStagedIdentity();
       await this.subscribeToEvents();
+    } else {
+      // Not connected: no client work to fail, so nothing to stage against.
+      applyStagedIdentity();
     }
   }
 

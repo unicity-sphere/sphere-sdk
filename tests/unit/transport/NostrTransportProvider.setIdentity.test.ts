@@ -14,6 +14,12 @@
  * `oldClient.disconnect()` only on the success tail — so a failed connect
  * orphaned the old client (open socket, unreachable from the provider, so
  * `disconnect()` could not reach it either) and every retry leaked another one.
+ *
+ * Two further invariants, from the #772 review:
+ * - a `disconnect()` that lands mid-swap wins — the replacement is disposed,
+ *   never installed into a provider nobody owns any more;
+ * - identity + key manager + dedup window move WITH the client, so a failed
+ *   swap leaves the old client running under its own key, not the new one.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -43,6 +49,8 @@ const clients: MockClient[] = [];
 const rejectConnectFor = new Set<number>();
 const hangConnectFor = new Set<number>();
 const throwSubscribeFor = new Set<number>();
+/** Connects that stay pending until the test resolves the gate, keyed by index. */
+const gateConnectFor = new Map<number, Promise<void>>();
 
 vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@unicitylabs/nostr-js-sdk')>();
@@ -55,6 +63,8 @@ vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
         connect: vi.fn(async () => {
           if (rejectConnectFor.has(id)) throw new Error(`relay refused (client ${id})`);
           if (hangConnectFor.has(id)) await new Promise<never>(() => { /* never settles */ });
+          const gate = gateConnectFor.get(id);
+          if (gate) await gate;
         }),
         disconnect: vi.fn(),
         isConnected: vi.fn().mockReturnValue(true),
@@ -82,12 +92,12 @@ const { NostrTransportProvider } = await import('../../../transport/NostrTranspo
 
 const TIMEOUT_MS = 50;
 
-function createProvider() {
+function createProvider(timeout: number = TIMEOUT_MS) {
   return new NostrTransportProvider({
     relays: ['wss://relay1.test'],
     // Inert: the (mocked) SDK NostrClient owns its own sockets.
     createWebSocket: (() => {}) as unknown as WebSocketFactory,
-    timeout: TIMEOUT_MS,
+    timeout,
     autoReconnect: false,
   });
 }
@@ -103,6 +113,17 @@ function identity(n: number) {
 /** Read the provider's private client field — the identity of the survivor. */
 function currentClient(provider: InstanceType<typeof NostrTransportProvider>): MockClient | null {
   return (provider as unknown as { nostrClient: MockClient | null }).nostrClient;
+}
+
+type ProviderInternals = {
+  identity: { privateKey: string; chainPubkey: string } | null;
+  processedEventIds: Set<string>;
+  lastDmEventTs: number;
+};
+
+/** No public accessor exists for these three — the cast is the only reader. */
+function internals(provider: InstanceType<typeof NostrTransportProvider>): ProviderInternals {
+  return provider as unknown as ProviderInternals;
 }
 
 /**
@@ -127,6 +148,7 @@ describe('NostrTransportProvider — setIdentity() client swap', () => {
     rejectConnectFor.clear();
     hangConnectFor.clear();
     throwSubscribeFor.clear();
+    gateConnectFor.clear();
   });
 
   afterEach(() => {
@@ -202,6 +224,58 @@ describe('NostrTransportProvider — setIdentity() client swap', () => {
     for (const c of clients) {
       expect(c.disconnect.mock.calls.length).toBeLessThanOrEqual(1);
     }
+  });
+
+  it('disposes the replacement when disconnect() lands mid-swap', async () => {
+    // Deadline well past the gate: the rejection must come from the ownership
+    // check, not from connectWithDeadline timing the gated connect out.
+    const provider = createProvider(10_000);
+    await provider.connect();                 // client 0
+    await provider.setIdentity(identity(1));  // client 1
+
+    let openTheRelay!: () => void;
+    gateConnectFor.set(2, new Promise<void>((resolve) => { openTheRelay = resolve; }));
+    const swap = provider.setIdentity(identity(2));   // client 2, connect pending
+    await vi.waitFor(() => expect(clients).toHaveLength(3));
+
+    await provider.disconnect();
+    openTheRelay();
+    await expect(swap).rejects.toThrow(/during setIdentity - identity not applied/);
+
+    expect(currentClient(provider)).toBeNull();          // no resurrection
+    expect(clients[2].disconnect).toHaveBeenCalledTimes(1);
+    expect(clients[2].subscribe).not.toHaveBeenCalled(); // no post-teardown subs
+    expect(clients[1].disconnect).toHaveBeenCalledTimes(1);
+    expect(leakedClients(provider)).toEqual([]);
+    expect(provider.getStatus()).toBe('disconnected');
+  });
+
+  it('keeps the OLD identity, key manager and dedup window when the swap fails', async () => {
+    const provider = createProvider();
+    await provider.connect();
+    await provider.setIdentity(identity(1));
+
+    const oldPubkey = provider.getNostrPubkey();
+    internals(provider).processedEventIds.add('event-seen-on-old-address');
+    internals(provider).lastDmEventTs = 1234;
+
+    rejectConnectFor.add(2);
+    await expect(provider.setIdentity(identity(2))).rejects.toThrow(/relay refused/);
+
+    // The old client is still installed and still subscribed with the old key.
+    expect(currentClient(provider)).toBe(clients[1]);
+    expect(provider.getNostrPubkey()).toBe(oldPubkey);
+    expect(internals(provider).identity).toEqual(identity(1));
+    expect(internals(provider).processedEventIds.has('event-seen-on-old-address')).toBe(true);
+    expect(internals(provider).lastDmEventTs).toBe(1234);
+
+    // ...and a swap that SUCCEEDS still applies everything.
+    await provider.setIdentity(identity(3));
+    expect(currentClient(provider)).toBe(clients[3]);
+    expect(provider.getNostrPubkey()).not.toBe(oldPubkey);
+    expect(internals(provider).identity).toEqual(identity(3));
+    expect(internals(provider).processedEventIds.size).toBe(0);
+    expect(internals(provider).lastDmEventTs).toBe(0);
   });
 
   it('leaves no pending connect-deadline timer behind', async () => {
