@@ -898,6 +898,16 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
       return null;
     };
 
+    // The bring-up must not be ENTERED, not merely undone. The guard after it discards
+    // whatever it built, so asserting only the end state cannot tell the two apart —
+    // and that is precisely what let this guard's mutation probe survive a full run.
+    const internals = sphere as unknown as {
+      buildTokenEngine: (identity: unknown) => Promise<ITokenEngine>;
+    };
+    const realBuild = internals.buildTokenEngine.bind(sphere);
+    const buildSpy = vi.fn(realBuild);
+    internals.buildTokenEngine = buildSpy;
+
     const switching = sphere.switchToAddress(1, { nametag: 'zed' }).then(
       () => 'resolved' as const,
       (err: unknown) => err
@@ -918,8 +928,9 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
       world.transports.filter((t) => t.session.startCalls === 1 && t.session.stopCalls === 0)
     ).toHaveLength(0);
     expect(world.transports).toHaveLength(1);
-    // Nothing rebuilt: no module set, no mux.
+    // Nothing rebuilt: no module set, no mux — and nothing was built to be undone.
     expect(modules.size).toBe(0);
+    expect(buildSpy).not.toHaveBeenCalled();
     expect((sphere as unknown as { _transportMux: unknown })._transportMux).toBeNull();
     expect(outcome).toBeInstanceOf(SphereError);
     expect((outcome as SphereError).code).toBe('NOT_INITIALIZED');

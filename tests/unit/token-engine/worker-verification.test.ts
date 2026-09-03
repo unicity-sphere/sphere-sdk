@@ -355,9 +355,20 @@ describe('dispose() during an in-flight verification (#770 item 4)', () => {
     // A 0-transfer token never reaches the pool, so no other guard can notice the
     // teardown: without the `disposed` gate on verify(), a torn-down engine keeps
     // handing out verdicts as if it were live.
-    const outcome = await settleWithin(engine.verify(mintedOnly), 3000);
-    expect(outcome.state).toBe('rejected');
-    expect(outcome).toMatchObject({ reason: { code: 'MODULE_DESTROYED' } });
+    //
+    // Asserting only the rejection is NOT enough any more: the post-registration
+    // re-check would reject too, which made this guard's mutation probe SURVIVE. The
+    // gate's own job is to not ENTER the torn-down SDK verifier at all, so that is
+    // what is asserted — through the base method, the one seam that can tell them apart.
+    const base = vi.spyOn(WorkerTokenVerifier.prototype, 'verify');
+    try {
+      const outcome = await settleWithin(engine.verify(mintedOnly), 3000);
+      expect(outcome.state).toBe('rejected');
+      expect(outcome).toMatchObject({ reason: { code: 'MODULE_DESTROYED' } });
+      expect(base).not.toHaveBeenCalled();
+    } finally {
+      base.mockRestore();
+    }
     expect(createWorker).not.toHaveBeenCalled();
   }, 30000);
 
