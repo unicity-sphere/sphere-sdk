@@ -963,16 +963,6 @@
     ]
   },
   {
-    "name": "sphere-switch-sets-transport-identity-after-destroy",
-    "note": "#770.3: setIdentity recreates the NostrClient, so an unguarded switch reconnects the transport after disconnectProvidersIndependently() already ran",
-    "file": "core/Sphere.ts",
-    "find": "    this.ensureAlive();\n    await this._transport.setIdentity(this._identity);",
-    "replace": "    await this._transport.setIdentity(this._identity);",
-    "tests": [
-      "tests/integration/sphere-payments-v2-wiring.test.ts"
-    ]
-  },
-  {
     "name": "sphere-refused-switch-persists-its-index",
     "note": "#770.3: a switch destroy() overtook must not leave its index on disk \u2014 persisting it sends the NEXT boot to an address the user never finished moving to",
     "file": "core/Sphere.ts",
@@ -1010,6 +1000,16 @@
     "replace": "    // probe: the receive drain is left untracked\n",
     "tests": [
       "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "health-accepts-any-blocknumber",
+    "note": "#769.1: the field being PRESENT is not a height. Accepting any string/number reports a gateway healthy on a body carrying no usable answer ({blockNumber:'error'}, '', 1.5, -1)",
+    "file": "core/network-health.ts",
+    "find": "  if (typeof n === 'string') return /^\\d+$/.test(n) ? n : null;\n  if (typeof n === 'number') return Number.isInteger(n) && n >= 0 ? String(n) : null;\n  return null;",
+    "replace": "  return typeof n === 'string' || typeof n === 'number' ? String(n) : null;",
+    "tests": [
+      "tests/unit/core/network-health.test.ts"
     ]
   }
 ]

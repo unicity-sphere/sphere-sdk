@@ -68,6 +68,35 @@ describe('checkNetworkHealth', () => {
       expect(result.services.oracle!.error).toContain('no such method');
     });
 
+    it.each([
+      ['a non-numeric string', 'error'],
+      ['an empty string', ''],
+      ['a fractional number', 1.5],
+      ['a negative number', -1],
+    ])('reports unhealthy when result.blockNumber is %s', async (_label, blockNumber) => {
+      // The field being PRESENT is not a height. Accepting any string or number here
+      // reports a gateway healthy on a body that carries no usable answer.
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify({ jsonrpc: '2.0', result: { blockNumber }, id: 1 }), {
+          status: 200,
+        }),
+      );
+
+      const result = await checkNetworkHealth('testnet', { services: ['oracle'] });
+
+      expect(result.services.oracle!.healthy).toBe(false);
+    });
+
+    it('accepts a decimal-string height beyond Number.MAX_SAFE_INTEGER', async () => {
+      // Heights arrive as decimal strings and eventually outgrow a JS number, so the
+      // string form is validated as digits rather than parsed.
+      fetchSpy.mockResolvedValueOnce(blockHeightBody('90071992547409910'));
+
+      const result = await checkNetworkHealth('testnet', { services: ['oracle'] });
+
+      expect(result.services.oracle!.healthy).toBe(true);
+    });
+
     it("surfaces the gateway's own error string from a 400 rather than a bare status", async () => {
       fetchSpy.mockResolvedValueOnce(
         new Response(JSON.stringify({ error: 'Shard ID not found: 0' }), {

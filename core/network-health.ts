@@ -261,7 +261,13 @@ function readBlockNumber(body: unknown): string | null {
   const result = (body as { result?: unknown }).result;
   if (typeof result !== 'object' || result === null) return null;
   const n = (result as { blockNumber?: unknown }).blockNumber;
-  return typeof n === 'string' || typeof n === 'number' ? String(n) : null;
+  // A height, not merely a present field. The gateway sends it as a decimal STRING
+  // ("40932"), and heights outstrip Number.MAX_SAFE_INTEGER eventually, so the string
+  // form is checked as digits rather than parsed. Without this, `{blockNumber: "error"}`
+  // or `""` reads as a healthy aggregator.
+  if (typeof n === 'string') return /^\d+$/.test(n) ? n : null;
+  if (typeof n === 'number') return Number.isInteger(n) && n >= 0 ? String(n) : null;
+  return null;
 }
 
 /** The `error` member of a JSON-RPC body, or the gateway's bare `{"error": "..."}`. */
