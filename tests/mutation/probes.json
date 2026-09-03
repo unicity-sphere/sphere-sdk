@@ -545,8 +545,8 @@
     "name": "init-failure-strands-registry",
     "note": "#767: a rejection inside the guarded bring-up must actually reach the catch \u2014 swallowing it would leave a half-built Sphere published and reported as success",
     "file": "core/Sphere.ts",
-    "find": "    try {\n      await bringUp();\n    } catch (err) {",
-    "replace": "    try {\n      await bringUp().catch(() => undefined);\n    } catch (err) {",
+    "find": "    try {\n      await bringUp();\n      Sphere.publishLive(sphere, clearGeneration);\n    } catch (err) {",
+    "replace": "    try {\n      await bringUp().catch(() => undefined);\n      Sphere.publishLive(sphere, clearGeneration);\n    } catch (err) {",
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
     ]
@@ -1040,6 +1040,57 @@
     "replace": "        (result) => {\n          resolve(result);\n        },\n        (error: unknown) => {\n          reject(error);\n        }",
     "tests": [
       "tests/unit/token-engine/worker-verification.test.ts"
+    ]
+  },
+  {
+    "name": "publish-refuses-cleared-store",
+    "note": "#772 review: an init is invisible to clear() until it publishes, so without this compare a create() whose KV was emptied mid-init publishes an isReady Sphere over nothing",
+    "file": "core/Sphere.ts",
+    "find": "    if (Sphere.clearGenerationOf(sphere._storage) !== clearGeneration) {",
+    "replace": "    if (false) {",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "clear-bumps-generation-on-entry",
+    "note": "#772 review: bumping only on exit misses an init that publishes DURING the clear \u2014 past its snapshot, before its wipe",
+    "file": "core/Sphere.ts",
+    "find": "    Sphere.bumpClearGeneration(storage);\n    try {\n      await Sphere.clearStore(storage);",
+    "replace": "    // probe\n    try {\n      await Sphere.clearStore(storage);",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "clear-bumps-generation-on-exit",
+    "note": "#772 review: bumping only on entry misses an init that STARTS mid-clear, records the already-bumped value and is wiped a moment later",
+    "file": "core/Sphere.ts",
+    "find": "    } finally {\n      Sphere.bumpClearGeneration(storage);\n    }",
+    "replace": "    } finally {\n      void storage;\n    }",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-index-refused-at-write",
+    "note": "#772 review: the uint32 rule must hold before the WRITE, not only after reload \u2014 a persisted 1.5 derives index 1's keys and aliases a real address",
+    "file": "storage/tracked-addresses.ts",
+    "find": "    if (!isDerivableIndex(entry.index)) {\n      throw new SphereError(",
+    "replace": "    if (false) {\n      throw new SphereError(",
+    "tests": [
+      "tests/unit/storage/tracked-addresses.test.ts",
+      "tests/unit/storage/contracts/tracked-addresses.contract.ts"
+    ]
+  },
+  {
+    "name": "derivation-refuses-underivable-index",
+    "note": "#772 review: the storage-layer refusal is too late \u2014 ensureAddressTracked mutates the in-memory registry before persisting, so derivation itself must refuse",
+    "file": "core/Sphere.ts",
+    "find": "    Sphere.assertDerivableIndex(index);\n\n    if (!this._masterKey) {",
+    "replace": "    // probe\n\n    if (!this._masterKey) {",
+    "tests": [
+      "tests/integration/tracked-addresses-concurrent.test.ts"
     ]
   }
 ]
