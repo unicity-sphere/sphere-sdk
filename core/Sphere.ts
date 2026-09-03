@@ -42,6 +42,7 @@
  */
 
 import { logger } from './logger';
+import { sharedCell } from './global-cell';
 import type {
   Identity,
   FullIdentity,
@@ -61,6 +62,7 @@ import type {
 } from '../types';
 import { SphereError } from './errors';
 import type { StorageProvider } from '../storage';
+import { isDerivableIndex } from '../storage/tracked-addresses';
 import type { TransportProvider, PeerInfo } from '../transport';
 import { MultiAddressTransportMux, AddressTransportAdapter } from '../transport/MultiAddressTransportMux';
 import type { OracleProvider } from '../oracle';
@@ -453,19 +455,72 @@ export interface AddressModuleSet {
   initialized: boolean;
 }
 
+/**
+ * The lifecycle state that must be PROCESS-wide, not per-bundle: every subpath export
+ * is its own tsup bundle, so a Sphere built through `sphere-sdk` was invisible to a
+ * `clear()` called through `sphere-sdk/core` — #766 again, across the entry points.
+ * The object keys travel with it: split, two bundles hand DIFFERENT providers the same
+ * `object:1` and one wallet's clear() destroys another's Sphere.
+ */
+interface SphereLifecycleCell {
+  readonly live: Map<string, Set<Sphere>>;
+  readonly clearGenerations: Map<string, number>;
+  readonly objectStoreKeys: WeakMap<StorageProvider, string>;
+  objectStoreSeq: number;
+}
+
+const lifecycle = sharedCell<SphereLifecycleCell>(
+  'core.sphere.lifecycle@1',
+  () => ({
+    live: new Map(),
+    clearGenerations: new Map(),
+    objectStoreKeys: new WeakMap(),
+    objectStoreSeq: 0,
+  }),
+  (cell) => {
+    const c = cell as Partial<SphereLifecycleCell>;
+    return c.live instanceof Map && c.clearGenerations instanceof Map
+      && c.objectStoreKeys instanceof WeakMap && typeof c.objectStoreSeq === 'number';
+  },
+);
+
 // =============================================================================
 // Sphere Class
 // =============================================================================
 
 export class Sphere {
-  // Singleton
-  private static instance: Sphere | null = null;
+  // Live Spheres, keyed by the BACKING STORE their provider addresses. NOT a liveness
+  // API: it exists only so clear()/import() tear down the instances whose data they
+  // really erase. Object identity was too narrow — two providers over one dataDir/DB
+  // are different objects but the same file, so clearing through one left the other's
+  // Sphere live over an emptied KV (#766).
+  private static readonly _liveByStorage: Map<string, Set<Sphere>> = lifecycle.live;
+
+  /** Fallback keys for providers that declare no `backingStoreId` — one per object. */
+  private static readonly _objectStoreKeys: WeakMap<StorageProvider, string> =
+    lifecycle.objectStoreKeys;
+
+  /**
+   * How many times each backing store has been cleared. An init is invisible to `clear()`
+   * until it PUBLISHES (#767), so a clear cannot destroy one in flight and would wipe the
+   * store under it. Every init records this number before its first storage work and
+   * publication refuses if it moved (#772). Only cleared stores get an entry, so the
+   * strongly-held keys are bounded by the stores a process actually clears.
+   */
+  private static readonly _clearGenerations: Map<string, number> = lifecycle.clearGenerations;
 
   // One-time best-effort cleanup of the orphaned vesting cache (prior versions).
   private static _orphanCacheCleaned = false;
 
   // State
   private _initialized = false;
+  /**
+   * Destroyed latch (#770). Distinct from `_initialized`, which destroy() clears LAST — after
+   * every teardown step — so it cannot mark "teardown has begun". This is set as destroy()'s
+   * very FIRST statement, so the WHOLE teardown window is guarded, not just the instant after
+   * it. Read by ensureAlive() and by the §7 lifecycle mutex.
+   */
+  private _destroyed = false;
   private _trackedAddressesLoaded = false;
   private _identity: MutableFullIdentity | null = null;
   private _masterKey: MasterKey | null = null;
@@ -630,7 +685,10 @@ export class Sphere {
    */
   static async init(options: SphereInitOptions): Promise<SphereInitResult> {
     // Configure debug logging (also needed in main bundle context, same as TokenRegistry)
-    if (options.debug) logger.configure({ debug: true });
+    // `undefined` leaves whatever the provider factory or consumer set; an explicit
+    // `false` MUST turn debug off. A truthy-only check made this process-global flag
+    // one-way — no second init could ever quieten it (#766).
+    if (options.debug !== undefined) logger.configure({ debug: options.debug });
 
     // Fail-closed BEFORE any work: retired module options + the required
     // wallet-api composition (create/load re-check for direct callers).
@@ -662,6 +720,7 @@ export class Sphere {
         market,
         communications: options.communications,
         password: options.password,
+        verification: options.verification,
         discoverAddresses: options.discoverAddresses,
         onProgress: options.onProgress,
       });
@@ -703,6 +762,7 @@ export class Sphere {
       market,
       communications: options.communications,
       password: options.password,
+      verification: options.verification,
       discoverAddresses: options.discoverAddresses,
       onProgress: options.onProgress,
     });
@@ -807,21 +867,24 @@ export class Sphere {
   /**
    * Own a registry for the duration of `bringUp`, disposing it if any of that rejects.
    *
-   * `bringUp` must cover EVERY fallible step from here until the Sphere is published to
-   * `Sphere.instance` — until then the caller receives nothing it could destroy, so a
+   * `bringUp` must cover EVERY fallible step from here until the Sphere is returned to
+   * its caller — until then nobody holds anything they could destroy, so a
    * registry left behind is unreachable and its hourly fetch runs for the life of the
    * process. Guarding a named subset of the steps is what failed twice: the guarded region
-   * and the fallible region were separate things, and drifted.
+   * and the fallible region were separate things, and drifted. Publication is the LAST
+   * guarded step for the same reason: it can refuse, and a refusal must tear down.
    */
   private static async withOwnedRegistry(
     sphere: Sphere,
     storage: StorageProvider,
     network: NetworkType | undefined,
+    clearGeneration: number,
     bringUp: () => Promise<void>,
   ): Promise<void> {
     sphere._registry = Sphere.createOwnedRegistry(storage, network);
     try {
       await bringUp();
+      Sphere.publishLive(sphere, clearGeneration);
     } catch (err) {
       // Tear down the WHOLE half-built Sphere, not just its registry. By this point
       // providers may be connected and the payments vertical running, and publication
@@ -848,7 +911,10 @@ export class Sphere {
    * Create new wallet with mnemonic
    */
   static async create(options: SphereCreateOptions): Promise<Sphere> {
-    if (options.debug) logger.configure({ debug: true });
+    // `undefined` leaves whatever the provider factory or consumer set; an explicit
+    // `false` MUST turn debug off. A truthy-only check made this process-global flag
+    // one-way — no second init could ever quieten it (#766).
+    if (options.debug !== undefined) logger.configure({ debug: options.debug });
 
     // Fail-closed BEFORE any storage write: retired module options + the
     // required wallet-api composition.
@@ -859,6 +925,11 @@ export class Sphere {
     if (!options.mnemonic || !Sphere.validateMnemonic(options.mnemonic)) {
       throw new SphereError('Invalid mnemonic', 'INVALID_IDENTITY');
     }
+
+    // #772: recorded BEFORE the first storage read/write and re-checked at publication —
+    // a clear() cannot see this init to destroy it, so it would otherwise wipe the keys
+    // written below out from under a Sphere that goes on to report itself ready.
+    const clearGeneration = Sphere.clearGenerationOf(options.storage);
 
     // Check if wallet already exists
     if (await Sphere.exists(options.storage)) {
@@ -901,7 +972,7 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, async () => {
+    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, clearGeneration, async () => {
       await sphere.initializeProviders();
       await sphere.initializeModules();
 
@@ -953,7 +1024,6 @@ export class Sphere {
       progress?.({ step: 'complete', message: 'Wallet created' });
     });
 
-    Sphere.instance = sphere;
     return sphere;
   }
 
@@ -961,11 +1031,17 @@ export class Sphere {
    * Load existing wallet from storage
    */
   static async load(options: SphereLoadOptions): Promise<Sphere> {
-    if (options.debug) logger.configure({ debug: true });
+    // `undefined` leaves whatever the provider factory or consumer set; an explicit
+    // `false` MUST turn debug off. A truthy-only check made this process-global flag
+    // one-way — no second init could ever quieten it (#766).
+    if (options.debug !== undefined) logger.configure({ debug: options.debug });
 
     // Fail-closed first: retired module options + the required wallet-api composition.
     Sphere.refuseRetiredModuleOptions(options);
     const composition = resolvePaymentsV2Composition(options.walletApi, options.network);
+
+    // #772: see create() — recorded before the first storage read, refused at publication.
+    const clearGeneration = Sphere.clearGenerationOf(options.storage);
 
     // Check if wallet exists
     if (!(await Sphere.exists(options.storage))) {
@@ -1005,7 +1081,7 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, async () => {
+    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, clearGeneration, async () => {
       await sphere.initializeProviders();
       await sphere.initializeModules();
 
@@ -1035,7 +1111,6 @@ export class Sphere {
       progress?.({ step: 'complete', message: 'Wallet loaded' });
     });
 
-    Sphere.instance = sphere;
     return sphere;
   }
 
@@ -1043,7 +1118,10 @@ export class Sphere {
    * Import wallet from mnemonic or master key
    */
   static async import(options: SphereImportOptions): Promise<Sphere> {
-    if (options.debug) logger.configure({ debug: true });
+    // `undefined` leaves whatever the provider factory or consumer set; an explicit
+    // `false` MUST turn debug off. A truthy-only check made this process-global flag
+    // one-way — no second init could ever quieten it (#766).
+    if (options.debug !== undefined) logger.configure({ debug: options.debug });
 
     // Fail-closed BEFORE the destructive clear below: retired module options +
     // the required wallet-api composition.
@@ -1058,10 +1136,12 @@ export class Sphere {
 
     logger.debug('Sphere', 'Starting import...');
 
-    // Clear existing wallet if any. Skip if no active instance and wallet
-    // doesn't exist — avoids a redundant IndexedDB delete/reopen that can race
-    // with a subsequent initialize().
-    const needsClear = Sphere.instance !== null || await Sphere.exists(options.storage);
+    // Clear THIS storage's wallet if it has one — not the liveness bucket's, which
+    // names the unit of ERASURE (an IndexedDB clear() empties the whole database).
+    // A sibling prefix's live Sphere lands in that bucket, so deciding on it made
+    // an import into an UNUSED prefix wipe a wallet nobody asked to touch.
+    const liveHere = Sphere.liveOn(options.storage).some((s) => s._storage === options.storage);
+    const needsClear = liveHere || (await Sphere.exists(options.storage));
     if (needsClear) {
       progress?.({ step: 'clearing', message: 'Clearing previous wallet data...' });
       logger.debug('Sphere', 'Clearing existing wallet data...');
@@ -1078,6 +1158,10 @@ export class Sphere {
       await options.storage.connect();
       logger.debug('Sphere', 'Storage reconnected');
     }
+
+    // #772: recorded AFTER import's OWN clear above, which bumps the generation. Recording
+    // it earlier would make every import refuse its own publication.
+    const clearGeneration = Sphere.clearGenerationOf(options.storage);
 
     // Configure TokenRegistry for THIS network in the main bundle context.
     // import() previously omitted this (unlike init/create/load), leaving the
@@ -1134,7 +1218,7 @@ export class Sphere {
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
     logger.debug('Sphere', 'Initializing providers...');
-    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, async () => {
+    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, clearGeneration, async () => {
       await sphere.initializeProviders();
       await sphere.initializeModules();
       logger.debug('Sphere', 'Modules initialized');
@@ -1189,7 +1273,6 @@ export class Sphere {
       logger.debug('Sphere', 'Import complete');
     });
 
-    Sphere.instance = sphere;
     return sphere;
   }
 
@@ -1208,12 +1291,27 @@ export class Sphere {
    */
   static async clear(options: { storage: StorageProvider }): Promise<void> {
     const storage = options.storage;
+    // Bumped on ENTRY and again on exit, so an init that publishes anywhere in this
+    // window is refused too — not only one that publishes after the wipe (#772). The
+    // snapshot below is taken before the wipe, so a Sphere that registers between the
+    // two is neither destroyed here nor able to keep its data.
+    Sphere.bumpClearGeneration(storage);
+    try {
+      await Sphere.clearStore(storage);
+    } finally {
+      Sphere.bumpClearGeneration(storage);
+    }
+  }
 
+  private static async clearStore(storage: StorageProvider): Promise<void> {
     // 1. Destroy Sphere instance — stops the payments vertical (quiescence),
     //    then closes all connections.
-    if (Sphere.instance) {
-      logger.debug('Sphere', 'Destroying Sphere instance...');
-      await Sphere.instance.destroy();
+    // Scoped on purpose: destroying whichever Sphere was constructed last silently
+    // killed a live wallet on an unrelated provider, dropping every sphere.on() handler
+    // with no event and no error (#766). A Sphere on other storage is not our business.
+    for (const live of Sphere.liveOn(storage)) {
+      logger.debug('Sphere', 'Destroying Sphere instance on this storage...');
+      await live.destroy();
       logger.debug('Sphere', 'Sphere instance destroyed');
     }
 
@@ -1287,17 +1385,72 @@ export class Sphere {
   }
 
   /**
-   * Get current instance
+   * The key a provider registers under: the store it addresses, so every provider
+   * over one dataDir/DB shares an entry. A provider that declares no store keeps a
+   * private key, leaving custom implementations scoped by object identity.
    */
-  static getInstance(): Sphere | null {
-    return Sphere.instance;
+  private static storeKeyOf(storage: StorageProvider): string {
+    const declared = storage.backingStoreId;
+    if (declared) return `store:${declared}`;
+    let key = Sphere._objectStoreKeys.get(storage);
+    if (!key) {
+      key = `object:${++lifecycle.objectStoreSeq}`;
+      Sphere._objectStoreKeys.set(storage, key);
+    }
+    return key;
+  }
+
+  /** The clears this store has seen. Absent means none — `clear()` creates the entry. */
+  private static clearGenerationOf(storage: StorageProvider): number {
+    return Sphere._clearGenerations.get(Sphere.storeKeyOf(storage)) ?? 0;
+  }
+
+  private static bumpClearGeneration(storage: StorageProvider): void {
+    const key = Sphere.storeKeyOf(storage);
+    Sphere._clearGenerations.set(key, (Sphere._clearGenerations.get(key) ?? 0) + 1);
   }
 
   /**
-   * Check if initialized
+   * Make a fully-built Sphere reachable — or refuse, if `clear()` emptied the store
+   * under it while it was building. Check and registration are one SYNCHRONOUS step on
+   * purpose: split by an await, a clear could land between them and wipe a store whose
+   * Sphere is already published. The refusal throws inside `withOwnedRegistry`, whose
+   * teardown then destroys the half-built Sphere the caller never received.
    */
-  static isInitialized(): boolean {
-    return Sphere.instance?._initialized ?? false;
+  private static publishLive(sphere: Sphere, clearGeneration: number): void {
+    if (Sphere.clearGenerationOf(sphere._storage) !== clearGeneration) {
+      throw new SphereError(
+        'The wallet store was cleared while this wallet was initializing, so the keys and journals this init wrote are gone. Nothing was published; re-run Sphere.init() once the clear has settled.',
+        'STORAGE_ERROR',
+      );
+    }
+    Sphere.registerLive(sphere);
+  }
+
+  /** Record a fully-built Sphere against the storage it owns. See `_liveByStorage`. */
+  private static registerLive(sphere: Sphere): void {
+    const key = Sphere.storeKeyOf(sphere._storage);
+    let live = Sphere._liveByStorage.get(key);
+    if (!live) {
+      live = new Set();
+      Sphere._liveByStorage.set(key, live);
+    }
+    live.add(sphere);
+  }
+
+  private static unregisterLive(sphere: Sphere): void {
+    const key = Sphere.storeKeyOf(sphere._storage);
+    const live = Sphere._liveByStorage.get(key);
+    if (!live) return;
+    live.delete(sphere);
+    // String keys mean the map holds them strongly: an emptied Set must go, or every
+    // store ever opened is retained for the life of the process.
+    if (live.size === 0) Sphere._liveByStorage.delete(key);
+  }
+
+  /** Snapshot — callers iterate this while destroy() mutates the underlying Set. */
+  private static liveOn(storage: StorageProvider): Sphere[] {
+    return Array.from(Sphere._liveByStorage.get(Sphere.storeKeyOf(storage)) ?? []);
   }
 
   /**
@@ -1460,9 +1613,11 @@ export class Sphere {
     // Keep the active address's OWN record in step — it is what a later switch
     // back reads, and a stale entry would hand that address a disposed engine.
     if (active) active.tokenEngine = this._tokenEngine;
-    // The facade snapshots its engine per operation — swap what FUTURE
-    // operations use; in-flight ones finish on the old engine (disposed below,
-    // which only tears down a verification worker pool).
+    // The facade snapshots its engine per operation — swap what FUTURE operations use. An
+    // in-flight op keeps the OLD handle, which is NOT the same as finishing on it: disposal
+    // cancels in-flight verification deterministically (the verify REJECTS), so an op that is
+    // mid-verify when the key changes fails instead of completing. `verify` is a receive-path
+    // read, never a spend — no money moves either way, but the caller sees an error.
     if (this._paymentsV2Active && this._tokenEngine) {
       this._paymentsV2Active.facade.setEngine(this._tokenEngine);
     }
@@ -1576,8 +1731,7 @@ export class Sphere {
         });
 
         if (result.success) {
-          const sphere = Sphere.getInstance();
-          return { success: true, sphere: sphere!, mnemonic: result.mnemonic };
+          return { success: true, sphere: result.sphere, mnemonic: result.mnemonic };
         }
 
         if (!password && result.error?.includes('Password required')) {
@@ -1956,7 +2110,8 @@ export class Sphere {
   /**
    * Import wallet from JSON backup
    *
-   * @returns Object with success status and optionally recovered mnemonic
+   * @returns `{ success, sphere?, mnemonic?, error? }`. `sphere` is the instance built
+   *   on the SUPPLIED storage — hold it, there is no global to look it up from (#766).
    *
    * @example
    * ```ts
@@ -1971,7 +2126,7 @@ export class Sphere {
   static async importFromJSON(options: Omit<SphereImportOptions, 'mnemonic' | 'masterKey' | 'chainCode' | 'derivationPath' | 'basePath' | 'derivationMode'> & {
     jsonContent: string;
     password?: string;
-  }): Promise<{ success: boolean; mnemonic?: string; error?: string }> {
+  }): Promise<{ success: boolean; sphere?: Sphere; mnemonic?: string; error?: string }> {
     const { jsonContent, password, ...baseOptions } = options;
 
     try {
@@ -2011,20 +2166,20 @@ export class Sphere {
 
       // Import using mnemonic if available (preferred)
       if (mnemonic) {
-        await Sphere.import({ ...baseOptions, mnemonic, basePath });
-        return { success: true, mnemonic };
+        const sphere = await Sphere.import({ ...baseOptions, mnemonic, basePath });
+        return { success: true, sphere, mnemonic };
       }
 
       // Otherwise import using master key
       if (masterKey) {
-        await Sphere.import({
+        const sphere = await Sphere.import({
           ...baseOptions,
           masterKey,
           chainCode: data.wallet.chainCode,
           basePath,
           derivationMode: data.derivationMode || (data.wallet.isBIP32 ? 'bip32' : 'wif_hmac'),
         });
-        return { success: true };
+        return { success: true, sphere };
       }
 
       return { success: false, error: 'No mnemonic or master key in wallet data' };
@@ -2156,7 +2311,11 @@ export class Sphere {
     }
     if (entry.hidden === hidden) return;
 
-    (entry as { hidden: boolean }).hidden = hidden;
+    // `updatedAt` moves with `hidden`: the registry merge (#766 item 5) resolves a
+    // conflicting entry by the greater `updatedAt`, so a stale flag left with its old
+    // timestamp would let another Sphere's snapshot win and silently undo this change.
+    (entry as { hidden: boolean; updatedAt: number }).hidden = hidden;
+    (entry as { hidden: boolean; updatedAt: number }).updatedAt = Date.now();
     await this.persistTrackedAddresses();
 
     const eventType = hidden ? 'address:hidden' : 'address:unhidden';
@@ -2187,10 +2346,6 @@ export class Sphere {
 
     if (!this._masterKey) {
       throw new SphereError('HD derivation requires master key with chain code. Cannot switch addresses.', 'INVALID_CONFIG');
-    }
-
-    if (index < 0) {
-      throw new SphereError('Address index must be non-negative', 'INVALID_CONFIG');
     }
 
     // If nametag requested, normalize and validate format early
@@ -2263,7 +2418,17 @@ export class Sphere {
       // storage keys.  Without this, modules would load the previous address's data.
       this._storage.setIdentity(newIdentity);
 
+      // #770: every await below re-checks liveness. switchToAddress calls ensureReady() ONCE
+      // at entry and then awaits ~8 times; destroy() can land in any of those gaps. This step
+      // is the transport vector: initializeAddressModules → ensureTransportMux BUILDS and
+      // connect()s a fresh mux whenever `_transportMux` is null — exactly what destroy()
+      // leaves behind — so an unguarded switch opens new sockets after teardown returned.
+      this.ensureAlive();
       await this.initializeAddressModules({ index, identity: newIdentity });
+      // The guard above is a check BEFORE an await: destroy() landing inside this
+      // bring-up would otherwise let the continuation register a live module set —
+      // and a reconnected mux — on a Sphere whose teardown had already returned.
+      if (this._destroyed) await this.discardModulesBuiltDuringDestroy(index);
     } else if (nametag !== this._addressModules.get(index)!.identity.nametag) {
       // Modules already exist — only the nametag label changed.
       this._addressModules.get(index)!.identity = newIdentity;
@@ -2289,8 +2454,14 @@ export class Sphere {
     // so two verticals never write one per-address KV; the lifecycle mutex
     // serializes overlapping switches. Re-visits compose a FRESH vertical
     // (durable state lives in the scoped KV; a stopped session can't restart).
+    this.ensureAlive();
     await this.stopThenStartPaymentsV2(index, newIdentity);
 
+    // #770: a refused switch must not leave its index on disk. Without this guard a switch
+    // that destroy() overtook still persisted the address it never finished moving to, so the
+    // NEXT boot loaded a different wallet address than the one the user was last on — and the
+    // write can race destroy()'s provider disconnect besides.
+    this.ensureAlive();
     // Persist current index
     await this._storage.set(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX, index.toString());
 
@@ -2303,12 +2474,17 @@ export class Sphere {
       this._transport.setFallbackSince(fallbackTs);
     }
 
+    // Defence in depth, and NOT individually falsifiable: the index-persist guard above
+    // throws first on every path that reaches here, so deleting this one changes no
+    // observable behaviour. It stays for the await between them (#770).
+    this.ensureAlive();
     await this._transport.setIdentity(this._identity);
 
     // The transport recreates its NostrClient on identity change (the
     // SDK's client doesn't support runtime key swaps). When the Mux is
     // sharing that client (#123), it must rebind to the new instance
     // and re-establish its wallet/chat subscriptions on the new socket.
+    this.ensureAlive();
     if (this._transportMux && typeof (this._transportMux as { rebindToSharedClient?: () => Promise<void> }).rebindToSharedClient === 'function') {
       await (this._transportMux as { rebindToSharedClient: () => Promise<void> }).rebindToSharedClient();
     }
@@ -2333,6 +2509,12 @@ export class Sphere {
    * Runs after switchToAddress returns so L3 queries can start immediately.
    */
   private async postSwitchSync(index: number, newNametag?: string): Promise<void> {
+    // Fire-and-forget from switchToAddress, so this is the one switch step that can outlive
+    // its caller (#770). Defensive only: it guards ENTRY, and the ensureAlive() before
+    // setIdentity already refuses earlier on this path — it stays so that a future reordering
+    // of switchToAddress cannot silently restart nametag registration / transport rebinding.
+    this.ensureAlive();
+
     // Sync identity with transport — recovers nametag from existing Nostr bindings
     if (!newNametag) {
       await this.syncIdentityWithTransport();
@@ -2357,6 +2539,42 @@ export class Sphere {
    * independently in background. The payments vertical is NOT created here —
    * the caller starts it via stopThenStartPaymentsV2 (§7 single vertical).
    */
+  /** Tear one address's module set down. Each address owns its own engine, so its own pool. */
+  private static destroyModuleSet(index: number, moduleSet: AddressModuleSet): void {
+    try {
+      moduleSet.communications.destroy();
+      moduleSet.groupChat?.destroy();
+      moduleSet.market?.destroy();
+      moduleSet.tokenEngine?.dispose?.();
+      logger.debug('Sphere', `Destroyed modules for address ${index}`);
+    } catch (err) {
+      logger.warn('Sphere', `Error destroying modules for address ${index}:`, err);
+    }
+  }
+
+  /**
+   * Undo a module set built while `destroy()` was running.
+   *
+   * `destroy()`'s teardown loop has already emptied `_addressModules`, so a set
+   * registered after it would stay live and unreachable — its own engine (and worker
+   * pool), and a transport mux `ensureTransportMux` rebuilt because teardown had just
+   * nulled the field. Then re-raise, so the switch fails rather than reporting success
+   * on a destroyed Sphere (#770, #772 review).
+   */
+  private async discardModulesBuiltDuringDestroy(index: number): Promise<never> {
+    const built = this._addressModules.get(index);
+    this._addressModules.delete(index);
+    if (built) Sphere.destroyModuleSet(index, built);
+    if (this._transportMux) {
+      const mux = this._transportMux;
+      this._transportMux = null;
+      await Sphere.safeDisconnect('transport mux', () => mux.disconnect());
+    }
+    this.ensureAlive();
+    /* c8 ignore next */
+    throw new SphereError('Sphere destroyed', 'NOT_INITIALIZED');
+  }
+
   private async initializeAddressModules(
     spec: { index: number; identity: FullIdentity },
   ): Promise<AddressModuleSet> {
@@ -2486,6 +2704,15 @@ export class Sphere {
     return adapter;
   }
 
+  /** A BIP32 child number: an integer in 0…0xffffffff. Anything else aliases an address. */
+  private static assertDerivableIndex(index: number): void {
+    if (isDerivableIndex(index)) return;
+    throw new SphereError(
+      `Address index ${String(index)} is not a BIP32 child number: it must be an integer in 0…0xffffffff.`,
+      'INVALID_CONFIG',
+    );
+  }
+
   /**
    * Derive address at a specific index
    *
@@ -2533,6 +2760,12 @@ export class Sphere {
    * when _initialized is still false.
    */
   private _deriveAddressInternal(index: number, isChange: boolean = false): AddressInfo {
+    // The path segment is parseInt()ed downstream, so 1.5 silently derives index 1's keys,
+    // and a child number past 0xffffffff pads to more than 8 hex digits and derives
+    // off-standard. Refused at the one point every index reaches derivation through —
+    // deriveAddress, ensureAddressTracked, discovery and switchToAddress alike.
+    Sphere.assertDerivableIndex(index);
+
     if (!this._masterKey) {
       throw new SphereError('HD derivation requires master key with chain code', 'INVALID_CONFIG');
     }
@@ -2643,7 +2876,11 @@ export class Sphere {
       }
 
       if (tracked.hidden !== hidden) {
-        (tracked as { hidden: boolean }).hidden = hidden;
+        // Bump `updatedAt` with `hidden` — the registry merge (#766 item 5) breaks a
+        // conflict by the greater `updatedAt`, so an unbumped flag can be overwritten
+        // by another Sphere's older snapshot.
+        (tracked as { hidden: boolean; updatedAt: number }).hidden = hidden;
+        (tracked as { hidden: boolean; updatedAt: number }).updatedAt = Date.now();
       }
     }
 
@@ -3469,7 +3706,24 @@ export class Sphere {
     }
   }
 
+  /**
+   * Tear this Sphere down: stop the vertical, destroy the modules, disconnect the providers
+   * and zero the key material. Idempotent by construction (every step is null-guarded) and
+   * deliberately WITHOUT an early return on re-entry, which would change what a double call
+   * means.
+   *
+   * #770: the FIRST statement flips `_destroyed` — before any await, and before this queues
+   * its own stop on the §7 lifecycle mutex. That position is load-bearing. Every guard reads
+   * the flag, so from that instant any switchToAddress step not yet begun refuses; and
+   * because it flips SYNCHRONOUSLY at entry, a stop/start pair the mutex runs after this call
+   * sees `true` and skips its start. Set it beside `_initialized` at the bottom instead and a
+   * concurrent switch re-arms a wallet whose owner already had destroy() return: fresh
+   * sockets, a fresh wallet-api session, a whole fresh vertical nothing will ever stop.
+   */
   async destroy(): Promise<void> {
+    // #770 — MUST stay the first statement; see the note above.
+    this._destroyed = true;
+
     // FIRST, before anything that can throw. Module teardown and
     // MultiAddressTransportMux.disconnect() propagate, so any later placement would let a
     // single failure leave this Sphere's registry fetching forever. Nothing below needs it.
@@ -3489,16 +3743,7 @@ export class Sphere {
 
     // Destroy all per-address module sets
     for (const [idx, moduleSet] of this._addressModules.entries()) {
-      try {
-        moduleSet.communications.destroy();
-        moduleSet.groupChat?.destroy();
-        moduleSet.market?.destroy();
-        // Each address has its OWN engine, so each may own its own worker pool.
-        moduleSet.tokenEngine?.dispose?.();
-        logger.debug('Sphere', `Destroyed modules for address ${idx}`);
-      } catch (err) {
-        logger.warn('Sphere', `Error destroying modules for address ${idx}:`, err);
-      }
+      Sphere.destroyModuleSet(idx, moduleSet);
     }
     this._addressModules.clear();
 
@@ -3537,9 +3782,7 @@ export class Sphere {
     this._disabledProviders.clear();
     this.eventHandlers.clear();
 
-    if (Sphere.instance === this) {
-      Sphere.instance = null;
-    }
+    Sphere.unregisterLive(this);
   }
 
   // ===========================================================================
@@ -4019,10 +4262,25 @@ export class Sphere {
     return run;
   }
 
-  /** Switch/boot: stop whatever runs, then start `index`'s vertical — atomically vs other lifecycle ops. */
+  /**
+   * Switch/boot: stop whatever runs, then start `index`'s vertical — atomically vs other
+   * lifecycle ops.
+   *
+   * #770: the destroyed check between the two halves settles the FACADE vector on its own.
+   * `_destroyed` flips synchronously at destroy() entry, so any closure that BEGINS executing
+   * after destroy() was called sees `true`, and any closure already past the check has
+   * facade.start() in flight — which destroy()'s own queued stop is necessarily ordered
+   * after. The TRANSPORT vector is not on this mutex at all; the ensureAlive() calls in
+   * switchToAddress are what cover it.
+   */
   private stopThenStartPaymentsV2(index: number, identity: FullIdentity): Promise<void> {
     return this.queuePaymentsV2Op(async () => {
       await this.stopPaymentsV2Inner();
+      // #770: destroy() may have run — or merely begun — while this pair waited its turn on
+      // the mutex. Starting now would attach a LIVE vertical (wallet-api session, wake
+      // socket, stream pulls, receive poll) to an owner whose destroy() already returned,
+      // and nothing would ever stop it again.
+      if (this._destroyed) return;
       await this.startPaymentsV2Inner(index, identity);
     });
   }
@@ -4081,7 +4339,20 @@ export class Sphere {
     await active.facade.stop();
   }
 
+  /**
+   * Refuse once destroy() has STARTED (#770). `_initialized` cannot carry this: destroy()
+   * clears it last, so every teardown step is a window in which a concurrent call still reads
+   * a ready Sphere and re-arms it.
+   */
+  private ensureAlive(): void {
+    if (this._destroyed) {
+      throw new SphereError('Sphere destroyed', 'NOT_INITIALIZED');
+    }
+  }
+
   private ensureReady(): void {
+    // Every existing ensureReady() caller inherits the destroyed check.
+    this.ensureAlive();
     if (!this._initialized) {
       throw new SphereError('Sphere not initialized', 'NOT_INITIALIZED');
     }
@@ -4147,5 +4418,4 @@ export const createSphere = Sphere.create.bind(Sphere);
 export const loadSphere = Sphere.load.bind(Sphere);
 export const importSphere = Sphere.import.bind(Sphere);
 export const initSphere = Sphere.init.bind(Sphere);
-export const getSphere = Sphere.getInstance.bind(Sphere);
 export const sphereExists = Sphere.exists.bind(Sphere);

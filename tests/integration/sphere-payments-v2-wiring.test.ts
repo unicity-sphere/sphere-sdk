@@ -25,6 +25,7 @@ import { getPublicKey, hexToBytes } from '../../core/crypto';
 import { decryptDeliveryBundle, deriveDeliveryEncryptionKey } from '../../core/delivery-envelope';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { TRUSTBASE_TESTNET2 } from '../../assets/trustbase';
+import { STORAGE_KEYS_GLOBAL } from '../../constants';
 import { TokenRegistry } from '../../registry';
 import type { PeerInfo, TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
@@ -347,7 +348,7 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
     // The guard now covers everything up to publication, not a named subset of steps.
     // Twice I widened it one step and the next step along was still unguarded; this pins
     // the far end — a failure at 'finalizing', after providers AND modules are up, still
-    // happens before Sphere.instance is assigned, so the caller gets nothing to destroy.
+    // happens before the Sphere is published, so the caller gets nothing to destroy.
     const create = vi.spyOn(TokenRegistry, 'create');
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-late2-'));
     const storage = new FileStorageProvider({ dataDir });
@@ -376,10 +377,11 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
 
   it('disposes the registry when the LAST init step rejects, after publication would have been', async () => {
     // Publication used to happen mid-init, and the guard ended there on the premise that a
-    // published Sphere is recoverable via Sphere.getInstance(). That premise fails under
-    // concurrent inits — a second one overwrites the static — so the guard now runs to the
-    // end and publication is the last thing before the return. 'complete' is the final
-    // progress step in create(), so a throw here is past every other fallible operation.
+    // published Sphere is still recoverable by the caller. It is not: publication only
+    // records the Sphere in the private per-storage registry clear()/import() tear down
+    // (#766) — there is no lookup API at all — so the guard runs to the end and publication
+    // is the last thing before the return. 'complete' is the final progress step in
+    // create(), so a throw here is past every other fallible operation.
     const create = vi.spyOn(TokenRegistry, 'create');
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-registry-last-'));
     const storage = new FileStorageProvider({ dataDir });
@@ -401,11 +403,10 @@ describe('Sphere payments wiring — the token registry is OWNED, not the proces
 
       expect(create).toHaveBeenCalledTimes(1);
       expect((create.mock.results[0]!.value as TokenRegistry).isDisposed).toBe(true);
-      // And the failed init published nothing, so no half-built Sphere is reachable.
-      expect(Sphere.getInstance()).toBeNull();
+      // The failed init published nothing, so no half-built Sphere is reachable by anyone.
       // Precisely because nothing is reachable, the failure path must tear the whole
-      // Sphere down — providers are connected and the vertical is running by now, and
-      // disposing only the registry would strand all of it with no owner.
+      // Sphere down itself — providers are connected and the vertical is running by now,
+      // and disposing only the registry would strand all of it with no owner.
       expect(transport.disconnect).toHaveBeenCalled();
       expect(storage.isConnected()).toBe(false);
     } finally {
@@ -808,6 +809,183 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     expect(caught).toBeInstanceOf(SphereError);
     expect((caught as SphereError).code).toBe('NOT_INITIALIZED');
   }, 20_000);
+
+  it('destroy() racing an unawaited switchToAddress leaves nothing running', async () => {
+    // #770: switchToAddress calls ensureReady() ONCE at entry and then awaits ~8 times, and
+    // `_initialized` is cleared LAST by destroy() — so every one of those hops is a window in
+    // which a concurrent teardown is invisible. The switch's stop/start pair is queued on the
+    // §7 mutex, so destroy()'s own stop is ordered AFTER it: without a destroyed latch the
+    // pair's start composes a whole new vertical (wallet-api session, wake socket, stream
+    // pulls, receive poll) for an owner whose destroy() has already RESOLVED, and nothing is
+    // left that could ever stop it.
+    const world = makeWorld();
+    const sphere = await buildSphere({ walletApi: world.walletApi });
+    const transport = (sphere as unknown as { _transport: TransportProvider })._transport;
+    const setIdentity = transport.setIdentity as unknown as ReturnType<typeof vi.fn>;
+
+    // Hold the boot vertical's stop at quiescence so the switch parks INSIDE its stop/start
+    // pair — the exact window destroy() has to land in.
+    let release!: () => void;
+    const opened = new Promise<void>((resolve) => (release = resolve));
+    world.gates.listMailbox = async () => opened;
+    const receiving = sphere.payments.receive();
+
+    // UNAWAITED: the caller's switch is still in flight when the owner tears the wallet down.
+    const switching = sphere.switchToAddress(1).then(
+      () => 'resolved' as const,
+      (err: unknown) => err
+    );
+    await sleep(200);
+    expect(world.transports).toHaveLength(1);
+
+    const identityCallsBeforeDestroy = setIdentity.mock.calls.length;
+    const storage = (sphere as unknown as { _storage: FileStorageProvider })._storage;
+    const indexBeforeDestroy = await storage.get(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX);
+    const destroying = sphere.destroy();
+    await sleep(50);
+    delete world.gates.listMailbox;
+    release();
+    await receiving.catch(() => undefined);
+    await destroying;
+    const outcome = await switching;
+    // Give anything the switch might still have queued a chance to actually run.
+    await sleep(200);
+
+    // The invariant: after destroy() resolves, NO vertical is left started-but-not-stopped.
+    expect(
+      world.transports.filter((t) => t.session.startCalls === 1 && t.session.stopCalls === 0)
+    ).toHaveLength(0);
+    // Stronger: the switch never composed a second vertical at all.
+    expect(world.transports).toHaveLength(1);
+    expect(world.transports[0]!.session.stopCalls).toBe(1);
+
+    // The switch refused instead of re-arming the transport (the vector the §7 mutex cannot
+    // cover — it is not a lifecycle op).
+    expect(outcome).toBeInstanceOf(SphereError);
+    expect((outcome as SphereError).code).toBe('NOT_INITIALIZED');
+    expect(setIdentity.mock.calls.length).toBe(identityCallsBeforeDestroy);
+    expect((sphere as unknown as { _transportMux: unknown })._transportMux).toBeNull();
+    // A refused switch must not leave its index on disk: persisting it would send the NEXT
+    // boot to an address the user never finished moving to.
+    expect(await storage.get(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX)).toBe(indexBeforeDestroy);
+
+    let caught: unknown;
+    try {
+      void sphere.payments;
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SphereError);
+    expect((caught as SphereError).code).toBe('NOT_INITIALIZED');
+  }, 30_000);
+
+  it('destroy() racing a switch parked BEFORE module bring-up never rebuilds the module set', async () => {
+    // The other half of #770, and the one the §7 mutex provably cannot reach: a switch parked
+    // on an await that is NOT a lifecycle op. initializeAddressModules → ensureTransportMux
+    // BUILDS and connect()s a fresh MultiAddressTransportMux whenever `_transportMux` is null
+    // — which is exactly the state destroy() leaves behind — so an unguarded resume opens new
+    // sockets and refills the per-address module map that destroy() just cleared.
+    const world = makeWorld();
+    const sphere = await buildSphere({ walletApi: world.walletApi });
+    const transport = (sphere as unknown as { _transport: TransportProvider })._transport;
+    const modules = (sphere as unknown as { _addressModules: Map<number, unknown> })._addressModules;
+
+    // Park at the nametag availability probe — the hop immediately BEFORE module bring-up.
+    let release!: () => void;
+    const opened = new Promise<void>((resolve) => (release = resolve));
+    (transport as unknown as { resolveNametag: () => Promise<null> }).resolveNametag = async () => {
+      await opened;
+      return null;
+    };
+
+    // The bring-up must not be ENTERED, not merely undone. The guard after it discards
+    // whatever it built, so asserting only the end state cannot tell the two apart —
+    // and that is precisely what let this guard's mutation probe survive a full run.
+    const internals = sphere as unknown as {
+      buildTokenEngine: (identity: unknown) => Promise<ITokenEngine>;
+    };
+    const realBuild = internals.buildTokenEngine.bind(sphere);
+    const buildSpy = vi.fn(realBuild);
+    internals.buildTokenEngine = buildSpy;
+
+    const switching = sphere.switchToAddress(1, { nametag: 'zed' }).then(
+      () => 'resolved' as const,
+      (err: unknown) => err
+    );
+    await sleep(200);
+
+    await sphere.destroy();
+    expect(modules.size).toBe(0);
+
+    release();
+    const outcome = await switching;
+    await sleep(200);
+
+    // THE invariant: after destroy() resolved, nothing is left started-but-not-stopped. This
+    // ordering is the one that leaves a PERMANENT orphan when unguarded — destroy()'s stop
+    // has already run, so the switch's start has no stop behind it, ever.
+    expect(
+      world.transports.filter((t) => t.session.startCalls === 1 && t.session.stopCalls === 0)
+    ).toHaveLength(0);
+    expect(world.transports).toHaveLength(1);
+    // Nothing rebuilt: no module set, no mux — and nothing was built to be undone.
+    expect(modules.size).toBe(0);
+    expect(buildSpy).not.toHaveBeenCalled();
+    expect((sphere as unknown as { _transportMux: unknown })._transportMux).toBeNull();
+    expect(outcome).toBeInstanceOf(SphereError);
+    expect((outcome as SphereError).code).toBe('NOT_INITIALIZED');
+  }, 30_000);
+
+  it('destroy() landing INSIDE module bring-up discards what the bring-up built', async () => {
+    // The guards in switchToAddress are checks BEFORE an await. This is the gap they
+    // cannot close on their own: destroy() lands while initializeAddressModules is
+    // itself awaiting, its teardown loop empties _addressModules, and the continuation
+    // then registers a fully-built set — its own token engine, and so its own worker
+    // pool — on a Sphere whose destroy() has already returned. Nothing would ever
+    // dispose it, and nothing holds a reference through which it could be found.
+    const world = makeWorld();
+    const sphere = await buildSphere({ walletApi: world.walletApi });
+    const modules = (sphere as unknown as { _addressModules: Map<number, unknown> })._addressModules;
+
+    // Park INSIDE the bring-up, on the engine build — past ensureTransportMux, before
+    // the module set is registered.
+    let release!: () => void;
+    const opened = new Promise<void>((resolve) => (release = resolve));
+    const internals = sphere as unknown as {
+      buildTokenEngine: (identity: unknown) => Promise<ITokenEngine>;
+    };
+    const realBuild = internals.buildTokenEngine.bind(sphere);
+    const built: ITokenEngine[] = [];
+    internals.buildTokenEngine = async (identity: unknown): Promise<ITokenEngine> => {
+      await opened;
+      const engine = await realBuild(identity);
+      engine.dispose = vi.fn();
+      built.push(engine);
+      return engine;
+    };
+
+    const switching = sphere.switchToAddress(1).then(
+      () => 'resolved' as const,
+      (err: unknown) => err
+    );
+    await sleep(200);
+
+    await sphere.destroy();
+    expect(modules.size).toBe(0);
+
+    release();
+    const outcome = await switching;
+    await sleep(200);
+
+    // The set the continuation built is gone again, and its engine — the one destroy()
+    // could not have disposed, because it did not exist yet — was disposed here.
+    expect(modules.size).toBe(0);
+    expect(built).toHaveLength(1);
+    expect(built[0]!.dispose).toHaveBeenCalledTimes(1);
+    expect((sphere as unknown as { _transportMux: unknown })._transportMux).toBeNull();
+    expect(outcome).toBeInstanceOf(SphereError);
+    expect((outcome as SphereError).code).toBe('NOT_INITIALIZED');
+  }, 30_000);
 
   it('setOracleApiKey rebuilds the engine and swaps it via facade.setEngine; the replaced engine is disposed', async () => {
     const world = makeWorld();

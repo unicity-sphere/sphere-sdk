@@ -156,14 +156,10 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
   beforeEach(() => {
     cleanTestDir();
     clearRelay();
-    if (Sphere.getInstance()) {
-      (Sphere as unknown as { instance: null }).instance = null;
-    }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
   });
 
   afterEach(() => {
-    (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
     clearRelay();
   });
@@ -221,7 +217,6 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
     expect(binding!.nametag).toBe('alice');
 
     await sphere1.destroy();
-    (Sphere as unknown as { instance: null }).instance = null;
     transport.publishIdentityBinding.mockClear();
     transport.resolve.mockClear();
 
@@ -267,7 +262,6 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
     expect(sphere1.identity!.nametag).toBe('bob');
 
     await sphere1.destroy();
-    (Sphere as unknown as { instance: null }).instance = null;
 
     // 2. Simulate nametag loss: remove nametag from storage but keep binding on relay
     // Clear nametag from addressNametags in storage
@@ -345,7 +339,6 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
     expect(relayBindings.get(directAddr)!.nametag).toBe('carol');
 
     await sphere1.destroy();
-    (Sphere as unknown as { instance: null }).instance = null;
 
     // 2. Reload with broken transport (resolve throws)
     const transport2 = createMockTransport({ resolveThrows: true });
@@ -388,7 +381,6 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
     const _directAddr = sphere1.identity!.directAddress!;
 
     await sphere1.destroy();
-    (Sphere as unknown as { instance: null }).instance = null;
 
     // 2. Simulate nametag loss in local storage
     const identityKey = 'sphere_identity';
@@ -418,7 +410,6 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
     expect(sphere2.identity!.nametag).toBe('dave');
 
     await sphere2.destroy();
-    (Sphere as unknown as { instance: null }).instance = null;
     transport.publishIdentityBinding.mockClear();
 
     // 4. Second reload — nametag should be in local storage now, no need to recover
@@ -457,7 +448,6 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
     const directAddr = sphere1.identity!.directAddress!;
 
     await sphere1.destroy();
-    (Sphere as unknown as { instance: null }).instance = null;
 
     // 2. Simulate legacy event format on relay:
     //    - binding exists (found by chainPubkey.slice(2))
@@ -515,7 +505,6 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
     expect(migrated!.nametag).toBe('legacy_user');
 
     await sphere2.destroy();
-    (Sphere as unknown as { instance: null }).instance = null;
 
     // 5. Second reload — should find new-format event, no migration needed
     transport.publishIdentityBinding.mockClear();

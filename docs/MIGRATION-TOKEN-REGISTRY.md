@@ -90,11 +90,37 @@ You can get ahead of it now:
 Nothing above is required in this release. It is what will make the removal a small change
 rather than a large one.
 
+## Also removed: the Sphere lifecycle globals
+
+`Sphere.getInstance()`, `Sphere.isInitialized()` and the `getSphere` export are **removed**
+([#766](https://github.com/unicity-sphere/sphere-sdk/issues/766)). Hold the instance the entry
+point returns, and use `sphere.isReady`. Nothing in the fleet used them — the consumer gate
+found zero call sites across every sibling repo.
+
+They could not be safely deprecated: after a second Sphere is created *and destroyed*,
+`getInstance()` returned `null` while the first was alive and serving money, and a deprecation
+note does not stop a wrong answer being consumed.
+
+`Sphere.clear()` and `Sphere.import()` now destroy only Spheres built on the storage they are
+given — scoped by the **backing store** that storage addresses, not by the provider object.
+Previously they destroyed whichever Sphere was constructed last, so `Sphere.import({ storage: B })`
+killed a live wallet on storage A, dropping every `sphere.on()` handler with no event and no
+error. The `exists(storage)` behaviour that callers actually depend on is unchanged.
+
+The store is reported by a new optional `StorageProvider.backingStoreId`: the resolved wallet
+path for `FileStorageProvider`, `dbName` + key prefix for `IndexedDBStorageProvider`, the
+`Storage` object + prefix for `LocalStorageProvider`. Custom providers need not implement it —
+without it, each object is scoped to itself, as before.
+
 ## Not fixed by this release
 
-`Sphere` still holds a process-global `static instance`, so `Sphere.getInstance()` and
-`isInitialized()` describe whichever Sphere was created last, and `Sphere.clear()` /
-`Sphere.import()` destroy whichever instance holds that static **regardless of which storage
-they were given**. Two `FileStorageProvider`s pointed at one `dataDir` also clobber each
-other's wallet file. Those are tracked in [#766](https://github.com/unicity-sphere/sphere-sdk/issues/766)
-and are the remainder of "create new ones at the same time".
+Two `FileStorageProvider` objects pointed at one `dataDir` still clobber each other's wallet
+file while both are live: that provider caches the whole store in memory and rewrites the
+entire file on every `set()`, so a stale in-memory copy overwrites every key, money journals
+included, not just the one being written. Tracked as
+[#771](https://github.com/unicity-sphere/sphere-sdk/issues/771).
+
+Only the **concurrent-write** half is still open. The **teardown** half is fixed above: the two
+objects report the same `backingStoreId`, so `Sphere.clear()` through either one destroys every
+live Sphere on that file instead of leaving one running over a wallet that was just emptied
+underneath it.

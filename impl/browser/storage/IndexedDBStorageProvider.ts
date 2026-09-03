@@ -8,6 +8,11 @@ import { SphereError } from '../../../core/errors';
 import type { ProviderStatus, FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, isNetworkScopedAddressKey, type NetworkType } from '../../../constants';
+import {
+  mergeTrackedAddresses,
+  parseTrackedAddresses,
+  type TrackedAddressesFile,
+} from '../../../storage/tracked-addresses';
 
 // =============================================================================
 // Configuration
@@ -43,6 +48,8 @@ export class IndexedDBStorageProvider implements StorageProvider {
   readonly name = 'IndexedDB Storage';
   readonly type = 'local' as const;
   readonly description = 'Browser IndexedDB for large-capacity persistence';
+  /** The DATABASE — the unit clear() erases, so the unit that shares a fate (#766). */
+  readonly backingStoreId: string;
 
   private prefix: string;
   private dbName: string;
@@ -59,6 +66,11 @@ export class IndexedDBStorageProvider implements StorageProvider {
     this.dbName = config?.dbName ?? DB_NAME;
     this.network = config?.network;
     this.debug = config?.debug ?? false;
+    // The DATABASE, not the prefix: backingStoreId names the unit of ERASURE, and
+    // clear() with no prefix calls idbClear(), which empties the whole object
+    // store. Splitting prefixes into separate liveness buckets let a clear wipe
+    // another wallet's data and leave its Sphere isReady over the remains.
+    this.backingStoreId = `indexeddb:${encodeURIComponent(this.dbName)}`;
   }
 
   // ===========================================================================
@@ -222,19 +234,28 @@ export class IndexedDBStorageProvider implements StorageProvider {
     }
   }
 
+  /**
+   * Persist the tracked-address registry by MERGING, never replacing.
+   *
+   * Every Sphere over this storage holds its own snapshot and writes it in
+   * full, so a wholesale write drops the addresses this writer never saw
+   * (#766 item 5 — a lost update, reproducible on one network). The read, the
+   * merge and the write share ONE transaction: a lock on this object would
+   * order only this object's calls, and `backingStoreId` exists precisely
+   * because two provider objects — or two TABS — can address one database.
+   * IndexedDB serializes overlapping readwrite transactions across every
+   * connection, so both are covered.
+   */
   async saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void> {
-    await this.set(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES, JSON.stringify({ version: 1, addresses: entries }));
+    this.ensureConnected();
+    await this.idbMergeTrackedAddresses(
+      this.getFullKey(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES),
+      entries,
+    );
   }
 
   async loadTrackedAddresses(): Promise<TrackedAddressEntry[]> {
-    const data = await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES);
-    if (!data) return [];
-    try {
-      const parsed = JSON.parse(data);
-      return parsed.addresses ?? [];
-    } catch {
-      return [];
-    }
+    return parseTrackedAddresses(await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES));
   }
 
   // ===========================================================================
@@ -379,6 +400,29 @@ export class IndexedDBStorageProvider implements StorageProvider {
       const request = store.getAll();
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result ?? []);
+    });
+  }
+
+  private idbMergeTrackedAddresses(key: string, entries: TrackedAddressEntry[]): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const tx = this.db!.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const read = store.get(key);
+      read.onerror = () => reject(read.error);
+      read.onsuccess = () => {
+        const onDisk = parseTrackedAddresses((read.result as { v?: string } | undefined)?.v ?? null);
+        const file: TrackedAddressesFile = {
+          version: 1,
+          addresses: mergeTrackedAddresses(onDisk, entries),
+        };
+        store.put({ k: key, v: JSON.stringify(file) });
+      };
+      // Resolve on the TRANSACTION, not the put: only completion means durable.
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      // A throw inside onsuccess aborts the transaction: this is what stops such a save
+      // from resolving with nothing written.
+      tx.onabort = () => reject(tx.error ?? new Error('tracked-address write aborted'));
     });
   }
 

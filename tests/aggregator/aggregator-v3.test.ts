@@ -24,8 +24,15 @@ import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createSphereTokenEngine, type ITokenEngine } from '../../token-engine';
-import { SigningService } from '../../token-engine/sdk';
+import {
+  HexConverter,
+  InclusionProofVerificationStatus,
+  RootTrustBase,
+  SigningService,
+  VerificationStatus,
+} from '../../token-engine/sdk';
 import { startAggregatorStack, type AggregatorStack } from './support/aggregatorStack';
+import { flattenTrace, verificationContextFor, withWrongRootKeys } from './support/trustBase';
 
 const COIN = 'aa'.repeat(32);
 
@@ -41,10 +48,11 @@ afterAll(async () => {
   await stack?.stop();
 }, 120_000);
 
-function newEngine(): Promise<ITokenEngine> {
+/** @param trustBase Defaults to the stack's real trust base; the vacuity guard passes a doctored one. */
+function newEngine(trustBase: unknown = trustBaseJson): Promise<ITokenEngine> {
   return createSphereTokenEngine({
     aggregatorUrl: stack.url,
-    trustBaseJson,
+    trustBaseJson: trustBase,
     privateKey: SigningService.generatePrivateKey(),
     proofTimeoutMs: 30_000,
     proofPollIntervalMs: 500,
@@ -132,4 +140,62 @@ describe('engine ↔ real aggregator-go v3', () => {
     expect(Buffer.from(resumed.blob.token).equals(Buffer.from(first.blob.token))).toBe(true);
     expect(await recipient.verify(resumed)).toEqual({ ok: true });
   }, 180_000);
+
+  // The guard against every `{ ok: true }` above being vacuous. A verify() that
+  // never consulted the trust base would pass all four; only a NO it can be made
+  // to say proves it looked. The token is genuinely certified by the running
+  // service — the sole defect is the key the seal's signatures are checked against.
+  it('refuses that same certified token when the trust base carries a WRONG root key', async () => {
+    const engine = await newEngine();
+    const token = await engine.mint({
+      recipientPubkey: engine.getIdentity().chainPubkey,
+      value: { assets: [{ coinId: COIN, amount: 5n }] },
+    });
+    // Both directions in one run: a suite that only ever showed a failure would
+    // stay green if verification rejected everything.
+    expect(await engine.verify(token)).toEqual({ ok: true });
+
+    const wrongJson = withWrongRootKeys(trustBaseJson);
+    const real = RootTrustBase.fromJSON(trustBaseJson);
+    const wrong = RootTrustBase.fromJSON(wrongJson);
+    // Well-formed, and identical everywhere the certificate verifier looks before
+    // it reaches a signature — so nothing but the key can explain the refusal.
+    expect(wrong.networkId.id).toBe(real.networkId.id);
+    expect(wrong.quorumThreshold).toBe(real.quorumThreshold);
+    expect([...wrong.rootNodes.keys()]).toEqual([...real.rootNodes.keys()]);
+    for (const [nodeId, node] of wrong.rootNodes) {
+      expect(SigningService.isPublicKeyValid(node.signingKey)).toBe(true);
+      expect(HexConverter.encode(node.signingKey)).not.toBe(
+        HexConverter.encode(real.rootNodes.get(nodeId)!.signingKey),
+      );
+    }
+
+    // 1. The gate the money path actually calls (receive/Receive.ts screens on it).
+    //    It reports only the aggregated status, so this proves refusal, not cause.
+    const wrongEngine = await newEngine(wrongJson);
+    expect(await wrongEngine.verify(token)).toEqual({ ok: false, reason: VerificationStatus.FAIL });
+
+    // 2. The cause, from the trace the port collapses. Running the CORRECT trust
+    //    base through the same reconstructed context first is what makes the
+    //    reconstruction trustworthy: a miswired context would fail here too.
+    const okTrace = flattenTrace(await token.sdkToken.verify(verificationContextFor(trustBaseJson)));
+    expect(okTrace[0].status).toBe(VerificationStatus.OK);
+    expect(okTrace.map((entry) => entry.status)).not.toContain(InclusionProofVerificationStatus.INVALID_TRUSTBASE);
+
+    const failTrace = flattenTrace(await token.sdkToken.verify(verificationContextFor(wrongJson)));
+    expect(failTrace[0].status).toBe(VerificationStatus.FAIL);
+    expect(failTrace.map((entry) => entry.status)).toContain(InclusionProofVerificationStatus.INVALID_TRUSTBASE);
+    // Failed ON THE KEY: the node was found and its signature rejected. A lookup
+    // miss ('No root node defined') would reach INVALID_TRUSTBASE too, while
+    // proving only that an unknown node id is unknown.
+    expect(
+      failTrace.some(
+        (entry) =>
+          entry.rule.startsWith('SignatureVerificationRule[') &&
+          entry.status === VerificationStatus.FAIL &&
+          entry.message === 'Signature verification failed',
+      ),
+    ).toBe(true);
+    expect(failTrace.map((entry) => entry.message)).not.toContain('No root node defined');
+  }, 120_000);
 });

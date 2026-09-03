@@ -172,8 +172,9 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   assertNetworkConsistency(network);
 
   // Configure global logger: top-level debug enables all, per-provider overrides are additive
-  const globalDebug = config?.debug ?? false;
-  sdkLogger.configure({ debug: globalDebug });
+  // Only override when explicitly provided — `?? false` silently disabled a debug flag
+  // the consumer had already configured. Matches createBrowserProviders.
+  if (config?.debug !== undefined) sdkLogger.configure({ debug: config.debug });
   if (config?.transport?.debug) sdkLogger.setTagDebug('Nostr', true);
   if (config?.oracle?.debug) sdkLogger.setTagDebug('Aggregator', true);
   if (config?.price?.debug) sdkLogger.setTagDebug('Price', true);

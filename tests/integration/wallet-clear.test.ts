@@ -116,14 +116,10 @@ describe('Sphere.clear() integration', () => {
 
   beforeEach(() => {
     cleanTestDir();
-    if (Sphere.getInstance()) {
-      (Sphere as unknown as { instance: null }).instance = null;
-    }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
   });
 
   afterEach(() => {
-    (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
     clearNostrRelay();
   });

@@ -63,6 +63,11 @@ class DetMintEngine extends RealizationEngine implements DeterministicMintCapabl
 
 afterEach(cleanupWorlds);
 
+/** Yield enough microtask generations for a promise-only pass to settle. */
+async function microtasks(turns = 256): Promise<void> {
+  for (let i = 0; i < turns; i++) await Promise.resolve();
+}
+
 describe('PaymentsFacade — send policy', () => {
   it('a multi-token send reports each leg as it certifies, so the UI can show real progress', async () => {
     const world = makeWorld();
@@ -570,6 +575,45 @@ describe('PaymentsFacade — lifecycle', () => {
     });
     const ok = await world.facade.send({ recipient: '@peer', amount: '60', coinId: COIN });
     expect(ok.status).toBe('delivered');
+  });
+
+  it('stop() awaits the POLL drain: a drain the 30s backstop spawned holds stop() until it settles (#770)', async () => {
+    vi.useFakeTimers();
+    try {
+      const world = makeWorld({ receivePollMs: 30_000 });
+      const gift = await world.engine.mint({
+        recipientPubkey: hexToBytes(OWN_PUB),
+        value: { assets: [{ coinId: COIN, amount: 42n }] },
+      });
+      await world.peerDeliver(gift, 'gift-poll');
+      await world.facade.start();
+      const gate = world.gate('incoming');
+      const timeline: string[] = [];
+      let incomingAtStop = -1;
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await microtasks();
+      expect(gate.entered).toBe(true); // the backstop fired and is inside the listing
+
+      const stopping = world.facade.stop().then(() => {
+        timeline.push('stop-resolved');
+        incomingAtStop = eventsOf(world, 'transfer:incoming').length;
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await microtasks();
+      // Nothing else observes this drain: unregistered, stop() would already be done
+      // here and the rest of destroy() would run against a live wallet-api drain.
+      expect(timeline).toEqual([]);
+
+      gate.release();
+      await stopping;
+      expect(timeline).toEqual(['stop-resolved']);
+      // Settled means SETTLED: verified, stored, acked and announced before stop returned.
+      expect(incomingAtStop).toBe(1);
+      expect(world.facade.tokens().map((t) => t.id)).toContain(gift.blob.tokenId);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('setEngine mid-flight: the old op finishes on the OLD engine, the old engine is disposed, future ops use the new one', async () => {

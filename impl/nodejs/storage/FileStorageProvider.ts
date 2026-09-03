@@ -8,6 +8,11 @@ import * as path from 'path';
 import type { StorageProvider } from '../../../storage';
 import type { FullIdentity, ProviderStatus, TrackedAddressEntry } from '../../../types';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, isNetworkScopedAddressKey, type NetworkType } from '../../../constants';
+import {
+  mergeTrackedAddresses,
+  parseTrackedAddresses,
+  type TrackedAddressesFile,
+} from '../../../storage/tracked-addresses';
 
 export interface FileStorageProviderConfig {
   /** Directory to store wallet data */
@@ -21,10 +26,44 @@ export interface FileStorageProviderConfig {
   network?: NetworkType;
 }
 
+/**
+ * The canonical path of `p`, for identity rather than for I/O.
+ *
+ * `path.resolve` is purely lexical, so a directory reached through a symlink and
+ * the same directory reached directly produce DIFFERENT strings for ONE file.
+ * Two providers would then report different `backingStoreId`s, and
+ * `Sphere.clear()` through one alias would miss the Sphere registered through
+ * the other — wiping its wallet.json and leaving it isReady over the remains.
+ *
+ * `realpathSync` needs the path to exist, and a fresh `dataDir` legitimately
+ * does not yet. So the deepest EXISTING ancestor is canonicalised and the
+ * not-yet-created tail appended lexically: two providers agree whether or not
+ * the directory has been created, as long as the symlinked part of the path
+ * exists — which is the case that causes the aliasing in the first place.
+ */
+function canonicalPath(p: string): string {
+  const resolved = path.resolve(p);
+  const tail: string[] = [];
+  let cursor = resolved;
+  while (!fs.existsSync(cursor)) {
+    const parent = path.dirname(cursor);
+    if (parent === cursor) return resolved; // hit the root without finding anything
+    tail.unshift(path.basename(cursor));
+    cursor = parent;
+  }
+  try {
+    return path.join(fs.realpathSync(cursor), ...tail);
+  } catch {
+    return resolved; // unreadable ancestor — lexical is the honest fallback
+  }
+}
+
 export class FileStorageProvider implements StorageProvider {
   readonly id = 'file-storage';
   readonly name = 'File Storage';
   readonly type = 'local' as const;
+  /** The resolved wallet file — two providers over one path share erasure (#766). */
+  readonly backingStoreId: string;
 
   private dataDir: string;
   private filePath: string;
@@ -35,15 +74,25 @@ export class FileStorageProvider implements StorageProvider {
   private _identity: FullIdentity | null = null;
 
   constructor(config: FileStorageProviderConfig | string) {
+    // Resolved once, at construction: a later process.chdir() would otherwise make this
+    // provider read and write a DIFFERENT file while still reporting the backingStoreId
+    // computed from the old cwd — so clear() would empty one store and destroy the
+    // liveness bucket of another.
     if (typeof config === 'string') {
-      this.dataDir = config;
-      this.filePath = path.join(config, 'wallet.json');
+      this.dataDir = path.resolve(config);
+      this.filePath = path.join(this.dataDir, 'wallet.json');
     } else {
-      this.dataDir = config.dataDir;
-      this.filePath = path.join(config.dataDir, config.fileName ?? 'wallet.json');
+      this.dataDir = path.resolve(config.dataDir);
+      this.filePath = path.join(this.dataDir, config.fileName ?? 'wallet.json');
       this.network = config.network;
     }
     this.isTxtMode = this.filePath.endsWith('.txt');
+    // Canonicalise the DIRECTORY, keep the final entry: a directory symlink is a
+    // true alias, but save() renames a .tmp OVER filePath, which REPLACES a
+    // final-component symlink rather than writing through it — so those two
+    // paths diverge on the first save and must not share a bucket.
+    this.backingStoreId =
+      `file:${path.join(canonicalPath(this.dataDir), path.basename(this.filePath))}`;
   }
 
   setIdentity(identity: FullIdentity): void {
@@ -169,19 +218,44 @@ export class FileStorageProvider implements StorageProvider {
     await this.save();
   }
 
+  /** Serializes the read-merge-write below, per provider instance. */
+  private trackedWrites: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Persist the tracked-address registry by MERGING, never replacing.
+   *
+   * Every Sphere over this storage holds its own snapshot and writes it in
+   * full, so a wholesale write drops the addresses this writer never saw
+   * (#766 item 5 — a lost update, reproducible on one network). Concurrent
+   * calls are serialized on `trackedWrites` so a read can never interleave
+   * with another call's write.
+   *
+   * Deliberately PER OBJECT, unlike the browser providers. Two objects over one
+   * `dataDir` share a `backingStoreId` but not this cache, and `save()` rewrites the
+   * WHOLE file from it — so a sibling's *unrelated* `set()` rolls the registry back
+   * regardless of how this one write is serialized. Sharing the chain here would make
+   * the cross-object contract case pass while leaving the provider unsafe. The real
+   * fix is #771 (refresh from disk under a per-file lock, on every write); until then
+   * `backingStoreId` scopes TEARDOWN only. Reviewers keep re-finding this — see the
+   * `unsupported:` note in tests/unit/storage/tracked-addresses-providers.test.ts.
+   */
   async saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void> {
-    await this.set(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES, JSON.stringify({ version: 1, addresses: entries }));
+    const run = this.trackedWrites.then(async () => {
+      const onDisk = parseTrackedAddresses(await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES));
+      const file: TrackedAddressesFile = {
+        version: 1,
+        addresses: mergeTrackedAddresses(onDisk, entries),
+      };
+      await this.set(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES, JSON.stringify(file));
+    });
+    // The chain tail swallows the rejection so one failed write cannot brick
+    // every later one; the caller still sees the error by awaiting `run`.
+    this.trackedWrites = run.then(() => undefined, () => undefined);
+    await run;
   }
 
   async loadTrackedAddresses(): Promise<TrackedAddressEntry[]> {
-    const data = await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES);
-    if (!data) return [];
-    try {
-      const parsed = JSON.parse(data);
-      return parsed.addresses ?? [];
-    } catch {
-      return [];
-    }
+    return parseTrackedAddresses(await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES));
   }
 
   /**

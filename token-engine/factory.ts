@@ -38,13 +38,56 @@ import type { EngineConfig, ITokenEngine, VerificationWorker, VerificationWorker
 
 const DEFAULT_VERIFICATION_POOL_SIZE = 4;
 
+/** #770(4): what a verification cancelled by `dispose()` rejects with. */
+function disposedError(): SphereError {
+  return new SphereError(
+    'Verification worker pool disposed — the in-flight verification was cancelled',
+    'MODULE_DESTROYED',
+  );
+}
+
 /**
  * The consumer's worker factory, bound to the base SDK's pool verifier. The SDK
  * leaves `createWorker()` abstract so the platform choice stays with the consumer;
  * the cast is the port boundary (same web-`Worker` subset, payloads `unknown` on
  * our side so no SDK wire type escapes).
+ *
+ * ── #770(4): dispose() must SETTLE the in-flight batch ──────────────────────────
+ * The SDK's `WorkerPool.dispose()` (3.0.1) only calls `worker.terminate()` on
+ * every worker it spawned. A dispatched task resolves ONLY from `worker.onmessage`,
+ * which a terminated worker never posts, and queued tasks are never drained — so
+ * `WorkerTokenVerifier.verify`, which awaits `Promise.all(pool.run(...))`, hangs
+ * FOREVER. `pool` is `private readonly` upstream, so the settle has to live here.
+ *
+ * Reachable in production: `Sphere.setOracleApiKey` → `PaymentsFacade.setEngine`
+ * disposes the engine it replaced while a receive drain may be mid-`verify`.
+ *
+ * The cancellation MUST REJECT — never resolve `{ ok: false }`. The only
+ * `engine.verify` caller in the money path is `modules/payments-v2/receive/Receive.ts`
+ * (`screen()`, the `const verdict = await engine.verify(token)` line): a falsy
+ * verdict there is a PERMANENT `rejectAck(entry, 'invalid')`, i.e. a VALID
+ * incoming token thrown away at the mailbox because an api-key change happened
+ * to land mid-drain. A rejection instead propagates to the drain's catch, which
+ * leaves the entry UNACKED so it re-lists on the next drain.
+ *
+ * ── Why the cancellation is PER CALL, not one shared promise ──────────────────
+ * Racing every verify() against a single long-lived never-settling promise
+ * LEAKS: `Promise.race` subscribes to every input and does not detach when
+ * another input wins, so each finished verification pins a reaction record to
+ * that promise until dispose() — retention growing with every token the wallet
+ * has ever verified, inside the very class added to fix a teardown bug. So each
+ * call registers its own rejector in `cancellations` and drops it the instant
+ * the call settles: retention is bounded by CONCURRENT verifications, never by
+ * lifetime count. No parked `.catch()` is needed to keep a cancellation from
+ * becoming an unhandled rejection either — the only promise built per call is
+ * the one RETURNED, so its rejection is the caller's to observe, as before, and
+ * no promise this class creates outlives the call that created it.
  */
 class ConfiguredWorkerTokenVerifier extends WorkerTokenVerifier {
+  private disposed = false;
+  /** One rejector per IN-FLIGHT verify(), dropped on settle; empty when idle. */
+  private readonly cancellations = new Set<() => void>();
+
   public constructor(
     private readonly spawn: () => VerificationWorker,
     poolSize: number
@@ -52,13 +95,77 @@ class ConfiguredWorkerTokenVerifier extends WorkerTokenVerifier {
     super(poolSize);
   }
 
+  /** Verifications awaiting a verdict — back to 0 whenever the verifier is idle. */
+  public get pendingCancellations(): number {
+    return this.cancellations.size;
+  }
+
+  /** Rejects (see the class note) if `dispose()` lands before the pool answers. */
+  public override verify(
+    ...args: Parameters<WorkerTokenVerifier['verify']>
+  ): ReturnType<WorkerTokenVerifier['verify']> {
+    if (this.disposed) return Promise.reject(disposedError());
+    const verdict = super.verify(...args);
+    return new Promise((resolve, reject) => {
+      const cancel = (): void => reject(disposedError());
+      this.cancellations.add(cancel);
+      // Defensive, and currently UNREACHABLE — the SDK awaits the genesis rule before
+      // fanning transfers out, so a reentrant dispose() (a worker's postMessage handler
+      // runs on THIS thread) cannot land before this line. Kept because that ordering is
+      // an internal detail of a pinned dependency: fan out first and dispose() would
+      // clear the set BEFORE registration, hanging this promise on a dead worker.
+      if (this.disposed) {
+        this.cancellations.delete(cancel);
+        cancel();
+      }
+      // Settling twice is a no-op, so a verdict landing after dispose() cancelled
+      // the call can never downgrade that rejection into a falsy verdict.
+      void verdict.then(
+        (result) => {
+          this.cancellations.delete(cancel);
+          resolve(result);
+        },
+        (error: unknown) => {
+          this.cancellations.delete(cancel);
+          reject(error);
+        }
+      );
+    });
+  }
+
+  /** Idempotent — Sphere.setOracleApiKey disposes the replaced engine twice (facade + caller). */
+  public override dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    super.dispose(); // terminate() every spawned worker, as before
+    // Only AFTER the pool is down: settle whatever the terminated workers will
+    // now never answer. A no-op when nothing is in flight.
+    const cancelling = [...this.cancellations];
+    this.cancellations.clear();
+    for (const cancel of cancelling) cancel();
+  }
+
   protected createWorker(): IWorker {
+    // The SDK's dispose() leaves its `workers` array populated, so a task that
+    // slips in afterwards would call acquire() → createWorker() and RESURRECT
+    // the pool it just tore down. Fail instead.
+    if (this.disposed) throw disposedError();
     return this.spawn() as unknown as IWorker;
   }
 }
 
+/**
+ * A verifier whose in-flight verifications `dispose()` cancels. `pendingCancellations`
+ * is the observable that the bookkeeping behind that is per-call and short-lived
+ * (see the class note): it must return to 0 as verifications settle, never grow
+ * with the number of tokens verified.
+ */
+export interface CancellableTokenVerifier extends DisposableTokenVerifier {
+  readonly pendingCancellations: number;
+}
+
 /** Workers spawn LAZILY on first verify and are reused, so this costs nothing to build. */
-export function createWorkerTokenVerifier(config: VerificationWorkerConfig): DisposableTokenVerifier {
+export function createWorkerTokenVerifier(config: VerificationWorkerConfig): CancellableTokenVerifier {
   const poolSize = config.poolSize ?? DEFAULT_VERIFICATION_POOL_SIZE;
   if (!Number.isInteger(poolSize) || poolSize < 1) {
     throw new TypeError(`verification.poolSize must be a positive integer, got ${String(config.poolSize)}`);

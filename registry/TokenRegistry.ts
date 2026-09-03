@@ -258,9 +258,11 @@ export class TokenRegistry {
    * Stops auto-refresh if running.
    */
   static resetInstance(): void {
-    if (TokenRegistry.instance) {
-      TokenRegistry.instance.stopAutoRefresh();
-    }
+    // dispose(), not stopAutoRefresh(): the latter leaves `disposed` unset, the generation
+    // unchanged and the in-flight fetch running, so a load already past its entry guard
+    // re-arms the interval on an instance getInstance() can no longer return — an
+    // unstoppable timer plus a live abort timer. (#770)
+    TokenRegistry.instance?.dispose();
     TokenRegistry.instance = null;
   }
 

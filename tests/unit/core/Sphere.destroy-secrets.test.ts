@@ -35,6 +35,12 @@ function secrets(sphere: Sphere): SphereSecrets {
   return sphere as unknown as SphereSecrets;
 }
 
+/**
+ * The Sphere the current test built, so afterEach can tear it down. There is no
+ * process-global instance to look it up from (#766) — hold the reference.
+ */
+let live: Sphere | null = null;
+
 async function initWallet(password?: string): Promise<Sphere> {
   const { storage, transport, oracle, walletApi } = makeMockProviders({ walletExists: false });
   const { sphere } = await Sphere.init({
@@ -46,26 +52,22 @@ async function initWallet(password?: string): Promise<Sphere> {
     mnemonic: TEST_MNEMONIC,
     ...(password ? { password } : {}),
   });
+  live = sphere;
   return sphere;
-}
-
-function resetSingleton(): void {
-  (Sphere as unknown as { instance: Sphere | null }).instance = null;
 }
 
 describe('Sphere.destroy() secret hygiene', () => {
   beforeEach(() => {
     TokenRegistry.resetInstance();
     stubFetch();
-    resetSingleton();
+    live = null;
   });
 
   afterEach(async () => {
-    const live = Sphere.getInstance();
     if (live) {
       try { await live.destroy(); } catch { /* ignore */ }
     }
-    resetSingleton();
+    live = null;
     TokenRegistry.destroy();
     vi.unstubAllGlobals();
   });
@@ -94,10 +96,24 @@ describe('Sphere.destroy() secret hygiene', () => {
     await sphere.destroy();
 
     // Silently answering false/null/a half-empty WalletInfo is worse than throwing: a
-    // caller cannot tell "no master key" from "the wallet is gone".
-    expect(() => sphere.getMnemonic()).toThrow('Sphere not initialized');
-    expect(() => sphere.hasMasterKey()).toThrow('Sphere not initialized');
-    expect(() => sphere.getWalletInfo()).toThrow('Sphere not initialized');
+    // caller cannot tell "no master key" from "the wallet is gone". The CODE is the
+    // contract. Since #770 the refusal comes from the destroyed latch — set at destroy()
+    // ENTRY, so it covers the WHOLE teardown window and not merely the instant after it —
+    // and the message says so instead of the vaguer "not initialized".
+    for (const call of [
+      () => sphere.getMnemonic(),
+      () => sphere.hasMasterKey(),
+      () => sphere.getWalletInfo(),
+    ]) {
+      expect(call).toThrow('Sphere destroyed');
+      let code: unknown;
+      try {
+        call();
+      } catch (err) {
+        code = (err as { code?: string }).code;
+      }
+      expect(code).toBe('NOT_INITIALIZED');
+    }
   });
 });
 
@@ -105,15 +121,14 @@ describe('Sphere.encrypt() fails closed', () => {
   beforeEach(() => {
     TokenRegistry.resetInstance();
     stubFetch();
-    resetSingleton();
+    live = null;
   });
 
   afterEach(async () => {
-    const live = Sphere.getInstance();
     if (live) {
       try { await live.destroy(); } catch { /* ignore */ }
     }
-    resetSingleton();
+    live = null;
     TokenRegistry.destroy();
     vi.unstubAllGlobals();
   });

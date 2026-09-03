@@ -109,14 +109,10 @@ describe('Tracked addresses integration', () => {
   beforeEach(() => {
     cleanTestDir();
     clearNostrRelay();
-    if (Sphere.getInstance()) {
-      (Sphere as unknown as { instance: null }).instance = null;
-    }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
   });
 
   afterEach(() => {
-    (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
     clearNostrRelay();
   });
@@ -346,7 +342,6 @@ describe('Tracked addresses integration', () => {
       await sphere.destroy();
 
       // --- Reload wallet from same storage ---
-      (Sphere as unknown as { instance: null }).instance = null;
       const storage2 = new FileStorageProvider({ dataDir: DATA_DIR });
       const transport2 = createMockTransport();
       const oracle2 = createMockOracle();
@@ -503,7 +498,6 @@ describe('Tracked addresses integration', () => {
       expect(await storage.get(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS)).not.toBeNull();
 
       await sphere.destroy();
-      (Sphere as unknown as { instance: null }).instance = null;
 
       // Clear wallet
       await Sphere.clear({ storage });
@@ -539,7 +533,6 @@ describe('Tracked addresses integration', () => {
 
       const firstAddresses = first.getAllTrackedAddresses();
       await first.destroy();
-      (Sphere as unknown as { instance: null }).instance = null;
 
       // Clear
       await Sphere.clear({ storage });

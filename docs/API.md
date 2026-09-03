@@ -21,6 +21,10 @@ Primary entry point. Creates a new wallet or loads an existing one automatically
 ```typescript
 const { sphere, created, generatedMnemonic } = await Sphere.init({
   storage, transport, oracle,
+  network: 'testnet2',       // REQUIRED in practice: 'testnet' | 'testnet2' | 'mainnet'.
+                             //   Compared to walletApi.network as an exact STRING — 'testnet'
+                             //   vs 'testnet2' is a mismatch (INVALID_CONFIG), alias or not.
+                             //   Also selects the token registry for this Sphere.
   walletApi,                 // REQUIRED: wallet-api transport config
                              //   { network, baseUrl, deviceId?, fetchFn?, webSocketFactory?,
                              //     paymentsV2Transport? } — createWalletApiProviders builds it;
@@ -33,8 +37,32 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
   price: priceProvider,      // Optional PriceProvider
   derivationPath: "m/44'/0'/0'", // Optional custom path
   dmSince: Math.floor(Date.now() / 1000) - 86400, // Optional: DM history fallback (unix seconds)
+
+  groupChat: true,           // Optional: NIP-29 group chat — true = network-default relays,
+                             //   or a GroupChatModuleConfig. Omit and sphere.groupChat is null
+  market: true,              // Optional: market intents — true | MarketModuleConfig.
+                             //   Omit and sphere.market is null
+  communications: { maxPerConversation: 200 },  // Optional CommunicationsModuleConfig
+  discoverAddresses: true,   // Optional: scan Nostr bindings for previously used HD addresses.
+                             //   Only applies when the wallet is newly created.
+                             //   true | DiscoverAddressesOptions
+  verification: { createWorker },  // Optional: opt in to PARALLEL token verification —
+                             //   { createWorker, poolSize? }, where createWorker spawns YOUR
+                             //   bundled worker entry script. Omit for the sequential
+                             //   verifier. See docs/VERIFICATION-WORKERS.md
+  debug: true,               // Optional: debug logging. The flag is process-global — an
+                             //   explicit false turns it off, omitting it leaves it as-is
+  onProgress: (p) => console.log(p.step, p.message), // Optional: init progress callback
 });
 ```
+
+**`network` is required even though the type marks it optional.** `Sphere.init` resolves the
+payments composition first, and that resolution throws `INVALID_CONFIG` unless `network` is a
+known network AND string-equal to `walletApi.network` — so all three of
+`createBrowserProviders`/`createNodeProviders`, the `walletApi` config, and `Sphere.init` must
+carry the *same literal*. The provider factories do not return `network` in their bundle, so
+spreading `{ ...providers }` does not supply it. `Sphere.create`, `Sphere.load` and
+`Sphere.import` take the same option and enforce the same rule.
 
 **Removed options:** `accounting: true` / `swap: true` **throw** a typed `INVALID_CONFIG` —
 invoicing and swaps no longer exist in the SDK, and that refusal is kept deliberately through
@@ -75,15 +103,48 @@ mnemonic with it. The 0.15.0 scoped-KV generation bump needs nothing from you �
 await Sphere.clear({ storage: providers.storage });
 ```
 
+**It destroys live Spheres — scoped by BACKING STORE, not by provider object.** Before wiping,
+`clear()` calls `destroy()` on every live `Sphere` built on the store `storage` addresses: the
+payments vertical stops, providers disconnect, and every `sphere.on()` handler goes with them.
+Those instances are dead afterwards; hold no references across a `clear()`.
+
+Which instances that covers is decided by
+[`StorageProvider.backingStoreId`](./INTEGRATION.md#storage-provider-interface). Two provider
+objects that report the same value address the same data, so clearing through either destroys
+the Spheres of both — the bundled providers report one (resolved wallet path for
+`FileStorageProvider`; `dbName` + key prefix for `IndexedDBStorageProvider`; the `Storage`
+object + prefix for `LocalStorageProvider`). A provider that declares none is scoped to itself,
+so a second object over the same data is treated as unrelated. A Sphere on *other* storage is
+never touched.
+
+`Sphere.import(options)` inherits all of this: it calls `Sphere.clear({ storage })` first
+whenever a wallet exists on that storage or a live Sphere is registered on it, so importing over
+storage B tears down the Spheres on B — and only those.
+
+**It also refuses an `init` / `create` / `load` / `import` that is in flight on that store.** A
+wallet being built is not yet registered, so `clear()` cannot destroy it; instead the bring-up
+checks at the very end whether the store was cleared under it and, if so, tears itself down and
+rejects with a `SphereError` of code `STORAGE_ERROR` rather than handing back a ready Sphere
+over an emptied KV. Retry the init once the clear has settled — it is a fresh wallet by then,
+so `Sphere.init` reports `created: true`.
+
 ### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
 | `identity` | `FullIdentity \| null` | Current wallet identity (after init/load) |
+| `isReady` | `boolean` | Whether this Sphere is initialized. `true` once `init`/`create`/`load`/`import` has finished building it; back to `false` after `destroy()` |
+| `networkId` | `number \| undefined` | The active network id, read from the oracle's root trust base (`RootTrustBase.networkId` — testnet2 = `4`, mainnet = `1`). `undefined` when the oracle has no trust base |
 | `payments` | `PaymentsV2` | The payments facade (assets/tokens/history/send/mint/receive/requests). **Throws** `NOT_INITIALIZED` while no vertical runs — init in flight, mid address-switch, or destroyed |
 | `communications` | `CommunicationsModule` | Messaging operations |
 | `groupChat` | `GroupChatModule \| null` | NIP-29 group chat (null unless enabled) |
 | `market` | `MarketModule \| null` | Market intents (null unless enabled) |
+
+`isReady` is the replacement for the removed `Sphere.isInitialized()` static. `Sphere.getInstance()`,
+`Sphere.isInitialized()` and the `getSphere` export are **gone** — hold the instance the entry point
+returned and read `sphere.isReady` on it. There was never a safe deprecation: once a second Sphere
+had been created *and* destroyed, `getInstance()` answered `null` while the first was alive and
+serving money. See [MIGRATION-TOKEN-REGISTRY.md](./MIGRATION-TOKEN-REGISTRY.md#also-removed-the-sphere-lifecycle-globals).
 
 ### Instance Methods
 
@@ -166,6 +227,9 @@ await sphere.switchToAddress(1);
 console.log(sphere.getCurrentAddressIndex()); // 1
 console.log(sphere.identity!.directAddress);  // DIRECT://... (address at index 1)
 ```
+
+`index` must be a uint32 (see [`TrackedAddressEntry`](#trackedaddressentry)); anything else
+throws `INVALID_CONFIG` before anything is derived, tracked or written.
 
 #### `getActiveAddresses(): TrackedAddress[]`
 
@@ -637,12 +701,28 @@ Minimal data stored in persistent storage for a tracked address.
 
 ```typescript
 interface TrackedAddressEntry {
-  readonly index: number;      // HD derivation index
+  readonly index: number;      // HD derivation index — must be a uint32 (see below)
   hidden: boolean;             // Whether hidden from UI
   readonly createdAt: number;  // Timestamp (ms) when first activated
   updatedAt: number;           // Timestamp (ms) of last modification
 }
 ```
+
+`index` is a **BIP32 child number, so it must be a uint32**: an integer in `0` … `0xffffffff`.
+It is enforced at both ends. A **write** carrying such a row — `saveTrackedAddresses`, and every
+address-index API that derives keys (`switchToAddress`, `deriveAddress`, `trackScannedAddresses`,
+`discoverAddresses`) — is **refused** with a typed `SphereError`; a row already **stored** is
+**dropped when the registry is read**, not repaired, so one bad row cannot brick later writes.
+Neither is repaired because `1.5` would `parseInt()` down to index 1's derivation path and hand
+back that address's keys, and anything above `0xffffffff` pads to more than 8 hex digits and
+derives off-standard.
+
+`createdAt` / `updatedAt` are repaired instead: a missing or non-finite value reads as `0`, and
+`hidden` reads as `true` only for an exact `true`.
+
+Custom `StorageProvider` implementations own this: see
+[the tracked-address write contract](./INTEGRATION.md#the-tracked-address-write-contract) for
+the merge rules `saveTrackedAddresses` must obey.
 
 ### TrackedAddress
 
@@ -890,4 +970,82 @@ Network configuration:
 
 - **testnet2:** `https://gateway.testnet2.unicity.network` (networkId 4)
 - **mainnet:** live v3 gateway (`gateway.mainnet.unicity.network`, network id 1). The chain is live; there is no mainnet wallet-api deployment yet, so the money path is not reachable. The `dev` preset was removed with the v1 network.
+
+---
+
+## TokenRegistry
+
+Token metadata (symbol, name, decimals, icons) by coin ID — fetched from the network's registry
+URL, cached in the `StorageProvider`, refreshed hourly. The lookup methods
+(`getDefinition`, `getSymbol`, `getDecimals`, `getCoinIdBySymbol`, `getAllDefinitions`, …) are
+covered in the [Browser](./QUICKSTART-BROWSER.md#look-up-asset-metadata) and
+[Node.js](./QUICKSTART-NODEJS.md#look-up-asset-metadata) quick starts. This section is the
+**lifecycle** surface.
+
+### Two kinds of registry
+
+| | Process-global singleton | Owned instance |
+|---|---|---|
+| Obtain | `TokenRegistry.getInstance()`, configured by `TokenRegistry.configure(options)` | `TokenRegistry.create(options)` |
+| Who else can repoint it | **anyone** — `configure()` reaches into whatever instance exists, and every `Sphere.init()` calls it | nobody |
+| Stopping it | `TokenRegistry.resetInstance()` / `TokenRegistry.destroy()` | `registry.dispose()` |
+
+A `Sphere` **builds and owns its own registry** (`TokenRegistry.create`) and the payments facade
+presents from that one, so two Spheres on different networks can no longer overwrite each
+other's metadata. `sphere.destroy()` disposes it. The global is still configured by
+`Sphere.init()` for code that reads it directly, and it is deliberately left running.
+
+`TokenRegistry.configure()` and `TokenRegistry.create()` take the same options:
+
+```typescript
+interface TokenRegistryConfig {
+  remoteUrl?: string;          // registry JSON URL — NETWORKS[network].tokenRegistryUrl
+  storage?: StorageProvider;   // persistent cache
+  refreshIntervalMs?: number;  // default 1 hour
+  autoRefresh?: boolean;       // default true
+}
+```
+
+### `TokenRegistry.create(options: TokenRegistryConfig): TokenRegistry`
+
+Build an **independent** registry rather than touching the singleton. The options are applied
+immediately — a cache read first, then the remote fetch, which is awaited only when the cache
+misses — exactly as `configure()` does on the global. Dispose it when its owner goes away.
+
+```typescript
+import { TokenRegistry, NETWORKS } from '@unicitylabs/sphere-sdk';
+
+const registry = TokenRegistry.create({
+  remoteUrl: NETWORKS.testnet2.tokenRegistryUrl,
+  storage: providers.storage,
+});
+
+await registry.waitForReady();
+const uct = registry.getDefinitionBySymbol('UCT');
+
+registry.dispose();
+```
+
+### `registry.dispose(): void`
+
+Stop this registry for good: no refresh timer, no late apply of an in-flight fetch, no late
+cache write — the request already in the air is aborted, not merely ignored. Idempotent.
+
+Required for any registry you `create()`: nothing in `registry/` calls `unref()`, so an
+undisposed registry keeps an hourly fetch running and, under Node, keeps the event loop alive.
+
+Reads still work after disposal; they are simply **frozen** at the last-applied definitions.
+Disposal is permanent — a disposed registry cannot be revived, so build a new one with
+`create()`.
+
+### `registry.isDisposed: boolean`
+
+Whether `dispose()` has been called.
+
+### `registry.waitForReady(timeoutMs?: number): Promise<boolean>`
+
+Wait for the initial load (cache, else remote) to settle. Resolves `true` when definitions were
+loaded, `false` on timeout or when there was no data source. `timeoutMs` defaults to `10_000`;
+pass `0` to wait without a timeout. The static `TokenRegistry.waitForReady()` is the same
+contract against the singleton.
 

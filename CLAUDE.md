@@ -154,13 +154,18 @@ const filtered = sphere.payments.tokens({ coinId: '...' });
 const result = await sphere.payments.send({
   recipient: '@bob',           // @nametag, DIRECT://..., or chain pubkey (02...)
   amount: '1000000',           // in smallest unit (string)
-  coinId: 'UCT',               // coin ID (64-hex canonical; short symbols resolved via registry)
+  coinId: coinIdHex,           // coin ID — 64-hex ONLY on the money path (see the note below)
   memo: 'Payment for coffee',  // optional (recipient-encrypted envelope)
 });
 // result: TransferResult { id, status, tokens, tokenTransfers, error?,
 //                          deliveryPending?, deliveryState? }
 // status: 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed'
 // deliveryPending: certified on-chain but mailbox deposit still owed — NOT a failure.
+// NOTE: coinId is NOT symbol-resolved on the money path. `getCoinIdBySymbol` /
+// `normalizeCoinId` have zero call sites in modules/payments-v2/ or core/Sphere.ts:
+// mint() rejects non-hex outright and send() byte-compares, so passing 'UCT' gets
+// a rejection from mint() and a silent no-match from send(). Resolve the symbol
+// yourself via the registry first. The registry is presentation only.
 
 // 7. Receive: the facade drains the wallet-api mailbox continuously while
 //    started; receive() is an explicit one-shot drain (returns what landed).
@@ -190,7 +195,7 @@ const addresses = sphere.getActiveAddresses(); // TrackedAddress[]
 
 // 12. Payment requests (wallet-api rail; encrypted memo envelope)
 const req = await sphere.payments.requests.create('@bob', {
-  coinId: 'UCT', amount: '1000000', memo: 'Pay for order #1234',
+  coinId: coinIdHex, amount: '1000000', memo: 'Pay for order #1234',  // 64-hex, not a symbol
 });
 sphere.on('payment_request:incoming', (view) => {
   // PaymentRequestView: { id, requestId, senderPubkey, senderNametag?, amount,
@@ -372,7 +377,7 @@ sphere-sdk/
 │   │   ├── restore.ts             # §5.1 epoch-change reseed (see the KV generation note below)
 │   │   ├── machine/               # TransferMachine + resume (E.2/E.4) + intent journal
 │   │   ├── select/                # CoinSelector, Reservations ledger, op queue
-│   │   ├── receive/               # Mailbox drain, seen-set, claim, verified-before-balance
+│   │   ├── receive/               # Mailbox drain, claim, verified-before-balance
 │   │   ├── requests/              # Payment requests (streams + settling journal)
 │   │   ├── history/               # Server read-through paged history
 │   │   ├── inventory/             # InventoryView + Asset presentation (legacy shape held)
@@ -419,7 +424,7 @@ Subpath exports: `.` (root), `./core`, `./token-engine`, `./payments-v2` (the fa
 - **Server is the record.** Token inventory, blobs, transfer intents, mailbox, history and
   payment requests live in the wallet-api backend. The client holds keys, a per-address scoped
   KV (`pv2g2:{network}:{chainPubkey}:*` in the plain `StorageProvider`) with the refresh token,
-  cursors, seen-set and journals — nothing else. There is no client token store to sync
+  cursors and journals — nothing else. There is no client token store to sync
   (`sphere.sync()` is gone).
 - **Composition:** `Sphere.init({ walletApi })` → `resolvePaymentsV2Composition` →
   `composePaymentsV2` builds one `PaymentsFacade` per active address over the wallet-api-v2
@@ -436,7 +441,7 @@ Subpath exports: `.` (root), `./core`, `./token-engine`, `./payments-v2` (the fa
   send); a clean conflict with a demoted source triggers one bounded re-plan (#625 marks the
   source `suspectedSpent`, excluded from selection, recoverable by resync).
 - **Receive:** continuous mailbox drain while started + explicit `receive()`. Every incoming
-  token is engine-verified and ownership-checked BEFORE entering the balance; seen-set dedup by
+  token is engine-verified and ownership-checked BEFORE entering the balance; dedup by
   **(tokenId, stateHash)** — genesis id alone would refuse a token legitimately re-acquired at a
   later state; store-before-ack (a crash between store and claim re-claims, never loses).
 - **Delivery journal (#621):** a certified-but-undelivered blob is journaled in the scoped KV
@@ -540,7 +545,7 @@ interface FullIdentity extends Identity {
 interface SendRequest {     // sphere.payments.send()
   recipient: string;        // @nametag, DIRECT://..., chain pubkey
   amount: string;           // Amount in smallest unit
-  coinId: string;           // Coin ID (64-hex canonical; short symbols resolved via registry)
+  coinId: string;           // Coin ID — even-length lowercase hex; NOT symbol-resolved
   memo?: string;            // Optional message (recipient-encrypted envelope)
 }
 
@@ -692,8 +697,11 @@ authoritative for build success.
   while started; `receive()` for an explicit one-shot).
 - **Verified before entering the balance:** `engine.verify` (full trust-base proof check) +
   `engine.isOwnedBy(token, own chainPubkey)`; failures are rejected (warn log). Dedup by
-  **(tokenId, stateHash)** via the durable seen-set — keyed on the genesis id alone, a token sent
-  away and legitimately received back (A→B→A) would be dropped as a duplicate. Store-before-ack:
+  **(tokenId, stateHash)** — keyed on the genesis id alone, a token sent away and legitimately
+  received back (A→B→A) would be dropped as a duplicate. There is **no durable seen-set**: the
+  comparison is against `heldStates`, an in-memory `Map` built per composition
+  (`modules/payments-v2/compose.ts`) and seeded from the inventory view, backed by the server-side
+  history `dedupKey`. Store-before-ack:
   the token is stored before the mailbox claim is acknowledged, so a crash re-claims instead of
   losing.
 
@@ -727,16 +735,22 @@ authoritative for build success.
   icons) by coin ID. No bundled data — remote URL per network
   (`NETWORKS[network].tokenRegistryUrl`; testnet/testnet2 use
   `unicity-ids.testnet2.json`) + persistent cache.
-- The facade consumes it for Asset presentation and short-symbol → coinId resolution.
-- Configured both by provider factories and by `Sphere` itself (tsup bundles
-  duplicate the singleton per entry point — both bundle contexts need `configure()`).
+- The facade consumes it for Asset presentation ONLY. It resolves no symbols on the money
+  path — `getCoinIdBySymbol`/`normalizeCoinId` have zero call sites in `modules/payments-v2/`
+  or `core/Sphere.ts`.
+- A `Sphere` builds and OWNS its registry (#767), disposed by `sphere.destroy()`. The provider
+  factories no longer call `TokenRegistry.configure()` — in the published package they are
+  separate tsup bundles with separate singleton copies, so that call wrote to an object no
+  consumer could read.
 
 ### Durable client state (the complete inventory — design §6)
 - Everything the client persists for money lives in the per-(network, address) scoped KV:
   `pv2g2:{network}:{chainPubkey}:*` inside the plain `StorageProvider` — refresh token, sync
-  cursors, receive seen-set, intent backstop, delivery journal (#621), mint journal, request
-  settling journal. One writer per store. Being self-prefixed with the network, it never rides
-  the legacy `isNetworkScopedAddressKey` mechanism (which still guards the remaining
+  cursors, intent backstop, split-checkpoint cache, delivery journal (#621), mint journal,
+  #690 shortfalls, request settling journal, the epoch latch and the §5.2 `suspectedSpent` /
+  `knownSpends` overlays — the complete list is `STORE_KEYS` in `modules/payments-v2/stores.ts`,
+  and it contains no receive seen-set. One writer per store. Being self-prefixed with the
+  network, it never rides the legacy `isNetworkScopedAddressKey` mechanism (which still guards the remaining
   chat/identity keys in the platform storage providers).
 - **The `pv2:` → `pv2g2:` rename IS the 3.x local migration** (`modules/payments-v2/stores.ts`;
   `sweepSupersededState()` clears the old prefix once per composition, from
@@ -794,8 +808,12 @@ Key test areas:
   Mint / transfer / split / same-transferId resume, each verified against the service's own
   generated trust base. `verify()` passing is the assertion no fake can make: the leaf value this
   client computes — `H(transactionHash, referenceTime)` since 3.x — reproduces the leaf the Go
-  service inserted. Guard against it going vacuous: with a well-formed but WRONG root key it must
-  fail `INVALID_TRUSTBASE`.
+  service inserted. Guard against it going vacuous: with a well-formed but WRONG root key the SAME
+  certified token must be refused — `engine.verify` reports the aggregated `FAIL` (the
+  granular status lives in the SDK's nested trace, which the test walks to name
+  `INVALID_TRUSTBASE` at the quorum-signature rule). The compose stack runs a SINGLE
+  bft-root node, so this exercises "wrong key", not a real quorum — mainnet's
+  4-node/threshold-3 shape is still unexercised anywhere in the repo.
 - `tests/mutation/probes.json` — mutation probes over `modules/payments-v2/*`,
   `token-engine/{proof-wait,SphereTokenEngine}.ts`, `impl/wallet-api-v2/*`, the `core/` wiring and
   `transport/NostrTransportProvider.ts`; `npm run test:mutation` must report every one KILLED

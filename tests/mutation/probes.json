@@ -545,8 +545,8 @@
     "name": "init-failure-strands-registry",
     "note": "#767: a rejection inside the guarded bring-up must actually reach the catch \u2014 swallowing it would leave a half-built Sphere published and reported as success",
     "file": "core/Sphere.ts",
-    "find": "    try {\n      await bringUp();\n    } catch (err) {",
-    "replace": "    try {\n      await bringUp().catch(() => undefined);\n    } catch (err) {",
+    "find": "    try {\n      await bringUp();\n      Sphere.publishLive(sphere, clearGeneration);\n    } catch (err) {",
+    "replace": "    try {\n      await bringUp().catch(() => undefined);\n      Sphere.publishLive(sphere, clearGeneration);\n    } catch (err) {",
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
     ]
@@ -599,6 +599,620 @@
     "replace": "      await disconnect();",
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-addresses-merge-drop",
+    "note": "#766 item 5: saveTrackedAddresses MERGES the on-disk registry with the writer's snapshot; writing the snapshot verbatim is the lost update that erases another Sphere's address (tracked-addresses-concurrent.test.ts)",
+    "file": "impl/nodejs/storage/FileStorageProvider.ts",
+    "find": "        addresses: mergeTrackedAddresses(onDisk, entries),",
+    "replace": "        addresses: (onDisk, entries),",
+    "tests": [
+      "tests/integration/tracked-addresses-concurrent.test.ts"
+    ]
+  },
+  {
+    "name": "init-verification-not-forwarded-to-load",
+    "note": "#769.2: Sphere.init() forwards `verification` to load() - dropped, a consumer opting into the worker pool at the documented entry point silently gets the sequential verifier",
+    "file": "core/Sphere.ts",
+    "find": "\n        verification: options.verification,",
+    "replace": "\n        // mutant: verification dropped on the load branch",
+    "tests": [
+      "tests/unit/core/Sphere.init-verification.test.ts"
+    ]
+  },
+  {
+    "name": "init-verification-not-forwarded-to-create",
+    "note": "#769.2: the SAME forwarding on the create branch - each call site lists its options by hand, so one can be dropped with the other intact",
+    "file": "core/Sphere.ts",
+    "find": "\n      verification: options.verification,",
+    "replace": "\n      // mutant: verification dropped on the create branch",
+    "tests": [
+      "tests/unit/core/Sphere.init-verification.test.ts"
+    ]
+  },
+  {
+    "name": "live-registry-tracks-one-sphere-per-storage",
+    "note": "#766: _liveByStorage maps a STORE to a SET - more than one Sphere can run over one store (a second provider LOADS the wallet the first created), and clear() must destroy all of them or one keeps running over an emptied KV",
+    "file": "core/Sphere.ts",
+    "find": "    const key = Sphere.storeKeyOf(sphere._storage);\n    let live = Sphere._liveByStorage.get(key);\n    if (!live) {\n      live = new Set();\n      Sphere._liveByStorage.set(key, live);\n    }\n    live.add(sphere);",
+    "replace": "    Sphere._liveByStorage.set(Sphere.storeKeyOf(sphere._storage), new Set([sphere]));",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "importfromjson-discards-imported-sphere",
+    "note": "#766: importFromJSON must RETURN the Sphere it built - discarding it is what made importFromLegacyFile reach for the process-global and hand back the wrong instance",
+    "file": "core/Sphere.ts",
+    "find": "      // Import using mnemonic if available (preferred)\n      if (mnemonic) {\n        const sphere = await Sphere.import({ ...baseOptions, mnemonic, basePath });\n        return { success: true, sphere, mnemonic };",
+    "replace": "      // Import using mnemonic if available (preferred)\n      if (mnemonic) {\n        await Sphere.import({ ...baseOptions, mnemonic, basePath });\n        return { success: true, mnemonic };",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "importfromlegacyfile-drops-threaded-sphere",
+    "note": "#766: the sphere-wallet JSON branch threads importFromJSON's instance out to the caller - dropping it returns success with no Sphere at all",
+    "file": "core/Sphere.ts",
+    "find": "          return { success: true, sphere: result.sphere, mnemonic: result.mnemonic };",
+    "replace": "          return { success: true, mnemonic: result.mnemonic };",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "registry-resetinstance-skips-dispose",
+    "note": "#770.5: resetInstance() must DISPOSE the outgoing singleton, not merely stop its timer - stopAutoRefresh leaves `disposed` unset, the generation unchanged and the in-flight fetch (plus its 10s abort timer) running on an instance getInstance() can no longer return",
+    "file": "registry/TokenRegistry.ts",
+    "find": "    TokenRegistry.instance?.dispose();",
+    "replace": "    TokenRegistry.instance?.stopAutoRefresh();",
+    "tests": [
+      "tests/unit/registry/TokenRegistry.instances.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-addresses-merge-drop-idb",
+    "note": "#766 item 5: the browser IDB provider keeps its OWN copy of the read-merge-write (now inside the single transaction); a wholesale write here is the same lost update the Node provider's probe guards",
+    "file": "impl/browser/storage/IndexedDBStorageProvider.ts",
+    "find": "          addresses: mergeTrackedAddresses(onDisk, entries),",
+    "replace": "          addresses: entries,",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-addresses-merge-drop-localstorage",
+    "note": "#766 item 5: and again in LocalStorageProvider - three implementations, three chances to regress to a wholesale write",
+    "file": "impl/browser/storage/LocalStorageProvider.ts",
+    "find": "        addresses: mergeTrackedAddresses(onDisk, entries),",
+    "replace": "        addresses: entries,",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-addresses-failed-write-bricks-chain",
+    "note": "#766 item 5: the serializing chain must swallow a rejection - carried forward, one transient write error freezes the registry for the life of the provider while every later caller still sees the ORIGINAL error",
+    "file": "impl/nodejs/storage/FileStorageProvider.ts",
+    "find": "    this.trackedWrites = run.then(() => undefined, () => undefined);",
+    "replace": "    this.trackedWrites = run;",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-address-index-aliases-real-address",
+    "note": "#766 review: the stored index must be a non-negative INTEGER - deriveKeyAtPath parseInt()s the path segment, so a 1.5 row derives index 1's keys and aliases a real address; Number.isFinite let 1.5 and negatives through. Re-pointed at isDerivableIndex(), where the check now lives.",
+    "file": "storage/tracked-addresses.ts",
+    "find": "  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;",
+    "replace": "  return typeof value === 'number' && Number.isFinite(value);",
+    "tests": [
+      "tests/unit/storage/tracked-addresses.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-debug-flag-one-way-init",
+    "note": "#766: the logger's state lives on globalThis, so `debug` is a PROCESS-global flag. Truthy-only made it ONE-WAY \u2014 once anything turned debug on, no later Sphere.init({ debug: false }) could quieten it. init() does NOT forward `debug` to the create/load it dispatches to, so this site is the only one the documented entry point uses.",
+    "file": "core/Sphere.ts",
+    "find": "    // Configure debug logging (also needed in main bundle context, same as TokenRegistry)\n    // `undefined` leaves whatever the provider factory or consumer set; an explicit\n    // `false` MUST turn debug off. A truthy-only check made this process-global flag\n    // one-way \u2014 no second init could ever quieten it (#766).\n    if (options.debug !== undefined) logger.configure({ debug: options.debug });",
+    "replace": "    // Configure debug logging (also needed in main bundle context, same as TokenRegistry)\n    // `undefined` leaves whatever the provider factory or consumer set; an explicit\n    // `false` MUST turn debug off. A truthy-only check made this process-global flag\n    // one-way \u2014 no second init could ever quieten it (#766).\n    if (options.debug) logger.configure({ debug: true }); // mutant: truthy-only, the flag goes one-way again",
+    "tests": [
+      "tests/unit/core/Sphere.debug-logging.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-debug-flag-one-way-create",
+    "note": "#766: the SAME guard on the direct create() entry point \u2014 all four sites are written out by hand, so one can regress with the other three intact.",
+    "file": "core/Sphere.ts",
+    "find": "    if (options.debug !== undefined) logger.configure({ debug: options.debug });\n\n    // Fail-closed BEFORE any storage write:",
+    "replace": "    if (options.debug) logger.configure({ debug: true }); // mutant: truthy-only, the flag goes one-way again\n\n    // Fail-closed BEFORE any storage write:",
+    "tests": [
+      "tests/unit/core/Sphere.debug-logging.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-debug-flag-one-way-load",
+    "note": "#766: the SAME guard on the direct load() entry point.",
+    "file": "core/Sphere.ts",
+    "find": "    if (options.debug !== undefined) logger.configure({ debug: options.debug });\n\n    // Fail-closed first: retired module options",
+    "replace": "    if (options.debug) logger.configure({ debug: true }); // mutant: truthy-only, the flag goes one-way again\n\n    // Fail-closed first: retired module options",
+    "tests": [
+      "tests/unit/core/Sphere.debug-logging.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-debug-flag-one-way-import",
+    "note": "#766: the SAME guard on the direct import() entry point.",
+    "file": "core/Sphere.ts",
+    "find": "    if (options.debug !== undefined) logger.configure({ debug: options.debug });\n\n    // Fail-closed BEFORE the destructive clear below:",
+    "replace": "    if (options.debug) logger.configure({ debug: true }); // mutant: truthy-only, the flag goes one-way again\n\n    // Fail-closed BEFORE the destructive clear below:",
+    "tests": [
+      "tests/unit/core/Sphere.debug-logging.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-address-index-above-uint32",
+    "note": "#766 review: a BIP32 child number is a uint32. deriveChildKey does index.toString(16).padStart(8,'0') and padStart only ADDS characters, so an index above 0xffffffff emits a 9th hex digit and pushes an extra byte into the HMAC input \u2014 off-standard derivation, silently. 0xffffffff itself and the hardened threshold 0x80000000 must SURVIVE.",
+    "file": "storage/tracked-addresses.ts",
+    "find": "  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;",
+    "replace": "  return typeof value === 'number' && Number.isInteger(value) && value >= 0;",
+    "tests": [
+      "tests/unit/storage/tracked-addresses.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-address-index-negative-allowed",
+    "note": "#766 review: the floor clause on its own \u2014 a negative index has no BIP32 derivation at all. Probed apart from the integer and ceiling clauses so a regression names which one went.",
+    "file": "storage/tracked-addresses.ts",
+    "find": "  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;",
+    "replace": "  return typeof value === 'number' && Number.isInteger(value) && value <= 0xffffffff;",
+    "tests": [
+      "tests/unit/storage/tracked-addresses.test.ts"
+    ]
+  },
+  {
+    "name": "idb-tracked-write-not-atomic",
+    "note": "#766 round 4: the IDB read-merge-write must share ONE transaction. Split back into get() then set() and two provider objects over one database - which backingStoreId exists to permit - both read the old registry before either writes, losing an address (tracked-addresses-providers.test.ts cross-object cases)",
+    "file": "impl/browser/storage/IndexedDBStorageProvider.ts",
+    "find": "    this.ensureConnected();\n    await this.idbMergeTrackedAddresses(\n      this.getFullKey(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES),\n      entries,\n    );",
+    "replace": "    const onDisk = parseTrackedAddresses(await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES));\n    await this.set(\n      STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES,\n      JSON.stringify({ version: 1, addresses: mergeTrackedAddresses(onDisk, entries) }),\n    );",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "idb-tracked-write-abort-unswallowed",
+    "note": "#766 round 4: a throw inside the transaction's success handler ABORTS it, so the abort is the only path that can settle the save. Drop the handler and an unserializable registry hangs saveTrackedAddresses forever instead of rejecting - switchToAddress never returns (tracked-addresses-providers.test.ts 'rejects a registry it cannot serialize')",
+    "file": "impl/browser/storage/IndexedDBStorageProvider.ts",
+    "find": "      tx.onabort = () => reject(tx.error ?? new Error('tracked-address write aborted'));",
+    "replace": "      tx.onabort = () => undefined;",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "localstorage-tracked-chain-not-shared",
+    "note": "#766 round 4: localStorage has no transaction, so the write chain must be keyed by the BACKING STORE. Key it per call (or per object) and two providers over one storage each read the old registry - the lost update, one level up (tracked-addresses-providers.test.ts cross-object cases)",
+    "file": "impl/browser/storage/LocalStorageProvider.ts",
+    "find": "    await serializeTrackedWrite(this.backingStoreId, async () => {",
+    "replace": "    await serializeTrackedWrite(`${this.backingStoreId}:${String(Math.random())}`, async () => {",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "localstorage-tracked-chain-carries-rejection",
+    "note": "#766 round 4: the shared-by-store chain must swallow a rejection - carried forward it is now WORSE than the per-instance version it replaced, freezing the registry for every provider object over that store, not just the one that failed",
+    "file": "impl/browser/storage/LocalStorageProvider.ts",
+    "find": "  const tail = run.then(() => undefined, () => undefined);",
+    "replace": "  const tail = run;",
+    "tests": [
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "live-registry-keyed-by-object-not-store",
+    "note": "#766 review: liveness must key on the BACKING STORE, not the provider object. Two FileStorageProviders over one dataDir are distinct objects addressing one wallet.json, so object keying makes clear() through either destroy NEITHER Sphere - worse than the process-global it replaced, which destroyed one.",
+    "file": "core/Sphere.ts",
+    "find": "    const declared = storage.backingStoreId;",
+    "replace": "    const declared: string | undefined = undefined; // mutant: object identity again",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "live-registry-entry-never-released",
+    "note": "#766 review: the map is keyed by STRING now, so nothing collects an emptied Set - every store the process ever opened would be retained, each holding a destroyed Sphere",
+    "file": "core/Sphere.ts",
+    "find": "    if (live.size === 0) Sphere._liveByStorage.delete(key);",
+    "replace": "    void live.size; // mutant: the emptied Set stays and the map grows forever",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "file-backing-store-id-is-a-class-constant",
+    "note": "#766 review: backingStoreId identifies the STORE. A constant (what `id` is) makes every FileStorageProvider in the process one store, so clear() on one wallet tears down every live Sphere - the exact cross-wallet kill #766 removed.",
+    "file": "impl/nodejs/storage/FileStorageProvider.ts",
+    "find": "      `file:${path.join(canonicalPath(this.dataDir), path.basename(this.filePath))}`;",
+    "replace": "      'file:'; // mutant: a class constant, every wallet collides",
+    "tests": [
+      "tests/unit/impl/backing-store-id.test.ts",
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "transport-orphans-old-client-on-failed-swap",
+    "note": "#770.1: a failed setIdentity connect must dispose ONLY the replacement; without it the half-built client leaks one socket per retry",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "        try { nextClient.disconnect(); } catch { /* best-effort cleanup */ }\n        throw error;",
+    "replace": "        throw error;",
+    "tests": [
+      "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
+  },
+  {
+    "name": "transport-swaps-client-before-connect",
+    "note": "#770.1: the field must not move until the new client is connected, or a failed swap orphans the old client beyond disconnect()'s reach",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "      try {\n        await this.connectWithDeadline(\n          nextClient,",
+    "replace": "      this.nostrClient = nextClient;\n      try {\n        await this.connectWithDeadline(\n          nextClient,",
+    "tests": [
+      "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
+  },
+  {
+    "name": "transport-keeps-old-client-when-subscribe-throws",
+    "note": "#770.1: after the swap the old client is unreachable, so it must be disposed on EVERY path out of subscribeToEvents",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "      try {\n        await this.subscribeToEvents();\n      } finally {\n        try { oldClient.disconnect(); } catch { /* best-effort cleanup */ }\n      }",
+    "replace": "      await this.subscribeToEvents();\n      try { oldClient.disconnect(); } catch { /* best-effort cleanup */ }",
+    "tests": [
+      "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
+  },
+  {
+    "name": "transport-leaves-connect-deadline-timer-pending",
+    "note": "#770.1: Promise.race does not cancel the loser \u2014 an un-cleared setTimeout pins Node's event loop for config.timeout",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "      if (timer !== undefined) clearTimeout(timer);",
+    "replace": "      if (timer === undefined) clearTimeout(timer);",
+    "tests": [
+      "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
+  },
+  {
+    "name": "verifier-dispose-no-cancel",
+    "note": "#770.4: dispose() terminates the workers but the SDK pool never settles their tasks; with the call's cancellation unregistered, verify() hangs forever and stop()/destroy() hang with it",
+    "file": "token-engine/factory.ts",
+    "find": "      this.cancellations.add(cancel);",
+    "replace": "      // probe: the call's cancellation is never registered",
+    "tests": [
+      "tests/unit/token-engine/worker-verification.test.ts"
+    ]
+  },
+  {
+    "name": "verifier-cancel-resolves-not-rejects",
+    "note": "#770.4 MONEY: a cancelled verification must REJECT. Resolving a falsy verdict makes Receive.screen() rejectAck(entry,'invalid') \u2014 a VALID incoming token destroyed because an api-key change landed mid-drain",
+    "file": "token-engine/factory.ts",
+    "find": "      const cancel = (): void => reject(disposedError());",
+    "replace": "      const cancel = (): void => resolve({ status: 'FAIL' } as unknown as Awaited<ReturnType<WorkerTokenVerifier['verify']>>);",
+    "tests": [
+      "tests/unit/token-engine/worker-verification.test.ts"
+    ]
+  },
+  {
+    "name": "verifier-post-dispose-gate",
+    "note": "#770.4: a verify() started after dispose() must reject \u2014 a token needing no worker would otherwise be answered by a torn-down engine",
+    "file": "token-engine/factory.ts",
+    "find": "    if (this.disposed) return Promise.reject(disposedError());",
+    "replace": "    // probe",
+    "tests": [
+      "tests/unit/token-engine/worker-verification.test.ts"
+    ]
+  },
+  {
+    "name": "verifier-pool-resurrection",
+    "note": "#770.4: the SDK leaves workers/idle populated after dispose(), so an unguarded createWorker() resurrects the pool or hands back a terminated worker",
+    "file": "token-engine/factory.ts",
+    "find": "    if (this.disposed) throw disposedError();",
+    "replace": "    // probe",
+    "tests": [
+      "tests/unit/token-engine/worker-verification.test.ts"
+    ]
+  },
+  {
+    "name": "factory-networkid-not-from-trustbase",
+    "note": "#764/#765: the trust base is the SINGLE source of the engine's NetworkId. Hardcoding it (here: mainnet 1) makes a wallet verify money against the wrong chain \u2014 factory.test.ts decodes a real token to read the derived id offline",
+    "file": "token-engine/factory.ts",
+    "find": "    networkId: trustBase.networkId,",
+    "replace": "    networkId: trustBase.networkId.constructor.fromId(1),",
+    "tests": [
+      "tests/unit/token-engine/factory.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-switch-starts-vertical-after-destroy",
+    "note": "#770.3: the lifecycle mutex orders a switch's queued start AFTER destroy()'s stop, so without this gate the pair composes a whole new vertical for an owner whose destroy() already returned",
+    "file": "core/Sphere.ts",
+    "find": "      if (this._destroyed) return;\n      await this.startPaymentsV2Inner(index, identity);",
+    "replace": "      await this.startPaymentsV2Inner(index, identity);",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-destroyed-latch-set-too-late",
+    "note": "#770.3: _destroyed must flip as destroy()'s FIRST statement \u2014 set later (or not at all) and the whole teardown window is unguarded, which is exactly why _initialized could not carry it",
+    "file": "core/Sphere.ts",
+    "find": "    this._destroyed = true;\n",
+    "replace": "    // probe: the destroyed latch is never set\n",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-switch-rebuilds-transport-mux-after-destroy",
+    "note": "#770.3: ensureTransportMux BUILDS and connect()s a fresh mux whenever _transportMux is null \u2014 which is what destroy() leaves behind \u2014 so an unguarded switch opens new sockets after teardown returned",
+    "file": "core/Sphere.ts",
+    "find": "      this.ensureAlive();\n      await this.initializeAddressModules({ index, identity: newIdentity });",
+    "replace": "      await this.initializeAddressModules({ index, identity: newIdentity });",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-refused-switch-persists-its-index",
+    "note": "#770.3: a switch destroy() overtook must not leave its index on disk \u2014 persisting it sends the NEXT boot to an address the user never finished moving to",
+    "file": "core/Sphere.ts",
+    "find": "    this.ensureAlive();\n    // Persist current index",
+    "replace": "    // Persist current index",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-ensureready-ignores-destroyed",
+    "note": "#770.3: ensureReady() is what every existing caller inherits the destroyed check from; without it a destroyed Sphere answers 'not initialized' semantics only after _initialized is finally cleared",
+    "file": "core/Sphere.ts",
+    "find": "    this.ensureAlive();\n    if (!this._initialized) {",
+    "replace": "    if (!this._initialized) {",
+    "tests": [
+      "tests/unit/core/Sphere.destroy-secrets.test.ts"
+    ]
+  },
+  {
+    "name": "receive-drain-untracked-by-quiescence",
+    "note": "#770.2: a self-spawned poll drain must hold stop() open, or teardown proceeds under live wallet-api I/O, engine.verify and scoped-KV writes",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "    const op = this.drainOnce();\n    if (this.deps.track !== undefined) this.deps.track(op);\n    else void op;",
+    "replace": "    void this.drainOnce();",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "compose-drops-receive-track-hook",
+    "note": "#770.2: track is optional on ReceiveDeps, so dropping it here compiles cleanly and silently un-tracks every self-spawned drain",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "    track: hooks.track,\n",
+    "replace": "    // probe: the receive drain is left untracked\n",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "health-accepts-any-blocknumber",
+    "note": "#769.1: the field being PRESENT is not a height. Accepting any string/number reports a gateway healthy on a body carrying no usable answer ({blockNumber:'error'}, '', 1.5, -1)",
+    "file": "core/network-health.ts",
+    "find": "  if (typeof n === 'string') return /^\\d+$/.test(n) ? n : null;\n  if (typeof n === 'number') return Number.isInteger(n) && n >= 0 ? String(n) : null;\n  return null;",
+    "replace": "  return typeof n === 'string' || typeof n === 'number' ? String(n) : null;",
+    "tests": [
+      "tests/unit/core/network-health.test.ts"
+    ]
+  },
+  {
+    "name": "transport-resurrects-client-after-teardown",
+    "note": "#772 review: a disconnect() during the swap's connect must win \u2014 installing nextClient afterwards leaves a live socket + subscriptions owned by nobody, with the caller told the identity took",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "      if (this.nostrClient !== oldClient || this.status !== 'connected') {",
+    "replace": "      if (false) {",
+    "tests": [
+      "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
+  },
+  {
+    "name": "transport-applies-identity-before-client",
+    "note": "#772 review: identity + key manager + dedup window move WITH the client; applied eagerly, a failed swap runs the OLD client and its old-address subscriptions under the NEW key",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "    const applyStagedIdentity = (): void => {\n      this.identity = identity;\n      this.keyManager = nextKeyManager;",
+    "replace": "    this.identity = identity;\n    this.keyManager = nextKeyManager;\n    const applyStagedIdentity = (): void => {",
+    "tests": [
+      "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
+  },
+  {
+    "name": "verifier-cancellation-leak",
+    "note": "#770.4 review: a call's cancellation entry must be released when that call SETTLES. Holding it until dispose() is the shared-promise leak again \u2014 one retained entry per token the wallet has ever verified, inside the class added to fix a teardown bug",
+    "file": "token-engine/factory.ts",
+    "find": "        (result) => {\n          this.cancellations.delete(cancel);\n          resolve(result);\n        },\n        (error: unknown) => {\n          this.cancellations.delete(cancel);\n          reject(error);\n        }",
+    "replace": "        (result) => {\n          resolve(result);\n        },\n        (error: unknown) => {\n          reject(error);\n        }",
+    "tests": [
+      "tests/unit/token-engine/worker-verification.test.ts"
+    ]
+  },
+  {
+    "name": "publish-refuses-cleared-store",
+    "note": "#772 review: an init is invisible to clear() until it publishes, so without this compare a create() whose KV was emptied mid-init publishes an isReady Sphere over nothing",
+    "file": "core/Sphere.ts",
+    "find": "    if (Sphere.clearGenerationOf(sphere._storage) !== clearGeneration) {",
+    "replace": "    if (false) {",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "clear-bumps-generation-on-entry",
+    "note": "#772 review: bumping only on exit misses an init that publishes DURING the clear \u2014 past its snapshot, before its wipe",
+    "file": "core/Sphere.ts",
+    "find": "    Sphere.bumpClearGeneration(storage);\n    try {\n      await Sphere.clearStore(storage);",
+    "replace": "    // probe\n    try {\n      await Sphere.clearStore(storage);",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "clear-bumps-generation-on-exit",
+    "note": "#772 review: bumping only on entry misses an init that STARTS mid-clear, records the already-bumped value and is wiped a moment later",
+    "file": "core/Sphere.ts",
+    "find": "    } finally {\n      Sphere.bumpClearGeneration(storage);\n    }",
+    "replace": "    } finally {\n      void storage;\n    }",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "tracked-index-refused-at-write",
+    "note": "#772 review: the uint32 rule must hold before the WRITE, not only after reload \u2014 a persisted 1.5 derives index 1's keys and aliases a real address",
+    "file": "storage/tracked-addresses.ts",
+    "find": "    if (!isDerivableIndex(entry.index)) {\n      throw new SphereError(",
+    "replace": "    if (false) {\n      throw new SphereError(",
+    "tests": [
+      "tests/unit/storage/tracked-addresses.test.ts",
+      "tests/unit/storage/contracts/tracked-addresses.contract.ts"
+    ]
+  },
+  {
+    "name": "derivation-refuses-underivable-index",
+    "note": "#772 review: the storage-layer refusal is too late \u2014 ensureAddressTracked mutates the in-memory registry before persisting, so derivation itself must refuse",
+    "file": "core/Sphere.ts",
+    "find": "    Sphere.assertDerivableIndex(index);\n\n    if (!this._masterKey) {",
+    "replace": "    // probe\n\n    if (!this._masterKey) {",
+    "tests": [
+      "tests/integration/tracked-addresses-concurrent.test.ts"
+    ]
+  },
+  {
+    "name": "switch-keeps-modules-built-during-destroy",
+    "note": "#772 codex: the switchToAddress guards are checks BEFORE an await. destroy() landing INSIDE initializeAddressModules lets the continuation register a live module set \u2014 its own engine and worker pool \u2014 on a Sphere whose destroy() already returned",
+    "file": "core/Sphere.ts",
+    "find": "      if (this._destroyed) await this.discardModulesBuiltDuringDestroy(index);",
+    "replace": "      // probe",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "health-deadline-dropped-before-body-read",
+    "note": "#769.1 codex: fetch settles on the HEADERS, so clearing the deadline there leaves the body read waiting forever on a gateway that stalls mid-response \u2014 timeoutMs stops applying exactly where the endpoint is least responsive",
+    "file": "core/network-health.ts",
+    "find": "    const responseTimeMs = Date.now() - startTime;\n\n    const body: unknown = await response.json().catch(() => null);",
+    "replace": "    clearTimeout(timer);\n    const responseTimeMs = Date.now() - startTime;\n\n    const body: unknown = await response.json().catch(() => null);",
+    "tests": [
+      "tests/unit/core/network-health.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-live-registry-splits-per-bundle",
+    "note": "#772 round 6: every subpath export is its own tsup bundle, so a class static splits \u2014 a Sphere built through the root entry becomes invisible to a clear() called through ./core, which then wipes the store and leaves it ready over an emptied KV",
+    "file": "core/Sphere.ts",
+    "find": "  private static readonly _liveByStorage: Map<string, Set<Sphere>> = lifecycle.live;",
+    "replace": "  private static readonly _liveByStorage = new Map<string, Set<Sphere>>();",
+    "tests": [
+      "tests/integration/sphere-cross-bundle-lifecycle.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-clear-generations-split-per-bundle",
+    "note": "#772 round 6: split per bundle, an init in the OTHER bundle never sees the clear and publishes a Sphere over a wiped store",
+    "file": "core/Sphere.ts",
+    "find": "  private static readonly _clearGenerations: Map<string, number> = lifecycle.clearGenerations;",
+    "replace": "  private static readonly _clearGenerations = new Map<string, number>();",
+    "tests": [
+      "tests/integration/sphere-cross-bundle-lifecycle.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-object-store-key-is-a-constant",
+    "note": "#772 round 6: a provider that declares no backingStoreId is scoped to ITSELF. A constant key puts every such provider \u2014 in every bundle \u2014 into one liveness bucket, so a clear() on one wallet destroys another's Sphere",
+    "file": "core/Sphere.ts",
+    "find": "      key = `object:${++lifecycle.objectStoreSeq}`;",
+    "replace": "      key = 'object:1';",
+    "tests": [
+      "tests/integration/sphere-cross-bundle-lifecycle.test.ts",
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "globalcell-adopts-a-hostile-value",
+    "note": "#772 round 6: the cell is read from globalThis, so a validator that throws (a Proxy trap) must be a refusal, not an SDK-wide crash at import time",
+    "file": "core/global-cell.ts",
+    "find": "  try {\n    return intact(candidate);\n  } catch {\n    return false;\n  }",
+    "replace": "  return intact(candidate);",
+    "tests": [
+      "tests/unit/core/global-cell.test.ts"
+    ]
+  },
+  {
+    "name": "localstorage-tags-split-per-bundle",
+    "note": "#772 round 6: the tag feeds backingStoreId, which is PROCESS-level identity. Split per module copy, each first Storage object gets tag 1 \u2014 two unrelated wallets collide and clear() destroys the wrong one",
+    "file": "impl/browser/storage/LocalStorageProvider.ts",
+    "find": "const storeIdentity = sharedCell<StorageIdentityCell>(\n  'impl.browser.localStorage.identity@1',\n  () => ({ tags: new WeakMap(), writeChains: new Map(), seq: 0 }),\n  (cell) => {\n    const c = cell as Partial<StorageIdentityCell>;\n    return c.tags instanceof WeakMap && c.writeChains instanceof Map && typeof c.seq === 'number';\n  },\n);\n",
+    "replace": "const storeIdentity: StorageIdentityCell = { tags: new WeakMap(), writeChains: new Map(), seq: 0 };\nvoid sharedCell;\n",
+    "tests": [
+      "tests/unit/impl/backing-store-id.test.ts",
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
+  },
+  {
+    "name": "connect-live-rebind-skips-network-check",
+    "note": "#772: updateSphere returns early for a LIVE host and the lock-edge guard sits behind wasLocked, so this is the one rebind that re-runs no compatibility check. Unguarded, a host switching network without locking keeps the approved session and serves the dApp a chain it never agreed to",
+    "file": "connect/host/ConnectHost.ts",
+    "find": "      if (this.session?.active && (this.snapshot.networkId ?? null) !== (next.networkId ?? null)) {",
+    "replace": "      if (false) {",
+    "tests": [
+      "tests/unit/connect/lock.test.ts"
+    ]
+  },
+  {
+    "name": "idb-store-id-splits-on-prefix",
+    "note": "#772 codex P1: backingStoreId must name the unit of ERASURE. clear() with no prefix empties the whole object store, so two prefixed wallets in one database share a fate \u2014 splitting them lets a clear wipe one wallet's data and leave the other's Sphere isReady over the remains",
+    "file": "impl/browser/storage/IndexedDBStorageProvider.ts",
+    "find": "    this.backingStoreId = `indexeddb:${encodeURIComponent(this.dbName)}`;",
+    "replace": "    this.backingStoreId = `indexeddb:${encodeURIComponent(this.dbName)}:${encodeURIComponent(this.prefix)}`;",
+    "tests": [
+      "tests/unit/impl/backing-store-id.test.ts"
+    ]
+  },
+  {
+    "name": "file-store-id-not-canonical",
+    "note": "#772 codex P2: path.resolve is lexical, so a symlinked dataDir and the real one give different ids for ONE wallet.json \u2014 clear() through one alias then misses the Sphere registered through the other",
+    "file": "impl/nodejs/storage/FileStorageProvider.ts",
+    "find": "      `file:${path.join(canonicalPath(this.dataDir), path.basename(this.filePath))}`;",
+    "replace": "      `file:${this.filePath}`;",
+    "tests": [
+      "tests/unit/impl/backing-store-id.test.ts"
+    ]
+  },
+  {
+    "name": "import-clears-on-the-widened-bucket",
+    "note": "#772 codex round 2: the liveness bucket names the unit of ERASURE and is therefore wider than the EXISTENCE scope. Deciding needsClear on it made an import into an unused IndexedDB prefix wipe the whole database and destroy a live wallet under a sibling prefix",
+    "file": "core/Sphere.ts",
+    "find": "    const liveHere = Sphere.liveOn(options.storage).some((s) => s._storage === options.storage);",
+    "replace": "    const liveHere = Sphere.liveOn(options.storage).length > 0;",
+    "tests": [
+      "tests/integration/sphere-instance-scoping.test.ts"
+    ]
+  },
+  {
+    "name": "file-store-id-resolves-the-final-symlink",
+    "note": "#772 codex round 2: save() renames a .tmp OVER filePath, REPLACING a final-component symlink rather than writing through it \u2014 so two paths differing only in that link diverge on the first save and must not share a bucket",
+    "file": "impl/nodejs/storage/FileStorageProvider.ts",
+    "find": "      `file:${path.join(canonicalPath(this.dataDir), path.basename(this.filePath))}`;",
+    "replace": "      `file:${canonicalPath(this.filePath)}`;",
+    "tests": [
+      "tests/unit/impl/backing-store-id.test.ts"
     ]
   }
 ]

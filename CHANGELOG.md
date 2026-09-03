@@ -7,6 +7,189 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-03
+
+### Removed (BREAKING) — the Sphere lifecycle globals (#766)
+
+`Sphere.getInstance()`, `Sphere.isInitialized()` and the root export `getSphere` are gone
+(root exports 126 → 125). Hold the instance the entry point returns; `sphere.isReady`
+answers the instance-level question. The consumer gate found zero users across every
+sibling repo.
+
+Not deprecated, because the defect survives deprecation: after a second Sphere was created
+*and destroyed*, `getInstance()` returned `null` while the first was alive and serving money.
+
+### Fixed — `clear()`/`import()` no longer destroy an unrelated wallet (#766)
+
+Both keyed off the removed static rather than the storage they were handed, so
+`Sphere.import({ storage: B })` destroyed a live wallet on storage **A**: identity nulled,
+`payments` throwing `NOT_INITIALIZED`, providers disconnected, and every `sphere.on()`
+handler dropped with no event and no error. They are now scoped by the **backing store** the
+provider addresses, reported by a new optional `StorageProvider.backingStoreId` — the resolved
+wallet path for `FileStorageProvider`, `dbName` + key prefix for `IndexedDBStorageProvider`,
+the `Storage` object + prefix for `LocalStorageProvider`. Neither of the two obvious keys
+works: `StorageProvider.id` is a class constant, so it collides every wallet in the process;
+provider *object* identity is too narrow the other way — two providers over one `dataDir` are
+distinct objects addressing one wallet.json, so it would have destroyed NEITHER of their
+Spheres, leaving a live wallet over a KV that was just emptied. A custom provider that declares
+no `backingStoreId` keeps per-object scoping, unchanged. The `exists(storage)` disjunct is
+preserved — that is the storage-wipe contract consumers actually depend on.
+
+`importFromLegacyFile` returned the wrong Sphere under an interleaved init, because
+`importFromJSON` discarded the one it built; it is now threaded out (additive).
+
+### Fixed — tracked addresses are merged, not clobbered (#766)
+
+Every persist wrote the instance's whole snapshot, so a second Sphere's address switch
+erased the first's entry from disk while its in-memory view still showed it. Now
+read-merge-write, serialized per provider: union by index, greater `updatedAt` wins
+`hidden`. Safe because there is no delete path. Deliberately **not** network-scoped — the
+payload is network-agnostic (`deriveDirectAddress` takes no network) and the bug reproduces
+with both Spheres on one network.
+
+A stored `index` must now be a uint32. `deriveKeyAtPath` `parseInt()`s the path segment, so
+a row with index `1.5` derived index `1`'s keys and impersonated a real address; and
+`deriveChildKey` pads the child number to 8 hex digits, so anything above `0xffffffff`
+emitted extra bytes. Such rows are dropped on read.
+
+### Fixed — the `debug` flag was one-way, and `verification` was dropped (#766, #769)
+
+`if (options.debug)` meant no later init could turn debug off; all four entry points now
+honour an explicit `false`. `createNodeProviders` had the mirror-image bug — `?? false`
+silently disabled a flag the consumer had set — and now only overrides when told to.
+
+`Sphere.init` also never forwarded `verification` to `create`/`load`, so opting into the
+worker pool at the documented entry point silently gave you the sequential verifier.
+
+The logger stays process-global by design: most of its 370 call sites are in providers
+constructed before any Sphere exists and shared between them.
+
+### Fixed — teardown no longer leaves live work behind (#770)
+
+Four defects of one shape: work spawned by a component outlived the component.
+
+- **`setIdentity` orphaned the previous `NostrClient`** (`transport/`). It assigned the
+  replacement to `this.nostrClient` *before* connecting, so a failed connect left the old
+  client's sockets, ping intervals and auto-reconnect chain running and unreachable —
+  `disconnect()` only ever reaches the field. `setIdentity` never touches `status`, so the
+  caller's next retry orphaned another. The field now moves only after a successful connect;
+  a failed connect disposes the replacement and leaves the provider on the working client,
+  and a throwing `subscribeToEvents()` disposes the old one from a `finally`. Deliberately
+  not "tear down both": `MultiAddressTransportMux` shares that client. Folds in the
+  same-class timer leak in `connect()` — `Promise.race` does not cancel the loser, so the
+  deadline timer pinned Node's event loop for the full timeout after the call returned.
+- **`engine.dispose()` mid-verify never settled the batch** (`token-engine/`). The base
+  SDK's `WorkerPool.dispose()` only `terminate()`s its workers; a dispatched task resolves
+  solely from `worker.onmessage`, so `verify` hung forever. Reachable through
+  `setOracleApiKey` → `PaymentsFacade.setEngine`. Disposal now **rejects** the in-flight
+  verification, and that is load-bearing rather than stylistic: the only `engine.verify`
+  caller in the money path turns a falsy verdict into a permanent mailbox rejection, so
+  resolving `{ ok: false }` would have destroyed a **valid incoming token** because an
+  api-key change happened to land mid-drain. A rejection leaves the entry unacked to
+  re-list. `createWorker()` also refuses once disposed, so a late task cannot resurrect the
+  pool. Only affects consumers who opt into `verification.createWorker`.
+- **The mailbox poll drain was untracked** (`modules/payments-v2/`). `Receive.start()`
+  spawned its 30 s poll with a bare `void drainOnce()`, so `PaymentsFacade.stop()` could
+  return while a drain was still doing wallet-api I/O, verification, scoped-KV writes and
+  `transfer:incoming` emission — and `destroy()` carried on underneath it. Both spawns now
+  register with the existing quiescence gate. (The wake path was accidentally covered, but
+  only because of subscriber ordering.)
+- **A `switchToAddress` racing `destroy()` re-armed the wallet** (`core/`).
+  `switchToAddress` checked liveness once and then awaited ~8 times, and `_initialized` is
+  cleared *last*, so it could not mark "teardown has begun". Two live vectors: a switch
+  rebuilt and reconnected the transport mux (`destroy()` leaves it null, which is exactly
+  the condition to build one), and its stop/start pair — queued behind `destroy()`'s own
+  stop on the lifecycle mutex — started a whole new vertical for an owner whose `destroy()`
+  had already resolved. A destroyed latch, set as `destroy()`'s first statement, now gates
+  both. A refused switch also no longer persists the address index it never finished moving
+  to, which would have sent the next boot to the wrong address.
+
+### Fixed — identity state no longer splits per bundle (#766)
+
+`tsup` ships each subpath export as its own bundle with `splitting: false`, and ESM and
+CJS duplicate it again — so class statics are per-bundle, not per-process. That made the
+lifecycle fixes above incomplete at the entry-point boundary: a Sphere built through
+`@unicitylabs/sphere-sdk` was invisible to a `Sphere.clear()` called through
+`@unicitylabs/sphere-sdk/core`, which wiped the backing store and left the first Sphere
+`isReady` over an emptied KV — the original #766 failure, one level out. The clear
+generation split the same way, so an in-flight init in the other bundle also missed the
+clear.
+
+`LocalStorageProvider` had the same shape for a different reason: it minted its
+`backingStoreId` tags from a module-level counter, so each copy gave its first unrelated
+`Storage` object the tag `1` — two different stores, one id, and `clear()` erasing the
+wrong wallet. Its read-merge-write serializer was module-local too, which is the
+tracked-address lost update one level out.
+
+All of it now lives in a versioned `globalThis` cell, the pattern `core/logger.ts`
+already uses. The cell is non-enumerable, validated on read (a foreign value is refused,
+not adopted), degrades to bundle-local rather than throwing if `globalThis` is frozen,
+and holds only Sphere instances, `backingStoreId` strings and counters — never key
+material. `IndexedDBStorageProvider` and `FileStorageProvider` needed no change: their
+ids are intrinsic (`dbName` + prefix, resolved path), not counter-allocated.
+
+No public API change.
+
+### Changed — three refusals that used to be silent successes
+
+Found by review of the fixes above; each turns a wrong answer into a typed error.
+
+- **`saveTrackedAddresses` rejects a non-uint32 index** instead of writing the row and
+  letting the next load drop it. The uint32 rule was enforced only on read, so a malformed
+  index reached derivation — `deriveKeyAtPath` `parseInt()`s the path segment, so `1.5`
+  derives index `1`'s keys — before anything noticed. Rows already on disk are still
+  *filtered* rather than rejected: one corrupt stored row must not brick every later write.
+- **`deriveAddress`, `switchToAddress`, `trackScannedAddresses` and address discovery throw
+  `INVALID_CONFIG` for any non-uint32 index.** Previously only `switchToAddress` checked, and
+  only for negatives. The guard sits at the one point every index reaches derivation
+  through — the storage-layer refusal alone is too late, because `ensureAddressTracked`
+  mutates the in-memory registry before persisting.
+- **`Sphere.init` / `create` / `load` / `import` can reject with `STORAGE_ERROR`** when
+  `Sphere.clear()` empties the store while they are building. An init is invisible to
+  `clear()` until it publishes, so previously the KV was wiped and the init went on to
+  publish a Sphere reporting `isReady` over nothing. Refusing is deliberate over serializing:
+  `import()` clears internally (a per-store mutex would round-trip through itself), and a
+  `clear()` blocked behind a slow bring-up is a worse outage than a loud refusal.
+
+A fourth, in the transport: **a failed `setIdentity()` no longer half-applies.** Identity,
+key material and the per-address dedup window are staged and committed with the client, so
+a swap that fails leaves the provider entirely on the old identity — previously the old
+client kept serving its old-address subscriptions under the *new* key. A caller retrying
+after a transient relay failure therefore re-attempts the whole swap.
+
+### Fixed — `checkNetworkHealth` reported healthy gateways as unhealthy (#769)
+
+It POSTed `get_round_number` with empty params and keyed the verdict off `response.ok`. The
+gateway is a routing layer: it refuses any call carrying neither `stateId` nor `shardId`
+with HTTP 400 before it looks at the method. So the check that exists to gate a network
+cutover answered "unhealthy" for every live gateway. It now sends `get_block_height` with a
+32-byte `stateId` and reads the JSON-RPC body — the status code cannot answer this in
+either direction, since a healthy gateway answers a routing mistake with a 400 plus a body
+and JSON-RPC puts application errors inside a 200. Verified live against testnet2 and
+mainnet.
+
+### Documentation
+
+`docs/INTEGRATION.md` published the `StorageProvider` interface with `saveTrackedAddresses`
+and no contract, so a custom provider written from it reproduced the #766 data-loss bug; it
+now carries the write contract, the uint32 rule and a worked implementation. `Sphere.init`'s
+option block, `TrackedAddressEntry.index`, `sphere.isReady`/`networkId`, the backing-store
+scoping of `clear()`/`import()` and the new `TokenRegistry` instance API are documented, and
+the token-registry migration guide is reachable from the README. Four CLAUDE.md claims the
+code does not honour were corrected (there is no durable receive seen-set; coin symbols are
+not registry-resolved on the money path).
+
+`tests/aggregator/` gained the `INVALID_TRUSTBASE` vacuity guard CLAUDE.md already claimed:
+a token the real service certified must be refused when the trust base carries a wrong root
+key. Without it, "verify() passes against a real aggregator" could have been true because
+verification never consulted the trust base.
+
+### Fixed — `TokenRegistry.resetInstance()` now disposes (#770)
+
+It called only `stopAutoRefresh()`, leaving `disposed` unset, the generation unchanged and
+the in-flight fetch running — so a load past its entry guard re-armed the interval on an
+instance `getInstance()` could no longer return.
+
 ### Changed — a Sphere owns its token registry, and destroy() disposes it (#766)
 
 `TokenRegistry` is a process-global singleton whose `configure()` repoints whatever instance
@@ -36,8 +219,8 @@ coin. See [docs/MIGRATION-TOKEN-REGISTRY.md](docs/MIGRATION-TOKEN-REGISTRY.md).
 - The ten singleton-bound free functions moved to `registry/global-readers.ts`, re-exported
   unchanged. The public surface is identical: same 126 root exports, same signatures.
 
-Not fixed here: `Sphere`'s own `static instance`, and `Sphere.clear()`/`import()` destroying
-whichever instance holds it regardless of the storage they were given. Tracked in #766.
+`Sphere`'s own `static instance` and the `clear()`/`import()` cross-wallet kill were still
+open when that shipped; both are fixed above in this release.
 
 ### Added — mainnet is a runnable network
 
@@ -1275,6 +1458,7 @@ consumed exclusively through the `token-engine/` port. Consequences:
      version tags past v0.9.x, so a tag-compare link would 404. -->
 
 [Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/main...HEAD
+[0.16.0]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.16.0
 [0.15.0]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.15.0
 [0.14.11]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.14.11
 [0.14.10]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.14.10

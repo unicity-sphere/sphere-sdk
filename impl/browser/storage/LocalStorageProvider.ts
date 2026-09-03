@@ -4,10 +4,16 @@
  */
 
 import { logger } from '../../../core/logger';
+import { sharedCell } from '../../../core/global-cell';
 import { SphereError } from '../../../core/errors';
 import type { ProviderStatus, FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, isNetworkScopedAddressKey, type NetworkType } from '../../../constants';
+import {
+  mergeTrackedAddresses,
+  parseTrackedAddresses,
+  type TrackedAddressesFile,
+} from '../../../storage/tracked-addresses';
 
 // =============================================================================
 // Configuration
@@ -31,11 +37,68 @@ export interface LocalStorageProviderConfig {
 // Implementation
 // =============================================================================
 
+/**
+ * Per-`Storage` tags for `backingStoreId`. The prefix alone does not identify the
+ * store: an SSR fallback mints a private in-memory `Storage` per provider, so two
+ * providers with the same prefix over different objects hold unrelated data. Weak,
+ * lazily assigned, and PROCESS-wide — a per-bundle counter gives the first unrelated
+ * `Storage` of each copy the tag `1`, and `Sphere.clear()` erases the wrong wallet.
+ * The write chains ride the same cell: two chains over one store lose an update.
+ */
+interface StorageIdentityCell {
+  readonly tags: WeakMap<Storage, string>;
+  readonly writeChains: Map<string, Promise<unknown>>;
+  seq: number;
+}
+
+const storeIdentity = sharedCell<StorageIdentityCell>(
+  'impl.browser.localStorage.identity@1',
+  () => ({ tags: new WeakMap(), writeChains: new Map(), seq: 0 }),
+  (cell) => {
+    const c = cell as Partial<StorageIdentityCell>;
+    return c.tags instanceof WeakMap && c.writeChains instanceof Map && typeof c.seq === 'number';
+  },
+);
+
+function storageObjectTag(storage: Storage): string {
+  let tag = storeIdentity.tags.get(storage);
+  if (!tag) {
+    tag = String(++storeIdentity.seq);
+    storeIdentity.tags.set(storage, tag);
+  }
+  return tag;
+}
+
+/**
+ * One write chain per BACKING STORE, not per provider object: `backingStoreId` exists
+ * because two providers may address the same localStorage + prefix, and two per-instance
+ * chains both read the old registry before either writes — the lost update again, one
+ * level up. This coordinates a single JS realm only; a SECOND TAB writing the same store
+ * is genuinely not covered, and no in-process lock can cover it.
+ */
+const trackedWriteChains = storeIdentity.writeChains;
+
+function serializeTrackedWrite(storeId: string, task: () => Promise<void>): Promise<void> {
+  const previous = trackedWriteChains.get(storeId) ?? Promise.resolve();
+  const run = previous.then(task);
+  // Carried forward, one transient error would reject every later write without running it.
+  const tail = run.then(() => undefined, () => undefined);
+  trackedWriteChains.set(storeId, tail);
+  // Drop the entry once nothing is queued behind it, so a per-request SSR storage does
+  // not leave a chain behind forever.
+  void tail.then(() => {
+    if (trackedWriteChains.get(storeId) === tail) trackedWriteChains.delete(storeId);
+  });
+  return run;
+}
+
 export class LocalStorageProvider implements StorageProvider {
   readonly id = 'localStorage';
   readonly name = 'Local Storage';
   readonly type = 'local' as const;
   readonly description = 'Browser localStorage for single-device persistence';
+  /** The `Storage` object + prefix — two providers over one pair share erasure (#766). */
+  readonly backingStoreId: string;
 
   private config: Required<Pick<LocalStorageProviderConfig, 'prefix' | 'debug'>> & {
     storage: Storage;
@@ -54,6 +117,8 @@ export class LocalStorageProvider implements StorageProvider {
       debug: config?.debug ?? false,
     };
     this.network = config?.network;
+    this.backingStoreId =
+      `localstorage:${storageObjectTag(storage)}:${encodeURIComponent(this.config.prefix)}`;
   }
 
   // ===========================================================================
@@ -150,19 +215,28 @@ export class LocalStorageProvider implements StorageProvider {
     }
   }
 
+  /**
+   * Persist the tracked-address registry by MERGING, never replacing.
+   *
+   * Every Sphere over this storage holds its own snapshot and writes it in
+   * full, so a wholesale write drops the addresses this writer never saw
+   * (#766 item 5 — a lost update, reproducible on one network). localStorage
+   * offers no transaction, so the read-merge-write is serialized by BACKING
+   * STORE — see `serializeTrackedWrite`, and the realm limit stated there.
+   */
   async saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void> {
-    await this.set(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES, JSON.stringify({ version: 1, addresses: entries }));
+    await serializeTrackedWrite(this.backingStoreId, async () => {
+      const onDisk = parseTrackedAddresses(await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES));
+      const file: TrackedAddressesFile = {
+        version: 1,
+        addresses: mergeTrackedAddresses(onDisk, entries),
+      };
+      await this.set(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES, JSON.stringify(file));
+    });
   }
 
   async loadTrackedAddresses(): Promise<TrackedAddressEntry[]> {
-    const data = await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES);
-    if (!data) return [];
-    try {
-      const parsed = JSON.parse(data);
-      return parsed.addresses ?? [];
-    } catch {
-      return [];
-    }
+    return parseTrackedAddresses(await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES));
   }
 
   // ===========================================================================

@@ -1337,6 +1337,38 @@ describe('updateSphere() re-arm after a lock', () => {
     expect(h.host.getSession()).toBeNull();
   });
 
+  it('REVOKES when the network changes under a LIVE session, without any lock', async () => {
+    // The lock-edge guard sits behind `wasLocked`, and updateSphere returns early for a
+    // live host — so this rebind is the ONE that re-runs no compatibility check at all.
+    // A host that switches network without locking would otherwise keep the approved
+    // session and serve the dApp a chain it never agreed to, while sphere_getIdentity
+    // still reported the old network.
+    const h = await connectHarness();
+    expect(h.host.walletState).toBe('live');
+    expect(h.host.getSession()).not.toBeNull();
+
+    h.host.updateSphere(createMockSphere({ networkId: 7 }));
+
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(1);
+    expect(h.host.getSession()).toBeNull();
+    expect(h.host.walletState).toBe('live');
+    // The snapshot still moves: the next handshake must report where the wallet IS.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((h.host as any).snapshot.networkId).toBe(7);
+  });
+
+  it('keeps a LIVE session across an address switch on the same network', async () => {
+    // The companion to the case above: identity changing is what an address switch IS,
+    // so the network guard must not turn every switch into a disconnect.
+    const h = await connectHarness();
+
+    h.host.updateSphere(createMockSphere({ chainPubkey: '02anotheraddress' }));
+
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.DISCONNECTED)).toHaveLength(0);
+    expect(h.host.getSession()).not.toBeNull();
+    expect(eventsOfType(h.pair.hostSent, WALLET_EVENTS.IDENTITY_CHANGED).length).toBeGreaterThan(0);
+  });
+
   it('re-arms silently when the locked host had no session', () => {
     const pair = createMockTransportPair();
     const host = makeHost(pair, { sphere: null, initialWalletState: 'locked' });

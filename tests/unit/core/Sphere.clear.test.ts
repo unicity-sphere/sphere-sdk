@@ -5,7 +5,7 @@
  * cursors, journals all live in the plain StorageProvider).
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { Sphere } from '../../../core/Sphere';
 import type { StorageProvider } from '../../../storage';
 import type { ProviderStatus } from '../../../types';
@@ -43,14 +43,6 @@ function createMockStorage(): StorageProvider & { _data: Map<string, string> } {
 // =============================================================================
 
 describe('Sphere.clear()', () => {
-  beforeEach(() => {
-    // Reset Sphere singleton
-    if (Sphere.getInstance()) {
-      // Force reset without calling destroy (which needs providers)
-      (Sphere as unknown as { instance: null }).instance = null;
-    }
-  });
-
   it('should call storage.clear() to remove all data', async () => {
     const storage = createMockStorage();
 
@@ -83,18 +75,31 @@ describe('Sphere.clear()', () => {
     it('should destroy existing Sphere instance before clearing', async () => {
       const storage = createMockStorage();
 
-      // Simulate an existing instance whose destroy() resets the singleton
+      // A live Sphere registered against THIS storage. clear() must tear it down before
+      // wiping the KV out from under it. Seeded straight into the private registry that
+      // replaced the process-global singleton (#766) — under the key the provider itself
+      // resolves to, since that registry is keyed by BACKING STORE, not by object. The
+      // mock's destroy() deregisters itself the way the real Sphere.destroy() does.
+      const sphereStatics = Sphere as unknown as {
+        _liveByStorage: Map<string, Set<unknown>>;
+        storeKeyOf(storage: StorageProvider): string;
+      };
+      const liveByStorage = sphereStatics._liveByStorage;
+      const registered = new Set<unknown>();
       const mockInstance = {
         destroy: vi.fn(async () => {
-          (Sphere as unknown as { instance: null }).instance = null;
+          registered.delete(mockInstance);
         }),
       };
-      (Sphere as unknown as { instance: typeof mockInstance }).instance = mockInstance;
+      registered.add(mockInstance);
+      liveByStorage.set(sphereStatics.storeKeyOf(storage), registered);
 
       await Sphere.clear({ storage });
 
       expect(mockInstance.destroy).toHaveBeenCalled();
-      expect(Sphere.getInstance()).toBeNull();
+      // ...and it is gone from the registry afterwards — clear() leaves no live Sphere
+      // holding storage it just emptied.
+      expect(registered.size).toBe(0);
     });
 
     it('should connect storage if disconnected before clearing', async () => {

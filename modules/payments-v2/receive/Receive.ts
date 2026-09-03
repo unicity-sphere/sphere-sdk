@@ -57,6 +57,7 @@ export interface ReceiveDeps {
   readonly refreshView?: () => void;
   readonly attention: AttentionEmitter;
   readonly syncEpoch: () => string;
+  readonly track?: (op: Promise<unknown>) => void;
   readonly now?: () => number;
 }
 
@@ -116,13 +117,14 @@ export class Receive {
   }
 
   start(pollIntervalMs: number = POLL_INTERVAL_MS): void {
-    this.unsubscribeWake ??=
-      this.deps.delivery.onWake?.(() => {
-        void this.drainOnce();
-      }) ?? null;
-    this.pollTimer ??= setInterval(() => {
-      void this.drainOnce();
-    }, pollIntervalMs);
+    this.unsubscribeWake ??= this.deps.delivery.onWake?.(() => this.spawnDrain()) ?? null;
+    this.pollTimer ??= setInterval(() => this.spawnDrain(), pollIntervalMs);
+  }
+
+  private spawnDrain(): void {
+    const op = this.drainOnce();
+    if (this.deps.track !== undefined) this.deps.track(op);
+    else void op;
   }
 
   stop(): void {
