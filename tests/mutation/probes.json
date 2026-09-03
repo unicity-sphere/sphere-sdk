@@ -947,7 +947,7 @@
     "note": "#770.3: _destroyed must flip as destroy()'s FIRST statement \u2014 set later (or not at all) and the whole teardown window is unguarded, which is exactly why _initialized could not carry it",
     "file": "core/Sphere.ts",
     "find": "    this._destroyed = true;\n",
-    "replace": "",
+    "replace": "    // probe: the destroyed latch is never set\n",
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
     ]
@@ -1007,7 +1007,7 @@
     "note": "#770.2: track is optional on ReceiveDeps, so dropping it here compiles cleanly and silently un-tracks every self-spawned drain",
     "file": "modules/payments-v2/compose.ts",
     "find": "    track: hooks.track,\n",
-    "replace": "",
+    "replace": "    // probe: the receive drain is left untracked\n",
     "tests": [
       "tests/unit/payments-v2/facade.test.ts"
     ]
