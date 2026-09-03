@@ -925,6 +925,57 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     expect((outcome as SphereError).code).toBe('NOT_INITIALIZED');
   }, 30_000);
 
+  it('destroy() landing INSIDE module bring-up discards what the bring-up built', async () => {
+    // The guards in switchToAddress are checks BEFORE an await. This is the gap they
+    // cannot close on their own: destroy() lands while initializeAddressModules is
+    // itself awaiting, its teardown loop empties _addressModules, and the continuation
+    // then registers a fully-built set — its own token engine, and so its own worker
+    // pool — on a Sphere whose destroy() has already returned. Nothing would ever
+    // dispose it, and nothing holds a reference through which it could be found.
+    const world = makeWorld();
+    const sphere = await buildSphere({ walletApi: world.walletApi });
+    const modules = (sphere as unknown as { _addressModules: Map<number, unknown> })._addressModules;
+
+    // Park INSIDE the bring-up, on the engine build — past ensureTransportMux, before
+    // the module set is registered.
+    let release!: () => void;
+    const opened = new Promise<void>((resolve) => (release = resolve));
+    const internals = sphere as unknown as {
+      buildTokenEngine: (identity: unknown) => Promise<ITokenEngine>;
+    };
+    const realBuild = internals.buildTokenEngine.bind(sphere);
+    const built: ITokenEngine[] = [];
+    internals.buildTokenEngine = async (identity: unknown): Promise<ITokenEngine> => {
+      await opened;
+      const engine = await realBuild(identity);
+      engine.dispose = vi.fn();
+      built.push(engine);
+      return engine;
+    };
+
+    const switching = sphere.switchToAddress(1).then(
+      () => 'resolved' as const,
+      (err: unknown) => err
+    );
+    await sleep(200);
+
+    await sphere.destroy();
+    expect(modules.size).toBe(0);
+
+    release();
+    const outcome = await switching;
+    await sleep(200);
+
+    // The set the continuation built is gone again, and its engine — the one destroy()
+    // could not have disposed, because it did not exist yet — was disposed here.
+    expect(modules.size).toBe(0);
+    expect(built).toHaveLength(1);
+    expect(built[0]!.dispose).toHaveBeenCalledTimes(1);
+    expect((sphere as unknown as { _transportMux: unknown })._transportMux).toBeNull();
+    expect(outcome).toBeInstanceOf(SphereError);
+    expect((outcome as SphereError).code).toBe('NOT_INITIALIZED');
+  }, 30_000);
+
   it('setOracleApiKey rebuilds the engine and swaps it via facade.setEngine; the replaced engine is disposed', async () => {
     const world = makeWorld();
     const sphere = await buildSphere({ walletApi: world.walletApi });

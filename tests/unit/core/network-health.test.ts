@@ -123,6 +123,31 @@ describe('checkNetworkHealth', () => {
       expect(result.healthy).toBe(false);
     });
 
+    it('honours timeoutMs while the BODY is still streaming, not only the headers', async () => {
+      // fetch settles on the response HEADERS. Clearing the deadline there left the
+      // body read waiting forever on a gateway that stalled mid-response — timeoutMs
+      // silently stopped applying at the point the endpoint is least responsive.
+      fetchSpy.mockImplementationOnce((_url: string, init: RequestInit) => {
+        const signal = init.signal!;
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          json: () =>
+            new Promise((_resolve, reject) => {
+              signal.addEventListener('abort', () => {
+                reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+              });
+            }),
+        } as unknown as Response);
+      });
+
+      const result = await checkNetworkHealth('testnet', { services: ['oracle'], timeoutMs: 50 });
+
+      expect(result.services.oracle!.healthy).toBe(false);
+      expect(result.services.oracle!.error).toContain('timeout');
+    }, 2000);
+
     it('should report oracle unhealthy on fetch error', async () => {
       fetchSpy.mockRejectedValueOnce(new Error('ECONNREFUSED'));
 

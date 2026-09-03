@@ -2393,6 +2393,10 @@ export class Sphere {
       // leaves behind — so an unguarded switch opens new sockets after teardown returned.
       this.ensureAlive();
       await this.initializeAddressModules({ index, identity: newIdentity });
+      // The guard above is a check BEFORE an await: destroy() landing inside this
+      // bring-up would otherwise let the continuation register a live module set —
+      // and a reconnected mux — on a Sphere whose teardown had already returned.
+      if (this._destroyed) await this.discardModulesBuiltDuringDestroy(index);
     } else if (nametag !== this._addressModules.get(index)!.identity.nametag) {
       // Modules already exist — only the nametag label changed.
       this._addressModules.get(index)!.identity = newIdentity;
@@ -2503,6 +2507,42 @@ export class Sphere {
    * independently in background. The payments vertical is NOT created here —
    * the caller starts it via stopThenStartPaymentsV2 (§7 single vertical).
    */
+  /** Tear one address's module set down. Each address owns its own engine, so its own pool. */
+  private static destroyModuleSet(index: number, moduleSet: AddressModuleSet): void {
+    try {
+      moduleSet.communications.destroy();
+      moduleSet.groupChat?.destroy();
+      moduleSet.market?.destroy();
+      moduleSet.tokenEngine?.dispose?.();
+      logger.debug('Sphere', `Destroyed modules for address ${index}`);
+    } catch (err) {
+      logger.warn('Sphere', `Error destroying modules for address ${index}:`, err);
+    }
+  }
+
+  /**
+   * Undo a module set built while `destroy()` was running.
+   *
+   * `destroy()`'s teardown loop has already emptied `_addressModules`, so a set
+   * registered after it would stay live and unreachable — its own engine (and worker
+   * pool), and a transport mux `ensureTransportMux` rebuilt because teardown had just
+   * nulled the field. Then re-raise, so the switch fails rather than reporting success
+   * on a destroyed Sphere (#770, #772 review).
+   */
+  private async discardModulesBuiltDuringDestroy(index: number): Promise<never> {
+    const built = this._addressModules.get(index);
+    this._addressModules.delete(index);
+    if (built) Sphere.destroyModuleSet(index, built);
+    if (this._transportMux) {
+      const mux = this._transportMux;
+      this._transportMux = null;
+      await Sphere.safeDisconnect('transport mux', () => mux.disconnect());
+    }
+    this.ensureAlive();
+    /* c8 ignore next */
+    throw new SphereError('Sphere destroyed', 'NOT_INITIALIZED');
+  }
+
   private async initializeAddressModules(
     spec: { index: number; identity: FullIdentity },
   ): Promise<AddressModuleSet> {
@@ -3671,16 +3711,7 @@ export class Sphere {
 
     // Destroy all per-address module sets
     for (const [idx, moduleSet] of this._addressModules.entries()) {
-      try {
-        moduleSet.communications.destroy();
-        moduleSet.groupChat?.destroy();
-        moduleSet.market?.destroy();
-        // Each address has its OWN engine, so each may own its own worker pool.
-        moduleSet.tokenEngine?.dispose?.();
-        logger.debug('Sphere', `Destroyed modules for address ${idx}`);
-      } catch (err) {
-        logger.warn('Sphere', `Error destroying modules for address ${idx}:`, err);
-      }
+      Sphere.destroyModuleSet(idx, moduleSet);
     }
     this._addressModules.clear();
 

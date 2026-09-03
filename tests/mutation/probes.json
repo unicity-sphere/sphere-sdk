@@ -1092,5 +1092,25 @@
     "tests": [
       "tests/integration/tracked-addresses-concurrent.test.ts"
     ]
+  },
+  {
+    "name": "switch-keeps-modules-built-during-destroy",
+    "note": "#772 codex: the switchToAddress guards are checks BEFORE an await. destroy() landing INSIDE initializeAddressModules lets the continuation register a live module set \u2014 its own engine and worker pool \u2014 on a Sphere whose destroy() already returned",
+    "file": "core/Sphere.ts",
+    "find": "      if (this._destroyed) await this.discardModulesBuiltDuringDestroy(index);",
+    "replace": "      // probe",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "health-deadline-dropped-before-body-read",
+    "note": "#769.1 codex: fetch settles on the HEADERS, so clearing the deadline there leaves the body read waiting forever on a gateway that stalls mid-response \u2014 timeoutMs stops applying exactly where the endpoint is least responsive",
+    "file": "core/network-health.ts",
+    "find": "    const responseTimeMs = Date.now() - startTime;\n\n    const body: unknown = await response.json().catch(() => null);",
+    "replace": "    clearTimeout(timer);\n    const responseTimeMs = Date.now() - startTime;\n\n    const body: unknown = await response.json().catch(() => null);",
+    "tests": [
+      "tests/unit/core/network-health.test.ts"
+    ]
   }
 ]

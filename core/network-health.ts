@@ -283,15 +283,41 @@ function readRpcError(body: unknown): string | null {
   return null;
 }
 
+/** The verdict for a probe that came back — healthy only on a real block height. */
+function oracleVerdict(
+  url: string,
+  responseTimeMs: number,
+  response: Response,
+  body: unknown,
+): ServiceHealthResult {
+  if (readBlockNumber(body) !== null) return { healthy: true, url, responseTimeMs };
+  const rpcError = readRpcError(body);
+  return {
+    healthy: false,
+    url,
+    responseTimeMs,
+    error:
+      rpcError ??
+      (response.ok
+        ? 'aggregator answered without a block height'
+        : `HTTP ${String(response.status)} ${response.statusText}`),
+  };
+}
+
 /**
  * Check oracle (aggregator) endpoint via HTTP POST.
  */
 async function checkOracle(url: string, timeoutMs: number): Promise<ServiceHealthResult> {
   const startTime = Date.now();
+  const controller = new AbortController();
+  // Deliberately NOT cleared when the fetch resolves. `fetch` settles on the response
+  // HEADERS, so a gateway that stalls mid-body would leave the read below waiting
+  // forever on a deadline that had already been cancelled — timeoutMs would silently
+  // stop applying at the one point the endpoint is least responsive. Cleared in the
+  // `finally` instead, once the body has been read or the abort has cut it short.
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     const response = await fetch(url, {
       method: 'POST',
@@ -305,25 +331,15 @@ async function checkOracle(url: string, timeoutMs: number): Promise<ServiceHealt
       signal: controller.signal,
     });
 
-    clearTimeout(timer);
     const responseTimeMs = Date.now() - startTime;
 
     const body: unknown = await response.json().catch(() => null);
-    if (readBlockNumber(body) !== null) {
-      return { healthy: true, url, responseTimeMs };
+    // The deadline can only have fired during the body read — the fetch itself would
+    // have rejected. Reported as the timeout it is, not as a malformed answer.
+    if (controller.signal.aborted) {
+      return { healthy: false, url, responseTimeMs, error: `Connection timeout after ${timeoutMs}ms` };
     }
-
-    const rpcError = readRpcError(body);
-    return {
-      healthy: false,
-      url,
-      responseTimeMs,
-      error:
-        rpcError ??
-        (response.ok
-          ? 'aggregator answered without a block height'
-          : `HTTP ${String(response.status)} ${response.statusText}`),
-    };
+    return oracleVerdict(url, responseTimeMs, response, body);
   } catch (err) {
     return {
       healthy: false,
@@ -333,6 +349,8 @@ async function checkOracle(url: string, timeoutMs: number): Promise<ServiceHealt
         ? (err.name === 'AbortError' ? `Connection timeout after ${timeoutMs}ms` : err.message)
         : String(err),
     };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
