@@ -1112,5 +1112,56 @@
     "tests": [
       "tests/unit/core/network-health.test.ts"
     ]
+  },
+  {
+    "name": "sphere-live-registry-splits-per-bundle",
+    "note": "#772 round 6: every subpath export is its own tsup bundle, so a class static splits \u2014 a Sphere built through the root entry becomes invisible to a clear() called through ./core, which then wipes the store and leaves it ready over an emptied KV",
+    "file": "core/Sphere.ts",
+    "find": "  private static readonly _liveByStorage: Map<string, Set<Sphere>> = lifecycle.live;",
+    "replace": "  private static readonly _liveByStorage = new Map<string, Set<Sphere>>();",
+    "tests": [
+      "tests/integration/sphere-cross-bundle-lifecycle.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-clear-generations-split-per-bundle",
+    "note": "#772 round 6: split per bundle, an init in the OTHER bundle never sees the clear and publishes a Sphere over a wiped store",
+    "file": "core/Sphere.ts",
+    "find": "  private static readonly _clearGenerations: Map<string, number> = lifecycle.clearGenerations;",
+    "replace": "  private static readonly _clearGenerations = new Map<string, number>();",
+    "tests": [
+      "tests/integration/sphere-cross-bundle-lifecycle.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-object-store-keys-split-per-bundle",
+    "note": "#772 round 6: with the live map shared but the key allocator split, two bundles hand DIFFERENT providers the same object:N key and put two unrelated wallets in one bucket \u2014 a clear() on either destroys both",
+    "file": "core/Sphere.ts",
+    "find": "  private static readonly _objectStoreKeys: WeakMap<StorageProvider, string> =\n    lifecycle.objectStoreKeys;",
+    "replace": "  private static readonly _objectStoreKeys = new WeakMap<StorageProvider, string>();",
+    "tests": [
+      "tests/integration/sphere-cross-bundle-lifecycle.test.ts"
+    ]
+  },
+  {
+    "name": "globalcell-adopts-a-hostile-value",
+    "note": "#772 round 6: the cell is read from globalThis, so a validator that throws (a Proxy trap) must be a refusal, not an SDK-wide crash at import time",
+    "file": "core/global-cell.ts",
+    "find": "  try {\n    return intact(candidate);\n  } catch {\n    return false;\n  }",
+    "replace": "  return intact(candidate);",
+    "tests": [
+      "tests/unit/core/global-cell.test.ts"
+    ]
+  },
+  {
+    "name": "localstorage-tags-split-per-bundle",
+    "note": "#772 round 6: the tag feeds backingStoreId, which is PROCESS-level identity. Split per module copy, each first Storage object gets tag 1 \u2014 two unrelated wallets collide and clear() destroys the wrong one",
+    "file": "impl/browser/storage/LocalStorageProvider.ts",
+    "find": "const storeIdentity = sharedCell<StorageIdentityCell>(\n  'impl.browser.localStorage.identity@1',\n  () => ({ tags: new WeakMap(), writeChains: new Map(), seq: 0 }),\n  (cell) => {\n    const c = cell as Partial<StorageIdentityCell>;\n    return c.tags instanceof WeakMap && c.writeChains instanceof Map && typeof c.seq === 'number';\n  },\n);\n",
+    "replace": "const storeIdentity: StorageIdentityCell = { tags: new WeakMap(), writeChains: new Map(), seq: 0 };\nvoid sharedCell;\n",
+    "tests": [
+      "tests/unit/impl/backing-store-id.test.ts",
+      "tests/unit/storage/tracked-addresses-providers.test.ts"
+    ]
   }
 ]
