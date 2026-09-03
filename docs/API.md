@@ -121,6 +121,13 @@ never touched.
 whenever a wallet exists on that storage or a live Sphere is registered on it, so importing over
 storage B tears down the Spheres on B — and only those.
 
+**It also refuses an `init` / `create` / `load` / `import` that is in flight on that store.** A
+wallet being built is not yet registered, so `clear()` cannot destroy it; instead the bring-up
+checks at the very end whether the store was cleared under it and, if so, tears itself down and
+rejects with a `SphereError` of code `STORAGE_ERROR` rather than handing back a ready Sphere
+over an emptied KV. Retry the init once the clear has settled — it is a fresh wallet by then,
+so `Sphere.init` reports `created: true`.
+
 ### Properties
 
 | Property | Type | Description |
@@ -220,6 +227,9 @@ await sphere.switchToAddress(1);
 console.log(sphere.getCurrentAddressIndex()); // 1
 console.log(sphere.identity!.directAddress);  // DIRECT://... (address at index 1)
 ```
+
+`index` must be a uint32 (see [`TrackedAddressEntry`](#trackedaddressentry)); anything else
+throws `INVALID_CONFIG` before anything is derived, tracked or written.
 
 #### `getActiveAddresses(): TrackedAddress[]`
 
@@ -699,10 +709,13 @@ interface TrackedAddressEntry {
 ```
 
 `index` is a **BIP32 child number, so it must be a uint32**: an integer in `0` … `0xffffffff`.
-A row whose `index` is not — fractional, negative, out of range, or not a number — is **dropped
-when the registry is read**, not repaired. It is a drop rather than a repair because `1.5` would
-`parseInt()` down to index 1's derivation path and alias a real address, and anything above
-`0xffffffff` pads to more than 8 hex digits and derives off-standard.
+It is enforced at both ends. A **write** carrying such a row — `saveTrackedAddresses`, and every
+address-index API that derives keys (`switchToAddress`, `deriveAddress`, `trackScannedAddresses`,
+`discoverAddresses`) — is **refused** with a typed `SphereError`; a row already **stored** is
+**dropped when the registry is read**, not repaired, so one bad row cannot brick later writes.
+Neither is repaired because `1.5` would `parseInt()` down to index 1's derivation path and hand
+back that address's keys, and anything above `0xffffffff` pads to more than 8 hex digits and
+derives off-standard.
 
 `createdAt` / `updatedAt` are repaired instead: a missing or non-finite value reads as `0`, and
 `hidden` reads as `true` only for an exact `true`.

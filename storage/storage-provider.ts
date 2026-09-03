@@ -90,11 +90,15 @@ export interface StorageProvider extends BaseProvider {
    *  - a failed write must not brick later writes, and must still reject to its
    *    own caller.
    *
-   * A stored `index` must be a UINT32 — a BIP32 child number. `deriveKeyAtPath` parseInt()s
+   * An `index` must be a UINT32 — a BIP32 child number. `deriveKeyAtPath` parseInt()s
    * that path segment, so `1.5` derives index 1's keys and the row aliases a real
    * address. The ceiling matters too: `deriveChildKey` pads the child number to 8 hex
    * digits, so anything above `0xffffffff` emits extra bytes and derives off-standard.
-   * Such rows are dropped on read rather than repaired.
+   * An `entries` row that is not one must REJECT the whole call (`mergeTrackedAddresses`
+   * throws `VALIDATION_ERROR`); dropping it silently on a write reports a save that
+   * never happened. Already-stored rows are dropped on READ instead, so one bad row
+   * cannot brick every later write. Validate before opening the write transaction if
+   * your platform would otherwise replace the reason with a generic abort.
    *
    * A union is safe because there is no delete path: entries are only ever added,
    * and wiping the wallet removes the key itself (`Sphere.clear()`). Adding a

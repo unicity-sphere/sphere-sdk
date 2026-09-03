@@ -11,7 +11,9 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { parseTrackedAddresses } from '../../../storage/tracked-addresses';
+import { SphereError } from '../../../core/errors';
+import { mergeTrackedAddresses, parseTrackedAddresses } from '../../../storage/tracked-addresses';
+import type { TrackedAddressEntry } from '../../../types';
 
 function stored(...addresses: unknown[]): string {
   return JSON.stringify({ version: 1, addresses });
@@ -144,5 +146,63 @@ describe('parseTrackedAddresses — the index must fit a BIP32 child number (uin
     );
 
     expect(parsed.map((e) => e.index)).toEqual([0]);
+  });
+});
+
+/**
+ * The same rule on the WRITE, where it is a refusal rather than a drop.
+ *
+ * Enforced only on read, `saveTrackedAddresses([{ index: 1.5, ... }])` STORED the row and
+ * reported success; the next load silently dropped it, so the address the caller believes
+ * it activated is simply absent — and before any of that, the live Sphere derives index 1's
+ * keys for it. Dropping the row here instead of throwing would keep the false success.
+ */
+describe('mergeTrackedAddresses — an underivable incoming index refuses the write', () => {
+  const ok = (index: number): TrackedAddressEntry =>
+    ({ index, hidden: false, createdAt: 1, updatedAt: 1 });
+  const bad = (index: unknown): TrackedAddressEntry =>
+    ({ index, hidden: false, createdAt: 1, updatedAt: 1 }) as unknown as TrackedAddressEntry;
+
+  it.each([
+    ['a fractional index, which parseInt()s onto another address', 1.5],
+    ['a negative index, which has no BIP32 derivation at all', -1],
+    ['one past the uint32 ceiling, where the child number grows a 9th hex digit', 0x100000000],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['a numeric string, which Number.isInteger rejects', '1'],
+    ['undefined', undefined],
+  ])('refuses %s', (_why, index) => {
+    expect(() => mergeTrackedAddresses([ok(0)], [bad(index)])).toThrow(
+      /not a BIP32 child number/,
+    );
+  });
+
+  it('refuses with a typed VALIDATION_ERROR, so a caller can tell it from a disk failure', () => {
+    try {
+      mergeTrackedAddresses([], [bad(1.5)]);
+      expect.unreachable('the merge must not accept an underivable index');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SphereError);
+      expect((err as SphereError).code).toBe('VALIDATION_ERROR');
+      expect((err as SphereError).message).toContain('1.5');
+    }
+  });
+
+  it('refuses the WHOLE call, so no half-written registry reaches the store', () => {
+    // The good rows travel with the bad one; returning them would let the provider
+    // persist a partial snapshot and call the save a success.
+    expect(() => mergeTrackedAddresses([ok(0)], [ok(1), bad(2.5), ok(3)])).toThrow(SphereError);
+  });
+
+  it('accepts the whole legal range — 0, hardened, and 0xffffffff', () => {
+    const merged = mergeTrackedAddresses([], [ok(0), ok(0x80000000), ok(0xffffffff)]);
+    expect(merged.map((e) => e.index)).toEqual([0, 2147483648, 4294967295]);
+  });
+
+  it('FILTERS a bad row already on disk instead of refusing, so one cannot brick writes', () => {
+    // Stored rows are read tolerantly; throwing on them would make every later write of a
+    // legitimate address fail for as long as the bad row sits in the file.
+    const merged = mergeTrackedAddresses([bad(1.5), ok(0)], [ok(1)]);
+    expect(merged.map((e) => e.index)).toEqual([0, 1]);
   });
 });

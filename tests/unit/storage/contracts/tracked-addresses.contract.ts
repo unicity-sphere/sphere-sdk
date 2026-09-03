@@ -141,6 +141,23 @@ export function describeTrackedAddressesContract(
       });
     });
 
+    it('refuses an underivable index instead of storing a row the next load drops', async () => {
+      await withProvider(async (provider) => {
+        await provider.saveTrackedAddresses([entry(0)]);
+
+        // `1.5` derives index 1's keys (the path segment is parseInt()ed), so a stored row
+        // aliases a real address. Enforced only on read, this save reported success and the
+        // next load silently dropped the address the caller believes it activated.
+        const underivable = { ...entry(0), index: 1.5 } as TrackedAddressEntry;
+        await expect(provider.saveTrackedAddresses([entry(2), underivable])).rejects.toThrow();
+
+        // Nothing from the refused call landed — not even its well-formed companion.
+        expect(indices(await provider.loadTrackedAddresses())).toEqual([0]);
+        await provider.saveTrackedAddresses([entry(1)]);
+        expect(indices(await provider.loadTrackedAddresses())).toEqual([0, 1]);
+      });
+    });
+
     if (options.crossObject !== true) return;
 
     it('merges across SEPARATE provider objects over the same backing store', async () => {

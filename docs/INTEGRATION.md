@@ -860,9 +860,17 @@ wallet removes the key itself (`Sphere.clear()`). Adding a per-entry delete woul
 revisiting this contract.
 
 `index` must be a **uint32** — an integer in `0` … `0xffffffff`, because it is a BIP32 child
-number. Rows that are not are **dropped on read**, not repaired (see
-[`TrackedAddressEntry`](./API.md#trackedaddressentry)). `loadTrackedAddresses` is otherwise
-tolerant: unusable or corrupt storage must read as `[]`, never throw.
+number. An `entries` row that is not one must make the **write reject** (the reference
+`mergeTrackedAddresses` throws a `VALIDATION_ERROR` `SphereError`): dropping it silently would
+report a save that never happened, and the row would derive another address's keys. Rows already
+**stored** are **dropped on read** instead, not repaired (see
+[`TrackedAddressEntry`](./API.md#trackedaddressentry)), so one bad row cannot brick every later
+write. `loadTrackedAddresses` is otherwise tolerant: unusable or corrupt storage must read as
+`[]`, never throw.
+
+If your platform runs the merge inside a transaction whose abort replaces the failure reason —
+IndexedDB does — validate the argument before opening it, or callers see a generic abort instead
+of the reason.
 
 ```typescript
 import type { StorageProvider, TrackedAddressEntry } from '@unicitylabs/sphere-sdk';
@@ -911,6 +919,10 @@ export async function saveTrackedAddressesMerging(
       merged.set(e.index, e);
     }
     for (const e of entries) {
+      // Refuse the WRITE: a dropped row here would report a save that never happened.
+      if (!Number.isInteger(e.index) || e.index < 0 || e.index > 0xffffffff) {
+        throw new Error(`tracked address index ${e.index} is not a BIP32 child number`);
+      }
       const existing = merged.get(e.index);
       if (!existing) {
         merged.set(e.index, e);

@@ -1,3 +1,4 @@
+import { SphereError } from '../core/errors';
 import type { TrackedAddressEntry } from '../types';
 
 /** On-disk shape of the global `tracked_addresses` key. */
@@ -6,8 +7,8 @@ export interface TrackedAddressesFile {
   addresses: TrackedAddressEntry[];
 }
 
-/** A BIP32 child number is a uint32 — see the port docstring for why. */
-function isDerivableIndex(value: unknown): value is number {
+/** A BIP32 child number is a uint32 — see the port docstring. */
+export function isDerivableIndex(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
 }
 
@@ -54,15 +55,25 @@ export function parseTrackedAddresses(raw: string | null): TrackedAddressEntry[]
  * On a conflict the greater `updatedAt` supplies `hidden` (ties keep `incoming`) and the
  * earlier `createdAt` survives — safe because nothing removes a single entry; see
  * `StorageProvider.saveTrackedAddresses` (#766 item 5).
+ * An underivable `incoming` index REJECTS the write; `onDisk` is filtered instead, since
+ * it is read tolerantly and one bad stored row must not brick every later write.
  */
 export function mergeTrackedAddresses(
   onDisk: readonly TrackedAddressEntry[],
   incoming: readonly TrackedAddressEntry[],
 ): TrackedAddressEntry[] {
   const merged = new Map<number, TrackedAddressEntry>();
-  for (const entry of onDisk) merged.set(entry.index, entry);
+  for (const entry of onDisk) {
+    if (isDerivableIndex(entry.index)) merged.set(entry.index, entry);
+  }
 
   for (const entry of incoming) {
+    if (!isDerivableIndex(entry.index)) {
+      throw new SphereError(
+        `Tracked address index ${String(entry.index)} is not a BIP32 child number: it must be an integer in 0…0xffffffff. Refusing the write — such a row derives another address's keys (1.5 parses to 1) instead of its own.`,
+        'VALIDATION_ERROR',
+      );
+    }
     const existing = merged.get(entry.index);
     if (!existing) {
       merged.set(entry.index, entry);

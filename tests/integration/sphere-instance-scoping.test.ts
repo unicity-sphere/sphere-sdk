@@ -384,6 +384,120 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
     expect(sphereA.isReady).toBe(false);
     expect(sphereB.isReady, 'undeclared stores stay scoped per object').toBe(true);
   });
+
+  describe('a bring-up publishes only if its store survived it (#772)', () => {
+    /** A pause point: `reached` settles when the code arrives, `open()` lets it through. */
+    function gate(): { arrive: () => void; reached: Promise<void>; open: () => void; passed: Promise<void> } {
+      let arrive!: () => void;
+      const reached = new Promise<void>((r) => { arrive = r; });
+      let open!: () => void;
+      const passed = new Promise<void>((r) => { open = r; });
+      return { arrive, reached, open, passed };
+    }
+
+    /**
+     * Park an init inside its bring-up: the mnemonic and the created marker are already
+     * on disk, and it has not published, so `clear()` cannot see it to destroy it.
+     */
+    function parkBringUp(wallet: Wallet): { reached: Promise<void>; open: () => void } {
+      const g = gate();
+      const publish = wallet.transport.publishIdentityBinding as unknown as ReturnType<typeof vi.fn>;
+      publish.mockImplementation(async () => {
+        g.arrive();
+        await g.passed;
+        return true;
+      });
+      return { reached: g.reached, open: g.open };
+    }
+
+    /** Park `Sphere.clear()` with its live snapshot taken and the wipe not yet applied. */
+    function parkWipe(wallet: Wallet): { reached: Promise<void>; open: () => void } {
+      const g = gate();
+      const wipe = wallet.storage.clear.bind(wallet.storage);
+      vi.spyOn(wallet.storage, 'clear').mockImplementation(async (prefix?: string) => {
+        g.arrive();
+        await g.passed;
+        await wipe(prefix);
+      });
+      return { reached: g.reached, open: g.open };
+    }
+
+    function initOf(wallet: Wallet, mnemonic: string): Promise<unknown> {
+      return Sphere.init({
+        storage: wallet.storage,
+        transport: wallet.transport,
+        oracle: wallet.oracle,
+        walletApi: wallet.world.walletApi,
+        network: NET,
+        mnemonic,
+      });
+    }
+
+    const CLEARED = /cleared while this wallet was initializing/;
+
+    it('refuses to publish over a store clear() emptied while it was building', async () => {
+      const a = makeWallet('wiped-under-init');
+      const park = parkBringUp(a);
+
+      const init = initOf(a, MNEMONIC_A);
+      await park.reached;
+      expect(await Sphere.exists(a.storage), 'the parked init has written its keys').toBe(true);
+
+      // Nothing is registered until publication (#767), so this clear finds no Sphere to
+      // destroy and wipes the KV the init is standing on.
+      await Sphere.clear({ storage: a.storage });
+      park.open();
+
+      await expect(init).rejects.toThrow(CLEARED);
+      // What a published Sphere would have been reporting `isReady` over.
+      expect(await Sphere.exists(a.storage)).toBe(false);
+      expect(liveStoreKeys().some((k) => k.includes(a.dataDir))).toBe(false);
+      expect(a.transport.disconnect, 'the refused Sphere is torn down, not leaked').toHaveBeenCalled();
+    });
+
+    it('refuses to publish DURING a clear, before the wipe that would empty it', async () => {
+      const a = makeWallet('publish-mid-clear');
+      const park = parkBringUp(a);
+      const wipe = parkWipe(a);
+
+      const init = initOf(a, MNEMONIC_A);
+      await park.reached;
+
+      const cleared = Sphere.clear({ storage: a.storage });
+      await wipe.reached;
+
+      // Publishing here is past the clear's snapshot: it would be destroyed by nobody and
+      // wiped a moment later. A generation bumped only when clear RETURNS misses this.
+      park.open();
+      await expect(init).rejects.toThrow(CLEARED);
+
+      wipe.open();
+      await cleared;
+      expect(await Sphere.exists(a.storage)).toBe(false);
+    });
+
+    it('refuses an init that began mid-clear, whose keys the wipe then erased', async () => {
+      const a = makeWallet('init-mid-clear');
+      const wipe = parkWipe(a);
+
+      const cleared = Sphere.clear({ storage: a.storage });
+      await wipe.reached;
+
+      // This init records the generation with the clear's entry already counted, so only a
+      // second bump when the clear FINISHES can tell it the wipe erased what it wrote.
+      const park = parkBringUp(a);
+      const init = initOf(a, MNEMONIC_A);
+      await park.reached;
+      expect(await Sphere.exists(a.storage)).toBe(true);
+
+      wipe.open();
+      await cleared;
+      park.open();
+
+      await expect(init).rejects.toThrow(CLEARED);
+      expect(await Sphere.exists(a.storage)).toBe(false);
+    });
+  });
 });
 
 /**

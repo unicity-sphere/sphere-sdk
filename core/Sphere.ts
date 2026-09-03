@@ -61,6 +61,7 @@ import type {
 } from '../types';
 import { SphereError } from './errors';
 import type { StorageProvider } from '../storage';
+import { isDerivableIndex } from '../storage/tracked-addresses';
 import type { TransportProvider, PeerInfo } from '../transport';
 import { MultiAddressTransportMux, AddressTransportAdapter } from '../transport/MultiAddressTransportMux';
 import type { OracleProvider } from '../oracle';
@@ -469,6 +470,15 @@ export class Sphere {
   private static readonly _objectStoreKeys = new WeakMap<StorageProvider, string>();
   private static _objectStoreSeq = 0;
 
+  /**
+   * How many times each backing store has been cleared. An init is invisible to `clear()`
+   * until it PUBLISHES (#767), so a clear cannot destroy one in flight and would wipe the
+   * store under it. Every init records this number before its first storage work and
+   * publication refuses if it moved (#772). Only cleared stores get an entry, so the
+   * strongly-held keys are bounded by the stores a process actually clears.
+   */
+  private static readonly _clearGenerations = new Map<string, number>();
+
   // One-time best-effort cleanup of the orphaned vesting cache (prior versions).
   private static _orphanCacheCleaned = false;
 
@@ -831,17 +841,20 @@ export class Sphere {
    * its caller — until then nobody holds anything they could destroy, so a
    * registry left behind is unreachable and its hourly fetch runs for the life of the
    * process. Guarding a named subset of the steps is what failed twice: the guarded region
-   * and the fallible region were separate things, and drifted.
+   * and the fallible region were separate things, and drifted. Publication is the LAST
+   * guarded step for the same reason: it can refuse, and a refusal must tear down.
    */
   private static async withOwnedRegistry(
     sphere: Sphere,
     storage: StorageProvider,
     network: NetworkType | undefined,
+    clearGeneration: number,
     bringUp: () => Promise<void>,
   ): Promise<void> {
     sphere._registry = Sphere.createOwnedRegistry(storage, network);
     try {
       await bringUp();
+      Sphere.publishLive(sphere, clearGeneration);
     } catch (err) {
       // Tear down the WHOLE half-built Sphere, not just its registry. By this point
       // providers may be connected and the payments vertical running, and publication
@@ -882,6 +895,11 @@ export class Sphere {
     if (!options.mnemonic || !Sphere.validateMnemonic(options.mnemonic)) {
       throw new SphereError('Invalid mnemonic', 'INVALID_IDENTITY');
     }
+
+    // #772: recorded BEFORE the first storage read/write and re-checked at publication —
+    // a clear() cannot see this init to destroy it, so it would otherwise wipe the keys
+    // written below out from under a Sphere that goes on to report itself ready.
+    const clearGeneration = Sphere.clearGenerationOf(options.storage);
 
     // Check if wallet already exists
     if (await Sphere.exists(options.storage)) {
@@ -924,7 +942,7 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, async () => {
+    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, clearGeneration, async () => {
       await sphere.initializeProviders();
       await sphere.initializeModules();
 
@@ -976,7 +994,6 @@ export class Sphere {
       progress?.({ step: 'complete', message: 'Wallet created' });
     });
 
-    Sphere.registerLive(sphere);
     return sphere;
   }
 
@@ -992,6 +1009,9 @@ export class Sphere {
     // Fail-closed first: retired module options + the required wallet-api composition.
     Sphere.refuseRetiredModuleOptions(options);
     const composition = resolvePaymentsV2Composition(options.walletApi, options.network);
+
+    // #772: see create() — recorded before the first storage read, refused at publication.
+    const clearGeneration = Sphere.clearGenerationOf(options.storage);
 
     // Check if wallet exists
     if (!(await Sphere.exists(options.storage))) {
@@ -1031,7 +1051,7 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, async () => {
+    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, clearGeneration, async () => {
       await sphere.initializeProviders();
       await sphere.initializeModules();
 
@@ -1061,7 +1081,6 @@ export class Sphere {
       progress?.({ step: 'complete', message: 'Wallet loaded' });
     });
 
-    Sphere.registerLive(sphere);
     return sphere;
   }
 
@@ -1107,6 +1126,10 @@ export class Sphere {
       await options.storage.connect();
       logger.debug('Sphere', 'Storage reconnected');
     }
+
+    // #772: recorded AFTER import's OWN clear above, which bumps the generation. Recording
+    // it earlier would make every import refuse its own publication.
+    const clearGeneration = Sphere.clearGenerationOf(options.storage);
 
     // Configure TokenRegistry for THIS network in the main bundle context.
     // import() previously omitted this (unlike init/create/load), leaving the
@@ -1163,7 +1186,7 @@ export class Sphere {
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
     logger.debug('Sphere', 'Initializing providers...');
-    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, async () => {
+    await Sphere.withOwnedRegistry(sphere, options.storage, options.network, clearGeneration, async () => {
       await sphere.initializeProviders();
       await sphere.initializeModules();
       logger.debug('Sphere', 'Modules initialized');
@@ -1218,7 +1241,6 @@ export class Sphere {
       logger.debug('Sphere', 'Import complete');
     });
 
-    Sphere.registerLive(sphere);
     return sphere;
   }
 
@@ -1237,7 +1259,19 @@ export class Sphere {
    */
   static async clear(options: { storage: StorageProvider }): Promise<void> {
     const storage = options.storage;
+    // Bumped on ENTRY and again on exit, so an init that publishes anywhere in this
+    // window is refused too — not only one that publishes after the wipe (#772). The
+    // snapshot below is taken before the wipe, so a Sphere that registers between the
+    // two is neither destroyed here nor able to keep its data.
+    Sphere.bumpClearGeneration(storage);
+    try {
+      await Sphere.clearStore(storage);
+    } finally {
+      Sphere.bumpClearGeneration(storage);
+    }
+  }
 
+  private static async clearStore(storage: StorageProvider): Promise<void> {
     // 1. Destroy Sphere instance — stops the payments vertical (quiescence),
     //    then closes all connections.
     // Scoped on purpose: destroying whichever Sphere was constructed last silently
@@ -1332,6 +1366,33 @@ export class Sphere {
       Sphere._objectStoreKeys.set(storage, key);
     }
     return key;
+  }
+
+  /** The clears this store has seen. Absent means none — `clear()` creates the entry. */
+  private static clearGenerationOf(storage: StorageProvider): number {
+    return Sphere._clearGenerations.get(Sphere.storeKeyOf(storage)) ?? 0;
+  }
+
+  private static bumpClearGeneration(storage: StorageProvider): void {
+    const key = Sphere.storeKeyOf(storage);
+    Sphere._clearGenerations.set(key, (Sphere._clearGenerations.get(key) ?? 0) + 1);
+  }
+
+  /**
+   * Make a fully-built Sphere reachable — or refuse, if `clear()` emptied the store
+   * under it while it was building. Check and registration are one SYNCHRONOUS step on
+   * purpose: split by an await, a clear could land between them and wipe a store whose
+   * Sphere is already published. The refusal throws inside `withOwnedRegistry`, whose
+   * teardown then destroys the half-built Sphere the caller never received.
+   */
+  private static publishLive(sphere: Sphere, clearGeneration: number): void {
+    if (Sphere.clearGenerationOf(sphere._storage) !== clearGeneration) {
+      throw new SphereError(
+        'The wallet store was cleared while this wallet was initializing, so the keys and journals this init wrote are gone. Nothing was published; re-run Sphere.init() once the clear has settled.',
+        'STORAGE_ERROR',
+      );
+    }
+    Sphere.registerLive(sphere);
   }
 
   /** Record a fully-built Sphere against the storage it owns. See `_liveByStorage`. */
@@ -2255,10 +2316,6 @@ export class Sphere {
       throw new SphereError('HD derivation requires master key with chain code. Cannot switch addresses.', 'INVALID_CONFIG');
     }
 
-    if (index < 0) {
-      throw new SphereError('Address index must be non-negative', 'INVALID_CONFIG');
-    }
-
     // If nametag requested, normalize and validate format early
     const newNametag = options?.nametag ? this.cleanNametag(options.nametag) : undefined;
     if (newNametag && !isValidNametag(newNametag)) {
@@ -2381,6 +2438,9 @@ export class Sphere {
       this._transport.setFallbackSince(fallbackTs);
     }
 
+    // Defence in depth, and NOT individually falsifiable: the index-persist guard above
+    // throws first on every path that reaches here, so deleting this one changes no
+    // observable behaviour. It stays for the await between them (#770).
     this.ensureAlive();
     await this._transport.setIdentity(this._identity);
 
@@ -2572,6 +2632,15 @@ export class Sphere {
     return adapter;
   }
 
+  /** A BIP32 child number: an integer in 0…0xffffffff. Anything else aliases an address. */
+  private static assertDerivableIndex(index: number): void {
+    if (isDerivableIndex(index)) return;
+    throw new SphereError(
+      `Address index ${String(index)} is not a BIP32 child number: it must be an integer in 0…0xffffffff.`,
+      'INVALID_CONFIG',
+    );
+  }
+
   /**
    * Derive address at a specific index
    *
@@ -2619,6 +2688,12 @@ export class Sphere {
    * when _initialized is still false.
    */
   private _deriveAddressInternal(index: number, isChange: boolean = false): AddressInfo {
+    // The path segment is parseInt()ed downstream, so 1.5 silently derives index 1's keys,
+    // and a child number past 0xffffffff pads to more than 8 hex digits and derives
+    // off-standard. Refused at the one point every index reaches derivation through —
+    // deriveAddress, ensureAddressTracked, discovery and switchToAddress alike.
+    Sphere.assertDerivableIndex(index);
+
     if (!this._masterKey) {
       throw new SphereError('HD derivation requires master key with chain code', 'INVALID_CONFIG');
     }

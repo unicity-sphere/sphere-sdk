@@ -237,6 +237,49 @@ describe('Tracked addresses — concurrent Spheres (#766 item 5)', () => {
     expect((await storage.loadTrackedAddresses()).map((e) => e.index)).toEqual([0, 1, 2]);
   });
 
+  /**
+   * The uint32 rule at the LIVE end, where a bad index costs more than a dropped row:
+   * `deriveKeyAtPath` parseInt()s the path segment, so index 1.5 hands back index 1's
+   * private key. The wallet would then track, persist and spend at "1.5" — one address
+   * under two registry entries — and only the next reload would notice, by deleting it.
+   */
+  it('refuses a non-uint32 index at every public entry point, before it derives or persists', async () => {
+    const { sphere } = await Sphere.init({
+      storage,
+      transport: createMockTransport(),
+      oracle: createMockOracle(),
+      network: TEST_NETWORK,
+      walletApi: makePv2World().walletApi,
+      autoGenerate: true,
+    });
+
+    await sphere.switchToAddress(1);
+    expect(await readPersistedIndices(storage)).toEqual([0, 1]);
+    const activePubkey = sphere.identity!.chainPubkey;
+
+    for (const index of [1.5, -1, 0x100000000, Number.NaN]) {
+      await expect(sphere.switchToAddress(index)).rejects.toThrow(/not a BIP32 child number/);
+    }
+
+    // The bulk-tracking path reaches derivation through ensureAddressTracked instead, so
+    // it is refused at the derivation choke point rather than at switchToAddress's door.
+    await expect(
+      sphere.trackScannedAddresses([{ index: 2.5, hidden: false }]),
+    ).rejects.toThrow(/not a BIP32 child number/);
+
+    // Nothing moved: not the in-memory registry, not the file, not the active identity.
+    // Refusing at the storage write alone is too late — ensureAddressTracked has already
+    // put the aliasing entry in `_trackedAddresses`, where getActiveAddresses() reports it.
+    expect(sphere.getAllTrackedAddresses().map((a) => a.index)).toEqual([0, 1]);
+    expect(await readPersistedIndices(storage)).toEqual([0, 1]);
+    expect(await storage.get(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX)).toBe('1');
+    expect(sphere.identity!.chainPubkey).toBe(activePubkey);
+
+    expect(() => sphere.deriveAddress(1.5)).toThrow(/not a BIP32 child number/);
+
+    await sphere.destroy();
+  });
+
   describe('merge semantics (deterministic, no clock)', () => {
     it('unions by index, greater updatedAt wins hidden, earlier createdAt is kept', () => {
       const merged = mergeTrackedAddresses(
