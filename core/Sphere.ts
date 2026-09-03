@@ -42,6 +42,7 @@
  */
 
 import { logger } from './logger';
+import { sharedCell } from './global-cell';
 import type {
   Identity,
   FullIdentity,
@@ -454,6 +455,35 @@ export interface AddressModuleSet {
   initialized: boolean;
 }
 
+/**
+ * The lifecycle state that must be PROCESS-wide, not per-bundle: every subpath export
+ * is its own tsup bundle, so a Sphere built through `sphere-sdk` was invisible to a
+ * `clear()` called through `sphere-sdk/core` — #766 again, across the entry points.
+ * The object keys travel with it: split, two bundles hand DIFFERENT providers the same
+ * `object:1` and one wallet's clear() destroys another's Sphere.
+ */
+interface SphereLifecycleCell {
+  readonly live: Map<string, Set<Sphere>>;
+  readonly clearGenerations: Map<string, number>;
+  readonly objectStoreKeys: WeakMap<StorageProvider, string>;
+  objectStoreSeq: number;
+}
+
+const lifecycle = sharedCell<SphereLifecycleCell>(
+  'core.sphere.lifecycle@1',
+  () => ({
+    live: new Map(),
+    clearGenerations: new Map(),
+    objectStoreKeys: new WeakMap(),
+    objectStoreSeq: 0,
+  }),
+  (cell) => {
+    const c = cell as Partial<SphereLifecycleCell>;
+    return c.live instanceof Map && c.clearGenerations instanceof Map
+      && c.objectStoreKeys instanceof WeakMap && typeof c.objectStoreSeq === 'number';
+  },
+);
+
 // =============================================================================
 // Sphere Class
 // =============================================================================
@@ -464,11 +494,11 @@ export class Sphere {
   // really erase. Object identity was too narrow — two providers over one dataDir/DB
   // are different objects but the same file, so clearing through one left the other's
   // Sphere live over an emptied KV (#766).
-  private static readonly _liveByStorage = new Map<string, Set<Sphere>>();
+  private static readonly _liveByStorage: Map<string, Set<Sphere>> = lifecycle.live;
 
   /** Fallback keys for providers that declare no `backingStoreId` — one per object. */
-  private static readonly _objectStoreKeys = new WeakMap<StorageProvider, string>();
-  private static _objectStoreSeq = 0;
+  private static readonly _objectStoreKeys: WeakMap<StorageProvider, string> =
+    lifecycle.objectStoreKeys;
 
   /**
    * How many times each backing store has been cleared. An init is invisible to `clear()`
@@ -477,7 +507,7 @@ export class Sphere {
    * publication refuses if it moved (#772). Only cleared stores get an entry, so the
    * strongly-held keys are bounded by the stores a process actually clears.
    */
-  private static readonly _clearGenerations = new Map<string, number>();
+  private static readonly _clearGenerations: Map<string, number> = lifecycle.clearGenerations;
 
   // One-time best-effort cleanup of the orphaned vesting cache (prior versions).
   private static _orphanCacheCleaned = false;
@@ -1362,7 +1392,7 @@ export class Sphere {
     if (declared) return `store:${declared}`;
     let key = Sphere._objectStoreKeys.get(storage);
     if (!key) {
-      key = `object:${++Sphere._objectStoreSeq}`;
+      key = `object:${++lifecycle.objectStoreSeq}`;
       Sphere._objectStoreKeys.set(storage, key);
     }
     return key;

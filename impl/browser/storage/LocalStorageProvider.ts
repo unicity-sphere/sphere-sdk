@@ -4,6 +4,7 @@
  */
 
 import { logger } from '../../../core/logger';
+import { sharedCell } from '../../../core/global-cell';
 import { SphereError } from '../../../core/errors';
 import type { ProviderStatus, FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { StorageProvider } from '../../../storage';
@@ -40,16 +41,30 @@ export interface LocalStorageProviderConfig {
  * Per-`Storage` tags for `backingStoreId`. The prefix alone does not identify the
  * store: an SSR fallback mints a private in-memory `Storage` per provider, so two
  * providers with the same prefix over different objects hold unrelated data. Weak,
- * lazily assigned, and process-local — it is only ever compared with itself.
+ * lazily assigned, and PROCESS-wide — a per-bundle counter gives the first unrelated
+ * `Storage` of each copy the tag `1`, and `Sphere.clear()` erases the wrong wallet.
+ * The write chains ride the same cell: two chains over one store lose an update.
  */
-const storageObjectTags = new WeakMap<Storage, string>();
-let storageObjectSeq = 0;
+interface StorageIdentityCell {
+  readonly tags: WeakMap<Storage, string>;
+  readonly writeChains: Map<string, Promise<unknown>>;
+  seq: number;
+}
+
+const storeIdentity = sharedCell<StorageIdentityCell>(
+  'impl.browser.localStorage.identity@1',
+  () => ({ tags: new WeakMap(), writeChains: new Map(), seq: 0 }),
+  (cell) => {
+    const c = cell as Partial<StorageIdentityCell>;
+    return c.tags instanceof WeakMap && c.writeChains instanceof Map && typeof c.seq === 'number';
+  },
+);
 
 function storageObjectTag(storage: Storage): string {
-  let tag = storageObjectTags.get(storage);
+  let tag = storeIdentity.tags.get(storage);
   if (!tag) {
-    tag = String(++storageObjectSeq);
-    storageObjectTags.set(storage, tag);
+    tag = String(++storeIdentity.seq);
+    storeIdentity.tags.set(storage, tag);
   }
   return tag;
 }
@@ -61,7 +76,7 @@ function storageObjectTag(storage: Storage): string {
  * level up. This coordinates a single JS realm only; a SECOND TAB writing the same store
  * is genuinely not covered, and no in-process lock can cover it.
  */
-const trackedWriteChains = new Map<string, Promise<unknown>>();
+const trackedWriteChains = storeIdentity.writeChains;
 
 function serializeTrackedWrite(storeId: string, task: () => Promise<void>): Promise<void> {
   const previous = trackedWriteChains.get(storeId) ?? Promise.resolve();

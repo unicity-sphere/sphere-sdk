@@ -9,9 +9,10 @@ import 'fake-indexeddb/auto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { StorageProvider } from '../../../storage';
+import type { TrackedAddressEntry } from '../../../types';
 import { IndexedDBStorageProvider } from '../../../impl/browser/storage/IndexedDBStorageProvider';
 import { LocalStorageProvider } from '../../../impl/browser/storage/LocalStorageProvider';
 import { FileStorageProvider } from '../../../impl/nodejs/storage/FileStorageProvider';
@@ -38,6 +39,49 @@ function failNextSet(provider: StorageProvider): (message: string) => void {
     vi.spyOn(provider, 'set').mockRejectedValueOnce(new Error(message));
   };
 }
+
+/**
+ * The cross-object merge one level further out: the two providers come from two SEPARATE
+ * MODULE COPIES. tsup gives every subpath export its own bundle (`splitting: false`) and
+ * ESM/CJS duplicate them again, so a chain map held in module scope orders each copy's
+ * writes against itself and nothing else — both copies read the same empty registry and
+ * the later write erases the earlier one's address (#766 item 5, across the entry points).
+ * `vi.resetModules()` + two dynamic imports is a real second instance over one globalThis.
+ */
+describe('saveTrackedAddresses serializes across module copies', () => {
+  const AT = 1_000;
+  const entry = (index: number): TrackedAddressEntry =>
+    ({ index, hidden: false, createdAt: AT, updatedAt: AT });
+
+  it('merges concurrent writes from providers built by two different copies', async () => {
+    vi.resetModules();
+    const copyA = await import('../../../impl/browser/storage/LocalStorageProvider');
+    vi.resetModules();
+    const copyB = await import('../../../impl/browser/storage/LocalStorageProvider');
+    expect(copyA.LocalStorageProvider, 'two genuinely separate module instances').not.toBe(
+      copyB.LocalStorageProvider,
+    );
+
+    const storage = memoryWebStorage();
+    const a = new copyA.LocalStorageProvider({ prefix: 'crossbundle_', storage });
+    const b = new copyB.LocalStorageProvider({ prefix: 'crossbundle_', storage });
+    await a.connect();
+    await b.connect();
+
+    // Disjoint snapshots, no await between them: unserialized, both read the empty
+    // registry and whichever lands last is the only one that survives.
+    await Promise.all([
+      a.saveTrackedAddresses([entry(0), entry(1)]),
+      b.saveTrackedAddresses([entry(0), entry(2)]),
+    ]);
+
+    const stored = (await b.loadTrackedAddresses()).map((each) => each.index).sort((x, y) => x - y);
+    expect(stored, 'neither writer may lose its address to the other').toEqual([0, 1, 2]);
+
+    await a.disconnect();
+    await b.disconnect();
+  });
+});
 
 describeTrackedAddressesContract('FileStorageProvider', async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sphere-tracked-'));

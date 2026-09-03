@@ -9,7 +9,7 @@
  * (the default fallback) never collides at all and misses the case this exists for.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -112,6 +112,53 @@ describe('LocalStorageProvider.backingStoreId', () => {
     const b = new LocalStorageProvider({ storage, prefix: 'two_' });
 
     expect(a.backingStoreId).not.toBe(b.backingStoreId);
+  });
+});
+
+/**
+ * The tag that separates two `Storage` objects is minted by a counter, and a counter is
+ * per-MODULE. tsup ships each subpath export as its own bundle (`splitting: false`), and
+ * ESM/CJS duplicate them again, so two copies of this file each hand THEIR first unrelated
+ * `Storage` the tag `1` — two unrelated stores reporting one `backingStoreId`, which is
+ * what `Sphere.clear()` uses to decide whose wallet it may destroy. `vi.resetModules()`
+ * plus two dynamic imports is a real second module instance over one globalThis: the
+ * two-bundle case exactly. It is NOT a second realm (an iframe or worker has its own
+ * globalThis and cannot be joined at all), and nothing below claims to cover one.
+ */
+describe('LocalStorageProvider tags are process-wide, not per-module-copy', () => {
+  async function freshCopy(): Promise<typeof import('../../../impl/browser/storage/LocalStorageProvider')> {
+    vi.resetModules();
+    return import('../../../impl/browser/storage/LocalStorageProvider');
+  }
+
+  it('never gives two UNRELATED Storage objects one id across two module copies', async () => {
+    const copyA = await freshCopy();
+    const copyB = await freshCopy();
+    expect(copyA.LocalStorageProvider, 'two genuinely separate module instances').not.toBe(
+      copyB.LocalStorageProvider,
+    );
+
+    const a = new copyA.LocalStorageProvider({ storage: fakeStorage(), prefix: 'sphere_' });
+    const b = new copyB.LocalStorageProvider({ storage: fakeStorage(), prefix: 'sphere_' });
+
+    expect(a.backingStoreId, 'a collision here is one wallet clearing another').not.toBe(
+      b.backingStoreId,
+    );
+  });
+
+  it('gives ONE Storage object the same id from either copy', async () => {
+    const copyA = await freshCopy();
+    const copyB = await freshCopy();
+    // A head start for one copy, so two independent counters cannot agree by accident.
+    new copyA.LocalStorageProvider({ storage: fakeStorage(), prefix: 'unrelated_' });
+    const storage = fakeStorage();
+
+    const a = new copyA.LocalStorageProvider({ storage, prefix: 'sphere_' });
+    const b = new copyB.LocalStorageProvider({ storage, prefix: 'sphere_' });
+
+    expect(b.backingStoreId, 'one store, so one id — that is what erasure follows').toBe(
+      a.backingStoreId,
+    );
   });
 });
 
