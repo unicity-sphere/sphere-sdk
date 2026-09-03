@@ -62,6 +62,73 @@ worker pool at the documented entry point silently gave you the sequential verif
 The logger stays process-global by design: most of its 370 call sites are in providers
 constructed before any Sphere exists and shared between them.
 
+### Fixed — teardown no longer leaves live work behind (#770)
+
+Four defects of one shape: work spawned by a component outlived the component.
+
+- **`setIdentity` orphaned the previous `NostrClient`** (`transport/`). It assigned the
+  replacement to `this.nostrClient` *before* connecting, so a failed connect left the old
+  client's sockets, ping intervals and auto-reconnect chain running and unreachable —
+  `disconnect()` only ever reaches the field. `setIdentity` never touches `status`, so the
+  caller's next retry orphaned another. The field now moves only after a successful connect;
+  a failed connect disposes the replacement and leaves the provider on the working client,
+  and a throwing `subscribeToEvents()` disposes the old one from a `finally`. Deliberately
+  not "tear down both": `MultiAddressTransportMux` shares that client. Folds in the
+  same-class timer leak in `connect()` — `Promise.race` does not cancel the loser, so the
+  deadline timer pinned Node's event loop for the full timeout after the call returned.
+- **`engine.dispose()` mid-verify never settled the batch** (`token-engine/`). The base
+  SDK's `WorkerPool.dispose()` only `terminate()`s its workers; a dispatched task resolves
+  solely from `worker.onmessage`, so `verify` hung forever. Reachable through
+  `setOracleApiKey` → `PaymentsFacade.setEngine`. Disposal now **rejects** the in-flight
+  verification, and that is load-bearing rather than stylistic: the only `engine.verify`
+  caller in the money path turns a falsy verdict into a permanent mailbox rejection, so
+  resolving `{ ok: false }` would have destroyed a **valid incoming token** because an
+  api-key change happened to land mid-drain. A rejection leaves the entry unacked to
+  re-list. `createWorker()` also refuses once disposed, so a late task cannot resurrect the
+  pool. Only affects consumers who opt into `verification.createWorker`.
+- **The mailbox poll drain was untracked** (`modules/payments-v2/`). `Receive.start()`
+  spawned its 30 s poll with a bare `void drainOnce()`, so `PaymentsFacade.stop()` could
+  return while a drain was still doing wallet-api I/O, verification, scoped-KV writes and
+  `transfer:incoming` emission — and `destroy()` carried on underneath it. Both spawns now
+  register with the existing quiescence gate. (The wake path was accidentally covered, but
+  only because of subscriber ordering.)
+- **A `switchToAddress` racing `destroy()` re-armed the wallet** (`core/`).
+  `switchToAddress` checked liveness once and then awaited ~8 times, and `_initialized` is
+  cleared *last*, so it could not mark "teardown has begun". Two live vectors: a switch
+  rebuilt and reconnected the transport mux (`destroy()` leaves it null, which is exactly
+  the condition to build one), and its stop/start pair — queued behind `destroy()`'s own
+  stop on the lifecycle mutex — started a whole new vertical for an owner whose `destroy()`
+  had already resolved. A destroyed latch, set as `destroy()`'s first statement, now gates
+  both. A refused switch also no longer persists the address index it never finished moving
+  to, which would have sent the next boot to the wrong address.
+
+### Fixed — `checkNetworkHealth` reported healthy gateways as unhealthy (#769)
+
+It POSTed `get_round_number` with empty params and keyed the verdict off `response.ok`. The
+gateway is a routing layer: it refuses any call carrying neither `stateId` nor `shardId`
+with HTTP 400 before it looks at the method. So the check that exists to gate a network
+cutover answered "unhealthy" for every live gateway. It now sends `get_block_height` with a
+32-byte `stateId` and reads the JSON-RPC body — the status code cannot answer this in
+either direction, since a healthy gateway answers a routing mistake with a 400 plus a body
+and JSON-RPC puts application errors inside a 200. Verified live against testnet2 and
+mainnet.
+
+### Documentation
+
+`docs/INTEGRATION.md` published the `StorageProvider` interface with `saveTrackedAddresses`
+and no contract, so a custom provider written from it reproduced the #766 data-loss bug; it
+now carries the write contract, the uint32 rule and a worked implementation. `Sphere.init`'s
+option block, `TrackedAddressEntry.index`, `sphere.isReady`/`networkId`, the backing-store
+scoping of `clear()`/`import()` and the new `TokenRegistry` instance API are documented, and
+the token-registry migration guide is reachable from the README. Four CLAUDE.md claims the
+code does not honour were corrected (there is no durable receive seen-set; coin symbols are
+not registry-resolved on the money path).
+
+`tests/aggregator/` gained the `INVALID_TRUSTBASE` vacuity guard CLAUDE.md already claimed:
+a token the real service certified must be refused when the trust base carries a wrong root
+key. Without it, "verify() passes against a real aggregator" could have been true because
+verification never consulted the trust base.
+
 ### Fixed — `TokenRegistry.resetInstance()` now disposes (#770)
 
 It called only `stopAutoRefresh()`, leaving `disposed` unset, the generation unchanged and
