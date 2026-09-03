@@ -312,7 +312,7 @@ export const NETWORKS = {
   // old goggregator testnet spoke the removed v1 protocol — a v2 engine cannot
   // run against it. 'testnet2' stays as an alias of the same configuration.
   testnet: {
-    name: 'Testnet2',
+    name: 'Testnet',
     networkId: 4,
     // v2 state-transition gateway (networkId 4 comes from the trust base). apiKey is env-injected.
     aggregatorUrl: 'https://gateway.testnet2.unicity.network',
@@ -322,7 +322,7 @@ export const NETWORKS = {
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
   },
   testnet2: {
-    name: 'Testnet2',
+    name: 'Testnet',
     networkId: 4,
     // v2 state-transition gateway (networkId 4 comes from the trust base). apiKey is env-injected.
     aggregatorUrl: 'https://gateway.testnet2.unicity.network',
