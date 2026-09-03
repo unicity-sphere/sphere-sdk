@@ -1164,5 +1164,15 @@
       "tests/unit/impl/backing-store-id.test.ts",
       "tests/unit/storage/tracked-addresses-providers.test.ts"
     ]
+  },
+  {
+    "name": "connect-live-rebind-skips-network-check",
+    "note": "#772: updateSphere returns early for a LIVE host and the lock-edge guard sits behind wasLocked, so this is the one rebind that re-runs no compatibility check. Unguarded, a host switching network without locking keeps the approved session and serves the dApp a chain it never agreed to",
+    "file": "connect/host/ConnectHost.ts",
+    "find": "      if (this.session?.active && (this.snapshot.networkId ?? null) !== (next.networkId ?? null)) {",
+    "replace": "      if (false) {",
+    "tests": [
+      "tests/unit/connect/lock.test.ts"
+    ]
   }
 ]

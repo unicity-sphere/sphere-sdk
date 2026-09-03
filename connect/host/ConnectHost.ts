@@ -256,6 +256,20 @@ export class ConnectHost {
     }
 
     if (this._walletState === 'live') {
+      // THIS rebind never re-runs checkCompatibility: the lock-edge guard below sits
+      // behind `wasLocked`. Unchecked, a host switching network without locking keeps
+      // the session and serves a chain the dApp never agreed to. Identity is NOT
+      // compared here — changing it is what an address switch IS.
+      if (this.session?.active && (this.snapshot.networkId ?? null) !== (next.networkId ?? null)) {
+        logger.warn(
+          'ConnectHost',
+          `Network changed under a live session — revoking instead of rebinding (origin=${this.config.origin ?? 'unverified'})`,
+        );
+        this.sphere = next;
+        this.snapshot = buildWalletSnapshot(next);
+        this.revokeSession();
+        return;
+      }
       // Address switch on a live host — today's behaviour, verbatim.
       this.sphere = next;
       this.snapshot = buildWalletSnapshot(next);
