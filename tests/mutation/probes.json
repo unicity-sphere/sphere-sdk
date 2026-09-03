@@ -931,5 +931,85 @@
     "tests": [
       "tests/unit/token-engine/factory.test.ts"
     ]
+  },
+  {
+    "name": "sphere-switch-starts-vertical-after-destroy",
+    "note": "#770.3: the lifecycle mutex orders a switch's queued start AFTER destroy()'s stop, so without this gate the pair composes a whole new vertical for an owner whose destroy() already returned",
+    "file": "core/Sphere.ts",
+    "find": "      if (this._destroyed) return;\n      await this.startPaymentsV2Inner(index, identity);",
+    "replace": "      await this.startPaymentsV2Inner(index, identity);",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-destroyed-latch-set-too-late",
+    "note": "#770.3: _destroyed must flip as destroy()'s FIRST statement \u2014 set later (or not at all) and the whole teardown window is unguarded, which is exactly why _initialized could not carry it",
+    "file": "core/Sphere.ts",
+    "find": "    this._destroyed = true;\n",
+    "replace": "",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-switch-rebuilds-transport-mux-after-destroy",
+    "note": "#770.3: ensureTransportMux BUILDS and connect()s a fresh mux whenever _transportMux is null \u2014 which is what destroy() leaves behind \u2014 so an unguarded switch opens new sockets after teardown returned",
+    "file": "core/Sphere.ts",
+    "find": "      this.ensureAlive();\n      await this.initializeAddressModules({ index, identity: newIdentity });",
+    "replace": "      await this.initializeAddressModules({ index, identity: newIdentity });",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-switch-sets-transport-identity-after-destroy",
+    "note": "#770.3: setIdentity recreates the NostrClient, so an unguarded switch reconnects the transport after disconnectProvidersIndependently() already ran",
+    "file": "core/Sphere.ts",
+    "find": "    this.ensureAlive();\n    await this._transport.setIdentity(this._identity);",
+    "replace": "    await this._transport.setIdentity(this._identity);",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-refused-switch-persists-its-index",
+    "note": "#770.3: a switch destroy() overtook must not leave its index on disk \u2014 persisting it sends the NEXT boot to an address the user never finished moving to",
+    "file": "core/Sphere.ts",
+    "find": "    this.ensureAlive();\n    // Persist current index",
+    "replace": "    // Persist current index",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "sphere-ensureready-ignores-destroyed",
+    "note": "#770.3: ensureReady() is what every existing caller inherits the destroyed check from; without it a destroyed Sphere answers 'not initialized' semantics only after _initialized is finally cleared",
+    "file": "core/Sphere.ts",
+    "find": "    this.ensureAlive();\n    if (!this._initialized) {",
+    "replace": "    if (!this._initialized) {",
+    "tests": [
+      "tests/unit/core/Sphere.destroy-secrets.test.ts"
+    ]
+  },
+  {
+    "name": "receive-drain-untracked-by-quiescence",
+    "note": "#770.2: a self-spawned poll drain must hold stop() open, or teardown proceeds under live wallet-api I/O, engine.verify and scoped-KV writes",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "    const op = this.drainOnce();\n    if (this.deps.track !== undefined) this.deps.track(op);\n    else void op;",
+    "replace": "    void this.drainOnce();",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "compose-drops-receive-track-hook",
+    "note": "#770.2: track is optional on ReceiveDeps, so dropping it here compiles cleanly and silently un-tracks every self-spawned drain",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "    track: hooks.track,\n",
+    "replace": "",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
   }
 ]
