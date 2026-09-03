@@ -96,10 +96,24 @@ describe('Sphere.destroy() secret hygiene', () => {
     await sphere.destroy();
 
     // Silently answering false/null/a half-empty WalletInfo is worse than throwing: a
-    // caller cannot tell "no master key" from "the wallet is gone".
-    expect(() => sphere.getMnemonic()).toThrow('Sphere not initialized');
-    expect(() => sphere.hasMasterKey()).toThrow('Sphere not initialized');
-    expect(() => sphere.getWalletInfo()).toThrow('Sphere not initialized');
+    // caller cannot tell "no master key" from "the wallet is gone". The CODE is the
+    // contract. Since #770 the refusal comes from the destroyed latch — set at destroy()
+    // ENTRY, so it covers the WHOLE teardown window and not merely the instant after it —
+    // and the message says so instead of the vaguer "not initialized".
+    for (const call of [
+      () => sphere.getMnemonic(),
+      () => sphere.hasMasterKey(),
+      () => sphere.getWalletInfo(),
+    ]) {
+      expect(call).toThrow('Sphere destroyed');
+      let code: unknown;
+      try {
+        call();
+      } catch (err) {
+        code = (err as { code?: string }).code;
+      }
+      expect(code).toBe('NOT_INITIALIZED');
+    }
   });
 });
 

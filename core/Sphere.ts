@@ -474,6 +474,13 @@ export class Sphere {
 
   // State
   private _initialized = false;
+  /**
+   * Destroyed latch (#770). Distinct from `_initialized`, which destroy() clears LAST — after
+   * every teardown step — so it cannot mark "teardown has begun". This is set as destroy()'s
+   * very FIRST statement, so the WHOLE teardown window is guarded, not just the instant after
+   * it. Read by ensureAlive() and by the §7 lifecycle mutex.
+   */
+  private _destroyed = false;
   private _trackedAddressesLoaded = false;
   private _identity: MutableFullIdentity | null = null;
   private _masterKey: MasterKey | null = null;
@@ -1513,9 +1520,11 @@ export class Sphere {
     // Keep the active address's OWN record in step — it is what a later switch
     // back reads, and a stale entry would hand that address a disposed engine.
     if (active) active.tokenEngine = this._tokenEngine;
-    // The facade snapshots its engine per operation — swap what FUTURE
-    // operations use; in-flight ones finish on the old engine (disposed below,
-    // which only tears down a verification worker pool).
+    // The facade snapshots its engine per operation — swap what FUTURE operations use. An
+    // in-flight op keeps the OLD handle, which is NOT the same as finishing on it: disposal
+    // cancels in-flight verification deterministically (the verify REJECTS), so an op that is
+    // mid-verify when the key changes fails instead of completing. `verify` is a receive-path
+    // read, never a spend — no money moves either way, but the caller sees an error.
     if (this._paymentsV2Active && this._tokenEngine) {
       this._paymentsV2Active.facade.setEngine(this._tokenEngine);
     }
@@ -2320,6 +2329,12 @@ export class Sphere {
       // storage keys.  Without this, modules would load the previous address's data.
       this._storage.setIdentity(newIdentity);
 
+      // #770: every await below re-checks liveness. switchToAddress calls ensureReady() ONCE
+      // at entry and then awaits ~8 times; destroy() can land in any of those gaps. This step
+      // is the transport vector: initializeAddressModules → ensureTransportMux BUILDS and
+      // connect()s a fresh mux whenever `_transportMux` is null — exactly what destroy()
+      // leaves behind — so an unguarded switch opens new sockets after teardown returned.
+      this.ensureAlive();
       await this.initializeAddressModules({ index, identity: newIdentity });
     } else if (nametag !== this._addressModules.get(index)!.identity.nametag) {
       // Modules already exist — only the nametag label changed.
@@ -2346,8 +2361,14 @@ export class Sphere {
     // so two verticals never write one per-address KV; the lifecycle mutex
     // serializes overlapping switches. Re-visits compose a FRESH vertical
     // (durable state lives in the scoped KV; a stopped session can't restart).
+    this.ensureAlive();
     await this.stopThenStartPaymentsV2(index, newIdentity);
 
+    // #770: a refused switch must not leave its index on disk. Without this guard a switch
+    // that destroy() overtook still persisted the address it never finished moving to, so the
+    // NEXT boot loaded a different wallet address than the one the user was last on — and the
+    // write can race destroy()'s provider disconnect besides.
+    this.ensureAlive();
     // Persist current index
     await this._storage.set(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX, index.toString());
 
@@ -2360,12 +2381,14 @@ export class Sphere {
       this._transport.setFallbackSince(fallbackTs);
     }
 
+    this.ensureAlive();
     await this._transport.setIdentity(this._identity);
 
     // The transport recreates its NostrClient on identity change (the
     // SDK's client doesn't support runtime key swaps). When the Mux is
     // sharing that client (#123), it must rebind to the new instance
     // and re-establish its wallet/chat subscriptions on the new socket.
+    this.ensureAlive();
     if (this._transportMux && typeof (this._transportMux as { rebindToSharedClient?: () => Promise<void> }).rebindToSharedClient === 'function') {
       await (this._transportMux as { rebindToSharedClient: () => Promise<void> }).rebindToSharedClient();
     }
@@ -2390,6 +2413,12 @@ export class Sphere {
    * Runs after switchToAddress returns so L3 queries can start immediately.
    */
   private async postSwitchSync(index: number, newNametag?: string): Promise<void> {
+    // Fire-and-forget from switchToAddress, so this is the one switch step that can outlive
+    // its caller (#770). Defensive only: it guards ENTRY, and the ensureAlive() before
+    // setIdentity already refuses earlier on this path — it stays so that a future reordering
+    // of switchToAddress cannot silently restart nametag registration / transport rebinding.
+    this.ensureAlive();
+
     // Sync identity with transport — recovers nametag from existing Nostr bindings
     if (!newNametag) {
       await this.syncIdentityWithTransport();
@@ -3530,7 +3559,24 @@ export class Sphere {
     }
   }
 
+  /**
+   * Tear this Sphere down: stop the vertical, destroy the modules, disconnect the providers
+   * and zero the key material. Idempotent by construction (every step is null-guarded) and
+   * deliberately WITHOUT an early return on re-entry, which would change what a double call
+   * means.
+   *
+   * #770: the FIRST statement flips `_destroyed` — before any await, and before this queues
+   * its own stop on the §7 lifecycle mutex. That position is load-bearing. Every guard reads
+   * the flag, so from that instant any switchToAddress step not yet begun refuses; and
+   * because it flips SYNCHRONOUSLY at entry, a stop/start pair the mutex runs after this call
+   * sees `true` and skips its start. Set it beside `_initialized` at the bottom instead and a
+   * concurrent switch re-arms a wallet whose owner already had destroy() return: fresh
+   * sockets, a fresh wallet-api session, a whole fresh vertical nothing will ever stop.
+   */
   async destroy(): Promise<void> {
+    // #770 — MUST stay the first statement; see the note above.
+    this._destroyed = true;
+
     // FIRST, before anything that can throw. Module teardown and
     // MultiAddressTransportMux.disconnect() propagate, so any later placement would let a
     // single failure leave this Sphere's registry fetching forever. Nothing below needs it.
@@ -4078,10 +4124,25 @@ export class Sphere {
     return run;
   }
 
-  /** Switch/boot: stop whatever runs, then start `index`'s vertical — atomically vs other lifecycle ops. */
+  /**
+   * Switch/boot: stop whatever runs, then start `index`'s vertical — atomically vs other
+   * lifecycle ops.
+   *
+   * #770: the destroyed check between the two halves settles the FACADE vector on its own.
+   * `_destroyed` flips synchronously at destroy() entry, so any closure that BEGINS executing
+   * after destroy() was called sees `true`, and any closure already past the check has
+   * facade.start() in flight — which destroy()'s own queued stop is necessarily ordered
+   * after. The TRANSPORT vector is not on this mutex at all; the ensureAlive() calls in
+   * switchToAddress are what cover it.
+   */
   private stopThenStartPaymentsV2(index: number, identity: FullIdentity): Promise<void> {
     return this.queuePaymentsV2Op(async () => {
       await this.stopPaymentsV2Inner();
+      // #770: destroy() may have run — or merely begun — while this pair waited its turn on
+      // the mutex. Starting now would attach a LIVE vertical (wallet-api session, wake
+      // socket, stream pulls, receive poll) to an owner whose destroy() already returned,
+      // and nothing would ever stop it again.
+      if (this._destroyed) return;
       await this.startPaymentsV2Inner(index, identity);
     });
   }
@@ -4140,7 +4201,20 @@ export class Sphere {
     await active.facade.stop();
   }
 
+  /**
+   * Refuse once destroy() has STARTED (#770). `_initialized` cannot carry this: destroy()
+   * clears it last, so every teardown step is a window in which a concurrent call still reads
+   * a ready Sphere and re-arms it.
+   */
+  private ensureAlive(): void {
+    if (this._destroyed) {
+      throw new SphereError('Sphere destroyed', 'NOT_INITIALIZED');
+    }
+  }
+
   private ensureReady(): void {
+    // Every existing ensureReady() caller inherits the destroyed check.
+    this.ensureAlive();
     if (!this._initialized) {
       throw new SphereError('Sphere not initialized', 'NOT_INITIALIZED');
     }
