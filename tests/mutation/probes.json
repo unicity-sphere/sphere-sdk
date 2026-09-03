@@ -884,10 +884,10 @@
   },
   {
     "name": "verifier-dispose-no-cancel",
-    "note": "#770.4: dispose() terminates the workers but the SDK pool never settles their tasks; without the race, verify() hangs forever and stop()/destroy() hang with it",
+    "note": "#770.4: dispose() terminates the workers but the SDK pool never settles their tasks; with the call's cancellation unregistered, verify() hangs forever and stop()/destroy() hang with it",
     "file": "token-engine/factory.ts",
-    "find": "    return Promise.race([super.verify(...args), this.cancelSignal()]);",
-    "replace": "    return super.verify(...args);",
+    "find": "      this.cancellations.add(cancel);",
+    "replace": "      // probe: the call's cancellation is never registered",
     "tests": [
       "tests/unit/token-engine/worker-verification.test.ts"
     ]
@@ -896,8 +896,8 @@
     "name": "verifier-cancel-resolves-not-rejects",
     "note": "#770.4 MONEY: a cancelled verification must REJECT. Resolving a falsy verdict makes Receive.screen() rejectAck(entry,'invalid') \u2014 a VALID incoming token destroyed because an api-key change landed mid-drain",
     "file": "token-engine/factory.ts",
-    "find": "      const promise = new Promise<never>((_resolve, rejectFn) => {\n        reject = rejectFn;\n      });",
-    "replace": "      const promise = new Promise<never>((resolveFn) => {\n        reject = resolveFn as unknown as (error: unknown) => void;\n      });",
+    "find": "      const cancel = (): void => reject(disposedError());",
+    "replace": "      const cancel = (): void => resolve({ status: 'FAIL' } as unknown as Awaited<ReturnType<WorkerTokenVerifier['verify']>>);",
     "tests": [
       "tests/unit/token-engine/worker-verification.test.ts"
     ]
@@ -1030,6 +1030,16 @@
     "replace": "    this.identity = identity;\n    this.keyManager = nextKeyManager;\n    const applyStagedIdentity = (): void => {",
     "tests": [
       "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
+  },
+  {
+    "name": "verifier-cancellation-leak",
+    "note": "#770.4 review: a call's cancellation entry must be released when that call SETTLES. Holding it until dispose() is the shared-promise leak again \u2014 one retained entry per token the wallet has ever verified, inside the class added to fix a teardown bug",
+    "file": "token-engine/factory.ts",
+    "find": "        (result) => {\n          this.cancellations.delete(cancel);\n          resolve(result);\n        },\n        (error: unknown) => {\n          this.cancellations.delete(cancel);\n          reject(error);\n        }",
+    "replace": "        (result) => {\n          resolve(result);\n        },\n        (error: unknown) => {\n          reject(error);\n        }",
+    "tests": [
+      "tests/unit/token-engine/worker-verification.test.ts"
     ]
   }
 ]
