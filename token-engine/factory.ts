@@ -105,12 +105,19 @@ class ConfiguredWorkerTokenVerifier extends WorkerTokenVerifier {
     ...args: Parameters<WorkerTokenVerifier['verify']>
   ): ReturnType<WorkerTokenVerifier['verify']> {
     if (this.disposed) return Promise.reject(disposedError());
-    // Started before its cancellation is registered, but nothing can interleave:
-    // an async function runs synchronously up to its first await.
     const verdict = super.verify(...args);
     return new Promise((resolve, reject) => {
       const cancel = (): void => reject(disposedError());
       this.cancellations.add(cancel);
+      // Defensive, and currently UNREACHABLE — the SDK awaits the genesis rule before
+      // fanning transfers out, so a reentrant dispose() (a worker's postMessage handler
+      // runs on THIS thread) cannot land before this line. Kept because that ordering is
+      // an internal detail of a pinned dependency: fan out first and dispose() would
+      // clear the set BEFORE registration, hanging this promise on a dead worker.
+      if (this.disposed) {
+        this.cancellations.delete(cancel);
+        cancel();
+      }
       // Settling twice is a no-op, so a verdict landing after dispose() cancelled
       // the call can never downgrade that rejection into a falsy verdict.
       void verdict.then(

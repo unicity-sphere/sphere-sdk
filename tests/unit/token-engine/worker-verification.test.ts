@@ -322,6 +322,31 @@ describe('dispose() during an in-flight verification (#770 item 4)', () => {
     expect(createWorker).toHaveBeenCalledTimes(spawnsBeforeSecondVerify);
   }, 30000);
 
+  it('rejects when dispose() runs REENTRANTLY from inside super.verify()', async () => {
+    // A worker's message handler runs on THIS thread, so dispose() can fire from inside
+    // postMessage. Today the cancellation is already registered when that happens — the
+    // SDK awaits the genesis rule before fanning transfers out — so this passes with the
+    // post-registration re-check removed, and it is NOT a falsification of that guard.
+    // It pins the OUTCOME rather than the mechanism: however the pinned SDK orders its
+    // internals, a reentrant teardown must reject, never hang on a terminated worker.
+    const spawned: SilentWorker[] = [];
+    let engineRef: { dispose?: () => void } | null = null;
+    const createWorker = vi.fn(() => {
+      const worker = new SilentWorker();
+      worker.onPost = (): void => engineRef?.dispose?.();
+      spawned.push(worker);
+      return worker;
+    });
+
+    const engine = await buildEngine(createWorker, 1);
+    engineRef = engine;
+
+    const outcome = await settleWithin(engine.verify(oneTransfer), 3000);
+    expect(outcome.state).toBe('rejected');
+    expect(outcome).toMatchObject({ reason: { code: 'MODULE_DESTROYED' } });
+    expect(spawned.every((w) => w.terminated)).toBe(true);
+  }, 30000);
+
   it('rejects a post-dispose verify even for a token that needs no worker at all', async () => {
     const createWorker = vi.fn(() => new SilentWorker());
     const engine = await buildEngine(createWorker);
