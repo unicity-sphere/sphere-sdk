@@ -347,6 +347,13 @@ This is a wipe, not a maintenance step: it clears the store with no prefix, so t
 with it. It is not the way to migrate the 0.15.0 scoped-KV generation — that needs nothing from
 you.
 
+It also **destroys the live Spheres on that backing store** before wiping: each one's payments
+vertical stops, its providers disconnect, and every `sphere.on()` handler goes with it. Drop
+your references afterwards. The scope is the store the provider addresses, not the provider
+object — two provider objects reporting the same
+[`backingStoreId`](#storage-provider-interface) share the teardown, and a Sphere on other
+storage is never touched. `Sphere.import()` clears first, so it carries the same consequence.
+
 ### Multi-Address Derivation
 
 The SDK supports HD (Hierarchical Deterministic) address derivation following BIP32/BIP44 standards.
@@ -799,10 +806,16 @@ interface StorageProvider {
   getStatus(): ProviderStatus;
 
   /**
-   * Optional, but supply it if two provider objects can address one store: two
-   * instances returning the same value share erasure, so `Sphere.clear()` tears
-   * down the live Spheres of both. Identify the STORE (path / database + prefix),
-   * never the class. Omitted, liveness falls back to per-object identity.
+   * Stable identity of the BACKING STORE this provider addresses — not of this
+   * object, and not of the class. Optional, but supply it if two provider objects
+   * can address one store: two instances returning the same value share erasure,
+   * so `Sphere.clear()` (and `Sphere.import()`, which clears first) tears down the
+   * live Spheres of both. Compose it from everything that selects the store (file
+   * path, database name, key prefix) behind a scheme prefix, so two kinds of store
+   * can never collide on one string. It must not change over the provider's
+   * lifetime — it is read again on teardown. Omitted, liveness falls back to
+   * per-object identity, i.e. a second provider over the same data is treated as
+   * unrelated.
    */
   readonly backingStoreId?: string;
 
@@ -814,11 +827,136 @@ interface StorageProvider {
   keys(prefix?: string): Promise<string[]>;
   clear(prefix?: string): Promise<void>;
 
-  // Tracked addresses registry
+  // Tracked addresses registry.
+  // saveTrackedAddresses MUST MERGE, NEVER REPLACE — see the write contract below.
+  // A replacing implementation silently loses addresses.
   saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void>;
   loadTrackedAddresses(): Promise<TrackedAddressEntry[]>;
 }
 ```
+
+#### The tracked-address write contract
+
+`saveTrackedAddresses` **must merge, never replace.** `entries` is one writer's snapshot, not
+the whole truth: every Sphere sharing this storage keeps its own copy of the registry and
+persists all of it. Writing the argument verbatim is a lost update — A activates index 1, B
+(whose snapshot predates that) activates index 2, and B's write erases index 1 while A still
+reports it. This happens on a single network with a single provider, and it is the #766
+data-loss bug; do **not** try to fix it by renaming or network-scoping the key.
+
+The contract — `storage/tracked-addresses.ts` is the in-repo reference implementation:
+
+- read the stored registry and **union it with `entries` by `index`**;
+- on a conflicting index, the entry with the greater `updatedAt` supplies `hidden` (ties keep
+  the incoming entry), and `createdAt` keeps the **earlier** value;
+- **serialize concurrent calls**, so one call's read cannot interleave with another's write.
+  Per provider instance is the floor; because `backingStoreId` explicitly permits several
+  provider objects over one store, serialize per backing store wherever the platform allows
+  it (see below);
+- a failed write must **not brick later writes**, and must still reject to its own caller.
+
+A union is safe because there is no delete path: entries are only ever added, and wiping the
+wallet removes the key itself (`Sphere.clear()`). Adding a per-entry delete would require
+revisiting this contract.
+
+`index` must be a **uint32** — an integer in `0` … `0xffffffff`, because it is a BIP32 child
+number. Rows that are not are **dropped on read**, not repaired (see
+[`TrackedAddressEntry`](./API.md#trackedaddressentry)). `loadTrackedAddresses` is otherwise
+tolerant: unusable or corrupt storage must read as `[]`, never throw.
+
+```typescript
+import type { StorageProvider, TrackedAddressEntry } from '@unicitylabs/sphere-sdk';
+
+/** Tolerant read: unusable JSON and a wrong top-level shape both read as absent. */
+export function parseRegistry(raw: string | null): TrackedAddressEntry[] {
+  if (!raw) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const rows = (parsed as { addresses?: unknown } | null)?.addresses;
+  if (!Array.isArray(rows)) return [];
+
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  return rows.flatMap((row) => {
+    const e = (row ?? {}) as Record<string, unknown>;
+    const index = e.index;
+    // Repair the timestamps, but DROP an underivable index: it would alias a real address.
+    if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index > 0xffffffff) {
+      return [];
+    }
+    return [{
+      ...e,
+      index,
+      hidden: e.hidden === true,
+      createdAt: num(e.createdAt),
+      updatedAt: num(e.updatedAt),
+    } as TrackedAddressEntry];
+  });
+}
+
+/** One write chain per BACKING STORE, so two provider objects over one store cannot interleave. */
+const trackedWrites = new Map<string, Promise<unknown>>();
+
+export async function saveTrackedAddressesMerging(
+  kv: Pick<StorageProvider, 'get' | 'set'>,
+  storeId: string,
+  entries: readonly TrackedAddressEntry[],
+): Promise<void> {
+  const run = (trackedWrites.get(storeId) ?? Promise.resolve()).then(async () => {
+    const merged = new Map<number, TrackedAddressEntry>();
+    for (const e of parseRegistry(await kv.get('tracked_addresses'))) {
+      merged.set(e.index, e);
+    }
+    for (const e of entries) {
+      const existing = merged.get(e.index);
+      if (!existing) {
+        merged.set(e.index, e);
+        continue;
+      }
+      const winner = e.updatedAt >= existing.updatedAt ? e : existing; // ties keep the incoming entry
+      merged.set(e.index, {
+        ...existing,
+        ...winner,
+        index: e.index,
+        createdAt: Math.min(existing.createdAt, e.createdAt),
+      });
+    }
+    const addresses = [...merged.values()].sort((a, b) => a.index - b.index);
+    await kv.set('tracked_addresses', JSON.stringify({ version: 1, addresses }));
+  });
+  // The chain tail swallows the rejection so one failed write cannot brick every later
+  // one; the caller still sees the error by awaiting `run`.
+  trackedWrites.set(storeId, run.then(() => undefined, () => undefined));
+  await run;
+}
+```
+
+The provider then delegates, and reads through the same tolerant parse:
+
+```typescript
+// inside your StorageProvider class
+readonly backingStoreId = `mystore:${this.path}`;
+
+async saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void> {
+  await saveTrackedAddressesMerging(this, this.backingStoreId, entries);
+}
+
+async loadTrackedAddresses(): Promise<TrackedAddressEntry[]> {
+  return parseRegistry(await this.get('tracked_addresses'));
+}
+```
+
+A module-level chain covers several provider objects in **one JS realm** and nothing more. Where
+the platform offers a real transaction, use it instead: `IndexedDBStorageProvider` does the whole
+read-merge-write in one `readwrite` transaction, which IndexedDB orders across every connection
+and every tab.
+
+Conformance is enforced by `tests/unit/storage/contracts/tracked-addresses.contract.ts` —
+run a custom provider through its `describeTrackedAddressesContract()` suite, the same one the
+three bundled providers are held to.
 
 ### Transport Provider Interface
 

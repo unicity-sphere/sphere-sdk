@@ -667,6 +667,14 @@ const sphere = await Sphere.import({
 });
 ```
 
+> **`Sphere.import()` wipes first, and that wipe destroys live Spheres.** When a wallet already
+> exists on the given storage — or a Sphere is live on it — import calls `Sphere.clear()` before
+> writing, which calls `destroy()` on every live `Sphere` built on that **backing store**: their
+> payments verticals stop, their providers disconnect, and every `sphere.on()` handler goes with
+> them. The scope is the store, not the provider object: two provider objects reporting the same
+> `backingStoreId` share the teardown, while a Sphere on unrelated storage is left alone. Drop
+> your references to the old instance rather than reusing it.
+
 ## Wallet Export/Import (JSON)
 
 ```typescript
@@ -880,6 +888,9 @@ Design and migration references:
 
 - [Payments vertical design](./docs/PAYMENTS-V2-DESIGN.md) — the authoritative money design
 - [Payments migration guide](./docs/MIGRATION-PAYMENTS-V2.md) — what the P11 flip moved
+- [Token registry migration guide](./docs/MIGRATION-TOKEN-REGISTRY.md) — the per-Sphere token
+  registry, the removed `Sphere.getInstance()` / `isInitialized()` lifecycle globals, and
+  `Sphere.clear()` / `import()` becoming backing-store-scoped
 
 ## Browser Providers
 
