@@ -102,6 +102,32 @@ Four defects of one shape: work spawned by a component outlived the component.
   both. A refused switch also no longer persists the address index it never finished moving
   to, which would have sent the next boot to the wrong address.
 
+### Fixed — identity state no longer splits per bundle (#766)
+
+`tsup` ships each subpath export as its own bundle with `splitting: false`, and ESM and
+CJS duplicate it again — so class statics are per-bundle, not per-process. That made the
+lifecycle fixes above incomplete at the entry-point boundary: a Sphere built through
+`@unicitylabs/sphere-sdk` was invisible to a `Sphere.clear()` called through
+`@unicitylabs/sphere-sdk/core`, which wiped the backing store and left the first Sphere
+`isReady` over an emptied KV — the original #766 failure, one level out. The clear
+generation split the same way, so an in-flight init in the other bundle also missed the
+clear.
+
+`LocalStorageProvider` had the same shape for a different reason: it minted its
+`backingStoreId` tags from a module-level counter, so each copy gave its first unrelated
+`Storage` object the tag `1` — two different stores, one id, and `clear()` erasing the
+wrong wallet. Its read-merge-write serializer was module-local too, which is the
+tracked-address lost update one level out.
+
+All of it now lives in a versioned `globalThis` cell, the pattern `core/logger.ts`
+already uses. The cell is non-enumerable, validated on read (a foreign value is refused,
+not adopted), degrades to bundle-local rather than throwing if `globalThis` is frozen,
+and holds only Sphere instances, `backingStoreId` strings and counters — never key
+material. `IndexedDBStorageProvider` and `FileStorageProvider` needed no change: their
+ids are intrinsic (`dbName` + prefix, resolved path), not counter-allocated.
+
+No public API change.
+
 ### Changed — three refusals that used to be silent successes
 
 Found by review of the fixes above; each turns a wrong answer into a typed error.
