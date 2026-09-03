@@ -808,8 +808,12 @@ Key test areas:
   Mint / transfer / split / same-transferId resume, each verified against the service's own
   generated trust base. `verify()` passing is the assertion no fake can make: the leaf value this
   client computes — `H(transactionHash, referenceTime)` since 3.x — reproduces the leaf the Go
-  service inserted. Guard against it going vacuous: with a well-formed but WRONG root key it must
-  fail `INVALID_TRUSTBASE`.
+  service inserted. Guard against it going vacuous: with a well-formed but WRONG root key the SAME
+  certified token must be refused — `engine.verify` reports the aggregated `FAIL` (the
+  granular status lives in the SDK's nested trace, which the test walks to name
+  `INVALID_TRUSTBASE` at the quorum-signature rule). The compose stack runs a SINGLE
+  bft-root node, so this exercises "wrong key", not a real quorum — mainnet's
+  4-node/threshold-3 shape is still unexercised anywhere in the repo.
 - `tests/mutation/probes.json` — mutation probes over `modules/payments-v2/*`,
   `token-engine/{proof-wait,SphereTokenEngine}.ts`, `impl/wallet-api-v2/*`, the `core/` wiring and
   `transport/NostrTransportProvider.ts`; `npm run test:mutation` must report every one KILLED
