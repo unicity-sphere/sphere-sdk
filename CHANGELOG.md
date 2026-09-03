@@ -102,6 +102,33 @@ Four defects of one shape: work spawned by a component outlived the component.
   both. A refused switch also no longer persists the address index it never finished moving
   to, which would have sent the next boot to the wrong address.
 
+### Changed — three refusals that used to be silent successes
+
+Found by review of the fixes above; each turns a wrong answer into a typed error.
+
+- **`saveTrackedAddresses` rejects a non-uint32 index** instead of writing the row and
+  letting the next load drop it. The uint32 rule was enforced only on read, so a malformed
+  index reached derivation — `deriveKeyAtPath` `parseInt()`s the path segment, so `1.5`
+  derives index `1`'s keys — before anything noticed. Rows already on disk are still
+  *filtered* rather than rejected: one corrupt stored row must not brick every later write.
+- **`deriveAddress`, `switchToAddress`, `trackScannedAddresses` and address discovery throw
+  `INVALID_CONFIG` for any non-uint32 index.** Previously only `switchToAddress` checked, and
+  only for negatives. The guard sits at the one point every index reaches derivation
+  through — the storage-layer refusal alone is too late, because `ensureAddressTracked`
+  mutates the in-memory registry before persisting.
+- **`Sphere.init` / `create` / `load` / `import` can reject with `STORAGE_ERROR`** when
+  `Sphere.clear()` empties the store while they are building. An init is invisible to
+  `clear()` until it publishes, so previously the KV was wiped and the init went on to
+  publish a Sphere reporting `isReady` over nothing. Refusing is deliberate over serializing:
+  `import()` clears internally (a per-store mutex would round-trip through itself), and a
+  `clear()` blocked behind a slow bring-up is a worse outage than a loud refusal.
+
+A fourth, in the transport: **a failed `setIdentity()` no longer half-applies.** Identity,
+key material and the per-address dedup window are staged and committed with the client, so
+a swap that fails leaves the provider entirely on the old identity — previously the old
+client kept serving its old-address subscriptions under the *new* key. A caller retrying
+after a transient relay failure therefore re-attempts the whole swap.
+
 ### Fixed — `checkNetworkHealth` reported healthy gateways as unhealthy (#769)
 
 It POSTed `get_round_number` with empty params and keyed the verdict off `response.ok`. The
