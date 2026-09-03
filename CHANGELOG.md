@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-03
+
 ### Removed (BREAKING) — the Sphere lifecycle globals (#766)
 
 `Sphere.getInstance()`, `Sphere.isInitialized()` and the root export `getSphere` are gone
@@ -1456,6 +1458,7 @@ consumed exclusively through the `token-engine/` port. Consequences:
      version tags past v0.9.x, so a tag-compare link would 404. -->
 
 [Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/main...HEAD
+[0.16.0]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.16.0
 [0.15.0]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.15.0
 [0.14.11]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.14.11
 [0.14.10]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.14.10
