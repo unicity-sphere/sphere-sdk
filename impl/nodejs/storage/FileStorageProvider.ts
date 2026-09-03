@@ -192,6 +192,15 @@ export class FileStorageProvider implements StorageProvider {
    * (#766 item 5 — a lost update, reproducible on one network). Concurrent
    * calls are serialized on `trackedWrites` so a read can never interleave
    * with another call's write.
+   *
+   * Deliberately PER OBJECT, unlike the browser providers. Two objects over one
+   * `dataDir` share a `backingStoreId` but not this cache, and `save()` rewrites the
+   * WHOLE file from it — so a sibling's *unrelated* `set()` rolls the registry back
+   * regardless of how this one write is serialized. Sharing the chain here would make
+   * the cross-object contract case pass while leaving the provider unsafe. The real
+   * fix is #771 (refresh from disk under a per-file lock, on every write); until then
+   * `backingStoreId` scopes TEARDOWN only. Reviewers keep re-finding this — see the
+   * `unsupported:` note in tests/unit/storage/tracked-addresses-providers.test.ts.
    */
   async saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void> {
     const run = this.trackedWrites.then(async () => {
