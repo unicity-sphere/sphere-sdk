@@ -52,7 +52,7 @@ function disposedError(): SphereError {
  * the cast is the port boundary (same web-`Worker` subset, payloads `unknown` on
  * our side so no SDK wire type escapes).
  *
- * ── #770(4): dispose() must SETTLE the in-flight batch ──────────────────────
+ * ── #770(4): dispose() must SETTLE the in-flight batch ──────────────────────────
  * The SDK's `WorkerPool.dispose()` (3.0.1) only calls `worker.terminate()` on
  * every worker it spawned. A dispatched task resolves ONLY from `worker.onmessage`,
  * which a terminated worker never posts, and queued tasks are never drained — so
@@ -69,11 +69,24 @@ function disposedError(): SphereError {
  * incoming token thrown away at the mailbox because an api-key change happened
  * to land mid-drain. A rejection instead propagates to the drain's catch, which
  * leaves the entry UNACKED so it re-lists on the next drain.
+ *
+ * ── Why the cancellation is PER CALL, not one shared promise ──────────────────
+ * Racing every verify() against a single long-lived never-settling promise
+ * LEAKS: `Promise.race` subscribes to every input and does not detach when
+ * another input wins, so each finished verification pins a reaction record to
+ * that promise until dispose() — retention growing with every token the wallet
+ * has ever verified, inside the very class added to fix a teardown bug. So each
+ * call registers its own rejector in `cancellations` and drops it the instant
+ * the call settles: retention is bounded by CONCURRENT verifications, never by
+ * lifetime count. No parked `.catch()` is needed to keep a cancellation from
+ * becoming an unhandled rejection either — the only promise built per call is
+ * the one RETURNED, so its rejection is the caller's to observe, as before, and
+ * no promise this class creates outlives the call that created it.
  */
 class ConfiguredWorkerTokenVerifier extends WorkerTokenVerifier {
   private disposed = false;
-  /** Lazily created so an idle verifier holds no promise at all. */
-  private cancellation: { promise: Promise<never>; reject: (error: unknown) => void } | null = null;
+  /** One rejector per IN-FLIGHT verify(), dropped on settle; empty when idle. */
+  private readonly cancellations = new Set<() => void>();
 
   public constructor(
     private readonly spawn: () => VerificationWorker,
@@ -82,12 +95,35 @@ class ConfiguredWorkerTokenVerifier extends WorkerTokenVerifier {
     super(poolSize);
   }
 
+  /** Verifications awaiting a verdict — back to 0 whenever the verifier is idle. */
+  public get pendingCancellations(): number {
+    return this.cancellations.size;
+  }
+
   /** Rejects (see the class note) if `dispose()` lands before the pool answers. */
   public override verify(
     ...args: Parameters<WorkerTokenVerifier['verify']>
   ): ReturnType<WorkerTokenVerifier['verify']> {
     if (this.disposed) return Promise.reject(disposedError());
-    return Promise.race([super.verify(...args), this.cancelSignal()]);
+    // Started before its cancellation is registered, but nothing can interleave:
+    // an async function runs synchronously up to its first await.
+    const verdict = super.verify(...args);
+    return new Promise((resolve, reject) => {
+      const cancel = (): void => reject(disposedError());
+      this.cancellations.add(cancel);
+      // Settling twice is a no-op, so a verdict landing after dispose() cancelled
+      // the call can never downgrade that rejection into a falsy verdict.
+      void verdict.then(
+        (result) => {
+          this.cancellations.delete(cancel);
+          resolve(result);
+        },
+        (error: unknown) => {
+          this.cancellations.delete(cancel);
+          reject(error);
+        }
+      );
+    });
   }
 
   /** Idempotent — Sphere.setOracleApiKey disposes the replaced engine twice (facade + caller). */
@@ -96,8 +132,10 @@ class ConfiguredWorkerTokenVerifier extends WorkerTokenVerifier {
     this.disposed = true;
     super.dispose(); // terminate() every spawned worker, as before
     // Only AFTER the pool is down: settle whatever the terminated workers will
-    // now never answer. A no-op when nothing was ever verified.
-    this.cancellation?.reject(disposedError());
+    // now never answer. A no-op when nothing is in flight.
+    const cancelling = [...this.cancellations];
+    this.cancellations.clear();
+    for (const cancel of cancelling) cancel();
   }
 
   protected createWorker(): IWorker {
@@ -107,26 +145,20 @@ class ConfiguredWorkerTokenVerifier extends WorkerTokenVerifier {
     if (this.disposed) throw disposedError();
     return this.spawn() as unknown as IWorker;
   }
+}
 
-  private cancelSignal(): Promise<never> {
-    if (this.cancellation === null) {
-      let reject!: (error: unknown) => void;
-      const promise = new Promise<never>((_resolve, rejectFn) => {
-        reject = rejectFn;
-      });
-      // Belt and braces: today the only caller hands this straight to
-      // `Promise.race`, which subscribes to it, so dispose()'s rejection is
-      // always observed. Park a no-op handler anyway so a future caller that
-      // drops the promise cannot turn a teardown into an unhandled rejection.
-      void promise.catch(() => undefined);
-      this.cancellation = { promise, reject };
-    }
-    return this.cancellation.promise;
-  }
+/**
+ * A verifier whose in-flight verifications `dispose()` cancels. `pendingCancellations`
+ * is the observable that the bookkeeping behind that is per-call and short-lived
+ * (see the class note): it must return to 0 as verifications settle, never grow
+ * with the number of tokens verified.
+ */
+export interface CancellableTokenVerifier extends DisposableTokenVerifier {
+  readonly pendingCancellations: number;
 }
 
 /** Workers spawn LAZILY on first verify and are reused, so this costs nothing to build. */
-export function createWorkerTokenVerifier(config: VerificationWorkerConfig): DisposableTokenVerifier {
+export function createWorkerTokenVerifier(config: VerificationWorkerConfig): CancellableTokenVerifier {
   const poolSize = config.poolSize ?? DEFAULT_VERIFICATION_POOL_SIZE;
   if (!Number.isInteger(poolSize) || poolSize < 1) {
     throw new TypeError(`verification.poolSize must be a positive integer, got ${String(config.poolSize)}`);

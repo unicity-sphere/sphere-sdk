@@ -16,7 +16,22 @@ import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { createSphereTokenEngine, createWorkerTokenVerifier } from '../../../token-engine/factory';
 import type { SphereToken, VerificationWorker } from '../../../token-engine';
-import { SigningService, VerificationStatus, WorkerTokenVerifier } from '../../../token-engine/sdk';
+import {
+  MintJustificationVerifierService,
+  PredicateVerifierService,
+  RootTrustBase,
+  Secp256k1SignatureVerifier,
+  SigningService,
+  SplitMintJustificationVerifier,
+  TokenIssuanceVerifierService,
+  UnicityCertificateVerifier,
+  UnicitySealQuorumSignaturesVerificationRule,
+  VerificationContext,
+  VerificationStatus,
+  VerifiedSealCache,
+  WorkerTokenVerifier,
+} from '../../../token-engine/sdk';
+import { decodeSpherePaymentData } from '../../../token-engine/SpherePaymentData';
 import { TestAggregatorClient } from './support/TestAggregatorClient';
 import { createTestEngine, freshPubkey } from './test-engine';
 
@@ -320,6 +335,80 @@ describe('dispose() during an in-flight verification (#770 item 4)', () => {
     expect(outcome).toMatchObject({ reason: { code: 'MODULE_DESTROYED' } });
     expect(createWorker).not.toHaveBeenCalled();
   }, 30000);
+
+  /**
+   * The same context the factory builds — the verifier needs a REAL one: it
+   * verifies the genesis on the calling thread and only fans the transfers out.
+   */
+  const verificationContext = (): VerificationContext => {
+    const trustBase = RootTrustBase.fromJSON(trustBaseJson);
+    const mintJustificationVerifier = new MintJustificationVerifierService();
+    mintJustificationVerifier.register(new SplitMintJustificationVerifier(decodeSpherePaymentData));
+    return new VerificationContext(
+      trustBase,
+      PredicateVerifierService.create(),
+      new UnicityCertificateVerifier(
+        new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), new VerifiedSealCache(256))
+      ),
+      mintJustificationVerifier,
+      new TokenIssuanceVerifierService(false)
+    );
+  };
+
+  /**
+   * The cancellation `dispose()` fires must not be paid for by every verification
+   * that ever SUCCEEDED. One shared never-settling promise raced against every
+   * call would be: `Promise.race` subscribes to every input and never detaches
+   * when another input wins, so a finished verification leaves its reaction
+   * pinned to that promise until dispose() — unbounded retention in a wallet that
+   * verifies a token on every receive, mint and resync.
+   *
+   * `pendingCancellations` is that retention made observable (no heap assertions:
+   * they would be flaky and prove nothing about the structure).
+   */
+  describe('cancellation retention tracks concurrency, not history', () => {
+    it('counts the verifications IN FLIGHT — up while they run, back to 0 when they settle', async () => {
+      const verifier = createWorkerTokenVerifier({ createWorker: () => new FakeWorker(), poolSize: 3 });
+      const context = verificationContext();
+      expect(verifier.pendingCancellations).toBe(0);
+
+      // Registered synchronously by verify(), so this reads the true in-flight set.
+      // Without this half the leak guard below would pass on a counter stuck at 0.
+      const inFlight = [
+        verifier.verify(oneTransfer.sdkToken, context),
+        verifier.verify(oneTransfer.sdkToken, context),
+        verifier.verify(oneTransfer.sdkToken, context),
+      ];
+      expect(verifier.pendingCancellations).toBe(3);
+
+      const results = await Promise.all(inFlight);
+      expect(results.map((r) => r.status)).toEqual([
+        VerificationStatus.OK,
+        VerificationStatus.OK,
+        VerificationStatus.OK,
+      ]);
+      expect(verifier.pendingCancellations).toBe(0);
+      verifier.dispose();
+    }, 30000);
+
+    it('retains nothing per completed verification — 300 sequential verifies leave 0', async () => {
+      const verifier = createWorkerTokenVerifier({ createWorker: () => new FakeWorker() });
+      const context = verificationContext();
+
+      let peak = 0;
+      for (let i = 0; i < 300; i++) {
+        const verifying = verifier.verify(oneTransfer.sdkToken, context);
+        peak = Math.max(peak, verifier.pendingCancellations);
+        expect((await verifying).status).toBe(VerificationStatus.OK);
+      }
+
+      // Sequential calls: at most ONE cancellation is ever live, and none survives
+      // the call that created it. A shape that only clears on dispose() reads 300.
+      expect(peak).toBe(1);
+      expect(verifier.pendingCancellations).toBe(0);
+      verifier.dispose();
+    }, 60000);
+  });
 
   it('a batch dispatched AFTER dispose() cannot resurrect the pool', async () => {
     // Deterministic ordering, no timing guess: two transfers + poolSize 2 means
