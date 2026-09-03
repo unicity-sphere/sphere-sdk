@@ -1011,5 +1011,25 @@
     "tests": [
       "tests/unit/core/network-health.test.ts"
     ]
+  },
+  {
+    "name": "transport-resurrects-client-after-teardown",
+    "note": "#772 review: a disconnect() during the swap's connect must win \u2014 installing nextClient afterwards leaves a live socket + subscriptions owned by nobody, with the caller told the identity took",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "      if (this.nostrClient !== oldClient || this.status !== 'connected') {",
+    "replace": "      if (false) {",
+    "tests": [
+      "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
+  },
+  {
+    "name": "transport-applies-identity-before-client",
+    "note": "#772 review: identity + key manager + dedup window move WITH the client; applied eagerly, a failed swap runs the OLD client and its old-address subscriptions under the NEW key",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "    const applyStagedIdentity = (): void => {\n      this.identity = identity;\n      this.keyManager = nextKeyManager;",
+    "replace": "    this.identity = identity;\n    this.keyManager = nextKeyManager;\n    const applyStagedIdentity = (): void => {",
+    "tests": [
+      "tests/unit/transport/NostrTransportProvider.setIdentity.test.ts"
+    ]
   }
 ]
