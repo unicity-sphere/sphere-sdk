@@ -16,10 +16,12 @@ import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DirectMessage } from '../../types';
+// One definition (env-overridable): three local copies all named the deleted v1
+// file, whose networkId 3 stopped matching `network: 'testnet'` at the cutover.
+import { TRUSTBASE_URL } from './support/staging';
 
 const rand = () => Math.random().toString(36).slice(2, 8);
 
-const TRUSTBASE_URL = 'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet.json';
 const DEFAULT_API_KEY = 'sk_06365a9c44654841a366068bcfc68986';
 
 function makeTempDirs(label: string) {
