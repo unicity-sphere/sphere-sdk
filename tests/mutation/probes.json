@@ -1327,10 +1327,10 @@
   },
   {
     "name": "history-received-flattens-to-empty-coin",
-    "note": "wallet-api#151: a coinless receipt must post assets: []. Flattening to a synthetic first asset posts coinId:'' which the backend 422s and History.post swallows \u2014 the row is lost silently.",
+    "note": "wallet-api#151: a coinless RECEIVED record must post assets: []. Flattening to a synthetic first asset posts coinId:'' which the backend 422s and History.post swallows \u2014 the row is lost silently. Kept RECEIVED-specific alongside history-wire-assets-forces-one-entry, which guards the shared helper.",
     "file": "modules/payments-v2/history/History.ts",
-    "find": "      assets: input.assets.map((a) => ({ coinId: a.coinId, amount: a.amount })),",
-    "replace": "      assets: [{ coinId: input.assets[0]?.coinId ?? '', amount: input.assets[0]?.amount ?? '0' }],",
+    "find": "      type: 'RECEIVED' as const,\n      assets: wireAssets(input.assets),",
+    "replace": "      type: 'RECEIVED' as const,\n      assets: [{ coinId: input.assets[0]?.coinId ?? '', amount: input.assets[0]?.amount ?? '0' }],",
     "tests": [
       "tests/unit/payments-v2/receive.test.ts",
       "tests/unit/payments-v2/history.test.ts"
