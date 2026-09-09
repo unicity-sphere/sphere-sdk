@@ -702,7 +702,10 @@ export class PaymentsFacade implements PaymentsV2 {
       spent: [],
       added: [{ tokenId: token.blob.tokenId, key }],
     });
-    await this.historyStore.recordMint({ tokenId: token.blob.tokenId, coinId, amount });
+    await this.historyStore.recordMint({
+      tokenId: token.blob.tokenId,
+      assets: [{ coinId, amount }],
+    });
     await this.machineStores.mintJournal.removeByKey(mintId);
     this.heldStates.set(token.blob.tokenId, (await engine.deliveryKeys(bytes)).stateHash);
     this.trackTail(this.view.delta());

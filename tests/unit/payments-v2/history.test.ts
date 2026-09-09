@@ -34,6 +34,8 @@ interface Harness {
   log: ReturnType<typeof vi.fn>;
   postResults: { inserted: number; deduped: number }[];
   setFailPosts: (fail: boolean) => void;
+  /** Fail POSTs with a specific error (e.g. a 422 carrying `status`). */
+  setPostError: (err: unknown) => void;
   serverRecords: () => Promise<readonly HistoryRecordInput[]>;
 }
 
@@ -42,6 +44,7 @@ function makeHarness(): Harness {
   const caller: FakeCaller = { chainPubkey: PUB, network: 'testnet' };
   const postResults: { inserted: number; deduped: number }[] = [];
   let failPosts = false;
+  let postError: unknown = null;
   // Thin client-shaped adapter over the fake (structural HistoryClient).
   const client: HistoryClient = {
     listHistory: async (options) => {
@@ -53,6 +56,7 @@ function makeHarness(): Harness {
       };
     },
     postHistory: async (records) => {
+      if (postError !== null) throw postError;
       if (failPosts) throw new Error('wallet-api 503');
       const result = await fake.appendHistory(caller, records);
       postResults.push(result);
@@ -71,6 +75,9 @@ function makeHarness(): Harness {
     postResults,
     setFailPosts: (fail) => {
       failPosts = fail;
+    },
+    setPostError: (err) => {
+      postError = err;
     },
     serverRecords: async () => (await fake.listHistory(caller)).records,
   };
@@ -177,7 +184,7 @@ describe('History §5.9 — read-through mapping', () => {
   it('amounts above 2^64 survive the round trip as exact decimal strings', async () => {
     const big = (BigInt(2) ** BigInt(128)).toString();
     const h = makeHarness();
-    await h.history.recordSent({ transferId: 'f0000000-0000-4000-8000-000000000001', coinId: COIN, amount: big });
+    await h.history.recordSent({ transferId: 'f0000000-0000-4000-8000-000000000001', assets: [{ coinId: COIN, amount: big }] });
     const [entry] = (await h.history.page()).entries;
     expect(entry.amount).toBe(big);
     expect(BigInt(entry.amount)).toBe(BigInt(2) ** BigInt(128));
@@ -186,7 +193,7 @@ describe('History §5.9 — read-through mapping', () => {
   it('passes before/limit through and pages by the server keyset cursor', async () => {
     const h = makeHarness();
     for (let i = 0; i < 5; i++) {
-      await h.history.recordMint({ tokenId: `${i}${i}`.repeat(32), coinId: COIN, amount: '1', timestamp: NOW + i * 1000 });
+      await h.history.recordMint({ tokenId: `${i}${i}`.repeat(32), assets: [{ coinId: COIN, amount: '1' }], timestamp: NOW + i * 1000 });
     }
     const first = await h.history.page({ limit: 2 });
     expect(first.entries).toHaveLength(2);
@@ -203,8 +210,8 @@ describe('History §5.9 — client POSTs and dedup keys', () => {
   it('SENT dedup key is the transferId — a resumed re-POST is a server no-op (one record)', async () => {
     const h = makeHarness();
     const transferId = 'a1111111-1111-4111-8111-111111111111';
-    await h.history.recordSent({ transferId, coinId: COIN, amount: '100' });
-    await h.history.recordSent({ transferId, coinId: COIN, amount: '100' });
+    await h.history.recordSent({ transferId, assets: [{ coinId: COIN, amount: '100' }] });
+    await h.history.recordSent({ transferId, assets: [{ coinId: COIN, amount: '100' }] });
     expect(h.postResults).toEqual([
       { inserted: 1, deduped: 0 },
       { inserted: 0, deduped: 1 },
@@ -231,8 +238,8 @@ describe('History §5.9 — client POSTs and dedup keys', () => {
   it('MINT dedup key is MINT:tokenId — a replayed mint yields one record, lowercased on the wire', async () => {
     const h = makeHarness();
     const upper = 'CC'.repeat(32);
-    await h.history.recordMint({ tokenId: upper, coinId: COIN, amount: '7' });
-    await h.history.recordMint({ tokenId: upper, coinId: COIN, amount: '7' });
+    await h.history.recordMint({ tokenId: upper, assets: [{ coinId: COIN, amount: '7' }] });
+    await h.history.recordMint({ tokenId: upper, assets: [{ coinId: COIN, amount: '7' }] });
     const records = await h.serverRecords();
     expect(records).toHaveLength(1);
     expect(records[0].dedupKey).toBe(`MINT:${TOKEN}`);
@@ -243,21 +250,21 @@ describe('History §5.9 — client POSTs and dedup keys', () => {
     const h = makeHarness();
     h.setFailPosts(true);
     await expect(
-      h.history.recordSent({ transferId: 'b2222222-2222-4222-8222-222222222222', coinId: COIN, amount: '1' })
+      h.history.recordSent({ transferId: 'b2222222-2222-4222-8222-222222222222', assets: [{ coinId: COIN, amount: '1' }] })
     ).resolves.toBeUndefined();
     await expect(
       h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [{ coinId: COIN, amount: '1' }] })
     ).resolves.toBeUndefined();
-    await expect(h.history.recordMint({ tokenId: TOKEN, coinId: COIN, amount: '1' })).resolves.toBeUndefined();
+    await expect(h.history.recordMint({ tokenId: TOKEN, assets: [{ coinId: COIN, amount: '1' }] })).resolves.toBeUndefined();
     expect(h.log).toHaveBeenCalledTimes(3);
     expect(h.emit).not.toHaveBeenCalled();
   });
 
   it('emits history:updated after each successful POST, carrying the recorded client-shaped entry', async () => {
     const h = makeHarness();
-    await h.history.recordSent({ transferId: 'c3333333-3333-4333-8333-333333333333', coinId: COIN, amount: '1' });
+    await h.history.recordSent({ transferId: 'c3333333-3333-4333-8333-333333333333', assets: [{ coinId: COIN, amount: '1' }] });
     await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [{ coinId: COIN, amount: '1' }] });
-    await h.history.recordMint({ tokenId: TOKEN, coinId: COIN, amount: '1' });
+    await h.history.recordMint({ tokenId: TOKEN, assets: [{ coinId: COIN, amount: '1' }] });
     expect(h.emit).toHaveBeenCalledTimes(3);
     expect(h.emit.mock.calls.map((c) => [c[0], (c[1] as { type: string }).type])).toEqual([
       ['history:updated', 'SENT'],
@@ -270,8 +277,7 @@ describe('History §5.9 — client POSTs and dedup keys', () => {
     const h = makeHarness();
     await h.history.recordSent({
       transferId: 'f6666666-6666-4666-8666-666666666666',
-      coinId: COIN,
-      amount: '450',
+      assets: [{ coinId: COIN, amount: '450' }],
       memo: 'lunch',
       recipientPubkey: PEER,
       recipientNametag: 'bob',
@@ -298,8 +304,7 @@ describe('History §5.9 — client POSTs and dedup keys', () => {
     const h = makeHarness();
     await h.history.recordSent({
       transferId: 'd4444444-4444-4444-8444-444444444444',
-      coinId: COIN,
-      amount: '9',
+      assets: [{ coinId: COIN, amount: '9' }],
       memo: 'order #42',
       recipientPubkey: PEER,
       recipientNametag: 'bob',
@@ -319,8 +324,7 @@ describe('History §5.9 — client POSTs and dedup keys', () => {
     const h = makeHarness();
     await h.history.recordSent({
       transferId: 'e5555555-5555-4555-8555-555555555555',
-      coinId: COIN,
-      amount: '2',
+      assets: [{ coinId: COIN, amount: '2' }],
       recipientPubkey: '@bob',
       recipientNametag: 'bob',
     });
@@ -363,5 +367,69 @@ describe('History — a coinless RECEIVED record (#777 / wallet-api#151)', () =>
       { coinId: COIN, amount: '10' },
       { coinId: OTHER_COIN, amount: '20' },
     ]);
+  });
+});
+
+describe('History — every type accepts an empty asset list (#780)', () => {
+  it('SENT posts assets: [] for a coinless send', async () => {
+    const h = makeHarness();
+    await h.history.recordSent({ transferId: 'd4444444-4444-4444-8444-444444444444', assets: [] });
+    const [record] = await h.serverRecords();
+    expect(record?.assets).toEqual([]);
+    expect(record?.type).toBe('SENT');
+  });
+
+  it('MINT posts assets: [] for a coinless mint', async () => {
+    const h = makeHarness();
+    await h.history.recordMint({ tokenId: TOKEN, assets: [] });
+    const [record] = await h.serverRecords();
+    expect(record?.assets).toEqual([]);
+    expect(record?.type).toBe('MINT');
+  });
+
+  it('never emits coinId: "" — the one spelling wallet-api deliberately still refuses', async () => {
+    const h = makeHarness();
+    await h.history.recordSent({ transferId: 'd5555555-5555-4555-8555-555555555555', assets: [] });
+    await h.history.recordMint({ tokenId: TOKEN, assets: [] });
+    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [] });
+    for (const record of await h.serverRecords()) {
+      expect(record.assets.map((a) => a.coinId)).not.toContain('');
+    }
+  });
+});
+
+describe('History — a permanent reject is distinguishable from a transient failure (#780)', () => {
+  const reject422 = Object.assign(new Error('unprocessable'), { status: 422 });
+
+  it('names a 422 as refused rather than retry-safe: no retry can fix a shape the server rejects', async () => {
+    const h = makeHarness();
+    h.setPostError(reject422);
+    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [] });
+    expect(h.log).toHaveBeenCalledWith(expect.stringMatching(/REJECTED/), reject422);
+  });
+
+  it('still calls a 503 retry-safe', async () => {
+    const h = makeHarness();
+    h.setFailPosts(true);
+    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [] });
+    expect(h.log).toHaveBeenCalledWith(expect.stringMatching(/retry safe/), expect.anything());
+  });
+
+  it('treats 429 and 408 as transient, not as a shape refusal', async () => {
+    for (const status of [408, 429]) {
+      const h = makeHarness();
+      h.setPostError(Object.assign(new Error('slow down'), { status }));
+      await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [] });
+      expect(h.log).toHaveBeenCalledWith(expect.stringMatching(/retry safe/), expect.anything());
+    }
+  });
+
+  it('neither kind throws into the money path, and neither emits history:updated', async () => {
+    const h = makeHarness();
+    h.setPostError(reject422);
+    await expect(
+      h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [] })
+    ).resolves.toBeUndefined();
+    expect(h.emit).not.toHaveBeenCalled();
   });
 });

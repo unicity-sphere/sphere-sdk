@@ -282,10 +282,9 @@ function buildMachineDeps(
     recordHistory: async ({ transferId, payload, committedAmount }) => {
       await historyStore.recordSent({
         transferId,
-        coinId: payload.coinId,
         // §5.9: the SETTLED amount (machine-computed from the certified
         // recipient blobs), never payload.amount — the plan.
-        amount: committedAmount,
+        assets: [{ coinId: payload.coinId, amount: committedAmount }],
         recipientPubkey: payload.recipient,
         ...(payload.memo !== undefined ? { memo: payload.memo } : {}),
       });

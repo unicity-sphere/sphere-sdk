@@ -1375,5 +1375,36 @@
     "tests": [
       "tests/unit/payments-v2/token-data.test.ts"
     ]
+  },
+  {
+    "name": "history-permanent-reject-logged-as-retry-safe",
+    "note": "#780: a 4xx is a permanent shape refusal that no retry can fix. Logging it as retry-safe is exactly what let a coinless receipt vanish silently.",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "  return status >= 400 && status < 500 && status !== 408 && status !== 429;",
+    "replace": "  return false;",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "history-treats-429-as-permanent",
+    "note": "#780: 408/429 are transient. Calling them permanent would tell an operator a retryable failure is unfixable.",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "  return status >= 400 && status < 500 && status !== 408 && status !== 429;",
+    "replace": "  return status >= 400 && status < 500;",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "history-wire-assets-forces-one-entry",
+    "note": "#780: every history type must be able to post an EMPTY asset list. Forcing a one-element array reintroduces the coinId:'' 422 on SENT and MINT.",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "  return assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));",
+    "replace": "  return assets.length === 0 ? [{ coinId: '', amount: '0' }] : assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts",
+      "tests/unit/payments-v2/receive.test.ts"
+    ]
   }
 ]
