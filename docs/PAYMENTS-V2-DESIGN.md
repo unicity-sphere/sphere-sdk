@@ -124,6 +124,8 @@ interface Payments {
   // reads — views over the wallet-api record
   assets(coinId?: string): Promise<Asset[]>;       // inventory-mirror aggregation + registry metadata + fiat
   tokens(filter?: { coinId?: string }): Token[];   // sync read of the inventory view
+  coinless(): CoinlessToken[];                     // #777: holdings naming no coin — DISJOINT from tokens()
+  tokenData(tokenId: string): Promise<Uint8Array | null>; // genesis payload, fetched on demand
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage>;
 
   // money movement
@@ -263,8 +265,28 @@ spent", keep the tombstone. Empty-import protection: never push a removal before
 successful inventory read; a token is removed only against a confirmed on-chain spend. Serves
 `assets()` (aggregated from the mirror, with registry + price — the server `/v1/balances`
 endpoint has no client consumer and the StoragePort exposes no balances member), `tokens()`
-(elements enriched from the registry; status set is `'confirmed' | 'transferring'`), and the
-selector's metadata pool. **In-flight exclusion
+(elements enriched from the registry; status set is `'confirmed' | 'transferring'`), `coinless()`,
+and the selector's metadata pool.
+
+**Coinless tokens (#777, wallet-api#140/#141).** A token whose genesis data is not a value envelope
+names no coin. `MirrorEntry.coinless` is computed ONCE at apply time, where `status` is in hand,
+because absent `assets` means two different things: a tombstone omits them for an unrelated reason,
+and a delta that omits them INHERITS the previous entry's (which `recoverRemoved` depends on). Only
+an ACTIVE row's absence states coinlessness — the §16 rule is *discriminate on `status`, never on
+the presence of assets*.
+
+`tokens()` and `coinless()` are DISJOINT: an active entry is in exactly one, so no coin consumer
+changes and a coinless token joins no balance and no selector pool. A coinless token is never a
+`Token` — that type requires `coinId`/`symbol`/`decimals`/`amount`, and sentinels would put untrue
+values in fields consumers sum. (sphere-sdk#781 proposed widening `tokens()` instead; the divergence
+and its cost are recorded on that issue.)
+
+Two invariants that span functions, so neither file states them alone:
+- `applyOne`'s unchanged-row early return compares `status` **and** the resolved `tokenType`, while
+  `recoverOne` flips `status` in place without recomputing `coinless`. Correct only together:
+  without the status comparison a recovered coin tombstone surfaces in `tokens()` AND `coinless()`.
+- The verdict is DERIVED from wallet-api's §8.2 step-6 boundary. Moving that boundary needs this
+  re-derived, not merely re-tested — wallet-api's §8.2 now records the coupling from its side. **In-flight exclusion
 (#517/#32, re-homed):** sources reserved by an open transfer — including keep-open intents whose
 spend may be on-chain — are excluded from the selector pool AND reported outside the spendable
 total (`transferring*` fields, never `totalAmount`) until their machine settles or resume adopts

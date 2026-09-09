@@ -346,6 +346,9 @@ for (const asset of assets) {
 
 // Individual tokens (synchronous inventory view)
 const tokens = sphere.payments.tokens();
+// Coinless tokens (NFTs) are a SEPARATE, disjoint read — never in tokens() (#777)
+const nfts = sphere.payments.coinless();
+const payload = nfts[0] ? await sphere.payments.tokenData(nfts[0].tokenId) : null;
 
 // Total portfolio value in USD (price fields are null without PriceProvider)
 const totalUsd = assets.reduce((sum, a) => sum + (a.fiatValueUsd ?? 0), 0);

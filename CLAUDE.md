@@ -147,6 +147,8 @@ console.log('Unicity ID:', identity.nametag);        // alice
 const assets = await sphere.payments.assets();        // Asset[] grouped by coin
 const uct = await sphere.payments.assets(coinIdHex);  // filter by coin
 const tokens = sphere.payments.tokens();              // individual Token[] (sync view)
+const nfts = sphere.payments.coinless();              // CoinlessToken[] — DISJOINT from tokens()
+const payload = await sphere.payments.tokenData(id); // an NFT's genesis bytes, or null
 const filtered = sphere.payments.tokens({ coinId: '...' });
 
 // 6. Send tokens (L3). Recipient must have a PUBLISHED chain pubkey
@@ -264,7 +266,9 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `Sphere.import(options)` | `Sphere` | Import from mnemonic/masterKey |
 | `Sphere.importFromLegacyFile(options)` | `Sphere` | Import a `.txt` / flat-JSON / bare-mnemonic backup |
 | `sphere.payments.assets(coinId?)` | `Promise<Asset[]>` | Assets grouped by coin (server read-through) |
-| `sphere.payments.tokens(filter?)` | `Token[]` | Individual tokens (sync inventory view) |
+| `sphere.payments.tokens(filter?)` | `Token[]` | Individual COIN tokens (sync inventory view) |
+| `sphere.payments.coinless()` | `CoinlessToken[]` | Coinless (NFT) holdings — disjoint from `tokens()` |
+| `sphere.payments.tokenData(tokenId)` | `Promise<Uint8Array \| null>` | A token's genesis payload (fetches the blob) |
 | `sphere.payments.send(request)` | `Promise<TransferResult>` | Send L3 tokens (wallet-api vertical) |
 | `sphere.payments.mint(coinIdHex, amount)` | `Promise<MintResult>` | Self-mint via engine (journal-first, no faucet) |
 | `sphere.payments.receive()` | `Promise<{ transfers }>` | Explicit one-shot mailbox drain |
@@ -299,7 +303,7 @@ The payments vertical emits exactly 8 events; identity/comms/groupchat events ri
 
 | Event | Payload | When |
 |-------|---------|------|
-| `transfer:incoming` | `IncomingTransfer` (`{ senderPubkey, senderNametag?, tokens, memo?, receivedAt }`) | Tokens landed from the wallet-api mailbox (verified before entering balance) |
+| `transfer:incoming` | `IncomingTransfer` (`{ senderPubkey, senderNametag?, tokens, coinless?, memo?, receivedAt }`) | Tokens landed from the wallet-api mailbox (verified before entering balance). A coinless arrival is named in `coinless`, NOT in `tokens` — read both |
 | `transfer:updated` | `TransferResult` | Outgoing transfer changed status (read `status` / `deliveryPending`) |
 | `transfer:attention` | `{ transferId, code, detail? }` | A transfer needs operator attention (stuck checkpoint, undeliverable, deferred) |
 | `inventory:updated` | `{}` | Inventory changed (send/receive/mint/resync) |
@@ -565,10 +569,28 @@ interface TokenBlob {
   token: Uint8Array; // the SDK's own Token.toCBOR() bytes — no sphere envelope
 }
 
+// A holding that names NO coin (wallet-api#140) — an NFT. Deliberately NOT a Token:
+// that type requires coinId/symbol/decimals/amount, and sentinels would put untrue
+// values in fields consumers sum. Disjoint from tokens(); joins no balance.
+interface CoinlessToken {
+  tokenId: string;    // the INSTANCE key
+  tokenType?: string; // the token's CLASS, lowercase hex — see the caveat below
+  stateHash: string;
+  transferring: boolean;
+  suspectedSpent?: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 interface SphereToken {
   sdkToken: Token;          // OPAQUE SDK handle — never touch outside token-engine/
   blob: TokenBlob;          // serializable form
   value: SphereValue | null; // decoded { assets: [{ coinId, amount: bigint }] }
+  // #778: WHY value is null. 'none_*' = genuinely coinless; 'bare_collection' =
+  // coins in the bridged dialect this SDK does not decode, so zero means "cannot
+  // read", NOT "has none". A corrupt envelope throws instead of reaching this.
+  valueEnvelope: 'sphere' | 'bare_collection' | 'none_tag' | 'none_other' | 'none_absent';
+  tokenType: string;        // genesis TokenType hex — the CLASS, never the instance
 }
 ```
 
@@ -710,6 +732,32 @@ authoritative for build success.
   wallet's own pubkey, no faucet). Journal-first: the mint journal entry is durable before the
   chain op; a replay converges by idempotent same-seed re-call. Lets a fresh wallet top up on
   testnet2.
+
+### Coinless tokens (#777/#778/#780/#781, wallet-api#140/#141/#147/#151)
+- A token whose genesis data is **not a value envelope** names no coin. The word is **coinless**,
+  never "non-fungible": in Unicity every token is non-fungible by construction (each is a unique
+  object keyed by `tokenId`), so that term names every token and distinguishes none.
+- Surfaced by `payments.coinless()`, **disjoint** from `tokens()` — an active entry is in exactly
+  one, so no coin consumer changes and an NFT joins no balance and no selector pool. It is not a
+  `Token`: that requires `coinId`/`symbol`/`decimals`/`amount`, and sentinels put untrue values in
+  fields consumers sum. `payments.tokenData(tokenId)` reads the genesis payload on demand.
+- **`tokenType` is a CLASS, not an identity.** Every token of one kind shares a type; `tokenId` is
+  the instance key. Resolve names with `TokenRegistry.getTypeDefinition()` — the registry file
+  holds TWO id namespaces discriminated by `assetKind` (a `fungible` entry's id is a coin id, a
+  `non-fungible` entry's is a token type), and the flat `getDefinition()` map cannot tell them
+  apart. An unrecognised type is legitimate — never reject or hide a token for it. Do NOT build a
+  "group by type" UI for *valued* tokens: `mint()` and split outputs derive a type per operation.
+- **`value === null` is ambiguous — read `valueEnvelope`.** `none_*` is genuinely coinless;
+  `bare_collection` is the bridged dialect this SDK does not decode, so zero there means "cannot
+  read", not "has none". Conflating them either hides real coins or invents a phantom NFT.
+- A corrupt value envelope **throws** rather than reading as valueless (#778). The classifier's
+  throw set must stay a SUBSET of wallet-api's §8.2 422 set: everything arriving over the mailbox
+  already passed §8.2, and `Receive.screen()` turns a decode throw into a terminal
+  `rejectAck('invalid')`, so throwing where wallet-api accepts LOSES the token.
+- History records `assets: []` for a coinless movement on every type. Never `coinId: ''` —
+  wallet-api keeps refusing that so there is only one wire spelling of "no coin".
+- The coinless verdict is DERIVED from wallet-api's §8.2 step-6 boundary. Moving that boundary
+  needs the client verdict re-derived, not merely re-tested (recorded in wallet-api's §8.2 too).
 
 ### Unicity IDs (nametags)
 - Human-readable aliases (e.g., `@alice`) for receiving payments.

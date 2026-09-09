@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — coinless tokens (#777, #781; wallet-api#140/#141/#147)
+
+`payments.coinless(): CoinlessToken[]` and `payments.tokenData(tokenId): Promise<Uint8Array | null>`.
+
+A token whose genesis data carries no value envelope names no coin — an NFT. `tokens()` skipped
+every such entry, so it was held, verified, claimed and tombstone-recoverable, and shown nowhere.
+
+The two reads are **disjoint**: an active inventory entry is in exactly one, so every existing
+`tokens()`/`assets()` consumer is byte-identical and a coinless token joins no balance and no
+coin-selection pool. It is deliberately not a `Token` — that type requires `coinId`, `symbol`,
+`decimals` and `amount`, and filling them with `''`/`'0'` would put untrue values in fields
+consumers sum or format. (#781 proposed widening `tokens()`; the divergence is recorded there.)
+
+`tokenData()` is a call rather than a field: the genesis payload is an NFT's actual content, it is
+unbounded, and blobs are lazy under server custody, so a list read must never carry it.
+
+`tokenType` names the token's **class, not the instance** — every token of one kind shares a type.
+Resolve display metadata with the new `TokenRegistry.getTypeDefinition()`, which reads the
+token-type namespace; one registry file carries both namespaces discriminated by `assetKind`, and
+the flat `getDefinition()` map cannot tell a type from a coin id. An unrecognised type is
+legitimate and must never cause a token to be rejected or hidden.
+
+`transfer:incoming` now names an arriving coinless token in a disjoint `coinless` field; it
+previously mapped over assets, so such an arrival announced `tokens: []` and a UI listening for
+arrivals saw nothing land.
+
+### Fixed — a corrupt value envelope no longer reads as "no value" (#778)
+
+`isSpherePaymentData` was `try { decodeTag(d).tag === CBOR_TAG } catch { return false }`, and both
+callers read `false` as "data token, no value". Since `decodeTag` parses the tagged body and asserts
+exhaustion, a **valid** `SpherePaymentData` carrying one trailing byte, a truncated one, a
+non-canonically encoded tag head, and a `tag(55799)`-wrapped envelope each rendered as `value = null`
+— real coins shown as zero, silently, with no error surface. A balance has no other one: showing
+zero is the outcome from which a user cannot tell "no coins" from "I cannot read the coins".
+
+Replaced by a structural classifier (`token-engine/value-envelope.ts`) ported from wallet-api's §8.2
+step 6, reading the outer major type and the tag head alone. `SphereToken` gains `valueEnvelope`,
+which distinguishes *why* `value` is null: `none_*` is genuinely coinless, `bare_collection` is the
+bridged dialect this SDK does not decode (so zero means "cannot read", not "carries none").
+
+Two fail-closed guards, both before any chain op: `split()` refuses a source whose value cannot be
+read (it previously died inside the SDK with a bare `CborError` naming neither token nor cause), and
+`mintDataToken()` refuses opaque bytes classification cannot frame — that check runs *before* the
+mint, because `wrapToken` runs after certification and would otherwise strand an on-chain token.
+
+### Fixed — history can record a coinless movement (#780; wallet-api#142/#151)
+
+`recordSent`/`recordMint`/`recordReceived` wrapped scalars unconditionally, so the only expressible
+shape was a one-element array — `[{coinId: '', amount: '0'}]` for a coinless token, which wallet-api
+refuses so there is never a second wire spelling of "no coin". All three now take the asset list
+directly and post `assets: []`.
+
+`History.post` logged every failure as retry-safe. A 4xx is a permanent shape refusal that no retry
+can fix, and that indiscriminate swallow is what let a refused receipt vanish with no error surface;
+the two are now named apart (408/429 stay transient). It still never throws into the money path.
+
+### Changed (BREAKING, internal ports)
+
+`RecordSentInput`/`RecordMintInput`/`RecordReceivedInput` take `assets: {coinId, amount}[]` in place
+of `coinId`/`amount` scalars. `SphereToken` gains required `valueEnvelope` and `tokenType`.
+`InventoryItem`/`InventoryItemWire` gain optional `tokenType`. These are internal to the vertical and
+the token-engine port; no root-export type changed shape except the additive `CoinlessToken` and
+`IncomingTransfer.coinless`.
+
 ## [0.16.0] - 2026-09-03
 
 ### Removed (BREAKING) — the Sphere lifecycle globals (#766)
