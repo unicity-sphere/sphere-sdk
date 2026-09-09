@@ -603,6 +603,26 @@ describe('InventoryView — coinless tokens (#777)', () => {
     expect(view.pool(COIN)).toEqual([{ tokenId: 'C', amount: 100n }]);
   });
 
+  it('survives a §5.4 restore re-pull: a coinless row stays coinless, a coin row stays a coin', async () => {
+    // The restore protocol drops every cursor and does a FULL re-pull, which
+    // re-applies rows the mirror already holds. `coinless` is computed at apply
+    // time, so an unchanged-row early return must not leave a stale verdict.
+    const { view, queue } = makeView([
+      page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE }), item('A', { seq: 1 })], 5),
+      page([], 5),
+    ]);
+    await view.fullPull();
+
+    queue.push(
+      page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE }), item('A', { seq: 1 })], 5),
+      page([], 5)
+    );
+    await view.fullPull();
+
+    expect(view.coinless().map((t) => t.tokenId)).toEqual(['N']);
+    expect(view.tokens(registry).map((t) => t.id)).toEqual(['A']);
+  });
+
   it('a row that GAINS assets stops being coinless', async () => {
     const { view, queue } = makeView([
       page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE })], 5),
