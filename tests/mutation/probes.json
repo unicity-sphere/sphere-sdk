@@ -1214,5 +1214,75 @@
     "tests": [
       "tests/unit/impl/backing-store-id.test.ts"
     ]
+  },
+  {
+    "name": "value-envelope-head-null-falls-through-to-coinless",
+    "note": "#778: an unreadable/non-canonical tag head must THROW, never bank as coinless. This is the exact naive fallback that silently zeroes a valid envelope with a trailing byte (value-envelope.test.ts reject table).",
+    "file": "token-engine/value-envelope.ts",
+    "find": "  const tag = headTagNumber(genesisData);\n  if (tag === null) {\n    throw invalid(",
+    "replace": "  const tag = headTagNumber(genesisData);\n  if (false as boolean) {\n    throw invalid(",
+    "tests": [
+      "tests/unit/token-engine/value-envelope.test.ts"
+    ]
+  },
+  {
+    "name": "value-envelope-decode-failure-reads-as-coinless",
+    "note": "#778 THE headline bug: a tag-39050 body that fails to decode must throw, not return a null value. Kills the `catch { return false }` shape the old predicate had.",
+    "file": "token-engine/value-envelope.ts",
+    "find": "    throw invalid(`Failed to decode token payment data: ${describe(error)}`);",
+    "replace": "    return { assets: [] } as SphereValue;",
+    "tests": [
+      "tests/unit/token-engine/value-envelope.test.ts"
+    ]
+  },
+  {
+    "name": "value-envelope-55799-over-value-accepted",
+    "note": "#778/wallet-api parity: tag(55799) hiding a real value envelope must be refused, or its coins are invisible with no error.",
+    "file": "token-engine/value-envelope.ts",
+    "find": "  if (tag === SELF_DESCRIBED_CBOR_TAG && selfDescribedBodyCarriesValue(body)) {",
+    "replace": "  if (false as boolean) {",
+    "tests": [
+      "tests/unit/token-engine/value-envelope.test.ts"
+    ]
+  },
+  {
+    "name": "value-envelope-array-some-becomes-every",
+    "note": "#778: `[uint(1), <valid Asset>]` is some=true/every=false \u2014 under .every it classifies coinless and a readable asset vanishes.",
+    "file": "token-engine/value-envelope.ts",
+    "find": "  return items.some(isAssetShaped)\n    ? { envelope: 'bare_collection', value: null }",
+    "replace": "  return items.every(isAssetShaped)\n    ? { envelope: 'bare_collection', value: null }",
+    "tests": [
+      "tests/unit/token-engine/value-envelope.test.ts"
+    ]
+  },
+  {
+    "name": "value-envelope-malformed-array-banked-as-coinless",
+    "note": "#778: an array that does not frame could be a CORRUPT collection; banking it as coinless is silent coin loss.",
+    "file": "token-engine/value-envelope.ts",
+    "find": "  if (items === null) {\n    throw invalid('Token value payload is not PaymentAssetCollection: malformed CBOR array');",
+    "replace": "  if (items === null) {\n    return { envelope: 'none_other', value: null };",
+    "tests": [
+      "tests/unit/token-engine/value-envelope.test.ts"
+    ]
+  },
+  {
+    "name": "engine-split-unreadable-value-guard-removed",
+    "note": "#778: splitting a source whose value this SDK cannot read must fail with a TYPED error before any chain op, not die inside TokenSplit with a bare CborError.",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "    if (params.token.value === null) {\n      throw new SphereError(",
+    "replace": "    if (false as boolean) {\n      throw new SphereError(",
+    "tests": [
+      "tests/unit/token-engine/SphereTokenEngine.hardening.test.ts"
+    ]
+  },
+  {
+    "name": "engine-mintdatatoken-preflight-removed",
+    "note": "#778: un-classifiable opaque bytes must be refused BEFORE the chain op. wrapToken runs on mintDataToken's last line, after certification, so without the pre-flight the refusal strands an on-chain token this SDK can never decode.",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "    assertMintableData(params.data);",
+    "replace": "    // mutant: pre-flight dropped",
+    "tests": [
+      "tests/unit/token-engine/SphereTokenEngine.hardening.test.ts"
+    ]
   }
 ]

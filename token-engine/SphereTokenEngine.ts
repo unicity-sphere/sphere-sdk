@@ -37,7 +37,6 @@ import { deriveDeliveryKeys } from './blob-keys';
 import { deriveRealization } from './realization';
 import { burntTokenFromCheckpoint, encodeCheckpoint } from './split-checkpoint';
 import {
-  CborDeserializer,
   CertificationData,
   CertificationStatus,
   EncodedPredicate,
@@ -72,6 +71,7 @@ import {
   type ITokenVerifier,
 } from './sdk';
 import { decodeSpherePaymentData, SpherePaymentData, sphereAssetToSdk } from './SpherePaymentData';
+import { assertMintableData, classifyValueEnvelope, wrapToken } from './value-envelope';
 import type { EngineOpOptions, ITokenEngine } from './engine';
 import type {
   CoinId,
@@ -242,8 +242,10 @@ export class SphereTokenEngine implements ITokenEngine {
       return sdkToken.latestTransaction.data;
     }
     // A minted output (e.g. a split output) carries the memo in its value envelope.
+    // Classify structurally: a CORRUPT envelope throws rather than reading as a
+    // memo-less data token (#778), and only `'sphere'` guarantees fromCBOR succeeds.
     const data = sdkToken.genesis.data;
-    if (data && this.isSpherePaymentData(data)) {
+    if (data && classifyValueEnvelope(data).envelope === 'sphere') {
       return SpherePaymentData.fromCBOR(data).memo;
     }
     return null;
@@ -286,10 +288,11 @@ export class SphereTokenEngine implements ITokenEngine {
     );
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
     const token = await Token.mint(certified, this.deps.verificationContext);
-    return this.wrapToken(token);
+    return wrapToken(token);
   }
 
   public async mintDataToken(params: MintDataTokenParams, options?: EngineOpOptions): Promise<SphereToken> {
+    assertMintableData(params.data);
     const recipient = SignaturePredicate.create(params.recipientPubkey);
     const tokenType = params.tokenType ? new TokenType(params.tokenType) : TokenType.generate();
     // A deterministic salt yields a stable, terms-derived tokenId (TokenId.fromSalt).
@@ -309,7 +312,7 @@ export class SphereTokenEngine implements ITokenEngine {
     );
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
     const token = await Token.mint(certified, this.deps.verificationContext);
-    return this.wrapToken(token);
+    return wrapToken(token);
   }
 
   public async transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken> {
@@ -337,13 +340,25 @@ export class SphereTokenEngine implements ITokenEngine {
     );
     const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
     const transferred = await params.token.sdkToken.transfer(certified, this.deps.verificationContext);
-    return this.wrapToken(transferred);
+    return wrapToken(transferred);
   }
 
   public async split(params: SplitParams, options?: EngineOpOptions): Promise<SplitResult> {
     this.assertOwned(params.token);
     if (params.outputs.length === 0) {
       throw new SphereError('Split requires at least one output', 'VALIDATION_ERROR');
+    }
+    // `TokenSplit.split` below is handed `decodeSpherePaymentData`, which reads only
+    // the tag-39050 envelope; without this an unreadable source dies inside the SDK
+    // with a bare CborError naming neither token nor cause. A coinless token cannot
+    // be split by construction, so this never refuses a legitimate split.
+    if (params.token.value === null) {
+      throw new SphereError(
+        `Cannot split token ${params.token.blob.tokenId}: its genesis payload carries no ` +
+          `value this SDK can read (envelope: ${params.token.valueEnvelope}). A coinless ` +
+          'token can only be transferred whole.',
+        'VALIDATION_ERROR',
+      );
     }
     const transferId = this.resolveTransferId(options);
 
@@ -536,7 +551,7 @@ export class SphereTokenEngine implements ITokenEngine {
     const proof = await this.submitSplitMintLeg(certData, mintTx, options);
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
     const token = await Token.mint(certified, this.deps.verificationContext);
-    return this.wrapToken(token);
+    return wrapToken(token);
   }
 
   /**
@@ -617,7 +632,7 @@ export class SphereTokenEngine implements ITokenEngine {
         'VALIDATION_ERROR',
       );
     }
-    return this.wrapToken(sdkToken);
+    return wrapToken(sdkToken);
   }
 
   // ── internals ────────────────────────────────────────────────────────────────
@@ -756,37 +771,6 @@ export class SphereTokenEngine implements ITokenEngine {
     }
   }
 
-  /** Wrap an SDK token into a SphereToken: cache its blob (incl. stable tokenId) + decoded value. */
-  private wrapToken(sdkToken: Token): SphereToken {
-    const data = sdkToken.genesis.data;
-    let value: SphereValue | null = null;
-    // Only value tokens carry a SpherePaymentData envelope; data tokens (e.g. invoices)
-    // leave value === null. A corrupt value envelope still errors loudly.
-    if (data && this.isSpherePaymentData(data)) {
-      try {
-        value = SpherePaymentData.fromCBOR(data).toValue();
-      } catch (err) {
-        throw new SphereError(
-          `Failed to decode token payment data: ${err instanceof Error ? err.message : String(err)}`,
-          'VALIDATION_ERROR',
-        );
-      }
-    }
-    const blob: TokenBlob = {
-      tokenId: HexConverter.encode(sdkToken.id.bytes),
-      token: sdkToken.toCBOR(),
-    };
-    return { sdkToken, blob, value };
-  }
-
-  /** True if the bytes are a SpherePaymentData envelope (value token) vs a raw data token. */
-  private isSpherePaymentData(data: Uint8Array): boolean {
-    try {
-      return CborDeserializer.decodeTag(data).tag === SpherePaymentData.CBOR_TAG;
-    } catch {
-      return false;
-    }
-  }
   /**
    * Terminate the verification worker pool, if this engine was configured with
    * one. Idempotent — the pool's dispose only touches workers it spawned.

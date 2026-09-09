@@ -62,6 +62,7 @@ class StubEngine implements ReceiveEngine {
       sdkToken: parsed as never,
       blob,
       value: { assets: parsed.assets.map((a) => ({ coinId: a.coinId, amount: BigInt(a.amount) })) },
+      valueEnvelope: 'sphere',
     };
   }
 
