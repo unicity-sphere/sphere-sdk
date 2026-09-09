@@ -5,6 +5,7 @@
 
 import type { Asset, Token } from '../../../types';
 import { SerialChain, SingleFlight } from '../async';
+import type { CoinlessToken } from '../api';
 import type { InventoryAsset, InventoryItem, InventoryPage, StoragePort } from '../ports';
 import { STORE_KEYS, type ScopedKV, type StreamCursor } from '../stores';
 import {
@@ -54,6 +55,14 @@ interface MirrorEntry {
   seq: number;
   status: 'active' | 'removed';
   assets: readonly InventoryAsset[];
+  /**
+   * Positive statement that this ACTIVE row names no coin (wallet-api#140).
+   * Computed here, where `status` is in hand, because absent `assets` means two
+   * different things: a tombstone omits them for an unrelated reason, and
+   * `assets` is INHERITED from the previous entry on a delta that omits them.
+   */
+  coinless: boolean;
+  tokenType?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -64,6 +73,31 @@ const CURSOR_KEY = STORE_KEYS.streamCursor('inventory');
 
 function stateKey(tokenId: string, stateHash: string): string {
   return `${tokenId}:${stateHash}`;
+}
+
+/**
+ * Only an ACTIVE row's absent `assets` positively states coinlessness. A tombstone
+ * omits them for an unrelated reason, so it inherits rather than being reclassified
+ * (wallet-api sdk-changes S2: discriminate on `status`, never on assets-absent).
+ */
+/**
+ * A type is a function of tokenId so it never CHANGES, but it can appear late
+ * (wallet-api writes it on insert and reactivate; migration 0015 does not
+ * backfill). The RESOLVED value is compared: comparing `item.tokenType` would
+ * rewrite the entry on every delta that merely omits it.
+ */
+function unchanged(prev: MirrorEntry, item: InventoryItem, tokenType: string | undefined): boolean {
+  return (
+    prev.seq === item.seq &&
+    prev.status === item.status &&
+    prev.stateHash === item.stateHash &&
+    tokenType === prev.tokenType
+  );
+}
+
+function isCoinless(item: InventoryItem, prev: MirrorEntry | undefined): boolean {
+  if (item.status !== 'active') return prev?.coinless ?? false;
+  return (item.assets?.length ?? 0) === 0;
 }
 
 export class InventoryView {
@@ -210,6 +244,29 @@ export class InventoryView {
     return out;
   }
 
+  /**
+   * Coinless holdings (#777) — DISJOINT from tokens(): an entry is coinless
+   * exactly when it is not, so no mirror row can appear in both reads.
+   */
+  coinless(): CoinlessToken[] {
+    const out: CoinlessToken[] = [];
+    for (const [tokenId, entry] of this.mirror) {
+      if (entry.status !== 'active' || !entry.coinless) continue;
+      out.push({
+        tokenId,
+        ...(entry.tokenType !== undefined ? { tokenType: entry.tokenType } : {}),
+        stateHash: entry.stateHash,
+        transferring: this.held(tokenId),
+        ...(this.suspected.has(stateKey(tokenId, entry.stateHash))
+          ? { suspectedSpent: true }
+          : {}),
+        createdAt: entry.createdAt,
+        updatedAt: entry.updatedAt,
+      });
+    }
+    return out;
+  }
+
   async assets(registry: RegistryReader, price?: PriceReader): Promise<Asset[]> {
     const raw = aggregateAssets(this.activeEntries(), (tokenId) => this.held(tokenId), registry);
     if (!price || raw.length === 0) return raw;
@@ -296,19 +353,17 @@ export class InventoryView {
   private applyOne(item: InventoryItem, now: number): boolean {
     const prev = this.mirror.get(item.tokenId);
     if (prev && item.seq < prev.seq) return false;
-    if (
-      prev &&
-      prev.seq === item.seq &&
-      prev.status === item.status &&
-      prev.stateHash === item.stateHash
-    ) {
-      return false;
-    }
+    const tokenType = item.tokenType ?? prev?.tokenType;
+    if (prev && unchanged(prev, item, tokenType)) return false;
     this.mirror.set(item.tokenId, {
       stateHash: item.stateHash,
       seq: item.seq,
       status: item.status,
+      // Left INHERITING deliberately: a tombstone omits assets, and recoverRemoved
+      // must still know the amount it is restoring (inventory.test.ts).
       assets: item.assets ?? prev?.assets ?? [],
+      coinless: isCoinless(item, prev),
+      ...(tokenType !== undefined ? { tokenType } : {}),
       createdAt: prev?.createdAt ?? now,
       updatedAt: now,
     });

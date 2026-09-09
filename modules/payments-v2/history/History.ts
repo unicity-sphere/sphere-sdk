@@ -66,8 +66,13 @@ export interface RecordSentInput {
 export interface RecordReceivedInput {
   tokenId: string;
   stateHash: string;
-  coinId: string;
-  amount: string;
+  /**
+   * What arrived. EMPTY for a coinless token (#777) — wallet-api#151 accepts an
+   * empty list and keeps refusing `coinId: ''`, so a synthetic empty-coin entry
+   * 422s and the row is lost. §10 forbids a record naming neither assets nor a
+   * tokenId; `tokenId` is always set here, so an empty list is legal.
+   */
+  assets: readonly { coinId: string; amount: string }[];
   transferId?: string;
   senderPubkey?: string;
   senderNametag?: string;
@@ -123,7 +128,7 @@ export class History {
       dedupKey: `RECEIVED:${input.tokenId.toLowerCase()}:${input.stateHash.toLowerCase()}`,
       id: (this.deps.newId ?? randomUUID)(),
       type: 'RECEIVED' as const,
-      assets: [{ coinId: input.coinId, amount: input.amount }],
+      assets: input.assets.map((a) => ({ coinId: a.coinId, amount: a.amount })),
       ts: this.ts(input.timestamp),
       ...(input.transferId !== undefined ? { transferId: input.transferId } : {}),
       ...this.wireTokenId(input.tokenId),

@@ -1,6 +1,6 @@
 // §4 of docs/PAYMENTS-V2-DESIGN.md
 
-import type { Asset, IncomingTransfer, Token, TransferResult } from '../../types';
+import type { Asset, CoinlessToken, IncomingTransfer, Token, TransferResult } from '../../types';
 
 export interface SendRequest {
   recipient: string;
@@ -96,6 +96,8 @@ export interface PaymentsV2 {
   discardPrewarm(): void;
   assets(coinId?: string): Promise<Asset[]>;
   tokens(filter?: { coinId?: string }): Token[];
+  coinless(): CoinlessToken[];
+  tokenData(tokenId: string): Promise<Uint8Array | null>;
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage>;
 
   send(req: SendRequest): Promise<TransferResult>;
@@ -126,3 +128,5 @@ export interface PaymentsV2Events {
   'payment_request:updated': { id: string; status: PaymentRequestStatus };
   'connection:status': { status: ConnectionStatus };
 }
+
+export type { CoinlessToken };

@@ -84,6 +84,13 @@ export interface SphereToken {
    * envelope never reaches this field: it throws during classification.
    */
   readonly valueEnvelope: ValueEnvelope;
+  /**
+   * Genesis `TokenType`, lowercase hex. The token's CLASS, never its instance —
+   * `blob.tokenId` is the instance key (wallet-api#147). Only as meaningful as its
+   * minter made it: `mint()` and split outputs derive one per operation, so for
+   * value tokens it is per-mint noise. Never a spend gate.
+   */
+  readonly tokenType: string;
 }
 
 // ── operation params (sphere-domain in, SphereToken out) ──────────────────────

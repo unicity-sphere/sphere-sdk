@@ -32,13 +32,33 @@ interface StubMeta {
   stateHash: string;
   owner: string;
   assets: { coinId: string; amount: string }[];
+  tokenType?: string;
+  /** A value envelope this SDK cannot decode: null value, but REAL coins. */
+  bridged?: boolean;
 }
 
-const meta = (tokenId: string, stateHash: string, opts: { owner?: string; amount?: string } = {}): StubMeta => ({
+// `coinless` models wallet-api#140: genesis data that is not a value envelope, so
+// the engine reports value === null and no assets at all.
+const meta = (
+  tokenId: string,
+  stateHash: string,
+  opts: {
+    owner?: string;
+    amount?: string;
+    coinless?: boolean;
+    tokenType?: string;
+    bridged?: boolean;
+  } = {}
+): StubMeta => ({
   tokenId,
   stateHash,
   owner: opts.owner ?? OWN,
-  assets: [{ coinId: COIN, amount: opts.amount ?? '1000' }],
+  assets:
+    opts.coinless === true || opts.bridged === true
+      ? []
+      : [{ coinId: COIN, amount: opts.amount ?? '1000' }],
+  ...(opts.tokenType !== undefined ? { tokenType: opts.tokenType } : {}),
+  ...(opts.bridged === true ? { bridged: true } : {}),
 });
 
 const blobOf = (m: StubMeta): Uint8Array => new TextEncoder().encode(JSON.stringify(m));
@@ -61,8 +81,17 @@ class StubEngine implements ReceiveEngine {
     return {
       sdkToken: parsed as never,
       blob,
-      value: { assets: parsed.assets.map((a) => ({ coinId: a.coinId, amount: BigInt(a.amount) })) },
-      valueEnvelope: 'sphere',
+      value:
+        parsed.assets.length === 0
+          ? null
+          : { assets: parsed.assets.map((a) => ({ coinId: a.coinId, amount: BigInt(a.amount) })) },
+      valueEnvelope:
+        parsed.bridged === true
+          ? 'bare_collection'
+          : parsed.assets.length === 0
+            ? 'none_other'
+            : 'sphere',
+      tokenType: parsed.tokenType ?? 'aa'.repeat(4),
     };
   }
 
@@ -1084,5 +1113,99 @@ describe('payments-v2 Receive — every drain refreshes, not just the explicit o
     await h.receive.drainOnce();
 
     expect(h.refreshes).toEqual([]);
+  });
+});
+
+describe('payments-v2 Receive — coinless arrivals (#777)', () => {
+  const NFT_TYPE = '971a26eef0e3aeb2';
+
+  it('NAMES the arriving coinless token instead of announcing an empty token list', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1', { coinless: true, tokenType: NFT_TYPE }));
+
+    const [transfer] = await h.receive.drainOnce();
+
+    // The bug: `tokens` is built by mapping over assets, so a coinless arrival
+    // announced `tokens: []` and a UI listening for arrivals saw nothing land.
+    expect(transfer?.tokens).toEqual([]);
+    expect(transfer?.coinless).toEqual([
+      {
+        tokenId: T(1),
+        tokenType: NFT_TYPE,
+        stateHash: 'S1',
+        transferring: false,
+        createdAt: transfer?.receivedAt,
+        updatedAt: transfer?.receivedAt,
+      },
+    ]);
+  });
+
+  it('stores, claims and verifies a coinless arrival exactly like a coin arrival', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1', { coinless: true, tokenType: NFT_TYPE }));
+
+    await h.receive.drainOnce();
+
+    expect(h.view.storeCalls).toEqual([
+      expect.objectContaining({ tokenId: T(1), stateHash: 'S1', assets: [] }),
+    ]);
+    expect(h.delivery.ackLog).toEqual([expect.objectContaining({ disposition: 'claimed' })]);
+  });
+
+  it('posts history with an EMPTY asset list, never a synthetic empty-coin entry', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1', { coinless: true, tokenType: NFT_TYPE }));
+
+    await h.receive.drainOnce();
+
+    // wallet-api#151 accepts `assets: []` and still refuses `coinId: ''`, so a
+    // synthetic entry would 422 and History.post would swallow the row silently.
+    expect(h.historyLog).toEqual([
+      expect.objectContaining({ tokenId: T(1), assets: [], tokenType: NFT_TYPE }),
+    ]);
+  });
+
+  it('a coin arrival is unchanged — no coinless field, assets intact', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+
+    const [transfer] = await h.receive.drainOnce();
+
+    expect(transfer?.coinless).toBeUndefined();
+    expect(transfer?.tokens).toHaveLength(1);
+    expect(h.historyLog[0]?.assets).toEqual([{ coinId: COIN, amount: '1000' }]);
+  });
+
+  it('a coinless arrival whose type the minter never set still lands', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1', { coinless: true }));
+
+    const [transfer] = await h.receive.drainOnce();
+
+    expect(transfer?.coinless).toHaveLength(1);
+    expect(h.view.storeCalls).toHaveLength(1);
+  });
+});
+
+describe('payments-v2 Receive — an unreadable value envelope is NOT an NFT (#778/#777)', () => {
+  it('never announces a bare_collection arrival as coinless: it carries coins this SDK cannot read', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1', { bridged: true, tokenType: '971a26eef0e3aeb2' }));
+
+    const [transfer] = await h.receive.drainOnce();
+
+    // `value === null` is true for BOTH a coinless token and a dialect this SDK
+    // cannot decode. Keying on it would hide real coins behind a token type.
+    expect(transfer?.coinless).toBeUndefined();
+  });
+
+  it('still accepts and claims the bridged arrival — unreadable value is not a rejection', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1', { bridged: true }));
+
+    await h.receive.drainOnce();
+
+    expect(h.view.storeCalls).toHaveLength(1);
+    expect(h.delivery.ackLog).toEqual([expect.objectContaining({ disposition: 'claimed' })]);
   });
 });

@@ -15,9 +15,11 @@ import type { ITokenEngine } from '../../token-engine/engine';
 import type { SphereToken } from '../../token-engine/types';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
-import type { ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest } from './api';
+import type { CoinlessToken, ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
+import { readTokenData } from './inventory/token-data';
+import { partialize, stampTransferId } from './send-errors';
 import { requireSameNetworkRecipient } from './recipient';
 import { reseedAndReset, type RestoreDeps } from './restore';
 import { mintParams } from './mint-params';
@@ -223,6 +225,15 @@ export class PaymentsFacade implements PaymentsV2 {
     return this.view.tokens(this.deps.registry, filter);
   }
 
+  coinless(): CoinlessToken[] {
+    return this.view.coinless();
+  }
+
+  tokenData(tokenId: string): Promise<Uint8Array | null> {
+    const deps = { engine: this.engine(), view: this.view, storagePort: this.deps.storagePort };
+    return readTokenData(deps, tokenId);
+  }
+
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage> {
     return this.historyStore.page(page ?? {});
   }
@@ -340,12 +351,12 @@ export class PaymentsFacade implements PaymentsV2 {
       try {
         ctx = await this.planAndMaterialize(recipient.chainPubkey, { ...request, amount: run.amount }, run);
       } catch (err) {
-        throw this.partialize(err, run);
+        throw partialize(err, run);
       }
       const disposition = await this.runAttempt(ctx);
-      if (disposition.kind === 'rethrow') throw this.partialize(disposition.error, run);
+      if (disposition.kind === 'rethrow') throw partialize(disposition.error, run);
       if (disposition.kind === 'retry-full') {
-        if (attempt >= MAX_RESELECT) throw this.partialize(disposition.error, run);
+        if (attempt >= MAX_RESELECT) throw partialize(disposition.error, run);
         continue;
       }
       if (disposition.kind === 'success') {
@@ -409,7 +420,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private async disposeFailedAttempt(ctx: AttemptCtx, err: unknown): Promise<AttemptDisposition> {
     if (isPossiblyCommittedSendOutcome(err)) {
       this.settleKeepOpen(ctx);
-      this.stampTransferId(err, ctx.transferId);
+      stampTransferId(err, ctx.transferId);
       return { kind: 'rethrow', error: err };
     }
     const backstop = await this.machineStores.backstop.getByKey(ctx.transferId);
@@ -445,7 +456,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private async disposeConvergeFailure(ctx: AttemptCtx, err: unknown): Promise<AttemptDisposition> {
     if (isPossiblyCommittedSendOutcome(err)) {
       this.settleKeepOpen(ctx);
-      this.stampTransferId(err, ctx.transferId);
+      stampTransferId(err, ctx.transferId);
       return { kind: 'rethrow', error: err };
     }
     if (classifyError(err) === 'conflict') {
@@ -617,24 +628,6 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   /** Nothing delivered → UNWRAPPED; after ≥1 delivered leg every failure surfaces as PartialSendConflictError over the settled set. */
-  private partialize(err: unknown, run: SendRun): unknown {
-    if (run.delivered.length === 0) return err;
-    return new PartialSendConflictError(
-      'Part of your payment was sent; the remaining amount could not be completed (see cause). The delivered portion is final — re-plan only the shortfall, never the full amount.',
-      run.firstPartialId ?? '',
-      run.delivered,
-      run.amount,
-      err
-    );
-  }
-
-  /** #441: possibly-committed errors must carry the transferId for the settling journal. */
-  private stampTransferId(err: unknown, transferId: string): void {
-    if (err instanceof SphereError && isPossiblyCommittedSendOutcome(err) && err.transferId === undefined) {
-      err.transferId = transferId;
-    }
-  }
-
   private async softAbort(transferId: string): Promise<void> {
     try {
       await this.deps.client.abortIntent(transferId);

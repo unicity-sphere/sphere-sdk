@@ -1284,5 +1284,96 @@
     "tests": [
       "tests/unit/token-engine/SphereTokenEngine.hardening.test.ts"
     ]
+  },
+  {
+    "name": "inventory-coinless-ignores-status",
+    "note": "#777: only an ACTIVE row's absent assets states coinlessness. A tombstone omits assets for an unrelated reason, so classifying it coinless would surface spent tokens as NFTs.",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "  if (item.status !== 'active') return prev?.coinless ?? false;",
+    "replace": "  // mutant: status ignored",
+    "tests": [
+      "tests/unit/payments-v2/inventory.test.ts"
+    ]
+  },
+  {
+    "name": "inventory-coinless-always-false",
+    "note": "#777: a coinless row must reach coinless(); always-false is the pre-fix behaviour where an NFT was invisible.",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "  return (item.assets?.length ?? 0) === 0;",
+    "replace": "  return false;",
+    "tests": [
+      "tests/unit/payments-v2/inventory.test.ts"
+    ]
+  },
+  {
+    "name": "inventory-coinless-not-disjoint",
+    "note": "#777: coinless() must skip non-coinless rows, or a coin token appears in BOTH reads.",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "      if (entry.status !== 'active' || !entry.coinless) continue;",
+    "replace": "      if (entry.status !== 'active') continue;",
+    "tests": [
+      "tests/unit/payments-v2/inventory.test.ts"
+    ]
+  },
+  {
+    "name": "receive-coinless-not-named",
+    "note": "#777: a coinless arrival must be NAMED on transfer:incoming. Dropping the tokenType makes the event announce an empty token list again \u2014 a UI sees nothing land.",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "      ...(isCoinlessEnvelope(token.valueEnvelope) ? { tokenType: token.tokenType } : {}),",
+    "replace": "      // mutant: arrival type dropped",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts"
+    ]
+  },
+  {
+    "name": "history-received-flattens-to-empty-coin",
+    "note": "wallet-api#151: a coinless receipt must post assets: []. Flattening to a synthetic first asset posts coinId:'' which the backend 422s and History.post swallows \u2014 the row is lost silently.",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "      assets: input.assets.map((a) => ({ coinId: a.coinId, amount: a.amount })),",
+    "replace": "      assets: [{ coinId: input.assets[0]?.coinId ?? '', amount: input.assets[0]?.amount ?? '0' }],",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts",
+      "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "registry-type-lookup-falls-back-to-coins",
+    "note": "wallet-api#147: a token TYPE and a coin id are different namespaces in one registry file. Falling back to the coin map would render a coin as a token class.",
+    "file": "registry/TokenRegistry.ts",
+    "find": "    return this.definitionsByType.get(tokenType.toLowerCase());",
+    "replace": "    return this.definitionsByType.get(tokenType.toLowerCase()) ?? this.definitionsById.get(tokenType.toLowerCase());",
+    "tests": [
+      "tests/unit/registry/TokenRegistry.test.ts"
+    ]
+  },
+  {
+    "name": "inventory-unchanged-ignores-late-tokentype",
+    "note": "#777: a tokenType can appear late at an otherwise identical row (insert/reactivate write it; 0015 does not backfill). Dropping it from the unchanged check strands the type; comparing item.tokenType instead of the RESOLVED value churns an update on every delta that omits it.",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "    tokenType === prev.tokenType",
+    "replace": "    true",
+    "tests": [
+      "tests/unit/payments-v2/inventory.test.ts"
+    ]
+  },
+  {
+    "name": "receive-conflates-unreadable-with-coinless",
+    "note": "#778/#777: `value === null` is true for a coinless token AND for a bare_collection carrying coins this SDK cannot decode. Keying the NFT announcement on it hides real coins behind a token type.",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "  return envelope.startsWith('none_');",
+    "replace": "  return envelope !== 'sphere';",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts"
+    ]
+  },
+  {
+    "name": "token-data-skips-inventory-guard",
+    "note": "#777: tokenData must refuse a token the wallet does not hold BEFORE fetching a blob, rather than returning bytes for an arbitrary id.",
+    "file": "modules/payments-v2/inventory/token-data.ts",
+    "find": "  if (deps.view.stateHashOf(tokenId) === undefined) {",
+    "replace": "  if (false as boolean) {",
+    "tests": [
+      "tests/unit/payments-v2/token-data.test.ts"
+    ]
   }
 ]

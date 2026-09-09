@@ -86,6 +86,24 @@ export interface Token {
   suspectedSpent?: boolean;
 }
 
+/**
+ * A holding that names no coin (wallet-api#140) — an NFT. Deliberately NOT a
+ * `Token`: no amount, decimals or symbol, and never returned by `tokens()` or
+ * counted in `assets()`. `tokenType` names the token's CLASS and `tokenId` the
+ * instance (wallet-api#147). The payload is read with `payments.tokenData()`.
+ */
+export interface CoinlessToken {
+  readonly tokenId: string;
+  readonly tokenType?: string;
+  readonly stateHash: string;
+  /** #737: reserved by a converging transfer — not spendable right now. */
+  readonly transferring: boolean;
+  /** #625: proven spent on-chain; excluded from spend selection. */
+  readonly suspectedSpent?: boolean;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
 export interface Asset {
   readonly coinId: string;
   readonly symbol: string;
@@ -177,6 +195,8 @@ export interface IncomingTransfer {
   readonly senderPubkey: string;
   readonly senderNametag?: string;
   readonly tokens: Token[];
+  /** Arrivals that name no coin (#777). Disjoint from `tokens`, never a zero Token. */
+  readonly coinless?: CoinlessToken[];
   readonly memo?: string;
   readonly receivedAt: number;
 }

@@ -11,6 +11,7 @@ export function mockSphereToken(value: SphereValue | null = { assets: [] }): Sph
     blob,
     value,
     valueEnvelope: value === null ? 'none_absent' : 'sphere',
+    tokenType: 'aa'.repeat(4),
   };
 }
 

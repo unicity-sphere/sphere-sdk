@@ -151,7 +151,13 @@ export function wrapToken(sdkToken: Token): SphereToken {
     tokenId: HexConverter.encode(sdkToken.id.bytes),
     token: sdkToken.toCBOR(),
   };
-  return { sdkToken, blob, value, valueEnvelope: envelope };
+  return {
+    sdkToken,
+    blob,
+    value,
+    valueEnvelope: envelope,
+    tokenType: HexConverter.encode(sdkToken.type.bytes),
+  };
 }
 
 /**

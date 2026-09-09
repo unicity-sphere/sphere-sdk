@@ -222,7 +222,13 @@ export class FakeTokenEngine implements ITokenEngine {
     const state = decodeFakeState(blob.token);
     const normalized: TokenBlob = { ...blob, tokenId: HexConverter.encode(state.tokenId) };
     const { envelope, value } = classify(state);
-    return Promise.resolve({ sdkToken: handleFor(blob.token), blob: normalized, value, valueEnvelope: envelope });
+    return Promise.resolve({
+      sdkToken: handleFor(blob.token),
+      blob: normalized,
+      value,
+      valueEnvelope: envelope,
+      tokenType: fakeTokenType(state),
+    });
   }
 
   // ── internals ──────────────────────────────────────────────────────────────
@@ -244,7 +250,13 @@ export class FakeTokenEngine implements ITokenEngine {
       token: stateBytes,
     };
     const { envelope, value } = classify(state);
-    return { sdkToken: handleFor(stateBytes), blob, value, valueEnvelope: envelope };
+    return {
+      sdkToken: handleFor(stateBytes),
+      blob,
+      value,
+      valueEnvelope: envelope,
+      tokenType: fakeTokenType(state),
+    };
   }
 
   /** Spent-tracking key = the per-state id (changes on every transfer). */
@@ -322,6 +334,14 @@ function decodeFakeState(bytes: Uint8Array): FakeState {
  */
 function classify(state: FakeState): ClassifiedValue {
   return classifyValueEnvelope(state.genesisData);
+}
+
+/**
+ * The fake carries no type field, so derive a STABLE one per token id — enough for
+ * a consumer to key a class on, without a fake-blob format change.
+ */
+function fakeTokenType(state: FakeState): string {
+  return HexConverter.encode(state.tokenId.slice(0, 8));
 }
 
 /** Map the fake's numeric network to the SDK NetworkId instance (for TokenId.fromSalt). */

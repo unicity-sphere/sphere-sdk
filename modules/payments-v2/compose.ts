@@ -328,12 +328,10 @@ function buildReceive(
 }
 
 async function recordReceived(historyStore: History, record: ReceivedRecord): Promise<void> {
-  const first = record.assets[0];
   await historyStore.recordReceived({
     tokenId: record.tokenId,
     stateHash: record.stateHash,
-    coinId: first?.coinId ?? '',
-    amount: first?.amount ?? '0',
+    assets: record.assets,
     ...(record.senderPubkey !== undefined ? { senderPubkey: record.senderPubkey } : {}),
     ...(record.senderNametag !== undefined ? { senderNametag: record.senderNametag } : {}),
     ...(record.memo !== undefined ? { memo: record.memo } : {}),

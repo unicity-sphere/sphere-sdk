@@ -216,15 +216,15 @@ describe('History §5.9 — client POSTs and dedup keys', () => {
 
   it('RECEIVED dedup key is per (tokenId, stateHash): an A→B→A round-trip yields two records', async () => {
     const h = makeHarness();
-    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, coinId: COIN, amount: '10' });
-    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_B, coinId: COIN, amount: '10' });
+    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [{ coinId: COIN, amount: '10' }] });
+    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_B, assets: [{ coinId: COIN, amount: '10' }] });
     const records = await h.serverRecords();
     expect(records).toHaveLength(2);
     expect(new Set(records.map((r) => r.dedupKey))).toEqual(
       new Set([`RECEIVED:${TOKEN}:${STATE_A}`, `RECEIVED:${TOKEN}:${STATE_B}`])
     );
     // Redelivery of the same leg stays one record.
-    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, coinId: COIN, amount: '10' });
+    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [{ coinId: COIN, amount: '10' }] });
     expect(await h.serverRecords()).toHaveLength(2);
   });
 
@@ -246,7 +246,7 @@ describe('History §5.9 — client POSTs and dedup keys', () => {
       h.history.recordSent({ transferId: 'b2222222-2222-4222-8222-222222222222', coinId: COIN, amount: '1' })
     ).resolves.toBeUndefined();
     await expect(
-      h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, coinId: COIN, amount: '1' })
+      h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [{ coinId: COIN, amount: '1' }] })
     ).resolves.toBeUndefined();
     await expect(h.history.recordMint({ tokenId: TOKEN, coinId: COIN, amount: '1' })).resolves.toBeUndefined();
     expect(h.log).toHaveBeenCalledTimes(3);
@@ -256,7 +256,7 @@ describe('History §5.9 — client POSTs and dedup keys', () => {
   it('emits history:updated after each successful POST, carrying the recorded client-shaped entry', async () => {
     const h = makeHarness();
     await h.history.recordSent({ transferId: 'c3333333-3333-4333-8333-333333333333', coinId: COIN, amount: '1' });
-    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, coinId: COIN, amount: '1' });
+    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [{ coinId: COIN, amount: '1' }] });
     await h.history.recordMint({ tokenId: TOKEN, coinId: COIN, amount: '1' });
     expect(h.emit).toHaveBeenCalledTimes(3);
     expect(h.emit.mock.calls.map((c) => [c[0], (c[1] as { type: string }).type])).toEqual([
@@ -327,5 +327,41 @@ describe('History §5.9 — client POSTs and dedup keys', () => {
     const [raw] = await h.serverRecords();
     expect(raw.counterpartyPubkey).toBeUndefined();
     expect(String(raw.counterpartyNametag).startsWith('enc1.')).toBe(true);
+  });
+});
+
+describe('History — a coinless RECEIVED record (#777 / wallet-api#151)', () => {
+  it('posts assets: [] verbatim, never a synthetic empty-coin entry', async () => {
+    const h = makeHarness();
+    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [] });
+    const [record] = await h.serverRecords();
+
+    // wallet-api#151 accepts an empty list and STILL refuses `coinId: ''`, so a
+    // flattened `[{coinId:'', amount:'0'}]` 422s — and History.post swallows the
+    // failure, so the row would vanish with no error surface anywhere.
+    expect(record?.assets).toEqual([]);
+    expect(record?.tokenId).toBe(TOKEN);
+  });
+
+  it('still carries a tokenId, which §10 requires of a record naming no assets', async () => {
+    const h = makeHarness();
+    await h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [] });
+    const [record] = await h.serverRecords();
+    expect(record?.tokenId).toBeDefined();
+  });
+
+  it('a multi-asset receipt posts every asset, not just the first', async () => {
+    const h = makeHarness();
+    const OTHER_COIN = 'bb'.repeat(32);
+    await h.history.recordReceived({
+      tokenId: TOKEN,
+      stateHash: STATE_A,
+      assets: [{ coinId: COIN, amount: '10' }, { coinId: OTHER_COIN, amount: '20' }],
+    });
+    const [record] = await h.serverRecords();
+    expect(record?.assets).toEqual([
+      { coinId: COIN, amount: '10' },
+      { coinId: OTHER_COIN, amount: '20' },
+    ]);
   });
 });
