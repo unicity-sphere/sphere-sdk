@@ -575,6 +575,8 @@ interface TokenBlob {
 interface CoinlessToken {
   tokenId: string;    // the INSTANCE key
   tokenType?: string; // the token's CLASS, lowercase hex — see the caveat below
+  name?: string;      // resolved from the wallet's OWN registry when recognised
+  iconUrl?: string;
   stateHash: string;
   transferring: boolean;
   suspectedSpent?: boolean;

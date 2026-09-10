@@ -422,6 +422,8 @@ and filling those with `''`/`'0'` would put untrue values in fields consumers su
 interface CoinlessToken {
   readonly tokenId: string;      // genesis-stable INSTANCE key
   readonly tokenType?: string;   // the token's CLASS, lowercase hex — see below
+  readonly name?: string;        // resolved from the OWNED registry, when recognised
+  readonly iconUrl?: string;
   readonly stateHash: string;
   readonly transferring: boolean;   // reserved by a converging transfer
   readonly suspectedSpent?: boolean;
@@ -435,10 +437,13 @@ const nfts = sphere.payments.coinless();
 `tokenType` names the token's **class, not the instance** — every token of one kind shares a type,
 so two NFTs of a collection are told apart by `tokenId`. It is absent on rows the backend indexed
 before it recorded types, and an unrecognised type is legitimate (a minter may use its own), so
-never reject or hide a token for it. Resolve a display name with
-`TokenRegistry.getTypeDefinition(tokenType)` — **not** `getDefinition()`, which reads the coin-id
-namespace. Do not build a "group by type" UI on it for *valued* tokens: `mint()` and split outputs
-derive a type per operation, so there it is per-mint noise.
+never reject or hide a token for it. Do not build a "group by type" UI on it for *valued* tokens:
+`mint()` and split outputs derive a type per operation, so there it is per-mint noise.
+
+`name` and `iconUrl` are resolved **for you**, from the registry this wallet owns, whenever the type
+is recognised. Do not look the type up yourself through `TokenRegistry.getInstance()`: a Sphere owns
+its registry (#767) and the process-global one is repointed by another Sphere's init, so a second
+wallet on another network would retarget it.
 
 ### `tokenData(tokenId: string): Promise<Uint8Array | null>`
 

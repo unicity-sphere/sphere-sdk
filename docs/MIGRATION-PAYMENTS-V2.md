@@ -112,9 +112,9 @@ of one kind shares it), `stateHash`, `transferring`, `suspectedSpent` and timest
 `transfer:incoming` gains an optional `coinless` array. If you render arrivals from `tokens`, a
 coinless arrival will look empty — read `coinless` too.
 
-Resolve an NFT's display metadata with `TokenRegistry.getTypeDefinition(tokenType)`, **not**
-`getDefinition()`: one registry file holds two id namespaces discriminated by `assetKind`, and
-`getDefinition` reads the coin one. An unrecognised type is legitimate — degrade, never hide.
+An NFT's display metadata (`name`, `iconUrl`) is resolved for you, from the registry the Sphere
+owns. Do not look the type up via `TokenRegistry.getInstance()`: a second Sphere's init repoints
+that singleton (#767). An unrecognised type is legitimate — the row still renders, unnamed.
 
 ## 3. Composition changes
 

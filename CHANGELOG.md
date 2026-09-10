@@ -24,10 +24,12 @@ consumers sum or format. (#781 proposed widening `tokens()`; the divergence is r
 unbounded, and blobs are lazy under server custody, so a list read must never carry it.
 
 `tokenType` names the token's **class, not the instance** — every token of one kind shares a type.
-Resolve display metadata with the new `TokenRegistry.getTypeDefinition()`, which reads the
-token-type namespace; one registry file carries both namespaces discriminated by `assetKind`, and
-the flat `getDefinition()` map cannot tell a type from a coin id. An unrecognised type is
-legitimate and must never cause a token to be rejected or hidden.
+Display metadata (`name`, `iconUrl`) is resolved onto the row from the registry the Sphere OWNS
+(#767), so callers never reach for one: the process-global singleton is repointed by another
+Sphere's init, which would retarget a second wallet on another network. `TokenRegistry` gains
+`getTypeDefinition()`/`getTypeMeta()`, reading the token-type namespace — one registry file carries
+both namespaces discriminated by `assetKind`, and the flat `getDefinition()` map cannot tell a type
+from a coin id. An unrecognised type is legitimate and must never cause a token to be hidden.
 
 `transfer:incoming` now names an arriving coinless token in a disjoint `coinless` field; it
 previously mapped over assets, so such an arrival announced `tokens: []` and a UI listening for
