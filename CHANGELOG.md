@@ -35,6 +35,30 @@ from a coin id. An unrecognised type is legitimate and must never cause a token 
 previously mapped over assets, so such an arrival announced `tokens: []` and a UI listening for
 arrivals saw nothing land.
 
+### Added — transferring a coinless token (#777)
+
+`payments.sendToken({ recipient, tokenId, memo? })` moves a coinless token whole: one named source,
+one direct transfer, never a split. A separate verb rather than a widened `send()` because the
+addressing differs — `send()` selects sources to cover an amount and may queue for a combination,
+`sendToken` reserves the token you named and never queues, since nothing can free up that helps.
+
+It is the SAME `TransferMachine`, durable intent, checkpoints, mailbox deposit and applyDelta —
+one money path, with the two spends diverging in exactly one function. Three independent gates keep
+a valued token out: the mirror (`spendableCoinless`), the reservation ledger (concurrency), and a
+re-check of the decoded blob, which is the authority on what a token actually carries.
+
+A proven conflict is **terminal** for a named source: #625's bounded re-plan exists to pick a
+different source after a lost race, and a named token has no alternative.
+
+The durable intent is now discriminated by a REQUIRED `kind` (`'coin' | 'token'`) on a still-`v:2`
+envelope; an absent kind reads as `'coin'` — a migration, not a guess, since it is the only shape
+any client wrote. A token intent names exactly one source and can never carry a split, re-checked
+on resume rather than trusted across the decrypt boundary.
+
+Connect 2.1 → 2.2: a `send_token` intent with its own `token:transfer` scope. Additive, and the
+handshake gate is MAJOR-only, so no existing dApp is cut off. The scope is deliberately separate —
+mapping `send_token` onto `transfer:request` would silently widen every dApp already holding it.
+
 ### Fixed — a corrupt value envelope no longer reads as "no value" (#778)
 
 `isSpherePaymentData` was `try { decodeTag(d).tag === CBOR_TAG } catch { return false }`, and both

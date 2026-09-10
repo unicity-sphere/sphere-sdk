@@ -460,6 +460,31 @@ const bytes = await sphere.payments.tokenData(nft.tokenId);
 Note an **empty** payload reads back as a zero-length `Uint8Array`, not `null` — only a genuinely
 absent one is `null`.
 
+### `sendToken(req: { recipient, tokenId, memo? }): Promise<TransferResult>`
+
+Move a **coinless** token whole. All-or-nothing: one named source, one direct transfer, never a
+split — there is no amount to divide and no change to return.
+
+```typescript
+const result = await sphere.payments.sendToken({
+  recipient: '@bob',        // same resolver send() uses
+  tokenId: nft.tokenId,
+  memo: 'happy birthday',   // optional, recipient-encrypted
+});
+```
+
+A separate verb rather than a widened `send()` because the addressing model differs: `send()`
+selects sources to cover an amount and may queue for a combination that frees up; `sendToken`
+reserves the one token you named.
+
+Refuses — **before any reservation or chain op** — a `tokenId` that is unknown, tombstoned, already
+in flight, #625-demoted, or that **carries coin value**. A valued token leaves only through
+`send()`, so its coins are always accounted for.
+
+Unlike a coin send, a proven conflict is **terminal**: #625's re-plan looks for a different source
+and a named token has none, so there is nothing to retry. Treat the same possibly-committed rules
+as `send()` — never re-issue after `CERTIFICATION_UNCONFIRMED`; `resumeNow()` converges it.
+
 ### `mint(coinIdHex: string, amount: bigint): Promise<MintResult>`
 
 Self-mint fungible tokens to this wallet via the token engine (no faucet). **Journal-first**:

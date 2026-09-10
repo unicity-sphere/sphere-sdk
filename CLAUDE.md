@@ -269,7 +269,8 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `sphere.payments.tokens(filter?)` | `Token[]` | Individual COIN tokens (sync inventory view) |
 | `sphere.payments.coinless()` | `CoinlessToken[]` | Coinless (NFT) holdings — disjoint from `tokens()` |
 | `sphere.payments.tokenData(tokenId)` | `Promise<Uint8Array \| null>` | A token's genesis payload (fetches the blob) |
-| `sphere.payments.send(request)` | `Promise<TransferResult>` | Send L3 tokens (wallet-api vertical) |
+| `sphere.payments.send(request)` | `Promise<TransferResult>` | Send L3 coin tokens (wallet-api vertical) |
+| `sphere.payments.sendToken(request)` | `Promise<TransferResult>` | Move a COINLESS token whole (`{recipient, tokenId, memo?}`) |
 | `sphere.payments.mint(coinIdHex, amount)` | `Promise<MintResult>` | Self-mint via engine (journal-first, no faucet) |
 | `sphere.payments.receive()` | `Promise<{ transfers }>` | Explicit one-shot mailbox drain |
 | `sphere.payments.history(page?)` | `Promise<HistoryPage>` | Paged history (`{ before?, limit? }`) |
@@ -756,6 +757,18 @@ authoritative for build success.
   throw set must stay a SUBSET of wallet-api's §8.2 422 set: everything arriving over the mailbox
   already passed §8.2, and `Receive.screen()` turns a decode throw into a terminal
   `rejectAck('invalid')`, so throwing where wallet-api accepts LOSES the token.
+- **Transfer** is `sendToken({recipient, tokenId, memo?})`, a separate verb: a coin spend SELECTS
+  sources for an amount and may queue; a token spend reserves the one it was NAMED and never
+  queues (nothing can free up that would help). Same `TransferMachine`, same durable intent — one
+  money path. A proven conflict is TERMINAL: #625's re-plan needs an alternative source and a
+  named token has none. Three independent gates keep a valued token out (mirror, reservation, and
+  a re-check of the decoded BLOB, which is the authority on what a token carries).
+- The durable intent is discriminated by a REQUIRED `kind` (`'coin' | 'token'`); an ABSENT kind
+  reads as `'coin'`, the only shape written before #777. A token intent names EXACTLY one source
+  and can never carry a split — re-checked on resume, because a second leg would let a '0'
+  remainder complete the intent and report success for a leg that never landed.
+- Connect: the `send_token` intent has its OWN `token:transfer` scope (2.1 → 2.2). Reusing
+  `transfer:request` would silently widen every dApp that already holds it.
 - History records `assets: []` for a coinless movement on every type. Never `coinId: ''` —
   wallet-api keeps refusing that so there is only one wire spelling of "no coin".
 - The coinless verdict is DERIVED from wallet-api's §8.2 step-6 boundary. Moving that boundary
