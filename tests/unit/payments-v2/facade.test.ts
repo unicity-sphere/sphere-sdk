@@ -845,6 +845,34 @@ describe('PaymentsFacade — sendToken: moving a coinless token (#777)', () => {
     await first;
   });
 
+  it('a proven conflict is TERMINAL for a named source — it never re-plans onto another token', async () => {
+    // #625's bounded re-plan exists to pick a DIFFERENT source after a lost race.
+    // A named token has no alternative, so retrying re-picks the same one (or
+    // nothing) and spins. Two coinless tokens are seeded deliberately: if the
+    // re-plan ever ran, the SECOND is what it would reach for — and moving a token
+    // the caller never named would be worse than the failure.
+    const world = makeWorld();
+    const nft = await world.seedCoinless();
+    const other = await world.seedCoinless(new TextEncoder().encode('other'));
+    await world.engine.foreignSpend(nft); // someone else spent it first
+    await world.facade.start();
+
+    const err = await world.facade
+      .sendToken({ recipient: '@peer', tokenId: nft.blob.tokenId })
+      .then(() => null, (e: unknown) => e);
+
+    // The caller must learn the token was spent elsewhere. If the re-plan ran, it
+    // re-picks the now-demoted source and reports "not a spendable coinless
+    // holding" instead — which hides the real cause behind a confusing one.
+    expect((err as Error).message).toMatch(/already consumed|conflict/i);
+    expect((err as Error).message).not.toMatch(/not a spendable coinless holding/);
+
+    // Nothing was deposited, and the untouched token stayed untouched.
+    const mailbox = await world.api.listMailbox(peerCaller, 0);
+    expect(mailbox.entries.map((e) => e.tokenId)).not.toContain(other.blob.tokenId);
+    expect(world.facade.coinless().map((t) => t.tokenId)).toContain(other.blob.tokenId);
+  });
+
   it('the COIN path is untouched: a coin send still selects and still splits', async () => {
     const world = makeWorld();
     await world.seedCoinless();

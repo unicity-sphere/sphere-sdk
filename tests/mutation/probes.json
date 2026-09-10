@@ -1434,8 +1434,7 @@
     "find": "    if (unproven !== null) {\n      throw new SphereError(`Cannot spend yet: ${unproven}`, 'SEND_SYNC_PENDING');",
     "replace": "    if (false as boolean) {\n      throw new SphereError(`Cannot spend yet: ${String(unproven)}`, 'SEND_SYNC_PENDING');",
     "tests": [
-      "tests/unit/payments-v2/queue.test.ts",
-      "tests/unit/payments-v2/facade.test.ts"
+      "tests/unit/payments-v2/pinned-balance.test.ts"
     ]
   },
   {
@@ -1475,7 +1474,7 @@
     "find": "  if (token.value !== null) {",
     "replace": "  if (false as boolean) {",
     "tests": [
-      "tests/unit/payments-v2/facade.test.ts"
+      "tests/unit/payments-v2/send-token.test.ts"
     ]
   },
   {
