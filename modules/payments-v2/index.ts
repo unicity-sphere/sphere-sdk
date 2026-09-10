@@ -1,4 +1,4 @@
-export type { PaymentsV2, PaymentsV2Events, ConnectionStatus, SendRequest, MintResult, HistoryEntry, HistoryPage, PaymentRequestView, PaymentRequestStatus, PaymentsRequestsApi, PendingTransfer } from './api';
+export type { PaymentsV2, PaymentsV2Events, ConnectionStatus, SendRequest, SendTokenRequest, MintResult, HistoryEntry, HistoryPage, PaymentRequestView, PaymentRequestStatus, PaymentsRequestsApi, PendingTransfer } from './api';
 export type {
   StoragePort,
   DeliveryPort,
