@@ -95,6 +95,14 @@ export interface Token {
 export interface CoinlessToken {
   readonly tokenId: string;
   readonly tokenType?: string;
+  /**
+   * Class metadata resolved from the registry THIS wallet owns, when the type is
+   * recognised. Resolved here so callers never reach for a registry themselves:
+   * the process-global singleton is repointable by another Sphere's init, so a
+   * second wallet on another network would retarget it (#767).
+   */
+  readonly name?: string;
+  readonly iconUrl?: string;
   readonly stateHash: string;
   /** #737: reserved by a converging transfer — not spendable right now. */
   readonly transferring: boolean;

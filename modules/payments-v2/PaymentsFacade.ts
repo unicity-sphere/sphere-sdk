@@ -226,7 +226,7 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   coinless(): CoinlessToken[] {
-    return this.view.coinless();
+    return this.view.coinless(this.deps.registry);
   }
 
   tokenData(tokenId: string): Promise<Uint8Array | null> {

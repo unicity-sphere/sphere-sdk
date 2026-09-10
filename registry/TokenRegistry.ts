@@ -692,6 +692,12 @@ export class TokenRegistry {
    * to `getDefinition`: a type and a coin id live in different namespaces, so a
    * type that collided with a coin id would otherwise render as that coin.
    */
+  getTypeMeta(tokenType: string): { name: string; iconUrl: string | null } | null {
+    const def = this.getTypeDefinition(tokenType);
+    if (!def) return null;
+    return { name: def.name, iconUrl: def.icons?.[0]?.url ?? null };
+  }
+
   getTypeDefinition(tokenType: string): TokenDefinition | undefined {
     if (!tokenType) return undefined;
     return this.definitionsByType.get(tokenType.toLowerCase());

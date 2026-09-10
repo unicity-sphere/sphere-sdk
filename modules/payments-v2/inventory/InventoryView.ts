@@ -248,13 +248,16 @@ export class InventoryView {
    * Coinless holdings (#777) — DISJOINT from tokens(): an entry is coinless
    * exactly when it is not, so no mirror row can appear in both reads.
    */
-  coinless(): CoinlessToken[] {
+  coinless(registry: RegistryReader): CoinlessToken[] {
     const out: CoinlessToken[] = [];
     for (const [tokenId, entry] of this.mirror) {
       if (entry.status !== 'active' || !entry.coinless) continue;
+      const meta = entry.tokenType !== undefined ? registry.getTypeMeta?.(entry.tokenType) : null;
       out.push({
         tokenId,
         ...(entry.tokenType !== undefined ? { tokenType: entry.tokenType } : {}),
+        ...(meta ? { name: meta.name } : {}),
+        ...(meta?.iconUrl != null ? { iconUrl: meta.iconUrl } : {}),
         stateHash: entry.stateHash,
         transferring: this.held(tokenId),
         ...(this.suspected.has(stateKey(tokenId, entry.stateHash))

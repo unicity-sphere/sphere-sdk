@@ -1406,5 +1406,25 @@
       "tests/unit/payments-v2/history.test.ts",
       "tests/unit/payments-v2/receive.test.ts"
     ]
+  },
+  {
+    "name": "fake-swallows-corrupt-envelope",
+    "note": "#778 review: the fake is FakeWalletApi's \u00a78.2 step-6 stand-in. Catching a classification throw makes it index a corrupt envelope as coinless \u2014 every payments-v2 test then models the pre-fix silent zero.",
+    "file": "tests/unit/token-engine/FakeTokenEngine.ts",
+    "find": "  if (!state.genesisData || classify(state).envelope !== 'sphere') return null;",
+    "replace": "  try { if (!state.genesisData || classify(state).envelope !== 'sphere') return null; } catch { return null; }",
+    "tests": [
+      "tests/unit/token-engine/FakeTokenEngine.test.ts"
+    ]
+  },
+  {
+    "name": "coinless-row-drops-class-metadata",
+    "note": "#777 review: class metadata must resolve from the registry the WALLET owns. Dropping it forces callers to the process-global singleton, which another Sphere's init repoints (#767).",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "      const meta = entry.tokenType !== undefined ? registry.getTypeMeta?.(entry.tokenType) : null;",
+    "replace": "      const meta = null as { name: string; iconUrl: string | null } | null;",
+    "tests": [
+      "tests/unit/payments-v2/inventory.test.ts"
+    ]
   }
 ]

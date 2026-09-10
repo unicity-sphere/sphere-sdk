@@ -282,14 +282,18 @@ export class FakeTokenEngine implements ITokenEngine {
 export function decodeFakeTokenAssets(
   tokenBytes: Uint8Array
 ): { coinId: string; amount: bigint }[] | null {
+  let state: FakeState;
   try {
-    const state = decodeFakeState(tokenBytes);
-    if (!state.genesisData || classify(state).envelope !== 'sphere') return null;
-    const value = SpherePaymentData.fromCBOR(state.genesisData).toValue();
-    return value.assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));
+    state = decodeFakeState(tokenBytes);
   } catch {
-    return null;
+    return null; // not fake-blob bytes at all
   }
+  // A classification throw PROPAGATES: the real backend 422s a corrupt envelope
+  // (§8.2 step 6), so swallowing it here would let the fake index one as coinless
+  // and every payments-v2 test would keep modelling the pre-#778 silent zero.
+  if (!state.genesisData || classify(state).envelope !== 'sphere') return null;
+  const value = SpherePaymentData.fromCBOR(state.genesisData).toValue();
+  return value.assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));
 }
 
 /**
