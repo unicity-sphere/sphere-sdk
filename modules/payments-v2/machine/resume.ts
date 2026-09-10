@@ -168,6 +168,17 @@ async function runOne(ctx: RunCtx, job: ResumeJob, report: ResumeReport): Promis
       report.failed.push(job.transferId); // fail closed: intent stays open, untouched
       return;
     }
+    // The blob is the authority on what a source carries — the same rule the send
+    // path applies at materialize. A durable intent labelled 'token' whose named
+    // source actually holds coins would move them while history records assets: [].
+    if (job.payload.kind === 'token' && token.value !== null) {
+      logger.warn(
+        'PaymentsV2',
+        `resume: token intent ${job.transferId} names a source carrying coin value — refusing`
+      );
+      report.failed.push(job.transferId);
+      return;
+    }
     mine.set(op.sourceTokenId, token);
   }
   try {
@@ -256,7 +267,16 @@ function validatePayload(raw: unknown): IntentPayload {
   // An ABSENT kind is the only shape written before #777, and it was always a coin
   // spend — so defaulting is a migration, not a guess. Anything written since
   // carries the discriminant, because the type makes omitting it a compile error.
+  // ABSENT migrates to 'coin' (the only shape written before #777). An EXPLICIT
+  // unknown one does NOT: a payload from a newer client, or a corrupted one, would
+  // otherwise execute under coin semantics it was never written for.
   const kind = p.kind ?? 'coin';
+  if (kind !== 'coin' && kind !== 'token') {
+    throw new SphereError(
+      `unsupported intent kind '${String(kind)}' — not resumable by this client`,
+      'VALIDATION_ERROR'
+    );
+  }
   return kind === 'token'
     ? validateTokenPayload(p as Partial<TokenIntentPayload>)
     : validateCoinPayload(p as Partial<CoinIntentPayload>);
