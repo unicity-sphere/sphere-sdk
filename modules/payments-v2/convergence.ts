@@ -6,7 +6,7 @@
 import type { PendingTransfer } from './api';
 import type { DeliveryPort } from './ports';
 import type { DeliveryJournalEntry, IntentBackstopEntry, ShortfallEntry } from './stores';
-import type { IntentPayload } from './machine/types';
+import type { CoinIntentPayload, IntentPayload } from './machine/types';
 import { retryAfterMsOf, type MachineStores, type ReplayDeps } from './machine/journal';
 import { resumeAll } from './machine/resume';
 import type { MachineDeps } from './machine/TransferMachine';
@@ -281,11 +281,29 @@ async function openRow(
     transferId: entry.transferId,
     kind: 'open',
     recipient: typeof payload?.recipient === 'string' ? payload.recipient : '',
-    coinId: typeof payload?.coinId === 'string' ? payload.coinId : '',
-    amount: typeof payload?.amount === 'string' ? payload.amount : '',
+    ...subject(payload),
     legs: { certified, total: Math.max(total, certified) },
     deliveryPending: journal.length > 0,
     createdAt: entry.createdAt,
+  };
+}
+
+/**
+ * What the row is FOR: a coin and an amount, or the token being moved. A
+ * token-addressed intent names no coin, so it renders as its token rather than
+ * as `coinId: ''` / `amount: ''`.
+ */
+function subject(
+  payload: Partial<IntentPayload> | null
+): { coinId: string; amount: string; tokenId?: string } {
+  if (payload?.kind === 'token') {
+    const tokenId = payload.direct?.[0];
+    return { coinId: '', amount: '', ...(typeof tokenId === 'string' ? { tokenId } : {}) };
+  }
+  const coin = payload as Partial<CoinIntentPayload> | null;
+  return {
+    coinId: typeof coin?.coinId === 'string' ? coin.coinId : '',
+    amount: typeof coin?.amount === 'string' ? coin.amount : '',
   };
 }
 

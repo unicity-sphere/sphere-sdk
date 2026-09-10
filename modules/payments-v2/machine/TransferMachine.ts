@@ -17,6 +17,7 @@ import {
   TransferConflictError,
 } from '../../../token-engine/errors';
 import type { DeliverOptions, DeliveryPort, StoragePort } from '../ports';
+import { coinIdOf, splitOf } from './payload-view';
 import type { DeliveryJournalEntry, ScopedKV, ShortfallEntry } from '../stores';
 import type { IntentPayload, OpOutcome, OutcomeClass, PlannedOp } from './types';
 import {
@@ -353,13 +354,16 @@ export class TransferMachine {
       const finished = await engine.transfer({ token: source, recipientPubkey }, opts);
       return { recipientBlob: finished.blob.token };
     }
-    const split = ctx.payload.split!;
+    const split = splitOf(ctx.payload)!;
+    // A split is planned only for a coin spend, so the coin id is present by
+    // construction; a token-addressed intent never reaches this branch.
+    const splitCoinId = coinIdOf(ctx.payload)!;
     const { outputs } = await engine.split(
       {
         token: source,
         outputs: [
-          { recipientPubkey, coinId: ctx.payload.coinId, amount: BigInt(split.splitAmount) },
-          { recipientPubkey: this.deps.ownPubkey, coinId: ctx.payload.coinId, amount: BigInt(split.remainderAmount) },
+          { recipientPubkey, coinId: splitCoinId, amount: BigInt(split.splitAmount) },
+          { recipientPubkey: this.deps.ownPubkey, coinId: splitCoinId, amount: BigInt(split.remainderAmount) },
         ],
       },
       opts
@@ -524,7 +528,9 @@ export class TransferMachine {
     const entry: ShortfallEntry = {
       transferId: r.transferId,
       remainingAmount: undelivered.toString(),
-      coinId: r.payload.coinId,
+      // '' only on a token-addressed intent, which is one leg: it either lands or
+      // conflicts, so a shortfall row is unreachable there (settlePartial needs >1).
+      coinId: coinIdOf(r.payload) ?? '',
       recipient: r.payload.recipient,
       committedTokenIds: committed.map((o) => o.op.sourceTokenId),
       createdAt: this.deps.now(),
@@ -561,7 +567,10 @@ export class TransferMachine {
     committed: OpOutcome[]
   ): Promise<void> {
     try {
-      const committedAmount = await this.settledAmount(engine, payload.coinId, committed);
+      // A token-addressed spend has no coin to sum: what settled is the token itself.
+      const coinId = coinIdOf(payload);
+      const committedAmount =
+        coinId === undefined ? '0' : await this.settledAmount(engine, coinId, committed);
       await this.deps.recordHistory?.({ transferId, payload, phase, committedAmount });
     } catch {
       /* a history failure never fails the money path */
@@ -619,6 +628,9 @@ function conflictAmount(
   op: PlannedOp,
   source: SphereToken | undefined
 ): bigint {
-  if (op.kind === 'split') return BigInt(payload.split!.splitAmount);
-  return source !== undefined ? engine.balanceOf(source, payload.coinId) : 0n;
+  const split = splitOf(payload);
+  if (op.kind === 'split') return BigInt(split!.splitAmount);
+  const coinId = coinIdOf(payload);
+  if (coinId === undefined) return 0n; // token-addressed: the unit is the token
+  return source !== undefined ? engine.balanceOf(source, coinId) : 0n;
 }

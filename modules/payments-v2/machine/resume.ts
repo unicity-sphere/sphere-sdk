@@ -6,7 +6,7 @@ import { SphereError } from '../../../core/errors';
 import { logger } from '../../../core/logger';
 import type { SphereToken } from '../../../token-engine/types';
 import type { DeliveryJournalEntry, IntentBackstopEntry } from '../stores';
-import type { IntentPayload } from './types';
+import type { CoinIntentPayload, IntentPayload, TokenIntentPayload } from './types';
 import { ATTENTION_CHECKPOINT_STUCK, createMachineStores, type MachineStores } from './journal';
 import { TransferMachine, buildOps, classifyError, type MachineDeps } from './TransferMachine';
 
@@ -209,6 +209,39 @@ async function classifyResumeFailure(
   report.failed.push(transferId);
 }
 
+/**
+ * A token-addressed intent is EXACTLY one named source and never a split. Both are
+ * enforced here rather than trusted: a second leg would make `settlePartial`
+ * reachable with every conflict amount 0n, so a remainder of '0' would complete the
+ * intent and report success for a leg that never landed.
+ */
+function validateCoinPayload(c: Partial<CoinIntentPayload>): CoinIntentPayload {
+  if (typeof c.coinId !== 'string' || typeof c.amount !== 'string') {
+    throw new SphereError('intent payload is missing coinId/amount', 'VALIDATION_ERROR');
+  }
+  const s = c.split;
+  if (
+    s !== undefined &&
+    (typeof s.tokenId !== 'string' || typeof s.splitAmount !== 'string' || typeof s.remainderAmount !== 'string')
+  ) {
+    throw new SphereError('intent payload split spec is malformed', 'VALIDATION_ERROR');
+  }
+  return { ...(c as CoinIntentPayload), kind: 'coin' };
+}
+
+function validateTokenPayload(p: Partial<TokenIntentPayload>): TokenIntentPayload {
+  if (p.direct?.length !== 1 || typeof p.direct[0] !== 'string' || p.direct[0] === '') {
+    throw new SphereError(
+      'token intent payload must name exactly one source token',
+      'VALIDATION_ERROR'
+    );
+  }
+  if (p.split !== undefined) {
+    throw new SphereError('token intent payload cannot carry a split', 'VALIDATION_ERROR');
+  }
+  return { ...(p as TokenIntentPayload), kind: 'token', direct: [p.direct[0]] };
+}
+
 function validatePayload(raw: unknown): IntentPayload {
   const p = raw !== null && typeof raw === 'object' ? (raw as Partial<IntentPayload>) : null;
   if (p === null || p.v !== 2 || !Array.isArray(p.direct) || p.direct.some((t) => typeof t !== 'string')) {
@@ -217,15 +250,14 @@ function validatePayload(raw: unknown): IntentPayload {
       'VALIDATION_ERROR'
     );
   }
-  if (typeof p.recipient !== 'string' || typeof p.coinId !== 'string' || typeof p.amount !== 'string') {
-    throw new SphereError('intent payload is missing recipient/coinId/amount', 'VALIDATION_ERROR');
+  if (typeof p.recipient !== 'string') {
+    throw new SphereError('intent payload is missing recipient', 'VALIDATION_ERROR');
   }
-  const s = p.split;
-  if (
-    s !== undefined &&
-    (typeof s.tokenId !== 'string' || typeof s.splitAmount !== 'string' || typeof s.remainderAmount !== 'string')
-  ) {
-    throw new SphereError('intent payload split spec is malformed', 'VALIDATION_ERROR');
-  }
-  return p as IntentPayload;
+  // An ABSENT kind is the only shape written before #777, and it was always a coin
+  // spend — so defaulting is a migration, not a guess. Anything written since
+  // carries the discriminant, because the type makes omitting it a compile error.
+  const kind = p.kind ?? 'coin';
+  return kind === 'token'
+    ? validateTokenPayload(p as Partial<TokenIntentPayload>)
+    : validateCoinPayload(p as Partial<CoinIntentPayload>);
 }

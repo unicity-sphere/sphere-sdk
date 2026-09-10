@@ -123,7 +123,7 @@ describe('TransferMachine resume path (§5.5 P6 — same machine, rehydrated)', 
     const shortfall = await createMachineStores(w.kv).shortfalls.getByKey('partial-1');
     expect(shortfall).toMatchObject({
       remainingAmount: '400',
-      coinId: plan.payload.coinId,
+      coinId: plan.payload.kind === 'coin' ? plan.payload.coinId : '',
       committedTokenIds: [tokenA.blob.tokenId],
     });
     expect(w.api.inspectIntent(w.caller, 'partial-1')?.status).toBe('completed');

@@ -282,9 +282,11 @@ function buildMachineDeps(
     recordHistory: async ({ transferId, payload, committedAmount }) => {
       await historyStore.recordSent({
         transferId,
-        // §5.9: the SETTLED amount (machine-computed from the certified
-        // recipient blobs), never payload.amount — the plan.
-        assets: [{ coinId: payload.coinId, amount: committedAmount }],
+        // §5.9: the SETTLED amount, never payload.amount — the plan. A token
+        // spend moved no coin: `assets: []` + tokenId (wallet-api#151 / §10).
+        ...(payload.kind === 'token'
+          ? { assets: [], tokenId: payload.direct[0] }
+          : { assets: [{ coinId: payload.coinId, amount: committedAmount }] }),
         recipientPubkey: payload.recipient,
         ...(payload.memo !== undefined ? { memo: payload.memo } : {}),
       });

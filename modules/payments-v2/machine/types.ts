@@ -1,15 +1,28 @@
-export interface IntentPayload {
+interface IntentPayloadBase {
   v: 2;
   recipient: string;
-  coinId: string;
-  amount: string;
   memo?: string;
   // Stored order is normative (E.3).
   direct: string[];
-  split?: { tokenId: string; splitAmount: string; remainderAmount: string };
   // Dual-field = old-module v:2 wire compat (always equal); collapse at the flip.
   spentStates?: Record<string, { local: string; protocol: string }>;
 }
+
+export interface CoinIntentPayload extends IntentPayloadBase {
+  kind: 'coin';
+  coinId: string;
+  amount: string;
+  split?: { tokenId: string; splitAmount: string; remainderAmount: string };
+}
+
+export interface TokenIntentPayload extends IntentPayloadBase {
+  kind: 'token';
+  direct: [string];
+  split?: undefined;
+}
+
+/** `kind` is REQUIRED on both arms: a missed writer must be a compile error. */
+export type IntentPayload = CoinIntentPayload | TokenIntentPayload;
 
 export interface PlannedOp {
   kind: 'direct' | 'split';

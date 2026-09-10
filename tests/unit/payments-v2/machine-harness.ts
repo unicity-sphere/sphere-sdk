@@ -425,6 +425,7 @@ async function buildPlan(w: WorldState, opts: PlanOpts): Promise<MachinePlan> {
   }
   const payload: IntentPayload = {
     v: 2,
+    kind: 'coin',
     recipient: w.recipientHex,
     coinId: COIN,
     amount: opts.amount,

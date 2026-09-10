@@ -84,6 +84,8 @@ export interface PendingTransfer {
   recipient: string;
   coinId: string;
   amount: string;
+  /** Set instead of coinId/amount when the intent is a token-addressed spend. */
+  tokenId?: string;
   legs: { certified: number; total: number };
   deliveryPending: boolean;
   createdAt: number;

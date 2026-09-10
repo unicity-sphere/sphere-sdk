@@ -362,9 +362,11 @@ export class InventoryView {
       stateHash: item.stateHash,
       seq: item.seq,
       status: item.status,
-      // Left INHERITING deliberately: a tombstone omits assets, and recoverRemoved
-      // must still know the amount it is restoring (inventory.test.ts).
-      assets: item.assets ?? prev?.assets ?? [],
+      // ONLY a tombstone inherits: it omits assets for an unrelated reason and
+      // recoverRemoved must know the amount it restores. An ACTIVE row that omits
+      // them is stating coinlessness, and inheriting there would keep stale assets
+      // in tokens() while `coinless` is true — the row in BOTH reads (§16).
+      assets: item.assets ?? (item.status === 'removed' ? (prev?.assets ?? []) : []),
       coinless: isCoinless(item, prev),
       ...(tokenType !== undefined ? { tokenType } : {}),
       createdAt: prev?.createdAt ?? now,
