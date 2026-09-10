@@ -208,13 +208,27 @@ export class InventoryView {
   pool(coinId: string): PoolEntry[] {
     const out: PoolEntry[] = [];
     for (const [tokenId, entry] of this.mirror) {
-      if (entry.status !== 'active') continue;
-      if (this.inFlight.has(tokenId) && !this.pinned(tokenId)) continue;
-      if (this.suspected.has(stateKey(tokenId, entry.stateHash))) continue;
+      if (!this.isSpendable(tokenId, entry)) continue;
       const asset = entry.assets.find((a) => a.coinId === coinId);
       if (asset) out.push({ tokenId, amount: BigInt(asset.amount) });
     }
     return out;
+  }
+
+  /**
+   * The eligibility gates every spend shares, coin or token — ONE definition, so a
+   * single probe covers both verbs and neither can drift from the other.
+   */
+  private isSpendable(tokenId: string, entry: MirrorEntry): boolean {
+    if (entry.status !== 'active') return false;
+    if (this.inFlight.has(tokenId) && !this.pinned(tokenId)) return false;
+    return !this.suspected.has(stateKey(tokenId, entry.stateHash));
+  }
+
+  /** #777: is this NAMED token a spendable COINLESS holding? Never a coin source. */
+  spendableCoinless(tokenId: string): boolean {
+    const entry = this.mirror.get(tokenId);
+    return entry !== undefined && entry.coinless && this.isSpendable(tokenId, entry);
   }
 
   /**

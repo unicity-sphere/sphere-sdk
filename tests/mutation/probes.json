@@ -1426,5 +1426,66 @@
     "tests": [
       "tests/unit/payments-v2/inventory.test.ts"
     ]
+  },
+  {
+    "name": "plantoken-skips-738-gate",
+    "note": "#777/#738: while the held-set is unproven nothing is spendable. Skipping the gate for a NAMED source lets a restart double-spend a token an open intent already holds.",
+    "file": "modules/payments-v2/select/queue.ts",
+    "find": "    if (unproven !== null) {\n      throw new SphereError(`Cannot spend yet: ${unproven}`, 'SEND_SYNC_PENDING');",
+    "replace": "    if (false as boolean) {\n      throw new SphereError(`Cannot spend yet: ${String(unproven)}`, 'SEND_SYNC_PENDING');",
+    "tests": [
+      "tests/unit/payments-v2/queue.test.ts",
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "plantoken-accepts-any-token",
+    "note": "#777: sendToken must refuse a source that is not a SPENDABLE COINLESS holding \u2014 otherwise a valued token moves with its coins unaccounted for.",
+    "file": "modules/payments-v2/select/queue.ts",
+    "find": "    if (this.deps.spendableCoinless?.(tokenId) !== true) {",
+    "replace": "    if (false as boolean) {",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "plantoken-ignores-existing-reservation",
+    "note": "#777: a second concurrent sendToken of the same token must be refused. Ignoring the ledger holder double-spends the one source.",
+    "file": "modules/payments-v2/select/queue.ts",
+    "find": "    const holder = this.deps.ledger.holderOf(tokenId);\n    if (holder !== undefined) {",
+    "replace": "    const holder = this.deps.ledger.holderOf(tokenId);\n    if (false as boolean) {",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "spendable-coinless-ignores-kind",
+    "note": "#777: spendableCoinless gates on entry.coinless. Dropping it makes every coin token a sendToken candidate.",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "    return entry !== undefined && entry.coinless && this.isSpendable(tokenId, entry);",
+    "replace": "    return entry !== undefined && this.isSpendable(tokenId, entry);",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "sendtoken-blob-value-guard-removed",
+    "note": "#777: the BLOB is the authority on what a source carries. Without the re-check a mirror that wrongly says coinless would move a valued token with its coins unaccounted for.",
+    "file": "modules/payments-v2/send-token.ts",
+    "find": "  if (token.value !== null) {",
+    "replace": "  if (false as boolean) {",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "sendtoken-conflict-replans",
+    "note": "#625's re-plan searches for a DIFFERENT source; a NAMED token has none, so a proven conflict must be terminal rather than spinning the bounded retry.",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "        if (job.kind === 'token' || attempt >= MAX_RESELECT) throw partialize(disposition.error, run);",
+    "replace": "        if (attempt >= MAX_RESELECT) throw partialize(disposition.error, run);",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
   }
 ]

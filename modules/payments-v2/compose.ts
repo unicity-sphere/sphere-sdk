@@ -173,6 +173,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
   const queue = new SpendQueue({
     ledger,
     getPool: (coinId) => view.pool(coinId),
+    spendableCoinless: (tokenId) => view.spendableCoinless(tokenId),
     ...(deps.workBudget !== undefined ? { workBudget: deps.workBudget } : {}),
   });
   const historyStore = new History({
