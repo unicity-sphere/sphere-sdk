@@ -11,6 +11,7 @@ import {
   isSphereConnectMessage,
   createRequestId,
 } from '../../../connect/protocol';
+import { hasIntentPermission, PERMISSION_SCOPES } from '../../../connect/permissions';
 
 describe('Protocol', () => {
   describe('isSphereConnectMessage', () => {
@@ -90,8 +91,8 @@ describe('Protocol', () => {
 });
 
 describe('protocol v2 gate surface', () => {
-  it('Connect version is bumped to 2.1', () => {
-    expect(SPHERE_CONNECT_VERSION).toBe('2.1');
+  it('Connect version is bumped to 2.2', () => {
+    expect(SPHERE_CONNECT_VERSION).toBe('2.2');
   });
   it('has the new error codes', () => {
     expect(ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION).toBe(4007);
@@ -140,5 +141,22 @@ describe('auto-pushed wallet events', () => {
     expect(isAutoPushedEvent('transfer:incoming')).toBe(false);
     expect(isAutoPushedEvent('message:dm')).toBe(false);
     expect(isAutoPushedEvent('')).toBe(false);
+  });
+});
+
+describe('send_token is gated by its OWN scope (#777)', () => {
+  it('transfer:request does NOT authorise moving a token', () => {
+    // The point of a separate scope: a wallet can grant coin transfers without
+    // granting NFT moves, and vice versa. Mapping send_token onto transfer:request
+    // would silently widen every dApp that already holds it.
+    expect(hasIntentPermission(new Set([PERMISSION_SCOPES.TRANSFER_REQUEST]), INTENT_ACTIONS.SEND_TOKEN)).toBe(false);
+  });
+
+  it('token:transfer does NOT authorise a coin send', () => {
+    expect(hasIntentPermission(new Set([PERMISSION_SCOPES.TOKEN_TRANSFER]), INTENT_ACTIONS.SEND)).toBe(false);
+  });
+
+  it('token:transfer authorises send_token', () => {
+    expect(hasIntentPermission(new Set([PERMISSION_SCOPES.TOKEN_TRANSFER]), INTENT_ACTIONS.SEND_TOKEN)).toBe(true);
   });
 });

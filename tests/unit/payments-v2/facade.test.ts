@@ -836,7 +836,7 @@ describe('PaymentsFacade — sendToken: moving a coinless token (#777)', () => {
     const gate = world.gate('deliver');
 
     const first = world.facade.sendToken({ recipient: '@peer', tokenId: nft.blob.tokenId });
-    await gate.reached;
+    await vi.waitFor(() => expect(gate.entered).toBe(true));
     await expect(
       world.facade.sendToken({ recipient: '@peer', tokenId: nft.blob.tokenId })
     ).rejects.toThrow(/already reserved/);

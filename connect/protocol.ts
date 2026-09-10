@@ -10,7 +10,7 @@ import { majorOf } from './semver';
 // =============================================================================
 
 export const SPHERE_CONNECT_NAMESPACE = 'sphere-connect';
-export const SPHERE_CONNECT_VERSION = '2.1';   // Connect protocol version (semver MAJOR.MINOR)
+export const SPHERE_CONNECT_VERSION = '2.2';   // Connect protocol version (semver MAJOR.MINOR)
 
 // Default npm-SDK floor a host enforces at the handshake (0.14.1 = the P11 flip:
 // the v1 payments era is gone; pre-flip ConnectClients expect a wallet that no
@@ -60,6 +60,10 @@ export const INTENT_ACTIONS = {
   RECEIVE: 'receive',
   SIGN_MESSAGE: 'sign_message',
   MINT: 'mint',
+  // #777: params { to, tokenId, memo? }. Distinct from SEND because the addressing
+  // model differs — a named token, no amount — and so a wallet can grant moving an
+  // NFT without granting coin transfers.
+  SEND_TOKEN: 'send_token',
 } as const;
 
 export type IntentAction = (typeof INTENT_ACTIONS)[keyof typeof INTENT_ACTIONS];
