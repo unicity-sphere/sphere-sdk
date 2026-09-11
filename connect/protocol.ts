@@ -60,10 +60,9 @@ export const INTENT_ACTIONS = {
   RECEIVE: 'receive',
   SIGN_MESSAGE: 'sign_message',
   MINT: 'mint',
-  // #777: params { to, tokenId, memo? }. Distinct from SEND because the addressing
-  // model differs — a named token, no amount — and so a wallet can grant moving an
-  // NFT without granting coin transfers.
-  SEND_TOKEN: 'send_token',
+  // #777: params { to, tokenId, memo? }. Named NFT rather than 'send_token':
+  // coins are tokens too, so 'token' does not say which kind moves.
+  SEND_NFT: 'send_nft',
 } as const;
 
 export type IntentAction = (typeof INTENT_ACTIONS)[keyof typeof INTENT_ACTIONS];

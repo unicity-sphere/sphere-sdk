@@ -144,19 +144,19 @@ describe('auto-pushed wallet events', () => {
   });
 });
 
-describe('send_token is gated by its OWN scope (#777)', () => {
-  it('transfer:request does NOT authorise moving a token', () => {
+describe('send_nft is gated by its OWN scope (#777)', () => {
+  it('transfer:request does NOT authorise moving an NFT', () => {
     // The point of a separate scope: a wallet can grant coin transfers without
-    // granting NFT moves, and vice versa. Mapping send_token onto transfer:request
+    // granting NFT moves, and vice versa. Mapping send_nft onto transfer:request
     // would silently widen every dApp that already holds it.
-    expect(hasIntentPermission(new Set([PERMISSION_SCOPES.TRANSFER_REQUEST]), INTENT_ACTIONS.SEND_TOKEN)).toBe(false);
+    expect(hasIntentPermission(new Set([PERMISSION_SCOPES.TRANSFER_REQUEST]), INTENT_ACTIONS.SEND_NFT)).toBe(false);
   });
 
-  it('token:transfer does NOT authorise a coin send', () => {
-    expect(hasIntentPermission(new Set([PERMISSION_SCOPES.TOKEN_TRANSFER]), INTENT_ACTIONS.SEND)).toBe(false);
+  it('nft:transfer does NOT authorise a coin send', () => {
+    expect(hasIntentPermission(new Set([PERMISSION_SCOPES.NFT_TRANSFER]), INTENT_ACTIONS.SEND)).toBe(false);
   });
 
-  it('token:transfer authorises send_token', () => {
-    expect(hasIntentPermission(new Set([PERMISSION_SCOPES.TOKEN_TRANSFER]), INTENT_ACTIONS.SEND_TOKEN)).toBe(true);
+  it('nft:transfer authorises send_nft', () => {
+    expect(hasIntentPermission(new Set([PERMISSION_SCOPES.NFT_TRANSFER]), INTENT_ACTIONS.SEND_NFT)).toBe(true);
   });
 });

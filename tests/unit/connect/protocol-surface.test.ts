@@ -30,17 +30,17 @@ const BUMP_REMINDER =
 // answered MODULE_NOT_AVAILABLE), and the consumer gate found zero dApp users. Version
 // stays 2.1 by owner decision; a removed method now falls through to METHOD_NOT_FOUND.
 const EXPECTED = {
-  // 2.2: #777 adds the send_token intent + token:transfer scope. Additive, and the
+  // 2.2: #777 adds the send_nft intent + nft:transfer scope. Additive, and the
   // handshake gate is MAJOR-only, so no existing dApp is cut off.
   version: '2.2',
   intents: [
-    'send', 'dm', 'payment_request', 'receive', 'sign_message', 'mint', 'send_token',
+    'send', 'dm', 'payment_request', 'receive', 'sign_message', 'mint', 'send_nft',
   ],
   scopes: [
     'identity:read', 'balance:read', 'tokens:read', 'history:read',
     'events:subscribe', 'resolve:peer', 'transfer:request', 'dm:request',
     'dm:read', 'dm:manage', 'payment:request', 'sign:request', 'mint:request',
-    'token:transfer',
+    'nft:transfer',
   ],
   methods: [
     'sphere_getIdentity', 'sphere_getBalance', 'sphere_getAssets',

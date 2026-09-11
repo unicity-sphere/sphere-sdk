@@ -55,9 +55,11 @@ envelope; an absent kind reads as `'coin'` — a migration, not a guess, since i
 any client wrote. A token intent names exactly one source and can never carry a split, re-checked
 on resume rather than trusted across the decrypt boundary.
 
-Connect 2.1 → 2.2: a `send_token` intent with its own `token:transfer` scope. Additive, and the
+Connect 2.1 → 2.2: a `send_nft` intent with its own `nft:transfer` scope. Additive, and the
 handshake gate is MAJOR-only, so no existing dApp is cut off. The scope is deliberately separate —
-mapping `send_token` onto `transfer:request` would silently widen every dApp already holding it.
+mapping it onto `transfer:request` would silently widen every dApp already holding that. Both are
+named *nft* rather than *token* because coins are tokens too: `token:transfer` next to
+`transfer:request` says nothing about which one moves what.
 
 ### Fixed — a corrupt value envelope no longer reads as "no value" (#778)
 

@@ -767,8 +767,10 @@ authoritative for build success.
   reads as `'coin'`, the only shape written before #777. A token intent names EXACTLY one source
   and can never carry a split — re-checked on resume, because a second leg would let a '0'
   remainder complete the intent and report success for a leg that never landed.
-- Connect: the `send_token` intent has its OWN `token:transfer` scope (2.1 → 2.2). Reusing
-  `transfer:request` would silently widen every dApp that already holds it.
+- Connect: the `send_nft` intent has its OWN `nft:transfer` scope (2.1 → 2.2). Reusing
+  `transfer:request` would silently widen every dApp that already holds it. Named *nft*, not
+  *token*: coins are tokens too, so `token:transfer` beside `transfer:request` distinguishes
+  nothing (and `TOKEN_TRANSFER` already named the removed Nostr kind 31113).
 - History records `assets: []` for a coinless movement on every type. Never `coinId: ''` —
   wallet-api keeps refusing that so there is only one wire spelling of "no coin".
 - The coinless verdict is DERIVED from wallet-api's §8.2 step-6 boundary. Moving that boundary
