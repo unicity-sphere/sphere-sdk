@@ -22,9 +22,12 @@ import type { SphereToken } from '../../token-engine/types';
 
 import { RUN_STAGING } from './support/staging';
 import {
+  activeRows,
+  drainUntil,
   logStep,
   makeVerticalWallet,
   shutdownVerticalWallets,
+  waitFor,
   type VWallet,
 } from './support/vertical';
 
@@ -166,5 +169,98 @@ describe.skipIf(!RUN_STAGING)('coinless tokens — live staging', () => {
       expect(assets[0]?.totalAmount).toBe('500');
     },
     900_000
+  );
+});
+
+describe.skipIf(!RUN_STAGING)('coinless tokens — transfer, live staging', () => {
+  afterAll(async () => {
+    await shutdownVerticalWallets();
+  });
+
+  async function mintAndIndex(w: VWallet, data: Uint8Array): Promise<SphereToken> {
+    const token = await w.engine.mintDataToken({
+      recipientPubkey: hexToBytes(w.identity.chainPubkey),
+      data,
+      tokenType: hexToBytes(TESTNET2_NFT_TYPE),
+    });
+    const bytes = token.blob.token;
+    const shaHex = bytesToHex(sha256(bytes));
+    const storage = new WalletApiStoragePort(w.api);
+    const key = (await storage.uploadBlobs([{ sha256: shaHex, bytes }])).get(shaHex);
+    if (key === undefined) throw new Error('upload returned no key');
+    await storage.applyDelta({
+      transferId: randomUUID(),
+      spent: [],
+      added: [{ tokenId: token.blob.tokenId, key }],
+    });
+    logStep(`indexed coinless ${token.blob.tokenId.slice(0, 12)}…`);
+    return token;
+  }
+
+  it(
+    'moves a REAL coinless token A→B: certified on testnet2, verified by B before it enters inventory',
+    async () => {
+      let a = await makeVerticalWallet('nft-a');
+      const b = await makeVerticalWallet('nft-b');
+      const nft = await mintAndIndex(a, NFT_PAYLOAD);
+
+      // Reopen so A's mirror sees the freshly indexed row.
+      await a.facade.stop().catch(() => undefined);
+      a = await makeVerticalWallet('nft-a', { identity: a.identity, kv: a.kv });
+      expect(a.facade.coinless().map((t) => t.tokenId)).toContain(nft.blob.tokenId);
+
+      const result = await a.facade.sendToken({
+        recipient: b.identity.chainPubkey,
+        tokenId: nft.blob.tokenId,
+      });
+      expect(['delivered', 'confirmed']).toContain(result.status);
+      expect(result.tokenTransfers).toEqual([
+        { sourceTokenId: nft.blob.tokenId, method: 'direct' },
+      ]);
+
+      // B accepting implies the FULL real trust-base verify + isOwnedBy passed —
+      // Receive screens before it stores or claims.
+      await drainUntil(
+        b,
+        () => b.facade.coinless().some((t) => t.tokenId === nft.blob.tokenId),
+        120_000,
+        'B receives the coinless token'
+      );
+      expect((await activeRows(b)).map((r) => r.tokenId)).toContain(nft.blob.tokenId);
+
+      // The payload survived the whole round trip, byte for byte, through a
+      // DIFFERENT wallet's blob fetch.
+      expect(await b.facade.tokenData(nft.blob.tokenId)).toEqual(NFT_PAYLOAD);
+
+      // …and it left A.
+      await waitFor(
+        a,
+        () => !a.facade.coinless().some((t) => t.tokenId === nft.blob.tokenId),
+        90_000,
+        'A no longer holds the token'
+      );
+      expect(await a.facade.assets()).toEqual([]);
+    },
+    900_000
+  );
+
+  it(
+    'refuses to move a VALUED token through sendToken, against the real backend',
+    async () => {
+      const w = await makeVerticalWallet('nft-refuse');
+      const mint = await w.facade.mint(HARNESS_COIN, 250n);
+      if (!mint.success || mint.tokenId === undefined) {
+        throw new Error(`valued mint failed: ${mint.error ?? 'unknown'}`);
+      }
+
+      await expect(
+        w.facade.sendToken({ recipient: w.identity.chainPubkey, tokenId: mint.tokenId })
+      ).rejects.toThrow(/not a spendable coinless holding|carries coin value/);
+
+      // Refused BEFORE any chain op: the coin is still spendable.
+      const assets = await w.facade.assets();
+      expect(assets[0]?.totalAmount).toBe('250');
+    },
+    600_000
   );
 });
