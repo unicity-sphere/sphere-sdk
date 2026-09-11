@@ -6,7 +6,6 @@ import { SphereError } from '../../../core/errors';
 import { logger } from '../../../core/logger';
 import type { SphereToken } from '../../../token-engine/types';
 import type { DeliveryJournalEntry, IntentBackstopEntry } from '../stores';
-import { isCoinlessEnvelope } from '../../../token-engine/value-envelope';
 import type { CoinIntentPayload, IntentPayload, WholeIntentPayload } from './types';
 import { ATTENTION_CHECKPOINT_STUCK, createMachineStores, type MachineStores } from './journal';
 import { TransferMachine, buildOps, classifyError, type MachineDeps } from './TransferMachine';
@@ -265,12 +264,9 @@ function validatePayload(raw: unknown): IntentPayload {
   if (typeof p.recipient !== 'string') {
     throw new SphereError('intent payload is missing recipient', 'VALIDATION_ERROR');
   }
-  // ABSENT migrates to 'coin' (the only shape written before #777) — a migration,
-  // not a guess. An EXPLICIT unknown one does NOT: a newer client's payload would
-  // otherwise execute under coin semantics it was never written for.
-  // 'coinless' is the 0.17.0 spelling of a whole-token spend, kept readable
-  // forever: it is durable server state, so a client that wrote one must still be
-  // able to resume it.
+  // ABSENT migrates to 'coin' (the only pre-#777 shape); an EXPLICIT unknown one
+  // does NOT. 'coinless' is 0.17.0's spelling of 'whole' — durable server state, so
+  // a client that wrote one must still resume it.
   const kind = p.kind ?? 'coin';
   if (kind !== 'coin' && kind !== 'whole' && kind !== 'coinless') {
     throw new SphereError(
