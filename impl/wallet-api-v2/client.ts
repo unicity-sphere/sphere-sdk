@@ -25,7 +25,18 @@ export interface InventoryItemWire {
   status: 'active' | 'removed';
   seq: number;
   stateHash: string;
+  /**
+   * Omitted for a tombstone AND for an ACTIVE COINLESS token (wallet-api#140),
+   * so absence is never "removed" or "not loaded" — discriminate on `status`.
+   */
   assets?: AssetWire[];
+  /**
+   * Genesis `TokenType`, lowercase hex (1-64 bytes ⇒ 2-128 chars). Names the
+   * token's CLASS, not the instance (wallet-api#147). Absent on rows written
+   * before wallet-api migration 0015. An unrecognised type is legitimate: never
+   * reject or hide a token for it.
+   */
+  tokenType?: string;
 }
 
 export interface InventoryPageWire {

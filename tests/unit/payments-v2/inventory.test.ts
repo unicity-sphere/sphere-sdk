@@ -18,6 +18,7 @@ interface ItemOpts {
   status?: 'active' | 'removed';
   amount?: string;
   noAssets?: boolean;
+  tokenType?: string;
 }
 
 function item(tokenId: string, opts: ItemOpts): InventoryItem {
@@ -27,6 +28,7 @@ function item(tokenId: string, opts: ItemOpts): InventoryItem {
     stateHash: opts.state ?? 'S1',
     status: opts.status ?? 'active',
     ...(opts.noAssets ? {} : { assets: [{ coinId: COIN, amount: opts.amount ?? '100' }] }),
+    ...(opts.tokenType !== undefined ? { tokenType: opts.tokenType } : {}),
   };
 }
 
@@ -65,6 +67,11 @@ const registry: RegistryReader = {
   getName: (coinId) => (coinId === COIN ? 'Unicity' : 'Unknown'),
   getDecimals: () => 6,
   getIconUrl: (coinId) => (coinId === COIN ? 'https://icons/uct.png' : null),
+  // The TOKEN-TYPE namespace, distinct from coin ids (wallet-api#147).
+  getTypeMeta: (tokenType) =>
+    tokenType === '971a26eef0e3aeb2'
+      ? { name: 'Unicity NFT', iconUrl: 'https://icons/nft.png' }
+      : null,
 };
 
 function makeView(
@@ -478,5 +485,183 @@ describe('releaseMany — one event for one logical change (#755)', () => {
     view.releaseMany(['A', 'never-held']);
 
     expect(events.filter((e) => e === 'inventory:updated').length).toBe(before);
+  });
+});
+
+describe('InventoryView — coinless tokens (#777)', () => {
+  const NFT_TYPE = '971a26eef0e3aeb2';
+
+  it('surfaces an active coinless row in coinless(), with its token type', async () => {
+    const { view } = makeView([
+      page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE })], 5),
+      page([], 5),
+    ]);
+    await view.fullPull();
+    expect(view.coinless(registry)).toEqual([
+      {
+        tokenId: 'N',
+        tokenType: NFT_TYPE,
+        name: 'Unicity NFT',
+        iconUrl: 'https://icons/nft.png',
+        stateHash: 'S1',
+        transferring: false,
+        createdAt: expect.any(Number),
+        updatedAt: expect.any(Number),
+      },
+    ]);
+  });
+
+  it('keeps the two reads DISJOINT: a coinless row is never a Token, a coin row never coinless', async () => {
+    const { view } = makeView([
+      page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE }), item('A', { seq: 1 })], 5),
+      page([], 5),
+    ]);
+    await view.fullPull();
+    expect(view.tokens(registry).map((t) => t.id)).toEqual(['A']);
+    expect(view.coinless(registry).map((t) => t.tokenId)).toEqual(['N']);
+  });
+
+  it('contributes nothing to assets() or pool() — an NFT is not a balance and not a spend source', async () => {
+    const { view } = makeView([
+      page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE })], 5),
+      page([], 5),
+    ]);
+    await view.fullPull();
+    expect(await view.assets(registry)).toEqual([]);
+    expect(view.pool(COIN)).toEqual([]);
+  });
+
+  it('renders a coinless token whose type the server never recorded (pre-0015 rows)', async () => {
+    const { view } = makeView([page([item('N', { seq: 1, noAssets: true })], 5), page([], 5)]);
+    await view.fullPull();
+    const [row] = view.coinless(registry);
+    expect(row?.tokenId).toBe('N');
+    expect(row?.tokenType).toBeUndefined();
+  });
+
+  it('a TOMBSTONE is not coinless: it omits assets for an unrelated reason', async () => {
+    const { view } = makeView([
+      page([item('T', { seq: 1, status: 'removed', noAssets: true })], 5),
+      page([], 5),
+    ]);
+    await view.fullPull();
+    expect(view.coinless(registry)).toEqual([]);
+  });
+
+  it('carries a tokenType forward when a later delta omits it', async () => {
+    const { view, queue } = makeView([
+      page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE })], 5),
+      page([], 5),
+    ]);
+    await view.fullPull();
+    queue.push(page([item('N', { seq: 2, state: 'S2', noAssets: true })], 6));
+    await view.delta();
+    expect(view.coinless(registry)[0]?.tokenType).toBe(NFT_TYPE);
+  });
+
+  it('adopts a tokenType that appears LATE at an otherwise unchanged row', async () => {
+    const { view, queue } = makeView([page([item('N', { seq: 1, noAssets: true })], 5), page([], 5)]);
+    await view.fullPull();
+    expect(view.coinless(registry)[0]?.tokenType).toBeUndefined();
+
+    // Same seq, status and stateHash — only the type is newly supplied. The
+    // unchanged-row early return must not discard it.
+    queue.push(page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE })], 6));
+    await view.delta();
+    expect(view.coinless(registry)[0]?.tokenType).toBe(NFT_TYPE);
+  });
+
+  it('a delta that merely OMITS a known tokenType is still a no-op (no update churn)', async () => {
+    const { view, queue, events } = makeView([
+      page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE })], 5),
+      page([], 5),
+    ]);
+    await view.fullPull();
+    const before = events.length;
+
+    queue.push(page([item('N', { seq: 1, noAssets: true })], 6));
+    await view.delta();
+
+    expect(events.length).toBe(before);
+    expect(view.coinless(registry)[0]?.tokenType).toBe(NFT_TYPE);
+  });
+
+  it('a RECOVERED coin tombstone comes back as a coin, never as an NFT', async () => {
+    // recoverOne flips status in place without recomputing `coinless`, so the
+    // status guard in isCoinless is what keeps this right: a tombstone omits
+    // assets, and classifying THAT as coinless would resurrect a 100-coin token
+    // into coinless() while its inherited assets still put it in tokens() —
+    // present in both reads at once, shown as an NFT.
+    const { view, queue } = makeView([page([item('C', { seq: 1, amount: '100' })], 5), page([], 5)]);
+    await view.fullPull();
+    queue.push(page([item('C', { seq: 2, status: 'removed', noAssets: true })], 6));
+    await view.delta();
+    expect(view.tokens(registry)).toEqual([]);
+
+    const recovered = await view.recoverRemoved(
+      async () => new Map([['C', blob(1)]]),
+      async () => false,
+      async (): Promise<ReAddResult> => 'added'
+    );
+
+    expect(recovered.recovered).toEqual(['C']);
+    expect(view.coinless(registry)).toEqual([]);
+    expect(view.tokens(registry).map((t) => t.id)).toEqual(['C']);
+    expect(view.pool(COIN)).toEqual([{ tokenId: 'C', amount: 100n }]);
+  });
+
+  it('survives a §5.4 restore re-pull: a coinless row stays coinless, a coin row stays a coin', async () => {
+    // The restore protocol drops every cursor and does a FULL re-pull, which
+    // re-applies rows the mirror already holds. `coinless` is computed at apply
+    // time, so an unchanged-row early return must not leave a stale verdict.
+    const { view, queue } = makeView([
+      page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE }), item('A', { seq: 1 })], 5),
+      page([], 5),
+    ]);
+    await view.fullPull();
+
+    queue.push(
+      page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE }), item('A', { seq: 1 })], 5),
+      page([], 5)
+    );
+    await view.fullPull();
+
+    expect(view.coinless(registry).map((t) => t.tokenId)).toEqual(['N']);
+    expect(view.tokens(registry).map((t) => t.id)).toEqual(['A']);
+  });
+
+  it('resolves class metadata from the registry the WALLET owns, not a global singleton', async () => {
+    const { view } = makeView([
+      page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE })], 5),
+      page([], 5),
+    ]);
+    await view.fullPull();
+    const [row] = view.coinless(registry);
+    expect(row?.name).toBe('Unicity NFT');
+    expect(row?.iconUrl).toBe('https://icons/nft.png');
+  });
+
+  it('renders an UNRECOGNISED type without a name rather than hiding the token', async () => {
+    // A minter may use its own type; length is the only structural constraint.
+    const { view } = makeView([
+      page([item('N', { seq: 1, noAssets: true, tokenType: 'ff'.repeat(8) })], 5),
+      page([], 5),
+    ]);
+    await view.fullPull();
+    const [row] = view.coinless(registry);
+    expect(row?.tokenId).toBe('N');
+    expect(row?.name).toBeUndefined();
+  });
+
+  it('a row that GAINS assets stops being coinless', async () => {
+    const { view, queue } = makeView([
+      page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE })], 5),
+      page([], 5),
+    ]);
+    await view.fullPull();
+    queue.push(page([item('N', { seq: 2, state: 'S2', amount: '5' })], 6));
+    await view.delta();
+    expect(view.coinless(registry)).toEqual([]);
+    expect(view.tokens(registry).map((t) => t.id)).toEqual(['N']);
   });
 });

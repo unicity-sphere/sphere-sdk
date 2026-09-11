@@ -104,6 +104,8 @@ export class TokenRegistry {
   private static instance: TokenRegistry | null = null;
 
   private readonly definitionsById: Map<string, TokenDefinition>;
+  /** Non-fungible definitions keyed by TOKEN TYPE — a separate namespace (#147). */
+  private readonly definitionsByType: Map<string, TokenDefinition>;
   private readonly definitionsBySymbol: Map<string, TokenDefinition>;
   private readonly definitionsByName: Map<string, TokenDefinition>;
 
@@ -124,6 +126,7 @@ export class TokenRegistry {
 
   private constructor() {
     this.definitionsById = new Map();
+    this.definitionsByType = new Map();
     this.definitionsBySymbol = new Map();
     this.definitionsByName = new Map();
   }
@@ -413,10 +416,16 @@ export class TokenRegistry {
     this.definitionsById.clear();
     this.definitionsBySymbol.clear();
     this.definitionsByName.clear();
+    this.definitionsByType.clear();
 
+    // ONE registry file, TWO id namespaces (wallet-api#147): a `fungible` entry's
+    // `id` is a COIN id, a `non-fungible` entry's is a TOKEN TYPE. The flat maps
+    // stay as they were (getDefinition resolves either, and is pinned that way);
+    // `definitionsByType` is the namespace-correct lookup a coinless token needs.
     for (const def of definitions) {
       const idLower = def.id.toLowerCase();
       this.definitionsById.set(idLower, def);
+      if (def.assetKind === 'non-fungible') this.definitionsByType.set(idLower, def);
 
       if (def.symbol) {
         this.definitionsBySymbol.set(def.symbol.toUpperCase(), def);
@@ -676,6 +685,22 @@ export class TokenRegistry {
    */
   getAllDefinitions(): TokenDefinition[] {
     return Array.from(this.definitionsById.values());
+  }
+
+  /**
+   * Definition for a coinless token's genesis TOKEN TYPE (#777). Never falls back
+   * to `getDefinition`: a type and a coin id live in different namespaces, so a
+   * type that collided with a coin id would otherwise render as that coin.
+   */
+  getTypeMeta(tokenType: string): { name: string; iconUrl: string | null } | null {
+    const def = this.getTypeDefinition(tokenType);
+    if (!def) return null;
+    return { name: def.name, iconUrl: def.icons?.[0]?.url ?? null };
+  }
+
+  getTypeDefinition(tokenType: string): TokenDefinition | undefined {
+    if (!tokenType) return undefined;
+    return this.definitionsByType.get(tokenType.toLowerCase());
   }
 
   /**

@@ -1214,5 +1214,217 @@
     "tests": [
       "tests/unit/impl/backing-store-id.test.ts"
     ]
+  },
+  {
+    "name": "value-envelope-head-null-falls-through-to-coinless",
+    "note": "#778: an unreadable/non-canonical tag head must THROW, never bank as coinless. This is the exact naive fallback that silently zeroes a valid envelope with a trailing byte (value-envelope.test.ts reject table).",
+    "file": "token-engine/value-envelope.ts",
+    "find": "  const tag = headTagNumber(genesisData);\n  if (tag === null) {\n    throw invalid(",
+    "replace": "  const tag = headTagNumber(genesisData);\n  if (false as boolean) {\n    throw invalid(",
+    "tests": [
+      "tests/unit/token-engine/value-envelope.test.ts"
+    ]
+  },
+  {
+    "name": "value-envelope-decode-failure-reads-as-coinless",
+    "note": "#778 THE headline bug: a tag-39050 body that fails to decode must throw, not return a null value. Kills the `catch { return false }` shape the old predicate had.",
+    "file": "token-engine/value-envelope.ts",
+    "find": "    throw invalid(`Failed to decode token payment data: ${describe(error)}`);",
+    "replace": "    return { assets: [] } as SphereValue;",
+    "tests": [
+      "tests/unit/token-engine/value-envelope.test.ts"
+    ]
+  },
+  {
+    "name": "value-envelope-55799-over-value-accepted",
+    "note": "#778/wallet-api parity: tag(55799) hiding a real value envelope must be refused, or its coins are invisible with no error.",
+    "file": "token-engine/value-envelope.ts",
+    "find": "  if (tag === SELF_DESCRIBED_CBOR_TAG && selfDescribedBodyCarriesValue(body)) {",
+    "replace": "  if (false as boolean) {",
+    "tests": [
+      "tests/unit/token-engine/value-envelope.test.ts"
+    ]
+  },
+  {
+    "name": "value-envelope-array-some-becomes-every",
+    "note": "#778: `[uint(1), <valid Asset>]` is some=true/every=false \u2014 under .every it classifies coinless and a readable asset vanishes.",
+    "file": "token-engine/value-envelope.ts",
+    "find": "  return items.some(isAssetShaped)\n    ? { envelope: 'bare_collection', value: null }",
+    "replace": "  return items.every(isAssetShaped)\n    ? { envelope: 'bare_collection', value: null }",
+    "tests": [
+      "tests/unit/token-engine/value-envelope.test.ts"
+    ]
+  },
+  {
+    "name": "value-envelope-malformed-array-banked-as-coinless",
+    "note": "#778: an array that does not frame could be a CORRUPT collection; banking it as coinless is silent coin loss.",
+    "file": "token-engine/value-envelope.ts",
+    "find": "  if (items === null) {\n    throw invalid('Token value payload is not PaymentAssetCollection: malformed CBOR array');",
+    "replace": "  if (items === null) {\n    return { envelope: 'none_other', value: null };",
+    "tests": [
+      "tests/unit/token-engine/value-envelope.test.ts"
+    ]
+  },
+  {
+    "name": "engine-split-unreadable-value-guard-removed",
+    "note": "#778: splitting a source whose value this SDK cannot read must fail with a TYPED error before any chain op, not die inside TokenSplit with a bare CborError.",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "    if (params.token.value === null) {\n      throw new SphereError(",
+    "replace": "    if (false as boolean) {\n      throw new SphereError(",
+    "tests": [
+      "tests/unit/token-engine/SphereTokenEngine.hardening.test.ts"
+    ]
+  },
+  {
+    "name": "engine-mintdatatoken-preflight-removed",
+    "note": "#778: un-classifiable opaque bytes must be refused BEFORE the chain op. wrapToken runs on mintDataToken's last line, after certification, so without the pre-flight the refusal strands an on-chain token this SDK can never decode.",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "    assertMintableData(params.data);",
+    "replace": "    // mutant: pre-flight dropped",
+    "tests": [
+      "tests/unit/token-engine/SphereTokenEngine.hardening.test.ts"
+    ]
+  },
+  {
+    "name": "inventory-coinless-ignores-status",
+    "note": "#777: only an ACTIVE row's absent assets states coinlessness. A tombstone omits assets for an unrelated reason, so classifying it coinless would surface spent tokens as NFTs.",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "  if (item.status !== 'active') return prev?.coinless ?? false;",
+    "replace": "  // mutant: status ignored",
+    "tests": [
+      "tests/unit/payments-v2/inventory.test.ts"
+    ]
+  },
+  {
+    "name": "inventory-coinless-always-false",
+    "note": "#777: a coinless row must reach coinless(); always-false is the pre-fix behaviour where an NFT was invisible.",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "  return (item.assets?.length ?? 0) === 0;",
+    "replace": "  return false;",
+    "tests": [
+      "tests/unit/payments-v2/inventory.test.ts"
+    ]
+  },
+  {
+    "name": "inventory-coinless-not-disjoint",
+    "note": "#777: coinless() must skip non-coinless rows, or a coin token appears in BOTH reads.",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "      if (entry.status !== 'active' || !entry.coinless) continue;",
+    "replace": "      if (entry.status !== 'active') continue;",
+    "tests": [
+      "tests/unit/payments-v2/inventory.test.ts"
+    ]
+  },
+  {
+    "name": "receive-coinless-not-named",
+    "note": "#777: a coinless arrival must be NAMED on transfer:incoming. Dropping the tokenType makes the event announce an empty token list again \u2014 a UI sees nothing land.",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "      ...(isCoinlessEnvelope(token.valueEnvelope) ? { tokenType: token.tokenType } : {}),",
+    "replace": "      // mutant: arrival type dropped",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts"
+    ]
+  },
+  {
+    "name": "history-received-flattens-to-empty-coin",
+    "note": "wallet-api#151: a coinless RECEIVED record must post assets: []. Flattening to a synthetic first asset posts coinId:'' which the backend 422s and History.post swallows \u2014 the row is lost silently. Kept RECEIVED-specific alongside history-wire-assets-forces-one-entry, which guards the shared helper.",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "      type: 'RECEIVED' as const,\n      assets: wireAssets(input.assets),",
+    "replace": "      type: 'RECEIVED' as const,\n      assets: [{ coinId: input.assets[0]?.coinId ?? '', amount: input.assets[0]?.amount ?? '0' }],",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts",
+      "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "registry-type-lookup-falls-back-to-coins",
+    "note": "wallet-api#147: a token TYPE and a coin id are different namespaces in one registry file. Falling back to the coin map would render a coin as a token class.",
+    "file": "registry/TokenRegistry.ts",
+    "find": "    return this.definitionsByType.get(tokenType.toLowerCase());",
+    "replace": "    return this.definitionsByType.get(tokenType.toLowerCase()) ?? this.definitionsById.get(tokenType.toLowerCase());",
+    "tests": [
+      "tests/unit/registry/TokenRegistry.test.ts"
+    ]
+  },
+  {
+    "name": "inventory-unchanged-ignores-late-tokentype",
+    "note": "#777: a tokenType can appear late at an otherwise identical row (insert/reactivate write it; 0015 does not backfill). Dropping it from the unchanged check strands the type; comparing item.tokenType instead of the RESOLVED value churns an update on every delta that omits it.",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "    tokenType === prev.tokenType",
+    "replace": "    true",
+    "tests": [
+      "tests/unit/payments-v2/inventory.test.ts"
+    ]
+  },
+  {
+    "name": "receive-conflates-unreadable-with-coinless",
+    "note": "#778/#777: `value === null` is true for a coinless token AND for a bare_collection carrying coins this SDK cannot decode. Keying the NFT announcement on it hides real coins behind a token type.",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "  return envelope.startsWith('none_');",
+    "replace": "  return envelope !== 'sphere';",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts"
+    ]
+  },
+  {
+    "name": "token-data-skips-inventory-guard",
+    "note": "#777: tokenData must refuse a token the wallet does not hold BEFORE fetching a blob, rather than returning bytes for an arbitrary id.",
+    "file": "modules/payments-v2/inventory/token-data.ts",
+    "find": "  if (deps.view.stateHashOf(tokenId) === undefined) {",
+    "replace": "  if (false as boolean) {",
+    "tests": [
+      "tests/unit/payments-v2/token-data.test.ts"
+    ]
+  },
+  {
+    "name": "history-permanent-reject-logged-as-retry-safe",
+    "note": "#780: a 4xx is a permanent shape refusal that no retry can fix. Logging it as retry-safe is exactly what let a coinless receipt vanish silently.",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "  return status >= 400 && status < 500 && status !== 408 && status !== 429;",
+    "replace": "  return false;",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "history-treats-429-as-permanent",
+    "note": "#780: 408/429 are transient. Calling them permanent would tell an operator a retryable failure is unfixable.",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "  return status >= 400 && status < 500 && status !== 408 && status !== 429;",
+    "replace": "  return status >= 400 && status < 500;",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "history-wire-assets-forces-one-entry",
+    "note": "#780: every history type must be able to post an EMPTY asset list. Forcing a one-element array reintroduces the coinId:'' 422 on SENT and MINT.",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "  return assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));",
+    "replace": "  return assets.length === 0 ? [{ coinId: '', amount: '0' }] : assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts",
+      "tests/unit/payments-v2/receive.test.ts"
+    ]
+  },
+  {
+    "name": "fake-swallows-corrupt-envelope",
+    "note": "#778 review: the fake is FakeWalletApi's \u00a78.2 step-6 stand-in. Catching a classification throw makes it index a corrupt envelope as coinless \u2014 every payments-v2 test then models the pre-fix silent zero.",
+    "file": "tests/unit/token-engine/FakeTokenEngine.ts",
+    "find": "  if (!state.genesisData || classify(state).envelope !== 'sphere') return null;",
+    "replace": "  try { if (!state.genesisData || classify(state).envelope !== 'sphere') return null; } catch { return null; }",
+    "tests": [
+      "tests/unit/token-engine/FakeTokenEngine.test.ts"
+    ]
+  },
+  {
+    "name": "coinless-row-drops-class-metadata",
+    "note": "#777 review: class metadata must resolve from the registry the WALLET owns. Dropping it forces callers to the process-global singleton, which another Sphere's init repoints (#767).",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "      const meta = entry.tokenType !== undefined ? registry.getTypeMeta?.(entry.tokenType) : null;",
+    "replace": "      const meta = null as { name: string; iconUrl: string | null } | null;",
+    "tests": [
+      "tests/unit/payments-v2/inventory.test.ts"
+    ]
   }
 ]

@@ -10,7 +10,9 @@ export interface InventoryItem {
   status: 'active' | 'removed';
   seq: number;
   stateHash: string;
+  /** Absent for a tombstone AND for an active COINLESS token — read `status`, not this. */
   assets?: InventoryAsset[];
+  tokenType?: string;
 }
 
 export interface InventoryPage {

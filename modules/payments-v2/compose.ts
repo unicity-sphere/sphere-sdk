@@ -282,10 +282,9 @@ function buildMachineDeps(
     recordHistory: async ({ transferId, payload, committedAmount }) => {
       await historyStore.recordSent({
         transferId,
-        coinId: payload.coinId,
         // §5.9: the SETTLED amount (machine-computed from the certified
         // recipient blobs), never payload.amount — the plan.
-        amount: committedAmount,
+        assets: [{ coinId: payload.coinId, amount: committedAmount }],
         recipientPubkey: payload.recipient,
         ...(payload.memo !== undefined ? { memo: payload.memo } : {}),
       });
@@ -328,12 +327,10 @@ function buildReceive(
 }
 
 async function recordReceived(historyStore: History, record: ReceivedRecord): Promise<void> {
-  const first = record.assets[0];
   await historyStore.recordReceived({
     tokenId: record.tokenId,
     stateHash: record.stateHash,
-    coinId: first?.coinId ?? '',
-    amount: first?.amount ?? '0',
+    assets: record.assets,
     ...(record.senderPubkey !== undefined ? { senderPubkey: record.senderPubkey } : {}),
     ...(record.senderNametag !== undefined ? { senderNametag: record.senderNametag } : {}),
     ...(record.memo !== undefined ? { memo: record.memo } : {}),

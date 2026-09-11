@@ -54,8 +54,8 @@ export interface HistoryDeps {
 
 export interface RecordSentInput {
   transferId: string;
-  coinId: string;
-  amount: string;
+  /** EMPTY when nothing with a coin moved (#780). Every type accepts an empty list. */
+  assets: readonly { coinId: string; amount: string }[];
   recipientPubkey?: string;
   recipientNametag?: string;
   memo?: string;
@@ -66,8 +66,13 @@ export interface RecordSentInput {
 export interface RecordReceivedInput {
   tokenId: string;
   stateHash: string;
-  coinId: string;
-  amount: string;
+  /**
+   * What arrived. EMPTY for a coinless token (#777) — wallet-api#151 accepts an
+   * empty list and keeps refusing `coinId: ''`, so a synthetic empty-coin entry
+   * 422s and the row is lost. §10 forbids a record naming neither assets nor a
+   * tokenId; `tokenId` is always set here, so an empty list is legal.
+   */
+  assets: readonly { coinId: string; amount: string }[];
   transferId?: string;
   senderPubkey?: string;
   senderNametag?: string;
@@ -77,9 +82,26 @@ export interface RecordReceivedInput {
 
 export interface RecordMintInput {
   tokenId: string;
-  coinId: string;
-  amount: string;
+  assets: readonly { coinId: string; amount: string }[];
   timestamp?: number;
+}
+
+/** Copied, never aliased: the wire record must not share the caller's array. */
+function wireAssets(
+  assets: readonly { coinId: string; amount: string }[]
+): { coinId: string; amount: string }[] {
+  return assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));
+}
+
+/**
+ * A 4xx other than 408/429 is the server refusing this record's SHAPE — permanent,
+ * so no retry can fix it. Duck-typed on `status` so the module keeps no dependency
+ * on a transport implementation.
+ */
+function isPermanentReject(err: unknown): boolean {
+  const status = (err as { status?: unknown } | null)?.status;
+  if (typeof status !== 'number') return false;
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
 const WIRE_TOKEN_ID = /^(?:[0-9a-f]{2}){1,64}$/;
@@ -109,7 +131,7 @@ export class History {
       dedupKey: input.transferId,
       id: (this.deps.newId ?? randomUUID)(),
       type: 'SENT' as const,
-      assets: [{ coinId: input.coinId, amount: input.amount }],
+      assets: wireAssets(input.assets),
       ts: this.ts(input.timestamp),
       transferId: input.transferId,
       ...this.wireTokenId(input.tokenId),
@@ -123,7 +145,7 @@ export class History {
       dedupKey: `RECEIVED:${input.tokenId.toLowerCase()}:${input.stateHash.toLowerCase()}`,
       id: (this.deps.newId ?? randomUUID)(),
       type: 'RECEIVED' as const,
-      assets: [{ coinId: input.coinId, amount: input.amount }],
+      assets: wireAssets(input.assets),
       ts: this.ts(input.timestamp),
       ...(input.transferId !== undefined ? { transferId: input.transferId } : {}),
       ...this.wireTokenId(input.tokenId),
@@ -137,7 +159,7 @@ export class History {
       dedupKey: `MINT:${input.tokenId.toLowerCase()}`,
       id: (this.deps.newId ?? randomUUID)(),
       type: 'MINT' as const,
-      assets: [{ coinId: input.coinId, amount: input.amount }],
+      assets: wireAssets(input.assets),
       ts: this.ts(input.timestamp),
       ...this.wireTokenId(input.tokenId),
     }));
@@ -150,7 +172,15 @@ export class History {
     try {
       await this.deps.client.postHistory([record]);
     } catch (err) {
-      this.deps.log?.('history POST failed (dedupKey makes retry safe)', err);
+      // §5.9 keeps this off the money path, but a 4xx is PERMANENT: no retry can
+      // fix a shape the server refuses, and logging it as retry-safe is what let a
+      // coinless receipt vanish silently (#780). Name the two apart.
+      this.deps.log?.(
+        isPermanentReject(err)
+          ? 'history POST REJECTED — the record shape is refused; no retry can fix it'
+          : 'history POST failed (dedupKey makes retry safe)',
+        err
+      );
       return;
     }
     // The recorded entry is in hand — emit it through the SAME read-through

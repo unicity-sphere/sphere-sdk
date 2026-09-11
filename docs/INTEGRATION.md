@@ -512,6 +512,25 @@ for (const token of tokens) {
 const uctTokens = sphere.payments.tokens({ coinId: coinIdHex });
 ```
 
+### Get Coinless Tokens (NFTs)
+
+A token whose genesis data carries no value envelope names no coin. These are a **separate,
+disjoint read** — never returned by `tokens()`, and contributing to no balance:
+
+```typescript
+const nfts = sphere.payments.coinless();
+
+for (const nft of nfts) {
+  console.log(`Token ${nft.tokenId}`);
+  // The CLASS of token, not its identity — every token of one kind shares a type.
+  console.log(`  Type: ${nft.tokenType ?? '(unrecorded)'}`);
+}
+
+// The payload — an NFT's actual content. A call, not a field: it is unbounded
+// and the blob is fetched on demand.
+const bytes = await sphere.payments.tokenData(nfts[0].tokenId);
+```
+
 Lazy tokens (blob not yet downloaded) carry value metadata only; the blob is fetched on demand
 when the token is selected for a spend.
 

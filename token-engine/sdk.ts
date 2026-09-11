@@ -72,6 +72,11 @@ export { DataHasherFactory } from '@unicitylabs/state-transition-sdk/lib/crypto/
 export { CborSerializer } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborSerializer.js';
 export { CborDeserializer } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborDeserializer.js';
 export { CborError } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborError.js';
+// Head-only CBOR reads, for classifying a value envelope WITHOUT parsing its body
+// (`value-envelope.ts`): `CborDeserializer.decodeTag` asserts exhaustion, so it
+// cannot tell a corrupt envelope from a payload that carries no envelope at all.
+export { CborReader } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/CborReader.js';
+export { MajorType } from '@unicitylabs/state-transition-sdk/lib/serialization/cbor/MajorType.js';
 
 // ── payment / value / split ─────────────────────────────────────────────────
 export type { IPaymentData } from '@unicitylabs/state-transition-sdk/lib/payment/IPaymentData.js';

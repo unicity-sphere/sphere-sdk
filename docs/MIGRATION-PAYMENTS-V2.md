@@ -91,6 +91,31 @@ Error contract is UNCHANGED and load-bearing: the typed codes
 `ProofUnconfirmedError.cause` carrying the raw network error all survive
 verbatim. Keep your PENDING_COMMIT handling exactly as it is.
 
+### 2a. New in [Unreleased]: coinless tokens (NFTs)
+
+Nothing to migrate — purely additive — but worth knowing so a token list is not read as complete:
+
+| need | call |
+|---|---|
+| coin tokens | `tokens(filter?)` — **unchanged**, and still excludes coinless holdings |
+| coinless (NFT) holdings | `coinless(): CoinlessToken[]` |
+| an NFT's payload | `tokenData(tokenId): Promise<Uint8Array \| null>` |
+
+The two reads are **disjoint**: an active token appears in exactly one, so `tokens()`, `assets()`
+and every balance are byte-identical to before. A UI that shows "all my tokens" now needs both.
+
+A coinless token is deliberately not a `Token` — that type requires `coinId`, `symbol`, `decimals`
+and `amount`, and populating them with `''`/`'0'` would put untrue values in fields UIs sum and
+format. `CoinlessToken` carries `tokenId` (the instance), `tokenType` (the **class** — every token
+of one kind shares it), `stateHash`, `transferring`, `suspectedSpent` and timestamps.
+
+`transfer:incoming` gains an optional `coinless` array. If you render arrivals from `tokens`, a
+coinless arrival will look empty — read `coinless` too.
+
+An NFT's display metadata (`name`, `iconUrl`) is resolved for you, from the registry the Sphere
+owns. Do not look the type up via `TokenRegistry.getInstance()`: a second Sphere's init repoints
+that singleton (#767). An unrecognised type is legitimate — the row still renders, unnamed.
+
 ## 3. Composition changes
 
 - **wallet-api is required** for money. `FileTokenStorageProvider` /

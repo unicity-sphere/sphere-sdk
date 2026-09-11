@@ -1373,3 +1373,38 @@ describe('Remote Refresh', () => {
     });
   });
 });
+
+describe('getTypeDefinition — the token-type namespace (#777 / wallet-api#147)', () => {
+  it('resolves a coinless token type that getDefinition would also find', async () => {
+    await configureWithCache();
+    const registry = TokenRegistry.getInstance();
+    const byType = registry.getTypeDefinition(UNICITY_NFT_COIN_ID);
+    expect(byType?.assetKind).toBe('non-fungible');
+    expect(byType?.id).toBe(UNICITY_NFT_COIN_ID);
+  });
+
+  it('refuses a FUNGIBLE coin id: a coin is not a token type', async () => {
+    await configureWithCache();
+    const registry = TokenRegistry.getInstance();
+    const coin = registry.getFungibleTokens()[0];
+    expect(coin).toBeDefined();
+    // getDefinition would happily return it — the two namespaces share one flat
+    // map. getTypeDefinition is the lookup that keeps a coin from rendering as a
+    // token class, which matters because the ids are minter-chosen and could collide.
+    expect(registry.getDefinition(coin!.id)?.id).toBe(coin!.id);
+    expect(registry.getTypeDefinition(coin!.id)).toBeUndefined();
+  });
+
+  it('is case-insensitive and rejects an empty type', async () => {
+    await configureWithCache();
+    const registry = TokenRegistry.getInstance();
+    expect(registry.getTypeDefinition(UNICITY_NFT_COIN_ID.toUpperCase())?.id).toBe(UNICITY_NFT_COIN_ID);
+    expect(registry.getTypeDefinition('')).toBeUndefined();
+  });
+
+  it('returns undefined for an unrecognised type rather than throwing — a minter may use its own', async () => {
+    await configureWithCache();
+    const registry = TokenRegistry.getInstance();
+    expect(registry.getTypeDefinition('ff'.repeat(32))).toBeUndefined();
+  });
+});

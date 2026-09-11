@@ -14,6 +14,7 @@
  */
 
 import type { Token } from './sdk';
+import type { ValueEnvelope } from './value-envelope';
 
 // ── identity / recipients ─────────────────────────────────────────────────────
 
@@ -74,6 +75,22 @@ export interface SphereToken {
   readonly blob: TokenBlob;
   /** Decoded value (cached); null when the token carries no sphere payment data. */
   readonly value: SphereValue | null;
+  /**
+   * Which value envelope the genesis payload carried (#778). Distinguishes the
+   * reasons `value` is null, which the old boolean predicate collapsed:
+   * `'none_*'` means the token genuinely names no coin — a COINLESS token — while
+   * `'bare_collection'` means it carries coins in the bridged dialect this SDK
+   * does not decode, so a zero here is "cannot read", not "has none". A corrupt
+   * envelope never reaches this field: it throws during classification.
+   */
+  readonly valueEnvelope: ValueEnvelope;
+  /**
+   * Genesis `TokenType`, lowercase hex. The token's CLASS, never its instance —
+   * `blob.tokenId` is the instance key (wallet-api#147). Only as meaningful as its
+   * minter made it: `mint()` and split outputs derive one per operation, so for
+   * value tokens it is per-mint noise. Never a spend gate.
+   */
+  readonly tokenType: string;
 }
 
 // ── operation params (sphere-domain in, SphereToken out) ──────────────────────

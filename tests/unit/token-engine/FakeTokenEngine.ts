@@ -26,6 +26,10 @@ import {
   TokenId,
   TokenSalt,
 } from '../../../token-engine/sdk';
+import {
+  type ClassifiedValue,
+  classifyValueEnvelope,
+} from '../../../token-engine/value-envelope';
 import type {
   CoinId,
   EngineIdentity,
@@ -102,7 +106,7 @@ export class FakeTokenEngine implements ITokenEngine {
   public readMemo(token: SphereToken): Uint8Array | null {
     const state = decodeFakeState(token.blob.token);
     if (state.transferMemo) return state.transferMemo;
-    if (state.genesisData && isSpherePaymentData(state.genesisData)) {
+    if (state.genesisData && classify(state).envelope === 'sphere') {
       return SpherePaymentData.fromCBOR(state.genesisData).memo;
     }
     return null;
@@ -217,7 +221,14 @@ export class FakeTokenEngine implements ITokenEngine {
     // passed alongside the bytes.
     const state = decodeFakeState(blob.token);
     const normalized: TokenBlob = { ...blob, tokenId: HexConverter.encode(state.tokenId) };
-    return Promise.resolve({ sdkToken: handleFor(blob.token), blob: normalized, value: valueOf(state) });
+    const { envelope, value } = classify(state);
+    return Promise.resolve({
+      sdkToken: handleFor(blob.token),
+      blob: normalized,
+      value,
+      valueEnvelope: envelope,
+      tokenType: fakeTokenType(state),
+    });
   }
 
   // ── internals ──────────────────────────────────────────────────────────────
@@ -238,7 +249,14 @@ export class FakeTokenEngine implements ITokenEngine {
       tokenId: HexConverter.encode(state.tokenId),
       token: stateBytes,
     };
-    return { sdkToken: handleFor(stateBytes), blob, value: valueOf(state) };
+    const { envelope, value } = classify(state);
+    return {
+      sdkToken: handleFor(stateBytes),
+      blob,
+      value,
+      valueEnvelope: envelope,
+      tokenType: fakeTokenType(state),
+    };
   }
 
   /** Spent-tracking key = the per-state id (changes on every transfer). */
@@ -264,14 +282,18 @@ export class FakeTokenEngine implements ITokenEngine {
 export function decodeFakeTokenAssets(
   tokenBytes: Uint8Array
 ): { coinId: string; amount: bigint }[] | null {
+  let state: FakeState;
   try {
-    const state = decodeFakeState(tokenBytes);
-    if (!state.genesisData || !isSpherePaymentData(state.genesisData)) return null;
-    const value = SpherePaymentData.fromCBOR(state.genesisData).toValue();
-    return value.assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));
+    state = decodeFakeState(tokenBytes);
   } catch {
-    return null;
+    return null; // not fake-blob bytes at all
   }
+  // A classification throw PROPAGATES: the real backend 422s a corrupt envelope
+  // (§8.2 step 6), so swallowing it here would let the fake index one as coinless
+  // and every payments-v2 test would keep modelling the pre-#778 silent zero.
+  if (!state.genesisData || classify(state).envelope !== 'sphere') return null;
+  const value = SpherePaymentData.fromCBOR(state.genesisData).toValue();
+  return value.assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));
 }
 
 /**
@@ -309,20 +331,21 @@ function decodeFakeState(bytes: Uint8Array): FakeState {
   };
 }
 
-/** Derive the decoded value exactly as the real adapter does (SpherePaymentData envelope only). */
-function valueOf(state: FakeState): SphereValue | null {
-  if (state.genesisData && isSpherePaymentData(state.genesisData)) {
-    return SpherePaymentData.fromCBOR(state.genesisData).toValue();
-  }
-  return null;
+/**
+ * Classify exactly as the real adapter does — the SAME function, never a copy.
+ * A private copy of the old naive predicate is what let every payments-v2 test
+ * model a pre-#778 engine while the real one moved on.
+ */
+function classify(state: FakeState): ClassifiedValue {
+  return classifyValueEnvelope(state.genesisData);
 }
 
-function isSpherePaymentData(data: Uint8Array): boolean {
-  try {
-    return CborDeserializer.decodeTag(data).tag === SpherePaymentData.CBOR_TAG;
-  } catch {
-    return false;
-  }
+/**
+ * The fake carries no type field, so derive a STABLE one per token id — enough for
+ * a consumer to key a class on, without a fake-blob format change.
+ */
+function fakeTokenType(state: FakeState): string {
+  return HexConverter.encode(state.tokenId.slice(0, 8));
 }
 
 /** Map the fake's numeric network to the SDK NetworkId instance (for TokenId.fromSalt). */

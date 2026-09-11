@@ -74,6 +74,60 @@ describe('SphereTokenEngine — hardening / edge cases', () => {
     expect(outputs.reduce((sum, o) => sum + e.balanceOf(o, COIN_A), 0n)).toBe(100n);
   }, 30000);
 
+  it('refuses un-classifiable data-token bytes BEFORE minting, never after certifying (#778)', async () => {
+    // Classification reads the outer major type, so opaque bytes starting in the CBOR
+    // array/tag range must frame cleanly. `wrapToken` runs on the LAST line of
+    // mintDataToken, after the on-chain certification — so without a pre-flight this
+    // refusal would strand a token that exists on-chain and can never be decoded again.
+    const e = createTestEngine();
+    const self = e.getIdentity().chainPubkey;
+    const submit = vi.spyOn(
+      e as unknown as { submitAndAwaitProof: (...a: unknown[]) => unknown },
+      'submitAndAwaitProof',
+    );
+
+    // 0x82 is an array header promising two elements that are not there.
+    const err = await e
+      .mintDataToken({ recipientPubkey: self, data: new Uint8Array([0x82]) })
+      .then(() => null, (caught: unknown) => caught);
+
+    expect(err).toBeInstanceOf(SphereError);
+    expect((err as SphereError).message).toMatch(/Cannot mint a data token/);
+    expect((err as SphereError).message).toMatch(/wrap them in a CBOR byte string/);
+    expect(submit).not.toHaveBeenCalled();
+  }, 15000);
+
+  it('still mints opaque data whose first byte is outside the array and tag ranges', async () => {
+    const e = createTestEngine();
+    const self = e.getIdentity().chainPubkey;
+    // A PNG magic header starts 0x89 — inside the ARRAY range — so it must be wrapped;
+    // a text/byte-string payload is the documented escape hatch and mints unchanged.
+    const data = new TextEncoder().encode('kitty #1');
+    const token = await e.mintDataToken({ recipientPubkey: self, data });
+    expect(e.readTokenData(token)).toEqual(data);
+    expect(e.readValue(token)).toBeNull();
+  }, 15000);
+
+  it('refuses to split a COINLESS token with a typed error, before any chain op (#778)', async () => {
+    // A coinless token is the wallet-api#140 case: genesis data that is not a value
+    // envelope. `TokenSplit.split` is handed `decodeSpherePaymentData`, so without the
+    // guard this dies inside the SDK with a bare CborError naming neither token nor cause.
+    const e = createTestEngine();
+    const self = e.getIdentity().chainPubkey;
+    const nft = await e.mintDataToken({
+      recipientPubkey: self,
+      data: new TextEncoder().encode('kitty #1'),
+    });
+    expect(e.readValue(nft)).toBeNull();
+
+    const err = await e
+      .split({ token: nft, outputs: [{ recipientPubkey: self, coinId: COIN_A, amount: 1n }] })
+      .then(() => null, (caught: unknown) => caught);
+    expect(err).toBeInstanceOf(SphereError);
+    expect((err as SphereError).message).toMatch(/no value this SDK can read/);
+    expect((err as SphereError).message).toMatch(/transferred whole/);
+  }, 15000);
+
   it('split preserves output ORDER across bounded-concurrency batches (#684)', async () => {
     // The mint legs are minted in parallel with a concurrency cap (MAX_MINT_CONCURRENCY=8),
     // so >8 outputs span MULTIPLE batches. Distinct amounts make the returned order

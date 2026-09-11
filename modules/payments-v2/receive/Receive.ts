@@ -25,6 +25,8 @@ export interface StoredIncoming {
   readonly tokenId: string;
   readonly stateHash: string;
   readonly assets: readonly IncomingAssetAmount[];
+  /** Genesis type of an arrival that names no coin (#777) — its only display handle. */
+  readonly tokenType?: string;
 }
 
 // Per-key seam over the inventory view (adapted by the facade in P9).
@@ -38,6 +40,7 @@ export interface ReceivedRecord {
   readonly tokenId: string;
   readonly stateHash: string;
   readonly assets: readonly IncomingAssetAmount[];
+  readonly tokenType?: string;
   readonly senderPubkey?: string;
   readonly senderNametag?: string;
   readonly memo?: string;
@@ -265,7 +268,12 @@ async function screen(deps: ReceiveDeps, engine: ReceiveEngine, entry: IncomingD
   }
   return {
     kind: 'accept',
-    record: { tokenId: keys.tokenId, stateHash: keys.stateHash, assets: toAssetAmounts(token) },
+    record: {
+      tokenId: keys.tokenId,
+      stateHash: keys.stateHash,
+      assets: toAssetAmounts(token),
+      ...(isCoinlessEnvelope(token.valueEnvelope) ? { tokenType: token.tokenType } : {}),
+    },
   };
 }
 
@@ -281,6 +289,7 @@ async function announce(
       tokenId: record.tokenId,
       stateHash: record.stateHash,
       assets: record.assets,
+      ...(record.tokenType !== undefined ? { tokenType: record.tokenType } : {}),
       ...(entry.senderPubkey !== undefined ? { senderPubkey: entry.senderPubkey } : {}),
       ...(entry.senderNametag !== undefined ? { senderNametag: entry.senderNametag } : {}),
       ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
@@ -295,6 +304,21 @@ async function announce(
     senderPubkey: entry.senderPubkey ?? '',
     ...(entry.senderNametag !== undefined ? { senderNametag: entry.senderNametag } : {}),
     tokens: record.assets.map((asset) => toUiToken(record.tokenId, asset, deps.registry, receivedAt)),
+    // #777: named here rather than mapped from assets, which announced an EMPTY list.
+    ...(record.tokenType !== undefined
+      ? {
+          coinless: [
+            {
+              tokenId: record.tokenId,
+              tokenType: record.tokenType,
+              stateHash: record.stateHash,
+              transferring: false,
+              createdAt: receivedAt,
+              updatedAt: receivedAt,
+            },
+          ],
+        }
+      : {}),
     ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
     receivedAt,
   };
@@ -419,6 +443,11 @@ function claimAck(entry: IncomingDelivery): PendingAck {
 
 function rejectAck(entry: IncomingDelivery, reason: 'invalid' | 'not-owned'): PendingAck {
   return { deliveryId: entry.deliveryId, disposition: 'rejected', reason, cursor: entry.cursor };
+}
+
+/** Only `none_*` names no coin: `bare_collection` hides coins this SDK cannot read. */
+function isCoinlessEnvelope(envelope: SphereToken['valueEnvelope']): boolean {
+  return envelope.startsWith('none_');
 }
 
 function toAssetAmounts(token: SphereToken): IncomingAssetAmount[] {

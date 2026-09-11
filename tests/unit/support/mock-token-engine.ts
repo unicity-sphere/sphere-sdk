@@ -6,7 +6,13 @@ import type {
 /** Build a SphereToken stand-in for interaction tests (sdkToken/blob are inert). */
 export function mockSphereToken(value: SphereValue | null = { assets: [] }): SphereToken {
   const blob: TokenBlob = { tokenId: '00'.repeat(32), token: new Uint8Array() };
-  return { sdkToken: {} as SphereToken['sdkToken'], blob, value };
+  return {
+    sdkToken: {} as SphereToken['sdkToken'],
+    blob,
+    value,
+    valueEnvelope: value === null ? 'none_absent' : 'sphere',
+    tokenType: 'aa'.repeat(4),
+  };
 }
 
 const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');

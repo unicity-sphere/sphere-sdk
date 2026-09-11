@@ -382,6 +382,7 @@ so a crash re-claims instead of losing.
 ```typescript
 const { transfers } = await sphere.payments.receive();
 sphere.on('transfer:incoming', (t) => console.log('from', t.senderNametag));
+// A coinless (NFT) arrival is named in `t.coinless`, never in `t.tokens` — read both.
 ```
 
 ### `assets(coinId?: string): Promise<Asset[]>`
@@ -407,6 +408,57 @@ the blob is fetched on demand when the token is selected for a spend.
 const all = sphere.payments.tokens();
 const uctOnly = sphere.payments.tokens({ coinId: coinIdHex });
 ```
+
+### `coinless(): CoinlessToken[]`
+
+Synchronous view of holdings that name **no coin** — what a UI calls an NFT (wallet-api#140).
+
+**Disjoint from `tokens()`**: an active token is in exactly one of the two reads, so existing
+`tokens()`/`assets()` consumers are unaffected and a coinless token contributes to no balance.
+It is deliberately not a `Token`: `Token` requires `coinId`, `symbol`, `decimals` and `amount`,
+and filling those with `''`/`'0'` would put untrue values in fields consumers sum or format.
+
+```typescript
+interface CoinlessToken {
+  readonly tokenId: string;      // genesis-stable INSTANCE key
+  readonly tokenType?: string;   // the token's CLASS, lowercase hex — see below
+  readonly name?: string;        // resolved from the OWNED registry, when recognised
+  readonly iconUrl?: string;
+  readonly stateHash: string;
+  readonly transferring: boolean;   // reserved by a converging transfer
+  readonly suspectedSpent?: boolean;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+const nfts = sphere.payments.coinless();
+```
+
+`tokenType` names the token's **class, not the instance** — every token of one kind shares a type,
+so two NFTs of a collection are told apart by `tokenId`. It is absent on rows the backend indexed
+before it recorded types, and an unrecognised type is legitimate (a minter may use its own), so
+never reject or hide a token for it. Do not build a "group by type" UI on it for *valued* tokens:
+`mint()` and split outputs derive a type per operation, so there it is per-mint noise.
+
+`name` and `iconUrl` are resolved **for you**, from the registry this wallet owns, whenever the type
+is recognised. Do not look the type up yourself through `TokenRegistry.getInstance()`: a Sphere owns
+its registry (#767) and the process-global one is repointed by another Sphere's init, so a second
+wallet on another network would retarget it.
+
+### `tokenData(tokenId: string): Promise<Uint8Array | null>`
+
+The token's genesis payload — an NFT's actual content — or `null` when it carries none.
+
+A call rather than a field on the row: the payload is unbounded and blobs are lazy under server
+custody, so a list read must never carry it. Fetches the blob and decodes it. Throws
+`VALIDATION_ERROR` for a token this wallet does not hold.
+
+```typescript
+const bytes = await sphere.payments.tokenData(nft.tokenId);
+```
+
+Note an **empty** payload reads back as a zero-length `Uint8Array`, not `null` — only a genuinely
+absent one is `null`.
 
 ### `mint(coinIdHex: string, amount: bigint): Promise<MintResult>`
 

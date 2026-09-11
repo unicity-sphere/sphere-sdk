@@ -10,6 +10,8 @@ export interface RegistryReader {
   getName(coinId: string): string;
   getDecimals(coinId: string): number;
   getIconUrl(coinId: string): string | null;
+  /** Coinless token CLASS metadata, keyed by token type — a separate namespace. */
+  getTypeMeta?(tokenType: string): { name: string; iconUrl: string | null } | null;
 }
 
 export interface PriceQuote {
