@@ -1438,10 +1438,10 @@
     ]
   },
   {
-    "name": "plantoken-accepts-any-token",
-    "note": "#777: sendToken must refuse a source that is not a SPENDABLE COINLESS holding \u2014 otherwise a valued token moves with its coins unaccounted for.",
+    "name": "planwhole-accepts-unspendable-token",
+    "note": "#777: planWhole must refuse a source that is not spendable \u2014 tombstoned, in flight, or #625-demoted.",
     "file": "modules/payments-v2/select/queue.ts",
-    "find": "    if (this.deps.spendableCoinless?.(tokenId) !== true) {",
+    "find": "    if (this.deps.spendableToken?.(tokenId) !== true) {",
     "replace": "    if (false as boolean) {",
     "tests": [
       "tests/unit/payments-v2/facade.test.ts"
@@ -1458,23 +1458,23 @@
     ]
   },
   {
-    "name": "spendable-coinless-ignores-kind",
-    "note": "#777: spendableCoinless gates on entry.coinless. Dropping it makes every coin token a sendToken candidate.",
+    "name": "spendable-token-ignores-eligibility",
+    "note": "#777: spendableToken must apply pool()'s eligibility gates; dropping them offers a tombstoned or in-flight token as a named source.",
     "file": "modules/payments-v2/inventory/InventoryView.ts",
-    "find": "    return entry !== undefined && entry.coinless && this.isSpendable(tokenId, entry);",
-    "replace": "    return entry !== undefined && this.isSpendable(tokenId, entry);",
+    "find": "    return entry !== undefined && this.isSpendable(tokenId, entry);",
+    "replace": "    return entry !== undefined;",
     "tests": [
-      "tests/unit/payments-v2/facade.test.ts"
+      "tests/unit/payments-v2/inventory.test.ts"
     ]
   },
   {
-    "name": "sendcoinless-blob-envelope-guard-removed",
-    "note": "#777: the BLOB is the authority on what a source carries. Without the re-check a mirror that wrongly says coinless would move a valued token with its coins unaccounted for.",
-    "file": "modules/payments-v2/send-coinless.ts",
-    "find": "  if (!isCoinlessEnvelope(token.valueEnvelope)) {",
+    "name": "sendwhole-unreadable-envelope-guard-removed",
+    "note": "#777: a whole spend moves the token as-is, so a valued source is fine \u2014 but bare_collection carries coins this SDK cannot decode, so the move would happen while history could only say assets: [].",
+    "file": "modules/payments-v2/send-whole.ts",
+    "find": "  if (token.valueEnvelope === 'bare_collection') {",
     "replace": "  if (false as boolean) {",
     "tests": [
-      "tests/unit/payments-v2/send-coinless.test.ts"
+      "tests/unit/payments-v2/send-whole.test.ts"
     ]
   },
   {
@@ -1501,7 +1501,7 @@
     "name": "resume-skips-blob-value-authority",
     "note": "#777: the blob is the authority on resume too. Without this a durable intent labelled 'token' whose named source carries coins moves them while history records assets: [] \u2014 value moved, nothing accounted.",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    if (job.payload.kind === 'coinless' && !isCoinlessEnvelope(token.valueEnvelope)) {",
+    "find": "    if (job.payload.kind === 'whole' && token.valueEnvelope === 'bare_collection') {",
     "replace": "    if (false as boolean) {",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
@@ -1514,8 +1514,18 @@
     "find": "  return envelope.startsWith('none_');",
     "replace": "  return envelope !== 'sphere';",
     "tests": [
-      "tests/unit/payments-v2/send-coinless.test.ts",
+      "tests/unit/payments-v2/send-whole.test.ts",
       "tests/unit/payments-v2/receive.test.ts"
+    ]
+  },
+  {
+    "name": "wholesend-history-drops-real-assets",
+    "note": "#777: a WHOLE send of a valued token must record the coins it actually carried. Falling back to [] logs a real coin movement as carrying nothing \u2014 the money moved, the ledger says otherwise.",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "        coinId === undefined ? await this.settledAssets(engine, committed) : undefined;",
+    "replace": "        coinId === undefined ? [] : undefined;",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
     ]
   }
 ]

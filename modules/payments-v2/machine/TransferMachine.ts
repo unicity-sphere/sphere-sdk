@@ -74,6 +74,8 @@ export interface MachineDeps {
     payload: IntentPayload;
     phase: 'sent' | 'resumed';
     committedAmount: string;
+    /** A WHOLE-token spend moves the token, not an amount: its real assets, [] when coinless. */
+    committedAssets?: readonly { coinId: string; amount: string }[];
   }) => Promise<void>;
 }
 
@@ -571,7 +573,17 @@ export class TransferMachine {
       const coinId = coinIdOf(payload);
       const committedAmount =
         coinId === undefined ? '0' : await this.settledAmount(engine, coinId, committed);
-      await this.deps.recordHistory?.({ transferId, payload, phase, committedAmount });
+      // A whole-token spend has no coin to sum — record what the moved token ACTUALLY
+      // carried, so a valued one is not logged as `assets: []`.
+      const committedAssets =
+        coinId === undefined ? await this.settledAssets(engine, committed) : undefined;
+      await this.deps.recordHistory?.({
+        transferId,
+        payload,
+        phase,
+        committedAmount,
+        ...(committedAssets !== undefined ? { committedAssets } : {}),
+      });
     } catch {
       /* a history failure never fails the money path */
     }
@@ -588,6 +600,22 @@ export class TransferMachine {
    * a journal-rehydrated resume leg has no source token, but every committed
    * leg carries its recipient blob, so the outcome-derived rule is uniform).
    */
+  /** Every asset across the certified recipient blobs — the whole-spend twin of settledAmount. */
+  private async settledAssets(
+    engine: ITokenEngine,
+    committed: OpOutcome[]
+  ): Promise<{ coinId: string; amount: string }[]> {
+    const total = new Map<string, bigint>();
+    for (const outcome of committed) {
+      if (outcome.recipientBlob === undefined) continue;
+      const token = await engine.decodeToken({ tokenId: '', token: outcome.recipientBlob });
+      for (const asset of engine.readValue(token)?.assets ?? []) {
+        total.set(asset.coinId, (total.get(asset.coinId) ?? 0n) + asset.amount);
+      }
+    }
+    return [...total].map(([coinId, amount]) => ({ coinId, amount: amount.toString() }));
+  }
+
   private async settledAmount(engine: ITokenEngine, coinId: string, committed: OpOutcome[]): Promise<string> {
     let total = 0n;
     for (const outcome of committed) {

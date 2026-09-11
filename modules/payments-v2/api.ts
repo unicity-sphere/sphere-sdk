@@ -9,7 +9,7 @@ export interface SendRequest {
   memo?: string;
 }
 
-export interface SendCoinlessRequest {
+export interface SendWholeTokenRequest {
   recipient: string;
   tokenId: string;
   memo?: string;
@@ -109,7 +109,7 @@ export interface PaymentsV2 {
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage>;
 
   send(req: SendRequest): Promise<TransferResult>;
-  sendCoinless(req: SendCoinlessRequest): Promise<TransferResult>;
+  sendWholeToken(req: SendWholeTokenRequest): Promise<TransferResult>;
   mint(coinId: string, amount: bigint): Promise<MintResult>;
   receive(): Promise<{ transfers: IncomingTransfer[] }>;
 

@@ -37,14 +37,14 @@ arrivals saw nothing land.
 
 ### Added — transferring a coinless token (#777)
 
-`payments.sendCoinless({ recipient, tokenId, memo? })` moves a coinless token whole: one named source,
+`payments.sendWholeToken({ recipient, tokenId, memo? })` moves a coinless token whole: one named source,
 one direct transfer, never a split. A separate verb rather than a widened `send()` because the
 addressing differs — `send()` selects sources to cover an amount and may queue for a combination,
-`sendCoinless` reserves the token you named and never queues, since nothing can free up that helps.
+`sendWholeToken` reserves the token you named and never queues, since nothing can free up that helps.
 
 It is the SAME `TransferMachine`, durable intent, checkpoints, mailbox deposit and applyDelta —
 one money path, with the two spends diverging in exactly one function. Three independent gates keep
-a valued token out: the mirror (`spendableCoinless`), the reservation ledger (concurrency), and a
+a valued token out: the mirror (`spendableToken`), the reservation ledger (concurrency), and a
 re-check of the decoded blob, which is the authority on what a token actually carries.
 
 A proven conflict is **terminal** for a named source: #625's bounded re-plan exists to pick a
@@ -55,7 +55,7 @@ envelope; an absent kind reads as `'coin'` — a migration, not a guess, since i
 any client wrote. A token intent names exactly one source and can never carry a split, re-checked
 on resume rather than trusted across the decrypt boundary.
 
-**Naming**: the SDK says *coinless* throughout (`CoinlessToken`, `coinless()`, `sendCoinless`,
+**Naming**: the SDK says *coinless* throughout (`CoinlessToken`, `coinless()`, `sendWholeToken`,
 `kind: 'coinless'`), matching wallet-api's spec rule. The Connect wire says *nft* (`send_nft`,
 `nft:transfer`) because that surface is read by a human in a consent prompt, where "coinless" would
 not communicate. "Token" is never used to mean "coinless token": coins are tokens too.

@@ -15,12 +15,12 @@ import type { ITokenEngine } from '../../token-engine/engine';
 import type { SphereToken } from '../../token-engine/types';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
-import type { CoinlessToken, ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest, SendCoinlessRequest } from './api';
+import type { CoinlessToken, ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest, SendWholeTokenRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { readTokenData } from './inventory/token-data';
 import { finalizeMint, type MintDeps, runMintUnderJournal } from './mint';
-import { materializeCoinlessSpend } from './send-coinless';
+import { materializeWholeSpend } from './send-whole';
 import { partialize, stampTransferId } from './send-errors';
 import { requireSameNetworkRecipient } from './recipient';
 import { reseedAndReset, type RestoreDeps } from './restore';
@@ -70,7 +70,7 @@ const INVENTORY_SCAN_PAGE_LIMIT = 50;
  */
 type SendJob =
   | { readonly kind: 'coin'; readonly request: SendRequest }
-  | { readonly kind: 'coinless'; readonly request: SendCoinlessRequest };
+  | { readonly kind: 'coinless'; readonly request: SendWholeTokenRequest };
 
 interface AttemptCtx {
   readonly transferId: string;
@@ -277,8 +277,8 @@ export class PaymentsFacade implements PaymentsV2 {
     return this.track(this.sendOutcome(request));
   }
 
-  sendCoinless(request: SendCoinlessRequest): Promise<TransferResult> {
-    return this.track(this.sendCoinlessOutcome(request));
+  sendWholeToken(request: SendWholeTokenRequest): Promise<TransferResult> {
+    return this.track(this.sendWholeTokenOutcome(request));
   }
 
   async receive(): Promise<{ transfers: IncomingTransfer[] }> {
@@ -344,7 +344,7 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   /** A token spend has no amount; '0' keeps the shortfall arithmetic total-free. */
-  private sendCoinlessOutcome(request: SendCoinlessRequest): Promise<TransferResult> {
+  private sendWholeTokenOutcome(request: SendWholeTokenRequest): Promise<TransferResult> {
     return this.runJob({ kind: 'coinless', request }, '0');
   }
 
@@ -517,10 +517,10 @@ export class PaymentsFacade implements PaymentsV2 {
     // The ONE divergence: a coin spend SELECTS sources to cover an amount and may
     // queue for them; a token spend reserves the one it was NAMED and never queues.
     if (job.kind === 'coinless') {
-      const spend = this.queue.planCoinless(transferId, job.request.tokenId);
+      const spend = this.queue.planWhole(transferId, job.request.tokenId);
       const sourceIds = this.markPlanned(transferId, '', spend);
       try {
-        return await materializeCoinlessSpend(
+        return await materializeWholeSpend(
           { engine: this.engine(), storagePort: this.deps.storagePort },
           { transferId, recipientPubkey, request: job.request, sourceIds }
         );

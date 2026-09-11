@@ -225,10 +225,10 @@ export class InventoryView {
     return !this.suspected.has(stateKey(tokenId, entry.stateHash));
   }
 
-  /** #777: is this NAMED token a spendable COINLESS holding? Never a coin source. */
-  spendableCoinless(tokenId: string): boolean {
+  /** Is this NAMED token spendable whole — coinless or valued (#777)? */
+  spendableToken(tokenId: string): boolean {
     const entry = this.mirror.get(tokenId);
-    return entry !== undefined && entry.coinless && this.isSpendable(tokenId, entry);
+    return entry !== undefined && this.isSpendable(tokenId, entry);
   }
 
   /**

@@ -1,21 +1,20 @@
 import { SphereError } from '../../core/errors';
 import type { ITokenEngine } from '../../token-engine/engine';
-import { isCoinlessEnvelope } from '../../token-engine/value-envelope';
 
-import { buildCoinlessPayload } from './machine/payload';
+import { buildWholePayload } from './machine/payload';
 import { buildOps, type MachinePlan } from './machine/TransferMachine';
-import type { SendCoinlessRequest } from './api';
+import type { SendWholeTokenRequest } from './api';
 import type { StoragePort } from './ports';
 
-export interface CoinlessSpendDeps {
+export interface WholeSpendDeps {
   readonly engine: ITokenEngine;
   readonly storagePort: Pick<StoragePort, 'getBlobs'>;
 }
 
-export interface CoinlessSpendInput {
+export interface WholeSpendInput {
   readonly transferId: string;
   readonly recipientPubkey: string;
-  readonly request: SendCoinlessRequest;
+  readonly request: SendWholeTokenRequest;
   readonly sourceIds: readonly string[];
 }
 
@@ -24,9 +23,9 @@ export interface CoinlessSpendInput {
  * coin, no split. `sourceTokens` stays EMPTY — those are the coin rows a UI shows
  * as in-flight, and a coinless token has no amount to show as moving.
  */
-export async function materializeCoinlessSpend(
-  deps: CoinlessSpendDeps,
-  input: CoinlessSpendInput
+export async function materializeWholeSpend(
+  deps: WholeSpendDeps,
+  input: WholeSpendInput
 ): Promise<{
   transferId: string;
   coinId: string;
@@ -41,17 +40,19 @@ export async function materializeCoinlessSpend(
     throw new SphereError(`Selected source ${tokenId} has no blob in storage`, 'STORAGE_ERROR');
   }
   const token = await engine.decodeToken({ tokenId, token: bytes });
-  // The BLOB is the authority, and the question is the ENVELOPE, not the value:
-  // `bare_collection` decodes to a null value while carrying coins this SDK cannot
-  // read, so a value check would move a valued token recording `assets: []`.
-  if (!isCoinlessEnvelope(token.valueEnvelope)) {
+  // A whole spend moves the token AS IS, coins included, so a valued source is fine.
+  // The one refusal is `bare_collection`: it carries coins this SDK cannot decode, so
+  // the move would be real while the history row could only say `assets: []` — value
+  // gone, nothing accounted. The BLOB decides, never the mirror.
+  if (token.valueEnvelope === 'bare_collection') {
     throw new SphereError(
-      `Token ${tokenId} carries coin value and cannot be sent with sendCoinless — use send()`,
+      `Token ${tokenId} carries a value envelope this SDK cannot read, so its coins ` +
+        'cannot be accounted for; it cannot be sent',
       'VALIDATION_ERROR'
     );
   }
   const keys = await engine.deliveryKeys(bytes);
-  const payload = buildCoinlessPayload(input.recipientPubkey, input.request, {
+  const payload = buildWholePayload(input.recipientPubkey, input.request, {
     [tokenId]: { local: keys.stateHash, protocol: keys.stateHash },
   });
   const plan: MachinePlan = {
