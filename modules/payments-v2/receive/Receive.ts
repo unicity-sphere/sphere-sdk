@@ -3,6 +3,7 @@
 
 import { logger } from '../../../core/logger';
 import type { ITokenEngine, SphereToken } from '../../../token-engine';
+import { isCoinlessEnvelope } from '../../../token-engine/value-envelope';
 import type { IncomingTransfer, Token } from '../../../types';
 import { SingleFlight } from '../async';
 import type { RegistryReader } from '../inventory/InventoryView';
@@ -445,10 +446,6 @@ function rejectAck(entry: IncomingDelivery, reason: 'invalid' | 'not-owned'): Pe
   return { deliveryId: entry.deliveryId, disposition: 'rejected', reason, cursor: entry.cursor };
 }
 
-/** Only `none_*` names no coin: `bare_collection` hides coins this SDK cannot read. */
-function isCoinlessEnvelope(envelope: SphereToken['valueEnvelope']): boolean {
-  return envelope.startsWith('none_');
-}
 
 function toAssetAmounts(token: SphereToken): IncomingAssetAmount[] {
   return (token.value?.assets ?? []).map((asset) => ({
