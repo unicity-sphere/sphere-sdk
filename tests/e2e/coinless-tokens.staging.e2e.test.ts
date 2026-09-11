@@ -24,6 +24,8 @@ import { RUN_STAGING } from './support/staging';
 import {
   activeRows,
   drainUntil,
+  localTotal,
+  serverTotal,
   logStep,
   makeVerticalWallet,
   shutdownVerticalWallets,
@@ -245,8 +247,37 @@ describe.skipIf(!RUN_STAGING)('coinless tokens — transfer, live staging', () =
   );
 
   it(
-    'refuses to move a VALUED token through sendWholeToken, against the real backend',
+    'moves a VALUED token whole A→B on testnet2, coins travelling with it',
     async () => {
+      let a = await makeVerticalWallet('whole-a');
+      const b = await makeVerticalWallet('whole-b');
+      const mint = await a.facade.mint(HARNESS_COIN, 250n);
+      if (!mint.success || mint.tokenId === undefined) {
+        throw new Error(`valued mint failed: ${mint.error ?? 'unknown'}`);
+      }
+      const tokenId = mint.tokenId;
+      await a.facade.stop().catch(() => undefined);
+      a = await makeVerticalWallet('whole-a', { identity: a.identity, kv: a.kv });
+
+      const result = await a.facade.sendWholeToken({
+        recipient: b.identity.chainPubkey,
+        tokenId,
+      });
+      expect(result.tokenTransfers).toEqual([{ sourceTokenId: tokenId, method: 'direct' }]);
+
+      // The WHOLE token moved: B holds 250, A holds nothing — no split, no change.
+      await drainUntil(b, () => localTotal(b) === 250n, 120_000, 'B receives the whole 250');
+      expect((await activeRows(b)).map((r) => r.tokenId)).toContain(tokenId);
+      await waitFor(a, async () => (await serverTotal(a)) === 0n, 90_000, 'A drained to 0');
+    },
+    900_000
+  );
+
+  it(
+    'the NFT-scoped verb still REFUSES a valued token, against the real backend',
+    async () => {
+      // The permission boundary: Connect's send_nft carries nft:transfer, which does
+      // not authorise moving coins.
       const w = await makeVerticalWallet('nft-refuse');
       const mint = await w.facade.mint(HARNESS_COIN, 250n);
       if (!mint.success || mint.tokenId === undefined) {
@@ -254,10 +285,9 @@ describe.skipIf(!RUN_STAGING)('coinless tokens — transfer, live staging', () =
       }
 
       await expect(
-        w.facade.sendWholeToken({ recipient: w.identity.chainPubkey, tokenId: mint.tokenId })
-      ).rejects.toThrow(/not a spendable coinless holding|carries coin value/);
+        w.facade.sendCoinless({ recipient: w.identity.chainPubkey, tokenId: mint.tokenId })
+      ).rejects.toThrow(/cannot be sent with sendCoinless/);
 
-      // Refused BEFORE any chain op: the coin is still spendable.
       const assets = await w.facade.assets();
       expect(assets[0]?.totalAmount).toBe('250');
     },

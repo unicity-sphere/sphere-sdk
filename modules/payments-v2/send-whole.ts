@@ -16,6 +16,12 @@ export interface WholeSpendInput {
   readonly recipientPubkey: string;
   readonly request: SendWholeTokenRequest;
   readonly sourceIds: readonly string[];
+  /**
+   * Refuse a source that carries coins. The NFT-scoped entry point sets this: a
+   * Connect dApp holding only `nft:transfer` must not be able to move coins by
+   * naming a valued token, and that scope is deliberately NOT `transfer:request`.
+   */
+  readonly requireCoinless: boolean;
 }
 
 /**
@@ -48,6 +54,13 @@ export async function materializeWholeSpend(
     throw new SphereError(
       `Token ${tokenId} carries a value envelope this SDK cannot read, so its coins ` +
         'cannot be accounted for; it cannot be sent',
+      'VALIDATION_ERROR'
+    );
+  }
+  if (input.requireCoinless && token.value !== null) {
+    throw new SphereError(
+      `Token ${tokenId} carries coin value and cannot be sent with sendCoinless — use ` +
+        'sendWholeToken, which requires coin-transfer authority',
       'VALIDATION_ERROR'
     );
   }

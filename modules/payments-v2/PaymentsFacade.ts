@@ -70,7 +70,12 @@ const INVENTORY_SCAN_PAGE_LIMIT = 50;
  */
 type SendJob =
   | { readonly kind: 'coin'; readonly request: SendRequest }
-  | { readonly kind: 'coinless'; readonly request: SendWholeTokenRequest };
+  | {
+      readonly kind: 'whole';
+      readonly request: SendWholeTokenRequest;
+      /** true for the NFT-scoped entry point, which must not move coins. */
+      readonly requireCoinless: boolean;
+    };
 
 interface AttemptCtx {
   readonly transferId: string;
@@ -278,7 +283,12 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   sendWholeToken(request: SendWholeTokenRequest): Promise<TransferResult> {
-    return this.track(this.sendWholeTokenOutcome(request));
+    return this.track(this.sendWholeTokenOutcome(request, false));
+  }
+
+  /** NFT-scoped twin of sendWholeToken: refuses a valued source. See SendJob. */
+  sendCoinless(request: SendWholeTokenRequest): Promise<TransferResult> {
+    return this.track(this.sendWholeTokenOutcome(request, true));
   }
 
   async receive(): Promise<{ transfers: IncomingTransfer[] }> {
@@ -344,8 +354,11 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   /** A token spend has no amount; '0' keeps the shortfall arithmetic total-free. */
-  private sendWholeTokenOutcome(request: SendWholeTokenRequest): Promise<TransferResult> {
-    return this.runJob({ kind: 'coinless', request }, '0');
+  private sendWholeTokenOutcome(
+    request: SendWholeTokenRequest,
+    requireCoinless: boolean
+  ): Promise<TransferResult> {
+    return this.runJob({ kind: 'whole', request, requireCoinless }, '0');
   }
 
   private async runJob(job: SendJob, amount: string): Promise<TransferResult> {
@@ -397,7 +410,7 @@ export class PaymentsFacade implements PaymentsV2 {
         // #625's re-plan searches for a DIFFERENT source. A named token has no
         // alternative — re-planning would pick the same one or nothing — so a
         // proven conflict is TERMINAL here rather than a bounded retry.
-        if (job.kind === 'coinless' || attempt >= MAX_RESELECT) throw partialize(disposition.error, run);
+        if (job.kind === 'whole' || attempt >= MAX_RESELECT) throw partialize(disposition.error, run);
         continue;
       }
       if (disposition.kind === 'success') {
@@ -516,13 +529,19 @@ export class PaymentsFacade implements PaymentsV2 {
     run.lastTransferId = transferId;
     // The ONE divergence: a coin spend SELECTS sources to cover an amount and may
     // queue for them; a token spend reserves the one it was NAMED and never queues.
-    if (job.kind === 'coinless') {
+    if (job.kind === 'whole') {
       const spend = this.queue.planWhole(transferId, job.request.tokenId);
       const sourceIds = this.markPlanned(transferId, '', spend);
       try {
         return await materializeWholeSpend(
           { engine: this.engine(), storagePort: this.deps.storagePort },
-          { transferId, recipientPubkey, request: job.request, sourceIds }
+          {
+            transferId,
+            recipientPubkey,
+            request: job.request,
+            sourceIds,
+            requireCoinless: job.requireCoinless,
+          }
         );
       } catch (err) {
         this.settleFailure(transferId, '', sourceIds);

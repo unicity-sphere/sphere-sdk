@@ -40,6 +40,7 @@ const input = {
   recipientPubkey: RECIPIENT,
   request: { recipient: '@peer', tokenId: TOKEN_ID },
   sourceIds: [TOKEN_ID],
+  requireCoinless: false,
 };
 
 describe('materializeWholeSpend', () => {
@@ -90,4 +91,23 @@ describe('materializeWholeSpend — the one envelope it refuses', () => {
       await expect(materializeWholeSpend(deps, input)).resolves.toBeDefined();
     }
   );
+});
+
+describe('the NFT-scoped entry point keeps its permission boundary (#783 review)', () => {
+  it('REFUSES a valued token when requireCoinless is set', async () => {
+    // Connect's `send_nft` carries `nft:transfer`, which deliberately does NOT
+    // authorise coin transfers. Routing it at the general verb would let a dApp
+    // holding only that scope move a valued token's coins.
+    const deps = { engine: engineWith({ assets: [{ coinId: 'bb'.repeat(32), amount: 5n }] }), storagePort };
+    await expect(
+      materializeWholeSpend(deps, { ...input, requireCoinless: true })
+    ).rejects.toThrow(/cannot be sent with sendCoinless/);
+  });
+
+  it('still allows a coinless token through the NFT-scoped path', async () => {
+    const deps = { engine: engineWith(null, 'none_other'), storagePort };
+    await expect(
+      materializeWholeSpend(deps, { ...input, requireCoinless: true })
+    ).resolves.toBeDefined();
+  });
 });
