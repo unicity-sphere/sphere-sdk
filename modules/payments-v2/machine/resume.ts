@@ -6,6 +6,7 @@ import { SphereError } from '../../../core/errors';
 import { logger } from '../../../core/logger';
 import type { SphereToken } from '../../../token-engine/types';
 import type { DeliveryJournalEntry, IntentBackstopEntry } from '../stores';
+import { isWholeIntent } from './payload-view';
 import type { CoinIntentPayload, IntentPayload, WholeIntentPayload } from './types';
 import { ATTENTION_CHECKPOINT_STUCK, createMachineStores, type MachineStores } from './journal';
 import { TransferMachine, buildOps, classifyError, type MachineDeps } from './TransferMachine';
@@ -169,9 +170,9 @@ async function runOne(ctx: RunCtx, job: ResumeJob, report: ResumeReport): Promis
       return;
     }
     // The blob is the authority on what a source carries — the same rule the send
-    // path applies at materialize. A durable intent labelled 'coinless' whose named
+    // path applies at materialize. A durable intent labelled whole whose named
     // source actually holds coins would move them while history records assets: [].
-    if (job.payload.kind === 'whole' && token.valueEnvelope === 'bare_collection') {
+    if (isWholeIntent(job.payload) && token.valueEnvelope === 'bare_collection') {
       logger.warn(
         'PaymentsV2',
         `resume: token intent ${job.transferId} names a source carrying coin value — refusing`

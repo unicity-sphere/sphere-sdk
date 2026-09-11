@@ -16,12 +16,12 @@ export interface CoinIntentPayload extends IntentPayloadBase {
 }
 
 export interface WholeIntentPayload extends IntentPayloadBase {
-  kind: 'whole';
+  // 'coinless' is 0.17.0's spelling, read-accepted; new payloads write 'whole'.
+  kind: 'whole' | 'coinless';
   direct: [string];
   split?: undefined;
 }
 
-/** `kind` is REQUIRED on both arms: a missed writer must be a compile error. */
 export type IntentPayload = CoinIntentPayload | WholeIntentPayload;
 
 export interface PlannedOp {

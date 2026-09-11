@@ -43,20 +43,25 @@ addressing differs — `send()` selects sources to cover an amount and may queue
 `sendWholeToken` reserves the token you named and never queues, since nothing can free up that helps.
 
 It is the SAME `TransferMachine`, durable intent, checkpoints, mailbox deposit and applyDelta —
-one money path, with the two spends diverging in exactly one function. Three independent gates keep
-a valued token out: the mirror (`spendableToken`), the reservation ledger (concurrency), and a
-re-check of the decoded blob, which is the authority on what a token actually carries.
+one money path, with the spends diverging in exactly one function.
+
+Two refusals, for different reasons. **`bare_collection`** is refused for everyone: those coins are
+real but this SDK cannot decode them, so the move would happen while the history row could only say
+`assets: []` — value gone, nothing accounted. The decoded blob decides that, never the mirror.
+**`sendCoinless`** additionally refuses any valued source, because Connect's `send_nft` routes there
+and its `nft:transfer` scope does not authorise coin transfers.
 
 A proven conflict is **terminal** for a named source: #625's bounded re-plan exists to pick a
 different source after a lost race, and a named token has no alternative.
 
-The durable intent is now discriminated by a REQUIRED `kind` (`'coin' | 'coinless'`) on a still-`v:2`
-envelope; an absent kind reads as `'coin'` — a migration, not a guess, since it is the only shape
-any client wrote. A token intent names exactly one source and can never carry a split, re-checked
-on resume rather than trusted across the decrypt boundary.
+The durable intent is discriminated by a REQUIRED `kind` on a still-`v:2` envelope. New payloads
+write `'whole'`; `'coinless'` is 0.17.0's spelling and stays accepted on read, since it is durable
+server state a client may already have written. An absent kind reads as `'coin'` — a migration, not
+a guess, since it is the only shape written before #777. A whole intent names exactly one source and
+can never carry a split, re-checked on resume rather than trusted across the decrypt boundary.
 
-**Naming**: the SDK says *coinless* throughout (`CoinlessToken`, `coinless()`, `sendWholeToken`,
-`kind: 'coinless'`), matching wallet-api's spec rule. The Connect wire says *nft* (`send_nft`,
+**Naming**: the SDK says *coinless* throughout (`CoinlessToken`, `coinless()`, `sendCoinless`),
+matching wallet-api's spec rule. The Connect wire says *nft* (`send_nft`,
 `nft:transfer`) because that surface is read by a human in a consent prompt, where "coinless" would
 not communicate. "Token" is never used to mean "coinless token": coins are tokens too.
 

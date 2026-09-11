@@ -8,6 +8,7 @@ import type { ITokenEngine, SplitCheckpointStore } from '../../token-engine/engi
 import type { TransferResult } from '../../types';
 
 import type { ConnectionStatus, SendRequest } from './api';
+import { isWholeIntent } from './machine/payload-view';
 import type { DeliveryPort, StoragePort } from './ports';
 import type { ScopedKV } from './stores';
 import { History, type HistoryClient } from './history/History';
@@ -285,7 +286,7 @@ function buildMachineDeps(
         transferId,
         // §5.9: the SETTLED amount, never payload.amount — the plan. A token
         // spend moved no coin: `assets: []` + tokenId (wallet-api#151 / §10).
-        ...(payload.kind === 'whole'
+        ...(isWholeIntent(payload)
           ? { assets: committedAssets ?? [], tokenId: payload.direct[0] }
           : { assets: [{ coinId: payload.coinId, amount: committedAmount }] }),
         recipientPubkey: payload.recipient,

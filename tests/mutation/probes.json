@@ -1498,10 +1498,20 @@
     ]
   },
   {
+    "name": "resume-drops-017-coinless-spelling",
+    "note": "#783: 'coinless' is 0.17.0's spelling of a whole intent and lives in DURABLE server state. Dropping it from the accept list makes every intent a 0.17.0 client left open permanently unresumable \u2014 sources reserved forever, no error surface.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (kind !== 'coin' && kind !== 'whole' && kind !== 'coinless') {",
+    "replace": "  if (kind !== 'coin' && kind !== 'whole') {",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
     "name": "resume-skips-blob-value-authority",
     "note": "#777: the blob is the authority on resume too. Without this a durable intent labelled 'token' whose named source carries coins moves them while history records assets: [] \u2014 value moved, nothing accounted.",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    if (job.payload.kind === 'whole' && token.valueEnvelope === 'bare_collection') {",
+    "find": "    if (isWholeIntent(job.payload) && token.valueEnvelope === 'bare_collection') {",
     "replace": "    if (false as boolean) {",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
