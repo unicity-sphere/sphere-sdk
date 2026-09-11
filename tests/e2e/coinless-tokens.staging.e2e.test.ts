@@ -20,7 +20,7 @@ import { WalletApiStoragePort } from '../../impl/wallet-api-v2/storage';
 import { CborSerializer } from '../../token-engine/sdk';
 import type { SphereToken } from '../../token-engine/types';
 
-import { RUN_STAGING } from './support/staging';
+import { HARNESS_COIN, RUN_STAGING } from './support/staging';
 import {
   activeRows,
   drainUntil,
@@ -44,7 +44,6 @@ const TESTNET2_NFT_TYPE = '971a26eef0e3aeb22bd3e7d44c47ce963400037e8df42b50d4d44
 /** Non-null on purpose: byte-identity needs something to compare. */
 const NFT_PAYLOAD = CborSerializer.encodeTextString('kitty #1');
 
-const HARNESS_COIN = 'a'.repeat(64);
 
 describe.skipIf(!RUN_STAGING)('coinless tokens — live staging', () => {
   afterAll(async () => {
