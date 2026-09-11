@@ -1478,10 +1478,10 @@
     ]
   },
   {
-    "name": "sendtoken-conflict-replans",
+    "name": "sendcoinless-conflict-replans",
     "note": "#625's re-plan searches for a DIFFERENT source; a NAMED token has none, so a proven conflict must be terminal rather than spinning the bounded retry.",
     "file": "modules/payments-v2/PaymentsFacade.ts",
-    "find": "        if (job.kind === 'token' || attempt >= MAX_RESELECT) throw partialize(disposition.error, run);",
+    "find": "        if (job.kind === 'coinless' || attempt >= MAX_RESELECT) throw partialize(disposition.error, run);",
     "replace": "        if (attempt >= MAX_RESELECT) throw partialize(disposition.error, run);",
     "tests": [
       "tests/unit/payments-v2/facade.test.ts"
@@ -1491,7 +1491,7 @@
     "name": "resume-migrates-unknown-kind-to-coin",
     "note": "#777: only an ABSENT kind migrates to 'coin'. An EXPLICIT unknown one (a newer client's payload, or a corrupted one) must be refused rather than executed under coin semantics it was never written for.",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "  if (kind !== 'coin' && kind !== 'token') {",
+    "find": "  if (kind !== 'coin' && kind !== 'coinless') {",
     "replace": "  if (false as boolean) {",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
@@ -1501,7 +1501,7 @@
     "name": "resume-skips-blob-value-authority",
     "note": "#777: the blob is the authority on resume too. Without this a durable intent labelled 'token' whose named source carries coins moves them while history records assets: [] \u2014 value moved, nothing accounted.",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    if (job.payload.kind === 'token' && token.value !== null) {",
+    "find": "    if (job.payload.kind === 'coinless' && token.value !== null) {",
     "replace": "    if (false as boolean) {",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
