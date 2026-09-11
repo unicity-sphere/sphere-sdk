@@ -14,6 +14,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { SphereError } from '../../../core/errors';
 import type { ITokenEngine } from '../../../token-engine/engine';
 import type { SphereToken } from '../../../token-engine/types';
+import type { RegistryReader } from '../../../modules/payments-v2/inventory/presentation';
 import { materializeWholeSpend } from '../../../modules/payments-v2/send-whole';
 
 const TOKEN_ID = 'aa'.repeat(32);
@@ -35,6 +36,19 @@ const storagePort = {
   getBlobs: vi.fn(async () => new Map([[TOKEN_ID, new Uint8Array([1, 2, 3])]])),
 };
 
+const registry: RegistryReader = {
+  getSymbol: () => 'TST',
+  getName: () => 'Test Coin',
+  getDecimals: () => 0,
+  getIconUrl: () => null,
+};
+
+const NOW = 1_700_000_000_000;
+
+function depsWith(engine: ITokenEngine) {
+  return { engine, storagePort, registry, now: NOW };
+}
+
 const input = {
   transferId: 'a1111111-1111-4111-8111-111111111111',
   recipientPubkey: RECIPIENT,
@@ -45,14 +59,14 @@ const input = {
 
 describe('materializeWholeSpend', () => {
   it('MOVES a valued token whole — coins travel with it, no split', async () => {
-    const deps = { engine: engineWith({ assets: [{ coinId: 'bb'.repeat(32), amount: 5n }] }), storagePort };
+    const deps = depsWith(engineWith({ assets: [{ coinId: 'bb'.repeat(32), amount: 5n }] }));
     const ctx = await materializeWholeSpend(deps, input);
     expect(ctx.plan.ops).toHaveLength(1);
     expect(ctx.plan.ops[0]?.kind).toBe('direct');
   });
 
   it('plans exactly ONE direct op for a genuinely coinless source — never a split', async () => {
-    const deps = { engine: engineWith(null), storagePort };
+    const deps = depsWith(engineWith(null));
     const ctx = await materializeWholeSpend(deps, input);
     expect(ctx.plan.ops).toHaveLength(1);
     expect(ctx.plan.ops[0]?.kind).toBe('direct');
@@ -61,14 +75,14 @@ describe('materializeWholeSpend', () => {
   });
 
   it('reports no coin and no in-flight coin rows: a coinless spend has no amount to show', async () => {
-    const deps = { engine: engineWith(null), storagePort };
+    const deps = depsWith(engineWith(null));
     const ctx = await materializeWholeSpend(deps, input);
     expect(ctx.coinId).toBe('');
     expect(ctx.sourceTokens).toEqual([]);
   });
 
   it('refuses when the blob is missing rather than planning a spend of nothing', async () => {
-    const deps = { engine: engineWith(null), storagePort: { getBlobs: vi.fn(async () => new Map()) } };
+    const deps = { ...depsWith(engineWith(null)), storagePort: { getBlobs: vi.fn(async () => new Map()) } };
     await expect(materializeWholeSpend(deps, input)).rejects.toThrow(/no blob in storage/);
   });
 });
@@ -79,7 +93,7 @@ describe('materializeWholeSpend — the one envelope it refuses', () => {
     // not: the coins are real but this SDK cannot decode them, so the move would
     // happen while the history row could only say `assets: []` — value gone,
     // nothing accounted. The BLOB decides, never the mirror.
-    const deps = { engine: engineWith(null, 'bare_collection'), storagePort };
+    const deps = depsWith(engineWith(null, 'bare_collection'));
     await expect(materializeWholeSpend(deps, input)).rejects.toThrow(/cannot be accounted for/);
   });
 
@@ -87,7 +101,7 @@ describe('materializeWholeSpend — the one envelope it refuses', () => {
     'allows a %s envelope — coinless or valued, both move whole',
     async (envelope) => {
       const value = envelope === 'sphere' ? { assets: [{ coinId: 'bb'.repeat(32), amount: 1n }] } : null;
-      const deps = { engine: engineWith(value, envelope), storagePort };
+      const deps = depsWith(engineWith(value, envelope));
       await expect(materializeWholeSpend(deps, input)).resolves.toBeDefined();
     }
   );
@@ -98,14 +112,14 @@ describe('the NFT-scoped entry point keeps its permission boundary (#783 review)
     // Connect's `send_nft` carries `nft:transfer`, which deliberately does NOT
     // authorise coin transfers. Routing it at the general verb would let a dApp
     // holding only that scope move a valued token's coins.
-    const deps = { engine: engineWith({ assets: [{ coinId: 'bb'.repeat(32), amount: 5n }] }), storagePort };
+    const deps = depsWith(engineWith({ assets: [{ coinId: 'bb'.repeat(32), amount: 5n }] }));
     await expect(
       materializeWholeSpend(deps, { ...input, requireCoinless: true })
     ).rejects.toThrow(/cannot be sent with sendCoinless/);
   });
 
   it('still allows a coinless token through the NFT-scoped path', async () => {
-    const deps = { engine: engineWith(null, 'none_other'), storagePort };
+    const deps = depsWith(engineWith(null, 'none_other'));
     await expect(
       materializeWholeSpend(deps, { ...input, requireCoinless: true })
     ).resolves.toBeDefined();

@@ -81,6 +81,11 @@ real but this SDK cannot decode them, so the move would happen while the history
 **`sendCoinless`** additionally refuses any valued source, because Connect's `send_nft` routes there
 and its `nft:transfer` scope does not authorise coin transfers.
 
+The `TransferResult` lists every asset the moved token carried, the same way `send()` does — a
+whole spend takes the source's coins along, so reporting `tokens: []` would tell callers and
+`transfer:updated` consumers that a send which moved real coins moved nothing. A coinless token
+reports none: it has no amount in flight.
+
 A proven conflict is **terminal** for a named source: #625's bounded re-plan exists to pick a
 different source after a lost race, and a named token has no alternative.
 

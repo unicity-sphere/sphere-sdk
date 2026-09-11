@@ -830,6 +830,28 @@ describe('PaymentsFacade — sendWholeToken: moving a coinless token (#777)', ()
     expect(sent[0]?.tokenId).toBe(coin.blob.tokenId);
     // The whole token left — no change came back.
     expect(world.facade.tokens().map((t) => t.id)).not.toContain(coin.blob.tokenId);
+    // ...and the RESULT says the same as the history row. Reporting `tokens: []`
+    // here would tell every caller and `transfer:updated` consumer that a send
+    // which moved 100 coins moved nothing.
+    expect(result.tokens.map((t) => ({ id: t.id, coinId: t.coinId, amount: t.amount }))).toEqual([
+      { id: coin.blob.tokenId, coinId: COIN, amount: '100' },
+    ]);
+  });
+
+  it('reports NO coin rows for a coinless whole send — there is no amount in flight', async () => {
+    const world = makeWorld();
+    const nft = await world.seedCoinless();
+    await world.facade.start();
+
+    const result = await world.facade.sendWholeToken({
+      recipient: '@peer',
+      tokenId: nft.blob.tokenId,
+    });
+
+    expect(result.tokens).toEqual([]);
+    expect(result.tokenTransfers).toEqual([
+      { sourceTokenId: nft.blob.tokenId, method: 'direct' },
+    ]);
   });
 
   it('REFUSES an unknown token before reserving anything or touching the chain', async () => {

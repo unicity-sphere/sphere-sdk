@@ -520,7 +520,7 @@ export class PaymentsFacade implements PaymentsV2 {
       const sourceIds = this.markPlanned(transferId, '', spend);
       try {
         return await materializeWholeSpend(
-          { engine: this.engine(), storagePort: this.deps.storagePort },
+          { engine: this.engine(), storagePort: this.deps.storagePort, registry: this.deps.registry, now: this.nowMs() },
           {
             transferId,
             recipientPubkey,

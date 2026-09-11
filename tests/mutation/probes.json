@@ -1538,6 +1538,16 @@
     ]
   },
   {
+    "name": "wholesend-result-drops-moved-coins",
+    "note": "#783 review: a whole spend carries the source's coins along, so the TransferResult must report them. Returning [] was correct only while the verb was coinless-only \u2014 on a valued token it tells every caller and every transfer:updated consumer that a send which moved real coins moved nothing, while the history row it writes records the true assets.",
+    "file": "modules/payments-v2/send-whole.ts",
+    "find": "  const sourceTokens = (token.value?.assets ?? []).map((asset) =>",
+    "replace": "  const sourceTokens = ([] as { coinId: string; amount: bigint }[]).map((asset) =>",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
     "name": "sendcoinless-loses-its-nft-boundary",
     "note": "#783 review P1: Connect's send_nft carries nft:transfer, which does NOT authorise coin transfers. Dropping requireCoinless lets a dApp holding only that scope move a valued token's coins by naming its id.",
     "file": "modules/payments-v2/send-whole.ts",

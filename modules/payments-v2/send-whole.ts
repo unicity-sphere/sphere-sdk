@@ -1,14 +1,18 @@
 import { SphereError } from '../../core/errors';
 import type { ITokenEngine } from '../../token-engine/engine';
+import type { Token } from '../../types';
 
 import { buildWholePayload } from './machine/payload';
 import { buildOps, type MachinePlan } from './machine/TransferMachine';
 import type { SendWholeTokenRequest } from './api';
+import { transferringToken, type RegistryReader } from './inventory/presentation';
 import type { StoragePort } from './ports';
 
 export interface WholeSpendDeps {
   readonly engine: ITokenEngine;
   readonly storagePort: Pick<StoragePort, 'getBlobs'>;
+  readonly registry: RegistryReader;
+  readonly now: number;
 }
 
 export interface WholeSpendInput {
@@ -21,9 +25,9 @@ export interface WholeSpendInput {
 }
 
 /**
- * The token-addressed twin of the facade's `materialize`: one named source, no
- * coin, no split. `sourceTokens` stays EMPTY — those are the coin rows a UI shows
- * as in-flight, and a coinless token has no amount to show as moving.
+ * The token-addressed twin of the facade's `materialize`: one named source, never a
+ * split. `sourceTokens` become the result's `tokens`, so they list every asset the
+ * named token carries — empty only for a coinless one, which moves no amount.
  */
 export async function materializeWholeSpend(
   deps: WholeSpendDeps,
@@ -33,7 +37,7 @@ export async function materializeWholeSpend(
   coinId: string;
   plan: MachinePlan;
   sourceIds: readonly string[];
-  sourceTokens: never[];
+  sourceTokens: Token[];
 }> {
   const { engine } = deps;
   const tokenId = input.request.tokenId;
@@ -71,5 +75,8 @@ export async function materializeWholeSpend(
     sources: new Map([[tokenId, token]]),
     ...(input.request.memo !== undefined ? { memo: input.request.memo } : {}),
   };
-  return { transferId: input.transferId, coinId: '', plan, sourceIds: input.sourceIds, sourceTokens: [] };
+  const sourceTokens = (token.value?.assets ?? []).map((asset) =>
+    transferringToken(tokenId, asset.coinId, asset.amount, deps.registry, deps.now)
+  );
+  return { transferId: input.transferId, coinId: '', plan, sourceIds: input.sourceIds, sourceTokens };
 }
