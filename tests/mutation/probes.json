@@ -1358,10 +1358,10 @@
   },
   {
     "name": "receive-conflates-unreadable-with-coinless",
-    "note": "#778/#777: `value === null` is true for a coinless token AND for a bare_collection carrying coins this SDK cannot decode. Keying the NFT announcement on it hides real coins behind a token type.",
+    "note": "#778/#777: `value === null` is true for a coinless token AND for a bare_collection carrying coins this SDK cannot decode. This is the RECEIVE-path decision \u2014 keying the NFT announcement on the value hides real coins behind a token type. The classifier itself is guarded separately by coinless-envelope-check-uses-value-not-envelope.",
     "file": "modules/payments-v2/receive/Receive.ts",
-    "find": "  return envelope.startsWith('none_');",
-    "replace": "  return envelope !== 'sphere';",
+    "find": "      ...(isCoinlessEnvelope(token.valueEnvelope) ? { tokenType: token.tokenType } : {}),",
+    "replace": "      ...(token.value === null ? { tokenType: token.tokenType } : {}),",
     "tests": [
       "tests/unit/payments-v2/receive.test.ts"
     ]

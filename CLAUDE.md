@@ -767,10 +767,14 @@ authoritative for build success.
 - `sendCoinless` is the **NFT-scoped twin**, refusing a valued source. Connect's `send_nft` must
   route there: its `nft:transfer` scope does NOT authorise coin transfers, so routing it at the
   general verb would let a dApp holding only that scope move coins.
-- The durable intent is discriminated by a REQUIRED `kind` (`'coin' | 'coinless'`); an ABSENT kind
-  reads as `'coin'`, the only shape written before #777. A token intent names EXACTLY one source
-  and can never carry a split — re-checked on resume, because a second leg would let a '0'
-  remainder complete the intent and report success for a leg that never landed.
+- The durable intent is discriminated by a REQUIRED `kind` (`'coin' | 'whole'`); an ABSENT kind
+  reads as `'coin'`, the only shape written before #777, and an EXPLICIT unknown one is refused.
+  `'coinless'` is 0.17.0's spelling of `'whole'` and is still ACCEPTED on read — the payload is
+  durable SERVER state, so a 0.17.0 client may have left one open and this client must resume it;
+  `isWholeIntent()` is the only discriminator, never a `=== 'whole'` comparison. A whole intent
+  names EXACTLY one source and can never carry a split — re-checked on resume, because a second
+  leg would let a '0' remainder complete the intent and report success for a leg that never
+  landed.
 - Connect: the `send_nft` intent has its OWN `nft:transfer` scope (2.1 → 2.2). Reusing
   `transfer:request` would silently widen every dApp that already holds it. Named *nft*, not
   *token*: coins are tokens too, so `token:transfer` beside `transfer:request` distinguishes
