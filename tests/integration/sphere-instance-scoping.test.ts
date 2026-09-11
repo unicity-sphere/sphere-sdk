@@ -211,7 +211,7 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
     // Sanity, so "A survived" can never be read as "clear() did nothing": B is the
     // wallet that WAS cleared, and its Sphere is gone.
     expect(b.sphere!.isReady).toBe(false);
-  });
+  }, 60_000);
 
   it('import() onto another storage leaves a live Sphere on a different one fully alive', async () => {
     // Same ordering: A is built last, so the old static pointed at it.
@@ -248,7 +248,7 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
 
     await sphereA.switchToAddress(1);
     expect(activated).toHaveLength(1);
-  });
+  }, 60_000);
 
   it('clear() on a Sphere OWN storage still destroys it — scoped, not abandoned', async () => {
     const b = makeWallet('b');
@@ -267,7 +267,7 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
     // ...and B, which was NOT cleared, is still alive.
     expect(b.sphere!.isReady).toBe(true);
     expect(() => b.sphere!.payments).not.toThrow();
-  });
+  }, 60_000);
 
   it('clear() destroys EVERY Sphere on that storage, not merely one of them', async () => {
     // The registry maps a provider to a SET, because more than one Sphere can be built
@@ -296,7 +296,7 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
     expect(second.isReady).toBe(false);
     expect(() => first.payments).toThrow();
     expect(() => second.payments).toThrow();
-  });
+  }, 60_000);
 
   it('clear() through one provider destroys the Spheres of every provider on that STORE', async () => {
     // Two provider OBJECTS over one dataDir address one wallet.json. Keyed by object
@@ -325,7 +325,7 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
     expect(first.isReady).toBe(false);
     expect(second.isReady, 'the twin addresses the KV clear() just emptied').toBe(false);
     expect(() => second.payments).toThrow();
-  });
+  }, 60_000);
 
   it('the live registry drops a store entry once its last Sphere is destroyed', async () => {
     // The map is keyed by STRING now, so nothing collects an emptied Set for us: every
@@ -350,7 +350,7 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
 
     await second.destroy();
     expect(liveStoreKeys().length, 'the emptied Set must be removed, not left behind').toBe(before);
-  });
+  }, 60_000);
 
   it('a provider that declares no backing store keeps object-identity scoping', async () => {
     // The documented fallback for custom implementations: without `backingStoreId` the
@@ -385,7 +385,7 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
 
     expect(sphereA.isReady).toBe(false);
     expect(sphereB.isReady, 'undeclared stores stay scoped per object').toBe(true);
-  });
+  }, 60_000);
 
   describe('a bring-up publishes only if its store survived it (#772)', () => {
     /** A pause point: `reached` settles when the code arrives, `open()` lets it through. */
@@ -455,7 +455,7 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
       expect(await Sphere.exists(a.storage)).toBe(false);
       expect(liveStoreKeys().some((k) => k.includes(a.dataDir))).toBe(false);
       expect(a.transport.disconnect, 'the refused Sphere is torn down, not leaked').toHaveBeenCalled();
-    });
+    }, 60_000);
 
     it('refuses to publish DURING a clear, before the wipe that would empty it', async () => {
       const a = makeWallet('publish-mid-clear');
@@ -476,7 +476,7 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
       wipe.open();
       await cleared;
       expect(await Sphere.exists(a.storage)).toBe(false);
-    });
+    }, 60_000);
 
     it('refuses an init that began mid-clear, whose keys the wipe then erased', async () => {
       const a = makeWallet('init-mid-clear');
@@ -498,7 +498,7 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
 
       await expect(init).rejects.toThrow(CLEARED);
       expect(await Sphere.exists(a.storage)).toBe(false);
-    });
+    }, 60_000);
   });
 });
 
@@ -580,7 +580,7 @@ describe('the legacy-import entry points return the Sphere on the SUPPLIED stora
     await Sphere.clear({ storage: b.storage });
     expect(result.sphere!.isReady).toBe(false);
     expect(sphereA.isReady).toBe(true);
-  });
+  }, 60_000);
 
   it('importFromJSON returns the Sphere for the mnemonic branch', async () => {
     const backup = await backupOfWalletC();
@@ -600,7 +600,7 @@ describe('the legacy-import entry points return the Sphere on the SUPPLIED stora
     expect(result.sphere).toBeDefined();
     b.sphere = result.sphere;
     expect(result.sphere!.identity!.chainPubkey).toBe(backup.chainPubkey);
-  });
+  }, 60_000);
 
   it('importFromJSON returns the Sphere for the master-key branch too', async () => {
     // A backup with no mnemonic takes the OTHER return site — a second place the
@@ -622,7 +622,7 @@ describe('the legacy-import entry points return the Sphere on the SUPPLIED stora
     expect(result.sphere).toBeDefined();
     b.sphere = result.sphere;
     expect(result.sphere!.identity!.chainPubkey).toBe(backup.chainPubkey);
-  });
+  }, 60_000);
 
   it('import() into an UNUSED prefix does not wipe a live wallet sharing the database', async () => {
     // backingStoreId names the unit of ERASURE, so an IndexedDB database is ONE

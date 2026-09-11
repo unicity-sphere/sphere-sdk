@@ -241,6 +241,31 @@ describe.skipIf(!RUN_STAGING)('coinless tokens — transfer, live staging', () =
         'A no longer holds the token'
       );
       expect(await a.facade.assets()).toEqual([]);
+
+      // BACK AGAIN. A→B proves delivery; only B→A proves the RECEIVED token is a
+      // valid source — that the state B claimed is spendable, not just visible.
+      const back = await b.facade.sendCoinless({
+        recipient: a.identity.chainPubkey,
+        tokenId: nft.blob.tokenId,
+      });
+      expect(back.tokenTransfers).toEqual([
+        { sourceTokenId: nft.blob.tokenId, method: 'direct' },
+      ]);
+
+      await drainUntil(
+        a,
+        () => a.facade.coinless().some((t) => t.tokenId === nft.blob.tokenId),
+        120_000,
+        'A receives the token back'
+      );
+      // Same genesis id after a full round trip, and the payload still intact.
+      expect(await a.facade.tokenData(nft.blob.tokenId)).toEqual(NFT_PAYLOAD);
+      await waitFor(
+        b,
+        () => !b.facade.coinless().some((t) => t.tokenId === nft.blob.tokenId),
+        90_000,
+        'B no longer holds it'
+      );
     },
     900_000
   );
@@ -268,6 +293,19 @@ describe.skipIf(!RUN_STAGING)('coinless tokens — transfer, live staging', () =
       await drainUntil(b, () => localTotal(b) === 250n, 120_000, 'B receives the whole 250');
       expect((await activeRows(b)).map((r) => r.tokenId)).toContain(tokenId);
       await waitFor(a, async () => (await serverTotal(a)) === 0n, 90_000, 'A drained to 0');
+
+      // BACK AGAIN, with the coins. Only the return leg proves the token B received
+      // is a spendable source — and that its value survived the round trip intact,
+      // which a one-way send cannot show.
+      const back = await b.facade.sendWholeToken({
+        recipient: a.identity.chainPubkey,
+        tokenId,
+      });
+      expect(back.tokenTransfers).toEqual([{ sourceTokenId: tokenId, method: 'direct' }]);
+
+      await drainUntil(a, () => localTotal(a) === 250n, 120_000, 'A receives the whole 250 back');
+      expect(await serverTotal(a)).toBe(250n);
+      await waitFor(b, async () => (await serverTotal(b)) === 0n, 90_000, 'B drained to 0');
     },
     900_000
   );
@@ -277,11 +315,16 @@ describe.skipIf(!RUN_STAGING)('coinless tokens — transfer, live staging', () =
     async () => {
       // The permission boundary: Connect's send_nft carries nft:transfer, which does
       // not authorise moving coins.
-      const w = await makeVerticalWallet('nft-refuse');
+      let w = await makeVerticalWallet('nft-refuse');
       const mint = await w.facade.mint(HARNESS_COIN, 250n);
       if (!mint.success || mint.tokenId === undefined) {
         throw new Error(`valued mint failed: ${mint.error ?? 'unknown'}`);
       }
+      // Reopen so the mirror holds the fresh row: otherwise the refusal comes from
+      // the "not a spendable holding" gate and this asserts the wrong one.
+      await w.facade.stop().catch(() => undefined);
+      w = await makeVerticalWallet('nft-refuse', { identity: w.identity, kv: w.kv });
+      expect(w.facade.tokens().map((t) => t.id)).toContain(mint.tokenId);
 
       await expect(
         w.facade.sendCoinless({ recipient: w.identity.chainPubkey, tokenId: mint.tokenId })
