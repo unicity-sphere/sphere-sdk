@@ -110,11 +110,7 @@ export interface PaymentsV2 {
 
   send(req: SendRequest): Promise<TransferResult>;
   sendWholeToken(req: SendWholeTokenRequest): Promise<TransferResult>;
-  /**
-   * NFT-scoped twin of `sendWholeToken`: refuses a source carrying coins. Connect's
-   * `send_nft` intent must route here — its `nft:transfer` scope deliberately does
-   * not authorise coin transfers.
-   */
+  /** NFT-scoped twin: refuses a valued source. Connect's `send_nft` routes here. */
   sendCoinless(req: SendWholeTokenRequest): Promise<TransferResult>;
   mint(coinId: string, amount: bigint): Promise<MintResult>;
   receive(): Promise<{ transfers: IncomingTransfer[] }>;

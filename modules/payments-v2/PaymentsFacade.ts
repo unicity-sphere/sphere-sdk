@@ -2,9 +2,7 @@
 // lives here (bounded re-plan, remainder accumulation, keep-open rethrow);
 // the TransferMachine stays policy-free. Wiring lives in compose.ts.
 
-import { sha256 } from '@noble/hashes/sha2.js';
 
-import { bytesToHex } from '../../core/crypto';
 import {
   PartialSendConflictError,
   SphereError,
@@ -73,7 +71,6 @@ type SendJob =
   | {
       readonly kind: 'whole';
       readonly request: SendWholeTokenRequest;
-      /** true for the NFT-scoped entry point, which must not move coins. */
       readonly requireCoinless: boolean;
     };
 
@@ -279,16 +276,17 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   send(request: SendRequest): Promise<TransferResult> {
-    return this.track(this.sendOutcome(request));
+    return this.track(this.runJob({ kind: 'coin', request }, request.amount));
   }
 
   sendWholeToken(request: SendWholeTokenRequest): Promise<TransferResult> {
-    return this.track(this.sendWholeTokenOutcome(request, false));
+    // '0': no amount, keeping the shortfall arithmetic total-free.
+    return this.track(this.runJob({ kind: 'whole', request, requireCoinless: false }, '0'));
   }
 
-  /** NFT-scoped twin of sendWholeToken: refuses a valued source. See SendJob. */
+  /** NFT-scoped twin: refuses a valued source. */
   sendCoinless(request: SendWholeTokenRequest): Promise<TransferResult> {
-    return this.track(this.sendWholeTokenOutcome(request, true));
+    return this.track(this.runJob({ kind: 'whole', request, requireCoinless: true }, '0'));
   }
 
   async receive(): Promise<{ transfers: IncomingTransfer[] }> {
@@ -349,18 +347,6 @@ export class PaymentsFacade implements PaymentsV2 {
 
   /** The ONE place a send() outcome is shaped: success emits in finishSend, a
    *  CLEAN rejection emits `transfer:updated{status:'failed'}` here (§4). */
-  private sendOutcome(request: SendRequest): Promise<TransferResult> {
-    return this.runJob({ kind: 'coin', request }, request.amount);
-  }
-
-  /** A token spend has no amount; '0' keeps the shortfall arithmetic total-free. */
-  private sendWholeTokenOutcome(
-    request: SendWholeTokenRequest,
-    requireCoinless: boolean
-  ): Promise<TransferResult> {
-    return this.runJob({ kind: 'whole', request, requireCoinless }, '0');
-  }
-
   private async runJob(job: SendJob, amount: string): Promise<TransferResult> {
     const run: SendRun = {
       amount,

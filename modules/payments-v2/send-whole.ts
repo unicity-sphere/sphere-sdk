@@ -16,11 +16,7 @@ export interface WholeSpendInput {
   readonly recipientPubkey: string;
   readonly request: SendWholeTokenRequest;
   readonly sourceIds: readonly string[];
-  /**
-   * Refuse a source that carries coins. The NFT-scoped entry point sets this: a
-   * Connect dApp holding only `nft:transfer` must not be able to move coins by
-   * naming a valued token, and that scope is deliberately NOT `transfer:request`.
-   */
+  /** NFT-scoped entry point sets this: `nft:transfer` must not move coins. */
   readonly requireCoinless: boolean;
 }
 
@@ -46,10 +42,9 @@ export async function materializeWholeSpend(
     throw new SphereError(`Selected source ${tokenId} has no blob in storage`, 'STORAGE_ERROR');
   }
   const token = await engine.decodeToken({ tokenId, token: bytes });
-  // A whole spend moves the token AS IS, coins included, so a valued source is fine.
-  // The one refusal is `bare_collection`: it carries coins this SDK cannot decode, so
-  // the move would be real while the history row could only say `assets: []` — value
-  // gone, nothing accounted. The BLOB decides, never the mirror.
+  // A whole spend moves the token AS IS, so a valued source is fine. `bare_collection`
+  // is not: its coins are real but undecodable here, so the move would happen while
+  // history could only say `assets: []`. The BLOB decides, never the mirror.
   if (token.valueEnvelope === 'bare_collection') {
     throw new SphereError(
       `Token ${tokenId} carries a value envelope this SDK cannot read, so its coins ` +
