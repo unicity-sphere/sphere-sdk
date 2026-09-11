@@ -20,6 +20,8 @@ export type PlanOutcome =
 export interface SpendQueueDeps {
   readonly ledger: ReservationLedger;
   readonly getPool: (coinId: string) => readonly PoolEntry[];
+  /** #777: is this NAMED coinless token spendable right now? Same gates as pool(). */
+  readonly spendableCoinless?: (tokenId: string) => boolean;
   readonly workBudget?: number;
 }
 
@@ -87,6 +89,41 @@ export class SpendQueue {
       return { kind: 'planned', spend: { reservationId, plan } };
     }
     return { kind: 'queued', settled: this.enqueue(reservationId, request.coinId, amount) };
+  }
+
+  /**
+   * #777: reserve a NAMED coinless source. Never queues — there is nothing to wait
+   * for. A coin plan waits because some OTHER combination may free up; a named
+   * token is either free now or held by a reservation that only its own transfer
+   * can release, so queueing would block until a timeout on a spend that cannot
+   * become possible.
+   */
+  planCoinless(reservationId: string, tokenId: string): PlannedSpend {
+    if (this.destroyed) {
+      throw new SphereError('Module has been destroyed', 'MODULE_DESTROYED');
+    }
+    // #738 fail-closed, the same gate freeView() applies: while the held-set is
+    // unproven nothing is spendable, or a restart could double-spend a source an
+    // open intent already holds.
+    const unproven = this.deps.ledger.unprovenReason();
+    if (unproven !== null) {
+      throw new SphereError(`Cannot spend yet: ${unproven}`, 'SEND_SYNC_PENDING');
+    }
+    if (this.deps.spendableCoinless?.(tokenId) !== true) {
+      throw new SphereError(
+        `Token ${tokenId} is not a spendable coinless holding`,
+        'VALIDATION_ERROR'
+      );
+    }
+    const holder = this.deps.ledger.holderOf(tokenId);
+    if (holder !== undefined) {
+      throw new SphereError(
+        `Token ${tokenId} is already reserved by transfer ${holder}`,
+        'VALIDATION_ERROR'
+      );
+    }
+    this.deps.ledger.reserve(reservationId, [{ tokenId }]);
+    return { reservationId, plan: { direct: [tokenId] } };
   }
 
   /**

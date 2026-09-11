@@ -1760,10 +1760,10 @@ describe('ConnectClient.walletProtocol', () => {
     expect(client.walletProtocol).toBeNull();
   });
 
-  it("records this SDK's wallet as 2.1", async () => {
+  it("records this SDK's wallet as 2.2", async () => {
     const h = await connectHarness();
     expect(h.client.walletProtocol).toBe(SPHERE_CONNECT_VERSION);
-    expect(h.client.walletProtocol).toBe('2.1');
+    expect(h.client.walletProtocol).toBe('2.2');
   });
 
   it('records an OLD 2.0 wallet, so a dApp knows wallet:unlocked will never arrive', async () => {
@@ -1792,7 +1792,7 @@ describe('ConnectClient.walletProtocol', () => {
 
   it('is cleared when the session goes away', async () => {
     const h = await connectHarness();
-    expect(h.client.walletProtocol).toBe('2.1');
+    expect(h.client.walletProtocol).toBe('2.2');
 
     await h.client.disconnect();
 

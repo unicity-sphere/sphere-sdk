@@ -653,6 +653,20 @@ describe('InventoryView — coinless tokens (#777)', () => {
     expect(row?.name).toBeUndefined();
   });
 
+  it('an ACTIVE row that stops naming assets does not inherit them — the two reads stay disjoint', async () => {
+    // §16: `assets` absent means tombstone OR active-coinless, so inheriting on an
+    // ACTIVE row makes `coinless` true while stale assets keep the row in tokens()
+    // as well — present in both reads at once. Only a tombstone may inherit.
+    const { view, queue } = makeView([page([item('X', { seq: 1, amount: '100' })], 5), page([], 5)]);
+    await view.fullPull();
+    queue.push(page([item('X', { seq: 2, state: 'S2', noAssets: true, tokenType: NFT_TYPE })], 6));
+    await view.delta();
+
+    expect(view.coinless(registry).map((t) => t.tokenId)).toEqual(['X']);
+    expect(view.tokens(registry).map((t) => t.id)).toEqual([]);
+    expect(view.pool(COIN)).toEqual([]);
+  });
+
   it('a row that GAINS assets stops being coinless', async () => {
     const { view, queue } = makeView([
       page([item('N', { seq: 1, noAssets: true, tokenType: NFT_TYPE })], 5),

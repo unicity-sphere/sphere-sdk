@@ -23,6 +23,8 @@ export const PERMISSION_SCOPES = {
   PAYMENT_REQUEST: 'payment:request',
   SIGN_REQUEST: 'sign:request',
   MINT_REQUEST: 'mint:request',
+  /** #777: moving a coinless token (an NFT). Distinct from transfer:request. */
+  NFT_TRANSFER: 'nft:transfer',
 } as const;
 
 export type PermissionScope = (typeof PERMISSION_SCOPES)[keyof typeof PERMISSION_SCOPES];
@@ -66,6 +68,7 @@ export const INTENT_PERMISSIONS: Record<string, PermissionScope> = {
   [INTENT_ACTIONS.RECEIVE]: PERMISSION_SCOPES.IDENTITY_READ,
   [INTENT_ACTIONS.SIGN_MESSAGE]: PERMISSION_SCOPES.SIGN_REQUEST,
   [INTENT_ACTIONS.MINT]: PERMISSION_SCOPES.MINT_REQUEST,
+  [INTENT_ACTIONS.SEND_NFT]: PERMISSION_SCOPES.NFT_TRANSFER,
 };
 
 // =============================================================================

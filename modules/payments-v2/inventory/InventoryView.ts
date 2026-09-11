@@ -208,13 +208,27 @@ export class InventoryView {
   pool(coinId: string): PoolEntry[] {
     const out: PoolEntry[] = [];
     for (const [tokenId, entry] of this.mirror) {
-      if (entry.status !== 'active') continue;
-      if (this.inFlight.has(tokenId) && !this.pinned(tokenId)) continue;
-      if (this.suspected.has(stateKey(tokenId, entry.stateHash))) continue;
+      if (!this.isSpendable(tokenId, entry)) continue;
       const asset = entry.assets.find((a) => a.coinId === coinId);
       if (asset) out.push({ tokenId, amount: BigInt(asset.amount) });
     }
     return out;
+  }
+
+  /**
+   * The eligibility gates every spend shares, coin or token — ONE definition, so a
+   * single probe covers both verbs and neither can drift from the other.
+   */
+  private isSpendable(tokenId: string, entry: MirrorEntry): boolean {
+    if (entry.status !== 'active') return false;
+    if (this.inFlight.has(tokenId) && !this.pinned(tokenId)) return false;
+    return !this.suspected.has(stateKey(tokenId, entry.stateHash));
+  }
+
+  /** #777: is this NAMED token a spendable COINLESS holding? Never a coin source. */
+  spendableCoinless(tokenId: string): boolean {
+    const entry = this.mirror.get(tokenId);
+    return entry !== undefined && entry.coinless && this.isSpendable(tokenId, entry);
   }
 
   /**
@@ -362,9 +376,11 @@ export class InventoryView {
       stateHash: item.stateHash,
       seq: item.seq,
       status: item.status,
-      // Left INHERITING deliberately: a tombstone omits assets, and recoverRemoved
-      // must still know the amount it is restoring (inventory.test.ts).
-      assets: item.assets ?? prev?.assets ?? [],
+      // ONLY a tombstone inherits: it omits assets for an unrelated reason and
+      // recoverRemoved must know the amount it restores. An ACTIVE row that omits
+      // them is stating coinlessness, and inheriting there would keep stale assets
+      // in tokens() while `coinless` is true — the row in BOTH reads (§16).
+      assets: item.assets ?? (item.status === 'removed' ? (prev?.assets ?? []) : []),
       coinless: isCoinless(item, prev),
       ...(tokenType !== undefined ? { tokenType } : {}),
       createdAt: prev?.createdAt ?? now,

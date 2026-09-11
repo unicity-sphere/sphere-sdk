@@ -23,6 +23,14 @@ export type ValueEnvelope =
   | 'none_other'
   | 'none_absent';
 
+/**
+ * Does the token genuinely name NO coin? NOT the same question as `value === null`:
+ * `bare_collection` is null too while carrying coins this SDK cannot read.
+ */
+export function isCoinlessEnvelope(envelope: ValueEnvelope): boolean {
+  return envelope.startsWith('none_');
+}
+
 export interface ClassifiedValue {
   readonly envelope: ValueEnvelope;
   /** Populated only for `'sphere'`; null for every other envelope. */

@@ -764,3 +764,124 @@ describe('PaymentsFacade — mint', () => {
     expect(world.facade.tokens()).toHaveLength(1);
   });
 });
+
+describe('PaymentsFacade — sendCoinless: moving a coinless token (#777)', () => {
+  it('moves the named token whole: one direct leg, deposited, intent completed', async () => {
+    const world = makeWorld();
+    const nft = await world.seedCoinless();
+    await world.facade.start();
+
+    const result = await world.facade.sendCoinless({ recipient: '@peer', tokenId: nft.blob.tokenId });
+
+    expect(result.status).toBe('delivered');
+    expect(result.tokenTransfers).toEqual([
+      { sourceTokenId: nft.blob.tokenId, method: 'direct' },
+    ]);
+    const mailbox = await world.api.listMailbox(peerCaller, 0);
+    expect(mailbox.entries.map((e) => e.tokenId)).toEqual([nft.blob.tokenId]);
+    await flushTail();
+    expect(world.api.inspectIntent(ownCaller, result.id)?.status).toBe('completed');
+  });
+
+  it('leaves the wallet: the token is gone from coinless() once the spend settles', async () => {
+    const world = makeWorld();
+    const nft = await world.seedCoinless();
+    await world.facade.start();
+    expect(world.facade.coinless().map((t) => t.tokenId)).toEqual([nft.blob.tokenId]);
+
+    await world.facade.sendCoinless({ recipient: '@peer', tokenId: nft.blob.tokenId });
+    await flushTail();
+
+    expect(world.facade.coinless().map((t) => t.tokenId)).not.toContain(nft.blob.tokenId);
+  });
+
+  it('records history with an EMPTY asset list and the tokenId, never a synthetic coin', async () => {
+    const world = makeWorld();
+    const nft = await world.seedCoinless();
+    await world.facade.start();
+
+    await world.facade.sendCoinless({ recipient: '@peer', tokenId: nft.blob.tokenId });
+    await flushTail();
+
+    const sent = (await world.api.listHistory(ownCaller, {})).records.filter((r) => r.type === 'SENT');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.assets).toEqual([]);
+    expect(sent[0]?.tokenId).toBe(nft.blob.tokenId);
+  });
+
+  it('REFUSES a valued token — it would move real coins unaccounted for', async () => {
+    const world = makeWorld();
+    const coin = await world.seed(100n);
+    await world.facade.start();
+
+    await expect(
+      world.facade.sendCoinless({ recipient: '@peer', tokenId: coin.blob.tokenId })
+    ).rejects.toThrow(/not a spendable coinless holding/);
+  });
+
+  it('REFUSES an unknown token before reserving anything or touching the chain', async () => {
+    const world = makeWorld();
+    await world.facade.start();
+
+    await expect(
+      world.facade.sendCoinless({ recipient: '@peer', tokenId: 'ff'.repeat(32) })
+    ).rejects.toThrow(/not a spendable coinless holding/);
+    expect(await world.facade.pendingTransfers()).toEqual([]);
+  });
+
+  it('REFUSES a second concurrent spend of the same token rather than double-spending it', async () => {
+    const world = makeWorld();
+    const nft = await world.seedCoinless();
+    await world.facade.start();
+    const gate = world.gate('deliver');
+
+    const first = world.facade.sendCoinless({ recipient: '@peer', tokenId: nft.blob.tokenId });
+    await vi.waitFor(() => expect(gate.entered).toBe(true));
+    await expect(
+      world.facade.sendCoinless({ recipient: '@peer', tokenId: nft.blob.tokenId })
+    ).rejects.toThrow(/already reserved/);
+
+    gate.release();
+    await first;
+  });
+
+  it('a proven conflict is TERMINAL for a named source — it never re-plans onto another token', async () => {
+    // #625's bounded re-plan exists to pick a DIFFERENT source after a lost race.
+    // A named token has no alternative, so retrying re-picks the same one (or
+    // nothing) and spins. Two coinless tokens are seeded deliberately: if the
+    // re-plan ever ran, the SECOND is what it would reach for — and moving a token
+    // the caller never named would be worse than the failure.
+    const world = makeWorld();
+    const nft = await world.seedCoinless();
+    const other = await world.seedCoinless(new TextEncoder().encode('other'));
+    await world.engine.foreignSpend(nft); // someone else spent it first
+    await world.facade.start();
+
+    const err = await world.facade
+      .sendCoinless({ recipient: '@peer', tokenId: nft.blob.tokenId })
+      .then(() => null, (e: unknown) => e);
+
+    // The caller must learn the token was spent elsewhere. If the re-plan ran, it
+    // re-picks the now-demoted source and reports "not a spendable coinless
+    // holding" instead — which hides the real cause behind a confusing one.
+    expect((err as Error).message).toMatch(/already consumed|conflict/i);
+    expect((err as Error).message).not.toMatch(/not a spendable coinless holding/);
+
+    // Nothing was deposited, and the untouched token stayed untouched.
+    const mailbox = await world.api.listMailbox(peerCaller, 0);
+    expect(mailbox.entries.map((e) => e.tokenId)).not.toContain(other.blob.tokenId);
+    expect(world.facade.coinless().map((t) => t.tokenId)).toContain(other.blob.tokenId);
+  });
+
+  it('the COIN path is untouched: a coin send still selects and still splits', async () => {
+    const world = makeWorld();
+    await world.seedCoinless();
+    const coin = await world.seed(100n);
+    await world.facade.start();
+
+    const result = await world.facade.send({ recipient: '@peer', amount: '40', coinId: COIN });
+
+    // The coinless token is not a candidate: selection saw only the coin token.
+    expect(result.tokenTransfers).toEqual([{ sourceTokenId: coin.blob.tokenId, method: 'split' }]);
+  });
+});

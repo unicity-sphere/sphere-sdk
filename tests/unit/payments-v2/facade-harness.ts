@@ -161,6 +161,8 @@ export interface World {
   /** The fake transport directory the production resolver reads (identifier → binding). */
   peers: Map<string, PeerInfo | null>;
   seed(amount: bigint): Promise<SphereToken>;
+  /** #777: a token that names NO coin, indexed through the fake backend. */
+  seedCoinless(data?: Uint8Array): Promise<SphereToken>;
   peerDeliver(token: SphereToken, transferId: string): Promise<void>;
   gate(name: 'putIntent' | 'deliver' | 'listOpen' | 'applyDelta' | 'incoming'): Gate;
 }
@@ -304,6 +306,21 @@ export function makeWorld(
       const token = await engine.mint({
         recipientPubkey: hexToBytes(OWN_PUB),
         value: { assets: [{ coinId: COIN, amount }] },
+      });
+      const bytes = token.blob.token;
+      const sha = sha256Hex(bytes);
+      await innerClient.uploadBlob(`fake://put/${sha}`, bytes);
+      await innerClient.apply({
+        transferId: `seed-${token.blob.tokenId}`,
+        spent: [],
+        added: [{ tokenId: token.blob.tokenId, key: sha }],
+      });
+      return token;
+    },
+    seedCoinless: async (data?: Uint8Array) => {
+      const token = await engine.mintDataToken({
+        recipientPubkey: hexToBytes(OWN_PUB),
+        data: data ?? new TextEncoder().encode('kitty'),
       });
       const bytes = token.blob.token;
       const sha = sha256Hex(bytes);

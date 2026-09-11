@@ -5,7 +5,7 @@ import { resumeAll } from '../../../modules/payments-v2/machine/resume';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
 import { STORE_KEYS } from '../../../modules/payments-v2/stores';
 import { FakeApiError } from './fakes/FakeWalletApi';
-import { makeWorld, type World } from './machine-harness';
+import { COIN, makeWorld, type World } from './machine-harness';
 
 const fail500 = async (): Promise<void> => {
   throw new FakeApiError(500, 'INTERNAL', 'injected outage');
@@ -123,7 +123,7 @@ describe('TransferMachine resume path (§5.5 P6 — same machine, rehydrated)', 
     const shortfall = await createMachineStores(w.kv).shortfalls.getByKey('partial-1');
     expect(shortfall).toMatchObject({
       remainingAmount: '400',
-      coinId: plan.payload.coinId,
+      coinId: plan.payload.kind === 'coin' ? plan.payload.coinId : '',
       committedTokenIds: [tokenA.blob.tokenId],
     });
     expect(w.api.inspectIntent(w.caller, 'partial-1')?.status).toBe('completed');
@@ -309,3 +309,109 @@ describe('TransferMachine resume path (§5.5 P6 — same machine, rehydrated)', 
     expect(w.applied.length).toBe(applies);
   });
 });
+
+describe('resume refuses a durable intent it cannot safely execute (#777)', () => {
+  /** Stage a raw intent the way a foreign/newer client would have written it. */
+  async function stageRawIntent(w: World, transferId: string, payload: unknown): Promise<void> {
+    await w.api.putIntent(w.caller, {
+      transferId,
+      payload: `enc:${JSON.stringify(payload)}`,
+      requiresSeedClose: false,
+    });
+  }
+
+  it('refuses an EXPLICIT unknown kind rather than running it under coin semantics', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const id = 'c0000000-0000-4000-8000-000000000001';
+    // Coin-SHAPED, so only the discriminant tells it apart. Migrating this to
+    // 'coin' would execute a payload written for semantics this client lacks.
+    await stageRawIntent(w, id, {
+      v: 2,
+      kind: 'swap',
+      recipient: w.recipientHex,
+      coinId: COIN,
+      amount: '1000',
+      direct: [token.blob.tokenId],
+    });
+
+    const report = await resumeAll(w.deps);
+
+    expect(report.failed).toContain(id);
+    expect(report.resumed).not.toContain(id);
+    expect(w.engine.transferCalls).toHaveLength(0);
+    expect(w.api.inspectIntent(w.caller, id)?.status).toBe('open');
+  });
+
+  it('still migrates an ABSENT kind to coin — the only shape written before #777', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const id = 'c0000000-0000-4000-8000-000000000002';
+    await stageRawIntent(w, id, {
+      v: 2,
+      recipient: w.recipientHex,
+      coinId: COIN,
+      amount: '1000',
+      direct: [token.blob.tokenId],
+      spentStates: {
+        [token.blob.tokenId]: await stateOfToken(w, token),
+      },
+    });
+
+    const report = await resumeAll(w.deps);
+
+    expect(report.failed).not.toContain(id);
+  });
+
+  it('refuses a coinless intent whose source is an UNREADABLE envelope, not just a valued one', async () => {
+    // `bare_collection` decodes to value === null exactly like a coinless token, so
+    // a value check passes it through. The envelope is the question.
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const id = 'c0000000-0000-4000-8000-000000000004';
+    w.engine.forceEnvelope(token.blob.tokenId, 'bare_collection');
+    await stageRawIntent(w, id, {
+      v: 2,
+      kind: 'coinless',
+      recipient: w.recipientHex,
+      direct: [token.blob.tokenId],
+      spentStates: { [token.blob.tokenId]: await stateOfToken(w, token) },
+    });
+
+    const report = await resumeAll(w.deps);
+
+    expect(report.failed).toContain(id);
+    expect(w.engine.transferCalls).toHaveLength(0);
+  });
+
+  it('refuses a token intent whose named source actually carries COINS', async () => {
+    // The blob is the authority. Executing this would move real coins while the
+    // history row for it records `assets: []` — value moved, nothing accounted.
+    const w = makeWorld();
+    const valued = await w.seed(1000n);
+    const id = 'c0000000-0000-4000-8000-000000000003';
+    await stageRawIntent(w, id, {
+      v: 2,
+      kind: 'coinless',
+      recipient: w.recipientHex,
+      direct: [valued.blob.tokenId],
+      spentStates: {
+        [valued.blob.tokenId]: await stateOfToken(w, valued),
+      },
+    });
+
+    const report = await resumeAll(w.deps);
+
+    expect(report.failed).toContain(id);
+    expect(w.engine.transferCalls).toHaveLength(0);
+    expect((await w.api.listMailbox(w.recipientCaller)).entries).toHaveLength(0);
+  });
+});
+
+async function stateOfToken(
+  w: World,
+  token: { blob: { token: Uint8Array } }
+): Promise<{ local: string; protocol: string }> {
+  const keys = await w.engine.deliveryKeys(token.blob.token);
+  return { local: keys.stateHash, protocol: keys.stateHash };
+}

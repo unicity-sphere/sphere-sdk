@@ -9,6 +9,12 @@ export interface SendRequest {
   memo?: string;
 }
 
+export interface SendCoinlessRequest {
+  recipient: string;
+  tokenId: string;
+  memo?: string;
+}
+
 export interface MintResult {
   success: boolean;
   tokenId?: string;
@@ -84,6 +90,8 @@ export interface PendingTransfer {
   recipient: string;
   coinId: string;
   amount: string;
+  /** Set instead of coinId/amount when the intent is a token-addressed spend. */
+  tokenId?: string;
   legs: { certified: number; total: number };
   deliveryPending: boolean;
   createdAt: number;
@@ -101,6 +109,7 @@ export interface PaymentsV2 {
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage>;
 
   send(req: SendRequest): Promise<TransferResult>;
+  sendCoinless(req: SendCoinlessRequest): Promise<TransferResult>;
   mint(coinId: string, amount: bigint): Promise<MintResult>;
   receive(): Promise<{ transfers: IncomingTransfer[] }>;
 

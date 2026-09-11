@@ -15,10 +15,12 @@ import type { ITokenEngine } from '../../token-engine/engine';
 import type { SphereToken } from '../../token-engine/types';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
-import type { CoinlessToken, ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest } from './api';
+import type { CoinlessToken, ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest, SendCoinlessRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { readTokenData } from './inventory/token-data';
+import { finalizeMint, type MintDeps, runMintUnderJournal } from './mint';
+import { materializeCoinlessSpend } from './send-coinless';
 import { partialize, stampTransferId } from './send-errors';
 import { requireSameNetworkRecipient } from './recipient';
 import { reseedAndReset, type RestoreDeps } from './restore';
@@ -62,8 +64,17 @@ export const ATTENTION_MINT_UNRESOLVED = 'mint:unresolved';
 
 const INVENTORY_SCAN_PAGE_LIMIT = 50;
 
+/**
+ * What this attempt is spending. The policy loop is shared; only planning and the
+ * conflict rule differ, so the union is narrowed in exactly those two places.
+ */
+type SendJob =
+  | { readonly kind: 'coin'; readonly request: SendRequest }
+  | { readonly kind: 'coinless'; readonly request: SendCoinlessRequest };
+
 interface AttemptCtx {
   readonly transferId: string;
+  /** '' for a token-addressed spend: it names no coin. */
   readonly coinId: string;
   readonly plan: MachinePlan;
   readonly sourceIds: readonly string[];
@@ -266,6 +277,10 @@ export class PaymentsFacade implements PaymentsV2 {
     return this.track(this.sendOutcome(request));
   }
 
+  sendCoinless(request: SendCoinlessRequest): Promise<TransferResult> {
+    return this.track(this.sendCoinlessOutcome(request));
+  }
+
   async receive(): Promise<{ transfers: IncomingTransfer[] }> {
     const transfers = await this.track(this.receiveLoop.drainOnce());
     return { transfers };
@@ -306,13 +321,36 @@ export class PaymentsFacade implements PaymentsV2 {
     return (this.deps.now ?? Date.now)();
   }
 
+  private mintDeps(): MintDeps {
+    return {
+      engine: this.engine(),
+      mintJournal: this.machineStores.mintJournal,
+      storagePort: this.deps.storagePort,
+      recordMint: (input) => this.historyStore.recordMint(input),
+      armHeartbeat: () => this.heartbeat.arm(),
+      noteHeldState: (tokenId, stateHash) => void this.heldStates.set(tokenId, stateHash),
+      refreshView: () => this.trackTail(this.view.delta()),
+      ownPubkeyBytes: this.ownPubkeyBytes,
+      now: () => this.nowMs(),
+    };
+  }
+
   // ── send policy (§5.5 + old-loop parity; the machine stays policy-free) ────
 
   /** The ONE place a send() outcome is shaped: success emits in finishSend, a
    *  CLEAN rejection emits `transfer:updated{status:'failed'}` here (§4). */
-  private async sendOutcome(request: SendRequest): Promise<TransferResult> {
+  private sendOutcome(request: SendRequest): Promise<TransferResult> {
+    return this.runJob({ kind: 'coin', request }, request.amount);
+  }
+
+  /** A token spend has no amount; '0' keeps the shortfall arithmetic total-free. */
+  private sendCoinlessOutcome(request: SendCoinlessRequest): Promise<TransferResult> {
+    return this.runJob({ kind: 'coinless', request }, '0');
+  }
+
+  private async runJob(job: SendJob, amount: string): Promise<TransferResult> {
     const run: SendRun = {
-      amount: request.amount,
+      amount,
       delivered: [],
       sentTokens: [],
       tokenTransfers: [],
@@ -322,7 +360,7 @@ export class PaymentsFacade implements PaymentsV2 {
       lastTransferId: '',
     };
     try {
-      return await this.sendWithPolicy(request, run);
+      return await this.sendWithPolicy(job, run);
     } catch (err) {
       this.emitCleanFailure(err, run.lastTransferId);
       throw err;
@@ -344,19 +382,22 @@ export class PaymentsFacade implements PaymentsV2 {
     this.deps.emit('transfer:updated', failed);
   }
 
-  private async sendWithPolicy(request: SendRequest, run: SendRun): Promise<TransferResult> {
-    const recipient = await requireSameNetworkRecipient(this.deps, request.recipient);
+  private async sendWithPolicy(job: SendJob, run: SendRun): Promise<TransferResult> {
+    const recipient = await requireSameNetworkRecipient(this.deps, job.request.recipient);
     for (let attempt = 0; ; attempt++) {
       let ctx: AttemptCtx;
       try {
-        ctx = await this.planAndMaterialize(recipient.chainPubkey, { ...request, amount: run.amount }, run);
+        ctx = await this.planAndMaterialize(recipient.chainPubkey, job, run);
       } catch (err) {
         throw partialize(err, run);
       }
       const disposition = await this.runAttempt(ctx);
       if (disposition.kind === 'rethrow') throw partialize(disposition.error, run);
       if (disposition.kind === 'retry-full') {
-        if (attempt >= MAX_RESELECT) throw partialize(disposition.error, run);
+        // #625's re-plan searches for a DIFFERENT source. A named token has no
+        // alternative — re-planning would pick the same one or nothing — so a
+        // proven conflict is TERMINAL here rather than a bounded retry.
+        if (job.kind === 'coinless' || attempt >= MAX_RESELECT) throw partialize(disposition.error, run);
         continue;
       }
       if (disposition.kind === 'success') {
@@ -470,9 +511,25 @@ export class PaymentsFacade implements PaymentsV2 {
     return { kind: 'rethrow', error: err };
   }
 
-  private async planAndMaterialize(recipientPubkey: string, request: SendRequest, run: SendRun): Promise<AttemptCtx> {
+  private async planAndMaterialize(recipientPubkey: string, job: SendJob, run: SendRun): Promise<AttemptCtx> {
     const transferId = this.newId();
     run.lastTransferId = transferId;
+    // The ONE divergence: a coin spend SELECTS sources to cover an amount and may
+    // queue for them; a token spend reserves the one it was NAMED and never queues.
+    if (job.kind === 'coinless') {
+      const spend = this.queue.planCoinless(transferId, job.request.tokenId);
+      const sourceIds = this.markPlanned(transferId, '', spend);
+      try {
+        return await materializeCoinlessSpend(
+          { engine: this.engine(), storagePort: this.deps.storagePort },
+          { transferId, recipientPubkey, request: job.request, sourceIds }
+        );
+      } catch (err) {
+        this.settleFailure(transferId, '', sourceIds);
+        throw err;
+      }
+    }
+    const request = { ...job.request, amount: run.amount };
     const planned = this.queue.plan(transferId, { coinId: request.coinId, amount: request.amount });
     const spend = planned.kind === 'planned' ? planned.spend : await planned.settled;
     const sourceIds = this.markPlanned(transferId, request.coinId, spend);
@@ -532,6 +589,7 @@ export class PaymentsFacade implements PaymentsV2 {
     };
     return { transferId, coinId: request.coinId, plan, sourceIds, sourceTokens };
   }
+
 
   /** isSpent sweep over the attempt's sources; demote proven-spent states (durable). */
   private async demoteSpentSources(ctx: AttemptCtx): Promise<number> {
@@ -646,69 +704,10 @@ export class PaymentsFacade implements PaymentsV2 {
     const mintId = this.newId();
     this.activeMoneyOps.add(mintId); // its replay stays hands-off while this attempt runs
     try {
-      return await this.mintUnderJournal(mintId, coinId, amount);
+      return await runMintUnderJournal(this.mintDeps(), { mintId, coinId, amount });
     } finally {
       this.activeMoneyOps.delete(mintId);
     }
-  }
-
-  private async mintUnderJournal(mintId: string, coinId: string, amount: bigint): Promise<MintResult> {
-    const engine = this.engine();
-    // tokenId stays '' until mint returns; replay converges via the F13 same-seed re-call.
-    const entry: MintJournalEntry = {
-      mintId,
-      coinId,
-      amount: amount.toString(),
-      tokenId: '',
-      createdAt: this.nowMs(),
-    };
-    await this.machineStores.mintJournal.upsert(entry);
-    let token: SphereToken;
-    try {
-      token = await engine.mint(mintParams(this.ownPubkeyBytes, coinId, amount), { transferId: mintId });
-    } catch (err) {
-      // Entry retained: the heartbeat / start() replay resolves it (inventory check / F13 seed).
-      this.heartbeat.arm();
-      return { success: false, error: messageOf(err) };
-    }
-    if (token.blob.tokenId !== entry.tokenId) {
-      await this.machineStores.mintJournal.upsert({ ...entry, tokenId: token.blob.tokenId });
-    }
-    try {
-      await this.finalizeMint(engine, mintId, token, coinId, amount.toString());
-    } catch (err) {
-      this.heartbeat.arm();
-      return { success: false, tokenId: token.blob.tokenId, error: messageOf(err) };
-    }
-    return { success: true, tokenId: token.blob.tokenId };
-  }
-
-  private async finalizeMint(
-    engine: ITokenEngine,
-    mintId: string,
-    token: SphereToken,
-    coinId: string,
-    amount: string
-  ): Promise<void> {
-    const bytes = token.blob.token;
-    const digest = bytesToHex(sha256(bytes));
-    const keys = await this.deps.storagePort.uploadBlobs([{ sha256: digest, bytes }]);
-    const key = keys.get(digest);
-    if (key === undefined) {
-      throw new SphereError(`no upload key returned for mint blob ${digest}`, 'STORAGE_ERROR');
-    }
-    await this.deps.storagePort.applyDelta({
-      transferId: mintId,
-      spent: [],
-      added: [{ tokenId: token.blob.tokenId, key }],
-    });
-    await this.historyStore.recordMint({
-      tokenId: token.blob.tokenId,
-      assets: [{ coinId, amount }],
-    });
-    await this.machineStores.mintJournal.removeByKey(mintId);
-    this.heldStates.set(token.blob.tokenId, (await engine.deliveryKeys(bytes)).stateHash);
-    this.trackTail(this.view.delta());
   }
 
   /** @returns how many journal entries were RESOLVED (cleared) — heartbeat progress. */
@@ -745,7 +744,7 @@ export class PaymentsFacade implements PaymentsV2 {
     if (token.blob.tokenId !== entry.tokenId) {
       await this.machineStores.mintJournal.upsert({ ...entry, tokenId: token.blob.tokenId });
     }
-    await this.finalizeMint(engine, entry.mintId, token, entry.coinId, entry.amount);
+    await finalizeMint(this.mintDeps(), entry.mintId, token, entry.coinId, entry.amount);
     return true;
   }
 

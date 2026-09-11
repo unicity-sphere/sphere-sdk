@@ -61,6 +61,18 @@ export class RealizationEngine extends FakeTokenEngine {
   readonly splitCalls: { key: string; checkpointStore: boolean }[] = [];
   readonly lineage = new Map<string, LineageInfo>();
   opLog: string[] | null = null;
+  /** #777: force a decoded token's envelope, to model the bridged dialect. */
+  private readonly forcedEnvelopes = new Map<string, SphereToken['valueEnvelope']>();
+
+  forceEnvelope(tokenId: string, envelope: SphereToken['valueEnvelope']): void {
+    this.forcedEnvelopes.set(tokenId, envelope);
+  }
+
+  override async decodeToken(blob: Parameters<FakeTokenEngine['decodeToken']>[0]): Promise<SphereToken> {
+    const token = await super.decodeToken(blob);
+    const forced = this.forcedEnvelopes.get(token.blob.tokenId);
+    return forced === undefined ? token : { ...token, valueEnvelope: forced };
+  }
   beforeOp: ((key: string, kind: 'direct' | 'split') => void) | null = null;
   afterOp: ((key: string, kind: 'direct' | 'split') => Error | null) | null = null;
 
@@ -425,6 +437,7 @@ async function buildPlan(w: WorldState, opts: PlanOpts): Promise<MachinePlan> {
   }
   const payload: IntentPayload = {
     v: 2,
+    kind: 'coin',
     recipient: w.recipientHex,
     coinId: COIN,
     amount: opts.amount,
