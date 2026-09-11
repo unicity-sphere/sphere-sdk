@@ -1,5 +1,6 @@
 import { SphereError } from '../../core/errors';
 import type { ITokenEngine } from '../../token-engine/engine';
+import { isCoinlessEnvelope } from '../../token-engine/value-envelope';
 
 import { buildCoinlessPayload } from './machine/payload';
 import { buildOps, type MachinePlan } from './machine/TransferMachine';
@@ -40,9 +41,10 @@ export async function materializeCoinlessSpend(
     throw new SphereError(`Selected source ${tokenId} has no blob in storage`, 'STORAGE_ERROR');
   }
   const token = await engine.decodeToken({ tokenId, token: bytes });
-  // The mirror said coinless; the BLOB is the authority on what it carries, and the
-  // two disagreeing means this would move a valued token with its coins unaccounted.
-  if (token.value !== null) {
+  // The BLOB is the authority, and the question is the ENVELOPE, not the value:
+  // `bare_collection` decodes to a null value while carrying coins this SDK cannot
+  // read, so a value check would move a valued token recording `assets: []`.
+  if (!isCoinlessEnvelope(token.valueEnvelope)) {
     throw new SphereError(
       `Token ${tokenId} carries coin value and cannot be sent with sendCoinless — use send()`,
       'VALIDATION_ERROR'

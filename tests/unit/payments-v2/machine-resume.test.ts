@@ -363,6 +363,27 @@ describe('resume refuses a durable intent it cannot safely execute (#777)', () =
     expect(report.failed).not.toContain(id);
   });
 
+  it('refuses a coinless intent whose source is an UNREADABLE envelope, not just a valued one', async () => {
+    // `bare_collection` decodes to value === null exactly like a coinless token, so
+    // a value check passes it through. The envelope is the question.
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const id = 'c0000000-0000-4000-8000-000000000004';
+    w.engine.forceEnvelope(token.blob.tokenId, 'bare_collection');
+    await stageRawIntent(w, id, {
+      v: 2,
+      kind: 'coinless',
+      recipient: w.recipientHex,
+      direct: [token.blob.tokenId],
+      spentStates: { [token.blob.tokenId]: await stateOfToken(w, token) },
+    });
+
+    const report = await resumeAll(w.deps);
+
+    expect(report.failed).toContain(id);
+    expect(w.engine.transferCalls).toHaveLength(0);
+  });
+
   it('refuses a token intent whose named source actually carries COINS', async () => {
     // The blob is the authority. Executing this would move real coins while the
     // history row for it records `assets: []` — value moved, nothing accounted.

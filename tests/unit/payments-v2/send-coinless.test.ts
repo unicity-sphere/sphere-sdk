@@ -19,9 +19,14 @@ import { materializeCoinlessSpend } from '../../../modules/payments-v2/send-coin
 const TOKEN_ID = 'aa'.repeat(32);
 const RECIPIENT = '02'.repeat(16) + '03';
 
-function engineWith(value: SphereToken['value']): ITokenEngine {
+function engineWith(
+  value: SphereToken['value'],
+  valueEnvelope: SphereToken['valueEnvelope'] = value === null ? 'none_other' : 'sphere'
+): ITokenEngine {
   return {
-    decodeToken: vi.fn(async () => ({ value, blob: { tokenId: TOKEN_ID } }) as unknown as SphereToken),
+    decodeToken: vi.fn(
+      async () => ({ value, valueEnvelope, blob: { tokenId: TOKEN_ID } }) as unknown as SphereToken
+    ),
     deliveryKeys: vi.fn(async () => ({ tokenId: TOKEN_ID, stateHash: 'S1' })),
   } as unknown as ITokenEngine;
 }
@@ -70,4 +75,22 @@ describe('materializeCoinlessSpend', () => {
     const deps = { engine: engineWith(null), storagePort: { getBlobs: vi.fn(async () => new Map()) } };
     await expect(materializeCoinlessSpend(deps, input)).rejects.toThrow(/no blob in storage/);
   });
+});
+
+describe('materializeCoinlessSpend — an unreadable envelope is not coinless', () => {
+  it('REFUSES a bare_collection source: null value, but REAL coins this SDK cannot decode', async () => {
+    // The bridged dialect decodes to `value: null` exactly like a coinless token.
+    // Checking the value rather than the ENVELOPE would move a valued token and
+    // record `assets: []` for it — coins gone, nothing accounted.
+    const deps = { engine: engineWith(null, 'bare_collection'), storagePort };
+    await expect(materializeCoinlessSpend(deps, input)).rejects.toThrow(/carries coin value/);
+  });
+
+  it.each(['none_absent', 'none_tag', 'none_other'] as const)(
+    'still allows a genuinely coinless %s envelope',
+    async (envelope) => {
+      const deps = { engine: engineWith(null, envelope), storagePort };
+      await expect(materializeCoinlessSpend(deps, input)).resolves.toBeDefined();
+    }
+  );
 });

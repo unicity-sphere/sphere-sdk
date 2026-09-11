@@ -6,6 +6,7 @@ import { SphereError } from '../../../core/errors';
 import { logger } from '../../../core/logger';
 import type { SphereToken } from '../../../token-engine/types';
 import type { DeliveryJournalEntry, IntentBackstopEntry } from '../stores';
+import { isCoinlessEnvelope } from '../../../token-engine/value-envelope';
 import type { CoinIntentPayload, IntentPayload, CoinlessIntentPayload } from './types';
 import { ATTENTION_CHECKPOINT_STUCK, createMachineStores, type MachineStores } from './journal';
 import { TransferMachine, buildOps, classifyError, type MachineDeps } from './TransferMachine';
@@ -171,7 +172,7 @@ async function runOne(ctx: RunCtx, job: ResumeJob, report: ResumeReport): Promis
     // The blob is the authority on what a source carries — the same rule the send
     // path applies at materialize. A durable intent labelled 'coinless' whose named
     // source actually holds coins would move them while history records assets: [].
-    if (job.payload.kind === 'coinless' && token.value !== null) {
+    if (job.payload.kind === 'coinless' && !isCoinlessEnvelope(token.valueEnvelope)) {
       logger.warn(
         'PaymentsV2',
         `resume: token intent ${job.transferId} names a source carrying coin value — refusing`
@@ -264,11 +265,8 @@ function validatePayload(raw: unknown): IntentPayload {
   if (typeof p.recipient !== 'string') {
     throw new SphereError('intent payload is missing recipient', 'VALIDATION_ERROR');
   }
-  // An ABSENT kind is the only shape written before #777, and it was always a coin
-  // spend — so defaulting is a migration, not a guess. Anything written since
-  // carries the discriminant, because the type makes omitting it a compile error.
-  // ABSENT migrates to 'coin' (the only shape written before #777). An EXPLICIT
-  // unknown one does NOT: a payload from a newer client, or a corrupted one, would
+  // ABSENT migrates to 'coin' (the only shape written before #777) — a migration,
+  // not a guess. An EXPLICIT unknown one does NOT: a newer client's payload would
   // otherwise execute under coin semantics it was never written for.
   const kind = p.kind ?? 'coin';
   if (kind !== 'coin' && kind !== 'coinless') {
