@@ -460,13 +460,13 @@ const bytes = await sphere.payments.tokenData(nft.tokenId);
 Note an **empty** payload reads back as a zero-length `Uint8Array`, not `null` — only a genuinely
 absent one is `null`.
 
-### `sendToken(req: { recipient, tokenId, memo? }): Promise<TransferResult>`
+### `sendCoinless(req: { recipient, tokenId, memo? }): Promise<TransferResult>`
 
 Move a **coinless** token whole. All-or-nothing: one named source, one direct transfer, never a
 split — there is no amount to divide and no change to return.
 
 ```typescript
-const result = await sphere.payments.sendToken({
+const result = await sphere.payments.sendCoinless({
   recipient: '@bob',        // same resolver send() uses
   tokenId: nft.tokenId,
   memo: 'happy birthday',   // optional, recipient-encrypted
@@ -474,7 +474,7 @@ const result = await sphere.payments.sendToken({
 ```
 
 A separate verb rather than a widened `send()` because the addressing model differs: `send()`
-selects sources to cover an amount and may queue for a combination that frees up; `sendToken`
+selects sources to cover an amount and may queue for a combination that frees up; `sendCoinless`
 reserves the one token you named.
 
 Refuses — **before any reservation or chain op** — a `tokenId` that is unknown, tombstoned, already

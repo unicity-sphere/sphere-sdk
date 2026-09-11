@@ -296,7 +296,7 @@ async function openRow(
 function subject(
   payload: Partial<IntentPayload> | null
 ): { coinId: string; amount: string; tokenId?: string } {
-  if (payload?.kind === 'token') {
+  if (payload?.kind === 'coinless') {
     const tokenId = payload.direct?.[0];
     return { coinId: '', amount: '', ...(typeof tokenId === 'string' ? { tokenId } : {}) };
   }

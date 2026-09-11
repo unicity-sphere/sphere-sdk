@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { SphereError } from '../../../core/errors';
 import type { ITokenEngine } from '../../../token-engine/engine';
 import type { SphereToken } from '../../../token-engine/types';
-import { materializeTokenSpend } from '../../../modules/payments-v2/send-token';
+import { materializeCoinlessSpend } from '../../../modules/payments-v2/send-coinless';
 
 const TOKEN_ID = 'aa'.repeat(32);
 const RECIPIENT = '02'.repeat(16) + '03';
@@ -37,37 +37,37 @@ const input = {
   sourceIds: [TOKEN_ID],
 };
 
-describe('materializeTokenSpend', () => {
+describe('materializeCoinlessSpend', () => {
   it('REFUSES a source whose blob carries coin value, even when the mirror called it coinless', async () => {
     const deps = { engine: engineWith({ assets: [{ coinId: 'bb'.repeat(32), amount: 5n }] }), storagePort };
-    await expect(materializeTokenSpend(deps, input)).rejects.toThrow(/carries coin value/);
+    await expect(materializeCoinlessSpend(deps, input)).rejects.toThrow(/carries coin value/);
   });
 
   it('names send() in the refusal, so the caller knows which verb moves it', async () => {
     const deps = { engine: engineWith({ assets: [{ coinId: 'bb'.repeat(32), amount: 5n }] }), storagePort };
-    const err = await materializeTokenSpend(deps, input).then(() => null, (e: unknown) => e);
+    const err = await materializeCoinlessSpend(deps, input).then(() => null, (e: unknown) => e);
     expect(err).toBeInstanceOf(SphereError);
     expect((err as SphereError).message).toMatch(/use send\(\)/);
   });
 
   it('plans exactly ONE direct op for a genuinely coinless source — never a split', async () => {
     const deps = { engine: engineWith(null), storagePort };
-    const ctx = await materializeTokenSpend(deps, input);
+    const ctx = await materializeCoinlessSpend(deps, input);
     expect(ctx.plan.ops).toHaveLength(1);
     expect(ctx.plan.ops[0]?.kind).toBe('direct');
-    expect(ctx.plan.payload.kind).toBe('token');
+    expect(ctx.plan.payload.kind).toBe('coinless');
     expect(ctx.plan.payload.direct).toEqual([TOKEN_ID]);
   });
 
   it('reports no coin and no in-flight coin rows: a coinless spend has no amount to show', async () => {
     const deps = { engine: engineWith(null), storagePort };
-    const ctx = await materializeTokenSpend(deps, input);
+    const ctx = await materializeCoinlessSpend(deps, input);
     expect(ctx.coinId).toBe('');
     expect(ctx.sourceTokens).toEqual([]);
   });
 
   it('refuses when the blob is missing rather than planning a spend of nothing', async () => {
     const deps = { engine: engineWith(null), storagePort: { getBlobs: vi.fn(async () => new Map()) } };
-    await expect(materializeTokenSpend(deps, input)).rejects.toThrow(/no blob in storage/);
+    await expect(materializeCoinlessSpend(deps, input)).rejects.toThrow(/no blob in storage/);
   });
 });

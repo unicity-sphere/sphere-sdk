@@ -3,7 +3,7 @@
 
 import type { SendRequest } from '../api';
 import type { PlannedSpend } from '../select/queue';
-import type { CoinIntentPayload, TokenIntentPayload } from './types';
+import type { CoinIntentPayload, CoinlessIntentPayload } from './types';
 
 export function buildPayload(
   recipientPubkey: string,
@@ -40,14 +40,14 @@ export function messageOf(err: unknown): string {
  * A token-addressed spend (#777). Takes no PlannedSpend because nothing was
  * selected: the source is named, so there is no amount, no split and no change.
  */
-export function buildTokenPayload(
+export function buildCoinlessPayload(
   recipientPubkey: string,
   request: { tokenId: string; memo?: string },
   spentStates: Record<string, { local: string; protocol: string }>
-): TokenIntentPayload {
+): CoinlessIntentPayload {
   return {
     v: 2,
-    kind: 'token',
+    kind: 'coinless',
     recipient: recipientPubkey,
     ...(request.memo !== undefined ? { memo: request.memo } : {}),
     direct: [request.tokenId],

@@ -15,12 +15,12 @@ import type { ITokenEngine } from '../../token-engine/engine';
 import type { SphereToken } from '../../token-engine/types';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
-import type { CoinlessToken, ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest, SendTokenRequest } from './api';
+import type { CoinlessToken, ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest, SendCoinlessRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { readTokenData } from './inventory/token-data';
 import { finalizeMint, type MintDeps, runMintUnderJournal } from './mint';
-import { materializeTokenSpend } from './send-token';
+import { materializeCoinlessSpend } from './send-coinless';
 import { partialize, stampTransferId } from './send-errors';
 import { requireSameNetworkRecipient } from './recipient';
 import { reseedAndReset, type RestoreDeps } from './restore';
@@ -70,7 +70,7 @@ const INVENTORY_SCAN_PAGE_LIMIT = 50;
  */
 type SendJob =
   | { readonly kind: 'coin'; readonly request: SendRequest }
-  | { readonly kind: 'token'; readonly request: SendTokenRequest };
+  | { readonly kind: 'coinless'; readonly request: SendCoinlessRequest };
 
 interface AttemptCtx {
   readonly transferId: string;
@@ -277,8 +277,8 @@ export class PaymentsFacade implements PaymentsV2 {
     return this.track(this.sendOutcome(request));
   }
 
-  sendToken(request: SendTokenRequest): Promise<TransferResult> {
-    return this.track(this.sendTokenOutcome(request));
+  sendCoinless(request: SendCoinlessRequest): Promise<TransferResult> {
+    return this.track(this.sendCoinlessOutcome(request));
   }
 
   async receive(): Promise<{ transfers: IncomingTransfer[] }> {
@@ -344,8 +344,8 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   /** A token spend has no amount; '0' keeps the shortfall arithmetic total-free. */
-  private sendTokenOutcome(request: SendTokenRequest): Promise<TransferResult> {
-    return this.runJob({ kind: 'token', request }, '0');
+  private sendCoinlessOutcome(request: SendCoinlessRequest): Promise<TransferResult> {
+    return this.runJob({ kind: 'coinless', request }, '0');
   }
 
   private async runJob(job: SendJob, amount: string): Promise<TransferResult> {
@@ -397,7 +397,7 @@ export class PaymentsFacade implements PaymentsV2 {
         // #625's re-plan searches for a DIFFERENT source. A named token has no
         // alternative — re-planning would pick the same one or nothing — so a
         // proven conflict is TERMINAL here rather than a bounded retry.
-        if (job.kind === 'token' || attempt >= MAX_RESELECT) throw partialize(disposition.error, run);
+        if (job.kind === 'coinless' || attempt >= MAX_RESELECT) throw partialize(disposition.error, run);
         continue;
       }
       if (disposition.kind === 'success') {
@@ -516,11 +516,11 @@ export class PaymentsFacade implements PaymentsV2 {
     run.lastTransferId = transferId;
     // The ONE divergence: a coin spend SELECTS sources to cover an amount and may
     // queue for them; a token spend reserves the one it was NAMED and never queues.
-    if (job.kind === 'token') {
-      const spend = this.queue.planToken(transferId, job.request.tokenId);
+    if (job.kind === 'coinless') {
+      const spend = this.queue.planCoinless(transferId, job.request.tokenId);
       const sourceIds = this.markPlanned(transferId, '', spend);
       try {
-        return await materializeTokenSpend(
+        return await materializeCoinlessSpend(
           { engine: this.engine(), storagePort: this.deps.storagePort },
           { transferId, recipientPubkey, request: job.request, sourceIds }
         );

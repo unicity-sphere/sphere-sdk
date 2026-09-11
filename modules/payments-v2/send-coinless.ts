@@ -1,20 +1,20 @@
 import { SphereError } from '../../core/errors';
 import type { ITokenEngine } from '../../token-engine/engine';
 
-import { buildTokenPayload } from './machine/payload';
+import { buildCoinlessPayload } from './machine/payload';
 import { buildOps, type MachinePlan } from './machine/TransferMachine';
-import type { SendTokenRequest } from './api';
+import type { SendCoinlessRequest } from './api';
 import type { StoragePort } from './ports';
 
-export interface TokenSpendDeps {
+export interface CoinlessSpendDeps {
   readonly engine: ITokenEngine;
   readonly storagePort: Pick<StoragePort, 'getBlobs'>;
 }
 
-export interface TokenSpendInput {
+export interface CoinlessSpendInput {
   readonly transferId: string;
   readonly recipientPubkey: string;
-  readonly request: SendTokenRequest;
+  readonly request: SendCoinlessRequest;
   readonly sourceIds: readonly string[];
 }
 
@@ -23,9 +23,9 @@ export interface TokenSpendInput {
  * coin, no split. `sourceTokens` stays EMPTY — those are the coin rows a UI shows
  * as in-flight, and a coinless token has no amount to show as moving.
  */
-export async function materializeTokenSpend(
-  deps: TokenSpendDeps,
-  input: TokenSpendInput
+export async function materializeCoinlessSpend(
+  deps: CoinlessSpendDeps,
+  input: CoinlessSpendInput
 ): Promise<{
   transferId: string;
   coinId: string;
@@ -44,12 +44,12 @@ export async function materializeTokenSpend(
   // two disagreeing means this would move a valued token with its coins unaccounted.
   if (token.value !== null) {
     throw new SphereError(
-      `Token ${tokenId} carries coin value and cannot be sent with sendToken — use send()`,
+      `Token ${tokenId} carries coin value and cannot be sent with sendCoinless — use send()`,
       'VALIDATION_ERROR'
     );
   }
   const keys = await engine.deliveryKeys(bytes);
-  const payload = buildTokenPayload(input.recipientPubkey, input.request, {
+  const payload = buildCoinlessPayload(input.recipientPubkey, input.request, {
     [tokenId]: { local: keys.stateHash, protocol: keys.stateHash },
   });
   const plan: MachinePlan = {

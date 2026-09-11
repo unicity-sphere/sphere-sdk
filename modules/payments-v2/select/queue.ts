@@ -98,7 +98,7 @@ export class SpendQueue {
    * can release, so queueing would block until a timeout on a spend that cannot
    * become possible.
    */
-  planToken(reservationId: string, tokenId: string): PlannedSpend {
+  planCoinless(reservationId: string, tokenId: string): PlannedSpend {
     if (this.destroyed) {
       throw new SphereError('Module has been destroyed', 'MODULE_DESTROYED');
     }

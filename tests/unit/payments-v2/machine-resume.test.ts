@@ -371,7 +371,7 @@ describe('resume refuses a durable intent it cannot safely execute (#777)', () =
     const id = 'c0000000-0000-4000-8000-000000000003';
     await stageRawIntent(w, id, {
       v: 2,
-      kind: 'token',
+      kind: 'coinless',
       recipient: w.recipientHex,
       direct: [valued.blob.tokenId],
       spentStates: {

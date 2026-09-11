@@ -1,7 +1,7 @@
-import type { CoinIntentPayload, IntentPayload, TokenIntentPayload } from './types';
+import type { CoinIntentPayload, IntentPayload, CoinlessIntentPayload } from './types';
 
-export function isTokenIntent(p: IntentPayload): p is TokenIntentPayload {
-  return p.kind === 'token';
+export function isCoinlessIntent(p: IntentPayload): p is CoinlessIntentPayload {
+  return p.kind === 'coinless';
 }
 
 export function isCoinIntent(p: IntentPayload): p is CoinIntentPayload {

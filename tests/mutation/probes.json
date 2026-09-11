@@ -1470,11 +1470,11 @@
   {
     "name": "sendtoken-blob-value-guard-removed",
     "note": "#777: the BLOB is the authority on what a source carries. Without the re-check a mirror that wrongly says coinless would move a valued token with its coins unaccounted for.",
-    "file": "modules/payments-v2/send-token.ts",
+    "file": "modules/payments-v2/send-coinless.ts",
     "find": "  if (token.value !== null) {",
     "replace": "  if (false as boolean) {",
     "tests": [
-      "tests/unit/payments-v2/send-token.test.ts"
+      "tests/unit/payments-v2/send-coinless.test.ts"
     ]
   },
   {

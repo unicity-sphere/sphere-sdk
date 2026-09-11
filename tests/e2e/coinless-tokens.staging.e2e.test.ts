@@ -209,7 +209,7 @@ describe.skipIf(!RUN_STAGING)('coinless tokens — transfer, live staging', () =
       a = await makeVerticalWallet('nft-a', { identity: a.identity, kv: a.kv });
       expect(a.facade.coinless().map((t) => t.tokenId)).toContain(nft.blob.tokenId);
 
-      const result = await a.facade.sendToken({
+      const result = await a.facade.sendCoinless({
         recipient: b.identity.chainPubkey,
         tokenId: nft.blob.tokenId,
       });
@@ -245,7 +245,7 @@ describe.skipIf(!RUN_STAGING)('coinless tokens — transfer, live staging', () =
   );
 
   it(
-    'refuses to move a VALUED token through sendToken, against the real backend',
+    'refuses to move a VALUED token through sendCoinless, against the real backend',
     async () => {
       const w = await makeVerticalWallet('nft-refuse');
       const mint = await w.facade.mint(HARNESS_COIN, 250n);
@@ -254,7 +254,7 @@ describe.skipIf(!RUN_STAGING)('coinless tokens — transfer, live staging', () =
       }
 
       await expect(
-        w.facade.sendToken({ recipient: w.identity.chainPubkey, tokenId: mint.tokenId })
+        w.facade.sendCoinless({ recipient: w.identity.chainPubkey, tokenId: mint.tokenId })
       ).rejects.toThrow(/not a spendable coinless holding|carries coin value/);
 
       // Refused BEFORE any chain op: the coin is still spendable.

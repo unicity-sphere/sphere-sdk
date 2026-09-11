@@ -285,7 +285,7 @@ function buildMachineDeps(
         transferId,
         // §5.9: the SETTLED amount, never payload.amount — the plan. A token
         // spend moved no coin: `assets: []` + tokenId (wallet-api#151 / §10).
-        ...(payload.kind === 'token'
+        ...(payload.kind === 'coinless'
           ? { assets: [], tokenId: payload.direct[0] }
           : { assets: [{ coinId: payload.coinId, amount: committedAmount }] }),
         recipientPubkey: payload.recipient,
