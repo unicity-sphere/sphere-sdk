@@ -372,7 +372,7 @@ describe('resume refuses a durable intent it cannot safely execute (#777)', () =
     w.engine.forceEnvelope(token.blob.tokenId, 'bare_collection');
     await stageRawIntent(w, id, {
       v: 2,
-      kind: 'coinless',
+      kind: 'whole',
       recipient: w.recipientHex,
       direct: [token.blob.tokenId],
       spentStates: { [token.blob.tokenId]: await stateOfToken(w, token) },
@@ -384,15 +384,46 @@ describe('resume refuses a durable intent it cannot safely execute (#777)', () =
     expect(w.engine.transferCalls).toHaveLength(0);
   });
 
-  it('refuses a token intent whose named source actually carries COINS', async () => {
-    // The blob is the authority. Executing this would move real coins while the
-    // history row for it records `assets: []` — value moved, nothing accounted.
+  it("applies the same guards to 0.17.0's 'coinless' spelling of a whole intent", async () => {
+    // 0.17.0 wrote kind: 'coinless'; those intents are durable SERVER state, so this
+    // client still resumes them — under the same envelope authority, not around it.
+    const w = makeWorld();
+    const bad = await w.seed(1000n);
+    const good = await w.seed(1000n);
+    const refused = 'c0000000-0000-4000-8000-000000000005';
+    const resumed = 'c0000000-0000-4000-8000-000000000006';
+    w.engine.forceEnvelope(bad.blob.tokenId, 'bare_collection');
+    await stageRawIntent(w, refused, {
+      v: 2,
+      kind: 'coinless',
+      recipient: w.recipientHex,
+      direct: [bad.blob.tokenId],
+      spentStates: { [bad.blob.tokenId]: await stateOfToken(w, bad) },
+    });
+    await stageRawIntent(w, resumed, {
+      v: 2,
+      kind: 'coinless',
+      recipient: w.recipientHex,
+      direct: [good.blob.tokenId],
+      spentStates: { [good.blob.tokenId]: await stateOfToken(w, good) },
+    });
+
+    const report = await resumeAll(w.deps);
+
+    expect(report.failed).toContain(refused);
+    expect(report.failed).not.toContain(resumed);
+    expect(report.resumed).toContain(resumed);
+  });
+
+  it('RESUMES a whole intent whose source carries coins — it moves the token, coins included', async () => {
+    // A whole spend is not coinless-only: a valued source travels as-is, and the
+    // history row records what it actually carried.
     const w = makeWorld();
     const valued = await w.seed(1000n);
     const id = 'c0000000-0000-4000-8000-000000000003';
     await stageRawIntent(w, id, {
       v: 2,
-      kind: 'coinless',
+      kind: 'whole',
       recipient: w.recipientHex,
       direct: [valued.blob.tokenId],
       spentStates: {
@@ -402,9 +433,8 @@ describe('resume refuses a durable intent it cannot safely execute (#777)', () =
 
     const report = await resumeAll(w.deps);
 
-    expect(report.failed).toContain(id);
-    expect(w.engine.transferCalls).toHaveLength(0);
-    expect((await w.api.listMailbox(w.recipientCaller)).entries).toHaveLength(0);
+    expect(report.failed).not.toContain(id);
+    expect(report.resumed).toContain(id);
   });
 });
 

@@ -460,30 +460,41 @@ const bytes = await sphere.payments.tokenData(nft.tokenId);
 Note an **empty** payload reads back as a zero-length `Uint8Array`, not `null` — only a genuinely
 absent one is `null`.
 
-### `sendCoinless(req: { recipient, tokenId, memo? }): Promise<TransferResult>`
+### `sendWholeToken(req: { recipient, tokenId, memo? }): Promise<TransferResult>`
 
-Move a **coinless** token whole. All-or-nothing: one named source, one direct transfer, never a
-split — there is no amount to divide and no change to return.
+Move **one named token** whole — coinless or valued. All-or-nothing: one source, one direct
+transfer, **never a split**, so a valued token's coins travel with it and no change comes back.
 
 ```typescript
-const result = await sphere.payments.sendCoinless({
-  recipient: '@bob',        // same resolver send() uses
-  tokenId: nft.tokenId,
-  memo: 'happy birthday',   // optional, recipient-encrypted
+const result = await sphere.payments.sendWholeToken({
+  recipient: '@bob',
+  tokenId: row.tokenId,     // from tokens() or coinless()
+  memo: 'here you go',      // optional, recipient-encrypted
 });
 ```
 
-A separate verb rather than a widened `send()` because the addressing model differs: `send()`
-selects sources to cover an amount and may queue for a combination that frees up; `sendCoinless`
-reserves the one token you named.
+Distinct from `send()`, which **selects** sources to cover an amount and may split one. Use this when
+the user picked a specific token and expects *that* token to move.
 
-Refuses — **before any reservation or chain op** — a `tokenId` that is unknown, tombstoned, already
-in flight, #625-demoted, or that **carries coin value**. A valued token leaves only through
-`send()`, so its coins are always accounted for.
+History records what actually moved: a valued token logs its real assets (every coin it carried), a
+coinless one logs `assets: []`.
 
-Unlike a coin send, a proven conflict is **terminal**: #625's re-plan looks for a different source
-and a named token has none, so there is nothing to retry. Treat the same possibly-committed rules
-as `send()` — never re-issue after `CERTIFICATION_UNCONFIRMED`; `resumeNow()` converges it.
+**Refused:** a token whose value envelope this SDK cannot decode (`bare_collection`, the bridged
+dialect). Its coins are real but unaccountable here, so the move would happen while history could
+only say `assets: []`. Also refused, before any chain op: a tokenId that is unknown, tombstoned,
+already in flight, or #625-demoted.
+
+A proven conflict is **terminal** — there is no alternative source to re-plan onto. Treat the
+possibly-committed rules exactly as for `send()`: never re-issue after `CERTIFICATION_UNCONFIRMED`;
+`resumeNow()` converges it.
+
+### `sendCoinless(req: { recipient, tokenId, memo? }): Promise<TransferResult>`
+
+The **NFT-scoped** twin of `sendWholeToken`: identical, except it refuses a source carrying coins.
+
+Connect's `send_nft` intent must route here. Its `nft:transfer` scope deliberately does not authorise
+coin transfers, so a dApp holding only that scope must not be able to move a valued token by naming
+its id.
 
 ### `mint(coinIdHex: string, amount: bigint): Promise<MintResult>`
 

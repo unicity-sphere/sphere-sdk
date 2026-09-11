@@ -8,6 +8,7 @@ import type { ITokenEngine, SplitCheckpointStore } from '../../token-engine/engi
 import type { TransferResult } from '../../types';
 
 import type { ConnectionStatus, SendRequest } from './api';
+import { isWholeIntent } from './machine/payload-view';
 import type { DeliveryPort, StoragePort } from './ports';
 import type { ScopedKV } from './stores';
 import { History, type HistoryClient } from './history/History';
@@ -173,7 +174,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
   const queue = new SpendQueue({
     ledger,
     getPool: (coinId) => view.pool(coinId),
-    spendableCoinless: (tokenId) => view.spendableCoinless(tokenId),
+    spendableToken: (tokenId) => view.spendableToken(tokenId),
     ...(deps.workBudget !== undefined ? { workBudget: deps.workBudget } : {}),
   });
   const historyStore = new History({
@@ -280,13 +281,13 @@ function buildMachineDeps(
     ...(deps.ownNametag !== undefined ? { ownNametag: deps.ownNametag } : {}),
     emit: deps.emit,
     now: deps.now ?? Date.now,
-    recordHistory: async ({ transferId, payload, committedAmount }) => {
+    recordHistory: async ({ transferId, payload, committedAmount, committedAssets }) => {
       await historyStore.recordSent({
         transferId,
         // §5.9: the SETTLED amount, never payload.amount — the plan. A token
         // spend moved no coin: `assets: []` + tokenId (wallet-api#151 / §10).
-        ...(payload.kind === 'coinless'
-          ? { assets: [], tokenId: payload.direct[0] }
+        ...(isWholeIntent(payload)
+          ? { assets: committedAssets ?? [], tokenId: payload.direct[0] }
           : { assets: [{ coinId: payload.coinId, amount: committedAmount }] }),
         recipientPubkey: payload.recipient,
         ...(payload.memo !== undefined ? { memo: payload.memo } : {}),

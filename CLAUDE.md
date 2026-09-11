@@ -270,7 +270,8 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `sphere.payments.coinless()` | `CoinlessToken[]` | Coinless (NFT) holdings — disjoint from `tokens()` |
 | `sphere.payments.tokenData(tokenId)` | `Promise<Uint8Array \| null>` | A token's genesis payload (fetches the blob) |
 | `sphere.payments.send(request)` | `Promise<TransferResult>` | Send L3 coin tokens (wallet-api vertical) |
-| `sphere.payments.sendCoinless(request)` | `Promise<TransferResult>` | Move a COINLESS token whole (`{recipient, tokenId, memo?}`) |
+| `sphere.payments.sendWholeToken(request)` | `Promise<TransferResult>` | Move ONE named token whole — coinless or valued, never split |
+| `sphere.payments.sendCoinless(request)` | `Promise<TransferResult>` | NFT-scoped twin: refuses a valued source (Connect `send_nft`) |
 | `sphere.payments.mint(coinIdHex, amount)` | `Promise<MintResult>` | Self-mint via engine (journal-first, no faucet) |
 | `sphere.payments.receive()` | `Promise<{ transfers }>` | Explicit one-shot mailbox drain |
 | `sphere.payments.history(page?)` | `Promise<HistoryPage>` | Paged history (`{ before?, limit? }`) |
@@ -757,16 +758,23 @@ authoritative for build success.
   throw set must stay a SUBSET of wallet-api's §8.2 422 set: everything arriving over the mailbox
   already passed §8.2, and `Receive.screen()` turns a decode throw into a terminal
   `rejectAck('invalid')`, so throwing where wallet-api accepts LOSES the token.
-- **Transfer** is `sendCoinless({recipient, tokenId, memo?})`, a separate verb: a coin spend SELECTS
-  sources for an amount and may queue; a token spend reserves the one it was NAMED and never
-  queues (nothing can free up that would help). Same `TransferMachine`, same durable intent — one
-  money path. A proven conflict is TERMINAL: #625's re-plan needs an alternative source and a
-  named token has none. Three independent gates keep a valued token out (mirror, reservation, and
-  a re-check of the decoded BLOB, which is the authority on what a token carries).
-- The durable intent is discriminated by a REQUIRED `kind` (`'coin' | 'coinless'`); an ABSENT kind
-  reads as `'coin'`, the only shape written before #777. A token intent names EXACTLY one source
-  and can never carry a split — re-checked on resume, because a second leg would let a '0'
-  remainder complete the intent and report success for a leg that never landed.
+- **Transfer** is `sendWholeToken({recipient, tokenId, memo?})` — ONE named token, coinless or
+  valued, never split, so a valued token's coins travel with it. A coin spend SELECTS sources for an
+  amount and may queue; a whole spend reserves the one it was NAMED and never queues. Same
+  `TransferMachine`, one money path. A proven conflict is TERMINAL: #625's re-plan needs an
+  alternative source and a named token has none. The one refusal is `bare_collection` — real coins
+  this SDK cannot decode, so the move would be unaccountable.
+- `sendCoinless` is the **NFT-scoped twin**, refusing a valued source. Connect's `send_nft` must
+  route there: its `nft:transfer` scope does NOT authorise coin transfers, so routing it at the
+  general verb would let a dApp holding only that scope move coins.
+- The durable intent is discriminated by a REQUIRED `kind` (`'coin' | 'whole'`); an ABSENT kind
+  reads as `'coin'`, the only shape written before #777, and an EXPLICIT unknown one is refused.
+  `'coinless'` is 0.17.0's spelling of `'whole'` and is still ACCEPTED on read — the payload is
+  durable SERVER state, so a 0.17.0 client may have left one open and this client must resume it;
+  `isWholeIntent()` is the only discriminator, never a `=== 'whole'` comparison. A whole intent
+  names EXACTLY one source and can never carry a split — re-checked on resume, because a second
+  leg would let a '0' remainder complete the intent and report success for a leg that never
+  landed.
 - Connect: the `send_nft` intent has its OWN `nft:transfer` scope (2.1 → 2.2). Reusing
   `transfer:request` would silently widen every dApp that already holds it. Named *nft*, not
   *token*: coins are tokens too, so `token:transfer` beside `transfer:request` distinguishes

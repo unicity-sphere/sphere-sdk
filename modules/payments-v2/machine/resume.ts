@@ -6,8 +6,8 @@ import { SphereError } from '../../../core/errors';
 import { logger } from '../../../core/logger';
 import type { SphereToken } from '../../../token-engine/types';
 import type { DeliveryJournalEntry, IntentBackstopEntry } from '../stores';
-import { isCoinlessEnvelope } from '../../../token-engine/value-envelope';
-import type { CoinIntentPayload, IntentPayload, CoinlessIntentPayload } from './types';
+import { isWholeIntent } from './payload-view';
+import type { CoinIntentPayload, IntentPayload, WholeIntentPayload } from './types';
 import { ATTENTION_CHECKPOINT_STUCK, createMachineStores, type MachineStores } from './journal';
 import { TransferMachine, buildOps, classifyError, type MachineDeps } from './TransferMachine';
 
@@ -170,9 +170,9 @@ async function runOne(ctx: RunCtx, job: ResumeJob, report: ResumeReport): Promis
       return;
     }
     // The blob is the authority on what a source carries — the same rule the send
-    // path applies at materialize. A durable intent labelled 'coinless' whose named
+    // path applies at materialize. A durable intent labelled whole whose named
     // source actually holds coins would move them while history records assets: [].
-    if (job.payload.kind === 'coinless' && !isCoinlessEnvelope(token.valueEnvelope)) {
+    if (isWholeIntent(job.payload) && token.valueEnvelope === 'bare_collection') {
       logger.warn(
         'PaymentsV2',
         `resume: token intent ${job.transferId} names a source carrying coin value — refusing`
@@ -241,7 +241,7 @@ function validateCoinPayload(c: Partial<CoinIntentPayload>): CoinIntentPayload {
   return { ...(c as CoinIntentPayload), kind: 'coin' };
 }
 
-function validateCoinlessPayload(p: Partial<CoinlessIntentPayload>): CoinlessIntentPayload {
+function validateWholePayload(p: Partial<WholeIntentPayload>): WholeIntentPayload {
   if (p.direct?.length !== 1 || typeof p.direct[0] !== 'string' || p.direct[0] === '') {
     throw new SphereError(
       'token intent payload must name exactly one source token',
@@ -251,7 +251,7 @@ function validateCoinlessPayload(p: Partial<CoinlessIntentPayload>): CoinlessInt
   if (p.split !== undefined) {
     throw new SphereError('token intent payload cannot carry a split', 'VALIDATION_ERROR');
   }
-  return { ...(p as CoinlessIntentPayload), kind: 'coinless', direct: [p.direct[0]] };
+  return { ...(p as WholeIntentPayload), kind: 'whole', direct: [p.direct[0]] };
 }
 
 function validatePayload(raw: unknown): IntentPayload {
@@ -265,17 +265,17 @@ function validatePayload(raw: unknown): IntentPayload {
   if (typeof p.recipient !== 'string') {
     throw new SphereError('intent payload is missing recipient', 'VALIDATION_ERROR');
   }
-  // ABSENT migrates to 'coin' (the only shape written before #777) — a migration,
-  // not a guess. An EXPLICIT unknown one does NOT: a newer client's payload would
-  // otherwise execute under coin semantics it was never written for.
+  // ABSENT migrates to 'coin' (the only pre-#777 shape); an EXPLICIT unknown one
+  // does NOT. 'coinless' is 0.17.0's spelling of 'whole' — durable server state, so
+  // a client that wrote one must still resume it.
   const kind = p.kind ?? 'coin';
-  if (kind !== 'coin' && kind !== 'coinless') {
+  if (kind !== 'coin' && kind !== 'whole' && kind !== 'coinless') {
     throw new SphereError(
       `unsupported intent kind '${String(kind)}' — not resumable by this client`,
       'VALIDATION_ERROR'
     );
   }
-  return kind === 'coinless'
-    ? validateCoinlessPayload(p as Partial<CoinlessIntentPayload>)
-    : validateCoinPayload(p as Partial<CoinIntentPayload>);
+  return kind === 'coin'
+    ? validateCoinPayload(p as Partial<CoinIntentPayload>)
+    : validateWholePayload(p as Partial<WholeIntentPayload>);
 }

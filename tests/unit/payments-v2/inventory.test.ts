@@ -679,3 +679,42 @@ describe('InventoryView — coinless tokens (#777)', () => {
     expect(view.tokens(registry).map((t) => t.id)).toEqual(['N']);
   });
 });
+
+describe('spendableToken — the gates a NAMED source must pass (#777)', () => {
+  async function seeded(): Promise<ReturnType<typeof makeView>> {
+    const v = makeView([page([item('A', { seq: 1, amount: '100' })], 5), page([], 5)]);
+    await v.view.fullPull();
+    return v;
+  }
+
+  it('a healthy active row is spendable', async () => {
+    const { view } = await seeded();
+    expect(view.spendableToken('A')).toBe(true);
+  });
+
+  it('an UNKNOWN token is not', async () => {
+    const { view } = await seeded();
+    expect(view.spendableToken('nope')).toBe(false);
+  });
+
+  it('a TOMBSTONED token is not — it has already left', async () => {
+    const { view, queue } = await seeded();
+    queue.push(page([item('A', { seq: 2, status: 'removed', noAssets: true })], 6));
+    await view.delta();
+    expect(view.spendableToken('A')).toBe(false);
+  });
+
+  it('an IN-FLIGHT token is not — another transfer holds it', async () => {
+    const { view } = await seeded();
+    view.markInFlightMany(['A']);
+    expect(view.spendableToken('A')).toBe(false);
+    view.releaseMany(['A']);
+    expect(view.spendableToken('A')).toBe(true);
+  });
+
+  it('a #625-demoted token is not — its state was proven spent on-chain', async () => {
+    const { view } = await seeded();
+    await view.demote('A', 'S1');
+    expect(view.spendableToken('A')).toBe(false);
+  });
+});

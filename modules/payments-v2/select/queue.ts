@@ -20,8 +20,8 @@ export type PlanOutcome =
 export interface SpendQueueDeps {
   readonly ledger: ReservationLedger;
   readonly getPool: (coinId: string) => readonly PoolEntry[];
-  /** #777: is this NAMED coinless token spendable right now? Same gates as pool(). */
-  readonly spendableCoinless?: (tokenId: string) => boolean;
+  /** #777: is this NAMED token spendable whole right now? Same gates as pool(). */
+  readonly spendableToken?: (tokenId: string) => boolean;
   readonly workBudget?: number;
 }
 
@@ -98,7 +98,7 @@ export class SpendQueue {
    * can release, so queueing would block until a timeout on a spend that cannot
    * become possible.
    */
-  planCoinless(reservationId: string, tokenId: string): PlannedSpend {
+  planWhole(reservationId: string, tokenId: string): PlannedSpend {
     if (this.destroyed) {
       throw new SphereError('Module has been destroyed', 'MODULE_DESTROYED');
     }
@@ -109,11 +109,8 @@ export class SpendQueue {
     if (unproven !== null) {
       throw new SphereError(`Cannot spend yet: ${unproven}`, 'SEND_SYNC_PENDING');
     }
-    if (this.deps.spendableCoinless?.(tokenId) !== true) {
-      throw new SphereError(
-        `Token ${tokenId} is not a spendable coinless holding`,
-        'VALIDATION_ERROR'
-      );
+    if (this.deps.spendableToken?.(tokenId) !== true) {
+      throw new SphereError(`Token ${tokenId} is not a spendable holding`, 'VALIDATION_ERROR');
     }
     const holder = this.deps.ledger.holderOf(tokenId);
     if (holder !== undefined) {

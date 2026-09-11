@@ -296,8 +296,11 @@ async function openRow(
 function subject(
   payload: Partial<IntentPayload> | null
 ): { coinId: string; amount: string; tokenId?: string } {
-  if (payload?.kind === 'coinless') {
-    const tokenId = payload.direct?.[0];
+  // Both spellings: this reads the RAW decrypted payload, never normalised by
+  // validatePayload, so a 0.17-written intent still says 'coinless'.
+  const rawKind = (payload as { kind?: string } | null)?.kind;
+  if (rawKind === 'whole' || rawKind === 'coinless') {
+    const tokenId = payload?.direct?.[0];
     return { coinId: '', amount: '', ...(typeof tokenId === 'string' ? { tokenId } : {}) };
   }
   const coin = payload as Partial<CoinIntentPayload> | null;

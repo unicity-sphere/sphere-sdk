@@ -9,7 +9,10 @@ export interface SendRequest {
   memo?: string;
 }
 
-export interface SendCoinlessRequest {
+/** 0.17.0's name for {@link SendWholeTokenRequest}. Kept so published imports compile. */
+export type SendCoinlessRequest = SendWholeTokenRequest;
+
+export interface SendWholeTokenRequest {
   recipient: string;
   tokenId: string;
   memo?: string;
@@ -109,7 +112,9 @@ export interface PaymentsV2 {
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage>;
 
   send(req: SendRequest): Promise<TransferResult>;
-  sendCoinless(req: SendCoinlessRequest): Promise<TransferResult>;
+  sendWholeToken(req: SendWholeTokenRequest): Promise<TransferResult>;
+  /** NFT-scoped twin: refuses a valued source. Connect's `send_nft` routes here. */
+  sendCoinless(req: SendWholeTokenRequest): Promise<TransferResult>;
   mint(coinId: string, amount: bigint): Promise<MintResult>;
   receive(): Promise<{ transfers: IncomingTransfer[] }>;
 

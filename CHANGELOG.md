@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-09-11
+
+### Changed — the whole-token verbs are named for what they move (#783)
+
+`sendCoinless` moved a token whole, which has nothing to do with whether that token carries coins —
+the name described the caller, not the operation. The verb is now
+`payments.sendWholeToken({ recipient, tokenId, memo? })`, and the durable intent it writes is
+`kind: 'whole'`.
+
+`sendCoinless` REMAINS, and is not an alias: it is the same spend with one added refusal — a valued
+source. Connect's `send_nft` routes there, and its `nft:transfer` scope must not be able to move
+coins. Collapsing the two verbs would have made that scope a coin-transfer permission.
+
+Nothing published in 0.17.0 stops compiling. `SendCoinlessRequest` is kept as an alias of
+`SendWholeTokenRequest`, and `IntentPayload`'s whole arm accepts `'whole' | 'coinless'`: the intent
+is durable SERVER state, so a 0.17.0 client may have left one open, and this client must still
+resume it. New payloads write `'whole'`; `'coinless'` is normalized on read.
+
+### Fixed — a second, diverging copy of `isCoinlessEnvelope` (#783)
+
+`receive/Receive.ts` carried its own copy of the envelope test instead of the one in
+`token-engine/value-envelope.ts`. Two definitions of "is this token coinless" can disagree, and the
+one on the receive path decides whether an arrival is announced as coinless — the classifier is now
+imported, so there is one answer.
+
+## [0.17.0] - 2026-09-11
+
+The API names below are 0.17.1's. 0.17.0 shipped this behaviour as `sendCoinless` /
+`SendCoinlessRequest` / `kind: 'coinless'`; see [0.17.1] for the rename and what still compiles.
+
 ### Added — coinless tokens (#777, #781; wallet-api#140/#141/#147)
 
 `payments.coinless(): CoinlessToken[]` and `payments.tokenData(tokenId): Promise<Uint8Array | null>`.
@@ -37,26 +67,36 @@ arrivals saw nothing land.
 
 ### Added — transferring a coinless token (#777)
 
-`payments.sendCoinless({ recipient, tokenId, memo? })` moves a coinless token whole: one named source,
+`payments.sendWholeToken({ recipient, tokenId, memo? })` moves a coinless token whole: one named source,
 one direct transfer, never a split. A separate verb rather than a widened `send()` because the
 addressing differs — `send()` selects sources to cover an amount and may queue for a combination,
-`sendCoinless` reserves the token you named and never queues, since nothing can free up that helps.
+`sendWholeToken` reserves the token you named and never queues, since nothing can free up that helps.
 
 It is the SAME `TransferMachine`, durable intent, checkpoints, mailbox deposit and applyDelta —
-one money path, with the two spends diverging in exactly one function. Three independent gates keep
-a valued token out: the mirror (`spendableCoinless`), the reservation ledger (concurrency), and a
-re-check of the decoded blob, which is the authority on what a token actually carries.
+one money path, with the spends diverging in exactly one function.
+
+Two refusals, for different reasons. **`bare_collection`** is refused for everyone: those coins are
+real but this SDK cannot decode them, so the move would happen while the history row could only say
+`assets: []` — value gone, nothing accounted. The decoded blob decides that, never the mirror.
+**`sendCoinless`** additionally refuses any valued source, because Connect's `send_nft` routes there
+and its `nft:transfer` scope does not authorise coin transfers.
+
+The `TransferResult` lists every asset the moved token carried, the same way `send()` does — a
+whole spend takes the source's coins along, so reporting `tokens: []` would tell callers and
+`transfer:updated` consumers that a send which moved real coins moved nothing. A coinless token
+reports none: it has no amount in flight.
 
 A proven conflict is **terminal** for a named source: #625's bounded re-plan exists to pick a
 different source after a lost race, and a named token has no alternative.
 
-The durable intent is now discriminated by a REQUIRED `kind` (`'coin' | 'coinless'`) on a still-`v:2`
-envelope; an absent kind reads as `'coin'` — a migration, not a guess, since it is the only shape
-any client wrote. A token intent names exactly one source and can never carry a split, re-checked
-on resume rather than trusted across the decrypt boundary.
+The durable intent is discriminated by a REQUIRED `kind` on a still-`v:2` envelope. An ABSENT kind
+reads as `'coin'` — a migration, not a guess, since it is the only shape written before #777; an
+explicit unknown one is refused rather than executed under semantics it was never written for. A
+whole intent names exactly one source and can never carry a split, re-checked on resume rather than
+trusted across the decrypt boundary.
 
-**Naming**: the SDK says *coinless* throughout (`CoinlessToken`, `coinless()`, `sendCoinless`,
-`kind: 'coinless'`), matching wallet-api's spec rule. The Connect wire says *nft* (`send_nft`,
+**Naming**: the SDK says *coinless* throughout (`CoinlessToken`, `coinless()`, `sendCoinless`),
+matching wallet-api's spec rule. The Connect wire says *nft* (`send_nft`,
 `nft:transfer`) because that surface is read by a human in a consent prompt, where "coinless" would
 not communicate. "Token" is never used to mean "coinless token": coins are tokens too.
 
@@ -1555,6 +1595,8 @@ consumed exclusively through the `token-engine/` port. Consequences:
      version tags past v0.9.x, so a tag-compare link would 404. -->
 
 [Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/main...HEAD
+[0.17.1]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.17.1
+[0.17.0]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.17.0
 [0.16.0]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.16.0
 [0.15.0]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.15.0
 [0.14.11]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.14.11

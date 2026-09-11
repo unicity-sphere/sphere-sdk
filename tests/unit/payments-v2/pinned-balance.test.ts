@@ -154,7 +154,7 @@ describe('#738 review: the held-set gate fails CLOSED', () => {
   });
 
   it('#777: a NAMED token spend is refused too while the ledger is unproven', async () => {
-    // planCoinless bypasses freeView(), where the #738 gate lives for coin spends, so
+    // planWhole bypasses freeView(), where the #738 gate lives for coin spends, so
     // it has to apply the gate itself — otherwise a restart could double-spend a
     // token an open intent already holds, which is exactly what the gate prevents.
     const ledger = new ReservationLedger();
@@ -162,9 +162,9 @@ describe('#738 review: the held-set gate fails CLOSED', () => {
     const queue = new SpendQueue({
       ledger,
       getPool: () => [],
-      spendableCoinless: () => true,
+      spendableToken: () => true,
     });
-    expect(() => queue.planCoinless('r1', 'nft-1')).toThrow(/spending is paused|cannot spend yet/i);
+    expect(() => queue.planWhole('r1', 'nft-1')).toThrow(/spending is paused|cannot spend yet/i);
   });
 
   it('#777: once the ledger is proven, the same named token plans and reserves', () => {
@@ -174,9 +174,9 @@ describe('#738 review: the held-set gate fails CLOSED', () => {
     const queue = new SpendQueue({
       ledger,
       getPool: () => [],
-      spendableCoinless: (id) => id === 'nft-1',
+      spendableToken: (id) => id === 'nft-1',
     });
-    expect(queue.planCoinless('r1', 'nft-1').plan.direct).toEqual(['nft-1']);
+    expect(queue.planWhole('r1', 'nft-1').plan.direct).toEqual(['nft-1']);
     expect(ledger.holderOf('nft-1')).toBe('r1');
   });
 

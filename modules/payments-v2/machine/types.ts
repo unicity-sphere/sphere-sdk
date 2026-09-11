@@ -15,14 +15,14 @@ export interface CoinIntentPayload extends IntentPayloadBase {
   split?: { tokenId: string; splitAmount: string; remainderAmount: string };
 }
 
-export interface CoinlessIntentPayload extends IntentPayloadBase {
-  kind: 'coinless';
+export interface WholeIntentPayload extends IntentPayloadBase {
+  // 'coinless' is 0.17.0's spelling, read-accepted; new payloads write 'whole'.
+  kind: 'whole' | 'coinless';
   direct: [string];
   split?: undefined;
 }
 
-/** `kind` is REQUIRED on both arms: a missed writer must be a compile error. */
-export type IntentPayload = CoinIntentPayload | CoinlessIntentPayload;
+export type IntentPayload = CoinIntentPayload | WholeIntentPayload;
 
 export interface PlannedOp {
   kind: 'direct' | 'split';
