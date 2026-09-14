@@ -117,6 +117,8 @@ export interface PaymentsFacadeDeps {
   fieldKey: Uint8Array;
   /** The session's network — a recipient not verifiably on it is refused (§5.6). */
   network: string;
+  /** The network's NFT vessel token type (64 hex) every mintNft() mints under (#785). */
+  nftTokenType: string;
   ownPubkey: string;
   ownNametag?: () => string | undefined;
   requestMemo: RequestMemoCodec;

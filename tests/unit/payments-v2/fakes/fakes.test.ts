@@ -287,6 +287,19 @@ describe('FakeWalletApi — blobs (Appendix B: presigned PUT semantics)', () => 
     const api = new FakeWalletApi();
     await expect(api.putBlob('ab'.repeat(32), new Uint8Array([1, 2, 3]))).rejects.toBeInstanceOf(ValidationFailedError);
   });
+
+  it('429s a blob-urls request naming more than pageLimit UNIQUE ids (inventory/service.ts blobUrls, page_limit)', () => {
+    const api = new FakeWalletApi({ pageLimit: 2 });
+    expect(() => api.assertBlobUrlsRequest(['a', 'b', 'a', 'b'])).not.toThrow();
+    let error: unknown;
+    try {
+      api.assertBlobUrlsRequest(['a', 'b', 'c']);
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(QuotaExceededError);
+    expect((error as QuotaExceededError).limitName).toBe('page_limit');
+  });
 });
 
 describe('FakeWalletApi — intents (intents/service.ts + intents/repository.ts)', () => {

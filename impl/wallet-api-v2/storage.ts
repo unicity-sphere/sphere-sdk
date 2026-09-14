@@ -7,6 +7,13 @@ import type { WalletApiV2Client } from './client';
 
 export const WALLET_API_V2_FANOUT_WIDTH = 8;
 
+/**
+ * Unique ids per blob-urls request. wallet-api answers more than its PAGE_LIMIT
+ * (1000 by default, set per deployment) with 429 QUOTA_EXCEEDED, and a small batch
+ * keeps each presigned GET well inside its TTL.
+ */
+export const WALLET_API_V2_BLOB_URLS_BATCH = 100;
+
 export type StoragePortClient = Pick<
   WalletApiV2Client,
   'listInventory' | 'blobUrls' | 'uploadUrls' | 'apply' | 'fetchBlob' | 'uploadBlob'
@@ -103,14 +110,17 @@ export class WalletApiStoragePort implements StoragePort {
     };
   }
 
+  /** One blob-urls request per batch of unique ids, each batch fetched before the next is presigned. */
   async getBlobs(tokenIds: string[]): Promise<Map<string, Uint8Array>> {
-    if (tokenIds.length === 0) return new Map();
-    const urls = await this.client.blobUrls(tokenIds);
-    const bytes = await mapBounded(urls, WALLET_API_V2_FANOUT_WIDTH, (u) => this.client.fetchBlob(u.getUrl));
+    const unique = [...new Set(tokenIds)];
     const result = new Map<string, Uint8Array>();
-    for (const [i, url] of urls.entries()) {
-      const blob = bytes[i];
-      if (blob !== undefined) result.set(url.tokenId, blob);
+    for (let start = 0; start < unique.length; start += WALLET_API_V2_BLOB_URLS_BATCH) {
+      const urls = await this.client.blobUrls(unique.slice(start, start + WALLET_API_V2_BLOB_URLS_BATCH));
+      const bytes = await mapBounded(urls, WALLET_API_V2_FANOUT_WIDTH, (u) => this.client.fetchBlob(u.getUrl));
+      for (const [i, url] of urls.entries()) {
+        const blob = bytes[i];
+        if (blob !== undefined) result.set(url.tokenId, blob);
+      }
     }
     return result;
   }

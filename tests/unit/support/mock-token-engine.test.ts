@@ -8,6 +8,7 @@ describe('createMockTokenEngine', () => {
     const methods: (keyof ITokenEngine)[] = [
       'getIdentity', 'deriveIdentityAddress', 'readValue', 'balanceOf',
       'mint', 'transfer', 'split', 'verify', 'isSpent', 'encodeToken', 'decodeToken',
+      'buildNftMint', 'readNft',
     ];
     for (const m of methods) expect(typeof e[m]).toBe('function');
   });

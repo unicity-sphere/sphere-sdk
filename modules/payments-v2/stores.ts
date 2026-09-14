@@ -81,6 +81,18 @@ export interface MintJournalEntry {
   createdAt: number;
 }
 
+// §5.9 NFT mint journal (#785). Its own store: an older client reading a coin
+// journal entry without coinId/amount would retry it every pass, forever.
+// Every field a byte-identical re-mint needs is journaled, so resume never re-signs.
+export interface NftMintJournalEntry {
+  mintId: string;
+  tokenId: string;
+  dataHex: string;
+  saltHex: string;
+  tokenTypeHex: string;
+  createdAt: number;
+}
+
 // #690 shortfall record.
 export interface ShortfallEntry {
   transferId: string;
@@ -113,6 +125,7 @@ export const STORE_KEYS = {
   checkpointCache: 'checkpoints',
   deliveryJournal: 'delivery-journal',
   mintJournal: 'mint-journal',
+  nftMintJournal: 'nft-mint-journal',
   shortfalls: 'shortfalls',
   settlingLinks: 'settling',
   streamCursor: (s: StreamName) => `cursor:${s}`,

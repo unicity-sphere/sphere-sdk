@@ -460,6 +460,105 @@ const bytes = await sphere.payments.tokenData(nft.tokenId);
 Note an **empty** payload reads back as a zero-length `Uint8Array`, not `null` — only a genuinely
 absent one is `null`.
 
+### `nft(tokenId: string): Promise<NftView | null>`
+
+A held token's genesis payload read as an **NFT** under the NFT metadata standard (#785; the
+normative format is [`docs/NFT-METADATA.md`](./NFT-METADATA.md)), or `null` when the payload is not
+a recognised NFT — which includes every coin token.
+
+```typescript
+interface NftView {
+  readonly tokenId: string;
+  readonly content: NftContent;           // NftMetadata | NftMedia | NftLink — see NFT content types
+  readonly creator: string | null;        // the key the payload CLAIMS (33-byte compressed, hex); null when unsigned
+  readonly signature: NftSignatureStatus; // 'unsigned' | 'valid' | 'invalid'
+}
+
+const view = await sphere.payments.nft(row.tokenId);   // row from coinless()
+if (view?.signature === 'valid') showCreator(view.creator);
+```
+
+- `signature` is checked against the token id and the token's **genesis** recipient, never its
+  current owner, so a `valid` NFT stays `valid` across transfers. `valid` proves the holder of
+  `creator` signed this payload for this token; resolving `creator` to a @nametag is a separate
+  lookup.
+- **`creator` is only a claim until `signature === 'valid'`.** Anyone can mint a payload naming
+  another wallet's key over a junk signature, so under `'invalid'` the field holds whatever key the
+  minter wrote. Never show it, or resolve it to a @nametag, as the creator unless the status is `valid`.
+- **Display-only.** `null` never means "refused": an unrecognised token is still held and
+  transferable. Show its raw payload from `tokenData()`.
+- Throws `VALIDATION_ERROR` for a token this wallet does not hold (checked before the cache and
+  before any fetch), and `STORAGE_ERROR` when its blob is missing or decodes as another token — the
+  `tokenData()` contract. A blob that fails to decode also throws.
+- Readings are cached per wallet address (least-recently-used, 256 entries), a "not an NFT" answer
+  included: a token id's genesis payload never changes. A failed decode is not cached.
+
+### `nfts(tokenIds: readonly string[]): Promise<ReadonlyMap<string, NftView>>`
+
+The batch read for list views: one batched blob read for every id not already cached (the wallet-api
+port asks for at most 100 ids per request, under the server's per-request cap).
+
+```typescript
+const rows = sphere.payments.coinless();
+const views = await sphere.payments.nfts(rows.map((r) => r.tokenId));
+for (const row of rows) render(row, views.get(row.tokenId)); // undefined → show the raw payload
+```
+
+An id is simply **absent** from the map when this wallet does not hold it, its blob is missing or
+does not decode, or its payload is not a recognised NFT. Duplicate ids are read once. Throws only
+when the blob fetch itself fails or no token engine is available.
+
+### NFT content types
+
+```typescript
+type NftContent = NftMetadata | NftMedia | NftLink;
+type NftMediaRef = NftMedia | NftLink;
+type NftSignatureStatus = 'unsigned' | 'valid' | 'invalid';
+
+interface NftMetadata {                       // ERC-721 field names
+  readonly kind: 'metadata';
+  readonly name: string;                      // required
+  readonly description: string | null;
+  readonly image: NftMediaRef | null;
+  readonly animation_url: NftMediaRef | null;
+  readonly external_url: string | null;
+  readonly attributes: readonly NftAttribute[]; // [] when there are none, never null
+  readonly collection: string | null;
+}
+
+interface NftAttribute {
+  readonly trait_type: string;
+  readonly value: string | number;            // text, or an integer within ±(2^53 − 1)
+}
+
+interface NftMedia {                          // an inline file
+  readonly kind: 'media';
+  readonly media_type: string;                // lowercase type/subtype, no parameters
+  readonly bytes: Uint8Array;                 // non-empty
+}
+
+interface NftLink {                           // a hosted file, pinned by its hash
+  readonly kind: 'link';
+  readonly media_type: string;
+  readonly uri: string;                       // https://, ipfs:// or ar://; at most 2048 characters
+  readonly sha256: string;                    // SHA-256 of the file's bytes, 64 hex (read back lower case)
+}
+```
+
+Every text field is non-empty: an absent optional one is `null`, never `''`. Write decimals and
+integers outside ±(2^53 − 1) as text. The complete rules are in
+[`docs/NFT-METADATA.md`](./NFT-METADATA.md).
+
+**Before rendering an `NftLink`**, fetch the file and check it: `verifyNftLinkContent(link, bytes)`
+is `false` when the bytes' SHA-256 is not the pinned one, and then the file must not be rendered.
+Render metadata text as plain text, never as markup.
+
+The codec ships from the package root and the `./payments-v2` subpath: `encodeNftContent` (throws
+`VALIDATION_ERROR` naming the offending field), `parseNftPayload` (never throws; `null` = not
+recognised), `verifyNftLinkContent`, and the tag numbers `NFT_METADATA_TAG`, `NFT_MEDIA_TAG`,
+`NFT_LINK_TAG`, `NFT_SIGNED_TAG` (`39052n`–`39055n`). The `./token-engine` subpath adds
+`encodeNftSigned`, `nftSignedDigest`, `verifyNftSignature` and `NFT_FORMAT_VERSION`.
+
 ### `sendWholeToken(req: { recipient, tokenId, memo? }): Promise<TransferResult>`
 
 Move **one named token** whole — coinless or valued. All-or-nothing: one source, one direct
@@ -509,6 +608,52 @@ const result = await sphere.payments.mint(coinIdHex, 1_000_000n);
 
 - `coinIdHex` must be even-length lowercase hex; `amount` must be `> 0n`.
 - Returns an error result instead of throwing when the engine is unavailable.
+
+### `mintNft(request: MintNftRequest): Promise<MintResult>`
+
+Mint an NFT (#785) to this wallet. The content is encoded under the NFT metadata standard and, by
+default, signed as its creator with this wallet's chain key.
+
+```typescript
+interface MintNftRequest {
+  readonly content: NftContent;   // NftMetadata, NftMedia or NftLink — see NFT content types
+  readonly sign?: boolean;        // default true: wrap in NftSigned, creator = this wallet's chain pubkey
+}
+
+const result = await sphere.payments.mintNft({
+  content: {
+    kind: 'metadata',
+    name: 'Cool Cat #1',
+    description: 'A ginger cat',
+    image: { kind: 'media', media_type: 'image/png', bytes: pngBytes },
+    animation_url: null,
+    external_url: 'https://coolcats.example',
+    attributes: [{ trait_type: 'Fur', value: 'Ginger' }, { trait_type: 'Lives', value: 9 }],
+    collection: 'Cool Cats',
+  },
+});
+// { success: true, tokenId } | { success: false, tokenId?, error }
+```
+
+- The token always mints to this wallet, under the network's NFT vessel token type
+  (`NETWORKS[network].nftTokenType`), and appears in `coinless()`. History records it as a `MINT`
+  with `assets: []`; the `HistoryEntry` read back carries the `tokenId` and no coin (`coinId: ''`,
+  `amount: '0'`).
+- **Invalid content** returns `{ success: false, error }` naming the offending field. Nothing is
+  journaled and nothing is minted.
+- **Journal-first, like `mint()`.** The planned payload, salt and token type are journaled before
+  the chain op. A failure after that returns `{ success: false, tokenId, error }` and keeps the
+  entry, and the facade replays those SAME bytes in its convergence pass (start, heartbeat,
+  `resumeNow()`) until the token is in inventory. **Never call `mintNft()` again for a failure that
+  carries a `tokenId`**: a new call draws a new salt and mints a second NFT.
+- A gateway failure during the mint is a journaled `{ success: false, tokenId, error }` (above).
+  Only a wallet with no token engine at all (no trust base or gateway configured) throws
+  `AGGREGATOR_ERROR`.
+- **Size limit.** A genesis payload over `NFT_MAX_PAYLOAD_BYTES` (1 MiB, the 107-byte `NftSigned`
+  wrapper included) returns `{ success: false, error }` with nothing journaled and nothing minted:
+  wallet-api refuses a blob over its `MAX_BLOB_BYTES` only at upload, after the mint has certified.
+  Inline media also travels with every transfer, growing the blob each time; prefer an `NftLink` for
+  large files.
 
 ### `history(page?: { before?: string; limit?: number }): Promise<HistoryPage>`
 

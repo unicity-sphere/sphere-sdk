@@ -9,8 +9,9 @@
  *
  * Its state mirrors the real engine: a token carries raw `genesisData` (a
  * SpherePaymentData envelope for value tokens, opaque bytes for data tokens) plus
- * an optional `transferMemo` (the latest transfer's data). value / readMemo /
- * readTokenData are derived exactly as the real adapter derives them.
+ * an optional `transferMemo` (the latest transfer's data) and its first owner.
+ * value / readMemo / readTokenData / readNft are derived exactly as the real
+ * adapter derives them; NFT plans and signatures use the real engine's code.
  *
  * This is a TEST double (lives under tests/, never shipped). The real adapter
  * puts a genuine v2 Token in SphereToken.sdkToken; here it is an opaque
@@ -22,15 +23,18 @@ import {
   CborSerializer,
   HexConverter,
   NetworkId,
+  SigningService,
   type Token,
   TokenId,
   TokenSalt,
 } from '../../../token-engine/sdk';
+import { nftRecipientCbor, planNftMint, readNftData, type NftOpsDeps } from '../../../token-engine/nft-ops';
 import {
   type ClassifiedValue,
   classifyValueEnvelope,
 } from '../../../token-engine/value-envelope';
 import type {
+  BuildNftMintParams,
   CoinId,
   EngineIdentity,
   EngineOpOptions,
@@ -38,6 +42,8 @@ import type {
   ITokenEngine,
   MintDataTokenParams,
   MintParams,
+  NftMintPlan,
+  NftReading,
   SphereToken,
   SphereValue,
   SplitParams,
@@ -61,21 +67,42 @@ interface FakeState {
   readonly genesisData: Uint8Array | null;
   /** The latest transfer's opaque memo, when the token was delivered by transfer. */
   readonly transferMemo: Uint8Array | null;
+  /** The first owner — the genesis recipient an NftSigned digest binds; transfers carry it unchanged. */
+  readonly genesisOwner: Uint8Array;
 }
 
 export interface FakeEngineConfig {
   readonly chainPubkey?: Uint8Array;
+  /** A real key to sign NFTs with; the identity defaults to its public key. */
+  readonly privateKey?: Uint8Array;
   readonly network?: number;
 }
 
+const NO_SIGNING_KEY = 'FakeTokenEngine: signing an NFT needs FakeEngineConfig.privateKey';
+
+/** Without a configured key a signed NFT plan fails loudly, rather than naming a creator it cannot sign as. */
+const UNKEYED_SIGNER: NftOpsDeps['signingService'] = {
+  get publicKey(): Uint8Array {
+    throw new Error(NO_SIGNING_KEY);
+  },
+  sign: () => Promise.reject(new Error(NO_SIGNING_KEY)),
+};
+
 export class FakeTokenEngine implements ITokenEngine {
   private readonly identity: EngineIdentity;
+  private readonly signer: NftOpsDeps['signingService'];
   private readonly network: number;
   private readonly spent = new Set<string>();
   private seq = 0;
 
   public constructor(config: FakeEngineConfig = {}) {
-    this.identity = { chainPubkey: config.chainPubkey ?? DEFAULT_PUBKEY };
+    const keyed = config.privateKey ? new SigningService(config.privateKey) : null;
+    const chainPubkey = config.chainPubkey ?? keyed?.publicKey ?? DEFAULT_PUBKEY;
+    if (keyed !== null && HexConverter.encode(keyed.publicKey) !== HexConverter.encode(chainPubkey)) {
+      throw new Error('FakeTokenEngine: chainPubkey is not the public key of privateKey');
+    }
+    this.identity = { chainPubkey };
+    this.signer = keyed ?? UNKEYED_SIGNER;
     this.network = config.network ?? 2; // testnet
   }
 
@@ -116,6 +143,18 @@ export class FakeTokenEngine implements ITokenEngine {
     return decodeFakeState(token.blob.token).genesisData;
   }
 
+  public async readNft(token: SphereToken): Promise<NftReading | null> {
+    try {
+      const state = decodeFakeState(token.blob.token);
+      // TokenId.toCBOR() is the bare id byte string; the recipient is built as the real mint builds it.
+      return await readNftData(state.genesisData, CborSerializer.encodeByteString(state.tokenId), () =>
+        nftRecipientCbor(state.genesisOwner),
+      );
+    } catch {
+      return null;
+    }
+  }
+
   public async mint(params: MintParams, _options?: EngineOpOptions): Promise<SphereToken> {
     const genesisData = params.value ? await SpherePaymentData.fromValue(params.value).encode() : null;
     return this.makeToken({
@@ -124,6 +163,7 @@ export class FakeTokenEngine implements ITokenEngine {
       owner: params.recipientPubkey,
       genesisData,
       transferMemo: null,
+      genesisOwner: params.recipientPubkey,
     });
   }
 
@@ -139,7 +179,13 @@ export class FakeTokenEngine implements ITokenEngine {
       owner: params.recipientPubkey,
       genesisData: params.data,
       transferMemo: null,
+      genesisOwner: params.recipientPubkey,
     });
+  }
+
+  public buildNftMint(params: BuildNftMintParams): Promise<NftMintPlan> {
+    // The real planner, on the network mintDataToken derives this fake's salted ids from.
+    return planNftMint({ networkId: networkIdOf(this.network), signingService: this.signer }, params);
   }
 
   public async transfer(params: TransferParams, _options?: EngineOpOptions): Promise<SphereToken> {
@@ -152,6 +198,7 @@ export class FakeTokenEngine implements ITokenEngine {
       owner: params.recipientPubkey,
       genesisData: source.genesisData,
       transferMemo: params.data ?? null,
+      genesisOwner: source.genesisOwner,
     });
   }
 
@@ -172,6 +219,7 @@ export class FakeTokenEngine implements ITokenEngine {
           owner: o.recipientPubkey,
           genesisData,
           transferMemo: null,
+          genesisOwner: o.recipientPubkey,
         }),
       );
     }
@@ -309,7 +357,13 @@ export function decodeFakeTokenId(tokenBytes: Uint8Array): string | null {
   }
 }
 
-// fake-token state: CBOR array[ tokenId, stateId, owner, genesisData?, transferMemo? ]
+/** Token id and CURRENT owner (hex) of fake inner-token bytes; throws on any other bytes. */
+export function readFakeTokenKeys(tokenBytes: Uint8Array): { tokenId: string; owner: string } {
+  const state = decodeFakeState(tokenBytes);
+  return { tokenId: HexConverter.encode(state.tokenId), owner: HexConverter.encode(state.owner) };
+}
+
+// fake-token state: CBOR array[ tokenId, stateId, owner, genesisData?, transferMemo?, genesisOwner ]
 function encodeFakeState(state: FakeState): Uint8Array {
   return CborSerializer.encodeArray(
     CborSerializer.encodeByteString(state.tokenId),
@@ -317,17 +371,19 @@ function encodeFakeState(state: FakeState): Uint8Array {
     CborSerializer.encodeByteString(state.owner),
     CborSerializer.encodeNullable(state.genesisData, CborSerializer.encodeByteString),
     CborSerializer.encodeNullable(state.transferMemo, CborSerializer.encodeByteString),
+    CborSerializer.encodeByteString(state.genesisOwner),
   );
 }
 
 function decodeFakeState(bytes: Uint8Array): FakeState {
-  const [tokenIdB, stateIdB, ownerB, genesisB, memoB] = CborDeserializer.decodeArray(bytes, 5);
+  const [tokenIdB, stateIdB, ownerB, genesisB, memoB, genesisOwnerB] = CborDeserializer.decodeArray(bytes, 6);
   return {
     tokenId: CborDeserializer.decodeByteString(tokenIdB),
     stateId: CborDeserializer.decodeByteString(stateIdB),
     owner: CborDeserializer.decodeByteString(ownerB),
     genesisData: CborDeserializer.decodeNullable(genesisB, CborDeserializer.decodeByteString),
     transferMemo: CborDeserializer.decodeNullable(memoB, CborDeserializer.decodeByteString),
+    genesisOwner: CborDeserializer.decodeByteString(genesisOwnerB),
   };
 }
 

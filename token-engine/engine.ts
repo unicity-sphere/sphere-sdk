@@ -19,6 +19,9 @@ import type {
   SplitParams,
   SplitResult,
   EngineVerifyResult,
+  BuildNftMintParams,
+  NftMintPlan,
+  NftReading,
 } from './types';
 
 /**
@@ -122,6 +125,8 @@ export interface ITokenEngine {
   readMemo(token: SphereToken): Uint8Array | null;
   /** Raw genesis data of a token (e.g. a data-token's terms). `null` when absent. Synchronous. */
   readTokenData(token: SphereToken): Uint8Array | null;
+  /** Read a token's genesis payload as an NFT. NEVER throws; null = not a recognised NFT. */
+  readNft(token: SphereToken): Promise<NftReading | null>;
 
   // ── lifecycle (sender-driven: build → submit → wait → certify → realize) ──
   /**
@@ -139,6 +144,8 @@ export interface ITokenEngine {
    * read its bytes via `readTokenData`. (Used e.g. for on-chain invoice tokens.)
    */
   mintDataToken(params: MintDataTokenParams, options?: EngineOpOptions): Promise<SphereToken>;
+  /** Plan an NFT mint: encode (and optionally sign as this engine's identity) the payload and derive its token id. No chain op. */
+  buildNftMint(params: BuildNftMintParams): Promise<NftMintPlan>;
   /** Spend a token wholesale to a recipient pubkey; returns the recipient's finished token. */
   transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken>;
   /** Split a token into N value-conserving outputs (burn source + internally mint each output). */

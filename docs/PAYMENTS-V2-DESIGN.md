@@ -126,11 +126,14 @@ interface Payments {
   tokens(filter?: { coinId?: string }): Token[];   // sync read of the inventory view
   coinless(): CoinlessToken[];                     // #777: holdings naming no coin — DISJOINT from tokens()
   tokenData(tokenId: string): Promise<Uint8Array | null>; // genesis payload, fetched on demand
+  nft(tokenId: string): Promise<NftView | null>;   // #785: a held token read as an NFT (§5.2) — null = not recognised, never a refusal
+  nfts(tokenIds: readonly string[]): Promise<ReadonlyMap<string, NftView>>; // #785: batch for list views — one blob fetch, cached
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage>;
 
   // money movement
   send(req: { recipient: string; amount: string; coinId: string; memo?: string }): Promise<TransferResult>;
   mint(coinId: string, amount: bigint): Promise<MintResult>;
+  mintNft(req: { content: NftContent; sign?: boolean }): Promise<MintResult>; // #785: an NFT to self, signed by default, journal-first (§5.9)
   receive(): Promise<{ transfers: IncomingTransfer[] }>;
 
   // convergence (§7 heartbeat surface; owner UX add 2026-08)
@@ -286,7 +289,21 @@ Two invariants that span functions, so neither file states them alone:
   `recoverOne` flips `status` in place without recomputing `coinless`. Correct only together:
   without the status comparison a recovered coin tombstone surfaces in `tokens()` AND `coinless()`.
 - The verdict is DERIVED from wallet-api's §8.2 step-6 boundary. Moving that boundary needs this
-  re-derived, not merely re-tested — wallet-api's §8.2 now records the coupling from its side. **In-flight exclusion
+  re-derived, not merely re-tested — wallet-api's §8.2 now records the coupling from its side.
+
+**NFT reads (#785).** `nft(tokenId)` / `nfts(tokenIds)` (`inventory/nft-read.ts`) read a held
+token's genesis payload through `engine.readNft`, under the format in `docs/NFT-METADATA.md`. The
+held check (`stateHashOf`) runs BEFORE the cache, so a cached reading never outlives the holding,
+and `nfts()` batches every cache miss into ONE `getBlobs` (`WalletApiStoragePort` splits it into
+blob-urls requests of at most 100 unique ids, under wallet-api's per-request `PAGE_LIMIT`); a blob
+must decode as the id it was fetched for. Recognition is display-only and never throws — `null`, or absence from the `nfts()`
+map, means "show the raw payload", never "refuse" — and nothing on the receive or mirror path calls
+it, because a throw there loses a token wallet-api accepted. Readings live in a facade-owned
+256-entry LRU keyed by token id, "not an NFT" (`null`) included, since a token id's genesis payload
+never changes; a failed decode is not cached, and each address's facade has its own cache. The
+signature status binds the token id and the GENESIS recipient, so a transfer never changes it.
+
+**In-flight exclusion
 (#517/#32, re-homed):** sources reserved by an open transfer — including keep-open intents whose
 spend may be on-chain — are excluded from the selector pool AND reported outside the spendable
 total (`transferring*` fields, never `totalAmount`) until their machine settles or resume adopts
@@ -591,6 +608,22 @@ it, a crash there mints a token on-chain with zero client record — the mint-pa
 Replay converges by an idempotent `mint` re-call under the same journaled `(transferId, opIndex)`
 seed (F13 recovers the existing certification); pre-derivation of the tokenId is dropped.
 
+**NFT mint (#785, `mint-nft.ts`).** `mintNft` first asks the engine for a plan — `buildNftMint`
+encodes the content, signs it as creator unless `sign: false`, draws a fresh salt and derives the
+token id, with no chain op — and a refused payload fails with nothing journaled. So does a payload
+over `NFT_MAX_PAYLOAD_BYTES` (1 MiB): wallet-api refuses an oversize blob only at upload, after the
+mint certified, and no replay could ever store that token. The plan's BYTES
+(payload, salt, token type, planned token id) are then journaled in a SEPARATE `nft-mint-journal`
+store before `mintDataToken` runs under `transferId = mintId`; separate because an older client
+that found an NFT entry in the coin journal would fail it on `BigInt(undefined)` and retry it every
+pass, forever. Replay rides the coin journal's convergence pass and heartbeat `pendingWork`, caught
+apart so one unreadable journal never starves the other. It clears an entry whose token is already
+active server-side, and otherwise re-submits the journaled bytes: the same salt is the same token
+id, so the engine's submit-then-probe recovers the first certification. With every input
+journaled, replay needs no deterministic engine and never re-signs. A minted id other than the
+planned one is never finalised; finalisation is the coin mint's (upload, apply, MINT record, clear,
+note the held state) with `assets: []`.
+
 ## 6. Durable client state — the complete inventory
 
 Everything below is a small keyed store with a single writer; **nothing else the client persists
@@ -602,6 +635,7 @@ can lose money.** Each row exists because of a documented server non-guarantee.
 | E.4 checkpoint ciphertext (encrypt-once bytes) | same, re-POST byte-identical | TransferMachine |
 | Delivery journal (`(transferId, opIndex)` → blob) | certification→deposit window is client-only | Delivery |
 | Mint journal (pre-submit seed: coinId, amount, mintId) | mint certification→`applyDelta` window is client-only (mint has no intent row) | Mint |
+| NFT mint journal (`nft-mint-journal`: planned payload, salt, token type and tokenId, as hex) | the same window for `mintNft` (#785); the planned BYTES are journaled so a replay re-submits exactly the first attempt | Mint |
 | Partial-shortfall record (`remainingAmount` + delivered set) | the delivered legs' intent completes — resume cannot recover a shortfall the app never saw (#690/#692); written before the partial surfaces, cleared on re-plan/ack | TransferMachine |
 | Seen-set `(tokenId, stateHash)` | mailbox is at-least-once; claimed entries stay listable | delivery impl (S7 port contract) |
 | `suspectedSpent` overlay | server never checks unspentness | InventoryView |

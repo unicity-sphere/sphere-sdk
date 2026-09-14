@@ -520,6 +520,13 @@ export class FakeWalletApi {
     return bytes === undefined ? undefined : Uint8Array.from(bytes);
   }
 
+  /** §5.5: a blob-urls request naming more than PAGE_LIMIT unique ids is a 429 (inventory/service.ts blobUrls). */
+  assertBlobUrlsRequest(tokenIds: readonly string[]): void {
+    if (new Set(tokenIds).size > this.pageLimit) {
+      throw new QuotaExceededError(`blob-urls per-request cap is ${String(this.pageLimit)} (§5.5)`, 'page_limit');
+    }
+  }
+
   // ── inventory ───────────────────────────────────────────────────────────────
 
   async listInventory(caller: FakeCaller, since?: number): Promise<InventoryWirePage> {

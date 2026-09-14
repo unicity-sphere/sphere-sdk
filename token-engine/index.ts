@@ -35,6 +35,9 @@ export type {
   SplitParams,
   SplitResult,
   EngineVerifyResult,
+  BuildNftMintParams,
+  NftMintPlan,
+  NftReading,
 } from './types';
 
 // Identity (A6): legacy DIRECT:// address derivation (Path A — XP-invariant).
@@ -66,3 +69,29 @@ export {
   decodeSpherePaymentData,
   sphereAssetToSdk,
 } from './SpherePaymentData';
+
+// The NFT metadata codec (#785; normative spec docs/NFT-METADATA.md): CBOR tags
+// 39052–39055. Reading is display-only and never throws.
+export {
+  NFT_FORMAT_VERSION,
+  NFT_LINK_TAG,
+  NFT_MEDIA_TAG,
+  NFT_METADATA_TAG,
+  NFT_SIGNED_TAG,
+  encodeNftContent,
+  encodeNftSigned,
+  nftSignedDigest,
+  parseNftPayload,
+  verifyNftLinkContent,
+  verifyNftSignature,
+} from './nft-payload';
+export type {
+  NftAttribute,
+  NftContent,
+  NftLink,
+  NftMedia,
+  NftMediaRef,
+  NftMetadata,
+  NftSignatureStatus,
+  ParsedNft,
+} from './nft-payload';

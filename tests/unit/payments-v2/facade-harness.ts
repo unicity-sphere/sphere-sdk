@@ -4,6 +4,7 @@
  * with per-call hooks/gates and a cleanup registry. Assertions stay in suites.
  */
 
+import { NETWORKS } from '../../../constants';
 import { getPublicKey, hexToBytes } from '../../../core/crypto';
 import { resolveRecipientInfo } from '../../../core/payments-v2-wiring';
 import type { PeerInfo } from '../../../transport';
@@ -281,6 +282,7 @@ export function makeWorld(
     signComplete: async (transferId) => fakeSeedSignature(OWN_PUB, completeMessageFor(transferId)),
     fieldKey: new Uint8Array(32).fill(7),
     network: NET,
+    nftTokenType: NETWORKS[NET].nftTokenType,
     ownPubkey: OWN_PUB,
     ...(options.ownNametag !== undefined ? { ownNametag: options.ownNametag } : {}),
     requestMemo: stubRequestMemoCodec,

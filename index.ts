@@ -195,6 +195,30 @@ export type {
 // keeps its name as an alias of the storage HistoryRecord it always was.
 export type { HistoryRecord as TransactionHistoryEntry } from './storage';
 
+// NFT metadata (#785; normative spec docs/NFT-METADATA.md): the shapes
+// `payments.mintNft()` / `nft()` / `nfts()` take and return, and the codec a
+// viewer needs to render a payload or check a linked file.
+export type { MintNftRequest, NftView } from './modules/payments-v2/api';
+export type {
+  NftAttribute,
+  NftContent,
+  NftLink,
+  NftMedia,
+  NftMediaRef,
+  NftMetadata,
+  NftSignatureStatus,
+} from './token-engine/nft-payload';
+export {
+  NFT_LINK_TAG,
+  NFT_MEDIA_TAG,
+  NFT_METADATA_TAG,
+  NFT_SIGNED_TAG,
+  encodeNftContent,
+  parseNftPayload,
+  verifyNftLinkContent,
+} from './token-engine/nft-payload';
+export { NFT_MAX_PAYLOAD_BYTES } from './modules/payments-v2/mint-nft';
+
 export {
   CommunicationsModule,
   createCommunicationsModule,

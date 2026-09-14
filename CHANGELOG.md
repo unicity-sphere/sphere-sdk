@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — NFT metadata standard: mintNft, nft/nfts reads, CBOR tags 39052–39055 (#785)
+
+A coinless token can now carry a name, media, traits and a creator signature. The format is four
+CBOR tags — `NftMetadata` (39052, ERC-721 field names), `NftMedia` (39053, an inline file),
+`NftLink` (39054, a hosted file pinned by its SHA-256) and `NftSigned` (39055) — specified
+normatively in `docs/NFT-METADATA.md`, with cross-SDK test vectors for the signed digest.
+
+`payments.mintNft({ content, sign? })` mints to the wallet itself under the network's NFT vessel
+token type (the new `NETWORKS[network].nftTokenType`, the registry's `non-fungible` entry), signed
+as creator with the wallet's chain key unless `sign: false`. It is journal-first like `mint()`, in
+its own `nft-mint-journal` store, and the journal holds the planned payload, salt and token type: a
+crash after certification replays exactly those bytes instead of re-signing or minting a second
+token. Invalid content, or a genesis payload over `NFT_MAX_PAYLOAD_BYTES` (1 MiB, the `NftSigned`
+wrapper included), returns `{ success: false, error }` before anything is journaled or minted:
+wallet-api refuses an oversize blob only at upload, after the mint has certified, so a larger payload
+would leave a certified token that can never be held. Link large files with `NftLink`. The mint's
+history record carries `assets: []`.
+
+`payments.nft(tokenId)` and `payments.nfts(tokenIds)` read held tokens as
+`NftView { tokenId, content, creator, signature }`; the batch read fetches all cache misses in one
+batched read, and readings are cached per address. Reading is display-only: an unrecognised payload
+is `null` (absent from the `nfts()` map), never a throw and never a refusal. `signature` is `valid`
+only for a low-s signature whose recovered key is `creator`, over the token id and the token's
+GENESIS recipient — so a transfer never invalidates it, while a payload copied onto another token,
+or a mint front-run to another first owner, reads `invalid`. `creator` is the key the payload
+claims, authenticated only when `signature` is `valid`.
+
+The codec (`encodeNftContent`, `parseNftPayload`, `verifyNftLinkContent`, `NFT_METADATA_TAG`,
+`NFT_MEDIA_TAG`, `NFT_LINK_TAG`, `NFT_SIGNED_TAG`), `NFT_MAX_PAYLOAD_BYTES` and the NFT types are
+exported from the package root and `./payments-v2`; `./token-engine` adds `encodeNftSigned`,
+`nftSignedDigest`, `verifyNftSignature` and `NFT_FORMAT_VERSION`.
+
+For implementers: `ITokenEngine` gains two required members, `buildNftMint` and `readNft`, and
+`PaymentsFacadeDeps` gains a required `nftTokenType`. A custom engine, or code that composes
+`PaymentsFacade` directly, must supply them; `Sphere.init` fills `nftTokenType` from the network.
+
+### Fixed — blob reads naming more ids than wallet-api accepts in one request
+
+`WalletApiStoragePort.getBlobs` put every id in one `blob-urls` request. wallet-api refuses a
+request naming more than `PAGE_LIMIT` unique ids (1000 by default) with 429 `QUOTA_EXCEEDED`, and
+nothing retries it, so a read that large failed every time — `nfts()` over a large coinless holding
+is the first caller to make one routinely. `getBlobs` now asks for at most 100 unique ids per request
+and fetches each batch before presigning the next.
+
 ## [0.17.1] - 2026-09-11
 
 ### Changed — the whole-token verbs are named for what they move (#783)

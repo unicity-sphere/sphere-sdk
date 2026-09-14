@@ -81,4 +81,20 @@ describe('published token registries — live', () => {
       );
     }
   });
+
+  it("every network's nftTokenType is a non-fungible entry of its registry", async () => {
+    for (const network of Object.keys(NETWORKS) as (keyof typeof NETWORKS)[]) {
+      const { tokenRegistryUrl, nftTokenType } = NETWORKS[network];
+      const defs = await fetchRegistry(tokenRegistryUrl);
+      if (!defs) {
+        console.warn(`[e2e] ${network} registry unavailable — skipping`);
+        continue;
+      }
+      // Membership, not equality: the registry gaining another non-fungible entry is no
+      // violation, but the vessel every NFT mints under changing or disappearing is.
+      const vessels = defs.filter((d) => d.assetKind === 'non-fungible').map((d) => d.id?.toLowerCase());
+      expect(vessels).toContain(nftTokenType);
+      console.info(`[e2e] ${network} vessel ${nftTokenType} is one of ${vessels.length} non-fungible id(s)`);
+    }
+  });
 });
