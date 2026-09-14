@@ -65,6 +65,24 @@ export {
 
 export type { PermissionScope } from './permissions';
 
+// NFT wire form (mint_nft intent)
+export { nftContentToWire, nftContentFromWire } from './nft-wire';
+export type {
+  MintNftIntentParams,
+  MintNftIntentResult,
+  WireNftContent,
+  WireNftMedia,
+  WireNftMetadata,
+} from './nft-wire';
+export type {
+  NftAttribute,
+  NftContent,
+  NftLink,
+  NftMedia,
+  NftMediaRef,
+  NftMetadata,
+} from '../token-engine/nft-payload';
+
 // Types
 export type {
   ConnectTransport,

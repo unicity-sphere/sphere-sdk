@@ -236,9 +236,11 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 
 **Queries (14):** `sphere_getIdentity`, `sphere_getBalance`, `sphere_getAssets`, `sphere_getFiatBalance`, `sphere_getTokens`, `sphere_getHistory`, `sphere_resolve`, `sphere_subscribe`, `sphere_unsubscribe`, `sphere_disconnect`, `sphere_getConversations`, `sphere_getMessages`, `sphere_getDMUnreadCount`, `sphere_markAsRead`. (The two invoice queries were removed with the P11 flip — they were experimental and never enabled in any wallet host.)
 
-**Intents (6):** `send`, `dm`, `payment_request`, `receive`, `sign_message`, `mint`. (The 9 invoice intents were removed with the P11 flip.)
+**Intents (8):** `send`, `dm`, `payment_request`, `receive`, `sign_message`, `mint`, `send_nft`, `mint_nft`. (The 9 invoice intents were removed with the P11 flip.)
 
-**Permission scopes (13):** `identity:read`, `balance:read`, `tokens:read`, `history:read`, `events:subscribe`, `resolve:peer`, `transfer:request`, `dm:request`, `dm:read`, `dm:manage`, `payment:request`, `sign:request`, `mint:request`.
+**Permission scopes (15):** `identity:read`, `balance:read`, `tokens:read`, `history:read`, `events:subscribe`, `resolve:peer`, `transfer:request`, `dm:request`, `dm:read`, `dm:manage`, `payment:request`, `sign:request`, `mint:request`, `nft:transfer`, `nft:mint`.
+
+- **`mint_nft` needs its own `nft:mint` scope (Connect 2.3)** — neither `mint:request` nor `nft:transfer` grants it, because minting an NFT puts the user's creator signature on content the DAPP chose, which a coin top-up or an NFT-move approval never agreed to. It always asks the user: `ConnectHost.setIntentAutoApprove` throws for it and the host routes every `mint_nft` to `onIntent`. Params cross the wire via `nftContentToWire`/`nftContentFromWire` (`connect/nft-wire.ts`, inline bytes as canonical base64; shape only — value rules stay in `payments.mintNft`).
 
 **Wire-compat adapter (`connect/host/payments-compat.ts`):** dApps written against the pre-flip event/query contract change NOTHING. On a v2 host, `sphere_getBalance`/`getAssets`/`getFiatBalance`/`getTokens`/`getHistory` are served from the facade (`assets()`/`tokens()`/`history()` — old result shapes held), and the old subscribable event names are re-emitted from the 8 v2 events: `transfer:confirmed`/`transfer:delivery_pending`/`transfer:failed` ← `transfer:updated`; `payment_request:paid|rejected|expired` ← `payment_request:updated`; `split:checkpoint-stuck`/`delivery:undeliverable`/`delivery:deferred` ← `transfer:attention`; `realtime:status`/`storage:degraded` ← `connection:status`; `sync:completed`/`sync:remote-update` ← `inventory:updated`. (`send:partial-remainder` is NOT re-emitted — folded by design, no consumer existed.)
 
@@ -936,7 +938,8 @@ Key test areas:
   `wire-version.test.ts` (a real 2.1.0-encoded token from `fixtures/token-sdk-2.1.0.hex` is
   refused with an error naming the version — that fixture is uncapturable once the pin moves
   again), `proof-deadline.test.ts` (the abort guard)
-- `tests/unit/connect/` — protocol surface guard (14/6/13 counts), lock semantics,
+- `tests/unit/connect/` — protocol surface guard (14/8/15 counts), `mint_nft` wire helpers
+  (`nft-wire.test.ts`) and its never-auto-approved guard, lock semantics,
   payments-compat adapter conformance (36 tests: old wire names/payloads from the v2 facade,
   against a mock Sphere whose `payments` getter THROWS exactly like the real one)
 - `tests/unit/core/` — Sphere lifecycle, clear, nametag sync/recovery, wallet-api-protocol pins

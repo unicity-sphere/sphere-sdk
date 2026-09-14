@@ -1706,5 +1706,35 @@
     "tests": [
       "tests/unit/payments-v2/nft.test.ts"
     ]
+  },
+  {
+    "name": "connect-mint-nft-scope-widened-to-mint-request",
+    "note": "Connect 2.3: mint_nft needs its own nft:mint scope. Mapped onto mint:request, every dApp approved to top up test coins could put the user's creator signature on content it chose.",
+    "file": "connect/permissions.ts",
+    "find": "  [INTENT_ACTIONS.MINT_NFT]: PERMISSION_SCOPES.NFT_MINT,",
+    "replace": "  [INTENT_ACTIONS.MINT_NFT]: PERMISSION_SCOPES.MINT_REQUEST,",
+    "tests": [
+      "tests/unit/connect/permissions.test.ts"
+    ]
+  },
+  {
+    "name": "base64-accepts-nonzero-padding-bits",
+    "note": "mint_nft wire form: base64DecodeCanonical accepts only the canonical spelling. Without the padding-bits check 'QR==' decodes like 'QQ==', so one byte string has several accepted spellings.",
+    "file": "core/base64.ts",
+    "find": "  return (buffer & ((1 << bits) - 1)) === 0 ? out : null;",
+    "replace": "  return out;",
+    "tests": [
+      "tests/unit/connect/nft-wire.test.ts"
+    ]
+  },
+  {
+    "name": "connect-mint-nft-auto-approve-dispatched",
+    "note": "Connect 2.3: mint_nft always reaches onIntent. Without the dispatch guard, an auto-approve handler that got into the map for it mints without asking the user.",
+    "file": "connect/host/ConnectHost.ts",
+    "find": "ALWAYS_ASK_INTENTS.has(msg.action) ? undefined : this.autoApprovedIntents.get(msg.action)",
+    "replace": "this.autoApprovedIntents.get(msg.action)",
+    "tests": [
+      "tests/unit/connect/integration.test.ts"
+    ]
   }
 ]

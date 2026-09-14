@@ -60,6 +60,32 @@ describe('Permissions', () => {
       expect(hasIntentPermission(granted, INTENT_ACTIONS.MINT)).toBe(false);
     });
 
+    it('nft:mint allows mint_nft intent', () => {
+      const granted = new Set([PERMISSION_SCOPES.NFT_MINT]);
+      expect(hasIntentPermission(granted, INTENT_ACTIONS.MINT_NFT)).toBe(true);
+    });
+
+    it('mint:request does NOT allow mint_nft intent', () => {
+      const granted = new Set([PERMISSION_SCOPES.MINT_REQUEST]);
+      expect(hasIntentPermission(granted, INTENT_ACTIONS.MINT_NFT)).toBe(false);
+    });
+
+    it('nft:transfer does NOT allow mint_nft intent', () => {
+      const granted = new Set([PERMISSION_SCOPES.NFT_TRANSFER]);
+      expect(hasIntentPermission(granted, INTENT_ACTIONS.MINT_NFT)).toBe(false);
+    });
+
+    it('every scope except nft:mint together still does NOT allow mint_nft intent', () => {
+      const granted = new Set(ALL_PERMISSIONS.filter((scope) => scope !== PERMISSION_SCOPES.NFT_MINT));
+      expect(hasIntentPermission(granted, INTENT_ACTIONS.MINT_NFT)).toBe(false);
+    });
+
+    it('nft:mint does NOT allow mint or send_nft intents', () => {
+      const granted = new Set([PERMISSION_SCOPES.NFT_MINT]);
+      expect(hasIntentPermission(granted, INTENT_ACTIONS.MINT)).toBe(false);
+      expect(hasIntentPermission(granted, INTENT_ACTIONS.SEND_NFT)).toBe(false);
+    });
+
     it('returns false for unknown actions', () => {
       const granted = new Set(ALL_PERMISSIONS);
       expect(hasIntentPermission(granted, 'unknown_action')).toBe(false);
@@ -100,6 +126,14 @@ describe('Permissions', () => {
 
     it('mint:request is a known scope', () => {
       expect(ALL_PERMISSIONS).toContain(PERMISSION_SCOPES.MINT_REQUEST);
+    });
+
+    it('mint_nft intent maps to nft:mint scope', () => {
+      expect(INTENT_PERMISSIONS[INTENT_ACTIONS.MINT_NFT]).toBe(PERMISSION_SCOPES.NFT_MINT);
+    });
+
+    it('nft:mint is a known scope', () => {
+      expect(ALL_PERMISSIONS).toContain(PERMISSION_SCOPES.NFT_MINT);
     });
 
     it('default permissions include identity:read', () => {

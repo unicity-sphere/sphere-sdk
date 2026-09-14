@@ -32,15 +32,17 @@ const BUMP_REMINDER =
 const EXPECTED = {
   // 2.2: #777 adds the send_nft intent + nft:transfer scope. Additive, and the
   // handshake gate is MAJOR-only, so no existing dApp is cut off.
-  version: '2.2',
+  // 2.3: adds the mint_nft intent + nft:mint scope. Additive for the same reason.
+  version: '2.3',
   intents: [
     'send', 'dm', 'payment_request', 'receive', 'sign_message', 'mint', 'send_nft',
+    'mint_nft',
   ],
   scopes: [
     'identity:read', 'balance:read', 'tokens:read', 'history:read',
     'events:subscribe', 'resolve:peer', 'transfer:request', 'dm:request',
     'dm:read', 'dm:manage', 'payment:request', 'sign:request', 'mint:request',
-    'nft:transfer',
+    'nft:transfer', 'nft:mint',
   ],
   methods: [
     'sphere_getIdentity', 'sphere_getBalance', 'sphere_getAssets',

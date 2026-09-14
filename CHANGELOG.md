@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `mint_nft` Connect intent and `nft:mint` scope (Connect 2.3)
+
+A dApp can ask the connected wallet to mint one NFT to the wallet's own active address: the
+`mint_nft` intent (`INTENT_ACTIONS.MINT_NFT`), params `{ content, sign? }`, result `{ tokenId }`.
+The wallet mints it with `payments.mintNft`, signing as creator unless `sign: false`, and must ask
+the user every time.
+
+The intent requires its own scope, `nft:mint` (`PERMISSION_SCOPES.NFT_MINT`). Neither
+`mint:request` nor `nft:transfer` grants it: a dApp approved to top up test coins or to move NFTs
+must not gain the right to put the user's creator signature on content the dApp chose. For the same
+reason `ConnectHost.setIntentAutoApprove` throws for `mint_nft`, and the host hands every `mint_nft`
+to `onIntent` even when an auto-approve handler is registered for it.
+
+Connect messages are JSON, so `content` travels in wire form: `NftContent` with every inline
+`NftMedia.bytes` as standard padded base64. `@unicitylabs/sphere-sdk/connect` exports
+`nftContentToWire` and `nftContentFromWire`, the types `MintNftIntentParams`,
+`MintNftIntentResult`, `WireNftContent`, `WireNftMedia` and `WireNftMetadata`, and the `Nft*`
+content types. `nftContentFromWire` checks shape only — exactly the fields of each kind, `null`
+rather than an omitted optional field, only `media` or `link` in a media slot, canonical base64 —
+and throws a `VALIDATION_ERROR` naming the offending field. Field values and the 1 MiB payload cap
+are still checked by `payments.mintNft`. The connect entry still does not import
+`@unicitylabs/state-transition-sdk`.
+
+`ConnectHostConfig.onIntent`, and an auto-approve handler, may now return `error.data`. The host
+relays it to the dApp as `ConnectError.data`, except when it downgrades the code to
+`INTENT_OUTCOME_UNKNOWN`; before, the host dropped it. A wallet uses it to name the `tokenId` of a
+mint that failed after it was journaled and may still complete.
+
+Connect 2.2 → 2.3 is additive, and the handshake gate compares MAJOR only, so no existing dApp is
+cut off. A 2.2 host answers `mint_nft` with `PERMISSION_DENIED`, because no scope maps to it there.
+
 ### Added — NFT metadata standard: mintNft, nft/nfts reads, CBOR tags 39052–39055 (#785)
 
 A coinless token can now carry a name, media, traits and a creator signature. The format is four

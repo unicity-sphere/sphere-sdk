@@ -25,6 +25,8 @@ export const PERMISSION_SCOPES = {
   MINT_REQUEST: 'mint:request',
   /** #777: moving a coinless token (an NFT). Distinct from transfer:request. */
   NFT_TRANSFER: 'nft:transfer',
+  /** Minting an NFT signs dApp-chosen content as the user; mint:request and nft:transfer do not imply it. */
+  NFT_MINT: 'nft:mint',
 } as const;
 
 export type PermissionScope = (typeof PERMISSION_SCOPES)[keyof typeof PERMISSION_SCOPES];
@@ -69,6 +71,7 @@ export const INTENT_PERMISSIONS: Record<string, PermissionScope> = {
   [INTENT_ACTIONS.SIGN_MESSAGE]: PERMISSION_SCOPES.SIGN_REQUEST,
   [INTENT_ACTIONS.MINT]: PERMISSION_SCOPES.MINT_REQUEST,
   [INTENT_ACTIONS.SEND_NFT]: PERMISSION_SCOPES.NFT_TRANSFER,
+  [INTENT_ACTIONS.MINT_NFT]: PERMISSION_SCOPES.NFT_MINT,
 };
 
 // =============================================================================
