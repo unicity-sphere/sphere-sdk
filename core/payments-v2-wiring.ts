@@ -343,6 +343,7 @@ export function composePaymentsV2(spec: ComposePaymentsV2Spec): PaymentsFacade {
     signComplete: async (transferId) => signMessage(identity.privateKey, completeSignMessage(transferId)),
     fieldKey,
     network,
+    nftTokenType: NETWORKS[network as keyof typeof NETWORKS].nftTokenType,
     ownPubkey: identity.chainPubkey,
     ownNametag: host.nametag,
     requestMemo: requestMemoCodec(identity.privateKey),

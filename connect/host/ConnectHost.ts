@@ -34,6 +34,7 @@ import {
   SPHERE_CONNECT_NAMESPACE,
   SPHERE_CONNECT_VERSION,
   RPC_METHODS,
+  INTENT_ACTIONS,
   ERROR_CODES,
   WALLET_EVENTS,
   createRequestId,
@@ -84,6 +85,9 @@ const CHANNEL_ONLY_CODES: ReadonlySet<number> = new Set<number>([
   ERROR_CODES.WALLET_LOCKED,
   ERROR_CODES.NOT_CONNECTED,
 ]);
+
+/** Intents that always reach `onIntent`: minting an NFT signs dApp-chosen content as the user, so no auto-approval may stand in for the prompt. */
+const ALWAYS_ASK_INTENTS: ReadonlySet<string> = new Set<string>([INTENT_ACTIONS.MINT_NFT]);
 
 const DEFAULT_REQUEST_DEADLINE_MS = 25000;
 // LONGER than ConnectClient's own DEFAULT_INTENT_TIMEOUT (120 s). The host must never be the
@@ -146,7 +150,7 @@ export class ConnectHost {
   // Intent auto-approve: action → handler that bypasses wallet UI
   private autoApprovedIntents = new Map<
     string,
-    (action: string, params: Record<string, unknown>, session: ConnectSession) => Promise<{ result?: unknown; error?: { code: number; message: string } }>
+    (action: string, params: Record<string, unknown>, session: ConnectSession) => Promise<{ result?: unknown; error?: { code: number; message: string; data?: unknown } }>
   >();
 
   // Rate limiting
@@ -196,15 +200,18 @@ export class ConnectHost {
     return this.session;
   }
 
-  /** Register an auto-approve handler for an intent action (session-scoped). */
+  /** Register an auto-approve handler for an intent action (session-scoped). Throws for an intent that always asks the user. */
   setIntentAutoApprove(
     action: string,
     handler: (
       action: string,
       params: Record<string, unknown>,
       session: ConnectSession,
-    ) => Promise<{ result?: unknown; error?: { code: number; message: string } }>,
+    ) => Promise<{ result?: unknown; error?: { code: number; message: string; data?: unknown } }>,
   ): void {
+    if (ALWAYS_ASK_INTENTS.has(action)) {
+      throw new SphereError(`Intent ${action} always asks the user and cannot be auto-approved`, 'INVALID_CONFIG');
+    }
     this.autoApprovedIntents.set(action, handler);
   }
 
@@ -906,7 +913,7 @@ export class ConnectHost {
     };
 
     try {
-      const autoHandler = this.autoApprovedIntents.get(msg.action);
+      const autoHandler = ALWAYS_ASK_INTENTS.has(msg.action) ? undefined : this.autoApprovedIntents.get(msg.action);
       const response = autoHandler
         ? await autoHandler(msg.action, msg.params, session)
         : await this.config.onIntent(msg.action, msg.params, session, ctx);
@@ -928,6 +935,7 @@ export class ConnectHost {
           msg.id,
           asserts ? ERROR_CODES.INTENT_OUTCOME_UNKNOWN : response.error.code,
           asserts ? INTENT_UNKNOWN_MESSAGE : response.error.message,
+          asserts ? undefined : response.error.data,
         );
       } else {
         this.sendIntentResult(msg.id, response.result);

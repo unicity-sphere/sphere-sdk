@@ -71,9 +71,6 @@
     }
   },
   "connect/index.ts": {
-    "budget/comment-ratio": {
-      "count": 1
-    },
     "budget/no-long-comment-block": {
       "count": 1
     }

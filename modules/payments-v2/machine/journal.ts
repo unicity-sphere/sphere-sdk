@@ -11,6 +11,7 @@ import {
   type DeliveryJournalEntry,
   type IntentBackstopEntry,
   type MintJournalEntry,
+  type NftMintJournalEntry,
   type ScopedKV,
   type ShortfallEntry,
 } from '../stores';
@@ -265,6 +266,7 @@ export interface MachineStores {
   readonly backstop: ListStore<IntentBackstopEntry>;
   readonly deliveryJournal: DeliveryJournal;
   readonly mintJournal: ListStore<MintJournalEntry>;
+  readonly nftMintJournal: ListStore<NftMintJournalEntry>;
   readonly shortfalls: ListStore<ShortfallEntry>;
 }
 
@@ -273,6 +275,7 @@ export function createMachineStores(kv: ScopedKV): MachineStores {
     backstop: new ListStore<IntentBackstopEntry>(kv, STORE_KEYS.intentBackstop, (e) => e.transferId),
     deliveryJournal: new DeliveryJournal(kv),
     mintJournal: new ListStore<MintJournalEntry>(kv, STORE_KEYS.mintJournal, (e) => e.mintId),
+    nftMintJournal: new ListStore<NftMintJournalEntry>(kv, STORE_KEYS.nftMintJournal, (e) => e.mintId),
     shortfalls: new ListStore<ShortfallEntry>(kv, STORE_KEYS.shortfalls, (e) => e.transferId),
   };
 }

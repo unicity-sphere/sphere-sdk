@@ -140,5 +140,17 @@ export function describeStoragePortContract(
       expect([...(blobs.get(a.tokenId) ?? [])]).toEqual([...a.bytes]);
       expect([...(blobs.get(b.tokenId) ?? [])]).toEqual([...b.bytes]);
     });
+
+    it('getBlobs returns every requested blob, however many ids one call names', async () => {
+      const h = await makeHarness();
+      const seeded: StorageContractBlob[] = [];
+      // More than one backend page: a caller never needs to know a wire cap.
+      for (let i = 0; i < 250; i++) seeded.push((await seed(h, `tid-many-${String(i)}`)).blob);
+
+      const blobs = await h.port.getBlobs(seeded.map((blob) => blob.tokenId));
+
+      expect(blobs.size).toBe(seeded.length);
+      for (const blob of seeded) expect(blobs.get(blob.tokenId)).toEqual(blob.bytes);
+    });
   });
 }

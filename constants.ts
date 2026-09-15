@@ -284,6 +284,9 @@ export interface NetworkConfig {
   readonly nostrRelays: readonly string[];
   readonly groupRelays: readonly string[];
   readonly tokenRegistryUrl: string;
+  /** The NFT vessel token type every NFT mints under (#785), 64 lowercase hex: the single
+   *  `non-fungible` entry of this network's unicity-ids registry. */
+  readonly nftTokenType: string;
   /** Canonical numeric network id (= RootTrustBase.networkId; testnet2 = 4).
    *  Optional: only set for networks that have a live v2 trust base. */
   readonly networkId?: number;
@@ -307,6 +310,7 @@ export const NETWORKS = {
     // six hex chars). Presentation only: the money path treats coinId as opaque bytes.
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.mainnet.json',
+    nftTokenType: '9f190eea6c8d7e1e564c35feb4c289add78be4bedb81bb77fe265e926e5493f4',
   },
   // v1 cutover: 'testnet' now POINTS AT TESTNET2 (the v2 gateway network). The
   // old goggregator testnet spoke the removed v1 protocol — a v2 engine cannot
@@ -320,6 +324,7 @@ export const NETWORKS = {
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
+    nftTokenType: '971a26eef0e3aeb22bd3e7d44c47ce963400037e8df42b50d4d44e1589f83826',
   },
   testnet2: {
     name: 'Testnet',
@@ -330,6 +335,7 @@ export const NETWORKS = {
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
+    nftTokenType: '971a26eef0e3aeb22bd3e7d44c47ce963400037e8df42b50d4d44e1589f83826',
   },
 } as const satisfies Record<string, NetworkConfig>;
 

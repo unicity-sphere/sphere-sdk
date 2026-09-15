@@ -13,18 +13,19 @@ import type { ITokenEngine } from '../../token-engine/engine';
 import type { SphereToken } from '../../token-engine/types';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
-import type { CoinlessToken, ConnectionStatus, HistoryPage, MintResult, PaymentsV2, PendingTransfer, SendRequest, SendWholeTokenRequest } from './api';
+import type { CoinlessToken, ConnectionStatus, HistoryPage, MintNftRequest, MintResult, NftView, PaymentsV2, PendingTransfer, SendRequest, SendWholeTokenRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
+import { NftCache, readNft, readNfts, type NftReadDeps } from './inventory/nft-read';
 import { readTokenData } from './inventory/token-data';
-import { finalizeMint, type MintDeps, runMintUnderJournal } from './mint';
+import { type CoinReplayDeps, replayCoinMints, runMintUnderJournal } from './mint';
+import { type NftReplayDeps, replayNftMints, runNftMintUnderJournal } from './mint-nft';
 import { materializeWholeSpend } from './send-whole';
 import { partialize, stampTransferId } from './send-errors';
 import { requireSameNetworkRecipient } from './recipient';
 import { reseedAndReset, type RestoreDeps } from './restore';
-import { mintParams } from './mint-params';
 import { PrewarmCache, takeSourceBlobs, warmSendSources, type WarmDeps } from './prewarm-cache';
-import type { MintJournalEntry, ShortfallEntry } from './stores';
+import type { ShortfallEntry } from './stores';
 import type { History } from './history/History';
 import type { InventoryView } from './inventory/InventoryView';
 import { transferringToken } from './inventory/presentation';
@@ -38,7 +39,6 @@ import { buildOps, classifyError, type MachineDeps, type MachinePlan, type Trans
 import { buildPayload, messageOf } from './machine/payload';
 import {
   composeFacadeParts,
-  supportsDeterministicMint,
   type HeldStateCache,
   type PaymentsFacadeDeps,
 } from './compose';
@@ -52,13 +52,12 @@ export {
   type PaymentsFacadeDeps,
   type RecipientInfo,
 } from './compose';
+export { ATTENTION_MINT_UNRESOLVED } from './mint';
 export { ATTENTION_RESEED_REJECTED } from './restore';
 export { ATTENTION_RECIPIENT_NETWORK_UNVERIFIED } from './recipient';
 
 /** Max re-plans after a conflicted attempt (#625/#677 parity with the old send loop). */
 export const MAX_RESELECT = 8;
-
-export const ATTENTION_MINT_UNRESOLVED = 'mint:unresolved';
 
 const INVENTORY_SCAN_PAGE_LIMIT = 50;
 
@@ -133,6 +132,8 @@ export class PaymentsFacade implements PaymentsV2 {
   private readonly activeMoneyOps = new Set<string>();
   /** #737: the ledger holds exactly the sources of the still-open intents. */
   private readonly pins: IntentPins;
+  /** Per facade, so per address: an NFT reading is never served to another wallet. */
+  private readonly nftCache = new NftCache();
 
   constructor(private readonly deps: PaymentsFacadeDeps) {
     const parts = composeFacadeParts(deps, {
@@ -166,7 +167,8 @@ export class PaymentsFacade implements PaymentsV2 {
       delivery: deps.deliveryPort,
       reconcile: (report) => this.requests.reconcile(report),
       refreshView: () => this.view.delta(),
-      replayMints: () => this.replayMints(),
+      replayMints: () => replayCoinMints(this.mintDeps()),
+      replayNftMints: () => replayNftMints(this.mintDeps()),
       isActiveOp: (id) => this.activeMoneyOps.has(id),
       emit: deps.emit,
       now: () => this.nowMs(),
@@ -243,8 +245,19 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   tokenData(tokenId: string): Promise<Uint8Array | null> {
-    const deps = { engine: this.engine(), view: this.view, storagePort: this.deps.storagePort };
-    return readTokenData(deps, tokenId);
+    return readTokenData(this.readDeps(), tokenId);
+  }
+
+  nft(tokenId: string): Promise<NftView | null> {
+    return readNft(this.readDeps(), tokenId);
+  }
+
+  nfts(tokenIds: readonly string[]): Promise<ReadonlyMap<string, NftView>> {
+    return readNfts(this.readDeps(), tokenIds);
+  }
+
+  private readDeps(): NftReadDeps {
+    return { engine: this.engine(), view: this.view, storagePort: this.deps.storagePort, cache: this.nftCache };
   }
 
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage> {
@@ -298,6 +311,10 @@ export class PaymentsFacade implements PaymentsV2 {
     return this.track(this.mintInner(coinId, amount));
   }
 
+  mintNft(request: MintNftRequest): Promise<MintResult> {
+    return this.track(this.ownedMint((mintId) => runNftMintUnderJournal(this.mintDeps(), { mintId, request })));
+  }
+
   // §4 retry verb: coalesces onto the running pass — NEVER re-issue send() (#631/#676).
   async resumeNow(): Promise<void> {
     if (!this.started) return;
@@ -329,16 +346,22 @@ export class PaymentsFacade implements PaymentsV2 {
     return (this.deps.now ?? Date.now)();
   }
 
-  private mintDeps(): MintDeps {
+  /** One snapshot serves the coin and the NFT mint, live and replayed. */
+  private mintDeps(): CoinReplayDeps & NftReplayDeps {
     return {
       engine: this.engine(),
       mintJournal: this.machineStores.mintJournal,
+      nftMintJournal: this.machineStores.nftMintJournal,
       storagePort: this.deps.storagePort,
       recordMint: (input) => this.historyStore.recordMint(input),
       armHeartbeat: () => this.heartbeat.arm(),
       noteHeldState: (tokenId, stateHash) => void this.heldStates.set(tokenId, stateHash),
       refreshView: () => this.trackTail(this.view.delta()),
       ownPubkeyBytes: this.ownPubkeyBytes,
+      nftTokenType: this.deps.nftTokenType,
+      isActiveOp: (mintId) => this.activeMoneyOps.has(mintId),
+      tokenInServerInventory: (tokenId) => this.tokenInServerInventory(tokenId),
+      emit: this.deps.emit,
       now: () => this.nowMs(),
     };
   }
@@ -706,51 +729,18 @@ export class PaymentsFacade implements PaymentsV2 {
     if (!/^(?:[0-9a-f]{2})+$/.test(coinId) || amount <= 0n) {
       return { success: false, error: 'coinId must be even-length lowercase hex and amount positive' };
     }
+    return this.ownedMint((mintId) => runMintUnderJournal(this.mintDeps(), { mintId, coinId, amount }));
+  }
+
+  /** A live mint under a fresh id — its replay stays hands-off while this attempt runs. */
+  private async ownedMint(run: (mintId: string) => Promise<MintResult>): Promise<MintResult> {
     const mintId = this.newId();
-    this.activeMoneyOps.add(mintId); // its replay stays hands-off while this attempt runs
+    this.activeMoneyOps.add(mintId);
     try {
-      return await runMintUnderJournal(this.mintDeps(), { mintId, coinId, amount });
+      return await run(mintId);
     } finally {
       this.activeMoneyOps.delete(mintId);
     }
-  }
-
-  /** @returns how many journal entries were RESOLVED (cleared) — heartbeat progress. */
-  private async replayMints(): Promise<number> {
-    let resolved = 0;
-    for (const entry of await this.machineStores.mintJournal.list()) {
-      if (this.activeMoneyOps.has(entry.mintId)) continue; // its mintInner still owns it
-      try {
-        if (await this.replayMint(entry)) resolved += 1;
-      } catch {
-        // Entry retained — replayed again at the next pass / start().
-      }
-    }
-    return resolved;
-  }
-
-  private async replayMint(entry: MintJournalEntry): Promise<boolean> {
-    if (entry.tokenId !== '' && (await this.tokenInServerInventory(entry.tokenId))) {
-      await this.machineStores.mintJournal.removeByKey(entry.mintId);
-      return true;
-    }
-    const engine = this.engine();
-    if (!supportsDeterministicMint(engine)) {
-      // Without the F13 seed a re-mint would create a SECOND token: hold + alert.
-      this.deps.emit('transfer:attention', {
-        transferId: entry.mintId,
-        code: ATTENTION_MINT_UNRESOLVED,
-      });
-      return false; // held, not resolved — never counts as heartbeat progress
-    }
-    const token = await engine.mint(mintParams(this.ownPubkeyBytes, entry.coinId, BigInt(entry.amount)), {
-      transferId: entry.mintId,
-    });
-    if (token.blob.tokenId !== entry.tokenId) {
-      await this.machineStores.mintJournal.upsert({ ...entry, tokenId: token.blob.tokenId });
-    }
-    await finalizeMint(this.mintDeps(), entry.mintId, token, entry.coinId, entry.amount);
-    return true;
   }
 
   private async tokenInServerInventory(tokenId: string): Promise<boolean> {

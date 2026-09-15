@@ -1,4 +1,30 @@
 export type { PaymentsV2, PaymentsV2Events, ConnectionStatus, SendRequest, SendWholeTokenRequest, SendCoinlessRequest, MintResult, HistoryEntry, HistoryPage, PaymentRequestView, PaymentRequestStatus, PaymentsRequestsApi, PendingTransfer } from './api';
+// NFT metadata (#785; normative spec docs/NFT-METADATA.md).
+export type {
+  MintNftRequest,
+  NftView,
+  NftAttribute,
+  NftContent,
+  NftLink,
+  NftMedia,
+  NftMediaRef,
+  NftMetadata,
+  NftSignatureStatus,
+} from './api';
+export type { NftSignatureContext } from '../../token-engine/nft-payload';
+export {
+  NFT_DOCUMENT_MEDIA_TYPE,
+  NFT_LINK_TAG,
+  NFT_MEDIA_TAG,
+  NFT_METADATA_TAG,
+  NFT_SIGNED_TAG,
+  encodeNftContent,
+  isNftDocumentLink,
+  parseNftDocument,
+  parseNftPayload,
+  verifyNftLinkContent,
+} from '../../token-engine/nft-payload';
+export { NFT_MAX_PAYLOAD_BYTES } from './mint-nft';
 export type {
   StoragePort,
   DeliveryPort,

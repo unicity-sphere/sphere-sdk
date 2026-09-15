@@ -1,6 +1,6 @@
 import { vi } from 'vitest';
 import type {
-  ITokenEngine, EngineIdentity, SphereToken, SphereValue, TokenBlob, CoinId,
+  ITokenEngine, EngineIdentity, NftMintPlan, SphereToken, SphereValue, TokenBlob, CoinId,
 } from '../../../token-engine';
 
 /** Build a SphereToken stand-in for interaction tests (sdkToken/blob are inert). */
@@ -27,7 +27,14 @@ export function createMockTokenEngine(overrides: Partial<ITokenEngine> = {}): IT
     readValue: vi.fn((t: SphereToken) => t.value),
     readMemo: vi.fn((_t: SphereToken) => null),
     readTokenData: vi.fn((_t: SphereToken) => null),
+    readNft: vi.fn(async (_t: SphereToken) => null),
     mintDataToken: vi.fn(async () => mockSphereToken(null)),
+    buildNftMint: vi.fn(async (): Promise<NftMintPlan> => ({
+      data: new Uint8Array(),
+      salt: new Uint8Array(32),
+      tokenType: new Uint8Array(32),
+      tokenId: '00'.repeat(32),
+    })),
     isOwnedBy: vi.fn((_t: SphereToken, _pubkey: Uint8Array) => true),
     deliveryKeys: vi.fn(async () => ({ tokenId: '00'.repeat(32), stateHash: '11'.repeat(32) })),
     balanceOf: vi.fn((_t: SphereToken, _c: CoinId) => 0n),

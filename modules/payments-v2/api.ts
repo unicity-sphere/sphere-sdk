@@ -1,5 +1,7 @@
 // §4 of docs/PAYMENTS-V2-DESIGN.md
 
+import type { NftContent } from '../../token-engine/nft-payload';
+import type { NftReading } from '../../token-engine/types';
 import type { Asset, CoinlessToken, IncomingTransfer, Token, TransferResult } from '../../types';
 
 export interface SendRequest {
@@ -22,6 +24,16 @@ export interface MintResult {
   success: boolean;
   tokenId?: string;
   error?: string;
+}
+
+/** #785: `content` uses ERC-721 field names; `sign` (default true) signs as creator with this wallet's chain key. */
+export interface MintNftRequest {
+  readonly content: NftContent;
+  readonly sign?: boolean;
+}
+
+export interface NftView extends NftReading {
+  readonly tokenId: string;
 }
 
 // Consumed field names: `timestamp`, not the wire's `ts`.
@@ -109,6 +121,10 @@ export interface PaymentsV2 {
   tokens(filter?: { coinId?: string }): Token[];
   coinless(): CoinlessToken[];
   tokenData(tokenId: string): Promise<Uint8Array | null>;
+  /** One held token read as an NFT; null = its payload is not a recognised NFT. `creator` is only CLAIMED unless `signature` is 'valid'. Throws VALIDATION_ERROR when not held, STORAGE_ERROR when its blob is missing (same contract as tokenData). */
+  nft(tokenId: string): Promise<NftView | null>;
+  /** Batch read for list views. Ids not held, blobs missing or undecodable, and non-NFT payloads are simply absent from the map. Throws only on a transport failure. */
+  nfts(tokenIds: readonly string[]): Promise<ReadonlyMap<string, NftView>>;
   history(page?: { before?: string; limit?: number }): Promise<HistoryPage>;
 
   send(req: SendRequest): Promise<TransferResult>;
@@ -116,6 +132,7 @@ export interface PaymentsV2 {
   /** NFT-scoped twin: refuses a valued source. Connect's `send_nft` routes here. */
   sendCoinless(req: SendWholeTokenRequest): Promise<TransferResult>;
   mint(coinId: string, amount: bigint): Promise<MintResult>;
+  mintNft(request: MintNftRequest): Promise<MintResult>;
   receive(): Promise<{ transfers: IncomingTransfer[] }>;
 
   // §7 convergence surface. A retry button calls resumeNow() — NEVER send():
@@ -144,3 +161,12 @@ export interface PaymentsV2Events {
 }
 
 export type { CoinlessToken };
+export type {
+  NftAttribute,
+  NftContent,
+  NftLink,
+  NftMedia,
+  NftMediaRef,
+  NftMetadata,
+  NftSignatureStatus,
+} from '../../token-engine/nft-payload';

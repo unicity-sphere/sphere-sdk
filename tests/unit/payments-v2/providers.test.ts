@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { getPublicKey } from '../../../core/crypto';
 import {
   DeltaConflictError,
+  WALLET_API_V2_BLOB_URLS_BATCH,
   WalletApiStoragePort,
   type StoragePortClient,
 } from '../../../impl/wallet-api-v2/storage';
@@ -155,6 +156,36 @@ describe('WalletApiStoragePort — request shape', () => {
     expect(fetched.size).toBe(20);
     expect(blobUrlCalls).toBe(1);
     expect(maxInflight).toBe(8);
+  });
+
+  it('getBlobs splits more unique ids than one blob-urls request may name into batches, and returns every blob', async () => {
+    // The fake refuses a request over its PAGE_LIMIT the way wallet-api does (429 QUOTA_EXCEEDED).
+    const fake = new FakeWalletApi({ pageLimit: WALLET_API_V2_BLOB_URLS_BATCH });
+    const client = new FakeWalletApiV2Client(fake, OWNER);
+    const requests: string[][] = [];
+    const counting: StoragePortClient = {
+      listInventory: (since) => client.listInventory(since),
+      uploadUrls: (blobs) => client.uploadUrls(blobs),
+      uploadBlob: (url, bytes) => client.uploadBlob(url, bytes),
+      apply: (delta) => client.apply(delta),
+      blobUrls: (ids) => {
+        requests.push([...ids]);
+        return client.blobUrls(ids);
+      },
+      fetchBlob: (url) => client.fetchBlob(url),
+    };
+    const port = new WalletApiStoragePort(counting);
+    const blobs = Array.from({ length: 2 * WALLET_API_V2_BLOB_URLS_BATCH + 1 }, () => fabricateBlob(OWNER_PUB));
+    await port.uploadBlobs(blobs.map((b) => ({ sha256: b.sha256, bytes: b.bytes })));
+    const ids = blobs.map((b) => b.tokenId);
+
+    const fetched = await port.getBlobs([...ids, ...ids]); // a repeated id counts once, as on the server
+
+    const batch = WALLET_API_V2_BLOB_URLS_BATCH;
+    expect(requests.map((request) => request.length)).toEqual([batch, batch, 1]);
+    expect(requests.flat()).toEqual(ids);
+    expect(fetched.size).toBe(ids.length);
+    for (const blob of blobs) expect(fetched.get(blob.tokenId)).toEqual(blob.bytes);
   });
 
   it('applyDelta maps a lineage 409 to DeltaConflictError carrying the cause', async () => {

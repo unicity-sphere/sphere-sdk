@@ -1556,5 +1556,235 @@
     "tests": [
       "tests/unit/payments-v2/send-whole.test.ts"
     ]
+  },
+  {
+    "name": "nft-parse-accepts-unknown-version",
+    "note": "#785: version is exactly 1 and arity is fixed per version, so a v1 reader shows a v2 item as a raw payload. Dropping the value check reads v0/v2 items through the v1 field layout.",
+    "file": "token-engine/nft-payload.ts",
+    "find": "  ensure(CborDeserializer.decodeUnsignedInteger(fields[0]) === NFT_FORMAT_VERSION, 'version', 'must be 1');",
+    "replace": "  CborDeserializer.decodeUnsignedInteger(fields[0]);",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-parse-accepts-signed-as-image",
+    "note": "#785 nesting: NftSigned appears only at the top level. checkMediaRef already refuses a wrapper object, so the live regression is a media-slot decoder that UNWRAPS one — recognising an image whose signature nobody verifies.",
+    "file": "token-engine/nft-payload.ts",
+    "find": "new Map<bigint, BodyDecoder<NftMediaRef>>([",
+    "replace": "new Map<bigint, BodyDecoder<NftMediaRef>>([\n  [NFT_SIGNED_TAG, (body) => decodeSigned(body).content as NftMediaRef],",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-parse-accepts-31-byte-sha256",
+    "note": "#785: an NftLink sha256 is exactly 32 bytes. A shorter digest can never match a file, so the payload would read as well-formed while every viewer refuses to render its link.",
+    "file": "token-engine/nft-payload.ts",
+    "find": "const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/i;",
+    "replace": "const SHA256_HEX_PATTERN = /^(?:[0-9a-f]{2}){31,32}$/i;",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-digest-omits-genesis-recipient",
+    "note": "#785: the NftSigned digest binds the genesis recipient. Without it anyone who sees the mint request resubmits it with the same salt naming themselves, and the stolen NFT still verifies valid. The digest is also a cross-SDK byte vector (docs/NFT-METADATA.md).",
+    "file": "token-engine/nft-payload.ts",
+    "find": "    CborSerializer.encodeByteString(context.recipientPredicate),",
+    "replace": "    CborSerializer.encodeByteString(new Uint8Array(0)),",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-digest-omits-network",
+    "note": "#785 review: the NftSigned digest names the mint's network id α, as the yellowpaper genesis commitment does. The token id already commits to α, so this is the explicit statement rather than a separate replay defence; the preimage is a cross-SDK byte vector (docs/NFT-METADATA.md).",
+    "file": "token-engine/nft-payload.ts",
+    "find": "    CborSerializer.encodeUnsignedInteger(NFT_FORMAT_VERSION),\n    CborSerializer.encodeUnsignedInteger(NetworkId.fromId(context.networkId).id),",
+    "replace": "    CborSerializer.encodeUnsignedInteger(NFT_FORMAT_VERSION),",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-digest-omits-token-type",
+    "note": "#785 review: the NftSigned digest binds the token type. The token id commits to the salt and network only, so without the type a signature made for one mint verifies on the same salt minted under another type.",
+    "file": "token-engine/nft-payload.ts",
+    "find": "    CborSerializer.encodeByteString(context.tokenId),\n    CborSerializer.encodeByteString(context.tokenType),",
+    "replace": "    CborSerializer.encodeByteString(context.tokenId),",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-collection-id-length-rule-dropped",
+    "note": "#785 review: collection_id is 1–64 bytes. Without the bound an empty identifier becomes a second spelling of absent beside null, and identifiers grow without limit; encoder and parser still agree with each other, so only the rule's own cases notice.",
+    "file": "token-engine/nft-payload.ts",
+    "find": "const COLLECTION_ID_PATTERN = /^(?:[0-9a-f]{2}){1,64}$/i;",
+    "replace": "const COLLECTION_ID_PATTERN = /^(?:[0-9a-f]{2})*$/i;",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-document-link-accepted-as-image",
+    "note": "#785 review: a document link (NFT_DOCUMENT_MEDIA_TYPE) is a token's content, never media. Accepted as image or animation_url, a viewer is handed a metadata document where it expects a picture, and a document could reach further documents through its media slots.",
+    "file": "token-engine/nft-payload.ts",
+    "find": "  ensure(!isNftDocumentLink(ref), fieldName(field, 'media_type'), DOCUMENT_AS_MEDIA_RULE);",
+    "replace": "  ensure(true, fieldName(field, 'media_type'), DOCUMENT_AS_MEDIA_RULE);",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-parse-document-accepts-link",
+    "note": "#785 review: a linked document is exactly one NftMetadata or NftMedia item. Accepting an NftLink lets documents chain, so a wallet's resolution has no end.",
+    "file": "token-engine/nft-payload.ts",
+    "find": "new Map<bigint, BodyDecoder<NftDocument>>([",
+    "replace": "new Map<bigint, BodyDecoder<NftDocument>>([\n  [NFT_LINK_TAG, decodeLink as unknown as BodyDecoder<NftDocument>],",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-verify-ignores-recovery-byte",
+    "note": "#785: verification recovers the key, which binds the recovery byte and refuses high-s. The non-recovering compact verify accepts the same (r, s) under another recovery id, so byte-different signatures both read valid.",
+    "file": "token-engine/nft-payload.ts",
+    "find": "    return (await SigningService.verifyWithPublicKey(digest, signature, signed.creator)) ? 'valid' : 'invalid';",
+    "replace": "    return (await SigningService.verify(digest, signed.signature.subarray(0, 64), signed.creator)) ? 'valid' : 'invalid';",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-read-verifies-current-owner",
+    "note": "#785: readNft verifies against the GENESIS recipient. Keying it on the current owner makes every signed NFT read invalid the moment it is transferred.",
+    "file": "token-engine/nft-ops.ts",
+    "find": "      recipientPredicate: genesis.recipient.toCBOR(),",
+    "replace": "      recipientPredicate: token.sdkToken.latestTransaction.recipient.toCBOR(),",
+    "tests": [
+      "tests/unit/token-engine/SphereTokenEngine.test.ts"
+    ]
+  },
+  {
+    "name": "fake-nft-read-verifies-current-owner",
+    "note": "#785 fake parity: the facade suites judge NFT signatures through FakeTokenEngine, so it must verify against the first owner exactly as the real engine does, or a genesis-binding regression stays green there.",
+    "file": "tests/unit/token-engine/FakeTokenEngine.ts",
+    "find": "nftRecipientCbor(state.genesisOwner),",
+    "replace": "nftRecipientCbor(state.owner),",
+    "tests": [
+      "tests/unit/token-engine/FakeTokenEngine.test.ts"
+    ]
+  },
+  {
+    "name": "nft-mint-chain-op-before-journal",
+    "note": "#785 §5.9: the NFT mint plan (payload, salt, type) is journaled BEFORE the chain op. Without it a crash after certification leaves a token on-chain with no client record and nothing to replay.",
+    "file": "modules/payments-v2/mint-nft.ts",
+    "find": "  await deps.nftMintJournal.upsert(entry);",
+    "replace": "  // mutant: the plan is never journaled",
+    "tests": [
+      "tests/unit/payments-v2/nft.test.ts"
+    ]
+  },
+  {
+    "name": "nft-replay-fresh-salt",
+    "note": "#785 §5.9: replay re-submits the JOURNALED bytes. A fresh salt is a new token id: a second token is certified and the first, certified-but-unfinalised one is never recovered.",
+    "file": "modules/payments-v2/mint-nft.ts",
+    "find": "        await mintJournaled(deps, entry);",
+    "replace": "        await mintJournaled(deps, { ...entry, saltHex: bytesToHex(crypto.getRandomValues(new Uint8Array(32))) });",
+    "tests": [
+      "tests/unit/payments-v2/nft.test.ts"
+    ]
+  },
+  {
+    "name": "nft-mint-finalises-unplanned-token",
+    "note": "#785 §5.9: a minted token id other than the plan's is never finalised, so the journal entry and its planned id stay authoritative.",
+    "file": "modules/payments-v2/mint-nft.ts",
+    "find": "  if (token.blob.tokenId !== entry.tokenId) {",
+    "replace": "  if (false as boolean) {",
+    "tests": [
+      "tests/unit/payments-v2/nft.test.ts"
+    ]
+  },
+  {
+    "name": "nfts-cache-never-consulted",
+    "note": "#785 §5.2: nfts() serves repeat reads from the per-facade cache. Never consulting it refetches every blob of a list view on every render.",
+    "file": "modules/payments-v2/inventory/nft-read.ts",
+    "find": "    const cached = deps.cache.get(tokenId);",
+    "replace": "    const cached = undefined as NftView | null | undefined;",
+    "tests": [
+      "tests/unit/payments-v2/nft.test.ts"
+    ]
+  },
+  {
+    "name": "nft-read-caches-decode-failure",
+    "note": "#785 §5.2: a blob that fails to decode is NOT cached. The cache is never invalidated, so remembering a transient failure as 'not an NFT' hides that NFT for the life of the facade.",
+    "file": "modules/payments-v2/inventory/nft-read.ts",
+    "find": "    throw err;",
+    "replace": "    view = null;",
+    "tests": [
+      "tests/unit/payments-v2/nft.test.ts"
+    ]
+  },
+  {
+    "name": "nft-read-skips-inventory-guard",
+    "note": "#785: nft() refuses a token the wallet does not hold BEFORE the cache and the fetch, so a cached reading never outlives the holding (the tokenData contract).",
+    "file": "modules/payments-v2/inventory/nft-read.ts",
+    "find": "  if (deps.view.stateHashOf(tokenId) === undefined) {",
+    "replace": "  if (false as boolean) {",
+    "tests": [
+      "tests/unit/payments-v2/nft.test.ts"
+    ]
+  },
+  {
+    "name": "nfts-skips-inventory-guard",
+    "note": "#785: nfts() reads held ids only. Without the filter a token already sent away is still served from the cache, and unheld ids are fetched.",
+    "file": "modules/payments-v2/inventory/nft-read.ts",
+    "find": ".filter((tokenId) => deps.view.stateHashOf(tokenId) !== undefined)",
+    "replace": ".filter((tokenId) => tokenId !== '')",
+    "tests": [
+      "tests/unit/payments-v2/nft.test.ts"
+    ]
+  },
+  {
+    "name": "converger-pendingwork-ignores-nft-journal",
+    "note": "#785: a retained NFT mint entry is heartbeat work. Leaving it out of pendingWork() lets the heartbeat go idle, so a certified NFT waits for the next start() to reach inventory.",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    const mintsOpen = mints.length > 0 || nftMints.length > 0;",
+    "replace": "    const mintsOpen = mints.length > 0;",
+    "tests": [
+      "tests/unit/payments-v2/nft.test.ts"
+    ]
+  },
+  {
+    "name": "connect-mint-nft-scope-widened-to-mint-request",
+    "note": "Connect 2.3: mint_nft needs its own nft:mint scope. Mapped onto mint:request, every dApp approved to top up test coins could put the user's creator signature on content it chose.",
+    "file": "connect/permissions.ts",
+    "find": "  [INTENT_ACTIONS.MINT_NFT]: PERMISSION_SCOPES.NFT_MINT,",
+    "replace": "  [INTENT_ACTIONS.MINT_NFT]: PERMISSION_SCOPES.MINT_REQUEST,",
+    "tests": [
+      "tests/unit/connect/permissions.test.ts"
+    ]
+  },
+  {
+    "name": "base64-accepts-nonzero-padding-bits",
+    "note": "mint_nft wire form: base64DecodeCanonical accepts only the canonical spelling. Without the padding-bits check 'QR==' decodes like 'QQ==', so one byte string has several accepted spellings.",
+    "file": "core/base64.ts",
+    "find": "  return (buffer & ((1 << bits) - 1)) === 0 ? out : null;",
+    "replace": "  return out;",
+    "tests": [
+      "tests/unit/connect/nft-wire.test.ts"
+    ]
+  },
+  {
+    "name": "connect-mint-nft-auto-approve-dispatched",
+    "note": "Connect 2.3: mint_nft always reaches onIntent. Without the dispatch guard, an auto-approve handler that got into the map for it mints without asking the user.",
+    "file": "connect/host/ConnectHost.ts",
+    "find": "ALWAYS_ASK_INTENTS.has(msg.action) ? undefined : this.autoApprovedIntents.get(msg.action)",
+    "replace": "this.autoApprovedIntents.get(msg.action)",
+    "tests": [
+      "tests/unit/connect/integration.test.ts"
+    ]
   }
 ]

@@ -13,6 +13,7 @@
  * generous deadline.
  */
 
+import { NETWORKS } from '../../../constants';
 import { hexToBytes, signMessage } from '../../../core/crypto';
 import { isPossiblyCommittedSendOutcome } from '../../../core/errors';
 import { deriveFieldEncryptionKey } from '../../../core/field-encryption';
@@ -174,6 +175,7 @@ export async function makeVerticalWallet(tag: string, options: MakeOptions = {})
     signComplete: async (transferId) => signMessage(identity.privateKey, completeSignMessage(transferId)),
     fieldKey,
     network: NETWORK,
+    nftTokenType: NETWORKS[NETWORK].nftTokenType,
     ownPubkey: identity.chainPubkey,
     requestMemo: requestMemoCodec(identity.privateKey),
     syncEpoch: () => session.currentEpoch(),

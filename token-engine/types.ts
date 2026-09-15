@@ -13,6 +13,7 @@
  *   Track B codes callers against it (using FakeTokenEngine until A lands).
  */
 
+import type { NftContent, NftSignatureStatus } from './nft-payload';
 import type { Token } from './sdk';
 import type { ValueEnvelope } from './value-envelope';
 
@@ -118,6 +119,28 @@ export interface MintDataTokenParams {
   readonly salt?: Uint8Array;
 }
 
+/** Plan an NFT mint (#785); `mintDataToken` then mints the plan. */
+export interface BuildNftMintParams {
+  /** The first owner's 33-byte compressed chain pubkey — the genesis recipient a signature binds. */
+  readonly recipientPubkey: Uint8Array;
+  readonly content: NftContent;
+  /** Wrap the content in NftSigned with this engine's chain pubkey as the creator. */
+  readonly sign: boolean;
+  /** The network's NFT vessel token type. */
+  readonly tokenType: Uint8Array;
+}
+
+/** A planned NFT mint. Journal all of it: only these exact bytes resume the mint byte-identically. */
+export interface NftMintPlan {
+  /** The final genesis payload. */
+  readonly data: Uint8Array;
+  /** Fresh random 32 bytes. */
+  readonly salt: Uint8Array;
+  readonly tokenType: Uint8Array;
+  /** 64 lowercase hex — the id `mintDataToken` derives from `salt` on this engine's network. */
+  readonly tokenId: string;
+}
+
 export interface TransferParams {
   /** The token to spend (must be owned by this engine's identity). */
   readonly token: SphereToken;
@@ -165,4 +188,13 @@ export interface EngineVerifyResult {
   readonly ok: boolean;
   /** Human-readable reason when `ok` is false (mapped from the SDK verification status). */
   readonly reason?: string;
+}
+
+/** A token's genesis payload read as an NFT (#785). Display-only. */
+export interface NftReading {
+  readonly content: NftContent;
+  /** 66-char hex of the key an NftSigned payload CLAIMS, else null. Authenticated only when `signature` is 'valid'. */
+  readonly creator: string | null;
+  /** Checked against the token id and GENESIS recipient, so a transfer never changes it. */
+  readonly signature: NftSignatureStatus;
 }

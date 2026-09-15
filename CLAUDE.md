@@ -149,6 +149,8 @@ const uct = await sphere.payments.assets(coinIdHex);  // filter by coin
 const tokens = sphere.payments.tokens();              // individual Token[] (sync view)
 const nfts = sphere.payments.coinless();              // CoinlessToken[] — DISJOINT from tokens()
 const payload = await sphere.payments.tokenData(id); // an NFT's genesis bytes, or null
+const view = await sphere.payments.nft(id);          // NftView | null: { content, creator, signature } (#785)
+const views = await sphere.payments.nfts(nfts.map((t) => t.tokenId)); // Map<tokenId, NftView>; one batched blob read
 const filtered = sphere.payments.tokens({ coinId: '...' });
 
 // 6. Send tokens (L3). Recipient must have a PUBLISHED chain pubkey
@@ -180,6 +182,11 @@ sphere.on('transfer:incoming', (transfer) => {
 //    coinId must be even-length lowercase hex (the canonical SDK AssetId form)
 const mint = await sphere.payments.mint(coinIdHex, 1000000n);
 // MintResult: { success: true, tokenId } | { success: false, error }
+// An NFT (#785; format docs/NFT-METADATA.md): minted to this wallet, signed as creator unless
+// sign: false. A failure that carries a tokenId is journaled and replays — never re-call it.
+const nftMint = await sphere.payments.mintNft({
+  content: { kind: 'media', media_type: 'image/png', bytes: pngBytes },
+});
 
 // 9. Transaction history — server read-through, PAGED
 const page = await sphere.payments.history({ limit: 50 });
@@ -229,9 +236,11 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 
 **Queries (14):** `sphere_getIdentity`, `sphere_getBalance`, `sphere_getAssets`, `sphere_getFiatBalance`, `sphere_getTokens`, `sphere_getHistory`, `sphere_resolve`, `sphere_subscribe`, `sphere_unsubscribe`, `sphere_disconnect`, `sphere_getConversations`, `sphere_getMessages`, `sphere_getDMUnreadCount`, `sphere_markAsRead`. (The two invoice queries were removed with the P11 flip — they were experimental and never enabled in any wallet host.)
 
-**Intents (6):** `send`, `dm`, `payment_request`, `receive`, `sign_message`, `mint`. (The 9 invoice intents were removed with the P11 flip.)
+**Intents (8):** `send`, `dm`, `payment_request`, `receive`, `sign_message`, `mint`, `send_nft`, `mint_nft`. (The 9 invoice intents were removed with the P11 flip.)
 
-**Permission scopes (13):** `identity:read`, `balance:read`, `tokens:read`, `history:read`, `events:subscribe`, `resolve:peer`, `transfer:request`, `dm:request`, `dm:read`, `dm:manage`, `payment:request`, `sign:request`, `mint:request`.
+**Permission scopes (15):** `identity:read`, `balance:read`, `tokens:read`, `history:read`, `events:subscribe`, `resolve:peer`, `transfer:request`, `dm:request`, `dm:read`, `dm:manage`, `payment:request`, `sign:request`, `mint:request`, `nft:transfer`, `nft:mint`.
+
+- **`mint_nft` needs its own `nft:mint` scope (Connect 2.3)** — neither `mint:request` nor `nft:transfer` grants it, because minting an NFT puts the user's creator signature on content the DAPP chose, which a coin top-up or an NFT-move approval never agreed to. It always asks the user: `ConnectHost.setIntentAutoApprove` throws for it and the host routes every `mint_nft` to `onIntent`. Params cross the wire via `nftContentToWire`/`nftContentFromWire` (`connect/nft-wire.ts`, inline bytes as canonical base64; shape only — value rules stay in `payments.mintNft`).
 
 **Wire-compat adapter (`connect/host/payments-compat.ts`):** dApps written against the pre-flip event/query contract change NOTHING. On a v2 host, `sphere_getBalance`/`getAssets`/`getFiatBalance`/`getTokens`/`getHistory` are served from the facade (`assets()`/`tokens()`/`history()` — old result shapes held), and the old subscribable event names are re-emitted from the 8 v2 events: `transfer:confirmed`/`transfer:delivery_pending`/`transfer:failed` ← `transfer:updated`; `payment_request:paid|rejected|expired` ← `payment_request:updated`; `split:checkpoint-stuck`/`delivery:undeliverable`/`delivery:deferred` ← `transfer:attention`; `realtime:status`/`storage:degraded` ← `connection:status`; `sync:completed`/`sync:remote-update` ← `inventory:updated`. (`send:partial-remainder` is NOT re-emitted — folded by design, no consumer existed.)
 
@@ -269,10 +278,13 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `sphere.payments.tokens(filter?)` | `Token[]` | Individual COIN tokens (sync inventory view) |
 | `sphere.payments.coinless()` | `CoinlessToken[]` | Coinless (NFT) holdings — disjoint from `tokens()` |
 | `sphere.payments.tokenData(tokenId)` | `Promise<Uint8Array \| null>` | A token's genesis payload (fetches the blob) |
+| `sphere.payments.nft(tokenId)` | `Promise<NftView \| null>` | A held token read as an NFT (#785); `null` = not a recognised NFT |
+| `sphere.payments.nfts(tokenIds)` | `Promise<ReadonlyMap<string, NftView>>` | Batch NFT read for list views (one blob fetch, cached); unreadable ids absent |
 | `sphere.payments.send(request)` | `Promise<TransferResult>` | Send L3 coin tokens (wallet-api vertical) |
 | `sphere.payments.sendWholeToken(request)` | `Promise<TransferResult>` | Move ONE named token whole — coinless or valued, never split |
 | `sphere.payments.sendCoinless(request)` | `Promise<TransferResult>` | NFT-scoped twin: refuses a valued source (Connect `send_nft`) |
 | `sphere.payments.mint(coinIdHex, amount)` | `Promise<MintResult>` | Self-mint via engine (journal-first, no faucet) |
+| `sphere.payments.mintNft({ content, sign? })` | `Promise<MintResult>` | Mint an NFT to this wallet, signed as creator by default (journal-first) |
 | `sphere.payments.receive()` | `Promise<{ transfers }>` | Explicit one-shot mailbox drain |
 | `sphere.payments.history(page?)` | `Promise<HistoryPage>` | Paged history (`{ before?, limit? }`) |
 | `sphere.payments.requests.create(to, terms)` | `{ success, requestId?, error? }` | Send a payment request |
@@ -476,7 +488,8 @@ sphere-domain type that moved is `TokenBlob` (two never-read fields dropped — 
 - `ITokenEngine` operations: `getIdentity`, `deriveIdentityAddress`, `tokenId`,
   `readValue`, `balanceOf`, `readMemo`, `readTokenData`, `mint`, `mintDataToken`,
   `transfer`, `split`, `verify`, `isSpent`, `isOwnedBy`, `encodeToken`,
-  `decodeToken`, `deliveryKeys`, and the optional `dispose` (worker-pool teardown).
+  `decodeToken`, `deliveryKeys`, `buildNftMint`, `readNft` (#785), and the optional
+  `dispose` (worker-pool teardown).
 - **The 3.x SDK surface** (visible only inside `token-engine/`): the three `create`/`split`
   builders take an options object where 2.x took trailing positionals, and
   `InclusionProofResponse.inclusionProof` is `InclusionProof | null` where **null IS "not certified
@@ -783,6 +796,42 @@ authoritative for build success.
   wallet-api keeps refusing that so there is only one wire spelling of "no coin".
 - The coinless verdict is DERIVED from wallet-api's §8.2 step-6 boundary. Moving that boundary
   needs the client verdict re-derived, not merely re-tested (recorded in wallet-api's §8.2 too).
+- **NFT metadata (#785)** is a payload format on top of coinless tokens — normative spec
+  `docs/NFT-METADATA.md`, CBOR tags 39052 `NftMetadata` / 39053 `NftMedia` / 39054 `NftLink` /
+  39055 `NftSigned`, codec `token-engine/nft-payload.ts`. `payments.mintNft({ content, sign? })`
+  mints to the wallet itself under `NETWORKS[network].nftTokenType` (the registry's `non-fungible`
+  vessel), signed by default; `payments.nft(tokenId)` / `nfts(tokenIds)` read
+  `NftView { tokenId, content, creator, signature }` behind a per-facade 256-entry LRU.
+  `creator` is the key the payload CLAIMS: attribute a token to it only when `signature` is `valid`.
+- A `valid` signature is **attribution, not authorization**: which key signed this item for this
+  token — never that the signer is recognised or that a collection authorized the issue (that is the
+  mint reason, under the type's issuance policy). `NftMetadata.collection_id` (1–64 bytes, hex in the
+  API) is likewise a CLAIM: never present it as verified membership. The format defines no supply cap.
+- An `NftLink` whose media type is `NFT_DOCUMENT_MEDIA_TYPE` (`application/vnd.unicity.nft+cbor`) is
+  a **document link**: allowed only as a token's content (top level or `NftSigned.payload`), refused
+  as `image`/`animation_url`. The linked file is exactly one `NftMetadata`/`NftMedia` item — resolve
+  with `verifyNftLinkContent`, then `parseNftDocument` (never throws).
+- `mintNft` refuses a genesis payload over `NFT_MAX_PAYLOAD_BYTES` (1 MiB) BEFORE the journal.
+  wallet-api's `MAX_BLOB_BYTES` refusal lands only at upload, after certification, so a larger
+  payload would leave a certified token that no replay can ever store.
+- NFT recognition is **display-only and never throws**: `parseNftPayload` / `engine.readNft` return
+  `null` for anything unrecognised, and nothing on the receive or mirror path calls them. Keep it
+  that way — a throw where a token can be refused LOSES a token wallet-api accepted, the same reason
+  the classifier's throw set is bounded above.
+- An `NftSigned` digest is `SHA-256(CBOR[h'UNICITY_NFT_SIGNED', 1, α, h(recipient predicate),
+  h(token id), h(token type), h(payload)])`, the yellowpaper genesis-commitment layout. The recipient
+  is the **GENESIS** one, never the current owner: a `valid` NFT stays valid across transfers, while
+  a payload copied onto another token, minted under another token type, or front-run to another
+  first owner reads `invalid`. Verification recovers the key, so the recovery byte is bound and
+  high-s is refused. The digest is a cross-SDK byte vector — hash the payload bytes as received,
+  never a re-encoding.
+- The NFT mint has its **own journal** (`STORE_KEYS.nftMintJournal`), never the coin one: an older
+  client would retry an entry with no `coinId`/`amount` every pass. It journals the planned BYTES
+  (payload, salt, token type) before the chain op, so replay re-submits exactly the first attempt —
+  no re-signing, no deterministic-engine requirement — and a minted id other than the plan's is
+  never finalised. The fake engine plans and verifies through the real `token-engine/nft-ops.ts`
+  and keeps each token's first owner and genesis token type, so it judges signatures exactly as the
+  real engine does.
 
 ### Unicity IDs (nametags)
 - Human-readable aliases (e.g., `@alice`) for receiving payments.
@@ -820,7 +869,7 @@ authoritative for build success.
 - Everything the client persists for money lives in the per-(network, address) scoped KV:
   `pv2g2:{network}:{chainPubkey}:*` inside the plain `StorageProvider` — refresh token, sync
   cursors, intent backstop, split-checkpoint cache, delivery journal (#621), mint journal,
-  #690 shortfalls, request settling journal, the epoch latch and the §5.2 `suspectedSpent` /
+  NFT mint journal (#785), #690 shortfalls, request settling journal, the epoch latch and the §5.2 `suspectedSpent` /
   `knownSpends` overlays — the complete list is `STORE_KEYS` in `modules/payments-v2/stores.ts`,
   and it contains no receive seen-set. One writer per store. Being self-prefixed with the
   network, it never rides the legacy `isNetworkScopedAddressKey` mechanism (which still guards the remaining
@@ -900,7 +949,8 @@ Key test areas:
   `wire-version.test.ts` (a real 2.1.0-encoded token from `fixtures/token-sdk-2.1.0.hex` is
   refused with an error naming the version — that fixture is uncapturable once the pin moves
   again), `proof-deadline.test.ts` (the abort guard)
-- `tests/unit/connect/` — protocol surface guard (14/6/13 counts), lock semantics,
+- `tests/unit/connect/` — protocol surface guard (14/8/15 counts), `mint_nft` wire helpers
+  (`nft-wire.test.ts`) and its never-auto-approved guard, lock semantics,
   payments-compat adapter conformance (36 tests: old wire names/payloads from the v2 facade,
   against a mock Sphere whose `payments` getter THROWS exactly like the real one)
 - `tests/unit/core/` — Sphere lifecycle, clear, nametag sync/recovery, wallet-api-protocol pins

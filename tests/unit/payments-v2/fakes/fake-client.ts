@@ -142,6 +142,11 @@ export class FakeWalletApiV2Client {
   }
 
   async blobUrls(tokenIds: string[]): Promise<BlobUrlWire[]> {
+    try {
+      this.fake.assertBlobUrlsRequest(tokenIds);
+    } catch (err) {
+      throw toHttpError(err);
+    }
     const urls: BlobUrlWire[] = [];
     for (const tokenId of tokenIds) {
       const key = this.keyByTokenId.get(tokenId);

@@ -110,13 +110,14 @@ export interface ConnectHostConfig {
   /** Called when dApp sends an intent. Wallet opens corresponding UI.
    *  `ctx` (added in Connect 2.1) carries the host-side deadline and an AbortSignal:
    *  the wallet MUST dismiss its modal on abort, otherwise the host's own deadline
-   *  manufactures the double-submit it was added to prevent. */
+   *  manufactures the double-submit it was added to prevent.
+   *  `error.data` reaches the dApp as `ConnectError.data`, unless the host downgrades the code. */
   onIntent: (
     action: string,
     params: Record<string, unknown>,
     session: ConnectSession,
     ctx?: IntentContext,
-  ) => Promise<{ result?: unknown; error?: { code: number; message: string } }>;
+  ) => Promise<{ result?: unknown; error?: { code: number; message: string; data?: unknown } }>;
 
   /** Called when dApp explicitly disconnects. Wallet can revoke persisted permissions. */
   onDisconnect?: (session: ConnectSession) => void | Promise<void>;

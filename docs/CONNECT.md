@@ -4,7 +4,15 @@ Sphere Connect is a secure wallet-dApp communication protocol. It allows web app
 
 ## Protocol Version
 
-The current Connect protocol version is **`2.1`** (`SPHERE_CONNECT_VERSION = '2.1'`).
+The current Connect protocol version is **`2.3`** (`SPHERE_CONNECT_VERSION = '2.3'`).
+
+- **2.3** adds the `mint_nft` intent and its `nft:mint` scope — see [mint_nft Intent](#mint_nft-intent).
+- **2.2** added the `send_nft` intent and its `nft:transfer` scope.
+
+Both are additive MINOR bumps. The handshake gate compares MAJOR only, so a 2.1 or 2.2 dApp still
+connects to a 2.3 wallet. An SDK host older than 2.3 answers `mint_nft` with `PERMISSION_DENIED`
+(4002), because no scope maps to it there; read `client.walletProtocol` to tell that apart from a
+refused scope.
 
 > **sphere-sdk 0.15.0 does NOT bump it.** That release is a hard wire break on the
 > *state-transition* protocol, but Connect messages carry no state-transition bytes — the token
@@ -546,6 +554,7 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `receive` | — | `{ transfers }` |
 | `sign_message` | `message` | `{ signature, publicKey }` |
 | `mint` | `coinId` (lowercase hex), `amount` (smallest units) | `{ tokenId, coinId, amount }` |
+| `mint_nft` | `content` (`WireNftContent`), `sign?` (default `true`) | `{ tokenId }` |
 
 > **Amount units:** `amount` is always in **base units** (the smallest indivisible unit), as a
 > string — the same convention as the SDK's `payments.mint(coinId, amount: bigint)`
@@ -622,6 +631,75 @@ const result = await client.intent('mint', {
 Requires the `mint:request` permission scope. Minting only succeeds on networks that allow standalone self-mint (testnet2 today); on networks where it is unavailable the wallet returns an error from the token engine.
 
 When the wallet runs with **subscriptions enabled**, a `mint` is rejected with `INTERNAL_ERROR` and the message `Subscription is still being set up — try again in a moment` until the wallet's per-wallet subscription key reaches the oracle. This is transient — treat it as a retry, not a failure. It never occurs on wallets running without subscriptions.
+
+### mint_nft Intent
+
+The `mint_nft` intent (Connect 2.3) asks the wallet to mint **one NFT to its own active address**
+with `payments.mintNft({ content, sign })`. **The wallet asks the user every time and shows what
+will be minted — a `mint_nft` is never auto-approved.** `ConnectHost.setIntentAutoApprove` throws
+for it, and the host hands every `mint_nft` to `onIntent` even if an auto-approve handler exists.
+
+It requires the `nft:mint` scope. Neither `mint:request` nor `nft:transfer` grants it: a dApp
+approved to top up test coins or to move NFTs must not gain the right to put the user's creator
+signature on content the dApp chose.
+
+```typescript
+import { nftContentToWire } from '@unicitylabs/sphere-sdk/connect';
+import type { MintNftIntentParams, MintNftIntentResult } from '@unicitylabs/sphere-sdk/connect';
+
+const params: MintNftIntentParams = {
+  content: nftContentToWire({
+    kind: 'metadata',
+    name: 'Cat #1',
+    description: null,
+    image: { kind: 'media', media_type: 'image/png', bytes: pngBytes }, // Uint8Array → base64
+    animation_url: null,
+    external_url: null,
+    attributes: [{ trait_type: 'Eyes', value: 'green' }],
+    collection: 'Cats',
+    collection_id: null,
+  }),
+  sign: true, // the default: NftSigned, with the wallet's chain key as creator
+};
+
+const { tokenId } = await client.intent<MintNftIntentResult>('mint_nft', params);
+```
+
+**Params.** `content` is a `WireNftContent`: an `NftContent` ([NFT-METADATA.md](NFT-METADATA.md))
+with every inline `NftMedia.bytes` replaced by standard base64 (RFC 4648 §4, with padding), because
+Connect messages are JSON and the extension transport cannot carry a `Uint8Array`. An `NftLink` is
+unchanged. `nftContentToWire` builds it.
+
+| `kind` | Fields besides `kind` — all required |
+|--------|--------------------------------------|
+| `metadata` | `name`, `description`, `image`, `animation_url`, `external_url`, `attributes`, `collection`, `collection_id`. An absent optional field is `null`, never omitted. `image` and `animation_url` each hold a `media`, a `link` or `null`; `attributes` is `[{ trait_type, value }]`, `[]` when there are none; `collection_id` is a hex string, passed through unchanged. |
+| `media` | `media_type`, `bytes` (base64) |
+| `link` | `media_type`, `uri`, `sha256` (64 hex) |
+
+**Wallet side.** `nftContentFromWire(params.content)` checks the shape — exactly these fields with
+these JSON types, no nested `metadata`, canonical base64 — and throws a `VALIDATION_ERROR` whose
+message names the offending field (`Invalid NFT content.image.bytes: …`). It does not judge field
+values: non-empty text, media-type grammar, URI schemes, the `collection_id` hex rule, a document
+link in a media slot and the size cap stay in `payments.mintNft`, whose refusal the wallet returns
+as the intent error.
+
+**Result.** `{ tokenId }` — 64 lowercase hex.
+
+**Errors.**
+
+| When | Answer |
+|------|--------|
+| The session lacks `nft:mint` | `PERMISSION_DENIED` (4002), from the host |
+| The user declines | `USER_REJECTED` (4003) |
+| Malformed params (shape, base64) | `INVALID_PARAMS` (-32602); the message names the field |
+| The mint is refused or fails | An intent error carrying `MintResult.error`. When `data.tokenId` is present the mint was journaled and **may still complete** — the wallet resumes it — so do not send the intent again. |
+
+`onIntent` may return `error.data`; the host relays it as `ConnectError.data`, except when it
+downgrades the code to `INTENT_OUTCOME_UNKNOWN`.
+
+**Size.** The encoded payload, `NftSigned` wrapper included, must be at most 1 MiB
+(`NFT_MAX_PAYLOAD_BYTES`); `payments.mintNft` refuses a larger one before anything is minted. Keep
+inline media at or below about 900 KB, and link larger files with `NftLink`.
 
 ## Removed: the invoice surface (P11 flip)
 
@@ -820,6 +898,8 @@ Permissions are requested during handshake and checked on every request:
 | `payment:request` | `payment_request` intent |
 | `sign:request` | `sign_message` intent |
 | `mint:request` | `mint` intent (self-mint a fungible token) |
+| `nft:transfer` | `send_nft` intent (move one NFT) |
+| `nft:mint` | `mint_nft` intent (mint one NFT to the wallet, signed as the user by default). Not implied by `mint:request` or `nft:transfer` |
 
 ---
 

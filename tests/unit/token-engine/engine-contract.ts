@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import type { ITokenEngine } from '../../../token-engine';
+import type { ITokenEngine, NftMetadata, NftMintPlan } from '../../../token-engine';
 
 export function runEngineContract(name: string, makeEngine: () => ITokenEngine): void {
   describe(`ITokenEngine contract — ${name}`, () => {
@@ -158,6 +158,107 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
       expect(e.balanceOf(outputs[1], COIN)).toBe(4n);
       expect(e.readMemo(outputs[0])).toEqual(memo);
       expect(e.readMemo(outputs[1])).toBeNull();
+    });
+
+    // ── NFT metadata (#785): a signature binds the network, GENESIS recipient, token id and token type ──
+    const toHex = (bytes: Uint8Array): string => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    const NFT_TYPE = new Uint8Array(32).fill(0x4e);
+    const NFT: NftMetadata = {
+      kind: 'metadata',
+      name: 'Contract Cat',
+      description: null,
+      image: { kind: 'media', media_type: 'image/png', bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]) },
+      animation_url: null,
+      external_url: null,
+      attributes: [{ trait_type: 'Lives', value: 9 }],
+      collection: 'Contract Cats',
+      collection_id: toHex(NFT_TYPE),
+    };
+    const planNft = (e: ITokenEngine, sign = true) =>
+      e.buildNftMint({ recipientPubkey: e.getIdentity().chainPubkey, content: NFT, sign, tokenType: NFT_TYPE });
+    const mintPlan = (e: ITokenEngine, plan: NftMintPlan, recipientPubkey = e.getIdentity().chainPubkey, salt = plan.salt) =>
+      e.mintDataToken({ recipientPubkey, data: plan.data, tokenType: plan.tokenType, salt });
+    const signedBy = (e: ITokenEngine, signature: 'valid' | 'invalid') =>
+      ({ content: NFT, creator: toHex(e.getIdentity().chainPubkey), signature });
+
+    it('buildNftMint plans a signed NFT whose token id the mint reproduces, and readNft verifies it', async () => {
+      const e = makeEngine();
+      const plan = await planNft(e);
+      expect(plan.tokenId).toMatch(/^[0-9a-f]{64}$/);
+      expect(plan.salt).toHaveLength(32);
+      expect(plan.tokenType).toEqual(NFT_TYPE);
+      const t = await mintPlan(e, plan);
+      expect(e.tokenId(t)).toBe(plan.tokenId);
+      expect(e.readTokenData(t)).toEqual(plan.data);
+      expect(await e.readNft(t)).toEqual(signedBy(e, 'valid'));
+      expect(await e.readNft(await e.decodeToken(e.encodeToken(t)))).toEqual(signedBy(e, 'valid'));
+    });
+
+    it('buildNftMint draws a fresh salt, so every plan names a new token', async () => {
+      const e = makeEngine();
+      const [a, b] = [await planNft(e), await planNft(e)];
+      expect(a.salt).not.toEqual(b.salt);
+      expect(a.tokenId).not.toBe(b.tokenId);
+    });
+
+    it('an unsigned NFT reads as unsigned, with no creator', async () => {
+      const e = makeEngine();
+      const t = await mintPlan(e, await planNft(e, false));
+      expect(await e.readNft(t)).toEqual({ content: NFT, creator: null, signature: 'unsigned' });
+    });
+
+    it('readNft stays valid after the NFT is transferred away from its first owner', async () => {
+      const e = makeEngine();
+      const recv = await e.transfer({ token: await mintPlan(e, await planNft(e)), recipientPubkey: PK_B });
+      expect(e.isOwnedBy(recv, PK_B)).toBe(true);
+      expect(await e.readNft(recv)).toEqual(signedBy(e, 'valid'));
+      expect(await e.readNft(await e.decodeToken(e.encodeToken(recv)))).toEqual(signedBy(e, 'valid'));
+    });
+
+    it('a signed payload minted under another token id reads invalid', async () => {
+      const e = makeEngine();
+      const plan = await planNft(e);
+      const t = await mintPlan(e, plan, e.getIdentity().chainPubkey, new Uint8Array(32).fill(0x5a));
+      expect(e.tokenId(t)).not.toBe(plan.tokenId);
+      expect(await e.readNft(t)).toEqual(signedBy(e, 'invalid'));
+    });
+
+    it('a signed payload minted under another token type reads invalid, though the salt gives the same token id', async () => {
+      const e = makeEngine();
+      const plan = await planNft(e);
+      const t = await e.mintDataToken({
+        recipientPubkey: e.getIdentity().chainPubkey,
+        data: plan.data,
+        tokenType: new Uint8Array(32).fill(0x4f),
+        salt: plan.salt,
+      });
+      expect(e.tokenId(t)).toBe(plan.tokenId);
+      expect(await e.readNft(t)).toEqual(signedBy(e, 'invalid'));
+    });
+
+    it('a signed payload minted to another first owner reads invalid (a front-run mint)', async () => {
+      const e = makeEngine();
+      const plan = await planNft(e);
+      const t = await mintPlan(e, plan, PK_B);
+      expect(e.tokenId(t)).toBe(plan.tokenId);
+      expect(await e.readNft(t)).toEqual(signedBy(e, 'invalid'));
+    });
+
+    it('buildNftMint refuses invalid content with VALIDATION_ERROR', async () => {
+      const e = makeEngine();
+      const request = { recipientPubkey: e.getIdentity().chainPubkey, sign: true, tokenType: NFT_TYPE };
+      await expect(e.buildNftMint({ ...request, content: { ...NFT, name: '' } })).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+      });
+    });
+
+    it('readNft is null for a coin token, a value-less token and a non-NFT data token', async () => {
+      const e = makeEngine();
+      const data = new Uint8Array([1, 2, 3, 4]);
+      const dataToken = await e.mintDataToken({ recipientPubkey: PK_A, data, tokenType: NFT_TYPE, salt: new Uint8Array(32).fill(3) });
+      expect(await e.readNft(await mintSelf(e, 5n))).toBeNull();
+      expect(await e.readNft(await e.mint({ recipientPubkey: PK_A }))).toBeNull();
+      expect(await e.readNft(dataToken)).toBeNull();
     });
   });
 }

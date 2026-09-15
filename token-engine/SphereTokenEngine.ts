@@ -35,6 +35,7 @@ import {
 import { deriveDirectAddress } from './identity';
 import { deriveDeliveryKeys } from './blob-keys';
 import { deriveRealization } from './realization';
+import { planNftMint, readTokenNft } from './nft-ops';
 import { burntTokenFromCheckpoint, encodeCheckpoint } from './split-checkpoint';
 import {
   CertificationData,
@@ -74,11 +75,14 @@ import { decodeSpherePaymentData, SpherePaymentData, sphereAssetToSdk } from './
 import { assertMintableData, classifyValueEnvelope, wrapToken } from './value-envelope';
 import type { EngineOpOptions, ITokenEngine } from './engine';
 import type {
+  BuildNftMintParams,
   CoinId,
   EngineIdentity,
   EngineVerifyResult,
   MintDataTokenParams,
   MintParams,
+  NftMintPlan,
+  NftReading,
   SphereToken,
   SphereValue,
   SplitParams,
@@ -256,6 +260,10 @@ export class SphereTokenEngine implements ITokenEngine {
     return data ? new Uint8Array(data) : null;
   }
 
+  public readNft(token: SphereToken): Promise<NftReading | null> {
+    return readTokenNft(token);
+  }
+
   // ── lifecycle ────────────────────────────────────────────────────────────────
 
   public async mint(params: MintParams, options?: EngineOpOptions): Promise<SphereToken> {
@@ -313,6 +321,10 @@ export class SphereTokenEngine implements ITokenEngine {
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
     const token = await Token.mint(certified, this.deps.verificationContext);
     return wrapToken(token);
+  }
+
+  public buildNftMint(params: BuildNftMintParams): Promise<NftMintPlan> {
+    return planNftMint(this.deps, params);
   }
 
   public async transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken> {

@@ -10,7 +10,8 @@ import type {
 import { PERMISSION_SCOPES } from '../../../connect/permissions';
 import { ERROR_CODES, RPC_METHODS, INTENT_ACTIONS } from '../../../connect/protocol';
 import type { PermissionScope } from '../../../connect/permissions';
-import { ConnectError } from '../../../connect';
+import { ConnectError, nftContentToWire } from '../../../connect';
+import type { MintNftIntentParams, MintNftIntentResult } from '../../../connect';
 
 // =============================================================================
 // Mock Transport: connects two sides in-memory
@@ -305,6 +306,135 @@ describe('Sphere Connect Integration', () => {
       );
       expect(result.tokenId).toBe('aa'.repeat(32));
       expect(result.amount).toBe('500');
+    });
+
+    describe('mint_nft', () => {
+      const TOKEN_ID = 'ab'.repeat(32);
+      const params: MintNftIntentParams = {
+        content: nftContentToWire({
+          kind: 'metadata',
+          name: 'Cat',
+          description: null,
+          image: { kind: 'media', media_type: 'image/png', bytes: Uint8Array.from([0x89, 0x50, 0x4e, 0x47]) },
+          animation_url: null,
+          external_url: null,
+          attributes: [{ trait_type: 'Eyes', value: 'green' }],
+          collection: null,
+          collection_id: null,
+        }),
+        sign: true,
+      };
+
+      async function connectWith(granted: PermissionScope[] = Object.values(PERMISSION_SCOPES)) {
+        host.destroy();
+        transports = createMockTransportPair();
+        const onIntent = vi.fn().mockResolvedValue({ result: { tokenId: TOKEN_ID } });
+        createHost({
+          onIntent,
+          onConnectionRequest: vi.fn().mockResolvedValue({ approved: true, grantedPermissions: granted }),
+        });
+        createClient({ permissions: granted });
+        await client.connect();
+        return onIntent;
+      }
+
+      it('hands the JSON wire params to onIntent and returns the tokenId', async () => {
+        const onIntent = await connectWith();
+
+        const result = await client.intent<MintNftIntentResult>(INTENT_ACTIONS.MINT_NFT, params);
+
+        expect(onIntent).toHaveBeenCalledWith(
+          'mint_nft',
+          params,
+          expect.any(Object),
+          expect.objectContaining({ expiresAt: expect.any(Number), signal: expect.any(AbortSignal) }),
+        );
+        expect(result).toEqual({ tokenId: TOKEN_ID });
+      });
+
+      it('is denied without nft:mint, even with mint:request and nft:transfer granted', async () => {
+        const onIntent = await connectWith([PERMISSION_SCOPES.MINT_REQUEST, PERMISSION_SCOPES.NFT_TRANSFER]);
+
+        const err = await client.intent(INTENT_ACTIONS.MINT_NFT, params).catch((e: unknown) => e);
+
+        expect(err).toBeInstanceOf(ConnectError);
+        expect((err as ConnectError).code).toBe(ERROR_CODES.PERMISSION_DENIED);
+        expect(onIntent).not.toHaveBeenCalled();
+      });
+
+      it('relays the error data a wallet attaches, so a journaled mint can name its tokenId', async () => {
+        host.destroy();
+        transports = createMockTransportPair();
+        const message = 'The NFT mint did not finish; it may still complete, because the wallet resumes it';
+        createHost({
+          onIntent: vi.fn().mockResolvedValue({
+            error: { code: ERROR_CODES.INTERNAL_ERROR, message, data: { tokenId: TOKEN_ID } },
+          }),
+        });
+        createClient();
+        await client.connect();
+
+        const err = await client.intent(INTENT_ACTIONS.MINT_NFT, params).catch((e: unknown) => e);
+
+        expect(err).toBeInstanceOf(ConnectError);
+        expect((err as ConnectError).code).toBe(ERROR_CODES.INTERNAL_ERROR);
+        expect((err as ConnectError).message).toBe(message);
+        expect((err as ConnectError).data).toEqual({ tokenId: TOKEN_ID });
+      });
+
+      it('does not relay error data under a code the host downgrades to INTENT_OUTCOME_UNKNOWN', async () => {
+        host.destroy();
+        transports = createMockTransportPair();
+        createHost({
+          onIntent: vi.fn().mockResolvedValue({
+            error: { code: ERROR_CODES.WALLET_LOCKED, message: 'Wallet locked', data: { reason: 'locked' } },
+          }),
+        });
+        createClient();
+        await client.connect();
+
+        const err = await client.intent(INTENT_ACTIONS.MINT_NFT, params).catch((e: unknown) => e);
+
+        expect(err).toBeInstanceOf(ConnectError);
+        expect((err as ConnectError).code).toBe(ERROR_CODES.INTENT_OUTCOME_UNKNOWN);
+        expect((err as ConnectError).data).toBeUndefined();
+      });
+
+      it('refuses to register an auto-approve handler for mint_nft, and still asks the wallet', async () => {
+        const onIntent = await connectWith();
+        const auto = vi.fn().mockResolvedValue({ result: { tokenId: 'cd'.repeat(32) } });
+
+        expect(() => host.setIntentAutoApprove(INTENT_ACTIONS.MINT_NFT, auto)).toThrow(/always asks the user/);
+        await client.intent(INTENT_ACTIONS.MINT_NFT, params);
+
+        expect(auto).not.toHaveBeenCalled();
+        expect(onIntent).toHaveBeenCalledTimes(1);
+      });
+
+      it('never runs an auto-approve handler for mint_nft, however it was registered', async () => {
+        const onIntent = await connectWith();
+        const auto = vi.fn().mockResolvedValue({ result: { tokenId: 'cd'.repeat(32) } });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (host as any).autoApprovedIntents.set(INTENT_ACTIONS.MINT_NFT, auto);
+
+        const result = await client.intent<MintNftIntentResult>(INTENT_ACTIONS.MINT_NFT, params);
+
+        expect(auto).not.toHaveBeenCalled();
+        expect(onIntent).toHaveBeenCalledTimes(1);
+        expect(result.tokenId).toBe(TOKEN_ID);
+      });
+
+      it('still runs a registered auto-approve handler for an intent that allows one (dm)', async () => {
+        const onIntent = await connectWith();
+        const auto = vi.fn().mockResolvedValue({ result: { sent: true } });
+        host.setIntentAutoApprove(INTENT_ACTIONS.DM, auto);
+
+        const result = await client.intent(INTENT_ACTIONS.DM, { to: '@bob', message: 'hi' });
+
+        expect(result).toEqual({ sent: true });
+        expect(auto).toHaveBeenCalledTimes(1);
+        expect(onIntent).not.toHaveBeenCalled();
+      });
     });
 
     it('handles user rejection', async () => {

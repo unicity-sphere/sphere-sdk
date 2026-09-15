@@ -99,6 +99,7 @@ export interface ConvergerDeps {
   reconcile(report: { resumed: string[]; conflicted: string[]; open: string[] }): Promise<void>;
   refreshView(): Promise<void>;
   replayMints(): Promise<number>;
+  replayNftMints(): Promise<number>;
   /** §7 ownership: the pass never adopts an op whose machine runs in-process. */
   isActiveOp(id: string): boolean;
   emit(event: string, payload: unknown): void;
@@ -123,22 +124,27 @@ export class Converger {
     } catch (err) {
       retryAfterMs ??= retryAfterMsOf(err);
     }
-    try {
-      progress = (await this.deps.replayMints()) > 0 || progress;
-    } catch (err) {
-      retryAfterMs ??= retryAfterMsOf(err);
+    // Caught apart: an unreadable coin journal must not starve the NFT one.
+    for (const replay of [() => this.deps.replayMints(), () => this.deps.replayNftMints()]) {
+      try {
+        progress = (await replay()) > 0 || progress;
+      } catch (err) {
+        retryAfterMs ??= retryAfterMsOf(err);
+      }
     }
     return { progress, retryAfterMs };
   }
 
   /** §4 heartbeat predicate — read fresh from the §6 stores, never cached. */
   async pendingWork(): Promise<boolean> {
-    const [backstop, journal, mints] = await Promise.all([
+    const [backstop, journal, mints, nftMints] = await Promise.all([
       this.deps.stores.backstop.list(),
       this.deps.stores.deliveryJournal.list(),
       this.deps.stores.mintJournal.list(),
+      this.deps.stores.nftMintJournal.list(),
     ]);
-    return backstop.length > 0 || journal.some((e) => e.undeliverable !== true) || mints.length > 0;
+    const mintsOpen = mints.length > 0 || nftMints.length > 0;
+    return backstop.length > 0 || journal.some((e) => e.undeliverable !== true) || mintsOpen;
   }
 
   private async resumePass(): Promise<boolean> {

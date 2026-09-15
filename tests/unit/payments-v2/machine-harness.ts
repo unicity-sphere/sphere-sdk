@@ -6,7 +6,7 @@
  * in-memory ScopedKV with fault flags, and plan/seed builders.
  */
 
-import { CborDeserializer, HexConverter } from '../../../token-engine/sdk';
+import { HexConverter } from '../../../token-engine/sdk';
 import type {
   EngineOpOptions,
   SphereToken,
@@ -25,7 +25,7 @@ import {
   type MachinePlan,
 } from '../../../modules/payments-v2/machine/TransferMachine';
 import { createMachineStores, type MachineStores } from '../../../modules/payments-v2/machine/journal';
-import { FakeTokenEngine, decodeFakeTokenAssets } from '../token-engine/FakeTokenEngine';
+import { FakeTokenEngine, decodeFakeTokenAssets, readFakeTokenKeys } from '../token-engine/FakeTokenEngine';
 import { memoryCheckpoints, memoryKV, type MemoryKV } from './support';
 import {
   FakeWalletApi,
@@ -144,9 +144,7 @@ export function stateOf(token: SphereToken): string {
 /** FakeWalletApi decodeBlob over FakeTokenEngine inner bytes + recorded lineage. */
 export function fakeDecodeBlobFor(engine: RealizationEngine): (bytes: Uint8Array) => FakeBlobMeta {
   return (bytes) => {
-    const fields = CborDeserializer.decodeArray(bytes, 5);
-    const tokenId = HexConverter.encode(CborDeserializer.decodeByteString(fields[0]));
-    const owner = HexConverter.encode(CborDeserializer.decodeByteString(fields[2]));
+    const { tokenId, owner } = readFakeTokenKeys(bytes);
     const lineage = engine.lineage.get(sha256Hex(bytes));
     const assets = (decodeFakeTokenAssets(bytes) ?? []).map((a) => ({ coinId: a.coinId, amount: a.amount.toString() }));
     return {
