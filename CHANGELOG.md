@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — a new group's id ends in a random part (#787)
+
+`GroupChatModule.createGroup` built a group's id from its name alone: lowercased, everything outside
+`a-z0-9` removed, cut to 20 characters. A group created with a deleted group's name reused that
+group's id, two users creating groups with the same name raced for one id, and a hidden group's id
+could be guessed from its name, which the relay's "that group already exists" answer then confirmed.
+
+The id is now a slug of the name, a hyphen, and 16 hex characters from `crypto.getRandomValues`.
+Accents and apostrophes are dropped, every other run of characters outside `a-z0-9` becomes one
+hyphen, and the slug is cut to at most 24 characters at a hyphen (`Café Crème` →
+`cafe-creme-4246b140c1a07b52`). A name with no Latin letters or digits gives `group-` and the
+random part. Where `crypto.getRandomValues` is missing, `createGroup` returns `null` instead of
+falling back to `Math.random`.
+
+Existing groups keep their ids, and joining by id or invite link is unchanged.
+
 ## [0.17.1] - 2026-09-11
 
 ### Changed — the whole-token verbs are named for what they move (#783)

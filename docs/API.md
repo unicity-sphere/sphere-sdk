@@ -664,6 +664,8 @@ const group = await groupChat.createGroup({
 });
 ```
 
+The new group's id (`GroupData.id`) is a slug of `name` followed by 16 random hex characters, for example `announcements-3f9a1c07b52e8d41`. A name with no Latin letters or digits gives `group-3f9a1c07b52e8d41`. Because of the random part, a group created with the same name as a deleted group gets a different id. Creating a group requires `crypto.getRandomValues`.
+
 #### `fetchAvailableGroups(): Promise<GroupData[]>`
 
 Fetches public groups from the relay. Returns `GroupData` objects including the `writeRestricted` flag.
