@@ -73,6 +73,7 @@ export {
 // The NFT metadata codec (#785; normative spec docs/NFT-METADATA.md): CBOR tags
 // 39052–39055. Reading is display-only and never throws.
 export {
+  NFT_DOCUMENT_MEDIA_TYPE,
   NFT_FORMAT_VERSION,
   NFT_LINK_TAG,
   NFT_MEDIA_TAG,
@@ -80,7 +81,9 @@ export {
   NFT_SIGNED_TAG,
   encodeNftContent,
   encodeNftSigned,
+  isNftDocumentLink,
   nftSignedDigest,
+  parseNftDocument,
   parseNftPayload,
   verifyNftLinkContent,
   verifyNftSignature,
@@ -92,6 +95,7 @@ export type {
   NftMedia,
   NftMediaRef,
   NftMetadata,
+  NftSignatureContext,
   NftSignatureStatus,
   ParsedNft,
 } from './nft-payload';

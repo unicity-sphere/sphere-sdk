@@ -1591,8 +1591,58 @@
     "name": "nft-digest-omits-genesis-recipient",
     "note": "#785: the NftSigned digest binds the genesis recipient. Without it anyone who sees the mint request resubmits it with the same salt naming themselves, and the stolen NFT still verifies valid. The digest is also a cross-SDK byte vector (docs/NFT-METADATA.md).",
     "file": "token-engine/nft-payload.ts",
-    "find": "    recipientPredicateCbor,\n    CborSerializer.encodeByteString(payload),",
-    "replace": "    CborSerializer.encodeByteString(new Uint8Array(0)),\n    CborSerializer.encodeByteString(payload),",
+    "find": "    CborSerializer.encodeByteString(context.recipientPredicate),",
+    "replace": "    CborSerializer.encodeByteString(new Uint8Array(0)),",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-digest-omits-network",
+    "note": "#785 review: the NftSigned digest names the mint's network id α, as the yellowpaper genesis commitment does. The token id already commits to α, so this is the explicit statement rather than a separate replay defence; the preimage is a cross-SDK byte vector (docs/NFT-METADATA.md).",
+    "file": "token-engine/nft-payload.ts",
+    "find": "    CborSerializer.encodeUnsignedInteger(NFT_FORMAT_VERSION),\n    CborSerializer.encodeUnsignedInteger(NetworkId.fromId(context.networkId).id),",
+    "replace": "    CborSerializer.encodeUnsignedInteger(NFT_FORMAT_VERSION),",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-digest-omits-token-type",
+    "note": "#785 review: the NftSigned digest binds the token type. The token id commits to the salt and network only, so without the type a signature made for one mint verifies on the same salt minted under another type.",
+    "file": "token-engine/nft-payload.ts",
+    "find": "    CborSerializer.encodeByteString(context.tokenId),\n    CborSerializer.encodeByteString(context.tokenType),",
+    "replace": "    CborSerializer.encodeByteString(context.tokenId),",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-collection-id-length-rule-dropped",
+    "note": "#785 review: collection_id is 1–64 bytes. Without the bound an empty identifier becomes a second spelling of absent beside null, and identifiers grow without limit; encoder and parser still agree with each other, so only the rule's own cases notice.",
+    "file": "token-engine/nft-payload.ts",
+    "find": "const COLLECTION_ID_PATTERN = /^(?:[0-9a-f]{2}){1,64}$/i;",
+    "replace": "const COLLECTION_ID_PATTERN = /^(?:[0-9a-f]{2})*$/i;",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-document-link-accepted-as-image",
+    "note": "#785 review: a document link (NFT_DOCUMENT_MEDIA_TYPE) is a token's content, never media. Accepted as image or animation_url, a viewer is handed a metadata document where it expects a picture, and a document could reach further documents through its media slots.",
+    "file": "token-engine/nft-payload.ts",
+    "find": "  ensure(!isNftDocumentLink(ref), fieldName(field, 'media_type'), DOCUMENT_AS_MEDIA_RULE);",
+    "replace": "  ensure(true, fieldName(field, 'media_type'), DOCUMENT_AS_MEDIA_RULE);",
+    "tests": [
+      "tests/unit/token-engine/nft-payload.test.ts"
+    ]
+  },
+  {
+    "name": "nft-parse-document-accepts-link",
+    "note": "#785 review: a linked document is exactly one NftMetadata or NftMedia item. Accepting an NftLink lets documents chain, so a wallet's resolution has no end.",
+    "file": "token-engine/nft-payload.ts",
+    "find": "new Map<bigint, BodyDecoder<NftDocument>>([",
+    "replace": "new Map<bigint, BodyDecoder<NftDocument>>([\n  [NFT_LINK_TAG, decodeLink as unknown as BodyDecoder<NftDocument>],",
     "tests": [
       "tests/unit/token-engine/nft-payload.test.ts"
     ]
@@ -1611,8 +1661,8 @@
     "name": "nft-read-verifies-current-owner",
     "note": "#785: readNft verifies against the GENESIS recipient. Keying it on the current owner makes every signed NFT read invalid the moment it is transferred.",
     "file": "token-engine/nft-ops.ts",
-    "find": "() => genesis.recipient.toCBOR()",
-    "replace": "() => token.sdkToken.latestTransaction.recipient.toCBOR()",
+    "find": "      recipientPredicate: genesis.recipient.toCBOR(),",
+    "replace": "      recipientPredicate: token.sdkToken.latestTransaction.recipient.toCBOR(),",
     "tests": [
       "tests/unit/token-engine/SphereTokenEngine.test.ts"
     ]

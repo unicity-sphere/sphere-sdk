@@ -34,6 +34,7 @@ const METADATA_INLINE_IMAGE: NftMetadata = {
     { trait_type: 'Debt', value: -3 },
   ],
   collection: 'Cats',
+  collection_id: 'c0'.repeat(32),
 };
 
 const METADATA_LINK_ANIMATION: NftMetadata = {
@@ -45,6 +46,7 @@ const METADATA_LINK_ANIMATION: NftMetadata = {
   external_url: null,
   attributes: [],
   collection: null,
+  collection_id: null,
 };
 
 type Wire = Record<string, unknown>;
@@ -127,6 +129,8 @@ describe('nftContentToWire / nftContentFromWire', () => {
     ['an attribute with an extra key', () => ({ ...wireMetadata(), attributes: [{ trait_type: 'Level', value: 5, display_type: 'number' }] }), 'content.attributes[0].display_type'],
     ['a numeric external_url', () => ({ ...wireMetadata(), external_url: 1 }), 'content.external_url'],
     ['metadata without collection', () => omit(wireMetadata(), 'collection'), 'content.collection'],
+    ['metadata without collection_id', () => omit(wireMetadata(), 'collection_id'), 'content.collection_id'],
+    ['a numeric collection_id', () => ({ ...wireMetadata(), collection_id: 7 }), 'content.collection_id'],
   ] as [string, () => unknown, string][])('refuses %s, naming %s', (_label, build, field) => {
     expectRefused(build(), field);
   });
@@ -164,6 +168,16 @@ describe('nftContentToWire / nftContentFromWire', () => {
 
     expect(content).toEqual({ kind: 'media', media_type: 'Image/PNG', bytes: new Uint8Array() });
     expect(() => encodeNftContent(content)).toThrow(/^Invalid NFT media_type: /);
+  });
+
+  it('passes collection_id through as given: upper-case hex encodes to the same bytes, odd-length hex is refused by encodeNftContent', () => {
+    const upper = nftContentFromWire({ ...wireMetadata(), collection_id: 'C0'.repeat(32) });
+    const odd = nftContentFromWire({ ...wireMetadata(), collection_id: 'abc' });
+
+    expect(upper).toMatchObject({ collection_id: 'C0'.repeat(32) });
+    expect(encodeNftContent(upper)).toEqual(encodeNftContent(METADATA_INLINE_IMAGE));
+    expect(odd).toMatchObject({ collection_id: 'abc' });
+    expect(() => encodeNftContent(odd)).toThrow(/^Invalid NFT collection_id: /);
   });
 
   it('refuses to relabel an unknown kind or to encode bytes that are not a Uint8Array', () => {

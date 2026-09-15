@@ -16,12 +16,15 @@ import { SphereError } from '../../../core/errors';
 import {
   encodeNftContent,
   encodeNftSigned,
+  isNftDocumentLink,
+  NFT_DOCUMENT_MEDIA_TYPE,
   NFT_FORMAT_VERSION,
   NFT_LINK_TAG,
   NFT_MEDIA_TAG,
   NFT_METADATA_TAG,
   NFT_SIGNED_TAG,
   nftSignedDigest,
+  parseNftDocument,
   parseNftPayload,
   verifyNftLinkContent,
   verifyNftSignature,
@@ -30,6 +33,7 @@ import {
   type NftLink,
   type NftMedia,
   type NftMetadata,
+  type NftSignatureContext,
   type ParsedNft,
 } from '../../../token-engine/nft-payload';
 import {
@@ -39,7 +43,6 @@ import {
   HexConverter,
   SignaturePredicate,
   SigningService,
-  TokenId,
 } from '../../../token-engine/sdk';
 import { SpherePaymentData } from '../../../token-engine/SpherePaymentData';
 import { assertMintableData, classifyValueEnvelope } from '../../../token-engine/value-envelope';
@@ -87,6 +90,8 @@ const tagged = (tag: bigint, fields: readonly Uint8Array[]): Uint8Array => C.enc
 
 const PNG = raw('89504e470d0a1a0a0000000d49484452');
 const LOGO_SHA256 = 'acc52f7f4e3c271cacb6e633ec8c8508ee74e1415384b8bfd889d6cf0251245c';
+// The manifest-hash form of a collection_id.
+const COLLECTION_ID = hex(sha256(utf8('cool-cats/collection.json')));
 
 const media: NftMedia = { kind: 'media', media_type: 'image/png', bytes: PNG };
 const link: NftLink = {
@@ -108,6 +113,7 @@ const metadata: NftMetadata = {
     { trait_type: 'Debt', value: -42 },
   ],
   collection: 'Cool Cats',
+  collection_id: COLLECTION_ID,
 };
 const minimal: NftMetadata = {
   kind: 'metadata',
@@ -118,6 +124,14 @@ const minimal: NftMetadata = {
   external_url: null,
   attributes: [],
   collection: null,
+  collection_id: null,
+};
+/** A link to a hosted metadata document: the encoded `metadata`, pinned by its SHA-256. */
+const documentLink: NftLink = {
+  kind: 'link',
+  media_type: NFT_DOCUMENT_MEDIA_TYPE,
+  uri: 'ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi/1.nft',
+  sha256: hex(sha256(encodeNftContent(metadata))),
 };
 
 const FORMS: readonly [name: string, content: NftContent][] = [
@@ -135,13 +149,21 @@ const RECIPIENT_PUBKEY = raw('0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d9
 const OTHER_PUBKEY = new SigningService(filled(32, 0x22)).publicKey;
 const CREATOR = new SigningService(filled(32, 0x11));
 const TOKEN_ID = raw('000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f');
-const TOKEN_ID_CBOR = TokenId.fromCBOR(bstr(TOKEN_ID)).toCBOR();
+// A testnet2 mint: its trust base's network id, under the testnet2 NFT vessel type.
+const NETWORK_ID = 4;
+const TOKEN_TYPE = raw('971a26eef0e3aeb22bd3e7d44c47ce963400037e8df42b50d4d44e1589f83826');
 const recipientCbor = (pubkey: Uint8Array): Uint8Array =>
   EncodedPredicate.fromPredicate(SignaturePredicate.create(pubkey)).toCBOR();
 const RECIPIENT_CBOR = recipientCbor(RECIPIENT_PUBKEY);
+const CONTEXT: NftSignatureContext = {
+  networkId: NETWORK_ID,
+  recipientPredicate: RECIPIENT_CBOR,
+  tokenId: TOKEN_ID,
+  tokenType: TOKEN_TYPE,
+};
 
 async function signedPayload(payload: Uint8Array, signer = CREATOR): Promise<Uint8Array> {
-  const signature = await signer.sign(await nftSignedDigest(TOKEN_ID_CBOR, RECIPIENT_CBOR, payload));
+  const signature = await signer.sign(await nftSignedDigest(CONTEXT, payload));
   return encodeNftSigned(signer.publicKey, payload, signature.encode());
 }
 
@@ -154,7 +176,7 @@ const LINK_FIELDS: readonly Uint8Array[] = [
   tstr('https://example.com/cat.png'),
   bstr(filled(32, 7)),
 ];
-const METADATA_FIELDS: readonly Uint8Array[] = [uint(1), tstr('Cat'), NULL, NULL, NULL, NULL, C.encodeArray(), NULL];
+const METADATA_FIELDS: readonly Uint8Array[] = [uint(1), tstr('Cat'), NULL, NULL, NULL, NULL, C.encodeArray(), NULL, NULL];
 const MEDIA_ITEM = tagged(NFT_MEDIA_TAG, MEDIA_FIELDS);
 // Structurally complete: a 33-byte creator that is not a curve point is still recognised.
 const SIGNED_FIELDS: readonly Uint8Array[] = [uint(1), bstr(filled(33, 2)), MEDIA_ITEM, bstr(filled(65, 1))];
@@ -179,6 +201,7 @@ const linkWith = (index: number, value: Uint8Array): Uint8Array =>
 const signedWith = (index: number, value: Uint8Array): Uint8Array =>
   tagged(NFT_SIGNED_TAG, withField(SIGNED_FIELDS, index, value));
 const withAttribute = (...items: Uint8Array[]): Uint8Array => metadataWith(6, C.encodeArray(C.encodeArray(...items)));
+const DOCUMENT_LINK_ITEM = linkWith(1, tstr(NFT_DOCUMENT_MEDIA_TYPE));
 
 const VALUE_ENVELOPE = await SpherePaymentData.fromValue({
   assets: [{ coinId: 'aa'.repeat(32), amount: 1000n }],
@@ -214,7 +237,7 @@ describe('NFT payload — round trip', () => {
     expect(hex(encodeNftContent(structuredClone(metadata)))).toBe(hex(encodeNftContent(metadata)));
   });
 
-  it('lays NftMetadata out as tag(39052)[1, name, description, image, animation_url, external_url, attributes, collection]', () => {
+  it('lays NftMetadata out as tag(39052)[1, name, description, image, animation_url, external_url, attributes, collection, collection_id]', () => {
     const expected = tagged(NFT_METADATA_TAG, [
       uint(1),
       tstr('Cool Cat #1'),
@@ -228,6 +251,7 @@ describe('NFT payload — round trip', () => {
         C.encodeArray(tstr('Debt'), nint(-42n)),
       ),
       tstr('Cool Cats'),
+      bstr(raw(COLLECTION_ID)),
     ]);
     expect(hex(encodeNftContent(metadata))).toBe(hex(expected));
   });
@@ -243,12 +267,24 @@ describe('NFT payload — round trip', () => {
         { trait_type: 'Debt', value: -42 },
       ],
     };
-    expect(hex(encodeNftContent(lives))).toBe('d9988c880163436174f6f6f6f68282654c69766573098264446562743829f6');
+    expect(hex(encodeNftContent(lives))).toBe('d9988c890163436174f6f6f6f68282654c69766573098264446562743829f6f6');
   });
 
   it('writes an upper-case link digest as bytes and reads it back in lower case', () => {
     const parsed = parseNftPayload(encodeNftContent({ ...link, sha256: LOGO_SHA256.toUpperCase() }));
     expect(parsed?.content).toEqual(link);
+  });
+
+  it('writes an upper-case collection_id as bytes and reads it back in lower case', () => {
+    const upper = encodeNftContent({ ...metadata, collection_id: COLLECTION_ID.toUpperCase() });
+    expect(hex(upper)).toBe(hex(encodeNftContent(metadata)));
+    expect(parseNftPayload(upper)?.content).toEqual(metadata);
+  });
+
+  it('accepts a collection_id of 1 byte and of 64 bytes', () => {
+    for (const collection_id of ['00', 'ff'.repeat(64)]) {
+      expect(parseNftPayload(encodeNftContent({ ...minimal, collection_id }))?.content).toEqual({ ...minimal, collection_id });
+    }
   });
 
   it('round-trips every integer head width and both safe-integer bounds', () => {
@@ -267,7 +303,7 @@ describe('NFT payload — round trip', () => {
     const entry = C.encodeArray(tstr('t'), uint(1));
     for (const count of [0, 1, 23, 24, 255, 256, 1000]) {
       const expected = tagged(NFT_METADATA_TAG, [
-        uint(1), tstr('Cat'), NULL, NULL, NULL, NULL, C.encodeArray(...new Array<Uint8Array>(count).fill(entry)), NULL,
+        uint(1), tstr('Cat'), NULL, NULL, NULL, NULL, C.encodeArray(...new Array<Uint8Array>(count).fill(entry)), NULL, NULL,
       ]);
       const attributes = Array.from({ length: count }, () => ({ trait_type: 't', value: 1 }));
       expect(hex(encodeNftContent({ ...minimal, attributes }))).toBe(hex(expected));
@@ -288,7 +324,7 @@ describe('NFT payload — round trip', () => {
 
     const bytes = encodeNftContent(content);
 
-    // tag(39052) array(8) 1 "Cat" null null null null = 13 bytes, then the attributes head.
+    // tag(39052) array(9) 1 "Cat" null null null null = 13 bytes, then the attributes head.
     expect(hex(bytes.subarray(13, 13 + head.length / 2))).toBe(head);
     const parsed = parseNftPayload(bytes);
     expect(parsed?.content.kind === 'metadata' && parsed.content.attributes.length).toBe(count);
@@ -360,6 +396,8 @@ describe('NFT payload — not recognised', () => {
     ['NftMetadata as the image', metadataWith(3, METADATA_ITEM)],
     ['NftSigned (over a valid NftMedia) as the image', metadataWith(3, SIGNED_ITEM)],
     ['NftSigned as the animation_url', metadataWith(4, SIGNED_ITEM)],
+    ['a document link as the image', metadataWith(3, DOCUMENT_LINK_ITEM)],
+    ['a document link as the animation_url', metadataWith(4, DOCUMENT_LINK_ITEM)],
     ['an image under an unknown tag', metadataWith(3, tagged(39056n, MEDIA_FIELDS))],
     ['an image that is an NftMedia with empty bytes', metadataWith(3, mediaWith(2, bstr(new Uint8Array(0))))],
     ['an empty external_url', metadataWith(5, tstr(''))],
@@ -382,6 +420,10 @@ describe('NFT payload — not recognised', () => {
     ['the integer value 2^64 − 1', withAttribute(tstr('Lives'), uint(2n ** 64n - 1n))],
     ['an empty collection', metadataWith(7, tstr(''))],
     ['a collection as an integer', metadataWith(7, uint(1))],
+    ['an empty collection_id', metadataWith(8, bstr(new Uint8Array(0)))],
+    ['a collection_id of 65 bytes', metadataWith(8, bstr(filled(65, 1)))],
+    ['a collection_id as hex text', metadataWith(8, tstr('ab'))],
+    ['a collection_id as an integer', metadataWith(8, uint(1))],
   ];
 
   const mediaAndLinkFields: readonly [string, Uint8Array][] = [
@@ -481,33 +523,43 @@ function reencode(parsed: ParsedNft): Uint8Array {
   return parsed.signed === null ? payload : encodeNftSigned(parsed.signed.creator, payload, parsed.signed.signature);
 }
 
+const FUZZ_ITERATIONS = 6000;
+
+/** Every valid encoding the fuzz mutates: each unsigned form, each signed, and the hand-built items. */
+async function fuzzSeeds(): Promise<Uint8Array[]> {
+  const unsigned = FORMS.map(([, content]) => encodeNftContent(content));
+  return [
+    ...unsigned,
+    ...(await Promise.all(unsigned.map((payload) => signedPayload(payload)))),
+    METADATA_ITEM,
+    MEDIA_ITEM,
+    SIGNED_ITEM,
+    tagged(NFT_LINK_TAG, LINK_FIELDS),
+    DOCUMENT_LINK_ITEM,
+  ];
+}
+
+/** In rotation: random bytes, random bytes behind an NFT tag head, and 1–3 mutations of a seed. */
+function fuzzInputs(seeds: readonly Uint8Array[]): Uint8Array[] {
+  const random = prng(0x785);
+  const randomBytes = (): Uint8Array =>
+    Uint8Array.from({ length: Math.floor(random() * 64) }, () => Math.floor(random() * 256));
+  const heads = ['d9988c', 'd9988d', 'd9988e', 'd9988f'].map(raw);
+  return Array.from({ length: FUZZ_ITERATIONS }, (_, i) => {
+    if (i % 5 === 0) return randomBytes();
+    if (i % 5 === 1) return cat(heads[i % heads.length], randomBytes());
+    let input = seeds[Math.floor(random() * seeds.length)];
+    for (let n = 1 + Math.floor(random() * 3); n > 0; n--) input = mutate(random, input);
+    return input;
+  });
+}
+
 describe('NFT payload — parseNftPayload never throws', () => {
   it('survives random bytes and mutations of valid encodings, and re-encodes whatever it recognises byte for byte', async () => {
-    const random = prng(0x785);
-    const randomBytes = (): Uint8Array =>
-      Uint8Array.from({ length: Math.floor(random() * 64) }, () => Math.floor(random() * 256));
-    const unsigned = FORMS.map(([, content]) => encodeNftContent(content));
-    const seeds = [
-      ...unsigned,
-      ...(await Promise.all(unsigned.map((payload) => signedPayload(payload)))),
-      METADATA_ITEM,
-      MEDIA_ITEM,
-      SIGNED_ITEM,
-      tagged(NFT_LINK_TAG, LINK_FIELDS),
-    ];
-    const heads = ['d9988c', 'd9988d', 'd9988e', 'd9988f'].map(raw);
     const failures: string[] = [];
     let recognised = 0;
-    const iterations = 6000;
 
-    for (let i = 0; i < iterations; i++) {
-      let input: Uint8Array;
-      if (i % 5 === 0) input = randomBytes();
-      else if (i % 5 === 1) input = cat(heads[i % heads.length], randomBytes());
-      else {
-        input = seeds[Math.floor(random() * seeds.length)];
-        for (let n = 1 + Math.floor(random() * 3); n > 0; n--) input = mutate(random, input);
-      }
+    for (const input of fuzzInputs(await fuzzSeeds())) {
       try {
         const parsed = parseNftPayload(input);
         if (parsed === null) continue;
@@ -520,7 +572,32 @@ describe('NFT payload — parseNftPayload never throws', () => {
 
     expect(failures).toEqual([]);
     expect(recognised).toBeGreaterThan(0);
-    expect(recognised).toBeLessThan(iterations);
+    expect(recognised).toBeLessThan(FUZZ_ITERATIONS);
+  });
+});
+
+describe('NFT payload — parseNftDocument never throws', () => {
+  it('recognises exactly the unsigned NftMetadata and NftMedia items parseNftPayload recognises, and re-encodes them byte for byte', async () => {
+    const failures: string[] = [];
+    let recognised = 0;
+
+    for (const input of fuzzInputs(await fuzzSeeds())) {
+      try {
+        const document = parseNftDocument(input);
+        const payload = parseNftPayload(input);
+        const isDocument = payload !== null && payload.signed === null && payload.content.kind !== 'link';
+        if ((document !== null) !== isDocument) failures.push(`disagrees with parseNftPayload on ${hex(input)}`);
+        if (document === null) continue;
+        recognised++;
+        if (hex(encodeNftContent(document)) !== hex(input)) failures.push(`recognised but re-encoded differently: ${hex(input)}`);
+      } catch (error) {
+        failures.push(`threw on ${hex(input)}: ${String(error)}`);
+      }
+    }
+
+    expect(failures).toEqual([]);
+    expect(recognised).toBeGreaterThan(0);
+    expect(recognised).toBeLessThan(FUZZ_ITERATIONS);
   });
 });
 
@@ -536,10 +613,19 @@ describe('NFT payload — the encoder refuses what the parser would not recognis
     ['an undefined description (absent is null)', 'description', () => encodeNftContent(bad({ ...minimal, description: undefined }))],
     ['an empty external_url', 'external_url', () => encodeNftContent({ ...minimal, external_url: '' })],
     ['an empty collection', 'collection', () => encodeNftContent({ ...minimal, collection: '' })],
+    ['an empty collection_id', 'collection_id', () => encodeNftContent({ ...minimal, collection_id: '' })],
+    ['an odd-length collection_id', 'collection_id', () => encodeNftContent({ ...minimal, collection_id: 'abc' })],
+    ['a collection_id that is not hex', 'collection_id', () => encodeNftContent({ ...minimal, collection_id: 'zz' })],
+    ['a collection_id with a 0x prefix', 'collection_id', () => encodeNftContent({ ...minimal, collection_id: '0xab' })],
+    ['a collection_id of 65 bytes', 'collection_id', () => encodeNftContent({ ...minimal, collection_id: 'ab'.repeat(65) })],
+    ['an undefined collection_id (absent is null)', 'collection_id', () => encodeNftContent(bad({ ...minimal, collection_id: undefined }))],
+    ['a collection_id given as bytes', 'collection_id', () => encodeNftContent(bad({ ...minimal, collection_id: filled(32, 1) }))],
     ['NftMetadata as the image', 'image', () => encodeNftContent(bad({ ...minimal, image: minimal }))],
     ['an undefined image', 'image', () => encodeNftContent(bad({ ...minimal, image: undefined }))],
     ['an image media_type in upper case', 'image.media_type', () => encodeNftContent({ ...minimal, image: { ...media, media_type: 'image/PNG' } })],
     ['an image with empty bytes', 'image.bytes', () => encodeNftContent({ ...minimal, image: { ...media, bytes: new Uint8Array(0) } })],
+    ['a document link as the image', 'image.media_type', () => encodeNftContent({ ...minimal, image: documentLink })],
+    ['a document link as the animation_url', 'animation_url.media_type', () => encodeNftContent({ ...minimal, animation_url: documentLink })],
     ['an animation_url over http://', 'animation_url.uri', () => encodeNftContent({ ...minimal, animation_url: { ...link, uri: 'http://example.com/a.mp4' } })],
     ['an animation_url with a 63-hex digest', 'animation_url.sha256', () => encodeNftContent({ ...minimal, animation_url: { ...link, sha256: LOGO_SHA256.slice(1) } })],
     ['null attributes', 'attributes', () => encodeNftContent(bad({ ...minimal, attributes: null }))],
@@ -595,36 +681,64 @@ describe('NFT payload — the encoder refuses what the parser would not recognis
 describe('NFT payload — the NftSigned digest (a cross-SDK vector)', () => {
   const payload = encodeNftContent({ kind: 'media', media_type: 'text/plain', bytes: utf8('hello') });
   const PREIMAGE_HEX =
-    '84' +
-    '694e66745369676e6564' +
-    '5820000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f' +
-    'd998788301410158210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798' +
-    '56d9988d83016a746578742f706c61696e4568656c6c6f';
-  const DIGEST_HEX = '0631e26c16a193f12c47ec9998b0f5eb01b3e7a46ee7460c6ba38f67361c3e4f';
+    '87' +
+    '52' + '554e49434954595f4e46545f5349474e4544' +
+    '01' +
+    '04' +
+    '582a' + 'd998788301410158210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798' +
+    '5820' + '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f' +
+    '5820' + '971a26eef0e3aeb22bd3e7d44c47ce963400037e8df42b50d4d44e1589f83826' +
+    '56' + 'd9988d83016a746578742f706c61696e4568656c6c6f';
+  const DIGEST_HEX = 'f9094d15f00e78f1395b59e7b70082a784e9fdd50d8d14d1d637676bd84b7daa';
   const SIGNED_HEX =
     'd9988f8401' +
     '5821034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa' +
     'd9988d83016a746578742f706c61696e4568656c6c6f' +
-    '584100c7a4d708926aae5f87f6b2b7b1ebf85bec6f560902a70a396debffbd868bee50dc85f66dca840592b762c227c92586ec9311ec254f9993c297a8ad8d9aa11b01';
+    '5841b78f79129a64e58e64413fb983d6744c8b2f0eef4af64be219d0872dc2a4347a0df9c5dcdb3e96454a9a98f7b21d47bb37a8639654542d5ca89c3f476bb9295701';
 
   it("encodes the genesis recipient as tag(39032)[engine 1, code h'01', the 33-byte key]", () => {
     expect(hex(RECIPIENT_CBOR)).toBe(hex(C.encodeTag(39032n, C.encodeArray(uint(1), bstr(raw('01')), bstr(RECIPIENT_PUBKEY)))));
   });
 
-  it('hashes CBOR ["NftSigned", bstr(tokenId), recipient predicate, bstr(payload)]', async () => {
-    const preimage = C.encodeArray(tstr('NftSigned'), bstr(TOKEN_ID), RECIPIENT_CBOR, bstr(payload));
+  it("hashes CBOR [h'UNICITY_NFT_SIGNED', 1, α, h(recipient predicate), h(token id), h(token type), h(payload)]", async () => {
+    // Assembled head by head, independently of the SDK array encoder the implementation uses.
+    const preimage = cat(
+      raw('87'),
+      raw('52'), utf8('UNICITY_NFT_SIGNED'),
+      raw('01'),
+      raw('04'),
+      raw('582a'), RECIPIENT_CBOR,
+      raw('5820'), TOKEN_ID,
+      raw('5820'), TOKEN_TYPE,
+      raw('56'), payload,
+    );
     expect(hex(preimage)).toBe(PREIMAGE_HEX);
-    const digest = await nftSignedDigest(TOKEN_ID_CBOR, RECIPIENT_CBOR, payload);
+    const digest = await nftSignedDigest(CONTEXT, payload);
     expect(digest.algorithm).toBe(HashAlgorithm.SHA256);
     expect(hex(digest.data)).toBe(hex(sha256(preimage)));
     expect(hex(digest.data)).toBe(DIGEST_HEX);
+  });
+
+  it('takes the network id as a number or a bigint, to the same digest', async () => {
+    const digest = await nftSignedDigest({ ...CONTEXT, networkId: BigInt(NETWORK_ID) }, payload);
+    expect(hex(digest.data)).toBe(DIGEST_HEX);
+  });
+
+  it.each([0, 1.5, -1, 0x10000])('refuses the network id %s, which no mint records', async (networkId) => {
+    await expect(Promise.resolve().then(() => nftSignedDigest({ ...CONTEXT, networkId }, payload))).rejects.toThrow();
   });
 
   it('verifies the published signed vector as valid', async () => {
     const parsed = parseNftPayload(raw(SIGNED_HEX));
     expect(parsed?.content).toEqual({ kind: 'media', media_type: 'text/plain', bytes: utf8('hello') });
     expect(hex(parsed!.signed!.creator)).toBe(hex(CREATOR.publicKey));
-    await expect(verifyNftSignature(parsed!.signed!, TOKEN_ID_CBOR, RECIPIENT_CBOR)).resolves.toBe('valid');
+    await expect(verifyNftSignature(parsed!.signed!, CONTEXT)).resolves.toBe('valid');
+  });
+
+  it('publishes the RFC 6979 signature, which plain secp256k1 verifies over the digest', async () => {
+    const signature = raw(SIGNED_HEX).subarray(-65);
+    expect(hex((await CREATOR.sign(await nftSignedDigest(CONTEXT, payload))).encode())).toBe(hex(signature));
+    expect(secp256k1.verify(signature.subarray(0, 64), raw(DIGEST_HEX), CREATOR.publicKey, { format: 'compact', prehash: false })).toBe(true);
   });
 });
 
@@ -632,10 +746,9 @@ describe('NFT payload — verifyNftSignature', () => {
   async function signedParts(): Promise<Signed> {
     return parseNftPayload(await signedPayload(encodeNftContent(metadata)))!.signed!;
   }
-  const verify = (signed: Signed, tokenIdCbor = TOKEN_ID_CBOR, recipient = RECIPIENT_CBOR) =>
-    verifyNftSignature(signed, tokenIdCbor, recipient);
+  const verify = (signed: Signed, context: NftSignatureContext = CONTEXT) => verifyNftSignature(signed, context);
 
-  it('is valid for the token id and genesis recipient it was signed over', async () => {
+  it('is valid for the context it was signed over', async () => {
     await expect(verify(await signedParts())).resolves.toBe('valid');
   });
 
@@ -645,12 +758,14 @@ describe('NFT payload — verifyNftSignature', () => {
     await expect(verify({ ...signed, payload })).resolves.toBe('invalid');
   });
 
-  it('is invalid for another token id (a payload copied onto another token)', async () => {
-    await expect(verify(await signedParts(), bstr(filled(32, 9)))).resolves.toBe('invalid');
-  });
-
-  it('is invalid for another genesis recipient (a front-run mint)', async () => {
-    await expect(verify(await signedParts(), TOKEN_ID_CBOR, recipientCbor(OTHER_PUBKEY))).resolves.toBe('invalid');
+  it.each([
+    ['another network id', { networkId: 1 }],
+    ['another genesis recipient (a front-run mint)', { recipientPredicate: recipientCbor(OTHER_PUBKEY) }],
+    ['another token id (a payload copied onto another token)', { tokenId: filled(32, 9) }],
+    ['another token type (the same salt minted under another type)', { tokenType: filled(32, 0x4e) }],
+    ['a token type one byte longer', { tokenType: cat(TOKEN_TYPE, raw('00')) }],
+  ] as [string, Partial<NftSignatureContext>][])('is invalid for %s', async (_name, change) => {
+    await expect(verify(await signedParts(), { ...CONTEXT, ...change })).resolves.toBe('invalid');
   });
 
   it('binds the recovery byte: the same (r, s) under the other recovery id is invalid', async () => {
@@ -664,7 +779,7 @@ describe('NFT payload — verifyNftSignature', () => {
     const r = signed.signature.subarray(0, 32);
     const s = BigInt(`0x${hex(signed.signature.subarray(32, 64))}`);
     const highS = raw((SECP256K1_N - s).toString(16).padStart(64, '0'));
-    const digest = await nftSignedDigest(TOKEN_ID_CBOR, RECIPIENT_CBOR, signed.payload);
+    const digest = await nftSignedDigest(CONTEXT, signed.payload);
     expect(secp256k1.verify(cat(r, highS), digest.data, signed.creator, { format: 'compact', prehash: false, lowS: false })).toBe(true);
     const twin = cat(r, highS, new Uint8Array([signed.signature[64] ^ 1]));
     await expect(verify({ ...signed, signature: twin })).resolves.toBe('invalid');
@@ -692,8 +807,9 @@ describe('NFT payload — verifyNftSignature', () => {
 
   it('never throws, even on inputs the parser never produces', async () => {
     const signed = await signedParts();
-    await expect(verifyNftSignature(bad({ creator: {}, payload: null, signature: 'x' }), TOKEN_ID_CBOR, RECIPIENT_CBOR)).resolves.toBe('invalid');
-    await expect(verifyNftSignature(signed, bad(undefined), bad(undefined))).resolves.toBe('invalid');
+    await expect(verifyNftSignature(bad({ creator: {}, payload: null, signature: 'x' }), CONTEXT)).resolves.toBe('invalid');
+    await expect(verifyNftSignature(signed, bad(undefined))).resolves.toBe('invalid');
+    await expect(verify(signed, { ...CONTEXT, networkId: 1.5 })).resolves.toBe('invalid');
   });
 });
 
@@ -714,5 +830,68 @@ describe('NFT payload — verifyNftLinkContent', () => {
 
   it('compares the digest case-insensitively', () => {
     expect(verifyNftLinkContent({ ...pinned, sha256: pinned.sha256.toUpperCase() }, PNG)).toBe(true);
+  });
+});
+
+describe('NFT payload — document links', () => {
+  it('reserves application/vnd.unicity.nft+cbor as the document media type', () => {
+    expect(NFT_DOCUMENT_MEDIA_TYPE).toBe('application/vnd.unicity.nft+cbor');
+  });
+
+  it("recognises a document link where a token's content is expected: the top level, and inside NftSigned", async () => {
+    expect(parseNftPayload(encodeNftContent(documentLink))).toEqual({ content: documentLink, signed: null });
+    const signed = parseNftPayload(await signedPayload(encodeNftContent(documentLink)));
+    expect(signed?.content).toEqual(documentLink);
+    await expect(verifyNftSignature(signed!.signed!, CONTEXT)).resolves.toBe('valid');
+  });
+
+  it('isNftDocumentLink is true only for an NftLink with the document media type', () => {
+    expect(isNftDocumentLink(documentLink)).toBe(true);
+    expect(isNftDocumentLink(link)).toBe(false);
+    expect(isNftDocumentLink({ kind: 'media', media_type: NFT_DOCUMENT_MEDIA_TYPE, bytes: encodeNftContent(metadata) })).toBe(false);
+    expect(isNftDocumentLink(metadata)).toBe(false);
+  });
+
+  it('resolves: the fetched bytes pass verifyNftLinkContent, then parse back as the document', () => {
+    const fetched = encodeNftContent(metadata);
+    expect(verifyNftLinkContent(documentLink, fetched)).toBe(true);
+    expect(parseNftDocument(fetched)).toEqual(metadata);
+  });
+
+  it('a signature over a document link covers the document: the link to another document does not verify', async () => {
+    const signed = parseNftPayload(await signedPayload(encodeNftContent(documentLink)))!.signed!;
+    const otherDocument: NftLink = { ...documentLink, sha256: hex(sha256(encodeNftContent(minimal))) };
+    await expect(verifyNftSignature({ ...signed, payload: encodeNftContent(otherDocument) }, CONTEXT)).resolves.toBe('invalid');
+  });
+});
+
+describe('NFT payload — parseNftDocument', () => {
+  it.each([
+    ['NftMetadata', metadata],
+    ['NftMetadata with every optional field null', minimal],
+    ['NftMedia', media],
+  ] as [string, NftContent][])('parses back %s', (_name, document) => {
+    expect(parseNftDocument(encodeNftContent(document))).toEqual(document);
+  });
+
+  it.each([
+    ['an NftLink', () => encodeNftContent(link)],
+    ['a document link (links do not chain)', () => encodeNftContent(documentLink)],
+    ['NftSigned over NftMetadata', () => signedPayload(encodeNftContent(metadata))],
+    ['NftMetadata followed by a trailing byte', () => cat(encodeNftContent(metadata), NULL)],
+    ['NftMetadata truncated by one byte', () => encodeNftContent(metadata).slice(0, -1)],
+    ['NftMetadata whose image is a document link', () => metadataWith(3, DOCUMENT_LINK_ITEM)],
+    ['NftMedia at version 2', () => mediaWith(0, uint(2))],
+    ['an empty file', () => new Uint8Array(0)],
+    ['raw JPEG bytes', () => raw('ffd8ffe000104a46494600010100000100010000')],
+    ['a 39050 value envelope', () => VALUE_ENVELOPE],
+    ['JSON metadata', () => utf8('{"name":"Cool Cat #1"}')],
+  ] as [string, () => Uint8Array | Promise<Uint8Array>][])('does not parse %s', async (_name, build) => {
+    expect(parseNftDocument(await build())).toBeNull();
+  });
+
+  it('never throws on input that is not bytes', () => {
+    expect(parseNftDocument(bad(null))).toBeNull();
+    expect(parseNftDocument(bad('d9988d'))).toBeNull();
   });
 });

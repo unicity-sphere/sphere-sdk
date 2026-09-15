@@ -51,6 +51,7 @@ const METADATA: NftMetadata = {
     { trait_type: 'lives', value: 9 },
   ],
   collection: 'Kitties',
+  collection_id: '5eed'.repeat(16),
 };
 
 /** The harness engine, able to sign as the wallet's own chain key. */

@@ -657,6 +657,7 @@ const params: MintNftIntentParams = {
     external_url: null,
     attributes: [{ trait_type: 'Eyes', value: 'green' }],
     collection: 'Cats',
+    collection_id: null,
   }),
   sign: true, // the default: NftSigned, with the wallet's chain key as creator
 };
@@ -671,15 +672,16 @@ unchanged. `nftContentToWire` builds it.
 
 | `kind` | Fields besides `kind` — all required |
 |--------|--------------------------------------|
-| `metadata` | `name`, `description`, `image`, `animation_url`, `external_url`, `attributes`, `collection`. An absent optional field is `null`, never omitted. `image` and `animation_url` each hold a `media`, a `link` or `null`; `attributes` is `[{ trait_type, value }]`, `[]` when there are none. |
+| `metadata` | `name`, `description`, `image`, `animation_url`, `external_url`, `attributes`, `collection`, `collection_id`. An absent optional field is `null`, never omitted. `image` and `animation_url` each hold a `media`, a `link` or `null`; `attributes` is `[{ trait_type, value }]`, `[]` when there are none; `collection_id` is a hex string, passed through unchanged. |
 | `media` | `media_type`, `bytes` (base64) |
 | `link` | `media_type`, `uri`, `sha256` (64 hex) |
 
 **Wallet side.** `nftContentFromWire(params.content)` checks the shape — exactly these fields with
 these JSON types, no nested `metadata`, canonical base64 — and throws a `VALIDATION_ERROR` whose
 message names the offending field (`Invalid NFT content.image.bytes: …`). It does not judge field
-values: non-empty text, media-type grammar, URI schemes and the size cap stay in
-`payments.mintNft`, whose refusal the wallet returns as the intent error.
+values: non-empty text, media-type grammar, URI schemes, the `collection_id` hex rule, a document
+link in a media slot and the size cap stay in `payments.mintNft`, whose refusal the wallet returns
+as the intent error.
 
 **Result.** `{ tokenId }` — 64 lowercase hex.
 

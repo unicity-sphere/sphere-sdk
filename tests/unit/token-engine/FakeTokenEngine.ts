@@ -69,6 +69,8 @@ interface FakeState {
   readonly transferMemo: Uint8Array | null;
   /** The first owner — the genesis recipient an NftSigned digest binds; transfers carry it unchanged. */
   readonly genesisOwner: Uint8Array;
+  /** The genesis token type, which an NftSigned digest binds; a mint that names none gets one derived from the id. */
+  readonly tokenType: Uint8Array;
 }
 
 export interface FakeEngineConfig {
@@ -146,10 +148,13 @@ export class FakeTokenEngine implements ITokenEngine {
   public async readNft(token: SphereToken): Promise<NftReading | null> {
     try {
       const state = decodeFakeState(token.blob.token);
-      // TokenId.toCBOR() is the bare id byte string; the recipient is built as the real mint builds it.
-      return await readNftData(state.genesisData, CborSerializer.encodeByteString(state.tokenId), () =>
-        nftRecipientCbor(state.genesisOwner),
-      );
+      // The network buildNftMint plans on; the recipient is built as the real mint builds it.
+      return await readNftData(state.genesisData, () => ({
+        networkId: networkIdOf(this.network).id,
+        recipientPredicate: nftRecipientCbor(state.genesisOwner),
+        tokenId: state.tokenId,
+        tokenType: state.tokenType,
+      }));
     } catch {
       return null;
     }
@@ -157,13 +162,15 @@ export class FakeTokenEngine implements ITokenEngine {
 
   public async mint(params: MintParams, _options?: EngineOpOptions): Promise<SphereToken> {
     const genesisData = params.value ? await SpherePaymentData.fromValue(params.value).encode() : null;
+    const tokenId = this.nextId();
     return this.makeToken({
-      tokenId: this.nextId(),
+      tokenId,
       stateId: this.nextId(),
       owner: params.recipientPubkey,
       genesisData,
       transferMemo: null,
       genesisOwner: params.recipientPubkey,
+      tokenType: derivedTokenType(tokenId),
     });
   }
 
@@ -180,6 +187,7 @@ export class FakeTokenEngine implements ITokenEngine {
       genesisData: params.data,
       transferMemo: null,
       genesisOwner: params.recipientPubkey,
+      tokenType: params.tokenType ?? derivedTokenType(tokenId),
     });
   }
 
@@ -199,6 +207,7 @@ export class FakeTokenEngine implements ITokenEngine {
       genesisData: source.genesisData,
       transferMemo: params.data ?? null,
       genesisOwner: source.genesisOwner,
+      tokenType: source.tokenType,
     });
   }
 
@@ -212,14 +221,16 @@ export class FakeTokenEngine implements ITokenEngine {
         { assets: [{ coinId: o.coinId, amount: o.amount }] },
         o.data ?? null,
       ).encode();
+      const tokenId = this.nextId();
       outputs.push(
         await this.makeToken({
-          tokenId: this.nextId(),
+          tokenId,
           stateId: this.nextId(),
           owner: o.recipientPubkey,
           genesisData,
           transferMemo: null,
           genesisOwner: o.recipientPubkey,
+          tokenType: derivedTokenType(tokenId),
         }),
       );
     }
@@ -363,7 +374,7 @@ export function readFakeTokenKeys(tokenBytes: Uint8Array): { tokenId: string; ow
   return { tokenId: HexConverter.encode(state.tokenId), owner: HexConverter.encode(state.owner) };
 }
 
-// fake-token state: CBOR array[ tokenId, stateId, owner, genesisData?, transferMemo?, genesisOwner ]
+// fake-token state: CBOR array[ tokenId, stateId, owner, genesisData?, transferMemo?, genesisOwner, tokenType ]
 function encodeFakeState(state: FakeState): Uint8Array {
   return CborSerializer.encodeArray(
     CborSerializer.encodeByteString(state.tokenId),
@@ -372,11 +383,12 @@ function encodeFakeState(state: FakeState): Uint8Array {
     CborSerializer.encodeNullable(state.genesisData, CborSerializer.encodeByteString),
     CborSerializer.encodeNullable(state.transferMemo, CborSerializer.encodeByteString),
     CborSerializer.encodeByteString(state.genesisOwner),
+    CborSerializer.encodeByteString(state.tokenType),
   );
 }
 
 function decodeFakeState(bytes: Uint8Array): FakeState {
-  const [tokenIdB, stateIdB, ownerB, genesisB, memoB, genesisOwnerB] = CborDeserializer.decodeArray(bytes, 6);
+  const [tokenIdB, stateIdB, ownerB, genesisB, memoB, genesisOwnerB, tokenTypeB] = CborDeserializer.decodeArray(bytes, 7);
   return {
     tokenId: CborDeserializer.decodeByteString(tokenIdB),
     stateId: CborDeserializer.decodeByteString(stateIdB),
@@ -384,6 +396,7 @@ function decodeFakeState(bytes: Uint8Array): FakeState {
     genesisData: CborDeserializer.decodeNullable(genesisB, CborDeserializer.decodeByteString),
     transferMemo: CborDeserializer.decodeNullable(memoB, CborDeserializer.decodeByteString),
     genesisOwner: CborDeserializer.decodeByteString(genesisOwnerB),
+    tokenType: CborDeserializer.decodeByteString(tokenTypeB),
   };
 }
 
@@ -396,12 +409,13 @@ function classify(state: FakeState): ClassifiedValue {
   return classifyValueEnvelope(state.genesisData);
 }
 
-/**
- * The fake carries no type field, so derive a STABLE one per token id — enough for
- * a consumer to key a class on, without a fake-blob format change.
- */
 function fakeTokenType(state: FakeState): string {
-  return HexConverter.encode(state.tokenId.slice(0, 8));
+  return HexConverter.encode(state.tokenType);
+}
+
+/** The type of a fake mint that names none: STABLE per token id, enough for a consumer to key a class on. */
+function derivedTokenType(tokenId: Uint8Array): Uint8Array {
+  return tokenId.slice(0, 8);
 }
 
 /** Map the fake's numeric network to the SDK NetworkId instance (for TokenId.fromSalt). */

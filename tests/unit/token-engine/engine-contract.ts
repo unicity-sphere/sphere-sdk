@@ -160,7 +160,7 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
       expect(e.readMemo(outputs[1])).toBeNull();
     });
 
-    // ── NFT metadata (#785): a signature binds the token id and the GENESIS recipient ──
+    // ── NFT metadata (#785): a signature binds the network, GENESIS recipient, token id and token type ──
     const toHex = (bytes: Uint8Array): string => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
     const NFT_TYPE = new Uint8Array(32).fill(0x4e);
     const NFT: NftMetadata = {
@@ -172,6 +172,7 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
       external_url: null,
       attributes: [{ trait_type: 'Lives', value: 9 }],
       collection: 'Contract Cats',
+      collection_id: toHex(NFT_TYPE),
     };
     const planNft = (e: ITokenEngine, sign = true) =>
       e.buildNftMint({ recipientPubkey: e.getIdentity().chainPubkey, content: NFT, sign, tokenType: NFT_TYPE });
@@ -219,6 +220,19 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
       const plan = await planNft(e);
       const t = await mintPlan(e, plan, e.getIdentity().chainPubkey, new Uint8Array(32).fill(0x5a));
       expect(e.tokenId(t)).not.toBe(plan.tokenId);
+      expect(await e.readNft(t)).toEqual(signedBy(e, 'invalid'));
+    });
+
+    it('a signed payload minted under another token type reads invalid, though the salt gives the same token id', async () => {
+      const e = makeEngine();
+      const plan = await planNft(e);
+      const t = await e.mintDataToken({
+        recipientPubkey: e.getIdentity().chainPubkey,
+        data: plan.data,
+        tokenType: new Uint8Array(32).fill(0x4f),
+        salt: plan.salt,
+      });
+      expect(e.tokenId(t)).toBe(plan.tokenId);
       expect(await e.readNft(t)).toEqual(signedBy(e, 'invalid'));
     });
 

@@ -206,14 +206,18 @@ export type {
   NftMedia,
   NftMediaRef,
   NftMetadata,
+  NftSignatureContext,
   NftSignatureStatus,
 } from './token-engine/nft-payload';
 export {
+  NFT_DOCUMENT_MEDIA_TYPE,
   NFT_LINK_TAG,
   NFT_MEDIA_TAG,
   NFT_METADATA_TAG,
   NFT_SIGNED_TAG,
   encodeNftContent,
+  isNftDocumentLink,
+  parseNftDocument,
   parseNftPayload,
   verifyNftLinkContent,
 } from './token-engine/nft-payload';

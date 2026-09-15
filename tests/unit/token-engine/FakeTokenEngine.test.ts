@@ -78,7 +78,7 @@ describe('FakeTokenEngine specifics', () => {
 
 
 describe('decodeFakeTokenAssets — the fake must not soften the classifier (#778)', () => {
-  /** The fake blob shape `decodeFakeState` reads: [tokenId, stateId, owner, genesis, memo, genesisOwner]. */
+  /** The fake blob shape `decodeFakeState` reads: [tokenId, stateId, owner, genesis, memo, genesisOwner, tokenType]. */
   const fakeState = (genesis: Uint8Array): Uint8Array =>
     CborSerializer.encodeArray(
       CborSerializer.encodeByteString(new Uint8Array(32).fill(1)),
@@ -87,6 +87,7 @@ describe('decodeFakeTokenAssets — the fake must not soften the classifier (#77
       CborSerializer.encodeByteString(genesis),
       CborSerializer.encodeNull(),
       CborSerializer.encodeByteString(new Uint8Array(33).fill(2)),
+      CborSerializer.encodeByteString(new Uint8Array(8).fill(1)),
     );
 
   it('PROPAGATES a corrupt-envelope throw instead of indexing it as coinless', async () => {

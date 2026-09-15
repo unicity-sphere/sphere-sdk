@@ -16,6 +16,7 @@ import {
   HashAlgorithm,
   HexConverter,
   MajorType,
+  NetworkId,
   Signature,
   SigningService,
 } from './sdk';
@@ -25,6 +26,8 @@ export const NFT_MEDIA_TAG = 39053n;
 export const NFT_LINK_TAG = 39054n;
 export const NFT_SIGNED_TAG = 39055n;
 export const NFT_FORMAT_VERSION = 1n;
+/** The media type of an NftLink that points at a metadata document instead of a media file. */
+export const NFT_DOCUMENT_MEDIA_TYPE = 'application/vnd.unicity.nft+cbor';
 
 /** An inline file. */
 export interface NftMedia {
@@ -59,10 +62,13 @@ export interface NftMetadata {
   readonly external_url: string | null;
   readonly attributes: readonly NftAttribute[];
   readonly collection: string | null;
+  /** The collection the item claims: 1–64 bytes as even-length hex (decoded lowercase). Never verified here. */
+  readonly collection_id: string | null;
 }
 
 export type NftContent = NftMetadata | NftMedia | NftLink;
 export type NftSignatureStatus = 'unsigned' | 'valid' | 'invalid';
+type NftDocument = NftMetadata | NftMedia;
 
 export interface ParsedNft {
   readonly content: NftContent;
@@ -74,7 +80,18 @@ export interface ParsedNft {
   } | null;
 }
 
-const METADATA_ARITY = 8;
+/** What an NftSigned signature binds besides its payload, exactly as the token's mint records it. */
+export interface NftSignatureContext {
+  /** The network identifier α (`NetworkId.id`). */
+  readonly networkId: number | bigint;
+  /** The genesis recipient predicate, as `EncodedPredicate.toCBOR()` bytes. */
+  readonly recipientPredicate: Uint8Array;
+  /** The 32 raw token id bytes. */
+  readonly tokenId: Uint8Array;
+  readonly tokenType: Uint8Array;
+}
+
+const METADATA_ARITY = 9;
 const MEDIA_ARITY = 3;
 const LINK_ARITY = 4;
 const SIGNED_ARITY = 4;
@@ -82,13 +99,16 @@ const CREATOR_BYTES = 33;
 const SIGNATURE_BYTES = 65;
 const MAX_URI_LENGTH = 2048;
 const LINK_SCHEMES = ['https://', 'ipfs://', 'ar://'];
-const SIGNED_DOMAIN = 'NftSigned';
+const SIGNED_DOMAIN = new TextEncoder().encode('UNICITY_NFT_SIGNED');
 const MEDIA_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
 const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/i;
+const COLLECTION_ID_PATTERN = /^(?:[0-9a-f]{2}){1,64}$/i;
 const LONE_SURROGATE = /\p{Cs}/u;
 const CBOR_MAJOR_TYPE_MASK = 0b1110_0000;
 const ATTRIBUTE_VALUE_RULE =
   'must be non-empty text or an integer within ±(2^53 − 1) — write decimals and larger numbers as text';
+const COLLECTION_ID_RULE = 'must be null or 1–64 bytes as even-length hex (2–128 characters)';
+const DOCUMENT_AS_MEDIA_RULE = `must not be ${NFT_DOCUMENT_MEDIA_TYPE}: a document link is a token's content, never media`;
 // The SDK's text decoder substitutes U+FFFD, which would recognise invalid UTF-8;
 // ignoreBOM keeps a leading U+FEFF so a decoded string re-encodes byte-identically.
 const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
@@ -113,6 +133,8 @@ const isBytes = (value: unknown, length?: number): value is Uint8Array =>
   value instanceof Uint8Array && (length === undefined ? value.length > 0 : value.length === length);
 
 const isMediaType = (value: unknown): boolean => typeof value === 'string' && MEDIA_TYPE_PATTERN.test(value);
+
+const isCollectionId = (value: unknown): boolean => typeof value === 'string' && COLLECTION_ID_PATTERN.test(value);
 
 const isAttributeValue = (value: unknown): boolean =>
   typeof value === 'number' ? Number.isSafeInteger(value) : isText(value);
@@ -165,8 +187,9 @@ function checkLink(prefix: string, link: NftLink): void {
 function checkMediaRef(field: string, ref: NftMediaRef | null): void {
   if (ref === null) return;
   if (ref?.kind === 'media') return checkMedia(field, ref);
-  if (ref?.kind === 'link') return checkLink(field, ref);
-  throw refuse(field, 'must be an NftMedia, an NftLink or null');
+  if (ref?.kind !== 'link') throw refuse(field, 'must be an NftMedia, an NftLink or null');
+  checkLink(field, ref);
+  ensure(!isNftDocumentLink(ref), fieldName(field, 'media_type'), DOCUMENT_AS_MEDIA_RULE);
 }
 
 function checkAttributes(attributes: readonly NftAttribute[]): void {
@@ -186,6 +209,7 @@ function checkMetadata(metadata: NftMetadata): void {
   checkOptionalText('external_url', metadata.external_url);
   checkAttributes(metadata.attributes);
   checkOptionalText('collection', metadata.collection);
+  ensure(metadata.collection_id === null || isCollectionId(metadata.collection_id), 'collection_id', COLLECTION_ID_RULE);
 }
 
 function checkContent(content: NftContent): void {
@@ -263,6 +287,9 @@ function arrayCbor(items: readonly Uint8Array[]): Uint8Array {
   return out;
 }
 
+const optionalHexBytes = (value: string | null): Uint8Array =>
+  CborSerializer.encodeNullable(value, (hex) => CborSerializer.encodeByteString(HexConverter.decode(hex.toLowerCase())));
+
 function metadataCbor(metadata: NftMetadata): Uint8Array {
   return versioned(
     NFT_METADATA_TAG,
@@ -273,6 +300,7 @@ function metadataCbor(metadata: NftMetadata): Uint8Array {
     optionalText(metadata.external_url),
     arrayCbor(metadata.attributes.map(attributeCbor)),
     optionalText(metadata.collection),
+    optionalHexBytes(metadata.collection_id),
   );
 }
 
@@ -347,13 +375,15 @@ function decodeMedia(body: Uint8Array): NftMedia {
   return { kind: 'media', media_type: decodeText(mediaType), bytes: CborDeserializer.decodeByteString(bytes) };
 }
 
+const decodeHex = (item: Uint8Array): string => HexConverter.encode(CborDeserializer.decodeByteString(item));
+
 function decodeLink(body: Uint8Array): NftLink {
   const [, mediaType, uri, digest] = versionedFields(body, LINK_ARITY);
   return {
     kind: 'link',
     media_type: decodeText(mediaType),
     uri: decodeText(uri),
-    sha256: HexConverter.encode(CborDeserializer.decodeByteString(digest)),
+    sha256: decodeHex(digest),
   };
 }
 
@@ -368,11 +398,13 @@ function decodeMetadata(body: Uint8Array): NftMetadata {
     external_url: decodeOptionalText(fields[5]),
     attributes: decodeAttributes(fields[6]),
     collection: decodeOptionalText(fields[7]),
+    collection_id: CborDeserializer.decodeNullable(fields[8], decodeHex),
   };
 }
 
-// The nesting rules: a media slot holds NftMedia or NftLink; NftSigned wraps any
-// unsigned item and itself appears only at the top level.
+// The nesting rules: a media slot holds NftMedia or NftLink (never a document link,
+// which checkMediaRef refuses); NftSigned wraps any unsigned item and itself appears
+// only at the top level; a linked document is NftMetadata or NftMedia.
 const MEDIA_REF_DECODERS: ReadonlyMap<bigint, BodyDecoder<NftMediaRef>> = new Map<bigint, BodyDecoder<NftMediaRef>>([
   [NFT_MEDIA_TAG, decodeMedia],
   [NFT_LINK_TAG, decodeLink],
@@ -381,6 +413,10 @@ const UNSIGNED_DECODERS: ReadonlyMap<bigint, BodyDecoder<NftContent>> = new Map<
   [NFT_METADATA_TAG, decodeMetadata],
   [NFT_MEDIA_TAG, decodeMedia],
   [NFT_LINK_TAG, decodeLink],
+]);
+const DOCUMENT_DECODERS: ReadonlyMap<bigint, BodyDecoder<NftDocument>> = new Map<bigint, BodyDecoder<NftDocument>>([
+  [NFT_METADATA_TAG, decodeMetadata],
+  [NFT_MEDIA_TAG, decodeMedia],
 ]);
 
 function decodeBody<T>(decoders: ReadonlyMap<bigint, BodyDecoder<T>>, field: string, tag: bigint, body: Uint8Array): T {
@@ -424,18 +460,39 @@ export function parseNftPayload(data: Uint8Array | null): ParsedNft | null {
   }
 }
 
+/**
+ * Parse the file a document link points at: exactly one NftMetadata or NftMedia item.
+ * NEVER throws; null = not a document. Check the bytes with verifyNftLinkContent first.
+ */
+export function parseNftDocument(bytes: Uint8Array): NftMetadata | NftMedia | null {
+  try {
+    const document = decodeItem(DOCUMENT_DECODERS, 'document', bytes);
+    checkContent(document);
+    return document;
+  } catch {
+    return null;
+  }
+}
+
+/** Is this an NftLink to a metadata document ({@link NFT_DOCUMENT_MEDIA_TYPE}), resolved with parseNftDocument? */
+export function isNftDocumentLink(content: NftContent): boolean {
+  return content?.kind === 'link' && content.media_type === NFT_DOCUMENT_MEDIA_TYPE;
+}
+
 // ── signature ───────────────────────────────────────────────────────────────
 
-/** SHA-256 of CBOR `["NftSigned", tokenId, genesis recipient predicate, bstr(payload)]`. */
-export function nftSignedDigest(
-  tokenIdCbor: Uint8Array,
-  recipientPredicateCbor: Uint8Array,
-  payload: Uint8Array,
-): Promise<DataHash> {
+/**
+ * SHA-256 of CBOR `[h'UNICITY_NFT_SIGNED', 1, α, h(recipient predicate), h(token id), h(token type), h(payload)]`:
+ * every term a byte string except the version and α, as in the yellowpaper genesis commitment.
+ */
+export function nftSignedDigest(context: NftSignatureContext, payload: Uint8Array): Promise<DataHash> {
   const preimage = CborSerializer.encodeArray(
-    CborSerializer.encodeTextString(SIGNED_DOMAIN),
-    tokenIdCbor,
-    recipientPredicateCbor,
+    CborSerializer.encodeByteString(SIGNED_DOMAIN),
+    CborSerializer.encodeUnsignedInteger(NFT_FORMAT_VERSION),
+    CborSerializer.encodeUnsignedInteger(NetworkId.fromId(context.networkId).id),
+    CborSerializer.encodeByteString(context.recipientPredicate),
+    CborSerializer.encodeByteString(context.tokenId),
+    CborSerializer.encodeByteString(context.tokenType),
     CborSerializer.encodeByteString(payload),
   );
   return new DataHasher(HashAlgorithm.SHA256).update(preimage).digest();
@@ -444,13 +501,12 @@ export function nftSignedDigest(
 /** Recovering verification: binds the recovery byte and refuses high-s. Never throws. */
 export async function verifyNftSignature(
   signed: NonNullable<ParsedNft['signed']>,
-  tokenIdCbor: Uint8Array,
-  recipientPredicateCbor: Uint8Array,
+  context: NftSignatureContext,
 ): Promise<Exclude<NftSignatureStatus, 'unsigned'>> {
   try {
     if (!SigningService.isPublicKeyValid(signed.creator)) return 'invalid';
     const signature = Signature.decode(signed.signature);
-    const digest = await nftSignedDigest(tokenIdCbor, recipientPredicateCbor, signed.payload);
+    const digest = await nftSignedDigest(context, signed.payload);
     return (await SigningService.verifyWithPublicKey(digest, signature, signed.creator)) ? 'valid' : 'invalid';
   } catch {
     return 'invalid';

@@ -320,6 +320,7 @@ describe('Sphere Connect Integration', () => {
           external_url: null,
           attributes: [{ trait_type: 'Eyes', value: 'green' }],
           collection: null,
+          collection_id: null,
         }),
         sign: true,
       };

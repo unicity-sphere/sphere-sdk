@@ -30,6 +30,8 @@ export interface WireNftMetadata {
   readonly external_url: string | null;
   readonly attributes: readonly NftAttribute[];
   readonly collection: string | null;
+  /** Hex, passed through unchanged; `encodeNftContent` judges its value. */
+  readonly collection_id: string | null;
 }
 
 export type WireNftContent = WireNftMetadata | WireNftMedia | NftLink;
@@ -49,7 +51,7 @@ export interface MintNftIntentResult {
 type WireRecord = Record<string, unknown>;
 
 const METADATA_FIELDS: readonly string[] = [
-  'kind', 'name', 'description', 'image', 'animation_url', 'external_url', 'attributes', 'collection',
+  'kind', 'name', 'description', 'image', 'animation_url', 'external_url', 'attributes', 'collection', 'collection_id',
 ];
 const MEDIA_FIELDS: readonly string[] = ['kind', 'media_type', 'bytes'];
 const LINK_FIELDS: readonly string[] = ['kind', 'media_type', 'uri', 'sha256'];
@@ -89,6 +91,7 @@ function metadataToWire(metadata: NftMetadata): WireNftMetadata {
     external_url: metadata.external_url,
     attributes: metadata.attributes.map(({ trait_type, value }) => ({ trait_type, value })),
     collection: metadata.collection,
+    collection_id: metadata.collection_id,
   };
 }
 
@@ -186,6 +189,7 @@ function metadataFromWire(record: WireRecord): NftMetadata {
     external_url: optionalStringAt(record, 'content', 'external_url'),
     attributes: attributesFromWire(record.attributes, 'content.attributes'),
     collection: optionalStringAt(record, 'content', 'collection'),
+    collection_id: optionalStringAt(record, 'content', 'collection_id'),
   };
 }
 

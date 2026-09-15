@@ -803,6 +803,14 @@ authoritative for build success.
   vessel), signed by default; `payments.nft(tokenId)` / `nfts(tokenIds)` read
   `NftView { tokenId, content, creator, signature }` behind a per-facade 256-entry LRU.
   `creator` is the key the payload CLAIMS: attribute a token to it only when `signature` is `valid`.
+- A `valid` signature is **attribution, not authorization**: which key signed this item for this
+  token — never that the signer is recognised or that a collection authorized the issue (that is the
+  mint reason, under the type's issuance policy). `NftMetadata.collection_id` (1–64 bytes, hex in the
+  API) is likewise a CLAIM: never present it as verified membership. The format defines no supply cap.
+- An `NftLink` whose media type is `NFT_DOCUMENT_MEDIA_TYPE` (`application/vnd.unicity.nft+cbor`) is
+  a **document link**: allowed only as a token's content (top level or `NftSigned.payload`), refused
+  as `image`/`animation_url`. The linked file is exactly one `NftMetadata`/`NftMedia` item — resolve
+  with `verifyNftLinkContent`, then `parseNftDocument` (never throws).
 - `mintNft` refuses a genesis payload over `NFT_MAX_PAYLOAD_BYTES` (1 MiB) BEFORE the journal.
   wallet-api's `MAX_BLOB_BYTES` refusal lands only at upload, after certification, so a larger
   payload would leave a certified token that no replay can ever store.
@@ -810,17 +818,20 @@ authoritative for build success.
   `null` for anything unrecognised, and nothing on the receive or mirror path calls them. Keep it
   that way — a throw where a token can be refused LOSES a token wallet-api accepted, the same reason
   the classifier's throw set is bounded above.
-- An `NftSigned` digest binds the token id and the **GENESIS recipient**, never the current owner:
-  a `valid` NFT stays valid across transfers, while a payload copied onto another token, or a mint
-  front-run to another first owner, reads `invalid`. Verification recovers the key, so the recovery
-  byte is bound and high-s is refused. The digest is a cross-SDK byte vector — hash the payload
-  bytes as received, never a re-encoding.
+- An `NftSigned` digest is `SHA-256(CBOR[h'UNICITY_NFT_SIGNED', 1, α, h(recipient predicate),
+  h(token id), h(token type), h(payload)])`, the yellowpaper genesis-commitment layout. The recipient
+  is the **GENESIS** one, never the current owner: a `valid` NFT stays valid across transfers, while
+  a payload copied onto another token, minted under another token type, or front-run to another
+  first owner reads `invalid`. Verification recovers the key, so the recovery byte is bound and
+  high-s is refused. The digest is a cross-SDK byte vector — hash the payload bytes as received,
+  never a re-encoding.
 - The NFT mint has its **own journal** (`STORE_KEYS.nftMintJournal`), never the coin one: an older
   client would retry an entry with no `coinId`/`amount` every pass. It journals the planned BYTES
   (payload, salt, token type) before the chain op, so replay re-submits exactly the first attempt —
   no re-signing, no deterministic-engine requirement — and a minted id other than the plan's is
   never finalised. The fake engine plans and verifies through the real `token-engine/nft-ops.ts`
-  and keeps each token's first owner, so it judges signatures exactly as the real engine does.
+  and keeps each token's first owner and genesis token type, so it judges signatures exactly as the
+  real engine does.
 
 ### Unicity IDs (nametags)
 - Human-readable aliases (e.g., `@alice`) for receiving payments.

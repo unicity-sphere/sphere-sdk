@@ -478,10 +478,12 @@ const view = await sphere.payments.nft(row.tokenId);   // row from coinless()
 if (view?.signature === 'valid') showCreator(view.creator);
 ```
 
-- `signature` is checked against the token id and the token's **genesis** recipient, never its
-  current owner, so a `valid` NFT stays `valid` across transfers. `valid` proves the holder of
-  `creator` signed this payload for this token; resolving `creator` to a @nametag is a separate
-  lookup.
+- `signature` is checked against the token's network, **genesis** recipient, token id and token
+  type, never its current owner, so a `valid` NFT stays `valid` across transfers.
+- **`valid` is attribution, not authorization.** It shows which key signed this item for this token,
+  not that the signer is a recognised artist or that a collection authorized the issue. Label it
+  "Signed", not "Verified", and keep a recognised signer and collection membership as separate
+  claims. Resolving `creator` to a @nametag is a separate lookup.
 - **`creator` is only a claim until `signature === 'valid'`.** Anyone can mint a payload naming
   another wallet's key over a junk signature, so under `'invalid'` the field holds whatever key the
   minter wrote. Never show it, or resolve it to a @nametag, as the creator unless the status is `valid`.
@@ -519,11 +521,12 @@ interface NftMetadata {                       // ERC-721 field names
   readonly kind: 'metadata';
   readonly name: string;                      // required
   readonly description: string | null;
-  readonly image: NftMediaRef | null;
-  readonly animation_url: NftMediaRef | null;
+  readonly image: NftMediaRef | null;         // never a document link
+  readonly animation_url: NftMediaRef | null; // never a document link
   readonly external_url: string | null;
   readonly attributes: readonly NftAttribute[]; // [] when there are none, never null
-  readonly collection: string | null;
+  readonly collection: string | null;         // a display name only
+  readonly collection_id: string | null;      // 1–64 bytes as even-length hex (read back lower case); a claim
 }
 
 interface NftAttribute {
@@ -539,7 +542,7 @@ interface NftMedia {                          // an inline file
 
 interface NftLink {                           // a hosted file, pinned by its hash
   readonly kind: 'link';
-  readonly media_type: string;
+  readonly media_type: string;                // NFT_DOCUMENT_MEDIA_TYPE: the file is a metadata document
   readonly uri: string;                       // https://, ipfs:// or ar://; at most 2048 characters
   readonly sha256: string;                    // SHA-256 of the file's bytes, 64 hex (read back lower case)
 }
@@ -549,15 +552,30 @@ Every text field is non-empty: an absent optional one is `null`, never `''`. Wri
 integers outside ±(2^53 − 1) as text. The complete rules are in
 [`docs/NFT-METADATA.md`](./NFT-METADATA.md).
 
+`collection_id` is an optional stable identifier of the collection the item claims, such as a
+collection's token type identifier or the SHA-256 of a collection manifest; `collection` stays a
+display name. Nothing verifies membership, so never present a `collection_id` as verified.
+
 **Before rendering an `NftLink`**, fetch the file and check it: `verifyNftLinkContent(link, bytes)`
 is `false` when the bytes' SHA-256 is not the pinned one, and then the file must not be rendered.
 Render metadata text as plain text, never as markup.
 
+**Document links.** An `NftLink` whose `media_type` is `NFT_DOCUMENT_MEDIA_TYPE`
+(`'application/vnd.unicity.nft+cbor'`) points at a hosted metadata document, not at media;
+`isNftDocumentLink(content)` tells the two apart. It is valid only as a token's content (top level
+or signed), and `encodeNftContent` refuses one as `image` or `animation_url`. To resolve it, fetch
+the file, check it with `verifyNftLinkContent(link, bytes)`, then read it with
+`parseNftDocument(bytes)`: the `NftMetadata` or `NftMedia` item, or `null` for anything else. It
+never throws.
+
 The codec ships from the package root and the `./payments-v2` subpath: `encodeNftContent` (throws
 `VALIDATION_ERROR` naming the offending field), `parseNftPayload` (never throws; `null` = not
-recognised), `verifyNftLinkContent`, and the tag numbers `NFT_METADATA_TAG`, `NFT_MEDIA_TAG`,
-`NFT_LINK_TAG`, `NFT_SIGNED_TAG` (`39052n`–`39055n`). The `./token-engine` subpath adds
-`encodeNftSigned`, `nftSignedDigest`, `verifyNftSignature` and `NFT_FORMAT_VERSION`.
+recognised), `parseNftDocument`, `isNftDocumentLink`, `verifyNftLinkContent`,
+`NFT_DOCUMENT_MEDIA_TYPE`, and the tag numbers `NFT_METADATA_TAG`, `NFT_MEDIA_TAG`, `NFT_LINK_TAG`,
+`NFT_SIGNED_TAG` (`39052n`–`39055n`). The `./token-engine` subpath adds `encodeNftSigned`,
+`nftSignedDigest(context, payload)`, `verifyNftSignature(signed, context)` and
+`NFT_FORMAT_VERSION`, where `context` is an `NftSignatureContext`
+(`{ networkId, recipientPredicate, tokenId, tokenType }`, as the token's mint records them).
 
 ### `sendWholeToken(req: { recipient, tokenId, memo? }): Promise<TransferResult>`
 
@@ -630,6 +648,7 @@ const result = await sphere.payments.mintNft({
     external_url: 'https://coolcats.example',
     attributes: [{ trait_type: 'Fur', value: 'Ginger' }, { trait_type: 'Lives', value: 9 }],
     collection: 'Cool Cats',
+    collection_id: null,
   },
 });
 // { success: true, tokenId } | { success: false, tokenId?, error }

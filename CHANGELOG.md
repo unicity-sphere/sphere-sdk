@@ -41,9 +41,9 @@ cut off. A 2.2 host answers `mint_nft` with `PERMISSION_DENIED`, because no scop
 ### Added — NFT metadata standard: mintNft, nft/nfts reads, CBOR tags 39052–39055 (#785)
 
 A coinless token can now carry a name, media, traits and a creator signature. The format is four
-CBOR tags — `NftMetadata` (39052, ERC-721 field names), `NftMedia` (39053, an inline file),
-`NftLink` (39054, a hosted file pinned by its SHA-256) and `NftSigned` (39055) — specified
-normatively in `docs/NFT-METADATA.md`, with cross-SDK test vectors for the signed digest.
+CBOR tags — `NftMetadata` (39052, ERC-721 field names plus `collection_id`), `NftMedia` (39053, an
+inline file), `NftLink` (39054, a hosted file pinned by its SHA-256) and `NftSigned` (39055) —
+specified normatively in `docs/NFT-METADATA.md`, with cross-SDK test vectors for the signed digest.
 
 `payments.mintNft({ content, sign? })` mints to the wallet itself under the network's NFT vessel
 token type (the new `NETWORKS[network].nftTokenType`, the registry's `non-fungible` entry), signed
@@ -60,15 +60,34 @@ history record carries `assets: []`.
 `NftView { tokenId, content, creator, signature }`; the batch read fetches all cache misses in one
 batched read, and readings are cached per address. Reading is display-only: an unrecognised payload
 is `null` (absent from the `nfts()` map), never a throw and never a refusal. `signature` is `valid`
-only for a low-s signature whose recovered key is `creator`, over the token id and the token's
-GENESIS recipient — so a transfer never invalidates it, while a payload copied onto another token,
-or a mint front-run to another first owner, reads `invalid`. `creator` is the key the payload
-claims, authenticated only when `signature` is `valid`.
+only for a low-s signature whose recovered key is `creator`, over a digest in the yellowpaper
+genesis-commitment layout that binds the token's network, GENESIS recipient, token id and token
+type — so a transfer never invalidates it, while a payload copied onto another token, minted under
+another token type, or front-run to another first owner, reads `invalid`. `creator` is the key the
+payload claims, authenticated only when `signature` is `valid`, and a `valid` signature is
+attribution only: it does not show that the signer is recognised or that a collection authorized
+the issue.
 
-The codec (`encodeNftContent`, `parseNftPayload`, `verifyNftLinkContent`, `NFT_METADATA_TAG`,
-`NFT_MEDIA_TAG`, `NFT_LINK_TAG`, `NFT_SIGNED_TAG`), `NFT_MAX_PAYLOAD_BYTES` and the NFT types are
-exported from the package root and `./payments-v2`; `./token-engine` adds `encodeNftSigned`,
-`nftSignedDigest`, `verifyNftSignature` and `NFT_FORMAT_VERSION`.
+`NftMetadata.collection_id` (1–64 bytes, even-length hex in the API) is an optional stable
+identifier of the collection the item claims; nothing verifies it. An `NftLink` whose media type is
+`NFT_DOCUMENT_MEDIA_TYPE` (`application/vnd.unicity.nft+cbor`) points at a hosted metadata
+document. It is allowed only as a token's content, never as `image` or `animation_url`, and
+`parseNftDocument` reads the linked file, which must be exactly one `NftMetadata` or `NftMedia`
+item.
+
+The codec (`encodeNftContent`, `parseNftPayload`, `parseNftDocument`, `isNftDocumentLink`,
+`verifyNftLinkContent`, `NFT_DOCUMENT_MEDIA_TYPE`, `NFT_METADATA_TAG`, `NFT_MEDIA_TAG`,
+`NFT_LINK_TAG`, `NFT_SIGNED_TAG`), `NFT_MAX_PAYLOAD_BYTES` and the NFT types, `NftSignatureContext`
+included, are exported from the package root and `./payments-v2`; `./token-engine` adds
+`encodeNftSigned`, `nftSignedDigest(context, payload)`, `verifyNftSignature(signed, context)` and
+`NFT_FORMAT_VERSION`.
+
+The v1 layout changed before release. The pre-release builds `0.17.2-dev.1`, `0.17.2-dev.2` and
+`0.18.0-dev.1` wrote an eight-field `NftMetadata` and signed an earlier digest. Read by this
+release, such an `NftMetadata` is not recognised, and a signature they wrote over an `NftMedia` or
+`NftLink` reads `invalid`. The `mint_nft` wire form in `0.17.2-dev.2` has no `collection_id`:
+`nftContentFromWire` refuses a `metadata` object without one, and that build refuses one that has
+it, so a dApp and its wallet move off it together.
 
 For implementers: `ITokenEngine` gains two required members, `buildNftMint` and `readNft`, and
 `PaymentsFacadeDeps` gains a required `nftTokenType`. A custom engine, or code that composes

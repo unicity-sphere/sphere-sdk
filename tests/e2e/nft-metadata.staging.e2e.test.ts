@@ -17,10 +17,11 @@
  *   npx vitest run --config vitest.e2e.config.ts tests/e2e/nft-metadata.staging.e2e.test.ts
  */
 
+import { sha256 } from '@noble/hashes/sha2.js';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { NETWORKS } from '../../constants';
-import { hexToBytes } from '../../core/crypto';
+import { bytesToHex, hexToBytes } from '../../core/crypto';
 import type { MintNftRequest } from '../../modules/payments-v2/api';
 import { createMachineStores } from '../../modules/payments-v2/machine/journal';
 import {
@@ -64,7 +65,10 @@ const LOGO_LINK: NftLink = {
   sha256: 'acc52f7f4e3c271cacb6e633ec8c8508ee74e1415384b8bfd889d6cf0251245c',
 };
 
-/** (1) Signed, inline image, text and integer attributes (one negative), collection, external_url. */
+/** A collection_id in its manifest-hash form: the SHA-256 of a stand-in collection manifest. */
+const COLLECTION_ID = bytesToHex(sha256(new TextEncoder().encode('sphere-sdk #785 staging e2e collection manifest')));
+
+/** (1) Signed, inline image, text and integer attributes (one negative), collection and collection_id, external_url. */
 const INLINE: NftMetadata = {
   kind: 'metadata',
   name: 'Pixel #1',
@@ -78,6 +82,7 @@ const INLINE: NftMetadata = {
     { trait_type: 'Offset', value: -7 },
   ],
   collection: 'Sphere SDK e2e',
+  collection_id: COLLECTION_ID,
 };
 
 /** (2) Signed, image hosted by NftLink; every optional field absent. */
@@ -90,6 +95,7 @@ const LINKED: NftMetadata = {
   external_url: null,
   attributes: [],
   collection: null,
+  collection_id: null,
 };
 
 /** (3) Unsigned bare media: no name, no creator. */
