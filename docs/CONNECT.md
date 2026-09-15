@@ -632,6 +632,8 @@ Requires the `mint:request` permission scope. Minting only succeeds on networks 
 
 When the wallet runs with **subscriptions enabled**, a `mint` is rejected with `INTERNAL_ERROR` and the message `Subscription is still being set up — try again in a moment` until the wallet's per-wallet subscription key reaches the oracle. This is transient — treat it as a retry, not a failure. It never occurs on wallets running without subscriptions.
 
+A mint that fails after the wallet journaled it may still complete: the wallet resumes it. The wallet answers `INTENT_OUTCOME_UNKNOWN` (4201) with `data.tokenId` — do not send the intent again; reconcile against that token id. A mint refused before anything was journaled carries no `data`, and may be sent again.
+
 ### mint_nft Intent
 
 The `mint_nft` intent (Connect 2.3) asks the wallet to mint **one NFT to its own active address**
@@ -692,10 +694,14 @@ as the intent error.
 | The session lacks `nft:mint` | `PERMISSION_DENIED` (4002), from the host |
 | The user declines | `USER_REJECTED` (4003) |
 | Malformed params (shape, base64) | `INVALID_PARAMS` (-32602); the message names the field |
-| The mint is refused or fails | An intent error carrying `MintResult.error`. When `data.tokenId` is present the mint was journaled and **may still complete** — the wallet resumes it — so do not send the intent again. |
+| The mint is refused before anything is journaled | An intent error carrying `MintResult.error`, with no `data`. Nothing was minted; the intent may be sent again. |
+| The mint fails after it was journaled | `INTENT_OUTCOME_UNKNOWN` (4201) with `data.tokenId`. The wallet resumes the mint, so it **may still complete**: do not send the intent again; reconcile against the token id. |
+| The wallet cannot tell whether the mint started | `INTENT_OUTCOME_UNKNOWN` (4201), without `data` |
+| The host stops waiting (its deadline, a lock, a revoked session) | `INTENT_OUTCOME_UNKNOWN` (4201), from the host. The wallet dismisses its dialog and starts nothing more for the intent, but a mint already under way may still complete: do not send the intent again. |
 
-`onIntent` may return `error.data`; the host relays it as `ConnectError.data`, except when it
-downgrades the code to `INTENT_OUTCOME_UNKNOWN`.
+`onIntent` may return `error.data`; the host relays it as `ConnectError.data` under the code the
+wallet chose, `INTENT_OUTCOME_UNKNOWN` included. It drops `data` only when it downgrades a channel
+code (`WALLET_LOCKED`, `NOT_CONNECTED`) to `INTENT_OUTCOME_UNKNOWN` itself.
 
 **Size.** The encoded payload, `NftSigned` wrapper included, must be at most 1 MiB
 (`NFT_MAX_PAYLOAD_BYTES`); `payments.mintNft` refuses a larger one before anything is minted. Keep
@@ -850,7 +856,7 @@ try {
 | 4101 | `ERROR_CODES.INVALID_RECIPIENT` | Recipient not resolvable to a chain pubkey. |
 | 4102 | `ERROR_CODES.TRANSFER_FAILED` | Transfer execution failed. |
 | 4200 | `ERROR_CODES.INTENT_CANCELLED` | Intent cancelled — the user declined and **nothing happened**. Safe to re-offer. |
-| 4201 | `ERROR_CODES.INTENT_OUTCOME_UNKNOWN` | The intent reached the wallet and the answer was lost (a host deadline, a lock, a logout). **The outcome is unknown — the money may or may not have moved. Do NOT retry**; reconcile out of band first. |
+| 4201 | `ERROR_CODES.INTENT_OUTCOME_UNKNOWN` | The intent reached the wallet and its outcome is unknown: the answer was lost (a host deadline, a lock, a logout), or the wallet cannot tell whether the operation will still complete (a mint journaled before it failed carries `data.tokenId`). **The money or token may or may not have moved. Do NOT retry**; reconcile out of band first. |
 
 Rejection `.data` for the two gate errors:
 

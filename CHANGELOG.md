@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-09-15
+
 ### Added — `mint_nft` Connect intent and `nft:mint` scope (Connect 2.3)
 
 A dApp can ask the connected wallet to mint one NFT to the wallet's own active address: the
@@ -31,9 +33,11 @@ are still checked by `payments.mintNft`. The connect entry still does not import
 `@unicitylabs/state-transition-sdk`.
 
 `ConnectHostConfig.onIntent`, and an auto-approve handler, may now return `error.data`. The host
-relays it to the dApp as `ConnectError.data`, except when it downgrades the code to
-`INTENT_OUTCOME_UNKNOWN`; before, the host dropped it. A wallet uses it to name the `tokenId` of a
-mint that failed after it was journaled and may still complete.
+relays it to the dApp as `ConnectError.data` under the code the wallet chose, `INTENT_OUTCOME_UNKNOWN`
+included; before, the host dropped it. The host drops `data` only when it downgrades a channel code
+(`WALLET_LOCKED`, `NOT_CONNECTED`) to `INTENT_OUTCOME_UNKNOWN` itself. A wallet uses it to name the
+`tokenId` of a mint that failed after it was journaled and may still complete, answered with
+`INTENT_OUTCOME_UNKNOWN`.
 
 Connect 2.2 → 2.3 is additive, and the handshake gate compares MAJOR only, so no existing dApp is
 cut off. A 2.2 host answers `mint_nft` with `PERMISSION_DENIED`, because no scope maps to it there.
