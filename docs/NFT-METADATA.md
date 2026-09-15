@@ -11,6 +11,12 @@ fields, where each may appear, how a reader recognises them, and the exact bytes
 creator signs. It is written for implementers in any language. The
 [test vectors](#test-vectors) fix the bytes.
 
+**Scope: display and attribution.** This format describes an item and records who
+signed it. It does not establish collection membership, authorization to issue, or
+supply. Those come from a token type's issuance policy, which this format does not
+define (see
+[Relationship to the yellowpaper token standards](#relationship-to-the-yellowpaper-token-standards)).
+
 The key words MUST, MUST NOT, SHOULD and MAY are used as described in RFC 2119.
 
 ## Background
@@ -22,10 +28,13 @@ The key words MUST, MUST NOT, SHOULD and MAY are used as described in RFC 2119.
   mint's inclusion proof. Transfer `data` is set by whoever sends that transfer.
 - **Nothing on chain authenticates the minter.** The mint signing key is derived from
   the token id and a fixed universal secret, so anyone who knows a token id can
-  reproduce it. Issuance verification dispatches by token type, which is the shared
-  vessel. Anyone can therefore mint a byte-identical copy of any payload, so
-  attribution has to live inside the payload. `NftSigned` carries it, and it is
-  attribution only ([Attribution, not authorization](#attribution-not-authorization)).
+  reproduce it. A verifier registered for a token type receives the whole certified
+  mint transaction, so a type can enforce an issuance policy, but sphere-sdk and
+  wallet-api register none: both build `TokenIssuanceVerifierService(false)`, which
+  accepts a token type that has no verifier, the NFT vessel included. Anyone can
+  therefore mint a byte-identical copy of any payload, so attribution has to live
+  inside the payload. `NftSigned` carries it, and it is attribution only
+  ([Attribution, not authorization](#attribution-not-authorization)).
 - **These payloads stay coinless.** A well-formed tag other than 39050 or 55799 is
   classified `none_tag` by sphere-sdk's `classifyValueEnvelope` and by wallet-api §8.2
   step 6, so wallet-api needs no change. An untagged top-level array with a
@@ -346,6 +355,14 @@ circulating supply.
 The yellowpaper's draft token standards define token types and mint authorization.
 This format sits beside them:
 
+- **The vessel is a container, not a collection type.** The NFT vessel token type
+  resembles the yellowpaper's UTS-0 blank container: a well-known type with no
+  issuance semantics, whose content the application interprets. An NFT minted into it
+  is not a UTS-2 token, even when its payload has the UTS-2 shape described below.
+- **Any token type can carry this format.** Recognition never looks at the token type
+  (see [Background](#background)), so a UTS-2 or UTS-3 NFT type can use these tags as
+  its payload and wallets read it the same way. That type's policy then establishes
+  collection membership and any cap; `collection_id` stays a claim.
 - **UTS-2 payloads.** A draft UTS-2 genesis payload `[1, h_content, uri]` maps onto
   `NftLink(application/vnd.unicity.nft+cbor, uri, h_content)` when the content is a
   document in this format. `NftLink` requires a [link URI](#link-uri), so a UTS-2
