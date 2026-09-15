@@ -34,6 +34,7 @@ import type {
   GetGroupMessagesPageOptions,
 } from './types';
 import { GroupRole as GroupRoleEnum, GroupVisibility as GroupVisibilityEnum } from './types';
+import { newGroupId } from './group-id';
 
 // =============================================================================
 // Dependencies
@@ -840,13 +841,9 @@ export class GroupChatModule {
     const creatorPubkey = this.getMyPublicKey();
     if (!creatorPubkey) return null;
 
-    const proposedGroupId = options.name
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, '')
-      .slice(0, 20) || this.randomId();
-
     try {
       const isPrivate = options.visibility === GroupVisibilityEnum.PRIVATE;
+      const proposedGroupId = newGroupId(options.name);
 
       // Publish CREATE_GROUP first, then fetch the metadata.
       // The relay creates the group synchronously, so by the time the OK
