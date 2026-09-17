@@ -6,8 +6,9 @@
  * - popup:  dApp (opener) ↔ wallet (popup window)
  */
 
-import type { ConnectTransport, SphereConnectMessage } from '../../../connect';
-import { isSphereConnectMessage } from '../../../connect';
+import type { ConnectTransport } from '../../../connect/types';
+import type { SphereConnectMessage } from '../../../connect/protocol';
+import { isSphereConnectMessage } from '../../../connect/protocol';
 
 // =============================================================================
 // Configuration

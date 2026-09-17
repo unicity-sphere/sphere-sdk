@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — the Connect ESM entry points share one `ConnectClient` and `ConnectError`
+
+`@unicitylabs/sphere-sdk/connect`, `/connect/browser` and `/connect/nodejs` were three separate
+bundles, and `/connect/browser` carried its own copy of `ConnectClient`, `ConnectError`, the
+protocol constants and dead `ConnectHost` helpers. A dApp importing both `autoConnect` and
+`ConnectError` got two classes: `err instanceof ConnectError` was false for every `autoConnect()`
+error, and `const c: ConnectClient = (await autoConnect(...)).client` failed with TS2322. The three
+entries are now built as one code-split ESM graph: shared modules live once in
+`dist/connect/chunks/`, the entry files keep their paths, and `/connect/browser` no longer carries
+any wallet-host code. The browser and Node transports import `connect/protocol` and `connect/types`
+directly instead of the `connect` barrel.
+
+`package.json` gains a `sideEffects` list naming every non-Connect bundle and the TypeScript
+sources (so the SDK's own build output is unchanged — all 46 non-Connect dist files are
+byte-identical); the Connect outputs are the only files left side-effect-free. The wallet host is
+emitted as its own chunk, so esbuild, and any bundler that honours `sideEffects`, drops it from a
+dApp that imports only client-side values (`ConnectError`, `ERROR_CODES`) from `/connect`; Rollup
+and Vite already did. An `autoConnect`-only dApp goes from 18613 to 16049 bytes minified under
+esbuild (6279 → 5340 gzipped); a dApp that also imports `ConnectClient` from `/connect` goes from
+31529 to 15949 (7154 → 5312).
+
+**The `.cjs` outputs are deliberately unchanged in shape**: still one unsplit bundle per entry, so
+a `require()`-based consumer still gets one `ConnectClient` per entry and `instanceof` across
+entries stays false there. tsup can only code-split CJS by rewriting every chunk with sucrase,
+which renames the exported classes to `_class`, changes class-field semantics and degrades the
+`.cjs.map` files. No consumer loads the CJS Connect files today. The `.cjs` entries did shrink,
+because the transports no longer pull the host in through the barrel.
+
+Public API, `exports` map and every declaration file path are unchanged.
+
+Intended behaviour changes: `err instanceof ConnectError` is now true across the ESM entries, and
+the `autoConnect()` client shares `ConnectClient.prototype` with `/connect`, so patching or spying
+on that prototype now affects it too. Code that relied on the two separate type declarations can
+see new type errors (an `instanceof ConnectClient` else-branch narrows to `never`; a module
+augmentation adding a required member now also applies to `autoConnect`'s types).
+
+Still true: a process that loads Connect through both `import` and `require()` has two copies, and
+so does a dApp whose dependencies bundle their own SDK — keep discriminating errors on `.code`.
+
 ## [0.17.2] - 2026-09-15
 
 ### Added — `mint_nft` Connect intent and `nft:mint` scope (Connect 2.3)

@@ -164,10 +164,77 @@ export const configs = [
       'ws',
     ],
   },
-  // Sphere Connect - Core (transport-agnostic)
+  // Sphere Connect — ESM: ./connect, ./connect/browser and ./connect/nodejs
+  // built as ONE code-split graph (was: one `splitting: false` config per
+  // entry, sphere-sdk#789).
+  //
+  // Why: with a bundle per entry, ./connect/browser inlined its own copy of
+  // ConnectClient/ConnectError (and, through the '../../../connect' barrel,
+  // dead ConnectHost leftovers), so a dApp importing both ./connect and
+  // ./connect/browser got two ConnectError classes and `err instanceof
+  // ConnectError` was false for autoConnect errors. With splitting, a module
+  // reached from several entries is emitted ONCE in dist/connect/chunks/ and
+  // every entry imports it; the public entry files keep their paths.
+  //
+  // The two `connect/internal/*` entries are NOT package exports. They exist
+  // only to give the wallet host and the NFT wire codec a chunk of their own
+  // (esbuild groups code by the set of entries that reach it), so
+  // dist/connect/index.js is a pure re-export file. A dApp that imports
+  // ConnectClient/ERROR_CODES from ./connect then uses nothing from the host
+  // chunk, and because package.json "sideEffects" does not list the Connect
+  // outputs, a bundler that honours "sideEffects" (esbuild, webpack) drops
+  // that file whole. Rollup/Vite already removed the host statement by
+  // statement.
+  //
+  // `platform: 'neutral'`: the graph uses no Node built-ins and touches no
+  // browser globals at module scope, so one build serves both runtimes. `ws`
+  // is reached only through a dynamic import inside WebSocketTransport and
+  // stays external.
+  //
+  // NOTE: entry files must never import each other — only non-entry chunks.
+  // An entry that imported dist/connect/index.js would let a consumer's
+  // vi.mock('@unicitylabs/sphere-sdk/connect') leak into autoConnect.
+  {
+    entry: {
+      'connect/index': 'connect/index.ts',
+      'connect/internal/host': 'connect/host/index.ts',
+      'connect/internal/nft-wire': 'connect/nft-wire.ts',
+      'impl/browser/connect/index': 'impl/browser/connect/index.ts',
+      'impl/nodejs/connect/index': 'impl/nodejs/connect/index.ts',
+    },
+    format: ['esm'],
+    dts: true,
+    clean: false,
+    splitting: true,
+    sourcemap: true,
+    platform: 'neutral',
+    target: 'es2022',
+    external: [
+      /^@unicitylabs\//,
+      'ws',
+    ],
+    esbuildOptions(options) {
+      // Shared chunks live under dist/connect/, not in the dist/ root.
+      options.chunkNames = 'connect/chunks/[name]-[hash]';
+    },
+  },
+  // Sphere Connect — CJS: deliberately still one unsplit bundle per entry,
+  // byte-for-byte the 0.17.2 build shape (minus the dead host code the
+  // transports' barrel import used to drag in).
+  //
+  // Why not split these too: tsup implements CJS splitting by running every
+  // emitted chunk through sucrase, which renames ConnectClient/ConnectHost and
+  // the WS transports to `_class` (`.name` is part of our public surface in
+  // logs and error reporting), switches class fields to assignment semantics
+  // and degrades the .cjs.map files. No consumer loads the .cjs Connect files,
+  // so the duplicate-class fix is shipped for ESM only and CJS keeps today's
+  // behaviour. If a CJS consumer ever needs one ConnectError across entries,
+  // revisit with `keepNames` plus CJS class-identity tests.
+  //
+  // These three also emit the .d.cts declarations package.json points at.
   {
     entry: { 'connect/index': 'connect/index.ts' },
-    format: ['esm', 'cjs'],
+    format: ['cjs'],
     dts: true,
     clean: false,
     splitting: false,
@@ -178,10 +245,9 @@ export const configs = [
       /^@unicitylabs\//,
     ],
   },
-  // Sphere Connect - Browser transport (PostMessage)
   {
     entry: { 'impl/browser/connect/index': 'impl/browser/connect/index.ts' },
-    format: ['esm', 'cjs'],
+    format: ['cjs'],
     dts: true,
     clean: false,
     splitting: false,
@@ -192,10 +258,9 @@ export const configs = [
       /^@unicitylabs\//,
     ],
   },
-  // Sphere Connect - Node.js transport (WebSocket)
   {
     entry: { 'impl/nodejs/connect/index': 'impl/nodejs/connect/index.ts' },
-    format: ['esm', 'cjs'],
+    format: ['cjs'],
     dts: true,
     clean: false,
     splitting: false,

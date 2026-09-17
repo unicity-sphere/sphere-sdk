@@ -812,7 +812,7 @@ is connected and must wait for `wallet:unlocked`, not re-handshake.
 
 `client.connect()` rejects with a **`ConnectError`** when the compatibility gate refuses the connection. `ConnectError` has a numeric `.code` and an optional `.data` payload with rejection details.
 
-**Important:** discriminate on the numeric `.code`, not `instanceof ConnectError`. The `instanceof` check is unreliable when multiple bundle copies of the SDK are present (e.g. a dApp and its dependencies each bundling the SDK separately).
+**Important:** discriminate on the numeric `.code`, not `instanceof ConnectError`. `instanceof` is false whenever the error was built by a different copy of the class. Up to 0.17.2 `@unicitylabs/sphere-sdk/connect/browser` shipped its own copy of `ConnectClient`, so errors from `autoConnect()` were never `instanceof` the `ConnectError` exported by `@unicitylabs/sphere-sdk/connect`. The ESM Connect entry points now share one copy, but the `.cjs` entries still carry one each, and a process that loads the SDK through both `import` and `require()`, or a dApp whose dependencies bundle their own SDK, still holds two.
 
 ```typescript
 import { ConnectError, ERROR_CODES } from '@unicitylabs/sphere-sdk/connect';
