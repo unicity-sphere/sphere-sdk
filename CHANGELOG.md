@@ -28,6 +28,18 @@ and Vite already did. An `autoConnect`-only dApp goes from 18613 to 16049 bytes 
 esbuild (6279 → 5340 gzipped); a dApp that also imports `ConnectClient` from `/connect` goes from
 31529 to 15949 (7154 → 5312).
 
+**New build warning, esbuild only, harmless.** A dApp bundled directly with esbuild now gets
+`Ignoring this import because ".../dist/connect/chunks/chunk-XXXXXXXX.js" was marked as having no
+side effects [ignored-bare-import]` — one warning per side-effect-only chunk import in the entries
+it pulls in (two, for a dApp that imports both `./connect` and `./connect/browser`). It appears
+because of the two halves of this change working together: code splitting makes esbuild emit bare
+`import "./chunks/...";` statements in the entry files to preserve module evaluation order, and the
+scoped `sideEffects` list above — which deliberately leaves the Connect outputs out — then tells the
+consumer's bundler those statements can be dropped. That is exactly what the list is for, and
+nothing is lost: the chunks named in the warnings hold declarations only (the `SphereError` class,
+the permission-scope constants), and every module that actually needs their exports imports them by
+name. The build still succeeds, the emitted bundle is correct, and Rollup/Vite print nothing.
+
 **The `.cjs` outputs are deliberately unchanged in shape**: still one unsplit bundle per entry, so
 a `require()`-based consumer still gets one `ConnectClient` per entry and `instanceof` across
 entries stays false there. tsup can only code-split CJS by rewriting every chunk with sucrase,
