@@ -90,13 +90,28 @@ export interface PaymentsV2Composition {
   factory: PaymentsV2TransportFactory;
 }
 
+/** The messaging-only opt-out (#793) — sharing the `walletApi` field is what makes "configured" and "deliberately absent" mutually exclusive. */
+export const NO_PAYMENTS = 'none';
+
+export type WalletApiOption = WalletApiTransportConfig | typeof NO_PAYMENTS;
+
+function readPaymentsOptOut(walletApi: string): typeof NO_PAYMENTS {
+  if (walletApi === NO_PAYMENTS) return NO_PAYMENTS;
+  throw new SphereError(
+    `walletApi must be a wallet-api transport config or the literal '${NO_PAYMENTS}' (the explicit messaging-only opt-out, #793) — received ${JSON.stringify(walletApi)}.`,
+    'INVALID_CONFIG'
+  );
+}
+
 // Fail-closed at init: money moves only through a wallet-api composition. #728:
 // walletApi.network must be KNOWN and equal the Sphere network — asserted BEFORE
 // any session/KV/provider is constructed.
 export function resolvePaymentsV2Composition(
   walletApi: unknown,
   sphereNetwork: string | undefined
-): PaymentsV2Composition {
+): PaymentsV2Composition | typeof NO_PAYMENTS {
+  // #793: "composing no money" must be sayable, or it reads as a forgotten `walletApi`.
+  if (typeof walletApi === 'string') return readPaymentsOptOut(walletApi);
   const source = walletApi as Partial<WalletApiTransportConfig> | null | undefined;
   const network = typeof source?.network === 'string' && source.network !== '' ? source.network : null;
   if (!source || network === null) {

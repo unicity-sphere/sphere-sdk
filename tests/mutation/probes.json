@@ -1786,5 +1786,55 @@
     "tests": [
       "tests/unit/connect/integration.test.ts"
     ]
+  },
+  {
+    "name": "msgonly-optout-strict",
+    "note": "#793: only the exact literal 'none' opts out — any other string is a near-miss and is refused by name (wallet-api-composition.test.ts 'refuses any OTHER string')",
+    "file": "core/payments-v2-wiring.ts",
+    "find": "  if (walletApi === NO_PAYMENTS) return NO_PAYMENTS;",
+    "replace": "  if (typeof walletApi === 'string') return NO_PAYMENTS;",
+    "tests": [
+      "tests/unit/impl/wallet-api-composition.test.ts"
+    ]
+  },
+  {
+    "name": "msgonly-start-gate",
+    "note": "#793: the opt-out composes NO vertical, at boot or on an address switch (sphere-payments-v2-wiring.test.ts, messaging-only block)",
+    "file": "core/Sphere.ts",
+    "find": "    if (this._paymentsV2Composition === NO_PAYMENTS) return;",
+    "replace": "    void NO_PAYMENTS;",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "msgonly-typed-error",
+    "note": "#793: payments names its permanent cause (PAYMENTS_NOT_COMPOSED), never the transient NOT_INITIALIZED a caller would sit and wait out",
+    "file": "core/Sphere.ts",
+    "find": "          'PAYMENTS_NOT_COMPOSED'",
+    "replace": "          'NOT_INITIALIZED'",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "msgonly-has-payments",
+    "note": "#793: hasPayments reports the composition, so a messaging-only wallet can branch without a try/catch",
+    "file": "core/Sphere.ts",
+    "find": "    return this._paymentsV2Composition !== NO_PAYMENTS;",
+    "replace": "    return true;",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "msgonly-no-engine",
+    "note": "#793: a messaging-only wallet builds no token engine — the facade is its only consumer",
+    "file": "core/Sphere.ts",
+    "find": "    if (this._paymentsV2Composition === NO_PAYMENTS) return undefined;",
+    "replace": "    void NO_PAYMENTS;",
+    "tests": [
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
   }
 ]

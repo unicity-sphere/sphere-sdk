@@ -111,6 +111,7 @@ A wallet is composed from **swappable ports**, layered in two steps:
 - **Custody is server-side.** The wallet-api backend holds your token inventory; your keys never leave the client. (Own-storage custody was rescinded — there is no local token store.)
 - **The money ports are contract-enforced.** `StoragePort`/`DeliveryPort` (`modules/payments-v2/ports.ts`) have wallet-api implementations; the `paymentsV2Transport` seam in the `walletApi` config lets tests/custom hosts inject a whole replacement bundle.
 - **`network` placement.** Required on `createBrowserProviders`/`createNodeProviders`, in the `walletApi` config, AND on `Sphere.init` — the three must agree. `Sphere.init` resolves the payments composition and the token registry from its own `network`, so omitting it or letting it disagree with `walletApi.network` throws `INVALID_CONFIG` before any storage write.
+- **Messaging-only wallets say so out loud.** A wallet that never touches money — a Nostr DM or group-chat bot — passes `walletApi: 'none'` instead of a config: no wallet-api session, device registration, mailbox drain, token engine or `pv2g2:` key. `sphere.payments` then throws `PAYMENTS_NOT_COMPOSED` and `sphere.hasPayments` is `false`. **Omitting `walletApi` altogether still throws `INVALID_CONFIG`** — a dropped env var must never read as a deliberate choice.
 
 For manual/advanced provider wiring, see [Custom Providers Configuration](#custom-providers-configuration). For the deeper integration guide, see [docs/INTEGRATION.md](docs/INTEGRATION.md).
 

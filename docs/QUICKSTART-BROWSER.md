@@ -43,7 +43,9 @@ async function initWallet() {
   });
 
   // Step 2: Attach the wallet-api transport config (REQUIRED — Sphere.init
-  //         throws INVALID_CONFIG without it; money rides the wallet-api vertical)
+  //         throws INVALID_CONFIG without it; money rides the wallet-api vertical).
+  //         A wallet that never touches money passes `walletApi: 'none'` instead (#793):
+  //         nothing of the vertical runs and `sphere.payments` throws PAYMENTS_NOT_COMPOSED.
   const providers = createWalletApiProviders(base, {
     baseUrl: 'https://wallet-api.unicity.network',
     network: 'testnet2',

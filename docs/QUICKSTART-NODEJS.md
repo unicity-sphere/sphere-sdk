@@ -198,6 +198,41 @@ async function main() {
 main().catch(console.error);
 ```
 
+## Messaging-Only Wallet (no money)
+
+A bot that is only ever a Nostr client — DMs, group chat, a nametag — declines the money
+composition explicitly. It needs no wallet-api deployment, no `WALLET_API_URL` in its config and
+no device id, and the backend carries no idle authenticated device for it.
+
+```typescript
+const base = createNodeProviders({ network: 'testnet2', dataDir: './bot-data' });
+
+const { sphere } = await Sphere.init({
+  ...base,               // storage + transport + oracle; no createWalletApiProviders call
+  network: 'testnet2',
+  walletApi: 'none',     // explicit: compose no money (#793)
+  autoGenerate: true,
+  nametag: 'kbbot',
+});
+
+sphere.hasPayments;      // false
+sphere.payments;         // throws SphereError, code 'PAYMENTS_NOT_COMPOSED'
+```
+
+Nothing of the payments vertical runs: no wallet-api session, device registration, wake socket or
+mailbox drain, no token engine, and no `pv2g2:` key on disk — at boot and on an address switch
+alike. Identity, storage, `communications`, `groupChat` and `registerNametag` are unchanged.
+
+**Omitting `walletApi` is still a refusal, not an opt-out** — `Sphere.init` throws
+`INVALID_CONFIG` exactly as before. A dropped environment variable must never be indistinguishable
+from a deliberate choice, which is the whole reason the choice has to be sayable.
+
+The opt-out is a composition choice, not a wipe: a wallet that HAS moved money keeps its `pv2g2:`
+state on disk, and opening it with `'none'` simply does not resume anything. Open intents stay
+open — their sources still reserved on the backend — until it is next opened with a wallet-api
+config, which resumes them as usual. Nothing is lost; it is deferred. Don't flip a wallet with
+transfers in flight.
+
 ## What Gets Created
 
 ```
