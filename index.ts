@@ -48,7 +48,7 @@
 // Core
 // =============================================================================
 
-export { Sphere, createSphere, loadSphere, initSphere, sphereExists, checkNetworkHealth, logger, SphereError, PartialSendConflictError, isSphereError, isPossiblyCommittedSendOutcome } from './core';
+export { Sphere, createSphere, loadSphere, initSphere, sphereExists, checkNetworkHealth, logger, SphereError, PartialSendConflictError, isSphereError, isPossiblyCommittedSendOutcome, NO_PAYMENTS } from './core';
 export { signMessage, verifySignedMessage, hashSignMessage, recoverPubkeyFromSignature, SIGN_MESSAGE_PREFIX } from './core/crypto';
 export type {
   SphereCreateOptions,
@@ -57,6 +57,7 @@ export type {
   SphereInitResult,
   SphereImportOptions,
   WalletApiTransportConfig,
+  WalletApiOption,
   InitProgressStep,
   InitProgress,
   InitProgressCallback,
