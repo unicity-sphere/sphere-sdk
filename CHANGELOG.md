@@ -31,6 +31,16 @@ than as a missing config, which would send the reader hunting an env var instead
 - `NO_PAYMENTS` and the `WalletApiOption` type are exported for consumers who prefer the name to
   the literal.
 
+The opt-out composes; it does not erase. A wallet that has moved money keeps its `pv2g2:` state,
+and opening it with `'none'` resumes nothing — open intents stay open, sources still reserved on
+the backend, until it is next opened with a config. Nothing is lost, but a wallet with transfers
+in flight should not be flipped.
+
+The three messaging e2e suites (`dm-nip17`, `messaging-e2e`, `dm-manual`) now compose this way
+instead of standing up a fake money world to satisfy the gate. That also repairs `dm-nip17` and
+`messaging-e2e`, which had been failing since #728: they pass `network: 'testnet'` while the fake
+world declares `'testnet2'`, and that check is a string comparison, alias or not.
+
 ## [0.17.2] - 2026-09-15
 
 ### Added — `mint_nft` Connect intent and `nft:mint` scope (Connect 2.3)

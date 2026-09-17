@@ -227,6 +227,12 @@ alike. Identity, storage, `communications`, `groupChat` and `registerNametag` ar
 `INVALID_CONFIG` exactly as before. A dropped environment variable must never be indistinguishable
 from a deliberate choice, which is the whole reason the choice has to be sayable.
 
+The opt-out is a composition choice, not a wipe: a wallet that HAS moved money keeps its `pv2g2:`
+state on disk, and opening it with `'none'` simply does not resume anything. Open intents stay
+open — their sources still reserved on the backend — until it is next opened with a wallet-api
+config, which resumes them as usual. Nothing is lost; it is deferred. Don't flip a wallet with
+transfers in flight.
+
 ## What Gets Created
 
 ```
