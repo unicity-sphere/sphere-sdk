@@ -8,15 +8,25 @@ Sphere Connect is a secure wallet-dApp communication protocol. It allows web app
 npm install @unicitylabs/sphere-sdk
 ```
 
-A dApp imports **only** the Connect subpaths. They are separate bundles with **no external npm
-dependencies** — no state-transition-sdk, no nostr, no `@noble`, no `bip39`, no `buffer` — so an
-`autoConnect`-only dApp ships a few KB, not the wallet SDK:
+A dApp imports **only** the Connect subpaths. They are small, self-contained bundles — no
+state-transition-sdk, no nostr, no `@noble`, no `bip39`, no `buffer` — so an `autoConnect`-only dApp
+ships a few KB, not the wallet SDK:
 
 | Subpath | What it gives you | Where it runs |
 |---------|-------------------|---------------|
 | `@unicitylabs/sphere-sdk/connect` | `ConnectClient`, `ConnectError`, `ERROR_CODES`, `SPHERE_NETWORKS`, `RPC_METHODS`, `INTENT_ACTIONS`, `PERMISSION_SCOPES`, the NFT wire helpers, and `ConnectHost` for wallets | anywhere (browser, Node, a backend service) |
 | `@unicitylabs/sphere-sdk/connect/browser` | `autoConnect`, `PostMessageTransport`, the `isInIframe`/`hasExtension`/`detectTransport` helpers, and the legacy `ExtensionTransport` | browser only |
-| `@unicitylabs/sphere-sdk/connect/nodejs` | `WebSocketTransport` (needs the optional `ws` peer dependency) | Node.js only |
+| `@unicitylabs/sphere-sdk/connect/nodejs` | `WebSocketTransport` (the `createServer`/`createClient` factory object), `WebSocketServerTransport`, `WebSocketClientTransport`, and the `WebSocketServerConfig` / `WebSocketClientConfig` types | Node.js only |
+
+**External dependencies, precisely.** `./connect` and `./connect/browser` import nothing outside the
+package: their built files contain no bare specifier at all, so a dApp that uses only those two
+pulls in no third-party code through the SDK. `./connect/nodejs` is the one exception —
+`WebSocketServerTransport.start()` runs `await import('ws')`, so the **server** side of that entry
+does need `ws` at runtime. It is declared as an **optional peer dependency** (`ws >= 8.0.0`), the
+import is dynamic and only reached when you start a server, and the build leaves `ws` external
+rather than bundling it, so nothing is inlined into your output. Install `ws` yourself if you host a
+WebSocket Connect endpoint. The client side never needs it: `WebSocketClientTransport` takes the
+`createWebSocket` factory you supply.
 
 Do **not** import the package root (`@unicitylabs/sphere-sdk`) from a dApp: that is the wallet-side
 SDK and pulls in the whole token engine.
@@ -475,19 +485,46 @@ await autoConnect({ dapp, walletUrl, network: SPHERE_NETWORKS.testnet2, forceTra
 
 ### Running against the hosted wallet
 
-The hosted wallet at `https://sphere.unicity.network` **does not serve the popup path**: opening
-`https://sphere.unicity.network/connect` from a dApp window answers **403**. The way a dApp runs
-against it is as a **custom agent**, which the wallet loads in an iframe — so `autoConnect` takes
-P1 and no popup is involved:
+The way a dApp runs against the hosted wallet at `https://sphere.unicity.network` is as a **custom
+agent**, which the wallet loads in an iframe — so `autoConnect` takes P1 and no popup is involved:
 
 ```
 https://sphere.unicity.network/agents/custom?url=<your dApp URL>
 ```
 
-**Your URL must be `https`.** The wallet frames a custom agent only when the URL's protocol is
-`https:` (`isHttpsUrl`, a protocol-only check), so `https://localhost:5173` with a local dev
-certificate works while plain `http://localhost:5173` is refused. Start your dev server over TLS
-(for example Vite's `--https` with a local certificate) and pass that URL.
+**Your dApp must be served over `https`, from a host that is reachable from the public internet.**
+Two independent gates enforce that, and a local dev URL fails both:
+
+1. **The CDN in front of the hosted wallet rejects local URLs in the query string.** Any request to
+   `sphere.unicity.network` whose query string contains `localhost` or `127.0.0.1` answers **403**,
+   served by CloudFront (`ERROR: The request could not be satisfied`), before the wallet's own code
+   runs. Measured with `curl` on 2026-09-17 against `/agents/custom?url=…` and `/connect?origin=…`,
+   with and without browser-like `User-Agent`/`Accept` headers; `https://localhost:5173` is refused
+   exactly like `http://localhost:5173`. It is a CDN rule about local URLs in the query, not
+   anything specific to Connect — the same routes answer **200** for a public `https` URL.
+2. **The wallet only frames `https`.** It builds a custom tab only when the URL's protocol is
+   `https:` — `isHttpsUrl`, a protocol-only check, in `sphere`'s
+   `src/components/desktop/DesktopLayout.tsx:80`. A plain `http://` URL never becomes an iframe
+   `src`.
+
+So to test a local build against the hosted wallet, put it behind an **https tunnel** — ngrok,
+cloudflared or equivalent — and open
+`https://sphere.unicity.network/agents/custom?url=<the tunnel's https URL>`. A tunnel URL is public
+and `https`, so it passes both gates.
+
+Typing an `https` URL into the wallet's own in-app **Load Custom URL** prompt keeps the URL out of
+the query string altogether, so gate 1 never applies and gate 2 should accept it — that path has
+not been tested end to end here, so treat it as untried rather than as a documented workaround.
+
+None of this constrains a wallet you run yourself. A local `sphere` dev server on
+`http://localhost:5173` sits behind no CDN, so a `localhost` dApp URL and the popup route are both
+fine against it — that is the normal local development setup.
+
+About the popup route (P3): the route itself is served — `GET https://sphere.unicity.network/connect`
+answers **200**, and so does `/connect?origin=<a public https origin>` (curl, 2026-09-17). A 403
+there is gate 1 above, triggered by a `localhost` origin in the query string, not the wallet
+refusing the route. Whether the popup handshake itself completes end to end against the hosted
+wallet has not been tested, which is why the custom-agent iframe path above is the documented one.
 
 Because the dApp runs inside the wallet's iframe, `isInIframe()` is true and
 `PostMessageTransport.forClient()` talks to the parent window — no `walletUrl` is needed in that
@@ -654,7 +691,7 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `receive` | — | `{ transfers }` |
 | `sign_message` | `message` | `{ signature, publicKey }` |
 | `mint` | `coinId` (lowercase hex), `amount` (smallest units) | `{ tokenId, coinId, amount }` |
-| `send_nft` | `to, tokenId, memo?` | **not implemented by the Sphere wallet** — it answers `METHOD_NOT_FOUND` (-32601). The intent and its `nft:transfer` scope exist on the wire since 2.2; feature-detect by trying it and treating -32601 as "unsupported". |
+| `send_nft` | `to, tokenId, memo?` | On the wire since 2.2, with its `nft:transfer` scope — but **the Sphere wallet currently does not implement it** and answers `METHOD_NOT_FOUND` (-32601); `SUPPORTED_INTENTS` in `sphere`'s `src/components/connect/intentValidation.ts` does not list it. That is the wallet's state today, not a protocol statement: feature-detect by trying the intent and treating -32601 as "unsupported". |
 | `mint_nft` | `content` (`WireNftContent`), `sign?` (default `true`) | `{ tokenId }` |
 
 > **Amount units:** `amount` is always in **base units** (the smallest indivisible unit), as a
@@ -794,7 +831,7 @@ as the intent error.
 |------|--------|
 | The session lacks `nft:mint` | `PERMISSION_DENIED` (4002), from the host |
 | The user declines | `USER_REJECTED` (4003) |
-| Malformed params (shape, base64) | `INVALID_PARAMS` (-32602); the message names the field |
+| Malformed params (shape, base64) | `INVALID_PARAMS` (-32602), from the wallet — the Sphere wallet checks them up front and its message names the offending field |
 | The mint is refused before anything is journaled | An intent error carrying `MintResult.error`, with no `data`. Nothing was minted; the intent may be sent again. |
 | The mint fails after it was journaled | `INTENT_OUTCOME_UNKNOWN` (4201) with `data.tokenId`. The wallet resumes the mint, so it **may still complete**: do not send the intent again; reconcile against the token id. |
 | The wallet cannot tell whether the mint started | `INTENT_OUTCOME_UNKNOWN` (4201), without `data` |
@@ -822,8 +859,10 @@ A removed — or simply unknown — method or intent answers **`PERMISSION_DENIE
 unmapped, and that check is what refuses the request. On a **locked** wallet the lock gate runs
 first, so the same request answers `WALLET_LOCKED` (4009) until `wallet:unlocked` — deliberately,
 so a dApp is not told its permissions are wrong for something it may simply have to retry.
-`METHOD_NOT_FOUND` (-32601) comes from the *wallet*, not from the SDK host: the Sphere wallet
-answers intents it does not implement (today `send_nft`) with it.
+`METHOD_NOT_FOUND` (-32601) comes from the *wallet*, not from the SDK host. The Sphere wallet
+currently answers any intent outside its supported set with it — `send_nft` today — per
+`SUPPORTED_INTENTS` in `sphere`'s `src/components/connect/intentValidation.ts`; another wallet may
+answer differently.
 
 ## Events (wallet → dApp push)
 
@@ -961,16 +1000,27 @@ try {
 | 4002 | `ERROR_CODES.PERMISSION_DENIED` | Method or intent not in granted permissions. |
 | 4003 | `ERROR_CODES.USER_REJECTED` | User rejected an intent in the wallet UI. |
 | 4004 | `ERROR_CODES.SESSION_EXPIRED` | Session TTL elapsed. |
-| 4005 | `ERROR_CODES.ORIGIN_BLOCKED` | **Reserved** — defined on the wire, but no SDK host or wallet path emits it today. |
+| 4005 | `ERROR_CODES.ORIGIN_BLOCKED` | **Reserved.** Defined on the wire; no sphere-sdk path emits it, and the Sphere wallet currently does not emit it either. |
 | 4006 | `ERROR_CODES.RATE_LIMITED` | Too many requests per second. |
-| 4100 | `ERROR_CODES.INSUFFICIENT_BALANCE` | **Reserved** — no code path emits it today; a failed send comes back as `TRANSFER_FAILED` (4102). |
-| 4101 | `ERROR_CODES.INVALID_RECIPIENT` | **Reserved** — no code path emits it today; an unresolvable recipient also fails as `TRANSFER_FAILED` (4102). |
-| 4102 | `ERROR_CODES.TRANSFER_FAILED` | Transfer execution failed (what the Sphere wallet sends when it rejects a send). |
-| -32601 | `ERROR_CODES.METHOD_NOT_FOUND` | The **wallet** does not implement this intent or method. The SDK host never sends it (an unmapped name is 4002); the Sphere wallet answers `send_nft` with it. |
-| -32602 | `ERROR_CODES.INVALID_PARAMS` | The wallet rejected the params of an otherwise supported intent, before showing any UI. |
+| 4100 | `ERROR_CODES.INSUFFICIENT_BALANCE` | **Reserved.** No sphere-sdk path emits it; the Sphere wallet currently answers a refused send with `TRANSFER_FAILED` (4102) instead. |
+| 4101 | `ERROR_CODES.INVALID_RECIPIENT` | **Reserved.** No sphere-sdk path emits it; the Sphere wallet currently answers an unresolvable recipient with `TRANSFER_FAILED` (4102) as well. |
+| 4102 | `ERROR_CODES.TRANSFER_FAILED` | Transfer execution failed — what the Sphere wallet currently sends when it rejects a send. |
+| -32601 | `ERROR_CODES.METHOD_NOT_FOUND` | Comes from the **wallet**, never from the SDK host (there an unmapped name is 4002). The Sphere wallet currently answers every intent outside its supported set, `send_nft` included, with it. |
+| -32602 | `ERROR_CODES.INVALID_PARAMS` | Also the wallet's. The Sphere wallet currently validates intent params up front and rejects a malformed one with it, before showing any UI. |
 | -32603 | `ERROR_CODES.INTERNAL_ERROR` | The host caught an error it cannot attribute (a router throw, a query that outlived the host deadline, a request in flight when the wallet went away). |
 | 4200 | `ERROR_CODES.INTENT_CANCELLED` | Intent cancelled — the user declined and **nothing happened**. Safe to re-offer. |
 | 4201 | `ERROR_CODES.INTENT_OUTCOME_UNKNOWN` | The intent reached the wallet and its outcome is unknown: the answer was lost (a host deadline, a lock, a logout), or the wallet cannot tell whether the operation will still complete (a mint journaled before it failed carries `data.tokenId`). **The money or token may or may not have moved. Do NOT retry**; reconcile out of band first. |
+
+> **Where each row comes from.** Nine codes are emitted by the SDK host itself — 4001, 4002, 4004,
+> 4006, 4007, 4008, 4009, -32603 and 4201 (the only `ERROR_CODES.*` members referenced under
+> `connect/`). Those are properties of this repo and hold for any wallet built on it. Everything
+> else in the table is the *wallet's* to send: 4003 and 4200 come from the wallet's own rejection,
+> relayed by the host, and the rows written "the Sphere wallet currently …" describe the Sphere
+> wallet as it stands today — `sphere`, `src/components/connect/intentValidation.ts`,
+> `ConnectIntentHandler.tsx` and `ConnectProvider.tsx`, read at commit `762d350d` — not protocol
+> guarantees. Every one of these codes is defined on the wire, so another wallet may legitimately
+> use a "reserved" code and the Sphere wallet may start emitting one. Discriminate on `.code`, and
+> handle the codes you depend on defensively rather than treating this column as fixed.
 
 Rejection `.data` for the two gate errors:
 

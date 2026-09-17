@@ -6,8 +6,9 @@
  *                   runs a dApp as a custom agent inside its own iframe
  *   P2: extension → ExtensionTransport — LEGACY: the Sphere browser extension is discontinued
  *                   and no supported wallet answers this transport
- *   P3: standalone → PostMessageTransport to popup window (the hosted wallet answers 403 on
- *                   its popup route; see docs/CONNECT.md)
+ *   P3: standalone → PostMessageTransport to popup window — the fallback when the dApp has its
+ *                   own tab; not the route the hosted wallet is driven through, see
+ *                   "Running against the hosted wallet" in docs/CONNECT.md
  *
  * Usage:
  *   import { autoConnect } from '@unicitylabs/sphere-sdk/connect/browser';
