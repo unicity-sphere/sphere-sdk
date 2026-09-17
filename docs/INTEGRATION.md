@@ -1072,9 +1072,11 @@ sphere.on('address:hidden', ({ index, addressId }) => { });
 sphere.on('address:unhidden', ({ index, addressId }) => { });
 ```
 
-The pre-flip names (`transfer:confirmed`, `transfer:failed`, `payment_request:paid`, `sync:*`,
-`invoice:*`, `swap:*`, …) are gone from the public event map — dApps on the Connect wire still
-receive them via the ConnectHost compat adapter (see [CONNECT.md](CONNECT.md)).
+The pre-flip names (`transfer:confirmed`, `transfer:failed`, `payment_request:paid`, `sync:*`, …)
+are gone from the public event map — dApps on the Connect wire still receive them via the
+ConnectHost compat adapter (see [CONNECT.md](CONNECT.md)). The `invoice:*` and `swap:*` names are
+**not** among them: the accounting and swap modules were deleted and the compat adapter never
+re-emitted those events, so nothing delivers them on any surface.
 
 ### Unsubscribe
 

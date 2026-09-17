@@ -5,7 +5,9 @@
  * through a ConnectTransport. Provides query and intent methods
  * that mirror the Sphere SDK API.
  *
- * Zero dependencies on the Sphere SDK core.
+ * Zero EXTERNAL dependencies: nothing from npm reaches a dApp through this file. It does use a
+ * few SDK-internal modules (core/logger, and constants by way of connect/protocol's
+ * SPHERE_NETWORKS), which are bundled into the Connect entry points.
  */
 
 import { logger } from '../../core/logger';

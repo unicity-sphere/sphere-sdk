@@ -46,6 +46,25 @@ augmentation adding a required member now also applies to `autoConnect`'s types)
 Still true: a process that loads Connect through both `import` and `require()` has two copies, and
 so does a dApp whose dependencies bundle their own SDK — keep discriminating errors on `.code`.
 
+### Documentation — the Connect guide matches the code again
+
+`docs/CONNECT.md`, `README.md`, `docs/INTEGRATION.md`, `CLAUDE.md` and the Connect JSDoc. No code
+behaviour changes. Corrected: samples that did not compile (`PostMessageTransport.forHost()` takes
+a target and options; `WebSocketTransport` has `createServer`/`createClient` plus `start()`/
+`connect()`, not `forHost`/`forClient`; `query`/`intent` return `unknown` and event handlers
+receive `unknown`, so the documented destructures need explicit types); every client sample now
+passes `network`, which is required at runtime; `ExtensionTransport` is marked legacy everywhere —
+the browser extension is discontinued and no supported wallet answers it; the hosted wallet is
+documented as the custom-agent iframe path, including its https requirement; the protocol version
+in the README is 2.3, the client SDK floor is 0.14.1; both mainnet and testnet2 are live, with no
+in-session switch; the intents table lists `send_nft` and says the Sphere wallet answers it with
+-32601; the error table gains -32601/-32602/-32603 and marks 4005/4100/4101 reserved; a removed or
+unknown method answers `PERMISSION_DENIED` (4002), or `WALLET_LOCKED` (4009) first when locked;
+the host intent deadline is 180000 ms and fires `INTENT_OUTCOME_UNKNOWN` (4201); the compat
+adapter never re-emitted `invoice:*` / `swap:*`. Added an "Install & entry points" section with
+the TypeScript setup dApps should use (`moduleResolution: bundler`/`node16`, never tsconfig
+`paths` into `dist/`).
+
 ## [0.17.2] - 2026-09-15
 
 ### Added — `mint_nft` Connect intent and `nft:mint` scope (Connect 2.3)

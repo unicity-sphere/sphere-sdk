@@ -1,6 +1,10 @@
 /**
  * ExtensionTransport — Chrome Extension transport for Sphere Connect.
  *
+ * LEGACY: the Sphere browser extension is discontinued and no supported wallet answers this
+ * transport. It still ships so existing builds keep compiling; new integrations use the hosted
+ * wallet (PostMessageTransport / autoConnect) or, in Node.js, WebSocketTransport.
+ *
  * Two modes:
  * - forClient(): dApp page sends messages via window.postMessage with namespace
  *   'sphere-connect-ext:tohost'. Content script relays to background via

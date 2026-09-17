@@ -2,6 +2,47 @@
 
 Sphere Connect is a secure wallet-dApp communication protocol. It allows web applications (dApps) to request wallet operations from a Sphere wallet — reading balances, sending tokens, signing messages — without exposing private keys.
 
+## Install & entry points
+
+```bash
+npm install @unicitylabs/sphere-sdk
+```
+
+A dApp imports **only** the Connect subpaths. They are separate bundles with **no external npm
+dependencies** — no state-transition-sdk, no nostr, no `@noble`, no `bip39`, no `buffer` — so an
+`autoConnect`-only dApp ships a few KB, not the wallet SDK:
+
+| Subpath | What it gives you | Where it runs |
+|---------|-------------------|---------------|
+| `@unicitylabs/sphere-sdk/connect` | `ConnectClient`, `ConnectError`, `ERROR_CODES`, `SPHERE_NETWORKS`, `RPC_METHODS`, `INTENT_ACTIONS`, `PERMISSION_SCOPES`, the NFT wire helpers, and `ConnectHost` for wallets | anywhere (browser, Node, a backend service) |
+| `@unicitylabs/sphere-sdk/connect/browser` | `autoConnect`, `PostMessageTransport`, the `isInIframe`/`hasExtension`/`detectTransport` helpers, and the legacy `ExtensionTransport` | browser only |
+| `@unicitylabs/sphere-sdk/connect/nodejs` | `WebSocketTransport` (needs the optional `ws` peer dependency) | Node.js only |
+
+Do **not** import the package root (`@unicitylabs/sphere-sdk`) from a dApp: that is the wallet-side
+SDK and pulls in the whole token engine.
+
+### TypeScript setup
+
+Resolve these subpaths through the package's `exports` map — set
+`"moduleResolution": "bundler"` (Vite, webpack, Rollup, esbuild) or `"node16"`/`"nodenext"` with a
+matching `"module"`. Nothing else is needed:
+
+```jsonc
+{
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true
+  }
+}
+```
+
+Do **not** hand-write tsconfig `paths` entries pointing at files inside the package's `dist/`
+folder. Those paths bypass `exports`, they are not part of the published contract, and a
+declaration file reached that way can bind to a sibling `.js` and silently degrade to `any`. If an
+older `"moduleResolution": "node"` setup cannot see the subpaths, upgrade the resolution mode
+rather than mapping into `dist/`.
+
 ## Protocol Version
 
 The current Connect protocol version is **`2.3`** (`SPHERE_CONNECT_VERSION = '2.3'`).
@@ -99,7 +140,7 @@ interface NetworkInfo {
 ## Architecture
 
 ```
-dApp (browser)                    Wallet (Sphere / Extension)
+dApp (browser or Node.js)         Wallet (Sphere)
 ─────────────────                 ──────────────────────────
 ConnectClient                ↔    ConnectHost
      │                                  │
@@ -108,7 +149,7 @@ ConnectClient                ↔    ConnectHost
 
 - **ConnectHost** — runs inside the wallet. Bridges `ConnectTransport` to a `Sphere` instance.
 - **ConnectClient** — runs inside the dApp. Sends requests and receives responses.
-- **ConnectTransport** — the communication channel (PostMessage, WebSocket, or Extension).
+- **ConnectTransport** — the communication channel: PostMessage (browser), WebSocket (Node.js), or the legacy Extension relay.
 
 ---
 
@@ -120,24 +161,40 @@ Used when the dApp and wallet communicate via `window.postMessage`.
 ```typescript
 import { PostMessageTransport } from '@unicitylabs/sphere-sdk/connect/browser';
 
-// dApp inside an iframe — talk to parent window
+// --- dApp side (client) ---
+
+// dApp inside an iframe — talk to the parent window (the default target)
 const transport = PostMessageTransport.forClient();
 
-// dApp opens wallet in a popup
+// dApp opens the wallet in a popup — see the note on the hosted wallet below
 const popup = window.open(WALLET_URL + '/connect', 'sphere-wallet', 'width=420,height=650');
 const transport = PostMessageTransport.forClient({ target: popup, targetOrigin: WALLET_URL });
 
-// Wallet side (host)
-const transport = PostMessageTransport.forHost();
+// --- Wallet side (host) ---
+// forHost(target, options) — BOTH arguments are required.
+// iframe mode: target = the iframe element (or its contentWindow)
+const transport = PostMessageTransport.forHost(iframeEl, { allowedOrigins: [dappOrigin] });
+// popup mode: target = window.opener
+const transport = PostMessageTransport.forHost(window.opener, { allowedOrigins: [dappOrigin] });
 ```
 
-### ExtensionTransport (browser extension)
-Used when the Sphere browser extension is installed. The dApp communicates through the extension's content script relay.
+`allowedOrigins` is the host's inbound filter; its first entry is also the `targetOrigin` the host
+posts to. `['*']` is development only.
+
+### ExtensionTransport (legacy — no supported wallet)
+
+> **Legacy.** The Sphere browser extension is discontinued: **no supported wallet answers this
+> transport today.** `ExtensionTransport` still ships so existing builds keep compiling, and
+> `autoConnect` still detects the extension (P2) if something injects `window.sphere`, but do not
+> build a new integration on it. Use the hosted wallet (iframe / custom agent) or, for Node.js,
+> `WebSocketTransport`.
+
+The dApp communicated through the extension's content script relay:
 
 ```typescript
 import { ExtensionTransport } from '@unicitylabs/sphere-sdk/connect/browser';
 
-// dApp side — sends via window.postMessage with sphere-connect-ext namespace
+// dApp side — sends via window.postMessage with the sphere-connect-ext namespace
 const transport = ExtensionTransport.forClient();
 
 // Extension background — receives via chrome.runtime.onMessage
@@ -148,13 +205,28 @@ const transport = ExtensionTransport.forHost({
 ```
 
 ### WebSocketTransport (Node.js)
-Used for server-side or CLI dApps.
+Used for server-side or CLI dApps. The factory methods are `createServer` / `createClient` — there
+is no `forHost` / `forClient` here — and each returns a transport you must open yourself.
 
 ```typescript
 import { WebSocketTransport } from '@unicitylabs/sphere-sdk/connect/nodejs';
+import type { WebSocketClientConfig } from '@unicitylabs/sphere-sdk/connect/nodejs';
+import WebSocket from 'ws';   // `ws` is an OPTIONAL peer dependency
 
-const transport = WebSocketTransport.forClient({ url: 'ws://localhost:3000' });
-const transport = WebSocketTransport.forHost({ port: 3000 });
+// Wallet side: listen. `start()` imports `ws` dynamically — install it or this throws.
+const server = WebSocketTransport.createServer({ port: 3000, host: '127.0.0.1' });
+await server.start();
+
+// dApp side: connect. `createWebSocket` is REQUIRED — the SDK never imports a
+// WebSocket implementation for you on the client path.
+const client = WebSocketTransport.createClient({
+  url: 'ws://localhost:3000',
+  // A `ws` socket works at runtime, but its event types are narrower than the SDK's
+  // internal socket interface, so TypeScript needs this cast.
+  createWebSocket: (url) => new WebSocket(url) as unknown as ReturnType<WebSocketClientConfig['createWebSocket']>,
+  autoReconnect: false,          // default: true
+});
+await client.connect();
 ```
 
 #### safeSend pattern for WebSocket bridges
@@ -392,23 +464,48 @@ await result.disconnect();
 
 | Priority | Mode | Detection | Transport |
 |----------|------|-----------|-----------|
-| P1 | Iframe | `isInIframe()` | `PostMessageTransport` to parent |
-| P2 | Extension | `hasExtension()` | `ExtensionTransport` via content script |
-| P3 | Popup | fallback | `PostMessageTransport` to popup window |
+| P1 | Iframe | `isInIframe()` | `PostMessageTransport` to parent — **the live path**, see below |
+| P2 | Extension | `hasExtension()` | `ExtensionTransport` via content script — **legacy, no supported wallet** |
+| P3 | Popup | fallback | `PostMessageTransport` to popup window — see the hosted-wallet note below |
 
 You can force a specific transport:
 ```typescript
-await autoConnect({ dapp, walletUrl, forceTransport: 'extension' });
+await autoConnect({ dapp, walletUrl, network: SPHERE_NETWORKS.testnet2, forceTransport: 'iframe' });
 ```
+
+### Running against the hosted wallet
+
+The hosted wallet at `https://sphere.unicity.network` **does not serve the popup path**: opening
+`https://sphere.unicity.network/connect` from a dApp window answers **403**. The way a dApp runs
+against it is as a **custom agent**, which the wallet loads in an iframe — so `autoConnect` takes
+P1 and no popup is involved:
+
+```
+https://sphere.unicity.network/agents/custom?url=<your dApp URL>
+```
+
+**Your URL must be `https`.** The wallet frames a custom agent only when the URL's protocol is
+`https:` (`isHttpsUrl`, a protocol-only check), so `https://localhost:5173` with a local dev
+certificate works while plain `http://localhost:5173` is refused. Start your dev server over TLS
+(for example Vite's `--https` with a local certificate) and pass that URL.
+
+Because the dApp runs inside the wallet's iframe, `isInIframe()` is true and
+`PostMessageTransport.forClient()` talks to the parent window — no `walletUrl` is needed in that
+mode.
 
 ### Auto-reconnect on page reload
 
-For extension mode, the wallet's background service worker is always running. A silent connect on page load reconnects instantly if the origin is already approved:
+A silent connect on page load reconnects without UI if the origin is already approved:
 
 ```typescript
 // On mount: try silent auto-connect
 try {
-  const result = await autoConnect({ dapp, walletUrl, silent: true });
+  const result = await autoConnect({
+    dapp,
+    walletUrl,
+    network: SPHERE_NETWORKS.testnet2,   // required at runtime — see below
+    silent: true,
+  });
   // Connected — origin was already approved
 } catch {
   // Not approved — show Connect button
@@ -486,10 +583,13 @@ const txResult = await client.intent('send', {
   coinId: '<lowercase 64-hex coin id>',
 });
 
-// Sign a message (e.g. challenge-response auth)
-const { signature, publicKey } = await client.intent('sign_message', {
-  message: 'Sign in to My App\n\nNonce: abc123',
-});
+// Sign a message (e.g. challenge-response auth).
+// `query` and `intent` are generic and default to `unknown`, so name the result shape
+// yourself — destructuring an untyped result does not compile under `strict`.
+const { signature, publicKey } = await client.intent<{ signature: string; publicKey: string }>(
+  'sign_message',
+  { message: 'Sign in to My App\n\nNonce: abc123' },
+);
 
 // Events — wallet pushes real-time updates
 const unsub = client.on('transfer:incoming', (data) => {
@@ -508,7 +608,7 @@ Silent mode lets a dApp check whether it is already approved by the wallet **wit
 
 ```typescript
 // On page load: silently check if already approved
-const client = new ConnectClient({ transport, dapp, silent: true });
+const client = new ConnectClient({ transport, dapp, network: SPHERE_NETWORKS.testnet2, silent: true });
 try {
   const result = await client.connect(); // fast: no popup, no UI
   // Already approved — restore session
@@ -554,6 +654,7 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `receive` | — | `{ transfers }` |
 | `sign_message` | `message` | `{ signature, publicKey }` |
 | `mint` | `coinId` (lowercase hex), `amount` (smallest units) | `{ tokenId, coinId, amount }` |
+| `send_nft` | `to, tokenId, memo?` | **not implemented by the Sphere wallet** — it answers `METHOD_NOT_FOUND` (-32601). The intent and its `nft:transfer` scope exist on the wire since 2.2; feature-detect by trying it and treating -32601 as "unsupported". |
 | `mint_nft` | `content` (`WireNftContent`), `sign?` (default `true`) | `{ tokenId }` |
 
 > **Amount units:** `amount` is always in **base units** (the smallest indivisible unit), as a
@@ -669,7 +770,7 @@ const { tokenId } = await client.intent<MintNftIntentResult>('mint_nft', params)
 
 **Params.** `content` is a `WireNftContent`: an `NftContent` ([NFT-METADATA.md](NFT-METADATA.md))
 with every inline `NftMedia.bytes` replaced by standard base64 (RFC 4648 §4, with padding), because
-Connect messages are JSON and the extension transport cannot carry a `Uint8Array`. An `NftLink` is
+Connect messages are JSON and JSON cannot carry a `Uint8Array`. An `NftLink` is
 unchanged. `nftContentToWire` builds it.
 
 | `kind` | Fields besides `kind` — all required |
@@ -712,9 +813,17 @@ inline media at or below about 900 KB, and link larger files with `NftLink`.
 The experimental invoice surface — 2 queries (`sphere_getInvoices`, `sphere_getInvoiceStatus`),
 9 intents (`create_invoice` … `set_auto_return`) and 2 scopes (`invoice:read`, `invoice:write`)
 — was **removed from the protocol** when the SDK's accounting module was deleted. It was never
-enabled in any wallet host (every call answered `MODULE_NOT_AVAILABLE`), and the protocol
-version stays 2.1. A removed method or intent now answers the standard `METHOD_NOT_FOUND` path;
-requesting the removed scopes fails permission validation.
+enabled in any wallet host (every call answered `MODULE_NOT_AVAILABLE`), and the removal did not
+bump the protocol version (2.1 at the time). Requesting the removed scopes fails permission
+validation.
+
+A removed — or simply unknown — method or intent answers **`PERMISSION_DENIED` (4002)**, not
+`METHOD_NOT_FOUND`: `hasMethodPermission()` / `hasIntentPermission()` return false for anything
+unmapped, and that check is what refuses the request. On a **locked** wallet the lock gate runs
+first, so the same request answers `WALLET_LOCKED` (4009) until `wallet:unlocked` — deliberately,
+so a dApp is not told its permissions are wrong for something it may simply have to retry.
+`METHOD_NOT_FOUND` (-32601) comes from the *wallet*, not from the SDK host: the Sphere wallet
+answers intents it does not implement (today `send_nft`) with it.
 
 ## Events (wallet → dApp push)
 
@@ -774,7 +883,9 @@ client.on('wallet:locked', () => {
   setWalletLocked(true);           // render "wallet locked — unlock to continue"
 });                                // do NOT disconnect, do NOT clear the session
 
-client.on('wallet:unlocked', ({ identity }) => {
+// `ConnectEventHandler` receives `unknown`: type the payload at the handler boundary.
+client.on('wallet:unlocked', (data) => {
+  const { identity } = data as { identity?: PublicIdentity };
   setWalletLocked(false);
   // The identity may differ from the one you connected with (a legal address switch before the
   // lock). Compare it before replaying anything that moves money.
@@ -850,11 +961,14 @@ try {
 | 4002 | `ERROR_CODES.PERMISSION_DENIED` | Method or intent not in granted permissions. |
 | 4003 | `ERROR_CODES.USER_REJECTED` | User rejected an intent in the wallet UI. |
 | 4004 | `ERROR_CODES.SESSION_EXPIRED` | Session TTL elapsed. |
-| 4005 | `ERROR_CODES.ORIGIN_BLOCKED` | dApp origin is blocked by the wallet. |
+| 4005 | `ERROR_CODES.ORIGIN_BLOCKED` | **Reserved** — defined on the wire, but no SDK host or wallet path emits it today. |
 | 4006 | `ERROR_CODES.RATE_LIMITED` | Too many requests per second. |
-| 4100 | `ERROR_CODES.INSUFFICIENT_BALANCE` | Send intent failed — not enough tokens. |
-| 4101 | `ERROR_CODES.INVALID_RECIPIENT` | Recipient not resolvable to a chain pubkey. |
-| 4102 | `ERROR_CODES.TRANSFER_FAILED` | Transfer execution failed. |
+| 4100 | `ERROR_CODES.INSUFFICIENT_BALANCE` | **Reserved** — no code path emits it today; a failed send comes back as `TRANSFER_FAILED` (4102). |
+| 4101 | `ERROR_CODES.INVALID_RECIPIENT` | **Reserved** — no code path emits it today; an unresolvable recipient also fails as `TRANSFER_FAILED` (4102). |
+| 4102 | `ERROR_CODES.TRANSFER_FAILED` | Transfer execution failed (what the Sphere wallet sends when it rejects a send). |
+| -32601 | `ERROR_CODES.METHOD_NOT_FOUND` | The **wallet** does not implement this intent or method. The SDK host never sends it (an unmapped name is 4002); the Sphere wallet answers `send_nft` with it. |
+| -32602 | `ERROR_CODES.INVALID_PARAMS` | The wallet rejected the params of an otherwise supported intent, before showing any UI. |
+| -32603 | `ERROR_CODES.INTERNAL_ERROR` | The host caught an error it cannot attribute (a router throw, a query that outlived the host deadline, a request in flight when the wallet went away). |
 | 4200 | `ERROR_CODES.INTENT_CANCELLED` | Intent cancelled — the user declined and **nothing happened**. Safe to re-offer. |
 | 4201 | `ERROR_CODES.INTENT_OUTCOME_UNKNOWN` | The intent reached the wallet and its outcome is unknown: the answer was lost (a host deadline, a lock, a logout), or the wallet cannot tell whether the operation will still complete (a mint journaled before it failed carries `data.tokenId`). **The money or token may or may not have moved. Do NOT retry**; reconcile out of band first. |
 
@@ -911,7 +1025,7 @@ Permissions are requested during handshake and checked on every request:
 
 ## Session Resume (popup mode)
 
-When using a popup window (P3), the session ID can be persisted to avoid re-showing the approval modal on page reload. Extension mode (P2) does not need this — the extension's background service worker keeps the session alive, and a silent `autoConnect` on mount is sufficient.
+When using a popup window (P3), the session ID can be persisted to avoid re-showing the approval modal on page reload. (The legacy extension mode did not need this — its background service worker kept the session alive — but no supported wallet serves that transport any more.)
 
 ### Full lifecycle
 
@@ -920,7 +1034,7 @@ When using a popup window (P3), the session ID can be persisted to avoid re-show
 ```typescript
 const SESSION_KEY = 'sphere-session';
 
-const result = await autoConnect({ dapp, walletUrl, permissions });
+const result = await autoConnect({ dapp, walletUrl, permissions, network: SPHERE_NETWORKS.testnet2 });
 sessionStorage.setItem(SESSION_KEY, result.connection.sessionId);
 ```
 
@@ -936,6 +1050,7 @@ try {
     dapp,
     walletUrl,
     permissions,
+    network: SPHERE_NETWORKS.testnet2,
     resumeSessionId: savedSession ?? undefined,
   });
   sessionStorage.setItem(SESSION_KEY, result.connection.sessionId);
@@ -958,7 +1073,7 @@ To prevent a flash of the Connect button before auto-connect completes, check wh
 
 ```typescript
 const willAutoConnect =
-  !!sessionStorage.getItem(SESSION_KEY) || (await hasExtension());
+  !!sessionStorage.getItem(SESSION_KEY) || isInIframe();   // both helpers are synchronous
 ```
 
 Use this to show a loading state instead of the Connect button while auto-connect is in progress.
@@ -971,6 +1086,7 @@ If you are using `ConnectClient` directly instead of `autoConnect`:
 const client = new ConnectClient({
   transport,
   dapp,
+  network: SPHERE_NETWORKS.testnet2,   // required at runtime, resume or not
   resumeSessionId: sessionStorage.getItem(SESSION_KEY) ?? undefined,
 });
 ```
@@ -1009,7 +1125,7 @@ When the wallet and dApps must both update (e.g. a new mandatory field or a MAJO
 2. **Release the new SDK** — makes dApps send the new fields (e.g. `network` + `sdkVersion` in v2).
 3. **Upgrade dApps** — update to the new SDK, declare `ConnectClientConfig.network`, wire `onConnectionRejected`.
 
-For the v1 → v2 migration specifically: the wallet already requires v2; dApps must update to SDK ≥ 0.9.x and declare `network` in their `ConnectClientConfig`.
+For the v1 → v2 migration specifically: the wallet already requires v2; dApps must declare `network` in their `ConnectClientConfig` and run an SDK at or above the host's npm floor, **`0.14.1`** (`DEFAULT_MIN_CLIENT_SDK_VERSION = '0.14.1-0'`, so every `0.14.1` prerelease passes). Anything below it is refused with `UNSUPPORTED_PROTOCOL_VERSION` (4007) before any UI appears.
 
 **Downstream repos that need separate PRs for v2:**
 - `sphere-sdk-connect-example` — declare `ConnectClientConfig.network` in all example clients.
@@ -1019,4 +1135,6 @@ For the v1 → v2 migration specifically: the wallet already requires v2; dApps 
 
 ## Deferred: Runtime Network Switching
 
-There is no `switch_network` intent, no `network:changed` event, and no `switchNetwork()` method. A network mismatch at handshake time is rejected with `INCOMPATIBLE_NETWORK` (4008). Runtime switching is deferred to a future multi-network effort — only testnet2 is live, and the SDK has no runtime network switch.
+There is no `switch_network` intent, no `network:changed` event, and no `switchNetwork()` method. A network mismatch at handshake time is rejected with `INCOMPATIBLE_NETWORK` (4008).
+
+**Both networks are live**: `SPHERE_NETWORKS.mainnet` (id 1) and `SPHERE_NETWORKS.testnet2` (id 4). Which one a wallet or dApp runs on is chosen when it starts, so a Connect session is bound to the network declared in its handshake — there is no in-session switch on either side. A dApp that wants to follow the user across networks must tear the session down and connect again against the other network. Runtime switching over the wire is deferred to a future multi-network effort.

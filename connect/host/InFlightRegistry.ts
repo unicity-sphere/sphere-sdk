@@ -25,8 +25,8 @@ export interface InFlightEntry {
 
 export interface InFlightRegistryOptions {
   /** Called when an entry's own timer fires. The entry is ALREADY removed and aborted, so
-   *  the sink just sends the frame (INTERNAL_ERROR for a query, INTENT_CANCELLED 4200 for
-   *  an intent). */
+   *  the sink just sends the frame (INTERNAL_ERROR -32603 for a query, INTENT_OUTCOME_UNKNOWN
+   *  4201 for an intent — never INTENT_CANCELLED, which would assert that nothing happened). */
   readonly onExpire: (entry: InFlightEntry) => void;
 }
 
