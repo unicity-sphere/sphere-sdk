@@ -294,7 +294,7 @@ const providers = createWalletApiProviders(baseProviders, {
 | `network` | string | Yes | Must equal the `network` passed to `Sphere.init`, as an exact string (`'testnet'` does not equal `'testnet2'` here), or init throws `INVALID_CONFIG`. |
 | `deviceId` | string | No | Per-device label — the refresh-token row's key. Keep it stable on one device across launches and different on every device. If omitted, the SDK uses a random `sphere-<uuid>` and every run performs a fresh challenge sign-in. |
 | `fetchFn` | function | No | Injectable fetch (defaults to `globalThis.fetch`) |
-| `webSocketFactory` | function | No | Injectable WebSocket factory (defaults to `globalThis.WebSocket`; e.g. the `ws` package on Node < 22) |
+| `webSocketFactory` | function | No | Injectable WebSocket factory (defaults to `globalThis.WebSocket`; inject one where there is no global `WebSocket`) |
 | `paymentsV2Transport` | function | No | DI seam: supply the whole per-address transport bundle (`{ session, client }`) — offline tests, custom hosts. When set, it is used instead of `baseUrl`. |
 
 To inject the transport without a `baseUrl`, build a `WalletApiTransportConfig` directly: there
@@ -1016,15 +1016,20 @@ const requests = sphere.payments.requests.list();
 sphere.payments.requests.dismissProcessed();
 ```
 
-`pay()` never leaves a request payable after a possibly-committed failure: before it rethrows
-such an error it durably links the request to the transfer and marks it `'settling'`, and a
-second `pay()` of the same id in the same process joins the first. That link is written after
-the send returns or throws, not before it starts. If the app or process stops while `pay()` is
-still waiting on the send, no link exists: on the next start the request is listed as
-`'pending'` again and `payment_request:incoming` fires again, even if the transfer went through
-(a transfer the SDK had already recorded is resumed when the wallet starts). Before paying a
-request again after a restart, check `sphere.payments.pendingTransfers()` and
-`sphere.payments.history()` for a transfer to that requester.
+When the send inside `pay()` fails with a possibly-committed error, `pay()` links the request to
+that transfer (the error's `transferId`) in the payments journal and marks it `'settling'` before
+it rethrows, so the request is not payable, and the link survives a restart. One exception: if
+writing that link to storage fails, `pay()` rejects with the storage error instead of the send
+error, so `isPossiblyCommittedSendOutcome` is `false` for it although the payment may have gone
+out; the link is then held in memory and reaches storage only with a later successful journal
+write. A second `pay()` of the same id while the first is still running joins it. The link is
+written after the send returns or throws, not before it starts. If the app or process stops while
+`pay()` is still waiting on the send, or before a link that failed to write reaches storage, no
+link exists: on the next start the request is listed as `'pending'` again and
+`payment_request:incoming` fires again, even if the transfer went through (a transfer the SDK had
+already recorded is resumed when the wallet starts). Before paying a request again after a
+restart, check `sphere.payments.pendingTransfers()` and `sphere.payments.history()` for a
+transfer to that requester.
 
 ---
 
@@ -1692,7 +1697,7 @@ logger.setTagDebug('Nostr', true);       // the Nostr transport
 ### 1. Always Handle Wallet State
 
 ```typescript
-import { Sphere } from '@unicitylabs/sphere-sdk';
+import { Sphere, randomUUID } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser'; // untyped entry: add the declaration shim
 import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
 
@@ -1703,7 +1708,8 @@ const NETWORK = 'testnet2';
 function deviceId(): string {
   let id = localStorage.getItem('sphere-device-id');
   if (!id) {
-    id = crypto.randomUUID();
+    // The SDK's randomUUID(): unlike crypto.randomUUID(), it also works outside a secure context.
+    id = randomUUID();
     localStorage.setItem('sphere-device-id', id);
   }
   return id;
