@@ -10,11 +10,11 @@
 > **Which version this page describes:** the 0.17 line (0.17.3 is the current npm release).
 > Coming from 0.14.x or earlier? Read [Upgrading to 0.15.0](#upgrading-to-0150) first — the
 > base-SDK pin moved to `@unicitylabs/state-transition-sdk@3.0.1`, which is a wire break no
-> client can straddle, and `sphere.paymentsV2` is gone. Later breaking changes are in the
+> client can straddle, and `sphere.paymentsV2` is gone. Later changes are in the
 > [CHANGELOG](../CHANGELOG.md): 0.16.0 removed `Sphere.getInstance()`, `Sphere.isInitialized()`
-> and the root export `getSphere` (hold the instance the entry point returns; `sphere.isReady`
-> answers readiness) and made mainnet runnable; 0.17.x added coinless tokens (NFTs) and, in
-> 0.17.3, the messaging-only `walletApi: 'none'` composition.
+> and the root export `getSphere` (a breaking change: hold the instance the entry point returns;
+> `sphere.isReady` answers readiness) and made mainnet runnable; 0.17.x added coinless tokens
+> (NFTs) and, in 0.17.3, the messaging-only `walletApi: 'none'` composition.
 
 ## Table of Contents
 
@@ -324,7 +324,9 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
 });
 
 if (created && generatedMnemonic) {
-  // First launch — show mnemonic to user for backup
+  // Returned only by the call that created the wallet. Do not rely on it alone for the backup
+  // prompt: keep your own "backup confirmed" flag and show sphere.getMnemonic() until it is set
+  // (see below).
   console.log('Save this mnemonic:', generatedMnemonic);
 }
 
@@ -489,6 +491,9 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
 });
 
 if (created && generatedMnemonic) {
+  // Returned only by the call that created the wallet. Do not rely on it alone for the backup
+  // prompt: keep your own "backup confirmed" flag and show sphere.getMnemonic() until it is set
+  // (see Best Practices #1).
   console.log('Backup these words:', generatedMnemonic);
 }
 ```
@@ -776,7 +781,8 @@ in the recipient's mailbox, or `'confirmed'` with `result.deliveryPending === tr
 transfer is certified and delivery is still being retried. That is success, not an error.
 `send()` never resolves with `'completed'` or `'failed'`, and it never sets `result.error`: a
 failure throws. Of the other `TransferStatus` values, `'submitted'` (progress) and `'failed'` (a
-clean failure) appear only on the `transfer:updated` event, and `'completed'` is never produced.
+clean failure) appear only on the `transfer:updated` event, and `'pending'` and `'completed'` are
+never produced.
 
 **SendRequest fields:**
 
@@ -1243,9 +1249,11 @@ The provider then delegates, and reads through the same tolerant parse:
 readonly backingStoreId: string;
 
 constructor(private readonly path: string) {
-  // Assign it here, after `path` exists. A field initializer that reads `this.path` runs
-  // before the constructor body and would give every instance 'mystore:undefined', i.e.
-  // one shared id, so Sphere.clear() on one store would tear down the Spheres of all of them.
+  // Assign it here, after `path` exists. With standard class fields (TypeScript's default
+  // from target ES2022 on), a field initializer that reads `this.path` runs before the
+  // parameter property is assigned: tsc reports TS2729, and every instance gets
+  // 'mystore:undefined', i.e. one shared id, so Sphere.clear() on one store would tear down
+  // the Spheres of all of them.
   this.backingStoreId = `mystore:${path}`;
 }
 
@@ -1455,7 +1463,8 @@ keyed by the short addressId, not by HD index.
 Failed to register Unicity ID. It may already be taken.
 ```
 
-With Nostr debug logging on (`logger.setTagDebug('Nostr', true)`), the transport also logs:
+When the Nostr client refuses the name as already claimed, the transport also logs this line
+(with Nostr debug logging on, `logger.setTagDebug('Nostr', true)`):
 ```
 [Nostr] Unicity ID already taken: myname
 ```
@@ -1524,7 +1533,9 @@ When loading an existing wallet, the SDK automatically syncs the identity bindin
 // On Sphere.load() (and Sphere.init() on an existing wallet):
 // 1. Looks up the binding published under this wallet's key
 // 2. If one exists: recovers a nametag missing locally (emits 'nametag:recovered'), and
-//    re-publishes only if the binding lacks the address, the pubkey or the local nametag
+//    re-publishes when that nametag had to be decrypted from a legacy-format binding (to
+//    publish it in the current format), or when the binding lacks the address or the pubkey,
+//    or has no nametag while the wallet has one
 // 3. If none exists: publishes one, and logs a warning if the nametag is taken by another pubkey
 // A failure here is logged and never fails the load.
 ```
@@ -1611,10 +1622,11 @@ try {
 }
 ```
 
-Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (not enough spendable funds; its
-message names funds pinned by transfers still converging), `INVALID_RECIPIENT` (no published
-chain pubkey, or a recipient on another network), `TRANSPORT_ERROR` (the recipient lookup could
-not reach the Nostr relays) and `VALIDATION_ERROR` (for example a malformed amount).
+Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (not enough spendable funds; when
+some funds are pinned by transfers still converging, its message says how much and points to
+`pendingTransfers()`), `INVALID_RECIPIENT` (no published chain pubkey, or a recipient on another
+network), `TRANSPORT_ERROR` (the recipient lookup could not reach the Nostr relays) and
+`VALIDATION_ERROR` (for example a malformed amount).
 `INSUFFICIENT_BALANCE` exists in the `SphereErrorCode` union but is never thrown.
 
 ### Verification Is Built In
@@ -1639,12 +1651,13 @@ sphere.on('transfer:attention', ({ transferId, code }) => {
 ### Typed Error Handling
 
 SDK methods throw `SphereError` with a typed `.code` field. `isSphereError()` is an `instanceof`
-check, and each bundle of the package (the root, `./core`, `./impl/browser`, `./impl/nodejs`)
-carries its own copy of the `SphereError` class. An error thrown inside a provider built by
-`createBrowserProviders` / `createNodeProviders` (for example the Nostr transport's
-`TRANSPORT_ERROR`) therefore fails `isSphereError()` imported from the root. Read `code`
-structurally when an error can come from a provider, and import `isPossiblyCommittedSendOutcome`
-/ `PartialSendConflictError` from the same entry point as `Sphere`.
+check, and each bundle of the package (for example the root, `./core`, `./impl/browser` and
+`./impl/nodejs`) carries its own copy of the `SphereError` class. An error thrown inside a
+provider built by `createBrowserProviders` / `createNodeProviders` (for example the Nostr
+transport's `TRANSPORT_ERROR`) therefore fails `isSphereError()` imported from the root. Read
+`code` structurally when an error can come from a provider, and import
+`isPossiblyCommittedSendOutcome` / `PartialSendConflictError` from the same entry point as
+`Sphere`.
 
 ```typescript
 try {
@@ -1756,19 +1769,30 @@ sphere.on('connection:changed', async ({ provider, connected }) => {
 
 Token transfers and payment requests do not travel over Nostr: they arrive through the
 wallet-api (mailbox and request stream), and receive dedup is described under
-[Receive Tokens](#receive-tokens). The Nostr transport persists resume timestamps for
-**messages** only, per wallet pubkey, so that on reconnect or app restart it asks the relays only
-for newer events.
+[Receive Tokens](#receive-tokens). Nostr resume timestamps are persisted for **messages** only,
+per wallet pubkey, so that on reconnect or app restart only newer events are requested from the
+relays.
 
 This is handled automatically when using `createBrowserProviders()` or `createNodeProviders()`: the
 storage provider is passed to the transport.
 
-**Behavior by subscription:**
+**Behavior by subscription.** In a Sphere wallet on the Nostr transport (what both provider
+factories build), the message subscriptions are run by Sphere's per-address multiplexer, not by
+the transport: when the wallet's modules start, the multiplexer takes over and the transport's
+own subscriptions are switched off. The multiplexer uses the transport's storage adapter and the
+same per-pubkey timestamps, and opens one subscription per kind for all the addresses it routes,
+starting from the earliest of their timestamps:
 
 | Subscription | With a stored timestamp | No stored timestamp | No storage adapter |
 |--------------|-------------------------|---------------------|--------------------|
-| Legacy kind-4 DMs | Resume from it | `now - 24h`, the one-shot fallback Sphere sets when it brings up the providers and on `switchToAddress()`; `now` if none is set | `now - 24h` |
-| NIP-17 gift-wrap DMs | Resume from it | The transport's fallback DM timestamp, if one was set before subscribing, else `now` | The same fallback, else `now` |
+| Legacy kind-4 DMs | Resume from it | `now` | `now` |
+| NIP-17 gift-wrap DMs | Resume from it | The fallback DM timestamp set for that address before subscribing, if any, else `now` | The same fallback, else `now` |
+
+`NostrTransportProvider` used on its own, without Sphere, differs only for kind-4 DMs: with a
+storage adapter but no stored timestamp it starts from the one-shot fallback set with
+`setFallbackSince()`, else `now`, and with no storage adapter it starts from `now - 24h`. The
+`now - 24h` fallback that Sphere sets on the transport when it brings up the providers and on
+`switchToAddress()` is not read by the multiplexer.
 
 Gift-wrap timestamps are randomised by up to two days for privacy, so the relay filter for them
 starts two days before the chosen timestamp.
