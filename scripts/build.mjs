@@ -7,19 +7,27 @@
 // #1270; vercel/ai#10662). That broke ~50% of publish dispatches at the
 // packaging gate and cost a manual re-dispatch every release.
 //
-// Fix: build each entry one at a time via tsup's programmatic API. Serial
-// execution removes the race entirely while preserving every per-entry option
-// in tsup.shared.js byte-for-byte (same outputs, just ordered). A single
+// Fix: build each CONFIG one at a time via tsup's programmatic API. Serial
+// execution removes the race entirely while preserving every option in
+// tsup.shared.js byte-for-byte (same outputs, just ordered). A single
 // up-front clean replaces the per-config `clean` flag so cleaning can never
 // race a sibling's writes. A final assertion fails the build loudly if any
 // declared artifact is still missing — defense in depth ahead of the publish
 // gate, never a silent broken tarball.
 //
+// Config != entry. Most configs carry exactly one entry, but the Connect ESM
+// config carries five and builds them as ONE code-split graph (sphere-sdk#789):
+// splitting only deduplicates modules across entries that are built together,
+// so those five must stay in a single config or ConnectClient/ConnectError get
+// duplicated again. `expectedArtifacts()` below therefore walks every entry key
+// of a config, not just the first.
+//
 // IMPORTANT: each build() passes `config: false`. tsup's programmatic build()
 // otherwise loads tsup.config.ts from cwd and merges it UNDER the override —
-// which, since that config is the 12-entry array, would re-run all 12 entries
-// (concurrently) on every call and reintroduce the very race we remove. With
-// `config: false` tsup uses only the options passed here: exactly one entry.
+// which, since that config is the same 12-config array, would re-run all 12
+// configs (concurrently) on every call and reintroduce the very race we remove.
+// With `config: false` tsup uses only the options passed here: exactly one
+// config, with exactly its own entry or entries.
 
 import { existsSync, rmSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -60,7 +68,7 @@ function expectedArtifacts(cfg) {
   });
 }
 
-console.log(`[build] cleaning dist/ and building ${configs.length} entries sequentially`);
+console.log(`[build] cleaning dist/ and building ${configs.length} configs sequentially`);
 rmSync('dist', { recursive: true, force: true });
 
 for (const [i, cfg] of configs.entries()) {
@@ -68,7 +76,7 @@ for (const [i, cfg] of configs.entries()) {
   console.log(`[build] (${i + 1}/${configs.length}) ${entryKeys}`);
   // clean:false — cleaning is done once, above (a per-config clean under tsup's
   // parallel model can wipe a sibling's output, sphere-sdk#548).
-  // config:false — do not load tsup.config.ts; build ONLY this entry (see note).
+  // config:false — do not load tsup.config.ts; build ONLY this config (see note).
   await build({ ...cfg, clean: false, config: false });
 }
 

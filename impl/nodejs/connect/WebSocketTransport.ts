@@ -8,8 +8,9 @@
  * Uses the existing IWebSocket/WebSocketFactory abstraction from transport/websocket.ts.
  */
 
-import type { ConnectTransport, SphereConnectMessage } from '../../../connect';
-import { isSphereConnectMessage } from '../../../connect';
+import type { ConnectTransport } from '../../../connect/types';
+import type { SphereConnectMessage } from '../../../connect/protocol';
+import { isSphereConnectMessage } from '../../../connect/protocol';
 import type { IWebSocket, WebSocketFactory } from '../../../transport/websocket';
 import { WebSocketReadyState } from '../../../transport/websocket';
 import { logger } from '../../../core/logger';
