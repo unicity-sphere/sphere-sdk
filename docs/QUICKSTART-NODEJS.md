@@ -476,8 +476,6 @@ const sphere = await Sphere.import({
 
 ## Password Encryption
 
-By default, the mnemonic is stored as **plaintext** in `wallet.json`. You can optionally encrypt it with a password.
-
 The wallet keeps its mnemonic (or master key) in the storage provider: IndexedDB in the browser, the wallet file
 on Node. If you pass `password` when the wallet is created or imported, the SDK encrypts that value with
 CryptoJS's password-based AES-256-CBC, which derives the key with OpenSSL's `EVP_BytesToKey` (MD5, one iteration).
@@ -715,7 +713,7 @@ try {
     // the SDK completes it under the same transferId.
     console.error('Sent, waiting for confirmation.');
     const pending = await sphere.payments.pendingTransfers(); // what is still converging
-    await sphere.payments.resumeNow();                        // the retry verb, never send()
+    // A "retry" (button or command) calls sphere.payments.resumeNow(), never send().
   } else {
     // Nothing left the wallet. Read `code` structurally: errors thrown by the providers
     // (e.g. the Nostr transport) are a different SphereError class copy, so isSphereError() is false for them.

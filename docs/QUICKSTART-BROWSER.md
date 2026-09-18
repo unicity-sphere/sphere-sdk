@@ -72,6 +72,10 @@ declare module '@unicitylabs/sphere-sdk/impl/browser' {
 Import `createWalletApiProviders` from the typed `@unicitylabs/sphere-sdk/impl/shared/wallet-api`
 subpath, not from `./impl/browser`.
 
+The shim declares only `createBrowserProviders`. If you import other `./impl/browser` exports, such as
+`createLocalStorageProvider` or `createUnicityAggregatorProvider`, add their declarations to the shim, or use
+the one-line `declare module '@unicitylabs/sphere-sdk/impl/browser';` form.
+
 > **Note:** No API key is bundled with the SDK: pass the gateway key through `oracle: { apiKey: '...' }`. The testnet2 key is **not a secret** (see `.env.example`): `sk_ddc3cfcc001e4a28ac3fad7407f99590`. A mainnet key, by contrast, IS a secret: keep it in your deploy environment only.
 >
 > **Networks:** the live networks are **testnet2** (network id 4) and **mainnet** (network id 1). Both are live, each with its own gateway and wallet-api deployment. `'testnet'` is a second name for testnet2's configuration (same endpoints), but it is a different string: use `'testnet2'` (see [One network literal](#one-network-literal)). On mainnet use `network: 'mainnet'` in `createBrowserProviders`, in the `walletApi` config and on `Sphere.init`, the mainnet wallet-api `https://wallet-api.mainnet.unicity.network`, and your mainnet gateway API key, which is a secret. Mainnet shares testnet2's Nostr relay for now, and its token registry lists no fungible coins yet. The v1 network is discontinued and the `dev` preset has been removed: passing it is a type error. The "2" in testnet2 names the **gateway network**, not the base-SDK major: testnet2 is still testnet2 on state-transition-sdk 3.x.
@@ -110,7 +114,7 @@ Save the setup as a module; the framework samples below import it.
 
 ```typescript
 // wallet.ts
-import { Sphere, type SphereInitResult } from '@unicitylabs/sphere-sdk';
+import { Sphere, randomUUID, type SphereInitResult } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser'; // untyped entry: add the declaration shim
 import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
 
@@ -118,10 +122,11 @@ import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wa
 export const NETWORK = 'testnet2';
 
 // A per-device id: stable across launches on this device, different on every device.
-function deviceId(): string {
+export function deviceId(): string {
   let id = localStorage.getItem('sphere-device-id');
   if (!id) {
-    id = crypto.randomUUID();
+    // The SDK's randomUUID(): unlike crypto.randomUUID(), it also works outside a secure context.
+    id = randomUUID();
     localStorage.setItem('sphere-device-id', id);
   }
   return id;
@@ -169,7 +174,7 @@ import { useState, useEffect } from 'react';
 import type { Sphere, SphereInitResult } from '@unicitylabs/sphere-sdk';
 import { initWallet } from './wallet'; // the Vanilla sample above
 
-// One wallet per page. It lives as long as the page; call sphere.destroy() on logout.
+// One wallet per page. It lives as long as the page; end it with logout() below.
 let walletPromise: Promise<SphereInitResult> | null = null;
 function getWallet(): Promise<SphereInitResult> {
   if (!walletPromise) {
@@ -177,6 +182,15 @@ function getWallet(): Promise<SphereInitResult> {
     walletPromise.catch(() => { walletPromise = null; }); // allow a retry after a failure
   }
   return walletPromise;
+}
+
+// Logout: forget the page's wallet, then destroy it. After destroy() the instance has no identity
+// and sphere.payments throws NOT_INITIALIZED, so the next getWallet() (call it after logout()
+// resolves) must start a new one.
+async function logout(): Promise<void> {
+  const current = walletPromise;
+  walletPromise = null;
+  if (current) await current.then(({ sphere }) => sphere.destroy(), () => undefined);
 }
 
 function useWallet() {
@@ -344,6 +358,7 @@ Where the wallet's data lives:
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser'; // untyped entry: add the declaration shim
 import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
+import { deviceId } from './wallet'; // the Vanilla sample above
 
 // Step 1: Base providers (storage, transport, oracle)
 const base = createBrowserProviders({
@@ -381,7 +396,7 @@ const base = createBrowserProviders({
 const providers = createWalletApiProviders(base, {
   baseUrl: 'https://wallet-api.unicity.network', // testnet2 wallet-api (mainnet: https://wallet-api.mainnet.unicity.network)
   network: 'testnet2',
-  deviceId: deviceId(),                          // the Vanilla sample's helper: stable on this device, unique per device
+  deviceId: deviceId(),                          // stable on this device, unique per device
 });
 
 // Step 3: Initialize wallet with the composed providers
@@ -754,8 +769,9 @@ const { sphere } = await Sphere.init({
   password: 'my-secret-password',
 });
 
-// A nametag registered earlier is recovered from Nostr during init, before it resolves
-// (the 'nametag:recovered' event has already fired by now), so read it from the identity:
+// init loads the nametag stored with the wallet. If storage has none, init tries to recover it
+// from the Nostr binding before it resolves (a recovery has already fired 'nametag:recovered').
+// Either way, read it from the identity:
 console.log('Nametag:', sphere.identity?.nametag);
 ```
 
