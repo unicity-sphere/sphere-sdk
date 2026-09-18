@@ -6,7 +6,7 @@
 > [Payments](#payments-spherepayments--the-paymentsv2-facade)). 0.15.0 also moved the base SDK pin
 > to `@unicitylabs/state-transition-sdk@3.0.1`, a wire break that no 2.x client can straddle; the
 > operational consequences are in [Upgrading to 0.15.0](./INTEGRATION.md#upgrading-to-0150) and the
-> [0.15.0 changelog entry](../CHANGELOG.md#0150---2026-08-27). Nothing on this page's method
+> [0.15.0 changelog entry](../CHANGELOG.md#0150---2026-08-28). Nothing on this page's method
 > signatures changed with the pin.
 
 ## Sphere
@@ -82,10 +82,9 @@ ignores `mnemonic`, `nametag` and `autoGenerate`. To replace the stored wallet w
 use [`Sphere.import`](#sphereimportoptions-sphereimportoptions-promisesphere), which first clears
 the storage's current wallet.
 
-**Removed options:** `accounting: true` / `swap: true` **throw** a typed `INVALID_CONFIG` —
-invoicing and swaps no longer exist in the SDK, and that refusal is kept deliberately through
-0.15.0 (a silent no-op would hide the removal in exactly the release where consumers
-re-integrate). `paymentsV2: true` was a deprecated no-op and is **gone in 0.15.0** — passing it
+**Removed options:** `accounting: true` / `swap: true` still **throw** a typed `INVALID_CONFIG`,
+deliberately: invoicing and swaps no longer exist in the SDK, and a silently ignored option would
+hide that. `paymentsV2: true` was a deprecated no-op and is **gone in 0.15.0** — passing it
 is an excess-property error against `SphereInitOptions`, not a runtime refusal. `tokenStorage` /
 `delivery` no longer exist (token custody is the wallet-api backend).
 
@@ -101,9 +100,9 @@ is an excess-property error against `SphereInitOptions`, not a runtime refusal. 
 The key derivation is fast, so the password keeps the phrase out of casual view and out of storage
 copies read without it, but anyone who obtains the stored value can try passwords offline at high
 speed: a short or common password gives little protection. The other stored data (derivation path,
-nametags, payment journals) is not encrypted either way. Set a long, unique password for wallets
-that hold value, and protect the storage itself at the operating-system level. The password is
-fixed when the seed is stored; there is no call to add or change it later.
+nametags, payment journals) is not protected by the password either way. Set a long, unique
+password for wallets that hold value, and protect the storage itself at the operating-system level.
+The password is fixed when the seed is stored; there is no call to add or change it later.
 `Sphere.importFromJSON` and `Sphere.importFromLegacyFile` use their `password` only to decrypt the
 backup and store the imported seed **without** a password.
 
@@ -547,10 +546,11 @@ button to [`resumeNow()`](#resumenow-promisevoid). A
 When `isPossiblyCommittedSendOutcome(err)` is `false`, the SDK's contract is that nothing left the
 wallet.
 
-Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (the message names funds pinned by
-transfers still converging), `INVALID_RECIPIENT` (no published chain pubkey, or a proven different
-network), `TRANSPORT_ERROR` (the recipient lookup could not reach the relay), `VALIDATION_ERROR`
-(for example a malformed or non-positive amount) and `TRANSFER_CONFLICT` (below).
+Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (when funds are pinned by transfers
+still converging, the message says how much and points to `pendingTransfers()`),
+`INVALID_RECIPIENT` (no published chain pubkey, or a proven different network), `TRANSPORT_ERROR`
+(the recipient lookup could not reach the relay), `VALIDATION_ERROR` (for example a malformed or
+non-positive amount) and `TRANSFER_CONFLICT` (below).
 `INSUFFICIENT_BALANCE` is never thrown by `send()`.
 
 A clean conflict (`TransferConflictError`, code `TRANSFER_CONFLICT`: the source was spent by a
@@ -1029,14 +1029,19 @@ interface PaymentRequestView {
 - Never pay from inside the `payment_request:incoming` handler without the user's decision;
   `pay()` and `decline()` are alternatives. `pay()` rethrows `send()`'s errors, so handle them as
   for `send()`.
-- **Crash safety, exactly.** `pay()` never leaves a request payable after a possibly-committed
-  failure: before it rethrows such an error it durably links the request to the transfer and marks
-  it `'settling'`, and a second `pay()` of the same id in the same process joins the first. That
+- **Crash safety, exactly.** When the send inside `pay()` fails with a possibly-committed error,
+  `pay()` links the request to that transfer in the payments journal and marks it `'settling'`
+  before it rethrows, so the request is not payable, and the link survives a restart. One
+  exception: if writing that link to storage fails, `pay()` rejects with the storage error instead
+  of the send error, so `isPossiblyCommittedSendOutcome` is `false` for it although the payment may
+  have gone out; the link is then held in memory and reaches storage only with a later successful
+  journal write. A second `pay()` of the same id while the first is still running joins it. The
   link is written after the send returns or throws, not before it starts. If the app or process
-  stops while `pay()` is still waiting on the send, no link exists: on the next start the request
-  is listed as `'pending'` again and `payment_request:incoming` fires again, even if the transfer
-  went through (a transfer the SDK had already recorded is resumed when the wallet starts). Before
-  paying a request again after a restart, check `sphere.payments.pendingTransfers()` and
+  stops while `pay()` is still waiting on the send, or before a link that failed to write reaches
+  storage, no link exists: on the next start the request is listed as `'pending'` again and
+  `payment_request:incoming` fires again, even if the transfer went through (a transfer the SDK had
+  already recorded is resumed when the wallet starts). Before paying a request again after a
+  restart, check `sphere.payments.pendingTransfers()` and
   `sphere.payments.history()` for a transfer to that requester.
 
 ```typescript
@@ -1516,7 +1521,7 @@ interface SphereEventMap {
 
 ## Unicity ID (Nametag) Registration
 
-Nametags (Unicity IDs, `@alice`) are **Nostr identity bindings** (name ↔ chainPubkey) — there is no PROXY address scheme and receive is always locked to the recipient's chain pubkey (`SignaturePredicate`). Registration publishes the binding; global uniqueness is first-seen-wins on the binding.
+Nametags (Unicity IDs, `@alice`) are **Nostr identity bindings** (name ↔ chainPubkey) — there is no PROXY address scheme and receive is always locked to the recipient's chain pubkey (`SignaturePredicate`). Registration publishes the binding; ownership follows UNIP-01 (marked bindings, single owner by relay receive order, ambiguous → null; `created_at` first-seen-wins only for legacy unmarked bindings), see [NAMETAG-BINDINGS.md](./NAMETAG-BINDINGS.md#anti-hijacking).
 
 ### Sphere Methods
 
