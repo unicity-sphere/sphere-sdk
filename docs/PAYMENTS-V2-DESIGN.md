@@ -1,5 +1,14 @@
 # Payments v2 — the wallet-api money vertical
 
+> **Design record, not the current API reference.** The code (`modules/payments-v2/api.ts` for
+> the public surface) and [`API.md`](./API.md) are normative. This document records the design and
+> the build as they were decided and tracked: its progress table and dated notes are historical,
+> the §4 interface block differs from the shipped `PaymentsV2` interface (for example,
+> `requests.create` resolves `{ success, requestId?, error? }`, and `sendWholeToken`,
+> `sendCoinless`, `prewarmSend` and `discardPrewarm` are missing from it), and the §5 layout block
+> is the build-time plan (see the note there). Read it for the *why*; check the code for the
+> *what*.
+
 > **Status: DRAFT — §4 (public API) awaits owner sign-off; everything else reflects decisions
 > locked 2026-07-31.** This document is both the design and the build tracker: the progress table
 > below is updated as phases land (docs-only commits). Design inputs were a seven-way deep read of
@@ -212,6 +221,13 @@ swap must not tear down the socket/session; operations snapshot the engine at en
 changes what *future* operations use while in-flight sends finish on the old one).
 
 ## 5. Architecture
+
+> **Historical layout.** The block below is the build-time plan. The shipped tree differs: there
+> is no `session/` or `transfer/` directory (the session is `impl/wallet-api-v2/session.ts`; the
+> transfer machine, its journals and resume live in `modules/payments-v2/machine/`), and the
+> rename to `modules/payments/` + `impl/wallet-api/` never happened (deferred at P11, see the
+> progress table). The directories that exist today are `machine/`, `select/`, `inventory/`,
+> `receive/`, `requests/` and `history/` under `modules/payments-v2/`.
 
 Layout during build (renamed to `modules/payments/` + `impl/wallet-api/` in the flip PR):
 

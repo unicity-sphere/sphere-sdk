@@ -1,5 +1,15 @@
 # Legacy inventory — what still exists only for backwards compatibility
 
+> **HISTORICAL snapshot (0.15.x era) — a design record, not a description of the current code.**
+> Do not act on an entry without re-verifying it against the tree. Since the snapshot, 0.16.0
+> made mainnet a runnable network and removed every v1 pointer and the `dev` network, so several
+> entries below name symbols that no longer exist: `DEFAULT_AGGREGATOR_URL`, `DEV_AGGREGATOR_URL`
+> and `TEST_AGGREGATOR_URL`; `getEmbeddedTrustBase`'s `case 'dev'` and `TRUSTBASE_DEV`; and
+> `RegistryNetwork`'s `'dev'` member (it is now `'testnet' | 'testnet2' | 'mainnet'`). Files the
+> REMOVE-NOW lists still name, such as `modules/payments/`, `modules/accounting/`, `modules/swap/`
+> and `impl/shared/wallet-api/WalletApiTokenStorageProvider.ts`, were deleted by the P11 flip.
+> Absolute `/home/...` paths below are the author's checkout, not repository paths.
+
 The wallet is on testnet and heading to mainnet, where the SDK should carry no
 back-compat branches. This is the inventory that decision was made from: every
 candidate was hunted with git evidence, then handed to a second agent whose only
