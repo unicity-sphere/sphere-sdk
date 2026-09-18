@@ -149,7 +149,9 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
 // (0.15.0): the vertical is the only path, so there was nothing left to switch.
 
 if (created && generatedMnemonic) {
-  // First run — prompt user to back up mnemonic
+  // Returned only by the call that created the wallet; if that call then threw, the next
+  // init returns created:false. Gate the backup prompt on your own 'backup confirmed' flag
+  // and show sphere.getMnemonic() until it is set.
   console.log('SAVE THIS:', generatedMnemonic);
 }
 
@@ -337,7 +339,7 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `sphere.payments.discardPrewarm()` | `void` | Drop the prewarmed reads |
 | `sphere.payments.requests.create(to, terms)` | `Promise<{ success, requestId?, error? }>` | Send a payment request (never throws; check `success`) |
 | `sphere.payments.requests.list()` | `PaymentRequestView[]` | Current views of requests you RECEIVED |
-| `sphere.payments.requests.pay(id)` | `Promise<TransferResult>` | Pay an incoming request (rethrows `send()` errors; a possibly-committed failure leaves it `settling`, never payable) |
+| `sphere.payments.requests.pay(id)` | `Promise<TransferResult>` | Pay an incoming request (rethrows `send()` errors; a possibly-committed failure links the request and leaves it `settling`, except when the link write fails: then `pay()` rejects with the storage error, the link lives only in memory, and the request can be payable again after a restart) |
 | `sphere.payments.requests.decline(id)` | `Promise<void>` | Decline (server 403/409 propagate) |
 | `sphere.payments.requests.dismissProcessed()` | `void` | Drop terminal entries from `list()` |
 | `sphere.resolve(identifier)` | `Promise<PeerInfo \| null>` | Resolve @nametag/address/pubkey |
@@ -784,10 +786,8 @@ authoritative for build success.
   `isLegacyFileEncrypted` + `exportToTxt` (live onboarding/backup path);
   `Asset.unconfirmed*` fields (pinned 0); the `:pv2` deviceId suffix (deployed refresh-token
   rows are keyed `<deviceId>:pv2`); `core/wallet-api-protocol.ts` (cross-repo contract strings).
-- **The ONE sanctioned refusal fossil**, deliberately KEPT through 0.15.0: `accounting:`/`swap:`
-  init options throw typed `INVALID_CONFIG` — silent-ignore would hide that invoices/swaps no
-  longer exist, and 0.15.0 is exactly the release where consumers re-integrate across the wire
-  break.
+- **The ONE sanctioned refusal fossil, still kept:** `accounting:`/`swap:` init options throw
+  typed `INVALID_CONFIG`, because a silent ignore would hide that invoices/swaps no longer exist.
 - **Interop, as of the 3.x bump: there is none across the major.** Pre-0.15 clients (including
   the pre-flip ≤0.13 module clients that used to transact freely with the vertical over the same
   mailbox rail) speak the 2.x wire: nothing they wrote decodes here, and once the gateway cuts
