@@ -146,8 +146,10 @@ Restore from a backup file: an `exportToTxt()` text backup (optionally password-
 `exportToJSON()` file, a legacy flat-JSON webwallet export, or a bare mnemonic in a text file.
 `options` add `fileContent: string`, `fileName: string` (used for type detection), `password?` and
 `onDecryptProgress?` to the key-less `Sphere.import` options. `needsPassword: true` means the file is
-encrypted and no password was given. Unlike `importFromJSON`, an error thrown by `Sphere.import`
-itself (for example a missing `network`) rejects instead of coming back as `{ success: false }`.
+encrypted and no password was given. Unlike `importFromJSON`, for a text backup, a legacy
+flat-JSON export or a bare mnemonic, an error thrown by `Sphere.import` itself (for example a
+missing `network`) rejects instead of coming back as `{ success: false }`. An `exportToJSON()`
+file is handed to `importFromJSON` and comes back as `{ success: false, error }`.
 The restored seed is stored without a password, as with `importFromJSON`.
 
 #### `Sphere.clear(options: { storage: StorageProvider }): Promise<void>`
@@ -180,9 +182,11 @@ never touched.
 
 **IndexedDB: the unit is the whole database, not the key prefix.** Every `prefix` inside one
 IndexedDB database (`dbName`) belongs to one backing store, and `clear()` empties the whole
-database. Clearing or importing through one prefix therefore destroys the Spheres of every prefix
-in that database and wipes their keys, mnemonic included. Give each wallet its own `dbName`; a
-separate `prefix` alone does not isolate two wallets.
+database. Clearing through one prefix, or importing through a prefix that already holds a wallet
+(or through a storage object a live Sphere is using), therefore destroys the Spheres of every
+prefix in that database and wipes their keys, mnemonic included. An import into an unused prefix
+does not clear anything. Give each wallet its own `dbName`; a separate `prefix` alone does not
+isolate two wallets.
 
 `Sphere.import(options)` inherits all of this: it calls `Sphere.clear({ storage })` first
 whenever a wallet exists on that storage or a live Sphere is registered on that storage object,
@@ -474,11 +478,12 @@ for `null`.
 - A certified-but-undelivered blob is journaled locally (#621) and re-deposited with a bounded
   poison budget (#517) — `deliveryPending: true` on the result, `transfer:attention` when
   deferred/undeliverable.
-- **Requirements:** the oracle must supply a trust base and a gateway URL (and an API key where
-  the gateway needs one). Without them no token engine can be built, and `Sphere.init` (like
-  `create`/`load`/`import`) rejects with `INVALID_CONFIG` ("payments requires the v2 token
-  engine …") unless the wallet is messaging-only (`walletApi: 'none'`). The recipient must have a
-  published chain pubkey (otherwise `INVALID_RECIPIENT`).
+- **Requirements:** the oracle must supply a trust base and a gateway URL. Without either, no
+  token engine can be built, and `Sphere.init` (like `create`/`load`/`import`) rejects with
+  `INVALID_CONFIG` ("payments requires the v2 token engine …") unless the wallet is
+  messaging-only (`walletApi: 'none'`). A missing gateway API key does not stop the engine from
+  being built: the SDK logs a warning and sends gateway requests without a key. The recipient
+  must have a published chain pubkey (otherwise `INVALID_RECIPIENT`).
 
 ### `send(req: SendRequest): Promise<TransferResult>`
 
@@ -1312,9 +1317,10 @@ the wallet, so never re-send (see [`send()`](#sendreq-sendrequest-promisetransfe
 `PAYMENTS_NOT_COMPOSED` is the permanent refusal of `sphere.payments` on a `walletApi: 'none'`
 wallet; `NOT_INITIALIZED` is the transient one.
 
-**One class per bundle.** Each built entry point (the package root, `./core`, `./payments-v2`,
-`./impl/nodejs`, `./impl/browser`) carries its own copy of `SphereError`, and `isSphereError()` is
-an `instanceof` check. So an error thrown by provider code (for example the Nostr transport during a
+**One class per bundle.** Each built entry point that uses `SphereError` (the package root,
+`./core`, `./payments-v2`, `./token-engine`, `./impl/nodejs`, `./impl/browser`,
+`./impl/wallet-api-v2` and `./connect`) carries its own copy of it, and `isSphereError()` is an
+`instanceof` check. So an error thrown by provider code (for example the Nostr transport during a
 recipient lookup) is not `instanceof` the root `SphereError`, and `isSphereError()` is `false` for
 it: read `code` structurally (`(err as { code?: unknown }).code`). Import
 `isPossiblyCommittedSendOutcome` and `PartialSendConflictError` from the same entry point as
