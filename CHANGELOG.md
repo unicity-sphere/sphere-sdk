@@ -7,41 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added — messaging-only composition: `walletApi: 'none'` (#793)
-
-A wallet that never touches money — a Nostr DM or group-chat bot — can now say so, instead of
-standing up a full payments vertical against a backend it never uses. `Sphere.init({ walletApi:
-'none' })` composes no money at all: no wallet-api session, no device registration, no wake
-socket, no mailbox drain, no token engine and no `pv2g2:` key, at boot or on an address switch.
-Identity, storage, `communications`, `groupChat` and `registerNametag` are unchanged — nametag
-registration is a Nostr identity binding and never needed the vertical.
-
-The opt-out shares the `walletApi` field with the transport config, so "configured" and
-"deliberately absent" cannot both be said. **Omitting `walletApi` still throws `INVALID_CONFIG`
-with the message it always had**: the #515 fail-closed invariant is intact, and a dropped env var
-must never read as a deliberate choice. A near-miss (`'None'`, `''`) is refused by name rather
-than as a missing config, which would send the reader hunting an env var instead of a typo.
-
-- `sphere.payments` throws the new `PAYMENTS_NOT_COMPOSED` — distinct from `NOT_INITIALIZED`,
-  which is transient (init in flight, mid address-switch, destroyed) and would have a caller
-  wait out a state that never resolves.
-- `sphere.hasPayments` (new) reports whether this Sphere composes money at all, so a
-  messaging-only wallet can branch without a try/catch. It is a composition-time property, fixed
-  for the instance's life, not a liveness check.
-- `NO_PAYMENTS` and the `WalletApiOption` type are exported for consumers who prefer the name to
-  the literal.
-
-The opt-out composes; it does not erase. A wallet that has moved money keeps its `pv2g2:` state,
-and opening it with `'none'` resumes nothing — open intents stay open, sources still reserved on
-the backend, until it is next opened with a config. Nothing is lost, but a wallet with transfers
-in flight should not be flipped.
-
-The three messaging e2e suites (`dm-nip17`, `messaging-e2e`, `dm-manual`) now compose this way
-instead of standing up a fake money world to satisfy the gate. That also repairs `dm-nip17` and
-`messaging-e2e`, which had been failing since #728: they pass `network: 'testnet'` while the fake
-world declares `'testnet2'`, and that check is a string comparison, alias or not.
-
-### Fixed — the Connect ESM entry points share one `ConnectClient` and `ConnectError`
+### Fixed — the Connect ESM entry points share one `ConnectClient` and `ConnectError` (#789, #790)
 
 `@unicitylabs/sphere-sdk/connect`, `/connect/browser` and `/connect/nodejs` were three separate
 bundles, and `/connect/browser` carried its own copy of `ConnectClient`, `ConnectError`, the
@@ -92,7 +58,7 @@ augmentation adding a required member now also applies to `autoConnect`'s types)
 Still true: a process that loads Connect through both `import` and `require()` has two copies, and
 so does a dApp whose dependencies bundle their own SDK — keep discriminating errors on `.code`.
 
-### Documentation — the Connect guide matches the code again
+### Documentation — the Connect guide matches the code again (#791)
 
 `docs/CONNECT.md`, `README.md`, `docs/INTEGRATION.md`, `CLAUDE.md` and the Connect JSDoc. No code
 behaviour changes. Corrected: samples that did not compile (`PostMessageTransport.forHost()` takes
@@ -115,7 +81,9 @@ repo can promise:
   gates: the CDN in front of `sphere.unicity.network` answers 403 to any request whose query string
   contains `localhost` or `127.0.0.1`, on every route, `https://localhost` included; and the wallet
   frames a custom tab only for an `https:` URL. Testing a local build against the hosted wallet
-  therefore means an https tunnel. A wallet you run yourself is unaffected.
+  therefore means an https tunnel. A wallet you run yourself has no CDN in front of it, so the
+  first gate does not apply there, but the second is the wallet's own code: it still frames a
+  custom-agent URL only when it is `https`.
 - **Which claims are the wallet's, not the protocol's.** Rows like "reserved" (4005/4100/4101),
   -32602's meaning and `send_nft` answering -32601 describe the Sphere wallet as it stands today,
   and say so, with a pointer to the wallet source. Codes the SDK host itself sends are marked as
@@ -127,6 +95,96 @@ bundler`/`node16`, never tsconfig `paths` into `dist/`), and an exact statement 
 dependencies: `./connect` and `./connect/browser` have none, while `./connect/nodejs` loads `ws`
 through a dynamic import in `WebSocketServerTransport.start()` and keeps it an optional peer
 dependency.
+
+### Documentation — every guide checked against the code (#773)
+
+`README.md`, the quickstarts, `docs/API.md`, `docs/INTEGRATION.md`, `docs/CONNECT.md`, the feature
+docs and `CLAUDE.md` were checked line by line against the code, and so was the JSDoc that ships in
+the `.d.ts` files as IDE hover text. No runtime code changes. What the documentation now says:
+
+- **Every entry point needs `walletApi` and `network`.** `Sphere.init`, `create`, `load`, `import`,
+  `importFromJSON` and `importFromLegacyFile` compare `network` with `walletApi.network` as plain
+  strings and throw `INVALID_CONFIG` when it is missing or different. The samples use one literal,
+  `'testnet2'`, for the base providers, the `walletApi` config and `Sphere.init`; `'testnet'`
+  reaches the same endpoints but is a different string. `walletApi: 'none'` still needs `network`.
+  The shipped JSDoc no longer calls `network` "informational only" or lists the removed `dev`
+  network.
+- **`coinId` is the 64-hex coin id.** Nothing on the money path resolves symbols: `coinId: 'UCT'`
+  fails with `SEND_INSUFFICIENT_BALANCE`, and a payment request created with it can never be paid.
+  The samples look the id up with `getCoinIdBySymbol()` after `TokenRegistry.waitForReady()`.
+- **What `send()` resolves and throws.** A resolved `send()` is sent: `status` is `'delivered'`, or
+  `'confirmed'` with `deliveryPending: true`; it never resolves `'completed'` or `'failed'`.
+  `isPossiblyCommittedSendOutcome(err)` is `true` for the six codes that must never be re-sent
+  (`SEND_SYNC_PENDING`, `CERTIFICATION_UNCONFIRMED`, `CHECKPOINT_PERSIST_FAILED`,
+  `SPLIT_CHECKPOINT_LOST`, `CHECKPOINT_TRUSTBASE_MISMATCH`, `SEND_PARTIALLY_COMPLETED`); the retry verb
+  is `payments.resumeNow()`, and `payments.pendingTransfers()` lists what is still converging.
+  `INSUFFICIENT_BALANCE` is never thrown. Errors thrown by the `./impl/*` bundles are a different
+  `SphereError` class copy, so the samples read `code` structurally.
+- **Payment requests.** `requests.create()` never throws and resolves `{ success, requestId?, error? }`;
+  `pay()` and `decline()` are the user's choice, never automatic; `payment_request:updated` covers only
+  requests you received. `pay()` links the request to its transfer after the send returns or throws,
+  so a process that stops during `pay()` can list the request as payable again after a restart.
+- **Seed storage.** With a `password`, the stored mnemonic is encrypted with CryptoJS AES-256-CBC
+  keyed by OpenSSL `EVP_BytesToKey` (MD5, one iteration), not PBKDF2; without one it is stored as
+  plaintext, not under a default key. There is no call to change the password, and `importFromJSON` /
+  `importFromLegacyFile` store the imported seed without one.
+- **Events.** `sphere.on()` handlers receive the payload itself (no `.data`); `transport:*` events
+  are emitted on the Nostr transport's own `onEvent()`, not on `sphere.on()`; the `nametag:recovered`
+  of the recovery done during `Sphere.init` has already fired when init resolves.
+- **Signatures and return shapes.** `Sphere.create` / `load` / `import` resolve the instance, not
+  `{ sphere }`; `importFromJSON` returns `sphere` and never throws; `getNametagForAddress()` takes the
+  short `addressId`, not an index; `deriveAddress()` returns key material, not an address;
+  `sendMessage(groupId, content, replyToId?)` and `fetchMessages(groupId, since?, limit?)`;
+  `createNodeTrustBaseLoader(path, network)` needs its fallback network; the relay-management
+  methods are optional members of `TransportProvider`, and `removeRelay()` only edits the
+  configuration.
+- **Setup.** `./impl/browser` ships no type declarations yet, and the README shows a declaration
+  shim; `ws` must be installed for `./impl/nodejs` on every Node version; a Node script calls
+  `TokenRegistry.destroy()` after `sphere.destroy()` to let the process exit; the mainnet wallet-api
+  is live at `https://wallet-api.mainnet.unicity.network`; the `dmSince` init option does not take
+  effect with the Nostr transport in this release; the CLI lives in `unicity-sphere/sphere-cli` and
+  is not published to npm.
+- **Connect.** A `sphere_subscribe` for one of the four auto-pushed wallet events is answered with
+  success without attaching anything, not refused; `ConnectClientConfig.timeout` also bounds
+  `connect()`, including the time the user takes to approve.
+
+## [0.17.3] - 2026-09-17
+
+### Added — messaging-only composition: `walletApi: 'none'` (#793)
+
+A wallet that never touches money — a Nostr DM or group-chat bot — can now say so, instead of
+standing up a full payments vertical against a backend it never uses. `Sphere.init({ walletApi:
+'none' })` composes no money at all: no wallet-api session, no device registration, no wake
+socket, no mailbox drain, no token engine and no `pv2g2:` key, at boot or on an address switch.
+Identity, storage, `communications`, `groupChat` and `registerNametag` are unchanged — nametag
+registration is a Nostr identity binding and never needed the vertical. **`network` is still
+required**: it selects the token registry and the group-chat relays, and `Sphere.init` throws
+`INVALID_CONFIG` without it; only the money composition is skipped.
+
+The opt-out shares the `walletApi` field with the transport config, so "configured" and
+"deliberately absent" cannot both be said. **Omitting `walletApi` still throws `INVALID_CONFIG`
+with the message it always had**: the #515 fail-closed invariant is intact, and a dropped env var
+must never read as a deliberate choice. A near-miss (`'None'`, `''`) is refused by name rather
+than as a missing config, which would send the reader hunting an env var instead of a typo.
+
+- `sphere.payments` throws the new `PAYMENTS_NOT_COMPOSED` — distinct from `NOT_INITIALIZED`,
+  which is transient (init in flight, mid address-switch, destroyed) and would have a caller
+  wait out a state that never resolves.
+- `sphere.hasPayments` (new) reports whether this Sphere composes money at all, so a
+  messaging-only wallet can branch without a try/catch. It is a composition-time property, fixed
+  for the instance's life, not a liveness check.
+- `NO_PAYMENTS` and the `WalletApiOption` type are exported for consumers who prefer the name to
+  the literal.
+
+The opt-out composes; it does not erase. A wallet that has moved money keeps its `pv2g2:` state,
+and opening it with `'none'` resumes nothing — open intents stay open, sources still reserved on
+the backend, until it is next opened with a config. Nothing is lost, but a wallet with transfers
+in flight should not be flipped.
+
+The three messaging e2e suites (`dm-nip17`, `messaging-e2e`, `dm-manual`) now compose this way
+instead of standing up a fake money world to satisfy the gate. That also repairs `dm-nip17` and
+`messaging-e2e`, which had been failing since #728: they pass `network: 'testnet'` while the fake
+world declares `'testnet2'`, and that check is a string comparison, alias or not.
 
 ## [0.17.2] - 2026-09-15
 
@@ -648,7 +706,7 @@ registry (`decimals` 0, symbol falls back to six hex chars). That is presentatio
 path treats `coinId` as an opaque byte string. Mainnet also shares testnet's Nostr relay until a
 dedicated one is stood up, which means nametag bindings for both networks share one namespace.
 
-## [0.15.0] - 2026-08-27
+## [0.15.0] - 2026-08-28
 
 ### Changed (BREAKING) — base SDK pinned to `@unicitylabs/state-transition-sdk@3.0.1` (was 2.1.0) (#760)
 
@@ -1826,10 +1884,9 @@ consumed exclusively through the `token-engine/` port. Consequences:
 - `PaymentsModule.destroy()` now cleans up storage event subscriptions and debounce timers
 - `IpfsStorageProvider.shutdown()` now disconnects the subscription client
 
-<!-- Released versions link to the published package: this repo carries no
-     version tags past v0.9.x, so a tag-compare link would 404. -->
-
-[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/main...HEAD
+[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.3...HEAD
+[0.17.3]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.2...v0.17.3
+[0.17.2]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.1...v0.17.2
 [0.17.1]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.17.1
 [0.17.0]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.17.0
 [0.16.0]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.16.0
