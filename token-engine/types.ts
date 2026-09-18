@@ -14,7 +14,7 @@
  */
 
 import type { NftContent, NftSignatureStatus } from './nft-payload';
-import type { Token } from './sdk';
+import type { IMintJustificationVerifier, Token } from './sdk';
 import type { ValueEnvelope } from './value-envelope';
 
 // ── identity / recipients ─────────────────────────────────────────────────────
@@ -117,6 +117,25 @@ export interface MintDataTokenParams {
   readonly tokenType?: Uint8Array;
   /** Salt bytes; deterministic salt → deterministic (terms-derived) tokenId. */
   readonly salt?: Uint8Array;
+  /** Genesis mint reason (the SDK's `justification`): tagged CBOR a registered verifier validates. */
+  readonly justification?: Uint8Array;
+  /** Verifiers for this mint's genesis reason, in place of the ones registered on the engine. */
+  readonly mintJustificationVerifiers?: readonly IMintJustificationVerifier[];
+}
+
+/** Spend a token to a burn predicate with the reason bytes as aux data. */
+export interface BurnParams {
+  readonly token: SphereToken;
+  /** The recipient predicate is `BurnPredicate(sha256(reasonBytes))`; the bytes ride in the aux data. */
+  readonly reasonBytes: Uint8Array;
+}
+
+/** Mint-reason verifiers keyed by CBOR tag, registered at engine construction. */
+export interface TokenPlugin {
+  /** Stable identifier for diagnostics, e.g. `'bridge:tron-usdt'`. */
+  readonly id: string;
+  /** Mint-reason verifiers to register; a duplicate tag across plugins is INVALID_CONFIG. */
+  readonly mintJustificationVerifiers?: readonly IMintJustificationVerifier[];
 }
 
 /** Plan an NFT mint (#785); `mintDataToken` then mints the plan. */

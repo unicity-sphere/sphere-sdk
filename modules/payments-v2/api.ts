@@ -1,5 +1,6 @@
 // §4 of docs/PAYMENTS-V2-DESIGN.md
 
+import type { IMintJustificationVerifier } from '../../token-engine';
 import type { NftContent } from '../../token-engine/nft-payload';
 import type { NftReading } from '../../token-engine/types';
 import type { Asset, CoinlessToken, IncomingTransfer, Token, TransferResult } from '../../types';
@@ -24,6 +25,41 @@ export interface MintResult {
   success: boolean;
   tokenId?: string;
   error?: string;
+}
+
+/** Custom-genesis mint (a TokenPlugin's token), always to this wallet; `assets` = what the payload declares. */
+export interface MintCustomRequest {
+  readonly tokenType: Uint8Array;
+  readonly salt: Uint8Array;
+  readonly data: Uint8Array;
+  readonly justification?: Uint8Array;
+  readonly assets: readonly { coinId: string; amount: bigint }[];
+  readonly mintJustificationVerifiers?: readonly IMintJustificationVerifier[];
+}
+
+/** Burn a held token to `BurnPredicate(sha256(reasonBytes))` with the bytes as aux data. */
+export interface BurnRequest {
+  readonly tokenId: string;
+  readonly reasonBytes: Uint8Array;
+}
+
+export interface BurnResult {
+  success: boolean;
+  burnId: string;
+  tokenId: string;
+  /** The burned blob, the proof of the burn: persist it, then `acknowledgeBurn(burnId)`. */
+  burnedToken?: Uint8Array;
+  error?: string;
+}
+
+/** A burn not yet acknowledged: in flight (`burnedToken` null), certified, or settled. */
+export interface PendingBurn {
+  readonly burnId: string;
+  readonly tokenId: string;
+  readonly reasonBytes: Uint8Array;
+  readonly burnedToken: Uint8Array | null;
+  readonly settled: boolean;
+  readonly createdAt: number;
 }
 
 /** #785: `content` uses ERC-721 field names; `sign` (default true) signs as creator with this wallet's chain key. */
@@ -133,6 +169,10 @@ export interface PaymentsV2 {
   sendCoinless(req: SendWholeTokenRequest): Promise<TransferResult>;
   mint(coinId: string, amount: bigint): Promise<MintResult>;
   mintNft(request: MintNftRequest): Promise<MintResult>;
+  mintCustom(request: MintCustomRequest): Promise<MintResult>;
+  burn(request: BurnRequest): Promise<BurnResult>;
+  pendingBurns(): Promise<PendingBurn[]>;
+  acknowledgeBurn(burnId: string): Promise<void>;
   receive(): Promise<{ transfers: IncomingTransfer[] }>;
 
   // §7 convergence surface. A retry button calls resumeNow() — NEVER send():

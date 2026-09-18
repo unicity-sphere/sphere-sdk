@@ -40,6 +40,7 @@ export function createMockTokenEngine(overrides: Partial<ITokenEngine> = {}): IT
     balanceOf: vi.fn((_t: SphereToken, _c: CoinId) => 0n),
     mint: vi.fn(async () => mockSphereToken()),
     transfer: vi.fn(async () => mockSphereToken()),
+    burn: vi.fn(async () => mockSphereToken()),
     split: vi.fn(async () => ({ outputs: [] })),
     verify: vi.fn(async () => ({ ok: true })),
     isSpent: vi.fn(async () => false),

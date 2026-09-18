@@ -8,20 +8,22 @@
  */
 
 import type {
-  EngineIdentity,
-  CoinId,
-  SphereValue,
-  SphereToken,
-  TokenBlob,
-  MintParams,
-  MintDataTokenParams,
-  TransferParams,
-  SplitParams,
-  SplitResult,
-  EngineVerifyResult,
   BuildNftMintParams,
+  BurnParams,
+  CoinId,
+  EngineIdentity,
+  EngineVerifyResult,
+  MintDataTokenParams,
+  MintParams,
   NftMintPlan,
   NftReading,
+  SphereToken,
+  SphereValue,
+  SplitParams,
+  SplitResult,
+  TokenBlob,
+  TokenPlugin,
+  TransferParams,
 } from './types';
 
 /**
@@ -148,6 +150,9 @@ export interface ITokenEngine {
   buildNftMint(params: BuildNftMintParams): Promise<NftMintPlan>;
   /** Spend a token wholesale to a recipient pubkey; returns the recipient's finished token. */
   transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken>;
+
+  /** Spend the token to `BurnPredicate(sha256(reasonBytes))` with the reason bytes as aux data. */
+  burn(params: BurnParams, options?: EngineOpOptions): Promise<SphereToken>;
   /** Split a token into N value-conserving outputs (burn source + internally mint each output). */
   split(params: SplitParams, options?: EngineOpOptions): Promise<SplitResult>;
 
@@ -250,6 +255,8 @@ export interface EngineConfig {
    * terminate the pool.
    */
   readonly verification?: VerificationWorkerConfig;
+  /** Token plugins whose mint-reason verifiers join the engine's verification context. */
+  readonly plugins?: readonly TokenPlugin[];
 }
 
 /** Factory signature for the real adapter (implemented in Track A). */

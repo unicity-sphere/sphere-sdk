@@ -1751,8 +1751,8 @@
     "name": "converger-pendingwork-ignores-nft-journal",
     "note": "#785: a retained NFT mint entry is heartbeat work. Leaving it out of pendingWork() lets the heartbeat go idle, so a certified NFT waits for the next start() to reach inventory.",
     "file": "modules/payments-v2/convergence.ts",
-    "find": "    const mintsOpen = mints.length > 0 || nftMints.length > 0;",
-    "replace": "    const mintsOpen = mints.length > 0;",
+    "find": "    const mintsOpen = mints.length > 0 || nftMints.length > 0 || customMints.length > 0;",
+    "replace": "    const mintsOpen = mints.length > 0 || customMints.length > 0;",
     "tests": [
       "tests/unit/payments-v2/nft.test.ts"
     ]

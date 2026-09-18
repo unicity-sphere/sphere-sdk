@@ -13,13 +13,15 @@ import type { ITokenEngine } from '../../token-engine/engine';
 import type { SphereToken } from '../../token-engine/types';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
-import type { CoinlessToken, ConnectionStatus, HistoryPage, MintNftRequest, MintResult, NftView, PaymentsV2, PendingTransfer, SendRequest, SendWholeTokenRequest } from './api';
+import type { BurnRequest, BurnResult, CoinlessToken, ConnectionStatus, HistoryPage, MintCustomRequest, MintNftRequest, MintResult, NftView, PaymentsV2, PendingBurn, PendingTransfer, SendRequest, SendWholeTokenRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { NftCache, readNft, readNfts, type NftReadDeps } from './inventory/nft-read';
 import { readTokenData } from './inventory/token-data';
-import { type CoinReplayDeps, replayCoinMints, runMintUnderJournal } from './mint';
+import { type CoinReplayDeps, INVENTORY_SCAN_PAGE_LIMIT, replayCoinMints, runMintUnderJournal, tokenInServerInventory } from './mint';
 import { type NftReplayDeps, replayNftMints, runNftMintUnderJournal } from './mint-nft';
+import { type CustomReplayDeps, replayCustomMints, runCustomMintUnderJournal } from './mint-custom';
+import { acknowledgeBurn, type BurnReplayDeps, pendingBurns, replayBurns, runBurnUnderJournal } from './burn';
 import { materializeWholeSpend } from './send-whole';
 import { partialize, stampTransferId } from './send-errors';
 import { requireSameNetworkRecipient } from './recipient';
@@ -59,7 +61,6 @@ export { ATTENTION_RECIPIENT_NETWORK_UNVERIFIED } from './recipient';
 /** Max re-plans after a conflicted attempt (#625/#677 parity with the old send loop). */
 export const MAX_RESELECT = 8;
 
-const INVENTORY_SCAN_PAGE_LIMIT = 50;
 
 /**
  * What this attempt is spending. The policy loop is shared; only planning and the
@@ -169,6 +170,8 @@ export class PaymentsFacade implements PaymentsV2 {
       refreshView: () => this.view.delta(),
       replayMints: () => replayCoinMints(this.mintDeps()),
       replayNftMints: () => replayNftMints(this.mintDeps()),
+      replayCustomMints: () => replayCustomMints(this.mintDeps()),
+      replayBurns: () => replayBurns(this.mintDeps()),
       isActiveOp: (id) => this.activeMoneyOps.has(id),
       emit: deps.emit,
       now: () => this.nowMs(),
@@ -312,8 +315,15 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   mintNft(request: MintNftRequest): Promise<MintResult> {
-    return this.track(this.ownedMint((mintId) => runNftMintUnderJournal(this.mintDeps(), { mintId, request })));
+    return this.track(this.ownedOp((mintId) => runNftMintUnderJournal(this.mintDeps(), { mintId, request })));
   }
+
+  mintCustom = (request: MintCustomRequest): Promise<MintResult> =>
+    this.track(this.ownedOp((mintId) => runCustomMintUnderJournal(this.mintDeps(), { mintId, request })));
+  burn = (request: BurnRequest): Promise<BurnResult> =>
+    this.track(this.ownedOp((burnId) => runBurnUnderJournal(this.mintDeps(), { burnId, request })));
+  pendingBurns = (): Promise<PendingBurn[]> => this.track(pendingBurns(this.mintDeps()));
+  acknowledgeBurn = (burnId: string): Promise<void> => this.track(acknowledgeBurn(this.mintDeps(), burnId));
 
   // §4 retry verb: coalesces onto the running pass — NEVER re-issue send() (#631/#676).
   async resumeNow(): Promise<void> {
@@ -346,12 +356,14 @@ export class PaymentsFacade implements PaymentsV2 {
     return (this.deps.now ?? Date.now)();
   }
 
-  /** One snapshot serves the coin and the NFT mint, live and replayed. */
-  private mintDeps(): CoinReplayDeps & NftReplayDeps {
+  /** One snapshot serves the coin, NFT and custom mints and the burn, live and replayed. */
+  private mintDeps(): CoinReplayDeps & NftReplayDeps & CustomReplayDeps & BurnReplayDeps {
     return {
       engine: this.engine(),
       mintJournal: this.machineStores.mintJournal,
       nftMintJournal: this.machineStores.nftMintJournal,
+      customMintJournal: this.machineStores.customMintJournal,
+      burnJournal: this.machineStores.burnJournal, recordSent: (input) => this.historyStore.recordSent(input),
       storagePort: this.deps.storagePort,
       recordMint: (input) => this.historyStore.recordMint(input),
       armHeartbeat: () => this.heartbeat.arm(),
@@ -360,7 +372,7 @@ export class PaymentsFacade implements PaymentsV2 {
       ownPubkeyBytes: this.ownPubkeyBytes,
       nftTokenType: this.deps.nftTokenType,
       isActiveOp: (mintId) => this.activeMoneyOps.has(mintId),
-      tokenInServerInventory: (tokenId) => this.tokenInServerInventory(tokenId),
+      tokenInServerInventory: (tokenId) => tokenInServerInventory(this.deps.storagePort, tokenId),
       emit: this.deps.emit,
       now: () => this.nowMs(),
     };
@@ -729,30 +741,18 @@ export class PaymentsFacade implements PaymentsV2 {
     if (!/^(?:[0-9a-f]{2})+$/.test(coinId) || amount <= 0n) {
       return { success: false, error: 'coinId must be even-length lowercase hex and amount positive' };
     }
-    return this.ownedMint((mintId) => runMintUnderJournal(this.mintDeps(), { mintId, coinId, amount }));
+    return this.ownedOp((mintId) => runMintUnderJournal(this.mintDeps(), { mintId, coinId, amount }));
   }
 
-  /** A live mint under a fresh id — its replay stays hands-off while this attempt runs. */
-  private async ownedMint(run: (mintId: string) => Promise<MintResult>): Promise<MintResult> {
-    const mintId = this.newId();
-    this.activeMoneyOps.add(mintId);
+  /** A live money op under a fresh id — its replay stays hands-off while this attempt runs (§7). */
+  private async ownedOp<T>(run: (id: string) => Promise<T>): Promise<T> {
+    const id = this.newId();
+    this.activeMoneyOps.add(id);
     try {
-      return await run(mintId);
+      return await run(id);
     } finally {
-      this.activeMoneyOps.delete(mintId);
+      this.activeMoneyOps.delete(id);
     }
-  }
-
-  private async tokenInServerInventory(tokenId: string): Promise<boolean> {
-    let page = await this.deps.storagePort.listInventory();
-    for (let i = 0; i < INVENTORY_SCAN_PAGE_LIMIT; i++) {
-      if (page.items.some((item) => item.tokenId === tokenId && item.status === 'active')) {
-        return true;
-      }
-      if (!page.more) return false;
-      page = await this.deps.storagePort.listInventory(page.cursor);
-    }
-    return false;
   }
 
   // ── wiring internals ───────────────────────────────────────────────────────

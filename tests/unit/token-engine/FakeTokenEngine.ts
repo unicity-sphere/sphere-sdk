@@ -35,6 +35,7 @@ import {
 } from '../../../token-engine/value-envelope';
 import type {
   BuildNftMintParams,
+  BurnParams,
   CoinId,
   EngineIdentity,
   EngineOpOptions,
@@ -206,6 +207,20 @@ export class FakeTokenEngine implements ITokenEngine {
       owner: params.recipientPubkey,
       genesisData: source.genesisData,
       transferMemo: params.data ?? null,
+      genesisOwner: source.genesisOwner,
+      tokenType: source.tokenType,
+    });
+  }
+
+  public async burn(params: BurnParams, _options?: EngineOpOptions): Promise<SphereToken> {
+    this.consume(params.token);
+    const source = decodeFakeState(params.token.blob.token);
+    return this.makeToken({
+      tokenId: source.tokenId,
+      stateId: this.nextId(),
+      owner: new Uint8Array(0),
+      genesisData: source.genesisData,
+      transferMemo: params.reasonBytes,
       genesisOwner: source.genesisOwner,
       tokenType: source.tokenType,
     });

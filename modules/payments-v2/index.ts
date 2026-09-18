@@ -1,4 +1,5 @@
 export type { PaymentsV2, PaymentsV2Events, ConnectionStatus, SendRequest, SendWholeTokenRequest, SendCoinlessRequest, MintResult, HistoryEntry, HistoryPage, PaymentRequestView, PaymentRequestStatus, PaymentsRequestsApi, PendingTransfer } from './api';
+export type { MintCustomRequest, BurnRequest, BurnResult, PendingBurn } from './api';
 // NFT metadata (#785; normative spec docs/NFT-METADATA.md).
 export type {
   MintNftRequest,
