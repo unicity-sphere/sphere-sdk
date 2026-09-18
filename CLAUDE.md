@@ -4,19 +4,21 @@ This file provides context for Claude Code when working with the Sphere SDK proj
 
 ## ⚡ wallet-api program — current work (read first)
 
-This repo is part of the wallet-api program (process: `../wallet-api/development-workflow.md`).
+This repo is part of the wallet-api program (process: `../wallet-api/docs/development-workflow.md`).
 
 - **Branch topology (updated 2026-07-31):** all work branches from and PRs back to **`main`** —
   the `feat/wallet-api-integration` era ended when the integration branches merged (releases ship
   from `main`; wallet-api#119 records this in the process doc). Every PR links a GitHub issue
-  (`Closes #N`, docs-only changes exempt); squash-merge after green CI (typecheck + lint + build +
-  unit tests + typecheck:tests).
+  (`Closes #N`, docs-only changes exempt); squash-merge after green CI (`.github/workflows/ci.yml`:
+  verify:version + typecheck + typecheck:tests + lint + build + test:run on Node 22 and 24,
+  plus a separate `test:mutation` job).
 - **The normative spec for the program's SDK work is `../wallet-api/docs/sdk-changes.md`** — Part E
   (recoverable engine), then S1–S7 (thin wallet, ports, wallet-api providers). It was adversarially
   verified; build it, don't redesign it. Spec-first: contract changes land in the spec in the same
-  PR, before code. **The payments vertical (P11 flip landed) is the ONLY money path — design +
-  build tracker: `docs/PAYMENTS-V2-DESIGN.md` (read it before touching `modules/payments-v2/` or
-  `impl/wallet-api-v2/`). Migration guide for consumers: `docs/MIGRATION-PAYMENTS-V2.md`.**
+  PR, before code. **The payments vertical (P11 flip landed) is the ONLY money path — design
+  record + build history: `docs/PAYMENTS-V2-DESIGN.md` (read it for the why before touching
+  `modules/payments-v2/` or `impl/wallet-api-v2/`; the code and `docs/API.md` are normative for the
+  current API). Migration guide for consumers: `docs/MIGRATION-PAYMENTS-V2.md`.**
 - **Resume is status-agnostic** (sdk-changes E.2): never key engine resume off a submit status —
   submit, always `getInclusionProof`, match-verify (`OK` = mine, `TRANSACTION_HASH_MISMATCH` =
   `TransferConflictError`). That stays the ONLY conflict signal under 3.x: a null
@@ -26,7 +28,7 @@ This repo is part of the wallet-api program (process: `../wallet-api/development
   no earlier attempt certified, so none of them is a clean reject. The `STATE_ID_EXISTS`
   aggregator lag is OVER (M7 live e2e observed 2026-06-12: the gateway answers `SUCCESS` for
   duplicate AND conflicting submits — the status carries no conflict signal; see the dated
-  OBSERVED note in `../wallet-api/sdk-changes.md` E.2);
+  OBSERVED note in `../wallet-api/docs/sdk-changes.md` E.2);
   tolerant parsing shipped via state-transition-sdk-js#125 and stays.
 - **Sphere sets no request deadline, ANYWHERE** (#760): every mint / transfer / split burn /
   split mint leg omits `expiresAt`, so the Unicity Service assigns one from consensus time and
@@ -49,20 +51,20 @@ This repo is part of the wallet-api program (process: `../wallet-api/development
   (`tests/unit/payments-v2/contracts/`); the Sphere frontend is a **view** — no provider-specific
   logic outside implementations; custody (`intoInventory`) is a composition-time property, never a
   per-call flag.
-- **Never weaken a test to make it pass**; no `.skip`/`.only`. Known pre-existing flaky/failing
-  tests are tracked in #487.
+- **Never weaken a test to make it pass**; no `.skip`/`.only`. (#487, the old pre-existing-failure
+  tracker, is closed: it covered tests of modules that have since been deleted.)
 - **Releases:** npm versions publish via `publish.yml` (workflow_dispatch, version input) — the
   workflow runs `npm version` itself, so `package.json` on a branch still reads the PREVIOUS
   version; never hand-edit the field. Publishing from `main` takes dist-tag `latest`, any other
   branch takes `dev` (line **`<next version>-dev.#`**). Consumers (wallet-api backend, sphere
   frontend) pin exact versions. The backend consumes ONLY the `./token-engine` subpath (must stay
   browser/Nostr-free — keep `token-engine/` clean).
-- **The 3.x bump is a fleet-wide flag day** (#760, shipping as **0.15.0**). The forcing function
+- **The 3.x bump was a fleet-wide flag day** (#760, shipped in **0.15.0**). The forcing function
   is `aggregator-go`, whose main already carries `CertificationDataVersion = 2` with a hard reject
   of version 1 — nothing can straddle the gateway cutover. `wallet-api` must bump in LOCKSTEP:
   both repos pin `@unicitylabs/state-transition-sdk` EXACTLY, so bumping sphere-sdk alone makes
   npm dedupe impossible and runs both wire realms live; they cross at
-  `../wallet-api/src/validation/verifier.ts`. A testnet + wallet-api backend reset accompanies the
+  `../wallet-api/src/validation/verifier.ts`. A testnet + wallet-api backend reset accompanied that
   release.
 - Pinned base SDK: `@unicitylabs/state-transition-sdk@3.0.1` (exact pin; bump only via PR).
   **What 3.x is:** every transaction now carries `expiresAt` — an exclusive request deadline in
@@ -93,30 +95,40 @@ npm install @unicitylabs/sphere-sdk ws
 
 ### Complete L3 Wallet Integration Example
 
+`@unicitylabs/sphere-sdk/impl/browser` ships no type declarations (`tsup.shared.js` builds that
+entry with `dts: false`, and `package.json` has no `types` condition for it). Under `strict`
+TypeScript a consumer's import of it fails with `TS7016` unless they add a declaration shim, for
+example the one-line `declare module '@unicitylabs/sphere-sdk/impl/browser';` (which types
+everything from that entry as `any`). `./impl/nodejs` and `./impl/shared/wallet-api` are typed.
+
 ```typescript
-import { Sphere } from '@unicitylabs/sphere-sdk';
-import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+import { Sphere, TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
+import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser'; // untyped entry: see above
 import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
-// For Node.js: import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+// For Node.js: import { createNodeProviders, createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+// One network literal, used in all three places below. 'testnet' reaches the same
+// endpoints but is a DIFFERENT string: mixing it with 'testnet2' fails Sphere.init.
+const NETWORK = 'testnet2';
 
 // 1. Create base providers. `network` is REQUIRED (throws INVALID_CONFIG otherwise).
 //    There is NO bundled gateway API key — inject it via oracle.apiKey.
 //    The testnet2 key is NOT a secret (see .env.example); a mainnet key IS.
 const base = createBrowserProviders({
-  network: 'testnet2', // 'testnet' is an alias of it — the gateway the engine talks to
+  network: NETWORK,
   oracle: { apiKey: 'sk_...' },
 });
-// Node.js: createNodeProviders({ network: 'testnet2', oracle: { apiKey: 'sk_...' },
-//                                dataDir: './sphere-data' })
+// Node.js: createNodeProviders({ network: NETWORK, oracle: { apiKey: 'sk_...' },
+//                                dataDir: './sphere-data' }) // dataDir is optional; this is its default
 
 // 2. Attach the wallet-api transport config — REQUIRED for money. Sphere.init
 //    throws INVALID_CONFIG without `walletApi`; tokens are server-custody
 //    (the wallet-api backend holds inventory; keys stay local). A wallet that
 //    never touches money passes `walletApi: 'none'` instead (#793) — see below.
 const providers = createWalletApiProviders(base, {
-  baseUrl: 'https://wallet-api.example',  // wallet-api backend
-  network: 'testnet2',
-  deviceId: 'my-device',                  // stable per device — keeps the refresh-token row
+  baseUrl: 'https://wallet-api.unicity.network', // the testnet2 wallet-api
+  network: NETWORK,
+  deviceId: myDeviceId, // stable on this device across launches, different on every device
 });
 
 // 3. Init wallet (creates new OR loads existing — single entry point).
@@ -124,7 +136,7 @@ const providers = createWalletApiProviders(base, {
 //    STRING — 'testnet' vs 'testnet2' is a mismatch (INVALID_CONFIG), alias or not.
 const { sphere, created, generatedMnemonic } = await Sphere.init({
   ...providers,
-  network: 'testnet2',  // must equal walletApi.network and the base providers' network
+  network: NETWORK,     // must equal walletApi.network and the base providers' network
   autoGenerate: true,   // Generate mnemonic if no wallet exists
   nametag: 'alice',     // Optional: register @alice (only on create)
   password: 'secret',   // Optional: encrypt mnemonic (plaintext if omitted)
@@ -145,6 +157,12 @@ console.log('Unicity ID:', identity.nametag);        // alice
 
 // 5. Balances and tokens (server-read-through; Asset keeps its legacy shape —
 //    unconfirmed* fields are pinned '0'/0 by the v2 presentation)
+// coinId is the 64-hex coin id everywhere on the money path. Look it up in the
+// registry once it has loaded (Sphere.init starts the load but does not await it);
+// undefined = the symbol is not in this network's registry.
+await TokenRegistry.waitForReady();
+const coinIdHex = getCoinIdBySymbol('UCT');
+if (!coinIdHex) throw new Error("UCT is not in this network's token registry");
 const assets = await sphere.payments.assets();        // Asset[] grouped by coin
 const uct = await sphere.payments.assets(coinIdHex);  // filter by coin
 const tokens = sphere.payments.tokens();              // individual Token[] (sync view)
@@ -164,13 +182,20 @@ const result = await sphere.payments.send({
 });
 // result: TransferResult { id, status, tokens, tokenTransfers, error?,
 //                          deliveryPending?, deliveryState? }
-// status: 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed'
-// deliveryPending: certified on-chain but mailbox deposit still owed — NOT a failure.
+// A RESOLVED send() means sent: status 'delivered' (landed in the recipient's mailbox), or
+// 'confirmed' with deliveryPending: true / deliveryState 'pending-delivery' (certified; the
+// mailbox deposit is retried automatically — NOT a failure). send() never resolves
+// 'completed' or 'failed' (those exist only in the TransferStatus union): failures THROW.
+// Six codes mean the money may already have left — isPossiblyCommittedSendOutcome(err) is true
+// for exactly SEND_SYNC_PENDING, CERTIFICATION_UNCONFIRMED, CHECKPOINT_PERSIST_FAILED,
+// SPLIT_CHECKPOINT_LOST, CHECKPOINT_TRUSTBASE_MISMATCH and SEND_PARTIALLY_COMPLETED. Never
+// send() again for those: a retry button calls payments.resumeNow(), and
+// payments.pendingTransfers() lists what is still converging.
 // NOTE: coinId is NOT symbol-resolved on the money path. `getCoinIdBySymbol` /
-// `normalizeCoinId` have zero call sites in modules/payments-v2/ or core/Sphere.ts:
-// mint() rejects non-hex outright and send() byte-compares, so passing 'UCT' gets
-// a rejection from mint() and a silent no-match from send(). Resolve the symbol
-// yourself via the registry first. The registry is presentation only.
+// `normalizeCoinId` have zero call sites in modules/payments-v2/ or core/: mint() rejects
+// non-hex outright, and send() matches coinId exactly, so passing 'UCT' makes send() throw
+// SEND_INSUFFICIENT_BALANCE. Resolve the symbol yourself via the registry first (step 5).
+// The registry is presentation only.
 
 // 7. Receive: the facade drains the wallet-api mailbox continuously while
 //    started; receive() is an explicit one-shot drain (returns what landed).
@@ -182,9 +207,10 @@ sphere.on('transfer:incoming', (transfer) => {
 // 8. Self-mint fungible tokens (testnet top-up; journal-first, crash-safe)
 //    coinId must be even-length lowercase hex (the canonical SDK AssetId form)
 const mint = await sphere.payments.mint(coinIdHex, 1000000n);
-// MintResult: { success: true, tokenId } | { success: false, error }
+// MintResult: { success, tokenId?, error? } — one flat interface, so `success` does not narrow
+// tokenId. A failure that carries a tokenId is journaled and replays — never re-call it.
 // An NFT (#785; format docs/NFT-METADATA.md): minted to this wallet, signed as creator unless
-// sign: false. A failure that carries a tokenId is journaled and replays — never re-call it.
+// sign: false. Same MintResult, same rule.
 const nftMint = await sphere.payments.mintNft({
   content: { kind: 'media', media_type: 'image/png', bytes: pngBytes },
 });
@@ -204,22 +230,29 @@ await sphere.registerNametag('alice2');
 const addresses = sphere.getActiveAddresses(); // TrackedAddress[]
 
 // 12. Payment requests (wallet-api rail; encrypted memo envelope)
+// create() never throws: it resolves { success, requestId?, error? } — check success.
 const req = await sphere.payments.requests.create('@bob', {
   coinId: coinIdHex, amount: '1000000', memo: 'Pay for order #1234',  // 64-hex, not a symbol
 });
+if (!req.success) console.error(req.error);
 sphere.on('payment_request:incoming', (view) => {
   // PaymentRequestView: { id, requestId, senderPubkey, senderNametag?, amount,
-  //                       coinId, symbol?, message?, timestamp, status }
-  sphere.payments.requests.pay(view.id);      // or .decline(view.id)
+  //                       coinId, symbol?, message?, timestamp, status } (symbol is not set here)
+  // Never pay from the handler itself: show the request and let the USER decide, then call
+  // sphere.payments.requests.pay(view.id) OR .decline(view.id). pay() rethrows send()'s errors.
 });
 sphere.on('payment_request:updated', ({ id, status }) => {
-  // status: 'pending' | 'settling' | 'paid' | 'rejected' | 'expired'
+  // Requests you RECEIVED only. status: 'pending' | 'settling' | 'paid' | 'rejected' | 'expired'
+  // A requester learns its own request was paid from transfer:incoming or history().
 });
 const open = sphere.payments.requests.list();  // PaymentRequestView[]
 sphere.payments.requests.dismissProcessed();   // drop terminal entries from list()
 
 // 13. Cleanup
 await sphere.destroy();
+// Node scripts that should exit: also call TokenRegistry.destroy(). Sphere.init configures the
+// process-global registry too, and its hourly refresh timer keeps the event loop alive;
+// sphere.destroy() disposes only the registry that Sphere owns.
 ```
 
 ---
@@ -249,7 +282,7 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 
 **Silent mode:** `new ConnectClient({ ..., silent: true })` — fast-check approved list without UI popup.
 
-**Wallet-pushed events (4):** `WALLET_EVENTS.LOCKED` (`wallet:locked`), `WALLET_EVENTS.UNLOCKED` (`wallet:unlocked`), `WALLET_EVENTS.DISCONNECTED` (`wallet:disconnected`), `WALLET_EVENTS.IDENTITY_CHANGED` (`identity:changed`) — pushed by the host without subscription, and `sphere_subscribe` **refuses** them (`Sphere.on()` would accept the name and silently never emit).
+**Wallet-pushed events (4):** `WALLET_EVENTS.LOCKED` (`wallet:locked`), `WALLET_EVENTS.UNLOCKED` (`wallet:unlocked`), `WALLET_EVENTS.DISCONNECTED` (`wallet:disconnected`), `WALLET_EVENTS.IDENTITY_CHANGED` (`identity:changed`) — pushed by the host without subscription. `sphere_subscribe` for one of them **answers success** (`{ subscribed: true, event }`) without attaching to `Sphere.on()` (which would accept the name and silently never emit): pre-2.1 dApps call it fire-and-forget, and throwing there broke them (`ConnectHost.handleSubscribe`). Do not "fix" the host to refuse.
 
 **Graceful wallet lock (Connect 2.1):** a lock is a **state, not a teardown** — the session survives. Host verbs: `setLocked()` (session preserved, push `wallet:locked`), `updateSphere(next)` (unlock, push `wallet:unlocked`), `revokeSession()` (teardown, push `wallet:disconnected`), `setUnavailable()` (Sphere gone for a non-lock reason). `notifyWalletLocked()` was **removed**, not aliased — its old meaning was the opposite of its new one. While locked a host that HOLDS a session answers four of fourteen `RPC_METHODS` — `sphere_getIdentity` (from an immutable snapshot), `sphere_subscribe`, `sphere_unsubscribe`, `sphere_disconnect` — and refuses the other ten plus every intent with `WALLET_LOCKED` (4009). That ten includes `sphere_resolve` and **all four DM reads**: messaging does NOT keep working while locked. Nothing is cached. A host that COLD-STARTS locked has no session and an empty snapshot, so the handshake itself is refused with an errorless empty response — the dApp sees no code at all, not 4009, and must treat it as "not ready yet" and wait for `HOST_READY`. `onLockedRequest` is notify-only and **must never raise a credential surface** — a passive badge only. See `docs/CONNECT.md`.
 
@@ -270,12 +303,12 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `Sphere.init(options)` | `{ sphere, created, generatedMnemonic? }` | Create or load wallet (requires `walletApi` config, or `'none'`) |
+| `Sphere.init(options)` | `Promise<{ sphere, created, generatedMnemonic? }>` | Create or load wallet (requires `network` and a `walletApi` config, or `'none'`) |
 | `sphere.hasPayments` | `boolean` | Whether this Sphere composes money at all (#793) — fixed for its life |
 | `Sphere.exists(storage)` | `Promise<boolean>` | Check if wallet exists |
-| `Sphere.clear({ storage })` | `void` | Delete all wallet data (the whole KV, both `pv2g2:*` and superseded `pv2:*`, + orphaned pre-flip token DBs) |
-| `Sphere.import(options)` | `Sphere` | Import from mnemonic/masterKey |
-| `Sphere.importFromLegacyFile(options)` | `Sphere` | Import a `.txt` / flat-JSON / bare-mnemonic backup |
+| `Sphere.clear({ storage })` | `Promise<void>` | Delete all wallet data (the whole KV, both `pv2g2:*` and superseded `pv2:*`, + orphaned pre-flip token DBs; for IndexedDB the whole `dbName`, every prefix) |
+| `Sphere.import(options)` | `Promise<Sphere>` | Import from mnemonic/masterKey (clears this storage's existing wallet first) |
+| `Sphere.importFromLegacyFile(options)` | `Promise<{ success, sphere?, mnemonic?, needsPassword?, error? }>` | Import a `.txt` / flat-JSON / bare-mnemonic backup |
 | `sphere.payments.assets(coinId?)` | `Promise<Asset[]>` | Assets grouped by coin (server read-through) |
 | `sphere.payments.tokens(filter?)` | `Token[]` | Individual COIN tokens (sync inventory view) |
 | `sphere.payments.coinless()` | `CoinlessToken[]` | Coinless (NFT) holdings — disjoint from `tokens()` |
@@ -289,16 +322,21 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `sphere.payments.mintNft({ content, sign? })` | `Promise<MintResult>` | Mint an NFT to this wallet, signed as creator by default (journal-first) |
 | `sphere.payments.receive()` | `Promise<{ transfers }>` | Explicit one-shot mailbox drain |
 | `sphere.payments.history(page?)` | `Promise<HistoryPage>` | Paged history (`{ before?, limit? }`) |
-| `sphere.payments.requests.create(to, terms)` | `{ success, requestId?, error? }` | Send a payment request |
-| `sphere.payments.requests.list()` | `PaymentRequestView[]` | Current request views |
-| `sphere.payments.requests.pay(id)` | `Promise<TransferResult>` | Pay an incoming request (durably `settling` first) |
+| `sphere.payments.pendingTransfers()` | `Promise<PendingTransfer[]>` | What is still converging (open intents, owed deliveries, partial-send shortfalls) — for the UI |
+| `sphere.payments.resumeNow()` | `Promise<void>` | Run a convergence pass now — the ONLY retry verb (never re-`send()`) |
+| `sphere.payments.connectionStatus()` | `'connected' \| 'degraded' \| 'offline'` | Current wallet-api session status (`connection:status` is the change event) |
+| `sphere.payments.prewarmSend(request)` | `Promise<void>` | Read a pending send's source blobs while the confirm screen is up (reserves nothing) |
+| `sphere.payments.discardPrewarm()` | `void` | Drop the prewarmed reads |
+| `sphere.payments.requests.create(to, terms)` | `Promise<{ success, requestId?, error? }>` | Send a payment request (never throws; check `success`) |
+| `sphere.payments.requests.list()` | `PaymentRequestView[]` | Current views of requests you RECEIVED |
+| `sphere.payments.requests.pay(id)` | `Promise<TransferResult>` | Pay an incoming request (rethrows `send()` errors; a possibly-committed failure leaves it `settling`, never payable) |
 | `sphere.payments.requests.decline(id)` | `Promise<void>` | Decline (server 403/409 propagate) |
 | `sphere.payments.requests.dismissProcessed()` | `void` | Drop terminal entries from `list()` |
-| `sphere.resolve(identifier)` | `PeerInfo \| null` | Resolve @nametag/address/pubkey |
-| `sphere.communications.resolvePeerNametag(pubkey)` | `string \| undefined` | Resolve peer Unicity ID via transport |
-| `sphere.registerNametag(name)` | `void` | Register Unicity ID (Nostr binding) |
+| `sphere.resolve(identifier)` | `Promise<PeerInfo \| null>` | Resolve @nametag/address/pubkey |
+| `sphere.communications.resolvePeerNametag(pubkey)` | `Promise<string \| undefined>` | Resolve peer Unicity ID via transport |
+| `sphere.registerNametag(name)` | `Promise<void>` | Register Unicity ID (Nostr binding; nothing is minted) |
 | `sphere.signMessage(message)` | `string` | Sign with wallet key (secp256k1 ECDSA) |
-| `sphere.switchToAddress(index, options?)` | `void` | Switch HD address |
+| `sphere.switchToAddress(index, options?)` | `Promise<void>` | Switch HD address |
 | `sphere.getActiveAddresses()` | `TrackedAddress[]` | Non-hidden tracked addresses |
 | `sphere.setOracleApiKey(key)` | `Promise<void>` | Rebuild the engine with a new gateway key |
 | `sphere.exportToTxt(options?)` | `string` | Text backup (optionally password-encrypted) |
@@ -331,7 +369,7 @@ The payments vertical emits exactly 8 events; identity/comms/groupchat events ri
 | `connection:status` | `{ status: 'connected' \| 'degraded' \| 'offline' }` | Wallet-api session/wake-socket health |
 | `identity:changed` | `{ directAddress?, chainPubkey, nametag?, addressIndex }` | Address switch |
 | `nametag:registered` | `{ nametag, addressIndex }` | Unicity ID registered |
-| `nametag:recovered` | `{ nametag }` | Unicity ID recovered from Nostr on import |
+| `nametag:recovered` | `{ nametag }` | Unicity ID recovered from Nostr. The init-time recovery (create/load/import) emits BEFORE the call returns, so a listener added afterwards never sees it — read `sphere.identity?.nametag`; later recoveries (after `switchToAddress`) do reach listeners |
 | `address:activated` | `{ address: TrackedAddress }` | New address tracked |
 | `message:dm` / `message:broadcast` / `groupchat:*` | see `types/index.ts` | Communications |
 
@@ -349,10 +387,10 @@ See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.m
 - **L3 (Unicity state transition network)** - Token transfers via the **v3 state-transition SDK** (pinned `3.0.1`), consumed exclusively through the `token-engine/` port. Wallets are L3-only.
 - **Money custody:** wallet-api backend (server inventory + mailbox delivery). Nostr carries DMs, group chat and nametag bindings ONLY — no asset or payment-request traffic.
 
-**Version:** `0.15.x` — the state-transition-sdk 3.x bump ships as **0.15.0**, a breaking release (no cross-major wire interop in either direction). `package.json` on a branch still reads the previous version: `publish.yml` sets the field at publish time from its `version` input. Releases ship from `main` under the npm `latest` tag; `-dev.#` builds are published from a branch and land under `dev`. Per-release notes: CHANGELOG (versioned sections start at `0.14.11`; older entries are pooled under `[0.14.10] and earlier`)
+**Version:** see `package.json` (the 0.17.x line). The state-transition-sdk 3.x bump shipped as **0.15.0**, a breaking release (no cross-major wire interop in either direction). `package.json` on a branch still reads the previous version: `publish.yml` sets the field at publish time from its `version` input. Releases ship from `main` under the npm `latest` tag; `-dev.#` builds are published from a branch and land under `dev`. Per-release notes: CHANGELOG (versioned sections start at `0.14.11`; older entries are pooled under `[0.14.10] and earlier`)
 **License:** MIT
 **Target:** Node.js >= 22.0.0, Browser (ESM/CJS)
-**CLI:** moved out to `@unicity-sphere/cli` (`npm run cli` only prints a pointer)
+**CLI:** moved out to its own repository, [unicity-sphere/sphere-cli](https://github.com/unicity-sphere/sphere-cli), which is not published to npm yet (`npm install -g @unicity-sphere/cli` fails with a 404, although `npm run cli` still prints that command)
 
 ## Directory Structure
 
@@ -364,8 +402,10 @@ sphere-sdk/
 │   ├── wallet-api-protocol.ts # Cross-repo contract strings (auth challenge, intent signing)
 │   ├── address.ts          # DIRECT:// address parsing/validation
 │   ├── crypto.ts           # BIP39/BIP32, secp256k1, hashing, message signing
-│   ├── encryption.ts       # AES/Argon2+ChaCha20 encryption utilities
-│   ├── field-encryption.ts / delivery-envelope.ts # pv2 field crypto + S6 memo envelope
+│   ├── encryption.ts       # Wallet/seed encryption, CryptoJS AES-256-CBC: encryptSimple (OpenSSL
+│   │                       #   passphrase mode, MD5 EVP_BytesToKey, 1 iteration) stores the seed
+│   │                       #   and exportToJSON; encrypt()/decrypt() use PBKDF2-SHA256 (100k)
+│   ├── field-encryption.ts / delivery-envelope.ts # pv2 field crypto + S6 memo envelope (XChaCha20-Poly1305)
 │   ├── errors.ts           # SphereError + SphereErrorCode
 │   ├── logger.ts           # Centralized logger singleton
 │   ├── currency.ts         # Amount formatting/conversion
@@ -420,14 +460,16 @@ sphere-sdk/
 ├── storage/                 # StorageProvider port (keys/identity/journals) + HistoryRecord
 ├── oracle/                  # Network-config provider for the token engine
 ├── price/                   # Token market prices (CoinGeckoPriceProvider)
-├── registry/                # Token metadata registry (remote fetch + cache singleton)
+├── registry/                # Token metadata registry (remote fetch + cache): the process-global
+│                           #   instance + one registry owned by each Sphere (#767)
 ├── serialization/           # Text wallet backup format (.txt) parsing/writing
 ├── connect/                 # Sphere Connect protocol (client/, host/ incl. payments-compat)
 ├── assets/                  # Embedded trust bases per network (trustbase.ts)
 │
 ├── tests/                   # Vitest: unit/ (incl. payments-v2 + contracts), integration/,
 │                           #   e2e/ (live staging), relay/, mutation/ (probes.json)
-├── docs/                    # PAYMENTS-V2-DESIGN, MIGRATION-PAYMENTS-V2, CONNECT, QUICKSTART-*, ...
+├── docs/                    # API, INTEGRATION, CONNECT, QUICKSTART-*, NFT-METADATA, VERIFICATION-WORKERS,
+│                           #   MIGRATION-PAYMENTS-V2, MIGRATION-TOKEN-REGISTRY, PAYMENTS-V2-DESIGN (design record), ...
 ├── index.ts                 # Main SDK entry point
 ├── constants.ts             # Global constants, NETWORKS, storage keys
 └── package.json
@@ -435,13 +477,18 @@ sphere-sdk/
 
 Subpath exports: `.` (root), `./core`, `./token-engine`, `./payments-v2` (the facade module),
 `./impl/wallet-api-v2`, `./impl/shared/wallet-api`, `./impl/browser`, `./impl/nodejs`,
-`./connect` (+ platform connect entries). The `./wallet-api` subpath (old S1 client) is GONE.
+`./connect`, `./connect/browser`, `./connect/nodejs`. Every entry ships type declarations
+EXCEPT `./impl/browser` (`dts: false` in `tsup.shared.js`; its exports map has no `types`), so a
+strict-TypeScript consumer of it needs a `declare module` shim. The `./wallet-api` subpath (old S1
+client) is GONE.
 
 ## Architecture
 
 ### Payments vertical (the only money path)
 
-`docs/PAYMENTS-V2-DESIGN.md` is the authoritative design. The short version:
+`docs/PAYMENTS-V2-DESIGN.md` is the design record (the why; the code and `docs/API.md` are
+normative for the current API, and its §5 layout and progress rows are historical). The short
+version:
 
 - **Server is the record.** Token inventory, blobs, transfer intents, mailbox, history and
   payment requests live in the wallet-api backend. The client holds keys, a per-address scoped
@@ -465,8 +512,9 @@ Subpath exports: `.` (root), `./core`, `./token-engine`, `./payments-v2` (the fa
   signed complete (`completeSignMessage` — the server's seedGate verifies it). Resume is THE SAME
   machine replaying the SAME transferId — runs inside `facade.start()` (off critical path),
   never re-issues a spend. A possibly-committed outcome keeps the intent OPEN (never a fresh
-  send); a clean conflict with a demoted source triggers one bounded re-plan (#625 marks the
-  source `suspectedSpent`, excluded from selection, recoverable by resync).
+  send); a clean conflict with a demoted source triggers a bounded re-plan — up to
+  `MAX_RESELECT` (8) re-selections, none for a whole-token send (#625 marks the source
+  `suspectedSpent`, excluded from selection, recoverable by resync).
 - **Receive:** continuous mailbox drain while started + explicit `receive()`. Every incoming
   token is engine-verified and ownership-checked BEFORE entering the balance; dedup by
   **(tokenId, stateHash)** — genesis id alone would refuse a token legitimately re-acquired at a
@@ -480,9 +528,11 @@ Subpath exports: `.` (root), `./core`, `./token-engine`, `./payments-v2` (the fa
   (`ProofUnconfirmedError` with `.cause`), `SEND_SYNC_PENDING`, the checkpoint trio,
   `SEND_PARTIALLY_COMPLETED`, `isPossiblyCommittedSendOutcome()` — callers keep PENDING_COMMIT
   handling exactly as before; never re-issue a send after a possibly-committed reject.
-- **Lifecycle:** `facade.start()`/`stop()` are Sphere-internal (init/destroy/address switch);
-  there is no public session or resume API. An address switch stops the old facade and starts a
-  fresh one (a stopped `WalletApiSession` does not restart).
+- **Lifecycle:** `facade.start()`/`stop()` are Sphere-internal (init/destroy/address switch).
+  The public convergence surface is `payments.pendingTransfers()` / `payments.resumeNow()` (a
+  retry button calls `resumeNow()`, NEVER `send()`: a re-issued send double-pays), plus
+  `payments.connectionStatus()` for the session. An address switch stops the old facade and
+  starts a fresh one (a stopped `WalletApiSession` does not restart).
 
 ### Token Engine (v3) — the only chain-op path
 
@@ -531,8 +581,13 @@ sphere-domain type that moved is `TokenBlob` (two never-read fields dropped — 
   and `engine.verify` fans per-transfer work out to a worker pool. The entry
   script is the CONSUMER's (only their bundler can emit a worker) and its
   predicate verifier must match the engine's or the verdict silently diverges.
-  Workers spawn lazily; `sphere.destroy()` / an address switch / an api-key change
-  call `engine.dispose()` to terminate the pool. The consumer-facing entry-script contract is
+  Workers spawn lazily. Each address builds its own engine (so its own pool) on first use;
+  `sphere.destroy()` disposes every address's engine and `setOracleApiKey()` disposes the one it
+  replaces, but an address switch disposes NOTHING (the previous address keeps its engine until
+  destroy), so up to `poolSize` × visited addresses workers can be alive. `createWorker` must
+  return the `VerificationWorker` port type: a DOM `Worker` / st-sdk `NodeWorker` needs an
+  `as VerificationWorker` cast under strict TS (their handler params are narrower).
+  The consumer-facing entry-script contract is
   UNCHANGED by the 3.x bump (the SDK's `IWorker`/`WorkerTokenVerifier` declarations are
   diff-clean; only the main-thread side moved). See `docs/VERIFICATION-WORKERS.md`.
 - **The engine is mandatory for money movement**: `send()` / `mint()` fail loudly
@@ -580,6 +635,8 @@ interface SendRequest {     // sphere.payments.send()
 interface TransferResult {
   readonly id: string;
   status: 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed';
+  // ^ the TransferStatus union. A resolved send() is only 'delivered' or 'confirmed'
+  //   (+ deliveryPending); 'failed' appears only on transfer:updated for a clean failure.
   readonly tokens: Token[];
   readonly tokenTransfers: TokenTransferDetail[];  // { sourceTokenId, method: 'direct'|'split' }
   error?: string;
@@ -649,9 +706,9 @@ Custom `OracleProvider` implementations MUST provide the three config accessors.
 
 | Network | Aggregator/Gateway | Status |
 |---------|--------------------|--------|
-| `testnet` | `https://gateway.testnet2.unicity.network` | ⭐ **Alias of testnet2** (the current gateway, trust-base networkId 4, testnet2 token registry) |
-| `testnet2` | `https://gateway.testnet2.unicity.network` | Same config as `testnet` |
-| `mainnet` | `gateway.mainnet.unicity.network` | Live v3 gateway; embedded trust base, **networkId 1** (pinned in `EXPECTED_NETWORK_ID`); own `unicity-ids.mainnet.json` registry (currently only the non-fungible base type). No mainnet wallet-api yet, so the money path is unreachable; shares testnet's Nostr relay until one is stood up |
+| `testnet` | `https://gateway.testnet2.unicity.network` | ⭐ **Same endpoints as testnet2** (the current gateway, trust-base networkId 4, testnet2 token registry) — but a DIFFERENT string: `Sphere.init` compares `network` with `walletApi.network` literally, so never mix `'testnet'` and `'testnet2'`; the testnet2 wallet-api signs in only as `'testnet2'` |
+| `testnet2` | `https://gateway.testnet2.unicity.network` | Same config as `testnet`; wallet-api `https://wallet-api.unicity.network` |
+| `mainnet` | `https://gateway.mainnet.unicity.network` | Live v3 gateway; embedded trust base, **networkId 1** (pinned in `EXPECTED_NETWORK_ID`); own `unicity-ids.mainnet.json` registry (currently only the non-fungible base type, no fungible coins). Live wallet-api at `https://wallet-api.mainnet.unicity.network` (use `'mainnet'` in all three places and a SECRET gateway key); shares testnet's Nostr relay until one is stood up |
 
 All networks share Nostr relays (`nostr-relay.testnet.unicity.network` for test
 nets) and group relays per `NETWORKS`.
@@ -675,8 +732,11 @@ npm test
 # Test (single run)
 npm run test:run
 
-# Mutation probes (payments-v2, token-engine, wallet-api-v2, wiring; all must be KILLED)
+# Mutation probes (tests/mutation/probes.json lists what they cover; all must be KILLED)
 npm run test:mutation
+
+# E2E against a REAL aggregator-go (Testcontainers; needs Docker)
+npm run test:aggregator
 
 # E2E tests (live testnet2/staging; needs .env — see .env.example)
 npm run test:e2e
@@ -735,10 +795,13 @@ authoritative for build success.
   signed, field-encrypted progress checkpoint; the mailbox deposit and the signed complete close
   it. A crash at ANY stage resumes the SAME transferId — never a second spend (E.2/E.4, #631,
   #676, #690).
-- **Never re-issue `send()` after a possibly-committed outcome** (`CERTIFICATION_UNCONFIRMED` /
-  `isPossiblyCommittedSendOutcome()`): the intent stays OPEN and `facade.start()` converges it.
-  A proven clean reject or `TransferConflictError` aborts (with #625 source demotion + one
-  bounded re-plan).
+- **Never re-issue `send()` after a possibly-committed outcome** (`isPossiblyCommittedSendOutcome()`
+  is true for exactly six codes: `SEND_SYNC_PENDING`, `CERTIFICATION_UNCONFIRMED`,
+  `CHECKPOINT_PERSIST_FAILED`, `SPLIT_CHECKPOINT_LOST`, `CHECKPOINT_TRUSTBASE_MISMATCH`,
+  `SEND_PARTIALLY_COMPLETED`): the intent stays OPEN and the convergence pass (`facade.start()`,
+  the heartbeat, or `payments.resumeNow()`) finishes it under the same transferId. A proven clean
+  reject or `TransferConflictError` aborts (with #625 source demotion + a bounded re-plan, up to
+  `MAX_RESELECT` = 8).
 
 ### Receive & Verification
 - Incoming tokens arrive as FINISHED SDK tokens via the wallet-api mailbox (continuous drain
@@ -844,22 +907,30 @@ authoritative for build success.
 
 ### Unicity IDs (nametags)
 - Human-readable aliases (e.g., `@alice`) for receiving payments.
-- **Registration = publishing the Nostr identity binding** (name ↔ chainPubkey,
-  first-seen-wins is the global uniqueness guard). Runtime name resolution is
+- **Registration = publishing the Nostr identity binding** (name ↔ chainPubkey). The binding
+  carries the UNIP-01 marker `["L", "unicity:nametag"]` (nostr-js-sdk 0.6.0): a UNIP-01 relay
+  enforces single ownership by receive order, and resolution prefers the marked binding
+  (ambiguous → `null`); `created_at` first-seen-wins is only the legacy fallback for unmarked
+  bindings and is forgeable. See `docs/NAMETAG-BINDINGS.md`. Runtime name resolution is
   Nostr-binding-only; receive is always `SignaturePredicate(chainPubkey)`;
   there is **no PROXY addressing anywhere**.
 - The self-issued `UnicityIdToken` mint was REMOVED with the 2.0.0 SDK bump
   (upstream deleted the unicity-id primitive, state-transition-sdk-js#132) —
   registration is Nostr-binding-only.
-- Recovered from Nostr when importing a wallet; each HD address can have its own.
+- Recovered from Nostr during create/load/import (before the call returns — read
+  `sphere.identity?.nametag`, the init-time `nametag:recovered` has no listener yet); each HD
+  address can have its own.
 
 ### Peer Resolution
 - `sphere.resolve(identifier)` — unified lookup via transport.
 - Accepts: `@nametag`, `DIRECT://...`, chain pubkey (`02`/`03`),
   transport pubkey (64-hex). Returns `PeerInfo` or `null`.
 - Identity binding event published on init/load — wallet discoverable without a Unicity ID.
-- The payments vertical rides the same resolution for `send()`/`requests.create()` recipients;
-  the recipient's network is pinned to the session network.
+- The payments vertical rides the same resolution for `send()`/`requests.create()` recipients.
+  A bare 66-hex chain pubkey is taken as being on the session network. A `@nametag` / `DIRECT://`
+  binding declares no network (#734), so every such send emits `transfer:attention`
+  `recipient:network-unverified` (with `transferId: ''`) and proceeds on the session network; a
+  resolved peer that DOES declare another network is refused with `INVALID_RECIPIENT`.
 
 ### Token Registry (Remote + Cached)
 - `TokenRegistry` singleton provides token metadata (symbol, name, decimals,
@@ -879,9 +950,11 @@ authoritative for build success.
   `pv2g2:{network}:{chainPubkey}:*` inside the plain `StorageProvider` — refresh token, sync
   cursors, intent backstop, split-checkpoint cache, delivery journal (#621), mint journal,
   NFT mint journal (#785), #690 shortfalls, request settling journal, the epoch latch and the §5.2 `suspectedSpent` /
-  `knownSpends` overlays — the complete list is `STORE_KEYS` in `modules/payments-v2/stores.ts`,
-  and it contains no receive seen-set. One writer per store. Being self-prefixed with the
-  network, it never rides the legacy `isNetworkScopedAddressKey` mechanism (which still guards the remaining
+  `knownSpends` overlays — the complete list is `STORE_KEYS` in `modules/payments-v2/stores.ts`
+  plus the session's refresh token under `refreshTokenKey(deviceId)` (`auth:refresh:<deviceId>`,
+  `impl/wallet-api-v2/session.ts`), and it contains no receive seen-set. One writer per store.
+  Being self-prefixed with the network, it never rides the legacy `isNetworkScopedAddressKey`
+  mechanism (which still guards the remaining
   chat/identity keys in the platform storage providers).
 - **The `pv2:` → `pv2g2:` rename IS the 3.x local migration** (`modules/payments-v2/stores.ts`;
   `sweepSupersededState()` clears the old prefix once per composition, from
@@ -905,8 +978,10 @@ authoritative for build success.
 |----------|----------|---------|
 | `sphere-storage` | `IndexedDBStorageProvider` | Wallet keys, per-address data, `pv2g2:*` scoped KV |
 
-`Sphere.clear({ storage })` deletes it (both KV generations with it) and sweeps orphaned
-pre-flip `sphere-token-storage-*` databases.
+`Sphere.clear({ storage })` empties it (the object store, not `deleteDatabase`; both KV
+generations and every key prefix in that `dbName` go with it) and sweeps orphaned pre-flip
+`sphere-token-storage-*` databases. `IndexedDBStorageProvider.backingStoreId` is therefore the
+database, not the prefix: two wallets sharing one `dbName` share one fate.
 
 ## Testing
 
@@ -926,7 +1001,7 @@ CBOR wrong. Only `tests/aggregator/` closes that gap.
 Key test areas:
 - `tests/unit/payments-v2/` — the vertical: TransferMachine send/resume, receive drain,
   requests, mint journal, history, facade assembly, inventory presentation, the KV generation
-  rename (`kv-generation.test.ts`), adversarial fakes (`fakes/FakeWalletApi` — 61 behavior pins —
+  rename (`kv-generation.test.ts`), adversarial fakes (`fakes/FakeWalletApi` behavior pins
   + FakeGateway), port contract suites
   (`contracts/{storage,delivery}-port.contract.ts` — swappability enforced)
 - `tests/aggregator/` — the real engine against a REAL aggregator-go v3, stood up by
@@ -945,10 +1020,12 @@ Key test areas:
   `INVALID_TRUSTBASE` at the quorum-signature rule). The compose stack runs a SINGLE
   bft-root node, so this exercises "wrong key", not a real quorum — mainnet's
   4-node/threshold-3 shape is still unexercised anywhere in the repo.
-- `tests/mutation/probes.json` — mutation probes over `modules/payments-v2/*`,
-  `token-engine/{proof-wait,SphereTokenEngine}.ts`, `impl/wallet-api-v2/*`, the `core/` wiring and
-  `transport/NostrTransportProvider.ts`; `npm run test:mutation` must report every one KILLED
-  (a probe count belongs in the file, not here — it has gone stale twice)
+- `tests/mutation/probes.json` — mutation probes over the money path and its neighbours:
+  `modules/payments-v2/*`, `token-engine/` (engine, factory, proof wait, NFT payload, value
+  envelope), `impl/wallet-api-v2/*`, `core/` (Sphere lifecycle, wiring), the Nostr transport, the
+  token registry, the storage providers and `storage/tracked-addresses.ts`, among others — the file
+  is the list; `npm run test:mutation` must report every one KILLED (a probe count belongs in the
+  file, not here — it has gone stale twice)
 - `tests/unit/token-engine/` — engine contract, factory, FakeTokenEngine,
   identity golden test (`identity.test.ts` locks the DIRECT:// derivation),
   `expires-at.test.ts` (no deadline on any submitted request nor on the token itself; two
@@ -960,7 +1037,7 @@ Key test areas:
   again), `proof-deadline.test.ts` (the abort guard)
 - `tests/unit/connect/` — protocol surface guard (14/8/15 counts), `mint_nft` wire helpers
   (`nft-wire.test.ts`) and its never-auto-approved guard, lock semantics,
-  payments-compat adapter conformance (36 tests: old wire names/payloads from the v2 facade,
+  payments-compat adapter conformance (old wire names/payloads from the v2 facade,
   against a mock Sphere whose `payments` getter THROWS exactly like the real one)
 - `tests/unit/core/` — Sphere lifecycle, clear, nametag sync/recovery, wallet-api-protocol pins
 - `tests/integration/` — Sphere payments wiring (defaults + walletApi config, incl. the
@@ -980,15 +1057,21 @@ Key test areas:
 - `bip39`, `crypto-js`, `canonicalize`, `buffer`
 
 **Optional/peer (Node WebSocket):**
-- `ws` `>=8.0.0` — Node.js WebSocket (peer, `peerDependenciesMeta.optional`)
+- `ws` `>=8.0.0` — Node.js WebSocket (peer, `peerDependenciesMeta.optional`). Optional in
+  metadata only: `@unicitylabs/sphere-sdk/impl/nodejs` imports `ws` when the module loads
+  (`impl/nodejs/transport/index.ts`), on every Node version, so Node consumers must install it.
 
 ## File Size Reference
 
-Largest files (for context):
-- `core/Sphere.ts` — wallet lifecycle (~4,000 lines post-flip)
-- `modules/payments-v2/machine/TransferMachine.ts` — the send/resume machine
-- `modules/payments-v2/PaymentsFacade.ts` — facade + lifecycle
-- `impl/wallet-api-v2/session.ts` — auth cell + wake socket
+Largest source files (September 2026, for context; sizes drift):
+- `core/Sphere.ts` — wallet lifecycle (~4,450 lines)
+- `transport/NostrTransportProvider.ts` — Nostr transport (~2,100)
+- `modules/groupchat/GroupChatModule.ts` — NIP-29 group chat (~1,850)
+- `transport/MultiAddressTransportMux.ts` — per-address transport mux (~1,800)
+- `connect/host/ConnectHost.ts` — Connect wallet host (~1,400)
+
+The money path's core files are smaller: `modules/payments-v2/PaymentsFacade.ts` (~790),
+`modules/payments-v2/machine/TransferMachine.ts` (~660), `impl/wallet-api-v2/session.ts` (~450).
 
 ## Code Style
 
