@@ -104,11 +104,13 @@ the `.d.ts` files as IDE hover text. No runtime code changes. What the documenta
 
 - **Every entry point needs `walletApi` and `network`.** `Sphere.init`, `create`, `load`, `import`,
   `importFromJSON` and `importFromLegacyFile` compare `network` with `walletApi.network` as plain
-  strings and throw `INVALID_CONFIG` when it is missing or different. The samples use one literal,
-  `'testnet2'`, for the base providers, the `walletApi` config and `Sphere.init`; `'testnet'`
-  reaches the same endpoints but is a different string. `walletApi: 'none'` still needs `network`.
-  The shipped JSDoc no longer calls `network` "informational only" or lists the removed `dev`
-  network.
+  strings and fail with `INVALID_CONFIG` when it is missing or different (`importFromJSON`, and
+  `importFromLegacyFile` for a sphere-wallet JSON backup, return that error's message as
+  `{ success: false, error }` instead of throwing). The samples use one literal, `'testnet2'`, for
+  the base providers, the `walletApi` config and `Sphere.init`; `'testnet'` has the same gateway,
+  relays and token registry but is a different string, and the testnet2 wallet-api signs in only as
+  `'testnet2'`. `walletApi: 'none'` still needs `network`. The shipped JSDoc no longer calls
+  `network` "informational only" or lists the removed `dev` network.
 - **`coinId` is the 64-hex coin id.** Nothing on the money path resolves symbols: `coinId: 'UCT'`
   fails with `SEND_INSUFFICIENT_BALANCE`, and a payment request created with it can never be paid.
   The samples look the id up with `getCoinIdBySymbol()` after `TokenRegistry.waitForReady()`.

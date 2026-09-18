@@ -282,7 +282,7 @@ The SDK ships network presets that configure all services automatically. `networ
 |-------------------|-----------|------------------|----------------------|------------------------------------|
 | `'testnet2'` | 4 | `https://gateway.testnet2.unicity.network` | `wss://nostr-relay.testnet.unicity.network` | `https://wallet-api.unicity.network` |
 | `'mainnet'` | 1 | `https://gateway.mainnet.unicity.network` | the testnet relay (mainnet has none of its own yet) | `https://wallet-api.mainnet.unicity.network` |
-| `'testnet'` | 4 | same as `testnet2` | same as `testnet2` | same as `testnet2`, but a different literal: do not mix `'testnet'` and `'testnet2'` |
+| `'testnet'` | 4 | same as `testnet2` | same as `testnet2` | none: the testnet2 wallet-api signs in only as `'testnet2'`, and the SDK refuses its sign-in challenge for `'testnet'`. Use `'testnet2'` |
 
 > **Live networks are testnet2 and mainnet**, each with its own gateway and wallet-api deployment. `testnet` is a second key with testnet2's configuration (network id 4, taken from the trust base; the testnet2 token registry), but it is a different string, so it fails the `network` check against a `'testnet2'` wallet-api config (see [`network` placement](#what-just-happened-the-provider-model)). `SPHERE_NETWORKS` exposes only `mainnet` and `testnet2`. The v1 network is discontinued — the old `goggregator-test` testnet spoke the removed v1 protocol, and the `dev` network that aliased its trust base has been removed along with every other v1 pointer. On mainnet use `network: 'mainnet'` in `createBrowserProviders`/`createNodeProviders`, in the `walletApi` config and on `Sphere.init`, the mainnet wallet-api `https://wallet-api.mainnet.unicity.network`, and your mainnet gateway API key, which is a secret. Mainnet shares testnet2's Nostr relay for now, and its token registry lists no fungible coins yet. The transfer wire payload is the finished token blob — the base SDK's own `Token.toCBOR()` bytes, with no sphere envelope around them — deposited into the recipient's wallet-api mailbox.
 >
@@ -318,7 +318,7 @@ The `testnet2` preset wires most of these automatically — you only pass `netwo
 
 | What | Value |
 |------|-------|
-| Network | `testnet2`, networkId **4** (the `testnet` key has the same values but is a different literal; do not mix them) |
+| Network | `testnet2`, networkId **4** (the `testnet` key has the same gateway, relays and token registry, but it is a different literal and the testnet2 wallet-api signs in only as `'testnet2'`; use `testnet2`) |
 | **Aggregator / gateway** (token engine) | `https://gateway.testnet2.unicity.network` |
 | **Aggregator API key** (public — **not** a secret) | `sk_ddc3cfcc001e4a28ac3fad7407f99590` |
 | **wallet-api** (delivery + token storage) | `https://wallet-api.unicity.network` |
@@ -484,12 +484,16 @@ Request payments from others over the wallet-api rail (`sphere.payments.requests
 - `payment_request:updated` reports requests you **received**. The SDK does not track requests you created: detect payment through `transfer:incoming` or `sphere.payments.history()`.
 - `request.amount` is a base-unit string and `request.coinId` the hex id; `request.symbol` is not set by the SDK event.
 
-`pay()` never leaves a request payable after a possibly-committed failure: before it rethrows such an error it
-durably links the request to the transfer and marks it `'settling'`, and a second `pay()` of the same id in the
-same process joins the first. That link is written after the send returns or throws, not before it starts. If the
-app or process stops while `pay()` is still waiting on the send, no link exists: on the next start the request is
-listed as `'pending'` again and `payment_request:incoming` fires again, even if the transfer went through (a transfer
-the SDK had already recorded is resumed when the wallet starts). Before paying a request again after a restart, check
+When the send inside `pay()` fails with a possibly-committed error, `pay()` links the request to that transfer (the
+error's `transferId`) in the payments journal and marks it `'settling'` before it rethrows, so the request is not
+payable, and the link survives a restart. One exception: if writing that link to storage fails, `pay()` rejects with
+the storage error instead of the send error, so `isPossiblyCommittedSendOutcome` is `false` for it although the
+payment may have gone out; the link is then held in memory and reaches storage only with a later successful journal
+write. A second `pay()` of the same id while the first is still running joins it. The link is written after the send
+returns or throws, not before it starts. If the app or process stops while `pay()` is still waiting on the send, or
+before a link that failed to write reaches storage, no link exists: on the next start the request is listed as
+`'pending'` again and `payment_request:incoming` fires again, even if the transfer went through (a transfer the SDK
+had already recorded is resumed when the wallet starts). Before paying a request again after a restart, check
 `sphere.payments.pendingTransfers()` and `sphere.payments.history()` for a transfer to that requester.
 
 ```typescript
