@@ -5,7 +5,7 @@
  *
  * @example
  * ```ts
- * import { Sphere } from '@unicitylabs/sphere-sdk';
+ * import { Sphere, TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
  * import { createLocalStorageProvider, createNostrTransportProvider, createUnicityAggregatorProvider } from '@unicitylabs/sphere-sdk/impl/browser';
  *
  * const storage = createLocalStorageProvider();
@@ -36,8 +36,10 @@
  *   const sphere = await Sphere.create({ mnemonic, storage, transport, oracle, walletApi, network: 'testnet2' });
  * }
  *
- * // Use the wallet
- * await sphere.payments.send({ coinId: 'UCT', amount: '1000', recipient: '@alice' });
+ * // Use the wallet. coinId is the 64-hex coin id: symbols are not resolved on the money path.
+ * await TokenRegistry.waitForReady();
+ * const coinId = getCoinIdBySymbol('UCT'); // string | undefined
+ * if (coinId) await sphere.payments.send({ coinId, amount: '1000', recipient: '@alice' });
  * ```
  */
 
@@ -192,7 +194,7 @@ export interface SphereCreateOptions extends SphereWalletApiOptions {
   mnemonic: string;
   /** Custom derivation path (default: m/44'/0'/0') */
   derivationPath?: string;
-  /** Optional nametag to register for this wallet (e.g., 'alice' for @alice). Token is auto-minted. */
+  /** Optional nametag to register for this wallet (e.g., 'alice' for @alice), published as a Nostr identity binding; nothing is minted. */
   nametag?: string;
   /** Storage provider instance */
   storage: StorageProvider;
@@ -203,9 +205,10 @@ export interface SphereCreateOptions extends SphereWalletApiOptions {
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
-   * Network type (mainnet, testnet, dev) - informational only.
-   * Actual network configuration comes from provider URLs.
-   * Use createBrowserProviders({ network: 'testnet' }) to set up testnet providers.
+   * Network: `'mainnet'`, `'testnet'` or `'testnet2'`. Required (optional in the type only): it
+   * selects the token registry and, unless `walletApi` is `'none'`, must equal `walletApi.network`
+   * as a string. A missing or different value throws `INVALID_CONFIG`. Use the same literal as the
+   * base providers (`createBrowserProviders` / `createNodeProviders`), e.g. `'testnet2'` everywhere.
    */
   network?: NetworkType;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
@@ -217,10 +220,11 @@ export interface SphereCreateOptions extends SphereWalletApiOptions {
   /** Optional password to encrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
   /**
-   * Auto-discover previously used HD addresses after creation.
-   * - true: discover with defaults (Nostr binding-event scan, autoTrack: true)
+   * Auto-discover previously used HD addresses after creation. On by default.
+   * - omitted or true: discover with defaults (Nostr binding-event scan, autoTrack: true)
    * - DiscoverAddressesOptions: custom config
-   * - false/undefined: no auto-discovery (default)
+   * - false: no auto-discovery
+   * Runs only when the transport implements discovery; a discovery failure is logged, not thrown.
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
   /** Enable debug logging (default: false) */
@@ -245,9 +249,10 @@ export interface SphereLoadOptions extends SphereWalletApiOptions {
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
-   * Network type (mainnet, testnet, dev) - informational only.
-   * Actual network configuration comes from provider URLs.
-   * Use createBrowserProviders({ network: 'testnet' }) to set up testnet providers.
+   * Network: `'mainnet'`, `'testnet'` or `'testnet2'`. Required (optional in the type only): it
+   * selects the token registry and, unless `walletApi` is `'none'`, must equal `walletApi.network`
+   * as a string. A missing or different value throws `INVALID_CONFIG`. Use the same literal as the
+   * base providers (`createBrowserProviders` / `createNodeProviders`), e.g. `'testnet2'` everywhere.
    */
   network?: NetworkType;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
@@ -259,10 +264,11 @@ export interface SphereLoadOptions extends SphereWalletApiOptions {
   /** Optional password to decrypt the wallet. Must match the password used during creation. */
   password?: string;
   /**
-   * Auto-discover previously used HD addresses on load.
-   * - true: discover with defaults (Nostr binding-event scan, autoTrack: true)
+   * Auto-discover previously used HD addresses on load. On by default.
+   * - omitted or true: discover with defaults (Nostr binding-event scan, autoTrack: true)
    * - DiscoverAddressesOptions: custom config
-   * - false/undefined: no auto-discovery (default)
+   * - false: no auto-discovery
+   * Runs only when the transport implements discovery; a discovery failure is logged, not thrown.
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
   /** Enable debug logging (default: false) */
@@ -290,11 +296,13 @@ export interface SphereImportOptions extends SphereWalletApiOptions {
   basePath?: string;
   /** Derivation mode: bip32, wif_hmac, legacy_hmac */
   derivationMode?: DerivationMode;
-  /** Optional nametag to register for this wallet (e.g., 'alice' for @alice). Token is auto-minted. */
+  /** Optional nametag to register for this wallet (e.g., 'alice' for @alice), published as a Nostr identity binding; nothing is minted. */
   nametag?: string;
-  /** Network this wallet runs on — drives TokenRegistry config. Without it, import
-   *  falls back to NETWORKS.testnet and a non-testnet wallet loads the wrong registry
-   *  (symbols resolve via baked values but icons/metadata don't) until a reload. */
+  /**
+   * Network: `'mainnet'`, `'testnet'` or `'testnet2'`. Required (optional in the type only): it
+   * selects the token registry and, unless `walletApi` is `'none'`, must equal `walletApi.network`
+   * as a string. A missing or different value throws `INVALID_CONFIG`; there is no fallback network.
+   */
   network?: NetworkType;
   /** Storage provider instance */
   storage: StorageProvider;
@@ -313,10 +321,11 @@ export interface SphereImportOptions extends SphereWalletApiOptions {
   /** Optional password to encrypt the wallet. If omitted, mnemonic/key is stored as plaintext. */
   password?: string;
   /**
-   * Auto-discover previously used HD addresses after import.
-   * - true: discover with defaults (Nostr binding-event scan, autoTrack: true)
+   * Auto-discover previously used HD addresses after import. On by default.
+   * - omitted or true: discover with defaults (Nostr binding-event scan, autoTrack: true)
    * - DiscoverAddressesOptions: custom config
-   * - false/undefined: no auto-discovery (default)
+   * - false: no auto-discovery
+   * Runs only when the transport implements discovery; a discovery failure is logged, not thrown.
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
   /** Enable debug logging (default: false) */
@@ -344,14 +353,15 @@ export interface SphereInitOptions extends SphereWalletApiOptions {
   autoGenerate?: boolean;
   /** Custom derivation path (default: m/44'/0'/0') */
   derivationPath?: string;
-  /** Optional nametag to register (only on create). Token is auto-minted. */
+  /** Optional nametag to register (only on create), published as a Nostr identity binding; nothing is minted. */
   nametag?: string;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
-   * Network type (mainnet, testnet, dev) - informational only.
-   * Actual network configuration comes from provider URLs.
-   * Use createBrowserProviders({ network: 'testnet' }) to set up testnet providers.
+   * Network: `'mainnet'`, `'testnet'` or `'testnet2'`. Required (optional in the type only): it
+   * selects the token registry and, unless `walletApi` is `'none'`, must equal `walletApi.network`
+   * as a string. A missing or different value throws `INVALID_CONFIG`. Use the same literal as the
+   * base providers (`createBrowserProviders` / `createNodeProviders`), e.g. `'testnet2'` everywhere.
    */
   network?: NetworkType;
   /**
@@ -366,17 +376,19 @@ export interface SphereInitOptions extends SphereWalletApiOptions {
   /** Optional password to encrypt/decrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
   /**
-   * Auto-discover previously used HD addresses when creating from mnemonic.
-   * Only applies when wallet is newly created (not on load of existing wallet).
-   * - true: discover with defaults (Nostr binding-event scan, autoTrack: true)
+   * Auto-discover previously used HD addresses. On by default, and forwarded to the create or
+   * load that init runs, so it applies to an existing wallet too.
+   * - omitted or true: discover with defaults (Nostr binding-event scan, autoTrack: true)
    * - DiscoverAddressesOptions: custom config
-   * - false/undefined: no auto-discovery (default)
+   * - false: no auto-discovery
+   * Runs only when the transport implements discovery; a discovery failure is logged, not thrown.
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
   /**
-   * Fallback 'since' timestamp (unix seconds) for the DM (gift-wrap) subscription.
-   * Used when no persisted DM timestamp exists in storage (e.g. first connect).
-   * Without this, a fresh wallet starts from "now" and misses older DMs.
+   * Fallback 'since' timestamp (unix seconds) for the DM (gift-wrap) subscription, meant for
+   * when no persisted DM timestamp exists in storage (e.g. first connect).
+   * Note: init records it only after create/load have opened the DM subscription, so with the
+   * Nostr transport it does not change where a first connect starts ("now").
    */
   dmSince?: number;
   /** Communications module configuration. */
@@ -670,21 +682,25 @@ export class Sphere {
   /**
    * Initialize wallet - auto-loads existing or creates new
    *
+   * If the storage already holds a wallet it is loaded, and `mnemonic`, `nametag` and
+   * `autoGenerate` are ignored. `walletApi` (a config, or `'none'`) and `network` are required.
+   *
    * @example
    * ```ts
+   * // providers = createWalletApiProviders(createNodeProviders({ network: 'testnet2' }),
+   * //   { baseUrl: 'https://wallet-api.unicity.network', network: 'testnet2' })
+   *
    * // Load existing or create with provided mnemonic
-   * const { sphere, created } = await Sphere.init({
-   *   storage,
-   *   transport,
-   *   oracle,
+   * const fromMnemonic = await Sphere.init({
+   *   ...providers,          // storage, transport, oracle, walletApi
+   *   network: 'testnet2',   // must equal walletApi.network
    *   mnemonic: 'your twelve words...',
    * });
    *
-   * // Load existing or auto-generate new mnemonic
+   * // Or: load existing or auto-generate new mnemonic
    * const { sphere, created, generatedMnemonic } = await Sphere.init({
-   *   storage,
-   *   transport,
-   *   oracle,
+   *   ...providers,
+   *   network: 'testnet2',
    *   autoGenerate: true,
    * });
    * if (generatedMnemonic) {
@@ -1657,12 +1673,17 @@ export class Sphere {
    * (the format `exportToTxt` writes, optionally password-encrypted), a legacy
    * flat-JSON webwallet export, or a bare mnemonic in a text file.
    *
+   * `password` only decrypts the backup: the imported seed is stored without a password.
+   * The wallet is imported through {@link Sphere.import}, which first clears the wallet already
+   * in `storage`.
+   *
    * @example
    * const result = await Sphere.importFromLegacyFile({
    *   fileContent: await file.text(),
    *   fileName: file.name,
    *   password,          // when the backup is encrypted
-   *   ...providers,
+   *   ...providers,      // storage, transport, oracle, walletApi
+   *   network: 'testnet2',
    * });
    */
   static async importFromLegacyFile(options: Omit<SphereImportOptions, 'mnemonic' | 'masterKey' | 'chainCode' | 'derivationPath' | 'basePath' | 'derivationMode'> & {
@@ -2138,15 +2159,22 @@ export class Sphere {
    *
    * @returns `{ success, sphere?, mnemonic?, error? }`. `sphere` is the instance built
    *   on the SUPPLIED storage — hold it, there is no global to look it up from (#766).
+   *   Errors are returned as `{ success: false, error }`, not thrown.
+   *
+   * `password` only decrypts the backup: the imported seed is stored without a password.
+   * The wallet is imported through {@link Sphere.import}, which first clears the wallet already
+   * in `storage`.
    *
    * @example
    * ```ts
    * const json = '{"version":"1.0",...}';
-   * const { success, mnemonic } = await Sphere.importFromJSON({
+   * const { success, sphere, error } = await Sphere.importFromJSON({
+   *   ...providers,        // storage, transport, oracle, walletApi
+   *   network: 'testnet2', // must equal walletApi.network
    *   jsonContent: json,
-   *   password: 'secret', // if encrypted
-   *   storage, transport, oracle,
+   *   password: 'secret',  // if encrypted
    * });
+   * if (!success || !sphere) throw new Error(error);
    * ```
    */
   static async importFromJSON(options: Omit<SphereImportOptions, 'mnemonic' | 'masterKey' | 'chainCode' | 'derivationPath' | 'basePath' | 'derivationMode'> & {
@@ -2236,7 +2264,9 @@ export class Sphere {
   /**
    * Get primary nametag for a specific address
    *
-   * @param addressId - Address identifier (DIRECT://xxx), defaults to current address
+   * @param addressId - Short address id (`DIRECT_xxxxxx_yyyyyy`: `TrackedAddress.addressId`, or
+   *   `getAddressId(directAddress)`), not an index and not the `DIRECT://` address; defaults to the
+   *   current address
    * @returns Primary nametag (index 0) or undefined if not registered
    */
   getNametagForAddress(addressId?: string): string | undefined {
@@ -2248,7 +2278,9 @@ export class Sphere {
   /**
    * Get all nametags for a specific address
    *
-   * @param addressId - Address identifier (DIRECT://xxx), defaults to current address
+   * @param addressId - Short address id (`DIRECT_xxxxxx_yyyyyy`: `TrackedAddress.addressId`, or
+   *   `getAddressId(directAddress)`), not an index and not the `DIRECT://` address; defaults to the
+   *   current address
    * @returns Map of nametagIndex to nametag, or undefined if no nametags
    */
   getNametagsForAddress(addressId?: string): Map<number, string> | undefined {
@@ -2547,8 +2579,7 @@ export class Sphere {
     }
 
     // If a new nametag was registered on switch, persist the cache and emit. The Nostr
-    // binding stays the registration record (D5); the on-chain UnicityIdToken claim is
-    // additionally minted + stored below, best-effort.
+    // binding is the only registration record (D5); nothing is minted.
     if (newNametag) {
       await this.persistAddressNametags();
 

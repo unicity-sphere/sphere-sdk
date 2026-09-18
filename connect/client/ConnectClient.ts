@@ -279,8 +279,8 @@ export class ConnectClient {
     if (!this.eventHandlers.has(event)) {
       this.eventHandlers.set(event, new Set());
       // Tell host to forward this event. Auto-pushed wallet events are NEVER routed through
-      // sphere_subscribe: the host pushes them unconditionally and refuses the RPC, and
-      // Sphere.on() would accept the name and silently never emit.
+      // sphere_subscribe: the host pushes them unconditionally and answers that RPC with success
+      // without attaching anything (Sphere.on() would accept the name and never emit).
       if (this.connected && !isAutoPushedEvent(event)) {
         this.query(RPC_METHODS.SUBSCRIBE, { event }).catch((err) => logger.debug('Connect', 'Event subscription failed', err));
       }

@@ -4,7 +4,7 @@ A modular TypeScript SDK for Unicity wallet operations (Unicity state transition
 
 ## Features
 
-- **Wallet Management** - BIP39/BIP32 key derivation; optional password encryption (PBKDF2)
+- **Wallet Management** - BIP39/BIP32 key derivation; optional password encryption of the stored seed (see [Wallet Security & Encryption](#wallet-security--encryption))
 - **Payments** - Engine-certified token transfers over the **wallet-api vertical** (durable server-side intents, mailbox delivery, crash-safe resume under the same transferId); server custody — the backend holds inventory, keys stay local
 - **Payment Requests** - Request payments over the wallet-api rail with encrypted memos and durable settling
 - **Market (Intents)** - Signed intent bulletin board with semantic search and live feed
@@ -12,35 +12,31 @@ A modular TypeScript SDK for Unicity wallet operations (Unicity state transition
 - **Messaging (Nostr)** - NIP-17 DMs + NIP-29 group chat and nametag publishing — **messaging only; not the payment rail**
 - **Multi-Address** - HD address derivation (BIP32/BIP44)
 - **Connect Protocol** - dApp ↔ wallet communication via `ConnectClient` / `ConnectHost` (hosted wallet in an iframe, or WebSocket for Node.js dApps)
-- **CLI** - Comprehensive command-line interface with shell auto-completion
 
 ## Installation
 
 ```bash
-npm install @unicitylabs/sphere-sdk
+npm install @unicitylabs/sphere-sdk        # browser
+npm install @unicitylabs/sphere-sdk ws     # Node.js: ws is required, see "Node.js Providers"
 ```
 
 ## Quick Start Guides
 
 Choose your platform:
 
-| Platform | Guide | Required | Optional |
-|----------|-------|----------|----------|
-| **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | IndexedDB storage |
-| **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | File storage |
-| **CLI** | [@unicity-sphere/cli](https://github.com/unicity-sphere/sphere-cli) | Separate package | - |
+| Platform | Guide | Required | Notes |
+|----------|-------|----------|-------|
+| **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | Default storage: IndexedDB. TypeScript: `./impl/browser` ships no type declarations yet (see [the shim](#typescript-declarations-for-implbrowser)) |
+| **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws`, Node.js >= 22 | Default storage: a wallet file under `./sphere-data` |
+| **CLI** | [unicity-sphere/sphere-cli](https://github.com/unicity-sphere/sphere-cli) | Separate repository | Not published to npm yet |
 | **dApp integration** | [CONNECT.md](docs/CONNECT.md) | SDK only | `ws` (Node.js dApps) |
 
 ## CLI (Command Line Interface)
 
-The CLI has moved to a dedicated package: [`@unicity-sphere/cli`](https://github.com/unicity-sphere/sphere-cli).
-
-```bash
-npm install -g @unicity-sphere/cli
-sphere --help
-```
-
-See [docs/QUICKSTART-CLI.md](docs/QUICKSTART-CLI.md) for the full command reference.
+The Sphere CLI lives in its own repository, [unicity-sphere/sphere-cli](https://github.com/unicity-sphere/sphere-cli),
+and is not published to npm yet: `npm install -g @unicity-sphere/cli` fails with a 404. Its `package.json`
+depends on this SDK through a local path (`file:../../sphere-sdk`), so it builds only next to a checkout of
+this repository. See [docs/QUICKSTART-CLI.md](docs/QUICKSTART-CLI.md).
 
 ## Quick Start
 
@@ -50,53 +46,84 @@ See [docs/QUICKSTART-CLI.md](docs/QUICKSTART-CLI.md) for the full command refere
 > vertical. Skipping it fails loudly: `Sphere.init` throws `INVALID_CONFIG`.
 
 ```typescript
-import { Sphere } from '@unicitylabs/sphere-sdk';
-import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+import { Sphere, TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
+import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser'; // untyped entry: add the declaration shim below
 import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
 
-// 1. Base providers: storage + transport + oracle. `network` is REQUIRED here (no default).
-//    The testnet2 gateway key is PUBLIC (not a secret); it is required at runtime for send/mint.
+// One network literal, used in all three places below.
+const NETWORK = 'testnet2';
+
+// A per-device id: stable across launches on this device, different on every device.
+function deviceId(): string {
+  let id = localStorage.getItem('sphere-device-id');
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem('sphere-device-id', id);
+  }
+  return id;
+}
+
+// 1. Base providers: storage (IndexedDB) + transport (Nostr) + oracle (gateway).
+//    `network` is required here: createBrowserProviders throws INVALID_CONFIG without it.
 const base = createBrowserProviders({
-  network: 'testnet',                                          // alias of testnet2 (networkId 4)
-  oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' },   // public testnet2 key
+  network: NETWORK,
+  oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' }, // public testnet2 gateway key
 });
 
-// 2. Attach the wallet-api transport config. Returns { ...base, walletApi } —
-//    a plain config object ({ network, baseUrl, deviceId?, ... }) that Sphere.init consumes.
+// 2. The wallet-api transport config that the payments vertical is composed from.
+//    Returns { ...base, walletApi }; walletApi is a plain config object.
 const providers = createWalletApiProviders(base, {
-  baseUrl: 'https://wallet-api.unicity.network',   // your wallet-api deployment (testnet2)
-  network: 'testnet2',
-  deviceId: 'my-stable-device-id',                 // persist this to avoid re-auth each launch
+  baseUrl: 'https://wallet-api.unicity.network', // testnet2 wallet-api
+  network: NETWORK,
+  deviceId: deviceId(),
 });
 
-// 3. Init the wallet (auto-creates one if none exists).
+// 3. Load the wallet in this storage, or create one. `network` is required here too.
 const { sphere, created, generatedMnemonic } = await Sphere.init({
   ...providers,
+  network: NETWORK,
   autoGenerate: true,
 });
 if (created && generatedMnemonic) {
   console.log('SAVE THIS RECOVERY PHRASE:', generatedMnemonic);
 }
 
-// 4. Send — engine-driven, certified on-chain. The recipient needs a published identity
+// 4. Send: engine-driven, certified on-chain. The recipient needs a published identity
 //    (chain pubkey), e.g. a registered Unicity ID; otherwise send fails with INVALID_RECIPIENT.
+//    coinId is the 64-hex coin id; symbols are not resolved on the money path.
+await TokenRegistry.waitForReady(); // Sphere.init starts the registry load but does not await it
+const coinId = getCoinIdBySymbol('UCT'); // string | undefined
+if (!coinId) throw new Error('UCT is not in this network\'s token registry');
+
 const result = await sphere.payments.send({
   recipient: '@alice',
-  amount: '1000000',     // decimal STRING — never a JS number
-  coinId: 'UCT',         // a symbol auto-resolves to its hex coinId
+  amount: '1000000',     // base units, as a decimal STRING (never a JS number)
+  coinId,
   memo: 'hello',
 });
-console.log(result.status);   // 'completed'
-// result.deliveryPending === true is NORMAL, not a failure: the token is certified on-chain but
-// the recipient's mailbox delivery was deferred and will land on retry (see "Send result" below).
+console.log(result.status);   // 'delivered', or 'confirmed' with result.deliveryPending === true
+// A resolved send() means sent. deliveryPending === true is NORMAL, not a failure: the token is
+// certified on-chain and the mailbox delivery is retried automatically (see "Send result" below).
 
-// 5. Receive — incoming transfers land automatically while the wallet runs (mailbox drain +
+// 5. Receive: incoming transfers land automatically while the wallet runs (mailbox drain +
 //    wake socket). To drain explicitly (e.g. a CLI/batch app), call receive():
 const { transfers } = await sphere.payments.receive();
-sphere.on('transfer:incoming', (t) => console.log('received from', t.senderNametag));
+sphere.on('transfer:incoming', (t) => console.log('received from', t.senderNametag ?? t.senderPubkey));
 
 console.log(await sphere.payments.assets());
 ```
+
+`generatedMnemonic` is returned only by the `Sphere.init` call that created the wallet. The phrase is
+stored before the rest of the setup runs, so if that call then throws (for example, a requested
+`nametag` is already taken), the next `Sphere.init` loads the stored wallet with `created: false`.
+Gate your backup prompt on your own "backup confirmed" flag and read the phrase with
+`sphere.getMnemonic()` until the user confirms.
+
+Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag` or `DIRECT://`
+recipient uses your network. Every such send emits `transfer:attention` with
+`code: 'recipient:network-unverified'` and an empty `transferId`, and then proceeds on your network.
+Treat it as information, not an error; on mainnet, make sure the recipient runs mainnet. A bare 66-hex
+chain pubkey recipient is taken as being on your network.
 
 ### What just happened (the provider model)
 
@@ -110,44 +137,121 @@ A wallet is composed from **swappable ports**, layered in two steps:
 - **The rail is wallet-api, not Nostr.** Transfers are certified on-chain by the token engine and the finished token is deposited into the recipient's **wallet-api mailbox**. Nostr carries messaging/nametags — **it does not move payments.**
 - **Custody is server-side.** The wallet-api backend holds your token inventory; your keys never leave the client. (Own-storage custody was rescinded — there is no local token store.)
 - **The money ports are contract-enforced.** `StoragePort`/`DeliveryPort` (`modules/payments-v2/ports.ts`) have wallet-api implementations; the `paymentsV2Transport` seam in the `walletApi` config lets tests/custom hosts inject a whole replacement bundle.
-- **`network` placement.** Required on `createBrowserProviders`/`createNodeProviders`, in the `walletApi` config, AND on `Sphere.init` — the three must agree. `Sphere.init` resolves the payments composition and the token registry from its own `network`, so omitting it or letting it disagree with `walletApi.network` throws `INVALID_CONFIG` before any storage write.
-- **Messaging-only wallets say so out loud.** A wallet that never touches money — a Nostr DM or group-chat bot — passes `walletApi: 'none'` instead of a config: no wallet-api session, device registration, mailbox drain, token engine or `pv2g2:` key. `sphere.payments` then throws `PAYMENTS_NOT_COMPOSED` and `sphere.hasPayments` is `false`. **Omitting `walletApi` altogether still throws `INVALID_CONFIG`** — a dropped env var must never read as a deliberate choice.
+- **`network` placement.** Required on `createBrowserProviders`/`createNodeProviders`, in the `walletApi` config, AND on `Sphere.init`; use one literal, `'testnet2'`, in all three places. Neither provider factory returns a `network` field, so `...providers` cannot supply it. `Sphere.init` compares its own `network` with `walletApi.network` as plain strings and throws `INVALID_CONFIG` ("walletApi.network "testnet2" does not match the Sphere network ...") when they differ, including when `Sphere.init` gets no `network` at all; this happens before any storage write. `'testnet'` and `'testnet2'` reach the same endpoints but are different strings, so mixing them fails this check. The wallet-api deployment names its network too: the testnet2 deployment signs you in only as `'testnet2'`, and the SDK refuses a sign-in challenge for any other network. The base-provider literal is not compared by that check, but it scopes the storage keys, while the payments state is keyed by the `Sphere.init` network, so mixing the two literals splits one wallet's state across two names.
+- **Messaging-only wallets say so out loud.** A wallet that never touches money — a Nostr DM or group-chat bot — passes `walletApi: 'none'` instead of a config: no wallet-api session, device registration, mailbox drain, token engine or `pv2g2:` key. `network` is still required, because it selects the token registry and the group-chat relays. `sphere.payments` then throws `PAYMENTS_NOT_COMPOSED` and `sphere.hasPayments` is `false`. **Omitting `walletApi` altogether still throws `INVALID_CONFIG`** — a dropped env var must never read as a deliberate choice.
 
 For manual/advanced provider wiring, see [Custom Providers Configuration](#custom-providers-configuration). For the deeper integration guide, see [docs/INTEGRATION.md](docs/INTEGRATION.md).
 
 ### Send result (`TransferResult`)
 
-`send()` resolves with a `TransferResult`:
+`send()` resolves only when the payment is sent, with a `TransferResult`:
 
 | Field | Meaning |
 |-------|---------|
-| `status` | `'completed'` on success. (`'pending' \| 'submitted' \| 'confirmed' \| 'delivered' \| 'failed'` also exist for in-flight/terminal states.) |
+| `status` | `'delivered'` when the payment landed in the recipient's mailbox, or `'confirmed'` when the transfer is certified and delivery is still being retried (`deliveryPending === true`). `send()` never resolves with `'completed'` or `'failed'`: a failure throws. (`'submitted'` and `'failed'` appear only as `transfer:updated` event payloads.) |
 | `deliveryPending` | `true` when the spend is **certified on-chain** but the recipient's **mailbox delivery was deferred** (a full inbox / transient outage). **This is success, not failure** — the token is finalized and the finished blob is journaled and re-delivered automatically. |
 | `deliveryState` | `'landed'` (delivered) or `'pending-delivery'` (deferred, as above). |
 
-Treat `status === 'completed'` as sent. Use `deliveryPending` only to show a "delivery pending" hint — never as an error. A stale-but-spent source is self-healed (the next live coin is selected automatically).
+A resolved `send()` is sent, whichever of the two statuses it carries. Use `deliveryPending` only to show a "delivery pending" hint — never as an error. A stale-but-spent source is self-healed (the next live coin is selected automatically).
 
-#### Handling `send()` rejections — `CERTIFICATION_UNCONFIRMED` is NOT re-sendable (money-safety)
+#### Handling `send()` rejections: never re-send a possibly-committed payment (money-safety)
 
-`send()` throws for genuine failures (`INVALID_RECIPIENT`, insufficient balance, a `TransferConflictError` lost race) **and** for one *indeterminate* case you must handle specially: a **`ProofUnconfirmedError`** (`code: 'CERTIFICATION_UNCONFIRMED'`, `mayHaveCertified: true`). It means the spend **may already be on-chain** but the proof fetch was inconclusive — the SDK keeps the intent **open** and completes it later under the **same `transferId`**.
+Some rejections mean the money may already have left the wallet. `isPossiblyCommittedSendOutcome(err)` is `true`
+for exactly these codes: `SEND_SYNC_PENDING`, `CERTIFICATION_UNCONFIRMED`, `CHECKPOINT_PERSIST_FAILED`,
+`SPLIT_CHECKPOINT_LOST`, `CHECKPOINT_TRUSTBASE_MISMATCH` and `SEND_PARTIALLY_COMPLETED`. Never call `send()` again
+for that payment: a new `send()` gets a new transfer id and pays the recipient a second time. The SDK finishes the
+original under its own transfer id; show it as pending (`sphere.payments.pendingTransfers()`), and wire any
+"retry" button to `sphere.payments.resumeNow()`. A `PartialSendConflictError` means part of the amount was
+delivered and is final; only `err.remainingAmount` is still owed. When `isPossiblyCommittedSendOutcome(err)` is
+`false`, the SDK's contract is that nothing left the wallet.
 
-- ⚠️ **Never re-issue `send()` on `CERTIFICATION_UNCONFIRMED`.** A fresh `send()` mints a new `transferId` on a *different* source, so the original resumes **and** the retry sends → **the recipient is double-paid.** Treat it as *"sent, pending confirmation."*
-- **Recovery is automatic.** The open intent is replayed under the same `transferId` (recovers the proof + delivery, or records the spend if a rival tx won; **never a second spend**): partially-committed outcomes converge in-process, and every remaining open intent is resumed when the vertical starts (`Sphere.init` / `Sphere.load` / an address switch). There is no public resume API to call.
+- `CERTIFICATION_UNCONFIRMED` is a **`ProofUnconfirmedError`** (`mayHaveCertified: true`): the spend may already be on-chain but the proof fetch was inconclusive. `SEND_SYNC_PENDING` can mean the spend committed on-chain and the wallet-api mirror is still catching up.
+- **Recovery is automatic.** The open intent is replayed under the same `transferId` (recovers the proof + delivery, or records the spend if a rival tx won; **never a second spend**): partially-committed outcomes converge in-process, and every remaining open intent is resumed when the vertical starts (`Sphere.init` / `Sphere.load` / an address switch). `sphere.payments.resumeNow()` runs that convergence now; it is the only retry verb.
+- Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (its message names funds pinned by transfers still converging), `INVALID_RECIPIENT`, `TRANSPORT_ERROR` (the recipient lookup could not reach the relay) and `VALIDATION_ERROR` (a bad amount). `INSUFFICIENT_BALANCE` is never thrown.
+- Import the error helpers from the same entry point as `Sphere`, and read `code` structurally for the clean failures: errors thrown by provider code (the `./impl/*` bundles, for example the Nostr transport during the recipient lookup) are a different `SphereError` class copy, so `isSphereError()` is `false` for them.
 
 ```ts
-import { isSphereError } from '@unicitylabs/sphere-sdk';
+// Import the error helpers from the same entry point as Sphere (here: the package root).
+import { PartialSendConflictError, isPossiblyCommittedSendOutcome } from '@unicitylabs/sphere-sdk';
 
 try {
-  const result = await sphere.payments.send({ recipient: '@bob', amount, coinId });
-  // result.status === 'completed' (or result.deliveryPending === true) → sent
+  const result = await sphere.payments.send({ recipient: '@alice', amount: '1000000', coinId });
+  // Resolved means sent: result.status is 'delivered', or 'confirmed' with deliveryPending === true.
+  if (result.deliveryPending) show('Sent. Delivery to the recipient is pending and is retried automatically.');
 } catch (err) {
-  if (isSphereError(err) && err.code === 'CERTIFICATION_UNCONFIRMED') {
-    // Possibly already sent on-chain — DO NOT re-send. Resume finishes it.
+  if (err instanceof PartialSendConflictError) {
+    // Part of the amount was delivered and is final. Only err.remainingAmount is still owed:
+    // if you pay it, do it as a NEW send of exactly that amount, never the original amount.
+    show(`Partly sent: ${err.remainingAmount} base units were not sent.`);
+  } else if (isPossiblyCommittedSendOutcome(err)) {
+    // The money may already have left the wallet. Never call send() again for this payment:
+    // the SDK completes it under the same transferId. Show it as pending.
+    show('Sent, waiting for confirmation.');
+    const pending = await sphere.payments.pendingTransfers(); // rows for a "pending" list
+    // A "retry" button calls sphere.payments.resumeNow(), never send().
   } else {
-    // genuine failure — safe to surface to the user / retry
+    // Nothing left the wallet. Read `code` structurally: errors thrown by the providers
+    // (e.g. the Nostr transport) are a different SphereError class copy, so isSphereError() is false for them.
+    const code = (err as { code?: unknown } | null)?.code;
+    switch (code) {
+      case 'SEND_INSUFFICIENT_BALANCE': show((err as Error).message); break; // names pinned funds when transfers are converging
+      case 'INVALID_RECIPIENT': show('Recipient not found'); break;
+      case 'TRANSPORT_ERROR': show('Could not look up the recipient. Check the connection.'); break;
+      default: show(err instanceof Error ? err.message : String(err));
+    }
   }
 }
 ```
+
+### TypeScript: declarations for `./impl/browser`
+
+`@unicitylabs/sphere-sdk/impl/browser` ships no type declarations in this release; under `strict`
+TypeScript add the declaration shim below (or a one-line `declare module '@unicitylabs/sphere-sdk/impl/browser';`,
+which types everything from that entry as `any`). Import `createWalletApiProviders` from the typed
+`@unicitylabs/sphere-sdk/impl/shared/wallet-api` subpath, as above.
+
+```typescript
+// Consumer-side declarations for '@unicitylabs/sphere-sdk/impl/browser'.
+// That entry ships no .d.ts (tsup builds it with dts: false), so strict
+// TypeScript reports TS7016 on the import without this file. Delete it once
+// the package ships declarations for ./impl/browser.
+declare module '@unicitylabs/sphere-sdk/impl/browser' {
+  import type {
+    NetworkType, StorageProvider, TransportProvider, OracleProvider, PriceProvider,
+    PricePlatform, GroupChatModuleConfig, MarketModuleConfig,
+  } from '@unicitylabs/sphere-sdk';
+
+  export interface BrowserProvidersConfig {
+    /** Required: createBrowserProviders throws INVALID_CONFIG without it. */
+    network: NetworkType;
+    debug?: boolean;
+    storage?: { prefix?: string; dbName?: string; debug?: boolean };
+    transport?: {
+      relays?: string[]; additionalRelays?: string[]; timeout?: number; autoReconnect?: boolean;
+      debug?: boolean; reconnectDelay?: number; maxReconnectAttempts?: number;
+    };
+    oracle?: { url?: string; apiKey?: string; timeout?: number; skipVerification?: boolean; debug?: boolean };
+    price?: { platform?: PricePlatform; apiKey?: string; baseUrl?: string; cacheTtlMs?: number; timeout?: number; debug?: boolean };
+    groupChat?: { enabled?: boolean; relays?: string[] } | boolean;
+    market?: { apiUrl?: string; timeout?: number } | boolean;
+  }
+
+  export interface BrowserProviders {
+    storage: StorageProvider;
+    transport: TransportProvider;
+    oracle: OracleProvider;
+    price?: PriceProvider;
+    groupChat?: GroupChatModuleConfig | boolean;
+    market?: MarketModuleConfig | boolean;
+  }
+
+  export function createBrowserProviders(config: BrowserProvidersConfig): BrowserProviders;
+}
+```
+
+The shim declares only `createBrowserProviders`. The other `./impl/browser` exports used later in this
+README (`createLocalStorageProvider`, `createNostrTransportProvider`, `createUnicityAggregatorProvider`)
+need their own declarations, or the one-line form.
 
 ## Migrating off `sphere.paymentsV2`
 
@@ -162,30 +266,35 @@ silently degraded to "no payments" before and now throw, so catch `NOT_INITIALIZ
 used to check for null. Code that runs after `await Sphere.init(…)` and before `destroy()` —
 everything else in this README — reads `sphere.payments` directly.
 
+A wallet initialised with `walletApi: 'none'` has no payments at all: there `sphere.payments` throws
+`PAYMENTS_NOT_COMPOSED`, permanently, instead of the transient `NOT_INITIALIZED`. Use
+`sphere.hasPayments` to tell the two cases apart without a try/catch.
+
 The `accounting:` / `swap:` options are **not** part of this cleanup: they still throw a typed
-`INVALID_CONFIG`, deliberately, because 0.15.0 is the release where consumers re-integrate.
+`INVALID_CONFIG`, deliberately, because those modules were removed and a silently ignored option
+would hide that.
 
 ## Network Configuration
 
 The SDK ships network presets that configure all services automatically. `network` is **required** — there is no default:
 
-| Network | Aggregator (gateway) | Nostr Relay |
-|---------|----------------------|-------------|
-| `testnet` | gateway.testnet2.unicity.network (v2) | nostr-relay.testnet.unicity.network |
-| `testnet2` | alias of `testnet` (same configuration) | nostr-relay.testnet.unicity.network |
-| `mainnet` | gateway.mainnet.unicity.network (v3) | nostr-relay.testnet.unicity.network (shared until mainnet has its own) |
+| `network` literal | networkId | Gateway (preset) | Nostr relay (preset) | wallet-api `baseUrl` (you pass it) |
+|-------------------|-----------|------------------|----------------------|------------------------------------|
+| `'testnet2'` | 4 | `https://gateway.testnet2.unicity.network` | `wss://nostr-relay.testnet.unicity.network` | `https://wallet-api.unicity.network` |
+| `'mainnet'` | 1 | `https://gateway.mainnet.unicity.network` | the testnet relay (mainnet has none of its own yet) | `https://wallet-api.mainnet.unicity.network` |
+| `'testnet'` | 4 | same as `testnet2` | same as `testnet2` | same as `testnet2`, but a different literal: do not mix `'testnet'` and `'testnet2'` |
 
-> **Live networks are testnet2 and mainnet.** `testnet` is an alias of **testnet2** (network id 4, taken from the trust base; own testnet2 token registry); `mainnet` is network id 1. The v1 network is discontinued — the old `goggregator-test` testnet spoke the removed v1 protocol, and the `dev` network that aliased its trust base has been removed along with every other v1 pointer. Mainnet has no wallet-api deployment yet, so its money path is not reachable even though the chain and gateway are live. The transfer wire payload is the finished token blob — the base SDK's own `Token.toCBOR()` bytes, with no sphere envelope around them — deposited into the recipient's wallet-api mailbox.
+> **Live networks are testnet2 and mainnet**, each with its own gateway and wallet-api deployment. `testnet` is a second key with testnet2's configuration (network id 4, taken from the trust base; the testnet2 token registry), but it is a different string, so it fails the `network` check against a `'testnet2'` wallet-api config (see [`network` placement](#what-just-happened-the-provider-model)). `SPHERE_NETWORKS` exposes only `mainnet` and `testnet2`. The v1 network is discontinued — the old `goggregator-test` testnet spoke the removed v1 protocol, and the `dev` network that aliased its trust base has been removed along with every other v1 pointer. On mainnet use `network: 'mainnet'` in `createBrowserProviders`/`createNodeProviders`, in the `walletApi` config and on `Sphere.init`, the mainnet wallet-api `https://wallet-api.mainnet.unicity.network`, and your mainnet gateway API key, which is a secret. Mainnet shares testnet2's Nostr relay for now, and its token registry lists no fungible coins yet. The transfer wire payload is the finished token blob — the base SDK's own `Token.toCBOR()` bytes, with no sphere envelope around them — deposited into the recipient's wallet-api mailbox.
 >
 > The **network** name (testnet2) and the **base-SDK major** (3.x since 0.15.0) are separate axes: testnet2 is still testnet2 after the 3.0.1 bump. What the bump changes is the bytes on that network — a gateway serving the v3 protocol accepts nothing a 2.x client writes, and vice versa.
 
 ```typescript
-// Use testnet for all services
-const providers = createBrowserProviders({ network: 'testnet' });
+// Use the testnet2 preset for all services
+const presetOnly = createBrowserProviders({ network: 'testnet2' });
 
-// Override specific services while using network preset
-const providers = createBrowserProviders({
-  network: 'testnet',
+// Override specific services while using the network preset
+const customGateway = createBrowserProviders({
+  network: 'testnet2',
   oracle: { url: 'https://custom-gateway.example.com' }, // custom testnet2 gateway
 });
 ```
@@ -195,8 +304,8 @@ const providers = createBrowserProviders({
 The SDK bundles **no default API key**. Pass the gateway key via `oracle: { apiKey }` — without it, gateway requests are unauthenticated and money movement on testnet2 fails.
 
 ```typescript
-const providers = createBrowserProviders({
-  network: 'testnet',
+const withApiKey = createBrowserProviders({
+  network: 'testnet2',
   oracle: { apiKey: 'sk_...' },
 });
 ```
@@ -205,11 +314,11 @@ The **testnet2 key is not a secret** — it is published in [.env.example](.env.
 
 ### Testnet2 endpoints (the values we build with)
 
-The `testnet` preset wires most of these automatically — you only pass `network`, `oracle.apiKey`, and the wallet-api `baseUrl`. The full set, for reference and manual wiring:
+The `testnet2` preset wires most of these automatically — you only pass `network`, `oracle.apiKey`, and the wallet-api `baseUrl`. The full set, for reference and manual wiring:
 
 | What | Value |
 |------|-------|
-| Network | `testnet` (alias `testnet2`), networkId **4** |
+| Network | `testnet2`, networkId **4** (the `testnet` key has the same values but is a different literal; do not mix them) |
 | **Aggregator / gateway** (token engine) | `https://gateway.testnet2.unicity.network` |
 | **Aggregator API key** (public — **not** a secret) | `sk_ddc3cfcc001e4a28ac3fad7407f99590` |
 | **wallet-api** (delivery + token storage) | `https://wallet-api.unicity.network` |
@@ -219,24 +328,28 @@ The `testnet` preset wires most of these automatically — you only pass `networ
 
 The aggregator key above is the **testnet2** key only and is safe in client code; a **mainnet** key is a real secret and must never be committed.
 
+Mainnet (`network: 'mainnet'`, networkId **1**): gateway `https://gateway.mainnet.unicity.network`, wallet-api
+`https://wallet-api.mainnet.unicity.network`, the same Nostr and group-chat relays as testnet2, and token registry
+`https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.mainnet.json`, which
+currently lists only the non-fungible base token type (no fungible coins yet).
+
 ## Price Provider (Optional)
 
 Enable fiat price display by adding a `price` config. Currently supports CoinGecko API (free and pro tiers).
 
 ```typescript
 // With CoinGecko (free tier, no API key)
-const providers = createBrowserProviders({
-  network: 'testnet',
+const base = createBrowserProviders({
+  network: 'testnet2',
   price: { platform: 'coingecko' },
 });
+// With CoinGecko Pro: price: { platform: 'coingecko', apiKey: 'CG-xxx' }
 
-// With CoinGecko Pro
-const providers = createBrowserProviders({
-  network: 'testnet',
-  price: { platform: 'coingecko', apiKey: 'CG-xxx' },
+const providers = createWalletApiProviders(base, {
+  baseUrl: 'https://wallet-api.unicity.network',
+  network: 'testnet2',
 });
-
-const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
+const { sphere } = await Sphere.init({ ...providers, network: 'testnet2', autoGenerate: true });
 
 // Assets with price data
 const assets = await sphere.payments.assets();
@@ -264,12 +377,14 @@ sphere.setPriceProvider(createPriceProvider({
 There is no faucet. On testnet you top up your wallet by **self-minting** fungible tokens via the token engine — `mint(coinIdHex, amount)` mints a finished token directly to this wallet (journal-first: crash-safe, a replay converges idempotently):
 
 ```typescript
-import { getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
+import { TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
 
-// Resolve the coin's hex id from the token registry (or pass a hex coinId directly)
-const coinId = getCoinIdBySymbol('UCT');
+// Resolve the coin's hex id from the token registry (or pass a hex coinId directly).
+await TokenRegistry.waitForReady(); // Sphere.init starts the registry load but does not await it
+const coinId = getCoinIdBySymbol('UCT'); // string | undefined
+if (!coinId) throw new Error('UCT is not in this network\'s token registry');
 
-const result = await sphere.payments.mint(coinId!, 1000n);
+const result = await sphere.payments.mint(coinId, 1000n);
 if (result.success) {
   console.log('Minted token:', result.tokenId);
 } else {
@@ -297,17 +412,24 @@ await sphere.registerNametag('bob');
 // Switch back to first address
 await sphere.switchToAddress(0);
 
-// Get nametag for specific address
-const bobNametag = sphere.getNametagForAddress(1); // 'bob'
+// Get the nametag of a specific address. Index 1 is tracked because we switched to it.
+const bobNametag = sphere.getTrackedAddress(1)?.nametag; // 'bob'
+// getNametagForAddress takes the short addressId ('DIRECT_xxxxxx_yyyyyy'), not an index:
+const sameNametag = sphere.getNametagForAddress(sphere.getTrackedAddress(1)?.addressId);
 
-// Get all address nametags
-const allNametags = sphere.getAllAddressNametags();
-// Map { 0 => 'alice', 1 => 'bob' }
+// All active addresses with their nametags (TrackedAddress[], sorted by index)
+const active = sphere.getActiveAddresses();
+// [{ index: 0, addressId: 'DIRECT_…', directAddress: 'DIRECT://…', nametag: 'alice', … }, { index: 1, …, nametag: 'bob' }]
 
-// Derive address without switching (for display/receiving)
-const addr2 = sphere.deriveAddress(2);
-console.log(addr2.address, addr2.publicKey);
+// deriveAddress() returns keys, not an address: { privateKey, publicKey, path, index }.
+const keys2 = sphere.deriveAddress(2);
+console.log(keys2.publicKey, keys2.path); // never log or serialise the whole object: it holds the private key
 ```
+
+`deriveAddress(index)` returns key material, `{ privateKey, publicKey, path, index }`, not an address; never log or
+serialise the whole object. For the `DIRECT://` address use `sphere.identity?.directAddress` (active address) or
+`sphere.getTrackedAddress(index)?.directAddress` (after `switchToAddress(index)`). `getAllAddressNametags()` is
+deprecated; it returns `Map<addressId, Map<nametagIndex, nametag>>`, keyed by the short `addressId`.
 
 ### Identity Properties
 
@@ -317,7 +439,7 @@ console.log(addr2.address, addr2.publicKey);
 interface Identity {
   chainPubkey: string;         // 33-byte compressed secp256k1 public key
   directAddress?: string;      // DIRECT address (DIRECT://...) - PRIMARY ADDRESS
-  ipnsName?: string;           // IPNS name for token sync
+  ipnsName?: string;           // legacy derived id ('12D3KooW…'); nothing in the SDK uses it
   nametag?: string;            // Registered nametag (@username)
 }
 
@@ -329,51 +451,79 @@ console.log(sphere.identity?.chainPubkey);      // 02abc123... (33-byte compress
 
 ### Address Change Event
 
+Event handlers receive the payload directly: `sphere.on('identity:changed', (e) => e.addressIndex)`, not
+`e.data.addressIndex`. `on()` returns an unsubscribe function.
+
 ```typescript
 // Listen for address switches
-sphere.on('identity:changed', (event) => {
-  console.log('Switched to address index:', event.data.addressIndex);
-  console.log('L3 address:', event.data.directAddress);
-  console.log('Chain pubkey:', event.data.chainPubkey);
-  console.log('Nametag:', event.data.nametag);
+const off = sphere.on('identity:changed', (event) => {
+  console.log('Switched to address index:', event.addressIndex);
+  console.log('L3 address:', event.directAddress);
+  console.log('Chain pubkey:', event.chainPubkey);
+  console.log('Nametag:', event.nametag);
 });
 
-// Listen for nametag recovery (when importing wallet)
+// Nametag recoveries after init (e.g. after switchToAddress)
 sphere.on('nametag:recovered', (event) => {
-  console.log('Recovered nametag from Nostr:', event.data.nametag);
+  console.log('Recovered nametag from Nostr:', event.nametag);
 });
+
+off(); // stop listening
 ```
+
+Nametag recovery during `Sphere.init` / `load` / `import` finishes, and emits `nametag:recovered`, before the call
+returns, so a listener added afterwards does not see it. Check `sphere.identity?.nametag` after init. The event is
+useful for later recoveries, such as after `switchToAddress()`.
 
 ## Payment Requests
 
-Request payments from others over the wallet-api rail (`sphere.payments.requests`). Request memos ride an encrypted recipient-ECDH envelope; a `pay()` is durably `settling` before any possibly-committed error can surface, so a crash never double-pays:
+Request payments from others over the wallet-api rail (`sphere.payments.requests`). Request memos ride an encrypted recipient-ECDH envelope.
+
+- `requests.create(to, { coinId, amount, memo? })` never throws; it resolves `{ success, requestId?, error? }`. Check `success`. `coinId` is the 64-hex coin id: a request created with a symbol such as `'UCT'` can never be paid.
+- Never pay from inside the `payment_request:incoming` handler without the user's decision; `pay()` and `decline()` are alternatives. `pay()` rethrows `send()`'s errors: handle them as in [Handling `send()` rejections](#handling-send-rejections-never-re-send-a-possibly-committed-payment-money-safety).
+- `payment_request:updated` reports requests you **received**. The SDK does not track requests you created: detect payment through `transfer:incoming` or `sphere.payments.history()`.
+- `request.amount` is a base-unit string and `request.coinId` the hex id; `request.symbol` is not set by the SDK event.
+
+`pay()` never leaves a request payable after a possibly-committed failure: before it rethrows such an error it
+durably links the request to the transfer and marks it `'settling'`, and a second `pay()` of the same id in the
+same process joins the first. That link is written after the send returns or throws, not before it starts. If the
+app or process stops while `pay()` is still waiting on the send, no link exists: on the next start the request is
+listed as `'pending'` again and `payment_request:incoming` fires again, even if the transfer went through (a transfer
+the SDK had already recorded is resumed when the wallet starts). Before paying a request again after a restart, check
+`sphere.payments.pendingTransfers()` and `sphere.payments.history()` for a transfer to that requester.
 
 ```typescript
-// Send a payment request
-const result = await sphere.payments.requests.create('@bob', {
-  coinId: 'UCT',
-  amount: '1000000',
-  memo: 'Payment for order #1234',
-});
+import { TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
 
-// Track status via the event stream
-sphere.on('payment_request:updated', ({ id, status }) => {
-  // status: 'pending' | 'settling' | 'paid' | 'rejected' | 'expired'
-  if (id === result.requestId && status === 'paid') console.log('Payment received!');
-});
+// Requester side: create() never throws. It resolves { success, requestId?, error? }.
+await TokenRegistry.waitForReady();
+const coinId = getCoinIdBySymbol('UCT'); // the 64-hex coin id, or undefined
+if (coinId) {
+  const created = await sphere.payments.requests.create('@bob', {
+    coinId,
+    amount: '1000000',
+    memo: 'Payment for order #1234',
+  });
+  if (!created.success) console.error(created.error);
+}
 
-// Handle incoming payment requests
+// Payer side: never pay from the event handler itself. Show the request and let the user decide.
 sphere.on('payment_request:incoming', async (request) => {
-  console.log(`${request.senderNametag} requests ${request.amount} ${request.symbol}`);
-
-  // Accept and pay
-  await sphere.payments.requests.pay(request.id);
-
-  // Or decline (a server 403/409 propagates — a refused decline is not success)
-  await sphere.payments.requests.decline(request.id);
+  // request.amount is a base-unit string and request.coinId the hex coin id; request.symbol is not set here.
+  console.log(`${request.senderNametag ?? request.senderPubkey} requests ${request.amount} of ${request.coinId}`);
+  try {
+    if (await askUser(request)) {
+      await sphere.payments.requests.pay(request.id);
+    } else {
+      // A server 403/409 propagates: a refused decline is not success.
+      await sphere.payments.requests.decline(request.id);
+    }
+  } catch (err) {
+    console.error('payment request failed', err); // pay() rethrows send() errors: handle them like send()
+  }
 });
 
-// Current views + housekeeping
+// Current views (requests you received) + housekeeping
 const open = sphere.payments.requests.list();
 sphere.payments.requests.dismissProcessed();
 ```
@@ -388,18 +538,13 @@ Relay-based group messaging using the NIP-29 protocol. The module embeds its own
 // Enable with network defaults (wss://sphere-relay.unicity.network)
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet2', // also selects the default group-chat relay
   autoGenerate: true,
   groupChat: true,
 });
+// Or enable with a custom relay: groupChat: { relays: ['wss://my-nip29-relay.com'] }
 
-// Enable with custom relay
-const { sphere } = await Sphere.init({
-  ...providers,
-  autoGenerate: true,
-  groupChat: { relays: ['wss://my-nip29-relay.com'] },
-});
-
-// Access the module
+// Access the module (null unless Sphere.init got groupChat)
 const gc = sphere.groupChat!;
 ```
 
@@ -419,11 +564,12 @@ const isRelayAdmin = await gc.isCurrentUserRelayAdmin();
 ```typescript
 import { GroupVisibility } from '@unicitylabs/sphere-sdk';
 
-// Create a public group
+// Create a public group. createGroup resolves GroupData | null.
 const group = await gc.createGroup({
   name: 'General',
   description: 'Public discussion',
 });
+if (!group) throw new Error('Could not create the group');
 
 // Create a private group
 const privateGroup = await gc.createGroup({
@@ -431,7 +577,7 @@ const privateGroup = await gc.createGroup({
   visibility: GroupVisibility.PRIVATE,
 });
 
-// Create a write-restricted group (only admins/writers can post)
+// Create a write-restricted group (only admins and moderators can post)
 const announcements = await gc.createGroup({
   name: 'Announcements',
   writeRestricted: true,
@@ -442,7 +588,7 @@ const available = await gc.fetchAvailableGroups(); // public groups on relay
 await gc.joinGroup(group.id);
 
 // Join private group with invite
-await gc.joinGroup(privateGroup.id, inviteCode);
+if (privateGroup) await gc.joinGroup(privateGroup.id, inviteCode);
 
 // List joined groups
 const groups = gc.getGroups();
@@ -455,14 +601,14 @@ await gc.deleteGroup(group.id); // admin only
 ### Messaging
 
 ```typescript
-// Send a message
+// Send a message. sendMessage resolves GroupMessageData | null.
 const msg = await gc.sendMessage(group.id, 'Hello!');
 
-// Reply to a message
-await gc.sendMessage(group.id, 'Agreed', { replyToId: msg.id });
+// Reply to a message: the third argument is replyToId?: string
+await gc.sendMessage(group.id, 'Agreed', msg?.id);
 
-// Fetch messages from relay
-const messages = await gc.fetchMessages(group.id, { limit: 50 });
+// Fetch messages from the relay: fetchMessages(groupId, since?: number (ms), limit?: number)
+const messages = await gc.fetchMessages(group.id, undefined, 50);
 
 // Get locally cached messages
 const cached = gc.getMessages(group.id);
@@ -493,11 +639,11 @@ await gc.deleteMessage(group.id, messageId);
 ### Invites (Private Groups)
 
 ```typescript
-// Create invite code (admin only)
+// Create invite code (admin only). createInvite resolves string | null.
 const invite = await gc.createInvite(group.id);
 
 // Share invite code, recipient joins with:
-await gc.joinGroup(group.id, invite);
+if (invite) await gc.joinGroup(group.id, invite);
 ```
 
 ### Unread Counts
@@ -515,12 +661,16 @@ interface GroupData {
   relayUrl: string;
   name: string;
   description?: string;
+  picture?: string;
   visibility: GroupVisibility;  // 'PUBLIC' | 'PRIVATE'
-  writeRestricted?: boolean;   // Only admins and moderators can post
+  createdAt: number;
+  updatedAt?: number;
   memberCount?: number;
   unreadCount?: number;
   lastMessageTime?: number;
   lastMessageText?: string;
+  writeRestricted?: boolean;   // Only admins and moderators can post
+  localJoinedAt?: number;      // When the current user joined this group locally
 }
 
 interface GroupMessageData {
@@ -531,6 +681,7 @@ interface GroupMessageData {
   senderPubkey: string;
   senderNametag?: string;
   replyToId?: string;
+  previousIds?: string[];
 }
 
 interface GroupMemberData {
@@ -560,25 +711,21 @@ sphere.communications.onDirectMessage((msg) => {
 
 By default, the SDK resumes from the last processed DM timestamp (persisted in storage). On first connect, it starts from "now" — no historical replay.
 
-Use `dmSince` to control how far back to fetch DMs on first connect:
-
-```typescript
-const { sphere } = await Sphere.init({
-  ...providers,
-  autoGenerate: true,
-  dmSince: Math.floor(Date.now() / 1000) - 86400,  // last 24 hours
-});
-```
-
-Once the SDK processes DMs, the timestamp is persisted and `dmSince` is ignored on subsequent connects.
+`Sphere.init` also accepts a `dmSince` option (unix seconds), meant as a fallback start for that first
+subscription. With the Nostr transport it does not take effect in this release: `Sphere.init` records it
+only after the wallet's DM subscription is already open, so a first connect starts from "now" either way.
 
 ### Ephemeral Mode (No Caching)
 
-For anonymous agents or LLM bots that don't need message history, disable DM caching:
+For anonymous agents or LLM bots that don't need message history, disable DM caching. A bot that never
+moves money also passes `walletApi: 'none'` (see [the provider model](#what-just-happened-the-provider-model)):
 
 ```typescript
 const { sphere } = await Sphere.init({
-  ...providers,
+  ...base,             // the createBrowserProviders / createNodeProviders result, without createWalletApiProviders
+  walletApi: 'none',   // messaging only: no wallet-api session, no token engine, no money
+  network: 'testnet2', // still required: it selects the token registry and group-chat relays
+  autoGenerate: true,
   communications: { cacheMessages: false },
 });
 
@@ -605,33 +752,35 @@ import {
   createLocalStorageProvider,
   createNostrTransportProvider,
   createUnicityAggregatorProvider,
-} from '@unicitylabs/sphere-sdk/impl/browser';
+} from '@unicitylabs/sphere-sdk/impl/browser'; // untyped entry: declare these too (see the TypeScript note above)
 
-const storage = createLocalStorageProvider();
-// Without config the transport defaults to mainnet relays — pass the
-// testnet relay explicitly when pairing with the testnet2 gateway below.
+const NETWORK = 'testnet2';
+
+const storage = createLocalStorageProvider({ network: NETWORK });
+// Without `relays` the transport falls back to public Nostr relays (relay.damus.io, nos.lol,
+// relay.nostr.band), so pass the Unicity relay explicitly.
 const transport = createNostrTransportProvider({
   relays: ['wss://nostr-relay.testnet.unicity.network'],
 });
-// `network` (or `trustBaseUrl`) is required — it selects the trust base the
-// token engine is built from. The apiKey authenticates gateway requests.
+// `network` is required: it selects the trust base the token engine is built from. A `trustBaseUrl`
+// is only an override and still needs `network` as its fallback. The apiKey authenticates gateway requests.
 const oracle = createUnicityAggregatorProvider({
   url: 'https://gateway.testnet2.unicity.network',
   apiKey: 'sk_...',
-  network: 'testnet',
+  network: NETWORK,
 });
 
 // The wallet-api transport config — REQUIRED for money (init throws INVALID_CONFIG without it)
 const walletApi = {
-  network: 'testnet2',
+  network: NETWORK,
   baseUrl: 'https://wallet-api.unicity.network',
-  deviceId: 'my-device',
+  deviceId: 'device-1234', // stable on this device, different on every device (e.g. a persisted UUID)
 };
 
 // Check if wallet exists
 if (await Sphere.exists(storage)) {
-  // Load existing wallet
-  const sphere = await Sphere.load({ storage, transport, oracle, walletApi });
+  // Load existing wallet: Sphere.load resolves the instance itself
+  const sphere = await Sphere.load({ storage, transport, oracle, walletApi, network: NETWORK });
 } else {
   // Create new wallet with mnemonic
   const mnemonic = Sphere.generateMnemonic();
@@ -641,6 +790,7 @@ if (await Sphere.exists(storage)) {
     transport,
     oracle,
     walletApi,
+    network: NETWORK,
   });
   console.log('Save this mnemonic:', mnemonic);
 }
@@ -651,20 +801,22 @@ if (await Sphere.exists(storage)) {
 For wallets whose master key was extracted elsewhere (e.g. an older backup):
 
 ```typescript
-// Import from master key + chain code (BIP32 mode)
-const sphere = await Sphere.import({
+// Import from master key + chain code (BIP32 mode). Sphere.import resolves the instance itself.
+const bip32Wallet = await Sphere.import({
   masterKey: '64-hex-chars-master-private-key',
   chainCode: '64-hex-chars-chain-code',
   basePath: "m/84'/1'/0'",  // BIP84 account path
   derivationMode: 'bip32',
   storage, transport, oracle, walletApi,
+  network: 'testnet2',
 });
 
-// Import from master key only (WIF HMAC mode)
-const sphere = await Sphere.import({
+// Or import from master key only (WIF HMAC mode)
+const wifWallet = await Sphere.import({
   masterKey: '64-hex-chars-master-private-key',
   derivationMode: 'wif_hmac',
   storage, transport, oracle, walletApi,
+  network: 'testnet2',
 });
 ```
 
@@ -675,6 +827,11 @@ const sphere = await Sphere.import({
 > them. The scope is the store, not the provider object: two provider objects reporting the same
 > `backingStoreId` share the teardown, while a Sphere on unrelated storage is left alone. Drop
 > your references to the old instance rather than reusing it.
+>
+> The clear also erases the storage's payments state (`pv2g2:*`), including the journals of
+> transfers still in flight, so do not import while transfers are pending. With IndexedDB the store
+> is the whole database named by `dbName`: every key `prefix` in it is erased, so give each wallet
+> its own `dbName`.
 
 ## Wallet Export/Import (JSON)
 
@@ -689,24 +846,27 @@ const encryptedJson = sphere.exportToJSON({ password: 'user-password' });
 // Export with multiple addresses
 const multiJson = sphere.exportToJSON({ addressCount: 5 });
 
-// Import from JSON
-const { success, mnemonic, error } = await Sphere.importFromJSON({
-  jsonContent: JSON.stringify(json),
-  password: 'user-password',  // if encrypted
-  storage, transport, oracle,
+// Import from JSON. importFromJSON never throws: { success, sphere?, mnemonic?, error? }.
+// Like Sphere.import it needs walletApi and network, and it first clears the wallet in this storage.
+const res = await Sphere.importFromJSON({
+  ...providers,               // storage, transport, oracle, walletApi
+  network: 'testnet2',
+  jsonContent: JSON.stringify(encryptedJson),
+  password: 'user-password',  // decrypts an encrypted backup
 });
-
-if (success && mnemonic) {
-  console.log('Recovered mnemonic:', mnemonic);
-}
+if (!res.success || !res.sphere) throw new Error(res.error ?? 'import failed');
+const restored = res.sphere;  // keep it: this is the live instance
 ```
+
+`importFromJSON` (and `importFromLegacyFile`) use `password` only to decrypt the backup: the imported
+seed is stored **without** a password (see [Wallet Security & Encryption](#wallet-security--encryption)).
 
 ## Wallet Info & Backup
 
 ```typescript
 // Get wallet info
 const info = sphere.getWalletInfo();
-console.log('Source:', info.source);        // 'mnemonic' | 'file'
+console.log('Source:', info.source);        // 'mnemonic' | 'file' | 'unknown'
 console.log('Has mnemonic:', info.hasMnemonic);
 console.log('Derivation mode:', info.derivationMode);
 console.log('Base path:', info.basePath);
@@ -825,60 +985,50 @@ Core Utilities
 
 ## Shared Configuration Pattern
 
-Both browser and Node.js implementations share common configuration interfaces and resolution logic:
+Both browser and Node.js implementations share common configuration interfaces and resolution logic
+(in this repository: `impl/shared/config.ts` and `impl/shared/resolvers.ts`). `@unicitylabs/sphere-sdk/impl/shared`
+is **not** a package export: the base types are re-exported from `@unicitylabs/sphere-sdk/impl/nodejs`, and the
+resolvers (`getNetworkConfig`, `resolveTransportConfig`, `resolveOracleConfig`, `resolveArrayConfig`) are internal.
 
 ```typescript
-// Base interfaces (impl/shared/config.ts)
 import type {
   BaseTransportConfig,  // Common transport options
   BaseOracleConfig,     // Common oracle options
   BaseProviders,        // Common result structure
-} from '@unicitylabs/sphere-sdk/impl/shared';
-
-// Resolver utilities (impl/shared/resolvers.ts)
-import {
-  getNetworkConfig,        // Get mainnet/testnet2 config
-  resolveTransportConfig,  // Apply extend/override pattern for relays
-  resolveOracleConfig,     // Resolve oracle URL with fallback
-  resolveArrayConfig,      // Generic array merge helper
-} from '@unicitylabs/sphere-sdk/impl/shared';
+  NodeOracleConfig,     // BaseOracleConfig + trustBasePath (Node.js)
+} from '@unicitylabs/sphere-sdk/impl/nodejs';
 ```
 
 ### Extend/Override Pattern
 
-The configuration resolution follows a consistent pattern across platforms:
+The configuration resolution follows a consistent pattern across platforms. For relay lists the priority is
+replace > extend > defaults:
 
-```typescript
-// Priority for arrays: replace > extend > defaults
-const result = resolveArrayConfig(
-  networkDefaults,    // ['a', 'b']
-  config.relays,      // If set, replaces entirely
-  config.additionalRelays  // If set, extends defaults
-);
-
-// Examples:
-// No config → ['a', 'b'] (defaults)
-// { relays: ['x'] } → ['x'] (replace)
-// { additionalRelays: ['c'] } → ['a', 'b', 'c'] (extend)
-```
+| Config | Result (network defaults `['a', 'b']`) |
+|--------|----------------------------------------|
+| none | `['a', 'b']` (defaults) |
+| `{ relays: ['x'] }` | `['x']` (replace) |
+| `{ additionalRelays: ['c'] }` | `['a', 'b', 'c']` (extend) |
 
 ### Platform-Specific Extensions
 
-Each platform extends the base interfaces with platform-specific options:
+Each platform extends the base interfaces with platform-specific options: the browser transport config adds
+`reconnectDelay` and `maxReconnectAttempts`; the Node.js oracle config adds `trustBasePath` for a file-based trust base:
 
 ```typescript
-// Browser: adds reconnectDelay, maxReconnectAttempts
-type TransportConfig = BaseTransportConfig & BrowserTransportExtensions;
+import type { NodeOracleConfig } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
-// Node.js: adds trustBasePath for file-based trust base
-type NodeOracleConfig = BaseOracleConfig & NodeOracleExtensions;
+const oracle: NodeOracleConfig = {
+  apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590', // public testnet2 gateway key
+  trustBasePath: './trustbase.json',             // Node.js only; falls back to the embedded trust base of `network`
+};
 ```
 
 ## Documentation
 
 Consumer-facing:
 
-- [API Reference](./docs/API.md) — the full surface of `Sphere` and the payments facade
+- [API Reference](./docs/API.md) — `Sphere`, the payments facade and the modules
 - [Integration Guide](./docs/INTEGRATION.md) — composition, custody, custom providers, events
 - [Browser Quick Start](./docs/QUICKSTART-BROWSER.md) / [Node.js Quick Start](./docs/QUICKSTART-NODEJS.md)
 - [Connect Protocol](./docs/CONNECT.md) — dApp ↔ wallet RPC (protocol version `2.3`)
@@ -887,7 +1037,7 @@ Consumer-facing:
 
 Design and migration references:
 
-- [Payments vertical design](./docs/PAYMENTS-V2-DESIGN.md) — the authoritative money design
+- [Payments vertical design](./docs/PAYMENTS-V2-DESIGN.md) — the design record of the money vertical (marked DRAFT; its §5 directory layout predates the current `modules/payments-v2/` tree)
 - [Payments migration guide](./docs/MIGRATION-PAYMENTS-V2.md) — what the P11 flip moved
 - [Token registry migration guide](./docs/MIGRATION-TOKEN-REGISTRY.md) — the per-Sphere token
   registry, the removed `Sphere.getInstance()` / `isInitialized()` lifecycle globals, and
@@ -899,33 +1049,50 @@ The SDK includes browser-ready provider implementations:
 
 | Provider | Description |
 |----------|-------------|
-| `LocalStorageProvider` | Browser localStorage with SSR fallback |
-| `NostrTransportProvider` | Nostr relay messaging with NIP-04 |
+| `IndexedDBStorageProvider` | IndexedDB storage; the default of `createBrowserProviders` |
+| `LocalStorageProvider` | Browser localStorage with SSR fallback (an alternative to IndexedDB) |
+| `NostrTransportProvider` | Nostr relay messaging: NIP-17 DMs (NIP-04 only for legacy encrypted events), nametag bindings |
 | `UnicityAggregatorProvider` | Network config for the token engine (trust base + gateway URL + API key) |
 
 ## Node.js Providers
 
-For CLI and server applications:
+For CLI and server applications. Install `ws` next to the SDK (`npm install @unicitylabs/sphere-sdk ws`).
+`@unicitylabs/sphere-sdk/impl/nodejs` imports `ws` when the module loads, on every Node version, and the package
+declares `ws` only as an optional peer dependency, so npm does not install it for you. The package requires
+Node.js >= 22 (`engines`).
 
 ```typescript
-import { Sphere } from '@unicitylabs/sphere-sdk';
-import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
-import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
+// npm install @unicitylabs/sphere-sdk ws
+import { Sphere, TokenRegistry } from '@unicitylabs/sphere-sdk';
+import { createNodeProviders, createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
-// Quick start with testnet
-const providers = createNodeProviders({
-  network: 'testnet',
-  dataDir: './wallet-data',
+const NETWORK = 'testnet2';
+
+// Quick start with testnet2
+const base = createNodeProviders({
+  network: NETWORK,
+  dataDir: './wallet-data', // optional, default './sphere-data'
+  oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' }, // public testnet2 gateway key
 });
 
 const { sphere } = await Sphere.init({
-  ...createWalletApiProviders(providers, { baseUrl: 'https://wallet-api.unicity.network', network: 'testnet2' }),
+  ...createWalletApiProviders(base, {
+    baseUrl: 'https://wallet-api.unicity.network',
+    network: NETWORK,
+    deviceId: 'my-service-host-1', // stable on this machine, unique per machine
+  }),
+  network: NETWORK,
   autoGenerate: true,
 });
 
+// ... use sphere ...
+
+await sphere.destroy();
+TokenRegistry.destroy(); // stops the process-global registry refresh timer, so Node can exit
+
 // Full configuration
-const providers = createNodeProviders({
-  network: 'testnet',
+const fullyConfigured = createNodeProviders({
+  network: NETWORK,
   dataDir: './wallet-data',
   transport: {
     additionalRelays: ['wss://my-relay.com'],
@@ -934,10 +1101,14 @@ const providers = createNodeProviders({
   },
   oracle: {
     apiKey: 'my-api-key',
-    trustBasePath: './trustbase.json',  // Node.js specific
+    trustBasePath: './trustbase.json',  // Node.js specific; `network` is the fallback when the file is missing
   },
 });
 ```
+
+`sphere.destroy()` stops this Sphere's own registry, but `Sphere.init` also configures the process-wide
+`TokenRegistry`, whose hourly refresh timer keeps Node's event loop alive. Call `TokenRegistry.destroy()` after
+`sphere.destroy()` when the process should exit.
 
 ### Manual Provider Creation
 
@@ -953,12 +1124,12 @@ const storage = new FileStorageProvider('./wallet-data');
 
 // Nostr with Node.js WebSocket
 const transport = createNostrTransportProvider({
-  relays: ['wss://relay.unicity.network'],
+  relays: ['wss://nostr-relay.testnet.unicity.network'],
 });
 
-// Load trust base from local file
-const trustBaseLoader = createNodeTrustBaseLoader('./trustbase-testnet.json');
-const trustBase = await trustBaseLoader.load();
+// Load the trust base from a local file. A path needs the network to fall back to:
+const trustBaseLoader = createNodeTrustBaseLoader('./trustbase-testnet2.json', 'testnet2');
+const trustBase = await trustBaseLoader.load(); // the file's JSON, or the embedded testnet2 trust base
 ```
 
 ## Custom Providers Configuration
@@ -973,11 +1144,11 @@ The SDK uses an **extend/override pattern** for flexible configuration:
 
 ```typescript
 // Simple: use network preset
-const providers = createBrowserProviders({ network: 'testnet' });
+const simple = createBrowserProviders({ network: 'testnet2' });
 
-// Add extra relays to testnet defaults
-const providers = createBrowserProviders({
-  network: 'testnet',
+// Add extra relays to testnet2 defaults
+const extraRelays = createBrowserProviders({
+  network: 'testnet2',
   transport: {
     additionalRelays: ['wss://my-relay.com', 'wss://backup-relay.com'],
     // Result: testnet relay + my-relay + backup-relay
@@ -985,26 +1156,26 @@ const providers = createBrowserProviders({
 });
 
 // Replace relays entirely (ignores network defaults)
-const providers = createBrowserProviders({
-  network: 'testnet',
+const ownRelays = createBrowserProviders({
+  network: 'testnet2',
   transport: {
     relays: ['wss://only-this-relay.com'],
     // Result: only-this-relay (testnet default ignored)
   },
 });
 
-// Override aggregator, keep other testnet defaults
-const providers = createBrowserProviders({
-  network: 'testnet',
+// Override aggregator, keep other testnet2 defaults
+const ownAggregator = createBrowserProviders({
+  network: 'testnet2',
   oracle: {
-    url: 'https://my-aggregator.com',  // replaces testnet aggregator
+    url: 'https://my-aggregator.com',  // replaces the testnet2 aggregator
     apiKey: 'my-api-key',
   },
 });
 
 // Full custom configuration
-const providers = createBrowserProviders({
-  network: 'testnet',
+const fullyCustom = createBrowserProviders({
+  network: 'testnet2',
   storage: {
     prefix: 'myapp_',
   },
@@ -1028,52 +1199,68 @@ const providers = createBrowserProviders({
 
 Token custody is the wallet-api backend — there is no local token store to swap. What IS swappable is the money transport: the `paymentsV2Transport` seam in the `walletApi` config injects a whole per-address bundle (session + wire client) in place of the default HTTP+WebSocket wire. This is how the SDK's own offline test suites run. The port contracts live in `modules/payments-v2/ports.ts` (`StoragePort`, `DeliveryPort`) with conformance suites under `tests/unit/payments-v2/contracts/`.
 
+`createWalletApiProviders()` types `baseUrl` as required. To supply the transport yourself, build the `walletApi`
+config directly: in `WalletApiTransportConfig`, `baseUrl` is optional when `paymentsV2Transport` is set, and the
+seam wins over `baseUrl`.
+
 ```typescript
-const providers = createWalletApiProviders(base, {
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import type { WalletApiTransportConfig } from '@unicitylabs/sphere-sdk';
+import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+const base = createNodeProviders({ network: 'testnet2' });
+const walletApi: WalletApiTransportConfig = {
   network: 'testnet2',
-  // Instead of baseUrl — supply the transport yourself:
-  paymentsV2Transport: (args) => myTransportBundle(args), // { session, client }
-});
+  paymentsV2Transport: (args) => myTransportBundle(args), // returns { session, client }
+};
+const { sphere } = await Sphere.init({ ...base, walletApi, network: 'testnet2', autoGenerate: true });
 ```
 
 ## Dynamic Relay Management
 
-Nostr relays can be added or removed at runtime through the transport provider:
+Nostr relays can be added or removed at runtime through the transport provider. The relay-management
+methods are optional members of `TransportProvider` (the Nostr transport implements them), so call them with `?.`
+under `strict`:
 
 ```typescript
 const transport = sphere.getTransport();
 
 // Get current relays
-const configuredRelays = transport.getRelays();       // All configured
-const connectedRelays = transport.getConnectedRelays(); // Currently connected
+const configuredRelays = transport.getRelays?.() ?? [];          // All configured
+const connectedRelays = transport.getConnectedRelays?.() ?? [];  // Currently connected
 
 // Add a new relay (connects immediately if provider is connected)
-await transport.addRelay('wss://new-relay.com');
+await transport.addRelay?.('wss://new-relay.com');
 
-// Remove a relay (disconnects if connected)
-await transport.removeRelay('wss://old-relay.com');
+// Remove a relay from the configuration. The live connection is dropped only on the next reconnect.
+await transport.removeRelay?.('wss://old-relay.com');
 
 // Check relay status
-transport.hasRelay('wss://relay.com');         // Is configured?
-transport.isRelayConnected('wss://relay.com'); // Is connected?
+transport.hasRelay?.('wss://relay.com');         // Is configured?
+transport.isRelayConnected?.('wss://relay.com'); // Is connected?
 ```
 
 ### Relay Events
 
+Relay events (`transport:relay_added`, `transport:relay_removed`, `transport:error`, ...) are not Sphere events;
+they are emitted by the Nostr transport provider and are subscribed with its `onEvent()`, which is not part of the
+`TransportProvider` interface. Connection changes also reach `sphere.on('connection:changed', ...)`.
+
 ```typescript
-// Listen for relay changes
-sphere.on('transport:relay_added', (event) => {
-  console.log(`Relay added: ${event.data.relay}`);
-  console.log(`Connected: ${event.data.connected}`);
+import type { Sphere, TransportEventCallback } from '@unicitylabs/sphere-sdk';
+
+const nostr = sphere.getTransport() as ReturnType<Sphere['getTransport']> & {
+  onEvent?(callback: TransportEventCallback): () => void;
+};
+const unsubscribe = nostr.onEvent?.((event) => {
+  // event: { type, timestamp, data?, error? }
+  if (event.type === 'transport:relay_added') console.log('Relay added:', event.data);      // { relay, connected, error? }
+  if (event.type === 'transport:relay_removed') console.log('Relay removed:', event.data);  // { relay }
+  if (event.type === 'transport:error') console.log('Transport error:', event.data ?? event.error);
 });
 
-sphere.on('transport:relay_removed', (event) => {
-  console.log(`Relay removed: ${event.data.relay}`);
-});
-
-sphere.on('transport:error', (event) => {
-  console.log(`Transport error: ${event.data.error}`);
-});
+// transport:connected / disconnected / reconnecting / error are also bridged to this Sphere event:
+sphere.on('connection:changed', (e) => console.log(e.provider, e.connected, e.status));
 ```
 
 ### UI Integration Example
@@ -1083,12 +1270,12 @@ sphere.on('transport:error', (event) => {
 async function handleAddRelay(relayUrl: string) {
   const transport = sphere.getTransport();
 
-  if (transport.hasRelay(relayUrl)) {
+  if (transport.hasRelay?.(relayUrl)) {
     showError('Relay already configured');
     return;
   }
 
-  const success = await transport.addRelay(relayUrl);
+  const success = await transport.addRelay?.(relayUrl);
   if (success) {
     showSuccess(`Added ${relayUrl}`);
   } else {
@@ -1096,19 +1283,20 @@ async function handleAddRelay(relayUrl: string) {
   }
 }
 
-// User removes relay via settings UI
+// User removes relay via settings UI. This edits the configuration only:
+// the live connection is dropped on the next reconnect.
 async function handleRemoveRelay(relayUrl: string) {
   const transport = sphere.getTransport();
-  await transport.removeRelay(relayUrl);
+  await transport.removeRelay?.(relayUrl);
   showSuccess(`Removed ${relayUrl}`);
 }
 
 // Display relay status in UI
 function getRelayStatuses() {
   const transport = sphere.getTransport();
-  return transport.getRelays().map(relay => ({
+  return (transport.getRelays?.() ?? []).map(relay => ({
     url: relay,
-    connected: transport.isRelayConnected(relay),
+    connected: transport.isRelayConnected?.(relay) ?? false,
   }));
 }
 ```
@@ -1124,9 +1312,11 @@ Registration is **Nostr-binding-only**. The self-issued `UnicityIdToken` on-chai
 ### Registering a Nametag
 
 ```typescript
-// During wallet creation
+// During wallet creation. If the storage already holds a wallet, init loads it and
+// ignores mnemonic and nametag.
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet2',
   mnemonic: 'your twelve words...',
   nametag: 'alice',  // Will register @alice
 });
@@ -1157,6 +1347,8 @@ This means the nametag is registered (bound on Nostr) to a **different public ke
    // ❌ WRONG: Random mnemonic each time
    const mnemonic = Sphere.generateMnemonic();
    const { sphere } = await Sphere.init({
+     ...providers,
+     network: 'testnet2',
      mnemonic,
      nametag: 'myservice',  // Fails after first run
    });
@@ -1169,12 +1361,18 @@ This means the nametag is registered (bound on Nostr) to a **different public ke
 **Option 1: Persistent file storage** (recommended for backend):
 
 ```typescript
-import { FileStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs';
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import { createNodeProviders, createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
-const storage = new FileStorageProvider('./wallet-data');  // Persists to disk
+// createNodeProviders stores the wallet in a file under dataDir, so it persists across restarts.
+const providers = createWalletApiProviders(
+  createNodeProviders({ network: 'testnet2', dataDir: './wallet-data' }),
+  { baseUrl: 'https://wallet-api.unicity.network', network: 'testnet2', deviceId: 'my-service-host-1' },
+);
 
 const { sphere } = await Sphere.init({
-  storage,
+  ...providers,
+  network: 'testnet2',
   autoGenerate: true,  // OK: mnemonic saved to disk, reused on restart
   nametag: 'myservice',
 });
@@ -1185,6 +1383,7 @@ const { sphere } = await Sphere.init({
 ```typescript
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet2',
   mnemonic: process.env.WALLET_MNEMONIC,  // Same mnemonic every time
   nametag: 'myservice',
 });
@@ -1203,22 +1402,22 @@ console.log('Wallet exists:', exists);  // Should be true after first run
 
 ### Nametag Recovery on Import
 
-When importing a wallet (from mnemonic or file), the SDK automatically attempts to recover the nametag from Nostr:
+When a wallet is imported (`Sphere.import`, `importFromJSON`, `importFromLegacyFile`) or created from an existing
+mnemonic without a `nametag`, the SDK looks the nametag up in its Nostr binding and restores it before the call
+returns. The `nametag:recovered` event for that recovery has already fired by then, so a listener added afterwards
+does not see it: read `sphere.identity?.nametag` instead.
 
 ```typescript
-// Import wallet - nametag will be recovered automatically if found on Nostr
-const { sphere } = await Sphere.init({
+// Import wallet: this CLEARS the wallet already in this storage first, then stores the given one.
+// The nametag is recovered automatically if found on Nostr.
+const sphere = await Sphere.import({
   ...providers,
+  network: 'testnet2',
   mnemonic: 'your twelve words...',
   // No nametag specified - will try to recover from Nostr
 });
 
-// Listen for recovery event
-sphere.on('nametag:recovered', (event) => {
-  console.log('Recovered nametag:', event.data.nametag);  // e.g., 'alice'
-});
-
-// After init, check if nametag was recovered
+// After import, check if nametag was recovered
 console.log(sphere.identity?.nametag);  // 'alice' (if found on Nostr)
 ```
 
@@ -1238,32 +1437,41 @@ await sphere.registerNametag('bob');
 // - Address 0 → @alice
 // - Address 1 → @bob
 
-// Get nametag for specific address
-const aliceTag = sphere.getNametagForAddress(0);  // 'alice'
-const bobTag = sphere.getNametagForAddress(1);    // 'bob'
+// Get nametag for specific address (both indexes are tracked: 0 at creation, 1 by the switch)
+const aliceTag = sphere.getTrackedAddress(0)?.nametag;  // 'alice'
+const bobTag = sphere.getTrackedAddress(1)?.nametag;    // 'bob'
 ```
 
 ---
 
 ## Wallet Security & Encryption
 
-The wallet seed can be encrypted with a **user password** — PBKDF2-derived key, 100k iterations
-(`core/encryption.ts`). Pass `password` to `Sphere.init` / `Sphere.create` / `Sphere.load`:
+The wallet keeps its mnemonic (or master key) in the storage provider: IndexedDB in the browser, the wallet file
+on Node. If you pass `password` when the wallet is created or imported, the SDK encrypts that value with
+CryptoJS's password-based AES-256-CBC, which derives the key with OpenSSL's `EVP_BytesToKey` (MD5, one iteration).
+That keeps the phrase out of casual view and out of copies of the storage that are read without the password, but
+it is a fast key derivation: anyone who obtains the stored value can try passwords offline at high speed, so a
+short or common password gives little protection. Without a password the mnemonic is stored as plaintext. The
+other stored data (derivation path, nametags, payment journals) is not encrypted either way. Always set a password
+for wallets that hold value, make it long and unique, and protect the storage itself at the operating-system level
+(file permissions and disk encryption on servers; the browser profile on clients). `exportToJSON({ password })`
+uses the same scheme. There is no call to add or change the password later, and `importFromJSON` /
+`importFromLegacyFile` store the imported seed without a password.
 
 ```typescript
-// Init/create with a password — the seed is encrypted at rest under a PBKDF2-derived key.
-const { sphere } = await Sphere.init({ ...providers, autoGenerate: true, password: userPassword });
+// Create or load with a password: the stored mnemonic is encrypted with it.
+const { sphere } = await Sphere.init({ ...providers, network: 'testnet2', autoGenerate: true, password: userPassword });
 
-// Loading later requires the same password.
-const { sphere } = await Sphere.load({ ...providers, password: userPassword });
+// Later launches must pass the same password; a wrong one fails with STORAGE_ERROR 'Failed to decrypt mnemonic'.
+await sphere.destroy();
+const again = await Sphere.load({ ...providers, network: 'testnet2', password: userPassword });
 
-// Encrypted JSON export/import use the same scheme.
-const encrypted = sphere.exportToJSON({ password: userPassword });
+// A password-protected JSON backup (same CryptoJS scheme as the stored seed):
+const backup = again.exportToJSON({ password: userPassword });
 ```
 
-If no `password` is supplied, the seed is stored under a built-in default key
-(`DEFAULT_ENCRYPTION_KEY`) — that is obfuscation at rest, **not** a substitute for a user password.
-Supply a password for any wallet holding real value.
+(`exportToTxt({ password })` uses a different scheme: PBKDF2-SHA1 with 100,000 iterations and a fixed salt, then
+CryptoJS AES with the derived key as a passphrase.)
 
 ## License
 

@@ -197,9 +197,10 @@ export interface ITokenEngine {
  * this shape may gain fields there without affecting the ITokenEngine contract.
  */
 /**
- * The web-`Worker` subset the verification pool drives (a browser `Worker` fits
- * as-is; in Node wrap a `worker_threads.Worker`). Payloads stay `unknown` so no
- * base-SDK wire type reaches this port.
+ * The web-`Worker` subset the verification pool drives (in Node wrap a `worker_threads.Worker`).
+ * A browser `Worker` has these members, but under `strictFunctionTypes` its `ErrorEvent` /
+ * `MessageEvent` handler types are not assignable here (TS2322), so it needs a cast or a thin
+ * wrapper. Payloads stay `unknown` so no base-SDK wire type reaches this port.
  */
 export interface VerificationWorker {
   onerror: ((event: { message: string }) => void) | null;
