@@ -29,7 +29,7 @@ Separately, `Sphere.destroy()` never touched the registry, so every discarded Sp
 hourly fetch running. Nothing in `registry/` calls `unref()`, so under Node that also keeps the
 event loop alive.
 
-## What changed in this release
+## What changed in 0.16.0
 
 - **A `Sphere` now builds and owns its own registry**, and the payments facade presents from
   that one instead of the global. Two Spheres on different networks no longer disturb each
@@ -42,7 +42,9 @@ event loop alive.
 - The ten singleton-bound free functions moved to `registry/global-readers.ts`. They are
   re-exported unchanged; no import path changes.
 
-The public surface is otherwise identical — same 126 root exports, same names, same signatures.
+Apart from these additions and the removals listed under
+[Also removed](#also-removed-the-sphere-lifecycle-globals), the public surface is unchanged: same
+names, same signatures.
 
 ## Do you need to change anything?
 
@@ -81,13 +83,16 @@ You can get ahead of it now:
 - **Prefer per-Sphere reads over global reads** for anything network-sensitive — above all
   anywhere a `coinId` or `decimals` from the registry reaches `send()`, `mint()` or an amount
   conversion. Those are the sites where a retargeted registry is a money bug rather than a
-  cosmetic one.
+  cosmetic one. A Sphere does not expose its registry directly; its per-Sphere reads go through
+  the payments facade: `sphere.payments.assets()` gives each held coin's `coinId`, `symbol` and
+  `decimals` from the registry that Sphere owns, and `CoinlessToken.name` / `iconUrl` come from the
+  same registry. For a coin the wallet does not hold, the global readers are the only lookup today.
 - **Don't rely on `getInstance()` in module-scope initialisers.** A module-scope capture binds
   to whichever network configured the global first, which is the bug in miniature.
 - **Test teardown that calls `TokenRegistry.resetInstance()`** to stop the background timer can
   eventually drop it: a Sphere-owned registry is disposed by `sphere.destroy()`.
 
-Nothing above is required in this release. It is what will make the removal a small change
+Nothing above is required in 0.16.0. It is what will make the removal a small change
 rather than a large one.
 
 ## Also removed: the Sphere lifecycle globals
@@ -108,11 +113,18 @@ killed a live wallet on storage A, dropping every `sphere.on()` handler with no 
 error. The `exists(storage)` behaviour that callers actually depend on is unchanged.
 
 The store is reported by a new optional `StorageProvider.backingStoreId`: the resolved wallet
-path for `FileStorageProvider`, `dbName` + key prefix for `IndexedDBStorageProvider`, the
-`Storage` object + prefix for `LocalStorageProvider`. Custom providers need not implement it —
+path for `FileStorageProvider`, the **database name** (`dbName`) for `IndexedDBStorageProvider`,
+the `Storage` object + prefix for `LocalStorageProvider`. Custom providers need not implement it —
 without it, each object is scoped to itself, as before.
 
-## Not fixed by this release
+The IndexedDB key prefix is **not** part of its store id, because the database is the unit that
+gets erased: `Sphere.clear()` calls `storage.clear()` with no prefix, which empties the whole
+database, every prefix in it. Two wallets in one `dbName` under different prefixes are therefore
+one store: `Sphere.clear()` (or a `Sphere.import()` that has to clear) through either provider
+destroys the live Spheres on both and erases both wallets' keys. Give each wallet its own
+`dbName`.
+
+## Not fixed by 0.16.0 (still open)
 
 Two `FileStorageProvider` objects pointed at one `dataDir` still clobber each other's wallet
 file while both are live: that provider caches the whole store in memory and rewrites the

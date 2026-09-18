@@ -29,10 +29,16 @@
 - **Init is fail-closed on the wallet-api composition:** pass `walletApi`
   (`{ network, baseUrl, deviceId?, fetchFn?, webSocketFactory?, paymentsV2Transport? }`,
   built by `createWalletApiProviders` from `impl/shared/wallet-api`) or
-  `Sphere.init` throws `INVALID_CONFIG` before touching storage. A wallet that
-  composes no money at all says so explicitly with `walletApi: 'none'` (#793) — `sphere.payments` then throws `PAYMENTS_NOT_COMPOSED` and
-  `sphere.hasPayments` is `false`. Omitting the field is still a refusal, not an
-  opt-out.
+  `Sphere.init` throws `INVALID_CONFIG` before touching storage. **`network` is
+  required on `Sphere.init` too**, and it must be the same string as
+  `walletApi.network`: the two are compared as plain strings, so a missing
+  `network`, or `'testnet'` against `'testnet2'`, throws `INVALID_CONFIG`
+  (the provider bundle carries no `network`, so `...providers` does not supply
+  it). Use one literal for the base providers, `walletApi.network` and
+  `Sphere.init`. Since 0.17.3, a wallet that composes no money at all says so
+  explicitly with `walletApi: 'none'` (#793): `sphere.payments` then throws
+  `PAYMENTS_NOT_COMPOSED`, `sphere.hasPayments` is `false`, and `network` is
+  still required. Omitting the field is still a refusal, not an opt-out.
 - `accounting: true` / `swap: true` **throw** typed `INVALID_CONFIG` (the one
   sanctioned refusal fossil — public flags whose silent-ignore would hide that
   invoices/swaps no longer exist). Deliberately **kept through 0.15.0**, unlike
@@ -52,10 +58,29 @@
 ## 1. Init: one flag (transition) → default (flip)
 
 ```ts
-const { sphere } = await Sphere.init({
-  ...providers,          // wallet-api composition REQUIRED (see §3)
+import { Sphere, TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
+import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
+
+const NETWORK = 'testnet2'; // one literal: base providers, walletApi.network and Sphere.init
+
+// `base` is createBrowserProviders({ network: NETWORK }) or createNodeProviders({ network: NETWORK }).
+const providers = createWalletApiProviders(base, {
+  baseUrl: 'https://wallet-api.unicity.network', // wallet-api composition REQUIRED (see §3)
+  network: NETWORK,
+  deviceId, // stable on this device, different on every device
 });
-sphere.payments.send({ recipient: '@bob', amount: '1000', coinId: 'UCT' });
+
+const { sphere } = await Sphere.init({
+  ...providers,
+  network: NETWORK, // REQUIRED, and the same string as walletApi.network
+  autoGenerate: true,
+});
+
+// coinId is the 64-hex coin id: v2 send() does not resolve symbols (v1 did, see §2).
+await TokenRegistry.waitForReady(); // Sphere.init starts the registry load but does not await it
+const coinId = getCoinIdBySymbol('UCT'); // string | undefined
+if (!coinId) throw new Error("UCT is not in this network's token registry");
+await sphere.payments.send({ recipient: '@bob', amount: '1000', coinId });
 ```
 
 ## 2. API map (old → new)
@@ -67,7 +92,7 @@ sphere.payments.send({ recipient: '@bob', amount: '1000', coinId: 'UCT' });
 | `getFiatBalance()` | sum `assets()[].fiatValueUsd` |
 | `getTokens(filter?)` | `tokens(filter?)` |
 | `getHistory()` | `history({ before?, limit? })` — **paged**; entries keep `timestamp` |
-| `send(request)` | `send(request)` — same shape; `addressMode`/`transferMode` gone |
+| `send(request)` | `send(request)` — same shape; `addressMode`/`transferMode` gone. **`coinId` must now be the 64-hex coin id**: v1 fell back to a registry symbol lookup when no held token matched (`'UCT'` worked), v2 matches `coinId` exactly, so a symbol throws `SEND_INSUFFICIENT_BALANCE`. Resolve it first: `getCoinIdBySymbol('UCT')` after `await TokenRegistry.waitForReady()`, or `coinId` from `assets()` |
 | `mintFungibleToken(hex, amt)` | `mint(hex, amt)` |
 | `receive(options?)` | `receive()` — options were already no-ops |
 | `sendPaymentRequest(to, {message})` | `requests.create(to, { memo })` |
@@ -94,15 +119,19 @@ Error contract is UNCHANGED and load-bearing: the typed codes
 `ProofUnconfirmedError.cause` carrying the raw network error all survive
 verbatim. Keep your PENDING_COMMIT handling exactly as it is.
 
-### 2a. New in [Unreleased]: coinless tokens (NFTs)
+### 2a. New in 0.17.x: coinless tokens (NFTs)
 
 Nothing to migrate — purely additive — but worth knowing so a token list is not read as complete:
 
-| need | call |
-|---|---|
-| coin tokens | `tokens(filter?)` — **unchanged**, and still excludes coinless holdings |
-| coinless (NFT) holdings | `coinless(): CoinlessToken[]` |
-| an NFT's payload | `tokenData(tokenId): Promise<Uint8Array \| null>` |
+| need | call | since |
+|---|---|---|
+| coin tokens | `tokens(filter?)` — **unchanged**, and still excludes coinless holdings | |
+| coinless (NFT) holdings | `coinless(): CoinlessToken[]` | 0.17.0 |
+| an NFT's payload | `tokenData(tokenId): Promise<Uint8Array \| null>` | 0.17.0 |
+| move one named token whole (never split) | `sendWholeToken({ recipient, tokenId, memo? })` | 0.17.0 (named `sendCoinless` there) |
+| the same, refusing a valued source (Connect `send_nft`) | `sendCoinless({ recipient, tokenId, memo? })` | 0.17.1 (as the NFT-scoped twin) |
+| read held tokens as NFTs ([NFT-METADATA.md](./NFT-METADATA.md)) | `nft(tokenId)`, `nfts(tokenIds)` | 0.17.2 |
+| mint an NFT to this wallet | `mintNft({ content, sign? })` | 0.17.2 |
 
 The two reads are **disjoint**: an active token appears in exactly one, so `tokens()`, `assets()`
 and every balance are byte-identical to before. A UI that shows "all my tokens" now needs both.
@@ -139,7 +168,8 @@ that singleton (#767). An unrecognised type is legitimate — the row still rend
 
 `modules/accounting` (invoices) and `modules/swap`, the Connect invoice
 surface (`sphere_getInvoices`, `sphere_getInvoiceStatus`, the 9 invoice
-intents, `invoice:read|write` scopes — Connect protocol stays 2.1; they were
+intents, `invoice:read|write` scopes — the Connect protocol stayed 2.1 at the
+flip; it is 2.3 today, after additive bumps in 0.17.0 and 0.17.2; they were
 never enabled in any wallet host), own-storage custody (`TokenStorageProvider`
 + both platform providers + `tokenStorage`/`tokensDir` options), the S1
 `WalletApiClient` (`./wallet-api` subpath), the Nostr asset/payment-request
