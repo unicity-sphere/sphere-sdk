@@ -50,11 +50,14 @@ top-level `await`, and without a `target` TypeScript falls back to ES5 and rejec
 ```
 
 **CommonJS projects.** Under `"node16"`/`"nodenext"` in a package without `"type": "module"`,
-TypeScript reads the `require` declarations (`.d.cts`), and there `./connect` and `./connect/browser`
-each declare their own `ConnectClient` and `ConnectError`. The client that `autoConnect()` returns is
-then not assignable to the `ConnectClient` type imported from `@unicitylabs/sphere-sdk/connect`
-(TS2322, "Types have separate declarations of a private property"). Build the dApp as ESM
-(`"type": "module"`) or use `"moduleResolution": "bundler"`; there both entries share one declaration.
+TypeScript reads the `require` declarations (`.d.cts`), and there `./connect/browser` declares its
+own `ConnectClient` class, separate from the one in `./connect`. The client that `autoConnect()`
+returns is then not assignable to the `ConnectClient` type imported from
+`@unicitylabs/sphere-sdk/connect` (TS2322, "Types have separate declarations of a private
+property"). Build the dApp as ESM (`"type": "module"`) or use `"moduleResolution": "bundler"`; there
+both entries share one declaration from the first release after 0.17.3. In 0.17.3 and earlier the
+ESM declarations of `./connect/browser` carry their own `ConnectClient` too, so the TS2322 appears
+in every mode.
 
 Do **not** hand-write tsconfig `paths` entries pointing at files inside the package's `dist/`
 folder. Those paths bypass `exports`, they are not part of the published contract, and a
@@ -211,7 +214,7 @@ See also the note on the hosted wallet below.
 
 ```typescript
 import { PostMessageTransport } from '@unicitylabs/sphere-sdk/connect/browser';
-import { HOST_READY_TYPE } from '@unicitylabs/sphere-sdk/connect';
+import { HOST_READY_TIMEOUT, HOST_READY_TYPE } from '@unicitylabs/sphere-sdk/connect';
 
 const WALLET_URL = 'https://sphere.unicity.network';
 const popup = window.open(
@@ -221,14 +224,27 @@ const popup = window.open(
 );
 if (!popup) throw new Error('The wallet popup was blocked');
 
-// Wait for HOST_READY (autoConnect gives up after HOST_READY_TIMEOUT, 30 s).
-await new Promise<void>((resolve) => {
-  window.addEventListener('message', function onReady(event: MessageEvent) {
-    if (event.source === popup && event.data?.type === HOST_READY_TYPE) {
-      window.removeEventListener('message', onReady);
-      resolve();
-    }
-  });
+// Wait for HOST_READY. Like autoConnect, give up after HOST_READY_TIMEOUT (30 s) or when the
+// user closes the popup, so a wallet that never answers cannot hang the dApp.
+await new Promise<void>((resolve, reject) => {
+  const finish = (error?: Error) => {
+    clearTimeout(timer);
+    clearInterval(closedCheck);
+    window.removeEventListener('message', onReady);
+    if (error) reject(error);
+    else resolve();
+  };
+  function onReady(event: MessageEvent) {
+    if (event.source === popup && event.data?.type === HOST_READY_TYPE) finish();
+  }
+  const timer = setTimeout(
+    () => finish(new Error('The wallet popup did not respond in time')),
+    HOST_READY_TIMEOUT,
+  );
+  const closedCheck = setInterval(() => {
+    if (popup.closed) finish(new Error('The wallet popup was closed'));
+  }, 500);
+  window.addEventListener('message', onReady);
 });
 
 const popupTransport = PostMessageTransport.forClient({ target: popup, targetOrigin: WALLET_URL });
@@ -762,12 +778,17 @@ await client.disconnect();
 ```
 
 **`timeout` also bounds `connect()`.** `ConnectClientConfig.timeout` (default 30000 ms) limits the
-handshake as well as each query, while the host keeps its approval prompt open for up to 120 s
-(`handshakeDeadlineMs`). A user who takes longer than `timeout` to approve gets an uncoded
-`Error('Connection timeout')` in the dApp, although the wallet goes on to create the session; the
-Sphere wallet also stores the approval, so connecting again succeeds without a prompt. For a
-non-silent connect, either set `timeout` above the approval window (it then applies to every query
-too) or catch the timeout and connect again.
+handshake as well as each query, while the host waits up to 120 s (`handshakeDeadlineMs`) for the
+wallet's `onConnectionRequest` to answer. A user who takes longer than `timeout` to approve gets an
+uncoded `Error('Connection timeout')` in the dApp, although the wallet goes on to create the
+session; the Sphere wallet also stores the approval, so connecting again succeeds without a prompt.
+For a non-silent connect, either set `timeout` above the approval window (it then applies to every
+query too) or catch the timeout and connect again with a new `autoConnect()` call, or with a new
+`ConnectClient` on a new transport (call `destroy()` on the old transport first). Do not call
+`connect()` again on the same client: `connect()` does not remove the message listener it
+registered, so a second `connect()` on the same client delivers every wallet event to your handlers
+twice. A new client on the old transport leaves the first client listening; it drops the events but
+logs a warning for each one.
 
 ---
 
@@ -1005,7 +1026,8 @@ bump the protocol version (2.1 at the time). Passing a removed scope in
 `ConnectClientConfig.permissions` is a type error (`PermissionScope` no longer has it). At runtime
 nothing rejects it: the SDK host does not validate requested scopes, it hands them to
 `onConnectionRequest` as received, and a granted unknown scope maps to no method or intent.
-`validatePermissions()` is exported for wallets that want to filter requested scopes themselves.
+`validatePermissions()` is exported for wallets that want to check requested scopes themselves: it
+returns `true` only when every scope is a known `PermissionScope`, and it does not filter the list.
 
 A removed — or simply unknown — method or intent answers **`PERMISSION_DENIED` (4002)**, not
 `METHOD_NOT_FOUND`: `hasMethodPermission()` / `hasIntentPermission()` return false for anything
@@ -1236,8 +1258,12 @@ A dApp can save its `sessionId` and present it again as `resumeSessionId` after 
 keeps its session in memory only, so a resume works only while the same wallet page, and its
 `ConnectHost`, is still alive:
 
-- **Iframe (P1): resume works.** The Sphere wallet's custom-agent host is not torn down when the
-  dApp inside it reloads, so the reloaded dApp resumes its session without any prompt.
+- **Iframe (P1): resume works when the dApp reloads itself.** The Sphere wallet's custom-agent host
+  is not torn down when the dApp inside it reloads, so the reloaded dApp resumes its session without
+  any prompt. The wallet does tear the host down when it navigates the frame itself (the Reload
+  button in its address bar, or opening another agent URL). After the wallet's Reload the new host
+  does not know the saved `sessionId`, and the wallet's stored approval for your origin reconnects
+  the dApp without a prompt.
 - **Popup (P3): resume cannot work.** `autoConnect` opens `<walletUrl>/connect` again on every call,
   which loads a fresh wallet page with a new host and no session, and the Sphere wallet's popup page
   also revokes its session when it unloads. What skips the approval prompt there is the wallet's own
