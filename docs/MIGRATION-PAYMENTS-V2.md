@@ -29,7 +29,10 @@
 - **Init is fail-closed on the wallet-api composition:** pass `walletApi`
   (`{ network, baseUrl, deviceId?, fetchFn?, webSocketFactory?, paymentsV2Transport? }`,
   built by `createWalletApiProviders` from `impl/shared/wallet-api`) or
-  `Sphere.init` throws `INVALID_CONFIG` before touching storage.
+  `Sphere.init` throws `INVALID_CONFIG` before touching storage. A wallet that
+  composes no money at all says so explicitly with `walletApi: 'none'` (#793) — `sphere.payments` then throws `PAYMENTS_NOT_COMPOSED` and
+  `sphere.hasPayments` is `false`. Omitting the field is still a refusal, not an
+  opt-out.
 - `accounting: true` / `swap: true` **throw** typed `INVALID_CONFIG` (the one
   sanctioned refusal fossil — public flags whose silent-ignore would hide that
   invoices/swaps no longer exist). Deliberately **kept through 0.15.0**, unlike

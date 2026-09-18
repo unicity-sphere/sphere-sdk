@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 /**
@@ -145,6 +146,69 @@ describe('Connect packaging', () => {
     // dist-only list let it drop re-exported token-engine modules from impl/wallet-api-v2.
     for (const file of ['index.ts', 'constants.ts', 'token-engine/sdk.ts', 'connect/host/ConnectHost.ts']) {
       expect(hasSideEffects(file), file).toBe(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Built-output guards.
+//
+// Everything above reads the build CONFIG; a config can be right and the
+// emitted tree still wrong (tsup resolves chunk names itself, and a changed
+// `entry` key moves a declaration file out from under package.json "exports").
+// These read dist/ instead. They skip when dist/ is absent — a fresh clone, or
+// CI before `npm run build` — and are meant to be the gate `npm run build`
+// already half-does, extended to the files "exports" actually points at.
+// ---------------------------------------------------------------------------
+
+const distPath = (target: string) => `${root}${target.replace(/^\.\//, '')}`;
+
+/** The three runtime files the Connect exports resolve to, per format. */
+const BUILT_ENTRY_JS = [...new Set(connectTargets.filter((t) => /\.c?js$/.test(t)))];
+/** The six declaration files those same exports point at. */
+const BUILT_ENTRY_DTS = [...new Set(connectTargets.filter((t) => /\.d\.c?ts$/.test(t)))];
+/** Not package exports: chunk-splitting entries for the host and the NFT wire codec. */
+const BUILT_INTERNAL_JS = ['./dist/connect/internal/host.js', './dist/connect/internal/nft-wire.js'];
+
+/** Relative specifiers in an emitted file: `from '...'`, bare `import '...'`, `require('...')`. */
+function relativeSpecifiers(src: string): string[] {
+  return [...src.matchAll(/(?:\bfrom|\bimport|\brequire)\s*\(?\s*['"](\.[^'"]*)['"]/g)].map((m) => m[1]);
+}
+
+describe.skipIf(!existsSync(distPath('./dist/connect/index.js')))('Connect packaging — built output', () => {
+  it('emits the six declaration files the Connect exports point at', () => {
+    // A moved .d.ts is silent: with skipLibCheck the consumer's Connect types
+    // degrade to `any` rather than erroring. Rebuild if this fails.
+    expect(BUILT_ENTRY_DTS).toHaveLength(6);
+    for (const target of BUILT_ENTRY_DTS) {
+      expect(existsSync(distPath(target)), `${target} missing — run the build`).toBe(true);
+    }
+  });
+
+  it('emits the shared chunks the split is for', () => {
+    expect(existsSync(distPath('./dist/connect/chunks')), 'dist/connect/chunks missing — run the build').toBe(
+      true,
+    );
+    expect(readdirSync(distPath('./dist/connect/chunks')).filter((f) => f.endsWith('.js')).length).toBeGreaterThan(
+      0,
+    );
+  });
+
+  it('never lets one built entry file import another built entry file', () => {
+    // Entries must reach shared code through chunks only. An entry that imported
+    // dist/connect/index.js would let a consumer's vi.mock('@unicitylabs/sphere-sdk/connect')
+    // leak into autoConnect, and would re-create the duplicate-class problem under require().
+    const entries = [...BUILT_ENTRY_JS, ...BUILT_INTERNAL_JS];
+    const entryPaths = new Set(entries.map((target) => resolve(distPath(target))));
+
+    for (const target of entries) {
+      const file = distPath(target);
+      expect(existsSync(file), `${target} missing — run the build`).toBe(true);
+      for (const spec of relativeSpecifiers(readFileSync(file, 'utf8'))) {
+        const resolved = resolve(dirname(file), spec);
+        expect(existsSync(resolved), `${target} -> ${spec} does not resolve`).toBe(true);
+        expect(entryPaths.has(resolved), `${target} imports the entry file ${spec}`).toBe(false);
+      }
     }
   });
 });

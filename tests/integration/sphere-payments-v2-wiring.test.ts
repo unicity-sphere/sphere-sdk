@@ -1008,3 +1008,110 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     expect(disposed).toHaveBeenCalledTimes(1);
   }, 20_000);
 });
+
+describe("Sphere payments wiring — the explicit messaging-only composition (walletApi: 'none', #793)", () => {
+  /** A Nostr-only wallet: storage + transport + oracle, and money declined out loud. */
+  async function buildMessagingOnly(options: { nametag?: string } = {}) {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-msgonly-'));
+    const storage = new FileStorageProvider({ dataDir });
+    const transport = createMockTransport();
+    const { sphere } = await Sphere.init({
+      storage,
+      transport,
+      oracle: createEngineOracle(),
+      mnemonic: MNEMONIC,
+      network: NET,
+      walletApi: 'none',
+      ...(options.nametag !== undefined ? { nametag: options.nametag } : {}),
+    });
+    cleanups.push(async () => {
+      await sphere.destroy();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    });
+    return { sphere, storage, transport };
+  }
+
+  /** The same wallet with a real composition — the control for the negative assertions. */
+  async function buildComposed() {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-composed-'));
+    const storage = new FileStorageProvider({ dataDir });
+    const { sphere } = await Sphere.init({
+      storage,
+      transport: createMockTransport(),
+      oracle: createEngineOracle(),
+      mnemonic: MNEMONIC,
+      network: NET,
+      walletApi: makeWorld().walletApi,
+    });
+    cleanups.push(async () => {
+      await sphere.destroy();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    });
+    return { sphere, storage };
+  }
+
+  it('initialises a usable wallet and reports hasPayments false', async () => {
+    const { sphere } = await buildMessagingOnly();
+
+    expect(sphere.identity!.chainPubkey).toBeTruthy();
+    expect(sphere.identity!.directAddress).toMatch(/^DIRECT:\/\//);
+    expect(sphere.communications).toBeTruthy();
+    expect(sphere.hasPayments).toBe(false);
+  }, 20_000);
+
+  it('payments throws PAYMENTS_NOT_COMPOSED — the cause is named, not the ambiguous NOT_INITIALIZED', async () => {
+    const { sphere } = await buildMessagingOnly();
+
+    // NOT_INITIALIZED means "not yet / mid-switch / destroyed" — all transient. This
+    // one is permanent for the instance, and a caller must be able to tell them apart.
+    expect(() => sphere.payments).toThrowError(SphereError);
+    expect(() => sphere.payments).toThrowError(/walletApi: 'none'/);
+    try {
+      void sphere.payments;
+      throw new Error('expected payments to throw');
+    } catch (err) {
+      expect((err as SphereError).code).toBe('PAYMENTS_NOT_COMPOSED');
+    }
+  }, 20_000);
+
+  it('writes no pv2g2: key — where a composed vertical does (the control keeps this honest)', async () => {
+    const composed = await buildComposed();
+    await vi.waitFor(async () => {
+      expect((await composed.storage.keys('pv2g2:')).length).toBeGreaterThan(0);
+    });
+
+    const messaging = await buildMessagingOnly();
+    await sleep(300);
+    expect(await messaging.storage.keys('pv2g2:')).toEqual([]);
+  }, 30_000);
+
+  it('registers a Unicity ID: the nametag path is transport-only and needs no vertical', async () => {
+    const { sphere, transport } = await buildMessagingOnly();
+
+    await sphere.registerNametag('kbbot');
+
+    expect(transport.publishIdentityBinding).toHaveBeenCalledWith(
+      sphere.identity!.chainPubkey,
+      expect.any(String),
+      'kbbot'
+    );
+    expect(sphere.identity!.nametag).toBe('kbbot');
+  }, 20_000);
+
+  it('an address switch starts no vertical either — the gate covers both boot and switch', async () => {
+    const { sphere, storage } = await buildMessagingOnly();
+
+    await sphere.switchToAddress(1);
+
+    expect(sphere.identity!.chainPubkey).toBeTruthy();
+    expect(sphere.hasPayments).toBe(false);
+    expect(() => sphere.payments).toThrowError(/walletApi: 'none'/);
+    expect(await storage.keys('pv2g2:')).toEqual([]);
+  }, 20_000);
+
+  it('builds no token engine: nothing consumes it, and its absence warning would be a false alarm', async () => {
+    const { sphere } = await buildMessagingOnly();
+
+    expect((sphere as unknown as { _tokenEngine?: ITokenEngine })._tokenEngine).toBeUndefined();
+  }, 20_000);
+});
