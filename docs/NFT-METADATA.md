@@ -519,7 +519,9 @@ is available from `@unicitylabs/sphere-sdk/token-engine`. The package root
 (`@unicitylabs/sphere-sdk`) re-exports all of them except `NFT_FORMAT_VERSION`,
 `encodeNftSigned`, `nftSignedDigest` and `verifyNftSignature`, which only `./token-engine` exports.
 A wallet app usually needs none of the signature functions: `sphere.payments.nft(tokenId)` /
-`nfts(tokenIds)` return the parsed content with `creator` and the `signature` status already checked.
+`nfts(tokenIds)` return the parsed content, the `creator` key the payload claims, and a `signature`
+status (`'unsigned'`, `'valid'` or `'invalid'`) already checked against the token's genesis. Treat
+`creator` as authenticated only when `signature` is `'valid'` (see [Signature status](#signature-status)).
 
 | Export | Purpose |
 |---|---|

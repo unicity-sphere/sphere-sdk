@@ -29,7 +29,7 @@ Separately, `Sphere.destroy()` never touched the registry, so every discarded Sp
 hourly fetch running. Nothing in `registry/` calls `unref()`, so under Node that also keeps the
 event loop alive.
 
-## What changed in 0.16.0
+## What changed in 0.16.0 (#766)
 
 - **A `Sphere` now builds and owns its own registry**, and the payments facade presents from
   that one instead of the global. Two Spheres on different networks no longer disturb each
@@ -43,8 +43,10 @@ event loop alive.
   re-exported unchanged; no import path changes.
 
 Apart from these additions and the removals listed under
-[Also removed](#also-removed-the-sphere-lifecycle-globals), the public surface is unchanged: same
-names, same signatures.
+[Also removed](#also-removed-the-sphere-lifecycle-globals), this change left the public surface
+unchanged: same names, same signatures. 0.16.0 carried other breaking changes too (the `dev`
+network and every v1 pointer were removed); see
+[CHANGELOG `[0.16.0]`](../CHANGELOG.md#0160---2026-09-03).
 
 ## Do you need to change anything?
 

@@ -168,12 +168,12 @@ that singleton (#767). An unrecognised type is legitimate — the row still rend
 
 `modules/accounting` (invoices) and `modules/swap`, the Connect invoice
 surface (`sphere_getInvoices`, `sphere_getInvoiceStatus`, the 9 invoice
-intents, `invoice:read|write` scopes — the Connect protocol stayed 2.1 at the
-flip; it is 2.3 today, after additive bumps in 0.17.0 and 0.17.2; they were
-never enabled in any wallet host), own-storage custody (`TokenStorageProvider`
-+ both platform providers + `tokenStorage`/`tokensDir` options), the S1
-`WalletApiClient` (`./wallet-api` subpath), the Nostr asset/payment-request
-rail, and the v1 TXF relic handling. The code is gone.
+intents, `invoice:read|write` scopes; that surface was never enabled in any
+wallet host, and the Connect protocol stayed 2.1 at the flip, then reached 2.3
+through additive bumps in 0.17.0 and 0.17.2), own-storage custody
+(`TokenStorageProvider` + both platform providers + `tokenStorage`/`tokensDir`
+options), the S1 `WalletApiClient` (`./wallet-api` subpath), the Nostr
+asset/payment-request rail, and the v1 TXF relic handling. The code is gone.
 
 ## 5. Can mixed versions transact? Across 0.15.0, no — it is a flag day
 

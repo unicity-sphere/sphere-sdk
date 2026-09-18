@@ -108,7 +108,10 @@ import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wa
 // For Node.js: import { createNodeProviders, createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
 // One network literal, used in all three places below. 'testnet' reaches the same
-// endpoints but is a DIFFERENT string: mixing it with 'testnet2' fails Sphere.init.
+// endpoints but is a DIFFERENT string: Sphere.init throws INVALID_CONFIG when its network
+// and walletApi.network differ ('testnet' vs 'testnet2' included). Sphere.init does not
+// compare the base-provider literal, but that literal picks the gateway, relays and trust
+// base and names the network-scoped storage keys, so keep all three the same.
 const NETWORK = 'testnet2';
 
 // 1. Create base providers. `network` is REQUIRED (throws INVALID_CONFIG otherwise).
@@ -136,7 +139,7 @@ const providers = createWalletApiProviders(base, {
 //    STRING — 'testnet' vs 'testnet2' is a mismatch (INVALID_CONFIG), alias or not.
 const { sphere, created, generatedMnemonic } = await Sphere.init({
   ...providers,
-  network: NETWORK,     // must equal walletApi.network and the base providers' network
+  network: NETWORK,     // must equal walletApi.network (checked); keep the base providers' the same
   autoGenerate: true,   // Generate mnemonic if no wallet exists
   nametag: 'alice',     // Optional: register @alice (only on create)
   password: 'secret',   // Optional: encrypt mnemonic (plaintext if omitted)
@@ -208,9 +211,14 @@ sphere.on('transfer:incoming', (transfer) => {
 //    coinId must be even-length lowercase hex (the canonical SDK AssetId form)
 const mint = await sphere.payments.mint(coinIdHex, 1000000n);
 // MintResult: { success, tokenId?, error? } — one flat interface, so `success` does not narrow
-// tokenId. A failure that carries a tokenId is journaled and replays — never re-call it.
+// tokenId. Both mints journal BEFORE the chain op, and the convergence pass (start, heartbeat)
+// replays a journaled entry under its own mintId. Never re-call for a journaled failure: a new
+// call is a new mintId, so a new token. A failure that carries a tokenId is journaled; so is a
+// mint() failure WITHOUT one when the engine call itself threw. Only mint()'s up-front
+// coinId/amount refusal and mintNft()'s refused content (build error or the 1 MiB payload cap)
+// journal nothing.
 // An NFT (#785; format docs/NFT-METADATA.md): minted to this wallet, signed as creator unless
-// sign: false. Same MintResult, same rule.
+// sign: false. Same MintResult.
 const nftMint = await sphere.payments.mintNft({
   content: { kind: 'media', media_type: 'image/png', bytes: pngBytes },
 });
@@ -404,7 +412,8 @@ sphere-sdk/
 │   ├── crypto.ts           # BIP39/BIP32, secp256k1, hashing, message signing
 │   ├── encryption.ts       # Wallet/seed encryption, CryptoJS AES-256-CBC: encryptSimple (OpenSSL
 │   │                       #   passphrase mode, MD5 EVP_BytesToKey, 1 iteration) stores the seed
-│   │                       #   and exportToJSON; encrypt()/decrypt() use PBKDF2-SHA256 (100k)
+│   │                       #   when a password is set (plaintext without one) and backs
+│   │                       #   exportToJSON; encrypt()/decrypt() use PBKDF2-SHA256 (100k)
 │   ├── field-encryption.ts / delivery-envelope.ts # pv2 field crypto + S6 memo envelope (XChaCha20-Poly1305)
 │   ├── errors.ts           # SphereError + SphereErrorCode
 │   ├── logger.ts           # Centralized logger singleton
@@ -505,8 +514,10 @@ version:
   explicit escape is `walletApi: 'none'` (#793, `NO_PAYMENTS`): a wallet that is only ever a
   Nostr client composes nothing — no session, device, wake socket, drain, token engine or
   `pv2g2:` key, at boot or on an address switch — and `payments` throws `PAYMENTS_NOT_COMPOSED`.
-  It shares the field with the config so both cannot be said; OMITTING it still refuses, because
-  "I forgot" must not read as "I meant it", and a near-miss (`'None'`) is refused by name.
+  `'none'` shares the field with the config so both cannot be said; OMITTING the field still
+  refuses, because "I forgot" must not read as "I meant it", and a near-miss (`'None'`) is
+  refused by name. `network` is still required with `'none'`: it configures the token
+  registry, and init throws `INVALID_CONFIG` without it (`configureTokenRegistry`).
 - **Send:** `TransferMachine` — durable intent on the server first (`putIntent`), then engine
   ops (transfer/split), per-op progress checkpoints (field-encrypted, signed), mailbox deposit,
   signed complete (`completeSignMessage` — the server's seedGate verifies it). Resume is THE SAME
@@ -802,6 +813,11 @@ authoritative for build success.
   the heartbeat, or `payments.resumeNow()`) finishes it under the same transferId. A proven clean
   reject or `TransferConflictError` aborts (with #625 source demotion + a bounded re-plan, up to
   `MAX_RESELECT` = 8).
+- Each dist bundle (root, `./core`, `./impl/nodejs`, `./impl/browser`) carries its own
+  `SphereError` class, and `isSphereError()` is an `instanceof` check. So an error thrown by
+  provider code (e.g. the Nostr transport's `TRANSPORT_ERROR` during recipient lookup) is not
+  `isSphereError()` for the root bundle: read `code` structurally, and import
+  `isPossiblyCommittedSendOutcome` / `PartialSendConflictError` from the same entry as `Sphere`.
 
 ### Receive & Verification
 - Incoming tokens arrive as FINISHED SDK tokens via the wallet-api mailbox (continuous drain
