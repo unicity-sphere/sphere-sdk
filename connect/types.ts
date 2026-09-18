@@ -167,8 +167,11 @@ export interface ConnectHostConfig {
   /** Host-side deadline for a query, in ms. Default: 25000. The host answers within it
    *  no matter what the router does. */
   requestDeadlineMs?: number;
-  /** Host-side deadline for an intent, in ms. Default: 90000. Fires INTENT_CANCELLED
-   *  (4200) AND aborts ctx.signal — it must cancel, not merely answer. */
+  /** Host-side deadline for an intent, in ms. Default: 180000 — deliberately longer than
+   *  ConnectClient's own 120 s intentTimeout, so the host is never the first to give up.
+   *  Fires INTENT_OUTCOME_UNKNOWN (4201), never INTENT_CANCELLED: the wallet may already
+   *  have submitted the transfer. It also aborts ctx.signal — it must cancel, not merely
+   *  answer. */
   intentDeadlineMs?: number;
   /** Host-side deadline for onConnectionRequest, in ms. Default: 120000. A handshake
    *  carries no id, so expiry sends the empty refusal. */
@@ -203,8 +206,10 @@ export interface ConnectClientConfig {
    *  No approval UI will be shown. Used for auto-connect on page load. */
   silent?: boolean;
 
-  /** The network this dApp is built for. Sent in the handshake; the wallet rejects a mismatch
-   *  with INCOMPATIBLE_NETWORK. */
+  /** The network this dApp is built for. Sent in the handshake; **required at runtime** —
+   *  optional in the type only for backward compatibility. A handshake without it, or with a
+   *  different network id than the wallet's, is rejected with INCOMPATIBLE_NETWORK (4008)
+   *  before any UI appears. Use SPHERE_NETWORKS.mainnet / SPHERE_NETWORKS.testnet2. */
   network?: NetworkInfo;
 }
 

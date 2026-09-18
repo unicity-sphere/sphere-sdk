@@ -2,21 +2,31 @@
  * autoConnect — Universal dApp connection to Sphere wallet.
  *
  * Auto-detects the best available transport and connects:
- *   P1: iframe   → PostMessageTransport to parent window
- *   P2: extension → ExtensionTransport via chrome extension
- *   P3: standalone → PostMessageTransport to popup window
+ *   P1: iframe    → PostMessageTransport to parent window — the live path: the hosted wallet
+ *                   runs a dApp as a custom agent inside its own iframe
+ *   P2: extension → ExtensionTransport — LEGACY: the Sphere browser extension is discontinued
+ *                   and no supported wallet answers this transport
+ *   P3: standalone → PostMessageTransport to popup window — the fallback when the dApp has its
+ *                   own tab; not the route the hosted wallet is driven through, see
+ *                   "Running against the hosted wallet" in docs/CONNECT.md
  *
  * Usage:
  *   import { autoConnect } from '@unicitylabs/sphere-sdk/connect/browser';
+ *   import { SPHERE_NETWORKS } from '@unicitylabs/sphere-sdk/connect';
  *
- *   const client = await autoConnect({
+ *   const { client, connection, disconnect } = await autoConnect({
  *     dapp: { name: 'My App', url: location.origin },
  *     walletUrl: 'https://sphere.unicity.network',
+ *     network: SPHERE_NETWORKS.testnet2,   // required at runtime (INCOMPATIBLE_NETWORK 4008)
  *   });
  *
  *   // Use the client — same API regardless of transport:
  *   const balance = await client.query('sphere_getBalance');
- *   await client.intent('send', { recipient: '@bob', amount: '1000', coinId: 'UCT' });
+ *   await client.intent('send', {
+ *     to: '@bob',
+ *     amount: '1000000000000000000',        // base units, as a string
+ *     coinId: '<lowercase 64-hex coin id>',
+ *   });
  *   client.on('transfer:incoming', (data) => console.log(data));
  */
 
@@ -91,9 +101,11 @@ export interface AutoConnectConfig {
   silent?: boolean;
 
   /**
-   * The network this dApp targets ({ id, name? }). Sent in the handshake; the wallet's
-   * compatibility gate rejects a mismatch with INCOMPATIBLE_NETWORK. Set this to the
-   * network your dApp is built for (e.g. testnet2 = { id: 4, name: 'testnet2' }).
+   * The network this dApp targets ({ id, name? }). Sent in the handshake; **required at
+   * runtime** — optional in the type only for backward compatibility. The wallet's
+   * compatibility gate rejects a missing or mismatched network with INCOMPATIBLE_NETWORK
+   * (4008) before any UI appears. Use SPHERE_NETWORKS.mainnet / SPHERE_NETWORKS.testnet2
+   * from '@unicitylabs/sphere-sdk/connect'; both networks are live.
    */
   network?: NetworkInfo;
 

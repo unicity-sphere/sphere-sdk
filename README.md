@@ -11,7 +11,7 @@ A modular TypeScript SDK for Unicity wallet operations (Unicity state transition
 - **Group Chat** - NIP-29 relay-based group messaging with moderation
 - **Messaging (Nostr)** - NIP-17 DMs + NIP-29 group chat and nametag publishing — **messaging only; not the payment rail**
 - **Multi-Address** - HD address derivation (BIP32/BIP44)
-- **Connect Protocol** - dApp ↔ wallet communication via `ConnectClient` / `ConnectHost` (browser extension + popup)
+- **Connect Protocol** - dApp ↔ wallet communication via `ConnectClient` / `ConnectHost` (hosted wallet in an iframe, or WebSocket for Node.js dApps)
 - **CLI** - Comprehensive command-line interface with shell auto-completion
 
 ## Installation
@@ -29,7 +29,7 @@ Choose your platform:
 | **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | IndexedDB storage |
 | **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | File storage |
 | **CLI** | [@unicity-sphere/cli](https://github.com/unicity-sphere/sphere-cli) | Separate package | - |
-| **dApp integration** | [CONNECT.md](docs/CONNECT.md) | SDK only | Sphere extension |
+| **dApp integration** | [CONNECT.md](docs/CONNECT.md) | SDK only | `ws` (Node.js dApps) |
 
 ## CLI (Command Line Interface)
 
@@ -881,7 +881,7 @@ Consumer-facing:
 - [API Reference](./docs/API.md) — the full surface of `Sphere` and the payments facade
 - [Integration Guide](./docs/INTEGRATION.md) — composition, custody, custom providers, events
 - [Browser Quick Start](./docs/QUICKSTART-BROWSER.md) / [Node.js Quick Start](./docs/QUICKSTART-NODEJS.md)
-- [Connect Protocol](./docs/CONNECT.md) — dApp ↔ wallet RPC (protocol version `2.1`)
+- [Connect Protocol](./docs/CONNECT.md) — dApp ↔ wallet RPC (protocol version `2.3`)
 - [Parallel token verification](./docs/VERIFICATION-WORKERS.md) — the opt-in worker pool
 - [CHANGELOG](./CHANGELOG.md) — per-release notes (versioned sections start at `0.14.11`)
 

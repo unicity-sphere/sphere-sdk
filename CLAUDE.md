@@ -231,9 +231,9 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | Role | Class | Where it runs |
 |------|-------|--------------|
 | dApp (client) | `ConnectClient` | any web page / app |
-| Wallet (host) | `ConnectHost` | Sphere app / extension background |
+| Wallet (host) | `ConnectHost` | Sphere app (hosted wallet) |
 
-**Transports:** `PostMessageTransport` (iframe/popup), `ExtensionTransport` (browser extension), `WebSocketTransport` (Node.js).
+**Transports:** `PostMessageTransport` (iframe/popup — the live browser path), `WebSocketTransport` (Node.js), and `ExtensionTransport` — **legacy: the browser extension is discontinued and no supported wallet answers it.**
 
 **Queries (14):** `sphere_getIdentity`, `sphere_getBalance`, `sphere_getAssets`, `sphere_getFiatBalance`, `sphere_getTokens`, `sphere_getHistory`, `sphere_resolve`, `sphere_subscribe`, `sphere_unsubscribe`, `sphere_disconnect`, `sphere_getConversations`, `sphere_getMessages`, `sphere_getDMUnreadCount`, `sphere_markAsRead`. (The two invoice queries were removed with the P11 flip — they were experimental and never enabled in any wallet host.)
 

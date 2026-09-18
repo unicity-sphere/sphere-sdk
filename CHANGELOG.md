@@ -92,6 +92,42 @@ augmentation adding a required member now also applies to `autoConnect`'s types)
 Still true: a process that loads Connect through both `import` and `require()` has two copies, and
 so does a dApp whose dependencies bundle their own SDK — keep discriminating errors on `.code`.
 
+### Documentation — the Connect guide matches the code again
+
+`docs/CONNECT.md`, `README.md`, `docs/INTEGRATION.md`, `CLAUDE.md` and the Connect JSDoc. No code
+behaviour changes. Corrected: samples that did not compile (`PostMessageTransport.forHost()` takes
+a target and options; `WebSocketTransport` has `createServer`/`createClient` plus `start()`/
+`connect()`, not `forHost`/`forClient`; `query`/`intent` return `unknown` and event handlers
+receive `unknown`, so the documented destructures need explicit types); every client sample now
+passes `network`, which is required at runtime; `ExtensionTransport` is marked legacy everywhere —
+the browser extension is discontinued and no supported wallet answers it; the protocol version
+in the README is 2.3, the client SDK floor is 0.14.1; both mainnet and testnet2 are live, with no
+in-session switch; the intents table lists `send_nft`; the error table gains -32601/-32602/-32603
+and marks 4005/4100/4101 reserved; a removed or unknown method answers `PERMISSION_DENIED` (4002),
+or `WALLET_LOCKED` (4009) first when locked; the host intent deadline is 180000 ms and fires
+`INTENT_OUTCOME_UNKNOWN` (4201); the compat adapter never re-emitted `invoice:*` / `swap:*`.
+
+Two things the guide now says that it did not say before, both about the boundary of what this
+repo can promise:
+
+- **Running against the hosted wallet.** A dApp is loaded as a custom agent
+  (`/agents/custom?url=…`), and its URL must be `https` **and publicly reachable**. Two separate
+  gates: the CDN in front of `sphere.unicity.network` answers 403 to any request whose query string
+  contains `localhost` or `127.0.0.1`, on every route, `https://localhost` included; and the wallet
+  frames a custom tab only for an `https:` URL. Testing a local build against the hosted wallet
+  therefore means an https tunnel. A wallet you run yourself is unaffected.
+- **Which claims are the wallet's, not the protocol's.** Rows like "reserved" (4005/4100/4101),
+  -32602's meaning and `send_nft` answering -32601 describe the Sphere wallet as it stands today,
+  and say so, with a pointer to the wallet source. Codes the SDK host itself sends are marked as
+  the protocol facts they are.
+
+Added an "Install & entry points" section: which subpath exports what — including the full
+`./connect/nodejs` surface — the TypeScript setup dApps should use (`moduleResolution:
+bundler`/`node16`, never tsconfig `paths` into `dist/`), and an exact statement of external
+dependencies: `./connect` and `./connect/browser` have none, while `./connect/nodejs` loads `ws`
+through a dynamic import in `WebSocketServerTransport.start()` and keeps it an optional peer
+dependency.
+
 ## [0.17.2] - 2026-09-15
 
 ### Added — `mint_nft` Connect intent and `nft:mint` scope (Connect 2.3)
