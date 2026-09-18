@@ -400,7 +400,7 @@ See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.m
 **Version:** see `package.json` (the 0.17.x line). The state-transition-sdk 3.x bump shipped as **0.15.0**, a breaking release (no cross-major wire interop in either direction). `package.json` on a branch still reads the previous version: `publish.yml` sets the field at publish time from its `version` input. Releases ship from `main` under the npm `latest` tag; `-dev.#` builds are published from a branch and land under `dev`. Per-release notes: CHANGELOG (versioned sections start at `0.14.11`; older entries are pooled under `[0.14.10] and earlier`)
 **License:** MIT
 **Target:** Node.js >= 22.0.0, Browser (ESM/CJS)
-**CLI:** moved out to its own repository, [unicity-sphere/sphere-cli](https://github.com/unicity-sphere/sphere-cli), which is not published to npm yet (`npm install -g @unicity-sphere/cli` fails with a 404, although `npm run cli` still prints that command)
+**CLI:** moved out to its own repository, [unicity-sphere/sphere-cli](https://github.com/unicity-sphere/sphere-cli), which is not published to npm yet (`npm install -g @unicity-sphere/cli` fails with a 404; `npm run cli` prints this pointer and exits with an error)
 
 ## Directory Structure
 
