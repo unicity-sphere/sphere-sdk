@@ -10,7 +10,6 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { Sphere } from '../../core/Sphere';
-import { makePv2World } from '../support/pv2-world';
 import { createNodeProviders } from '../../impl/nodejs';
 import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -85,7 +84,8 @@ async function createSphere(label: string, nametag?: string) {
       apiKey: DEFAULT_API_KEY,
     },
   });
-  const result = await Sphere.init({ ...providers, walletApi: makePv2World().walletApi, network: 'testnet', autoGenerate: true, ...(nametag ? { nametag } : {}) });
+  // #793: these wallets only ever speak Nostr — they compose no money at all.
+  const result = await Sphere.init({ ...providers, walletApi: 'none', network: 'testnet', autoGenerate: true, ...(nametag ? { nametag } : {}) });
   return { sphere: result.sphere, dirs };
 }
 

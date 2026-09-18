@@ -111,7 +111,8 @@ const base = createBrowserProviders({
 
 // 2. Attach the wallet-api transport config — REQUIRED for money. Sphere.init
 //    throws INVALID_CONFIG without `walletApi`; tokens are server-custody
-//    (the wallet-api backend holds inventory; keys stay local).
+//    (the wallet-api backend holds inventory; keys stay local). A wallet that
+//    never touches money passes `walletApi: 'none'` instead (#793) — see below.
 const providers = createWalletApiProviders(base, {
   baseUrl: 'https://wallet-api.example',  // wallet-api backend
   network: 'testnet2',
@@ -269,7 +270,8 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `Sphere.init(options)` | `{ sphere, created, generatedMnemonic? }` | Create or load wallet (requires `walletApi` config) |
+| `Sphere.init(options)` | `{ sphere, created, generatedMnemonic? }` | Create or load wallet (requires `walletApi` config, or `'none'`) |
+| `sphere.hasPayments` | `boolean` | Whether this Sphere composes money at all (#793) — fixed for its life |
 | `Sphere.exists(storage)` | `Promise<boolean>` | Check if wallet exists |
 | `Sphere.clear({ storage })` | `void` | Delete all wallet data (the whole KV, both `pv2g2:*` and superseded `pv2:*`, + orphaned pre-flip token DBs) |
 | `Sphere.import(options)` | `Sphere` | Import from mnemonic/masterKey |
@@ -306,7 +308,9 @@ Notes:
 - `sphere.paymentsV2` is **GONE** (0.15.0) — `sphere.payments` is the only accessor. The
   behavioural difference consumers must handle: the alias returned `null` while no vertical ran,
   `sphere.payments` **THROWS `NOT_INITIALIZED`** (init in flight, mid address-switch, destroyed).
-  Read it lazily at the call site, never once at construction.
+  Read it lazily at the call site, never once at construction. Under the #793 messaging-only
+  composition it throws **`PAYMENTS_NOT_COMPOSED`** instead — permanent, not transient, and
+  `sphere.hasPayments` is the try/catch-free way to ask.
 - `sphere.groupChat`, `sphere.market` are nullable getters — `null` unless enabled in init
   options. `sphere.accounting` / `sphere.swap` DO NOT EXIST (P11 flip); passing
   `accounting:`/`swap:` init options throws `INVALID_CONFIG`.
@@ -450,7 +454,12 @@ Subpath exports: `.` (root), `./core`, `./token-engine`, `./payments-v2` (the fa
   a `WalletApiSession` (challenge sign-in → JWT + refresh token, wake WebSocket, single-flight
   re-auth), and fires `sweepSupersededState()` once (the `pv2:` generation — see below). The
   `paymentsV2Transport` seam in the config injects a whole custom bundle (tests, custom hosts).
-  Init is FAIL-CLOSED: no `walletApi` → `INVALID_CONFIG`, before any storage write.
+  Init is FAIL-CLOSED: no `walletApi` → `INVALID_CONFIG`, before any storage write. The ONE
+  explicit escape is `walletApi: 'none'` (#793, `NO_PAYMENTS`): a wallet that is only ever a
+  Nostr client composes nothing — no session, device, wake socket, drain, token engine or
+  `pv2g2:` key, at boot or on an address switch — and `payments` throws `PAYMENTS_NOT_COMPOSED`.
+  It shares the field with the config so both cannot be said; OMITTING it still refuses, because
+  "I forgot" must not read as "I meant it", and a near-miss (`'None'`) is refused by name.
 - **Send:** `TransferMachine` — durable intent on the server first (`putIntent`), then engine
   ops (transfer/split), per-op progress checkpoints (field-encrypted, signed), mailbox deposit,
   signed complete (`completeSignMessage` — the server's seedGate verifies it). Resume is THE SAME

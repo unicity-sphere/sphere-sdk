@@ -69,6 +69,7 @@ describe('createWalletApiProviders — the transport CONFIG preset', () => {
   it('resolvePaymentsV2Composition accepts the produced config (the Sphere.init duck)', () => {
     const out = createWalletApiProviders(base(), CONFIG);
     const composition = resolvePaymentsV2Composition(out.walletApi, 'testnet2');
+    if (composition === 'none') throw new Error('expected a composition, not the opt-out');
     expect(composition.network).toBe('testnet2');
     expect(typeof composition.factory).toBe('function');
   });
@@ -83,5 +84,24 @@ describe('createWalletApiProviders — the transport CONFIG preset', () => {
     expect(() => resolvePaymentsV2Composition(undefined, 'testnet2')).toThrowError(
       /requires a wallet-api composition/
     );
+  });
+});
+
+describe('resolvePaymentsV2Composition — the explicit messaging-only opt-out (#793)', () => {
+  it("resolves the literal 'none' to the opt-out, composing no money", () => {
+    expect(resolvePaymentsV2Composition('none', 'testnet2')).toBe('none');
+  });
+
+  it("refuses any OTHER string, naming 'none' as the only accepted literal", () => {
+    // Without its own branch a typo'd sentinel falls into the "pass `walletApi`"
+    // message and sends the reader hunting a dropped env var instead of a typo.
+    expect(() => resolvePaymentsV2Composition('None', 'testnet2')).toThrowError(/'none'/);
+    expect(() => resolvePaymentsV2Composition('', 'testnet2')).toThrowError(/'none'/);
+  });
+
+  it('does not check the network for an opt-out — there is no composition to pin', () => {
+    // `walletApi.network` must match the Sphere network (#728), but that rule is
+    // about a composition's single-network invariant. There is no composition here.
+    expect(resolvePaymentsV2Composition('none', undefined)).toBe('none');
   });
 });

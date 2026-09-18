@@ -15,7 +15,6 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { Sphere } from '../../core/Sphere';
-import { makePv2World } from '../support/pv2-world';
 import { createNodeProviders } from '../../impl/nodejs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -100,7 +99,7 @@ async function createSphere(
 
   const result = await Sphere.init({
     ...providers,
-    walletApi: makePv2World().walletApi,
+    walletApi: 'none', // #793: messaging only — no money composed
     network: 'testnet',
     autoGenerate: true,
     ...(nametag ? { nametag } : {}),

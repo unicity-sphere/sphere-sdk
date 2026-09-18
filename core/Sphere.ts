@@ -112,14 +112,16 @@ import {
 } from '../token-engine';
 import {
   composePaymentsV2,
+  NO_PAYMENTS,
   resolvePaymentsV2Composition,
   type PaymentsV2Composition,
-  type WalletApiTransportConfig,
+  type WalletApiOption,
 } from './payments-v2-wiring';
 import type { PaymentsV2 } from '../modules/payments-v2/api';
 import type { PaymentsFacade } from '../modules/payments-v2/PaymentsFacade';
 
-export type { WalletApiTransportConfig } from './payments-v2-wiring';
+export type { WalletApiTransportConfig, WalletApiOption } from './payments-v2-wiring';
+export { NO_PAYMENTS } from './payments-v2-wiring';
 import {
   isTextWalletEncrypted,
   isWalletTextFormat,
@@ -168,14 +170,17 @@ export type InitProgressCallback = (progress: InitProgress) => void;
 // =============================================================================
 
 /**
- * The wallet-api transport config every wallet needs (money moves only through
- * the wallet-api vertical): `{ network, baseUrl, deviceId?, ... }` —
- * `createWalletApiProviders` (impl/shared/wallet-api) builds it. Shared by all
- * four init-option shapes below.
+ * The wallet-api transport config every wallet that moves money needs:
+ * `{ network, baseUrl, deviceId?, ... }` — `createWalletApiProviders`
+ * (impl/shared/wallet-api) builds it. Shared by all four init-option shapes below.
  */
 interface SphereWalletApiOptions {
-  /** Wallet-api transport config — REQUIRED (init throws INVALID_CONFIG without it). */
-  walletApi?: WalletApiTransportConfig;
+  /**
+   * Wallet-api transport config — REQUIRED, with one explicit escape: `'none'`
+   * composes no money at all (#793). Omitting the field still throws INVALID_CONFIG:
+   * "I forgot it" must never read the same as "I meant it".
+   */
+  walletApi?: WalletApiOption;
   /** @deprecated REMOVED with the P11 flip — any truthy value throws INVALID_CONFIG (invoicing no longer exists in the SDK). */
   accounting?: unknown;
   /** @deprecated REMOVED with the P11 flip — any truthy value throws INVALID_CONFIG (swaps no longer exist in the SDK). */
@@ -557,8 +562,12 @@ export class Sphere {
   // The payments vertical (the ONLY money path since the P11 flip)
   /** The ACTIVE address's running vertical — §7: exactly one at a time, ever. */
   private _paymentsV2Active: { index: number; facade: PaymentsFacade } | null = null;
-  /** Resolved wallet-api transport composition (network + per-address factory); set at init, fail-closed. */
-  private _paymentsV2Composition: PaymentsV2Composition | null = null;
+  /**
+   * Money composition, set at init. `null` = never resolved (a construction bug),
+   * `NO_PAYMENTS` = the explicit #793 opt-out, an object = a real composition. One
+   * spelling for the last two would read a forgotten resolve as messaging-only.
+   */
+  private _paymentsV2Composition: PaymentsV2Composition | typeof NO_PAYMENTS | null = null;
   /**
    * §7 lifecycle mutex: every stop/start pair runs strictly serialized, so
    * overlapping switch/destroy calls can never observe a half-stopped vertical
@@ -1476,10 +1485,27 @@ export class Sphere {
   get payments(): PaymentsV2 {
     const facade = this._paymentsV2Active?.facade;
     if (!facade) {
+      // #793: a messaging-only wallet has no vertical and never will, so it must not
+      // report the transient NOT_INITIALIZED — a caller told "not yet" waits forever.
+      if (this._paymentsV2Composition === NO_PAYMENTS) {
+        throw new SphereError(
+          "payments is not composed: this Sphere was initialised with `walletApi: 'none'`, the explicit messaging-only composition. Money has no path here — re-init with a wallet-api transport config to move any.",
+          'PAYMENTS_NOT_COMPOSED'
+        );
+      }
       // Not started yet (init in flight), mid address-switch, or destroyed.
       throw new SphereError('Sphere not initialized', 'NOT_INITIALIZED');
     }
     return facade;
+  }
+
+  /**
+   * Whether this Sphere composes money at all (#793) — fixed for the instance's life,
+   * so a messaging-only wallet can branch without a try/catch. Not a liveness check:
+   * `true` still leaves `payments` throwing NOT_INITIALIZED mid-init or mid-switch.
+   */
+  get hasPayments(): boolean {
+    return this._paymentsV2Composition !== NO_PAYMENTS;
   }
 
   /** Communications module */
@@ -4157,6 +4183,10 @@ export class Sphere {
    * breaks initialization.
    */
   private async buildTokenEngine(identity?: FullIdentity): Promise<ITokenEngine | undefined> {
+    // #793: the facade is the engine's only consumer (everything else merely disposes
+    // it), so a messaging-only wallet builds none — and is spared the warning below,
+    // which would announce a money outage nobody asked to avoid.
+    if (this._paymentsV2Composition === NO_PAYMENTS) return undefined;
     const oracle = this._oracle as {
       getTrustBaseJson?: () => unknown;
       getAggregatorUrl?: () => string;
@@ -4292,6 +4322,9 @@ export class Sphere {
    * setOracleApiKey rebuild is what future operations snapshot.
    */
   private async startPaymentsV2Inner(index: number, identity: FullIdentity): Promise<void> {
+    // #793: the one gate for both entries — boot and address switch. Nothing composes,
+    // so no wallet-api session, no wake socket, no drain and no `pv2g2:` key is written.
+    if (this._paymentsV2Composition === NO_PAYMENTS) return;
     if (!this._paymentsV2Composition) {
       // Unreachable through init/create/load/import (all fail-closed on it).
       throw new SphereError('wallet-api composition required for money', 'INVALID_CONFIG');

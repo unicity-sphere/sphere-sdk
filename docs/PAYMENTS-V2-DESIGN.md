@@ -830,7 +830,9 @@ all; unsupported payloads refused; reservation gate + synchronous critical secti
 pay single-flight; settling journal durable-before-throw; post-commit mirror failure ≠ failure;
 pre-submit 422 intent rejection drops backstop (re-seed rejection keeps it), never aborts;
 suspectedSpent demotion durable + re-plan bounded; remainder-only re-plan under new transferId +
-durable shortfall record; provider pinning; fail-closed composition; recipient network pinned at
+durable shortfall record; provider pinning; fail-closed composition (with ONE explicit escape:
+`walletApi: 'none'` composes no money at all — #793 — while an OMITTED config still refuses);
+recipient network pinned at
 resolve (deposit 200 ≠ reachability); mint journaled pre-submit, replayed at start; no request
 deadline on any submitted transaction, so every rebuild is clock-independent (#760).
 E.4 checkpoint: no mint submit before the checkpoint is server-acked and read back

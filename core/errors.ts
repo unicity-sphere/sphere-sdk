@@ -68,6 +68,10 @@ export type SphereErrorCode =
   | 'TIMEOUT'
   | 'DECRYPTION_ERROR'
   | 'MODULE_NOT_AVAILABLE'
+  // #793: this Sphere was initialised with `walletApi: 'none'` — the explicit
+  // messaging-only composition. Distinct from NOT_INITIALIZED, which is transient
+  // (init in flight, mid address-switch, destroyed): this one never resolves.
+  | 'PAYMENTS_NOT_COMPOSED'
   | 'SIGNING_ERROR'
   // Token Spend Queue error codes
   | 'SEND_QUEUE_TIMEOUT'

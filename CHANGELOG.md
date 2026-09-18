@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — messaging-only composition: `walletApi: 'none'` (#793)
+
+A wallet that never touches money — a Nostr DM or group-chat bot — can now say so, instead of
+standing up a full payments vertical against a backend it never uses. `Sphere.init({ walletApi:
+'none' })` composes no money at all: no wallet-api session, no device registration, no wake
+socket, no mailbox drain, no token engine and no `pv2g2:` key, at boot or on an address switch.
+Identity, storage, `communications`, `groupChat` and `registerNametag` are unchanged — nametag
+registration is a Nostr identity binding and never needed the vertical.
+
+The opt-out shares the `walletApi` field with the transport config, so "configured" and
+"deliberately absent" cannot both be said. **Omitting `walletApi` still throws `INVALID_CONFIG`
+with the message it always had**: the #515 fail-closed invariant is intact, and a dropped env var
+must never read as a deliberate choice. A near-miss (`'None'`, `''`) is refused by name rather
+than as a missing config, which would send the reader hunting an env var instead of a typo.
+
+- `sphere.payments` throws the new `PAYMENTS_NOT_COMPOSED` — distinct from `NOT_INITIALIZED`,
+  which is transient (init in flight, mid address-switch, destroyed) and would have a caller
+  wait out a state that never resolves.
+- `sphere.hasPayments` (new) reports whether this Sphere composes money at all, so a
+  messaging-only wallet can branch without a try/catch. It is a composition-time property, fixed
+  for the instance's life, not a liveness check.
+- `NO_PAYMENTS` and the `WalletApiOption` type are exported for consumers who prefer the name to
+  the literal.
+
+The opt-out composes; it does not erase. A wallet that has moved money keeps its `pv2g2:` state,
+and opening it with `'none'` resumes nothing — open intents stay open, sources still reserved on
+the backend, until it is next opened with a config. Nothing is lost, but a wallet with transfers
+in flight should not be flipped.
+
+The three messaging e2e suites (`dm-nip17`, `messaging-e2e`, `dm-manual`) now compose this way
+instead of standing up a fake money world to satisfy the gate. That also repairs `dm-nip17` and
+`messaging-e2e`, which had been failing since #728: they pass `network: 'testnet'` while the fake
+world declares `'testnet2'`, and that check is a string comparison, alias or not.
+
 ### Fixed — the Connect ESM entry points share one `ConnectClient` and `ConnectError`
 
 `@unicitylabs/sphere-sdk/connect`, `/connect/browser` and `/connect/nodejs` were three separate
