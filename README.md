@@ -46,7 +46,7 @@ this repository. See [docs/QUICKSTART-CLI.md](docs/QUICKSTART-CLI.md).
 > vertical. Skipping it fails loudly: `Sphere.init` throws `INVALID_CONFIG`.
 
 ```typescript
-import { Sphere, TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
+import { Sphere, TokenRegistry, getCoinIdBySymbol, randomUUID } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser'; // untyped entry: add the declaration shim below
 import { createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/shared/wallet-api';
 
@@ -57,7 +57,8 @@ const NETWORK = 'testnet2';
 function deviceId(): string {
   let id = localStorage.getItem('sphere-device-id');
   if (!id) {
-    id = crypto.randomUUID();
+    // The SDK's randomUUID(): unlike crypto.randomUUID(), it also works outside a secure context.
+    id = randomUUID();
     localStorage.setItem('sphere-device-id', id);
   }
   return id;
@@ -167,7 +168,7 @@ delivered and is final; only `err.remainingAmount` is still owed. When `isPossib
 
 - `CERTIFICATION_UNCONFIRMED` is a **`ProofUnconfirmedError`** (`mayHaveCertified: true`): the spend may already be on-chain but the proof fetch was inconclusive. `SEND_SYNC_PENDING` can mean the spend committed on-chain and the wallet-api mirror is still catching up.
 - **Recovery is automatic.** The open intent is replayed under the same `transferId` (recovers the proof + delivery, or records the spend if a rival tx won; **never a second spend**): partially-committed outcomes converge in-process, and every remaining open intent is resumed when the vertical starts (`Sphere.init` / `Sphere.load` / an address switch). `sphere.payments.resumeNow()` runs that convergence now; it is the only retry verb.
-- Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (its message names funds pinned by transfers still converging), `INVALID_RECIPIENT`, `TRANSPORT_ERROR` (the recipient lookup could not reach the relay) and `VALIDATION_ERROR` (a bad amount). `INSUFFICIENT_BALANCE` is never thrown.
+- Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (when funds are pinned by transfers still converging, its message says how much and points to `pendingTransfers()`), `INVALID_RECIPIENT`, `TRANSPORT_ERROR` (the recipient lookup could not reach the relay) and `VALIDATION_ERROR` (a bad amount). `INSUFFICIENT_BALANCE` is never thrown.
 - Import the error helpers from the same entry point as `Sphere`, and read `code` structurally for the clean failures: errors thrown by provider code (the `./impl/*` bundles, for example the Nostr transport during the recipient lookup) are a different `SphereError` class copy, so `isSphereError()` is `false` for them.
 
 ```ts
@@ -301,7 +302,7 @@ const customGateway = createBrowserProviders({
 
 ### API Key
 
-The SDK bundles **no default API key**. Pass the gateway key via `oracle: { apiKey }` — without it, gateway requests are unauthenticated and money movement on testnet2 fails.
+The SDK bundles **no default API key**. Pass the gateway key via `oracle: { apiKey }`. Without one the token engine is still built, the SDK logs a `TokenEngine` warning, and gateway requests are unauthenticated; whether a gateway serves them is the gateway's policy.
 
 ```typescript
 const withApiKey = createBrowserProviders({
@@ -392,7 +393,10 @@ if (result.success) {
 }
 ```
 
-> **Note:** Minting requires a working oracle config (trust base + gateway URL + API key) — it fails with an error result otherwise. See [API Key](#api-key) above.
+> **Note:** Minting needs the token engine, which `Sphere.init` builds from the oracle's trust base and
+> gateway URL (without them `Sphere.init` rejects with `INVALID_CONFIG`); pass the gateway key via
+> `oracle: { apiKey }`. A mint that fails after it was journaled resolves `{ success: false, error }`
+> and is replayed by the SDK: do not call `mint()` again for it. See [API Key](#api-key) above.
 
 ## Multi-Address Support
 
@@ -1309,7 +1313,7 @@ function getRelayStatuses() {
 
 Nametags provide human-readable addresses (e.g., `@alice`) for receiving payments. Valid formats: lowercase alphanumeric with `_` or `-` (3–20 chars), or E.164 phone numbers (e.g., `+14155552671`). Input is normalized to lowercase automatically.
 
-**How registration works:** registering a nametag publishes a **Nostr identity binding** (name ↔ chain pubkey). Uniqueness is first-seen-wins — a name is available iff no binding already resolves for it (`sphere.isNametagAvailable(name)`). Runtime name resolution is binding-only; payments always go to the recipient's key-based `DIRECT://` address (there are no PROXY addresses).
+**How registration works:** registering a nametag publishes a **Nostr identity binding** (name ↔ chain pubkey). Uniqueness follows UNIP-01: every nametag binding the SDK publishes carries the `["L", "unicity:nametag"]` marker, a UNIP-01 relay keeps the first author it receives for a marked name, and resolution uses the marked binding (`null` when more than one author holds a marked binding for the name). `created_at` first-seen-wins applies only to legacy unmarked bindings and can be forged (see [docs/NAMETAG-BINDINGS.md](docs/NAMETAG-BINDINGS.md)). A name is available iff no binding resolves for it (`sphere.isNametagAvailable(name)`). Runtime name resolution is binding-only; payments always go to the recipient's key-based `DIRECT://` address (there are no PROXY addresses).
 
 Registration is **Nostr-binding-only**. The self-issued `UnicityIdToken` on-chain claim was removed with the 2.0.0 state-transition-sdk bump (upstream deleted the unicity-id primitive) — nothing is minted at registration, and nothing on chain is consulted to resolve a name.
 
@@ -1456,11 +1460,13 @@ CryptoJS's password-based AES-256-CBC, which derives the key with OpenSSL's `EVP
 That keeps the phrase out of casual view and out of copies of the storage that are read without the password, but
 it is a fast key derivation: anyone who obtains the stored value can try passwords offline at high speed, so a
 short or common password gives little protection. Without a password the mnemonic is stored as plaintext. The
-other stored data (derivation path, nametags, payment journals) is not encrypted either way. Always set a password
-for wallets that hold value, make it long and unique, and protect the storage itself at the operating-system level
-(file permissions and disk encryption on servers; the browser profile on clients). `exportToJSON({ password })`
-uses the same scheme. There is no call to add or change the password later, and `importFromJSON` /
-`importFromLegacyFile` store the imported seed without a password.
+other stored data (derivation path, nametags, payment journals) is not protected by the password either way.
+Always set a password for wallets that hold value, make it long and unique, and protect the storage itself at the
+operating-system level (file permissions and disk encryption on servers; the browser profile on clients).
+`exportToJSON({ password })` uses the same scheme. There is no call to add or change the password later, and
+`importFromJSON` / `importFromLegacyFile` store the imported mnemonic or master key without a password: load that
+wallet later without `password` (passing the backup password to `Sphere.init` / `Sphere.load` fails with
+`STORAGE_ERROR`).
 
 ```typescript
 // Create or load with a password: the stored mnemonic is encrypted with it.

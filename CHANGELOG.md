@@ -129,7 +129,8 @@ the `.d.ts` files as IDE hover text. No runtime code changes. What the documenta
 - **Seed storage.** With a `password`, the stored mnemonic is encrypted with CryptoJS AES-256-CBC
   keyed by OpenSSL `EVP_BytesToKey` (MD5, one iteration), not PBKDF2; without one it is stored as
   plaintext, not under a default key. There is no call to change the password, and `importFromJSON` /
-  `importFromLegacyFile` store the imported seed without one.
+  `importFromLegacyFile` store the imported mnemonic or master key without one, so that wallet loads
+  without `password`.
 - **Events.** `sphere.on()` handlers receive the payload itself (no `.data`); `transport:*` events
   are emitted on the Nostr transport's own `onEvent()`, not on `sphere.on()`; the `nametag:recovered`
   of the recovery done during `Sphere.init` has already fired when init resolves.
@@ -145,10 +146,16 @@ the `.d.ts` files as IDE hover text. No runtime code changes. What the documenta
   `TokenRegistry.destroy()` after `sphere.destroy()` to let the process exit; the mainnet wallet-api
   is live at `https://wallet-api.mainnet.unicity.network`; the `dmSince` init option does not take
   effect with the Nostr transport in this release; the CLI lives in `unicity-sphere/sphere-cli` and
-  is not published to npm.
+  is not published to npm, and `npm run cli` now says so instead of printing an install command
+  that fails.
+- **Nametags.** Ownership follows UNIP-01: the SDK's bindings carry the `["L", "unicity:nametag"]`
+  marker and resolution prefers the marked binding; `created_at` first-seen-wins is only the
+  forgeable fallback for legacy unmarked bindings.
 - **Connect.** A `sphere_subscribe` for one of the four auto-pushed wallet events is answered with
   success without attaching anything, not refused; `ConnectClientConfig.timeout` also bounds
-  `connect()`, including the time the user takes to approve.
+  `connect()`, including the time the user takes to approve. `onLockedRequest` is not called for a
+  refused handshake; `ConnectHostConfig.minSdkVersion` replaces the default floor rather than adding
+  to it; `resumeSessionId` cannot resume a session in popup mode.
 
 ## [0.17.3] - 2026-09-17
 

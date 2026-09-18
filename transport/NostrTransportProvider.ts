@@ -436,10 +436,8 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   /**
-   * Remove a relay dynamically
-   * Will disconnect from the relay if connected
-   * NOTE: NostrClient doesn't support removing individual relays at runtime.
-   * We remove from config so it won't be used on next connect().
+   * Remove a relay from the configuration. The live connection is not closed: NostrClient
+   * cannot drop one relay at runtime, so the relay stops being used only on the next connect().
    */
   async removeRelay(relayUrl: string): Promise<boolean> {
     const index = this.config.relays.indexOf(relayUrl);
