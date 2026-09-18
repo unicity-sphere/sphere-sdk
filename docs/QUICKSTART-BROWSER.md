@@ -159,7 +159,9 @@ import { initWallet } from './wallet';
 const { sphere, created, generatedMnemonic } = await initWallet();
 
 if (created && generatedMnemonic) {
-  // IMPORTANT: Show to user and ask them to save it!
+  // Returned only by the call that created the wallet. Do not rely on it alone for the backup
+  // prompt: keep your own "backup confirmed" flag and show sphere.getMnemonic() until it is set
+  // (see "Prompt User to Save Mnemonic" below).
   alert('Save your recovery phrase: ' + generatedMnemonic);
 }
 ```
@@ -203,6 +205,7 @@ function useWallet() {
     getWallet().then(
       ({ sphere, created, generatedMnemonic }) => {
         if (!active) return;
+        // Only the creating call returns it: see "Prompt User to Save Mnemonic" for the backup flag.
         if (created && generatedMnemonic) setMnemonic(generatedMnemonic);
         setSphere(sphere);
       },
@@ -265,6 +268,7 @@ onMounted(async () => {
       await result.sphere.destroy();
       return;
     }
+    // Only the creating call returns it: see "Prompt User to Save Mnemonic" for the backup flag.
     if (result.created && result.generatedMnemonic) {
       mnemonic.value = result.generatedMnemonic;
     }
@@ -593,7 +597,7 @@ console.log(`Received ${transfers.length} new transfers`);
 
 ### Register Nametag
 
-> **Note:** `registerNametag()` registers the name by publishing a Nostr identity binding (name ↔ chain pubkey, first-seen-wins). Runtime name resolution uses only the Nostr binding. No token is minted.
+> **Note:** `registerNametag()` registers the name by publishing a Nostr identity binding (name ↔ chain pubkey, one owner per name under UNIP-01; see [NAMETAG-BINDINGS.md](./NAMETAG-BINDINGS.md)). Runtime name resolution uses only the Nostr binding. No token is minted.
 
 ```typescript
 async function registerNametag(username: string) {
@@ -688,12 +692,16 @@ sphere.payments.requests.dismissProcessed();
 `payment_request:updated` and `requests.list()` cover requests you **received**. The SDK does not track the
 requests you create: detect that one was paid through `transfer:incoming` or `sphere.payments.history()`.
 
-`pay()` never leaves a request payable after a possibly-committed failure: before it rethrows such an error it
-durably links the request to the transfer and marks it `'settling'`, and a second `pay()` of the same id in the
-same process joins the first. That link is written after the send returns or throws, not before it starts. If the
-app or process stops while `pay()` is still waiting on the send, no link exists: on the next start the request is
-listed as `'pending'` again and `payment_request:incoming` fires again, even if the transfer went through (a transfer
-the SDK had already recorded is resumed when the wallet starts). Before paying a request again after a restart, check
+When the send inside `pay()` fails with a possibly-committed error, `pay()` links the request to that transfer (the
+error's `transferId`) in the payments journal and marks it `'settling'` before it rethrows, so the request is not
+payable, and the link survives a restart. One exception: if writing that link to storage fails, `pay()` rejects with
+the storage error instead of the send error, so `isPossiblyCommittedSendOutcome` is `false` for it although the
+payment may have gone out; the link is then held in memory and reaches storage only with a later successful journal
+write. A second `pay()` of the same id while the first is still running joins it. The link is written after the send
+returns or throws, not before it starts. If the app or process stops while `pay()` is still waiting on the send, or
+before a link that failed to write reaches storage, no link exists: on the next start the request is listed as
+`'pending'` again and `payment_request:incoming` fires again, even if the transfer went through (a transfer the SDK
+had already recorded is resumed when the wallet starts). Before paying a request again after a restart, check
 `sphere.payments.pendingTransfers()` and `sphere.payments.history()` for a transfer to that requester.
 
 ### Transaction History
@@ -822,7 +830,8 @@ function WalletApp() {
       .then(async ({ sphere, created, generatedMnemonic }) => {
         if (!active) return;
         if (created && generatedMnemonic) {
-          // In production, show a modal that asks the user to back up the phrase.
+          // In production, show a modal that asks the user to back up the phrase, gated on your
+          // own "backup confirmed" flag (see "Prompt User to Save Mnemonic"), not on `created`.
           console.log('NEW WALLET - Save mnemonic:', generatedMnemonic);
         }
         setSphere(sphere);
@@ -981,10 +990,21 @@ const mnemonic = (document.getElementById('mnemonicInput') as HTMLInputElement |
 
 ### Prompt User to Save Mnemonic
 
+`generatedMnemonic` is returned only by the `Sphere.init` call that created the wallet. The phrase is
+stored before the rest of the setup runs, so if that call then throws (for example, a requested
+`nametag` is already taken), the next `Sphere.init` loads the stored wallet with `created: false`.
+Gate your backup prompt on your own "backup confirmed" flag and read the phrase with
+`sphere.getMnemonic()` until the user confirms.
+
 ```typescript
-if (created && generatedMnemonic) {
-  // Show modal, not just console.log
-  showMnemonicModal(generatedMnemonic);
+// Your own flag, one per wallet: set it only when the user confirms the backup.
+const backupKey = `sphere-backup-confirmed:${sphere.identity?.chainPubkey}`;
+if (localStorage.getItem(backupKey) !== 'true') {
+  const phrase = sphere.getMnemonic(); // null for a wallet imported from a master key
+  if (phrase) {
+    // Show modal, not just console.log
+    showMnemonicModal(phrase, () => localStorage.setItem(backupKey, 'true'));
+  }
 }
 ```
 
@@ -996,11 +1016,13 @@ CryptoJS's password-based AES-256-CBC, which derives the key with OpenSSL's `EVP
 That keeps the phrase out of casual view and out of copies of the storage that are read without the password, but
 it is a fast key derivation: anyone who obtains the stored value can try passwords offline at high speed, so a
 short or common password gives little protection. Without a password the mnemonic is stored as plaintext. The
-other stored data (derivation path, nametags, payment journals) is not encrypted either way. Always set a password
-for wallets that hold value, make it long and unique, and protect the storage itself at the operating-system level
-(file permissions and disk encryption on servers; the browser profile on clients). `exportToJSON({ password })`
-uses the same scheme. There is no call to add or change the password later, and `importFromJSON` /
-`importFromLegacyFile` store the imported seed without a password.
+other stored data (derivation path, nametags, payment journals) is not protected by the password either way. Always
+set a password for wallets that hold value, make it long and unique, and protect the storage itself at the
+operating-system level (file permissions and disk encryption on servers; the browser profile on clients).
+`exportToJSON({ password })` uses the same scheme. There is no call to add or change the password later.
+`importFromJSON` / `importFromLegacyFile` use their `password` only to decrypt the backup and store the imported
+mnemonic (or master key) without a password, so load a wallet restored that way without `password`: with one,
+loading fails with `STORAGE_ERROR`.
 
 ```typescript
 import { Sphere } from '@unicitylabs/sphere-sdk';

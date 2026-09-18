@@ -88,6 +88,9 @@ async function main() {
 
   // 4. Save mnemonic on first run!
   if (created && generatedMnemonic) {
+    // Returned only by the call that created the wallet. Do not rely on it alone for the backup
+    // prompt: keep your own "backup confirmed" flag and show sphere.getMnemonic() until it is set
+    // (see below).
     console.log('SAVE THIS MNEMONIC:', generatedMnemonic);
   }
 
@@ -101,6 +104,12 @@ async function main() {
 
 main().catch(console.error);
 ```
+
+`generatedMnemonic` is returned only by the `Sphere.init` call that created the wallet. The phrase is
+stored before the rest of the setup runs, so if that call then throws (for example, a requested
+`nametag` is already taken), the next `Sphere.init` loads the stored wallet with `created: false`.
+Gate your backup prompt on your own "backup confirmed" flag and read the phrase with
+`sphere.getMnemonic()` until the user confirms.
 
 `sphere.destroy()` stops this Sphere's own registry, but `Sphere.init` also configures the process-wide
 `TokenRegistry`, whose hourly refresh timer keeps Node's event loop alive. Call `TokenRegistry.destroy()` after
@@ -401,7 +410,7 @@ for (const transfer of transfers) {
 
 ### Register Nametag
 
-> **Note:** `registerNametag()` registers the name by publishing a Nostr identity binding (name ↔ chain pubkey, first-seen-wins). Runtime name resolution uses only the Nostr binding. No token is minted.
+> **Note:** `registerNametag()` registers the name by publishing a Nostr identity binding (name ↔ chain pubkey, one owner per name under UNIP-01; see [NAMETAG-BINDINGS.md](./NAMETAG-BINDINGS.md)). Runtime name resolution uses only the Nostr binding. No token is minted.
 
 ```typescript
 // Publishes the Nostr binding; throws if the name is already taken
@@ -482,11 +491,13 @@ CryptoJS's password-based AES-256-CBC, which derives the key with OpenSSL's `EVP
 That keeps the phrase out of casual view and out of copies of the storage that are read without the password, but
 it is a fast key derivation: anyone who obtains the stored value can try passwords offline at high speed, so a
 short or common password gives little protection. Without a password the mnemonic is stored as plaintext. The
-other stored data (derivation path, nametags, payment journals) is not encrypted either way. Always set a password
-for wallets that hold value, make it long and unique, and protect the storage itself at the operating-system level
-(file permissions and disk encryption on servers; the browser profile on clients). `exportToJSON({ password })`
-uses the same scheme. There is no call to add or change the password later, and `importFromJSON` /
-`importFromLegacyFile` store the imported seed without a password.
+other stored data (derivation path, nametags, payment journals) is not protected by the password either way. Always
+set a password for wallets that hold value, make it long and unique, and protect the storage itself at the
+operating-system level (file permissions and disk encryption on servers; the browser profile on clients).
+`exportToJSON({ password })` uses the same scheme. There is no call to add or change the password later.
+`importFromJSON` / `importFromLegacyFile` use their `password` only to decrypt the backup and store the imported
+mnemonic (or master key) without a password, so load a wallet restored that way without `password`: with one,
+loading fails with `STORAGE_ERROR`.
 
 Create a wallet with password encryption:
 
@@ -662,12 +673,16 @@ sphere.payments.requests.dismissProcessed();
 `payment_request:updated` and `requests.list()` cover requests you **received**. The SDK does not track the
 requests you create: detect that one was paid through `transfer:incoming` or `sphere.payments.history()`.
 
-`pay()` never leaves a request payable after a possibly-committed failure: before it rethrows such an error it
-durably links the request to the transfer and marks it `'settling'`, and a second `pay()` of the same id in the
-same process joins the first. That link is written after the send returns or throws, not before it starts. If the
-app or process stops while `pay()` is still waiting on the send, no link exists: on the next start the request is
-listed as `'pending'` again and `payment_request:incoming` fires again, even if the transfer went through (a transfer
-the SDK had already recorded is resumed when the wallet starts). Before paying a request again after a restart, check
+When the send inside `pay()` fails with a possibly-committed error, `pay()` links the request to that transfer (the
+error's `transferId`) in the payments journal and marks it `'settling'` before it rethrows, so the request is not
+payable, and the link survives a restart. One exception: if writing that link to storage fails, `pay()` rejects with
+the storage error instead of the send error, so `isPossiblyCommittedSendOutcome` is `false` for it although the
+payment may have gone out; the link is then held in memory and reaches storage only with a later successful journal
+write. A second `pay()` of the same id while the first is still running joins it. The link is written after the send
+returns or throws, not before it starts. If the app or process stops while `pay()` is still waiting on the send, or
+before a link that failed to write reaches storage, no link exists: on the next start the request is listed as
+`'pending'` again and `payment_request:incoming` fires again, even if the transfer went through (a transfer the SDK
+had already recorded is resumed when the wallet starts). Before paying a request again after a restart, check
 `sphere.payments.pendingTransfers()` and `sphere.payments.history()` for a transfer to that requester.
 
 ## Transaction History
@@ -782,6 +797,9 @@ async function main() {
   });
 
   if (created) {
+    // Returned only by the call that created the wallet. Do not rely on it alone for the backup
+    // prompt: keep your own "backup confirmed" flag and show sphere.getMnemonic() until it is set
+    // (see "Minimal Example").
     console.log('\n=== NEW WALLET CREATED ===');
     console.log('Mnemonic (SAVE THIS!):', generatedMnemonic);
     console.log('==========================\n');
