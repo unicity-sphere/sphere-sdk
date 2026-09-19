@@ -111,18 +111,20 @@ export interface NodeProviders {
 // =============================================================================
 
 /**
- * Create all Node.js providers with default configuration
+ * Create all Node.js providers with default configuration.
+ * `network` is required (INVALID_CONFIG without it); `dataDir` defaults to './sphere-data'.
+ * The result carries no `network` field: pass it to `Sphere.init` as well.
  *
  * @example
  * ```ts
- * // Simple - testnet with defaults
- * const providers = createNodeProviders({
- *   network: 'testnet',
+ * // Simple - testnet2 with defaults
+ * const base = createNodeProviders({
+ *   network: 'testnet2',
  * });
  *
  * // Full configuration
- * const providers = createNodeProviders({
- *   network: 'testnet',
+ * const configured = createNodeProviders({
+ *   network: 'testnet2',
  *   dataDir: './wallet-data',
  *   transport: {
  *     additionalRelays: ['wss://my-relay.com'],
@@ -134,9 +136,10 @@ export interface NodeProviders {
  *   },
  * });
  *
- * // Use with Sphere.init
+ * // Use with Sphere.init: add the wallet-api transport config and the same network literal
  * const { sphere } = await Sphere.init({
- *   ...providers,
+ *   ...createWalletApiProviders(base, { baseUrl: 'https://wallet-api.unicity.network', network: 'testnet2' }),
+ *   network: 'testnet2',
  *   autoGenerate: true,
  * });
  * ```

@@ -109,7 +109,11 @@ export interface AutoConnectConfig {
    */
   network?: NetworkInfo;
 
-  /** Existing session ID to resume (for popup mode). */
+  /**
+   * Existing session ID to resume. The host keeps sessions in memory, so this works only while
+   * the ConnectHost that issued it is still alive (in practice iframe mode). A popup is a fresh
+   * wallet page with a new host, so there the handshake runs as a new connection.
+   */
   resumeSessionId?: string;
 
   /** Timeout for query requests in ms. Default: 30000. */

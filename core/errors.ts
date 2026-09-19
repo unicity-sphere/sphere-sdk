@@ -4,20 +4,25 @@
  * Structured error codes for programmatic error handling in UI.
  * UI can switch on error.code to show appropriate user-facing messages.
  *
+ * Errors thrown by provider code (the `./impl/*` bundles) are a different `SphereError` class
+ * copy, so `instanceof SphereError` / `isSphereError()` is false for them: read `code` structurally.
+ *
  * @example
  * ```ts
- * import { SphereError } from '@unicitylabs/sphere-sdk';
+ * import { isPossiblyCommittedSendOutcome } from '@unicitylabs/sphere-sdk';
  *
  * try {
- *   await sphere.payments.send({ ... });
+ *   await sphere.payments.send({ recipient: '@alice', amount: '1000000', coinId });
  * } catch (err) {
- *   if (err instanceof SphereError) {
- *     switch (err.code) {
- *       case 'INSUFFICIENT_BALANCE': showToast('Not enough funds'); break;
+ *   if (isPossiblyCommittedSendOutcome(err)) {
+ *     // The money may already have left the wallet: never call send() again for this payment.
+ *     showToast('Sent, waiting for confirmation');
+ *   } else {
+ *     switch ((err as { code?: unknown } | null)?.code) {
+ *       case 'SEND_INSUFFICIENT_BALANCE': showToast('Not enough funds'); break;
  *       case 'INVALID_RECIPIENT': showToast('Recipient not found'); break;
  *       case 'TRANSPORT_ERROR': showToast('Network connection issue'); break;
- *       case 'TIMEOUT': showToast('Request timed out, try again'); break;
- *       default: showToast(err.message);
+ *       default: showToast(err instanceof Error ? err.message : String(err));
  *     }
  *   }
  * }
@@ -29,6 +34,7 @@ export type SphereErrorCode =
   | 'ALREADY_INITIALIZED'
   | 'INVALID_CONFIG'
   | 'INVALID_IDENTITY'
+  // Not thrown by the SDK: a send short of funds throws SEND_INSUFFICIENT_BALANCE.
   | 'INSUFFICIENT_BALANCE'
   | 'INVALID_RECIPIENT'
   | 'TRANSFER_FAILED'

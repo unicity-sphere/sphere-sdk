@@ -128,8 +128,9 @@ export interface ConnectHostConfig {
   onConnectionRejected?: (dapp: DAppMetadata | undefined, error: SphereRpcError, silent?: boolean) => void;
 
   /**
-   * Notify-only: the host has just answered WALLET_LOCKED (4009) — or refused a handshake
-   * while locked. The host has ALREADY answered and never waits for this callback;
+   * Notify-only: the host has just answered WALLET_LOCKED (4009) to a query or intent, or
+   * accepted a session resume while locked. It is not called for a refused handshake.
+   * The host has ALREADY answered and never waits for this callback;
    * throwing from it must not break the host (the host wraps the call in try/catch).
    *
    * THIS MUST NOT RAISE A CREDENTIAL SURFACE. A dApp request may trigger a CONSENT
@@ -156,7 +157,8 @@ export interface ConnectHostConfig {
    */
   initialWalletState?: 'live' | 'locked';
 
-  /** Optional secondary npm-SDK floor (rarely needed — the Connect protocol version is the era gate). */
+  /** Optional npm-SDK floor for dApps. Replaces the default floor (DEFAULT_MIN_CLIENT_SDK_VERSION,
+   *  '0.14.1-0') rather than adding to it, so a lower value admits older dApps again; never set it lower. */
   minSdkVersion?: string;
   /** Optional MINOR floor within the current Connect MAJOR. */
   minMinorVersion?: number;
@@ -192,7 +194,9 @@ export interface ConnectClientConfig {
   /** Permissions to request. Defaults to all. */
   permissions?: PermissionScope[];
 
-  /** Timeout for query requests in ms. Default: 30000. */
+  /** Timeout in ms for query requests and for connect(). Default: 30000. The handshake answer waits
+   *  for the user's approval, so a non-silent connect() rejects with 'Connection timeout' when the
+   *  user takes longer than this. */
   timeout?: number;
 
   /** Timeout for intent requests in ms (user interaction). Default: 120000. */
