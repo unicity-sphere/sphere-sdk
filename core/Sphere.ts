@@ -328,6 +328,18 @@ export interface SphereImportOptions extends SphereWalletApiOptions {
    * {@link SphereInitOptions.verification}. Omit for the sequential verifier.
    */
   verification?: VerificationWorkerConfig;
+  /**
+   * Replace a wallet that already exists on `storage` (#801). Default `false`: when
+   * `storage` already holds a wallet, `import()` rejects with `ALREADY_INITIALIZED` and
+   * leaves it untouched. To keep several wallets side by side, import into a different
+   * storage instead — on Node another `walletFileName` or `dataDir` of
+   * `createNodeProviders()`, listed with `listWallets()` from
+   * `@unicitylabs/sphere-sdk/impl/nodejs`.
+   *
+   * With `true` the existing wallet is erased, but only after every input check has
+   * passed, so an import that is rejected never erases anything.
+   */
+  overwrite?: boolean;
 }
 
 /** Options for unified init (auto-create or load) */
@@ -848,6 +860,39 @@ export class Sphere {
   }
 
   /**
+   * #801: the checks `import()` used to reach only AFTER erasing the existing wallet.
+   * Each one mirrors a later step that would otherwise throw on an emptied storage:
+   * the network lookup in configureTokenRegistry (not guarded before for
+   * `walletApi: 'none'`), encrypt() with an empty password, mnemonic validation, and
+   * a master key or chain code the loader cannot read back (it accepts only 64 hex
+   * chars, see decrypt()).
+   */
+  private static assertImportInputs(options: SphereImportOptions): void {
+    if (!options.network || !Object.prototype.hasOwnProperty.call(NETWORKS, options.network)) {
+      throw new SphereError(
+        `network is required and must be one of: ${Object.keys(NETWORKS).join(', ')}`,
+        'INVALID_CONFIG',
+      );
+    }
+    if (options.password === '') {
+      throw new SphereError('password must be a non-empty string, or omitted', 'INVALID_CONFIG');
+    }
+    if (options.mnemonic) {
+      if (!Sphere.validateMnemonic(options.mnemonic)) {
+        throw new SphereError('Invalid mnemonic', 'INVALID_IDENTITY');
+      }
+      return;
+    }
+    if (!/^[0-9a-fA-F]{64}$/.test(options.masterKey ?? '')) {
+      throw new SphereError('Invalid master key: expected 64 hex chars', 'INVALID_IDENTITY');
+    }
+    // Truthiness, as storeMasterKey reads it: an empty chain code means "none" (wif_hmac).
+    if (options.chainCode && !/^[0-9a-fA-F]{64}$/.test(options.chainCode)) {
+      throw new SphereError('Invalid chain code: expected 64 hex chars', 'INVALID_IDENTITY');
+    }
+  }
+
+  /**
    * Configure TokenRegistry in the main bundle context.
    *
    * The provider factory functions (createBrowserProviders / createNodeProviders)
@@ -1141,6 +1186,10 @@ export class Sphere {
       throw new SphereError('Either mnemonic or masterKey is required', 'INVALID_CONFIG');
     }
 
+    // #801: every other input that can reject this call is checked here too, still before
+    // anything on storage is touched, so a rejected import never erases a wallet.
+    Sphere.assertImportInputs(options);
+
     const progress = options.onProgress;
 
     logger.debug('Sphere', 'Starting import...');
@@ -1152,6 +1201,14 @@ export class Sphere {
     const liveHere = Sphere.liveOn(options.storage).some((s) => s._storage === options.storage);
     const needsClear = liveHere || (await Sphere.exists(options.storage));
     if (needsClear) {
+      // #801: replacing a wallet is an explicit choice, never a side effect of importing.
+      if (options.overwrite !== true) {
+        throw new SphereError(
+          'A wallet already exists on this storage. Pass overwrite: true to replace it, ' +
+            'or import into a different storage (on Node: another walletFileName or dataDir).',
+          'ALREADY_INITIALIZED',
+        );
+      }
       progress?.({ step: 'clearing', message: 'Clearing previous wallet data...' });
       logger.debug('Sphere', 'Clearing existing wallet data...');
       await Sphere.clear({ storage: options.storage });
@@ -1198,10 +1255,7 @@ export class Sphere {
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
 
     if (options.mnemonic) {
-      // Validate and store mnemonic
-      if (!Sphere.validateMnemonic(options.mnemonic)) {
-        throw new SphereError('Invalid mnemonic', 'INVALID_IDENTITY');
-      }
+      // Already validated by assertImportInputs, before the clear.
       logger.debug('Sphere', 'Storing mnemonic...');
       await sphere.storeMnemonic(options.mnemonic, options.derivationPath, options.basePath);
       logger.debug('Sphere', 'Initializing identity from mnemonic...');
