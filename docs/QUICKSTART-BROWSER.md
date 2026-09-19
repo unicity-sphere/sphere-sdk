@@ -451,11 +451,10 @@ if (balanceEl) balanceEl.textContent = `$${totalUsd.toFixed(2)}`;
 
 ### Coin IDs
 
-`coinId` is the 64-character hex coin id. The SDK does not resolve symbols on the money path: `coinId: 'UCT'`
-matches no coin, so `send()` fails with `SEND_INSUFFICIENT_BALANCE`, and a payment request created with it can
-never be paid. Look the id up first: `getCoinIdBySymbol('UCT')` (after `await TokenRegistry.waitForReady()`,
-because `Sphere.init` starts the registry load without waiting for it; it returns `undefined` when the symbol is
-unknown), or take `coinId` from `sphere.payments.assets()` for a coin the wallet holds.
+`coinId` is the 64-character hex coin id. To get it from a symbol, call `getCoinIdBySymbol('UCT')` (after
+`await TokenRegistry.waitForReady()`, because `Sphere.init` starts the registry load without waiting for it; it
+returns `undefined` when the symbol is unknown), or take `coinId` from `sphere.payments.assets()` for a coin the
+wallet holds.
 
 ```typescript
 import { TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
@@ -478,7 +477,7 @@ There is no faucet — on testnet you top up by **self-minting** tokens via the 
 ```typescript
 import { TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
 
-// mint takes the hex coin id, not the symbol
+// mint takes the 64-hex coin id
 await TokenRegistry.waitForReady();
 const coinId = getCoinIdBySymbol('UCT');
 if (!coinId) throw new Error('UCT is not in this network\'s token registry');
@@ -537,7 +536,7 @@ delivery is still being retried. That is success, not an error. `send()` never r
 // Import the error helpers from the same entry point as Sphere (here: the package root).
 import { PartialSendConflictError, isPossiblyCommittedSendOutcome } from '@unicitylabs/sphere-sdk';
 
-// amount: base units; coinId: the 64-hex coin id (see "Coin IDs"), never a symbol.
+// amount: base units; coinId: the 64-hex coin id (see "Coin IDs").
 async function sendTokens(recipient: string, amount: string, coinId: string) {
   try {
     const result = await sphere.payments.send({ recipient, amount, coinId });
@@ -856,7 +855,7 @@ function WalletApp() {
     setSending(true);
     setStatus('Sending...');
     try {
-      // send() takes the 64-hex coin id, not the symbol.
+      // send() takes the 64-hex coin id.
       await TokenRegistry.waitForReady();
       const coinId = getCoinIdBySymbol('UCT');
       if (!coinId) {

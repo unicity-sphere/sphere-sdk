@@ -36,7 +36,7 @@
  *   const sphere = await Sphere.create({ mnemonic, storage, transport, oracle, walletApi, network: 'testnet2' });
  * }
  *
- * // Use the wallet. coinId is the 64-hex coin id: symbols are not resolved on the money path.
+ * // Use the wallet. coinId is the 64-hex coin id.
  * await TokenRegistry.waitForReady();
  * const coinId = getCoinIdBySymbol('UCT'); // string | undefined
  * if (coinId) await sphere.payments.send({ coinId, amount: '1000', recipient: '@alice' });

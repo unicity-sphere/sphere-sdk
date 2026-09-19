@@ -91,7 +91,7 @@ if (created && generatedMnemonic) {
 
 // 4. Send: engine-driven, certified on-chain. The recipient needs a published identity
 //    (chain pubkey), e.g. a registered Unicity ID; otherwise send fails with INVALID_RECIPIENT.
-//    coinId is the 64-hex coin id; symbols are not resolved on the money path.
+//    coinId is the 64-hex coin id; getCoinIdBySymbol() returns it for a symbol.
 await TokenRegistry.waitForReady(); // Sphere.init starts the registry load but does not await it
 const coinId = getCoinIdBySymbol('UCT'); // string | undefined
 if (!coinId) throw new Error('UCT is not in this network\'s token registry');
@@ -483,7 +483,7 @@ useful for later recoveries, such as after `switchToAddress()`.
 
 Request payments from others over the wallet-api rail (`sphere.payments.requests`). Request memos ride an encrypted recipient-ECDH envelope.
 
-- `requests.create(to, { coinId, amount, memo? })` never throws; it resolves `{ success, requestId?, error? }`. Check `success`. `coinId` is the 64-hex coin id: a request created with a symbol such as `'UCT'` can never be paid.
+- `requests.create(to, { coinId, amount, memo? })` never throws; it resolves `{ success, requestId?, error? }`. Check `success`. `coinId` is the 64-hex coin id (look it up with `getCoinIdBySymbol()`).
 - Never pay from inside the `payment_request:incoming` handler without the user's decision; `pay()` and `decline()` are alternatives. `pay()` rethrows `send()`'s errors: handle them as in [Handling `send()` rejections](#handling-send-rejections-never-re-send-a-possibly-committed-payment-money-safety).
 - `payment_request:updated` reports requests you **received**. The SDK does not track requests you created: detect payment through `transfer:incoming` or `sphere.payments.history()`.
 - `request.amount` is a base-unit string and `request.coinId` the hex id; `request.symbol` is not set by the SDK event.
