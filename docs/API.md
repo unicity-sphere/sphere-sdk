@@ -490,7 +490,7 @@ for `null`.
 interface SendRequest {
   recipient: string;    // @nametag, hex chain pubkey, or DIRECT:// address
   amount: string;       // Amount in smallest units (decimal string)
-  coinId: string;       // The 64-hex coin id. Symbols such as 'UCT' are NOT resolved
+  coinId: string;       // The 64-hex coin id
   memo?: string;        // Optional message (recipient-encrypted envelope)
 }
 
@@ -506,9 +506,7 @@ interface TransferResult {
 }
 ```
 
-`coinId` is the 64-character hex coin id. The SDK does not resolve symbols on the money path:
-`coinId: 'UCT'` matches no coin, so `send()` fails with `SEND_INSUFFICIENT_BALANCE`, and a payment
-request created with it can never be paid. Look the id up first: `getCoinIdBySymbol('UCT')` (after
+`coinId` is the 64-character hex coin id. To get it from a symbol, call `getCoinIdBySymbol('UCT')` (after
 `await TokenRegistry.waitForReady()`, because `Sphere.init` starts the registry load without
 waiting for it; it returns `undefined` when the symbol is unknown), or take `coinId` from
 `sphere.payments.assets()` for a coin the wallet holds. On mainnet the token registry lists no
@@ -858,7 +856,7 @@ const result = await sphere.payments.mint(coinIdHex, 1_000_000n);
 // { success: true, tokenId } | { success: false, tokenId?, error }
 ```
 
-- `coinId` must be even-length lowercase hex (a symbol is refused); `amount` must be `> 0n`.
+- `coinId` must be even-length lowercase hex; `amount` must be `> 0n`.
   Otherwise it resolves `{ success: false, error }` with nothing journaled.
 - **A failure after journaling keeps the entry.** A failed chain op resolves
   `{ success: false, error }`, and a failure after the mint certified resolves
@@ -1021,8 +1019,7 @@ interface PaymentRequestView {
 ```
 
 - `create()` never throws: it resolves `{ success, requestId?, error? }`, so check `success`. Its
-  `coinId` is the hex id (see [`send()`](#sendreq-sendrequest-promisetransferresult)); a request
-  created with a symbol can never be paid.
+  `coinId` is the hex id (see [`send()`](#sendreq-sendrequest-promisetransferresult)).
 - `list()`, `payment_request:incoming` and `payment_request:updated` cover requests you
   **received**. The SDK does not track requests you created: detect that one was paid through
   `transfer:incoming` or `payments.history()`.
@@ -1738,7 +1735,7 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
   password: 'my-password', // Optional: encrypt mnemonic
 });
 
-// 4. Send a token (coinId is the 64-hex coin id, never a symbol)
+// 4. Send a token (coinId is the 64-hex coin id)
 await TokenRegistry.waitForReady();
 const coinId = getCoinIdBySymbol('UCT');
 if (!coinId) throw new Error('UCT is not in this network\'s token registry');
