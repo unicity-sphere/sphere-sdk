@@ -394,7 +394,7 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
 });
 
 // Step 4: Use payments (sender-driven, certified on-chain, delivered via mailbox).
-// coinId is the 64-hex coin id; look it up, symbols are not resolved on the money path.
+// coinId is the 64-hex coin id; getCoinIdBySymbol() returns it for a symbol.
 await TokenRegistry.waitForReady(); // Sphere.init starts the registry load but does not await it
 const coinId = getCoinIdBySymbol('UCT'); // string | undefined
 if (!coinId) throw new Error('UCT is not in this network\'s token registry');
@@ -743,7 +743,7 @@ when the token is selected for a spend.
 ```typescript
 import { TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
 
-// coinId is the 64-hex coin id. send() does not resolve symbols.
+// coinId is the 64-hex coin id.
 await TokenRegistry.waitForReady(); // Sphere.init starts the registry load but does not await it
 const coinId = getCoinIdBySymbol('UCT'); // string | undefined
 if (!coinId) throw new Error('UCT is not in this network\'s token registry');
@@ -790,7 +790,7 @@ never produced.
 |-------|----------|-------------|
 | `recipient` | Yes | `@nametag`, `DIRECT://...`, or chain pubkey |
 | `amount` | Yes | Amount in smallest unit (string) |
-| `coinId` | Yes | The 64-character hex coin id. Symbols are **not** resolved on the money path: `coinId: 'UCT'` matches no coin, so `send()` fails with `SEND_INSUFFICIENT_BALANCE`. Look it up with `getCoinIdBySymbol()` (after `await TokenRegistry.waitForReady()`; it returns `undefined` for an unknown symbol), or take `coinId` from `sphere.payments.assets()` for a coin the wallet holds. |
+| `coinId` | Yes | The 64-character hex coin id. Look it up with `getCoinIdBySymbol()` (after `await TokenRegistry.waitForReady()`; it returns `undefined` for an unknown symbol), or take `coinId` from `sphere.payments.assets()` for a coin the wallet holds. |
 | `memo` | No | Optional message (recipient-encrypted envelope) |
 
 The recipient must have a **published chain pubkey** (Nostr identity binding) — otherwise
@@ -944,8 +944,7 @@ recipient-ECDH encrypted envelope.
 ### Send Payment Request
 
 `create()` never throws: it resolves `{ success, requestId?, error? }`, so check `success`.
-`coinId` is the 64-hex coin id: a request created with `coinId: 'UCT'` is accepted and stored
-verbatim, but it can never be paid (the payer's `send()` matches no coin).
+`coinId` is the 64-hex coin id; `getCoinIdBySymbol()` returns it for a symbol.
 
 ```typescript
 import { TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
