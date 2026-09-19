@@ -196,10 +196,7 @@ const result = await sphere.payments.send({
 // SPLIT_CHECKPOINT_LOST, CHECKPOINT_TRUSTBASE_MISMATCH and SEND_PARTIALLY_COMPLETED. Never
 // send() again for those: a retry button calls payments.resumeNow(), and
 // payments.pendingTransfers() lists what is still converging.
-// NOTE: coinId is NOT symbol-resolved on the money path. `getCoinIdBySymbol` /
-// `normalizeCoinId` have zero call sites in modules/payments-v2/ or core/: mint() rejects
-// non-hex outright, and send() matches coinId exactly, so passing 'UCT' makes send() throw
-// SEND_INSUFFICIENT_BALANCE. Resolve the symbol yourself via the registry first (step 5).
+// NOTE: coinId is the 64-hex coin id; get it from a symbol with getCoinIdBySymbol() (step 5).
 // The registry is presentation only.
 
 // 7. Receive: the facade drains the wallet-api mailbox continuously while
@@ -242,7 +239,7 @@ const addresses = sphere.getActiveAddresses(); // TrackedAddress[]
 // 12. Payment requests (wallet-api rail; encrypted memo envelope)
 // create() never throws: it resolves { success, requestId?, error? } — check success.
 const req = await sphere.payments.requests.create('@bob', {
-  coinId: coinIdHex, amount: '1000000', memo: 'Pay for order #1234',  // 64-hex, not a symbol
+  coinId: coinIdHex, amount: '1000000', memo: 'Pay for order #1234',  // 64-hex coin id
 });
 if (!req.success) console.error(req.error);
 sphere.on('payment_request:incoming', (view) => {
@@ -641,7 +638,7 @@ interface FullIdentity extends Identity {
 interface SendRequest {     // sphere.payments.send()
   recipient: string;        // @nametag, DIRECT://..., chain pubkey
   amount: string;           // Amount in smallest unit
-  coinId: string;           // Coin ID — even-length lowercase hex; NOT symbol-resolved
+  coinId: string;           // Coin ID — even-length lowercase hex
   memo?: string;            // Optional message (recipient-encrypted envelope)
 }
 
@@ -953,9 +950,7 @@ authoritative for build success.
   icons) by coin ID. No bundled data — remote URL per network
   (`NETWORKS[network].tokenRegistryUrl`; testnet/testnet2 use
   `unicity-ids.testnet2.json`) + persistent cache.
-- The facade consumes it for Asset presentation ONLY. It resolves no symbols on the money
-  path — `getCoinIdBySymbol`/`normalizeCoinId` have zero call sites in `modules/payments-v2/`
-  or `core/Sphere.ts`.
+- The facade consumes it for Asset presentation only; the money path works with coin ids.
 - A `Sphere` builds and OWNS its registry (#767), disposed by `sphere.destroy()`. The provider
   factories no longer call `TokenRegistry.configure()` — in the published package they are
   separate tsup bundles with separate singleton copies, so that call wrote to an object no

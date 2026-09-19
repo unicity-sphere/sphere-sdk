@@ -76,7 +76,7 @@ const { sphere } = await Sphere.init({
   autoGenerate: true,
 });
 
-// coinId is the 64-hex coin id: v2 send() does not resolve symbols (v1 did, see §2).
+// coinId is the 64-hex coin id (v1 also accepted a symbol, see §2).
 await TokenRegistry.waitForReady(); // Sphere.init starts the registry load but does not await it
 const coinId = getCoinIdBySymbol('UCT'); // string | undefined
 if (!coinId) throw new Error("UCT is not in this network's token registry");
@@ -92,7 +92,7 @@ await sphere.payments.send({ recipient: '@bob', amount: '1000', coinId });
 | `getFiatBalance()` | sum `assets()[].fiatValueUsd` |
 | `getTokens(filter?)` | `tokens(filter?)` |
 | `getHistory()` | `history({ before?, limit? })` — **paged**; entries keep `timestamp` |
-| `send(request)` | `send(request)` — same shape; `addressMode`/`transferMode` gone. **`coinId` must now be the 64-hex coin id**: v1 fell back to a registry symbol lookup when no held token matched (`'UCT'` worked), v2 matches `coinId` exactly, so a symbol throws `SEND_INSUFFICIENT_BALANCE`. Resolve it first: `getCoinIdBySymbol('UCT')` after `await TokenRegistry.waitForReady()`, or `coinId` from `assets()` |
+| `send(request)` | `send(request)` — same shape; `addressMode`/`transferMode` gone. **`coinId` must be the 64-hex coin id** (v1 also accepted a registry symbol such as `'UCT'`). Get it with `getCoinIdBySymbol('UCT')` after `await TokenRegistry.waitForReady()`, or `coinId` from `assets()` |
 | `mintFungibleToken(hex, amt)` | `mint(hex, amt)` |
 | `receive(options?)` | `receive()` — options were already no-ops |
 | `sendPaymentRequest(to, {message})` | `requests.create(to, { memo })` |
