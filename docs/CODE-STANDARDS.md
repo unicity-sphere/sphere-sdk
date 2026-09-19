@@ -20,7 +20,7 @@ Size and complexity are ESLint core rules. Only the two comment rules are local
 ## The ratchet
 
 Existing violations are held by **ESLint's native suppressions** in `eslint-suppressions.json`
-(879 across 150 files at the time of writing; 17 files still exceed `max-lines`). Suppressions store a *count per rule per file*, so:
+(the file itself is the current count; it shrinks as `lint:prune` runs). Suppressions store a *count per rule per file*, so:
 
 - a **new** violation anywhere fails
 - a **new** oversized function inside an already-suppressed file fails — the count is exceeded
@@ -102,5 +102,7 @@ another.
 
 ## Related
 
-- [`PAYMENTS-REFACTOR.md`](./PAYMENTS-REFACTOR.md) — the staged plan
-- [`PAYMENTS-ANALYSIS.md`](./PAYMENTS-ANALYSIS.md) — evidence, including how the growth happened
+- [`PAYMENTS-REFACTOR.md`](./PAYMENTS-REFACTOR.md) — historical: the staged refactor plan for the
+  v1 `PaymentsModule`, which the P11 flip later deleted
+- [`PAYMENTS-ANALYSIS.md`](./PAYMENTS-ANALYSIS.md) — historical evidence, including how the growth
+  happened
