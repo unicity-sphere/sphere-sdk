@@ -853,8 +853,7 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 > example viem's or ethers' `parseUnits('1.5', decimals)`, and display with `formatUnits`. The
 > SDK's `parseTokenAmount` / `formatAmount` are exported only from the package root and `./core`,
 > which a dApp should not import (see [Install & entry points](#install--entry-points)); no Connect
-> entry exports them. `coinId` is always the canonical lowercase 64-hex id (a symbol like `UCT` is
-> rejected).
+> entry exports them. `coinId` is always the canonical lowercase 64-hex id.
 
 ### send Intent Result — delivery semantics
 

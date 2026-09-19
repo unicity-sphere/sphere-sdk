@@ -20,7 +20,7 @@
  * });
  * const { sphere } = await Sphere.init({ ...providers, network: 'testnet2', autoGenerate: true });
  *
- * // Payments: coinId is the 64-hex coin id, not a symbol
+ * // Payments: coinId is the 64-hex coin id
  * await TokenRegistry.waitForReady();
  * const coinId = getCoinIdBySymbol('UCT');
  * if (coinId) await sphere.payments.send({ coinId, amount: '1000000', recipient: '@alice' });

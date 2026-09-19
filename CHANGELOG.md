@@ -111,9 +111,8 @@ the `.d.ts` files as IDE hover text. No runtime code changes. What the documenta
   relays and token registry but is a different string, and the testnet2 wallet-api signs in only as
   `'testnet2'`. `walletApi: 'none'` still needs `network`. The shipped JSDoc no longer calls
   `network` "informational only" or lists the removed `dev` network.
-- **`coinId` is the 64-hex coin id.** Nothing on the money path resolves symbols: `coinId: 'UCT'`
-  fails with `SEND_INSUFFICIENT_BALANCE`, and a payment request created with it can never be paid.
-  The samples look the id up with `getCoinIdBySymbol()` after `TokenRegistry.waitForReady()`.
+- **`coinId` is the 64-hex coin id.** The samples passed the symbol `'UCT'`, which is not a coin
+  id; they now look the id up with `getCoinIdBySymbol()` after `TokenRegistry.waitForReady()`.
 - **What `send()` resolves and throws.** A resolved `send()` is sent: `status` is `'delivered'`, or
   `'confirmed'` with `deliveryPending: true`; it never resolves `'completed'` or `'failed'`.
   `isPossiblyCommittedSendOutcome(err)` is `true` for the six codes that must never be re-sent
