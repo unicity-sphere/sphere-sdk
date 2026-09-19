@@ -11,9 +11,9 @@
 export const STORAGE_PREFIX = 'sphere_' as const;
 
 /**
- * Default encryption key for wallet data
- * WARNING: This is a placeholder. In production, use user-provided password.
- * This key is used when no password is provided to encrypt/decrypt mnemonic.
+ * Legacy key: Sphere's private decrypt() tries it only as a fallback for wallets written by old
+ * SDK versions when no password is given. Nothing is encrypted with it; without a password the
+ * mnemonic or master key is stored as plaintext.
  */
 export const DEFAULT_ENCRYPTION_KEY = 'sphere-default-key' as const;
 

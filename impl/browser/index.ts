@@ -125,7 +125,9 @@ export interface BrowserProviders {
 // =============================================================================
 
 /**
- * Create all browser providers with default configuration
+ * Create all browser providers with default configuration.
+ * `network` is required (INVALID_CONFIG without it). The result carries no `network` field:
+ * pass it to `Sphere.init` as well.
  *
  * Supports extend/override pattern for flexible configuration:
  * - Use `network` preset for quick setup (mainnet/testnet/testnet2)
@@ -134,31 +136,29 @@ export interface BrowserProviders {
  *
  * @example
  * ```ts
- * // Simple - uses mainnet defaults
- * const providers = createBrowserProviders();
+ * // Simple - testnet2 with defaults
+ * const base = createBrowserProviders({ network: 'testnet2' });
  *
- * // Testnet - all services use testnet URLs
- * const providers = createBrowserProviders({ network: 'testnet' });
- *
- * // Add extra relays to testnet defaults
- * const providers = createBrowserProviders({
- *   network: 'testnet',
+ * // Add extra relays to the testnet2 defaults
+ * const withExtraRelays = createBrowserProviders({
+ *   network: 'testnet2',
  *   transport: {
  *     additionalRelays: ['wss://my-relay.com', 'wss://backup-relay.com'],
  *   },
  * });
  *
  * // Replace relays entirely (ignores network defaults)
- * const providers = createBrowserProviders({
- *   network: 'testnet',
+ * const ownRelaysOnly = createBrowserProviders({
+ *   network: 'testnet2',
  *   transport: {
  *     relays: ['wss://only-this-relay.com'],
  *   },
  * });
  *
- * // Use with Sphere.init (add the wallet-api transport config)
+ * // Use with Sphere.init: add the wallet-api transport config and the same network literal
  * const { sphere } = await Sphere.init({
- *   ...createWalletApiProviders(providers, { baseUrl, network: 'testnet' }),
+ *   ...createWalletApiProviders(base, { baseUrl: 'https://wallet-api.unicity.network', network: 'testnet2' }),
+ *   network: 'testnet2',
  *   autoGenerate: true,
  * });
  * ```

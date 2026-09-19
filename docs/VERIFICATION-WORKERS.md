@@ -92,13 +92,18 @@ new Worker().bootstrap();
 
 ```ts
 import { Worker } from 'node:worker_threads';
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import type { VerificationWorker } from '@unicitylabs/sphere-sdk/token-engine';
 import { NodeWorker } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/worker/NodeWorker.js';
 
+// providers = createWalletApiProviders(createNodeProviders({ network: 'testnet2' }), { baseUrl, network: 'testnet2', deviceId })
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet2', // required: the same string as walletApi.network
   verification: {
+    // The cast is needed under strict TypeScript: see "Typing the worker" below.
     createWorker: () =>
-      new NodeWorker(new Worker(new URL('./verification-worker.mjs', import.meta.url))),
+      new NodeWorker(new Worker(new URL('./verification-worker.mjs', import.meta.url))) as VerificationWorker,
     poolSize: 4, // optional, default 4
   },
 });
@@ -138,25 +143,53 @@ new Worker().bootstrap();
 ```
 
 ```ts
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import type { VerificationWorker } from '@unicitylabs/sphere-sdk/token-engine';
+
+// providers = createWalletApiProviders(createBrowserProviders({ network: 'testnet2' }), { baseUrl, network: 'testnet2', deviceId })
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet2', // required: the same string as walletApi.network
   verification: {
-    // Vite/webpack emit the worker from this URL form; a browser Worker already
-    // matches the shape Sphere expects.
-    createWorker: () => new Worker(new URL('./verification-worker.ts', import.meta.url), { type: 'module' }),
+    // Vite/webpack emit the worker from this URL form. The cast is needed under
+    // strict TypeScript: see "Typing the worker" below.
+    createWorker: () =>
+      new Worker(new URL('./verification-worker.ts', import.meta.url), { type: 'module' }) as VerificationWorker,
   },
 });
 ```
 
+### Typing the worker
+
+`verification.createWorker` returns Sphere's `VerificationWorker` port (exported from
+`@unicitylabs/sphere-sdk/token-engine`): `onerror`, `onmessage`, `postMessage` and `terminate`, with
+payloads typed `unknown`. Both a browser `Worker` and the base SDK's `NodeWorker` have that shape at
+runtime, but neither is assignable to it under strict TypeScript, because their handler properties
+take narrower event types (`ErrorEvent` for the DOM `onerror`; a typed `data` for `NodeWorker`'s
+`onmessage`), and function-typed properties are checked contravariantly. Without the cast the
+`createWorker` line fails with `TS2322`. The cast changes nothing at runtime: the pool drives the
+object only through those four members.
+
+Separately, `@unicitylabs/sphere-sdk/impl/browser` (where `createBrowserProviders` lives) ships no
+type declarations in this release; under `strict` TypeScript add a declaration shim for it, such as
+the one-line `declare module '@unicitylabs/sphere-sdk/impl/browser';`, which types everything from
+that entry as `any`.
+
 ## Lifecycle
 
 Workers spawn **lazily** — the first verification creates one, up to `poolSize`, and they
-are reused after that. Building an engine costs nothing, which matters because Sphere
-rebuilds it on every address switch and API-key change.
+are reused after that. Building an engine costs nothing, which matters because Sphere builds
+one engine per address, the first time that address is used, and rebuilds the active address's
+engine on `setOracleApiKey()`. Each engine owns its own pool.
 
-`sphere.destroy()` terminates the pool. So does an address switch or `setOracleApiKey()`,
-for the engine being replaced. If you drive `createSphereTokenEngine` yourself, call
-`engine.dispose()` when you are done with it — otherwise the threads outlive the wallet.
+`sphere.destroy()` terminates every address's pool. `setOracleApiKey()` terminates the pool of
+the engine it replaces. **An address switch terminates nothing**: the previous address keeps its
+engine and pool, and switching back reuses them, until `sphere.destroy()`. A wallet that visits
+N addresses can therefore hold up to `poolSize × N` worker threads; size `poolSize` with that in
+mind. If you drive `createSphereTokenEngine` yourself, call `engine.dispose?.()` when you are done
+with it — otherwise the threads outlive the wallet. (`dispose` is an optional member of
+`ITokenEngine`, so strict TypeScript needs the `?.`; the engine `createSphereTokenEngine` builds
+implements it.)
 
 ## What is guaranteed
 
@@ -166,5 +199,7 @@ for the engine being replaced. If you drive `createSphereTokenEngine` yourself, 
   on both sides resolving the same base-SDK major — see [Same major on both
   sides](#same-major-on-both-sides).
 - **No effect when unset.** Omit `verification` and the engine runs the sequential verifier
-  it always did. No worker module enters your bundle — Sphere imports only the base SDK
-  paths it already used.
+  it always did, and no worker is ever spawned. No worker entry script and no thread code
+  (`node:worker_threads`) enter your bundle. The base SDK's pool class
+  (`WorkerTokenVerifier`) is imported by sphere-sdk either way, but it only spawns workers
+  through the `createWorker` you pass.

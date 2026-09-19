@@ -10,35 +10,30 @@
  *
  * @example
  * ```ts
- * import { Sphere } from '@unicitylabs/sphere-sdk';
- * import {
- *   createLocalStorageProvider,
- *   createNostrTransportProvider,
- *   createUnicityAggregatorProvider,
- * } from '@unicitylabs/sphere-sdk/impl/browser';
+ * import { Sphere, TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
+ * import { createNodeProviders, createWalletApiProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
  *
- * const sphere = await Sphere.create({
- *   identity: { mnemonic: 'your twelve words...' },
- *   storage: createLocalStorageProvider(),
- *   transport: createNostrTransportProvider(),
- *   oracle: createUnicityAggregatorProvider({ url: '/rpc' }),
+ * // One network literal in all three places: base providers, walletApi and Sphere.init.
+ * const providers = createWalletApiProviders(createNodeProviders({ network: 'testnet2' }), {
+ *   baseUrl: 'https://wallet-api.unicity.network',
+ *   network: 'testnet2',
  * });
+ * const { sphere } = await Sphere.init({ ...providers, network: 'testnet2', autoGenerate: true });
  *
- * // Payments
- * await sphere.payments.send({
- *   coinId: 'UCT',
- *   amount: '1000000',
- *   recipient: '@alice',
- * });
+ * // Payments: coinId is the 64-hex coin id
+ * await TokenRegistry.waitForReady();
+ * const coinId = getCoinIdBySymbol('UCT');
+ * if (coinId) await sphere.payments.send({ coinId, amount: '1000000', recipient: '@alice' });
  *
  * // Communications
  * await sphere.communications.sendDM('@bob', 'Hello!');
  *
- * // Events
- * sphere.on('transfer:incoming', (data) => console.log(data));
+ * // Events: handlers receive the payload itself
+ * sphere.on('transfer:incoming', (transfer) => console.log(transfer.senderPubkey));
  *
- * // Cleanup
+ * // Cleanup (TokenRegistry.destroy() stops the process-wide registry timer so Node can exit)
  * await sphere.destroy();
+ * TokenRegistry.destroy();
  * ```
  *
  * @packageDocumentation
@@ -409,7 +404,9 @@ export type { AddressType, ParsedAddress } from './core/address';
 // on internal layout. Safe to export — they are all existing stable utilities.
 // =============================================================================
 
-// Encryption (strong Argon2 + ChaCha20 flow)
+// Encryption: CryptoJS AES-256-CBC. encrypt()/decrypt() derive the key with PBKDF2-SHA256
+// (100,000 iterations); encryptSimple()/encryptMnemonic() use CryptoJS passphrase mode
+// (OpenSSL EVP_BytesToKey: MD5, one iteration), which is what the stored seed uses.
 export {
   encrypt,
   decrypt,

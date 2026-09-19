@@ -27,7 +27,8 @@
 > `ConflictPolicy` seam, not create a parallel one. Re-run the line-number survey before executing
 > any stage past the mechanical ones.
 **Design:** Architecture A (collaborator extraction, risk-first) with Design B's send-pipeline seam, conflict-policy parameter, and verification apparatus grafted in.
-**Status:** ready to execute. Stage 1 is runnable today.
+**Status:** historical, not executable: the target file no longer exists (see the banner above).
+The plan's original status line read "ready to execute".
 
 ---
 
