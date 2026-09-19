@@ -35,17 +35,29 @@ SDK and pulls in the whole token engine.
 
 Resolve these subpaths through the package's `exports` map — set
 `"moduleResolution": "bundler"` (Vite, webpack, Rollup, esbuild) or `"node16"`/`"nodenext"` with a
-matching `"module"`. Nothing else is needed:
+matching `"module"`, and set a `"target"` of ES2017 or later. The samples in this guide use
+top-level `await`, and without a `target` TypeScript falls back to ES5 and rejects it (TS1378):
 
 ```jsonc
 {
   "compilerOptions": {
+    "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
     "strict": true
   }
 }
 ```
+
+**CommonJS projects.** Under `"node16"`/`"nodenext"` in a package without `"type": "module"`,
+TypeScript reads the `require` declarations (`.d.cts`), and there `./connect/browser` declares its
+own `ConnectClient` class, separate from the one in `./connect`. The client that `autoConnect()`
+returns is then not assignable to the `ConnectClient` type imported from
+`@unicitylabs/sphere-sdk/connect` (TS2322, "Types have separate declarations of a private
+property"). Build the dApp as ESM (`"type": "module"`) or use `"moduleResolution": "bundler"`; there
+both entries share one declaration from the first release after 0.17.3. In 0.17.3 and earlier the
+ESM declarations of `./connect/browser` carry their own `ConnectClient` too, so the TS2322 appears
+in every mode.
 
 Do **not** hand-write tsconfig `paths` entries pointing at files inside the package's `dist/`
 folder. Those paths bypass `exports`, they are not part of the published contract, and a
@@ -84,7 +96,8 @@ refused scope.
 > `sdkVersion` is missing or below `0.14.1-0` (every 0.14.1 prerelease passes) with
 > `UNSUPPORTED_PROTOCOL_VERSION` (4007) and a message naming the required minimum — pre-flip
 > clients expect a wallet surface that no longer exists. Override via
-> `ConnectHostConfig.minSdkVersion`. The claim is compatibility hygiene, not security.
+> `ConnectHostConfig.minSdkVersion`, which replaces this floor rather than adding to it, so a lower
+> value admits pre-flip clients again. The claim is compatibility hygiene, not security.
 
 Two new optional fields are sent in the handshake (added in v2; both fields are additive and carry no breaking change to the wire format):
 
@@ -115,13 +128,14 @@ The wallet's network id comes from `Sphere.networkId`, which is derived from the
 Use `SPHERE_NETWORKS` (exported from `@unicitylabs/sphere-sdk/connect`) instead of a raw `{ id, name }` literal. It is derived directly from `constants.NETWORKS` so the numeric id can never drift from the SDK's embedded trust base:
 
 ```typescript
-import { SPHERE_NETWORKS } from '@unicitylabs/sphere-sdk/connect';
+import { ConnectClient, SPHERE_NETWORKS } from '@unicitylabs/sphere-sdk/connect';
+import { autoConnect } from '@unicitylabs/sphere-sdk/connect/browser';
 
-// With ConnectClient:
-const client = new ConnectClient({ /* ... */, network: SPHERE_NETWORKS.testnet2 });
+// With ConnectClient (transport and dapp as in "Setting up ConnectClient" below):
+const client = new ConnectClient({ transport, dapp, network: SPHERE_NETWORKS.testnet2 });
 
 // With autoConnect:
-const result = await autoConnect({ /* ... */, network: SPHERE_NETWORKS.testnet2 });
+const result = await autoConnect({ dapp, network: SPHERE_NETWORKS.testnet2 });
 ```
 
 `SPHERE_NETWORKS` is also importable by backend services from `@unicitylabs/sphere-sdk/connect` — this entry point has no browser-only deps, so it is safe to use in Node.js and `sphere-api` without pulling in DOM APIs.
@@ -176,9 +190,7 @@ import { PostMessageTransport } from '@unicitylabs/sphere-sdk/connect/browser';
 // dApp inside an iframe — talk to the parent window (the default target)
 const transport = PostMessageTransport.forClient();
 
-// dApp opens the wallet in a popup — see the note on the hosted wallet below
-const popup = window.open(WALLET_URL + '/connect', 'sphere-wallet', 'width=420,height=650');
-const transport = PostMessageTransport.forClient({ target: popup, targetOrigin: WALLET_URL });
+// dApp opens the wallet in a popup — see "dApp side, popup" below
 
 // --- Wallet side (host) ---
 // forHost(target, options) — BOTH arguments are required.
@@ -190,6 +202,53 @@ const transport = PostMessageTransport.forHost(window.opener, { allowedOrigins: 
 
 `allowedOrigins` is the host's inbound filter; its first entry is also the `targetOrigin` the host
 posts to. `['*']` is development only.
+
+**dApp side, popup (P3).** `autoConnect` does all of this for you (see
+[autoConnect](#autoconnect-recommended-for-browser-dapps)); by hand it takes three steps. Open
+`<wallet>/connect?origin=<your origin>`: the Sphere wallet's popup page refuses to start without
+`origin` ("Missing origin parameter") and uses it as its `allowedOrigins`. Check that the popup
+opened, because `window.open()` returns `null` when it is blocked. Then wait for the wallet's
+`HOST_READY` message before the handshake: `connect()` sends its handshake once, and one that
+arrives before the popup's host listens is lost, so `connect()` fails with "Connection timeout".
+See also the note on the hosted wallet below.
+
+```typescript
+import { PostMessageTransport } from '@unicitylabs/sphere-sdk/connect/browser';
+import { HOST_READY_TIMEOUT, HOST_READY_TYPE } from '@unicitylabs/sphere-sdk/connect';
+
+const WALLET_URL = 'https://sphere.unicity.network';
+const popup = window.open(
+  `${WALLET_URL}/connect?origin=${encodeURIComponent(location.origin)}`,
+  'sphere-wallet',
+  'width=420,height=720',
+);
+if (!popup) throw new Error('The wallet popup was blocked');
+
+// Wait for HOST_READY. Like autoConnect, give up after HOST_READY_TIMEOUT (30 s) or when the
+// user closes the popup, so a wallet that never answers cannot hang the dApp.
+await new Promise<void>((resolve, reject) => {
+  const finish = (error?: Error) => {
+    clearTimeout(timer);
+    clearInterval(closedCheck);
+    window.removeEventListener('message', onReady);
+    if (error) reject(error);
+    else resolve();
+  };
+  function onReady(event: MessageEvent) {
+    if (event.source === popup && event.data?.type === HOST_READY_TYPE) finish();
+  }
+  const timer = setTimeout(
+    () => finish(new Error('The wallet popup did not respond in time')),
+    HOST_READY_TIMEOUT,
+  );
+  const closedCheck = setInterval(() => {
+    if (popup.closed) finish(new Error('The wallet popup was closed'));
+  }, 500);
+  window.addEventListener('message', onReady);
+});
+
+const popupTransport = PostMessageTransport.forClient({ target: popup, targetOrigin: WALLET_URL });
+```
 
 ### ExtensionTransport (legacy — no supported wallet)
 
@@ -239,6 +298,17 @@ const client = WebSocketTransport.createClient({
 await client.connect();
 ```
 
+**Security of the WebSocket host.** `WebSocketServerTransport` binds `0.0.0.0` unless you pass
+`host`, so pass `'127.0.0.1'` as above. Loopback keeps other machines out, not other programs on
+this one: the server does not look at the upgrade request (there is no `Origin` check), so nothing
+in the SDK tells your dApp apart from any other local process, or from a browser page, that connects
+to the port. It serves one socket at a time, and the session is **not tied to that socket**: when
+the approved client's socket closes without `sphere_disconnect`, the host keeps the session, and
+the next socket to connect is served under it with no handshake, because queries and intents carry
+no session id. The transport tells the host nothing when a socket closes. So on this transport
+never approve silently or from a stored approval (there is no verified origin to key one on), keep
+`sessionTtlMs` short, and use it only between processes you trust.
+
 #### safeSend pattern for WebSocket bridges
 
 When building a WebSocket bridge (e.g. a backend relay between two `WebSocketTransport` instances), always guard `ws.send()` calls. Queries from the remote side may arrive while the local WebSocket is closing, which throws an error.
@@ -258,11 +328,14 @@ Use `safeSend` everywhere you would otherwise call `ws.send()` in message handle
 ```typescript
 import { ConnectHost } from '@unicitylabs/sphere-sdk/connect';
 
+// dappOrigin: the origin your transport verifies — the one you passed to
+// PostMessageTransport.forHost(target, { allowedOrigins: [dappOrigin] }). Key every stored
+// approval by it, never by dapp.url, which the dApp fills in itself.
 const host = new ConnectHost({
   sphere,        // Sphere SDK instance — pass null when initialWalletState is 'locked'
   transport,     // any ConnectTransport
-  origin,        // optional: the origin this host serves, for the wallet's own badge and logs
-                 // (NEVER session.dapp.url, which is dApp-CLAIMED metadata)
+  origin: dappOrigin, // optional: the dApp origin this host serves, for the wallet's own badge
+                      // and logs (NEVER session.dapp.url, which is dApp-CLAIMED metadata)
   initialWalletState: 'locked',  // optional — pass when the wallet is already locked at
                                  // construction (cold start with an encrypted wallet)
 
@@ -270,12 +343,14 @@ const host = new ConnectHost({
   // silent=true means: reject immediately if not already approved — do NOT open any UI.
   // clientInfo carries { protocolVersion, network?, sdkVersion? } from the handshake.
   onConnectionRequest: async (dapp, requestedPermissions, silent, clientInfo) => {
-    if (silent) {
-      // Check your approval storage — if not approved, return rejected
-      return { approved: false, grantedPermissions: [] };
-    }
+    // Your approval storage, keyed by the verified origin (a WebSocket host has none:
+    // see "Security of the WebSocket host").
+    const saved = loadApproval(dappOrigin);
+    if (saved) return { approved: true, grantedPermissions: saved };
+    if (silent) return { approved: false, grantedPermissions: [] };
     // Show approval UI to user
     const approved = await showApprovalUI(dapp, requestedPermissions);
+    if (approved) saveApproval(dappOrigin, requestedPermissions);
     return { approved, grantedPermissions: requestedPermissions };
   },
 
@@ -288,9 +363,10 @@ const host = new ConnectHost({
     return { result };
   },
 
-  // Called when a dApp explicitly disconnects — clean up any persisted permissions
-  onDisconnect: async (session) => {
-    await removeApprovedOrigin(session.dapp.url);
+  // Called when a dApp explicitly disconnects — drop its stored approval, under the same
+  // verified origin (session.dapp.url is dApp-claimed)
+  onDisconnect: async () => {
+    removeApproval(dappOrigin);
   },
 
   // Notify-only: called when the compatibility gate rejects a connection.
@@ -301,8 +377,9 @@ const host = new ConnectHost({
     if (!silent) showRejectionBanner(dapp?.name, error.message);
   },
 
-  // Notify-only: the host has ALREADY answered WALLET_LOCKED (4009), or refused a handshake
-  // while locked. It never waits for you, and a throw here cannot break it.
+  // Notify-only: the host has ALREADY answered a query or intent with WALLET_LOCKED (4009),
+  // or accepted a session resume while locked. It is not called for a refused handshake.
+  // It never waits for you, and a throw here cannot break it.
   //
   // THIS MUST NOT RAISE A CREDENTIAL SURFACE. A dApp request may trigger a CONSENT prompt;
   // it may never trigger a password field. Light a PASSIVE badge in your PERMANENT chrome
@@ -323,10 +400,13 @@ const host = new ConnectHost({
   // the transfer. Expiry answers INTENT_OUTCOME_UNKNOWN (4201) — never a cancellation — and
   // aborts ctx.signal so a wallet that CAN still back out does.
   intentDeadlineMs: 180000,
-  handshakeDeadlineMs: 120000,  // onConnectionRequest — expiry sends the empty refusal
+  handshakeDeadlineMs: 120000,  // onConnectionRequest — expiry sends the empty refusal.
+                                // The dApp's own ConnectClient `timeout` (30 s default)
+                                // also bounds connect(): see "Setting up ConnectClient".
 
-  // Optional secondary floors (rarely needed — the Connect MAJOR is the era gate)
-  minSdkVersion: '0.9.0',    // reject dApps whose npm SDK version is older
+  // Optional floors. minSdkVersion REPLACES the default npm-SDK floor ('0.14.1-0',
+  // DEFAULT_MIN_CLIENT_SDK_VERSION) instead of adding to it, so never set it lower.
+  minSdkVersion: '0.14.1-0',  // reject dApps whose npm SDK version is older
   minMinorVersion: 0,         // minimum MINOR within the current MAJOR
 });
 
@@ -343,8 +423,9 @@ host.revokeSession();
 // Bind a (new) Sphere: the address-switch path AND the unlock path.
 host.updateSphere(sphere);
 
-// Destroy host and clean up transport
+// Destroy the host. It does not own the transport: destroy that yourself.
 host.destroy();
+transport.destroy();
 ```
 
 ### ConnectHost: the `SphereInstance` contract
@@ -379,6 +460,14 @@ export interface SphereInstance {
 
 None of this reaches a dApp: the wire is unchanged.
 
+One related case does reach a dApp. A **messaging-only** `Sphere` (`walletApi: 'none'`, 0.17.3 and
+later) has no payments at all: `sphere.hasPayments` is `false`, and its `payments` getter throws
+`PAYMENTS_NOT_COMPOSED` for the life of the instance, not the transient `NOT_INITIALIZED`. A host
+bound to one answers every money query (`sphere_getBalance`, `getAssets`, `getFiatBalance`,
+`getTokens`, `getHistory`) with `INTERNAL_ERROR` (-32603) and `data.reason: 'PAYMENTS_NOT_COMPOSED'`,
+and retrying does not help. Subscribing to a payment event succeeds, but the event never fires,
+because nothing composes the payments module that would emit it. `sphere_getIdentity` still answers.
+
 ### The lifecycle verbs
 
 `notifyWalletLocked()` **no longer exists**. Its old meaning was *revoke*; its new meaning would
@@ -398,12 +487,15 @@ instance.
 
 ```typescript
 useEffect(() => {
-  if (sphere && hostRef.current) {
-    hostRef.current.updateSphere(sphere);          // unlock, or a live address switch
-  } else if (!sphere && !isLoading && hostRef.current) {
-    hostRef.current.setLocked();                   // a LOCK — the dApp stays connected
+  const host = hostRef.current;
+  if (!host) return;
+  if (sphere) {
+    host.updateSphere(sphere);                     // unlock, or a live address switch
+  } else if (!isLoading) {
+    if (isLocked) host.setLocked();                // a LOCK — the dApp stays connected
+    else host.setUnavailable();                    // any other loss of Sphere — revokes
   }
-}, [sphere, isLoading]);
+}, [sphere, isLoading, isLocked]);
 ```
 
 While locked, a host that HOLDS a session answers exactly four of the fourteen `RPC_METHODS`:
@@ -420,17 +512,39 @@ memory-only, so a page reload or a fresh popup lands there. Such a host holds no
 empty snapshot, so the HANDSHAKE itself is refused with an errorless empty response — `connect()`
 rejects with a bare "Connection rejected by wallet" carrying **no code at all**. There is no 4009
 to match on. That silence is deliberate: the refusal must reveal nothing about the wallet to an
-origin holding no approval. Treat it as "not ready yet" rather than a permanent rejection — keep
-waiting for `HOST_READY`, which the wallet emits once a human unlocks it.
+origin holding no approval. Treat it as "not ready yet" rather than a permanent rejection, and
+connect again when the wallet posts `HOST_READY`. The Sphere wallet posts it when a human unlocks a
+host that holds no session. `HOST_READY` is a plain `{ type: HOST_READY_TYPE }` window message,
+outside the Connect namespace, so it never reaches a `ConnectClient`, and `autoConnect` does not
+listen for it in iframe mode (P1): listen yourself.
+
+```typescript
+import { HOST_READY_TYPE } from '@unicitylabs/sphere-sdk/connect';
+
+// Iframe mode (P1): connect again whenever the wallet announces a ready host.
+window.addEventListener('message', (event: MessageEvent) => {
+  if (event.source === window.parent && event.data?.type === HOST_READY_TYPE) void tryConnect();
+});
+```
+
+The Sphere wallet's custom-agent host also posts `HOST_READY` every time the dApp's frame loads,
+locked or not, so a retry can be refused again: keep the listener until you are connected. In popup
+mode (P3) `autoConnect` itself waits for `HOST_READY` before its handshake, and the Sphere wallet's
+popup does not post it while locked, so the user has `HOST_READY_TIMEOUT` (30 s) to unlock before
+`autoConnect` rejects with "autoConnect: Wallet popup did not respond in time".
 
 On the way back, `updateSphere()` compares the new Sphere's `chainPubkey` against the one frozen
 at lock time. A mismatch — "Forgot password → restore from recovery phrase" installs a different
-seed behind an origin-keyed approval — **revokes** instead of unlocking.
+seed behind an origin-keyed approval — **revokes** instead of unlocking. A different network id
+revokes as well, and so does a session that expired while the wallet was locked. On a live wallet,
+an `updateSphere()` with a Sphere on a different network also revokes instead of rebinding; an
+address switch on the same network keeps the session.
 
 ### onLockedRequest — a badge, never a password field
 
-`ConnectHostConfig.onLockedRequest` is notify-only: the host has **already** answered 4009 and
-never waits for the wallet. A throw from it cannot break the host.
+`ConnectHostConfig.onLockedRequest` is notify-only: the host has **already** answered a query or
+intent with 4009, or accepted a session resume while locked, and never waits for the wallet. It is
+not called for a handshake the host refuses. A throw from it cannot break the host.
 
 **It must not raise a credential surface.** A dApp request may trigger a *consent* prompt; it may
 never trigger a *password* field. Light a passive badge in your permanent chrome ("N requests
@@ -456,8 +570,10 @@ const result = await autoConnect({
   dapp: { name: 'My App', url: location.origin },
   walletUrl: 'https://sphere.unicity.network',
   network: SPHERE_NETWORKS.testnet2, // required by the v2 compatibility gate
-  silent: true, // auto-reconnect without UI if already approved
 });
+// Not `silent: true` here: a silent connect is refused, without any UI, for an origin the
+// wallet has not approved yet, so a first-time user could never connect. See
+// "Auto-reconnect on page reload" for the silent attempt.
 
 // Use the client
 const balance = await result.client.query('sphere_getBalance');
@@ -512,13 +628,16 @@ cloudflared or equivalent — and open
 `https://sphere.unicity.network/agents/custom?url=<the tunnel's https URL>`. A tunnel URL is public
 and `https`, so it passes both gates.
 
-Typing an `https` URL into the wallet's own in-app **Load Custom URL** prompt keeps the URL out of
-the query string altogether, so gate 1 never applies and gate 2 should accept it — that path has
-not been tested end to end here, so treat it as untried rather than as a documented workaround.
+Typing an `https` URL into the wallet's own in-app **Load Custom URL** prompt navigates inside the
+page to `/agents/custom?url=…`, so no request reaches the CDN at that moment and gate 1 does not
+apply then; reloading or sharing that page does send the URL to the CDN, and a local URL then gets
+the 403. Gate 2 still applies: a bare `localhost:5173` typed into the prompt is completed to
+`http://localhost:5173` and refused, so type the full `https://` URL. That path has not been tested
+end to end here, so treat it as untried rather than as a documented workaround.
 
-None of this constrains a wallet you run yourself. A local `sphere` dev server on
-`http://localhost:5173` sits behind no CDN, so a `localhost` dApp URL and the popup route are both
-fine against it — that is the normal local development setup.
+A wallet you run yourself has no CDN in front of it, so gate 1 does not apply, but gate 2 is wallet
+code: a custom-agent URL must still be `https` there too (for a local dApp, serve it over `https`
+with a certificate the browser trusts). The popup route (P3) has no such check.
 
 About the popup route (P3): the route itself is served — `GET https://sphere.unicity.network/connect`
 answers **200**, and so does `/connect?origin=<a public https origin>` (curl, 2026-09-17). A 403
@@ -530,24 +649,45 @@ Because the dApp runs inside the wallet's iframe, `isInIframe()` is true and
 `PostMessageTransport.forClient()` talks to the parent window — no `walletUrl` is needed in that
 mode.
 
+That client accepts whichever page is its parent. `forClient()` without a `targetOrigin` posts to
+`'*'` and filters inbound messages only by "the sender is `window.parent`", with no origin check,
+and `autoConnect` has no option to change that. So any page that frames your dApp can answer its
+handshake and act as its wallet. Do not treat an identity or an intent result received over Connect
+as proof: verify payments and signatures on your server. If the dApp should run only inside the
+hosted wallet, send `Content-Security-Policy: frame-ancestors https://sphere.unicity.network`, or
+pin the parent yourself with `new ConnectClient({ transport: PostMessageTransport.forClient({
+targetOrigin: 'https://sphere.unicity.network' }), dapp, network })` instead of `autoConnect`.
+
 ### Auto-reconnect on page reload
 
-A silent connect on page load reconnects without UI if the origin is already approved:
+Inside the wallet (iframe mode, P1), a silent connect on page load reconnects without UI if the
+origin is already approved:
 
 ```typescript
-// On mount: try silent auto-connect
-try {
-  const result = await autoConnect({
-    dapp,
-    walletUrl,
-    network: SPHERE_NETWORKS.testnet2,   // required at runtime — see below
-    silent: true,
-  });
-  // Connected — origin was already approved
-} catch {
-  // Not approved — show Connect button
+import { autoConnect, isInIframe } from '@unicitylabs/sphere-sdk/connect/browser';
+import { SPHERE_NETWORKS } from '@unicitylabs/sphere-sdk/connect';
+
+// On mount, in iframe mode only: try a silent auto-connect
+if (isInIframe()) {
+  try {
+    const result = await autoConnect({
+      dapp,
+      walletUrl,
+      network: SPHERE_NETWORKS.testnet2,   // required at runtime — see below
+      silent: true,
+    });
+    // Connected — origin was already approved
+  } catch {
+    // Not approved (or the wallet is locked) — show Connect button
+  }
 }
 ```
+
+In popup mode (P3) there is no silent reconnect. `autoConnect` always opens the wallet popup first,
+and `silent` only suppresses the approval prompt inside it. Browsers generally block `window.open()`
+outside a user gesture, and `autoConnect` then throws "autoConnect: Failed to open wallet popup —
+check popup blocker settings"; if the popup does open, the user sees a wallet window. Connect in
+popup mode from a click handler.
 
 ### Detection utilities
 
@@ -595,7 +735,7 @@ const client = new ConnectClient({
   // Set to true for silent auto-connect checks (no approval popup shown)
   silent: false,
 
-  // Resume a previous popup session (P3 / popup mode only)
+  // Resume a session the wallet's host still holds (in practice iframe mode: see Session Resume)
   resumeSessionId: sessionStorage.getItem('sphere-session') ?? undefined,
 });
 
@@ -637,6 +777,19 @@ const unsub = client.on('transfer:incoming', (data) => {
 await client.disconnect();
 ```
 
+**`timeout` also bounds `connect()`.** `ConnectClientConfig.timeout` (default 30000 ms) limits the
+handshake as well as each query, while the host waits up to 120 s (`handshakeDeadlineMs`) for the
+wallet's `onConnectionRequest` to answer. A user who takes longer than `timeout` to approve gets an
+uncoded `Error('Connection timeout')` in the dApp, although the wallet goes on to create the
+session; the Sphere wallet also stores the approval, so connecting again succeeds without a prompt.
+For a non-silent connect, either set `timeout` above the approval window (it then applies to every
+query too) or catch the timeout and connect again with a new `autoConnect()` call, or with a new
+`ConnectClient` on a new transport (call `destroy()` on the old transport first). Do not call
+`connect()` again on the same client: `connect()` does not remove the message listener it
+registered, so a second `connect()` on the same client delivers every wallet event to your handlers
+twice. A new client on the old transport leaves the first client listening; it drops the events but
+logs a warning for each one.
+
 ---
 
 ## Silent Mode
@@ -667,7 +820,7 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `sphere_getAssets` | `coinId?` | asset array |
 | `sphere_getFiatBalance` | — | `{ fiatBalance }` |
 | `sphere_getTokens` | `coinId?` | token array |
-| `sphere_getHistory` | — | transaction history |
+| `sphere_getHistory` | `limit?` | transaction history: the first page, sized by `limit`, when `limit` is given; otherwise every entry |
 | `sphere_resolve` | `identifier` | resolved address info |
 | `sphere_getConversations` | — | DM conversation list |
 | `sphere_getMessages` | `peerPubkey, limit?, before?` | DM message page |
@@ -696,9 +849,12 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 
 > **Amount units:** `amount` is always in **base units** (the smallest indivisible unit), as a
 > string — the same convention as the SDK's `payments.mint(coinId, amount: bigint)`
-> and `payments.send`. Convert from a human amount at the dApp edge with the SDK's
-> `parseTokenAmount('1.5', decimals)` (or ethers/viem `parseUnits`); display with `formatAmount`.
-> `coinId` is always the canonical lowercase 64-hex id (a symbol like `UCT` is rejected).
+> and `payments.send`. Convert from a human amount at the dApp edge with your own converter, for
+> example viem's or ethers' `parseUnits('1.5', decimals)`, and display with `formatUnits`. The
+> SDK's `parseTokenAmount` / `formatAmount` are exported only from the package root and `./core`,
+> which a dApp should not import (see [Install & entry points](#install--entry-points)); no Connect
+> entry exports them. `coinId` is always the canonical lowercase 64-hex id (a symbol like `UCT` is
+> rejected).
 
 ### send Intent Result — delivery semantics
 
@@ -749,8 +905,21 @@ const isValid = verifySignedMessage(originalMessage, signature, expectedPubkey);
 **Security properties:**
 - Private key never leaves the wallet — signing happens inside `Sphere.signMessage()`
 - Recoverable signature — server can verify without storing the public key
-- Canonical signatures — prevents signature malleability attacks
-- The wallet displays the full message text for user review before signing
+- The Sphere wallet displays the full message text for user review before signing
+
+**What they do not cover:**
+- **Signatures are not unique.** The wallet produces low-S signatures, but `verifySignedMessage()`
+  does not require low-S: it also accepts the high-S twin of a valid signature (`s' = n − s`, recovery
+  bit flipped), which anyone can compute from the original. Never use the signature string as an id
+  or a replay key; put a single-use nonce in the message and check it.
+- **Nothing binds the signature to the dApp that asked for it.** The wallet signs whatever text the
+  dApp sends, and the `Domain:` line in the sample above is text the dApp wrote. The Sphere wallet
+  shows it as "Requested by …" without comparing it with the origin the request came from, so a
+  connected dApp can ask the user to sign a challenge that another service issued. A server that
+  accepts signed sign-ins must check that the signature verifies for the expected public key and that
+  the message is exactly a challenge it issued itself (its own domain, a nonce it has not seen before,
+  a short expiry). Those checks stop replays; they cannot prove that the user signed on your site, so
+  never treat the `Domain:` line as that proof.
 
 ### mint Intent
 
@@ -832,7 +1001,9 @@ as the intent error.
 | The session lacks `nft:mint` | `PERMISSION_DENIED` (4002), from the host |
 | The user declines | `USER_REJECTED` (4003) |
 | Malformed params (shape, base64) | `INVALID_PARAMS` (-32602), from the wallet — the Sphere wallet checks them up front and its message names the offending field |
-| The mint is refused before anything is journaled | An intent error carrying `MintResult.error`, with no `data`. Nothing was minted; the intent may be sent again. |
+| Content that is certainly over the size cap | `INVALID_PARAMS` (-32602), from the Sphere wallet, before any UI: it estimates the size from the params as they arrive. Content that passes this estimate but is still too large is refused by `payments.mintNft`, as in the next row. |
+| The mint is refused before anything is journaled | An intent error carrying `MintResult.error`, with no `data`; the Sphere wallet sends it as `INTERNAL_ERROR` (-32603). Nothing was minted; the intent may be sent again. |
+| The Sphere wallet runs with subscriptions enabled and its subscription key has not reached the oracle yet | `INTERNAL_ERROR` (-32603), `Subscription is still being set up — try again in a moment`, before anything is minted. Transient: retry, as for `mint`. |
 | The mint fails after it was journaled | `INTENT_OUTCOME_UNKNOWN` (4201) with `data.tokenId`. The wallet resumes the mint, so it **may still complete**: do not send the intent again; reconcile against the token id. |
 | The wallet cannot tell whether the mint started | `INTENT_OUTCOME_UNKNOWN` (4201), without `data` |
 | The host stops waiting (its deadline, a lock, a revoked session) | `INTENT_OUTCOME_UNKNOWN` (4201), from the host. The wallet dismisses its dialog and starts nothing more for the intent, but a mint already under way may still complete: do not send the intent again. |
@@ -851,8 +1022,12 @@ The experimental invoice surface — 2 queries (`sphere_getInvoices`, `sphere_ge
 9 intents (`create_invoice` … `set_auto_return`) and 2 scopes (`invoice:read`, `invoice:write`)
 — was **removed from the protocol** when the SDK's accounting module was deleted. It was never
 enabled in any wallet host (every call answered `MODULE_NOT_AVAILABLE`), and the removal did not
-bump the protocol version (2.1 at the time). Requesting the removed scopes fails permission
-validation.
+bump the protocol version (2.1 at the time). Passing a removed scope in
+`ConnectClientConfig.permissions` is a type error (`PermissionScope` no longer has it). At runtime
+nothing rejects it: the SDK host does not validate requested scopes, it hands them to
+`onConnectionRequest` as received, and a granted unknown scope maps to no method or intent.
+`validatePermissions()` is exported for wallets that want to check requested scopes themselves: it
+returns `true` only when every scope is a known `PermissionScope`, and it does not filter the list.
 
 A removed — or simply unknown — method or intent answers **`PERMISSION_DENIED` (4002)**, not
 `METHOD_NOT_FOUND`: `hasMethodPermission()` / `hasIntentPermission()` return false for anything
@@ -876,9 +1051,12 @@ answer differently.
 | `wallet:disconnected` | the session is GONE — re-handshake to continue | auto-pushed (no subscribe) |
 | `identity:changed` | active identity changed | auto-pushed (no subscribe) |
 
-> The four wallet events are pushed unconditionally and **cannot** be subscribed —
-> `sphere_subscribe` refuses them. `Sphere.on()` accepts any string and would silently never
-> emit for them, so the subscribe used to succeed and deliver nothing forever.
+> The four wallet events are pushed unconditionally, and the 2.1+ client never sends
+> `sphere_subscribe` for them. A `sphere_subscribe` for one of them (an older dApp sends it) is
+> answered with **success**, `{ subscribed: true, event }`, without attaching anything to
+> `Sphere.on()`, which accepts any string and would never emit these names. The host answers success
+> rather than an error on purpose: an error broke every dApp built before 2.1, whose
+> `client.on('wallet:locked', …)` sends that subscribe.
 
 ## Compatibility: the old wire contract on a v2 host
 
@@ -907,8 +1085,9 @@ only path — the host's pre-flip fallbacks went with the `sphere.paymentsV2` al
   `inventory:updated`, `connection:status`, `payment_request:updated`, …) also works — they are
   ordinary `Sphere.on()` events.
 
-> Session expiry is **not** an event — the next request after the TTL is rejected with
-> error `4004 SESSION_EXPIRED`.
+> There is no dedicated expiry event and no expiry timer: the first request after the TTL is
+> answered `4004 SESSION_EXPIRED`, and the host then revokes the session and pushes
+> `wallet:disconnected`.
 
 ### Wallet Lock Handling
 
@@ -962,7 +1141,7 @@ is connected and must wait for `wallet:unlocked`, not re-handshake.
 
 `client.connect()` rejects with a **`ConnectError`** when the compatibility gate refuses the connection. `ConnectError` has a numeric `.code` and an optional `.data` payload with rejection details.
 
-**Important:** discriminate on the numeric `.code`, not `instanceof ConnectError`. `instanceof` is false whenever the error was built by a different copy of the class. Up to 0.17.2 `@unicitylabs/sphere-sdk/connect/browser` shipped its own copy of `ConnectClient`, so errors from `autoConnect()` were never `instanceof` the `ConnectError` exported by `@unicitylabs/sphere-sdk/connect`. The ESM Connect entry points now share one copy, but the `.cjs` entries still carry one each, and a process that loads the SDK through both `import` and `require()`, or a dApp whose dependencies bundle their own SDK, still holds two.
+**Important:** discriminate on the numeric `.code`, not `instanceof ConnectError`. `instanceof` is false whenever the error was built by a different copy of the class. In 0.17.3 and earlier, `@unicitylabs/sphere-sdk/connect/browser` shipped its own copy of `ConnectClient`, so errors from `autoConnect()` were never `instanceof` the `ConnectError` exported by `@unicitylabs/sphere-sdk/connect`. From the first release after 0.17.3 the ESM Connect entry points share one copy; the `.cjs` entries still carry one each, and a process that loads the SDK through both `import` and `require()`, or a dApp whose dependencies bundle their own SDK, still holds two.
 
 ```typescript
 import { ConnectError, ERROR_CODES } from '@unicitylabs/sphere-sdk/connect';
@@ -996,7 +1175,7 @@ try {
 | 4007 | `ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION` | Connect MAJOR version mismatch (e.g. v1 dApp connecting to v2 wallet). dApp must update its SDK. |
 | 4008 | `ERROR_CODES.INCOMPATIBLE_NETWORK` | dApp targets a different network than the wallet (or omitted `network` in `ConnectClientConfig`). |
 | 4009 | `ERROR_CODES.WALLET_LOCKED` | The wallet is locked. **The session is still alive** — retry after `wallet:unlocked`. Carries `data: { reason: 'locked' }`. Discriminate on the code, never on the message. |
-| 4001 | `ERROR_CODES.NOT_CONNECTED` | Request sent before `connect()` succeeded. |
+| 4001 | `ERROR_CODES.NOT_CONNECTED` | No live session: `connect()` has not succeeded, or the session was revoked (`sphere_disconnect`, a logout, expiry, `setUnavailable()`). A query in flight when the session is revoked gets it too. The client also raises it locally, as "Not connected" or "Disconnected". |
 | 4002 | `ERROR_CODES.PERMISSION_DENIED` | Method or intent not in granted permissions. |
 | 4003 | `ERROR_CODES.USER_REJECTED` | User rejected an intent in the wallet UI. |
 | 4004 | `ERROR_CODES.SESSION_EXPIRED` | Session TTL elapsed. |
@@ -1007,7 +1186,7 @@ try {
 | 4102 | `ERROR_CODES.TRANSFER_FAILED` | Transfer execution failed — what the Sphere wallet currently sends when it rejects a send. |
 | -32601 | `ERROR_CODES.METHOD_NOT_FOUND` | Comes from the **wallet**, never from the SDK host (there an unmapped name is 4002). The Sphere wallet currently answers every intent outside its supported set, `send_nft` included, with it. |
 | -32602 | `ERROR_CODES.INVALID_PARAMS` | Also the wallet's. The Sphere wallet currently validates intent params up front and rejects a malformed one with it, before showing any UI. |
-| -32603 | `ERROR_CODES.INTERNAL_ERROR` | The host caught an error it cannot attribute (a router throw, a query that outlived the host deadline, a request in flight when the wallet went away). |
+| -32603 | `ERROR_CODES.INTERNAL_ERROR` | The host caught an error it cannot attribute: a router throw (a `SphereError`'s code rides in `data.reason`, e.g. `'PAYMENTS_NOT_COMPOSED'` from a messaging-only wallet), a query that outlived the host deadline, or an intent handler that threw. A wallet that destroys its Sphere without calling `setLocked()` / `setUnavailable()` first also produces it. |
 | 4200 | `ERROR_CODES.INTENT_CANCELLED` | Intent cancelled — the user declined and **nothing happened**. Safe to re-offer. |
 | 4201 | `ERROR_CODES.INTENT_OUTCOME_UNKNOWN` | The intent reached the wallet and its outcome is unknown: the answer was lost (a host deadline, a lock, a logout), or the wallet cannot tell whether the operation will still complete (a mint journaled before it failed carries `data.tokenId`). **The money or token may or may not have moved. Do NOT retry**; reconcile out of band first. |
 
@@ -1073,11 +1252,29 @@ Permissions are requested during handshake and checked on every request:
 
 ---
 
-## Session Resume (popup mode)
+## Session Resume
 
-When using a popup window (P3), the session ID can be persisted to avoid re-showing the approval modal on page reload. (The legacy extension mode did not need this — its background service worker kept the session alive — but no supported wallet serves that transport any more.)
+A dApp can save its `sessionId` and present it again as `resumeSessionId` after a reload. The host
+keeps its session in memory only, so a resume works only while the same wallet page, and its
+`ConnectHost`, is still alive:
 
-### Full lifecycle
+- **Iframe (P1): resume works when the dApp reloads itself.** The Sphere wallet's custom-agent host
+  is not torn down when the dApp inside it reloads, so the reloaded dApp resumes its session without
+  any prompt. The wallet does tear the host down when it navigates the frame itself (the Reload
+  button in its address bar, or opening another agent URL). After the wallet's Reload the new host
+  does not know the saved `sessionId`, and the wallet's stored approval for your origin reconnects
+  the dApp without a prompt.
+- **Popup (P3): resume cannot work.** `autoConnect` opens `<walletUrl>/connect` again on every call,
+  which loads a fresh wallet page with a new host and no session, and the Sphere wallet's popup page
+  also revokes its session when it unloads. What skips the approval prompt there is the wallet's own
+  stored approval for your origin, not the `sessionId`.
+
+A `sessionId` the host does not hold is not an error: the host treats the handshake as a new
+connection and calls `onConnectionRequest` (with the Sphere wallet, an approved origin connects
+without a prompt). (The legacy extension mode did not need any of this — its background service
+worker kept the session alive — but no supported wallet serves that transport any more.)
+
+### Full lifecycle (iframe mode)
 
 **1. Save session after successful connect:**
 
@@ -1090,7 +1287,7 @@ sessionStorage.setItem(SESSION_KEY, result.connection.sessionId);
 
 **2. Resume on page refresh:**
 
-Read the saved sessionId and pass it as `resumeSessionId`. If resume fails (e.g. wallet popup was closed), clear storage and fall back to a fresh connect:
+Read the saved sessionId and pass it as `resumeSessionId`. If the host no longer holds that session, the handshake simply runs as a new connection; if `autoConnect` rejects (the user declined, or the wallet is locked), clear the saved id and show your Connect button:
 
 ```typescript
 const savedSession = sessionStorage.getItem(SESSION_KEY);
@@ -1106,7 +1303,7 @@ try {
   sessionStorage.setItem(SESSION_KEY, result.connection.sessionId);
 } catch {
   sessionStorage.removeItem(SESSION_KEY);
-  // Show Connect button — session could not be resumed
+  // Show Connect button — no automatic connection this time
 }
 ```
 
@@ -1119,11 +1316,10 @@ sessionStorage.removeItem(SESSION_KEY);
 
 **4. `willAutoConnect` check:**
 
-To prevent a flash of the Connect button before auto-connect completes, check whether a resume is likely to succeed before rendering:
+To prevent a flash of the Connect button before auto-connect completes, check before rendering whether an automatic connect will run. Resume and silent reconnects happen only in iframe mode, so:
 
 ```typescript
-const willAutoConnect =
-  !!sessionStorage.getItem(SESSION_KEY) || isInIframe();   // both helpers are synchronous
+const willAutoConnect = isInIframe();   // synchronous
 ```
 
 Use this to show a loading state instead of the Connect button while auto-connect is in progress.
@@ -1177,9 +1373,9 @@ When the wallet and dApps must both update (e.g. a new mandatory field or a MAJO
 
 For the v1 → v2 migration specifically: the wallet already requires v2; dApps must declare `network` in their `ConnectClientConfig` and run an SDK at or above the host's npm floor, **`0.14.1`** (`DEFAULT_MIN_CLIENT_SDK_VERSION = '0.14.1-0'`, so every `0.14.1` prerelease passes). Anything below it is refused with `UNSUPPORTED_PROTOCOL_VERSION` (4007) before any UI appears.
 
-**Downstream repos that need separate PRs for v2:**
-- `sphere-sdk-connect-example` — declare `ConnectClientConfig.network` in all example clients.
-- `sphere` (wallet) — wire `onConnectionRejected` in the Connect page host config.
+**Downstream follow-ups for v2 (both done):**
+- `sphere-sdk-connect-example` declares `ConnectClientConfig.network` (`SPHERE_NETWORKS.testnet2`) in its example clients.
+- `sphere` (wallet) wires `onConnectionRejected` in both of its Connect hosts, the popup page and the custom-agent iframe.
 
 ---
 
