@@ -1,42 +1,57 @@
-/**
- * The wallets kept side by side in one Node data directory (#801): one per
- * `walletFileName` of `createNodeProviders()`. Import a new wallet under another
- * file name instead of over the current one, then let the user pick from this list.
- */
+/** Wallets kept side by side in one Node data directory, one per `walletFileName` (#801). */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { STORAGE_KEYS_GLOBAL } from '../../../constants';
+import { DEFAULT_ENCRYPTION_KEY, STORAGE_KEYS_GLOBAL } from '../../../constants';
 import { validateMnemonic } from '../../../core/crypto';
+import { decryptSimple } from '../../../core/encryption';
 
 export interface NodeWalletFile {
   /** Pass as `walletFileName` to `createNodeProviders()` to open this wallet. */
   fileName: string;
   filePath: string;
-  /** The seed is stored encrypted: opening it needs the wallet's `password`. */
+  /** Opening this wallet needs its `password`: `Sphere.load()` cannot read the seed without one. */
   passwordProtected: boolean;
 }
 
 const WALLET_FILE = /\.(json|txt)$/;
 const PLAINTEXT_KEY = /^[0-9a-f]{64}$/i;
+// CryptoJS passphrase output (encryptSimple): base64 of "Salted__" + salt + ciphertext.
+const PASSPHRASE_CIPHERTEXT = /^U2FsdGVkX1[0-9A-Za-z+/=]+$/;
 
 function readStoredSecret(filePath: string, content: string): string | null {
-  if (filePath.endsWith('.txt')) return content || null;
-  let record: Record<string, unknown>;
+  if (filePath.endsWith('.txt')) {
+    return validateMnemonic(content) || PASSPHRASE_CIPHERTEXT.test(content) ? content : null;
+  }
+  let record: unknown;
   try {
-    record = JSON.parse(content) as Record<string, unknown>;
+    record = JSON.parse(content);
   } catch {
     return null;
   }
   if (typeof record !== 'object' || record === null) return null;
+  const fields = record as Record<string, unknown>;
+  // An exportToJSON() backup also carries `mnemonic`, but it is not a wallet store.
+  if (fields.type === 'sphere-wallet') return null;
   for (const key of [STORAGE_KEYS_GLOBAL.MNEMONIC, STORAGE_KEYS_GLOBAL.MASTER_KEY]) {
-    const value = record[key];
+    const value = fields[key];
     if (typeof value === 'string' && value !== '') return value;
   }
   return null;
 }
 
-/** Wallet files in `dataDir` (the test `Sphere.exists()` applies), sorted by name. */
+/** Mirrors Sphere's password-less decrypt(), including the legacy default key (SDK <= 0.3.3). */
+function opensWithoutPassword(secret: string): boolean {
+  if (validateMnemonic(secret) || PLAINTEXT_KEY.test(secret)) return true;
+  try {
+    const legacy = decryptSimple(secret, DEFAULT_ENCRYPTION_KEY);
+    return validateMnemonic(legacy) || PLAINTEXT_KEY.test(legacy);
+  } catch {
+    return false;
+  }
+}
+
+/** `*.json`/`*.txt` wallet stores in `dataDir`, sorted by name; `exportToJSON()` backups are skipped. */
 export async function listWallets(dataDir: string): Promise<NodeWalletFile[]> {
   const dir = path.resolve(dataDir);
   let entries: fs.Dirent[];
@@ -53,8 +68,7 @@ export async function listWallets(dataDir: string): Promise<NodeWalletFile[]> {
     const filePath = path.join(dir, entry.name);
     const secret = readStoredSecret(filePath, (await fs.promises.readFile(filePath, 'utf-8')).trim());
     if (secret === null) continue;
-    const passwordProtected = !(validateMnemonic(secret) || PLAINTEXT_KEY.test(secret));
-    wallets.push({ fileName: entry.name, filePath, passwordProtected });
+    wallets.push({ fileName: entry.name, filePath, passwordProtected: !opensWithoutPassword(secret) });
   }
   return wallets.sort((a, b) => a.fileName.localeCompare(b.fileName));
 }

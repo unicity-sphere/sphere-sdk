@@ -152,4 +152,52 @@ describe('Sphere.import over an existing wallet (#801)', () => {
     expect(fullClears(p)).toBe(0);
     expect(p.storage._data.get(STORAGE_KEYS_GLOBAL.MNEMONIC)).toBe(OTHER_MNEMONIC);
   });
+
+  it('importFromJSON reports a wrong password that decrypts to garbage, and keeps the wallet', async () => {
+    const p = providers(true);
+    // OTHER_MNEMONIC encrypted with 'right-password'. CryptoJS has no MAC, and 'wrong-34'
+    // decrypts this ciphertext to a 2-character string instead of throwing.
+    const jsonContent = JSON.stringify({
+      version: '1.0', type: 'sphere-wallet', encrypted: true, wallet: {},
+      mnemonic: 'U2FsdGVkX18Vj01wyiL3v4L/OQpvF5LENkk1Wk7FjwFcnEn+MmdNJ54VOluRiIgCfvqplWIlqErro+V3J/kwODQ+qmhFpu8MyyOv9cnzt4KYTMLEU+FItqqDPMqGAkah',
+    });
+    const result = await Sphere.importFromJSON({ ...common(p), jsonContent, password: 'wrong-34', overwrite: true });
+    expect(result).toMatchObject({ success: false, error: 'Failed to decrypt mnemonic - wrong password?' });
+    expectWalletUntouched(p);
+  });
+
+  describe('a store that fails to open is never taken for an empty one', () => {
+    /** connect() fails `failures` times, then succeeds: a blocked IndexedDB open, for example. */
+    function flakyStore(failures: number): MockProviders {
+      const p = providers(true);
+      let connected = false;
+      let left = failures;
+      (p.storage.isConnected as Mock).mockImplementation(() => connected);
+      (p.storage.connect as Mock).mockImplementation(async () => {
+        if (left-- > 0) throw new Error('open timed out');
+        connected = true;
+      });
+      (p.storage.disconnect as Mock).mockImplementation(async () => { connected = false; });
+      return p;
+    }
+
+    it('import rejects instead of writing over the wallet', async () => {
+      const p = flakyStore(1);
+      await expect(Sphere.import({ ...common(p), mnemonic: OTHER_MNEMONIC })).rejects.toThrow('open timed out');
+      expectWalletUntouched(p);
+    });
+
+    it('create rejects instead of writing over the wallet', async () => {
+      const p = flakyStore(1);
+      await expect(Sphere.create({ ...common(p), mnemonic: OTHER_MNEMONIC })).rejects.toThrow('open timed out');
+      expectWalletUntouched(p);
+    });
+
+    it('init with autoGenerate rejects instead of generating a new seed over the wallet', async () => {
+      // Two failures: init's own check, then the one in create().
+      const p = flakyStore(2);
+      await expect(Sphere.init({ ...common(p), autoGenerate: true })).rejects.toThrow('open timed out');
+      expectWalletUntouched(p);
+    });
+  });
 });
