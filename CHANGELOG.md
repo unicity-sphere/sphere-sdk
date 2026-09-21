@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — `listWallets()` could hide a wallet and list a backup (#813)
+
+Not in 0.17.4: it merged while that release was already building. The extension test was
+case-sensitive, so a wallet file named with an upper-case extension (`Wallet.JSON`) was left out
+although `createNodeProviders()` opens it; and the only backup guard was `type: 'sphere-wallet'`,
+so the legacy flat export `importFromLegacyFile()` also reads was listed as an openable wallet.
+
 ## [0.17.4] - 2026-09-21
 
 ### Fixed (BREAKING, wallet safety) — an import never erases a wallet as a side effect (#801, #808)
