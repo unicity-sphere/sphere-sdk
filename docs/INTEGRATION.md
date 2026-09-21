@@ -505,20 +505,33 @@ and `Sphere.import` return the `Sphere` instance itself (`Promise<Sphere>`), not
 
 `Sphere.init({ ...providers, mnemonic })` is create-or-load, not an import: if a wallet already
 exists in the storage it is loaded and `mnemonic` is ignored. To replace the stored wallet with
-another phrase, use `Sphere.import`:
+another phrase, use `Sphere.import` with `overwrite: true`:
 
 ```typescript
 const sphere = await Sphere.import({
   ...providers,
   network: 'testnet2',
   mnemonic: 'abandon abandon abandon ...',
+  overwrite: true, // replace the stored wallet; without it, import rejects with ALREADY_INITIALIZED
 });
 ```
 
-`Sphere.import` first clears the storage's current wallet, including the payment journals of
-transfers still in flight; do not run it while transfers are pending. For IndexedDB the cleared
-unit is the whole database named by `dbName` (every key `prefix` in it), so give each wallet its
-own `dbName`.
+Without `overwrite: true`, `Sphere.import` rejects with `ALREADY_INITIALIZED` and leaves the
+stored wallet untouched whenever the storage already holds one, or a live `Sphere` is using that
+storage object. Importing into a storage that holds no wallet needs no flag. Every input check
+(`network`, `password`, the mnemonic, `masterKey`/`chainCode`) runs before the storage is
+touched, so an import rejected by a check erases nothing either.
+
+With `overwrite: true` it first clears the storage's current wallet, including the payment
+journals of transfers still in flight; do not replace a wallet while transfers are pending, and
+back up its recovery phrase first — the clear runs before the new wallet is brought up, so a
+failure after it (a storage reconnect, provider start-up, a taken `nametag`) does not bring the
+old wallet back. For IndexedDB the cleared unit is the whole database named by `dbName` (every
+key `prefix` in it), so give each wallet its own `dbName`. On Node, keep wallets side by side
+with one `walletFileName` each; `listWallets(dataDir)` from
+`@unicitylabs/sphere-sdk/impl/nodejs` lists the wallet files in a directory as
+`{ fileName, filePath, passwordProtected }[]`, and `fileName` is what you pass back as
+`walletFileName`.
 
 ### Get Identity
 
@@ -548,7 +561,8 @@ vertical stops, its providers disconnect, and every `sphere.on()` handler goes w
 your references afterwards. The scope is the store the provider addresses, not the provider
 object — two provider objects reporting the same
 [`backingStoreId`](#storage-provider-interface) share the teardown, and a Sphere on other
-storage is never touched. `Sphere.import()` clears first, so it carries the same consequence.
+storage is never touched. `Sphere.import()` with `overwrite: true` clears first over an existing
+wallet, so it carries the same consequence.
 
 ### Multi-Address Derivation
 
@@ -1109,7 +1123,7 @@ interface StorageProvider extends BaseProvider {
    * Stable identity of the BACKING STORE this provider addresses — not of this
    * object, and not of the class. Optional, but supply it if two provider objects
    * can address one store: two instances returning the same value share erasure,
-   * so `Sphere.clear()` (and `Sphere.import()`, which clears first) tears down the
+   * so `Sphere.clear()` (and `Sphere.import({ overwrite: true })`) tears down the
    * live Spheres of both. Compose it from everything that selects the store (file
    * path, database name, key prefix) behind a scheme prefix, so two kinds of store
    * can never collide on one string. It must not change over the provider's
@@ -1120,6 +1134,9 @@ interface StorageProvider extends BaseProvider {
   readonly backingStoreId?: string;
 
   setIdentity(identity: FullIdentity): void;
+  // Must resolve null for a missing key, and reject only when the store cannot be read:
+  // Sphere.init/create/import read the stored seed through it, and a rejection now makes them
+  // fail instead of writing a new seed over a wallet they could not see.
   get(key: string): Promise<string | null>;
   set(key: string, value: string): Promise<void>;
   remove(key: string): Promise<void>;
@@ -1475,10 +1492,13 @@ When the Nostr client refuses the name as already claimed, the transport also lo
 
 **Cause:** The nametag is registered to a different public key. This happens when:
 
-1. **Storage cleared or inaccessible** → `Sphere.exists()` returns `false` → new wallet created
+1. **Storage cleared** → `Sphere.init()` finds no wallet → new wallet created
 2. **Different mnemonic provided** on subsequent runs
 
-**Note:** `autoGenerate: true` does NOT generate new mnemonic every restart. It only generates if `Sphere.exists()` returns `false`.
+**Note:** `autoGenerate: true` does NOT generate new mnemonic every restart. It only generates
+when the storage holds no wallet. A storage that cannot be opened or read is no longer taken for
+an empty one: `Sphere.init`, `Sphere.create` and `Sphere.import` reject with the storage error
+instead (`Sphere.exists()` itself still answers `false` there).
 
 **Solution:**
 
@@ -1549,7 +1569,8 @@ When loading an existing wallet, the SDK automatically syncs the identity bindin
 When importing a wallet without specifying a nametag, the SDK automatically attempts to recover it from Nostr:
 
 ```typescript
-// Import wallet - nametag will be recovered if found on Nostr
+// Import wallet into a storage with no wallet yet (over an existing one, import rejects with
+// ALREADY_INITIALIZED unless you pass overwrite: true) - nametag recovered if found on Nostr
 const sphere = await Sphere.import({
   ...providers,
   network: 'testnet2',
@@ -1674,6 +1695,15 @@ try {
   else throw err;
 }
 ```
+
+`ALREADY_INITIALIZED` also comes from `Sphere.create()`, and from `Sphere.import()` over a
+storage that already holds a wallet — nothing is erased in that case. Retry the import with
+`overwrite: true` only once the user has confirmed replacing that wallet, or import into
+separate storage instead; `Sphere.create()` has no such flag — load the wallet that is there.
+`importFromJSON()` returns the same refusal as `{ success: false, error }`, where `error` is the
+message text and the `ALREADY_INITIALIZED` code itself is not returned; `importFromLegacyFile()`
+does the same for an `exportToJSON()` backup, and its other paths (a text backup, a legacy
+flat-JSON export, a bare mnemonic) reject.
 
 ### Debug Logging
 

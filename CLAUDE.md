@@ -312,10 +312,12 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 |--------|---------|-------------|
 | `Sphere.init(options)` | `Promise<{ sphere, created, generatedMnemonic? }>` | Create or load wallet (requires `network` and a `walletApi` config, or `'none'`) |
 | `sphere.hasPayments` | `boolean` | Whether this Sphere composes money at all (#793) — fixed for its life |
-| `Sphere.exists(storage)` | `Promise<boolean>` | Check if wallet exists |
+| `Sphere.exists(storage)` | `Promise<boolean>` | Check if wallet exists (`false` on any storage error; `init`/`create`/`import` use the strict check and reject with that error instead) |
 | `Sphere.clear({ storage })` | `Promise<void>` | Delete all wallet data (the whole KV, both `pv2g2:*` and superseded `pv2:*`, + orphaned pre-flip token DBs; for IndexedDB the whole `dbName`, every prefix) |
-| `Sphere.import(options)` | `Promise<Sphere>` | Import from mnemonic/masterKey (clears this storage's existing wallet first) |
-| `Sphere.importFromLegacyFile(options)` | `Promise<{ success, sphere?, mnemonic?, needsPassword?, error? }>` | Import a `.txt` / flat-JSON / bare-mnemonic backup |
+| `Sphere.import(options)` | `Promise<Sphere>` | Import from mnemonic/masterKey; every input is checked before storage is touched. Over a storage that already holds a wallet (or one a live Sphere uses) it rejects `ALREADY_INITIALIZED` unless `overwrite: true`, which clears that wallet first (#801) |
+| `Sphere.importFromJSON(options)` | `Promise<{ success, sphere?, mnemonic?, error? }>` | Import an `exportToJSON()` backup; same `overwrite` rule as `import`, but the refusal comes back as `{ success: false, error }` |
+| `Sphere.importFromLegacyFile(options)` | `Promise<{ success, sphere?, mnemonic?, needsPassword?, error? }>` | Import a `.txt` / flat-JSON / bare-mnemonic backup; same `overwrite` rule as `import` (these paths reject; only a delegated `exportToJSON()` file returns `{ success: false, error }`) |
+| `listWallets(dataDir)` (`./impl/nodejs`) | `Promise<NodeWalletFile[]>` | Wallet files side by side in one Node `dataDir`, one per `walletFileName`: `{ fileName, filePath, passwordProtected }`, sorted by `fileName`; needs no password (#801) |
 | `sphere.payments.assets(coinId?)` | `Promise<Asset[]>` | Assets grouped by coin (server read-through) |
 | `sphere.payments.tokens(filter?)` | `Token[]` | Individual COIN tokens (sync inventory view) |
 | `sphere.payments.coinless()` | `CoinlessToken[]` | Coinless (NFT) holdings — disjoint from `tokens()` |
@@ -458,7 +460,7 @@ sphere-sdk/
 │
 ├── impl/                    # Platform-specific implementations
 │   ├── browser/            # IndexedDB storage, browser oracle/transport, connect
-│   ├── nodejs/             # FileStorage, Node oracle/transport, connect
+│   ├── nodejs/             # FileStorage (+ listWallets), Node oracle/transport, connect
 │   ├── shared/             # Config resolvers, network checks, trust-base loaders
 │   │   └── wallet-api/     # createWalletApiProviders → { walletApi: WalletApiTransportConfig }
 │   └── wallet-api-v2/      # Wallet-api wire: session (auth+wake WS), client, http,

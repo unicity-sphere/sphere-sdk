@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (BREAKING, wallet safety) — an import never erases a wallet as a side effect (#801, #808)
+
+`Sphere.import()` cleared the wallet already on its storage **before** it checked its own input, so
+an import that was then rejected left the storage empty, or holding a master key the loader cannot
+read back. Every input check now runs before anything on the storage is touched: `network` must be
+a known network (with `walletApi: 'none'` it was not checked before the clear) and `password` must
+be non-empty or omitted (both `INVALID_CONFIG`); the mnemonic must be valid BIP39, and `masterKey`,
+and `chainCode` when one is given, must be 64 hex characters (`INVALID_IDENTITY`). A wrong password
+that CryptoJS decrypts to garbage now makes `importFromJSON()` report
+`Failed to decrypt mnemonic - wrong password?` instead of `Invalid mnemonic`.
+
+**Replacing a wallet is now explicit.** Over a storage that already holds a wallet, or a storage
+object a live Sphere is using, `Sphere.import()`, `importFromJSON()` and `importFromLegacyFile()`
+refuse with `ALREADY_INITIALIZED`, the code `Sphere.create()` uses for the same case, and leave the
+wallet as it was. `importFromJSON()`, and `importFromLegacyFile()` for an `exportToJSON()` file,
+return the refusal as `{ success: false, error }`; the other `importFromLegacyFile()` paths reject.
+An import into a storage with no wallet needs no flag.
+
+`SphereImportOptions.overwrite: true` replaces the wallet as before: the whole backing store is
+cleared (on IndexedDB that is the database, wallets under other `prefix` values included) and the
+live Spheres on it are destroyed. The clear still comes before the new wallet is brought up, so a
+failure after the input checks (a storage reconnect, provider start-up, a taken `nametag`) does not
+bring the old wallet back.
+
+**A storage that cannot be opened is no longer taken for an empty one.** `Sphere.init()`,
+`create()` and `import()` asked `Sphere.exists()` whether a wallet was stored, and `exists()`
+answers `false` on any storage error. When the store failed to open for that check but opened for
+the write (an IndexedDB open that times out once, then succeeds), `init({ autoGenerate: true })`,
+`create()` and `import()` wrote a new seed over the stored one. They now reject with the storage
+error. `Sphere.exists()` itself is unchanged. A custom `StorageProvider` whose `get()` throws for a
+missing key, instead of resolving `null` as the interface requires, now makes these calls reject.
+
+**Migration.** A flow that replaces a wallet on purpose, after the user has confirmed it, passes
+`overwrite: true`. Any other caller now gets an error where it used to lose a wallet: import into
+separate storage instead (another `walletFileName` or `dataDir` on Node, another `dbName` in the
+browser).
+
+### Added — `listWallets(dataDir)` for Node wallets kept side by side (#801, #808)
+
+`@unicitylabs/sphere-sdk/impl/nodejs` exports `listWallets(dataDir)`: the wallet stores in one data
+directory, one per `walletFileName` of `createNodeProviders()`, as `NodeWalletFile[]`
+(`{ fileName, filePath, passwordProtected }`) sorted by `fileName`. It lists the `.json` and `.txt`
+files that hold a stored seed (the keys `Sphere.exists()` reads), skips `exportToJSON()` backups,
+and returns `[]` for a directory that does not exist. `passwordProtected` is `true` when
+`Sphere.load()` needs the wallet's `password` to read the seed.
+
 ### Fixed — the Connect ESM entry points share one `ConnectClient` and `ConnectError` (#789, #790)
 
 `@unicitylabs/sphere-sdk/connect`, `/connect/browser` and `/connect/nodejs` were three separate

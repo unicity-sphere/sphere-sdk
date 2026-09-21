@@ -20,7 +20,8 @@ export interface StorageProvider extends BaseProvider {
    * which is exactly the wrong granularity).
    *
    * Two providers that return the SAME value address the same data, so erasing
-   * through one erases through the other: `Sphere.clear({ storage })` tears down
+   * through one erases through the other: `Sphere.clear({ storage })` — and
+   * `Sphere.import({ overwrite: true })`, which clears first — tears down
    * the live Spheres of every provider sharing this value, not merely those built
    * on this object. Compose it from everything that selects the store (file path,
    * database name, key prefix) behind a scheme prefix, so two kinds of store can
@@ -40,7 +41,9 @@ export interface StorageProvider extends BaseProvider {
   setIdentity(identity: FullIdentity): void;
 
   /**
-   * Get value by key
+   * Get value by key. Resolve `null` for a missing key and reject only when the store cannot
+   * be read: `Sphere.init`/`create`/`import` read the stored seed through this, and a rejection
+   * now makes them fail instead of writing a new seed over a wallet they could not see (#801).
    */
   get(key: string): Promise<string | null>;
 

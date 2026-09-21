@@ -261,7 +261,8 @@ see it. Read `sphere.identity?.nametag` instead; the event is useful for later r
 the identity sync after `switchToAddress()`.
 
 ```typescript
-// Import replaces the wallet in this storage, then recovers the nametag from the relay.
+// Import into a storage with no wallet yet (over an existing wallet, import rejects with
+// ALREADY_INITIALIZED unless overwrite: true replaces it), then recover the nametag from the relay.
 const sphere = await Sphere.import({ ...providers, network: 'testnet2', mnemonic });
 console.log(sphere.identity?.nametag); // the recovered nametag, or undefined if none was found
 ```

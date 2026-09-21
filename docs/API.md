@@ -79,8 +79,9 @@ it selects the token registry and the group-chat relays. `sphere.hasPayments` is
 
 **An existing wallet wins.** If the storage already holds a wallet, `Sphere.init` loads it and
 ignores `mnemonic`, `nametag` and `autoGenerate`. To replace the stored wallet with another phrase,
-use [`Sphere.import`](#sphereimportoptions-sphereimportoptions-promisesphere), which first clears
-the storage's current wallet.
+use [`Sphere.import`](#sphereimportoptions-sphereimportoptions-promisesphere) with `overwrite: true`,
+which then clears the storage's current wallet first; without that flag `Sphere.import` rejects with
+`ALREADY_INITIALIZED` and leaves the wallet untouched.
 
 **Removed options:** `accounting: true` / `swap: true` still **throw** a typed `INVALID_CONFIG`,
 deliberately: invoicing and swaps no longer exist in the SDK, and a silently ignored option would
@@ -108,7 +109,11 @@ backup and store the imported seed **without** a password.
 
 #### `Sphere.exists(storage: StorageProvider): Promise<boolean>`
 
-Check if wallet data exists in storage.
+Check if wallet data exists in storage. A storage that cannot be opened or read answers `false`
+here; `Sphere.init`, `Sphere.create` and `Sphere.import` run the same check *without* that catch,
+so a failing store rejects with its own error there instead of being taken for an empty one.
+`Sphere.load` still uses the catching check, so a store it cannot read looks empty and `load`
+rejects with `NOT_INITIALIZED`.
 
 #### `Sphere.create(options: SphereCreateOptions): Promise<Sphere>`
 
@@ -119,25 +124,39 @@ Create wallet from a known mnemonic (low-level; prefer `Sphere.init()`).
 Load existing wallet from storage (low-level; prefer `Sphere.init()`).
 
 `create`, `load` and `import` resolve the `Sphere` itself, not `{ sphere }`. `create` refuses when
-the storage already holds a wallet (`ALREADY_INITIALIZED`); `load` refuses when it holds none
-(`NOT_INITIALIZED`). All of them need `storage`, `transport`, `oracle`, `walletApi` and `network`.
+the storage already holds a wallet (`ALREADY_INITIALIZED`), and so does `import` unless
+`overwrite: true` is passed; `load` refuses when it holds none (`NOT_INITIALIZED`). All of them
+need `storage`, `transport`, `oracle`, `walletApi` and `network`.
 
 #### `Sphere.import(options: SphereImportOptions): Promise<Sphere>`
 
 Import a wallet from a `mnemonic`, or from a `masterKey` (with optional `chainCode`, `basePath` and
-`derivationMode`); throws `INVALID_CONFIG` when neither is given. **It clears the wallet already in
-that storage first** (keys, identity and the `pv2g2:*` payment journals, including those of
-transfers still in flight) whenever a wallet exists there or a live Sphere is registered on that
-storage object: see `Sphere.clear()` below. Do not run it while transfers are pending.
+`derivationMode`); throws `INVALID_CONFIG` when neither is given. Every input is checked before the
+storage is touched: a missing or unknown `network`, and a `password` of `''`, throw
+`INVALID_CONFIG`; an invalid mnemonic, and a `masterKey` or a non-empty `chainCode` that is not 64
+hex characters, throw `INVALID_IDENTITY`. **When a wallet already exists in that storage**, or a
+live Sphere is registered on that storage object, it rejects with `ALREADY_INITIALIZED` and leaves
+the wallet untouched, unless you pass `overwrite: true`. An import into a storage that holds no
+wallet needs no flag.
+
+`overwrite: true` clears that wallet first (keys, identity and the `pv2g2:*` payment journals,
+including those of transfers still in flight): see `Sphere.clear()` below. Do not run it while
+transfers are pending, and back up the current recovery phrase first — the clear runs before the new
+wallet is brought up, so a failure after it (unreachable relays, a `nametag` already taken) leaves
+the new wallet's keys stored and the old wallet gone. To keep both wallets, import into other
+storage instead: on Node another `walletFileName` or `dataDir` (see
+[`listWallets()`](#base-providers-platform-specific)), in the browser another `dbName`.
 
 #### `Sphere.importFromJSON(options): Promise<{ success: boolean; sphere?: Sphere; mnemonic?: string; error?: string }>`
 
 Restore from an `exportToJSON()` backup. `options` are the `Sphere.import` options without the key
-fields, plus `jsonContent: string` and `password?: string` (to decrypt an encrypted backup). It
-never throws: bad input, a wrong password and errors from `Sphere.import` all come back as
-`{ success: false, error }`. Keep `result.sphere`: it is the live instance, built on the storage you
-passed. The restored seed is stored **without** a password (the `password` only decrypts the
-backup).
+fields — `overwrite` is still one of them — plus `jsonContent: string` and `password?: string` (to
+decrypt an encrypted backup). It never throws: bad input, a wrong password and errors from
+`Sphere.import` all come back as `{ success: false, error }`. That covers the refusal over a
+storage that already holds a wallet — `error` is then `'A wallet already exists on this storage.
+Pass overwrite: true to replace it, ...'`, the `ALREADY_INITIALIZED` code is not returned, and
+nothing is erased. Keep `result.sphere`: it is the live instance, built on the storage you passed.
+The restored seed is stored **without** a password (the `password` only decrypts the backup).
 
 #### `Sphere.importFromLegacyFile(options): Promise<{ success: boolean; sphere?: Sphere; mnemonic?: string; needsPassword?: boolean; error?: string }>`
 
@@ -147,8 +166,9 @@ Restore from a backup file: an `exportToTxt()` text backup (optionally password-
 `onDecryptProgress?` to the key-less `Sphere.import` options. `needsPassword: true` means the file is
 encrypted and no password was given. Unlike `importFromJSON`, for a text backup, a legacy
 flat-JSON export or a bare mnemonic, an error thrown by `Sphere.import` itself (for example a
-missing `network`) rejects instead of coming back as `{ success: false }`. An `exportToJSON()`
-file is handed to `importFromJSON` and comes back as `{ success: false, error }`.
+missing `network`, or `ALREADY_INITIALIZED` when the storage already holds a wallet and
+`overwrite: true` was not passed) rejects instead of coming back as `{ success: false }`. An
+`exportToJSON()` file is handed to `importFromJSON` and comes back as `{ success: false, error }`.
 The restored seed is stored without a password, as with `importFromJSON`.
 
 #### `Sphere.clear(options: { storage: StorageProvider }): Promise<void>`
@@ -181,16 +201,17 @@ never touched.
 
 **IndexedDB: the unit is the whole database, not the key prefix.** Every `prefix` inside one
 IndexedDB database (`dbName`) belongs to one backing store, and `clear()` empties the whole
-database. Clearing through one prefix, or importing through a prefix that already holds a wallet
-(or through a storage object a live Sphere is using), therefore destroys the Spheres of every
-prefix in that database and wipes their keys, mnemonic included. An import into an unused prefix
-does not clear anything. Give each wallet its own `dbName`; a separate `prefix` alone does not
-isolate two wallets.
+database. Clearing through one prefix, or importing with `overwrite: true` through a prefix that
+already holds a wallet (or through a storage object a live Sphere is using), therefore destroys the
+Spheres of every prefix in that database and wipes their keys, mnemonic included. An import into an
+unused prefix does not clear anything, and neither does one without `overwrite: true`. Give each
+wallet its own `dbName`; a separate `prefix` alone does not isolate two wallets.
 
-`Sphere.import(options)` inherits all of this: it calls `Sphere.clear({ storage })` first
-whenever a wallet exists on that storage or a live Sphere is registered on that storage object,
-so importing over storage B tears down the Spheres on B's backing store (for IndexedDB, every
-prefix in B's database) — and only those.
+`Sphere.import(options)` with `overwrite: true` inherits all of this: it calls
+`Sphere.clear({ storage })` first whenever a wallet exists on that storage or a live Sphere is
+registered on that storage object, so importing over storage B tears down the Spheres on B's
+backing store (for IndexedDB, every prefix in B's database) — and only those. Without
+`overwrite: true` it rejects with `ALREADY_INITIALIZED` in exactly those cases and clears nothing.
 
 **It also refuses an `init` / `create` / `load` / `import` that is in flight on that store.** A
 wallet being built is not yet registered, so `clear()` cannot destroy it; instead the bring-up
@@ -240,15 +261,16 @@ Cleanup and disconnect all providers.
 #### `exportToJSON(options?: WalletJSONExportOptions): WalletJSON`
 
 A JSON backup (`{ includeMnemonic?, password?, addressCount? }`), which
-`Sphere.importFromJSON` restores. With `password`, the mnemonic and master private key are
-encrypted with the same CryptoJS scheme as the stored seed; without it they are exported in
-**plaintext**.
+`Sphere.importFromJSON` restores — onto a storage that already holds a wallet, only with
+`overwrite: true`. With `password`, the mnemonic and master private key are encrypted with the same
+CryptoJS scheme as the stored seed; without it they are exported in **plaintext**.
 
 #### `exportToTxt(options?: { password?: string; addressCount?: number }): string`
 
 The `UNICITY WALLET DETAILS` text backup of the master private key, which
-`Sphere.importFromLegacyFile` restores. With `password`, the key is encrypted (PBKDF2-SHA1 with
-100,000 iterations and a fixed salt, then CryptoJS AES); without it, it is written in plaintext.
+`Sphere.importFromLegacyFile` restores — onto a storage that already holds a wallet, only with
+`overwrite: true`. With `password`, the key is encrypted (PBKDF2-SHA1 with 100,000 iterations and a
+fixed salt, then CryptoJS AES); without it, it is written in plaintext.
 
 #### `getMnemonic(): string | null`
 
@@ -1319,6 +1341,13 @@ the wallet, so never re-send (see [`send()`](#sendreq-sendrequest-promisetransfe
 `PAYMENTS_NOT_COMPOSED` is the permanent refusal of `sphere.payments` on a `walletApi: 'none'`
 wallet; `NOT_INITIALIZED` is the transient one.
 
+`ALREADY_INITIALIZED` refuses to write a wallet over one that is already there, and nothing is
+erased when it is thrown: `Sphere.create()` always, and `Sphere.import()` /
+`Sphere.importFromLegacyFile()` unless `overwrite: true` is passed (`importFromJSON()`, and
+`importFromLegacyFile()` for an `exportToJSON()` file, return its message as
+`{ success: false, error }` instead). `registerNametag()` throws it too, when the active address
+already has a Unicity ID.
+
 **One class per bundle.** Each built entry point that uses `SphereError` (the package root,
 `./core`, `./payments-v2`, `./token-engine`, `./impl/nodejs`, `./impl/browser`,
 `./impl/wallet-api-v2` and `./connect`) carries its own copy of it, and `isSphereError()` is an
@@ -1568,6 +1597,18 @@ const base = createNodeProviders({
 ```
 
 `@unicitylabs/sphere-sdk/impl/nodejs` also exports `createWalletApiProviders`, with types.
+
+**Several wallets in one `dataDir`.** Each wallet lives in one file — `walletFileName` (default
+`'wallet.json'`) under `dataDir` — so a second wallet goes under its own file name rather than over
+the current one (`Sphere.import` refuses a storage that already holds a wallet unless
+`overwrite: true`). `listWallets(dataDir: string): Promise<NodeWalletFile[]>`, also exported by
+`@unicitylabs/sphere-sdk/impl/nodejs`, lists them: the `.json` and `.txt` files directly in that
+directory that hold a stored seed, sorted by `fileName`, each one
+`{ fileName: string; filePath: string; passwordProtected: boolean }`. Pass `fileName` back as
+`walletFileName` to open that wallet; `filePath` is absolute; `passwordProtected` is `true` when
+`Sphere.load()` needs the wallet's `password` to read the seed; `listWallets` itself never needs
+one — it only repeats `Sphere.load()`'s password-less read. It skips `exportToJSON()` backup files,
+and returns `[]` for a directory that does not exist.
 
 **Browser variant:**
 ```typescript

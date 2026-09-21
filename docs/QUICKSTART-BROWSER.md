@@ -720,9 +720,15 @@ if (page.more) {
 ## Import Existing Wallet
 
 `Sphere.init` loads the wallet that is already in the storage, if there is one, and then ignores `mnemonic`,
-`nametag` and `autoGenerate`. To replace the stored wallet with another phrase, use `Sphere.import`, which first
-clears the storage's current wallet, including the payment journals of transfers still in flight; do not run it
-while transfers are pending. That clear also destroys any live `Sphere` on the same storage.
+`nametag` and `autoGenerate`. `Sphere.import` does not silently take that storage over either: when it already
+holds a wallet (or a live `Sphere` is using it), the import rejects with `ALREADY_INITIALIZED` and leaves the
+wallet untouched. Pass `overwrite: true` to replace it. That clears the storage's current wallet first, including
+the payment journals of transfers still in flight, so do not run it while transfers are pending; the clear also
+destroys any live `Sphere` on the same storage, and for IndexedDB it empties the whole database named by `dbName`,
+every key `prefix` in it. Back up the phrase you are replacing: the clear runs before the new wallet is brought up,
+so a failure after it (relays unreachable, a `nametag` already taken) leaves the new wallet's keys in storage, not
+the old ones. To keep both wallets, import into storage with its own database instead
+(`createBrowserProviders({ storage: { dbName: 'sphere-storage-2' }, ... })`).
 
 Restore from a mnemonic into an empty storage (plaintext storage, the default):
 
@@ -761,7 +767,31 @@ const sphere = await Sphere.import({
   ...createProviders(),
   network: NETWORK,
   mnemonic: 'word1 word2 word3 ... word12',
+  overwrite: true, // replace the stored wallet; without it, import rejects with ALREADY_INITIALIZED
 });
+```
+
+Import without the flag first when the user may still have a wallet on this device. `Sphere.import` checks every
+input — `network`, `password`, the mnemonic or master key — before it touches storage, so the wallet is still
+there when you catch the refusal:
+
+```typescript
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import { NETWORK, createProviders } from './wallet';
+
+const mnemonic = 'word1 word2 word3 ... word12';
+let sphere: Sphere | undefined;
+
+try {
+  sphere = await Sphere.import({ ...createProviders(), network: NETWORK, mnemonic });
+} catch (err) {
+  // Read `code` structurally: errors thrown by the providers are a different SphereError class copy.
+  if ((err as { code?: unknown } | null)?.code !== 'ALREADY_INITIALIZED') throw err;
+  // Nothing was erased. Replace that wallet only once the user has confirmed it and has its phrase:
+  if (confirm('Replace the wallet on this device?')) {
+    sphere = await Sphere.import({ ...createProviders(), network: NETWORK, mnemonic, overwrite: true });
+  }
+}
 ```
 
 Load an existing password-protected wallet:
