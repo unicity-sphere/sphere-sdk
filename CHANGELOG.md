@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.4] - 2026-09-21
+
 ### Fixed (BREAKING, wallet safety) — an import never erases a wallet as a side effect (#801, #808)
 
 `Sphere.import()` cleared the wallet already on its storage **before** it checked its own input, so
@@ -1938,7 +1940,8 @@ consumed exclusively through the `token-engine/` port. Consequences:
 - `PaymentsModule.destroy()` now cleans up storage event subscriptions and debounce timers
 - `IpfsStorageProvider.shutdown()` now disconnects the subscription client
 
-[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.3...HEAD
+[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.4...HEAD
+[0.17.4]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.3...v0.17.4
 [0.17.3]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.2...v0.17.3
 [0.17.2]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.1...v0.17.2
 [0.17.1]: https://www.npmjs.com/package/@unicitylabs/sphere-sdk/v/0.17.1
