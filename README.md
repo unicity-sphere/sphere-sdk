@@ -1350,7 +1350,7 @@ This means the nametag is registered (bound on Nostr) to a **different public ke
    - SDK creates a new wallet with new keypair
    - Nametag registration fails because old pubkey owns it on Nostr
 
-2. **Different mnemonic provided**:
+2. **Different mnemonic provided**: `Sphere.init` uses `mnemonic` and `nametag` only when the storage holds no wallet; when it holds one, init loads that wallet and ignores both. A mnemonic that changes between runs therefore breaks registration only when the storage did not keep the wallet (cause 1), or when you pass it with the nametag to `Sphere.import`, which clears the stored wallet and creates a new one from that mnemonic:
    ```typescript
    // ❌ WRONG: Random mnemonic each time
    const mnemonic = Sphere.generateMnemonic();
@@ -1358,7 +1358,7 @@ This means the nametag is registered (bound on Nostr) to a **different public ke
      ...providers,
      network: 'testnet2',
      mnemonic,
-     nametag: 'myservice',  // Fails after first run
+     nametag: 'myservice',  // Fails on a later run whenever the storage did not keep the wallet (cause 1)
    });
    ```
 

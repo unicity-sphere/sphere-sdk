@@ -72,10 +72,11 @@ The current Connect protocol version is **`2.3`** (`SPHERE_CONNECT_VERSION = '2.
 - **2.3** adds the `mint_nft` intent and its `nft:mint` scope — see [mint_nft Intent](#mint_nft-intent).
 - **2.2** added the `send_nft` intent and its `nft:transfer` scope.
 
-Both are additive MINOR bumps. The handshake gate compares MAJOR only, so a 2.1 or 2.2 dApp still
-connects to a 2.3 wallet. An SDK host older than 2.3 answers `mint_nft` with `PERMISSION_DENIED`
-(4002), because no scope maps to it there; read `client.walletProtocol` to tell that apart from a
-refused scope.
+Both are additive MINOR bumps. The protocol check compares MAJOR only, so a 2.1 or 2.2 dApp on SDK
+0.14.1 or later still connects to a 2.3 wallet; an older SDK is refused by the SDK version floor
+(see [Handshake fields](#handshake-fields)). An SDK host older than 2.3 answers `mint_nft` with
+`PERMISSION_DENIED` (4002), because no scope maps to it there; read `client.walletProtocol` to tell
+that apart from a refused scope.
 
 > **sphere-sdk 0.15.0 does NOT bump it.** That release is a hard wire break on the
 > *state-transition* protocol, but Connect messages carry no state-transition bytes — the token
@@ -86,7 +87,7 @@ refused scope.
 
 ### Compatibility policy
 
-- **Same MAJOR = compatible.** A dApp on 2.0 and a wallet on 2.1 connect fine — MINOR versions within the same MAJOR interoperate.
+- **Same MAJOR passes the protocol check.** MINOR versions within one MAJOR interoperate on the wire, but by default the host also enforces the npm SDK floor `0.14.1-0` (see [Handshake fields](#handshake-fields)). Every SDK that speaks Connect 2.0 (0.10.1 to 0.12.0) is below that floor, and so is a 2.1 dApp on SDK 0.13.x or 0.14.0: they get `UNSUPPORTED_PROTOCOL_VERSION` (4007) unless the wallet lowers `ConnectHostConfig.minSdkVersion`.
 - **Different MAJOR = rejected.** A v1-era dApp (protocol `'1.0'`) that attempts to handshake with a v2 wallet is rejected with `UNSUPPORTED_PROTOCOL_VERSION` (4007). That peer must update its SDK.
 - The **v1 → v2** cut is a one-time hard break: v1 peers are genuinely incompatible and must upgrade.
 
@@ -188,16 +189,16 @@ import { PostMessageTransport } from '@unicitylabs/sphere-sdk/connect/browser';
 // --- dApp side (client) ---
 
 // dApp inside an iframe — talk to the parent window (the default target)
-const transport = PostMessageTransport.forClient();
+const clientTransport = PostMessageTransport.forClient();
 
 // dApp opens the wallet in a popup — see "dApp side, popup" below
 
 // --- Wallet side (host) ---
 // forHost(target, options) — BOTH arguments are required.
 // iframe mode: target = the iframe element (or its contentWindow)
-const transport = PostMessageTransport.forHost(iframeEl, { allowedOrigins: [dappOrigin] });
+const iframeHostTransport = PostMessageTransport.forHost(iframeEl, { allowedOrigins: [dappOrigin] });
 // popup mode: target = window.opener
-const transport = PostMessageTransport.forHost(window.opener, { allowedOrigins: [dappOrigin] });
+const popupHostTransport = PostMessageTransport.forHost(window.opener, { allowedOrigins: [dappOrigin] });
 ```
 
 `allowedOrigins` is the host's inbound filter; its first entry is also the `targetOrigin` the host
@@ -254,9 +255,9 @@ const popupTransport = PostMessageTransport.forClient({ target: popup, targetOri
 
 > **Legacy.** The Sphere browser extension is discontinued: **no supported wallet answers this
 > transport today.** `ExtensionTransport` still ships so existing builds keep compiling, and
-> `autoConnect` still detects the extension (P2) if something injects `window.sphere`, but do not
-> build a new integration on it. Use the hosted wallet (iframe / custom agent) or, for Node.js,
-> `WebSocketTransport`.
+> `autoConnect` still detects the extension (P2) outside an iframe if something injects a
+> `window.sphere` object whose `isInstalled()` returns `true`, but do not build a new integration
+> on it. Use the hosted wallet (iframe / custom agent) or, for Node.js, `WebSocketTransport`.
 
 The dApp communicated through the extension's content script relay:
 
@@ -264,10 +265,10 @@ The dApp communicated through the extension's content script relay:
 import { ExtensionTransport } from '@unicitylabs/sphere-sdk/connect/browser';
 
 // dApp side — sends via window.postMessage with the sphere-connect-ext namespace
-const transport = ExtensionTransport.forClient();
+const clientTransport = ExtensionTransport.forClient();
 
 // Extension background — receives via chrome.runtime.onMessage
-const transport = ExtensionTransport.forHost({
+const hostTransport = ExtensionTransport.forHost({
   onMessage: chrome.runtime.onMessage,
   tabs: chrome.tabs,
 });
@@ -1053,9 +1054,11 @@ answer differently.
 > The four wallet events are pushed unconditionally, and the 2.1+ client never sends
 > `sphere_subscribe` for them. A `sphere_subscribe` for one of them (an older dApp sends it) is
 > answered with **success**, `{ subscribed: true, event }`, without attaching anything to
-> `Sphere.on()`, which accepts any string and would never emit these names. The host answers success
-> rather than an error on purpose: an error broke every dApp built before 2.1, whose
-> `client.on('wallet:locked', …)` sends that subscribe.
+> `Sphere.on()`. Sphere never emits the three `wallet:*` names (the host pushes them itself), and
+> the host already forwards Sphere's `identity:changed` through its own subscription, armed at
+> handshake (or at unlock, if the wallet was locked then). The host answers success rather than an
+> error on purpose: an error broke every dApp built before 2.1, whose `client.on('wallet:locked', …)`
+> sends that subscribe.
 
 ## Compatibility: the old wire contract on a v2 host
 
@@ -1171,7 +1174,7 @@ try {
 
 | Code | Constant | When |
 |------|----------|------|
-| 4007 | `ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION` | Connect MAJOR version mismatch (e.g. v1 dApp connecting to v2 wallet). dApp must update its SDK. |
+| 4007 | `ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION` | The compatibility gate refused the handshake: a Connect MAJOR mismatch (e.g. a v1 dApp connecting to a v2 wallet), a protocol MINOR below the host's optional `minMinorVersion`, or — enforced by default — an `sdkVersion` that is missing or below `0.14.1-0` (see [Handshake fields](#handshake-fields)). dApp must update its SDK. |
 | 4008 | `ERROR_CODES.INCOMPATIBLE_NETWORK` | dApp targets a different network than the wallet (or omitted `network` in `ConnectClientConfig`). |
 | 4009 | `ERROR_CODES.WALLET_LOCKED` | The wallet is locked. **The session is still alive** — retry after `wallet:unlocked`. Carries `data: { reason: 'locked' }`. Discriminate on the code, never on the message. |
 | 4001 | `ERROR_CODES.NOT_CONNECTED` | No live session: `connect()` has not succeeded, or the session was revoked (`sphere_disconnect`, a logout, expiry, `setUnavailable()`). A query in flight when the session is revoked gets it too. The client also raises it locally, as "Not connected" or "Disconnected". |
@@ -1350,7 +1353,7 @@ Connect uses semver MAJOR.MINOR. The rules:
 | Change or remove an existing message / field | MAJOR | Breaking — requires a deprecation window |
 | Behaviour fix with no wire change | PATCH (no Connect bump) | Invisible to peers |
 
-**Enforced in CI:** `tests/unit/connect/protocol-surface.test.ts` snapshots the full wire surface (intents, scopes, methods, **events, error codes**) + `SPHERE_CONNECT_VERSION`. Any change to the surface fails that test until you bump the version and update its snapshot — so the bump can't be forgotten.
+**Enforced in CI:** `tests/unit/connect/protocol-surface.test.ts` snapshots the full wire surface (intents, scopes, methods, **events, error codes**) + `SPHERE_CONNECT_VERSION`. Any change to the surface fails that test until its `EXPECTED` snapshot is updated, so no surface change lands silently. The failure message tells you to bump `SPHERE_CONNECT_VERSION` before updating the snapshot, but the test does not check that the version moved: making the bump is up to the author and the reviewer.
 
 **One exception:** an error code the **host never sends** is client-local — it bumps the npm MINOR, not the protocol MINOR. The wire surface did not change, so no dApp can observe it from the wallet.
 

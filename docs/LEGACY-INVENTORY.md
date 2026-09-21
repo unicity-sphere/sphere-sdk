@@ -31,8 +31,9 @@ entry by grepping its backticked symbol, not by its address.
   `acceptPaymentRequest` / `markPaymentRequestPaid` and the whole `'accepted'`
   concept.
 - Earlier: the pre-E.4 (`v:1`) intent resume path.
-- **P11 flip (this branch, commits 59cc52ac adapter / 83100c72 flip / 0443ff5d deletion
-  wave / 22e28206 test estate + the docs commit)** — CLOSED-BY-P11: `modules/payments`,
+- **P11 flip (PR #728, merge 00656567; commits c04c895f adapter / e6ede16f flip /
+  75c35776 deletion wave / 1c6ff4b6 test estate + the docs commit a2e26822)** —
+  CLOSED-BY-P11: `modules/payments`,
   `modules/accounting`, `modules/swap`, `wallet-api/` (S1 client), the old
   `impl/shared/wallet-api` providers, `TokenStorageProvider` + both platform
   token-storage providers, `DeliveryProvider`, the Nostr asset/PR rail

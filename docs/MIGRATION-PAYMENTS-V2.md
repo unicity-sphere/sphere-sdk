@@ -5,8 +5,8 @@
 > `docs/PAYMENTS-V2-DESIGN.md`). During 0.14.0-dev.\* it was opt-in
 > (`paymentsV2: true`); **the flip release (0.14.x) made it the only path and
 > deleted the legacy module.** This guide is the whole migration — a
-> worked example is the Sphere frontend's own migration (sphere PR #470:
-> +326 −325 across 23 files, rename-shaped).
+> worked example is the Sphere frontend's own migration (sphere PR #470,
+> commit e87d5b34: +326 −325 across 23 files, rename-shaped).
 >
 > **Amended for 0.15.0 (#760).** 0.15.0 pins
 > `@unicitylabs/state-transition-sdk@3.0.1` and serves the one-release
@@ -128,8 +128,8 @@ Nothing to migrate — purely additive — but worth knowing so a token list is 
 | coin tokens | `tokens(filter?)` — **unchanged**, and still excludes coinless holdings | |
 | coinless (NFT) holdings | `coinless(): CoinlessToken[]` | 0.17.0 |
 | an NFT's payload | `tokenData(tokenId): Promise<Uint8Array \| null>` | 0.17.0 |
-| move one named token whole (never split) | `sendWholeToken({ recipient, tokenId, memo? })` | 0.17.0 (named `sendCoinless` there) |
-| the same, refusing a valued source (Connect `send_nft`) | `sendCoinless({ recipient, tokenId, memo? })` | 0.17.1 (as the NFT-scoped twin) |
+| move one named token whole (never split), coinless or valued | `sendWholeToken({ recipient, tokenId, memo? })` | 0.17.1 (in 0.17.0 the only by-tokenId verb, `sendCoinless`, refused a valued source) |
+| the same, refusing a valued source (Connect `send_nft`) | `sendCoinless({ recipient, tokenId, memo? })` | 0.17.0 (same refusal then; since 0.17.1 it is the NFT-scoped twin of `sendWholeToken`) |
 | read held tokens as NFTs ([NFT-METADATA.md](./NFT-METADATA.md)) | `nft(tokenId)`, `nfts(tokenIds)` | 0.17.2 |
 | mint an NFT to this wallet | `mintNft({ content, sign? })` | 0.17.2 |
 
@@ -236,9 +236,12 @@ The Connect wire contract is preserved by the host adapter: `sphere_getBalance`,
 working against a v2 host. dApp builders need ONE change: bump
 `@unicitylabs/sphere-sdk` to **≥ 0.14.1** — 0.14.1+ wallet hosts enforce an SDK
 version floor at the handshake (`UNSUPPORTED_PROTOCOL_VERSION` with a message
-naming the minimum; pre-0.14.1 clients don't report a version and are rejected
-as such — the floor is still `0.14.1-0` in 0.15.0). Invoice-surface consumers
-additionally see §4.
+naming the minimum). A 0.10.1–0.14.0 client reports its SDK version and is
+refused with it named, e.g. `SDK version 0.13.2 is below the required minimum
+0.14.1-0`; a client older than 0.10.1 speaks Connect protocol 1.0 and is refused
+earlier, by the protocol MAJOR check (`Incompatible Connect protocol version:
+app speaks 1.0, wallet speaks …`). The floor is still `0.14.1-0` in 0.15.0.
+Invoice-surface consumers additionally see §4.
 
 **Wallet hosts (not dApps) see one shape change in 0.15.0.** With the
 `paymentsV2` alias gone, the `SphereInstance` a `ConnectHost` is constructed

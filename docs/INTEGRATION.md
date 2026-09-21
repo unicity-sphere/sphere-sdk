@@ -868,7 +868,10 @@ if (peer) {
 ```typescript
 import { createPriceProvider } from '@unicitylabs/sphere-sdk';
 
-// Set or replace PriceProvider at runtime
+// Price is a composition-time property of the payments vertical. To have prices from
+// the start, pass `price` to createBrowserProviders()/createNodeProviders() (or Sphere.init()).
+// setPriceProvider() does not change the running vertical: assets() keeps its current
+// price fields until the next address switch composes a new vertical, which picks it up.
 sphere.setPriceProvider(createPriceProvider({
   platform: 'coingecko',
   apiKey: userProvidedKey,  // Optional for free tier

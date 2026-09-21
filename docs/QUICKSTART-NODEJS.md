@@ -200,8 +200,10 @@ const base = createNodeProviders({
 
   // Transport options
   transport: {
-    relays: ['wss://custom-relay.com'],           // Replace default relays
-    additionalRelays: ['wss://extra-relay.com'],  // Add to defaults
+    // Set one of the two: `relays` replaces the network defaults; `additionalRelays`
+    // extends them and is ignored when `relays` is also set.
+    relays: ['wss://custom-relay.com'],              // Replace default relays
+    // additionalRelays: ['wss://extra-relay.com'],  // Or: add to defaults
     timeout: 5000,
     autoReconnect: true,
     debug: false,
@@ -336,17 +338,20 @@ console.log(uct?.name, uct?.decimals);  // 'unicity', 18 (testnet2 registry)
 const coinId = registry.getCoinIdBySymbol('UCT');
 ```
 
-> **Note:** The registry is configured automatically by `Sphere.init()`. `createNodeProviders()` does **not** configure it — if you build providers without initialising a Sphere and then read the registry directly, configure it yourself:
+> **Note:** The registry is configured automatically by `Sphere.init()`. `createNodeProviders()` does **not** configure it — if you build providers without initialising a Sphere and then read the registry directly, configure it yourself, and connect the storage first:
 >
 > ```ts
 > import { TokenRegistry, NETWORKS } from '@unicitylabs/sphere-sdk';
 >
+> // Load wallet.json first: an unconnected file storage starts empty, and its
+> // first write (the registry cache) would replace the file, mnemonic included.
+> await providers.storage.connect();
 > TokenRegistry.configure({
 >   remoteUrl: NETWORKS.testnet2.tokenRegistryUrl,
 >   storage: providers.storage,
 > });
 > ```
-> Data is fetched from the network and cached in the storage provider you pass (the wallet file here).
+> Data is fetched from the network and cached in the storage provider you pass (the wallet file here). Never pass a storage that is not connected and points at an existing wallet file. If you do not need the cache, leave `storage` out.
 
 ### Send Tokens
 
@@ -636,14 +641,14 @@ a decision: `pay()` and `decline()` are alternatives, and `pay()` rethrows `send
 [Error Handling](#error-handling)).
 
 ```typescript
-import { getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
+import { TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
 
 // Requester side: create() never throws. It resolves { success, requestId?, error? }.
-const coinId = getCoinIdBySymbol('UCT'); // the hex coin id (see "Coin IDs")
-if (coinId) {
-  const created = await sphere.payments.requests.create('@bob', { coinId, amount: '1000000', memo: 'Order #1234' });
-  if (!created.success) console.error(created.error);
-}
+await TokenRegistry.waitForReady(); // Sphere.init starts the registry load but does not await it
+const coinId = getCoinIdBySymbol('UCT'); // the hex coin id, or undefined (see "Coin IDs")
+if (!coinId) throw new Error('UCT is not in this network\'s token registry');
+const created = await sphere.payments.requests.create('@bob', { coinId, amount: '1000000', memo: 'Order #1234' });
+if (!created.success) console.error(created.error);
 
 // Payer side: never pay from the event handler itself. Decide first (a person, or your own policy).
 sphere.on('payment_request:incoming', async (request) => {

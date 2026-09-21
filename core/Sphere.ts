@@ -9,7 +9,8 @@
  * import { createLocalStorageProvider, createNostrTransportProvider, createUnicityAggregatorProvider } from '@unicitylabs/sphere-sdk/impl/browser';
  *
  * const storage = createLocalStorageProvider();
- * const transport = createNostrTransportProvider();
+ * // Without `relays` the transport falls back to public Nostr relays, so pass the network's relay:
+ * const transport = createNostrTransportProvider({ relays: ['wss://nostr-relay.testnet.unicity.network'] });
  * const oracle = createUnicityAggregatorProvider({ url: '/rpc', network: 'testnet2' });
  * // Money rides the wallet-api vertical — the transport config is REQUIRED:
  * const walletApi = { network: 'testnet2', baseUrl: 'https://wallet-api...', deviceId: 'my-device' };
@@ -20,7 +21,7 @@
  *   transport,
  *   oracle,
  *   walletApi,
- *   network: 'testnet2', // required: selects registry/trustbase/aggregator
+ *   network: 'testnet2', // required: selects the token registry and must equal walletApi.network (the trust base and gateway come from the oracle)
  *   mnemonic: 'your twelve words...', // optional - will load if wallet exists
  *   autoGenerate: true, // generate new mnemonic if needed
  * });
