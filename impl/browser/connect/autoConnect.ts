@@ -116,7 +116,11 @@ export interface AutoConnectConfig {
    */
   resumeSessionId?: string;
 
-  /** Timeout for query requests in ms. Default: 30000. */
+  /**
+   * Timeout in ms for query requests and for the connect handshake. Default: 30000. The
+   * handshake answer waits for the user's approval, so a non-silent autoConnect() rejects with
+   * 'Connection timeout' when the user takes longer than this.
+   */
   timeout?: number;
 
   /** Timeout for intent requests in ms. Default: 120000. */

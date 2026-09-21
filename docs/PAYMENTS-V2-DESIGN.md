@@ -115,8 +115,9 @@ client state (§6).
   relay delivery rail that tombstones defended against is out of scope).
 - **The local history ledger** — history is a server read-through plus client POSTs (§5.9).
 - **The Nostr leg of payment requests**, v1 TXF relic handling, the multi-provider storage
-  fan-out, the local nametag store (the `getCurrentNametag` injection stays), and the 25
-  declared-public members with zero consumers.
+  fan-out, the local nametag store (the injected own-nametag getter stays: `getCurrentNametag`
+  on the old module, `ownNametag` in the v2 vertical, fed by Sphere's per-address `nametag`
+  host getter), and the 25 declared-public members with zero consumers.
 - **The `PROXY://` leftovers** in `core/transport-resolver.ts` and the Nostr transport (the
   untracked Codex P2 from #722) — the v2 recipient resolution rides these paths, so the branches
   are deleted in P11 at the latest.
@@ -201,8 +202,8 @@ never re-wrap it; test-pinned); **`TransferResult`'s consumed fields** — `id`,
 `tokenTransfers`, and `deliveryPending` (Connect's send-intent forwards it with `?? false`, so
 dropping the field silently reports "delivered" on every send; the §5.5 resolution point sets
 `deliveryPending: true` whenever the deposit is not yet confirmed); and the requests durability
-ordering (#441): the settling-journal write is durable **before** any possibly-committed throw
-surfaces.
+ordering (#441): the settling-journal write is durable **before** a possibly-committed throw that
+carries a `transferId` surfaces (nothing is linked while the send runs: the #806 gaps, §5.8).
 
 **Compatibility:** the Connect *wire* contract is adapted inside `ConnectHost`, not in payments —
 `sphere_getBalance`/`sphere_getFiatBalance` served from `assets()`; `sphere_getHistory` serves the
@@ -215,7 +216,8 @@ re-emitted by the adapter** — `transfer:confirmed`/`transfer:delivery_pending`
 (by code); `realtime:status`/`storage:degraded` from `connection:status`;
 `sync:completed`/`sync:remote-update` from `inventory:updated` — nothing a dApp subscribes to
 silently stops firing. Lifecycle (`initialize`/`load`/`destroy`/`resumeOpenIntents`) collapses to
-internal `start(deps)`/`stop()` owned by `Sphere`, with intent resume inside `start` — plus one
+internal `start()`/`stop()` owned by `Sphere` (the facade receives its dependencies in the
+`PaymentsFacade` constructor), with intent resume inside `start` — plus one
 explicit seam the frontend's subscription flow requires: **`setEngine(next)`** (the api-key hot
 swap must not tear down the socket/session; operations snapshot the engine at entry, so a swap
 changes what *future* operations use while in-flight sends finish on the old one).
@@ -435,8 +437,9 @@ Normative behaviors bound into the transitions (not call sites):
   under a **new** transferId (`PartialSendConflictError`, deliberately not a
   `TransferConflictError` subclass); a conflicted resume leg delivered nothing — never recorded
   spent. Certified-during-failure sources are terminal `'spent'`, never restored.
-- **Fan-out:** certify at width 8, fail-fast **between** batches (in-flight siblings always
-  settle); the burn certifies + checkpoints before any mint; mint legs parallel (width 8).
+- **Fan-out:** certify at width 20 (`CERTIFY_WIDTH`, widened from 8 by #746), fail-fast
+  **between** batches (in-flight siblings always settle); the burn certifies + checkpoints before
+  any mint; mint legs parallel (width 8).
 - `applyDelta` targets the provider snapshot the sources were read from (#715) and runs after the
   deposit **attempt** of the same `transferId` — delivered, deferred (429), or failed-and-journaled
   alike; a deferred deposit must not leave spent sources listed active on every device (the S3
@@ -574,9 +577,10 @@ construction — another owner holds equal-or-newer state, the delivery is stale
 non-destructive server-side (terminal for discovery only; blob retained; never downgrades a
 claim), so no retry counter exists (zero client state); `transfer:attention`
 `{code:'claim:conflict'}` makes it operator-visible. The emitted `transfer:incoming` payload
-keeps its consumed shape: sender
-nametag resolved via transport, token display fields (`symbol`, `decimals`, `iconUrl`) enriched
-from the registry, memo decrypted from the ECDH bundle. Wake-driven with the 30 s poll as the
+keeps its consumed shape: sender nametag and memo both come from the recipient-ECDH delivery
+bundle (sphere#487; the nametag is the sender's own claim, carried in its envelope, and is not
+looked up or checked against a published binding), and token display fields (`symbol`,
+`decimals`, `iconUrl`) are enriched from the registry. Wake-driven with the 30 s poll as the
 correctness backstop. **Restore self-detection (S7 port shape):** the mailbox page response
 carries `syncEpoch`, and the DeliveryPort surfaces it — `incomingEpoch(): string | null`, the
 epoch of the most recent `incoming()` page, updated per page — so Receive persists its
@@ -590,17 +594,26 @@ the same sentence.
 
 wallet-api streams only. Incoming = gap-free `?since=` upsert-by-id stream (reconcile by id, a
 status change re-surfaces at higher seq); outgoing = backfill view, no tailing. `pay()` is
-per-request single-flight; the #441 settling journal is kept verbatim: durable request→transferId
-link **before** any possibly-committed throw; reconcile by the linked transfer's outcome; direction
-of error is always paid-never-re-payable. **The settlement invariant (one code path):** a settling
-link is removed ONLY by a CONFIRMED paid respond (2xx, or the 409 already-resolved absorb) or by a
-proven clean pre-commit failure — never by a network error, a 5xx, or a reload; a clean-success
-send whose respond fails keeps the link (status `settling`) and the next reconcile's
-committed-link override retries the respond. The 409 swallow-and-clear applies **only to the
-paid-respond leg** (the payment already succeeded — 409 means already resolved); `decline()`
-**propagates** 403/409 to the caller, as the frontend contract requires (a refused decline must
-never look like success). Requests memo encryption is the recipient-ECDH bundle shared with
-Delivery (`core/delivery-envelope.ts`). Expiry is server-owned.
+per-request single-flight (in memory); the #441 settling journal: the request→transferId link is
+written once `send()` returns or throws, and before `pay()` rethrows a possibly-committed error
+that carries a `transferId` (one without a `transferId` only marks the request `paid` in memory;
+on the clean-success arm a failed link write never throws — it logs, responds paid fail-closed so
+the server record is the anchor when that respond lands, and `pay()` returns with the link in
+memory only); reconcile by the linked transfer's outcome, and an unaccounted link resolves paid
+unless the server lists its intent as aborted (paid-never-re-payable once a durable link exists).
+**Known gap (#806):** no link exists while the send runs, so a process that stops during
+`pay()` can list an already-paid request as `pending` (payable) again after a restart; and
+if the link write fails on the possibly-committed path, `pay()` rejects with the storage error
+instead of the send error and the link lives only in memory. Until #806 is fixed, check
+`pendingTransfers()` / `history()` before paying a request again. **The settlement invariant (one
+code path):** a settling link is removed ONLY by a CONFIRMED paid respond (2xx, or the 409
+already-resolved absorb) or by a proven clean pre-commit failure — never by a network error, a
+5xx, or a reload; a clean-success send whose respond fails keeps the link (status `settling`) and
+the next reconcile's committed-link override retries the respond. The 409 swallow-and-clear
+applies **only to the paid-respond leg** (the payment already succeeded — 409 means already
+resolved); `decline()` **propagates** 403/409 to the caller, as the frontend contract requires (a
+refused decline must never look like success). Requests memo encryption is the recipient-ECDH
+bundle shared with Delivery (`core/delivery-envelope.ts`). Expiry is server-owned.
 
 ### 5.9 `History` + `Mint`
 
@@ -717,7 +730,7 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
 Rules (each enforced by a request-count regression test, not a duration): the intent PUT is the
 single pre-spend liveness gate; `applyDelta` is the only authoritative write in a send — there is
 no `save()` to storm (#713 has no substrate); selected source blobs fetch bounded-parallel (#716);
-certify width 8 + one batched deposit (kept from #698/#700); `send()` resolves before the
+certify width 20 (#746; 8 in #698) + one batched deposit (#700); `send()` resolves before the
 fire-and-forget tail (#717). Budget for the modal single-source send: ~1 certification round
 (~1.0–1.5 s at the 300 ms proof poll) + ~150–300 ms delivery + 1 `applyDelta` round trip
 (APPLYING is inside the awaited path — §5.5) ≈ **≤ 2 s**. Receive: wake → drain immediately (no
@@ -843,7 +856,8 @@ settled-only accounting with keep-open > conflict > other; keep-open family neve
 same-transferId resume, foreign proof never applied; re-deliver never re-certify; conflicted leg
 never recorded spent; locally-aborted intents never resumed, unknown local disposition defers
 all; unsupported payloads refused; reservation gate + synchronous critical section; per-request
-pay single-flight; settling journal durable-before-throw; post-commit mirror failure ≠ failure;
+pay single-flight; settling journal durable-before-throw (not during the send: #806, §5.8);
+post-commit mirror failure ≠ failure;
 pre-submit 422 intent rejection drops backstop (re-seed rejection keeps it), never aborts;
 suspectedSpent demotion durable + re-plan bounded; remainder-only re-plan under new transferId +
 durable shortfall record; provider pinning; fail-closed composition (with ONE explicit escape:

@@ -417,10 +417,13 @@ interface PeerInfo {
 - `preResolveDM(address: string): Promise<void>` — resolve a recipient ahead of DMs; throws
   `INVALID_RECIPIENT` when it cannot be resolved.
 - `setOracleApiKey(apiKey: string): Promise<void>` — apply a new gateway API key to the live
-  oracle and rebuild the active address's token engine (other tracked addresses re-key on their
-  next switch). Operations started after the call use the new key; one already in flight keeps
-  the old engine, which is then disposed, so an operation still verifying a token at that moment
-  fails.
+  oracle and rebuild the token engine of the active address only. An address that already has
+  an engine in this session (the boot address and every address switched to since) keeps the
+  old key when you switch back to it; only an address switched to for the first time after the
+  call builds its engine with the new key. To re-key such an address, switch to it and call
+  `setOracleApiKey` again. Operations started after the call use the new key; one already in
+  flight keeps the old engine, which is then disposed, so an operation still verifying a token
+  at that moment fails.
 - `setPriceProvider(provider: PriceProvider): void` — takes effect for payments verticals composed
   after the call (the next address switch).
 - `getStatus(): SphereStatus`, `reconnect(): Promise<void>` (disconnects and reconnects the
@@ -453,9 +456,12 @@ the superseded `pv2:` keys are swept once at composition.
 `sphere.payments` is the same facade the alias returned, with one behavioural difference that
 matters at the call site: where the alias evaluated to `null` while no vertical was running, the
 getter **throws** `SphereError` with `code: 'NOT_INITIALIZED'`. Code written as
-`sphere.paymentsV2?.tokens() ?? []` silently degraded before and now throws — rewrite it to read
-the facade only after `Sphere.init()` resolves, or catch that one code where you used to check
-for `null`.
+`sphere.paymentsV2?.tokens() ?? []` no longer compiles under TypeScript (TS2551: `paymentsV2`
+does not exist on `Sphere`). In plain JavaScript the property is simply gone, so that expression
+now always evaluates to `[]` and hides the wallet's tokens instead of failing. Rename it to
+`sphere.payments`, and note that `sphere.payments?.tokens() ?? []` does not degrade: the getter
+throws before `?.` is reached. Read the facade only after `Sphere.init()` resolves, or catch that
+one code where you used to check for `null`.
 
 ### How Transfers Work (sender-driven)
 
@@ -471,9 +477,11 @@ for `null`.
 
 - The intent is durable on the server **before** any chain op; a crash at any stage resumes
   the SAME `transferId` inside the facade's start — never a second spend.
-- Whole-token transfers use `engine.transfer`; partial amounts use `engine.split` (recipient
-  output + change certified in one on-chain operation; split progress is checkpointed
-  server-side, field-encrypted and signed).
+- Whole-token transfers use `engine.transfer`; partial amounts use `engine.split`: the source
+  is burned in one certified operation, then the recipient output and the change are each
+  minted in their own certified operation (the mints run in parallel). The burn and its
+  inclusion proof are checkpointed server-side, field-encrypted and signed, before any mint is
+  submitted, so an interrupted split resumes from that checkpoint instead of burning again.
 - A certified-but-undelivered blob is journaled locally (#621) and re-deposited with a bounded
   poison budget (#517) — `deliveryPending: true` on the result, `transfer:attention` when
   deferred/undeliverable.
@@ -835,7 +843,13 @@ already in flight, or #625-demoted.
 
 A proven conflict is **terminal** — there is no alternative source to re-plan onto. Treat the
 possibly-committed rules exactly as for `send()`: never re-issue after any error for which
-`isPossiblyCommittedSendOutcome(err)` is `true`; `resumeNow()` converges it.
+`isPossiblyCommittedSendOutcome(err)` is `true`; `resumeNow()` converges it. One exception: a
+`SEND_SYNC_PENDING` that carries no `err.transferId` (message `Cannot spend yet: …`) is a refusal
+before anything was reserved or sent. The SDK spends nothing until it has confirmed which tokens
+the transfers still converging hold; it runs that check when payments start (also after an
+address switch) and on every convergence pass. Nothing moved and `pendingTransfers()` has no row
+for it, so call `sendWholeToken` (or `sendCoinless`) again later. `resumeNow()` re-runs the check
+but does not send the token.
 
 ### `sendCoinless(req: { recipient, tokenId, memo? }): Promise<TransferResult>`
 
@@ -1076,7 +1090,7 @@ sphere.on('payment_request:incoming', async (request: PaymentRequestView) => {
 
 #### `sendDM(recipient: string, content: string): Promise<DirectMessage>`
 
-Send a direct message using NIP-17 gift wrapping (kind 1059). The recipient can be a `@nametag` or a hex public key. Content is wrapped in the Sphere messaging format (`{senderNametag, text}`) for compatibility with the Sphere app.
+Send a direct message using NIP-17 gift wrapping (kind 1059). The recipient can be a `@nametag` or a hex public key. When the sending address has a nametag, the content is wrapped in the Sphere messaging format (`{senderNametag, text}`) for compatibility with the Sphere app; an address without a nametag sends the content as-is.
 
 ```typescript
 interface DirectMessage {
@@ -1111,7 +1125,7 @@ Resolve a peer's nametag by their transport pubkey via live lookup from Nostr re
 
 #### `onDirectMessage(handler: (msg: DirectMessage) => void): () => void`
 
-Subscribe to incoming direct messages. Supports both NIP-17 gift-wrapped messages (kind 1059, used by Sphere app) and NIP-04 encrypted DMs (kind 4, legacy). For NIP-17 messages, the sender's nametag is extracted from the Sphere messaging format if present.
+Subscribe to incoming direct messages. Only NIP-17 gift-wrapped messages (kind 1059, the format the Sphere app sends) are delivered; legacy NIP-04 kind-4 events are ignored by the transport and never reach this handler. The sender's nametag is extracted from the Sphere messaging format if present.
 
 **DM history on connect:** The SDK persists, per address, the timestamp of the last processed DM event. On reconnect, only DMs newer than that timestamp are fetched from the relay. On first connect (no persisted timestamp), the SDK starts from "now". The `dmSince` option of `Sphere.init()` (unix seconds) is meant as the fallback for that case, but in this release it does not reach the bundled Nostr transport's DM subscription: `Sphere.init` records it only after the wallet has been created or loaded, when the boot address's subscription is already set up, and for an address added later by `switchToAddress` the fallback is applied before the address is registered with the transport, so it is dropped. Do not rely on `dmSince` to fetch older DMs.
 
@@ -1347,7 +1361,7 @@ interface Identity {
   readonly chainPubkey: string;
   /** L3 DIRECT address (DIRECT://...) */
   readonly directAddress?: string;
-  /** Legacy derived id; retained in the TXF `_meta` shape */
+  /** Legacy derived id: '12D3KooW' + first 40 hex chars of sha256(chainPubkey bytes); nothing in the SDK uses it */
   readonly ipnsName?: string;
   /** Registered @name alias */
   readonly nametag?: string;

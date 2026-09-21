@@ -600,8 +600,15 @@ sphere-domain type that moved is `TokenBlob` (two never-read fields dropped — 
   The consumer-facing entry-script contract is
   UNCHANGED by the 3.x bump (the SDK's `IWorker`/`WorkerTokenVerifier` declarations are
   diff-clean; only the main-thread side moved). See `docs/VERIFICATION-WORKERS.md`.
-- **The engine is mandatory for money movement**: `send()` / `mint()` fail loudly
-  (`AGGREGATOR_ERROR`) when the oracle does not supply a trust base + gateway URL.
+- **The engine is mandatory for money movement**: when the oracle does not supply a trust base +
+  gateway URL (or the engine cannot be constructed), `Sphere.init` / `create` / `load` / `import`
+  reject with `INVALID_CONFIG` ('payments requires the v2 token engine …') and tear the half-built
+  Sphere down, so `send()` / `mint()` are never reachable; `switchToAddress()` to an address whose
+  engine cannot be built rejects the same way. The missing-engine `AGGREGATOR_ERROR` ('paymentsV2:
+  token engine unavailable') is raised only by the facade's `engineRef` guard, after init: a money
+  call can reject with it when its address's engine record is empty as the call starts (e.g. after a
+  `setOracleApiKey()` rebuild that could not construct one). A `walletApi: 'none'` wallet builds no
+  engine and starts no payments vertical.
 
 ### Single Identity Model
 A single secp256k1 key pair backs the L3 identity:
@@ -820,12 +827,19 @@ authoritative for build success.
 - Incoming tokens arrive as FINISHED SDK tokens via the wallet-api mailbox (continuous drain
   while started; `receive()` for an explicit one-shot).
 - **Verified before entering the balance:** `engine.verify` (full trust-base proof check) +
-  `engine.isOwnedBy(token, own chainPubkey)`; failures are rejected (warn log). Dedup by
+  `engine.isOwnedBy(token, own chainPubkey)`; a failed check is a terminal mailbox reject
+  (reason `'invalid'` / `'not-owned'`) and is not logged. Only an undecodable blob is also
+  warn-logged. A `verify` that throws (infra) is not a reject: the entry stays unacked and
+  re-lists on the next drain. Dedup by
   **(tokenId, stateHash)** — keyed on the genesis id alone, a token sent away and legitimately
-  received back (A→B→A) would be dropped as a duplicate. There is **no durable seen-set**: the
-  comparison is against `heldStates`, an in-memory `Map` built per composition
-  (`modules/payments-v2/compose.ts`) and seeded from the inventory view, backed by the server-side
-  history `dedupKey`. Store-before-ack:
+  received back (A→B→A) would be dropped as a duplicate. Dedup has two layers. First,
+  `WalletApiDeliveryPort` (`impl/wallet-api-v2/mailbox.ts`) keeps a durable seen-set of settled
+  (claimed or rejected) mailbox `deliveryId`s, each the content-derived
+  `sha256(tokenId ‖ stateHash)`, under `delivery:seen` in the per-address scoped KV; an id is
+  written only after its ack succeeds, and `incoming()` skips every id already in the set.
+  Second, Receive compares each yielded entry against `heldStates`, an in-memory `Map` built per
+  composition (`modules/payments-v2/compose.ts`) and seeded from the server inventory listing
+  (`storagePort.listInventory()`), backed by the server-side history `dedupKey`. Store-before-ack:
   the token is stored before the mailbox claim is acknowledged, so a crash re-claims instead of
   losing.
 
@@ -959,11 +973,13 @@ authoritative for build success.
 ### Durable client state (the complete inventory — design §6)
 - Everything the client persists for money lives in the per-(network, address) scoped KV:
   `pv2g2:{network}:{chainPubkey}:*` inside the plain `StorageProvider` — refresh token, sync
-  cursors, intent backstop, split-checkpoint cache, delivery journal (#621), mint journal,
+  cursors, receive seen-set, intent backstop, split-checkpoint cache, delivery journal (#621), mint journal,
   NFT mint journal (#785), #690 shortfalls, request settling journal, the epoch latch and the §5.2 `suspectedSpent` /
   `knownSpends` overlays — the complete list is `STORE_KEYS` in `modules/payments-v2/stores.ts`
   plus the session's refresh token under `refreshTokenKey(deviceId)` (`auth:refresh:<deviceId>`,
-  `impl/wallet-api-v2/session.ts`), and it contains no receive seen-set. One writer per store.
+  `impl/wallet-api-v2/session.ts`) plus the delivery port's receive seen-set under
+  `DELIVERY_SEEN_KEY` (`delivery:seen`, `impl/wallet-api-v2/mailbox.ts`: settled mailbox entry
+  ids, written only after the ack succeeds). One writer per store.
   Being self-prefixed with the network, it never rides the legacy `isNetworkScopedAddressKey`
   mechanism (which still guards the remaining
   chat/identity keys in the platform storage providers).

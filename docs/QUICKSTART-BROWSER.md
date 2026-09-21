@@ -372,8 +372,10 @@ const base = createBrowserProviders({
 
   // Transport options
   transport: {
-    relays: ['wss://custom-relay.com'],           // Replace defaults
-    additionalRelays: ['wss://extra-relay.com'],  // Add to defaults
+    // Set one of the two: `relays` replaces the network defaults; `additionalRelays`
+    // extends them and is ignored when `relays` is also set.
+    relays: ['wss://custom-relay.com'],              // Replace defaults
+    // additionalRelays: ['wss://extra-relay.com'],  // Or: add to defaults
     timeout: 5000,
     autoReconnect: true,
     debug: false,
@@ -518,12 +520,13 @@ const coinId = registry.getCoinIdBySymbol('UCT');
 > ```ts
 > import { TokenRegistry, NETWORKS } from '@unicitylabs/sphere-sdk';
 >
+> await providers.storage.connect(); // the registry caches only into a connected storage
 > TokenRegistry.configure({
 >   remoteUrl: NETWORKS.testnet2.tokenRegistryUrl,
 >   storage: providers.storage,
 > });
 > ```
-> Data is fetched from the network and cached in the storage provider you pass (IndexedDB here).
+> Data is fetched from the network and cached in the storage provider you pass (IndexedDB here). The provider must be connected: on an unconnected one the cache writes fail silently and the definitions are kept in memory only.
 
 ### Send Tokens
 
@@ -655,14 +658,14 @@ the user's decision: `pay()` and `decline()` are alternatives, and `pay()` rethr
 them as in [Send Tokens](#send-tokens)).
 
 ```typescript
-import { getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
+import { TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
 
 // Requester side: create() never throws. It resolves { success, requestId?, error? }.
-const coinId = getCoinIdBySymbol('UCT'); // the hex coin id (see "Coin IDs")
-if (coinId) {
-  const created = await sphere.payments.requests.create('@bob', { coinId, amount: '1000000', memo: 'Order #1234' });
-  if (!created.success) console.error(created.error);
-}
+await TokenRegistry.waitForReady(); // Sphere.init starts the registry load but does not await it
+const coinId = getCoinIdBySymbol('UCT'); // the hex coin id, or undefined (see "Coin IDs")
+if (!coinId) throw new Error('UCT is not in this network\'s token registry');
+const created = await sphere.payments.requests.create('@bob', { coinId, amount: '1000000', memo: 'Order #1234' });
+if (!created.success) console.error(created.error);
 
 // Payer side: never pay from the event handler itself. Show the request and let the user decide.
 sphere.on('payment_request:incoming', async (request) => {

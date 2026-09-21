@@ -67,8 +67,13 @@ await this.journal(blob);
 await this.deliver(blob);
 ```
 
-Public API JSDoc is the contract and does not count against the block limit — but it documents
-**behavior**, never history.
+Public API JSDoc is the contract. A JSDoc block does not count against the block limit when the
+line directly below it (no blank line between) opens a declaration the rule recognises: a keyword
+or modifier (`export`, `function`, `class`, `interface`, `public`, `static`, `readonly`, …), a
+decorator, or `name:` / `name(` / `name<`. JSDoc above a bare `get`/`set` accessor, a quoted key,
+an enum member or an untyped class field (`count = 0`) does count, so keep it to 5 lines. A
+trailing `//` comment on the declaration line joins the block, and the rule then tests the line
+after it instead. Either way JSDoc documents **behavior**, never history.
 
 ### What goes
 

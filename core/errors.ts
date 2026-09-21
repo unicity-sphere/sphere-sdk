@@ -9,12 +9,16 @@
  *
  * @example
  * ```ts
- * import { isPossiblyCommittedSendOutcome } from '@unicitylabs/sphere-sdk';
+ * import { PartialSendConflictError, isPossiblyCommittedSendOutcome } from '@unicitylabs/sphere-sdk';
  *
  * try {
  *   await sphere.payments.send({ recipient: '@alice', amount: '1000000', coinId });
  * } catch (err) {
- *   if (isPossiblyCommittedSendOutcome(err)) {
+ *   if (err instanceof PartialSendConflictError) {
+ *     // Part of the amount already left the wallet and is final. Only err.remainingAmount is still owed:
+ *     // if you pay it, do it as a NEW send of exactly that amount, never the original amount.
+ *     showToast(`Partly sent: ${err.remainingAmount} base units were not sent`);
+ *   } else if (isPossiblyCommittedSendOutcome(err)) {
  *     // The money may already have left the wallet: never call send() again for this payment.
  *     showToast('Sent, waiting for confirmation');
  *   } else {

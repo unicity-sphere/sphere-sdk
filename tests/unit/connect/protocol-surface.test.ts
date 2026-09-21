@@ -28,10 +28,11 @@ const BUMP_REMINDER =
 // P11 flip: the 9 invoice intents, 2 invoice queries and 2 invoice scopes were removed
 // WITHOUT a MAJOR — they were experimental, never enabled in any wallet host (every call
 // answered MODULE_NOT_AVAILABLE), and the consumer gate found zero dApp users. Version
-// stays 2.1 by owner decision; a removed method now falls through to METHOD_NOT_FOUND.
+// stays 2.1 by owner decision; a removed method now answers PERMISSION_DENIED (4002) on an
+// unlocked host (unmapped in METHOD_PERMISSIONS), never METHOD_NOT_FOUND.
 const EXPECTED = {
   // 2.2: #777 adds the send_nft intent + nft:transfer scope. Additive, and the
-  // handshake gate is MAJOR-only, so no existing dApp is cut off.
+  // protocol-version check is MAJOR-only, so the bump cuts no existing dApp off.
   // 2.3: adds the mint_nft intent + nft:mint scope. Additive for the same reason.
   version: '2.3',
   intents: [
