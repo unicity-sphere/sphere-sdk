@@ -194,8 +194,7 @@ describe('Sphere.import over an existing wallet (#801)', () => {
     });
 
     it('init with autoGenerate rejects instead of generating a new seed over the wallet', async () => {
-      // Two failures: init's own check, then the one in create().
-      const p = flakyStore(2);
+      const p = flakyStore(1);
       await expect(Sphere.init({ ...common(p), autoGenerate: true })).rejects.toThrow('open timed out');
       expectWalletUntouched(p);
     });

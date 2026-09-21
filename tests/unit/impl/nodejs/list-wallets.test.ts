@@ -63,6 +63,8 @@ describe('listWallets (#801)', () => {
     // An exportToJSON() backup carries `mnemonic` too, but opening it as a wallet file
     // would let FileStorageProvider rewrite it.
     write('import-wallet.json', JSON.stringify({ version: '1.0', type: 'sphere-wallet', mnemonic: MNEMONIC, wallet: {} }));
+    // A legacy flat export, the other backup shape importFromLegacyFile() reads.
+    write('legacy-export.json', JSON.stringify({ mnemonic: MNEMONIC, masterPrivateKey: MASTER_KEY, descriptorPath: "84'/1'/0'" }));
     write('wallet.json.tmp', JSON.stringify({ mnemonic: MNEMONIC }));
     write('notes.md', MNEMONIC);
     fs.mkdirSync(path.join(dir, 'nested.json'));
@@ -78,6 +80,12 @@ describe('listWallets (#801)', () => {
     await storage.connect();
     expect(await storage.get('mnemonic')).toBe(MNEMONIC);
     await storage.disconnect();
+  });
+
+  it('lists a wallet whose file name has an upper-case extension', async () => {
+    // FileStorageProvider opens any walletFileName, so the listing must not hide one.
+    write('Wallet.JSON', JSON.stringify({ mnemonic: MNEMONIC }));
+    expect(await listWallets(dir)).toMatchObject([{ fileName: 'Wallet.JSON', passwordProtected: false }]);
   });
 
   it('returns an empty list for a directory that does not exist', async () => {

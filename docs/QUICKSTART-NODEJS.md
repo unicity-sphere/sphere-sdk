@@ -450,7 +450,7 @@ sphere.communications.onDirectMessage((msg) => {
 `nametag` and `autoGenerate`. `Sphere.import` does not silently take that storage over either: when the wallet
 file already holds a wallet (or a live `Sphere` is using it), the import rejects with `ALREADY_INITIALIZED` and
 leaves the wallet untouched. It checks every input — `network`, `password`, the mnemonic or master key — before it
-touches storage, so a rejected import erases nothing. Pass `overwrite: true` to replace the stored wallet. That
+touches storage, so an import rejected by a check erases nothing. Pass `overwrite: true` to replace the stored wallet. That
 clears it first, including the payment journals of transfers still in flight, so do not run it while transfers are
 pending; the clear also destroys any live `Sphere` on the same storage. Back up the phrase you are replacing: the
 clear runs before the new wallet is brought up, so a failure after it (relays unreachable, a `nametag` already
