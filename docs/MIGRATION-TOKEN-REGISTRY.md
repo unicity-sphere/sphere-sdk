@@ -112,7 +112,10 @@ note does not stop a wrong answer being consumed.
 given — scoped by the **backing store** that storage addresses, not by the provider object.
 Previously they destroyed whichever Sphere was constructed last, so `Sphere.import({ storage: B })`
 killed a live wallet on storage A, dropping every `sphere.on()` handler with no event and no
-error. The `exists(storage)` behaviour that callers actually depend on is unchanged.
+error. The `exists(storage)` behaviour that callers actually depend on is unchanged. (A later
+release makes `Sphere.import()`'s clear opt-in: over a storage that already holds a wallet it
+rejects with `ALREADY_INITIALIZED` unless `overwrite: true` is passed —
+[#801](https://github.com/unicity-sphere/sphere-sdk/issues/801). `Sphere.clear()` is unchanged.)
 
 The store is reported by a new optional `StorageProvider.backingStoreId`: the resolved wallet
 path for `FileStorageProvider`, the **database name** (`dbName`) for `IndexedDBStorageProvider`,
@@ -122,9 +125,9 @@ without it, each object is scoped to itself, as before.
 The IndexedDB key prefix is **not** part of its store id, because the database is the unit that
 gets erased: `Sphere.clear()` calls `storage.clear()` with no prefix, which empties the whole
 database, every prefix in it. Two wallets in one `dbName` under different prefixes are therefore
-one store: `Sphere.clear()` (or a `Sphere.import()` that has to clear) through either provider
-destroys the live Spheres on both and erases both wallets' keys. Give each wallet its own
-`dbName`.
+one store: `Sphere.clear()` (or a `Sphere.import({ overwrite: true })` over an existing wallet)
+through either provider destroys the live Spheres on both and erases both wallets' keys. Give
+each wallet its own `dbName`.
 
 ## Not fixed by 0.16.0 (still open)
 

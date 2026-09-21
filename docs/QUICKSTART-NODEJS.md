@@ -447,9 +447,15 @@ sphere.communications.onDirectMessage((msg) => {
 ## Import Existing Wallet
 
 `Sphere.init` loads the wallet that is already in the storage, if there is one, and then ignores `mnemonic`,
-`nametag` and `autoGenerate`. To replace the stored wallet with another phrase, use `Sphere.import`, which first
-clears the storage's current wallet, including the payment journals of transfers still in flight; do not run it
-while transfers are pending. That clear also destroys any live `Sphere` on the same storage.
+`nametag` and `autoGenerate`. `Sphere.import` does not silently take that storage over either: when the wallet
+file already holds a wallet (or a live `Sphere` is using it), the import rejects with `ALREADY_INITIALIZED` and
+leaves the wallet untouched. It checks every input — `network`, `password`, the mnemonic or master key — before it
+touches storage, so a rejected import erases nothing. Pass `overwrite: true` to replace the stored wallet. That
+clears it first, including the payment journals of transfers still in flight, so do not run it while transfers are
+pending; the clear also destroys any live `Sphere` on the same storage. Back up the phrase you are replacing: the
+clear runs before the new wallet is brought up, so a failure after it (relays unreachable, a `nametag` already
+taken) leaves the new wallet's keys in the file, not the old ones. To keep both wallets, import into another
+`walletFileName` instead — see [Several Wallets in One Directory](#several-wallets-in-one-directory).
 
 The samples in this section and the next use `providers` from the [Minimal Example](#minimal-example).
 
@@ -483,6 +489,7 @@ const sphere = await Sphere.import({
   basePath: "m/84'/1'/0'",
   derivationMode: 'bip32',
   network: 'testnet2',
+  overwrite: true, // replace the stored wallet; without it, import rejects with ALREADY_INITIALIZED
   ...providers,
 });
 ```
@@ -581,13 +588,58 @@ const providers = createWalletApiProviders(base, {
 });
 
 // Creates the wallet from the phrase when wallet.json holds none; if it already holds
-// a wallet, that wallet is loaded and `mnemonic` is ignored (use Sphere.import to replace it).
+// a wallet, that wallet is loaded and `mnemonic` is ignored (Sphere.import with
+// overwrite: true replaces it; another walletFileName keeps both).
 const { sphere } = await Sphere.init({
   ...providers,
   network: 'testnet2',
   mnemonic,
 });
 ```
+
+### Several Wallets in One Directory
+
+Every `walletFileName` in one `dataDir` is its own wallet, so a second wallet can be imported next to the current
+one instead of over it — no `overwrite: true`, and nothing in the other file is touched. `listWallets(dataDir)`
+returns the wallet files that are there:
+
+```typescript
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import { createNodeProviders, createWalletApiProviders, listWallets } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+const providersFor = (walletFileName: string) =>
+  createWalletApiProviders(
+    createNodeProviders({
+      network: 'testnet2',
+      dataDir: './wallet-data',
+      walletFileName, // one wallet per file: 'wallet.json', 'savings.json', ...
+      oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' },
+    }),
+    { baseUrl: 'https://wallet-api.unicity.network', network: 'testnet2', deviceId: 'my-service-host-1' },
+  );
+
+// A second wallet file next to ./wallet-data/wallet.json, which keeps its own wallet.
+const imported = await Sphere.import({
+  ...providersFor('savings.json'),
+  network: 'testnet2',
+  mnemonic: 'your twelve word mnemonic phrase here ...',
+});
+await imported.destroy();
+
+// Every wallet file in the directory, sorted by file name:
+// [{ fileName: 'savings.json', filePath: '<absolute path>', passwordProtected: false },
+//  { fileName: 'wallet.json', filePath: '<absolute path>', passwordProtected: false }]
+const wallets = await listWallets('./wallet-data');
+
+// Open the one the user picks: its `fileName` is the `walletFileName` to pass back.
+const { sphere } = await Sphere.init({ ...providersFor(wallets[0].fileName), network: 'testnet2' });
+```
+
+`listWallets` looks only at the files directly in `dataDir`, and never needs a password: a `.json` file counts
+when it stores a mnemonic or a master key, a `.txt` file when it holds a recovery phrase (encrypted or not).
+Files that hold no wallet are left out, and so are `exportToJSON()` backups: they carry a `mnemonic` but are not
+a wallet store. A directory that does not exist gives `[]`. `passwordProtected` is `true` when `Sphere.load()`
+needs that wallet's `password` to read the seed back.
 
 ## Multi-Address Wallet
 

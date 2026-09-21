@@ -806,10 +806,13 @@ if (await Sphere.exists(storage)) {
 
 ## Import from Master Key (Legacy Wallets)
 
-For wallets whose master key was extracted elsewhere (e.g. an older backup):
+For wallets whose master key was extracted elsewhere (e.g. an older backup), into a storage that holds no
+wallet yet — over one that already holds a wallet `Sphere.import` refuses with `ALREADY_INITIALIZED` unless
+you pass `overwrite: true` (see the note below):
 
 ```typescript
-// Import from master key + chain code (BIP32 mode). Sphere.import resolves the instance itself.
+// Import from master key + chain code (BIP32 mode) into a storage with no wallet yet.
+// Sphere.import resolves the instance itself.
 const bip32Wallet = await Sphere.import({
   masterKey: '64-hex-chars-master-private-key',
   chainCode: '64-hex-chars-chain-code',
@@ -819,7 +822,7 @@ const bip32Wallet = await Sphere.import({
   network: 'testnet2',
 });
 
-// Or import from master key only (WIF HMAC mode)
+// Or, instead of the call above, import from master key only (WIF HMAC mode)
 const wifWallet = await Sphere.import({
   masterKey: '64-hex-chars-master-private-key',
   derivationMode: 'wif_hmac',
@@ -828,8 +831,13 @@ const wifWallet = await Sphere.import({
 });
 ```
 
-> **`Sphere.import()` wipes first, and that wipe destroys live Spheres.** When a wallet already
-> exists on the given storage — or a Sphere is live on it — import calls `Sphere.clear()` before
+> **`Sphere.import()` replaces a wallet only when you pass `overwrite: true`.** When a wallet already
+> exists on the given storage — or a Sphere is live on that storage object — import rejects with
+> `ALREADY_INITIALIZED` and leaves the wallet as it was. It checks every input first — `network`,
+> `password`, the mnemonic, the master key and the chain code — so an import rejected for any of those
+> erases nothing either. Into a storage with no wallet no flag is needed.
+>
+> **With `overwrite: true` the wipe destroys live Spheres.** Import then calls `Sphere.clear()` before
 > writing, which calls `destroy()` on every live `Sphere` built on that **backing store**: their
 > payments verticals stop, their providers disconnect, and every `sphere.on()` handler goes with
 > them. The scope is the store, not the provider object: two provider objects reporting the same
@@ -837,9 +845,12 @@ const wifWallet = await Sphere.import({
 > your references to the old instance rather than reusing it.
 >
 > The clear also erases the storage's payments state (`pv2g2:*`), including the journals of
-> transfers still in flight, so do not import while transfers are pending. With IndexedDB the store
-> is the whole database named by `dbName`: every key `prefix` in it is erased, so give each wallet
-> its own `dbName`.
+> transfers still in flight, so do not overwrite while transfers are pending. It runs before the new
+> wallet is brought up, so a failure after the input checks (a storage reconnect, provider start-up, a
+> taken `nametag`) does not bring the old wallet back: back up its recovery phrase before you
+> overwrite. With IndexedDB the store is the whole database named by `dbName`: every key
+> `prefix` in it is erased, so give each wallet its own `dbName`. On Node, keep wallets side by side
+> with one `walletFileName` each (see [Node.js Providers](#nodejs-providers)).
 
 ## Wallet Export/Import (JSON)
 
@@ -855,10 +866,12 @@ const encryptedJson = sphere.exportToJSON({ password: 'user-password' });
 const multiJson = sphere.exportToJSON({ addressCount: 5 });
 
 // Import from JSON. importFromJSON never throws: { success, sphere?, mnemonic?, error? }.
-// Like Sphere.import it needs walletApi and network, and it first clears the wallet in this storage.
+// Like Sphere.import it needs walletApi and network. Over a storage that already holds a wallet it
+// returns { success: false, error } unless overwrite: true is passed, which clears that wallet first.
 const res = await Sphere.importFromJSON({
   ...providers,               // storage, transport, oracle, walletApi
   network: 'testnet2',
+  overwrite: true,            // this storage holds the wallet exported above: replace it
   jsonContent: JSON.stringify(encryptedJson),
   password: 'user-password',  // decrypts an encrypted backup
 });
@@ -1118,6 +1131,53 @@ const fullyConfigured = createNodeProviders({
 `TokenRegistry`, whose hourly refresh timer keeps Node's event loop alive. Call `TokenRegistry.destroy()` after
 `sphere.destroy()` when the process should exit.
 
+### Several Wallets in One Data Directory
+
+Each `walletFileName` under one `dataDir` is a separate wallet (default `'wallet.json'`), so a second wallet goes
+into its own file instead of over the current one: `Sphere.import` refuses a storage that already holds a wallet
+unless you pass `overwrite: true`. `listWallets(dataDir)`, also exported by
+`@unicitylabs/sphere-sdk/impl/nodejs`, lists the wallet files in a directory.
+
+```typescript
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import { createNodeProviders, createWalletApiProviders, listWallets } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+const walletApi = {
+  baseUrl: 'https://wallet-api.unicity.network',
+  network: 'testnet2',
+  deviceId: 'my-service-host-1',
+} as const;
+const providersFor = (walletFileName: string) =>
+  createWalletApiProviders(
+    createNodeProviders({
+      network: 'testnet2',
+      dataDir: './wallet-data',
+      walletFileName,
+      oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' },
+    }),
+    walletApi,
+  );
+
+// A second wallet next to ./wallet-data/wallet.json: nothing already there is touched.
+const savings = await Sphere.import({
+  ...providersFor('savings.json'),
+  network: 'testnet2',
+  mnemonic: 'your twelve words...',
+});
+await savings.destroy();
+
+// Every wallet store in the directory, sorted by file name:
+// [{ fileName: 'savings.json', filePath: '<absolute path>', passwordProtected: false },
+//  { fileName: 'wallet.json', filePath: '<absolute path>', passwordProtected: false }]
+const wallets = await listWallets('./wallet-data');
+const { sphere } = await Sphere.init({ ...providersFor(wallets[0].fileName), network: 'testnet2' });
+```
+
+`listWallets` reads only the files directly in `dataDir`: the `.json` and `.txt` files that hold a stored seed
+(the keys `Sphere.exists()` reads), with `exportToJSON()` backups skipped. It never asks for a password, and a
+directory that does not exist gives `[]`. `passwordProtected` is `true` when `Sphere.load()` needs that
+wallet's `password` to read the seed. Pass `fileName` back as `walletFileName` to open the wallet.
+
 ### Manual Provider Creation
 
 ```typescript
@@ -1346,7 +1406,9 @@ Failed to register Unicity ID. It may already be taken.
 This means the nametag is registered (bound on Nostr) to a **different public key**. Common causes:
 
 1. **Storage cleared or not persisting**:
-   - `Sphere.exists()` returns `false` because storage is empty/inaccessible
+   - The storage holds no wallet, because it is empty or was cleared, so a new one is created
+     (a storage that cannot be opened or read no longer counts as empty: `Sphere.init`,
+     `Sphere.create` and `Sphere.import` reject with the storage error instead)
    - SDK creates a new wallet with new keypair
    - Nametag registration fails because old pubkey owns it on Nostr
 
@@ -1362,7 +1424,7 @@ This means the nametag is registered (bound on Nostr) to a **different public ke
    });
    ```
 
-**Note:** `autoGenerate: true` does NOT generate a new mnemonic on every restart. It only generates one if `Sphere.exists()` returns `false` (wallet not found in storage).
+**Note:** `autoGenerate: true` does NOT generate a new mnemonic on every restart. It only generates one when the storage holds no wallet. A storage that cannot be opened or read is no longer taken for an empty one: `Sphere.init`, `Sphere.create` and `Sphere.import` reject with the storage error instead (`Sphere.exists()` itself still answers `false` there).
 
 ### Solution: Persistent Storage or Fixed Mnemonic
 
@@ -1416,7 +1478,8 @@ returns. The `nametag:recovered` event for that recovery has already fired by th
 does not see it: read `sphere.identity?.nametag` instead.
 
 ```typescript
-// Import wallet: this CLEARS the wallet already in this storage first, then stores the given one.
+// Import wallet into a storage that holds no wallet yet — over an existing one the import rejects
+// with ALREADY_INITIALIZED unless overwrite: true clears that wallet first.
 // The nametag is recovered automatically if found on Nostr.
 const sphere = await Sphere.import({
   ...providers,

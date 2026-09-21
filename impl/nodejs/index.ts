@@ -3,7 +3,8 @@
  * Providers for CLI/Node.js usage
  */
 
-// Storage
+// Storage: FileStorageProvider + listWallets(dataDir), which lists the wallet files
+// kept side by side in one data directory (#801).
 export * from './storage';
 
 // Transport
@@ -80,7 +81,10 @@ export interface NodeProvidersConfig {
   debug?: boolean;
   /** Directory for wallet data storage */
   dataDir?: string;
-  /** Wallet file name (default: 'wallet.json') */
+  /**
+   * Wallet file name (default: 'wallet.json'). One wallet per file: keep several side by side
+   * in one `dataDir` under different names, and list them with `listWallets(dataDir)`.
+   */
   walletFileName?: string;
   /** Transport (Nostr) configuration */
   transport?: NodeTransportConfig;
@@ -135,6 +139,11 @@ export interface NodeProviders {
  *     trustBasePath: './trustbase.json',
  *   },
  * });
+ *
+ * // Several wallets in one dataDir, one file each — listWallets() names them:
+ * for (const wallet of await listWallets('./wallet-data')) {
+ *   console.log(wallet.fileName, wallet.passwordProtected); // pass fileName as walletFileName to open it
+ * }
  *
  * // Use with Sphere.init: add the wallet-api transport config and the same network literal
  * const { sphere } = await Sphere.init({

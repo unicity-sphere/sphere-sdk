@@ -224,7 +224,8 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
     const activated: unknown[] = [];
     sphereA.on('address:activated', (data) => activated.push(data));
 
-    // import() clears storage B first — via the same storage-scoped teardown.
+    // import() clears storage B first — via the same storage-scoped teardown. Replacing a
+    // wallet is an explicit overwrite since #801.
     const imported = await Sphere.import({
       storage: b.storage,
       transport: b.transport,
@@ -232,6 +233,7 @@ describe('Sphere lifecycle statics are scoped to the storage they are handed (#7
       walletApi: b.world.walletApi,
       network: NET,
       mnemonic: MNEMONIC_C,
+      overwrite: true,
     });
     b.sphere = imported;
 

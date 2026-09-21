@@ -143,8 +143,9 @@ export class FileStorageProvider implements StorageProvider {
             fs.renameSync(tmpPath, this.filePath);
           } catch {
             // Both files corrupt — this is a hard failure, NOT a silent reset.
-            // Silently falling back to {} would cause Sphere.exists() to return
-            // false, leading to accidental identity replacement.
+            // Silently falling back to {} would make the stored-wallet check see no seed,
+            // leading to accidental identity replacement — init/create/import reject on a
+            // storage error, but only if the provider actually raises one (#801).
             throw new Error(
               `Wallet file "${this.filePath}" is corrupt and no valid backup exists. ` +
               `Manual recovery required. Check "${this.filePath}.corrupt" for the damaged file.`
