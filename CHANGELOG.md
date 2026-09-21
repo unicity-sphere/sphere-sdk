@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 an import that was then rejected left the storage empty, or holding a master key the loader cannot
 read back. Every input check now runs before anything on the storage is touched: `network` must be
 a known network (with `walletApi: 'none'` it was not checked before the clear) and `password` must
-be non-empty or omitted (both `INVALID_CONFIG`); the mnemonic must be valid BIP39, and `masterKey`,
-and `chainCode` when one is given, must be 64 hex characters (`INVALID_IDENTITY`). A wrong password
+be non-empty or omitted (both `INVALID_CONFIG`); a mnemonic must be valid BIP39, and the
+`masterKey` an import without a mnemonic uses, with its `chainCode` when one is given, must be 64
+hex characters (`INVALID_IDENTITY`). A wrong password
 that CryptoJS decrypts to garbage now makes `importFromJSON()` report
 `Failed to decrypt mnemonic - wrong password?` instead of `Invalid mnemonic`.
 

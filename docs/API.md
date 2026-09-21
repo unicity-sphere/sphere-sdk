@@ -133,8 +133,8 @@ need `storage`, `transport`, `oracle`, `walletApi` and `network`.
 Import a wallet from a `mnemonic`, or from a `masterKey` (with optional `chainCode`, `basePath` and
 `derivationMode`); throws `INVALID_CONFIG` when neither is given. Every input is checked before the
 storage is touched: a missing or unknown `network`, and a `password` of `''`, throw
-`INVALID_CONFIG`; an invalid mnemonic, and a `masterKey` or a non-empty `chainCode` that is not 64
-hex characters, throw `INVALID_IDENTITY`. **When a wallet already exists in that storage**, or a
+`INVALID_CONFIG`; an invalid mnemonic, and — when no mnemonic is given — a `masterKey` or a
+non-empty `chainCode` that is not 64 hex characters, throw `INVALID_IDENTITY`. **When a wallet already exists in that storage**, or a
 live Sphere is registered on that storage object, it rejects with `ALREADY_INITIALIZED` and leaves
 the wallet untouched, unless you pass `overwrite: true`. An import into a storage that holds no
 wallet needs no flag.

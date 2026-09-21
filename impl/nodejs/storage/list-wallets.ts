@@ -14,13 +14,13 @@ export interface NodeWalletFile {
   passwordProtected: boolean;
 }
 
-const WALLET_FILE = /\.(json|txt)$/;
+const WALLET_FILE = /\.(json|txt)$/i;
 const PLAINTEXT_KEY = /^[0-9a-f]{64}$/i;
 // CryptoJS passphrase output (encryptSimple): base64 of "Salted__" + salt + ciphertext.
 const PASSPHRASE_CIPHERTEXT = /^U2FsdGVkX1[0-9A-Za-z+/=]+$/;
 
 function readStoredSecret(filePath: string, content: string): string | null {
-  if (filePath.endsWith('.txt')) {
+  if (/\.txt$/i.test(filePath)) {
     return validateMnemonic(content) || PASSPHRASE_CIPHERTEXT.test(content) ? content : null;
   }
   let record: unknown;
@@ -31,8 +31,10 @@ function readStoredSecret(filePath: string, content: string): string | null {
   }
   if (typeof record !== 'object' || record === null) return null;
   const fields = record as Record<string, unknown>;
-  // An exportToJSON() backup also carries `mnemonic`, but it is not a wallet store.
+  // Backups carry `mnemonic` too, but they are not wallet stores: exportToJSON() files, and the
+  // legacy flat exports importFromLegacyFile() reads (camelCase keys a store never has).
   if (fields.type === 'sphere-wallet') return null;
+  if ('masterPrivateKey' in fields || 'descriptorPath' in fields || 'encrypted' in fields) return null;
   for (const key of [STORAGE_KEYS_GLOBAL.MNEMONIC, STORAGE_KEYS_GLOBAL.MASTER_KEY]) {
     const value = fields[key];
     if (typeof value === 'string' && value !== '') return value;
