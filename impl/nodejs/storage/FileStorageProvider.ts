@@ -70,6 +70,7 @@ export class FileStorageProvider implements StorageProvider {
   private isTxtMode: boolean;
   private network?: NetworkType;
   private data: Record<string, string> = {};
+  private loading: Promise<void> | null = null;
   private status: ProviderStatus = 'disconnected';
   private _identity: FullIdentity | null = null;
 
@@ -165,8 +166,28 @@ export class FileStorageProvider implements StorageProvider {
   }
 
   async disconnect(): Promise<void> {
-    await this.save();
+    // Only a connected provider holds the file's contents. Saving from a never-connected
+    // one would write the empty snapshot OVER the wallet file (#811).
+    if (this.status === 'connected') {
+      await this.save();
+    }
     this.status = 'disconnected';
+  }
+
+  /**
+   * `data` holds the file's contents only after connect() has read them. Used before
+   * that, this provider answered reads from an empty map and — worse — save() rewrote
+   * the WHOLE file from it, so one set() on a never-connected provider erased the wallet
+   * and every payment journal (#811). Every data method now loads the file first; an
+   * explicit connect() stays the normal path and this is the safety net under it.
+   */
+  private async ensureLoaded(): Promise<void> {
+    if (this.status === 'connected') return;
+    // One shared attempt: parallel calls must not each open and race the same file.
+    this.loading ??= this.connect().finally(() => {
+      this.loading = null;
+    });
+    await this.loading;
   }
 
   isConnected(): boolean {
@@ -178,28 +199,33 @@ export class FileStorageProvider implements StorageProvider {
   }
 
   async get(key: string): Promise<string | null> {
+    await this.ensureLoaded();
     const fullKey = this.getFullKey(key);
     return this.data[fullKey] ?? null;
   }
 
   async set(key: string, value: string): Promise<void> {
+    await this.ensureLoaded();
     const fullKey = this.getFullKey(key);
     this.data[fullKey] = value;
     await this.save();
   }
 
   async remove(key: string): Promise<void> {
+    await this.ensureLoaded();
     const fullKey = this.getFullKey(key);
     delete this.data[fullKey];
     await this.save();
   }
 
   async has(key: string): Promise<boolean> {
+    await this.ensureLoaded();
     const fullKey = this.getFullKey(key);
     return fullKey in this.data;
   }
 
   async keys(prefix?: string): Promise<string[]> {
+    await this.ensureLoaded();
     const allKeys = Object.keys(this.data);
     if (prefix) {
       return allKeys.filter((k) => k.startsWith(prefix));
@@ -208,6 +234,7 @@ export class FileStorageProvider implements StorageProvider {
   }
 
   async clear(prefix?: string): Promise<void> {
+    await this.ensureLoaded();
     if (prefix) {
       const keysToDelete = Object.keys(this.data).filter((k) => k.startsWith(prefix));
       for (const key of keysToDelete) {
