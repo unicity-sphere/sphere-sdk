@@ -83,6 +83,12 @@ jobs:
       - name: Publish to npm
         run: npm publish --access public --tag ${{ steps.dist-tag.outputs.tag }}
 
+      # Before the release commit, so the dated section rides in it. Doing this by hand
+      # afterwards meant a follow-up PR per release (#814 for 0.17.4, #818 for 0.17.6),
+      # and a released version whose entries sat under [Unreleased] until it landed.
+      - name: Date the CHANGELOG section for this release
+        run: node scripts/date-changelog.mjs ${{ inputs.version }}
+
       - name: Create git tag
         run: |
           git config user.name "github-actions[bot]"
@@ -90,7 +96,24 @@ jobs:
           # connect/version.ts is REGENERATED from the bumped package.json above, and the CI
           # gate compares the two. Leaving it out of the release commit means main fails
           # verify:version immediately after every release.
-          git add package.json package-lock.json connect/version.ts
+          git add package.json package-lock.json connect/version.ts CHANGELOG.md
           git commit -m "chore: release v${{ inputs.version }}"
+          # The tag names what was actually built and published, so push it first and on
+          # its own: it must land even if the branch push below cannot.
           git tag "v${{ inputs.version }}"
-          git push origin HEAD --tags
+          git push origin "v${{ inputs.version }}"
+          # npm publish has already succeeded by now, so the release commit MUST reach main.
+          # A merge during the ~3 minute build moved the branch and the push was rejected
+          # (v0.17.4), which left the tag on a commit that was on no branch. Rebase the one
+          # release commit onto whatever main is now and retry.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "main moved during the build — rebasing the release commit (attempt $attempt)"
+            git fetch origin main
+            git rebase origin/main
+          done
+          echo "Could not push the release commit to main. npm HAS v${{ inputs.version }};"
+          echo "cherry-pick tag v${{ inputs.version }} onto main by hand."
+          exit 1
