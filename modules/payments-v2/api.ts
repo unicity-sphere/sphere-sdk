@@ -157,6 +157,8 @@ export interface PaymentsV2 {
   tokens(filter?: { coinId?: string }): Token[];
   coinless(): CoinlessToken[];
   tokenData(tokenId: string): Promise<Uint8Array | null>;
+  /** The genesis mint reason of one held token; null when it was minted without one. Same contract as tokenData. */
+  tokenJustification(tokenId: string): Promise<Uint8Array | null>;
   /** One held token read as an NFT; null = its payload is not a recognised NFT. `creator` is only CLAIMED unless `signature` is 'valid'. Throws VALIDATION_ERROR when not held, STORAGE_ERROR when its blob is missing (same contract as tokenData). */
   nft(tokenId: string): Promise<NftView | null>;
   /** Batch read for list views. Ids not held, blobs missing or undecodable, and non-NFT payloads are simply absent from the map. Throws only on a transport failure. */

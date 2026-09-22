@@ -130,6 +130,7 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
       const t = await e.mintDataToken({ recipientPubkey: PK_A, data, tokenType, salt });
       expect(e.readValue(t)).toBeNull();
       expect(e.readTokenData(t)).toEqual(data);
+      expect(e.readTokenJustification(t)).toBeNull();
       expect(e.tokenId(t)).toMatch(/^[0-9a-f]{64}$/);
       // tokenId is derived from (networkId, salt): the same terms-derived salt re-mints
       // to the identical, stable tokenId (the invoice-id use case).

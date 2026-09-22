@@ -17,7 +17,7 @@ import type { BurnRequest, BurnResult, CoinlessToken, ConnectionStatus, HistoryP
 import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { NftCache, readNft, readNfts, type NftReadDeps } from './inventory/nft-read';
-import { readTokenData } from './inventory/token-data';
+import { readTokenData, readTokenJustification } from './inventory/token-data';
 import { type CoinReplayDeps, INVENTORY_SCAN_PAGE_LIMIT, replayCoinMints, runMintUnderJournal, tokenInServerInventory } from './mint';
 import { type NftReplayDeps, replayNftMints, runNftMintUnderJournal } from './mint-nft';
 import { type CustomReplayDeps, replayCustomMints, runCustomMintUnderJournal } from './mint-custom';
@@ -249,6 +249,10 @@ export class PaymentsFacade implements PaymentsV2 {
 
   tokenData(tokenId: string): Promise<Uint8Array | null> {
     return readTokenData(this.readDeps(), tokenId);
+  }
+
+  tokenJustification(tokenId: string): Promise<Uint8Array | null> {
+    return readTokenJustification(this.readDeps(), tokenId);
   }
 
   nft(tokenId: string): Promise<NftView | null> {

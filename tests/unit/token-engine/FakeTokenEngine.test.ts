@@ -88,6 +88,7 @@ describe('decodeFakeTokenAssets — the fake must not soften the classifier (#77
       CborSerializer.encodeNull(),
       CborSerializer.encodeByteString(new Uint8Array(33).fill(2)),
       CborSerializer.encodeByteString(new Uint8Array(8).fill(1)),
+      CborSerializer.encodeNull(),
     );
 
   it('PROPAGATES a corrupt-envelope throw instead of indexing it as coinless', async () => {

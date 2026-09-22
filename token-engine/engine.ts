@@ -127,6 +127,8 @@ export interface ITokenEngine {
   readMemo(token: SphereToken): Uint8Array | null;
   /** Raw genesis data of a token (e.g. a data-token's terms). `null` when absent. Synchronous. */
   readTokenData(token: SphereToken): Uint8Array | null;
+  /** The genesis mint reason (`justification`) of a token; `null` when it was minted without one. Synchronous. */
+  readTokenJustification(token: SphereToken): Uint8Array | null;
   /** Read a token's genesis payload as an NFT. NEVER throws; null = not a recognised NFT. */
   readNft(token: SphereToken): Promise<NftReading | null>;
 

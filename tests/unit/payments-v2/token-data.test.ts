@@ -1,17 +1,19 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { SphereError } from '../../../core/errors';
-import { readTokenData } from '../../../modules/payments-v2/inventory/token-data';
+import { readTokenData, readTokenJustification } from '../../../modules/payments-v2/inventory/token-data';
 import type { ITokenEngine } from '../../../token-engine/engine';
 import type { SphereToken, TokenBlob } from '../../../token-engine/types';
 
 const TOKEN = 'aa'.repeat(32);
 const PAYLOAD = new TextEncoder().encode('kitty #1');
+const REASON = new Uint8Array([0xd9, 0x14, 0x4c, 0x52]);
 
-function engineWith(data: Uint8Array | null): ITokenEngine {
+function engineWith(data: Uint8Array | null, justification: Uint8Array | null = REASON): ITokenEngine {
   return {
     decodeToken: vi.fn(async (blob: TokenBlob) => ({ blob }) as unknown as SphereToken),
     readTokenData: vi.fn(() => data),
+    readTokenJustification: vi.fn(() => justification),
   } as unknown as ITokenEngine;
 }
 
@@ -71,5 +73,20 @@ describe('readTokenData', () => {
       },
     };
     await expect(readTokenData(d, TOKEN)).resolves.toEqual(PAYLOAD);
+  });
+});
+
+describe('readTokenJustification', () => {
+  it('returns the mint reason of a held token', async () => {
+    await expect(readTokenJustification(deps({ stateHash: 'S1' }), TOKEN)).resolves.toEqual(REASON);
+  });
+
+  it('returns null for a token minted without one', async () => {
+    const d = { ...deps({ stateHash: 'S1' }), engine: engineWith(PAYLOAD, null) };
+    await expect(readTokenJustification(d, TOKEN)).resolves.toBeNull();
+  });
+
+  it('refuses a token the wallet does not hold, like readTokenData', async () => {
+    await expect(readTokenJustification(deps({ stateHash: undefined }), TOKEN)).rejects.toBeInstanceOf(SphereError);
   });
 });

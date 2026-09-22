@@ -263,6 +263,11 @@ export class SphereTokenEngine implements ITokenEngine {
     return data ? new Uint8Array(data) : null;
   }
 
+  public readTokenJustification(token: SphereToken): Uint8Array | null {
+    const justification = token.sdkToken.genesis.justification;
+    return justification ? new Uint8Array(justification) : null;
+  }
+
   public readNft(token: SphereToken): Promise<NftReading | null> {
     return readTokenNft(token);
   }
