@@ -343,15 +343,13 @@ const coinId = registry.getCoinIdBySymbol('UCT');
 > ```ts
 > import { TokenRegistry, NETWORKS } from '@unicitylabs/sphere-sdk';
 >
-> // Load wallet.json first: an unconnected file storage starts empty, and its
-> // first write (the registry cache) would replace the file, mnemonic included.
-> await providers.storage.connect();
+> await providers.storage.connect(); // the clear order; the provider also loads on first use
 > TokenRegistry.configure({
 >   remoteUrl: NETWORKS.testnet2.tokenRegistryUrl,
 >   storage: providers.storage,
 > });
 > ```
-> Data is fetched from the network and cached in the storage provider you pass (the wallet file here). Never pass a storage that is not connected and points at an existing wallet file. If you do not need the cache, leave `storage` out.
+> Data is fetched from the network and cached in the storage provider you pass (the wallet file here). A `createNodeProviders()` storage reads the file on its first use, so the cache write lands next to the wallet rather than over it (up to and including 0.17.5 it replaced the file, mnemonic included). If you do not need the cache, leave `storage` out.
 
 ### Send Tokens
 

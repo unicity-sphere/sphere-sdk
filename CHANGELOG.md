@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (wallet safety) — the Node file storage no longer writes an empty store over the wallet file (#811)
+
+`FileStorageProvider` holds the whole store as an in-memory snapshot that only `connect()`
+fills, and `save()` rewrites the entire file from it. Used before connect, it wrote that
+empty snapshot over an existing `wallet.json`: one `set()` left a single-key file and a
+bare `disconnect()` left `{}`, taking the seed and every `pv2g2:*` payment journal with
+it. Reads were wrong the other way — `get('mnemonic')` answered `null` for a wallet that
+was on disk, the same "storage looks empty" signal `Sphere.init` was hardened against in
+0.17.4.
+
+`get`, `set`, `remove`, `has`, `keys` and `clear` now read the file first if it has not
+been read yet (one shared load, so parallel first calls do not race), and `disconnect()`
+saves only what it loaded. Calling `connect()` explicitly stays the normal path and
+behaves exactly as before; nothing about the connected provider changes.
+
+This does not cover two `FileStorageProvider` objects over one `dataDir`, where each
+still rewrites the file from its own snapshot (#771).
+
 ## [0.17.5] - 2026-09-21
 
 ### Fixed — `listWallets()` could hide a wallet and list a backup (#813)
