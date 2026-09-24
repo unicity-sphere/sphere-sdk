@@ -49,6 +49,7 @@ export type { ITokenVerifier } from '@unicitylabs/state-transition-sdk/lib/trans
 export { WorkerTokenVerifier } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/worker/WorkerTokenVerifier.js';
 export type { IWorker } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/worker/IWorker.js';
 export type { IVerificationContext } from '@unicitylabs/state-transition-sdk/lib/verification/IVerificationContext.js';
+export type { IMintJustificationVerifier } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/IMintJustificationVerifier.js';
 
 // ── predicates / unlock scripts ─────────────────────────────────────────────
 export type { IPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/IPredicate.js';

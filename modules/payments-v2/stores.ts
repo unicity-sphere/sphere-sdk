@@ -93,6 +93,27 @@ export interface NftMintJournalEntry {
   createdAt: number;
 }
 
+export interface CustomMintJournalEntry {
+  mintId: string;
+  tokenId: string;
+  dataHex: string;
+  saltHex: string;
+  tokenTypeHex: string;
+  justificationHex: string | null;
+  assets: { coinId: string; amount: string }[];
+  createdAt: number;
+}
+
+export interface BurnJournalEntry {
+  burnId: string;
+  tokenId: string;
+  reasonHex: string;
+  burnedTokenHex: string | null;
+  settled: boolean;
+  assets: { coinId: string; amount: string }[];
+  createdAt: number;
+}
+
 // #690 shortfall record.
 export interface ShortfallEntry {
   transferId: string;
@@ -126,6 +147,8 @@ export const STORE_KEYS = {
   deliveryJournal: 'delivery-journal',
   mintJournal: 'mint-journal',
   nftMintJournal: 'nft-mint-journal',
+  customMintJournal: 'custom-mint-journal',
+  burnJournal: 'burn-journal',
   shortfalls: 'shortfalls',
   settlingLinks: 'settling',
   streamCursor: (s: StreamName) => `cursor:${s}`,

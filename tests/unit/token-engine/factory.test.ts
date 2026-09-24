@@ -84,6 +84,49 @@ describe('createSphereTokenEngine', () => {
     warn.mockRestore();
   });
 
+  it('registers each plugin mint-reason verifier by tag: a tag registered once is claimed, so a second engine over the same plugin list still builds (fresh registry per engine)', async () => {
+    const plugin = (id: string, tags: bigint[]) => ({
+      id,
+      mintJustificationVerifiers: tags.map((tag) => ({ tag, verify: vi.fn() })),
+    });
+    const config = {
+      aggregatorUrl: 'http://localhost:3000',
+      privateKey: SigningService.generatePrivateKey(),
+      trustBaseJson: TRUST_BASE_JSON,
+      plugins: [plugin('bridge:tron-usdt', [1330002n]), plugin('issuer:x', [1330010n, 1330011n])],
+    };
+    const first = await createSphereTokenEngine(config);
+    const second = await createSphereTokenEngine(config);
+    expect(first.getIdentity().chainPubkey).toEqual(second.getIdentity().chainPubkey);
+  });
+
+  it('refuses two plugins claiming the same mint-reason tag with INVALID_CONFIG, naming the plugin', async () => {
+    const verifier = { tag: 1330002n, verify: vi.fn() };
+    await expect(
+      createSphereTokenEngine({
+        aggregatorUrl: 'http://localhost:3000',
+        privateKey: SigningService.generatePrivateKey(),
+        trustBaseJson: TRUST_BASE_JSON,
+        plugins: [
+          { id: 'bridge:a', mintJustificationVerifiers: [verifier] },
+          { id: 'bridge:b', mintJustificationVerifiers: [verifier] },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_CONFIG', message: expect.stringMatching(/bridge:b.*1330002/) });
+  });
+
+  it('refuses a plugin that re-declares the SDK split verifier tag', async () => {
+    const { SplitMintJustification } = await import('../../../token-engine/sdk');
+    await expect(
+      createSphereTokenEngine({
+        aggregatorUrl: 'http://localhost:3000',
+        privateKey: SigningService.generatePrivateKey(),
+        trustBaseJson: TRUST_BASE_JSON,
+        plugins: [{ id: 'rogue', mintJustificationVerifiers: [{ tag: SplitMintJustification.CBOR_TAG, verify: vi.fn() }] }],
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+  });
+
   it('rejects a config without a trust base', async () => {
     await expect(
       createSphereTokenEngine({

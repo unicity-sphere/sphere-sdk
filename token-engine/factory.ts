@@ -39,6 +39,25 @@ import type { EngineConfig, ITokenEngine, VerificationWorker, VerificationWorker
 const DEFAULT_VERIFICATION_POOL_SIZE = 4;
 
 /** #770(4): what a verification cancelled by `dispose()` rejects with. */
+function registerPluginVerifiers(
+  registry: MintJustificationVerifierService,
+  plugins: EngineConfig['plugins'],
+): void {
+  for (const plugin of plugins ?? []) {
+    for (const verifier of plugin.mintJustificationVerifiers ?? []) {
+      try {
+        registry.register(verifier);
+      } catch (err) {
+        throw new SphereError(
+          `Token plugin '${plugin.id}' registers mint-reason tag ${verifier.tag} twice or over another plugin's: ` +
+            (err instanceof Error ? err.message : String(err)),
+          'INVALID_CONFIG',
+        );
+      }
+    }
+  }
+}
+
 function disposedError(): SphereError {
   return new SphereError(
     'Verification worker pool disposed — the in-flight verification was cancelled',
@@ -197,6 +216,7 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
   mintJustificationVerifier.register(
       new SplitMintJustificationVerifier(decodeSpherePaymentData),
   );
+  registerPluginVerifiers(mintJustificationVerifier, config.plugins);
 
   const deps: EngineDeps = {
     client: new StateTransitionClient(new AggregatorClient(config.aggregatorUrl, config.apiKey ?? null)),

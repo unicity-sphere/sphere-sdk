@@ -111,6 +111,7 @@ import {
   createSphereTokenEngine,
   deriveDirectAddress,
   type ITokenEngine,
+  type TokenPlugin,
   type VerificationWorkerConfig,
 } from '../token-engine';
 import {
@@ -237,6 +238,8 @@ export interface SphereCreateOptions extends SphereWalletApiOptions {
    * {@link SphereInitOptions.verification}. Omit for the sequential verifier.
    */
   verification?: VerificationWorkerConfig;
+  /** Token plugins: mint-reason verifiers registered into every engine this Sphere builds. */
+  plugins?: readonly TokenPlugin[];
 }
 
 /** Options for loading existing wallet */
@@ -281,6 +284,8 @@ export interface SphereLoadOptions extends SphereWalletApiOptions {
    * {@link SphereInitOptions.verification}. Omit for the sequential verifier.
    */
   verification?: VerificationWorkerConfig;
+  /** Token plugins: mint-reason verifiers registered into every engine this Sphere builds. */
+  plugins?: readonly TokenPlugin[];
 }
 
 /** Options for importing a wallet */
@@ -355,6 +360,8 @@ export interface SphereImportOptions extends SphereWalletApiOptions {
    * registration) still rejects, and the erased wallet is not restored: keep a backup of it.
    */
   overwrite?: boolean;
+  /** Token plugins: mint-reason verifiers registered into every engine this Sphere builds. */
+  plugins?: readonly TokenPlugin[];
 }
 
 /** Options for unified init (auto-create or load) */
@@ -425,6 +432,8 @@ export interface SphereInitOptions extends SphereWalletApiOptions {
    * {@link VerificationWorkerConfig}); `sphere.destroy()` terminates the pool.
    */
   verification?: VerificationWorkerConfig;
+  /** Token plugins: mint-reason verifiers registered into every engine this Sphere builds. */
+  plugins?: readonly TokenPlugin[];
 }
 
 /** Result of init operation */
@@ -622,6 +631,8 @@ export class Sphere {
    * the rebuild after an api-key change share one pool configuration.
    */
   private _verification: VerificationWorkerConfig | undefined;
+  /** Token plugins (SphereInitOptions.plugins), applied to every engine like _verification. */
+  private _plugins: readonly TokenPlugin[] | undefined;
   /** This Sphere's OWN token registry. Disposed by destroy(); never the process global. */
   private _registry: TokenRegistry | null = null;
 
@@ -777,6 +788,7 @@ export class Sphere {
         communications: options.communications,
         password: options.password,
         verification: options.verification,
+        plugins: options.plugins,
         discoverAddresses: options.discoverAddresses,
         onProgress: options.onProgress,
       });
@@ -819,6 +831,7 @@ export class Sphere {
       communications: options.communications,
       password: options.password,
       verification: options.verification,
+      plugins: options.plugins,
       discoverAddresses: options.discoverAddresses,
       onProgress: options.onProgress,
     });
@@ -1047,6 +1060,7 @@ export class Sphere {
       options.communications,
     );
     sphere._verification = options.verification;
+    sphere._plugins = options.plugins;
     sphere._paymentsV2Composition = composition;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
@@ -1154,6 +1168,7 @@ export class Sphere {
       options.communications,
     );
     sphere._verification = options.verification;
+    sphere._plugins = options.plugins;
     sphere._paymentsV2Composition = composition;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
@@ -1289,6 +1304,7 @@ export class Sphere {
       options.communications,
     );
     sphere._verification = options.verification;
+    sphere._plugins = options.plugins;
     sphere._paymentsV2Composition = composition;
     sphere._password = options.password ?? null;
     sphere._passwordProtected = sphere._password !== null;
@@ -4320,6 +4336,7 @@ export class Sphere {
         privateKey: hexToBytes(privateKey),
         trustBaseJson,
         ...(this._verification ? { verification: this._verification } : {}),
+        ...(this._plugins ? { plugins: this._plugins } : {}),
       });
     } catch (err) {
       logger.warn(

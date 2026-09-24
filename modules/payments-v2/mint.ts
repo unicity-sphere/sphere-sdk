@@ -15,6 +15,7 @@ import type { MintJournalEntry } from './stores';
 import type { StoragePort } from './ports';
 
 export const ATTENTION_MINT_UNRESOLVED = 'mint:unresolved';
+export const INVENTORY_SCAN_PAGE_LIMIT = 50;
 
 /** What finalising a certified mint needs — shared by the coin and the NFT mint. */
 export interface FinalizeMintDeps {
@@ -118,6 +119,19 @@ export async function finalizeMint(deps: FinalizeMintDeps, input: FinalizeMintIn
   await input.journal.removeByKey(mintId);
   deps.noteHeldState(token.blob.tokenId, (await deps.engine.deliveryKeys(bytes)).stateHash);
   deps.refreshView();
+}
+
+export async function tokenInServerInventory(
+  storagePort: Pick<StoragePort, 'listInventory'>,
+  tokenId: string
+): Promise<boolean> {
+  let page = await storagePort.listInventory();
+  for (let i = 0; i < INVENTORY_SCAN_PAGE_LIMIT; i++) {
+    if (page.items.some((item) => item.tokenId === tokenId && item.status === 'active')) return true;
+    if (!page.more) return false;
+    page = await storagePort.listInventory(page.cursor);
+  }
+  return false;
 }
 
 /** @returns how many coin journal entries were RESOLVED (cleared) — heartbeat progress. */
