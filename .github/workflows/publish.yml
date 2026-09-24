@@ -35,6 +35,12 @@ jobs:
             echo "Error: Invalid version format. Use semver (e.g., 1.0.0, 1.0.1-beta.1)"
             exit 1
           fi
+          # The release commit is pushed back to the branch this ran from; a tag has none.
+          # Refuse here, before npm has the version, not after.
+          if [ "${{ github.ref_type }}" != "branch" ]; then
+            echo "Error: dispatch from a branch, not a ${{ github.ref_type }} (${{ github.ref_name }})"
+            exit 1
+          fi
 
       - name: Update package version
         run: npm version ${{ inputs.version }} --no-git-tag-version
@@ -86,7 +92,11 @@ jobs:
       # Before the release commit, so the dated section rides in it. Doing this by hand
       # afterwards meant a follow-up PR per release (#814 for 0.17.4, #818 for 0.17.6),
       # and a released version whose entries sat under [Unreleased] until it landed.
+      # Only a release from main closes [Unreleased]. On a dev build from a branch it would
+      # file that branch's entries under a -dev heading and point the [Unreleased] compare
+      # link at a dev tag, and both would ride the squash-merge into main.
       - name: Date the CHANGELOG section for this release
+        if: github.ref_name == 'main'
         run: node scripts/date-changelog.mjs ${{ inputs.version }}
 
       - name: Create git tag
@@ -102,18 +112,21 @@ jobs:
           # its own: it must land even if the branch push below cannot.
           git tag "v${{ inputs.version }}"
           git push origin "v${{ inputs.version }}"
-          # npm publish has already succeeded by now, so the release commit MUST reach main.
+          # npm publish has already succeeded by now, so the release commit MUST reach the
+          # branch it was built from: main for a release, the feature branch for a dev build.
+          # Never main for a dev build: its HEAD carries the branch's unmerged commits (#823).
           # A merge during the ~3 minute build moved the branch and the push was rejected
           # (v0.17.4), which left the tag on a commit that was on no branch. Rebase the one
-          # release commit onto whatever main is now and retry.
+          # release commit onto whatever the branch is now and retry.
+          branch="${{ github.ref_name }}"
           for attempt in 1 2 3; do
-            if git push origin HEAD:main; then
+            if git push origin "HEAD:refs/heads/$branch"; then
               exit 0
             fi
-            echo "main moved during the build — rebasing the release commit (attempt $attempt)"
-            git fetch origin main
-            git rebase origin/main
+            echo "$branch moved during the build — rebasing the release commit (attempt $attempt)"
+            git fetch origin "refs/heads/$branch"
+            git rebase FETCH_HEAD
           done
-          echo "Could not push the release commit to main. npm HAS v${{ inputs.version }};"
-          echo "cherry-pick tag v${{ inputs.version }} onto main by hand."
+          echo "Could not push the release commit to $branch. npm HAS v${{ inputs.version }};"
+          echo "cherry-pick tag v${{ inputs.version }} onto $branch by hand."
           exit 1
