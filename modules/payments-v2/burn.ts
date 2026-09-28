@@ -35,6 +35,18 @@ async function heldToken(deps: BurnDeps, tokenId: string): Promise<SphereToken> 
   return deps.engine.decodeToken({ tokenId, token: bytes });
 }
 
+function assertBurnable(engine: ITokenEngine, token: SphereToken, tokenId: string): void {
+  if (!engine.isOwnedBy(token, engine.getIdentity().chainPubkey)) {
+    throw new SphereError(`Token ${tokenId} is not owned by this wallet`, 'VALIDATION_ERROR');
+  }
+  if (token.valueEnvelope === 'bare_collection') {
+    throw new SphereError(
+      `Token ${tokenId} carries a value envelope this SDK cannot read, so its coins cannot be accounted for; it cannot be burned`,
+      'VALIDATION_ERROR'
+    );
+  }
+}
+
 function assetsOf(token: SphereToken): { coinId: string; amount: string }[] {
   return (token.value?.assets ?? []).map((a) => ({ coinId: a.coinId, amount: a.amount.toString() }));
 }
@@ -51,9 +63,7 @@ export async function runBurnUnderJournal(
   let token: SphereToken;
   try {
     token = await heldToken(deps, tokenId);
-    if (!deps.engine.isOwnedBy(token, deps.engine.getIdentity().chainPubkey)) {
-      throw new SphereError(`Token ${tokenId} is not owned by this wallet`, 'VALIDATION_ERROR');
-    }
+    assertBurnable(deps.engine, token, tokenId);
   } catch (err) {
     return { success: false, burnId, tokenId, error: messageOf(err) };
   }

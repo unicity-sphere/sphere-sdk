@@ -90,6 +90,20 @@ describe('PaymentsFacade — burn (plugin tokens)', () => {
     expect(await journal(world)).toEqual([]);
   });
 
+  it('refuses a bare_collection token before anything is journaled: its coins could not be recorded', async () => {
+    const det = new DetBurnEngine();
+    const world = makeWorld({ engine: det });
+    const source = await world.seed(100n);
+    await world.facade.start();
+    det.forceEnvelope(source.blob.tokenId, 'bare_collection');
+
+    const result = await world.facade.burn({ tokenId: source.blob.tokenId, reasonBytes: REASON });
+
+    expect(result).toMatchObject({ success: false, error: expect.stringMatching(/cannot be accounted for/) });
+    expect(det.calls).toEqual([]);
+    expect(await journal(world)).toEqual([]);
+  });
+
   it('a burn that certified but died before the apply is settled after a restart under the SAME burnId — no second burn', async () => {
     const det = new DetBurnEngine();
     const world = makeWorld({ engine: det });
