@@ -58,14 +58,14 @@ export async function runBurnUnderJournal(
   const { burnId } = input;
   const { tokenId, reasonBytes } = input.request;
   if (!HEX32.test(tokenId) || reasonBytes.length === 0) {
-    return { success: false, burnId, tokenId, error: 'burn: tokenId must be 64 hex and reasonBytes non-empty' };
+    return { success: false, burnId, tokenId, error: 'burn: tokenId must be 64 hex and reasonBytes non-empty', errorCode: 'VALIDATION_ERROR' };
   }
   let token: SphereToken;
   try {
     token = await heldToken(deps, tokenId);
     assertBurnable(deps.engine, token, tokenId);
   } catch (err) {
-    return { success: false, burnId, tokenId, error: messageOf(err) };
+    return refused(burnId, tokenId, err);
   }
   const entry: BurnJournalEntry = {
     burnId,
@@ -124,6 +124,11 @@ export async function acknowledgeBurn(deps: Pick<BurnDeps, 'burnJournal'>, burnI
     throw new SphereError(`Burn ${burnId} is not settled yet; it cannot be acknowledged`, 'VALIDATION_ERROR');
   }
   await deps.burnJournal.removeByKey(burnId);
+}
+
+export function refused(burnId: string, tokenId: string, err: unknown): BurnResult {
+  const failure = failureOf(err);
+  return { success: false, burnId, tokenId, error: failure.message, errorCode: failure.code };
 }
 
 function isTerminal(err: unknown): boolean {

@@ -94,7 +94,7 @@ describe('PaymentsFacade — burn (plugin tokens)', () => {
 
     const result = await world.facade.burn({ tokenId: 'ab'.repeat(32), reasonBytes: REASON });
 
-    expect(result).toMatchObject({ success: false, error: expect.stringMatching(/not a spendable holding/) });
+    expect(result).toMatchObject({ success: false, errorCode: 'VALIDATION_ERROR', error: expect.stringMatching(/not a spendable holding/) });
     expect(det.calls).toEqual([]);
     expect(await journal(world)).toEqual([]);
   });
@@ -155,7 +155,7 @@ describe('PaymentsFacade — burn (plugin tokens)', () => {
 
     const result = await world.facade.burn({ tokenId: source.blob.tokenId, reasonBytes: REASON });
 
-    expect(result).toMatchObject({ success: false, error: expect.stringMatching(/cannot be accounted for/) });
+    expect(result).toMatchObject({ success: false, errorCode: 'VALIDATION_ERROR', error: expect.stringMatching(/cannot be accounted for/) });
     expect(det.calls).toEqual([]);
     expect(await journal(world)).toEqual([]);
   });

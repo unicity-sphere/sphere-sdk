@@ -1,7 +1,7 @@
 import type { BurnResult } from './api';
+import { refused } from './burn';
 import type { InventoryView } from './inventory/InventoryView';
 import type { ListStore } from './machine/journal';
-import { messageOf } from './machine/payload';
 import type { ReservationLedger } from './select/ledger';
 import type { IntentPins } from './select/pins';
 import type { SpendQueue } from './select/queue';
@@ -24,7 +24,7 @@ export class BurnHold {
     try {
       this.deps.queue.planWhole(burnId, tokenId);
     } catch (err) {
-      return { success: false, burnId, tokenId, error: messageOf(err) };
+      return refused(burnId, tokenId, err);
     }
     this.deps.view.markInFlightMany([tokenId]);
     let burned = false;
