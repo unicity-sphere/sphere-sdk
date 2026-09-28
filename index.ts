@@ -223,6 +223,7 @@ export {
   verifyNftLinkContent,
 } from './token-engine/nft-payload';
 export { NFT_MAX_PAYLOAD_BYTES } from './modules/payments-v2/mint-nft';
+export { CUSTOM_MINT_MAX_PAYLOAD_BYTES } from './modules/payments-v2/mint-custom';
 
 export {
   CommunicationsModule,

@@ -26,6 +26,7 @@ export {
   verifyNftLinkContent,
 } from '../../token-engine/nft-payload';
 export { NFT_MAX_PAYLOAD_BYTES } from './mint-nft';
+export { CUSTOM_MINT_MAX_PAYLOAD_BYTES } from './mint-custom';
 export type {
   StoragePort,
   DeliveryPort,
