@@ -150,6 +150,24 @@ describe('PaymentsFacade — burn (plugin tokens)', () => {
     expect(det.calls).toHaveLength(1);
   });
 
+  it('lists and acknowledges burns while the address has no token engine: both only read the burn journal', async () => {
+    const world = makeWorld({ engineUnavailable: true });
+    const entry: BurnJournalEntry = {
+      burnId: 'burn-1',
+      tokenId: 'ab'.repeat(32),
+      reasonHex: bytesToHex(REASON),
+      burnedTokenHex: '01',
+      settled: true,
+      assets: [],
+      createdAt: 1,
+    };
+    await createMachineStores(world.kv).burnJournal.upsert(entry);
+
+    await expect(world.facade.pendingBurns()).resolves.toEqual([expect.objectContaining({ burnId: 'burn-1', settled: true })]);
+    await world.facade.acknowledgeBurn('burn-1');
+    expect(await journal(world)).toEqual([]);
+  });
+
   it('acknowledging an unsettled burn is refused; acknowledging an unknown burn is a no-op', async () => {
     const det = new DetBurnEngine();
     const world = makeWorld({ engine: det });

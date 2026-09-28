@@ -6,6 +6,7 @@
 
 import { NETWORKS } from '../../../constants';
 import { getPublicKey, hexToBytes } from '../../../core/crypto';
+import { SphereError } from '../../../core/errors';
 import { resolveRecipientInfo } from '../../../core/payments-v2-wiring';
 import type { PeerInfo } from '../../../transport';
 import type { SphereToken } from '../../../token-engine';
@@ -212,6 +213,8 @@ export function makeWorld(
     ownNametag?: () => string | undefined;
     /** Receive's poll backstop; the default parks it far outside any test's clock. */
     receivePollMs?: number;
+    /** The address has no token engine: every engine read throws, as Sphere's engineRef does. */
+    engineUnavailable?: boolean;
   } = {}
 ): World {
   const prior = options.restartOf;
@@ -267,7 +270,10 @@ export function makeWorld(
       hooks
     ),
     checkpointStore: memoryCheckpoints(),
-    engineRef: () => engine,
+    engineRef: () => {
+      if (options.engineUnavailable === true) throw new SphereError('paymentsV2: token engine unavailable', 'AGGREGATOR_ERROR');
+      return engine;
+    },
     kv,
     registry,
     emit: (event, payload) => {

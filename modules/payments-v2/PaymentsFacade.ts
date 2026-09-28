@@ -326,8 +326,8 @@ export class PaymentsFacade implements PaymentsV2 {
     this.track(this.ownedOp((mintId) => runCustomMintUnderJournal(this.mintDeps(), { mintId, request })));
   burn = (request: BurnRequest): Promise<BurnResult> =>
     this.track(this.ownedOp((burnId) => runBurnUnderJournal(this.mintDeps(), { burnId, request })));
-  pendingBurns = (): Promise<PendingBurn[]> => this.track(pendingBurns(this.mintDeps()));
-  acknowledgeBurn = (burnId: string): Promise<void> => this.track(acknowledgeBurn(this.mintDeps(), burnId));
+  pendingBurns = (): Promise<PendingBurn[]> => this.track(pendingBurns(this.machineStores));
+  acknowledgeBurn = (burnId: string): Promise<void> => this.track(acknowledgeBurn(this.machineStores, burnId));
 
   // §4 retry verb: coalesces onto the running pass — NEVER re-issue send() (#631/#676).
   async resumeNow(): Promise<void> {
