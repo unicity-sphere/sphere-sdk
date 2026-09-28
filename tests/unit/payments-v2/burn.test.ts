@@ -135,34 +135,36 @@ describe('PaymentsFacade — burn (plugin tokens)', () => {
     expect(history.records.filter((r) => r.type === 'SENT')).toHaveLength(1);
   });
 
-  it('a burn whose spend was applied but not marked settled is not re-applied on replay', async () => {
+  it('a burn whose spend was applied but not marked settled re-applies under the SAME burnId on replay, which wallet-api treats as a replay', async () => {
     const det = new DetBurnEngine();
     const world = makeWorld({ engine: det });
     const source = await world.seed(100n);
     await world.facade.start();
-    let applies = 0;
-    world.hooks.applyDelta = async () => {
-      applies += 1;
+    const applied: { transferId: string; spent: string[] }[] = [];
+    const record = async (delta: { transferId: string; spent: string[] }) => {
+      applied.push({ transferId: delta.transferId, spent: delta.spent });
     };
+    world.hooks.applyDelta = record;
 
     const first = await world.facade.burn({ tokenId: source.blob.tokenId, reasonBytes: REASON });
     expect(first.success).toBe(true);
-    expect(applies).toBe(1);
     const [entry] = await journal(world);
     await createMachineStores(world.kv).burnJournal.upsert({ ...entry!, settled: false });
     await world.facade.stop();
 
     const restarted = makeWorld({ restartOf: world });
-    restarted.hooks.applyDelta = async () => {
-      applies += 1;
-    };
+    restarted.hooks.applyDelta = record;
     await restarted.facade.start();
     await vi.waitFor(async () => {
       expect(await journal(restarted)).toEqual([expect.objectContaining({ settled: true })]);
     });
 
-    expect(applies).toBe(1);
+    expect(applied).toEqual([
+      { transferId: first.burnId, spent: [source.blob.tokenId] },
+      { transferId: first.burnId, spent: [source.blob.tokenId] },
+    ]);
     expect(det.calls).toHaveLength(1);
+    expect(restarted.api.inspectInventoryRow(ownCaller, source.blob.tokenId)).toMatchObject({ status: 'removed', removalClass: 'external' });
   });
 
   it('lists and acknowledges burns while the address has no token engine: both only read the burn journal', async () => {

@@ -22,7 +22,6 @@ export interface BurnDeps {
 
 export interface BurnReplayDeps extends BurnDeps {
   readonly isActiveOp: (burnId: string) => boolean;
-  readonly tokenInServerInventory: (tokenId: string) => Promise<boolean>;
 }
 
 const HEX32 = /^[0-9a-f]{64}$/;
@@ -78,7 +77,7 @@ export async function runBurnUnderJournal(
   };
   await deps.burnJournal.upsert(entry);
   try {
-    const settled = await burnJournaled(deps, entry, token, { applied: false });
+    const settled = await burnJournaled(deps, entry, token);
     return { success: true, burnId, tokenId, burnedToken: hexToBytes(settled.burnedTokenHex ?? '') };
   } catch (err) {
     deps.armHeartbeat();
@@ -92,8 +91,7 @@ export async function replayBurns(deps: BurnReplayDeps): Promise<number> {
     if (entry.settled || deps.isActiveOp(entry.burnId)) continue;
     try {
       const token = entry.burnedTokenHex === null ? await heldToken(deps, entry.tokenId) : null;
-      const applied = entry.burnedTokenHex !== null && !(await deps.tokenInServerInventory(entry.tokenId));
-      await burnJournaled(deps, entry, token, { applied });
+      await burnJournaled(deps, entry, token);
       progressed += 1;
     } catch {
       continue;
@@ -122,12 +120,7 @@ export async function acknowledgeBurn(deps: Pick<BurnDeps, 'burnJournal'>, burnI
   await deps.burnJournal.removeByKey(burnId);
 }
 
-async function burnJournaled(
-  deps: BurnDeps,
-  entry: BurnJournalEntry,
-  token: SphereToken | null,
-  state: { applied: boolean }
-): Promise<BurnJournalEntry> {
+async function burnJournaled(deps: BurnDeps, entry: BurnJournalEntry, token: SphereToken | null): Promise<BurnJournalEntry> {
   let current = entry;
   if (current.burnedTokenHex === null) {
     if (token === null) throw new SphereError('burn replay needs the held token to certify', 'VALIDATION_ERROR');
@@ -141,9 +134,7 @@ async function burnJournaled(
     current = { ...current, burnedTokenHex: bytesToHex(burned.blob.token) };
     await deps.burnJournal.upsert(current);
   }
-  if (!state.applied) {
-    await deps.storagePort.applyDelta({ transferId: current.burnId, spent: [current.tokenId], added: [], externalDelivery: true });
-  }
+  await deps.storagePort.applyDelta({ transferId: current.burnId, spent: [current.tokenId], added: [], externalDelivery: true });
   await deps.recordSent({ transferId: current.burnId, assets: current.assets, tokenId: current.tokenId });
   current = { ...current, settled: true };
   await deps.burnJournal.upsert(current);

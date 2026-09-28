@@ -69,7 +69,7 @@ export interface Hooks {
   putIntent?: () => Promise<void>;
   listOpen?: () => Promise<void>;
   complete?: (transferId: string) => Promise<void>;
-  applyDelta?: () => Promise<void>;
+  applyDelta?: (delta: { transferId: string; spent: string[] }) => Promise<void>;
   deliver?: () => Promise<void>;
   /** Runs before the mailbox listing yields — gates a drain mid-flight. */
   incoming?: () => Promise<void>;
@@ -116,7 +116,7 @@ function hookedStorage(inner: StoragePort, hooks: Hooks): StoragePort {
     },
     uploadBlobs: (blobs) => inner.uploadBlobs(blobs),
     applyDelta: async (delta) => {
-      if (hooks.applyDelta) await hooks.applyDelta();
+      if (hooks.applyDelta) await hooks.applyDelta(delta);
       return inner.applyDelta(delta);
     },
   };
