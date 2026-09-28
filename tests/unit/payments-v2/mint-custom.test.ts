@@ -5,6 +5,7 @@ import type { EngineOpOptions, MintDataTokenParams, SphereToken } from '../../..
 import { ProofUnconfirmedError } from '../../../token-engine/errors';
 import { SpherePaymentData } from '../../../token-engine/SpherePaymentData';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
+import { CUSTOM_MINT_MAX_PAYLOAD_BYTES } from '../../../modules/payments-v2/mint-custom';
 import type { CustomMintJournalEntry } from '../../../modules/payments-v2/stores';
 import { RealizationEngine } from './machine-harness';
 import { COIN, OWN_PRIV, OWN_PUB, cleanupWorlds, flushTail, makeWorld, ownCaller, type World } from './facade-harness';
@@ -112,8 +113,14 @@ describe('PaymentsFacade — mintCustom (plugin tokens)', () => {
     const badType = await world.facade.mintCustom({ ...request(await valuedPayload()), tokenType: new Uint8Array(31) });
     const badSalt = await world.facade.mintCustom({ ...request(await valuedPayload()), salt: new Uint8Array(8) });
     const badAsset = await world.facade.mintCustom({ ...request(await valuedPayload()), assets: [{ coinId: 'zz', amount: 1n }] });
+    const emptyReason = await world.facade.mintCustom({ ...request(await valuedPayload()), justification: new Uint8Array(0) });
+    const oversize = await world.facade.mintCustom({
+      ...request(new Uint8Array(CUSTOM_MINT_MAX_PAYLOAD_BYTES - JUSTIFICATION.length + 1).fill(0x41)),
+    });
 
-    for (const r of [badType, badSalt, badAsset]) expect(r).toMatchObject({ success: false, error: expect.stringMatching(/mintCustom/) });
+    for (const r of [badType, badSalt, badAsset, emptyReason, oversize]) {
+      expect(r).toMatchObject({ success: false, error: expect.stringMatching(/mintCustom/) });
+    }
     expect(det.calls).toEqual([]);
     expect(await journal(world)).toEqual([]);
   });

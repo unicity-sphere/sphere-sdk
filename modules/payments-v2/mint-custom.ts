@@ -18,6 +18,9 @@ export type CustomReplayDeps = CustomMintDeps & MintReplayDeps;
 
 const HEX32 = /^[0-9a-f]{64}$/;
 
+/** Cap on `data` plus `justification`: wallet-api refuses an oversize blob only after the mint certified. */
+export const CUSTOM_MINT_MAX_PAYLOAD_BYTES = 1024 * 1024;
+
 function assertRequest(request: MintCustomRequest): void {
   if (request.tokenType.length !== 32) {
     throw new SphereError('mintCustom: tokenType must be 32 bytes', 'VALIDATION_ERROR');
@@ -27,6 +30,12 @@ function assertRequest(request: MintCustomRequest): void {
   }
   if (request.data.length === 0) {
     throw new SphereError('mintCustom: data must not be empty', 'VALIDATION_ERROR');
+  }
+  if (request.justification !== undefined && request.justification.length === 0) {
+    throw new SphereError('mintCustom: justification must be omitted, not empty', 'VALIDATION_ERROR');
+  }
+  if (request.data.length + (request.justification?.length ?? 0) > CUSTOM_MINT_MAX_PAYLOAD_BYTES) {
+    throw new SphereError(`mintCustom: data and justification exceed ${CUSTOM_MINT_MAX_PAYLOAD_BYTES} bytes`, 'VALIDATION_ERROR');
   }
   for (const asset of request.assets) {
     if (!HEX32.test(asset.coinId) || asset.amount <= 0n) {
