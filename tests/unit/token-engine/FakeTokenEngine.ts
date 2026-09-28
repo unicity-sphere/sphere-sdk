@@ -30,9 +30,11 @@ import {
 } from '../../../token-engine/sdk';
 import { nftRecipientCbor, planNftMint, readNftData, type NftOpsDeps } from '../../../token-engine/nft-ops';
 import {
+  assertMintableData,
   type ClassifiedValue,
   classifyValueEnvelope,
 } from '../../../token-engine/value-envelope';
+import { SphereError } from '../../../core/errors';
 import type {
   BuildNftMintParams,
   BurnParams,
@@ -179,6 +181,12 @@ export class FakeTokenEngine implements ITokenEngine {
       tokenType: derivedTokenType(tokenId),
       justification: null,
     });
+  }
+
+  /** No reason registry here: any non-empty reason is mintable. */
+  public assertMintable(params: MintDataTokenParams): void {
+    assertMintableData(params.data);
+    if (params.justification?.length === 0) throw new SphereError('The mint reason is not tagged CBOR', 'VALIDATION_ERROR');
   }
 
   public async mintDataToken(params: MintDataTokenParams, _options?: EngineOpOptions): Promise<SphereToken> {

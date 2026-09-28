@@ -38,7 +38,8 @@ import { deriveDirectAddress } from './identity';
 import { deriveDeliveryKeys } from './blob-keys';
 import { deriveRealization } from './realization';
 import { planNftMint, readTokenNft } from './nft-ops';
-import { contextWithMintVerifiers } from './plugin-ops';
+import type { MintReasonRegistry } from './mint-reasons';
+import { mintContext } from './plugin-ops';
 import { burntTokenFromCheckpoint, encodeCheckpoint } from './split-checkpoint';
 import {
   BurnPredicate,
@@ -48,7 +49,6 @@ import {
   HexConverter,
   type InclusionProof,
   type ITransaction,
-  type MintJustificationVerifierService,
   MintTransaction,
   type NetworkId,
   PaymentAssetCollection,
@@ -75,7 +75,7 @@ import {
   type ITokenVerifier,
 } from './sdk';
 import { decodeSpherePaymentData, SpherePaymentData, sphereAssetToSdk } from './SpherePaymentData';
-import { assertMintableData, classifyValueEnvelope, wrapToken } from './value-envelope';
+import { classifyValueEnvelope, wrapToken } from './value-envelope';
 import type { EngineOpOptions, ITokenEngine } from './engine';
 import type {
   BuildNftMintParams, BurnParams,
@@ -105,7 +105,7 @@ export interface EngineDeps {
   readonly trustBase: RootTrustBase;
   readonly predicateVerifier: PredicateVerifierService;
   readonly unicityCertificateVerifier: UnicityCertificateVerifier;
-  readonly mintJustificationVerifier: MintJustificationVerifierService;
+  readonly mintJustificationVerifier: MintReasonRegistry;
   readonly verificationContext: VerificationContext;
   /**
    * Opt-in parallel verifier (EngineConfig.verification). Absent → tokens verify
@@ -307,8 +307,10 @@ export class SphereTokenEngine implements ITokenEngine {
     return wrapToken(token);
   }
 
+  public readonly assertMintable = (params: MintDataTokenParams): void => void mintContext(this.deps, params);
+
   public async mintDataToken(params: MintDataTokenParams, options?: EngineOpOptions): Promise<SphereToken> {
-    assertMintableData(params.data);
+    const context = mintContext(this.deps, params);
     const recipient = SignaturePredicate.create(params.recipientPubkey);
     const tokenType = params.tokenType ? new TokenType(params.tokenType) : TokenType.generate();
     // A deterministic salt yields a stable, terms-derived tokenId (TokenId.fromSalt).
@@ -327,8 +329,7 @@ export class SphereTokenEngine implements ITokenEngine {
       options,
     );
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
-    const verifiers = params.mintJustificationVerifiers;
-    return wrapToken(await Token.mint(certified, verifiers ? contextWithMintVerifiers(this.deps, verifiers) : this.deps.verificationContext));
+    return wrapToken(await Token.mint(certified, context));
   }
 
   public buildNftMint(params: BuildNftMintParams): Promise<NftMintPlan> {

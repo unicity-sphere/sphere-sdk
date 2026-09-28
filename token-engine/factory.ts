@@ -17,7 +17,6 @@ import { SphereError } from '../core/errors';
 import { logger } from '../core/logger';
 import {
   AggregatorClient,
-  MintJustificationVerifierService,
   PredicateVerifierService,
   RootTrustBase,
   Secp256k1SignatureVerifier,
@@ -32,6 +31,7 @@ import {
   WorkerTokenVerifier,
   type IWorker,
 } from './sdk';
+import { MintReasonRegistry } from './mint-reasons';
 import { decodeSpherePaymentData } from './SpherePaymentData';
 import { type DisposableTokenVerifier, type EngineDeps, SphereTokenEngine } from './SphereTokenEngine';
 import type { EngineConfig, ITokenEngine, VerificationWorker, VerificationWorkerConfig } from './engine';
@@ -39,7 +39,7 @@ import type { EngineConfig, ITokenEngine, VerificationWorker, VerificationWorker
 const DEFAULT_VERIFICATION_POOL_SIZE = 4;
 
 function registerPluginVerifiers(
-  registry: MintJustificationVerifierService,
+  registry: MintReasonRegistry,
   plugins: EngineConfig['plugins'],
 ): void {
   for (const plugin of plugins ?? []) {
@@ -212,7 +212,7 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
   const unicityCertificateVerifier = new UnicityCertificateVerifier(
     new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), new VerifiedSealCache(256)),
   );
-  const mintJustificationVerifier = new MintJustificationVerifierService();
+  const mintJustificationVerifier = new MintReasonRegistry();
   mintJustificationVerifier.register(
       new SplitMintJustificationVerifier(decodeSpherePaymentData),
   );

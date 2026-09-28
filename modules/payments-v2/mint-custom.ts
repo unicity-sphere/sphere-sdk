@@ -1,6 +1,7 @@
 import { bytesToHex, hexToBytes } from '../../core/crypto';
 import { SphereError } from '../../core/errors';
 
+import type { MintDataTokenParams } from '../../token-engine';
 import type { MintCustomRequest, MintResult } from './api';
 import type { ListStore } from './machine/journal';
 import { messageOf } from './machine/payload';
@@ -48,12 +49,14 @@ export async function runCustomMintUnderJournal(
   deps: CustomMintDeps,
   input: { mintId: string; request: MintCustomRequest }
 ): Promise<MintResult> {
+  let entry: CustomMintJournalEntry;
   try {
     assertRequest(input.request);
+    entry = journalEntryOf(input.mintId, input.request, deps.now());
+    deps.engine.assertMintable(mintParamsOf(deps, entry, input.request.mintJustificationVerifiers));
   } catch (err) {
     return { success: false, error: messageOf(err) };
   }
-  const entry = journalEntryOf(input.mintId, input.request, deps.now());
   await deps.customMintJournal.upsert(entry);
   let tokenId: string;
   try {
@@ -96,22 +99,27 @@ function journalEntryOf(mintId: string, request: MintCustomRequest, createdAt: n
   };
 }
 
+function mintParamsOf(
+  deps: CustomMintDeps,
+  entry: CustomMintJournalEntry,
+  mintJustificationVerifiers: MintCustomRequest['mintJustificationVerifiers']
+): MintDataTokenParams {
+  return {
+    recipientPubkey: deps.ownPubkeyBytes,
+    data: hexToBytes(entry.dataHex),
+    tokenType: hexToBytes(entry.tokenTypeHex),
+    salt: hexToBytes(entry.saltHex),
+    ...(entry.justificationHex !== null ? { justification: hexToBytes(entry.justificationHex) } : {}),
+    ...(mintJustificationVerifiers ? { mintJustificationVerifiers } : {}),
+  };
+}
+
 async function mintJournaled(
   deps: CustomMintDeps,
   entry: CustomMintJournalEntry,
   mintJustificationVerifiers: MintCustomRequest['mintJustificationVerifiers']
 ): Promise<string> {
-  const token = await deps.engine.mintDataToken(
-    {
-      recipientPubkey: deps.ownPubkeyBytes,
-      data: hexToBytes(entry.dataHex),
-      tokenType: hexToBytes(entry.tokenTypeHex),
-      salt: hexToBytes(entry.saltHex),
-      ...(entry.justificationHex !== null ? { justification: hexToBytes(entry.justificationHex) } : {}),
-      ...(mintJustificationVerifiers ? { mintJustificationVerifiers } : {}),
-    },
-    { transferId: entry.mintId }
-  );
+  const token = await deps.engine.mintDataToken(mintParamsOf(deps, entry, mintJustificationVerifiers), { transferId: entry.mintId });
   if (entry.tokenId !== '' && token.blob.tokenId !== entry.tokenId) {
     throw new SphereError(`minted token ${token.blob.tokenId}, but the journal names ${entry.tokenId}`, 'VALIDATION_ERROR');
   }

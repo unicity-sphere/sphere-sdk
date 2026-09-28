@@ -6,7 +6,7 @@
 
 import {
   type IAggregatorClient,
-  MintJustificationVerifierService,
+  type IMintJustificationVerifier,
   NetworkId,
   PredicateVerifierService,
   SigningService,
@@ -19,6 +19,7 @@ import {
   UnicitySealQuorumSignaturesVerificationRule,
   VerifiedSealCache,
 } from '../../../token-engine/sdk';
+import { MintReasonRegistry } from '../../../token-engine/mint-reasons';
 import { decodeSpherePaymentData } from '../../../token-engine/SpherePaymentData';
 import { type EngineDeps, SphereTokenEngine } from '../../../token-engine/SphereTokenEngine';
 import { AdversarialResubmitClient } from './support/AdversarialResubmitClient';
@@ -43,6 +44,8 @@ export interface TestEngineOptions {
   /** #739: shorten the inclusion-proof deadline so deadline behaviour is testable. */
   proofTimeoutMs?: number;
   proofPollIntervalMs?: number;
+  /** Mint-reason verifiers registered on the engine next to the split verifier. */
+  mintReasonVerifiers?: readonly IMintJustificationVerifier[];
 }
 
 /**
@@ -60,10 +63,11 @@ export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngin
   const unicityCertificateVerifier = new UnicityCertificateVerifier(
     new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), new VerifiedSealCache(256)),
   );
-  const mintJustificationVerifier = new MintJustificationVerifierService();
+  const mintJustificationVerifier = new MintReasonRegistry();
   mintJustificationVerifier.register(
       new SplitMintJustificationVerifier(decodeSpherePaymentData),
   );
+  for (const verifier of opts.mintReasonVerifiers ?? []) mintJustificationVerifier.register(verifier);
   const privateKey = opts.privateKey ?? SigningService.generatePrivateKey();
   const deps: EngineDeps = {
     client: new StateTransitionClient(opts.wireClient ?? new AdversarialResubmitClient(aggregator)),

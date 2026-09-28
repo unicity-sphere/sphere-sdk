@@ -30,6 +30,7 @@ export function createMockTokenEngine(overrides: Partial<ITokenEngine> = {}): IT
     readTokenJustification: vi.fn((_t: SphereToken) => null),
     readNft: vi.fn(async (_t: SphereToken) => null),
     mintDataToken: vi.fn(async () => mockSphereToken(null)),
+    assertMintable: vi.fn(),
     buildNftMint: vi.fn(async (): Promise<NftMintPlan> => ({
       data: new Uint8Array(),
       salt: new Uint8Array(32),

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { bytesToHex, hexToBytes } from '../../../core/crypto';
+import { SphereError } from '../../../core/errors';
 import type { EngineOpOptions, MintDataTokenParams, SphereToken } from '../../../token-engine';
 import { ProofUnconfirmedError } from '../../../token-engine/errors';
 import { SpherePaymentData } from '../../../token-engine/SpherePaymentData';
@@ -20,10 +21,18 @@ const AMOUNT = 1_000_000n;
 class DetEngine extends RealizationEngine {
   readonly calls: { transferId?: string; data: string; salt: string; tokenType: string; justification: string | null }[] = [];
   failNext = false;
+  readonly knownReasons = new Set<string>([bytesToHex(JUSTIFICATION)]);
   private readonly certified = new Map<string, { data: string; token: SphereToken }>();
 
   constructor() {
     super({ chainPubkey: hexToBytes(OWN_PUB), privateKey: hexToBytes(OWN_PRIV) });
+  }
+
+  override assertMintable(params: MintDataTokenParams): void {
+    super.assertMintable(params);
+    if (params.justification !== undefined && !this.knownReasons.has(bytesToHex(params.justification))) {
+      throw new SphereError('No verifier is registered on the engine for this mint-reason tag', 'VALIDATION_ERROR');
+    }
   }
 
   override async mintDataToken(params: MintDataTokenParams, options?: EngineOpOptions): Promise<SphereToken> {
@@ -121,6 +130,18 @@ describe('PaymentsFacade — mintCustom (plugin tokens)', () => {
     for (const r of [badType, badSalt, badAsset, emptyReason, oversize]) {
       expect(r).toMatchObject({ success: false, error: expect.stringMatching(/mintCustom/) });
     }
+    expect(det.calls).toEqual([]);
+    expect(await journal(world)).toEqual([]);
+  });
+
+  it('refuses a reason the engine has no verifier for before anything is journaled: its replay could never verify', async () => {
+    const det = new DetEngine();
+    const world = makeWorld({ engine: det });
+    await world.facade.start();
+
+    const result = await world.facade.mintCustom({ ...request(await valuedPayload()), justification: new Uint8Array([0xda, 0x00, 0x14, 0x4b, 0x5a, 0x01]) });
+
+    expect(result).toMatchObject({ success: false, error: expect.stringMatching(/No verifier is registered/) });
     expect(det.calls).toEqual([]);
     expect(await journal(world)).toEqual([]);
   });

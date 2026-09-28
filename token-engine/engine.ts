@@ -148,6 +148,8 @@ export interface ITokenEngine {
    * read its bytes via `readTokenData`. (Used e.g. for on-chain invoice tokens.)
    */
   mintDataToken(params: MintDataTokenParams, options?: EngineOpOptions): Promise<SphereToken>;
+  /** Throws VALIDATION_ERROR when `mintDataToken` would refuse `params` before submitting, e.g. a reason tag no registered verifier handles. */
+  assertMintable(params: MintDataTokenParams): void;
   /** Plan an NFT mint: encode (and optionally sign as this engine's identity) the payload and derive its token id. No chain op. */
   buildNftMint(params: BuildNftMintParams): Promise<NftMintPlan>;
   /** Spend a token wholesale to a recipient pubkey; returns the recipient's finished token. */
