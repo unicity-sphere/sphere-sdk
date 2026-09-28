@@ -82,6 +82,7 @@ export interface FakeEngineConfig {
   /** A real key to sign NFTs with; the identity defaults to its public key. */
   readonly privateKey?: Uint8Array;
   readonly network?: number;
+  readonly coinIssuers?: Readonly<Record<CoinId, string>>;
 }
 
 const NO_SIGNING_KEY = 'FakeTokenEngine: signing an NFT needs FakeEngineConfig.privateKey';
@@ -98,6 +99,7 @@ export class FakeTokenEngine implements ITokenEngine {
   private readonly identity: EngineIdentity;
   private readonly signer: NftOpsDeps['signingService'];
   private readonly network: number;
+  private readonly coinIssuers: Readonly<Record<CoinId, string>>;
   private readonly spent = new Set<string>();
   private seq = 0;
 
@@ -110,6 +112,7 @@ export class FakeTokenEngine implements ITokenEngine {
     this.identity = { chainPubkey };
     this.signer = keyed ?? UNKEYED_SIGNER;
     this.network = config.network ?? 2; // testnet
+    this.coinIssuers = config.coinIssuers ?? {};
   }
 
   public getIdentity(): EngineIdentity {
@@ -151,6 +154,10 @@ export class FakeTokenEngine implements ITokenEngine {
 
   public readTokenJustification(token: SphereToken): Uint8Array | null {
     return decodeFakeState(token.blob.token).justification;
+  }
+
+  public coinIssuer(coinId: CoinId): string | null {
+    return this.coinIssuers[coinId.toLowerCase()] ?? null;
   }
 
   public async readNft(token: SphereToken): Promise<NftReading | null> {

@@ -129,6 +129,8 @@ export interface ITokenEngine {
   readTokenData(token: SphereToken): Uint8Array | null;
   /** The genesis mint reason (`justification`) of a token; `null` when it was minted without one. Synchronous. */
   readTokenJustification(token: SphereToken): Uint8Array | null;
+  /** The token type (lowercase hex) whose issuance policy claims this coin; `null` when no policy does. Synchronous. */
+  coinIssuer(coinId: CoinId): string | null;
   /** Read a token's genesis payload as an NFT. NEVER throws; null = not a recognised NFT. */
   readNft(token: SphereToken): Promise<NftReading | null>;
 
@@ -259,7 +261,7 @@ export interface EngineConfig {
    * terminate the pool.
    */
   readonly verification?: VerificationWorkerConfig;
-  /** Token plugins whose mint-reason verifiers join the engine's verification context. */
+  /** Token plugins whose mint-reason verifiers and issuance policies join the engine's verification context. */
   readonly plugins?: readonly TokenPlugin[];
 }
 

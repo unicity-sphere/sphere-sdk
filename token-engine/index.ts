@@ -10,7 +10,7 @@
  */
 
 // Frozen contract
-export type { IMintJustificationVerifier } from './sdk';
+export type { IMintJustificationVerifier, ITokenIssuanceVerifier } from './sdk';
 
 export type {
   ITokenEngine,
@@ -34,6 +34,7 @@ export type {
   MintDataTokenParams,
   BurnParams,
   TokenPlugin,
+  TokenIssuancePolicy,
   TransferParams,
   SplitOutput,
   SplitParams,

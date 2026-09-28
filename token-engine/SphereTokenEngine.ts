@@ -29,7 +29,7 @@ import { certificationFailure } from './certification-outcome';
 import { randomUUID } from '../core/uuid';
 import {
   CheckpointPersistFailedError,
-  CheckpointTrustbaseMismatchError,
+  isKeepOpenSplitError,
   ProofUnconfirmedError,
   SplitCheckpointLostError,
   TransferConflictError,
@@ -38,6 +38,7 @@ import { deriveDirectAddress } from './identity';
 import { deriveDeliveryKeys } from './blob-keys';
 import { deriveRealization } from './realization';
 import { planNftMint, readTokenNft } from './nft-ops';
+import type { IssuancePolicies } from './issuance';
 import type { MintReasonRegistry } from './mint-reasons';
 import { mintContext } from './plugin-ops';
 import { burntTokenFromCheckpoint, encodeCheckpoint } from './split-checkpoint';
@@ -106,6 +107,7 @@ export interface EngineDeps {
   readonly predicateVerifier: PredicateVerifierService;
   readonly unicityCertificateVerifier: UnicityCertificateVerifier;
   readonly mintJustificationVerifier: MintReasonRegistry;
+  readonly issuancePolicies: IssuancePolicies;
   readonly verificationContext: VerificationContext;
   /**
    * Opt-in parallel verifier (EngineConfig.verification). Absent → tokens verify
@@ -142,23 +144,6 @@ export const DEFAULT_PROOF_POLL_INTERVAL_MS = 300;
  * gateway load on a large multi-output split.
  */
 const MAX_MINT_CONCURRENCY = 8;
-
-/**
- * The keep-open engine errors a split leg can raise — mirrors PaymentsModule's `keepOpen` set.
- * When one of these settles a parallel mint fan-out, the leg's spend MAY already be certified
- * on-chain, so the intent MUST stay OPEN for checkpoint-based resume; the fan-out must surface a
- * keep-open outcome rather than an abortable clean failure that would strand a certified sibling
- * (#684). Only ProofUnconfirmedError / SplitCheckpointLostError are reachable from a mint leg
- * today; the checkpoint pair is included so the classifier stays faithful to the keep-open family.
- */
-function isKeepOpenSplitError(err: unknown): boolean {
-  return (
-    err instanceof ProofUnconfirmedError ||
-    err instanceof CheckpointPersistFailedError ||
-    err instanceof SplitCheckpointLostError ||
-    err instanceof CheckpointTrustbaseMismatchError
-  );
-}
 
 /** Canonical lowercase UUID — the spec's `transferId` wire form (sdk-changes E.1). */
 const TRANSFER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -266,6 +251,10 @@ export class SphereTokenEngine implements ITokenEngine {
   public readTokenJustification(token: SphereToken): Uint8Array | null {
     const justification = token.sdkToken.genesis.justification;
     return justification ? new Uint8Array(justification) : null;
+  }
+
+  public coinIssuer(coinId: CoinId): string | null {
+    return this.deps.issuancePolicies.issuerOf(coinId);
   }
 
   public readNft(token: SphereToken): Promise<NftReading | null> {
