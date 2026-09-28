@@ -114,8 +114,8 @@
     "name": "receive-ack-before-store",
     "note": "#724 outcome: the view store precedes the claimed ack (receive.test.ts 'a claimed ack is issued only after the view store succeeds')",
     "file": "modules/payments-v2/receive/Receive.ts",
-    "find": "    await deps.view.store(screened.record);\n    pending.push(claimAck(entry));",
-    "replace": "    pending.push(claimAck(entry));\n    await deps.view.store(screened.record);",
+    "find": "    await deps.view.store(screened.record);\n    queueAck(ctx, claimAck(entry));",
+    "replace": "    queueAck(ctx, claimAck(entry));\n    await deps.view.store(screened.record);",
     "tests": [
       "tests/unit/payments-v2/receive.test.ts"
     ]
@@ -1278,9 +1278,9 @@
   {
     "name": "engine-mintdatatoken-preflight-removed",
     "note": "#778: un-classifiable opaque bytes must be refused BEFORE the chain op. wrapToken runs on mintDataToken's last line, after certification, so without the pre-flight the refusal strands an on-chain token this SDK can never decode.",
-    "file": "token-engine/SphereTokenEngine.ts",
-    "find": "    assertMintableData(params.data);",
-    "replace": "    // mutant: pre-flight dropped",
+    "file": "token-engine/plugin-ops.ts",
+    "find": "  assertMintableData(params.data);",
+    "replace": "  // mutant: pre-flight dropped",
     "tests": [
       "tests/unit/token-engine/SphereTokenEngine.hardening.test.ts"
     ]
@@ -1835,6 +1835,86 @@
     "replace": "    void NO_PAYMENTS;",
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "burn-apply-not-external",
+    "note": "A burn's spend has no deposit evidence; without externalDelivery wallet-api tombstones it unevidenced and raises the critical theft alert.",
+    "file": "modules/payments-v2/burn.ts",
+    "find": "added: [], externalDelivery: true });",
+    "replace": "added: [] });",
+    "tests": [
+      "tests/unit/payments-v2/burn.test.ts"
+    ]
+  },
+  {
+    "name": "burn-terminal-conflict-retried",
+    "note": "A burn that lost to another spend can never complete; retrying it keeps the heartbeat busy forever and acknowledge can never clear it.",
+    "file": "modules/payments-v2/burn.ts",
+    "find": "      if (!isTerminal(err)) continue;",
+    "replace": "      if (err !== undefined) continue;",
+    "tests": [
+      "tests/unit/payments-v2/burn.test.ts"
+    ]
+  },
+  {
+    "name": "burn-token-not-reserved",
+    "note": "An unreserved burn source stays selectable, so a send can race the burn for the same token.",
+    "file": "modules/payments-v2/burn-hold.ts",
+    "find": "      this.deps.queue.planWhole(burnId, tokenId);",
+    "replace": "      void this.deps.queue;",
+    "tests": [
+      "tests/unit/payments-v2/burn.test.ts"
+    ]
+  },
+  {
+    "name": "burn-live-entry-not-pinned",
+    "note": "Without the live burn journal entries the restart pin re-derivation offers a token still being burned as spendable.",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    if (isLiveBurn(burn)) holds.set(burn.burnId, [burn.tokenId]);",
+    "replace": "    void burn;",
+    "tests": [
+      "tests/unit/payments-v2/burn.test.ts"
+    ]
+  },
+  {
+    "name": "receive-unverifiable-rejected",
+    "note": "A token whose mint reason is not verifiable yet may be valid; rejecting it at the mailbox loses it for good.",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "    if (isSphereError(err) && err.code === 'MINT_REASON_UNVERIFIABLE') return null;",
+    "replace": "    if (isSphereError(err) && err.code === 'MINT_REASON_UNVERIFIABLE') return { ok: false, reason: 'unverifiable' };",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts"
+    ]
+  },
+  {
+    "name": "receive-deferral-cursor-advances",
+    "note": "The listing resumes after the persisted cursor, so a cursor past a deferred entry means it is never listed again.",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": " && pending[i].holdsCursor !== true) {",
+    "replace": ") {",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts"
+    ]
+  },
+  {
+    "name": "mint-reason-plugin-throw-is-fail",
+    "note": "A plugin throw means the answer is not known yet (RPC outage, lock short of its confirmations); a FAIL there rejects a valid token.",
+    "file": "token-engine/mint-reasons.ts",
+    "find": "    throw new MintReasonUnverifiableError(`Mint-reason tag ${verifier.tag} cannot be verified yet: ${why}`, err);",
+    "replace": "    return new VerificationResult(RULE, VerificationStatus.FAIL, why);",
+    "tests": [
+      "tests/unit/token-engine/mint-reasons.test.ts"
+    ]
+  },
+  {
+    "name": "mint-reason-overlay-drops-registered",
+    "note": "A per-call verifier must overlay the engine registry; replacing it drops every other tag, the split verifier included.",
+    "file": "token-engine/mint-reasons.ts",
+    "find": "    for (const [tag, verifier] of this.byTag) {",
+    "replace": "    for (const [tag, verifier] of [...this.byTag].filter(([t]) => replaced.has(t))) {",
+    "tests": [
+      "tests/unit/token-engine/mint-reasons.test.ts"
     ]
   }
 ]
