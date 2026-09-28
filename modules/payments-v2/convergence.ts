@@ -264,6 +264,9 @@ export async function deriveOpenIntentHolds(
     const split = typeof payload?.split?.tokenId === 'string' ? [payload.split.tokenId] : [];
     holds.set(entry.transferId, [...direct, ...split]);
   }
+  for (const burn of await stores.burnJournal.list()) {
+    if (isLiveBurn(burn)) holds.set(burn.burnId, [burn.tokenId]);
+  }
   return { open: holds, complete };
 }
 

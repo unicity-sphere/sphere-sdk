@@ -97,6 +97,11 @@ export class FakeWalletApiV2Client {
     this.keyByTokenId.set(tokenId, key);
   }
 
+  /** A restarted client reads the blobs the server already holds, as the real blob-urls route does. */
+  copyBlobIndexFrom(other: FakeWalletApiV2Client): void {
+    for (const [tokenId, key] of other.keyByTokenId) this.keyByTokenId.set(tokenId, key);
+  }
+
   // ── auth (not modeled by FakeWalletApi) ──────────────────────────────────
 
   authChallenge(_pubkey: string): Promise<AuthChallengeWire> {

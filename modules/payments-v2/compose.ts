@@ -20,6 +20,7 @@ import type { RestoreDeps } from './restore';
 import { ReservationLedger } from './select/ledger';
 import { IntentPins } from './select/pins';
 import { SpendQueue } from './select/queue';
+import { BurnHold } from './burn-hold';
 import { createMachineStores, type MachineStores } from './machine/journal';
 import { TransferMachine, type MachineDeps } from './machine/TransferMachine';
 
@@ -148,6 +149,7 @@ export interface FacadeParts {
   ledger: ReservationLedger;
   pins: IntentPins;
   queue: SpendQueue;
+  burnHold: BurnHold;
   historyStore: History;
   machineStores: MachineStores;
   machineDeps: MachineDeps;
@@ -192,13 +194,15 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
   const heldStates: HeldStateCache = new Map();
 
   const refreshView = coalesced(() => view.delta(), hooks.track);
+  const pins = buildPins(deps, hooks, { ledger, view, machineStores, machineDeps });
   return {
     ownPubkeyBytes,
     view,
     refreshView,
     ledger,
-    pins: buildPins(deps, hooks, { ledger, view, machineStores, machineDeps }),
+    pins,
     queue,
+    burnHold: new BurnHold({ queue, ledger, view, pins, burnJournal: machineStores.burnJournal, track: hooks.track }),
     historyStore,
     machineStores,
     machineDeps,

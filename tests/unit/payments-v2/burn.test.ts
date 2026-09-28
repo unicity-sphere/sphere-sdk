@@ -17,6 +17,7 @@ class DetBurnEngine extends RealizationEngine {
   readonly calls: { transferId?: string; tokenId: string; reason: string }[] = [];
   failNext = false;
   conflictNext = false;
+  gate: Promise<void> | null = null;
   private readonly certified = new Map<string, SphereToken>();
 
   constructor() {
@@ -26,6 +27,7 @@ class DetBurnEngine extends RealizationEngine {
   override async burn(params: BurnParams, options?: EngineOpOptions): Promise<SphereToken> {
     const id = options?.transferId ?? '';
     this.calls.push({ transferId: options?.transferId, tokenId: params.token.blob.tokenId, reason: bytesToHex(params.reasonBytes) });
+    if (this.gate !== null) await this.gate;
     if (this.conflictNext) {
       this.conflictNext = false;
       throw new TransferConflictError('the source state was spent by another transaction (simulated)');
@@ -92,9 +94,56 @@ describe('PaymentsFacade — burn (plugin tokens)', () => {
 
     const result = await world.facade.burn({ tokenId: 'ab'.repeat(32), reasonBytes: REASON });
 
-    expect(result).toMatchObject({ success: false, error: expect.stringMatching(/not held here/) });
+    expect(result).toMatchObject({ success: false, error: expect.stringMatching(/not a spendable holding/) });
     expect(det.calls).toEqual([]);
     expect(await journal(world)).toEqual([]);
+  });
+
+  it('reserves the token while the burn certifies: a send of it, or a second burn, is refused', async () => {
+    const det = new DetBurnEngine();
+    const world = makeWorld({ engine: det });
+    const source = await world.seed(100n);
+    await world.facade.start();
+    let open = (): void => undefined;
+    det.gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+
+    const burning = world.facade.burn({ tokenId: source.blob.tokenId, reasonBytes: REASON });
+    await vi.waitFor(() => expect(det.calls).toHaveLength(1));
+
+    await expect(world.facade.sendWholeToken({ recipient: '@peer', tokenId: source.blob.tokenId })).rejects.toThrow(/already reserved/);
+    await expect(world.facade.burn({ tokenId: source.blob.tokenId, reasonBytes: REASON })).resolves.toMatchObject({
+      success: false,
+      error: expect.stringMatching(/already reserved|not a spendable holding/),
+    });
+    open();
+    expect((await burning).success).toBe(true);
+    expect(det.calls).toHaveLength(1);
+  });
+
+  it('a burn that failed after journaling keeps its token reserved until its replay settles, across a restart too', async () => {
+    const det = new DetBurnEngine();
+    const world = makeWorld({ engine: det });
+    const source = await world.seed(100n);
+    await world.facade.start();
+    det.failNext = true;
+    let open = (): void => undefined;
+    det.gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const burning = world.facade.burn({ tokenId: source.blob.tokenId, reasonBytes: REASON });
+    await vi.waitFor(() => expect(det.calls).toHaveLength(1));
+    const [entry] = await journal(world);
+
+    const restarted = makeWorld({ restartOf: world });
+    await restarted.facade.start();
+    await expect(restarted.facade.sendWholeToken({ recipient: '@peer', tokenId: source.blob.tokenId })).rejects.toThrow(/already reserved/);
+    expect(entry).toMatchObject({ settled: false, burnedTokenHex: null });
+    det.gate = null;
+    open();
+    expect((await burning).success).toBe(false);
+    await expect(world.facade.sendWholeToken({ recipient: '@peer', tokenId: source.blob.tokenId })).rejects.toThrow(/already reserved/);
   });
 
   it('refuses a bare_collection token before anything is journaled: its coins could not be recorded', async () => {
@@ -125,6 +174,7 @@ describe('PaymentsFacade — burn (plugin tokens)', () => {
     await world.facade.stop();
 
     const restarted = makeWorld({ restartOf: world });
+    restarted.innerClient.copyBlobIndexFrom(world.innerClient);
     await restarted.facade.start();
     await vi.waitFor(async () => {
       expect(await journal(restarted)).toEqual([expect.objectContaining({ settled: true })]);

@@ -35,6 +35,7 @@ import type { Receive } from './receive/Receive';
 import type { Requests } from './requests/Requests';
 import type { ReservationLedger } from './select/ledger';
 import type { IntentPins } from './select/pins';
+import type { BurnHold } from './burn-hold';
 import type { SpendQueue, PlannedSpend } from './select/queue';
 import type { MachineStores } from './machine/journal';
 import { buildOps, classifyError, type MachineDeps, type MachinePlan, type TransferMachine } from './machine/TransferMachine';
@@ -133,6 +134,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private readonly activeMoneyOps = new Set<string>();
   /** #737: the ledger holds exactly the sources of the still-open intents. */
   private readonly pins: IntentPins;
+  private readonly burnHold: BurnHold;
   /** Per facade, so per address: an NFT reading is never served to another wallet. */
   private readonly nftCache = new NftCache();
 
@@ -157,6 +159,7 @@ export class PaymentsFacade implements PaymentsV2 {
     this.restoreDeps = parts.restoreDeps;
     this.requests = parts.requests;
     this.pins = parts.pins;
+    this.burnHold = parts.burnHold;
     deps.deliveryPort.bindDeliveryKeys((blob) => this.engine().deliveryKeys(blob));
     this.heartbeat = new ConvergenceHeartbeat({
       now: () => this.nowMs(),
@@ -325,7 +328,7 @@ export class PaymentsFacade implements PaymentsV2 {
   mintCustom = (request: MintCustomRequest): Promise<MintResult> =>
     this.track(this.ownedOp((mintId) => runCustomMintUnderJournal(this.mintDeps(), { mintId, request })));
   burn = (request: BurnRequest): Promise<BurnResult> =>
-    this.track(this.ownedOp((burnId) => runBurnUnderJournal(this.mintDeps(), { burnId, request })));
+    this.track(this.ownedOp((burnId) => this.burnHold.run(burnId, request.tokenId, () => runBurnUnderJournal(this.mintDeps(), { burnId, request }))));
   pendingBurns = (): Promise<PendingBurn[]> => this.track(pendingBurns(this.machineStores));
   acknowledgeBurn = (burnId: string): Promise<void> => this.track(acknowledgeBurn(this.machineStores, burnId));
 
