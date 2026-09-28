@@ -133,6 +133,7 @@ export class WalletApiStoragePort implements StoragePort {
     transferId: string;
     spent: string[];
     added: { tokenId: string; key: string }[];
+    externalDelivery?: boolean;
   }): Promise<ApplyDeltaResult> {
     try {
       const result = await this.client.apply(delta);

@@ -189,6 +189,7 @@ export class FakeWalletApiV2Client {
     transferId: string;
     spent: string[];
     added: { tokenId: string; key: string }[];
+    externalDelivery?: boolean;
   }): Promise<ApplyDeltaWire> {
     const result = await this.run(() => this.fake.apply(this.caller, delta));
     for (const added of delta.added) this.keyByTokenId.set(added.tokenId, added.key);

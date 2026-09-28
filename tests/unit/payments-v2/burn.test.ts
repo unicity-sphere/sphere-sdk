@@ -61,6 +61,7 @@ describe('PaymentsFacade — burn (plugin tokens)', () => {
     await vi.waitFor(async () => {
       expect(await heldIds(world)).toEqual([]);
     });
+    expect(world.api.inspectInventoryRow(ownCaller, tokenId)).toMatchObject({ status: 'removed', removalClass: 'external' });
     const history = await world.api.listHistory(ownCaller);
     expect(history.records.filter((r) => r.type === 'SENT')).toEqual([
       expect.objectContaining({ tokenId, assets: [{ coinId: COIN, amount: '100' }] }),

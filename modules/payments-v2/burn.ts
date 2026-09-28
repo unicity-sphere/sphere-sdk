@@ -142,7 +142,7 @@ async function burnJournaled(
     await deps.burnJournal.upsert(current);
   }
   if (!state.applied) {
-    await deps.storagePort.applyDelta({ transferId: current.burnId, spent: [current.tokenId], added: [] });
+    await deps.storagePort.applyDelta({ transferId: current.burnId, spent: [current.tokenId], added: [], externalDelivery: true });
   }
   await deps.recordSent({ transferId: current.burnId, assets: current.assets, tokenId: current.tokenId });
   current = { ...current, settled: true };
