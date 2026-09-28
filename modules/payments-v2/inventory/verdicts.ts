@@ -131,7 +131,12 @@ export class TokenVerdicts {
   }
 
   private async verdictOf(tokenId: string, bytes: Uint8Array): Promise<Verdict> {
-    const engine = this.deps.engine();
+    let engine: ReturnType<TokenVerdictsDeps['engine']>;
+    try {
+      engine = this.deps.engine();
+    } catch {
+      return 'retry';
+    }
     let token: SphereToken;
     try {
       token = await engine.decodeToken({ tokenId, token: bytes });

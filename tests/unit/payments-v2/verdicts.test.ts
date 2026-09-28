@@ -153,4 +153,32 @@ describe('TokenVerdicts', () => {
 
     expect(verdicts.trusts(native.blob.tokenId, BRIDGED_COIN)).toBe(false);
   });
+
+  it('checks again later when the address has no engine yet', async () => {
+    vi.useFakeTimers();
+    const { engine, verdicts, mint, kv, getBlobs } = await wallet();
+    const bridged = await mint(BRIDGED_COIN, BRIDGED_TYPE);
+    let available = false;
+    const claims = new CoinClaims();
+    claims.add({ tokenType: new TokenType(hexBytes(BRIDGED_TYPE)), coinIds: [BRIDGED_COIN], verify: vi.fn() });
+    const late = new TokenVerdicts({
+      kv,
+      claims,
+      engine: () => {
+        if (!available) throw new SphereError('paymentsV2: token engine unavailable', 'AGGREGATOR_ERROR');
+        return engine;
+      },
+      getBlobs,
+      changed: vi.fn(),
+    });
+    await late.start();
+
+    await late.review([bridged.blob.tokenId]);
+    available = true;
+    await vi.advanceTimersByTimeAsync(VERDICT_RETRY_MS);
+
+    expect(late.trusts(bridged.blob.tokenId, BRIDGED_COIN)).toBe(true);
+    late.stop();
+    verdicts.stop();
+  });
 });
