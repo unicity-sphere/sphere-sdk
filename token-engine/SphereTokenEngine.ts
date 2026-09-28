@@ -38,7 +38,6 @@ import { deriveDirectAddress } from './identity';
 import { deriveDeliveryKeys } from './blob-keys';
 import { deriveRealization } from './realization';
 import { planNftMint, readTokenNft } from './nft-ops';
-import type { IssuancePolicies } from './issuance';
 import type { MintReasonRegistry } from './mint-reasons';
 import { mintContext } from './plugin-ops';
 import { burntTokenFromCheckpoint, encodeCheckpoint } from './split-checkpoint';
@@ -107,7 +106,6 @@ export interface EngineDeps {
   readonly predicateVerifier: PredicateVerifierService;
   readonly unicityCertificateVerifier: UnicityCertificateVerifier;
   readonly mintJustificationVerifier: MintReasonRegistry;
-  readonly issuancePolicies: IssuancePolicies;
   readonly verificationContext: VerificationContext;
   /**
    * Opt-in parallel verifier (EngineConfig.verification). Absent → tokens verify
@@ -251,10 +249,6 @@ export class SphereTokenEngine implements ITokenEngine {
   public readTokenJustification(token: SphereToken): Uint8Array | null {
     const justification = token.sdkToken.genesis.justification;
     return justification ? new Uint8Array(justification) : null;
-  }
-
-  public coinIssuer(coinId: CoinId): string | null {
-    return this.deps.issuancePolicies.issuerOf(coinId);
   }
 
   public readNft(token: SphereToken): Promise<NftReading | null> {

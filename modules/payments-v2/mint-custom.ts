@@ -1,7 +1,7 @@
 import { bytesToHex, hexToBytes } from '../../core/crypto';
 import { SphereError } from '../../core/errors';
 
-import type { MintDataTokenParams } from '../../token-engine';
+import type { MintDataTokenParams, SphereToken } from '../../token-engine';
 import type { MintCustomRequest, MintResult } from './api';
 import type { ListStore } from './machine/journal';
 import { messageOf } from './machine/payload';
@@ -13,6 +13,7 @@ export interface CustomMintDeps extends FinalizeMintDeps {
   readonly armHeartbeat: () => void;
   readonly ownPubkeyBytes: Uint8Array;
   readonly now: () => number;
+  readonly accepted?: (token: SphereToken) => Promise<void>;
 }
 
 export type CustomReplayDeps = CustomMintDeps & MintReplayDeps;
@@ -126,6 +127,7 @@ async function mintJournaled(
   if (entry.tokenId === '') {
     await deps.customMintJournal.upsert({ ...entry, tokenId: token.blob.tokenId });
   }
+  await deps.accepted?.(token);
   await finalizeMint(deps, {
     mintId: entry.mintId,
     token,

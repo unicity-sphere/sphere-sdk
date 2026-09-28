@@ -24,6 +24,7 @@ import {
   SigningService,
   SplitMintJustificationVerifier,
   StateTransitionClient,
+  TokenIssuanceVerifierService,
   UnicityCertificateVerifier,
   UnicitySealQuorumSignaturesVerificationRule,
   VerificationContext,
@@ -31,7 +32,7 @@ import {
   WorkerTokenVerifier,
   type IWorker,
 } from './sdk';
-import { IssuancePolicies } from './issuance';
+import { CoinClaims } from './claims';
 import { MintReasonRegistry } from './mint-reasons';
 import { decodeSpherePaymentData } from './SpherePaymentData';
 import { type DisposableTokenVerifier, type EngineDeps, SphereTokenEngine } from './SphereTokenEngine';
@@ -40,18 +41,23 @@ import type { TokenPlugin } from './types';
 
 const DEFAULT_VERIFICATION_POOL_SIZE = 4;
 
-function registerPlugins(
-  registry: MintReasonRegistry,
-  policies: IssuancePolicies,
-  plugins: EngineConfig['plugins'],
-): void {
+interface PluginRegistries {
+  readonly reasons: MintReasonRegistry;
+  readonly policies: TokenIssuanceVerifierService;
+  readonly claims: CoinClaims;
+}
+
+function registerPlugins(registries: PluginRegistries, plugins: EngineConfig['plugins']): void {
   for (const plugin of plugins ?? []) {
     for (const verifier of plugin.mintJustificationVerifiers ?? []) {
-      claim(plugin, `mint-reason tag ${verifier.tag}`, () => registry.registerPlugin(verifier));
+      claim(plugin, `mint-reason tag ${verifier.tag}`, () => registries.reasons.registerPlugin(verifier));
     }
     for (const policy of plugin.tokenIssuancePolicies ?? []) {
       const tokenType = HexConverter.encode(policy.tokenType.bytes);
-      claim(plugin, `an issuance policy for token type ${tokenType}`, () => policies.register(policy));
+      claim(plugin, `an issuance policy for token type ${tokenType}`, () => {
+        registries.claims.add(policy);
+        registries.policies.register(policy);
+      });
     }
   }
 }
@@ -227,8 +233,11 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
   mintJustificationVerifier.register(
       new SplitMintJustificationVerifier(decodeSpherePaymentData),
   );
-  const issuancePolicies = new IssuancePolicies();
-  registerPlugins(mintJustificationVerifier, issuancePolicies, config.plugins);
+  const tokenIssuanceVerifier = new TokenIssuanceVerifierService(false);
+  registerPlugins(
+    { reasons: mintJustificationVerifier, policies: tokenIssuanceVerifier, claims: new CoinClaims() },
+    config.plugins,
+  );
 
   const deps: EngineDeps = {
     client: new StateTransitionClient(new AggregatorClient(config.aggregatorUrl, config.apiKey ?? null)),
@@ -236,13 +245,12 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
     predicateVerifier,
     unicityCertificateVerifier,
     mintJustificationVerifier,
-    issuancePolicies,
     verificationContext: new VerificationContext(
       trustBase,
       predicateVerifier,
       unicityCertificateVerifier,
       mintJustificationVerifier,
-      issuancePolicies.verifier,
+      tokenIssuanceVerifier,
     ),
     signingService: new SigningService(config.privateKey),
     // Also the HKDF ikm for deterministic realization (Part E.1) — the

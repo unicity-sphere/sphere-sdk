@@ -134,6 +134,20 @@ export async function tokenInServerInventory(
   return false;
 }
 
+export async function seedHeldStates(
+  storagePort: Pick<StoragePort, 'listInventory'>,
+  heldStates: Map<string, string>
+): Promise<void> {
+  let page = await storagePort.listInventory();
+  for (let i = 0; i < INVENTORY_SCAN_PAGE_LIMIT; i++) {
+    for (const item of page.items) {
+      if (item.status === 'active') heldStates.set(item.tokenId, item.stateHash);
+    }
+    if (!page.more) return;
+    page = await storagePort.listInventory(page.cursor);
+  }
+}
+
 /** @returns how many coin journal entries were RESOLVED (cleared) — heartbeat progress. */
 export async function replayCoinMints(deps: CoinReplayDeps): Promise<number> {
   let resolved = 0;

@@ -1,4 +1,3 @@
-import type { IssuancePolicies } from './issuance';
 import type { MintReasonRegistry } from './mint-reasons';
 import {
   type PredicateVerifierService,
@@ -14,7 +13,6 @@ export interface MintContextDeps {
   readonly predicateVerifier: PredicateVerifierService;
   readonly unicityCertificateVerifier: UnicityCertificateVerifier;
   readonly mintJustificationVerifier: MintReasonRegistry;
-  readonly issuancePolicies: IssuancePolicies;
   readonly verificationContext: VerificationContext;
 }
 
@@ -32,6 +30,6 @@ export function mintContext(
     deps.predicateVerifier,
     deps.unicityCertificateVerifier,
     deps.mintJustificationVerifier.overlaid(verifiers),
-    deps.issuancePolicies.verifier,
+    deps.verificationContext.tokenIssuanceVerifier,
   );
 }

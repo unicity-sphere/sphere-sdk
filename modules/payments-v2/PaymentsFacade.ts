@@ -18,7 +18,7 @@ import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { NftCache, readNft, readNfts, type NftReadDeps } from './inventory/nft-read';
 import { readTokenData, readTokenJustification } from './inventory/token-data';
-import { type CoinReplayDeps, INVENTORY_SCAN_PAGE_LIMIT, replayCoinMints, runMintUnderJournal, tokenInServerInventory } from './mint';
+import { type CoinReplayDeps, replayCoinMints, runMintUnderJournal, seedHeldStates, tokenInServerInventory } from './mint';
 import { type NftReplayDeps, replayNftMints, runNftMintUnderJournal } from './mint-nft';
 import { type CustomReplayDeps, replayCustomMints, runCustomMintUnderJournal } from './mint-custom';
 import { acknowledgeBurn, type BurnReplayDeps, pendingBurns, replayBurns, runBurnUnderJournal } from './burn';
@@ -30,6 +30,7 @@ import { PrewarmCache, takeSourceBlobs, warmSendSources, type WarmDeps } from '.
 import type { ShortfallEntry } from './stores';
 import type { History } from './history/History';
 import type { InventoryView } from './inventory/InventoryView';
+import type { TokenVerdicts } from './inventory/verdicts';
 import { transferringToken } from './inventory/presentation';
 import type { Receive } from './receive/Receive';
 import type { Requests } from './requests/Requests';
@@ -106,6 +107,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private readonly wakeRefresh: () => void;
   private readonly prewarmed = new PrewarmCache();
   private readonly view: InventoryView;
+  private readonly verdicts: TokenVerdicts;
   private readonly ledger: ReservationLedger;
   private readonly queue: SpendQueue;
   private readonly machine: TransferMachine;
@@ -146,6 +148,7 @@ export class PaymentsFacade implements PaymentsV2 {
       track: (op) => this.trackTail(op),
     });
     this.view = parts.view;
+    this.verdicts = parts.verdicts;
     this.wakeRefresh = parts.refreshView;
     this.ledger = parts.ledger;
     this.queue = parts.queue;
@@ -209,7 +212,8 @@ export class PaymentsFacade implements PaymentsV2 {
     await this.pins.sync().catch(() => undefined);
     // §7 start posture: never awaited; the heartbeat re-runs this same pass.
     this.trackTail(this.runConvergencePass());
-    this.trackTail(this.seedHeldStates());
+    this.trackTail(seedHeldStates(this.deps.storagePort, this.heldStates));
+    await this.verdicts.start().catch(() => undefined);
     await this.view.fullPull().catch(() => undefined);
     this.receiveLoop.start(this.deps.receivePollMs);
   }
@@ -219,6 +223,7 @@ export class PaymentsFacade implements PaymentsV2 {
     this.started = false;
     this.heartbeat.stop(); // §7 quiescence unchanged: a mid-backoff stop cancels cleanly
     this.receiveLoop.stop();
+    this.verdicts.stop();
     for (const unsubscribe of this.unsubscribers) unsubscribe();
     this.unsubscribers = [];
     await this.deps.session.stop();
@@ -382,6 +387,7 @@ export class PaymentsFacade implements PaymentsV2 {
       tokenInServerInventory: (tokenId) => tokenInServerInventory(this.deps.storagePort, tokenId),
       emit: this.deps.emit,
       now: () => this.nowMs(),
+      accepted: (token) => this.verdicts.accept(token),
     };
   }
 
@@ -770,17 +776,6 @@ export class PaymentsFacade implements PaymentsV2 {
 
   private newId(): string {
     return (this.deps.newId ?? randomUUID)();
-  }
-
-  private async seedHeldStates(): Promise<void> {
-    let page = await this.deps.storagePort.listInventory();
-    for (let i = 0; i < INVENTORY_SCAN_PAGE_LIMIT; i++) {
-      for (const item of page.items) {
-        if (item.status === 'active') this.heldStates.set(item.tokenId, item.stateHash);
-      }
-      if (!page.more) return;
-      page = await this.deps.storagePort.listInventory(page.cursor);
-    }
   }
 
   private track<T>(op: Promise<T>): Promise<T> {

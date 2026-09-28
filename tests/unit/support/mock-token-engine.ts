@@ -28,7 +28,6 @@ export function createMockTokenEngine(overrides: Partial<ITokenEngine> = {}): IT
     readMemo: vi.fn((_t: SphereToken) => null),
     readTokenData: vi.fn((_t: SphereToken) => null),
     readTokenJustification: vi.fn((_t: SphereToken) => null),
-    coinIssuer: vi.fn((_coinId: string) => null as string | null),
     readNft: vi.fn(async (_t: SphereToken) => null),
     mintDataToken: vi.fn(async () => mockSphereToken(null)),
     assertMintable: vi.fn(),

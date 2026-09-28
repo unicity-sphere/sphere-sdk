@@ -48,7 +48,15 @@ export interface InventoryViewDeps {
    * only knows about the attempt still running in THIS session.
    */
   readonly isPinned?: (tokenId: string) => boolean;
+  readonly trust?: CoinTrust;
 }
+
+export interface CoinTrust {
+  isClaimed(coinId: string): boolean;
+  trusts(tokenId: string, coinId: string): boolean;
+}
+
+const TRUST_ALL: CoinTrust = { isClaimed: () => false, trusts: () => true };
 
 interface MirrorEntry {
   stateHash: string;
@@ -193,6 +201,10 @@ export class InventoryView {
     if (changed) this.deps.emit('inventory:updated');
   }
 
+  private get trust(): CoinTrust {
+    return this.deps.trust ?? TRUST_ALL;
+  }
+
   private pinned(tokenId: string): boolean {
     return this.deps.isPinned?.(tokenId) ?? false;
   }
@@ -222,6 +234,7 @@ export class InventoryView {
   private isSpendable(tokenId: string, entry: MirrorEntry): boolean {
     if (entry.status !== 'active') return false;
     if (this.inFlight.has(tokenId) && !this.pinned(tokenId)) return false;
+    if (!entry.assets.every((asset) => this.trust.trusts(tokenId, asset.coinId))) return false;
     return !this.suspected.has(stateKey(tokenId, entry.stateHash));
   }
 
@@ -252,6 +265,7 @@ export class InventoryView {
         toToken(tokenId, entry, asset, registry, {
           transferring: this.held(tokenId),
           suspectedSpent: this.suspected.has(stateKey(tokenId, entry.stateHash)),
+          unverified: !this.trust.trusts(tokenId, asset.coinId),
         })
       );
     }
@@ -285,9 +299,21 @@ export class InventoryView {
   }
 
   async assets(registry: RegistryReader, price?: PriceReader): Promise<Asset[]> {
-    const raw = aggregateAssets(this.activeEntries(), (tokenId) => this.held(tokenId), registry);
+    const reading = {
+      isTransferring: (tokenId: string) => this.held(tokenId),
+      trusts: (tokenId: string, coinId: string) => this.trust.trusts(tokenId, coinId),
+    };
+    const raw = aggregateAssets(this.activeEntries(), reading, registry);
     if (!price || raw.length === 0) return raw;
     return withPrices(raw, registry, price);
+  }
+
+  claimHolders(): string[] {
+    const out: string[] = [];
+    for (const [tokenId, entry] of this.activeEntries()) {
+      if (entry.assets.some((asset) => this.trust.isClaimed(asset.coinId))) out.push(tokenId);
+    }
+    return out;
   }
 
   private *activeEntries(): Iterable<[string, MirrorEntry]> {

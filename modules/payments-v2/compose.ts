@@ -4,6 +4,7 @@
 import { coalesced } from './async';
 import { hexToBytes } from '../../core/crypto';
 import { decryptField, encryptField } from '../../core/field-encryption';
+import { CoinClaims } from '../../token-engine/claims';
 import type { ITokenEngine, SplitCheckpointStore } from '../../token-engine/engine';
 import type { TransferResult } from '../../types';
 
@@ -13,6 +14,7 @@ import type { DeliveryPort, StoragePort } from './ports';
 import type { ScopedKV } from './stores';
 import { History, type HistoryClient } from './history/History';
 import { InventoryView, type PriceReader, type RegistryReader } from './inventory/InventoryView';
+import { TokenVerdicts } from './inventory/verdicts';
 import { Receive, type ReceivedRecord, type StoredIncoming } from './receive/Receive';
 import { Requests, type RequestMemoCodec, type RequestsWireClient } from './requests/Requests';
 import { deriveOpenIntentHolds } from './convergence';
@@ -111,6 +113,8 @@ export interface PaymentsFacadeDeps {
   kv: ScopedKV;
   registry: RegistryReader;
   price?: PriceReader;
+  /** Coins that count only in verified tokens of their issuing type (TokenPlugin issuance policies). */
+  claims?: CoinClaims;
   emit: (event: string, payload: unknown) => void;
   resolveRecipient: (identifier: string) => Promise<RecipientInfo | null>;
   signComplete: (transferId: string) => Promise<string>;
@@ -146,6 +150,7 @@ export interface FacadeHooks {
 export interface FacadeParts {
   ownPubkeyBytes: Uint8Array;
   view: InventoryView;
+  verdicts: TokenVerdicts;
   ledger: ReservationLedger;
   pins: IntentPins;
   queue: SpendQueue;
@@ -165,16 +170,8 @@ export interface FacadeParts {
 export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks): FacadeParts {
   const ownPubkeyBytes = hexToBytes(deps.ownPubkey);
   const ledger = new ReservationLedger();
-  const view = new InventoryView({
-    port: deps.storagePort,
-    kv: deps.kv,
-    emit: (event) => deps.emit(event, {}),
-    // #737: a reserved token is unselectable, so it is never confirmed balance.
-    // #738: while the held-set is unproven, EVERY token reads pinned — the report
-    // must not call a token spendable that the queue is about to refuse to spend.
-    isPinned: (tokenId) => ledger.unprovenReason() !== null || ledger.holderOf(tokenId) !== undefined,
-    ...(deps.now !== undefined ? { now: deps.now } : {}),
-  });
+  const verdicts = buildVerdicts(deps, hooks);
+  const view = buildView(deps, hooks, ledger, verdicts);
   const queue = new SpendQueue({
     ledger,
     getPool: (coinId) => view.pool(coinId),
@@ -189,7 +186,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     ...(deps.now !== undefined ? { now: deps.now } : {}),
     ...(deps.newId !== undefined ? { newId: deps.newId } : {}),
   });
-  const machineDeps = buildMachineDeps(deps, hooks, historyStore);
+  const machineDeps = buildMachineDeps(deps, hooks, historyStore, verdicts);
   const machineStores = createMachineStores(deps.kv);
   const heldStates: HeldStateCache = new Map();
 
@@ -198,6 +195,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
   return {
     ownPubkeyBytes,
     view,
+    verdicts,
     refreshView,
     ledger,
     pins,
@@ -208,10 +206,44 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     machineDeps,
     machine: new TransferMachine(machineDeps),
     heldStates,
-    receiveLoop: buildReceive(deps, hooks, historyStore, heldStates, refreshView),
+    receiveLoop: buildReceive(deps, hooks, { historyStore, heldStates, verdicts }, refreshView),
     requests: buildRequests(deps, hooks),
     restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view),
   };
+}
+
+function buildView(
+  deps: PaymentsFacadeDeps,
+  hooks: FacadeHooks,
+  ledger: ReservationLedger,
+  verdicts: TokenVerdicts
+): InventoryView {
+  const view: InventoryView = new InventoryView({
+    port: deps.storagePort,
+    kv: deps.kv,
+    trust: verdicts,
+    emit: (event) => {
+      deps.emit(event, {});
+      hooks.track(verdicts.review(view.claimHolders()));
+    },
+    // #737: a reserved token is unselectable, so it is never confirmed balance.
+    // #738: while the held-set is unproven, EVERY token reads pinned — the report
+    // must not call a token spendable that the queue is about to refuse to spend.
+    isPinned: (tokenId) => ledger.unprovenReason() !== null || ledger.holderOf(tokenId) !== undefined,
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+  });
+  return view;
+}
+
+function buildVerdicts(deps: PaymentsFacadeDeps, hooks: FacadeHooks): TokenVerdicts {
+  return new TokenVerdicts({
+    kv: deps.kv,
+    claims: deps.claims ?? new CoinClaims(),
+    engine: () => hooks.engine(),
+    getBlobs: (tokenIds) => deps.storagePort.getBlobs(tokenIds),
+    changed: () => deps.emit('inventory:updated', {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+  });
 }
 
 /** #737 pin lifecycle wiring (see select/pins.ts); the facade owns when it runs. */
@@ -263,9 +295,11 @@ function buildRestoreDeps(
 function buildMachineDeps(
   deps: PaymentsFacadeDeps,
   hooks: FacadeHooks,
-  historyStore: History
+  historyStore: History,
+  verdicts: TokenVerdicts
 ): MachineDeps {
   return {
+    recordSplit: (sourceTokenId, outputTokenId) => verdicts.recordSplit(sourceTokenId, outputTokenId),
     engine: () => hooks.engine(),
     storage: deps.storagePort,
     delivery: deps.deliveryPort,
@@ -305,13 +339,15 @@ function buildMachineDeps(
 function buildReceive(
   deps: PaymentsFacadeDeps,
   hooks: FacadeHooks,
-  historyStore: History,
-  heldStates: HeldStateCache,
+  parts: { historyStore: History; heldStates: HeldStateCache; verdicts: TokenVerdicts },
   refreshView: () => void
 ): Receive {
+  const { historyStore, heldStates, verdicts } = parts;
   return new Receive({
     delivery: deps.deliveryPort,
     engine: () => hooks.engine(),
+    claims: deps.claims ?? new CoinClaims(),
+    accepted: (token) => verdicts.accept(token),
     view: {
       heldState: (tokenId) => heldStates.get(tokenId) ?? null,
       store: async (entry: StoredIncoming) => {

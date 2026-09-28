@@ -18,7 +18,6 @@ import { createTestEngine } from './test-engine';
 const LOCK_TAG = 1330002n;
 const TYPE = new Uint8Array(32).fill(0x6f);
 const COIN = 'ab'.repeat(32);
-const OTHER_COIN = 'cd'.repeat(32);
 
 function lockReason(): Uint8Array {
   return CborSerializer.encodeTag(LOCK_TAG, CborSerializer.encodeUnsignedInteger(1n));
@@ -89,13 +88,5 @@ describe('SphereTokenEngine — issuance policies', () => {
       expect(output.tokenType).toBe(bridged.tokenType);
       await expect(e.verify(output)).resolves.toEqual({ ok: true });
     }
-  });
-
-  it('names the token type that issues a claimed coin, and none for a coin no policy claims', () => {
-    const e = createTestEngine({ issuancePolicies: [lockOrSplit()] });
-
-    expect(e.coinIssuer(COIN)).toBe('6f'.repeat(32));
-    expect(e.coinIssuer(COIN.toUpperCase())).toBe('6f'.repeat(32));
-    expect(e.coinIssuer(OTHER_COIN)).toBeNull();
   });
 });

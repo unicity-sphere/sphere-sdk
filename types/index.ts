@@ -84,6 +84,8 @@ export interface Token {
    * send self-heals instead of wedging on a stale source.
    */
   suspectedSpent?: boolean;
+  /** Carries a coin that an issuance policy claims, without having passed that policy: shown, never spent. */
+  readonly unverified?: boolean;
 }
 
 /**
@@ -148,6 +150,8 @@ export interface Asset {
   readonly fiatValueUsd: number | null;
   /** Total fiat value in EUR */
   readonly fiatValueEur: number | null;
+  /** Holds tokens of a claimed coin that have not passed its issuance policy: never spendable, never priced. */
+  readonly unverified?: boolean;
 }
 
 // =============================================================================

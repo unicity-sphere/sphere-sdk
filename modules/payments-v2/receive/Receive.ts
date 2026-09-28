@@ -4,10 +4,12 @@
 import { isSphereError } from '../../../core/errors';
 import { logger } from '../../../core/logger';
 import type { EngineVerifyResult, ITokenEngine, SphereToken } from '../../../token-engine';
+import type { CoinClaims } from '../../../token-engine/claims';
 import { isCoinlessEnvelope } from '../../../token-engine/value-envelope';
 import type { IncomingTransfer, Token } from '../../../types';
 import { SingleFlight } from '../async';
 import type { RegistryReader } from '../inventory/InventoryView';
+import { honoursClaims } from '../inventory/verdicts';
 import type { AttentionEmitter } from '../machine/journal';
 import { isRetryableAckError } from '../ports';
 import type { AckOutcome, AckRequest, DeliveryPort, IncomingDelivery } from '../ports';
@@ -29,6 +31,8 @@ export interface StoredIncoming {
   readonly assets: readonly IncomingAssetAmount[];
   /** Genesis type of an arrival that names no coin (#777) — its only display handle. */
   readonly tokenType?: string;
+  /** Claimed coins this arrival carries without being of their issuing type. */
+  readonly unverifiedCoinIds?: readonly string[];
 }
 
 // Per-key seam over the inventory view (adapted by the facade in P9).
@@ -53,6 +57,8 @@ export interface ReceiveDeps {
   readonly delivery: DeliveryPort;
   /** Snapshot taken once per drain (§7 collaborator-snapshot rule). */
   readonly engine: () => ReceiveEngine;
+  readonly claims?: Pick<CoinClaims, 'issuerOf'>;
+  readonly accepted?: (token: SphereToken) => Promise<void>;
   readonly view: ReceiveView;
   readonly kv: ScopedKV;
   readonly registry: RegistryReader;
@@ -95,7 +101,10 @@ interface PendingAck {
   readonly holdsCursor?: boolean;
 }
 
-type Screened = { kind: 'ack'; ack: PendingAck } | { kind: 'accept'; record: StoredIncoming } | { kind: 'defer' };
+type Screened =
+  | { kind: 'ack'; ack: PendingAck }
+  | { kind: 'accept'; record: StoredIncoming; token: SphereToken }
+  | { kind: 'defer' };
 
 /** The mutable state one listing pass threads through (max-params ≤ 5). */
 interface DrainPass {
@@ -251,6 +260,7 @@ export class Receive {
       if (screened.ack.disposition === 'claimed') claimable.n += 1;
       return;
     }
+    await deps.accepted?.(screened.token);
     await deps.view.store(screened.record);
     queueAck(ctx, claimAck(entry));
     claimable.n += 1;
@@ -299,15 +309,24 @@ async function screen(deps: ReceiveDeps, engine: ReceiveEngine, entry: IncomingD
     // #687 gate: a replayed OLDER, already-spent state never displaces the live one.
     return { kind: 'ack', ack: rejectAck(entry, 'invalid') };
   }
+  const unverifiedCoinIds = unverifiedCoinsOf(deps, token);
   return {
     kind: 'accept',
+    token,
     record: {
       tokenId: keys.tokenId,
       stateHash: keys.stateHash,
       assets: toAssetAmounts(token),
       ...(isCoinlessEnvelope(token.valueEnvelope) ? { tokenType: token.tokenType } : {}),
+      ...(unverifiedCoinIds.length > 0 ? { unverifiedCoinIds } : {}),
     },
   };
+}
+
+function unverifiedCoinsOf(deps: ReceiveDeps, token: SphereToken): string[] {
+  const claims = deps.claims;
+  if (claims === undefined || honoursClaims(claims, token)) return [];
+  return (token.value?.assets ?? []).map((asset) => asset.coinId).filter((coinId) => claims.issuerOf(coinId) !== null);
 }
 
 /** null = the mint reason is not verifiable yet: leave the entry unacked, never reject a token that may be valid. */
@@ -346,7 +365,10 @@ async function announce(
     id: record.tokenId,
     senderPubkey: entry.senderPubkey ?? '',
     ...(entry.senderNametag !== undefined ? { senderNametag: entry.senderNametag } : {}),
-    tokens: record.assets.map((asset) => toUiToken(record.tokenId, asset, deps.registry, receivedAt)),
+    tokens: record.assets.map((asset) => ({
+      ...toUiToken(record.tokenId, asset, deps.registry, receivedAt),
+      ...(record.unverifiedCoinIds?.includes(asset.coinId) ? { unverified: true } : {}),
+    })),
     // #777: named here rather than mapped from assets, which announced an EMPTY list.
     ...(record.tokenType !== undefined
       ? {

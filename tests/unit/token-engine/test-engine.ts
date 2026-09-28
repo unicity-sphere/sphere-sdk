@@ -12,13 +12,13 @@ import {
   SigningService,
   SplitMintJustificationVerifier,
   StateTransitionClient,
+  TokenIssuanceVerifierService,
   VerificationContext,
   Secp256k1SignatureVerifier,
   UnicityCertificateVerifier,
   UnicitySealQuorumSignaturesVerificationRule,
   VerifiedSealCache,
 } from '../../../token-engine/sdk';
-import { IssuancePolicies } from '../../../token-engine/issuance';
 import { MintReasonRegistry } from '../../../token-engine/mint-reasons';
 import type { TokenIssuancePolicy } from '../../../token-engine/types';
 import { decodeSpherePaymentData } from '../../../token-engine/SpherePaymentData';
@@ -70,8 +70,8 @@ export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngin
       new SplitMintJustificationVerifier(decodeSpherePaymentData),
   );
   for (const verifier of opts.mintReasonVerifiers ?? []) mintJustificationVerifier.registerPlugin(verifier);
-  const issuancePolicies = new IssuancePolicies();
-  for (const policy of opts.issuancePolicies ?? []) issuancePolicies.register(policy);
+  const tokenIssuanceVerifier = new TokenIssuanceVerifierService(false);
+  for (const policy of opts.issuancePolicies ?? []) tokenIssuanceVerifier.register(policy);
   const privateKey = opts.privateKey ?? SigningService.generatePrivateKey();
   const deps: EngineDeps = {
     client: new StateTransitionClient(opts.wireClient ?? new AdversarialResubmitClient(aggregator)),
@@ -79,13 +79,12 @@ export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngin
     predicateVerifier,
     unicityCertificateVerifier,
     mintJustificationVerifier,
-    issuancePolicies,
     verificationContext: new VerificationContext(
       trustBase,
       predicateVerifier,
       unicityCertificateVerifier,
       mintJustificationVerifier,
-      issuancePolicies.verifier,
+      tokenIssuanceVerifier,
     ),
     signingService: new SigningService(privateKey),
     privateKey,

@@ -969,11 +969,30 @@ const result = await sphere.payments.mintNft({
 
 ### Token plugins
 
-A `TokenPlugin` (`{ id, mintJustificationVerifiers }`, passed as `Sphere.init({ plugins })`) adds
-tokens whose genesis carries a mint reason the SDK does not know, such as a bridged asset whose
-reason names a lock on another chain. Each verifier handles one CBOR tag. A verifier returns FAIL
-for a reason that is definitively wrong; it throws when it cannot answer yet, and the engine then
-reports the reason as not verifiable yet (`MINT_REASON_UNVERIFIABLE`) instead of invalid.
+A `TokenPlugin` (`{ id, mintJustificationVerifiers, tokenIssuancePolicies }`, passed as
+`Sphere.init({ plugins })`) adds tokens whose genesis carries a mint reason the SDK does not know,
+such as a bridged asset whose reason names a lock on another chain. Each verifier handles one CBOR
+tag. A verifier returns FAIL for a reason that is definitively wrong; it throws when it cannot answer
+yet, and the engine then reports the reason as not verifiable yet (`MINT_REASON_UNVERIFIABLE`)
+instead of invalid.
+
+A mint reason alone is optional: a token minted without one skips the verifiers. A
+`TokenIssuancePolicy` makes the rule of a token type mandatory. It is the state-transition SDK's
+`ITokenIssuanceVerifier` (`tokenType`, `verify(genesis)`) plus `coinIds`, the coins only that type
+may issue. Every genesis of that type, the burned source of a split included, must pass `verify`,
+so a token of the type minted without its reason fails verification and receive refuses it. A
+claimed coin counts only inside a token of its issuing type that verified:
+
+- `assets()` lists the other holdings of a claimed coin as a separate asset with `unverified: true`
+  and no price, and `tokens()` marks each such token `unverified: true`. A token of another type
+  that carries the coin, a token that failed verification, and one not checked yet all read this way.
+- An unverified token is never spent: coin selection skips it, and `sendWholeToken()` and `burn()`
+  refuse it as not a spendable holding.
+- A token received, minted with `mintCustom()`, or left as change of a verified token counts at once.
+  Any other held token of a claimed coin, for instance one another device received, is verified in
+  the background, and a check that cannot answer yet is retried with backoff.
+- Two policies for one token type, or two types claiming one coin, fail engine construction with
+  `INVALID_CONFIG`.
 
 ### `mintCustom(request: MintCustomRequest): Promise<MintResult>`
 

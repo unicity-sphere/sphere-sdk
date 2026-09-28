@@ -30,7 +30,8 @@ import { TokenRegistry } from '../../registry';
 import type { PeerInfo, TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { ProviderStatus } from '../../types';
-import type { ITokenEngine } from '../../token-engine';
+import type { ITokenEngine, TokenPlugin } from '../../token-engine';
+import { TokenType } from '../../token-engine/sdk';
 import type { PaymentsFacade } from '../../modules/payments-v2/PaymentsFacade';
 import type {
   PaymentsV2Transport,
@@ -198,6 +199,7 @@ interface BuildOptions {
   walletApi: WalletApiTransportConfig;
   peers?: Record<string, PeerInfo>;
   nametag?: string;
+  plugins?: readonly TokenPlugin[];
 }
 
 async function buildSphere(options: BuildOptions): Promise<Sphere> {
@@ -212,6 +214,7 @@ async function buildSphere(options: BuildOptions): Promise<Sphere> {
     network: NET,
     walletApi: options.walletApi,
     ...(options.nametag !== undefined ? { nametag: options.nametag } : {}),
+    ...(options.plugins !== undefined ? { plugins: options.plugins } : {}),
   });
   cleanups.push(async () => {
     await sphere.destroy();
@@ -606,6 +609,21 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     });
     const assets = await sphere.payments.assets(COIN);
     expect(assets[0]?.totalAmount).toBe('40');
+  }, 20_000);
+
+  it('a plugin that claims a coin keeps a held token of another type out of that coin balance', async () => {
+    const world = makeWorld();
+    const policy = { tokenType: new TokenType(new Uint8Array(32).fill(0x6f)), coinIds: [COIN], verify: vi.fn() };
+    const sphere = await buildSphere({ walletApi: world.walletApi, plugins: [{ id: 'bridge', tokenIssuancePolicies: [policy] }] });
+
+    const seeded = await seedInventory(world, world.transports[0]!, 40n);
+    world.transports[0]!.session.fire('inventory');
+    await vi.waitFor(() => {
+      expect(sphere.payments.tokens().map((t) => t.id)).toContain(seeded.blob.tokenId);
+    });
+
+    const assets = await sphere.payments.assets(COIN);
+    expect(assets.map((a) => [a.totalAmount, a.unverified ?? false])).toEqual([['40', true]]);
   }, 20_000);
 
   // #733: proves composePaymentsV2 wires the resolver that reports the PEER's
