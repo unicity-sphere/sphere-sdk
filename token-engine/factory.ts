@@ -38,7 +38,6 @@ import type { EngineConfig, ITokenEngine, VerificationWorker, VerificationWorker
 
 const DEFAULT_VERIFICATION_POOL_SIZE = 4;
 
-/** #770(4): what a verification cancelled by `dispose()` rejects with. */
 function registerPluginVerifiers(
   registry: MintJustificationVerifierService,
   plugins: EngineConfig['plugins'],
@@ -58,6 +57,7 @@ function registerPluginVerifiers(
   }
 }
 
+/** #770(4): what a verification cancelled by `dispose()` rejects with. */
 function disposedError(): SphereError {
   return new SphereError(
     'Verification worker pool disposed — the in-flight verification was cancelled',
