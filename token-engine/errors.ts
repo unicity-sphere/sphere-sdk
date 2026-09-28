@@ -42,6 +42,14 @@ export class TransferConflictError extends SphereError {
  * certified proof + recipient blob, or records the spend if a foreign tx won the
  * race — never a second on-chain spend (sdk-changes E.2/E.3, #631).
  */
+/** A token's mint reason cannot be judged yet: no verifier for its tag here, or the plugin could not reach an answer. */
+export class MintReasonUnverifiableError extends SphereError {
+  constructor(message: string, cause?: unknown) {
+    super(message, 'MINT_REASON_UNVERIFIABLE', cause);
+    this.name = 'MintReasonUnverifiableError';
+  }
+}
+
 export class ProofUnconfirmedError extends SphereError {
   readonly mayHaveCertified = true as const;
 

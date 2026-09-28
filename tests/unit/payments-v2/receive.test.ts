@@ -4,6 +4,8 @@ import type { RegistryReader } from '../../../modules/payments-v2/inventory/Inve
 import type { DeliveryPort, IncomingDelivery } from '../../../modules/payments-v2/ports';
 import {
   ACK_BATCH_SIZE,
+  RECHECK_BASE_MS,
+  RECHECK_MAX_MS,
   REFRESH_INTERVAL_MS,
   Receive,
   receivedDedupKey,
@@ -17,6 +19,7 @@ import type { AckOutcome, AckRequest } from '../../../modules/payments-v2/ports'
 import type { StreamCursor } from '../../../modules/payments-v2/stores';
 import type { EngineVerifyResult, SphereToken, TokenBlob } from '../../../token-engine';
 import type { IncomingTransfer } from '../../../types';
+import { MintReasonUnverifiableError } from '../../../token-engine/errors';
 import { memoryKV, registryStub, type MemoryKV } from './support';
 
 const OWN = `02${'aa'.repeat(32)}`;
@@ -69,6 +72,8 @@ class StubEngine implements ReceiveEngine {
   badProof = new Set<string>();
   spentStates = new Set<string>();
   verifyOutageOn = new Set<string>();
+  unverifiableOn = new Set<string>();
+  verifyCalls: string[] = [];
   isSpentOutage = false;
 
   getIdentity(): { chainPubkey: Uint8Array } {
@@ -96,7 +101,11 @@ class StubEngine implements ReceiveEngine {
   }
 
   async verify(token: SphereToken): Promise<EngineVerifyResult> {
+    this.verifyCalls.push(skey(metaOf(token)));
     if (this.verifyOutageOn.has(skey(metaOf(token)))) throw new Error('trust base unavailable');
+    if (this.unverifiableOn.has(skey(metaOf(token)))) {
+      throw new MintReasonUnverifiableError('lock short of its confirmations (simulated)');
+    }
     return this.badProof.has(skey(metaOf(token))) ? { ok: false, reason: 'bad proof' } : { ok: true };
   }
 
@@ -496,6 +505,54 @@ describe('payments-v2 Receive drain', () => {
     expect(second.map((t) => t.id)).toEqual([T(2), T(3)]);
     expect(h.delivery.claimed()).toHaveLength(3);
     expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '3', syncEpoch: 'e1' });
+  });
+
+  it('an entry whose mint reason is not verifiable yet stays unacked, the entries after it are received, and the cursor holds before it', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.delivery.add(meta(T(3), 'S1'));
+    h.engine.unverifiableOn.add(`${T(2)}:S1`);
+
+    const first = await h.receive.drainOnce();
+
+    expect(first.map((t) => t.id)).toEqual([T(1), T(3)]);
+    expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'unacked', 'claimed']);
+    expect(h.delivery.ackLog.some((a) => a.disposition === 'rejected')).toBe(false);
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '1', syncEpoch: 'e1' });
+
+    h.engine.unverifiableOn.clear();
+    h.clock += RECHECK_MAX_MS;
+    const second = await h.receive.drainOnce();
+
+    expect(h.delivery.sinceLog[1]).toBe('1');
+    expect(second.map((t) => t.id)).toEqual([T(2)]);
+    expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'claimed', 'claimed']);
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '2', syncEpoch: 'e1' });
+  });
+
+  it('a not-yet-verifiable entry is re-verified on a doubling schedule, not on every drain', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    const checks = (): number => h.engine.verifyCalls.filter((k) => k === `${T(1)}:S1`).length;
+
+    await h.receive.drainOnce();
+    await h.receive.drainOnce();
+    expect(checks()).toBe(1);
+
+    h.clock += RECHECK_BASE_MS;
+    await h.receive.drainOnce();
+    await h.receive.drainOnce();
+    expect(checks()).toBe(2);
+
+    h.clock += RECHECK_BASE_MS;
+    await h.receive.drainOnce();
+    expect(checks()).toBe(2);
+    h.clock += RECHECK_BASE_MS;
+    await h.receive.drainOnce();
+    expect(checks()).toBe(3);
+    expect(h.delivery.entries[0].status).toBe('unacked');
   });
 
   it('acks batch at 200: the first flush happens only after 200 entries are stored, the remainder flushes at drain end', async () => {

@@ -45,7 +45,7 @@ function registerPluginVerifiers(
   for (const plugin of plugins ?? []) {
     for (const verifier of plugin.mintJustificationVerifiers ?? []) {
       try {
-        registry.register(verifier);
+        registry.registerPlugin(verifier);
       } catch (err) {
         throw new SphereError(
           `Token plugin '${plugin.id}' registers mint-reason tag ${verifier.tag} twice or over another plugin's: ` +

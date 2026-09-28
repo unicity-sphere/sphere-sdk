@@ -44,7 +44,7 @@ export interface TestEngineOptions {
   /** #739: shorten the inclusion-proof deadline so deadline behaviour is testable. */
   proofTimeoutMs?: number;
   proofPollIntervalMs?: number;
-  /** Mint-reason verifiers registered on the engine next to the split verifier. */
+  /** Plugin mint-reason verifiers registered on the engine next to the split verifier. */
   mintReasonVerifiers?: readonly IMintJustificationVerifier[];
 }
 
@@ -67,7 +67,7 @@ export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngin
   mintJustificationVerifier.register(
       new SplitMintJustificationVerifier(decodeSpherePaymentData),
   );
-  for (const verifier of opts.mintReasonVerifiers ?? []) mintJustificationVerifier.register(verifier);
+  for (const verifier of opts.mintReasonVerifiers ?? []) mintJustificationVerifier.registerPlugin(verifier);
   const privateKey = opts.privateKey ?? SigningService.generatePrivateKey();
   const deps: EngineDeps = {
     client: new StateTransitionClient(opts.wireClient ?? new AdversarialResubmitClient(aggregator)),

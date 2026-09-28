@@ -1,8 +1,9 @@
 // §5.7 of docs/PAYMENTS-V2-DESIGN.md — the single-flighted receive drain.
 // Entry order is money-load-bearing: the view store precedes the claimed ack (#724).
 
+import { isSphereError } from '../../../core/errors';
 import { logger } from '../../../core/logger';
-import type { ITokenEngine, SphereToken } from '../../../token-engine';
+import type { EngineVerifyResult, ITokenEngine, SphereToken } from '../../../token-engine';
 import { isCoinlessEnvelope } from '../../../token-engine/value-envelope';
 import type { IncomingTransfer, Token } from '../../../types';
 import { SingleFlight } from '../async';
@@ -75,6 +76,9 @@ export const ACK_BATCH_SIZE = 200;
  */
 export const REFRESH_INTERVAL_MS = 2500;
 export const POLL_INTERVAL_MS = 30_000;
+/** An entry whose mint reason is not verifiable yet is rechecked after this, doubling up to RECHECK_MAX_MS. */
+export const RECHECK_BASE_MS = POLL_INTERVAL_MS;
+export const RECHECK_MAX_MS = 60 * 60 * 1000;
 export const ATTENTION_CLAIM_CONFLICT = 'claim:conflict';
 
 export function receivedDedupKey(tokenId: string, stateHash: string): string {
@@ -88,9 +92,10 @@ interface PendingAck {
   readonly reason?: 'invalid' | 'not-owned' | 'other';
   readonly cursor: string;
   readonly transferId?: string;
+  readonly holdsCursor?: boolean;
 }
 
-type Screened = { kind: 'ack'; ack: PendingAck } | { kind: 'accept'; record: StoredIncoming };
+type Screened = { kind: 'ack'; ack: PendingAck } | { kind: 'accept'; record: StoredIncoming } | { kind: 'defer' };
 
 /** The mutable state one listing pass threads through (max-params ≤ 5). */
 interface DrainPass {
@@ -101,6 +106,8 @@ interface DrainPass {
   readonly pageEpoch: () => string;
   /** Entries this drain made claimable — stored, or a held-state claim retry. */
   readonly claimable: { n: number };
+  /** Set once an entry is deferred: later acks settle but the cursor stays before the deferred one. */
+  readonly deferred: { any: boolean };
 }
 
 function isClaimConflict(err: unknown): boolean {
@@ -113,6 +120,7 @@ export class Receive {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private unsubscribeWake: (() => void) | null = null;
   private lastRefreshAt = 0;
+  private readonly rechecks = new Map<string, { attempts: number; atMs: number }>();
 
   constructor(private readonly deps: ReceiveDeps) {}
 
@@ -192,6 +200,7 @@ export class Receive {
     // wake is best-effort), counted where the entry becomes claimable — every
     // downstream proxy had a path that destroyed it.
     const claimable = { n: 0 };
+    const deferred = { any: false };
     const finish = (): IncomingTransfer[] => {
       if (claimable.n > 0) deps.refreshView?.();
       return stored;
@@ -202,7 +211,7 @@ export class Receive {
       // latch gates the resume decision.
       let basis = record !== null && record.syncEpoch === deps.syncEpoch() ? record : null;
       for (let pass = 0; pass < 2; pass++) {
-        await this.drainPages({ deps, engine, pending, stored, pageEpoch, claimable }, basis);
+        await this.drainPages({ deps, engine, pending, stored, pageEpoch, claimable, deferred }, basis);
         const served = deps.delivery.incomingEpoch();
         if (basis === null || served === null || served === basis.syncEpoch) break;
         // §5.7 restore self-detection: the page reports a different epoch than
@@ -228,21 +237,43 @@ export class Receive {
   }
 
   private async processEntry(ctx: DrainPass, entry: IncomingDelivery): Promise<void> {
-    const { deps, engine, pending, stored, claimable } = ctx;
-    const screened = await screen(deps, engine, entry);
+    const { deps, engine, stored, claimable } = ctx;
+    const screened = this.recheckDue(entry.deliveryId) ? await screen(deps, engine, entry) : { kind: 'defer' as const };
+    this.scheduleRecheck(entry.deliveryId, screened.kind === 'defer');
+    if (screened.kind === 'defer') {
+      ctx.deferred.any = true;
+      return;
+    }
     if (screened.kind === 'ack') {
-      pending.push(screened.ack);
+      queueAck(ctx, screened.ack);
       // A held-state re-list is the retry after a failed ack: nothing to store,
       // but it still materializes server-side.
       if (screened.ack.disposition === 'claimed') claimable.n += 1;
       return;
     }
     await deps.view.store(screened.record);
-    pending.push(claimAck(entry));
+    queueAck(ctx, claimAck(entry));
     claimable.n += 1;
     const transfer = await announce(deps, entry, screened.record);
     stored.push(transfer);
     deps.emit('transfer:incoming', transfer);
+  }
+
+  private recheckDue(deliveryId: string): boolean {
+    const recheck = this.rechecks.get(deliveryId);
+    return recheck === undefined || (this.deps.now?.() ?? Date.now()) >= recheck.atMs;
+  }
+
+  private scheduleRecheck(deliveryId: string, deferred: boolean): void {
+    if (!deferred) {
+      this.rechecks.delete(deliveryId);
+      return;
+    }
+    const previous = this.rechecks.get(deliveryId);
+    if (previous !== undefined && (this.deps.now?.() ?? Date.now()) < previous.atMs) return;
+    const attempts = (previous?.attempts ?? 0) + 1;
+    const delay = Math.min(RECHECK_BASE_MS * 2 ** (attempts - 1), RECHECK_MAX_MS);
+    this.rechecks.set(deliveryId, { attempts, atMs: (this.deps.now?.() ?? Date.now()) + delay });
   }
 }
 
@@ -255,7 +286,8 @@ async function screen(deps: ReceiveDeps, engine: ReceiveEngine, entry: IncomingD
     logger.warn('PaymentsV2', `receive: undecodable blob rejected — ${String(err)}`);
     return { kind: 'ack', ack: rejectAck(entry, 'invalid') };
   }
-  const verdict = await engine.verify(token);
+  const verdict = await verdictOf(engine, token);
+  if (verdict === null) return { kind: 'defer' };
   if (!verdict.ok) return { kind: 'ack', ack: rejectAck(entry, 'invalid') };
   if (!engine.isOwnedBy(token, engine.getIdentity().chainPubkey)) {
     return { kind: 'ack', ack: rejectAck(entry, 'not-owned') };
@@ -276,6 +308,16 @@ async function screen(deps: ReceiveDeps, engine: ReceiveEngine, entry: IncomingD
       ...(isCoinlessEnvelope(token.valueEnvelope) ? { tokenType: token.tokenType } : {}),
     },
   };
+}
+
+/** null = the mint reason is not verifiable yet: leave the entry unacked, never reject a token that may be valid. */
+async function verdictOf(engine: ReceiveEngine, token: SphereToken): Promise<EngineVerifyResult | null> {
+  try {
+    return await engine.verify(token);
+  } catch (err) {
+    if (isSphereError(err) && err.code === 'MINT_REASON_UNVERIFIABLE') return null;
+    throw err;
+  }
 }
 
 async function announce(
@@ -337,7 +379,7 @@ async function flushAcks(
   try {
     const settled = await settleAcks(deps, pending);
     let i = 0;
-    while (i < pending.length && settled.has(pending[i].deliveryId)) {
+    while (i < pending.length && settled.has(pending[i].deliveryId) && pending[i].holdsCursor !== true) {
       lastAcked = pending[i].cursor;
       i += 1;
     }
@@ -431,6 +473,10 @@ async function ackOne(deps: ReceiveDeps, ack: PendingAck): Promise<void> {
     if (ack.disposition !== 'claimed' || !isClaimConflict(err)) throw err;
     await rejectStaleClaim(deps, ack.deliveryId, ack.transferId);
   }
+}
+
+function queueAck(ctx: DrainPass, ack: PendingAck): void {
+  ctx.pending.push(ctx.deferred.any ? { ...ack, holdsCursor: true } : ack);
 }
 
 function claimAck(entry: IncomingDelivery): PendingAck {

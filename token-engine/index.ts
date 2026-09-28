@@ -59,6 +59,7 @@ export { createSphereTokenEngine } from './factory';
 export {
   CheckpointPersistFailedError,
   CheckpointTrustbaseMismatchError,
+  MintReasonUnverifiableError,
   ProofUnconfirmedError,
   SplitCheckpointLostError,
   TransferConflictError,
