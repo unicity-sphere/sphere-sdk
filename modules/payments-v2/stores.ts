@@ -112,6 +112,16 @@ export interface BurnJournalEntry {
   settled: boolean;
   assets: { coinId: string; amount: string }[];
   createdAt: number;
+  failure?: BurnFailure;
+}
+
+export interface BurnFailure {
+  code: string;
+  message: string;
+}
+
+export function isLiveBurn(entry: BurnJournalEntry): boolean {
+  return !entry.settled && entry.failure === undefined;
 }
 
 // #690 shortfall record.

@@ -8,7 +8,8 @@ import type { RecordSentInput } from './history/History';
 import type { ListStore } from './machine/journal';
 import { messageOf } from './machine/payload';
 import type { StoragePort } from './ports';
-import type { BurnJournalEntry } from './stores';
+import { classifyError } from './machine/TransferMachine';
+import { isLiveBurn, type BurnFailure, type BurnJournalEntry } from './stores';
 
 export interface BurnDeps {
   readonly engine: ITokenEngine;
@@ -80,21 +81,25 @@ export async function runBurnUnderJournal(
     const settled = await burnJournaled(deps, entry, token);
     return { success: true, burnId, tokenId, burnedToken: hexToBytes(settled.burnedTokenHex ?? '') };
   } catch (err) {
-    deps.armHeartbeat();
-    return { success: false, burnId, tokenId, error: messageOf(err) };
+    const failure = failureOf(err);
+    if (isTerminal(err)) await deps.burnJournal.upsert({ ...entry, failure });
+    else deps.armHeartbeat();
+    return { success: false, burnId, tokenId, error: failure.message, errorCode: failure.code };
   }
 }
 
 export async function replayBurns(deps: BurnReplayDeps): Promise<number> {
   let progressed = 0;
   for (const entry of await deps.burnJournal.list()) {
-    if (entry.settled || deps.isActiveOp(entry.burnId)) continue;
+    if (!isLiveBurn(entry) || deps.isActiveOp(entry.burnId)) continue;
     try {
       const token = entry.burnedTokenHex === null ? await heldToken(deps, entry.tokenId) : null;
       await burnJournaled(deps, entry, token);
       progressed += 1;
-    } catch {
-      continue;
+    } catch (err) {
+      if (!isTerminal(err)) continue;
+      await deps.burnJournal.upsert({ ...entry, failure: failureOf(err) });
+      progressed += 1;
     }
   }
   return progressed;
@@ -108,16 +113,26 @@ export async function pendingBurns(deps: Pick<BurnDeps, 'burnJournal'>): Promise
     burnedToken: entry.burnedTokenHex === null ? null : hexToBytes(entry.burnedTokenHex),
     settled: entry.settled,
     createdAt: entry.createdAt,
+    ...(entry.failure !== undefined ? { failure: entry.failure } : {}),
   }));
 }
 
 export async function acknowledgeBurn(deps: Pick<BurnDeps, 'burnJournal'>, burnId: string): Promise<void> {
   const entry = await deps.burnJournal.getByKey(burnId);
   if (entry === undefined) return;
-  if (!entry.settled) {
+  if (isLiveBurn(entry)) {
     throw new SphereError(`Burn ${burnId} is not settled yet; it cannot be acknowledged`, 'VALIDATION_ERROR');
   }
   await deps.burnJournal.removeByKey(burnId);
+}
+
+function isTerminal(err: unknown): boolean {
+  return classifyError(err) === 'conflict';
+}
+
+function failureOf(err: unknown): BurnFailure {
+  const code = err !== null && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+  return { code: typeof code === 'string' ? code : 'UNKNOWN', message: messageOf(err) };
 }
 
 async function burnJournaled(deps: BurnDeps, entry: BurnJournalEntry, token: SphereToken | null): Promise<BurnJournalEntry> {

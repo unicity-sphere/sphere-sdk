@@ -50,6 +50,7 @@ export interface BurnResult {
   /** The burned blob, the proof of the burn: persist it, then `acknowledgeBurn(burnId)`. */
   burnedToken?: Uint8Array;
   error?: string;
+  errorCode?: string;
 }
 
 /** A burn not yet acknowledged: in flight (`burnedToken` null), certified, or settled. */
@@ -60,6 +61,7 @@ export interface PendingBurn {
   readonly burnedToken: Uint8Array | null;
   readonly settled: boolean;
   readonly createdAt: number;
+  readonly failure?: { readonly code: string; readonly message: string };
 }
 
 /** #785: `content` uses ERC-721 field names; `sign` (default true) signs as creator with this wallet's chain key. */

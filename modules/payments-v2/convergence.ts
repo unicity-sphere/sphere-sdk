@@ -5,7 +5,7 @@
 
 import type { PendingTransfer } from './api';
 import type { DeliveryPort } from './ports';
-import type { DeliveryJournalEntry, IntentBackstopEntry, ShortfallEntry } from './stores';
+import { isLiveBurn, type DeliveryJournalEntry, type IntentBackstopEntry, type ShortfallEntry } from './stores';
 import type { CoinIntentPayload, IntentPayload } from './machine/types';
 import { retryAfterMsOf, type MachineStores, type ReplayDeps } from './machine/journal';
 import { resumeAll } from './machine/resume';
@@ -153,7 +153,7 @@ export class Converger {
       this.deps.stores.burnJournal.list(),
     ]);
     const mintsOpen = mints.length > 0 || nftMints.length > 0 || customMints.length > 0;
-    const burnsOpen = burns.some((e) => !e.settled);
+    const burnsOpen = burns.some(isLiveBurn);
     return backstop.length > 0 || journal.some((e) => e.undeliverable !== true) || mintsOpen || burnsOpen;
   }
 

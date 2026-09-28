@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { bytesToHex, hexToBytes } from '../../../core/crypto';
 import type { BurnParams, EngineOpOptions, SphereToken } from '../../../token-engine';
-import { ProofUnconfirmedError } from '../../../token-engine/errors';
+import { ProofUnconfirmedError, TransferConflictError } from '../../../token-engine/errors';
+import { Converger, type ConvergerDeps } from '../../../modules/payments-v2/convergence';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
 import type { BurnJournalEntry } from '../../../modules/payments-v2/stores';
 import { RealizationEngine } from './machine-harness';
@@ -15,6 +16,7 @@ const REASON = new Uint8Array([0xd9, 0x98, 0x88, 0x8b, 0x01, 0x1a, 0xcd, 0x86, 0
 class DetBurnEngine extends RealizationEngine {
   readonly calls: { transferId?: string; tokenId: string; reason: string }[] = [];
   failNext = false;
+  conflictNext = false;
   private readonly certified = new Map<string, SphereToken>();
 
   constructor() {
@@ -24,6 +26,10 @@ class DetBurnEngine extends RealizationEngine {
   override async burn(params: BurnParams, options?: EngineOpOptions): Promise<SphereToken> {
     const id = options?.transferId ?? '';
     this.calls.push({ transferId: options?.transferId, tokenId: params.token.blob.tokenId, reason: bytesToHex(params.reasonBytes) });
+    if (this.conflictNext) {
+      this.conflictNext = false;
+      throw new TransferConflictError('the source state was spent by another transaction (simulated)');
+    }
     let burned = this.certified.get(id);
     if (burned === undefined) {
       burned = await super.burn(params, options);
@@ -183,6 +189,44 @@ describe('PaymentsFacade — burn (plugin tokens)', () => {
     await expect(world.facade.pendingBurns()).resolves.toEqual([expect.objectContaining({ burnId: 'burn-1', settled: true })]);
     await world.facade.acknowledgeBurn('burn-1');
     expect(await journal(world)).toEqual([]);
+  });
+
+  it('a burn that lost to another spend is terminal: its code is returned, it is never retried, it stops being heartbeat work, and acknowledge clears it', async () => {
+    const det = new DetBurnEngine();
+    const world = makeWorld({ engine: det });
+    const source = await world.seed(100n);
+    await world.facade.start();
+    const converger = new Converger({ stores: createMachineStores(world.kv) } as unknown as ConvergerDeps);
+
+    det.conflictNext = true;
+    const result = await world.facade.burn({ tokenId: source.blob.tokenId, reasonBytes: REASON });
+
+    expect(result).toMatchObject({ success: false, errorCode: 'TRANSFER_CONFLICT' });
+    expect(await converger.pendingWork()).toBe(false);
+    await world.facade.resumeNow();
+    expect(det.calls).toHaveLength(1);
+    expect(await world.facade.pendingBurns()).toEqual([
+      expect.objectContaining({ burnId: result.burnId, settled: false, failure: { code: 'TRANSFER_CONFLICT', message: expect.any(String) } }),
+    ]);
+    await world.facade.acknowledgeBurn(result.burnId);
+    expect(await journal(world)).toEqual([]);
+  });
+
+  it('a replayed burn that lost to another spend is marked terminal and not retried on the next pass', async () => {
+    const det = new DetBurnEngine();
+    const world = makeWorld({ engine: det });
+    const source = await world.seed(100n);
+    await world.facade.start();
+    det.failNext = true;
+    const first = await world.facade.burn({ tokenId: source.blob.tokenId, reasonBytes: REASON });
+    expect(first).toMatchObject({ success: false, errorCode: 'CERTIFICATION_UNCONFIRMED' });
+
+    det.conflictNext = true;
+    await world.facade.resumeNow();
+    await world.facade.resumeNow();
+
+    expect(det.calls).toHaveLength(2);
+    expect(await journal(world)).toEqual([expect.objectContaining({ burnId: first.burnId, failure: expect.objectContaining({ code: 'TRANSFER_CONFLICT' }) })]);
   });
 
   it('acknowledging an unsettled burn is refused; acknowledging an unknown burn is a no-op', async () => {
