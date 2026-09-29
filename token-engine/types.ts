@@ -134,7 +134,7 @@ export interface BurnParams {
 export interface TokenIssuancePolicy extends ITokenIssuanceVerifier {
   /** A token carrying one of these coins counts only when it is of this type and verified. */
   readonly coinIds: readonly CoinId[];
-  /** Changes whenever the proofs this policy accepts change, so wallets check their held tokens again. */
+  /** Must change whenever the proofs this policy accepts change, a fix to its verification code included, so wallets check held tokens again. */
   readonly revision?: string;
 }
 

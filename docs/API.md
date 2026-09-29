@@ -979,7 +979,8 @@ instead of invalid.
 A mint reason alone is optional: a token minted without one skips the verifiers. A
 `TokenIssuancePolicy` makes the rule of a token type mandatory. It is the state-transition SDK's
 `ITokenIssuanceVerifier` (`tokenType`, `verify(genesis)`) plus `coinIds`, the coins only that type
-may issue, and an optional `revision` that changes whenever the proofs the policy accepts change. Every genesis of that type, the burned source of a split included, must pass `verify`,
+may issue, and an optional `revision` that must change whenever the proofs the policy accepts change,
+a fix to its verification code included. Every genesis of that type, the burned source of a split included, must pass `verify`,
 so a token of the type minted without its reason fails verification and receive refuses it. A
 claimed coin counts only inside a token of its issuing type that verified:
 
