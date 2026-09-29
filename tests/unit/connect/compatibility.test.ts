@@ -161,6 +161,8 @@ describe('checkCompatibility', () => {
         ['a string id', { id: '4' }],
         ['a fractional id', { id: 4.5 }],
         ['a negative id', { id: -1 }],
+        ['an id above MAX_SAFE_INTEGER', { id: Number.MAX_SAFE_INTEGER + 1 }],
+        ['an astronomically large integer id', { id: 1e300 }],
         ['a truthy non-object', 'mainnet'],
       ];
 
@@ -188,7 +190,43 @@ describe('checkCompatibility', () => {
       });
     });
 
-    // The guards are `< 0` and `>= 0`, never falsiness: 0 is a real network id on either side.
+    // One id rule for BOTH sides: a non-negative integer no larger than MAX_SAFE_INTEGER. A wallet
+    // whose own id is NaN or a fraction does not know its own network, which is the state that must
+    // never raise a prompt: `clientNetwork.id !== NaN` is true for every handshake from every
+    // origin, so without the wallet-side check every one of them would carry a mismatch.
+    describe('an id outside the offerable range refuses with the unchanged payload and offers nothing', () => {
+      const refusal = (walletId: number, clientNetwork: unknown) => ({
+        ok: false,
+        error: {
+          code: ERROR_CODES.INCOMPATIBLE_NETWORK,
+          message: 'dApp targets a different network than the wallet',
+          data: { reason: 'network_incompatible', walletNetwork: { id: walletId }, clientNetwork },
+        },
+      });
+
+      it.each([
+        ['a NaN wallet id', NaN, { id: 4 }],
+        ['a fractional wallet id', 4.5, { id: 4 }],
+        ['a wallet id above MAX_SAFE_INTEGER', 1e300, { id: 4 }],
+        ['a client id above MAX_SAFE_INTEGER', NET, { id: Number.MAX_SAFE_INTEGER + 1 }],
+        ['an astronomically large client id', NET, { id: 1e300 }],
+      ])('%s', (_label, walletNetworkId, clientNetwork) => {
+        const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: clientNetwork as NetworkInfo, walletNetworkId });
+        // The whole result, so a stray `mismatch` key (even an undefined-valued one) fails too.
+        expect(r).toStrictEqual(refusal(walletNetworkId, clientNetwork));
+      });
+
+      it('still offers at the boundary: MAX_SAFE_INTEGER itself is a valid id on either side', () => {
+        const client = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: Number.MAX_SAFE_INTEGER }, walletNetworkId: NET });
+        expect(client.ok).toBe(false);
+        if (!client.ok) expect(client.mismatch).toStrictEqual({ kind: 'network', walletNetwork: { id: NET }, clientNetwork: { id: Number.MAX_SAFE_INTEGER } });
+        const wallet = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: 4 }, walletNetworkId: Number.MAX_SAFE_INTEGER });
+        expect(wallet.ok).toBe(false);
+        if (!wallet.ok) expect(wallet.mismatch).toStrictEqual({ kind: 'network', walletNetwork: { id: Number.MAX_SAFE_INTEGER }, clientNetwork: { id: 4 } });
+      });
+    });
+
+    // The guard is the id rule above (`>= 0`), never falsiness: 0 is a real network id on either side.
     describe('network id 0 is a real network', () => {
       it('on the wallet side (only the -1 sentinel is "unknown")', () => {
         const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: 4 }, walletNetworkId: 0 });

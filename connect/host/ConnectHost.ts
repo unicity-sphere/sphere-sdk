@@ -105,10 +105,15 @@ const DEFAULT_HANDSHAKE_DEADLINE_MS = 120000;
 /** Resolve `promise`, or `fallback()` after `ms`. Used for the two handshake-time prompts,
  *  onConnectionRequest and onNetworkMismatch, which have no id and therefore cannot live in
  *  InFlightRegistry. A rejection still propagates, so handleHandshake's own error handling
- *  is unchanged. */
+ *  is unchanged, and so does a throwing `fallback`: it rejects instead of leaving the race
+ *  unsettled. */
 function withDeadline<T>(promise: Promise<T>, ms: number, fallback: () => T): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => resolve(fallback()), ms);
+    // Both fallbacks log first, and a wallet's log sink may throw. An escape from a timer
+    // callback settles nothing, so the dApp would get no frame at all: reject instead.
+    const timer = setTimeout(() => {
+      try { resolve(fallback()); } catch (error) { reject(error); }
+    }, ms);
     promise.then(
       (value) => { clearTimeout(timer); resolve(value); },
       (error) => { clearTimeout(timer); reject(error); },
@@ -826,10 +831,10 @@ export class ConnectHost {
 
     // Only a lock reaches this check: setUnavailable() and destroy() empty the snapshot, so the
     // network check above already took them. Re-read the state as handleHandshake does after
-    // onConnectionRequest (`stateAfterPrompt`). `!== stateBefore` is redundant today (a hook is
-    // only asked while 'live'); it stays as deliberate belt-and-braces so a state added later
-    // cannot slip through.
-    if (this._walletState !== 'live' || this._walletState !== stateBefore) {
+    // onConnectionRequest (`stateAfterPrompt`). `stateBefore !== 'live'` is redundant today (a
+    // hook is only asked while 'live'); it stays as deliberate belt-and-braces so a state added
+    // later cannot slip through.
+    if (stateBefore !== 'live' || this._walletState !== 'live') {
       logger.warn('ConnectHost', `Wallet left 'live' while the network-switch prompt was open — refusing (state=${this._walletState})`);
       return { action: 'refuse' };
     }
@@ -838,7 +843,10 @@ export class ConnectHost {
       logger.warn('ConnectHost', 'onNetworkMismatch answered with a network the dApp did not ask for — refusing', { answered: decision.to?.id, asked: mismatch.clientNetwork.id });
       return { action: 'refuse' };
     }
-    return decision;
+    // A value the host built, never the wallet's own object: handleHandshake reads it again, and
+    // a getter on the wallet's answer could say something different each time. `to.id` was
+    // checked above and is the only thing the host ever compares.
+    return { action: 'switch', to: { id: mismatch.clientNetwork.id } };
   }
 
   // `warning` is a forward-compatible deprecation-notice slot (see SphereHandshake.warning);

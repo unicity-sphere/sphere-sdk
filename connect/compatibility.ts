@@ -23,9 +23,10 @@ export interface CompatInput {
  * a protocol failure must be structurally unable to raise a user prompt.
  *
  * `clientNetwork` is a sanitised COPY, not the peer's object: `{ id }` (a non-negative
- * integer) plus `name` only when it is a string of at most 64 characters. Nothing else
- * the peer sent is carried. It is still peer-declared, so never render it as a label.
- * `error.data.clientNetwork`, by contrast, echoes the raw wire value unchanged.
+ * integer, at most Number.MAX_SAFE_INTEGER) plus `name` only when it is a string of at most
+ * 64 characters. Nothing else the peer sent is carried. It is still peer-declared, so never
+ * render it as a label. `error.data.clientNetwork`, by contrast, echoes the raw wire value
+ * unchanged.
  */
 export interface NetworkMismatch {
   readonly kind: 'network';
@@ -54,29 +55,39 @@ function fail(
 const MAX_NETWORK_NAME_LENGTH = 64;
 
 /**
+ * The id rule for a network a mismatch may carry, applied to BOTH sides: a non-negative
+ * integer no larger than Number.MAX_SAFE_INTEGER. Symmetric on purpose. The wallet's
+ * `walletNetworkId` is `snapshot.networkId ?? -1` at the call site, so -1 is "the wallet does
+ * not know its own network"; a NaN or a fraction is the same state, and it must not raise a
+ * prompt either (`clientNetwork.id !== NaN` is true for every handshake from every origin).
+ * 0 is a real id: the test is a range, never falsiness. `Number.isInteger` alone lets 1e300
+ * through, hence the upper bound.
+ */
+function isNetworkId(id: unknown): id is number {
+  return typeof id === 'number' && Number.isInteger(id) && id >= 0 && id <= Number.MAX_SAFE_INTEGER;
+}
+
+/**
  * `CompatInput.clientNetwork` is typed `NetworkInfo`, but it is the handshake's
  * `msg.network` straight off the wire. `isSphereConnectMessage` checks only the
  * namespace (plus the version on non-handshake frames), nothing else inspects `network`
  * on the way here, and the handshake runs before any user approval, so any origin can
  * put anything in it. A `mismatch` is a typed claim that the wallet has a concrete
- * network to offer, so it is only made for a non-null object whose `id` is a
- * non-negative integer. Anything else still refuses (that decision is check #4's own
- * and is unchanged); it just carries no `mismatch`.
+ * network to offer, so it is only made for a non-null object whose `id` passes
+ * isNetworkId. Anything else still refuses (that decision is check #4's own and is
+ * unchanged); it just carries no `mismatch`.
+ *
+ * Returns the COPY a mismatch carries, or undefined when there is nothing to offer: `{ id }`
+ * plus `name` only when it is a string of at most MAX_NETWORK_NAME_LENGTH characters. Built,
+ * never spread, so no other key the peer sent survives, and no `name` key exists at all when
+ * it is dropped. Validation and copying are one function: the `id` it checks is the very value
+ * it copies, read once, never fetched a second time from the peer's object.
  */
-function isOfferableNetwork(value: unknown): value is NetworkInfo {
-  if (typeof value !== 'object' || value === null) return false;
-  const id = (value as { id?: unknown }).id;
-  return typeof id === 'number' && Number.isInteger(id) && id >= 0;
-}
-
-/**
- * The copy a mismatch carries: `{ id }` plus `name` only when it is a string of at most
- * MAX_NETWORK_NAME_LENGTH characters. Built, never spread, so no other key the peer sent
- * survives, and no `name` key exists at all when it is dropped. Takes an already-validated
- * network (see isOfferableNetwork), so `id` needs no further check here.
- */
-function sanitizedNetwork(net: NetworkInfo): NetworkInfo {
-  const { id, name } = net;
+function offerableNetwork(value: unknown): NetworkInfo | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const { id } = value as { id?: unknown };
+  if (!isNetworkId(id)) return undefined;
+  const { name } = value as { name?: unknown };
   return typeof name === 'string' && name.length <= MAX_NETWORK_NAME_LENGTH ? { id, name } : { id };
 }
 
@@ -130,11 +141,11 @@ export function checkCompatibility(input: CompatInput): CompatResult {
       'dApp targets a different network than the wallet',
       { walletNetwork: { id: input.walletNetworkId }, clientNetwork: input.clientNetwork ?? null });
     // Offerable only when both sides are real. An undeclared or malformed dApp network
-    // gives the wallet nothing to switch to, and walletNetworkId is
-    // `snapshot.networkId ?? -1` at the call site, so -1 means "the wallet does not
-    // know its own network". 0 is a real id: the test is `< 0`, never falsiness.
+    // gives the wallet nothing to switch to, and a wallet id that is not a valid id (the -1
+    // sentinel, NaN, a fraction) means the wallet does not know its own network.
     // The refusal above is identical either way; only the mismatch is withheld.
-    if (!isOfferableNetwork(input.clientNetwork) || input.walletNetworkId < 0) return refusal;
+    const offered = offerableNetwork(input.clientNetwork);
+    if (!offered || !isNetworkId(input.walletNetworkId)) return refusal;
     // The mismatch carries a COPY built from checked parts, never the peer's object:
     // typed `NetworkInfo` must mean what it says, and nothing else the peer sent (extra
     // keys, a non-string or oversized name) travels with it. `error.data.clientNetwork`
@@ -144,7 +155,7 @@ export function checkCompatibility(input: CompatInput): CompatResult {
       mismatch: {
         kind: 'network',
         walletNetwork: { id: input.walletNetworkId },
-        clientNetwork: sanitizedNetwork(input.clientNetwork),
+        clientNetwork: offered,
       },
     };
   }

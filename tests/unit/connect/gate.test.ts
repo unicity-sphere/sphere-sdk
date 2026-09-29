@@ -5,6 +5,7 @@ import type { ConnectTransport, ConnectHostConfig, NetworkMismatchContext, Spher
 import { SDK_VERSION } from '../../../connect/version';
 import { ERROR_CODES, SPHERE_CONNECT_NAMESPACE, SPHERE_CONNECT_VERSION } from '../../../connect/protocol';
 import { PERMISSION_SCOPES } from '../../../connect/permissions';
+import { logger } from '../../../core/logger';
 
 const WALLET_NET = 4;
 
@@ -179,14 +180,19 @@ describe('ConnectHost network-mismatch hook', () => {
       return { action: 'refuse' as const };
     });
     const harness: ReturnType<typeof makeHostHarness> = makeHostHarness({ onNetworkMismatch });
+    const before = Date.now();
     harness.send(MISMATCH);
     await new Promise((r) => setTimeout(r, 0));
+    const after = Date.now();
     expect(sentWhenAsked).toBe(0);                       // nothing had been sent yet
     const ctx = onNetworkMismatch.mock.calls[0][1];
-    expect(ctx.walletNetwork).toEqual({ id: WALLET_NET });
-    expect(ctx.clientNetwork).toEqual({ id: 1 });
+    expect(ctx.walletNetwork).toStrictEqual({ id: WALLET_NET });
+    expect(ctx.clientNetwork).toStrictEqual({ id: 1 });
     expect(ctx.clientProtocol).toBe(SPHERE_CONNECT_VERSION);
-    expect(typeof ctx.expiresAt).toBe('number');
+    // The moment the host gives up: the hook was asked between `before` and `after`, and the
+    // default handshake deadline is 120 s (documented as such), so the window is exact to the ms.
+    expect(ctx.expiresAt).toBeGreaterThanOrEqual(before + 120000);
+    expect(ctx.expiresAt).toBeLessThanOrEqual(after + 120000);
   });
 
   it('an absent hook reproduces today’s refusal exactly', async () => {
@@ -213,6 +219,20 @@ describe('ConnectHost network-mismatch hook', () => {
     expect(switched).toEqual(refused);                    // byte-identical answer to the dApp
     expect(withHook.onConnectionRejected).not.toHaveBeenCalled();
     expect(plain.onConnectionRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it('acts on ONE reading of the wallet’s answer: a getter that changes its mind cannot split the outcome', async () => {
+    // The host must not hand the wallet's own object on to be read again. A first reading of
+    // 'switch' followed by 'refuse' would skip onConnectionRejected on the strength of the first
+    // and paint the rejection on the strength of the second.
+    let reads = 0;
+    const flaky = { get action() { return reads++ === 0 ? 'switch' : 'refuse'; }, to: { id: 1 } };
+    const h = makeHostHarness({ onNetworkMismatch: async () => flaky as unknown as { action: 'switch'; to: { id: number } } });
+    h.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(handshakeResponses(h.sent)).toHaveLength(1);
+    expect(reads).toBe(1);
+    expect(h.onConnectionRejected).not.toHaveBeenCalled();   // it read 'switch', once, and acted on that
   });
 
   it('refuses when the hook offers a network the dApp did not ask for', async () => {
@@ -279,6 +299,23 @@ describe('ConnectHost network-mismatch hook', () => {
     expect(h.onConnectionRejected).toHaveBeenCalledTimes(1);
   });
 
+  it('still answers when the timeout fallback itself throws: a log sink that chokes on the timeout line', async () => {
+    // The fallback logs first, and logger.warn is always live. Its throw used to escape a timer
+    // callback, so nothing settled and the dApp got no frame at all.
+    const h = makeHostHarness({ handshakeDeadlineMs: 20, onNetworkMismatch: () => new Promise(() => {}) });
+    logger.configure({
+      handler: (_level, _tag, message) => { if (message.includes('timed out')) throw new Error('log sink is down'); },
+    });
+    try {
+      h.send(MISMATCH);
+      await new Promise((r) => setTimeout(r, 80));
+    } finally {
+      logger.configure({ debug: false, handler: null });
+    }
+    // The throw rejects the race, and handleMessage answers a handshake that threw with the empty refusal.
+    expect(handshakeResponses(h.sent)).toHaveLength(1);
+  });
+
   it('refuses a switch when the wallet locked while the prompt was open', async () => {
     const harness: ReturnType<typeof makeHostHarness> = makeHostHarness({
       onNetworkMismatch: async () => {
@@ -324,12 +361,24 @@ describe('ConnectHost network-mismatch hook', () => {
     expect(h.onConnectionRejected.mock.calls[0][2]).toBe(false);
   });
 
-  it.each(['switch', 'refuse'] as const)(
-    'sends only the empty refusal when the wallet network moved under the prompt, whatever the hook answers (%s)',
-    async (answer) => {
-      const harness: ReturnType<typeof makeHostHarness> = makeHostHarness({
+  // Every way the wallet's network id can change under an open prompt: a rebind to another
+  // network, and the two verbs that empty the snapshot (docs/CONNECT.md's outcome table and the
+  // askNetworkMismatch JSDoc both put them on this row). A lock is NOT one of them.
+  type MismatchHarness = ReturnType<typeof makeHostHarness>;
+  const networkMoves: Array<[string, (h: MismatchHarness) => void]> = [
+    ['updateSphere to another network id', (h) => h.host.updateSphere({ ...h.sphere, networkId: 1 })],
+    ['setUnavailable()', (h) => h.host.setUnavailable()],
+    ['destroy()', (h) => h.host.destroy()],
+  ];
+  const stale = networkMoves.flatMap(([move, act]) =>
+    (['switch', 'refuse'] as const).map((answer) => [move, answer, act] as const));
+
+  it.each(stale)(
+    'sends only the empty refusal when the wallet network moved under the prompt by %s, whatever the hook answers (%s)',
+    async (_move, answer, act) => {
+      const harness: MismatchHarness = makeHostHarness({
         onNetworkMismatch: async () => {
-          harness.host.updateSphere({ ...harness.sphere, networkId: 1 });   // rebind while the prompt is open
+          act(harness);                                  // the wallet's network moves while the prompt is open
           return answer === 'switch' ? { action: 'switch', to: { id: 1 } } : { action: 'refuse' };
         },
       });
@@ -381,6 +430,6 @@ describe('ConnectHost network-mismatch hook', () => {
     expect((dapp as { url: string }).url).toBe('https://d');
     expect(ctx.origin).toBe('https://wallet.example');
     expect(ctx.clientSdkVersion).toBe(SDK_VERSION);
-    expect(ctx.clientNetwork).toEqual({ id: 1, name: 'Mainnet' });   // `extra` never reaches the wallet
+    expect(ctx.clientNetwork).toStrictEqual({ id: 1, name: 'Mainnet' });   // `extra` never reaches the wallet
   });
 });
