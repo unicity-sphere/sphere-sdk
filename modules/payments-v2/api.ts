@@ -156,7 +156,9 @@ export interface PaymentsV2 {
   prewarmSend(request: SendRequest): Promise<void>;
   discardPrewarm(): void;
   assets(coinId?: string): Promise<Asset[]>;
+  unverifiedAssets(coinId?: string): Promise<Asset[]>;
   tokens(filter?: { coinId?: string }): Token[];
+  unverifiedTokens(filter?: { coinId?: string }): Token[];
   coinless(): CoinlessToken[];
   tokenData(tokenId: string): Promise<Uint8Array | null>;
   /** The genesis mint reason of one held token; null when it was minted without one. Same contract as tokenData. */

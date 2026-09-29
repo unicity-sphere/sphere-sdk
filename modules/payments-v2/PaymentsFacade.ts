@@ -243,13 +243,21 @@ export class PaymentsFacade implements PaymentsV2 {
   // ── reads ──────────────────────────────────────────────────────────────────
 
   async assets(coinId?: string): Promise<Asset[]> {
+    return (await this.heldAssets(coinId)).filter((asset) => asset.unverified === undefined);
+  }
+
+  unverifiedAssets = async (coinId?: string): Promise<Asset[]> => (await this.heldAssets(coinId)).filter((a) => a.unverified !== undefined);
+
+  private async heldAssets(coinId?: string): Promise<Asset[]> {
     const all = await this.view.assets(this.deps.registry, this.deps.price);
     return coinId === undefined ? all : all.filter((asset) => asset.coinId === coinId);
   }
 
   tokens(filter?: { coinId?: string }): Token[] {
-    return this.view.tokens(this.deps.registry, filter);
+    return this.view.tokens(this.deps.registry, filter).filter((token) => token.unverified === undefined);
   }
+
+  unverifiedTokens = (filter?: { coinId?: string }): Token[] => this.view.tokens(this.deps.registry, filter).filter((t) => t.unverified !== undefined);
 
   coinless(): CoinlessToken[] {
     return this.view.coinless(this.deps.registry);

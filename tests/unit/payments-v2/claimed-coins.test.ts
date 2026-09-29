@@ -35,7 +35,8 @@ async function minted(world: World, tokenType: string, salt: number): Promise<Sp
 }
 
 async function holdings(world: World): Promise<[string, string | null][]> {
-  return (await world.facade.assets(CLAIMED)).map((a) => [a.totalAmount, a.unverified ?? null]);
+  const shown = [...(await world.facade.assets(CLAIMED)), ...(await world.facade.unverifiedAssets(CLAIMED))];
+  return shown.map((a) => [a.totalAmount, a.unverified ?? null]);
 }
 
 afterEach(cleanupWorlds);
@@ -50,6 +51,21 @@ describe('PaymentsFacade — claimed coins', () => {
 
     await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', null], ['10', 'refused']]));
     expect(eventsOf(world, 'inventory:updated').length).toBeGreaterThan(0);
+  });
+
+  it('lists only verified holdings in assets() and tokens(), and the others in unverifiedAssets() and unverifiedTokens()', async () => {
+    const world = makeWorld({ claims: claims() });
+    const bridged = await minted(world, BRIDGED_TYPE, 1);
+    const lookalike = await minted(world, OTHER_TYPE, 2);
+    await world.hold(bridged);
+    await world.hold(lookalike);
+    await world.facade.start();
+    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', null], ['10', 'refused']]));
+
+    expect((await world.facade.assets(CLAIMED)).map((a) => a.unverified ?? null)).toEqual([null]);
+    expect((await world.facade.unverifiedAssets(CLAIMED)).map((a) => a.unverified)).toEqual(['refused']);
+    expect(world.facade.tokens({ coinId: CLAIMED }).map((t) => t.id)).toEqual([bridged.blob.tokenId]);
+    expect(world.facade.unverifiedTokens({ coinId: CLAIMED }).map((t) => t.id)).toEqual([lookalike.blob.tokenId]);
   });
 
   it('refuses to spend a token of a claimed coin that failed verification', async () => {
@@ -142,5 +158,7 @@ describe('PaymentsFacade — claimed coins', () => {
     expect(transfers.flatMap((t) => t.tokens.map((token) => token.unverified ?? 'verified')).sort()).toEqual(['refused', 'verified']);
     await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', null], ['10', 'refused']]));
     expect(verify).toHaveBeenCalledTimes(2);
+    const received = (await world.facade.history()).entries.filter((e) => e.type === 'RECEIVED' && e.coinId === CLAIMED);
+    expect(received.map((e) => e.amount)).toEqual(['10']);
   });
 });

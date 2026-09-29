@@ -983,10 +983,13 @@ may issue, and an optional `revision` that changes whenever the proofs the polic
 so a token of the type minted without its reason fails verification and receive refuses it. A
 claimed coin counts only inside a token of its issuing type that verified:
 
-- `assets()` lists the other holdings of a claimed coin as separate assets with no price, and
-  `tokens()` marks each such token. `unverified: 'pending'` means the check has not passed yet, for
-  instance while a lock waits for its confirmations. `unverified: 'refused'` means the token failed
-  verification or is of another type than the one that issues the coin.
+- `assets()` and `tokens()` return only holdings that count, so a caller that predates this sees no
+  counterfeit. The other holdings of a claimed coin come from `unverifiedAssets()` and
+  `unverifiedTokens()`, as separate assets with no price, each marked `unverified`. `'pending'` means
+  the check has not passed yet, for instance while a lock waits for its confirmations. `'refused'`
+  means the token failed verification or is of another type than the one that issues the coin.
+- A received token that carries a claimed coin under another type is announced with `unverified:
+  'refused'` and is not written to history for that coin, so history never shows it as a receipt.
 - An unverified token is never spent: coin selection skips it, and `sendWholeToken()` and `burn()`
   refuse it as not a spendable holding.
 - A token received, left as change of a verified token, or minted with `mintCustom()` under the

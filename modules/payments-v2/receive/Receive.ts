@@ -345,22 +345,7 @@ async function announce(
   record: StoredIncoming
 ): Promise<IncomingTransfer> {
   const receivedAt = (deps.now ?? Date.now)();
-  try {
-    await deps.recordReceived({
-      dedupKey: receivedDedupKey(record.tokenId, record.stateHash),
-      tokenId: record.tokenId,
-      stateHash: record.stateHash,
-      assets: record.assets,
-      ...(record.tokenType !== undefined ? { tokenType: record.tokenType } : {}),
-      ...(entry.senderPubkey !== undefined ? { senderPubkey: entry.senderPubkey } : {}),
-      ...(entry.senderNametag !== undefined ? { senderNametag: entry.senderNametag } : {}),
-      ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
-      receivedAt,
-    });
-  } catch (err) {
-    // §5.9: the history hook never fails the money path.
-    logger.debug('PaymentsV2', 'RECEIVED history hook failed (money path unaffected):', err);
-  }
+  await recordArrival(deps, entry, record, receivedAt);
   return {
     id: record.tokenId,
     senderPubkey: entry.senderPubkey ?? '',
@@ -387,6 +372,32 @@ async function announce(
     ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
     receivedAt,
   };
+}
+
+async function recordArrival(
+  deps: ReceiveDeps,
+  entry: IncomingDelivery,
+  record: StoredIncoming,
+  receivedAt: number
+): Promise<void> {
+  const assets = record.assets.filter((asset) => !record.unverifiedCoinIds?.includes(asset.coinId));
+  if (assets.length === 0 && record.unverifiedCoinIds !== undefined) return;
+  try {
+    await deps.recordReceived({
+      dedupKey: receivedDedupKey(record.tokenId, record.stateHash),
+      tokenId: record.tokenId,
+      stateHash: record.stateHash,
+      assets,
+      ...(record.tokenType !== undefined ? { tokenType: record.tokenType } : {}),
+      ...(entry.senderPubkey !== undefined ? { senderPubkey: entry.senderPubkey } : {}),
+      ...(entry.senderNametag !== undefined ? { senderNametag: entry.senderNametag } : {}),
+      ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
+      receivedAt,
+    });
+  } catch (err) {
+    // §5.9: the history hook never fails the money path.
+    logger.debug('PaymentsV2', 'RECEIVED history hook failed (money path unaffected):', err);
+  }
 }
 
 /** Cursor reaches only the last CONSECUTIVE success. progressed=false means nothing settled. */

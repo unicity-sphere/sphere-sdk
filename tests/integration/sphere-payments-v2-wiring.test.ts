@@ -619,11 +619,12 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     const seeded = await seedInventory(world, world.transports[0]!, 40n);
     world.transports[0]!.session.fire('inventory');
     await vi.waitFor(() => {
-      expect(sphere.payments.tokens().map((t) => t.id)).toContain(seeded.blob.tokenId);
+      expect(sphere.payments.unverifiedTokens().map((t) => t.id)).toContain(seeded.blob.tokenId);
     });
 
-    const assets = await sphere.payments.assets(COIN);
-    expect(assets.map((a) => [a.totalAmount, a.unverified ?? null])).toEqual([['40', 'refused']]);
+    expect(await sphere.payments.assets(COIN)).toEqual([]);
+    const unverified = await sphere.payments.unverifiedAssets(COIN);
+    expect(unverified.map((a) => [a.totalAmount, a.unverified])).toEqual([['40', 'refused']]);
   }, 20_000);
 
   // #733: proves composePaymentsV2 wires the resolver that reports the PEER's
