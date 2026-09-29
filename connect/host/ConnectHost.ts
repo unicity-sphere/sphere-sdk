@@ -655,9 +655,11 @@ export class ConnectHost {
       }
 
       // The dApp gets the same frame either way. The only difference is that a wallet which
-      // is about to switch must not also be told to paint a rejection.
+      // is about to switch must not also be told to paint a rejection. `silent` was computed on
+      // arrival and the prompt above is a human-time await: a wallet that locked meanwhile must
+      // still be told silent, so its own state now is read here as well.
       if (decision.action !== 'switch') {
-        this.config.onConnectionRejected?.(dapp, result.error, silent);
+        this.config.onConnectionRejected?.(dapp, result.error, silent || this._walletState !== 'live');
       }
       this.sendHandshakeResponse([], undefined, undefined, result.error, msg.v);
       return;

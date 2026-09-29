@@ -154,8 +154,9 @@ export interface ConnectHostConfig {
 
   /** Notify-only: the compatibility gate rejected a connection. Lets the wallet surface the reason
    *  in its UI. Does NOT affect the decision (the host already decided). `silent` is true when the
-   *  dApp asked for a silent handshake (an auto-connect attempt) AND whenever the wallet was
-   *  locked when the handshake arrived: the wallet should not show UI for either. Not called when
+   *  dApp asked for a silent handshake (an auto-connect attempt) AND whenever the wallet is locked,
+   *  whether it was locked when the handshake arrived or locked while `onNetworkMismatch` was
+   *  waiting on the user: the wallet should not show UI for either. Not called when
    *  `onNetworkMismatch` answered 'switch', nor for the empty refusal the host sends when the
    *  wallet's network changes under that prompt. */
   onConnectionRejected?: (dapp: DAppMetadata | undefined, error: SphereRpcError, silent?: boolean) => void;

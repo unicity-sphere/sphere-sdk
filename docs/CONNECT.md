@@ -387,9 +387,9 @@ const host = new ConnectHost({
   // Notify-only: called when the compatibility gate rejects a connection.
   // Use this to surface the rejection reason in the wallet UI.
   // Does NOT affect the gate decision — the host already rejected when this fires.
-  // `silent` is true for an auto-connect attempt AND whenever the wallet was locked when the
-  // handshake arrived: draw no UI for either. It is not called when onNetworkMismatch
-  // answered 'switch'.
+  // `silent` is true for an auto-connect attempt AND whenever the wallet is locked, including a
+  // lock that happened while onNetworkMismatch was waiting on the user: draw no UI for either.
+  // It is not called when onNetworkMismatch answered 'switch'.
   onConnectionRejected: (dapp, error, silent) => {
     if (!silent) showRejectionBanner(dapp?.name, error.message);
   },
@@ -642,7 +642,7 @@ answer and the reload tears down the window that would post it.
 | The hook returned `'switch'` naming the dApp's network | the 4008 | not called |
 | The hook returned `'refuse'`, or anything that is not a decision | the 4008 | called |
 | The hook threw, rejected, or did not settle within `handshakeDeadlineMs` (default 120 s) | the 4008 | called |
-| The wallet locked | the 4008 | called |
+| The wallet locked | the 4008 | called, with `silent: true` |
 | The hook returned `'switch'` naming a network other than the dApp's | the 4008 | called |
 | The wallet's own network id changed | the empty refusal, no error | not called |
 

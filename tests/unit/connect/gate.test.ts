@@ -290,6 +290,38 @@ describe('ConnectHost network-mismatch hook', () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(handshakeResponses(harness.sent)).toHaveLength(1);
     expect(harness.onConnectionRejected).toHaveBeenCalledTimes(1);
+    expect(harness.onConnectionRejected.mock.calls[0][2]).toBe(true);   // told silent, as the wallet is locked now
+  });
+
+  it('tells onConnectionRejected silent: true when the wallet locked while the prompt was open', async () => {
+    const harness: ReturnType<typeof makeHostHarness> = makeHostHarness({
+      onNetworkMismatch: async () => {
+        harness.host.setLocked();
+        return { action: 'refuse' };
+      },
+    });
+    harness.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 0));
+
+    const plain = makeHostHarness();
+    plain.send(MISMATCH);
+    await Promise.resolve();
+
+    const resp = handshakeResponses(harness.sent);
+    expect(resp).toHaveLength(1);
+    expect((resp[0].error as { code: number }).code).toBe(ERROR_CODES.INCOMPATIBLE_NETWORK);
+    expect(resp[0]).toEqual(handshakeResponses(plain.sent)[0]);   // the frame is untouched
+    expect(harness.onConnectionRejected).toHaveBeenCalledTimes(1);
+    expect(harness.onConnectionRejected.mock.calls[0][2]).toBe(true);
+  });
+
+  it('still tells onConnectionRejected silent: false when the wallet stays live and refuses', async () => {
+    const h = makeHostHarness({ onNetworkMismatch: async () => ({ action: 'refuse' }) });
+    h.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(handshakeResponses(h.sent)).toHaveLength(1);
+    expect(h.onConnectionRejected).toHaveBeenCalledTimes(1);
+    expect(h.onConnectionRejected.mock.calls[0][2]).toBe(false);
   });
 
   it.each(['switch', 'refuse'] as const)(
