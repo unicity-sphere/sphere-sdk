@@ -204,8 +204,8 @@ export interface ConnectHostConfig {
    * 120 s).
    *
    * A LATE ANSWER IS IGNORED, YOUR SIDE EFFECTS ARE NOT. The hook gets no abort signal, only
-   * `ctx.expiresAt`: after it passes the host has refused and moved on, but the promise the
-   * wallet returned keeps running and whatever it does still happens. Nothing serialises
+   * `ctx.expiresAt`, the moment after which the host answers on its own. The promise the wallet
+   * returned keeps running past it and whatever it does still happens. Nothing serialises
    * handshakes, so a dApp that connects again reaches the hook a second time. Check
    * `ctx.expiresAt` after the user answers and before acting, or make the switch idempotent.
    */

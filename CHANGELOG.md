@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 before the dApp is answered, and the host waits for it (up to `handshakeDeadlineMs`, default 120 s).
 The wallet answers `{ action: 'refuse' }` or, once the user has agreed, `{ action: 'switch', to }`
 with `to.id` equal to the id of the network the dApp declared (the id is all the host compares).
-`ctx` carries the wallet's network, the dApp's
-declared network, the wallet's own `origin`, the client protocol and SDK version, and the deadline.
+`ctx` carries the wallet's network, the dApp's declared network, the wallet's own `origin`, the
+client protocol and SDK version, and the deadline.
 
 **The protocol is unchanged.** `SPHERE_CONNECT_VERSION` is still `'2.3'`, no error code was added,
 and the dApp receives the same `INCOMPATIBLE_NETWORK` (4008) frame whether the user refused or the

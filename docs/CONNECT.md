@@ -417,7 +417,8 @@ const host = new ConnectHost({
     const target = resolveSphereNetwork(clientNetwork.id);   // YOUR label, never clientNetwork.name
     if (!target || !origin) return { action: 'refuse' };     // nothing trustworthy to offer
     const agreed = await askUserToSwitch({ origin, from: walletNetwork, to: target });
-    if (!agreed || Date.now() >= expiresAt) return { action: 'refuse' };   // host has moved on
+    if (!agreed) return { action: 'refuse' };
+    if (Date.now() >= expiresAt) return { action: 'refuse' };   // too late: host answers on its own
     queueNetworkSwitch(target.name);                         // resolve FIRST, reload after
     return { action: 'switch', to: target };                 // to.id must equal clientNetwork.id
   },
@@ -645,33 +646,34 @@ switches by reloading the page must resolve the hook first, because the host sti
 answer and the reload tears down the window that would post it.
 
 **A late answer is ignored, your side effects are not.** The hook gets no abort signal, only
-`ctx.expiresAt`. When that passes the host has already refused and moved on, but the promise you
-returned keeps running and whatever it does still happens: a user who agrees at 121 seconds still
-makes the example above call `queueNetworkSwitch`, unless it checks `expiresAt` first. The host
-does not serialise handshakes either, so a dApp that connects again while your prompt is open
-reaches the hook a second time. Check `ctx.expiresAt` after the user answers and before you act,
-or make the switch idempotent, and close your own prompt when `expiresAt` passes.
+`ctx.expiresAt`, the moment after which the host answers on its own. The promise you returned keeps
+running past it, and whatever it does still happens: a wallet with no `expiresAt` check, whose user
+agrees at 121 seconds, still switches networks after the dApp has been refused. The example above
+refuses instead, because it checks `expiresAt` after the user answers. The host does not serialise
+handshakes either, so a dApp that connects again while your prompt is open reaches the hook a
+second time. Check `ctx.expiresAt` after the user answers and before you act, or make the switch
+idempotent, and close your own prompt when `expiresAt` passes.
 
 **How the host reads what happened while the prompt was open.**
 
-| While the prompt was open | The dApp receives | `onConnectionRejected` |
-|---------------------------|-------------------|------------------------|
-| The hook returned `'switch'` naming the dApp's network | the 4008 | not called |
-| The hook returned `'refuse'`, or anything that is not a decision | the 4008 | called |
-| The hook threw, rejected, or did not settle within `handshakeDeadlineMs` (default 120 s) | the 4008 | called |
-| The wallet is locked when the host reads the answer | the 4008 | called, with `silent: true` |
-| The hook returned `'switch'` with a `to.id` other than the dApp's network id | the 4008 | called |
-| The wallet's own network id changed | the empty refusal, no error | not called |
+| Wallet's network id | Wallet when the answer is read | The hook | The dApp receives | `onConnectionRejected` |
+|---------------------|--------------------------------|-----------|-------------------|------------------------|
+| changed | any state | anything | the empty refusal, no error | not called |
+| unchanged | locked | anything | the 4008 | called, with `silent: true` |
+| unchanged | live | `'switch'`, `to.id` equal to the dApp's network id | the 4008 | not called |
+| unchanged | live | `'switch'`, any other `to.id` | the 4008 | called |
+| unchanged | live | `'refuse'`, or anything that is not a decision | the 4008 | called |
+| unchanged | live | threw, rejected, or did not settle within `handshakeDeadlineMs` (default 120 s) | the 4008 | called |
 
-In every row where `onConnectionRejected` is called, `silent` is true if the dApp asked for a
-silent handshake or the wallet is locked when the refusal is reported.
+`silent` is true only in the locked row: the hook is never asked for a silent handshake, and the
+other rows that call `onConnectionRejected` have a live wallet.
 
-The last row wins over the hook's answer: whatever the hook returns, a wallet whose network changed
+The first row wins over the hook's answer: whatever the hook returns, a wallet whose network changed
 gets the empty refusal. The 4008 would describe a comparison that no longer holds, so the host
 sends the dApp "nothing to say" instead of a stale answer. A change is `updateSphere()` rebinding
 the host to a Sphere on another network id, `setUnavailable()`, or `destroy()` (both empty the
 snapshot). An `updateSphere()` to a Sphere on the same network id is not a change. A lock is not a
-change either, so a wallet that is locked when the answer is read lands on the 4008 row. The state
+change either, so a wallet that is locked when the answer is read lands on the locked row. The state
 is read at that moment: a lock followed by an unlock to the same network leaves the wallet live
 again, and a valid `'switch'` still stands.
 
@@ -1516,7 +1518,7 @@ For the v1 → v2 migration specifically: the wallet already requires v2; dApps 
 
 There is no `switch_network` intent, no `network:changed` event, and no `switchNetwork()` method: a dApp cannot ask the wallet to move, and a live session never changes network. A network mismatch at handshake time still ends in `INCOMPATIBLE_NETWORK` (4008) with an unchanged frame, unless the wallet's own network id changes while its switch prompt is open: then the dApp gets the empty refusal instead (see [onNetworkMismatch](#onnetworkmismatch-offer-the-switch-or-refuse)).
 
-What a **wallet** can now do is offer the user a switch before that refusal is reported, through `ConnectHostConfig.onNetworkMismatch` (available from the first release after 0.17.6). It is wallet-side only and adds nothing to the wire beyond that one exception: a dApp receives the same 4008 whether the user declined or the wallet is about to switch, so no dApp code has to change. Nothing retries a 4008, so the dApp, or the user, handshakes again after the switch, and that handshake connects normally.
+What a **wallet** can now do is offer the user a switch before that refusal is reported, through `ConnectHostConfig.onNetworkMismatch` (available from the first release after 0.17.6). It is wallet-side only and adds nothing to the wire. In the one exception above, a frame the host already sends (the empty refusal it uses for a rate-limited handshake or an unavailable wallet) replaces the 4008. Otherwise a dApp receives the same 4008 whether the user declined or the wallet is about to switch, so no dApp code has to change. Nothing retries a 4008, so the dApp, or the user, handshakes again after the switch, and that handshake connects normally.
 
 Still deferred: a dApp-initiated switch request, and a network change event inside a session. A live session whose wallet ends up on another network is revoked (`wallet:disconnected`), never rebound.
 
