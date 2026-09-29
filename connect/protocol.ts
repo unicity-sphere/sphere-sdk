@@ -19,12 +19,13 @@ export const SPHERE_CONNECT_VERSION = '2.3';   // Connect protocol version (semv
 // compatibility hygiene, not security — a hostile client can lie about it.
 export const DEFAULT_MIN_CLIENT_SDK_VERSION = '0.14.1-0';
 
-export { HOST_READY_TYPE, HOST_READY_TIMEOUT, SPHERE_NETWORKS } from '../constants';
+export { HOST_READY_TYPE, HOST_READY_TIMEOUT, SPHERE_NETWORKS, resolveSphereNetwork } from '../constants';
 // Import for local use (e.g. SphereHandshake.network) AND re-export for connect consumers.
 // A bare `export type { NetworkInfo } from '../constants'` would re-export without bringing
 // the name into this module's scope, breaking the local references (TS2304).
 import type { NetworkInfo } from '../constants';
 export type { NetworkInfo };
+export type { SphereNetworkName } from '../constants';
 
 // =============================================================================
 // RPC Method Names (query — return data, no UI)

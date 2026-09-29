@@ -363,6 +363,21 @@ export const SPHERE_NETWORKS = {
   testnet2: { id: NETWORKS.testnet2.networkId as number, name: 'testnet2' },
 } as const satisfies Record<string, NetworkInfo>;
 
+/** The keys of {@link SPHERE_NETWORKS} — the networks a dApp may declare. */
+export type SphereNetworkName = keyof typeof SPHERE_NETWORKS;
+
+/**
+ * Look a network up by its canonical id.
+ *
+ * Built from SPHERE_NETWORKS, and NETWORKS must NOT be used for this: `testnet` and
+ * `testnet2` both hold networkId 4 and `testnet` is declared first, so inverting NETWORKS
+ * answers id 4 with the legacy alias. The failure is quiet — the alias is a valid
+ * NetworkType — and lands wherever the answer is fed back into a network switcher.
+ */
+export function resolveSphereNetwork(id: number): NetworkInfo | undefined {
+  return Object.values(SPHERE_NETWORKS).find((n) => n.id === id);
+}
+
 // =============================================================================
 // Timeouts & Limits
 // =============================================================================
