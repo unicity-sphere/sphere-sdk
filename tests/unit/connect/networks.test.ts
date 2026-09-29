@@ -1,6 +1,13 @@
-import { describe, it, expect } from 'vitest';
-import { NETWORKS, SPHERE_NETWORKS, resolveSphereNetwork } from '../../../constants';
+import { describe, it, expect, expectTypeOf } from 'vitest';
+import {
+  NETWORKS,
+  SPHERE_NETWORKS,
+  resolveSphereNetwork,
+  type NetworkInfo,
+  type SphereNetworkName,
+} from '../../../constants';
 import { SPHERE_NETWORKS as SN_CONNECT, resolveSphereNetwork as resolveViaConnect } from '../../../connect';
+import type * as Root from '../../../index';
 import { checkCompatibility } from '../../../connect/compatibility';
 import { SPHERE_CONNECT_VERSION } from '../../../connect/protocol';
 
@@ -60,13 +67,39 @@ describe('resolveSphereNetwork', () => {
     expect(resolveSphereNetwork(4)?.name).toBe('testnet2');
   });
 
-  it('every SPHERE_NETWORKS name is a key of NETWORKS, so a resolved name can be used as one', () => {
+  it('round-trips every SPHERE_NETWORKS entry, which also proves the ids are unique', () => {
     for (const entry of Object.values(SPHERE_NETWORKS)) {
-      expect(Object.keys(NETWORKS)).toContain(entry.name);
+      const resolved = resolveSphereNetwork(entry.id);
+      expect(resolved).toEqual(entry);
+      expect(Object.keys(NETWORKS)).toContain(resolved?.name);
     }
+  });
+
+  it('answers with a copy, so enriching the result cannot rewrite SPHERE_NETWORKS', () => {
+    const net = resolveSphereNetwork(4)!;
+    Object.assign(net, { name: 'renamed', icon: 'x.png' });   // type-checks even on a readonly target
+    expect(net).not.toBe(SPHERE_NETWORKS.testnet2);
+    expect(SPHERE_NETWORKS.testnet2).toEqual({ id: 4, name: 'testnet2' });
+    expect(resolveSphereNetwork(4)).toEqual({ id: 4, name: 'testnet2' });
+  });
+
+  it('types the resolved name as a network key, so a switcher needs no cast', () => {
+    const net = resolveSphereNetwork(4);
+    // Compile-time guard (typecheck:tests): indexing NETWORKS with `net.name` stops
+    // compiling if the name is ever widened back to `string | undefined`.
+    expect(net && NETWORKS[net.name].networkId).toBe(4);
   });
 
   it('is reachable from the connect entry point too', () => {
     expect(resolveViaConnect(4)).toEqual({ id: 4, name: 'testnet2' });
+  });
+
+  // Compile-time only: `import type` is erased, so the root (which pulls in the whole
+  // token-engine) is never loaded at runtime; typecheck:tests is what checks this.
+  it('is reachable from the package root too, beside the table it is built from', () => {
+    expectTypeOf<typeof Root.resolveSphereNetwork>().toEqualTypeOf<typeof resolveSphereNetwork>();
+    expectTypeOf<typeof Root.SPHERE_NETWORKS>().toEqualTypeOf<typeof SPHERE_NETWORKS>();
+    expectTypeOf<Root.NetworkInfo>().toEqualTypeOf<NetworkInfo>();
+    expectTypeOf<Root.SphereNetworkName>().toEqualTypeOf<SphereNetworkName>();
   });
 });

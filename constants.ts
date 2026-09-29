@@ -373,9 +373,14 @@ export type SphereNetworkName = keyof typeof SPHERE_NETWORKS;
  * `testnet2` both hold networkId 4 and `testnet` is declared first, so inverting NETWORKS
  * answers id 4 with the legacy alias. The failure is quiet — the alias is a valid
  * NetworkType — and lands wherever the answer is fed back into a network switcher.
+ *
+ * The result is a COPY: enriching it (say with an icon for display) cannot rewrite the
+ * process-wide table. Its `name` is always present and is a key of both SPHERE_NETWORKS and
+ * NETWORKS, which is what makes it safe to hand to a network switcher without a cast.
  */
-export function resolveSphereNetwork(id: number): NetworkInfo | undefined {
-  return Object.values(SPHERE_NETWORKS).find((n) => n.id === id);
+export function resolveSphereNetwork(id: number): (typeof SPHERE_NETWORKS)[SphereNetworkName] | undefined {
+  const entry = Object.values(SPHERE_NETWORKS).find((n) => n.id === id);
+  return entry === undefined ? undefined : { ...entry };
 }
 
 // =============================================================================

@@ -284,12 +284,13 @@ export {
   COIN_TYPES,
   // Networks
   NETWORKS,
+  SPHERE_NETWORKS,
   resolveSphereNetwork,
   // Timeouts & Limits
   TIMEOUTS,
   LIMITS,
 } from './constants';
-export type { NetworkType, SphereNetworkName } from './constants';
+export type { NetworkType, NetworkInfo, SphereNetworkName } from './constants';
 
 // =============================================================================
 // Browser Implementations
