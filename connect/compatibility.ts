@@ -42,10 +42,28 @@ function fail(
 }
 
 /**
+ * `CompatInput.clientNetwork` is typed `NetworkInfo`, but it is the handshake's
+ * `msg.network` straight off the wire. `isSphereConnectMessage` checks only the
+ * namespace (plus the version on non-handshake frames), nothing else inspects `network`
+ * on the way here, and the handshake runs before any user approval, so any origin can
+ * put anything in it. A `mismatch` is a typed claim that the wallet has a concrete
+ * network to offer, so it is only made for a non-null object whose `id` is a
+ * non-negative integer. Anything else still refuses (that decision is check #4's own
+ * and is unchanged); it just carries no `mismatch`.
+ */
+function isOfferableNetwork(value: unknown): value is NetworkInfo {
+  if (typeof value !== 'object' || value === null) return false;
+  const id = (value as { id?: unknown }).id;
+  return typeof id === 'number' && Number.isInteger(id) && id >= 0;
+}
+
+/**
  * Decide whether a connecting peer is compatible. Runs four ordered checks
  * (protocol MAJOR → optional MINOR floor → optional SDK floor → network) and
- * returns {ok:true} or {ok:false, error}. A malformed clientProtocol (NaN MAJOR)
- * is treated as protocol-incompatible.
+ * returns {ok:true} or {ok:false, error}. A refusal from the network check may also
+ * carry a typed `mismatch` (see `NetworkMismatch` for exactly when); no other check
+ * ever does. A malformed clientProtocol (NaN MAJOR) is treated as
+ * protocol-incompatible.
  *
  * Every refusal message NAMES the versions involved. The same numbers are also in
  * `error.data` for anything that wants to branch on them, but `data` alone is not
@@ -88,10 +106,12 @@ export function checkCompatibility(input: CompatInput): CompatResult {
     const refusal = fail(ERROR_CODES.INCOMPATIBLE_NETWORK, 'network_incompatible',
       'dApp targets a different network than the wallet',
       { walletNetwork: { id: input.walletNetworkId }, clientNetwork: input.clientNetwork ?? null });
-    // Offerable only when both sides are real: an undeclared network gives the wallet
-    // nothing to switch to, and walletNetworkId is `snapshot.networkId ?? -1` at the
-    // call site, so -1 means "the wallet does not know its own network".
-    if (!input.clientNetwork || input.walletNetworkId < 0) return refusal;
+    // Offerable only when both sides are real. An undeclared or malformed dApp network
+    // gives the wallet nothing to switch to, and walletNetworkId is
+    // `snapshot.networkId ?? -1` at the call site, so -1 means "the wallet does not
+    // know its own network". 0 is a real id: the test is `< 0`, never falsiness.
+    // The refusal above is identical either way; only the mismatch is withheld.
+    if (!isOfferableNetwork(input.clientNetwork) || input.walletNetworkId < 0) return refusal;
     return {
       ...refusal,
       mismatch: {

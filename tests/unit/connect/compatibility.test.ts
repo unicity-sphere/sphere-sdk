@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { checkCompatibility } from '../../../connect/compatibility';
 import { DEFAULT_MIN_CLIENT_SDK_VERSION } from '../../../connect/protocol';
 import { ERROR_CODES, SPHERE_CONNECT_VERSION } from '../../../connect/protocol';
+import type { NetworkInfo } from '../../../connect/protocol';
 
 const W = SPHERE_CONNECT_VERSION;     // '2.0'
 const NET = 4;                        // testnet2
@@ -126,11 +127,91 @@ describe('checkCompatibility', () => {
       const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: 1 }, walletNetworkId: NET });
       expect(r.ok).toBe(false);
       if (!r.ok) {
-        expect(r.error).toEqual({
+        // toStrictEqual, not toEqual: toEqual treats an undefined-valued property as absent,
+        // so it would let a stray key on the error pass as "unchanged".
+        expect(r.error).toStrictEqual({
           code: ERROR_CODES.INCOMPATIBLE_NETWORK,
           message: 'dApp targets a different network than the wallet',
           data: { reason: 'network_incompatible', walletNetwork: { id: NET }, clientNetwork: { id: 1 } },
         });
+      }
+    });
+
+    it('does not change the payload on a branch that carries no mismatch either', () => {
+      const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: undefined, walletNetworkId: NET });
+      // The whole result, so a stray `mismatch` key (even an undefined-valued one) fails too.
+      expect(r).toStrictEqual({
+        ok: false,
+        error: {
+          code: ERROR_CODES.INCOMPATIBLE_NETWORK,
+          message: 'dApp targets a different network than the wallet',
+          data: { reason: 'network_incompatible', walletNetwork: { id: NET }, clientNetwork: null },
+        },
+      });
+    });
+
+    // `msg.network` is unvalidated wire data (isSphereConnectMessage never looks at it) and the
+    // handshake runs before any user approval, so any origin can send any of these. The refusal
+    // is the same one it has always been; what must not happen is the typed `mismatch` vouching
+    // for a network that was never checked.
+    describe('a malformed dApp network still refuses, but offers nothing', () => {
+      const shapes: Array<[string, unknown]> = [
+        ['an object with no id', {}],
+        ['a NaN id', { id: NaN }],
+        ['a string id', { id: '4' }],
+        ['a fractional id', { id: 4.5 }],
+        ['a negative id', { id: -1 }],
+        ['a truthy non-object', 'mainnet'],
+      ];
+
+      it.each(shapes)('%s', (_label, raw) => {
+        const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: raw as NetworkInfo, walletNetworkId: NET });
+        expect(r.ok).toBe(false);
+        if (!r.ok) {
+          expect(r.error.code).toBe(ERROR_CODES.INCOMPATIBLE_NETWORK);
+          expect(r.mismatch).toBeUndefined();
+          // The payload keeps echoing exactly what the dApp sent. Do not "fix" this along with the guard.
+          expect((r.error.data as { clientNetwork: unknown }).clientNetwork).toBe(raw);
+        }
+      });
+
+      it('leaves the whole refusal byte-identical, echoing the raw value', () => {
+        const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: '4' } as unknown as NetworkInfo, walletNetworkId: NET });
+        expect(r).toStrictEqual({
+          ok: false,
+          error: {
+            code: ERROR_CODES.INCOMPATIBLE_NETWORK,
+            message: 'dApp targets a different network than the wallet',
+            data: { reason: 'network_incompatible', walletNetwork: { id: NET }, clientNetwork: { id: '4' } },
+          },
+        });
+      });
+    });
+
+    // The guards are `< 0` and `>= 0`, never falsiness: 0 is a real network id on either side.
+    describe('network id 0 is a real network', () => {
+      it('on the wallet side (only the -1 sentinel is "unknown")', () => {
+        const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: 4 }, walletNetworkId: 0 });
+        expect(r.ok).toBe(false);
+        if (!r.ok) {
+          expect(r.mismatch).toEqual({ kind: 'network', walletNetwork: { id: 0 }, clientNetwork: { id: 4 } });
+        }
+      });
+
+      it('on the dApp side', () => {
+        const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: 0 }, walletNetworkId: NET });
+        expect(r.ok).toBe(false);
+        if (!r.ok) {
+          expect(r.mismatch).toEqual({ kind: 'network', walletNetwork: { id: NET }, clientNetwork: { id: 0 } });
+        }
+      });
+    });
+
+    it('carries a well-formed id the wallet has never heard of; resolving it is the wallet\'s job', () => {
+      const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: 999 }, walletNetworkId: NET });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.mismatch).toEqual({ kind: 'network', walletNetwork: { id: NET }, clientNetwork: { id: 999 } });
       }
     });
   });
