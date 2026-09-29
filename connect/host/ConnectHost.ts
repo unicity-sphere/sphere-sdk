@@ -780,8 +780,8 @@ export class ConnectHost {
    *
    * Nothing here changes what the dApp is told. The caller sends the same 4008 frame for
    * either answer; a 'switch' only skips `onConnectionRejected`. So a throw (synchronous or
-   * not), a timeout, an answer that is not a decision, a wallet that locked while the prompt
-   * was open, and a network the dApp did not ask for are all refusals, never an error.
+   * not), a timeout, an answer that is not a decision, a wallet that is locked when the answer
+   * is read, and a network the dApp did not ask for are all refusals, never an error.
    *
    * The one exception is 'stale': the wallet's own network id changed while the prompt was
    * open, whatever it then answered. `setUnavailable()` and `destroy()` empty the snapshot, so

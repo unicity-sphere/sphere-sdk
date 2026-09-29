@@ -372,9 +372,10 @@ export type SphereNetworkName = keyof typeof SPHERE_NETWORKS;
  * Look a network up by its canonical id.
  *
  * Built from SPHERE_NETWORKS, and NETWORKS must NOT be used for this: `testnet` and
- * `testnet2` both hold networkId 4 and `testnet` is declared first, so inverting NETWORKS
- * answers id 4 with the legacy alias. The failure is quiet — the alias is a valid
- * NetworkType — and lands wherever the answer is fed back into a network switcher.
+ * `testnet2` both hold networkId 4, so the table cannot be inverted safely. Two entries
+ * collide on that id, and which name an inversion returns depends on how it is written. The
+ * failure is quiet — either answer is a valid NetworkType — and lands wherever the answer is
+ * fed back into a network switcher.
  *
  * The result is a COPY: enriching it (say with an icon for display) cannot rewrite the
  * process-wide table. Its `name` is always present and is a key of both SPHERE_NETWORKS and

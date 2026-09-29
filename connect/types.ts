@@ -100,7 +100,8 @@ export interface NetworkMismatchContext {
 /** Answer to {@link ConnectHostConfig.onNetworkMismatch}. */
 export type NetworkMismatchDecision =
   | { action: 'refuse' }
-  /** The wallet is switching to `to`, which MUST equal the dApp's declared network. */
+  /** The wallet is switching to `to`. `to.id` MUST equal the dApp's declared network id; the
+   *  host compares the id and nothing else. */
   | { action: 'switch'; to: NetworkInfo };
 
 // =============================================================================
@@ -154,11 +155,11 @@ export interface ConnectHostConfig {
 
   /** Notify-only: the compatibility gate rejected a connection. Lets the wallet surface the reason
    *  in its UI. Does NOT affect the decision (the host already decided). `silent` is true when the
-   *  dApp asked for a silent handshake (an auto-connect attempt) AND whenever the wallet is locked,
-   *  whether it was locked when the handshake arrived or locked while `onNetworkMismatch` was
-   *  waiting on the user: the wallet should not show UI for either. Not called when
-   *  `onNetworkMismatch` answered 'switch', nor for the empty refusal the host sends when the
-   *  wallet's network changes under that prompt. */
+   *  dApp asked for a silent handshake (an auto-connect attempt), or the wallet is locked when the
+   *  refusal is reported; the wallet should show no UI in either case. The lock is read at that
+   *  moment, so one that lifted again before `onNetworkMismatch` resolved reports false. Not
+   *  called when `onNetworkMismatch` answered 'switch', nor for the empty refusal the host sends
+   *  when the wallet's network changes under that prompt. */
   onConnectionRejected?: (dapp: DAppMetadata | undefined, error: SphereRpcError, silent?: boolean) => void;
 
   /**
@@ -170,10 +171,11 @@ export interface ConnectHostConfig {
    * no network, never when the wallet does not know its own network, and never for a silent
    * or locked handshake.
    *
-   * Return `{ action: 'switch', to }` only once the user has agreed; `to` must be the network
-   * in `ctx.clientNetwork`. The dApp is answered identically either way — the only difference
-   * is that `onConnectionRejected` is NOT called for a switch, so the wallet does not paint an
-   * error beside the decision the user just took.
+   * Return `{ action: 'switch', to }` only once the user has agreed; `to.id` must equal
+   * `ctx.clientNetwork.id`, which is all the host compares. The dApp is answered identically
+   * either way — the only difference is that `onConnectionRejected` is NOT called for a switch,
+   * so the wallet does not paint an error beside the decision the user just took. Nothing
+   * retries the 4008: the dApp, or the user, handshakes again once the wallet has switched.
    *
    * NAME THE NETWORK YOURSELF. The wallet gets the network's identity from
    * `ctx.clientNetwork.id` and looks its own label up for that id. A `name` on
@@ -195,9 +197,17 @@ export interface ConnectHostConfig {
    * `HOST_READY` once it is bound to its new network, or the dApp retries by itself; the retry
    * is then answered against the network the wallet is on now.
    *
-   * A throw, a rejection, a timeout, a wallet that LOCKED while the prompt was open, and an
-   * answer that names a network other than `ctx.clientNetwork` are refusals: the dApp gets the
-   * 4008 and `onConnectionRejected` runs. The timeout is `handshakeDeadlineMs` (default 120 s).
+   * A throw, a rejection, a timeout, a wallet that is LOCKED when its answer is read, and an
+   * answer whose `to.id` is not `ctx.clientNetwork.id` are refusals: the dApp gets the 4008 and
+   * `onConnectionRejected` runs. A lock that lifted again to the same network before the answer
+   * is read leaves a valid 'switch' standing. The timeout is `handshakeDeadlineMs` (default
+   * 120 s).
+   *
+   * A LATE ANSWER IS IGNORED, YOUR SIDE EFFECTS ARE NOT. The hook gets no abort signal, only
+   * `ctx.expiresAt`: after it passes the host has refused and moved on, but the promise the
+   * wallet returned keeps running and whatever it does still happens. Nothing serialises
+   * handshakes, so a dApp that connects again reaches the hook a second time. Check
+   * `ctx.expiresAt` after the user answers and before acting, or make the switch idempotent.
    */
   onNetworkMismatch?: (
     dapp: DAppMetadata,
