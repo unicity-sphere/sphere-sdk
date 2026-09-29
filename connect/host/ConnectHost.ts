@@ -578,6 +578,13 @@ export class ConnectHost {
       return;
     }
 
+    // FORCED SILENT while locked: the wallet's `if (silent) return { approved: false }` branch
+    // refuses an unapproved origin with NO UI, so a locked handshake can never open a credential
+    // surface. Computed ABOVE the compatibility gate on purpose: its refusal path reports this
+    // flag to the wallet, and `silent: false` while locked would have it draw a surface.
+    // `locked` is written only at its declaration and after the approval prompt.
+    const silent = msg.silent === true || locked;
+
     // Compatibility gate — runs BEFORE resume and BEFORE onConnectionRequest, so an
     // incompatible/old client cannot slip through on a stale sessionId.
     const result = checkCompatibility({
@@ -598,7 +605,7 @@ export class ConnectHost {
         clientNetwork: msg.network ?? null,
         walletNetwork: this.snapshot.networkId ?? null,
       });
-      this.config.onConnectionRejected?.(dapp, result.error, !!msg.silent);
+      this.config.onConnectionRejected?.(dapp, result.error, silent);
       this.sendHandshakeResponse([], undefined, undefined, result.error, msg.v);
       return;
     }
@@ -629,12 +636,6 @@ export class ConnectHost {
     }
 
     const requestedPermissions = msg.permissions as PermissionScope[];
-
-    // FORCED SILENT while locked: the wallet's existing `if (silent) return { approved:
-    // false }` branch refuses an unapproved origin with NO UI, and a previously approved
-    // origin is approved from persisted state. No dApp request may ever raise a credential
-    // surface, so a locked handshake must never be able to open one.
-    const silent = msg.silent === true || locked;
 
     const { approved, grantedPermissions } = await withDeadline(
       Promise.resolve(

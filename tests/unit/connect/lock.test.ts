@@ -1662,6 +1662,52 @@ describe('handshake while locked', () => {
   });
 });
 
+describe('the silent flag reported on a refused handshake', () => {
+  // The wallet renders UI from onConnectionRejected, and a locked wallet may not be made to
+  // render a consent surface by an unapproved origin. A WARM lock keeps the snapshot identity,
+  // so the handshake gets past step 0 and reaches the compatibility gate — which means the
+  // flag this callback receives has to be the EFFECTIVE one, not the client's claim.
+  function mismatchedHandshake(pair: MockPair, silent?: boolean) {
+    pair.client.send({
+      ns: SPHERE_CONNECT_NAMESPACE,
+      v: SPHERE_CONNECT_VERSION,
+      type: 'handshake',
+      direction: 'request',
+      permissions: [],
+      sdkVersion: SDK_VERSION,
+      dapp: DAPP,
+      network: { id: 1 },            // the mock sphere is on 4 → the network check fails
+      ...(silent === undefined ? {} : { silent }),
+    } as unknown as SphereConnectMessage);
+  }
+
+  it('reports silent:true while locked, whatever the client claimed', async () => {
+    const pair = createMockTransportPair();
+    const onConnectionRejected = vi.fn();
+    const sphere = createMockSphere();
+    const host = makeHost(pair, { sphere, onConnectionRejected });
+    host.setLocked();                // warm lock: the snapshot survives
+
+    mismatchedHandshake(pair, false);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(onConnectionRejected).toHaveBeenCalledTimes(1);
+    expect(onConnectionRejected.mock.calls[0][2]).toBe(true);
+  });
+
+  it('still reports silent:false on an unlocked wallet', async () => {
+    const pair = createMockTransportPair();
+    const onConnectionRejected = vi.fn();
+    const host = makeHost(pair, { sphere: createMockSphere(), onConnectionRejected });
+    void host;
+
+    mismatchedHandshake(pair, false);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(onConnectionRejected.mock.calls[0][2]).toBe(false);
+  });
+});
+
 // ===========================================================================
 // Task 14 — lifecycle logging
 // ===========================================================================
