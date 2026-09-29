@@ -357,11 +357,13 @@ export interface NetworkInfo {
  * so it cannot drift. Use as `network: SPHERE_NETWORKS.testnet2`. Custom networks
  * are the same shape: `network: { id, name }`. Only live v2 networks appear here;
  * the legacy `testnet` alias is intentionally not surfaced.
+ *
+ * The `satisfies` clause keeps every `name` a `NETWORKS` key; do not loosen it to `NetworkInfo`.
  */
 export const SPHERE_NETWORKS = {
   mainnet: { id: NETWORKS.mainnet.networkId as number, name: 'mainnet' },
   testnet2: { id: NETWORKS.testnet2.networkId as number, name: 'testnet2' },
-} as const satisfies Record<string, NetworkInfo>;
+} as const satisfies Record<string, { id: number; name: NetworkType }>;
 
 /** The keys of {@link SPHERE_NETWORKS} — the networks a dApp may declare. */
 export type SphereNetworkName = keyof typeof SPHERE_NETWORKS;
