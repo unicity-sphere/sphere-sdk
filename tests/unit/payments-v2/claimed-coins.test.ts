@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { hexToBytes } from '../../../core/crypto';
 import { SphereError } from '../../../core/errors';
+import { VERDICT_RETRY_MS } from '../../../modules/payments-v2/inventory/verdicts';
 import { CoinClaims } from '../../../token-engine/claims';
 import { TokenType } from '../../../token-engine/sdk';
 import { SpherePaymentData } from '../../../token-engine/SpherePaymentData';
@@ -33,8 +34,8 @@ async function minted(world: World, tokenType: string, salt: number): Promise<Sp
   });
 }
 
-async function holdings(world: World): Promise<[string, boolean][]> {
-  return (await world.facade.assets(CLAIMED)).map((a) => [a.totalAmount, a.unverified ?? false]);
+async function holdings(world: World): Promise<[string, string | null][]> {
+  return (await world.facade.assets(CLAIMED)).map((a) => [a.totalAmount, a.unverified ?? null]);
 }
 
 afterEach(cleanupWorlds);
@@ -47,7 +48,7 @@ describe('PaymentsFacade — claimed coins', () => {
 
     await world.facade.start();
 
-    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', false], ['10', true]]));
+    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', null], ['10', 'refused']]));
     expect(eventsOf(world, 'inventory:updated').length).toBeGreaterThan(0);
   });
 
@@ -63,7 +64,7 @@ describe('PaymentsFacade — claimed coins', () => {
 
     await expect(send).rejects.toBeInstanceOf(SphereError);
     await expect(send).rejects.toMatchObject({ code: 'SEND_INSUFFICIENT_BALANCE' });
-    expect(await holdings(world)).toEqual([['10', true]]);
+    expect(await holdings(world)).toEqual([['10', 'refused']]);
   });
 
   it('trusts a custom mint of the issuing type at once, without checking the held token again', async () => {
@@ -80,20 +81,46 @@ describe('PaymentsFacade — claimed coins', () => {
     });
 
     expect(result.success).toBe(true);
-    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', false]]));
+    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', null]]));
     expect(verify).not.toHaveBeenCalled();
+  });
+
+  it('keeps a custom mint accepted only by its own per-call verifier pending until the registered verifier passes', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const world = makeWorld({ claims: claims() });
+    await world.facade.start();
+    const verify = vi
+      .spyOn(world.engine, 'verify')
+      .mockRejectedValueOnce(new SphereError('lock short of its confirmations', 'MINT_REASON_UNVERIFIABLE'))
+      .mockResolvedValue({ ok: true });
+
+    const result = await world.facade.mintCustom({
+      tokenType: hexBytes(BRIDGED_TYPE),
+      salt: new Uint8Array(32).fill(8),
+      data: await SpherePaymentData.fromValue({ assets: [{ coinId: CLAIMED, amount: 10n }] }).encode(),
+      justification: REASON,
+      assets: [{ coinId: CLAIMED, amount: 10n }],
+      mintJustificationVerifiers: [{ tag: 49152n, verify: vi.fn() }],
+    });
+
+    expect(result.success).toBe(true);
+    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', 'pending']]));
+    await vi.advanceTimersByTimeAsync(VERDICT_RETRY_MS);
+    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', null]]));
+    expect(verify).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
   });
 
   it('keeps the change of a verified token trusted after a send, without checking it again', async () => {
     const world = makeWorld({ claims: claims() });
     await world.hold(await minted(world, BRIDGED_TYPE, 1));
     await world.facade.start();
-    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', false]]));
+    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', null]]));
     const verify = vi.spyOn(world.engine, 'verify');
 
     await world.facade.send({ recipient: '@peer', amount: '4', coinId: CLAIMED });
 
-    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['6', false]]));
+    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['6', null]]));
     expect(verify).not.toHaveBeenCalled();
   });
 
@@ -106,8 +133,8 @@ describe('PaymentsFacade — claimed coins', () => {
 
     const { transfers } = await world.facade.receive();
 
-    expect(transfers.flatMap((t) => t.tokens.map((token) => token.unverified ?? false)).sort()).toEqual([false, true]);
-    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', false], ['10', true]]));
+    expect(transfers.flatMap((t) => t.tokens.map((token) => token.unverified ?? 'verified')).sort()).toEqual(['refused', 'verified']);
+    await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', null], ['10', 'refused']]));
     expect(verify).toHaveBeenCalledTimes(2);
   });
 });

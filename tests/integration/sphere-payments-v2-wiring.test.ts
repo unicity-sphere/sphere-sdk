@@ -623,7 +623,7 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     });
 
     const assets = await sphere.payments.assets(COIN);
-    expect(assets.map((a) => [a.totalAmount, a.unverified ?? false])).toEqual([['40', true]]);
+    expect(assets.map((a) => [a.totalAmount, a.unverified ?? null])).toEqual([['40', 'refused']]);
   }, 20_000);
 
   // #733: proves composePaymentsV2 wires the resolver that reports the PEER's

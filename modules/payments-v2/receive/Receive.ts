@@ -367,7 +367,7 @@ async function announce(
     ...(entry.senderNametag !== undefined ? { senderNametag: entry.senderNametag } : {}),
     tokens: record.assets.map((asset) => ({
       ...toUiToken(record.tokenId, asset, deps.registry, receivedAt),
-      ...(record.unverifiedCoinIds?.includes(asset.coinId) ? { unverified: true } : {}),
+      ...(record.unverifiedCoinIds?.includes(asset.coinId) ? { unverified: 'refused' as const } : {}),
     })),
     // #777: named here rather than mapped from assets, which announced an EMPTY list.
     ...(record.tokenType !== undefined

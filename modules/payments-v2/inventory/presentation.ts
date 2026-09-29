@@ -4,6 +4,7 @@
 
 import type { Asset, Token } from '../../../types';
 import type { InventoryAsset } from '../ports';
+import type { Standing } from './InventoryView';
 
 export interface RegistryReader {
   getSymbol(coinId: string): string;
@@ -33,7 +34,7 @@ export interface TokenSnapshot {
 export interface TokenFlags {
   readonly transferring: boolean;
   readonly suspectedSpent: boolean;
-  readonly unverified: boolean;
+  readonly standing: Standing;
 }
 
 export function toToken(
@@ -57,13 +58,13 @@ export function toToken(
     updatedAt: snapshot.updatedAt,
     lazy: true,
     ...(flags.suspectedSpent ? { suspectedSpent: true } : {}),
-    ...(flags.unverified ? { unverified: true } : {}),
+    ...(flags.standing !== 'trusted' ? { unverified: flags.standing } : {}),
   };
 }
 
 interface CoinTotals {
   coinId: string;
-  unverified: boolean;
+  standing: Standing;
   total: bigint;
   count: number;
   transferring: bigint;
@@ -72,7 +73,7 @@ interface CoinTotals {
 
 export interface AssetReading {
   readonly isTransferring: (tokenId: string) => boolean;
-  readonly trusts: (tokenId: string, coinId: string) => boolean;
+  readonly standing: (tokenId: string, coinId: string) => Standing;
 }
 
 export function aggregateAssets(
@@ -84,11 +85,11 @@ export function aggregateAssets(
   for (const [tokenId, entry] of entries) {
     const moving = reading.isTransferring(tokenId);
     for (const asset of entry.assets) {
-      const unverified = !reading.trusts(tokenId, asset.coinId);
-      const key = unverified ? `${asset.coinId}:unverified` : asset.coinId;
+      const standing = reading.standing(tokenId, asset.coinId);
+      const key = standing === 'trusted' ? asset.coinId : `${asset.coinId}:${standing}`;
       let group = groups.get(key);
       if (!group) {
-        group = { coinId: asset.coinId, unverified, total: 0n, count: 0, transferring: 0n, transferringCount: 0 };
+        group = { coinId: asset.coinId, standing, total: 0n, count: 0, transferring: 0n, transferringCount: 0 };
         groups.set(key, group);
       }
       if (moving) {
@@ -125,7 +126,7 @@ function toAsset(totals: CoinTotals, registry: RegistryReader): Asset {
     change24h: null,
     fiatValueUsd: null,
     fiatValueEur: null,
-    ...(totals.unverified ? { unverified: true } : {}),
+    ...(totals.standing !== 'trusted' ? { unverified: totals.standing } : {}),
   };
 }
 
@@ -184,6 +185,6 @@ export function transferringToken(
   return toToken(tokenId, snapshot, { coinId, amount: amount.toString() }, registry, {
     transferring: true,
     suspectedSpent: false,
-    unverified: false,
+    standing: 'trusted',
   });
 }

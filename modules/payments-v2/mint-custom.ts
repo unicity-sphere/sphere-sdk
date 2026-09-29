@@ -127,7 +127,7 @@ async function mintJournaled(
   if (entry.tokenId === '') {
     await deps.customMintJournal.upsert({ ...entry, tokenId: token.blob.tokenId });
   }
-  await deps.accepted?.(token);
+  if (mintJustificationVerifiers === undefined) await deps.accepted?.(token);
   await finalizeMint(deps, {
     mintId: entry.mintId,
     token,

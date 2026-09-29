@@ -979,18 +979,23 @@ instead of invalid.
 A mint reason alone is optional: a token minted without one skips the verifiers. A
 `TokenIssuancePolicy` makes the rule of a token type mandatory. It is the state-transition SDK's
 `ITokenIssuanceVerifier` (`tokenType`, `verify(genesis)`) plus `coinIds`, the coins only that type
-may issue. Every genesis of that type, the burned source of a split included, must pass `verify`,
+may issue, and an optional `revision` that changes whenever the proofs the policy accepts change. Every genesis of that type, the burned source of a split included, must pass `verify`,
 so a token of the type minted without its reason fails verification and receive refuses it. A
 claimed coin counts only inside a token of its issuing type that verified:
 
-- `assets()` lists the other holdings of a claimed coin as a separate asset with `unverified: true`
-  and no price, and `tokens()` marks each such token `unverified: true`. A token of another type
-  that carries the coin, a token that failed verification, and one not checked yet all read this way.
+- `assets()` lists the other holdings of a claimed coin as separate assets with no price, and
+  `tokens()` marks each such token. `unverified: 'pending'` means the check has not passed yet, for
+  instance while a lock waits for its confirmations. `unverified: 'refused'` means the token failed
+  verification or is of another type than the one that issues the coin.
 - An unverified token is never spent: coin selection skips it, and `sendWholeToken()` and `burn()`
   refuse it as not a spendable holding.
-- A token received, minted with `mintCustom()`, or left as change of a verified token counts at once.
-  Any other held token of a claimed coin, for instance one another device received, is verified in
-  the background, and a check that cannot answer yet is retried with backoff.
+- A token received, left as change of a verified token, or minted with `mintCustom()` under the
+  registered verifiers counts at once. A custom mint accepted only by its per-call verifiers, such as
+  a depositor's own mint before the lock is final, stays pending. Pending tokens and any other held
+  token of a claimed coin, for instance one another device received, are verified in the background,
+  and a check that cannot answer yet is retried with backoff.
+- Verified tokens are remembered per device together with a fingerprint of the registered policies.
+  A changed policy, claim or `revision` discards them, so every held token is checked again.
 - Two policies for one token type, or two types claiming one coin, fail engine construction with
   `INVALID_CONFIG`.
 

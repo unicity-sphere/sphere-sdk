@@ -19,11 +19,10 @@ function hexBytes(hex: string): Uint8Array {
   return Uint8Array.from(hex.match(/../g)!.map((b) => parseInt(b, 16)));
 }
 
-async function wallet(kv: MemoryKV = memoryKV()) {
+async function wallet(kv: MemoryKV = memoryKV(), revision = 'vaults-1', held = new Map<string, SphereToken>()) {
   const engine = new FakeTokenEngine();
   const claims = new CoinClaims();
-  claims.add({ tokenType: new TokenType(hexBytes(BRIDGED_TYPE)), coinIds: [BRIDGED_COIN], verify: vi.fn() });
-  const held = new Map<string, SphereToken>();
+  claims.add({ tokenType: new TokenType(hexBytes(BRIDGED_TYPE)), coinIds: [BRIDGED_COIN], revision, verify: vi.fn() });
   const getBlobs = vi.fn(async (ids: string[]) => {
     const found = ids.filter((id) => held.has(id)).map((id) => [id, held.get(id)!.blob.token] as const);
     return new Map(found);
@@ -43,7 +42,7 @@ async function wallet(kv: MemoryKV = memoryKV()) {
     held.set(token.blob.tokenId, token);
     return token;
   };
-  return { engine, verdicts, getBlobs, changed, mint, kv };
+  return { engine, verdicts, getBlobs, changed, mint, kv, held };
 }
 
 afterEach(() => {
@@ -57,11 +56,11 @@ describe('TokenVerdicts', () => {
     const lookalike = await mint(BRIDGED_COIN, OTHER_TYPE);
     const native = await mint(NATIVE_COIN, OTHER_TYPE);
 
-    expect(verdicts.trusts(bridged.blob.tokenId, BRIDGED_COIN)).toBe(false);
+    expect(verdicts.standing(bridged.blob.tokenId, BRIDGED_COIN)).toBe('pending');
     await verdicts.review([bridged.blob.tokenId, lookalike.blob.tokenId]);
 
     expect(verdicts.trusts(bridged.blob.tokenId, BRIDGED_COIN)).toBe(true);
-    expect(verdicts.trusts(lookalike.blob.tokenId, BRIDGED_COIN)).toBe(false);
+    expect(verdicts.standing(lookalike.blob.tokenId, BRIDGED_COIN)).toBe('refused');
     expect(verdicts.trusts(native.blob.tokenId, NATIVE_COIN)).toBe(true);
     expect(verdicts.isClaimed(BRIDGED_COIN)).toBe(true);
     expect(verdicts.isClaimed(NATIVE_COIN)).toBe(false);
@@ -76,7 +75,7 @@ describe('TokenVerdicts', () => {
     await verdicts.review([counterfeit.blob.tokenId]);
     await verdicts.review([counterfeit.blob.tokenId]);
 
-    expect(verdicts.trusts(counterfeit.blob.tokenId, BRIDGED_COIN)).toBe(false);
+    expect(verdicts.standing(counterfeit.blob.tokenId, BRIDGED_COIN)).toBe('refused');
     expect(verify).toHaveBeenCalledTimes(1);
     expect(changed).not.toHaveBeenCalled();
   });
@@ -93,7 +92,7 @@ describe('TokenVerdicts', () => {
 
     await verdicts.review([settling.blob.tokenId]);
     await verdicts.review([settling.blob.tokenId]);
-    expect(verdicts.trusts(settling.blob.tokenId, BRIDGED_COIN)).toBe(false);
+    expect(verdicts.standing(settling.blob.tokenId, BRIDGED_COIN)).toBe('pending');
     expect(verify).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(VERDICT_RETRY_MS);
@@ -117,6 +116,22 @@ describe('TokenVerdicts', () => {
 
     expect(second.verdicts.trusts(kept.blob.tokenId, BRIDGED_COIN)).toBe(true);
     expect(verify).not.toHaveBeenCalled();
+  });
+
+  it('checks remembered tokens again once the issuance policies change', async () => {
+    const kv = memoryKV();
+    const first = await wallet(kv, 'vaults-1');
+    const kept = await first.mint(BRIDGED_COIN, BRIDGED_TYPE);
+    await first.verdicts.review([kept.blob.tokenId]);
+
+    const second = await wallet(kv, 'vaults-2', first.held);
+    const verify = vi.spyOn(second.engine, 'verify').mockResolvedValue({ ok: false, reason: 'FAIL' });
+    await second.verdicts.hydrate();
+
+    expect(second.verdicts.standing(kept.blob.tokenId, BRIDGED_COIN)).toBe('pending');
+    await second.verdicts.review([kept.blob.tokenId]);
+    expect(verify).toHaveBeenCalledTimes(1);
+    expect(second.verdicts.standing(kept.blob.tokenId, BRIDGED_COIN)).toBe('refused');
   });
 
   it('records a verified arrival of the issuing type and ignores a look-alike or a token without claimed coins', async () => {

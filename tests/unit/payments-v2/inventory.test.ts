@@ -3,6 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   type CoinTrust,
   InventoryView,
+  type Standing,
   type RegistryReader,
   type ReAddResult,
 } from '../../../modules/payments-v2/inventory/InventoryView';
@@ -729,60 +730,62 @@ describe('InventoryView — claimed coins', () => {
     status: 'active',
     assets: [{ coinId: CLAIMED, amount }],
   });
+  const STANDINGS: Record<string, Standing> = { V: 'trusted', P: 'pending', U: 'refused' };
 
-  function claimView(verified: readonly string[]): InventoryView {
+  function claimView(): InventoryView {
     const trust: CoinTrust = {
       isClaimed: (coinId) => coinId === CLAIMED,
-      trusts: (tokenId, coinId) => coinId !== CLAIMED || verified.includes(tokenId),
+      standing: (tokenId, coinId) => (coinId === CLAIMED ? (STANDINGS[tokenId] ?? 'pending') : 'trusted'),
     };
     const { port } = makePort([
-      page([claimed('V', '10'), claimed('U', '5'), item('N', { seq: 1, amount: '7' })], 1),
+      page([claimed('V', '10'), claimed('P', '3'), claimed('U', '5'), item('N', { seq: 1, amount: '7' })], 1),
       page([], 1),
     ]);
     return new InventoryView({ port, kv: memoryKV(), emit: () => undefined, trust });
   }
 
-  it('counts a claimed coin only in trusted tokens and lists the others as a separate unverified asset', async () => {
-    const view = claimView(['V']);
+  it('counts a claimed coin only in trusted tokens and lists pending and refused holdings as separate assets', async () => {
+    const view = claimView();
     await view.fullPull();
 
     const assets = await view.assets(registry);
 
-    expect(assets.map((a) => [a.coinId, a.totalAmount, a.unverified ?? false])).toEqual([
-      [CLAIMED, '10', false],
-      [CLAIMED, '5', true],
-      [COIN, '7', false],
+    expect(assets.map((a) => [a.coinId, a.totalAmount, a.unverified ?? null])).toEqual([
+      [CLAIMED, '10', null],
+      [CLAIMED, '3', 'pending'],
+      [CLAIMED, '5', 'refused'],
+      [COIN, '7', null],
     ]);
   });
 
   it('prices only the trusted holdings of a claimed coin', async () => {
-    const view = claimView(['V']);
+    const view = claimView();
     await view.fullPull();
     const price = { getPrices: vi.fn(async (names: string[]) => new Map(names.map((n) => [n, { priceUsd: 1 }]))) };
 
     const assets = await view.assets(registry, price);
 
-    expect(assets.filter((a) => a.coinId === CLAIMED).map((a) => a.fiatValueUsd)).toEqual([0.00001, null]);
+    expect(assets.filter((a) => a.coinId === CLAIMED).map((a) => a.fiatValueUsd)).toEqual([0.00001, null, null]);
   });
 
-  it('never spends an untrusted token, by coin or whole, and flags it in the token list', async () => {
-    const view = claimView(['V']);
+  it('never spends an untrusted token, by coin or whole, and says why in the token list', async () => {
+    const view = claimView();
     await view.fullPull();
 
     expect(view.pool(CLAIMED).map((e) => e.tokenId)).toEqual(['V']);
-    expect(view.spendableToken('U')).toBe(false);
-    expect(view.spendableToken('V')).toBe(true);
-    expect(view.tokens(registry).map((t) => [t.id, t.unverified ?? false])).toEqual([
-      ['V', false],
-      ['U', true],
-      ['N', false],
+    expect(['V', 'P', 'U'].map((id) => view.spendableToken(id))).toEqual([true, false, false]);
+    expect(view.tokens(registry).map((t) => [t.id, t.unverified ?? null])).toEqual([
+      ['V', null],
+      ['P', 'pending'],
+      ['U', 'refused'],
+      ['N', null],
     ]);
   });
 
   it('names the active tokens that carry a claimed coin', async () => {
-    const view = claimView([]);
+    const view = claimView();
     await view.fullPull();
 
-    expect(view.claimHolders()).toEqual(['V', 'U']);
+    expect(view.claimHolders()).toEqual(['V', 'P', 'U']);
   });
 });

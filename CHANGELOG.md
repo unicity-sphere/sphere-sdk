@@ -13,9 +13,10 @@ A `TokenPlugin` can register `tokenIssuancePolicies`: the state-transition SDK's
 check plus the coins that type alone may issue. A token of a policed type minted without its reason
 now fails verification, where it used to pass because a missing mint reason skips every verifier.
 A claimed coin counts, prices and spends only inside a verified token of its issuing type; other
-holdings of it show as a separate asset with `unverified: true`, and `Token.unverified` marks them in
-`tokens()` and incoming transfers. Tokens received, custom-minted or kept as change are trusted at
-once; other held tokens of a claimed coin are verified in the background.
+holdings of it show as separate assets marked `unverified: 'pending'` or `'refused'`, and
+`Token.unverified` marks them in `tokens()` and incoming transfers. Tokens received, kept as change,
+or custom-minted under the registered verifiers are trusted at once; other held tokens of a claimed
+coin are verified in the background, and a change to the registered policies checks them again.
 
 ## [0.17.6] - 2026-09-22
 

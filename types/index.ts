@@ -58,6 +58,8 @@ export type TokenStatus =
   | 'spent'        // Transferred away
   | 'invalid';     // Validation failed
 
+export type Unverified = 'pending' | 'refused';
+
 export interface Token {
   readonly id: string;
   readonly coinId: string;
@@ -84,8 +86,8 @@ export interface Token {
    * send self-heals instead of wedging on a stale source.
    */
   suspectedSpent?: boolean;
-  /** Carries a coin that an issuance policy claims, without having passed that policy: shown, never spent. */
-  readonly unverified?: boolean;
+  /** Carries a coin an issuance policy claims without having passed that policy yet (`pending`) or at all (`refused`): shown, never spent. */
+  readonly unverified?: Unverified;
 }
 
 /**
@@ -150,8 +152,8 @@ export interface Asset {
   readonly fiatValueUsd: number | null;
   /** Total fiat value in EUR */
   readonly fiatValueEur: number | null;
-  /** Holds tokens of a claimed coin that have not passed its issuance policy: never spendable, never priced. */
-  readonly unverified?: boolean;
+  /** Holds tokens of a claimed coin that have not passed its issuance policy yet (`pending`) or at all (`refused`): never spendable, never priced. */
+  readonly unverified?: Unverified;
 }
 
 // =============================================================================

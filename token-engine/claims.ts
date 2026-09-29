@@ -3,6 +3,7 @@ import type { CoinId, TokenIssuancePolicy, TokenPlugin } from './types';
 
 export class CoinClaims {
   private readonly issuers = new Map<CoinId, string>();
+  private readonly policies: string[] = [];
 
   public static fromPlugins(plugins: readonly TokenPlugin[] | undefined): CoinClaims {
     const claims = new CoinClaims();
@@ -18,6 +19,11 @@ export class CoinClaims {
     const taken = coinIds.find((coinId) => this.issuers.has(coinId));
     if (taken !== undefined) throw new Error(`Coin ${taken} is already issued by token type ${this.issuers.get(taken)}.`);
     for (const coinId of coinIds) this.issuers.set(coinId, tokenType);
+    this.policies.push(JSON.stringify([tokenType, [...coinIds].sort(), policy.revision ?? '']));
+  }
+
+  public fingerprint(): string {
+    return [...this.policies].sort().join('\n');
   }
 
   public issuerOf(coinId: CoinId): string | null {

@@ -3,11 +3,17 @@ import type { ITokenEngine } from '../../../token-engine/engine';
 import type { SphereToken } from '../../../token-engine/types';
 import { SerialChain } from '../async';
 import { STORE_KEYS, type ScopedKV } from '../stores';
+import type { Standing } from './InventoryView';
 
 export const VERDICT_RETRY_MS = 30_000;
 export const VERDICT_RETRY_MAX_MS = 60 * 60 * 1000;
 
 type ClaimReader = Pick<CoinClaims, 'issuerOf'>;
+
+interface Remembered {
+  readonly fingerprint: string;
+  readonly tokenIds: readonly string[];
+}
 type Verdict = 'verified' | 'refused' | 'retry';
 
 interface Retry {
@@ -17,7 +23,7 @@ interface Retry {
 
 export interface TokenVerdictsDeps {
   readonly kv: ScopedKV;
-  readonly claims: ClaimReader;
+  readonly claims: Pick<CoinClaims, 'issuerOf' | 'fingerprint'>;
   readonly engine: () => Pick<ITokenEngine, 'decodeToken' | 'verify'>;
   readonly getBlobs: (tokenIds: string[]) => Promise<Map<string, Uint8Array>>;
   readonly changed: () => void;
@@ -47,8 +53,13 @@ export class TokenVerdicts {
     return this.deps.claims.issuerOf(coinId) !== null;
   }
 
+  standing(tokenId: string, coinId: string): Standing {
+    if (!this.isClaimed(coinId) || this.verified.has(tokenId)) return 'trusted';
+    return this.refused.has(tokenId) ? 'refused' : 'pending';
+  }
+
   trusts(tokenId: string, coinId: string): boolean {
-    return !this.isClaimed(coinId) || this.verified.has(tokenId);
+    return this.standing(tokenId, coinId) === 'trusted';
   }
 
   hydrate(): Promise<void> {
@@ -187,12 +198,14 @@ export class TokenVerdicts {
   }
 
   private persist(): Promise<void> {
-    return this.writes.enqueue(() => this.deps.kv.set(STORE_KEYS.verifiedTokens, [...this.verified]));
+    const remembered: Remembered = { fingerprint: this.deps.claims.fingerprint(), tokenIds: [...this.verified] };
+    return this.writes.enqueue(() => this.deps.kv.set(STORE_KEYS.verifiedTokens, remembered));
   }
 
   private async load(): Promise<void> {
-    const tokenIds = await this.deps.kv.get<string[]>(STORE_KEYS.verifiedTokens);
-    for (const tokenId of tokenIds ?? []) this.verified.add(tokenId);
+    const remembered = await this.deps.kv.get<Remembered>(STORE_KEYS.verifiedTokens);
+    if (remembered?.fingerprint !== this.deps.claims.fingerprint()) return;
+    for (const tokenId of remembered.tokenIds) this.verified.add(tokenId);
   }
 
   private now(): number {
