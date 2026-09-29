@@ -778,13 +778,16 @@ export class ConnectHost {
    *
    * Nothing here changes what the dApp is told. The caller sends the same 4008 frame for
    * either answer; a 'switch' only skips `onConnectionRejected`. So a throw (synchronous or
-   * not), a timeout, an answer that is not a decision, a wallet that left 'live' while the
-   * prompt was open, and a network the dApp did not ask for are all refusals, never an error.
+   * not), a timeout, an answer that is not a decision, a wallet that locked while the prompt
+   * was open, and a network the dApp did not ask for are all refusals, never an error.
    *
-   * The one exception is 'stale': the wallet's own network moved while the prompt was open,
-   * whatever it then answered. The frame's `error.data` would describe a comparison that no
-   * longer holds, so the caller sends the empty refusal instead, which the dApp reads as "not
-   * ready, handshake again" and which is then answered against the network the wallet is on.
+   * The one exception is 'stale': the wallet's own network id changed while the prompt was
+   * open, whatever it then answered. `setUnavailable()` and `destroy()` empty the snapshot, so
+   * they land here too; only a lock keeps it, which is why a lock is the one 'left live' case
+   * that reaches the refusal below. The frame's `error.data` would describe a comparison that
+   * no longer holds, so the caller sends the empty refusal instead. `ConnectClient` rejects
+   * that with a bare error and does not retry: a handshake that follows (after `HOST_READY`, or
+   * the dApp's own retry) is answered against the network the wallet is on.
    */
   private async askNetworkMismatch(
     dapp: DAppMetadata,
@@ -819,10 +822,11 @@ export class ConnectHost {
 
     if (decision?.action !== 'switch') return { action: 'refuse' };
 
-    // The wallet can have locked, logged out or gone unavailable while the prompt was open, so
-    // re-read the state as handleHandshake does after onConnectionRequest (`stateAfterPrompt`).
-    // `!== stateBefore` is redundant today (a hook is only asked while 'live'); it stays as
-    // deliberate belt-and-braces so a state added later cannot slip through.
+    // Only a lock reaches this check: setUnavailable() and destroy() empty the snapshot, so the
+    // network check above already took them. Re-read the state as handleHandshake does after
+    // onConnectionRequest (`stateAfterPrompt`). `!== stateBefore` is redundant today (a hook is
+    // only asked while 'live'); it stays as deliberate belt-and-braces so a state added later
+    // cannot slip through.
     if (this._walletState !== 'live' || this._walletState !== stateBefore) {
       logger.warn('ConnectHost', `Wallet left 'live' while the network-switch prompt was open — refusing (state=${this._walletState})`);
       return { action: 'refuse' };

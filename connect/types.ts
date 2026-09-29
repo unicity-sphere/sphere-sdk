@@ -153,8 +153,11 @@ export interface ConnectHostConfig {
   onDisconnect?: (session: ConnectSession) => void | Promise<void>;
 
   /** Notify-only: the compatibility gate rejected a connection. Lets the wallet surface the reason
-   *  in its UI. Does NOT affect the decision (the host already decided). `silent` is true for
-   *  auto-connect attempts — the wallet should not show UI for those. */
+   *  in its UI. Does NOT affect the decision (the host already decided). `silent` is true when the
+   *  dApp asked for a silent handshake (an auto-connect attempt) AND whenever the wallet was
+   *  locked when the handshake arrived: the wallet should not show UI for either. Not called when
+   *  `onNetworkMismatch` answered 'switch', nor for the empty refusal the host sends when the
+   *  wallet's network changes under that prompt. */
   onConnectionRejected?: (dapp: DAppMetadata | undefined, error: SphereRpcError, silent?: boolean) => void;
 
   /**
@@ -181,12 +184,19 @@ export interface ConnectHostConfig {
    * resolve this promise first: the host still has to post its answer, and the reload tears
    * down the window that would post it.
    *
-   * A wallet that rebinds in place (`updateSphere`) while this promise is pending is answered
-   * with the empty refusal instead, whatever it resolves: the comparison the host made no
-   * longer holds, and the dApp reads an empty refusal as "not ready, handshake again".
+   * If the wallet's own network id CHANGES while this promise is pending, the dApp is answered
+   * with the errorless empty refusal instead of the 4008, whatever this resolves, and
+   * `onConnectionRejected` is skipped: the comparison the host made no longer holds. A change
+   * is `updateSphere` rebinding to a Sphere on another network id, `setUnavailable()` or
+   * `destroy()`; an `updateSphere` to the same network id is not one. `ConnectClient` does not
+   * read that frame as "handshake again": `connect()` rejects with a bare
+   * `Error('Connection rejected by wallet')` and never retries. Either the wallet posts
+   * `HOST_READY` once it is bound to its new network, or the dApp retries by itself; the retry
+   * is then answered against the network the wallet is on now.
    *
-   * A throw, a rejection or a timeout is a refusal. The host's budget is
-   * `handshakeDeadlineMs` (default 120 s).
+   * A throw, a rejection, a timeout, a wallet that LOCKED while the prompt was open, and an
+   * answer that names a network other than `ctx.clientNetwork` are refusals: the dApp gets the
+   * 4008 and `onConnectionRejected` runs. The timeout is `handshakeDeadlineMs` (default 120 s).
    */
   onNetworkMismatch?: (
     dapp: DAppMetadata,
@@ -241,8 +251,9 @@ export interface ConnectHostConfig {
    *  have submitted the transfer. It also aborts ctx.signal — it must cancel, not merely
    *  answer. */
   intentDeadlineMs?: number;
-  /** Host-side deadline for onConnectionRequest, in ms. Default: 120000. A handshake
-   *  carries no id, so expiry sends the empty refusal. */
+  /** Host-side deadline for onConnectionRequest and for onNetworkMismatch, in ms. Default:
+   *  120000. A handshake carries no id, so an onConnectionRequest expiry sends the empty
+   *  refusal, while an onNetworkMismatch expiry is a refusal carrying the 4008. */
   handshakeDeadlineMs?: number;
 }
 
