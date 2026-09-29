@@ -181,7 +181,9 @@ export interface ConnectHostConfig {
    * `ctx.clientNetwork.id` and looks its own label up for that id. A `name` on
    * `ctx.clientNetwork` is peer-declared text: the dApp chose it, nothing checks it against the
    * id, and rendering it as a label lets a dApp caption a prompt in its own words. It must not
-   * be used as a label, in the prompt or anywhere else the user reads.
+   * be used as a label, in the prompt or anywhere else the user reads. `dapp.name` and `dapp.url`
+   * are dApp-claimed in exactly the same way, and they are the strings a prompt title reaches for
+   * first: name the requester by `ctx.origin`, which the wallet verified, never by them.
    *
    * RESOLVE BEFORE YOU RELOAD. A wallet that switches network by reloading the page must
    * resolve this promise first: the host still has to post its answer, and the reload tears

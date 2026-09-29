@@ -20,11 +20,16 @@ client protocol and SDK version, and the deadline.
 and the dApp receives the same `INCOMPATIBLE_NETWORK` (4008) frame whether the user refused or the
 wallet is about to switch. The only difference is that an accepted switch skips
 `onConnectionRejected`, so the wallet does not paint an error beside the decision the user just
-took. No dApp code has to change, but nothing retries a 4008: the dApp, or the user, handshakes
-again once the wallet has switched.
+took. No dApp code has to change, but the timing does: once a wallet implements the hook, a dApp on
+the wrong network no longer always gets an instant typed 4008, because the host waits up to 120 s
+for the user while `ConnectClient`'s own handshake timeout is 30 s, so a user who takes longer than
+30 s to answer leaves the dApp rejecting first with an uncoded `Error('Connection timeout')`, which
+a dApp that branches only on `ConnectError.code` drops into its generic branch. Nothing retries a
+4008: the dApp, or the user, handshakes again once the wallet has switched.
 
 The hook is asked for the network check only: never for a protocol or SDK-floor refusal, for a dApp
-that declared no network (or an `id` that is not a non-negative integer), when the wallet does not
+that declared no network (or an `id` that is not a non-negative integer no larger than
+`Number.MAX_SAFE_INTEGER`), when the wallet does not
 know its own network, or for a silent or locked handshake. A throw, a rejection, a timeout, a wallet
 that is locked when its answer is read, and an answer whose `to.id` is not the dApp's network id are
 all refusals. The hook gets no abort signal, only `ctx.expiresAt`: a late answer is ignored by the
@@ -42,13 +47,13 @@ string of at most 64 characters. It is still text the dApp typed, so a wallet ta
 identity from `id` and labels it itself.
 
 - `resolveSphereNetwork(id)` (new) looks a network up by its canonical id and returns the
-  `SPHERE_NETWORKS` entry as a copy, or `undefined`. Its `name` is typed as a key of both
+  `SPHERE_NETWORKS` entry as a copy (typed `SphereNetwork`), or `undefined`. Its `name` is typed as a key of both
   `SPHERE_NETWORKS` and `NETWORKS`, so it can be handed to a network switcher without a cast.
   `NETWORKS` cannot be inverted safely for this: `testnet` and `testnet2` collide on network id 4.
   It is exported from the package root and from `/connect`.
-- The package root now also exports `SPHERE_NETWORKS` and the `NetworkInfo` and `SphereNetworkName`
-  types. `/connect` now exports the `SphereNetworkName`, `NetworkMismatchContext` and
-  `NetworkMismatchDecision` types.
+- The package root now also exports `SPHERE_NETWORKS` and the `NetworkInfo`, `SphereNetworkName` and
+  `SphereNetwork` types. `/connect` now exports the `SphereNetworkName`, `SphereNetwork`,
+  `NetworkMismatchContext` and `NetworkMismatchDecision` types.
 
 ### Fixed — `onConnectionRejected` reported the client's `silent` claim, not the effective one
 

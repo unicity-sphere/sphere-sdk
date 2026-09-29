@@ -14,7 +14,7 @@ ships a few KB, not the wallet SDK:
 
 | Subpath | What it gives you | Where it runs |
 |---------|-------------------|---------------|
-| `@unicitylabs/sphere-sdk/connect` | `ConnectClient`, `ConnectError`, `ERROR_CODES`, `SPHERE_NETWORKS`, `RPC_METHODS`, `INTENT_ACTIONS`, `PERMISSION_SCOPES`, the NFT wire helpers, and `ConnectHost` for wallets | anywhere (browser, Node, a backend service) |
+| `@unicitylabs/sphere-sdk/connect` | `ConnectClient`, `ConnectError`, `ERROR_CODES`, `SPHERE_NETWORKS`, `resolveSphereNetwork` (first release after 0.17.6), `RPC_METHODS`, `INTENT_ACTIONS`, `PERMISSION_SCOPES`, the NFT wire helpers, and `ConnectHost` for wallets | anywhere (browser, Node, a backend service) |
 | `@unicitylabs/sphere-sdk/connect/browser` | `autoConnect`, `PostMessageTransport`, the `isInIframe`/`hasExtension`/`detectTransport` helpers, and the legacy `ExtensionTransport` | browser only |
 | `@unicitylabs/sphere-sdk/connect/nodejs` | `WebSocketTransport` (the `createServer`/`createClient` factory object), `WebSocketServerTransport`, `WebSocketClientTransport`, and the `WebSocketServerConfig` / `WebSocketClientConfig` types | Node.js only |
 
@@ -145,7 +145,7 @@ The registry exposes two entries: `SPHERE_NETWORKS.mainnet` = `{ id: 1, name: 'm
 
 ### resolveSphereNetwork: look a network up by its id (wallet side)
 
-`resolveSphereNetwork(id)` returns the `SPHERE_NETWORKS` entry whose `id` matches, or `undefined` for an id the registry does not hold. It is what a wallet uses to turn the id a dApp declared into its own label, for [`onNetworkMismatch`](#onnetworkmismatch-offer-the-switch-or-refuse). It is exported from `@unicitylabs/sphere-sdk/connect` and from the package root (`SPHERE_NETWORKS` and the `NetworkInfo` type are exported from the root too), from the first release after 0.17.6.
+`resolveSphereNetwork(id)` returns the `SPHERE_NETWORKS` entry whose `id` matches, or `undefined` for an id the registry does not hold. It is what a wallet uses to turn the id a dApp declared into its own label, for [`onNetworkMismatch`](#onnetworkmismatch-offer-the-switch-or-refuse). It is exported from `@unicitylabs/sphere-sdk/connect` and from the package root (`SPHERE_NETWORKS` and the `NetworkInfo` type are exported from the root too), from the first release after 0.17.6. Its return type is exported by name as `SphereNetwork` (the `SPHERE_NETWORKS` entry type, with `name` typed as a network key), from both entries, so a wallet's own types need no `ReturnType<typeof resolveSphereNetwork>`.
 
 ```typescript
 // Needs the first release after 0.17.6: 0.17.6 and earlier do not export it.
@@ -413,10 +413,14 @@ const host = new ConnectHost({
   //
   // A LATE ANSWER IS IGNORED, YOUR SIDE EFFECTS ARE NOT: there is no abort signal, only
   // expiresAt, so check it after the user answers and before you act.
+  //
+  // ONE PROMPT AT A TIME: nothing serialises handshakes, so refuse at once while one is open.
   onNetworkMismatch: async (dapp, { origin, walletNetwork, clientNetwork, expiresAt }) => {
-    const target = resolveSphereNetwork(clientNetwork.id);   // YOUR label, never clientNetwork.name
-    if (!target || !origin) return { action: 'refuse' };     // nothing trustworthy to offer
-    const agreed = await askUserToSwitch({ origin, from: walletNetwork, to: target });
+    // YOUR labels for BOTH networks, never clientNetwork.name and never a bare { id }
+    const target = resolveSphereNetwork(clientNetwork.id);
+    const from = resolveSphereNetwork(walletNetwork.id);
+    if (!target || !from || !origin) return { action: 'refuse' };   // nothing trustworthy to name
+    const agreed = await askUserToSwitch({ origin, from, to: target });
     if (!agreed) return { action: 'refuse' };
     if (Date.now() >= expiresAt) return { action: 'refuse' };   // too late: host answers on its own
     queueNetworkSwitch(target.name);                         // resolve FIRST, reload after
@@ -618,11 +622,11 @@ dApp, or the user, has to handshake again once the wallet is on the dApp's netwo
 handshake connects normally. The hook is available from the first release after 0.17.6.
 
 **When it is asked.** Only when the handshake failed the network check and both networks are known:
-the dApp declared a network whose `id` is a non-negative integer, and the wallet knows its own. The
+the dApp declared a network whose `id` is a non-negative integer (at most `Number.MAX_SAFE_INTEGER`), and the wallet knows its own. The
 host asks before it sends anything and waits for the answer. It never asks:
 
 - for a protocol or SDK-floor refusal (`UNSUPPORTED_PROTOCOL_VERSION`, 4007);
-- for a dApp that declared no network, or one whose `id` is not a non-negative integer;
+- for a dApp that declared no network, or one whose `id` is not a non-negative integer no larger than `Number.MAX_SAFE_INTEGER`;
 - when the wallet does not know its own network;
 - for a silent handshake, or while the wallet is locked (a locked handshake is always silent).
 
@@ -635,7 +639,9 @@ complete it.
 
 **Name the network yourself.** Take the network's identity from `ctx.clientNetwork.id` alone.
 `ctx.clientNetwork.name` is text the dApp typed and nothing checks it against the id: rendering it
-lets a dApp caption your prompt in its own words. Look your own label up with
+lets a dApp caption your prompt in its own words. `dapp.name` and `dapp.url` are dApp-claimed in exactly
+the same way, and they are the strings a prompt title reaches for first: name the requester by
+`ctx.origin`, which the wallet verified, never by them. Look your own label up with
 `resolveSphereNetwork(id)` (see [Network Configuration](#network-configuration)) and refuse when it
 returns `undefined`.
 
@@ -653,6 +659,18 @@ refuses instead, because it checks `expiresAt` after the user answers. The host 
 handshakes either, so a dApp that connects again while your prompt is open reaches the hook a
 second time. Check `ctx.expiresAt` after the user answers and before you act, or make the switch
 idempotent, and close your own prompt when `expiresAt` passes.
+
+A late frame has a limit of its own: handshake frames carry no correlation id. `ConnectClient`
+keeps one handshake in flight and settles it with whichever handshake response arrives next, so a
+frame that arrives after the dApp gave up on its first attempt and started a second one settles the
+second. Neither the host nor the client can tell the two apart.
+
+**Admit one prompt at a time.** The host rate-limits how fast handshakes arrive (`maxRequestsPerSecond`,
+20 by default), not how many of your prompts are open at once, and each one can stay open for
+`handshakeDeadlineMs`. While a prompt is open, answer `{ action: 'refuse' }` at once to every
+further call instead of drawing another. Otherwise a dApp that keeps handshaking buries the user in
+switch dialogs, or leaves several switches queued behind one another that each still run when the
+user gets to them.
 
 **How the host reads what happened while the prompt was open.**
 
@@ -1308,7 +1326,7 @@ try {
 | Code | Constant | When |
 |------|----------|------|
 | 4007 | `ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION` | The compatibility gate refused the handshake: a Connect MAJOR mismatch (e.g. a v1 dApp connecting to a v2 wallet), a protocol MINOR below the host's optional `minMinorVersion`, or — enforced by default — an `sdkVersion` that is missing or below `0.14.1-0` (see [Handshake fields](#handshake-fields)). dApp must update its SDK. |
-| 4008 | `ERROR_CODES.INCOMPATIBLE_NETWORK` | dApp targets a different network than the wallet (or omitted `network` in `ConnectClientConfig`). A wallet that offers a network switch (`onNetworkMismatch`) sends this same frame whether the user refused or the wallet is about to switch, so it does not prove the user said no. |
+| 4008 | `ERROR_CODES.INCOMPATIBLE_NETWORK` | dApp targets a different network than the wallet (or omitted `network` in `ConnectClientConfig`). A wallet that offers a network switch (`onNetworkMismatch`) sends this same frame whether the user refused or the wallet is about to switch, so it does not prove the user said no. Against such a wallet a wrong-network handshake may also come back as an uncoded `Error('Connection timeout')` (the user took longer than the client's `timeout`, 30 s by default, to answer) or as the errorless empty refusal (the wallet's own network changed while its prompt was open), rather than always as a coded 4008. |
 | 4009 | `ERROR_CODES.WALLET_LOCKED` | The wallet is locked. **The session is still alive** — retry after `wallet:unlocked`. Carries `data: { reason: 'locked' }`. Discriminate on the code, never on the message. |
 | 4001 | `ERROR_CODES.NOT_CONNECTED` | No live session: `connect()` has not succeeded, or the session was revoked (`sphere_disconnect`, a logout, expiry, `setUnavailable()`). A query in flight when the session is revoked gets it too. The client also raises it locally, as "Not connected" or "Disconnected". |
 | 4002 | `ERROR_CODES.PERMISSION_DENIED` | Method or intent not in granted permissions. |
