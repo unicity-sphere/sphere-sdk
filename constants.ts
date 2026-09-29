@@ -368,10 +368,11 @@ export const SPHERE_NETWORKS = {
 /** The keys of {@link SPHERE_NETWORKS} — the networks a dApp may declare. */
 export type SphereNetworkName = keyof typeof SPHERE_NETWORKS;
 
-/** One entry of {@link SPHERE_NETWORKS}: what {@link resolveSphereNetwork} returns. Its `name` is a
- *  literal key of both SPHERE_NETWORKS and NETWORKS. Nameable, so a wallet's own types need no
+/** One ENTRY of {@link SPHERE_NETWORKS} (`{ id, name }`), not a network name: {@link NetworkType} is
+ *  the name. It is what {@link resolveSphereNetwork} returns, and its `name` is a literal key of both
+ *  SPHERE_NETWORKS and NETWORKS. Nameable, so a wallet's own types need no
  *  `ReturnType<typeof resolveSphereNetwork>`. */
-export type SphereNetwork = (typeof SPHERE_NETWORKS)[SphereNetworkName];
+export type SphereNetworkEntry = (typeof SPHERE_NETWORKS)[SphereNetworkName];
 
 /**
  * Look a network up by its canonical id.
@@ -386,7 +387,7 @@ export type SphereNetwork = (typeof SPHERE_NETWORKS)[SphereNetworkName];
  * process-wide table. Its `name` is always present and is a key of both SPHERE_NETWORKS and
  * NETWORKS, which is what makes it safe to hand to a network switcher without a cast.
  */
-export function resolveSphereNetwork(id: number): SphereNetwork | undefined {
+export function resolveSphereNetwork(id: number): SphereNetworkEntry | undefined {
   const entry = Object.values(SPHERE_NETWORKS).find((n) => n.id === id);
   return entry === undefined ? undefined : { ...entry };
 }

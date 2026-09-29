@@ -126,11 +126,11 @@ function withDeadline<T>(promise: Promise<T>, ms: number, fallback: () => T): Pr
 type NetworkMismatchOutcome = NetworkMismatchDecision | { action: 'stale' };
 
 /**
- * Call `onNetworkMismatch` and settle within `deadlineMs`. Never throws and never rejects: a
- * synchronous throw, a rejection and a timeout all come back as a refusal, because an escape
- * would reach handleMessage and answer the dApp with the errorless frame instead of the 4008.
- * `err` goes to the logger as its own argument, never interpolated: stringifying an arbitrary
- * thrown value is itself code that can throw.
+ * Call `onNetworkMismatch` and settle within `deadlineMs`. A synchronous throw, a rejection and
+ * a timeout all come back as a refusal, PROVIDED THE LOGGER DOES NOT THROW: each of the three
+ * logs first. If it does, the rejection escapes to handleMessage and the dApp is answered with
+ * the errorless empty refusal instead of the 4008. `err` goes to the logger as its own argument,
+ * never interpolated: stringifying an arbitrary thrown value is itself code that can throw.
  */
 function runNetworkMismatchHook(
   hook: NonNullable<ConnectHostConfig['onNetworkMismatch']>,

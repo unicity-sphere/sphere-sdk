@@ -51,7 +51,7 @@ export type {
   WalletIdentityChangedPayload,
   NetworkInfo,
   SphereNetworkName,
-  SphereNetwork,
+  SphereNetworkEntry,
 } from './protocol';
 
 // Permissions

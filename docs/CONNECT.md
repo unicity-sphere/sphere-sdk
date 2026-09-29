@@ -145,7 +145,7 @@ The registry exposes two entries: `SPHERE_NETWORKS.mainnet` = `{ id: 1, name: 'm
 
 ### resolveSphereNetwork: look a network up by its id (wallet side)
 
-`resolveSphereNetwork(id)` returns the `SPHERE_NETWORKS` entry whose `id` matches, or `undefined` for an id the registry does not hold. It is what a wallet uses to turn the id a dApp declared into its own label, for [`onNetworkMismatch`](#onnetworkmismatch-offer-the-switch-or-refuse). It is exported from `@unicitylabs/sphere-sdk/connect` and from the package root (`SPHERE_NETWORKS` and the `NetworkInfo` type are exported from the root too), from the first release after 0.17.6. Its return type is exported by name as `SphereNetwork` (the `SPHERE_NETWORKS` entry type, with `name` typed as a network key), from both entries, so a wallet's own types need no `ReturnType<typeof resolveSphereNetwork>`.
+`resolveSphereNetwork(id)` returns the `SPHERE_NETWORKS` entry whose `id` matches, or `undefined` for an id the registry does not hold. It is what a wallet uses to turn the id a dApp declared into its own label, for [`onNetworkMismatch`](#onnetworkmismatch-offer-the-switch-or-refuse). It is exported from `@unicitylabs/sphere-sdk/connect` and from the package root (`SPHERE_NETWORKS` and the `NetworkInfo` type are exported from the root too), from the first release after 0.17.6. Its return type is exported by name as `SphereNetworkEntry` (the `SPHERE_NETWORKS` entry type, with `name` typed as a network key), from both entries, so a wallet's own types need no `ReturnType<typeof resolveSphereNetwork>`.
 
 ```typescript
 // Needs the first release after 0.17.6: 0.17.6 and earlier do not export it.
@@ -682,6 +682,7 @@ user gets to them.
 | unchanged | live | `'switch'`, any other `to.id` | the 4008 | called |
 | unchanged | live | `'refuse'`, or anything that is not a decision | the 4008 | called |
 | unchanged | live | threw, rejected, or did not settle within `handshakeDeadlineMs` (default 120 s) | the 4008 | called |
+| unchanged | live | as the row above, and the wallet's own log sink threw on the line the host logs for it | the empty refusal, no error | not called |
 
 `silent` is true only in the locked row: the hook is never asked for a silent handshake, and the
 other rows that call `onConnectionRejected` have a live wallet.

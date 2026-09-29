@@ -5,12 +5,12 @@ import {
   resolveSphereNetwork,
   type NetworkInfo,
   type SphereNetworkName,
-  type SphereNetwork,
+  type SphereNetworkEntry,
 } from '../../../constants';
 import {
   SPHERE_NETWORKS as SN_CONNECT,
   resolveSphereNetwork as resolveViaConnect,
-  type SphereNetwork as ConnectSphereNetwork,
+  type SphereNetworkEntry as ConnectSphereNetworkEntry,
 } from '../../../connect';
 import type * as Root from '../../../index';
 import { checkCompatibility } from '../../../connect/compatibility';
@@ -106,14 +106,14 @@ describe('resolveSphereNetwork', () => {
     expectTypeOf<typeof Root.SPHERE_NETWORKS>().toEqualTypeOf<typeof SPHERE_NETWORKS>();
     expectTypeOf<Root.NetworkInfo>().toEqualTypeOf<NetworkInfo>();
     expectTypeOf<Root.SphereNetworkName>().toEqualTypeOf<SphereNetworkName>();
-    expectTypeOf<Root.SphereNetwork>().toEqualTypeOf<SphereNetwork>();
+    expectTypeOf<Root.SphereNetworkEntry>().toEqualTypeOf<SphereNetworkEntry>();
   });
 
   // Compile-time only, like the block above: the name a consumer types a switcher argument with
   // is the very type the function returns, from every entry that exports it.
   it('names its own return type, from the root, /connect and constants alike', () => {
-    expectTypeOf(resolveSphereNetwork).returns.toEqualTypeOf<SphereNetwork | undefined>();
-    expectTypeOf<ConnectSphereNetwork>().toEqualTypeOf<SphereNetwork>();
-    expectTypeOf<SphereNetwork['name']>().toEqualTypeOf<'mainnet' | 'testnet2'>();
+    expectTypeOf(resolveSphereNetwork).returns.toEqualTypeOf<SphereNetworkEntry | undefined>();
+    expectTypeOf<ConnectSphereNetworkEntry>().toEqualTypeOf<SphereNetworkEntry>();
+    expectTypeOf<SphereNetworkEntry['name']>().toEqualTypeOf<'mainnet' | 'testnet2'>();
   });
 });

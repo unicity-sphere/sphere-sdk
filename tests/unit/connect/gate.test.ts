@@ -313,7 +313,11 @@ describe('ConnectHost network-mismatch hook', () => {
       logger.configure({ debug: false, handler: null });
     }
     // The throw rejects the race, and handleMessage answers a handshake that threw with the empty refusal.
-    expect(handshakeResponses(h.sent)).toHaveLength(1);
+    // This is the narrow row of the outcome table in docs/CONNECT.md: no 4008, no onConnectionRejected.
+    const resp = handshakeResponses(h.sent);
+    expect(resp).toHaveLength(1);
+    expect(resp[0].error).toBeUndefined();
+    expect(h.onConnectionRejected).not.toHaveBeenCalled();
   });
 
   it('refuses a switch when the wallet locked while the prompt was open', async () => {

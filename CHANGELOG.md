@@ -47,12 +47,12 @@ string of at most 64 characters. It is still text the dApp typed, so a wallet ta
 identity from `id` and labels it itself.
 
 - `resolveSphereNetwork(id)` (new) looks a network up by its canonical id and returns the
-  `SPHERE_NETWORKS` entry as a copy (typed `SphereNetwork`), or `undefined`. Its `name` is typed as a key of both
+  `SPHERE_NETWORKS` entry as a copy (typed `SphereNetworkEntry`), or `undefined`. Its `name` is typed as a key of both
   `SPHERE_NETWORKS` and `NETWORKS`, so it can be handed to a network switcher without a cast.
   `NETWORKS` cannot be inverted safely for this: `testnet` and `testnet2` collide on network id 4.
   It is exported from the package root and from `/connect`.
 - The package root now also exports `SPHERE_NETWORKS` and the `NetworkInfo`, `SphereNetworkName` and
-  `SphereNetwork` types. `/connect` now exports the `SphereNetworkName`, `SphereNetwork`,
+  `SphereNetworkEntry` types. `/connect` now exports the `SphereNetworkName`, `SphereNetworkEntry`,
   `NetworkMismatchContext` and `NetworkMismatchDecision` types.
 
 ### Fixed — `onConnectionRejected` reported the client's `silent` claim, not the effective one
