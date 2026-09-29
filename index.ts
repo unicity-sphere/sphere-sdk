@@ -290,7 +290,7 @@ export {
   TIMEOUTS,
   LIMITS,
 } from './constants';
-export type { NetworkType, NetworkInfo, SphereNetworkName } from './constants';
+export type { NetworkType, NetworkInfo, SphereNetworkName, SphereNetwork } from './constants';
 
 // =============================================================================
 // Browser Implementations

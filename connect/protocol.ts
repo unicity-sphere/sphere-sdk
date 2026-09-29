@@ -25,7 +25,7 @@ export { HOST_READY_TYPE, HOST_READY_TIMEOUT, SPHERE_NETWORKS, resolveSphereNetw
 // the name into this module's scope, breaking the local references (TS2304).
 import type { NetworkInfo } from '../constants';
 export type { NetworkInfo };
-export type { SphereNetworkName } from '../constants';
+export type { SphereNetworkName, SphereNetwork } from '../constants';
 
 // =============================================================================
 // RPC Method Names (query — return data, no UI)
