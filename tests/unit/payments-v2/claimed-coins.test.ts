@@ -105,6 +105,12 @@ describe('PaymentsFacade — claimed coins', () => {
 
     expect(result.success).toBe(true);
     await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', 'pending']]));
+    const tokenId = result.tokenId!;
+    await expect(world.facade.send({ recipient: '@peer', amount: '10', coinId: CLAIMED })).rejects.toMatchObject({
+      code: 'SEND_INSUFFICIENT_BALANCE',
+    });
+    await expect(world.facade.sendWholeToken({ recipient: '@peer', tokenId })).rejects.toThrow(/not a spendable holding/);
+    expect(await world.facade.burn({ tokenId, reasonBytes: new Uint8Array([1]) })).toMatchObject({ success: false });
     await vi.advanceTimersByTimeAsync(VERDICT_RETRY_MS);
     await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', null]]));
     expect(verify).toHaveBeenCalledTimes(2);
