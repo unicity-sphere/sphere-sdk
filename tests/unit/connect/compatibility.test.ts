@@ -207,6 +207,54 @@ describe('checkCompatibility', () => {
       });
     });
 
+    // mismatch.clientNetwork is typed NetworkInfo and is about to feed a wallet prompt, so it is
+    // BUILT from checked parts: { id } plus a short string name, nothing else the peer sent. The
+    // raw wire value stays only in error.data.clientNetwork (the payload is a contract).
+    describe('the mismatch carries a sanitised copy of the dApp network', () => {
+      const WALLET_NET = 1;
+      const refuse = (raw: unknown) => {
+        const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: raw as NetworkInfo, walletNetworkId: WALLET_NET });
+        if (r.ok) throw new Error('expected a refusal');
+        // The wire payload never changes: data.clientNetwork is the raw object, by reference.
+        expect((r.error.data as { clientNetwork: unknown }).clientNetwork).toBe(raw);
+        return r;
+      };
+      const expected = (clientNetwork: NetworkInfo) => ({ kind: 'network', walletNetwork: { id: WALLET_NET }, clientNetwork });
+
+      it('keeps a string name', () => {
+        const raw = { id: 4, name: 'testnet2' };
+        const r = refuse(raw);
+        expect(r.mismatch).toStrictEqual(expected({ id: 4, name: 'testnet2' }));
+        expect(r.mismatch?.clientNetwork).not.toBe(raw);   // a copy, not the peer's object
+      });
+
+      it.each([
+        ['a number', 123],
+        ['an object', { evil: true }],
+        ['null', null],
+      ])('drops a name that is %s, leaving no name key at all', (_label, name) => {
+        // toStrictEqual: an undefined-valued `name` key would fail it.
+        expect(refuse({ id: 4, name }).mismatch).toStrictEqual(expected({ id: 4 }));
+      });
+
+      it('drops, rather than truncates, a name over 64 characters', () => {
+        expect(refuse({ id: 4, name: 'x'.repeat(65) }).mismatch).toStrictEqual(expected({ id: 4 }));
+      });
+
+      it('keeps a name of exactly 64 characters', () => {
+        const name = 'x'.repeat(64);
+        expect(refuse({ id: 4, name }).mismatch).toStrictEqual(expected({ id: 4, name }));
+      });
+
+      it('carries nothing else the peer invented', () => {
+        const raw = { id: 4, name: 'testnet2', evil: 'payload' };
+        const r = refuse(raw);
+        expect(r.mismatch).toStrictEqual(expected({ id: 4, name: 'testnet2' }));
+        // ...while the wire payload still echoes the raw object, extra key included.
+        expect((r.error.data as { clientNetwork: unknown }).clientNetwork).toBe(raw);
+      });
+    });
+
     it('carries a well-formed id the wallet has never heard of; resolving it is the wallet\'s job', () => {
       const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: 999 }, walletNetworkId: NET });
       expect(r.ok).toBe(false);

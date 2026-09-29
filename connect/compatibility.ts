@@ -21,6 +21,11 @@ export interface CompatInput {
  * declared none, and a wallet whose own network is the -1 sentinel, both refuse with
  * the same error and no mismatch. The host branches on THIS, never on error.code —
  * a protocol failure must be structurally unable to raise a user prompt.
+ *
+ * `clientNetwork` is a sanitised COPY, not the peer's object: `{ id }` (a non-negative
+ * integer) plus `name` only when it is a string of at most 64 characters. Nothing else
+ * the peer sent is carried. It is still peer-declared, so never render it as a label.
+ * `error.data.clientNetwork`, by contrast, echoes the raw wire value unchanged.
  */
 export interface NetworkMismatch {
   readonly kind: 'network';
@@ -42,6 +47,13 @@ function fail(
 }
 
 /**
+ * Longest peer-declared network name a mismatch will carry. The wallet never prints it
+ * (network labels come from the wallet's own table, never from the peer); it rides along
+ * only so a log line can say what the dApp claimed. Longer names are dropped, not truncated.
+ */
+const MAX_NETWORK_NAME_LENGTH = 64;
+
+/**
  * `CompatInput.clientNetwork` is typed `NetworkInfo`, but it is the handshake's
  * `msg.network` straight off the wire. `isSphereConnectMessage` checks only the
  * namespace (plus the version on non-handshake frames), nothing else inspects `network`
@@ -55,6 +67,17 @@ function isOfferableNetwork(value: unknown): value is NetworkInfo {
   if (typeof value !== 'object' || value === null) return false;
   const id = (value as { id?: unknown }).id;
   return typeof id === 'number' && Number.isInteger(id) && id >= 0;
+}
+
+/**
+ * The copy a mismatch carries: `{ id }` plus `name` only when it is a string of at most
+ * MAX_NETWORK_NAME_LENGTH characters. Built, never spread, so no other key the peer sent
+ * survives, and no `name` key exists at all when it is dropped. Takes an already-validated
+ * network (see isOfferableNetwork), so `id` needs no further check here.
+ */
+function sanitizedNetwork(net: NetworkInfo): NetworkInfo {
+  const { id, name } = net;
+  return typeof name === 'string' && name.length <= MAX_NETWORK_NAME_LENGTH ? { id, name } : { id };
 }
 
 /**
@@ -112,12 +135,16 @@ export function checkCompatibility(input: CompatInput): CompatResult {
     // know its own network". 0 is a real id: the test is `< 0`, never falsiness.
     // The refusal above is identical either way; only the mismatch is withheld.
     if (!isOfferableNetwork(input.clientNetwork) || input.walletNetworkId < 0) return refusal;
+    // The mismatch carries a COPY built from checked parts, never the peer's object:
+    // typed `NetworkInfo` must mean what it says, and nothing else the peer sent (extra
+    // keys, a non-string or oversized name) travels with it. `error.data.clientNetwork`
+    // above is deliberately still the raw value: that is the wire payload.
     return {
       ...refusal,
       mismatch: {
         kind: 'network',
         walletNetwork: { id: input.walletNetworkId },
-        clientNetwork: input.clientNetwork,
+        clientNetwork: sanitizedNetwork(input.clientNetwork),
       },
     };
   }
