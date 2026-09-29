@@ -181,6 +181,10 @@ export interface ConnectHostConfig {
    * resolve this promise first: the host still has to post its answer, and the reload tears
    * down the window that would post it.
    *
+   * A wallet that rebinds in place (`updateSphere`) while this promise is pending is answered
+   * with the empty refusal instead, whatever it resolves: the comparison the host made no
+   * longer holds, and the dApp reads an empty refusal as "not ready, handshake again".
+   *
    * A throw, a rejection or a timeout is a refusal. The host's budget is
    * `handshakeDeadlineMs` (default 120 s).
    */

@@ -768,6 +768,7 @@ describe('end-to-end gate over the mock transport pair', () => {
     new ConnectHost({
       sphere: createMockSphere(),
       transport: hostT,
+      origin: 'https://d',
       onConnectionRequest: async () => ({ approved: true, grantedPermissions: [] }),
       onIntent: async () => ({}),
       onNetworkMismatch,

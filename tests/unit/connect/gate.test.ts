@@ -97,14 +97,13 @@ function makeHostHarness(opts?: {
   const onConnectionRequest = vi.fn(async () => ({ approved: true, grantedPermissions: [PERMISSION_SCOPES.IDENTITY_READ] }));
   const host = new ConnectHost({
     sphere, transport, onConnectionRequest, onConnectionRejected, onIntent: vi.fn(),
-    onNetworkMismatch: opts?.onNetworkMismatch,
     ...opts,
   });
   // Deliberately UNTYPED wire input: these tests hand the host off-version handshakes
   // (v: '1.0'), which `SphereConnectMessage` cannot express by construction.
   const send = (msg: Record<string, unknown>) =>
     clientHandler?.({ ns: SPHERE_CONNECT_NAMESPACE, type: 'handshake', direction: 'request', permissions: [], ...msg } as unknown as SphereConnectMessage);
-  return { host, sent, send, onConnectionRejected, onConnectionRequest };
+  return { host, sent, send, onConnectionRejected, onConnectionRequest, sphere };
 }
 
 const handshakeResponses = (sent: SphereConnectMessage[]) =>
@@ -203,6 +202,7 @@ describe('ConnectHost network-mismatch hook', () => {
     const withHook = makeHostHarness({ onNetworkMismatch: async () => ({ action: 'switch', to: { id: 1 } }) });
     withHook.send(MISMATCH);
     await new Promise((r) => setTimeout(r, 0));
+    expect(handshakeResponses(withHook.sent)).toHaveLength(1);
     const switched = handshakeResponses(withHook.sent)[0];
 
     const plain = makeHostHarness();
@@ -249,6 +249,17 @@ describe('ConnectHost network-mismatch hook', () => {
     expect(h.onConnectionRejected).toHaveBeenCalledTimes(1);
   });
 
+  it('refuses when the thrown value cannot even be turned into a string', async () => {
+    const hostile = { toString(): string { throw new Error('no string for you'); } };
+    const h = makeHostHarness({ onNetworkMismatch: async () => { throw hostile; } });
+    h.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 0));
+    const resp = handshakeResponses(h.sent);
+    expect(resp).toHaveLength(1);
+    expect((resp[0].error as { code: number }).code).toBe(ERROR_CODES.INCOMPATIBLE_NETWORK);
+    expect(h.onConnectionRejected).toHaveBeenCalledTimes(1);
+  });
+
   it('refuses when the hook answers with nothing at all', async () => {
     const answersNothing = (async () => undefined) as unknown as ConnectHostConfig['onNetworkMismatch'];
     const h = makeHostHarness({ onNetworkMismatch: answersNothing });
@@ -279,6 +290,43 @@ describe('ConnectHost network-mismatch hook', () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(handshakeResponses(harness.sent)).toHaveLength(1);
     expect(harness.onConnectionRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['switch', 'refuse'] as const)(
+    'sends only the empty refusal when the wallet network moved under the prompt, whatever the hook answers (%s)',
+    async (answer) => {
+      const harness: ReturnType<typeof makeHostHarness> = makeHostHarness({
+        onNetworkMismatch: async () => {
+          harness.host.updateSphere({ ...harness.sphere, networkId: 1 });   // rebind while the prompt is open
+          return answer === 'switch' ? { action: 'switch', to: { id: 1 } } : { action: 'refuse' };
+        },
+      });
+      harness.send(MISMATCH);
+      await new Promise((r) => setTimeout(r, 0));
+      const resp = handshakeResponses(harness.sent);
+      expect(resp).toHaveLength(1);
+      expect(resp[0].error).toBeUndefined();             // no 4008 describing a comparison that is no longer true
+      expect(resp[0].sessionId).toBeUndefined();
+      expect(harness.onConnectionRejected).not.toHaveBeenCalled();
+    },
+  );
+
+  it('answers a handshake retried after the rebind against the wallet’s new network', async () => {
+    const harness: ReturnType<typeof makeHostHarness> = makeHostHarness({
+      onNetworkMismatch: async () => {
+        harness.host.updateSphere({ ...harness.sphere, networkId: 1 });
+        return { action: 'switch', to: { id: 1 } };
+      },
+    });
+    harness.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 0));
+    harness.send(MISMATCH);                              // the dApp reads the empty refusal as "not ready"
+    await new Promise((r) => setTimeout(r, 0));
+    const [first, second] = handshakeResponses(harness.sent);
+    expect(first.error).toBeUndefined();
+    expect(second.error).toBeUndefined();
+    expect(second.sessionId).toBeTypeOf('string');
+    expect((second.network as { id: number }).id).toBe(1);
   });
 
   it('is never called while the wallet is locked', async () => {

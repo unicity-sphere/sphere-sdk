@@ -102,9 +102,10 @@ const DEFAULT_REQUEST_DEADLINE_MS = 25000;
 const DEFAULT_INTENT_DEADLINE_MS = 180000;
 const DEFAULT_HANDSHAKE_DEADLINE_MS = 120000;
 
-/** Resolve `promise`, or `fallback()` after `ms`. Used ONLY for onConnectionRequest, which
- *  has no id and therefore cannot live in InFlightRegistry. A rejection still propagates,
- *  so handleHandshake's own error handling is unchanged. */
+/** Resolve `promise`, or `fallback()` after `ms`. Used for the two handshake-time prompts,
+ *  onConnectionRequest and onNetworkMismatch, which have no id and therefore cannot live in
+ *  InFlightRegistry. A rejection still propagates, so handleHandshake's own error handling
+ *  is unchanged. */
 function withDeadline<T>(promise: Promise<T>, ms: number, fallback: () => T): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => resolve(fallback()), ms);
@@ -113,6 +114,36 @@ function withDeadline<T>(promise: Promise<T>, ms: number, fallback: () => T): Pr
       (error) => { clearTimeout(timer); reject(error); },
     );
   });
+}
+
+/** What `askNetworkMismatch` tells `handleHandshake`. 'stale' is host-internal and never part
+ *  of the public decision: the wallet's network moved while the prompt was open. */
+type NetworkMismatchOutcome = NetworkMismatchDecision | { action: 'stale' };
+
+/**
+ * Call `onNetworkMismatch` and settle within `deadlineMs`. Never throws and never rejects: a
+ * synchronous throw, a rejection and a timeout all come back as a refusal, because an escape
+ * would reach handleMessage and answer the dApp with the errorless frame instead of the 4008.
+ * `err` goes to the logger as its own argument, never interpolated: stringifying an arbitrary
+ * thrown value is itself code that can throw.
+ */
+function runNetworkMismatchHook(
+  hook: NonNullable<ConnectHostConfig['onNetworkMismatch']>,
+  dapp: DAppMetadata,
+  ctx: NetworkMismatchContext,
+  deadlineMs: number,
+): Promise<NetworkMismatchDecision> {
+  return withDeadline(
+    new Promise<NetworkMismatchDecision>((resolve) => resolve(hook(dapp, ctx))).catch((err: unknown) => {
+      logger.warn('ConnectHost', 'onNetworkMismatch threw — refusing', err);
+      return { action: 'refuse' } as NetworkMismatchDecision;
+    }),
+    deadlineMs,
+    () => {
+      logger.warn('ConnectHost', 'Network-switch prompt timed out', { dapp: dapp.name });
+      return { action: 'refuse' } as NetworkMismatchDecision;
+    },
+  );
 }
 
 export class ConnectHost {
@@ -616,6 +647,13 @@ export class ConnectHost {
         ? await this.askNetworkMismatch(dapp, result.mismatch, msg, silent)
         : ({ action: 'refuse' } as const);
 
+      // The wallet's network moved while it was asked, so `result.error` describes a comparison
+      // that no longer holds. Send the empty refusal the `stateAfterPrompt` guard sends.
+      if (decision.action === 'stale') {
+        this.sendHandshakeResponse([], undefined, undefined);
+        return;
+      }
+
       // The dApp gets the same frame either way. The only difference is that a wallet which
       // is about to switch must not also be told to paint a rejection.
       if (decision.action !== 'switch') {
@@ -742,18 +780,24 @@ export class ConnectHost {
    * either answer; a 'switch' only skips `onConnectionRejected`. So a throw (synchronous or
    * not), a timeout, an answer that is not a decision, a wallet that left 'live' while the
    * prompt was open, and a network the dApp did not ask for are all refusals, never an error.
+   *
+   * The one exception is 'stale': the wallet's own network moved while the prompt was open,
+   * whatever it then answered. The frame's `error.data` would describe a comparison that no
+   * longer holds, so the caller sends the empty refusal instead, which the dApp reads as "not
+   * ready, handshake again" and which is then answered against the network the wallet is on.
    */
   private async askNetworkMismatch(
     dapp: DAppMetadata,
     mismatch: NetworkMismatch,
     msg: SphereHandshake,
     silent: boolean,
-  ): Promise<NetworkMismatchDecision> {
+  ): Promise<NetworkMismatchOutcome> {
     const hook = this.config.onNetworkMismatch;
     if (!hook || silent) return { action: 'refuse' };
 
     const deadlineMs = this.config.handshakeDeadlineMs ?? DEFAULT_HANDSHAKE_DEADLINE_MS;
     const stateBefore = this._walletState;
+    const networkBefore = this.snapshot.networkId ?? -1;   // exactly what the gate compared against
     const ctx: NetworkMismatchContext = {
       origin: this.config.origin,
       walletNetwork: mismatch.walletNetwork,
@@ -763,29 +807,29 @@ export class ConnectHost {
       expiresAt: Date.now() + deadlineMs,
     };
 
-    const decision = await withDeadline(
-      new Promise<NetworkMismatchDecision>((resolve) => resolve(hook(dapp, ctx))).catch((err: unknown) => {
-        logger.warn('ConnectHost', `onNetworkMismatch threw — refusing (${String(err)})`);
-        return { action: 'refuse' } as NetworkMismatchDecision;
-      }),
-      deadlineMs,
-      () => {
-        logger.warn('ConnectHost', 'Network-switch prompt timed out', { dapp: dapp.name });
-        return { action: 'refuse' } as NetworkMismatchDecision;
-      },
-    );
+    const decision = await runNetworkMismatchHook(hook, dapp, ctx, deadlineMs);
+
+    // updateSphere() rebinds a live host without leaving 'live', so the state guard below
+    // cannot see a network change. Read the network again, and let staleness decide.
+    const networkNow = this.snapshot.networkId ?? -1;
+    if (networkNow !== networkBefore) {
+      logger.warn('ConnectHost', 'Wallet network changed while the network-switch prompt was open — sending the empty refusal', { before: networkBefore, now: networkNow });
+      return { action: 'stale' };
+    }
 
     if (decision?.action !== 'switch') return { action: 'refuse' };
 
-    // Human-time await, so the same re-read the approval prompt does below: the wallet can
-    // have locked, logged out or gone unavailable while the prompt was open.
+    // The wallet can have locked, logged out or gone unavailable while the prompt was open, so
+    // re-read the state as handleHandshake does after onConnectionRequest (`stateAfterPrompt`).
+    // `!== stateBefore` is redundant today (a hook is only asked while 'live'); it stays as
+    // deliberate belt-and-braces so a state added later cannot slip through.
     if (this._walletState !== 'live' || this._walletState !== stateBefore) {
       logger.warn('ConnectHost', `Wallet left 'live' while the network-switch prompt was open — refusing (state=${this._walletState})`);
       return { action: 'refuse' };
     }
     // A wallet bug must never make the host promise a network nobody asked for.
     if (decision.to?.id !== mismatch.clientNetwork.id) {
-      logger.warn('ConnectHost', `onNetworkMismatch answered with network ${String(decision.to?.id)} but the dApp asked for ${mismatch.clientNetwork.id} — refusing`);
+      logger.warn('ConnectHost', 'onNetworkMismatch answered with a network the dApp did not ask for — refusing', { answered: decision.to?.id, asked: mismatch.clientNetwork.id });
       return { action: 'refuse' };
     }
     return decision;
