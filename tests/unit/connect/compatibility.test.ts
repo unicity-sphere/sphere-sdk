@@ -77,6 +77,63 @@ describe('checkCompatibility', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.code).toBe(ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION);
   });
+
+  // The host uses this field, NOT error.code, to decide whether a refusal may be turned into
+  // a "switch network?" prompt. It must therefore be impossible for any non-network failure to
+  // carry it, and impossible for a network failure with nothing to offer to carry it either.
+  describe('network mismatch discriminator', () => {
+    it('is populated for a plain wrong-network refusal, carrying both sides', () => {
+      const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: 1, name: 'mainnet' }, walletNetworkId: NET });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.mismatch).toEqual({
+          kind: 'network',
+          walletNetwork: { id: NET },
+          clientNetwork: { id: 1, name: 'mainnet' },
+        });
+      }
+    });
+
+    it('is absent when the dApp declared no network — there is nothing to switch to', () => {
+      const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: undefined, walletNetworkId: NET });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error.code).toBe(ERROR_CODES.INCOMPATIBLE_NETWORK);
+        expect(r.mismatch).toBeUndefined();
+      }
+    });
+
+    it('is absent when the wallet network is the -1 sentinel', () => {
+      const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: 4 }, walletNetworkId: -1 });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.mismatch).toBeUndefined();
+    });
+
+    it('is absent for every protocol/SDK failure, even when the network also differs', () => {
+      const major = checkCompatibility({ clientProtocol: '1.0', walletProtocol: W, clientNetwork: { id: 1 }, walletNetworkId: NET });
+      const minor = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: 1 }, walletNetworkId: NET, minMinor: 9 });
+      const sdk = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: 1 }, walletNetworkId: NET, minSdkVersion: '9.9.9', clientSdkVersion: '0.1.0' });
+      for (const r of [major, minor, sdk]) {
+        expect(r.ok).toBe(false);
+        if (!r.ok) {
+          expect(r.error.code).toBe(ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION);
+          expect(r.mismatch).toBeUndefined();
+        }
+      }
+    });
+
+    it('does not change the error payload one bit', () => {
+      const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: 1 }, walletNetworkId: NET });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error).toEqual({
+          code: ERROR_CODES.INCOMPATIBLE_NETWORK,
+          message: 'dApp targets a different network than the wallet',
+          data: { reason: 'network_incompatible', walletNetwork: { id: NET }, clientNetwork: { id: 1 } },
+        });
+      }
+    });
+  });
 });
 
 /**

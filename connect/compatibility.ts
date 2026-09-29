@@ -15,14 +15,29 @@ export interface CompatInput {
   minSdkVersion?: string;
 }
 
-export type CompatResult = { ok: true } | { ok: false; error: SphereRpcError };
+/**
+ * A refusal the wallet can act on rather than merely report. Populated ONLY by the
+ * network check, and only when there is a concrete network to offer: a dApp that
+ * declared none, and a wallet whose own network is the -1 sentinel, both refuse with
+ * the same error and no mismatch. The host branches on THIS, never on error.code —
+ * a protocol failure must be structurally unable to raise a user prompt.
+ */
+export interface NetworkMismatch {
+  readonly kind: 'network';
+  readonly walletNetwork: NetworkInfo;
+  readonly clientNetwork: NetworkInfo;
+}
+
+export type CompatResult =
+  | { ok: true }
+  | { ok: false; error: SphereRpcError; mismatch?: NetworkMismatch };
 
 function fail(
   code: number,
   reason: IncompatibleReason,
   message: string,
   extra: Record<string, unknown>,
-): CompatResult {
+): { ok: false; error: SphereRpcError } {
   return { ok: false, error: { code, message, data: { reason, ...extra } } };
 }
 
@@ -70,9 +85,21 @@ export function checkCompatibility(input: CompatInput): CompatResult {
 
   // 4. Network must match (a missing network is treated as a mismatch).
   if (!input.clientNetwork || input.clientNetwork.id !== input.walletNetworkId) {
-    return fail(ERROR_CODES.INCOMPATIBLE_NETWORK, 'network_incompatible',
+    const refusal = fail(ERROR_CODES.INCOMPATIBLE_NETWORK, 'network_incompatible',
       'dApp targets a different network than the wallet',
       { walletNetwork: { id: input.walletNetworkId }, clientNetwork: input.clientNetwork ?? null });
+    // Offerable only when both sides are real: an undeclared network gives the wallet
+    // nothing to switch to, and walletNetworkId is `snapshot.networkId ?? -1` at the
+    // call site, so -1 means "the wallet does not know its own network".
+    if (!input.clientNetwork || input.walletNetworkId < 0) return refusal;
+    return {
+      ...refusal,
+      mismatch: {
+        kind: 'network',
+        walletNetwork: { id: input.walletNetworkId },
+        clientNetwork: input.clientNetwork,
+      },
+    };
   }
 
   return { ok: true };
