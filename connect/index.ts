@@ -94,4 +94,6 @@ export type {
   WalletState,
   LockedRequestContext,
   IntentContext,
+  NetworkMismatchContext,
+  NetworkMismatchDecision,
 } from './types';

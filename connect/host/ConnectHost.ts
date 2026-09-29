@@ -16,12 +16,15 @@ import type {
   WalletState,
   LockedRequestContext,
   IntentContext,
+  NetworkMismatchContext,
+  NetworkMismatchDecision,
 } from '../types';
 import type {
   SphereConnectMessage,
   SphereRpcRequest,
   SphereIntentRequest,
   SphereHandshake,
+  DAppMetadata,
   PublicIdentity,
   SphereRpcError,
   NetworkInfo,
@@ -42,6 +45,7 @@ import {
   DEFAULT_MIN_CLIENT_SDK_VERSION,
 } from '../protocol';
 import { checkCompatibility } from '../compatibility';
+import type { NetworkMismatch } from '../compatibility';
 import { SDK_VERSION } from '../version';
 import {
   DEFAULT_PERMISSIONS,
@@ -605,7 +609,18 @@ export class ConnectHost {
         clientNetwork: msg.network ?? null,
         walletNetwork: this.snapshot.networkId ?? null,
       });
-      this.config.onConnectionRejected?.(dapp, result.error, silent);
+      // A wrong network is the one refusal the wallet can act on: it can offer to switch.
+      // Ask here, where the verdict exists and nothing has been sent yet. Everything else
+      // refuses immediately, and the typed `mismatch` is what makes that structural.
+      const decision = result.mismatch
+        ? await this.askNetworkMismatch(dapp, result.mismatch, msg, silent)
+        : ({ action: 'refuse' } as const);
+
+      // The dApp gets the same frame either way. The only difference is that a wallet which
+      // is about to switch must not also be told to paint a rejection.
+      if (decision.action !== 'switch') {
+        this.config.onConnectionRejected?.(dapp, result.error, silent);
+      }
       this.sendHandshakeResponse([], undefined, undefined, result.error, msg.v);
       return;
     }
@@ -714,6 +729,66 @@ export class ConnectHost {
       locked ? true : undefined,
     );
     if (locked) this.pushClientEvent(WALLET_EVENTS.LOCKED, {} as WalletLockedPayload);
+  }
+
+  /**
+   * Ask the wallet whether it wants to switch networks instead of being refused. Returns a
+   * refusal for every reason a prompt must not appear, so the caller has one branch.
+   *
+   * `silent` is `msg.silent === true || locked`, so it already covers a locked wallet: a
+   * locked or silent handshake never reaches the hook, because a prompt is a surface.
+   *
+   * Nothing here changes what the dApp is told. The caller sends the same 4008 frame for
+   * either answer; a 'switch' only skips `onConnectionRejected`. So a throw (synchronous or
+   * not), a timeout, an answer that is not a decision, a wallet that left 'live' while the
+   * prompt was open, and a network the dApp did not ask for are all refusals, never an error.
+   */
+  private async askNetworkMismatch(
+    dapp: DAppMetadata,
+    mismatch: NetworkMismatch,
+    msg: SphereHandshake,
+    silent: boolean,
+  ): Promise<NetworkMismatchDecision> {
+    const hook = this.config.onNetworkMismatch;
+    if (!hook || silent) return { action: 'refuse' };
+
+    const deadlineMs = this.config.handshakeDeadlineMs ?? DEFAULT_HANDSHAKE_DEADLINE_MS;
+    const stateBefore = this._walletState;
+    const ctx: NetworkMismatchContext = {
+      origin: this.config.origin,
+      walletNetwork: mismatch.walletNetwork,
+      clientNetwork: mismatch.clientNetwork,
+      clientProtocol: msg.v,
+      clientSdkVersion: msg.sdkVersion,
+      expiresAt: Date.now() + deadlineMs,
+    };
+
+    const decision = await withDeadline(
+      new Promise<NetworkMismatchDecision>((resolve) => resolve(hook(dapp, ctx))).catch((err: unknown) => {
+        logger.warn('ConnectHost', `onNetworkMismatch threw — refusing (${String(err)})`);
+        return { action: 'refuse' } as NetworkMismatchDecision;
+      }),
+      deadlineMs,
+      () => {
+        logger.warn('ConnectHost', 'Network-switch prompt timed out', { dapp: dapp.name });
+        return { action: 'refuse' } as NetworkMismatchDecision;
+      },
+    );
+
+    if (decision?.action !== 'switch') return { action: 'refuse' };
+
+    // Human-time await, so the same re-read the approval prompt does below: the wallet can
+    // have locked, logged out or gone unavailable while the prompt was open.
+    if (this._walletState !== 'live' || this._walletState !== stateBefore) {
+      logger.warn('ConnectHost', `Wallet left 'live' while the network-switch prompt was open — refusing (state=${this._walletState})`);
+      return { action: 'refuse' };
+    }
+    // A wallet bug must never make the host promise a network nobody asked for.
+    if (decision.to?.id !== mismatch.clientNetwork.id) {
+      logger.warn('ConnectHost', `onNetworkMismatch answered with network ${String(decision.to?.id)} but the dApp asked for ${mismatch.clientNetwork.id} — refusing`);
+      return { action: 'refuse' };
+    }
+    return decision;
   }
 
   // `warning` is a forward-compatible deprecation-notice slot (see SphereHandshake.warning);

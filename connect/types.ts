@@ -73,6 +73,36 @@ export interface IntentContext {
   readonly signal: AbortSignal;
 }
 
+/**
+ * Context handed to {@link ConnectHostConfig.onNetworkMismatch}. Unlike
+ * {@link ConnectHostConfig.onConnectionRejected}, this one is asked BEFORE the host answers,
+ * and the host waits for it.
+ */
+export interface NetworkMismatchContext {
+  /** ConnectHostConfig.origin, when the wallet supplied one. NEVER the dApp-claimed
+   *  `dapp.url`. A wallet that cannot name a verified origin should refuse: the prompt
+   *  it would draw has nothing trustworthy to name. */
+  readonly origin?: string;
+  /** The wallet's own network, as the gate compared it. */
+  readonly walletNetwork: NetworkInfo;
+  /** The network the dApp declared. Never absent: a dApp that declared none is refused
+   *  without ever reaching this hook. Take the network's IDENTITY from `id` alone. Any `name`
+   *  here is text the dApp typed: the host copies it (at most 64 characters) but never
+   *  vouches for it, so it must not be rendered as a label or used to pick a network. */
+  readonly clientNetwork: NetworkInfo;
+  /** Inline, like onConnectionRequest's clientInfo. There is no named ClientInfo type. */
+  readonly clientProtocol: string;
+  readonly clientSdkVersion?: string;
+  /** Epoch ms after which the host answers on its own, with a refusal. */
+  readonly expiresAt: number;
+}
+
+/** Answer to {@link ConnectHostConfig.onNetworkMismatch}. */
+export type NetworkMismatchDecision =
+  | { action: 'refuse' }
+  /** The wallet is switching to `to`, which MUST equal the dApp's declared network. */
+  | { action: 'switch'; to: NetworkInfo };
+
 // =============================================================================
 // ConnectHost Config
 // =============================================================================
@@ -126,6 +156,38 @@ export interface ConnectHostConfig {
    *  in its UI. Does NOT affect the decision (the host already decided). `silent` is true for
    *  auto-connect attempts — the wallet should not show UI for those. */
   onConnectionRejected?: (dapp: DAppMetadata | undefined, error: SphereRpcError, silent?: boolean) => void;
+
+  /**
+   * The handshake failed the NETWORK check and the wallet may be able to fix it by switching
+   * networks. Asked BEFORE the dApp is answered, and awaited — this is the one gate callback
+   * that can change what the host does next.
+   *
+   * It is never called for a protocol or SDK-version refusal, never for a dApp that declared
+   * no network, never when the wallet does not know its own network, and never for a silent
+   * or locked handshake.
+   *
+   * Return `{ action: 'switch', to }` only once the user has agreed; `to` must be the network
+   * in `ctx.clientNetwork`. The dApp is answered identically either way — the only difference
+   * is that `onConnectionRejected` is NOT called for a switch, so the wallet does not paint an
+   * error beside the decision the user just took.
+   *
+   * NAME THE NETWORK YOURSELF. The wallet gets the network's identity from
+   * `ctx.clientNetwork.id` and looks its own label up for that id. A `name` on
+   * `ctx.clientNetwork` is peer-declared text: the dApp chose it, nothing checks it against the
+   * id, and rendering it as a label lets a dApp caption a prompt in its own words. It must not
+   * be used as a label, in the prompt or anywhere else the user reads.
+   *
+   * RESOLVE BEFORE YOU RELOAD. A wallet that switches network by reloading the page must
+   * resolve this promise first: the host still has to post its answer, and the reload tears
+   * down the window that would post it.
+   *
+   * A throw, a rejection or a timeout is a refusal. The host's budget is
+   * `handshakeDeadlineMs` (default 120 s).
+   */
+  onNetworkMismatch?: (
+    dapp: DAppMetadata,
+    ctx: NetworkMismatchContext,
+  ) => Promise<NetworkMismatchDecision> | NetworkMismatchDecision;
 
   /**
    * Notify-only: the host has just answered WALLET_LOCKED (4009) to a query or intent, or

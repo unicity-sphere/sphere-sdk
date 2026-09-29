@@ -761,4 +761,27 @@ describe('end-to-end gate over the mock transport pair', () => {
     expect(err).toBeInstanceOf(ConnectError);
     expect((err as ConnectError).code).toBe(ERROR_CODES.INCOMPATIBLE_NETWORK);
   });
+
+  it('answers the dApp promptly even when the wallet accepts the switch', async () => {
+    const { host: hostT, client: clientT } = createMockTransportPair();
+    const onNetworkMismatch = vi.fn(async () => ({ action: 'switch' as const, to: { id: 1 } }));
+    new ConnectHost({
+      sphere: createMockSphere(),
+      transport: hostT,
+      onConnectionRequest: async () => ({ approved: true, grantedPermissions: [] }),
+      onIntent: async () => ({}),
+      onNetworkMismatch,
+    });
+    const client = new ConnectClient({
+      transport: clientT,
+      dapp: { name: 'd', url: 'https://d' },
+      permissions: [],
+      network: { id: 1 },                 // the mock sphere is on 4
+    });
+
+    // A host that waits for the wallet and forgets to answer hangs the dApp for its full 30 s
+    // timeout, which the test timeout turns into a failure.
+    await expect(client.connect()).rejects.toMatchObject({ code: ERROR_CODES.INCOMPATIBLE_NETWORK });
+    expect(onNetworkMismatch).toHaveBeenCalledTimes(1);
+  });
 });

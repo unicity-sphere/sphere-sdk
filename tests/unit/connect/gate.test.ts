@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ConnectClient, ConnectError } from '../../../connect/client/ConnectClient';
 import { ConnectHost } from '../../../connect/host/ConnectHost';
-import type { ConnectTransport, SphereConnectMessage } from '../../../connect/types';
+import type { ConnectTransport, ConnectHostConfig, NetworkMismatchContext, SphereConnectMessage } from '../../../connect/types';
 import { SDK_VERSION } from '../../../connect/version';
 import { ERROR_CODES, SPHERE_CONNECT_NAMESPACE, SPHERE_CONNECT_VERSION } from '../../../connect/protocol';
 import { PERMISSION_SCOPES } from '../../../connect/permissions';
@@ -72,7 +72,12 @@ describe('ConnectClient gate', () => {
 
 // ---- Host-side gate tests ----
 
-function makeHostHarness(opts?: { minMinorVersion?: number }) {
+function makeHostHarness(opts?: {
+  minMinorVersion?: number;
+  onNetworkMismatch?: ConnectHostConfig['onNetworkMismatch'];
+  handshakeDeadlineMs?: number;
+  origin?: string;
+}) {
   const sent: SphereConnectMessage[] = [];
   let clientHandler: ((m: SphereConnectMessage) => void) | undefined;
   const transport: ConnectTransport = {
@@ -90,7 +95,11 @@ function makeHostHarness(opts?: { minMinorVersion?: number }) {
   };
   const onConnectionRejected = vi.fn();
   const onConnectionRequest = vi.fn(async () => ({ approved: true, grantedPermissions: [PERMISSION_SCOPES.IDENTITY_READ] }));
-  const host = new ConnectHost({ sphere, transport, onConnectionRequest, onConnectionRejected, onIntent: vi.fn(), ...opts });
+  const host = new ConnectHost({
+    sphere, transport, onConnectionRequest, onConnectionRejected, onIntent: vi.fn(),
+    onNetworkMismatch: opts?.onNetworkMismatch,
+    ...opts,
+  });
   // Deliberately UNTYPED wire input: these tests hand the host off-version handshakes
   // (v: '1.0'), which `SphereConnectMessage` cannot express by construction.
   const send = (msg: Record<string, unknown>) =>
@@ -150,5 +159,148 @@ describe('ConnectHost gate', () => {
     expect(resp.error).toBeUndefined();
     expect((resp.network as { id: number }).id).toBe(WALLET_NET);
     expect(resp.v).toBe(SPHERE_CONNECT_VERSION);
+  });
+});
+
+describe('ConnectHost network-mismatch hook', () => {
+  const MISMATCH = { v: SPHERE_CONNECT_VERSION, sdkVersion: SDK_VERSION, dapp: { name: 'd', url: 'https://d' }, network: { id: 1 } };
+
+  it('is not called for a protocol refusal — only the network check may prompt', async () => {
+    const onNetworkMismatch = vi.fn(async () => ({ action: 'refuse' as const }));
+    const h = makeHostHarness({ onNetworkMismatch });
+    h.send({ v: '1.0', dapp: { name: 'old', url: 'https://old' }, network: { id: WALLET_NET } });
+    await Promise.resolve();
+    expect(onNetworkMismatch).not.toHaveBeenCalled();
+  });
+
+  it('is called before any frame is sent, with both networks and the client protocol', async () => {
+    let sentWhenAsked = -1;
+    const onNetworkMismatch = vi.fn(async (_dapp: unknown, _ctx: NetworkMismatchContext) => {
+      sentWhenAsked = harness.sent.length;              // harness is assigned before any send
+      return { action: 'refuse' as const };
+    });
+    const harness: ReturnType<typeof makeHostHarness> = makeHostHarness({ onNetworkMismatch });
+    harness.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sentWhenAsked).toBe(0);                       // nothing had been sent yet
+    const ctx = onNetworkMismatch.mock.calls[0][1];
+    expect(ctx.walletNetwork).toEqual({ id: WALLET_NET });
+    expect(ctx.clientNetwork).toEqual({ id: 1 });
+    expect(ctx.clientProtocol).toBe(SPHERE_CONNECT_VERSION);
+    expect(typeof ctx.expiresAt).toBe('number');
+  });
+
+  it('an absent hook reproduces today’s refusal exactly', async () => {
+    const h = makeHostHarness();
+    h.send(MISMATCH);
+    await Promise.resolve();
+    const resp = handshakeResponses(h.sent)[0];
+    expect((resp.error as { code: number }).code).toBe(ERROR_CODES.INCOMPATIBLE_NETWORK);
+    expect(h.onConnectionRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it('on ‘switch’ sends the SAME frame and skips onConnectionRejected', async () => {
+    const withHook = makeHostHarness({ onNetworkMismatch: async () => ({ action: 'switch', to: { id: 1 } }) });
+    withHook.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 0));
+    const switched = handshakeResponses(withHook.sent)[0];
+
+    const plain = makeHostHarness();
+    plain.send(MISMATCH);
+    await Promise.resolve();
+    const refused = handshakeResponses(plain.sent)[0];
+
+    expect(switched).toEqual(refused);                    // byte-identical answer to the dApp
+    expect(withHook.onConnectionRejected).not.toHaveBeenCalled();
+    expect(plain.onConnectionRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses when the hook offers a network the dApp did not ask for', async () => {
+    const h = makeHostHarness({ onNetworkMismatch: async () => ({ action: 'switch', to: { id: 99 } }) });
+    h.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(h.onConnectionRejected).toHaveBeenCalledTimes(1);   // downgraded to a refusal
+  });
+
+  it('refuses when the hook throws', async () => {
+    const h = makeHostHarness({ onNetworkMismatch: async () => { throw new Error('boom'); } });
+    h.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(handshakeResponses(h.sent)).toHaveLength(1);
+    expect(h.onConnectionRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it('is never called for a silent attempt', async () => {
+    const onNetworkMismatch = vi.fn(async () => ({ action: 'refuse' as const }));
+    const h = makeHostHarness({ onNetworkMismatch });
+    h.send({ ...MISMATCH, silent: true });
+    await Promise.resolve();
+    expect(onNetworkMismatch).not.toHaveBeenCalled();
+    expect(handshakeResponses(h.sent)).toHaveLength(1);
+  });
+
+  it('refuses when the hook throws synchronously', async () => {
+    const h = makeHostHarness({ onNetworkMismatch: () => { throw new Error('boom'); } });
+    h.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 0));
+    const resp = handshakeResponses(h.sent);
+    expect(resp).toHaveLength(1);
+    expect((resp[0].error as { code: number }).code).toBe(ERROR_CODES.INCOMPATIBLE_NETWORK);
+    expect(h.onConnectionRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses when the hook answers with nothing at all', async () => {
+    const answersNothing = (async () => undefined) as unknown as ConnectHostConfig['onNetworkMismatch'];
+    const h = makeHostHarness({ onNetworkMismatch: answersNothing });
+    h.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 0));
+    const resp = handshakeResponses(h.sent);
+    expect(resp).toHaveLength(1);
+    expect((resp[0].error as { code: number }).code).toBe(ERROR_CODES.INCOMPATIBLE_NETWORK);
+    expect(h.onConnectionRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses when the prompt outlives handshakeDeadlineMs', async () => {
+    const h = makeHostHarness({ handshakeDeadlineMs: 20, onNetworkMismatch: () => new Promise(() => {}) });
+    h.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(handshakeResponses(h.sent)).toHaveLength(1);
+    expect(h.onConnectionRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a switch when the wallet locked while the prompt was open', async () => {
+    const harness: ReturnType<typeof makeHostHarness> = makeHostHarness({
+      onNetworkMismatch: async () => {
+        harness.host.setLocked();
+        return { action: 'switch', to: { id: 1 } };
+      },
+    });
+    harness.send(MISMATCH);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(handshakeResponses(harness.sent)).toHaveLength(1);
+    expect(harness.onConnectionRejected).toHaveBeenCalledTimes(1);
+  });
+
+  it('is never called while the wallet is locked', async () => {
+    const onNetworkMismatch = vi.fn(async () => ({ action: 'refuse' as const }));
+    const h = makeHostHarness({ onNetworkMismatch });
+    h.host.setLocked();
+    h.send(MISMATCH);
+    await Promise.resolve();
+    expect(onNetworkMismatch).not.toHaveBeenCalled();
+    expect(handshakeResponses(h.sent)).toHaveLength(1);
+    expect(h.onConnectionRejected).toHaveBeenCalledWith(expect.anything(), expect.anything(), true);
+  });
+
+  it('hands the wallet its own origin and only the checked parts of the dApp network', async () => {
+    const onNetworkMismatch = vi.fn(async (_dapp: unknown, _ctx: NetworkMismatchContext) => ({ action: 'refuse' as const }));
+    const h = makeHostHarness({ origin: 'https://wallet.example', onNetworkMismatch });
+    h.send({ ...MISMATCH, network: { id: 1, name: 'Mainnet', extra: 'x'.repeat(10) } });
+    await new Promise((r) => setTimeout(r, 0));
+    const [dapp, ctx] = onNetworkMismatch.mock.calls[0];
+    expect((dapp as { url: string }).url).toBe('https://d');
+    expect(ctx.origin).toBe('https://wallet.example');
+    expect(ctx.clientSdkVersion).toBe(SDK_VERSION);
+    expect(ctx.clientNetwork).toEqual({ id: 1, name: 'Mainnet' });   // `extra` never reaches the wallet
   });
 });
