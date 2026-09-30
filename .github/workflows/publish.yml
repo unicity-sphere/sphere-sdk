@@ -15,6 +15,13 @@ jobs:
     permissions:
       contents: write
       id-token: write
+    # The dispatcher controls the version input and the branch name, and a branch name may
+    # contain shell syntax such as $(...). An expression is pasted into the script text
+    # before bash parses it, so the run: steps read these as variables instead.
+    env:
+      VERSION: ${{ inputs.version }}
+      REF_NAME: ${{ github.ref_name }}
+      REF_TYPE: ${{ github.ref_type }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,13 +38,19 @@ jobs:
 
       - name: Validate version format
         run: |
-          if ! echo "${{ inputs.version }}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
             echo "Error: Invalid version format. Use semver (e.g., 1.0.0, 1.0.1-beta.1)"
+            exit 1
+          fi
+          # The release commit is pushed back to the branch this ran from; a tag has none.
+          # Refuse here, before npm has the version, not after.
+          if [ "$REF_TYPE" != "branch" ]; then
+            echo "Error: dispatch from a branch, not a $REF_TYPE ($REF_NAME)"
             exit 1
           fi
 
       - name: Update package version
-        run: npm version ${{ inputs.version }} --no-git-tag-version
+        run: npm version "$VERSION" --no-git-tag-version
 
       # Immediately after the bump, before any test runs: tests assert that
       # connect/version.ts === package.json version, and Build (which would regenerate it
@@ -69,7 +82,7 @@ jobs:
       - name: Determine npm dist-tag
         id: dist-tag
         run: |
-          if [ "${{ github.ref_name }}" = "main" ]; then
+          if [ "$REF_NAME" = "main" ]; then
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           else
             echo "tag=dev" >> "$GITHUB_OUTPUT"
@@ -86,8 +99,12 @@ jobs:
       # Before the release commit, so the dated section rides in it. Doing this by hand
       # afterwards meant a follow-up PR per release (#814 for 0.17.4, #818 for 0.17.6),
       # and a released version whose entries sat under [Unreleased] until it landed.
+      # Only a release from main closes [Unreleased]. On a dev build from a branch it would
+      # file that branch's entries under a -dev heading and point the [Unreleased] compare
+      # link at a dev tag, and both would ride the squash-merge into main.
       - name: Date the CHANGELOG section for this release
-        run: node scripts/date-changelog.mjs ${{ inputs.version }}
+        if: github.ref_name == 'main'
+        run: node scripts/date-changelog.mjs "$VERSION"
 
       - name: Create git tag
         run: |
@@ -97,23 +114,26 @@ jobs:
           # gate compares the two. Leaving it out of the release commit means main fails
           # verify:version immediately after every release.
           git add package.json package-lock.json connect/version.ts CHANGELOG.md
-          git commit -m "chore: release v${{ inputs.version }}"
+          git commit -m "chore: release v$VERSION"
           # The tag names what was actually built and published, so push it first and on
           # its own: it must land even if the branch push below cannot.
-          git tag "v${{ inputs.version }}"
-          git push origin "v${{ inputs.version }}"
-          # npm publish has already succeeded by now, so the release commit MUST reach main.
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+          # npm publish has already succeeded by now, so the release commit MUST reach the
+          # branch it was built from: main for a release, the feature branch for a dev build.
+          # Never main for a dev build: its HEAD carries the branch's unmerged commits (#823).
           # A merge during the ~3 minute build moved the branch and the push was rejected
           # (v0.17.4), which left the tag on a commit that was on no branch. Rebase the one
-          # release commit onto whatever main is now and retry.
+          # release commit onto whatever the branch is now and retry.
+          branch="$REF_NAME"
           for attempt in 1 2 3; do
-            if git push origin HEAD:main; then
+            if git push origin "HEAD:refs/heads/$branch"; then
               exit 0
             fi
-            echo "main moved during the build — rebasing the release commit (attempt $attempt)"
-            git fetch origin main
-            git rebase origin/main
+            echo "$branch moved during the build — rebasing the release commit (attempt $attempt)"
+            git fetch origin "refs/heads/$branch"
+            git rebase FETCH_HEAD
           done
-          echo "Could not push the release commit to main. npm HAS v${{ inputs.version }};"
-          echo "cherry-pick tag v${{ inputs.version }} onto main by hand."
+          echo "Could not push the release commit to $branch. npm HAS v$VERSION;"
+          echo "cherry-pick tag v$VERSION onto $branch by hand."
           exit 1
