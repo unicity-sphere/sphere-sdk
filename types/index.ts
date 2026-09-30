@@ -211,6 +211,8 @@ export interface IncomingTransfer {
   readonly tokens: Token[];
   /** Arrivals that name no coin (#777). Disjoint from `tokens`, never a zero Token. */
   readonly coinless?: CoinlessToken[];
+  /** Refused arrivals of a claimed coin under another type; never counted, and never in `tokens`. */
+  readonly unverifiedTokens?: Token[];
   readonly memo?: string;
   readonly receivedAt: number;
 }

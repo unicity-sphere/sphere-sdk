@@ -155,7 +155,11 @@ describe('PaymentsFacade — claimed coins', () => {
 
     const { transfers } = await world.facade.receive();
 
-    expect(transfers.flatMap((t) => t.tokens.map((token) => token.unverified ?? 'verified')).sort()).toEqual(['refused', 'verified']);
+    const announced = transfers.map((t) => [t.tokens.map((x) => x.unverified ?? 'verified'), (t.unverifiedTokens ?? []).map((x) => x.unverified)]);
+    expect(announced.sort()).toEqual([
+      [[], ['refused']],
+      [['verified'], []],
+    ]);
     await vi.waitFor(async () => expect(await holdings(world)).toEqual([['10', null], ['10', 'refused']]));
     expect(verify).toHaveBeenCalledTimes(2);
     const received = (await world.facade.history()).entries.filter((e) => e.type === 'RECEIVED' && e.coinId === CLAIMED);

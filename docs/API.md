@@ -989,8 +989,9 @@ claimed coin counts only inside a token of its issuing type that verified:
   `unverifiedTokens()`, as separate assets with no price, each marked `unverified`. `'pending'` means
   the check has not passed yet, for instance while a lock waits for its confirmations. `'refused'`
   means the token failed verification or is of another type than the one that issues the coin.
-- A received token that carries a claimed coin under another type is announced with `unverified:
-  'refused'` and is not written to history for that coin, so history never shows it as a receipt.
+- A received token that carries a claimed coin under another type is announced in the
+  `transfer:incoming` event's `unverifiedTokens`, marked `unverified: 'refused'`, never in `tokens`,
+  and is not written to history for that coin, so history never shows it as a receipt.
 - An unverified token is never spent: coin selection skips it, and `sendWholeToken()` and `burn()`
   refuse it as not a spendable holding.
 - A token received, left as change of a verified token, or minted with `mintCustom()` under the
@@ -1024,7 +1025,9 @@ interface MintCustomRequest {
 - **Per-call verifiers** replace the registered verifier of their own tag for this call only, and
   every other tag keeps its registered verifier. A per-call verifier for a tag no plugin registers is
   refused. The depositor of a bridged asset uses this to accept its own mint before the lock is
-  final.
+  final. The type's issuance policy still applies: a reason it refuses certifies on chain but never
+  passes `verify`, so its journal entry is replayed and never settles. Mint only reasons the type's
+  policy accepts.
 - **Journal-first, like `mint()`.** The bytes are journaled before the chain op, and a failure
   after that returns `{ success: false, error }` and keeps the entry. The convergence pass replays
   the same bytes under the **registered** verifiers (per-call ones are not journaled), so a replay

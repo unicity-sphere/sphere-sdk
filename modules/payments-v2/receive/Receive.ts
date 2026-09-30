@@ -346,14 +346,16 @@ async function announce(
 ): Promise<IncomingTransfer> {
   const receivedAt = (deps.now ?? Date.now)();
   await recordArrival(deps, entry, record, receivedAt);
+  const refused = record.assets.filter((asset) => record.unverifiedCoinIds?.includes(asset.coinId));
+  const counted = record.assets.filter((asset) => !refused.includes(asset));
   return {
     id: record.tokenId,
     senderPubkey: entry.senderPubkey ?? '',
     ...(entry.senderNametag !== undefined ? { senderNametag: entry.senderNametag } : {}),
-    tokens: record.assets.map((asset) => ({
-      ...toUiToken(record.tokenId, asset, deps.registry, receivedAt),
-      ...(record.unverifiedCoinIds?.includes(asset.coinId) ? { unverified: 'refused' as const } : {}),
-    })),
+    tokens: counted.map((asset) => toUiToken(record.tokenId, asset, deps.registry, receivedAt)),
+    ...(refused.length > 0
+      ? { unverifiedTokens: refused.map((asset) => ({ ...toUiToken(record.tokenId, asset, deps.registry, receivedAt), unverified: 'refused' as const })) }
+      : {}),
     // #777: named here rather than mapped from assets, which announced an EMPTY list.
     ...(record.tokenType !== undefined
       ? {
