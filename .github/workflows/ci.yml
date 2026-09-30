@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main, feat/wallet-api-integration, feat/payments-v2]
+    branches: [main]
+  # Every pull request, whatever its base: a PR stacked on another PR's branch
+  # (#826 on feat/token-plugins) needs the same checks as one against main (#830).
   pull_request:
-    branches: [main, feat/wallet-api-integration, feat/payments-v2]
 
 jobs:
   build:
