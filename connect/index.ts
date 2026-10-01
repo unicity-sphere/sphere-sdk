@@ -24,6 +24,7 @@ export {
   AUTO_PUSHED_EVENTS,
   isAutoPushedEvent,
   SPHERE_NETWORKS,
+  resolveSphereNetwork,
   isSphereConnectMessage,
   createRequestId,
 } from './protocol';
@@ -49,6 +50,8 @@ export type {
   WalletDisconnectedPayload,
   WalletIdentityChangedPayload,
   NetworkInfo,
+  SphereNetworkName,
+  SphereNetworkEntry,
 } from './protocol';
 
 // Permissions
@@ -94,4 +97,6 @@ export type {
   WalletState,
   LockedRequestContext,
   IntentContext,
+  NetworkMismatchContext,
+  NetworkMismatchDecision,
 } from './types';

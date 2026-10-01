@@ -1117,6 +1117,30 @@ describe('host deadlines', () => {
     expect(handshakeResponses(pair.hostSent)).toHaveLength(1);
   });
 
+  it('still answers when the deadline fallback throws: a log sink that chokes on the timeout line', async () => {
+    // The fallback logs first, and logger.warn is always live. Its throw used to escape a timer
+    // callback, settling nothing: no frame at all, and the dApp waited out its own timeout.
+    const pair = createMockTransportPair();
+    makeHost(pair, {
+      handshakeDeadlineMs: 20,
+      onConnectionRequest: vi.fn(() => new Promise(() => {})),
+    });
+    logger.configure({
+      handler: (_level, _tag, message) => { if (message.includes('timed out')) throw new Error('log sink is down'); },
+    });
+    try {
+      sendRawHandshake(pair);
+      await tick(80);
+    } finally {
+      logger.configure({ debug: false, handler: null });
+    }
+
+    const responses = handshakeResponses(pair.hostSent);
+    expect(responses).toHaveLength(1);
+    expect(responses[0].error).toBeUndefined();   // the empty refusal
+    expect(responses[0].sessionId).toBeUndefined();
+  });
+
   it('does not interfere with a prompt answered in time', async () => {
     const h = await connectHarness({
       intentDeadlineMs: 5_000,
@@ -1588,7 +1612,9 @@ describe('handshake while locked', () => {
   it('never leaks INCOMPATIBLE_NETWORK from a cold-start-locked host', async () => {
     const pair = createMockTransportPair();
     const onConnectionRequest = vi.fn().mockResolvedValue({ approved: true, grantedPermissions: [] });
-    makeHost(pair, { sphere: null, initialWalletState: 'locked', onConnectionRequest });
+    const onNetworkMismatch = vi.fn().mockResolvedValue({ action: 'refuse' });
+    const onConnectionRejected = vi.fn();
+    makeHost(pair, { sphere: null, initialWalletState: 'locked', onConnectionRequest, onNetworkMismatch, onConnectionRejected });
 
     sendRawHandshake(pair);
     await tick();
@@ -1599,6 +1625,11 @@ describe('handshake while locked', () => {
     // hand it walletNetwork { id: -1 }. Step 0 refuses BEFORE checkCompatibility.
     expect(responses[0].error).toBeUndefined();
     expect(onConnectionRequest).not.toHaveBeenCalled();
+    // Step 0 is what keeps a network prompt away from an unapproved origin here. It is a different
+    // mechanism from the `silent` gate (which would also refuse the hook): the refusal must happen
+    // before the compatibility gate, so neither the hook nor onConnectionRejected is ever reached.
+    expect(onNetworkMismatch).not.toHaveBeenCalled();
+    expect(onConnectionRejected).not.toHaveBeenCalled();
   });
 
   it('refuses even a matching resume when there is no snapshot at all', async () => {
@@ -1659,6 +1690,57 @@ describe('handshake while locked', () => {
     expect(result.sessionId).toBeTypeOf('string');
     expect(result.locked).toBeUndefined();
     expect(host.walletState).toBe('live');
+  });
+});
+
+describe('the silent flag reported on a refused handshake', () => {
+  // The wallet renders UI from onConnectionRejected, and a locked wallet may not be made to
+  // render a consent surface by an unapproved origin. A WARM lock keeps the snapshot identity,
+  // so the handshake gets past step 0 and reaches the compatibility gate — which means the
+  // flag this callback receives has to be the EFFECTIVE one, not the client's claim.
+  // network { id: 1 } against the mock sphere's 4 makes the network check fail.
+  const mismatched = (silent?: boolean) => ({
+    network: { id: 1 },
+    ...(silent === undefined ? {} : { silent }),
+  });
+
+  it('reports silent:true while locked, whatever the client claimed', async () => {
+    const pair = createMockTransportPair();
+    const onConnectionRejected = vi.fn();
+    const sphere = createMockSphere();
+    const host = makeHost(pair, { sphere, onConnectionRejected });
+    host.setLocked();                // warm lock: the snapshot survives
+
+    sendRawHandshake(pair, mismatched(false));
+    await tick();
+
+    expect(onConnectionRejected).toHaveBeenCalledTimes(1);
+    expect(onConnectionRejected.mock.calls[0][2]).toBe(true);
+  });
+
+  it('still reports silent:false on an unlocked wallet', async () => {
+    const pair = createMockTransportPair();
+    const onConnectionRejected = vi.fn();
+    makeHost(pair, { sphere: createMockSphere(), onConnectionRejected });
+
+    sendRawHandshake(pair, mismatched(false));
+    await tick();
+
+    expect(onConnectionRejected.mock.calls[0][2]).toBe(false);
+  });
+
+  it('still reports silent:true for a genuine auto-connect on a live wallet', async () => {
+    // The client's own claim, on a wallet that is not locked: forcing silent while locked must
+    // not have replaced the claim, only added to it.
+    const pair = createMockTransportPair();
+    const onConnectionRejected = vi.fn();
+    makeHost(pair, { sphere: createMockSphere(), onConnectionRejected });
+
+    sendRawHandshake(pair, mismatched(true));
+    await tick();
+
+    expect(onConnectionRejected).toHaveBeenCalledTimes(1);
+    expect(onConnectionRejected.mock.calls[0][2]).toBe(true);
   });
 });
 

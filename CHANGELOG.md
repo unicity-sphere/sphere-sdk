@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Connect: a wallet can offer a network switch instead of a bare refusal
+
+`ConnectHostConfig.onNetworkMismatch(dapp, ctx)` is asked when a handshake fails the network check,
+before the dApp is answered, and the host waits for it (up to `handshakeDeadlineMs`, default 120 s).
+The wallet answers `{ action: 'refuse' }` or, once the user has agreed, `{ action: 'switch', to }`
+with `to.id` equal to the id of the network the dApp declared (the id is all the host compares).
+`ctx` carries the wallet's network, the dApp's declared network, the wallet's own `origin`, the
+client protocol and SDK version, and the deadline.
+
+**The protocol is unchanged.** `SPHERE_CONNECT_VERSION` is still `'2.3'`, no error code was added,
+and the dApp receives the same `INCOMPATIBLE_NETWORK` (4008) frame whether the user refused or the
+wallet is about to switch. The only difference is that an accepted switch skips
+`onConnectionRejected`, so the wallet does not paint an error beside the decision the user just
+took. No dApp code has to change, but the timing does: once a wallet implements the hook, a dApp on
+the wrong network no longer always gets an instant typed 4008, because the host waits up to 120 s
+for the user while `ConnectClient`'s own handshake timeout is 30 s, so a user who takes longer than
+30 s to answer leaves the dApp rejecting first with an uncoded `Error('Connection timeout')`, which
+a dApp that branches only on `ConnectError.code` drops into its generic branch. Nothing retries a
+4008: the dApp, or the user, handshakes again once the wallet has switched.
+
+The hook is asked for the network check only: never for a protocol or SDK-floor refusal, for a dApp
+that declared no network (or an `id` that is not a non-negative integer no larger than
+`Number.MAX_SAFE_INTEGER`), when the wallet does not
+know its own network, or for a silent or locked handshake. A throw, a rejection, a timeout, a wallet
+that is locked when its answer is read, and an answer whose `to.id` is not the dApp's network id are
+all refusals. The hook gets no abort signal, only `ctx.expiresAt`: a late answer is ignored by the
+host but the wallet's own side effects still run, so a wallet checks `expiresAt` before acting.
+
+If the wallet's own network id changes while the prompt is open (`updateSphere` to a Sphere on
+another network, `setUnavailable()`, `destroy()`), the host sends the errorless empty refusal
+instead of the 4008 and skips `onConnectionRejected`, whatever the hook answers: the comparison it
+made no longer holds. `ConnectClient` does not retry on that frame. It rejects with a bare
+`Error('Connection rejected by wallet')`, so the wallet must post `HOST_READY` afterwards or the
+dApp must retry by itself.
+
+`ctx.clientNetwork` is built from checked parts: `{ id }`, plus a `name` only when the dApp sent a
+string of at most 64 characters. It is still text the dApp typed, so a wallet takes the network's
+identity from `id` and labels it itself.
+
+- `resolveSphereNetwork(id)` (new) looks a network up by its canonical id and returns the
+  `SPHERE_NETWORKS` entry as a copy (typed `SphereNetworkEntry`), or `undefined`. Its `name` is typed as a key of both
+  `SPHERE_NETWORKS` and `NETWORKS`, so it can be handed to a network switcher without a cast.
+  `NETWORKS` cannot be inverted safely for this: `testnet` and `testnet2` collide on network id 4.
+  It is exported from the package root and from `/connect`.
+- The package root now also exports `SPHERE_NETWORKS` and the `NetworkInfo`, `SphereNetworkName` and
+  `SphereNetworkEntry` types. `/connect` now exports the `SphereNetworkName`, `SphereNetworkEntry`,
+  `NetworkMismatchContext` and `NetworkMismatchDecision` types.
+
+### Fixed — `onConnectionRejected` reported the client's `silent` claim, not the effective one
+
+`ConnectHost` forces a handshake silent while the wallet is locked and passes that to
+`onConnectionRequest`, but it handed `onConnectionRejected` the raw `silent` flag from the message.
+A warm lock keeps the snapshot identity, so a locked wallet gets past the cold-start check, reaches
+the compatibility gate, and was told `silent: false`. A wallet that renders anything from that
+callback rendered it while locked, which the forced-silent rule exists to prevent. `silent` is now
+computed before the compatibility gate, and a refusal that waited on an `onNetworkMismatch` prompt
+reads the wallet's state again when it is reported. So `silent` is `true` whenever the wallet is
+locked when the refusal is reported, for a protocol, SDK-floor or network refusal alike (a lock that
+lifted again before the prompt resolved reports `false`). The `onConnectionRejected` documentation
+said `silent` meant an auto-connect attempt; it now says it is also true while the wallet is locked.
+
 ## [0.17.6] - 2026-09-22
 
 ### Fixed (wallet safety) — the Node file storage no longer writes an empty store over the wallet file (#811)
