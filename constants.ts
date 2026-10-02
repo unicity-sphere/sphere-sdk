@@ -287,10 +287,15 @@ export interface NetworkConfig {
   /** The NFT vessel token type every NFT mints under (#785), 64 lowercase hex: the single
    *  `non-fungible` entry of this network's unicity-ids registry. */
   readonly nftTokenType: string;
+  /** This network's own coins: a registry `issuance` on one is ignored, so one registry edit cannot freeze them. */
+  readonly nativeCoinIds: readonly string[];
   /** Canonical numeric network id (= RootTrustBase.networkId; testnet2 = 4).
    *  Optional: only set for networks that have a live v2 trust base. */
   readonly networkId?: number;
 }
+
+/** UCT on testnet2, as unicity-ids.testnet2.json names it. */
+const TESTNET2_UCT_COIN_ID = 'f581d30f593e4b369d684a4563b5246f07b1d265f7178a2c0a82b81f39c24dc0';
 
 /** Network configurations */
 export const NETWORKS = {
@@ -311,6 +316,8 @@ export const NETWORKS = {
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.mainnet.json',
     nftTokenType: '9f190eea6c8d7e1e564c35feb4c289add78be4bedb81bb77fe265e926e5493f4',
+    // No UCT coin id is published for mainnet yet (its registry lists no fungible coin).
+    nativeCoinIds: [],
   },
   // v1 cutover: 'testnet' now POINTS AT TESTNET2 (the v2 gateway network). The
   // old goggregator testnet spoke the removed v1 protocol — a v2 engine cannot
@@ -325,6 +332,7 @@ export const NETWORKS = {
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
     nftTokenType: '971a26eef0e3aeb22bd3e7d44c47ce963400037e8df42b50d4d44e1589f83826',
+    nativeCoinIds: [TESTNET2_UCT_COIN_ID],
   },
   testnet2: {
     name: 'Testnet',
@@ -336,6 +344,7 @@ export const NETWORKS = {
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
     nftTokenType: '971a26eef0e3aeb22bd3e7d44c47ce963400037e8df42b50d4d44e1589f83826',
+    nativeCoinIds: [TESTNET2_UCT_COIN_ID],
   },
 } as const satisfies Record<string, NetworkConfig>;
 

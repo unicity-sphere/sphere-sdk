@@ -16,7 +16,7 @@ import {
   getCoinIdByName,
 } from '../../../registry';
 import type { StorageProvider } from '../../../storage';
-import { STORAGE_KEYS_GLOBAL } from '../../../constants';
+import { NETWORKS, STORAGE_KEYS_GLOBAL } from '../../../constants';
 import { logger } from '../../../core/logger';
 
 // =============================================================================
@@ -1535,5 +1535,56 @@ describe('TokenRegistry — issuance', () => {
     unsubscribe();
     await registry.refreshFromRemote();
     expect(heard).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores an issuance on a network's native coin, so no registry edit can freeze UCT, and warns once", async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const uct = NETWORKS.testnet2.nativeCoinIds[0];
+    const claimed = [{ ...USDC_E_ENTRY, id: uct, symbol: 'UCT', name: 'unicity' }, USDC_E_ENTRY];
+    const registry = await cachedRegistry(claimed, Date.now(), URL);
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify(claimed), { status: 200 }));
+
+    await registry.refreshFromRemote();
+
+    expect(registry.getIssuingTokenType(uct)).toBeNull();
+    expect(registry.getDefinition(uct)?.symbol).toBe('UCT');
+    expect(registry.getIssuingTokenType(USDC_E)).toBe(USDC_E_TYPE);
+    expect(warn.mock.calls.filter(([, message]) => String(message).includes(uct))).toHaveLength(1);
+  });
+
+  it('skips a malformed entry, warning once, and applies the rest of the file with its claims', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const nameless = { network: 'unicity:testnet2', assetKind: 'fungible', symbol: 'BAD', decimals: 0, id: 'ab'.repeat(32) };
+    const oddSymbol = { ...USDC_E_ENTRY, id: 'cd'.repeat(32), name: 'odd', symbol: 7 };
+    const served = [nameless, ...TEST_DEFINITIONS, oddSymbol, USDC_E_ENTRY];
+    const registry = await cachedRegistry([], Date.now(), URL);
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify(served), { status: 200 }));
+
+    expect(await registry.refreshFromRemote()).toBe(true);
+    await registry.refreshFromRemote();
+
+    expect(registry.getDefinition(UCT_COIN_ID)?.symbol).toBe('UCT');
+    expect(registry.getIssuingTokenType(USDC_E)).toBe(USDC_E_TYPE);
+    expect(registry.getDefinition('ab'.repeat(32))).toBeUndefined();
+    expect(registry.getDefinition('cd'.repeat(32))).toBeUndefined();
+    expect(registry.getIssuingTokenType('cd'.repeat(32))).toBeNull();
+    expect(warn.mock.calls.filter(([, message]) => String(message).includes('malformed registry entry'))).toHaveLength(2);
+  });
+
+  it('warns once per malformed issuance value, not on every apply', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const malformed = (tokenType: string) => [{ ...USDC_E_ENTRY, issuance: { tokenType } }];
+    let served = malformed(USDC_E_TYPE.toUpperCase());
+    const registry = await cachedRegistry(served, Date.now(), URL);
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify(served), { status: 200 }));
+    const issuanceWarnings = (): number => warn.mock.calls.filter(([, message]) => String(message).includes('malformed issuance')).length;
+
+    await registry.refreshFromRemote();
+    await registry.refreshFromRemote();
+    expect(issuanceWarnings()).toBe(1);
+
+    served = malformed(USDC_E_TYPE.slice(2));
+    await registry.refreshFromRemote();
+    expect(issuanceWarnings()).toBe(2);
   });
 });

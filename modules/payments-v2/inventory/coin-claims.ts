@@ -12,7 +12,7 @@ const NO_CLAIMS: ReadonlyMap<string, string> = new Map();
  */
 export class WalletCoinClaims {
   private seen: ReadonlyMap<string, string> | null = null;
-  private print = '';
+  private registryVersion = '';
   private readonly conflicts = new Set<string>();
   private readiness: Promise<void> | null = null;
 
@@ -25,15 +25,20 @@ export class WalletCoinClaims {
     return this.plugins.issuerOf(coinId) ?? this.registryClaims().get(coinId.toLowerCase()) ?? null;
   }
 
-  /** Only a plugin's policy is enforced by `verify`; a registry claim names the type but cannot vouch for a token of it. */
-  enforces(tokenType: string): boolean {
-    return this.plugins.enforces(tokenType);
+  /** Only a plugin's own claim on the coin lets its policy vouch for it; a registry claim never does. */
+  vouches(coinId: string, tokenType: string): boolean {
+    return this.plugins.vouches(coinId, tokenType);
   }
 
-  /** The plugins' fingerprint, extended by the registry claims that apply; unchanged when none do. */
+  /** The plugins' policies, which a remembered verdict is kept under. */
   fingerprint(): string {
+    return this.plugins.fingerprint();
+  }
+
+  /** Changes whenever a registry claim that can change a verdict does: one on a coin no plugin claims. */
+  version(): string {
     this.registryClaims();
-    return this.print;
+    return this.registryVersion;
   }
 
   /** Resolves once the registry's persistent cache has been read, so a cached claim applies from the start. */
@@ -52,16 +57,15 @@ export class WalletCoinClaims {
     return current;
   }
 
-  /** Only a claim on a coin no plugin claims can change a verdict, so only those reach the fingerprint. */
   private adopt(current: ReadonlyMap<string, string>): void {
     const lines: string[] = [];
     for (const [coinId, tokenType] of current) {
       const plugin = this.plugins.issuerOf(coinId);
-      if (plugin === null) lines.push(JSON.stringify(['registry', coinId, tokenType]));
+      if (plugin === null) lines.push(JSON.stringify([coinId, tokenType]));
       else if (plugin !== tokenType) this.noteConflict(coinId, tokenType, plugin);
     }
     this.seen = current;
-    this.print = [this.plugins.fingerprint(), ...lines.sort()].join('\n');
+    this.registryVersion = lines.sort().join('\n');
   }
 
   private noteConflict(coinId: string, tokenType: string, plugin: string): void {

@@ -9,25 +9,45 @@ import type { Standing } from './InventoryView';
 export const VERDICT_RETRY_MS = 30_000;
 export const VERDICT_RETRY_MAX_MS = 60 * 60 * 1000;
 
-/** Which token type issues a coin, and whether `verify` enforces that type's issuance policy here. */
-export type ClaimReader = Pick<CoinClaims, 'issuerOf' | 'enforces'>;
+/** Which token type issues a coin, and whether a loaded policy of that type claims the coin itself. */
+export type ClaimReader = Pick<CoinClaims, 'issuerOf' | 'vouches'>;
 
 export interface VerdictClaims extends ClaimReader {
+  /** The loaded policies: remembered verdicts are kept only under the same ones. */
   fingerprint(): string;
+  /** Changes whenever a claim that can change a verdict does. */
+  version?(): string;
   whenReady?(): Promise<void>;
   subscribe?(listener: () => void): () => void;
 }
 
+/** Each coin a token carries, with its issuer when the verdict was reached: the verdict holds while they all still do. */
+type Issuers = ReadonlyMap<string, string | null>;
+type Settled = 'verified' | 'refused' | 'unvouched';
+
+interface Judgement {
+  readonly verdict: Settled;
+  readonly issuers: Issuers;
+}
+
+interface Checked {
+  readonly verdict: Settled | 'retry';
+  readonly issuers?: Issuers;
+}
+
+type RememberedEntry = readonly [string, readonly (readonly [string, string | null])[]];
+
 interface Remembered {
   readonly fingerprint: string;
-  readonly tokenIds: readonly string[];
+  readonly verified?: readonly RememberedEntry[];
 }
-type Verdict = 'verified' | 'refused' | 'unvouched' | 'retry';
 
 interface Retry {
   readonly attempts: number;
   readonly atMs: number;
 }
+
+const NO_COINS: Issuers = new Map();
 
 export interface TokenVerdictsDeps {
   readonly kv: ScopedKV;
@@ -46,27 +66,32 @@ export function honoursClaims(claims: Pick<ClaimReader, 'issuerOf'>, token: Sphe
   return issuers.some((issuer) => issuer !== null) && issuers.every((issuer) => issuer === null || issuer === token.tokenType);
 }
 
-/** Of the type that issues every claimed coin it carries, under a policy `verify` enforces here. */
+function claimedCoins(claims: Pick<ClaimReader, 'issuerOf'>, token: SphereToken): string[] {
+  return (token.value?.assets ?? []).map((asset) => asset.coinId).filter((coinId) => claims.issuerOf(coinId) !== null);
+}
+
+/** Every claimed coin it carries is claimed for its type by a loaded policy, so `verify` judges each one. */
 export function vouchedFor(claims: ClaimReader, token: SphereToken): boolean {
-  return honoursClaims(claims, token) && claims.enforces(token.tokenType);
+  const coinIds = claimedCoins(claims, token);
+  return coinIds.length > 0 && coinIds.every((coinId) => claims.vouches(coinId, token.tokenType));
 }
 
 /** The claimed coins of a verified arrival that do not count yet, and why; null when all of them count. */
 export function unverifiedOnArrival(claims: ClaimReader, token: SphereToken): { coinIds: string[]; standing: Unverified } | null {
-  const coinIds = (token.value?.assets ?? []).map((asset) => asset.coinId).filter((coinId) => claims.issuerOf(coinId) !== null);
+  const coinIds = claimedCoins(claims, token);
   if (coinIds.length === 0 || vouchedFor(claims, token)) return null;
   return { coinIds, standing: honoursClaims(claims, token) ? 'pending' : 'refused' };
 }
 
+function rememberedEntries(remembered: Remembered): RememberedEntry[] {
+  return Array.isArray(remembered.verified) ? remembered.verified.filter((entry) => Array.isArray(entry?.[1])) : [];
+}
+
 export class TokenVerdicts {
-  private readonly verified = new Set<string>();
-  private readonly refused = new Set<string>();
-  /** Of the issuing type under a claim no policy here enforces: pending until the claims change. */
-  private readonly unvouched = new Set<string>();
+  private readonly judged = new Map<string, Judgement>();
   private readonly retries = new Map<string, Retry>();
   private readonly writes = new SerialChain();
-  /** The claims fingerprint every verdict above was reached under. */
-  private basis: string;
+  private version: string;
   private hydration: Promise<void> | null = null;
   private queued: readonly string[] | null = null;
   private running: Promise<void> | null = null;
@@ -76,7 +101,7 @@ export class TokenVerdicts {
   private live = false;
 
   constructor(private readonly deps: TokenVerdictsDeps) {
-    this.basis = deps.claims.fingerprint();
+    this.version = deps.claims.version?.() ?? '';
   }
 
   isClaimed(coinId: string): boolean {
@@ -84,27 +109,14 @@ export class TokenVerdicts {
   }
 
   standing(tokenId: string, coinId: string): Standing {
-    this.syncClaims();
-    if (!this.isClaimed(coinId) || this.verified.has(tokenId)) return 'trusted';
-    return this.refused.has(tokenId) ? 'refused' : 'pending';
+    if (!this.isClaimed(coinId)) return 'trusted';
+    const verdict = this.current(tokenId)?.verdict;
+    if (verdict === 'verified') return 'trusted';
+    return verdict === 'refused' ? 'refused' : 'pending';
   }
 
   trusts(tokenId: string, coinId: string): boolean {
     return this.standing(tokenId, coinId) === 'trusted';
-  }
-
-  /** Forgets every verdict reached under other claims and, while started, judges the holders again; true when the claims moved. */
-  syncClaims(): boolean {
-    const current = this.deps.claims.fingerprint();
-    if (current === this.basis) return false;
-    this.basis = current;
-    this.verified.clear();
-    this.refused.clear();
-    this.unvouched.clear();
-    this.retries.clear();
-    this.disarmRetry();
-    if (this.live) this.rejudge();
-    return true;
   }
 
   hydrate(): Promise<void> {
@@ -117,7 +129,10 @@ export class TokenVerdicts {
 
   start(): Promise<void> {
     this.live = true;
-    this.unwatch ??= this.deps.claims.subscribe?.(() => this.onClaimsChanged()) ?? null;
+    if (this.unwatch === null) {
+      this.version = this.deps.claims.version?.() ?? '';
+      this.unwatch = this.deps.claims.subscribe?.(() => this.onClaimsChanged()) ?? null;
+    }
     return this.hydrate();
   }
 
@@ -129,12 +144,15 @@ export class TokenVerdicts {
   }
 
   async accept(token: SphereToken): Promise<void> {
-    const vouched = (): boolean => vouchedFor(this.deps.claims, token);
-    if (vouched()) await this.remember(token.blob.tokenId, vouched);
+    if (!vouchedFor(this.deps.claims, token)) return;
+    await this.hydrate();
+    if (vouchedFor(this.deps.claims, token)) await this.remember(token.blob.tokenId, this.issuersOf(token));
   }
 
-  recordSplit(sourceTokenId: string, outputTokenId: string): Promise<void> {
-    return this.remember(outputTokenId, () => this.verified.has(sourceTokenId));
+  async recordSplit(sourceTokenId: string, outputTokenId: string): Promise<void> {
+    await this.hydrate();
+    const source = this.current(sourceTokenId);
+    if (source?.verdict === 'verified') await this.remember(outputTokenId, source.issuers);
   }
 
   review(holders: readonly string[]): Promise<void> {
@@ -143,14 +161,28 @@ export class TokenVerdicts {
     return this.running;
   }
 
-  private onClaimsChanged(): void {
-    if (this.syncClaims()) this.deps.changed();
+  /** A verdict counts only while every coin its token carries keeps the issuer it was reached under. */
+  private current(tokenId: string): Judgement | undefined {
+    const judgement = this.judged.get(tokenId);
+    if (judgement === undefined) return undefined;
+    for (const [coinId, issuer] of judgement.issuers) if (this.deps.claims.issuerOf(coinId) !== issuer) return undefined;
+    return judgement;
   }
 
-  private rejudge(): void {
+  private issuersOf(token: SphereToken): Issuers {
+    return new Map((token.value?.assets ?? []).map((asset) => [asset.coinId.toLowerCase(), this.deps.claims.issuerOf(asset.coinId)]));
+  }
+
+  private onClaimsChanged(): void {
+    const version = this.deps.claims.version?.() ?? '';
+    if (version === this.version) return;
+    this.version = version;
+    this.retries.clear();
+    this.disarmRetry();
     const op = this.review(this.deps.holders?.() ?? this.held).then(() => this.deps.changed());
     if (this.deps.track !== undefined) this.deps.track(op);
     else void op.catch(() => undefined);
+    this.deps.changed();
   }
 
   private disarmRetry(): void {
@@ -172,18 +204,11 @@ export class TokenVerdicts {
 
   private async reviewOnce(holders: readonly string[]): Promise<void> {
     await this.hydrate();
-    this.syncClaims();
-    const basis = this.basis;
     this.held = holders;
     const due = holders.filter((tokenId) => this.isDue(tokenId));
-    const verdicts = due.length === 0 ? new Map<string, Verdict>() : await this.check(due);
-    this.syncClaims();
-    if (this.basis !== basis) {
-      this.queued ??= holders;
-      return;
-    }
-    for (const tokenId of due) this.settle(tokenId, verdicts.get(tokenId) ?? 'retry');
-    if (due.some((tokenId) => verdicts.get(tokenId) === 'verified')) {
+    const checked = due.length === 0 ? new Map<string, Checked>() : await this.check(due);
+    for (const tokenId of due) this.settle(tokenId, checked.get(tokenId) ?? { verdict: 'retry' });
+    if (due.some((tokenId) => checked.get(tokenId)?.verdict === 'verified')) {
       await this.persist();
       this.deps.changed();
     }
@@ -191,54 +216,56 @@ export class TokenVerdicts {
   }
 
   private isDue(tokenId: string): boolean {
-    if (this.verified.has(tokenId) || this.refused.has(tokenId) || this.unvouched.has(tokenId)) return false;
+    if (this.current(tokenId) !== undefined) return false;
     return (this.retries.get(tokenId)?.atMs ?? 0) <= this.now();
   }
 
-  private async check(due: readonly string[]): Promise<Map<string, Verdict>> {
-    const verdicts = new Map<string, Verdict>();
+  private async check(due: readonly string[]): Promise<Map<string, Checked>> {
+    const checked = new Map<string, Checked>();
     let blobs: Map<string, Uint8Array>;
     try {
       blobs = await this.deps.getBlobs([...due]);
     } catch {
-      return verdicts;
+      return checked;
     }
     for (const tokenId of due) {
       const bytes = blobs.get(tokenId);
-      if (bytes !== undefined) verdicts.set(tokenId, await this.verdictOf(tokenId, bytes));
+      if (bytes !== undefined) checked.set(tokenId, await this.verdictOf(tokenId, bytes));
     }
-    return verdicts;
+    return checked;
   }
 
-  private async verdictOf(tokenId: string, bytes: Uint8Array): Promise<Verdict> {
+  /** The issuers are read before `verify`: claims that move during it leave the verdict holding for the old ones only. */
+  private async verdictOf(tokenId: string, bytes: Uint8Array): Promise<Checked> {
     let engine: ReturnType<TokenVerdictsDeps['engine']>;
     try {
       engine = this.deps.engine();
     } catch {
-      return 'retry';
+      return { verdict: 'retry' };
     }
     let token: SphereToken;
     try {
       token = await engine.decodeToken({ tokenId, token: bytes });
     } catch {
-      return 'refused';
+      return { verdict: 'refused', issuers: NO_COINS };
     }
-    if (token.blob.tokenId !== tokenId || !honoursClaims(this.deps.claims, token)) return 'refused';
-    if (!this.deps.claims.enforces(token.tokenType)) return 'unvouched';
+    const issuers = this.issuersOf(token);
+    if (token.blob.tokenId !== tokenId || !honoursClaims(this.deps.claims, token)) return { verdict: 'refused', issuers };
+    if (!vouchedFor(this.deps.claims, token)) return { verdict: 'unvouched', issuers };
     try {
-      return (await engine.verify(token)).ok ? 'verified' : 'refused';
+      return { verdict: (await engine.verify(token)).ok ? 'verified' : 'refused', issuers };
     } catch {
-      return 'retry';
+      return { verdict: 'retry' };
     }
   }
 
-  private settle(tokenId: string, verdict: Verdict): void {
-    if (verdict === 'retry') {
+  private settle(tokenId: string, checked: Checked): void {
+    if (checked.verdict === 'retry') {
       this.retries.set(tokenId, this.nextRetry(this.retries.get(tokenId)));
       return;
     }
     this.retries.delete(tokenId);
-    ({ verified: this.verified, refused: this.refused, unvouched: this.unvouched })[verdict].add(tokenId);
+    this.judged.set(tokenId, { verdict: checked.verdict, issuers: checked.issuers ?? NO_COINS });
   }
 
   private nextRetry(previous: Retry | undefined): Retry {
@@ -258,30 +285,29 @@ export class TokenVerdicts {
     }, delay);
   }
 
-  /** Records a token as verified when `vouched` holds under the claims current once hydrated. */
-  private async remember(tokenId: string, vouched: () => boolean): Promise<void> {
-    await this.hydrate();
-    this.syncClaims();
-    if (this.verified.has(tokenId) || !vouched()) return;
-    this.verified.add(tokenId);
-    this.refused.delete(tokenId);
-    this.unvouched.delete(tokenId);
+  private async remember(tokenId: string, issuers: Issuers): Promise<void> {
+    if (this.current(tokenId)?.verdict === 'verified') return;
+    this.judged.set(tokenId, { verdict: 'verified', issuers });
     this.retries.delete(tokenId);
     await this.persist();
   }
 
-  /** Written under the claims the set was reached under. */
+  /** Each verified token is written with the issuers it was verified under, so a restart re-checks only those that moved. */
   private persist(): Promise<void> {
-    const remembered: Remembered = { fingerprint: this.basis, tokenIds: [...this.verified] };
+    const verified: RememberedEntry[] = [];
+    for (const [tokenId, judgement] of this.judged) {
+      if (judgement.verdict === 'verified') verified.push([tokenId, [...judgement.issuers]]);
+    }
+    const remembered: Remembered = { fingerprint: this.deps.claims.fingerprint(), verified };
     return this.writes.enqueue(() => this.deps.kv.set(STORE_KEYS.verifiedTokens, remembered));
   }
 
   private async load(): Promise<void> {
-    await this.deps.claims.whenReady?.();
     const remembered = await this.deps.kv.get<Remembered>(STORE_KEYS.verifiedTokens);
-    this.syncClaims();
-    if (remembered?.fingerprint !== this.basis) return;
-    for (const tokenId of remembered.tokenIds) this.verified.add(tokenId);
+    if (remembered === null || remembered.fingerprint !== this.deps.claims.fingerprint()) return;
+    for (const [tokenId, issuers] of rememberedEntries(remembered)) {
+      this.judged.set(tokenId, { verdict: 'verified', issuers: new Map(issuers) });
+    }
   }
 
   private now(): number {

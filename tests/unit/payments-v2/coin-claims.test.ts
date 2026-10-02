@@ -8,6 +8,7 @@ import { TokenType } from '../../../token-engine/sdk';
 
 const PLUGIN_COIN = 'ab'.repeat(32);
 const REGISTRY_COIN = 'cd'.repeat(32);
+const OTHER_COIN = 'ef'.repeat(32);
 const PLUGIN_TYPE = '6f'.repeat(32);
 const REGISTRY_TYPE = '70'.repeat(32);
 
@@ -26,35 +27,39 @@ afterEach(() => {
 });
 
 describe('WalletCoinClaims', () => {
-  it('claims a coin for the registry type when no plugin claims it, and enforces only the types a plugin polices', () => {
-    const claims = new WalletCoinClaims(plugin(), registry({ [REGISTRY_COIN]: REGISTRY_TYPE }));
+  it('claims a coin for the registry type when no plugin claims it, and vouches only for a coin a plugin claims for that type', () => {
+    const claims = new WalletCoinClaims(plugin(), registry({ [REGISTRY_COIN]: REGISTRY_TYPE, [OTHER_COIN]: PLUGIN_TYPE }));
 
     expect(claims.issuerOf(REGISTRY_COIN.toUpperCase())).toBe(REGISTRY_TYPE);
     expect(claims.issuerOf(PLUGIN_COIN)).toBe(PLUGIN_TYPE);
+    expect(claims.issuerOf(OTHER_COIN)).toBe(PLUGIN_TYPE);
     expect(claims.issuerOf('ee'.repeat(32))).toBeNull();
-    expect(claims.enforces(PLUGIN_TYPE)).toBe(true);
-    expect(claims.enforces(REGISTRY_TYPE)).toBe(false);
+    expect(claims.vouches(PLUGIN_COIN, PLUGIN_TYPE)).toBe(true);
+    expect(claims.vouches(REGISTRY_COIN, REGISTRY_TYPE)).toBe(false);
+    expect(claims.vouches(OTHER_COIN, PLUGIN_TYPE)).toBe(false);
   });
 
-  it('keeps the fingerprint of the plugins when the registry only agrees or conflicts, and extends it for a coin only the registry claims', () => {
+  it('keeps its plugin fingerprint whatever the registry says, and moves its version only for a coin no plugin claims', () => {
     const plugins = plugin();
+    const silent = new WalletCoinClaims(plugin(), registry({}));
     const agreeing = new WalletCoinClaims(plugin(), registry({ [PLUGIN_COIN]: PLUGIN_TYPE }));
     const conflicting = new WalletCoinClaims(plugin(), registry({ [PLUGIN_COIN]: REGISTRY_TYPE }));
     const extending = new WalletCoinClaims(plugin(), registry({ [REGISTRY_COIN]: REGISTRY_TYPE }));
     vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
 
-    expect(agreeing.fingerprint()).toBe(plugins.fingerprint());
-    expect(conflicting.fingerprint()).toBe(plugins.fingerprint());
-    expect(extending.fingerprint()).not.toBe(plugins.fingerprint());
-    expect(extending.fingerprint()).toContain(REGISTRY_TYPE);
+    for (const claims of [silent, agreeing, conflicting, extending]) expect(claims.fingerprint()).toBe(plugins.fingerprint());
+    expect(agreeing.version()).toBe(silent.version());
+    expect(conflicting.version()).toBe(silent.version());
+    expect(extending.version()).not.toBe(silent.version());
+    expect(extending.version()).toContain(REGISTRY_TYPE);
   });
 
   it('keeps the plugin claim over a conflicting registry claim, and logs the conflict once', () => {
     const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
     const claims = new WalletCoinClaims(plugin(), registry({ [PLUGIN_COIN]: REGISTRY_TYPE }));
 
-    claims.fingerprint();
-    claims.fingerprint();
+    claims.version();
+    claims.version();
 
     expect(claims.issuerOf(PLUGIN_COIN)).toBe(PLUGIN_TYPE);
     expect(warn).toHaveBeenCalledTimes(1);

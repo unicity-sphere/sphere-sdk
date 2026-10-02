@@ -449,4 +449,54 @@ describe('PaymentsFacade — coins the token registry claims (#833)', () => {
     expect(decode).not.toHaveBeenCalled();
     expect(eventsOf(world, 'inventory:updated').length).toBe(before);
   });
+
+  it("keeps a coin the registry claims for a plugin's type pending: the plugin's policy covers only the coins the plugin claims", async () => {
+    const price = anyPrice();
+    const world = makeWorld({ claims: claims(), registry: registryFrom([{ ...USDC_E_ENTRY, issuance: { tokenType: BRIDGED_TYPE } }]), price });
+    const squat = await minted(world, BRIDGED_TYPE, 1, { coinId: USDC_E });
+    await world.hold(squat);
+    const verify = vi.spyOn(world.engine, 'verify').mockResolvedValue({ ok: true });
+    const decode = vi.spyOn(world.engine, 'decodeToken');
+
+    await world.facade.start();
+    await vi.waitFor(() => expect(decode.mock.calls.some(([blob]) => blob.tokenId === squat.blob.tokenId)).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(await holdings(world, USDC_E)).toEqual([['10', 'pending']]);
+    expect(verify.mock.calls.filter(([token]) => token.blob.tokenId === squat.blob.tokenId)).toEqual([]);
+    expect((await world.facade.unverifiedAssets(USDC_E)).map((a) => a.priceUsd)).toEqual([null]);
+    expect(price.asked).not.toContain('usd-coin-sepolia');
+    await expect(world.facade.send({ recipient: '@peer', amount: '10', coinId: USDC_E })).rejects.toMatchObject({
+      code: 'SEND_INSUFFICIENT_BALANCE',
+    });
+    await expect(world.facade.sendWholeToken({ recipient: '@peer', tokenId: squat.blob.tokenId })).rejects.toThrow(/not a spendable holding/);
+  });
+
+  it("keeps a plugin-verified coin trusted and spendable while the registry claims another coin, and across a restart", async () => {
+    const registry = registryFrom(null);
+    const first = makeWorld({ claims: claims(), registry });
+    await first.hold(await minted(first, BRIDGED_TYPE, 1));
+    await first.hold(await minted(first, OTHER_TYPE, 2, { coinId: USDC_E }));
+    await first.facade.start();
+    await vi.waitFor(async () => expect(await holdings(first)).toEqual([['10', null]]));
+    const verify = vi.spyOn(first.engine, 'verify');
+
+    await refresh(registry, [USDC_E_ENTRY]);
+
+    expect(await holdings(first)).toEqual([['10', null]]);
+    await vi.waitFor(async () => expect(await holdings(first, USDC_E)).toEqual([['10', 'refused']]));
+    await first.facade.send({ recipient: '@peer', amount: '4', coinId: CLAIMED });
+    await refresh(registry, [{ ...USDC_E_ENTRY, issuance: { tokenType: OTHER_TYPE } }]);
+    await vi.waitFor(async () => expect(await holdings(first, USDC_E)).toEqual([['10', 'pending']]));
+    expect(await holdings(first)).toEqual([['6', null]]);
+    expect(verify).not.toHaveBeenCalled();
+    await first.facade.stop();
+
+    const restarted = makeWorld({ restartOf: first, claims: claims(), registry: registryFrom([{ ...USDC_E_ENTRY, issuance: { tokenType: OTHER_TYPE } }]) });
+    const reverify = vi.spyOn(restarted.engine, 'verify');
+    await restarted.facade.start();
+
+    await vi.waitFor(async () => expect(await holdings(restarted)).toEqual([['6', null]]));
+    expect(reverify).not.toHaveBeenCalled();
+  });
 });

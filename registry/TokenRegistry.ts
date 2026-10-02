@@ -8,9 +8,9 @@
 import { logger } from '../core/logger';
 import { TOKEN_REGISTRY_REFRESH_INTERVAL, STORAGE_KEYS_GLOBAL } from '../constants';
 import type { StorageProvider } from '../storage';
-import { issuersOf, withValidIssuance, type TokenIssuance } from './issuance';
+import { indexDefinitions, type TokenIssuance } from './definitions';
 
-export type { TokenIssuance } from './issuance';
+export type { TokenIssuance } from './definitions';
 
 // =============================================================================
 // Types
@@ -108,15 +108,16 @@ const FETCH_TIMEOUT_MS = 10_000;
 export class TokenRegistry {
   private static instance: TokenRegistry | null = null;
 
-  private readonly definitionsById: Map<string, TokenDefinition>;
+  private definitionsById = new Map<string, TokenDefinition>();
   /** Non-fungible definitions keyed by TOKEN TYPE — a separate namespace (#147). */
-  private readonly definitionsByType: Map<string, TokenDefinition>;
-  private readonly definitionsBySymbol: Map<string, TokenDefinition>;
-  private readonly definitionsByName: Map<string, TokenDefinition>;
+  private definitionsByType = new Map<string, TokenDefinition>();
+  private definitionsBySymbol = new Map<string, TokenDefinition>();
+  private definitionsByName = new Map<string, TokenDefinition>();
   /** Coin id → issuing token type. Replaced, never mutated, so a reader can tell a change by identity. */
   private issuers: ReadonlyMap<string, string> = new Map();
   private readonly changeListeners = new Set<() => void>();
   private cacheReadPromise: Promise<void> = Promise.resolve();
+  private readonly warned = new Set<string>();
 
   // Remote refresh state
   private remoteUrl: string | null = null;
@@ -133,12 +134,7 @@ export class TokenRegistry {
   /** Cancels the in-flight fetch (and its abort timer) when the registry is disposed. */
   private inFlight: { abort: () => void } | null = null;
 
-  private constructor() {
-    this.definitionsById = new Map();
-    this.definitionsByType = new Map();
-    this.definitionsBySymbol = new Map();
-    this.definitionsByName = new Map();
-  }
+  private constructor() {}
 
   /**
    * Get singleton instance of TokenRegistry
@@ -386,7 +382,7 @@ export class TokenRegistry {
       if (gen !== this.generation) return false;
 
       if (Date.now() - ts > this.refreshIntervalMs) {
-        this.applyIssuers(issuersOf((data as TokenDefinition[]).map(withValidIssuance)));
+        this.applyIssuers(indexDefinitions(data as TokenDefinition[], this.warnOnce).issuers);
         return false;
       }
       this.applyDefinitions(data as TokenDefinition[]);
@@ -418,34 +414,21 @@ export class TokenRegistry {
   // Remote Refresh
   // ===========================================================================
 
-  /**
-   * Apply an array of token definitions to the internal maps.
-   * Clears existing data before applying.
-   */
+  /** Replaces every lookup map at once with ones built from `served`; a malformed entry is skipped. */
   private applyDefinitions(served: TokenDefinition[]): void {
-    this.definitionsById.clear();
-    this.definitionsBySymbol.clear();
-    this.definitionsByName.clear();
-    this.definitionsByType.clear();
-    const definitions = served.map(withValidIssuance);
-
-    // ONE registry file, TWO id namespaces (wallet-api#147): a `fungible` entry's
-    // `id` is a COIN id, a `non-fungible` entry's is a TOKEN TYPE. The flat maps
-    // stay as they were (getDefinition resolves either, and is pinned that way);
-    // `definitionsByType` is the namespace-correct lookup a coinless token needs.
-    for (const def of definitions) {
-      const idLower = def.id.toLowerCase();
-      this.definitionsById.set(idLower, def);
-      if (def.assetKind === 'non-fungible') this.definitionsByType.set(idLower, def);
-
-      if (def.symbol) {
-        this.definitionsBySymbol.set(def.symbol.toUpperCase(), def);
-      }
-
-      this.definitionsByName.set(def.name.toLowerCase(), def);
-    }
-    this.applyIssuers(issuersOf(definitions));
+    const index = indexDefinitions(served, this.warnOnce);
+    this.definitionsById = index.byId;
+    this.definitionsByType = index.byType;
+    this.definitionsBySymbol = index.bySymbol;
+    this.definitionsByName = index.byName;
+    this.applyIssuers(index.issuers);
   }
+
+  private readonly warnOnce = (key: string, message: string): void => {
+    if (this.warned.has(key)) return;
+    this.warned.add(key);
+    logger.warn('TokenRegistry', message);
+  };
 
   private applyIssuers(issuers: ReadonlyMap<string, string>): void {
     this.issuers = issuers;

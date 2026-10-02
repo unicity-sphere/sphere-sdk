@@ -1013,9 +1013,10 @@ claimed coin counts only inside a token of its issuing type that verified:
   a depositor's own mint before the lock is final, stays pending. Pending tokens and any other held
   token of a claimed coin, for instance one another device received, are verified in the background,
   and a check that cannot answer yet is retried with backoff.
-- Verified tokens are remembered per device together with a fingerprint of the registered policies
-  and of the registry claims below. A changed policy, claim or `revision` discards them, so every
-  held token is checked again.
+- Verified tokens are remembered per device, each with the issuer of every coin it carries, under
+  a fingerprint of the registered policies. A changed policy or `revision` discards them all. A
+  changed claim, including one from the registry below, discards only the verdicts of tokens
+  carrying that coin, so those tokens alone are checked again.
 - Two policies for one token type, or two types claiming one coin, fail engine construction with
   `INVALID_CONFIG`.
 
@@ -1037,25 +1038,31 @@ Every wallet then treats the coin as claimed by that type, whether or not it loa
 type, so a token that merely carries the coin id is never shown, priced or spent as that coin:
 
 - A token of another type carrying the coin is `'refused'`, as under a plugin claim.
-- A token of the issuing type stays `'pending'` as long as no issuance policy for the type is
-  loaded. Without the policy `verify` passes a token of the type minted with no reason at all, so it
-  cannot vouch for one. Such a token is never trusted, spent or priced. When received it is
-  announced in `unverifiedTokens` marked `'pending'` and not written to history. A `mintCustom()` of
-  the type and the change of such a token stay pending too.
-- A wallet that loads a plugin with a policy for the type checks the token under that policy, as
-  under a plugin claim. If a plugin claims the coin for another type, the plugin's claim is kept and
-  the conflict is logged once.
-- An `issuance` that is not 64 lowercase hex, or that sits on a non-fungible entry, is dropped with
-  a warning.
+- A token of the issuing type stays `'pending'` unless a loaded plugin itself claims the coin for
+  that type. Without such a claim no loaded policy was written for the coin, so `verify` cannot
+  vouch for the token: with no policy for the type at all it passes a token minted with no reason,
+  and a plugin's policy for the type judges only the coins that plugin lists. Such a token is never
+  trusted, spent or priced. When received it is announced in `unverifiedTokens` marked `'pending'`
+  and not written to history. A `mintCustom()` of the type and the change of such a token stay
+  pending too.
+- A wallet whose plugin claims the coin for the same type behaves exactly as under the plugin claim.
+  If a plugin claims the coin for another type, the plugin's claim is kept and the conflict is
+  logged once.
+- An `issuance` that is not 64 lowercase hex, that sits on a non-fungible entry, or that names a
+  network's own coin (UCT on testnet2, per `NETWORKS[network].nativeCoinIds`) is dropped with one
+  warning per registry and value. An entry whose fields would break a lookup (no `name`, a
+  non-string `symbol`, malformed `icons`) is skipped with a warning; the rest of the file and its
+  claims still apply.
 
 Registry claims are read live: the registry loads after `Sphere.init` and refreshes hourly. A receive
-drain and the remembered verdicts wait for the registry's persistent cache, so a claim the cache
-holds applies from the first drain. A cache older than the refresh interval still supplies its
-claims, though not its definitions. Until the registry has loaded once on a device the coin is
-unclaimed, as it was before this field existed. A load or refresh that changes the claims discards
-the remembered verdicts, checks the held tokens again and emits `inventory:updated`, so a UI moves
-tokens between `assets()` and `unverifiedAssets()` without a reload. A registry claim that agrees or
-conflicts with a loaded plugin's changes nothing.
+drain waits for the registry's persistent cache, so a claim the cache holds applies from the first
+drain. A cache older than the refresh interval still supplies its claims, though not its
+definitions. Until the registry has loaded once on a device the coin is unclaimed, as it was before
+this field existed. A verdict stops counting the moment a coin its token carries changes issuer, and
+a load or refresh that changes a claim checks the affected tokens again and emits
+`inventory:updated`, so a UI moves tokens between `assets()` and `unverifiedAssets()` without a
+reload. Every other verdict stands. A registry claim that agrees or conflicts with a loaded plugin's
+changes nothing.
 
 ### `mintCustom(request: MintCustomRequest): Promise<MintResult>`
 

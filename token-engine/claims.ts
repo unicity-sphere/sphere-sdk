@@ -4,7 +4,6 @@ import type { CoinId, TokenIssuancePolicy, TokenPlugin } from './types';
 export class CoinClaims {
   private readonly issuers = new Map<CoinId, string>();
   private readonly policies: string[] = [];
-  private readonly policedTypes = new Set<string>();
 
   public static fromPlugins(plugins: readonly TokenPlugin[] | undefined): CoinClaims {
     const claims = new CoinClaims();
@@ -20,7 +19,6 @@ export class CoinClaims {
     const taken = coinIds.find((coinId) => this.issuers.has(coinId));
     if (taken !== undefined) throw new Error(`Coin ${taken} is already issued by token type ${this.issuers.get(taken)}.`);
     for (const coinId of coinIds) this.issuers.set(coinId, tokenType);
-    this.policedTypes.add(tokenType);
     this.policies.push(JSON.stringify([tokenType, [...coinIds].sort(), policy.revision ?? '']));
   }
 
@@ -32,8 +30,8 @@ export class CoinClaims {
     return this.issuers.get(coinId.toLowerCase()) ?? null;
   }
 
-  /** Whether an issuance policy for this token type is registered, so `verify` enforces it. */
-  public enforces(tokenType: string): boolean {
-    return this.policedTypes.has(tokenType.toLowerCase());
+  /** Whether a registered policy of this token type claims this coin, so `verify` judges the coin under it. */
+  public vouches(coinId: CoinId, tokenType: string): boolean {
+    return this.issuerOf(coinId) === tokenType.toLowerCase();
   }
 }

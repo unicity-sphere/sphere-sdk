@@ -1941,7 +1941,7 @@
     "name": "verdicts-trust-all",
     "note": "#825: a claimed coin is trusted only in a verified token",
     "file": "modules/payments-v2/inventory/verdicts.ts",
-    "find": "    if (!this.isClaimed(coinId) || this.verified.has(tokenId)) return 'trusted';",
+    "find": "    if (!this.isClaimed(coinId)) return 'trusted';",
     "replace": "    return 'trusted';",
     "tests": [
       "tests/unit/payments-v2/verdicts.test.ts"
@@ -1961,7 +1961,7 @@
     "name": "verdicts-fingerprint-ignored",
     "note": "#825: remembered verdicts reset when the policies change",
     "file": "modules/payments-v2/inventory/verdicts.ts",
-    "find": "    if (remembered?.fingerprint !== this.basis) return;",
+    "find": "    if (remembered === null || remembered.fingerprint !== this.deps.claims.fingerprint()) return;",
     "replace": "    if (remembered === null) return;",
     "tests": [
       "tests/unit/payments-v2/verdicts.test.ts"
@@ -2031,34 +2031,46 @@
     ]
   },
   {
-    "name": "registry-claims-outside-fingerprint",
-    "note": "#833: the verdict fingerprint covers registry claims, so a load or refresh that moves them re-checks held tokens (verdicts.test.ts 'forgets verdicts reached under other claims...')",
+    "name": "registry-claim-vouched-by-type",
+    "note": "#833 review: a policy vouches only for the coins its own plugin claims, never for a coin the registry names its type for (claimed-coins.test.ts 'keeps a coin the registry claims for a plugin's type pending...')",
     "file": "modules/payments-v2/inventory/coin-claims.ts",
-    "find": "    this.print = [this.plugins.fingerprint(), ...lines.sort()].join('\\n');",
-    "replace": "    this.print = this.plugins.fingerprint();",
+    "find": "    return this.plugins.vouches(coinId, tokenType);",
+    "replace": "    return this.issuerOf(coinId) === tokenType.toLowerCase();",
     "tests": [
-      "tests/unit/payments-v2/verdicts.test.ts",
+      "tests/unit/payments-v2/claimed-coins.test.ts",
       "tests/unit/payments-v2/coin-claims.test.ts",
-      "tests/unit/payments-v2/claimed-coins.test.ts"
+      "tests/unit/payments-v2/verdicts.test.ts"
     ]
   },
   {
-    "name": "registry-only-claim-counts-as-enforced",
-    "note": "#833: only a plugin's policy is enforced by verify, so a registry claim alone never vouches for a token (claimed-coins.test.ts type-squat)",
+    "name": "registry-claim-change-unversioned",
+    "note": "#833: a registry claim change on a coin no plugin claims moves the claims version, which re-judges the held tokens (claimed-coins.test.ts 're-judges held tokens when the registry loads...')",
     "file": "modules/payments-v2/inventory/coin-claims.ts",
-    "find": "    return this.plugins.enforces(tokenType);",
-    "replace": "    return tokenType.length > 0;",
+    "find": "    this.registryVersion = lines.sort().join('\\n');",
+    "replace": "    this.registryVersion = '';",
+    "tests": [
+      "tests/unit/payments-v2/coin-claims.test.ts",
+      "tests/unit/payments-v2/claimed-coins.test.ts",
+      "tests/unit/payments-v2/verdicts.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-vouched-by-type",
+    "note": "#833 review: every claimed coin a token carries must be vouched for by a plugin claim on that coin (verdicts.test.ts 'never lets a plugin's policy vouch for a coin only the registry claims...')",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "  return coinIds.length > 0 && coinIds.every((coinId) => claims.vouches(coinId, token.tokenType));",
+    "replace": "  return coinIds.length > 0 && honoursClaims(claims, token);",
     "tests": [
       "tests/unit/payments-v2/claimed-coins.test.ts",
-      "tests/unit/payments-v2/coin-claims.test.ts"
+      "tests/unit/payments-v2/verdicts.test.ts"
     ]
   },
   {
     "name": "verdicts-registry-only-claim-verified",
-    "note": "#833: the background check never promotes a token of a type no policy here enforces, whatever verify answers (claimed-coins.test.ts 'never trusts a token of the issuing type minted with no reason...')",
+    "note": "#833: the background check never promotes a token no plugin claim vouches for, whatever verify answers (claimed-coins.test.ts 'never trusts a token of the issuing type minted with no reason...')",
     "file": "modules/payments-v2/inventory/verdicts.ts",
-    "find": "    if (!this.deps.claims.enforces(token.tokenType)) return 'unvouched';",
-    "replace": "    if (token.tokenType.length < 0) return 'unvouched';",
+    "find": "    if (!vouchedFor(this.deps.claims, token)) return { verdict: 'unvouched', issuers };",
+    "replace": "    if (token.tokenType.length < 0) return { verdict: 'unvouched', issuers };",
     "tests": [
       "tests/unit/payments-v2/claimed-coins.test.ts",
       "tests/unit/payments-v2/verdicts.test.ts"
@@ -2068,8 +2080,8 @@
     "name": "verdicts-accept-trusts-unvouched-arrival",
     "note": "#833: an arrival or custom mint of a registry-only claim is not trusted at once (claimed-coins.test.ts 'receives a token of the issuing type as pending...')",
     "file": "modules/payments-v2/inventory/verdicts.ts",
-    "find": "    const vouched = (): boolean => vouchedFor(this.deps.claims, token);",
-    "replace": "    const vouched = (): boolean => honoursClaims(this.deps.claims, token);",
+    "find": "    if (!vouchedFor(this.deps.claims, token)) return;\n    await this.hydrate();\n    if (vouchedFor(this.deps.claims, token)) await this.remember(",
+    "replace": "    if (!honoursClaims(this.deps.claims, token)) return;\n    await this.hydrate();\n    if (honoursClaims(this.deps.claims, token)) await this.remember(",
     "tests": [
       "tests/unit/payments-v2/claimed-coins.test.ts",
       "tests/unit/payments-v2/verdicts.test.ts"
@@ -2086,6 +2098,100 @@
     ]
   },
   {
+    "name": "verdicts-judgement-outlives-its-issuers",
+    "note": "#833 review: a verdict counts only while every coin its token carries keeps the issuer it was reached under (verdicts.test.ts 'stops counting a verdict the moment a coin its token carries changes issuer')",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "    for (const [coinId, issuer] of judgement.issuers) if (this.deps.claims.issuerOf(coinId) !== issuer) return undefined;",
+    "replace": "    void judgement.issuers;",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts",
+      "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-claims-change-forgets-every-verdict",
+    "note": "#833 review: a claim change on one coin leaves the verdicts of tokens of other coins standing (verdicts.test.ts 'keeps a verified token trusted when the registry claims another coin...')",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "    this.retries.clear();\n    this.disarmRetry();",
+    "replace": "    this.judged.clear();\n    this.retries.clear();\n    this.disarmRetry();",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts",
+      "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-restart-ignores-recorded-issuers",
+    "note": "#833 review: a remembered verdict comes back with the issuers it was reached under, so one whose coin moved does not count (verdicts.test.ts 'remembers each verified token with the issuers...')",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "      this.judged.set(tokenId, { verdict: 'verified', issuers: new Map(issuers) });",
+    "replace": "      this.judged.set(tokenId, { verdict: 'verified', issuers: new Map() });",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-remembered-without-issuers",
+    "note": "#833 review: each remembered verified token is written with its issuers (verdicts.test.ts 'remembers each verified token with the issuers...')",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "      if (judgement.verdict === 'verified') verified.push([tokenId, [...judgement.issuers]]);",
+    "replace": "      if (judgement.verdict === 'verified') verified.push([tokenId, []]);",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-claims-change-unwatched",
+    "note": "#833: a claims change re-judges held tokens and tells readers without a reload (verdicts.test.ts 'while started, a claims change tells readers...')",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "      this.unwatch = this.deps.claims.subscribe?.(() => this.onClaimsChanged()) ?? null;",
+    "replace": "      this.unwatch = null;",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts",
+      "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-claims-change-keeps-stale-retry-timer",
+    "note": "#833: a claims change disarms the old retry timer, so the backoff restarts under the new claims instead of waiting out up to an hour (verdicts.test.ts 'restarts the retry backoff when the claims change...')",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "    this.retries.clear();\n    this.disarmRetry();",
+    "replace": "    this.retries.clear();",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-claims-change-not-rejudged",
+    "note": "#833: while started, a claims change judges the holders again at once (claimed-coins.test.ts 're-judges held tokens when the registry loads or refreshes after start...')",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "    const op = this.review(this.deps.holders?.() ?? this.held).then(() => this.deps.changed());",
+    "replace": "    const op = Promise.resolve();",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts",
+      "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-identical-claims-rejudged",
+    "note": "#833: an hourly refresh that leaves the claims as they were re-judges nothing and emits nothing (claimed-coins.test.ts 'a refresh that leaves the claims as they were judges nothing again')",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "    if (version === this.version) return;",
+    "replace": "    void this.version;",
+    "tests": [
+      "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-version-not-taken-at-start",
+    "note": "#833: the claims version is read when the verdicts start, so a cache loaded after composition is not mistaken for a change (claimed-coins.test.ts 'a refresh that leaves the claims as they were judges nothing again')",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "      this.version = this.deps.claims.version?.() ?? '';\n      this.unwatch",
+    "replace": "      this.unwatch",
+    "tests": [
+      "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
+  },
+  {
     "name": "receive-drains-before-claims-ready",
     "note": "#833: a drain waits for the registry cache read, so a cached claim applies from the first drain (claimed-coins.test.ts 'applies a cached registry claim from the first drain...')",
     "file": "modules/payments-v2/receive/Receive.ts",
@@ -2096,53 +2202,31 @@
     ]
   },
   {
-    "name": "verdicts-load-before-claims-ready",
-    "note": "#833: remembered verdicts are read only after the registry cache, so a restart keeps them (claimed-coins.test.ts 'reads the registry cache before the remembered verdicts...')",
-    "file": "modules/payments-v2/inventory/verdicts.ts",
-    "find": "    await this.deps.claims.whenReady?.();",
-    "replace": "    void this.deps.claims;",
-    "tests": [
-      "tests/unit/payments-v2/claimed-coins.test.ts"
-    ]
-  },
-  {
-    "name": "verdicts-keep-verdicts-across-claims-change",
-    "note": "#833: verdicts reached under other claims are forgotten (verdicts.test.ts 'forgets verdicts reached under other claims...')",
-    "file": "modules/payments-v2/inventory/verdicts.ts",
-    "find": "    if (current === this.basis) return false;",
-    "replace": "    if (current === this.basis || current !== this.basis) return false;",
-    "tests": [
-      "tests/unit/payments-v2/verdicts.test.ts",
-      "tests/unit/payments-v2/claimed-coins.test.ts"
-    ]
-  },
-  {
-    "name": "verdicts-settle-check-from-old-claims",
-    "note": "#833: a check the claims moved under is discarded and run again (verdicts.test.ts 'judges a token again under the new claims...')",
-    "file": "modules/payments-v2/inventory/verdicts.ts",
-    "find": "    if (this.basis !== basis) {\n      this.queued ??= holders;\n      return;\n    }",
-    "replace": "    if (this.basis !== basis) {\n      void holders;\n    }",
-    "tests": [
-      "tests/unit/payments-v2/verdicts.test.ts"
-    ]
-  },
-  {
-    "name": "verdicts-claims-change-unwatched",
-    "note": "#833: a claims change re-judges held tokens and tells readers without a reload (verdicts.test.ts 'while started, a claims change tells readers...')",
-    "file": "modules/payments-v2/inventory/verdicts.ts",
-    "find": "    this.unwatch ??= this.deps.claims.subscribe?.(() => this.onClaimsChanged()) ?? null;",
-    "replace": "    this.unwatch ??= null;",
-    "tests": [
-      "tests/unit/payments-v2/verdicts.test.ts",
-      "tests/unit/payments-v2/claimed-coins.test.ts"
-    ]
-  },
-  {
     "name": "registry-malformed-issuance-kept",
     "note": "#833: an issuance that is not 64 lowercase hex on a fungible entry is dropped (TokenRegistry.test.ts 'ignores a malformed issuance...')",
-    "file": "registry/issuance.ts",
-    "find": "  if (def.assetKind === 'fungible' && typeof tokenType === 'string' && TOKEN_TYPE_HEX.test(tokenType)) return def;",
-    "replace": "  if (def.assetKind === 'fungible' || typeof tokenType === 'string') return def;",
+    "file": "registry/definitions.ts",
+    "find": "  const wellFormed = def.assetKind === 'fungible' && typeof tokenType === 'string' && TOKEN_TYPE_HEX.test(tokenType);",
+    "replace": "  const wellFormed = def.assetKind === 'fungible' || typeof tokenType === 'string';",
+    "tests": [
+      "tests/unit/registry/TokenRegistry.test.ts"
+    ]
+  },
+  {
+    "name": "registry-native-coin-issuance-kept",
+    "note": "#833 review: an issuance on a network's own coin is ignored, so no registry edit can freeze UCT (TokenRegistry.test.ts 'ignores an issuance on a network's native coin...')",
+    "file": "registry/definitions.ts",
+    "find": "  if (wellFormed && !NATIVE_COIN_IDS.has(def.id.toLowerCase())) return def;",
+    "replace": "  if (wellFormed) return def;",
+    "tests": [
+      "tests/unit/registry/TokenRegistry.test.ts"
+    ]
+  },
+  {
+    "name": "registry-malformed-entry-blocks-file",
+    "note": "#833 review: a malformed entry is skipped, and the rest of the file and its claims still apply (TokenRegistry.test.ts 'skips a malformed entry...')",
+    "file": "registry/definitions.ts",
+    "find": "    if (!isWellFormed(entry)) {",
+    "replace": "    if (entry === null) {",
     "tests": [
       "tests/unit/registry/TokenRegistry.test.ts"
     ]
@@ -2151,7 +2235,7 @@
     "name": "registry-stale-cache-drops-claims",
     "note": "#833: a stale cache still supplies its claims (TokenRegistry.test.ts 'keeps the claims of a stale cache...')",
     "file": "registry/TokenRegistry.ts",
-    "find": "        this.applyIssuers(issuersOf((data as TokenDefinition[]).map(withValidIssuance)));",
+    "find": "        this.applyIssuers(indexDefinitions(data as TokenDefinition[], this.warnOnce).issuers);",
     "replace": "        void data;",
     "tests": [
       "tests/unit/registry/TokenRegistry.test.ts"
@@ -2179,24 +2263,13 @@
     ]
   },
   {
-    "name": "verdicts-claims-change-keeps-stale-retry-timer",
-    "note": "#833: a claims change disarms the old retry timer, so the backoff restarts under the new claims instead of waiting out up to an hour (verdicts.test.ts 'restarts the retry backoff when the claims change...')",
-    "file": "modules/payments-v2/inventory/verdicts.ts",
-    "find": "    this.retries.clear();\n    this.disarmRetry();",
-    "replace": "    this.retries.clear();",
+    "name": "registry-warns-every-apply",
+    "note": "#833 review: a registry warning is logged once per entry and value, not on every hourly apply (TokenRegistry.test.ts 'warns once per malformed issuance value...')",
+    "file": "registry/TokenRegistry.ts",
+    "find": "    if (this.warned.has(key)) return;",
+    "replace": "    if (key === '') return;",
     "tests": [
-      "tests/unit/payments-v2/verdicts.test.ts"
-    ]
-  },
-  {
-    "name": "verdicts-claims-change-not-rejudged",
-    "note": "#833: while started, verdicts forgotten on a claims change are judged again at once, however the change was noticed (claimed-coins.test.ts 're-judges held tokens when the registry loads or refreshes after start...')",
-    "file": "modules/payments-v2/inventory/verdicts.ts",
-    "find": "    if (this.live) this.rejudge();",
-    "replace": "    void this.live;",
-    "tests": [
-      "tests/unit/payments-v2/verdicts.test.ts",
-      "tests/unit/payments-v2/claimed-coins.test.ts"
+      "tests/unit/registry/TokenRegistry.test.ts"
     ]
   }
 ]

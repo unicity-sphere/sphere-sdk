@@ -968,13 +968,14 @@ authoritative for build success.
   `unicity-ids.testnet2.json`) + persistent cache.
 - The facade consumes it for Asset presentation and for coin claims; the money path works with coin
   ids. A fungible entry's `issuance.tokenType` claims its coin for that type in every wallet (#833):
-  another type is `refused`, and the issuing type stays `pending` unless a plugin loads a policy for
-  it — without one `verify` passes a token of the type minted with no reason, so a registry-only
-  claim must never let a token become trusted. Claims are read live (`WalletCoinClaims`,
-  `modules/payments-v2/inventory/coin-claims.ts`); a plugin claim wins a conflict; the verdict
-  fingerprint covers registry claims on coins no plugin claims, so a refresh that moves them
-  re-checks held tokens. A drain and the remembered verdicts wait for `registry.cacheRead()`; before a
-  device's first registry load the coin is unclaimed.
+  another type is `refused`, and the issuing type stays `pending` unless a loaded PLUGIN claims that
+  very coin for that type (`vouches(coin, type)`, per coin, never per type) — `verify` judges a coin
+  only under a policy written for it, so a registry-only claim must never let a token become
+  trusted. Claims are read live (`WalletCoinClaims`, `modules/payments-v2/inventory/coin-claims.ts`);
+  a plugin claim wins a conflict; an `issuance` on a native coin (`NETWORKS[n].nativeCoinIds`) is
+  ignored. Each verdict records the issuer of every coin its token carries and counts only while
+  they hold, so a claim change re-checks just that coin's tokens. A drain waits for
+  `registry.cacheRead()`; before a device's first registry load the coin is unclaimed.
 - A `Sphere` builds and OWNS its registry (#767), disposed by `sphere.destroy()`. The provider
   factories no longer call `TokenRegistry.configure()` — in the published package they are
   separate tsup bundles with separate singleton copies, so that call wrote to an object no

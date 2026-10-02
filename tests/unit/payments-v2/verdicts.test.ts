@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SphereError } from '../../../core/errors';
 import { WalletCoinClaims } from '../../../modules/payments-v2/inventory/coin-claims';
 import { TokenVerdicts, VERDICT_RETRY_MS } from '../../../modules/payments-v2/inventory/verdicts';
-import { STORE_KEYS } from '../../../modules/payments-v2/stores';
 import { CoinClaims } from '../../../token-engine/claims';
 import { TokenType } from '../../../token-engine/sdk';
 import { SpherePaymentData } from '../../../token-engine/SpherePaymentData';
@@ -201,6 +200,12 @@ describe('TokenVerdicts', () => {
 });
 
 describe('TokenVerdicts — claims that move (#833)', () => {
+  const started: TokenVerdicts[] = [];
+
+  afterEach(() => {
+    for (const verdicts of started.splice(0)) verdicts.stop();
+  });
+
   /** Plugin claims plus a registry whose claims the test replaces, as a refresh does. */
   function moving(plugin: CoinClaims, initial: Record<string, string> = {}) {
     let current: ReadonlyMap<string, string> = new Map(Object.entries(initial));
@@ -224,19 +229,25 @@ describe('TokenVerdicts — claims that move (#833)', () => {
     const getBlobs = vi.fn(async (ids: string[]) => new Map(ids.filter((id) => held.has(id)).map((id) => [id, held.get(id)!.blob.token] as const)));
     const changed = vi.fn();
     const verdicts = new TokenVerdicts({ kv, claims, engine: () => engine, getBlobs, changed, holders: () => [...held.keys()] });
+    const start = async (): Promise<void> => {
+      started.push(verdicts);
+      await verdicts.start();
+    };
     let salt = 0;
-    const mint = async (coinId: string, tokenType: string): Promise<SphereToken> => {
+    const mint = async (coinIds: string | string[], tokenType: string): Promise<SphereToken> => {
       salt += 1;
+      const assets = (Array.isArray(coinIds) ? coinIds : [coinIds]).map((coinId) => ({ coinId, amount: 10n }));
       const token = await engine.mintDataToken({
         recipientPubkey: engine.getIdentity().chainPubkey,
-        data: await SpherePaymentData.fromValue({ assets: [{ coinId, amount: 10n }] }).encode(),
+        data: await SpherePaymentData.fromValue({ assets }).encode(),
         tokenType: hexBytes(tokenType),
         salt: new Uint8Array(32).fill(salt),
+        justification: REASON,
       });
       held.set(token.blob.tokenId, token);
       return token;
     };
-    return { engine, verdicts, getBlobs, changed, mint, kv, held };
+    return { engine, verdicts, start, getBlobs, changed, mint, kv, held };
   }
 
   function bridgePlugin(coinIds: string[] = [BRIDGED_COIN]): CoinClaims {
@@ -245,32 +256,61 @@ describe('TokenVerdicts — claims that move (#833)', () => {
     return plugin;
   }
 
-  it('forgets verdicts reached under other claims, checks again, and remembers the set under the claims it was reached under', async () => {
+  const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it('keeps a verified token trusted when the registry claims another coin, and re-judges only the tokens of that coin', async () => {
     const registry = moving(bridgePlugin());
-    const { engine, verdicts, mint, kv } = await judged(registry.claims);
-    const kept = await mint(BRIDGED_COIN, BRIDGED_TYPE);
-    await verdicts.review([kept.blob.tokenId]);
-    expect(verdicts.trusts(kept.blob.tokenId, BRIDGED_COIN)).toBe(true);
+    const { engine, verdicts, start, mint } = await judged(registry.claims);
+    const bridged = await mint(BRIDGED_COIN, BRIDGED_TYPE);
+    const native = await mint(NATIVE_COIN, OTHER_TYPE);
+    await start();
+    await verdicts.review([bridged.blob.tokenId]);
     const verify = vi.spyOn(engine, 'verify');
+
+    registry.set({ [NATIVE_COIN]: BRIDGED_TYPE });
+
+    expect(verdicts.trusts(bridged.blob.tokenId, BRIDGED_COIN)).toBe(true);
+    await vi.waitFor(() => expect(verdicts.standing(native.blob.tokenId, NATIVE_COIN)).toBe('refused'));
+    expect(verify).not.toHaveBeenCalled();
+    expect(verdicts.trusts(bridged.blob.tokenId, BRIDGED_COIN)).toBe(true);
+  });
+
+  it('stops counting a verdict the moment a coin its token carries changes issuer', async () => {
+    const registry = moving(bridgePlugin());
+    const { verdicts, mint } = await judged(registry.claims);
+    const mixed = await mint([BRIDGED_COIN, NATIVE_COIN], BRIDGED_TYPE);
+    await verdicts.review([mixed.blob.tokenId]);
+    expect(verdicts.trusts(mixed.blob.tokenId, BRIDGED_COIN)).toBe(true);
 
     registry.set({ [NATIVE_COIN]: OTHER_TYPE });
 
-    expect(verdicts.standing(kept.blob.tokenId, BRIDGED_COIN)).toBe('pending');
-    await verdicts.review([kept.blob.tokenId]);
-    expect(verify).toHaveBeenCalledTimes(1);
-    expect(verdicts.trusts(kept.blob.tokenId, BRIDGED_COIN)).toBe(true);
-    expect(kv.map.get(STORE_KEYS.verifiedTokens)).toEqual({ fingerprint: registry.claims.fingerprint(), tokenIds: [kept.blob.tokenId] });
-
-    const before = moving(bridgePlugin());
-    const restarted = await judged(before.claims, kv);
-    await restarted.verdicts.hydrate();
-    expect(restarted.verdicts.standing(kept.blob.tokenId, BRIDGED_COIN)).toBe('pending');
+    expect(verdicts.standing(mixed.blob.tokenId, BRIDGED_COIN)).toBe('pending');
+    await verdicts.review([mixed.blob.tokenId]);
+    expect(verdicts.standing(mixed.blob.tokenId, BRIDGED_COIN)).toBe('refused');
   });
 
-  it('judges a token again under the new claims when they move while it is being checked', async () => {
-    const registry = moving(bridgePlugin([]), { [BRIDGED_COIN]: BRIDGED_TYPE });
+  it('remembers each verified token with the issuers it was verified under, so a restart keeps it unless one of its coins moved', async () => {
+    const kv = memoryKV();
+    const first = await judged(moving(bridgePlugin()).claims, kv);
+    const bridged = await first.mint(BRIDGED_COIN, BRIDGED_TYPE);
+    const mixed = await first.mint([BRIDGED_COIN, NATIVE_COIN], BRIDGED_TYPE);
+    await first.verdicts.review([bridged.blob.tokenId, mixed.blob.tokenId]);
+
+    const second = await judged(moving(bridgePlugin(), { [NATIVE_COIN]: OTHER_TYPE }).claims, kv, first.held);
+    const verify = vi.spyOn(second.engine, 'verify');
+    await second.verdicts.hydrate();
+
+    expect(second.verdicts.trusts(bridged.blob.tokenId, BRIDGED_COIN)).toBe(true);
+    expect(second.verdicts.standing(mixed.blob.tokenId, BRIDGED_COIN)).toBe('pending');
+    await second.verdicts.review([bridged.blob.tokenId, mixed.blob.tokenId]);
+    expect(verify).not.toHaveBeenCalled();
+    expect(second.verdicts.standing(mixed.blob.tokenId, BRIDGED_COIN)).toBe('refused');
+  });
+
+  it('never trusts a verdict reached under claims that moved while the token was being checked', async () => {
+    const registry = moving(bridgePlugin());
     const { engine, verdicts, mint } = await judged(registry.claims);
-    const token = await mint(BRIDGED_COIN, BRIDGED_TYPE);
+    const mixed = await mint([BRIDGED_COIN, NATIVE_COIN], BRIDGED_TYPE);
     let pass = (): void => undefined;
     const checking = new Promise<void>((resolve) => {
       pass = resolve;
@@ -280,23 +320,25 @@ describe('TokenVerdicts — claims that move (#833)', () => {
       return { ok: true };
     });
 
-    const review = verdicts.review([token.blob.tokenId]);
+    const review = verdicts.review([mixed.blob.tokenId]);
     await vi.waitFor(() => expect(verify).toHaveBeenCalled());
-    registry.set({ [BRIDGED_COIN]: OTHER_TYPE });
+    registry.set({ [NATIVE_COIN]: OTHER_TYPE });
     pass();
     await review;
 
-    expect(verdicts.standing(token.blob.tokenId, BRIDGED_COIN)).toBe('refused');
+    expect(verdicts.trusts(mixed.blob.tokenId, BRIDGED_COIN)).toBe(false);
+    await verdicts.review([mixed.blob.tokenId]);
+    expect(verdicts.standing(mixed.blob.tokenId, BRIDGED_COIN)).toBe('refused');
   });
 
   it('never vouches for a token of a type no policy here enforces: pending, never verified, never checked again', async () => {
     vi.useFakeTimers();
     const registry = moving(new CoinClaims(), { [BRIDGED_COIN]: BRIDGED_TYPE });
-    const { engine, verdicts, mint, getBlobs } = await judged(registry.claims);
+    const { engine, verdicts, start, mint, getBlobs } = await judged(registry.claims);
     const squat = await mint(BRIDGED_COIN, BRIDGED_TYPE);
     const lookalike = await mint(BRIDGED_COIN, OTHER_TYPE);
     const verify = vi.spyOn(engine, 'verify');
-    await verdicts.start();
+    await start();
 
     await verdicts.review([squat.blob.tokenId, lookalike.blob.tokenId]);
     await verdicts.accept(squat);
@@ -308,16 +350,28 @@ describe('TokenVerdicts — claims that move (#833)', () => {
     expect(verdicts.standing(lookalike.blob.tokenId, BRIDGED_COIN)).toBe('refused');
     expect(verify).not.toHaveBeenCalled();
     expect(getBlobs).toHaveBeenCalledTimes(1);
-    verdicts.stop();
+  });
+
+  it("never lets a plugin's policy vouch for a coin only the registry claims, even for the plugin's own type", async () => {
+    const registry = moving(bridgePlugin([BRIDGED_COIN]), { [NATIVE_COIN]: BRIDGED_TYPE });
+    const { engine, verdicts, mint } = await judged(registry.claims);
+    const squat = await mint(NATIVE_COIN, BRIDGED_TYPE);
+    const verify = vi.spyOn(engine, 'verify').mockResolvedValue({ ok: true });
+
+    await verdicts.review([squat.blob.tokenId]);
+    await verdicts.accept(squat);
+
+    expect(verdicts.standing(squat.blob.tokenId, NATIVE_COIN)).toBe('pending');
+    expect(verify).not.toHaveBeenCalled();
   });
 
   it('restarts the retry backoff when the claims change, instead of waiting out the old one', async () => {
     vi.useFakeTimers();
     const registry = moving(bridgePlugin());
-    const { engine, verdicts, mint } = await judged(registry.claims);
+    const { engine, verdicts, start, mint } = await judged(registry.claims);
     const token = await mint(BRIDGED_COIN, BRIDGED_TYPE);
     const verify = vi.spyOn(engine, 'verify').mockRejectedValue(new Error('gateway down'));
-    await verdicts.start();
+    await start();
     await verdicts.review([token.blob.tokenId]);
     for (const backoff of [1, 2, 4, 8]) await vi.advanceTimersByTimeAsync(VERDICT_RETRY_MS * backoff);
     expect(verify).toHaveBeenCalledTimes(5);
@@ -328,14 +382,13 @@ describe('TokenVerdicts — claims that move (#833)', () => {
     await vi.advanceTimersByTimeAsync(VERDICT_RETRY_MS);
 
     expect(verdicts.trusts(token.blob.tokenId, BRIDGED_COIN)).toBe(true);
-    verdicts.stop();
   });
 
   it('while started, a claims change tells readers and judges the holders again; stopped, it does neither', async () => {
     const registry = moving(new CoinClaims());
-    const { verdicts, mint, changed, getBlobs } = await judged(registry.claims);
+    const { verdicts, start, mint, changed, getBlobs } = await judged(registry.claims);
     const lookalike = await mint(BRIDGED_COIN, OTHER_TYPE);
-    await verdicts.start();
+    await start();
 
     registry.set({ [BRIDGED_COIN]: BRIDGED_TYPE });
 
@@ -346,6 +399,7 @@ describe('TokenVerdicts — claims that move (#833)', () => {
     changed.mockClear();
     getBlobs.mockClear();
     registry.set({});
+    await flush();
     expect(changed).not.toHaveBeenCalled();
     expect(getBlobs).not.toHaveBeenCalled();
   });
