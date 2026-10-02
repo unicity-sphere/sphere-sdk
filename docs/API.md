@@ -647,9 +647,13 @@ BEFORE the mailbox claim is acknowledged, so a crash re-claims instead of losing
 A token whose mint reason **cannot be judged yet** is neither accepted nor rejected: no registered
 plugin handles its reason tag (a wallet that has not installed the plugin), or the plugin could not
 reach an answer (for a bridged token, the source chain is unreachable or the lock is short of its
-confirmations). The entry stays unacknowledged, the mailbox cursor stays before it, and the drain
-goes on with the entries after it. It is rechecked 30 s later, then on a doubling schedule capped at
-one hour, and accepted or rejected once the plugin gives an answer.
+confirmations). The entry stays unacknowledged on the server and is parked in the wallet's scoped
+store with its position; the mailbox cursor moves past it, so the entries after it are received and
+acknowledged as usual. The first time an entry is parked the SDK emits `transfer:attention` with code
+`receive:unverifiable` and the delivery id as `detail`, so a wallet can say that a token arrived
+which it cannot verify yet. A parked entry is listed again on its own 30 s later, then on a doubling
+schedule capped at one hour (the schedule survives a restart), and accepted or rejected once the
+plugin gives an answer.
 
 ```typescript
 const { transfers } = await sphere.payments.receive();
