@@ -368,7 +368,7 @@ The payments vertical emits exactly 8 events; identity/comms/groupchat events ri
 
 | Event | Payload | When |
 |-------|---------|------|
-| `transfer:incoming` | `IncomingTransfer` (`{ senderPubkey, senderNametag?, tokens, coinless?, memo?, receivedAt }`) | Tokens landed from the wallet-api mailbox (verified before entering balance). A coinless arrival is named in `coinless`, NOT in `tokens` — read both. An arrival whose mint reason no plugin here can verify yet is not in this event: it is parked (unacked on the server, recorded in the scoped KV, the cursor moves past it), rechecked on a doubling schedule, and announced once with `transfer:attention` code `receive:unverifiable` |
+| `transfer:incoming` | `IncomingTransfer` (`{ senderPubkey, senderNametag?, tokens, coinless?, memo?, receivedAt }`) | Tokens landed from the wallet-api mailbox (verified before entering balance). A coinless arrival is named in `coinless`, NOT in `tokens` — read both. An arrival whose mint reason no plugin here can verify yet is not in this event: it is parked (unacked on the server, recorded in the scoped KV, the cursor moves past it), rechecked on a doubling schedule, announced once with `transfer:attention` code `receive:unverifiable`, and listed by `payments.parkedArrivals()` |
 | `transfer:updated` | `TransferResult` | Outgoing transfer changed status (read `status` / `deliveryPending`) |
 | `transfer:attention` | `{ transferId, code, detail? }` | A transfer needs operator attention (stuck checkpoint, undeliverable, deferred) |
 | `inventory:updated` | `{}` | Inventory changed (send/receive/mint/resync) |

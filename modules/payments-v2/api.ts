@@ -4,6 +4,9 @@ import type { IMintJustificationVerifier } from '../../token-engine';
 import type { NftContent } from '../../token-engine/nft-payload';
 import type { NftReading } from '../../token-engine/types';
 import type { Asset, CoinlessToken, IncomingTransfer, Token, TransferResult } from '../../types';
+import type { DeferredDelivery as ParkedArrival } from './receive/Receive';
+
+export type { ParkedArrival };
 
 export interface SendRequest {
   recipient: string;
@@ -180,6 +183,8 @@ export interface PaymentsV2 {
   pendingBurns(): Promise<PendingBurn[]>;
   acknowledgeBurn(burnId: string): Promise<void>;
   receive(): Promise<{ transfers: IncomingTransfer[] }>;
+  /** Arrivals parked because no plugin here can verify their mint reason yet; each raised `transfer:attention` once. */
+  parkedArrivals(): Promise<readonly ParkedArrival[]>;
 
   // §7 convergence surface. A retry button calls resumeNow() — NEVER send():
   // a re-issued send double-pays (#631/#676). Coalesces with a running pass.

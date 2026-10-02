@@ -5,6 +5,7 @@ import type { DeliveryPort, IncomingDelivery } from '../../../modules/payments-v
 import {
   ACK_BATCH_SIZE,
   ATTENTION_UNVERIFIABLE,
+  RECHECKS_PER_DRAIN,
   RECHECK_BASE_MS,
   RECHECK_MAX_MS,
   REFRESH_INTERVAL_MS,
@@ -528,7 +529,9 @@ describe('payments-v2 Receive drain', () => {
     expect(h.kv.map.get(DEFERRED_KEY)).toEqual([
       { deliveryId: `d:${T(2)}:S1`, since: '1', syncEpoch: 'e1', attempts: 1, dueAtMs: h.clock + RECHECK_BASE_MS },
     ]);
-    expect(h.attentions).toEqual([{ transferId: '', code: ATTENTION_UNVERIFIABLE, detail: `d:${T(2)}:S1` }]);
+    expect(h.attentions).toEqual([
+      { transferId: '', code: ATTENTION_UNVERIFIABLE, detail: `d:${T(2)}:S1 lock short of its confirmations (simulated)` },
+    ]);
 
     h.engine.unverifiableOn.clear();
     h.clock += RECHECK_MAX_MS;
@@ -576,6 +579,172 @@ describe('payments-v2 Receive drain', () => {
     await h.receive.drainOnce();
 
     expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
+  });
+
+  it('a newly parked entry is written before the cursor passes it, and when that write fails the cursor holds before it', async () => {
+    const h = makeHarness();
+    h.kv.failWriteKeys.add(DEFERRED_KEY);
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.delivery.add(meta(T(3), 'S1'));
+    h.engine.unverifiableOn.add(`${T(2)}:S1`);
+
+    const first = await h.receive.drainOnce();
+
+    expect(first.map((t) => t.id)).toEqual([T(1), T(3)]);
+    expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'unacked', 'claimed']);
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '1', syncEpoch: 'e1' });
+    expect(h.kv.map.get(DEFERRED_KEY)).toBeUndefined();
+
+    h.kv.failWriteKeys.clear();
+    const second = await h.receive.drainOnce();
+
+    expect(second).toEqual([]);
+    const parkedWrite = h.kv.sets.findIndex((w) => w.key === DEFERRED_KEY);
+    const cursorPast = h.kv.sets.findIndex((w) => w.key === CURSOR_KEY && (w.value as StreamCursor).cursor === '2');
+    expect(parkedWrite).toBeGreaterThanOrEqual(0);
+    expect(parkedWrite).toBeLessThan(cursorPast);
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '2', syncEpoch: 'e1' });
+    expect(h.kv.map.get(DEFERRED_KEY)).toMatchObject([{ deliveryId: `d:${T(2)}:S1`, since: '1' }]);
+  });
+
+  it('a rechecked entry is forgotten only once its claim settled; a failed claim keeps it parked and due at once', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    await h.receive.drainOnce();
+
+    h.engine.unverifiableOn.clear();
+    h.clock += RECHECK_BASE_MS;
+    h.delivery.acksUntilFail = h.delivery.ackLog.length;
+    const announced = await h.receive.drainOnce();
+
+    expect(announced.map((t) => t.id)).toEqual([T(1)]);
+    expect(h.delivery.entries[0].status).toBe('unacked');
+    expect(h.kv.map.get(DEFERRED_KEY)).toMatchObject([{ deliveryId: `d:${T(1)}:S1`, dueAtMs: h.clock }]);
+
+    h.delivery.acksUntilFail = Infinity;
+    const again = await h.receive.drainOnce();
+
+    expect(again).toEqual([]);
+    expect(h.delivery.entries[0].status).toBe('claimed');
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
+  });
+
+  it('a batched claim that hits a wall keeps the rechecked entry parked and due at once', async () => {
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    await h.receive.drainOnce();
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '2', syncEpoch: 'e1' });
+
+    h.engine.unverifiableOn.clear();
+    h.clock += RECHECK_BASE_MS;
+    h.delivery.batchFailure = 'retryable';
+    await h.receive.drainOnce();
+
+    expect(h.delivery.entries[0].status).toBe('unacked');
+    expect(h.kv.map.get(DEFERRED_KEY)).toMatchObject([{ deliveryId: `d:${T(1)}:S1`, dueAtMs: h.clock }]);
+  });
+
+  it('a recheck that fails on infrastructure backs that entry off and the others are still rechecked', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.delivery.add(meta(T(3), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    h.engine.unverifiableOn.add(`${T(2)}:S1`);
+    await h.receive.drainOnce();
+
+    h.engine.unverifiableOn.clear();
+    h.engine.verifyOutageOn.add(`${T(1)}:S1`);
+    h.clock += RECHECK_BASE_MS;
+    const received = await h.receive.drainOnce();
+
+    expect(received.map((t) => t.id)).toEqual([T(2)]);
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([
+      { deliveryId: `d:${T(1)}:S1`, since: null, syncEpoch: 'e1', attempts: 2, dueAtMs: h.clock + 2 * RECHECK_BASE_MS },
+    ]);
+  });
+
+  it('rechecks are bounded per drain, the rest wait for the next one', async () => {
+    const h = makeHarness();
+    for (let i = 1; i <= RECHECKS_PER_DRAIN + 5; i++) {
+      h.delivery.add(meta(T(i), 'S1'));
+      h.engine.unverifiableOn.add(`${T(i)}:S1`);
+    }
+    await h.receive.drainOnce();
+    const checks = (): number => h.engine.verifyCalls.length;
+    expect(checks()).toBe(RECHECKS_PER_DRAIN + 5);
+
+    h.clock += RECHECK_BASE_MS;
+    await h.receive.drainOnce();
+    expect(checks()).toBe(2 * RECHECKS_PER_DRAIN + 5);
+
+    await h.receive.drainOnce();
+    expect(checks()).toBe(2 * RECHECKS_PER_DRAIN + 10);
+  });
+
+  it('parking and the cursor move work through ackBatch, which never sees the deferred entry', async () => {
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.delivery.add(meta(T(3), 'S1'));
+    h.engine.unverifiableOn.add(`${T(2)}:S1`);
+
+    await h.receive.drainOnce();
+
+    expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'unacked', 'claimed']);
+    expect(h.delivery.batchCalls).toEqual([[`d:${T(1)}:S1`, `d:${T(3)}:S1`]]);
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '3', syncEpoch: 'e1' });
+    expect(h.kv.map.get(DEFERRED_KEY)).toMatchObject([{ deliveryId: `d:${T(2)}:S1` }]);
+  });
+
+  it('a parked entry whose recheck finds it invalid is rejected and forgotten', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    await h.receive.drainOnce();
+
+    h.engine.unverifiableOn.clear();
+    h.engine.badProof.add(`${T(1)}:S1`);
+    h.clock += RECHECK_BASE_MS;
+    const received = await h.receive.drainOnce();
+
+    expect(received).toEqual([]);
+    expect(h.delivery.ackLog).toContainEqual(expect.objectContaining({ deliveryId: `d:${T(1)}:S1`, disposition: 'rejected' }));
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
+  });
+
+  it('a parked entry listed again by the main pass before it is due is passed over without a verify', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.engine.unverifiableOn.add(`${T(2)}:S1`);
+    h.delivery.acksUntilFail = 0;
+    await h.receive.drainOnce();
+    expect(h.kv.map.get(CURSOR_KEY)).toBeUndefined();
+    expect(h.kv.map.get(DEFERRED_KEY)).toMatchObject([{ deliveryId: `d:${T(2)}:S1` }]);
+
+    h.delivery.acksUntilFail = Infinity;
+    await h.receive.drainOnce();
+
+    expect(h.engine.verifyCalls.filter((k) => k === `${T(2)}:S1`)).toHaveLength(1);
+    expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'unacked']);
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '2', syncEpoch: 'e1' });
+  });
+
+  it('parked() reads what is parked, so a listener that attaches late still finds the arrivals it cannot verify', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    await h.receive.drainOnce();
+
+    await expect(new Receive(h.deps).parked()).resolves.toMatchObject([{ deliveryId: `d:${T(1)}:S1`, attempts: 1 }]);
   });
 
   it('a parked entry from another sync epoch is dropped, since the full re-listing finds it again', async () => {

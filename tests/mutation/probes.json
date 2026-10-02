@@ -1881,7 +1881,7 @@
     "name": "receive-unverifiable-rejected",
     "note": "A token whose mint reason is not verifiable yet may be valid; rejecting it at the mailbox loses it for good.",
     "file": "modules/payments-v2/receive/Receive.ts",
-    "find": "    if (isUnverifiable(err)) return null;",
+    "find": "    if (isUnverifiable(err)) return err.message;",
     "replace": "    if (isUnverifiable(err)) return { ok: false, reason: 'unverifiable' };",
     "tests": [
       "tests/unit/payments-v2/receive.test.ts"
@@ -1891,7 +1891,7 @@
     "name": "receive-deferral-not-parked",
     "note": "The cursor moves past a deferred entry, so only its parked record brings it back; dropping the record loses the token for good.",
     "file": "modules/payments-v2/receive/Receive.ts",
-    "find": "      this.park(ctx, entry, parked);\n      queueAck(ctx, deferredAck(entry));",
+    "find": "      this.park(ctx, entry, parked, screened.reason);\n      queueAck(ctx, deferredAck(entry));",
     "replace": "      queueAck(ctx, deferredAck(entry));",
     "tests": [
       "tests/unit/payments-v2/receive.test.ts"
@@ -1986,6 +1986,26 @@
     "tests": [
       "tests/unit/payments-v2/inventory.test.ts",
       "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
+  },
+  {
+    "name": "receive-parked-saved-after-cursor",
+    "note": "A newly parked entry must be written before the cursor passes it, or a crash or failed write in between leaves an unacked entry nothing remembers.",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "  const deferredSettle = await ctx.parked.save();\n  const toSend",
+    "replace": "  const deferredSettle = true;\n  const toSend",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts"
+    ]
+  },
+  {
+    "name": "receive-parked-forgotten-before-ack-settles",
+    "note": "A parked entry leaves the set only with its settled ack; forgetting it on screening loses the token when the ack then fails, since the cursor is already past it.",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "    if (settled.has(p.deliveryId)) parked.delete(p.deliveryId);\n    else parked.set({ ...record, dueAtMs: ctx.deps.now?.() ?? Date.now() });",
+    "replace": "    parked.delete(p.deliveryId);",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts"
     ]
   }
 ]
