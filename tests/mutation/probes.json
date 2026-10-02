@@ -996,8 +996,8 @@
     "name": "compose-drops-receive-track-hook",
     "note": "#770.2: track is optional on ReceiveDeps, so dropping it here compiles cleanly and silently un-tracks every self-spawned drain",
     "file": "modules/payments-v2/compose.ts",
-    "find": "    track: hooks.track,\n",
-    "replace": "    // probe: the receive drain is left untracked\n",
+    "find": "    // #770: the poll/wake drains Receive spawns itself must hold stop() too.\n    track: hooks.track,\n",
+    "replace": "    // #770: the poll/wake drains Receive spawns itself must hold stop() too.\n    // probe: the receive drain is left untracked\n",
     "tests": [
       "tests/unit/payments-v2/facade.test.ts"
     ]
