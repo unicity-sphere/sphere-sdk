@@ -263,21 +263,10 @@ export class PaymentsFacade implements PaymentsV2 {
     return this.view.coinless(this.deps.registry);
   }
 
-  tokenData(tokenId: string): Promise<Uint8Array | null> {
-    return readTokenData(this.readDeps(), tokenId);
-  }
-
-  tokenJustification(tokenId: string): Promise<Uint8Array | null> {
-    return readTokenJustification(this.readDeps(), tokenId);
-  }
-
-  nft(tokenId: string): Promise<NftView | null> {
-    return readNft(this.readDeps(), tokenId);
-  }
-
-  nfts(tokenIds: readonly string[]): Promise<ReadonlyMap<string, NftView>> {
-    return readNfts(this.readDeps(), tokenIds);
-  }
+  tokenData = (tokenId: string): Promise<Uint8Array | null> => readTokenData(this.readDeps(), tokenId);
+  tokenJustification = (tokenId: string): Promise<Uint8Array | null> => readTokenJustification(this.readDeps(), tokenId);
+  nft = (tokenId: string): Promise<NftView | null> => readNft(this.readDeps(), tokenId);
+  nfts = (tokenIds: readonly string[]): Promise<ReadonlyMap<string, NftView>> => readNfts(this.readDeps(), tokenIds);
 
   private readDeps(): NftReadDeps {
     return { engine: this.engine(), view: this.view, storagePort: this.deps.storagePort, cache: this.nftCache };
