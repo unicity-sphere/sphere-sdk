@@ -311,6 +311,26 @@ describe('TokenVerdicts — claims that move (#833)', () => {
     verdicts.stop();
   });
 
+  it('restarts the retry backoff when the claims change, instead of waiting out the old one', async () => {
+    vi.useFakeTimers();
+    const registry = moving(bridgePlugin());
+    const { engine, verdicts, mint } = await judged(registry.claims);
+    const token = await mint(BRIDGED_COIN, BRIDGED_TYPE);
+    const verify = vi.spyOn(engine, 'verify').mockRejectedValue(new Error('gateway down'));
+    await verdicts.start();
+    await verdicts.review([token.blob.tokenId]);
+    for (const backoff of [1, 2, 4, 8]) await vi.advanceTimersByTimeAsync(VERDICT_RETRY_MS * backoff);
+    expect(verify).toHaveBeenCalledTimes(5);
+
+    registry.set({ [NATIVE_COIN]: OTHER_TYPE });
+    await vi.waitFor(() => expect(verify).toHaveBeenCalledTimes(6));
+    verify.mockResolvedValue({ ok: true });
+    await vi.advanceTimersByTimeAsync(VERDICT_RETRY_MS);
+
+    expect(verdicts.trusts(token.blob.tokenId, BRIDGED_COIN)).toBe(true);
+    verdicts.stop();
+  });
+
   it('while started, a claims change tells readers and judges the holders again; stopped, it does neither', async () => {
     const registry = moving(new CoinClaims());
     const { verdicts, mint, changed, getBlobs } = await judged(registry.claims);

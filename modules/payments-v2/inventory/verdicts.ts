@@ -93,7 +93,7 @@ export class TokenVerdicts {
     return this.standing(tokenId, coinId) === 'trusted';
   }
 
-  /** Forgets every verdict reached under other claims; true when the claims moved since the last call. */
+  /** Forgets every verdict reached under other claims and, while started, judges the holders again; true when the claims moved. */
   syncClaims(): boolean {
     const current = this.deps.claims.fingerprint();
     if (current === this.basis) return false;
@@ -102,6 +102,8 @@ export class TokenVerdicts {
     this.refused.clear();
     this.unvouched.clear();
     this.retries.clear();
+    this.disarmRetry();
+    if (this.live) this.rejudge();
     return true;
   }
 
@@ -123,8 +125,7 @@ export class TokenVerdicts {
     this.live = false;
     this.unwatch?.();
     this.unwatch = null;
-    if (this.timer !== null) clearTimeout(this.timer);
-    this.timer = null;
+    this.disarmRetry();
   }
 
   async accept(token: SphereToken): Promise<void> {
@@ -143,11 +144,18 @@ export class TokenVerdicts {
   }
 
   private onClaimsChanged(): void {
-    if (!this.syncClaims()) return;
+    if (this.syncClaims()) this.deps.changed();
+  }
+
+  private rejudge(): void {
     const op = this.review(this.deps.holders?.() ?? this.held).then(() => this.deps.changed());
     if (this.deps.track !== undefined) this.deps.track(op);
     else void op.catch(() => undefined);
-    this.deps.changed();
+  }
+
+  private disarmRetry(): void {
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
   }
 
   private async drain(): Promise<void> {

@@ -2177,5 +2177,26 @@
       "tests/unit/registry/TokenRegistry.test.ts",
       "tests/unit/payments-v2/claimed-coins.test.ts"
     ]
+  },
+  {
+    "name": "verdicts-claims-change-keeps-stale-retry-timer",
+    "note": "#833: a claims change disarms the old retry timer, so the backoff restarts under the new claims instead of waiting out up to an hour (verdicts.test.ts 'restarts the retry backoff when the claims change...')",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "    this.retries.clear();\n    this.disarmRetry();",
+    "replace": "    this.retries.clear();",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-claims-change-not-rejudged",
+    "note": "#833: while started, verdicts forgotten on a claims change are judged again at once, however the change was noticed (claimed-coins.test.ts 're-judges held tokens when the registry loads or refreshes after start...')",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "    if (this.live) this.rejudge();",
+    "replace": "    void this.live;",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts",
+      "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
   }
 ]
