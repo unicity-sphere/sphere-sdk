@@ -3,12 +3,11 @@
 
 import { logger } from '../../../core/logger';
 import type { EngineVerifyResult, ITokenEngine, SphereToken } from '../../../token-engine';
-import type { CoinClaims } from '../../../token-engine/claims';
 import { isCoinlessEnvelope } from '../../../token-engine/value-envelope';
-import type { IncomingTransfer, Token } from '../../../types';
+import type { IncomingTransfer, Token, Unverified } from '../../../types';
 import { SingleFlight } from '../async';
 import type { RegistryReader } from '../inventory/InventoryView';
-import { honoursClaims } from '../inventory/verdicts';
+import { unverifiedOnArrival, type ClaimReader } from '../inventory/verdicts';
 import type { AttentionEmitter } from '../machine/journal';
 import { isRetryableAckError } from '../ports';
 import type { AckOutcome, AckRequest, DeliveryPort, IncomingDelivery } from '../ports';
@@ -30,8 +29,8 @@ export interface StoredIncoming {
   readonly assets: readonly IncomingAssetAmount[];
   /** Genesis type of an arrival that names no coin (#777) — its only display handle. */
   readonly tokenType?: string;
-  /** Claimed coins this arrival carries without being of their issuing type. */
-  readonly unverifiedCoinIds?: readonly string[];
+  /** Claimed coins this arrival carries that do not count yet: of another type (`refused`), or not verifiable here (`pending`). */
+  readonly unverified?: { readonly coinIds: readonly string[]; readonly standing: Unverified };
 }
 
 // Per-key seam over the inventory view (adapted by the facade in P9).
@@ -56,7 +55,8 @@ export interface ReceiveDeps {
   readonly delivery: DeliveryPort;
   /** Snapshot taken once per drain (§7 collaborator-snapshot rule). */
   readonly engine: () => ReceiveEngine;
-  readonly claims?: Pick<CoinClaims, 'issuerOf'>;
+  /** Read on every arrival; a drain waits for `whenReady` first, so a cached registry claim applies from the first one. */
+  readonly claims?: ClaimReader & { whenReady?(): Promise<void> };
   readonly accepted?: (token: SphereToken) => Promise<void>;
   readonly view: ReceiveView;
   readonly kv: ScopedKV;
@@ -263,6 +263,7 @@ export class Receive {
 
   private async doDrain(): Promise<IncomingTransfer[]> {
     const deps = this.deps;
+    await deps.claims?.whenReady?.();
     // Clock starts at the drain: one finishing inside an interval refreshes once,
     // at the end, exactly as before. Only a slow drain pays for mid-flight ones.
     this.lastRefreshAt = deps.now?.() ?? Date.now();
@@ -421,7 +422,7 @@ async function screen(deps: ReceiveDeps, engine: ReceiveEngine, entry: IncomingD
     // #687 gate: a replayed OLDER, already-spent state never displaces the live one.
     return { kind: 'ack', ack: rejectAck(entry, 'invalid') };
   }
-  const unverifiedCoinIds = unverifiedCoinsOf(deps, token);
+  const unverified = deps.claims === undefined ? null : unverifiedOnArrival(deps.claims, token);
   return {
     kind: 'accept',
     token,
@@ -430,15 +431,9 @@ async function screen(deps: ReceiveDeps, engine: ReceiveEngine, entry: IncomingD
       stateHash: keys.stateHash,
       assets: toAssetAmounts(token),
       ...(isCoinlessEnvelope(token.valueEnvelope) ? { tokenType: token.tokenType } : {}),
-      ...(unverifiedCoinIds.length > 0 ? { unverifiedCoinIds } : {}),
+      ...(unverified !== null ? { unverified } : {}),
     },
   };
-}
-
-function unverifiedCoinsOf(deps: ReceiveDeps, token: SphereToken): string[] {
-  const claims = deps.claims;
-  if (claims === undefined || honoursClaims(claims, token)) return [];
-  return (token.value?.assets ?? []).map((asset) => asset.coinId).filter((coinId) => claims.issuerOf(coinId) !== null);
 }
 
 /** A string = the mint reason is not verifiable yet, and why: leave the entry unacked, never reject a token that may be valid. */
@@ -463,15 +458,16 @@ async function announce(
 ): Promise<IncomingTransfer> {
   const receivedAt = (deps.now ?? Date.now)();
   await recordArrival(deps, entry, record, receivedAt);
-  const refused = record.assets.filter((asset) => record.unverifiedCoinIds?.includes(asset.coinId));
-  const counted = record.assets.filter((asset) => !refused.includes(asset));
+  const unverified = record.unverified;
+  const held = record.assets.filter((asset) => unverified?.coinIds.includes(asset.coinId));
+  const counted = record.assets.filter((asset) => !held.includes(asset));
   return {
     id: record.tokenId,
     senderPubkey: entry.senderPubkey ?? '',
     ...(entry.senderNametag !== undefined ? { senderNametag: entry.senderNametag } : {}),
     tokens: counted.map((asset) => toUiToken(record.tokenId, asset, deps.registry, receivedAt)),
-    ...(refused.length > 0
-      ? { unverifiedTokens: refused.map((asset) => ({ ...toUiToken(record.tokenId, asset, deps.registry, receivedAt), unverified: 'refused' as const })) }
+    ...(unverified !== undefined && held.length > 0
+      ? { unverifiedTokens: held.map((asset) => ({ ...toUiToken(record.tokenId, asset, deps.registry, receivedAt), unverified: unverified.standing })) }
       : {}),
     // #777: named here rather than mapped from assets, which announced an EMPTY list.
     ...(record.tokenType !== undefined
@@ -499,8 +495,8 @@ async function recordArrival(
   record: StoredIncoming,
   receivedAt: number
 ): Promise<void> {
-  const assets = record.assets.filter((asset) => !record.unverifiedCoinIds?.includes(asset.coinId));
-  if (assets.length === 0 && record.unverifiedCoinIds !== undefined) return;
+  const assets = record.assets.filter((asset) => !record.unverified?.coinIds.includes(asset.coinId));
+  if (assets.length === 0 && record.unverified !== undefined) return;
   try {
     await deps.recordReceived({
       dedupKey: receivedDedupKey(record.tokenId, record.stateHash),

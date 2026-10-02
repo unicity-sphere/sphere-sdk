@@ -14,6 +14,7 @@ import type { CoinClaims } from '../../../token-engine/claims';
 import { WalletApiStoragePort } from '../../../impl/wallet-api-v2/storage';
 import { WalletApiDeliveryPort } from '../../../impl/wallet-api-v2/mailbox';
 import type { DeliveryPort, StoragePort } from '../../../modules/payments-v2/ports';
+import type { PriceReader, RegistryReader } from '../../../modules/payments-v2/inventory/presentation';
 import { PaymentsFacade, type FacadeClient } from '../../../modules/payments-v2/PaymentsFacade';
 import { RealizationEngine, fakeDecodeBlobFor } from './machine-harness';
 import {
@@ -218,6 +219,9 @@ export function makeWorld(
     /** The address has no token engine: every engine read throws, as Sphere's engineRef does. */
     engineUnavailable?: boolean;
     claims?: CoinClaims;
+    /** The wallet's token registry; its `issuance` claims join the plugins' (#833). */
+    registry?: RegistryReader;
+    price?: PriceReader;
   } = {}
 ): World {
   const prior = options.restartOf;
@@ -289,7 +293,8 @@ export function makeWorld(
       return engine;
     },
     kv,
-    registry,
+    registry: options.registry ?? registry,
+    ...(options.price !== undefined ? { price: options.price } : {}),
     ...(options.claims !== undefined ? { claims: options.claims } : {}),
     emit: (event, payload) => {
       events.push({ event, payload });

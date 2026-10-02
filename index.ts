@@ -351,6 +351,7 @@ export {
 export type {
   TokenDefinition,
   TokenIcon,
+  TokenIssuance,
   RegistryNetwork,
 } from './registry';
 

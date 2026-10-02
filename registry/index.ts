@@ -10,6 +10,7 @@ export {
   // Types
   type TokenDefinition,
   type TokenIcon,
+  type TokenIssuance,
   type RegistryNetwork,
   type TokenRegistryConfig,
   // Convenience functions

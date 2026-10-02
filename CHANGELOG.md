@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — the token registry claims a coin for its issuing token type (#833)
+
+Until now only a loaded plugin could claim a coin, so a wallet without the plugin trusted every
+token carrying the coin id. Once the registry names such a coin, every client without the plugin
+(sphere-cli, agents, other SDK consumers) would have shown a self-minted token carrying it under the
+registry's name and icon, priced and spendable, since minting is permissionless.
+
+A fungible registry entry may now carry `issuance: { tokenType }`, the only token type that may
+issue its coin, and every wallet treats that coin as claimed whether or not it loads the plugin. A
+token of another type carrying the coin is `refused`. A token of the issuing type is `pending` as
+long as no issuance policy for the type is loaded: without the policy `verify` passes a token of the
+type minted with no reason at all, so neither receive, the background check, `mintCustom()` nor a
+split's change trusts it. Pending and refused holdings stay out of `assets()`, `tokens()`, prices,
+spending and history, and are listed by `unverifiedAssets()` and `unverifiedTokens()`. An arrival is
+announced in `IncomingTransfer.unverifiedTokens`, marked `'pending'` or `'refused'`. A wallet that
+loads the plugin behaves as before. When the registry names another type than a loaded plugin, the
+plugin's claim is kept and the conflict is logged once. A malformed `issuance` is dropped with a
+warning.
+
+Registry claims are read live. A receive drain and the remembered verdicts wait for the registry's
+persistent cache, so a cached claim applies from the first drain, and a stale cache now still
+supplies its claims (not its definitions). Before a device's first registry load the coin is
+unclaimed, as before. The verdict fingerprint includes the registry claims on coins no plugin
+claims, so a load or refresh that changes them checks held tokens again and emits
+`inventory:updated`. `TokenDefinition` gains `issuance`, and `TokenRegistry` gains
+`getIssuingTokenType()`, `getIssuanceClaims()`, `cacheRead()` and `onDefinitionsChanged()`. The
+first entry to use the field is USDC.e on testnet2 (unicitynetwork/unicity-ids#10).
+
 ## [0.18.0] - 2026-10-02
 
 ### Added — mandatory issuance policies for plugin token types (#825)

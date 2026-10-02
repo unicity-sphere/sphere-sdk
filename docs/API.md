@@ -1012,10 +1012,49 @@ claimed coin counts only inside a token of its issuing type that verified:
   a depositor's own mint before the lock is final, stays pending. Pending tokens and any other held
   token of a claimed coin, for instance one another device received, are verified in the background,
   and a check that cannot answer yet is retried with backoff.
-- Verified tokens are remembered per device together with a fingerprint of the registered policies.
-  A changed policy, claim or `revision` discards them, so every held token is checked again.
+- Verified tokens are remembered per device together with a fingerprint of the registered policies
+  and of the registry claims below. A changed policy, claim or `revision` discards them, so every
+  held token is checked again.
 - Two policies for one token type, or two types claiming one coin, fail engine construction with
   `INVALID_CONFIG`.
+
+#### Coins the token registry claims
+
+A fungible entry of the network's token registry may name the token type that issues its coin
+(the testnet2 USDC.e entry, unicitynetwork/unicity-ids#10):
+
+```json
+{
+  "assetKind": "fungible",
+  "symbol": "USDC.e",
+  "id": "eae954053183b9d1836d6b5c892867014bcc1571fcc6813f5b56b16a78d0497f",
+  "issuance": { "tokenType": "2ccbf3157add2b9a2dcc10e772abf5cf328e2723f9f290a9d2b6c4a42a132d6c" }
+}
+```
+
+Every wallet then treats the coin as claimed by that type, whether or not it loads the plugin of the
+type, so a token that merely carries the coin id is never shown, priced or spent as that coin:
+
+- A token of another type carrying the coin is `'refused'`, as under a plugin claim.
+- A token of the issuing type stays `'pending'` as long as no issuance policy for the type is
+  loaded. Without the policy `verify` passes a token of the type minted with no reason at all, so it
+  cannot vouch for one. Such a token is never trusted, spent or priced. When received it is
+  announced in `unverifiedTokens` marked `'pending'` and not written to history. A `mintCustom()` of
+  the type and the change of such a token stay pending too.
+- A wallet that loads a plugin with a policy for the type checks the token under that policy, as
+  under a plugin claim. If a plugin claims the coin for another type, the plugin's claim is kept and
+  the conflict is logged once.
+- An `issuance` that is not 64 lowercase hex, or that sits on a non-fungible entry, is dropped with
+  a warning.
+
+Registry claims are read live: the registry loads after `Sphere.init` and refreshes hourly. A receive
+drain and the remembered verdicts wait for the registry's persistent cache, so a claim the cache
+holds applies from the first drain. A cache older than the refresh interval still supplies its
+claims, though not its definitions. Until the registry has loaded once on a device the coin is
+unclaimed, as it was before this field existed. A load or refresh that changes the claims discards
+the remembered verdicts, checks the held tokens again and emits `inventory:updated`, so a UI moves
+tokens between `assets()` and `unverifiedAssets()` without a reload. A registry claim that agrees or
+conflicts with a loaded plugin's changes nothing.
 
 ### `mintCustom(request: MintCustomRequest): Promise<MintResult>`
 
@@ -2084,4 +2123,44 @@ Wait for the initial load (cache, else remote) to settle. Resolves `true` when d
 loaded, `false` on timeout or when there was no data source. `timeoutMs` defaults to `10_000`;
 pass `0` to wait without a timeout. The static `TokenRegistry.waitForReady()` is the same
 contract against the singleton.
+
+### `TokenDefinition`
+
+```typescript
+interface TokenDefinition {
+  network: string;
+  assetKind: 'fungible' | 'non-fungible';
+  name: string;
+  symbol?: string;                     // fungible only
+  decimals?: number;                   // fungible only
+  description: string;
+  icons?: { url: string }[];
+  id: string;                          // a coin id (fungible) or a token type (non-fungible)
+  issuance?: { tokenType: string };    // fungible only: the token type that issues the coin, 64 lowercase hex
+}
+```
+
+A malformed `issuance` is dropped, with a warning, when the definitions are applied, so a
+definition read from the registry never carries one. What a claim does to the wallet is described
+under [Coins the token registry claims](#coins-the-token-registry-claims).
+
+### `registry.getIssuingTokenType(coinId: string): string | null`
+
+The token type the registry names as the issuer of a coin, or `null`. Case-insensitive in `coinId`.
+
+### `registry.getIssuanceClaims(): ReadonlyMap<string, string>`
+
+Every issuance claim, coin id to token type. The same map object is returned until the claims are
+next applied, so a reader can detect a change by identity.
+
+### `registry.cacheRead(): Promise<void>`
+
+Resolves once the persistent cache has been read, whether or not it held anything. It never waits
+on the network.
+
+### `registry.onDefinitionsChanged(listener: () => void): () => void`
+
+Calls `listener` each time definitions or issuance claims are applied: a cache load, a fetch, or a
+network switch of the global registry. Returns the unsubscribe. A listener that throws is logged
+and the others still run. `dispose()` drops every listener.
 
