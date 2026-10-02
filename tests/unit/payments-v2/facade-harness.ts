@@ -222,6 +222,7 @@ export function makeWorld(
     /** The wallet's token registry; its `issuance` claims join the plugins' (#833). */
     registry?: RegistryReader;
     price?: PriceReader;
+    claimsReadyTimeoutMs?: number;
   } = {}
 ): World {
   const prior = options.restartOf;
@@ -295,6 +296,7 @@ export function makeWorld(
     kv,
     registry: options.registry ?? registry,
     ...(options.price !== undefined ? { price: options.price } : {}),
+    ...(options.claimsReadyTimeoutMs !== undefined ? { claimsReadyTimeoutMs: options.claimsReadyTimeoutMs } : {}),
     ...(options.claims !== undefined ? { claims: options.claims } : {}),
     emit: (event, payload) => {
       events.push({ event, payload });

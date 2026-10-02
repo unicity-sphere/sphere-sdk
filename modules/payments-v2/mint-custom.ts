@@ -14,6 +14,7 @@ export interface CustomMintDeps extends FinalizeMintDeps {
   readonly ownPubkeyBytes: Uint8Array;
   readonly now: () => number;
   readonly accepted?: (token: SphereToken) => Promise<void>;
+  readonly claims?: { issuerOf(coinId: string): string | null };
 }
 
 export type CustomReplayDeps = CustomMintDeps & MintReplayDeps;
@@ -54,6 +55,7 @@ export async function runCustomMintUnderJournal(
   try {
     assertRequest(input.request);
     entry = journalEntryOf(input.mintId, input.request, deps.now());
+    assertIssuable(deps, entry);
     deps.engine.assertMintable(mintParamsOf(deps, entry, input.request.mintJustificationVerifiers));
   } catch (err) {
     return { success: false, error: messageOf(err) };
@@ -85,6 +87,16 @@ export async function replayCustomMints(deps: CustomReplayDeps): Promise<number>
     }
   }
   return resolved;
+}
+
+/** A claimed coin minted under another type than its issuer would be refused for good once held. */
+function assertIssuable(deps: CustomMintDeps, entry: CustomMintJournalEntry): void {
+  for (const asset of entry.assets) {
+    const issuer = deps.claims?.issuerOf(asset.coinId) ?? null;
+    if (issuer !== null && issuer !== entry.tokenTypeHex) {
+      throw new SphereError(`mintCustom: coin ${asset.coinId} is issued only by token type ${issuer}`, 'VALIDATION_ERROR');
+    }
+  }
 }
 
 function journalEntryOf(mintId: string, request: MintCustomRequest, createdAt: number): CustomMintJournalEntry {

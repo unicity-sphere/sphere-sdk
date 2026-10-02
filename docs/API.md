@@ -924,6 +924,9 @@ const result = await sphere.payments.mint(coinIdHex, 1_000_000n);
 
 - `coinId` must be even-length lowercase hex; `amount` must be `> 0n`.
   Otherwise it resolves `{ success: false, error }` with nothing journaled.
+- A claimed coin (by a plugin or the token registry) is refused the same way: only its issuing
+  token type may carry it, and a self-mint never has that type, so the token would be refused for
+  good.
 - **A failure after journaling keeps the entry.** A failed chain op resolves
   `{ success: false, error }`, and a failure after the mint certified resolves
   `{ success: false, tokenId, error }`; in both cases the facade replays that journal entry in its
@@ -1048,15 +1051,18 @@ type, so a token that merely carries the coin id is never shown, priced or spent
 - A wallet whose plugin claims the coin for the same type behaves exactly as under the plugin claim.
   If a plugin claims the coin for another type, the plugin's claim is kept and the conflict is
   logged once.
-- An `issuance` that is not 64 lowercase hex, that sits on a non-fungible entry, or that names a
-  network's own coin (UCT on testnet2, per `NETWORKS[network].nativeCoinIds`) is dropped with one
-  warning per registry and value. An entry whose fields would break a lookup (no `name`, a
-  non-string `symbol`, malformed `icons`) is skipped with a warning; the rest of the file and its
-  claims still apply.
+- `issuance.tokenType` is read case-insensitively and may carry a `0x` prefix. One that is still not
+  64 hex digits, that sits on a non-fungible entry, or that names a network's own coin (UCT on
+  testnet2, per `NETWORKS[network].nativeCoinIds`) is dropped with one warning per registry and
+  value.
+- A claim needs only a fungible entry with a string `id`. A malformed display field (a non-string
+  `symbol`, an icon without a string `url`) is dropped with a warning and the rest of the entry
+  kept; `null` reads as absent. An entry with no `name` gets no definition, but its claim applies.
 
-Registry claims are read live: the registry loads after `Sphere.init` and refreshes hourly. A receive
-drain waits for the registry's persistent cache, so a claim the cache holds applies from the first
-drain. A cache older than the refresh interval still supplies its claims, though not its
+Registry claims are read live: the registry loads after `Sphere.init` and refreshes hourly. The
+facade's `start()` waits for the registry's persistent cache, up to 3 s (it logs and goes on without
+the claims when the read does not settle), so a claim the cache holds applies before anything is
+read, spent or received. A cache older than the refresh interval still supplies its claims, though not its
 definitions. Until the registry has loaded once on a device the coin is unclaimed, as it was before
 this field existed. A verdict stops counting the moment a coin its token carries changes issuer, and
 a load or refresh that changes a claim checks the affected tokens again and emits
@@ -1080,8 +1086,9 @@ interface MintCustomRequest {
 ```
 
 - **Refused before anything is journaled:** a malformed request, an empty `justification`,
-  `data` plus `justification` over `CUSTOM_MINT_MAX_PAYLOAD_BYTES` (1 MiB), and a reason tag no
-  registered plugin handles. Each returns `{ success: false, error }`.
+  `data` plus `justification` over `CUSTOM_MINT_MAX_PAYLOAD_BYTES` (1 MiB), a reason tag no
+  registered plugin handles, and an asset whose coin is claimed for another token type than
+  `tokenType`. Each returns `{ success: false, error }`.
 - **Per-call verifiers** replace the registered verifier of their own tag for this call only, and
   every other tag keeps its registered verifier. A per-call verifier for a tag no plugin registers is
   refused. The depositor of a bridged asset uses this to accept its own mint before the lock is

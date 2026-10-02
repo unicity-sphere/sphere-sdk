@@ -116,6 +116,8 @@ export interface PaymentsFacadeDeps {
   price?: PriceReader;
   /** Coins that count only in verified tokens of their issuing type (TokenPlugin issuance policies); the registry's `issuance` claims join them. */
   claims?: CoinClaims;
+  /** How long start() waits for the registry's cached claims before going on without them; default 3 s. */
+  claimsReadyTimeoutMs?: number;
   emit: (event: string, payload: unknown) => void;
   resolveRecipient: (identifier: string) => Promise<RecipientInfo | null>;
   signComplete: (transferId: string) => Promise<string>;
@@ -150,6 +152,7 @@ export interface FacadeHooks {
 
 export interface FacadeParts {
   ownPubkeyBytes: Uint8Array;
+  claims: WalletCoinClaims;
   view: InventoryView;
   verdicts: TokenVerdicts;
   ledger: ReservationLedger;
@@ -171,7 +174,7 @@ export interface FacadeParts {
 export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks): FacadeParts {
   const ownPubkeyBytes = hexToBytes(deps.ownPubkey);
   const ledger = new ReservationLedger();
-  const claims = new WalletCoinClaims(deps.claims ?? new CoinClaims(), deps.registry);
+  const claims = new WalletCoinClaims(deps.claims ?? new CoinClaims(), deps.registry, deps.claimsReadyTimeoutMs);
   const verdicts = buildVerdicts(deps, hooks, claims, () => view.claimHolders());
   const view = buildView(deps, hooks, ledger, verdicts);
   const queue = new SpendQueue({
@@ -196,6 +199,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
   const pins = buildPins(deps, hooks, { ledger, view, machineStores, machineDeps });
   return {
     ownPubkeyBytes,
+    claims,
     view,
     verdicts,
     refreshView,

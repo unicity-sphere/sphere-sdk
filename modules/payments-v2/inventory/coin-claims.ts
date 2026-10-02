@@ -6,6 +6,9 @@ export type ClaimRegistry = Pick<RegistryReader, 'getIssuanceClaims' | 'cacheRea
 
 const NO_CLAIMS: ReadonlyMap<string, string> = new Map();
 
+/** How long `whenReady()` waits for the registry's cache before going on without its claims. */
+export const CLAIMS_READY_TIMEOUT_MS = 3000;
+
 /**
  * The coins this wallet treats as claimed: its plugins' claims, plus the token registry's for every
  * coin no plugin claims. Read live, because the registry loads after composition and refreshes.
@@ -18,7 +21,8 @@ export class WalletCoinClaims {
 
   constructor(
     private readonly plugins: CoinClaims,
-    private readonly registry: ClaimRegistry
+    private readonly registry: ClaimRegistry,
+    private readonly readyTimeoutMs = CLAIMS_READY_TIMEOUT_MS
   ) {}
 
   issuerOf(coinId: string): string | null {
@@ -41,10 +45,26 @@ export class WalletCoinClaims {
     return this.registryVersion;
   }
 
-  /** Resolves once the registry's persistent cache has been read, so a cached claim applies from the start. */
+  /** Resolves once the registry's persistent cache has been read, or after the timeout: a storage read that never settles must not hold the wallet. */
   whenReady(): Promise<void> {
-    this.readiness ??= (this.registry.cacheRead?.() ?? Promise.resolve()).catch(() => undefined);
+    this.readiness ??= this.awaitCache();
     return this.readiness;
+  }
+
+  private async awaitCache(): Promise<void> {
+    const cacheRead = this.registry.cacheRead?.();
+    if (cacheRead === undefined) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(true), this.readyTimeoutMs);
+    });
+    try {
+      if (await Promise.race([cacheRead.then(() => false, () => false), timeout])) {
+        logger.warn('PaymentsV2', `The token registry cache was not read within ${this.readyTimeoutMs} ms; going on without its coin claims until it is`);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   subscribe(listener: () => void): () => void {

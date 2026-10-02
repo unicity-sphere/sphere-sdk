@@ -1,3 +1,4 @@
+import { logger } from '../../../core/logger';
 import type { CoinClaims } from '../../../token-engine/claims';
 import type { ITokenEngine } from '../../../token-engine/engine';
 import type { SphereToken } from '../../../token-engine/types';
@@ -17,7 +18,6 @@ export interface VerdictClaims extends ClaimReader {
   fingerprint(): string;
   /** Changes whenever a claim that can change a verdict does. */
   version?(): string;
-  whenReady?(): Promise<void>;
   subscribe?(listener: () => void): () => void;
 }
 
@@ -37,8 +37,10 @@ interface Checked {
 
 type RememberedEntry = readonly [string, readonly (readonly [string, string | null])[]];
 
+/** `tokenIds` is the shape 0.18.0 reads, kept so an older client on the same storage still loads it. */
 interface Remembered {
   readonly fingerprint: string;
+  readonly tokenIds: readonly string[];
   readonly verified?: readonly RememberedEntry[];
 }
 
@@ -83,8 +85,20 @@ export function unverifiedOnArrival(claims: ClaimReader, token: SphereToken): { 
   return { coinIds, standing: honoursClaims(claims, token) ? 'pending' : 'refused' };
 }
 
+function isIssuerPair(pair: unknown): boolean {
+  return Array.isArray(pair) && typeof pair[0] === 'string' && (pair[1] === null || typeof pair[1] === 'string');
+}
+
+function isRememberedEntry(entry: unknown): entry is RememberedEntry {
+  return Array.isArray(entry) && typeof entry[0] === 'string' && Array.isArray(entry[1]) && entry[1].every(isIssuerPair);
+}
+
+/** The well-formed entries of a remembered set; one that is not is skipped, so it cannot fail every hydration. */
 function rememberedEntries(remembered: Remembered): RememberedEntry[] {
-  return Array.isArray(remembered.verified) ? remembered.verified.filter((entry) => Array.isArray(entry?.[1])) : [];
+  if (!Array.isArray(remembered.verified)) return [];
+  const entries = remembered.verified.filter(isRememberedEntry);
+  if (entries.length < remembered.verified.length) logger.warn('PaymentsV2', 'Skipping malformed entries of the remembered verified tokens');
+  return entries;
 }
 
 export class TokenVerdicts {
@@ -247,7 +261,7 @@ export class TokenVerdicts {
     try {
       token = await engine.decodeToken({ tokenId, token: bytes });
     } catch {
-      return { verdict: 'refused', issuers: NO_COINS };
+      return { verdict: 'retry' };
     }
     const issuers = this.issuersOf(token);
     if (token.blob.tokenId !== tokenId || !honoursClaims(this.deps.claims, token)) return { verdict: 'refused', issuers };
@@ -298,7 +312,8 @@ export class TokenVerdicts {
     for (const [tokenId, judgement] of this.judged) {
       if (judgement.verdict === 'verified') verified.push([tokenId, [...judgement.issuers]]);
     }
-    const remembered: Remembered = { fingerprint: this.deps.claims.fingerprint(), verified };
+    const tokenIds = verified.map(([tokenId]) => tokenId);
+    const remembered: Remembered = { fingerprint: this.deps.claims.fingerprint(), tokenIds, verified };
     return this.writes.enqueue(() => this.deps.kv.set(STORE_KEYS.verifiedTokens, remembered));
   }
 

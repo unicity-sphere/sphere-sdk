@@ -204,6 +204,15 @@ interface BuildOptions {
   registryCache?: readonly object[];
 }
 
+/**
+ * The claim check decodes a held token to learn its type, and the real engine cannot read this
+ * world's fake-minted blobs (it would retry them as undecodable), so the facade reads them with the
+ * fake engine that minted them.
+ */
+function readsFakeBlobs(sphere: Sphere, world: World): void {
+  (sphere.payments as unknown as PaymentsFacade).setEngine(world.realization);
+}
+
 async function buildSphere(options: BuildOptions): Promise<Sphere> {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-wiring-'));
   const storage = new FileStorageProvider({ dataDir });
@@ -623,6 +632,7 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     const world = makeWorld();
     const policy = { tokenType: new TokenType(new Uint8Array(32).fill(0x6f)), coinIds: [COIN], verify: vi.fn() };
     const sphere = await buildSphere({ walletApi: world.walletApi, plugins: [{ id: 'bridge', tokenIssuancePolicies: [policy] }] });
+    readsFakeBlobs(sphere, world);
 
     const seeded = await seedInventory(world, world.transports[0]!, 40n);
     world.transports[0]!.session.fire('inventory');
@@ -650,6 +660,7 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify([entry]), { status: 200 }));
     cleanups.push(async () => fetch.mockRestore());
     const sphere = await buildSphere({ walletApi: world.walletApi, registryCache: [entry] });
+    readsFakeBlobs(sphere, world);
 
     const seeded = await seedInventory(world, world.transports[0]!, 40n);
     world.transports[0]!.session.fire('inventory');

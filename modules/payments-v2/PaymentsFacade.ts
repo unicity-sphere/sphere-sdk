@@ -29,6 +29,7 @@ import { reseedAndReset, type RestoreDeps } from './restore';
 import { PrewarmCache, takeSourceBlobs, warmSendSources, type WarmDeps } from './prewarm-cache';
 import type { ShortfallEntry } from './stores';
 import type { History } from './history/History';
+import type { WalletCoinClaims } from './inventory/coin-claims';
 import type { InventoryView } from './inventory/InventoryView';
 import type { TokenVerdicts } from './inventory/verdicts';
 import { transferringToken } from './inventory/presentation';
@@ -107,6 +108,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private readonly wakeRefresh: () => void;
   private readonly prewarmed = new PrewarmCache();
   private readonly view: InventoryView;
+  private readonly claims: WalletCoinClaims;
   private readonly verdicts: TokenVerdicts;
   private readonly ledger: ReservationLedger;
   private readonly queue: SpendQueue;
@@ -148,6 +150,7 @@ export class PaymentsFacade implements PaymentsV2 {
       track: (op) => this.trackTail(op),
     });
     this.view = parts.view;
+    this.claims = parts.claims;
     this.verdicts = parts.verdicts;
     this.wakeRefresh = parts.refreshView;
     this.ledger = parts.ledger;
@@ -189,6 +192,9 @@ export class PaymentsFacade implements PaymentsV2 {
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
+    // Nothing reads, spends or receives a claimed coin before the registry's cached claims are in.
+    await this.claims.whenReady();
+    if (!this.started) return;
     this.heartbeat.start();
     // Subscriptions BEFORE session.start(): no frame can beat the restore hook.
     this.unsubscribers.push(
@@ -386,6 +392,7 @@ export class PaymentsFacade implements PaymentsV2 {
       emit: this.deps.emit,
       now: () => this.nowMs(),
       accepted: (token) => this.verdicts.accept(token),
+      claims: this.claims,
     };
   }
 

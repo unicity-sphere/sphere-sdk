@@ -5,6 +5,7 @@ import { hexToBytes } from '../../../core/crypto';
 import { SphereError } from '../../../core/errors';
 import { logger } from '../../../core/logger';
 import { VERDICT_RETRY_MS } from '../../../modules/payments-v2/inventory/verdicts';
+import { STORE_KEYS } from '../../../modules/payments-v2/stores';
 import type { PriceReader } from '../../../modules/payments-v2/inventory/presentation';
 import { TokenRegistry } from '../../../registry';
 import type { StorageProvider } from '../../../storage';
@@ -378,20 +379,64 @@ describe('PaymentsFacade — coins the token registry claims (#833)', () => {
     expect(String(conflicts[0]![1])).toContain(USDC_E_TYPE);
   });
 
-  it('applies a cached registry claim from the first drain: a drain waits for the cache read, never for a fetch', async () => {
+  it('start() waits for the cached claims, so neither a spend nor the first drain straight after it can count a look-alike', async () => {
     const fetch = vi.spyOn(globalThis, 'fetch');
     const { registry, release } = slowRegistryFrom([USDC_E_ENTRY]);
     const world = makeWorld({ registry });
-    await world.peerDeliver(await minted(world, USDC_E_TYPE, 1, { coinId: USDC_E }), 'in-1');
+    await world.hold(await minted(world, OTHER_TYPE, 1, { coinId: USDC_E }));
+    await world.peerDeliver(await minted(world, USDC_E_TYPE, 2, { coinId: USDC_E }), 'in-1');
+    setTimeout(release, 30);
 
-    const drained = world.facade.receive();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    release();
-    const { transfers } = await drained;
+    await world.facade.start();
+    const send = world.facade.send({ recipient: '@peer', amount: '10', coinId: USDC_E });
 
+    await expect(send).rejects.toMatchObject({ code: 'SEND_INSUFFICIENT_BALANCE' });
+    const { transfers } = await world.facade.receive();
     expect(transfers.flatMap((t) => t.tokens)).toEqual([]);
     expect(transfers.flatMap((t) => (t.unverifiedTokens ?? []).map((x) => x.unverified))).toEqual(['pending']);
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('start() goes on without the cached claims when the registry cache read never settles, and says so', async () => {
+    const warn = vi.spyOn(logger, 'warn');
+    const world = makeWorld({ registry: registryFrom([USDC_E_ENTRY], new Promise<void>(() => undefined)), claimsReadyTimeoutMs: 50 });
+    await world.peerDeliver(await minted(world, OTHER_TYPE, 1), 'in-1');
+
+    await world.facade.start();
+    const { transfers } = await world.facade.receive();
+
+    expect(transfers).toHaveLength(1);
+    expect(warn.mock.calls.some(([, message]) => String(message).includes('was not read within 50 ms'))).toBe(true);
+  });
+
+  it('refuses to self-mint a claimed coin before journaling, since a self-mint never has the issuing type', async () => {
+    const world = makeWorld({ claims: claims(), registry: registryFrom([USDC_E_ENTRY]) });
+    await world.facade.start();
+
+    const byPlugin = await world.facade.mint(CLAIMED, 10n);
+    const byRegistry = await world.facade.mint(USDC_E, 10n);
+
+    expect(byPlugin).toMatchObject({ success: false, error: expect.stringContaining('issued only by token type') });
+    expect(byRegistry).toMatchObject({ success: false, error: expect.stringContaining(USDC_E_TYPE) });
+    expect(world.kv.sets.filter((s) => s.key.includes(STORE_KEYS.mintJournal))).toEqual([]);
+    expect(world.facade.unverifiedTokens()).toEqual([]);
+    expect((await world.facade.history()).entries.filter((e) => e.type === 'MINT')).toEqual([]);
+  });
+
+  it('refuses a custom mint of a claimed coin under a type other than its issuer, before journaling', async () => {
+    const world = makeWorld({ registry: registryFrom([USDC_E_ENTRY]) });
+    await world.facade.start();
+
+    const result = await world.facade.mintCustom({
+      tokenType: hexBytes(OTHER_TYPE),
+      salt: new Uint8Array(32).fill(7),
+      data: await SpherePaymentData.fromValue({ assets: [{ coinId: USDC_E, amount: 10n }] }).encode(),
+      justification: REASON,
+      assets: [{ coinId: USDC_E, amount: 10n }],
+    });
+
+    expect(result).toMatchObject({ success: false, error: expect.stringContaining(`issued only by token type ${USDC_E_TYPE}`) });
+    expect(world.kv.sets.filter((s) => s.key.includes(STORE_KEYS.customMintJournal))).toEqual([]);
   });
 
   it('reads the registry cache before the remembered verdicts, so a restart keeps them when the registry claims other coins', async () => {

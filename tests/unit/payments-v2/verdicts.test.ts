@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { SphereError } from '../../../core/errors';
+import { logger } from '../../../core/logger';
 import { WalletCoinClaims } from '../../../modules/payments-v2/inventory/coin-claims';
 import { TokenVerdicts, VERDICT_RETRY_MS } from '../../../modules/payments-v2/inventory/verdicts';
+import { STORE_KEYS } from '../../../modules/payments-v2/stores';
 import { CoinClaims } from '../../../token-engine/claims';
 import { TokenType } from '../../../token-engine/sdk';
 import { SpherePaymentData } from '../../../token-engine/SpherePaymentData';
@@ -48,6 +50,7 @@ async function wallet(kv: MemoryKV = memoryKV(), revision = 'vaults-1', held = n
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe('TokenVerdicts', () => {
@@ -168,6 +171,57 @@ describe('TokenVerdicts', () => {
     await verdicts.review([native.blob.tokenId]);
 
     expect(verdicts.trusts(native.blob.tokenId, BRIDGED_COIN)).toBe(false);
+  });
+
+  it('writes the verified set in a shape a 0.18.0 client sharing the storage still loads', async () => {
+    const kv = memoryKV();
+    const { verdicts, mint } = await wallet(kv);
+    const kept = await mint(BRIDGED_COIN, BRIDGED_TYPE);
+    await verdicts.review([kept.blob.tokenId]);
+    const claims = new CoinClaims();
+    claims.add({ tokenType: new TokenType(hexBytes(BRIDGED_TYPE)), coinIds: [BRIDGED_COIN], revision: 'vaults-1', verify: vi.fn() });
+
+    // 0.18.0's TokenVerdicts.load(), verbatim apart from the set it fills.
+    const loaded0180 = (remembered: { fingerprint: string; tokenIds: string[] } | null): string[] => {
+      const verified: string[] = [];
+      if (remembered?.fingerprint !== claims.fingerprint()) return verified;
+      for (const tokenId of remembered.tokenIds) verified.push(tokenId);
+      return verified;
+    };
+
+    expect(loaded0180(await kv.get(STORE_KEYS.verifiedTokens))).toEqual([kept.blob.tokenId]);
+  });
+
+  it('skips a malformed remembered entry instead of failing every hydration', async () => {
+    const kv = memoryKV();
+    const first = await wallet(kv);
+    const kept = await first.mint(BRIDGED_COIN, BRIDGED_TYPE);
+    await first.verdicts.review([kept.blob.tokenId]);
+    const record = (await kv.get<{ verified: unknown[] }>(STORE_KEYS.verifiedTokens))!;
+    await kv.set(STORE_KEYS.verifiedTokens, { ...record, verified: [...record.verified, ['x', [['coin']]], ['y', 'nope'], 7] });
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+    const second = await wallet(kv);
+    await second.verdicts.hydrate();
+
+    expect(second.verdicts.trusts(kept.blob.tokenId, BRIDGED_COIN)).toBe(true);
+    expect(warn).toHaveBeenCalledWith('PaymentsV2', expect.stringContaining('malformed entries'));
+  });
+
+  it('checks a token again later when its blob cannot be decoded yet, rather than refusing it for good', async () => {
+    vi.useFakeTimers();
+    const { engine, verdicts, mint } = await wallet();
+    const token = await mint(BRIDGED_COIN, BRIDGED_TYPE);
+    const decode = vi.spyOn(engine, 'decodeToken').mockRejectedValueOnce(new Error('engine still loading'));
+    await verdicts.start();
+
+    await verdicts.review([token.blob.tokenId]);
+    expect(verdicts.standing(token.blob.tokenId, BRIDGED_COIN)).toBe('pending');
+    await vi.advanceTimersByTimeAsync(VERDICT_RETRY_MS);
+
+    expect(decode).toHaveBeenCalledTimes(2);
+    expect(verdicts.trusts(token.blob.tokenId, BRIDGED_COIN)).toBe(true);
+    verdicts.stop();
   });
 
   it('checks again later when the address has no engine yet', async () => {

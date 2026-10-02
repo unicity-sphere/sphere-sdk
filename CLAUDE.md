@@ -974,8 +974,10 @@ authoritative for build success.
   trusted. Claims are read live (`WalletCoinClaims`, `modules/payments-v2/inventory/coin-claims.ts`);
   a plugin claim wins a conflict; an `issuance` on a native coin (`NETWORKS[n].nativeCoinIds`) is
   ignored. Each verdict records the issuer of every coin its token carries and counts only while
-  they hold, so a claim change re-checks just that coin's tokens. A drain waits for
-  `registry.cacheRead()`; before a device's first registry load the coin is unclaimed.
+  they hold, so a claim change re-checks just that coin's tokens. `facade.start()` waits up to 3 s
+  for `registry.cacheRead()` before anything reads, spends or receives; before a device's first
+  registry load the coin is unclaimed. `mint()` refuses a claimed coin; the remembered verified set
+  keeps the `tokenIds` field 0.18.0 reads.
 - A `Sphere` builds and OWNS its registry (#767), disposed by `sphere.destroy()`. The provider
   factories no longer call `TokenRegistry.configure()` — in the published package they are
   separate tsup bundles with separate singleton copies, so that call wrote to an object no

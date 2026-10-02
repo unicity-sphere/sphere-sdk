@@ -55,8 +55,7 @@ export interface ReceiveDeps {
   readonly delivery: DeliveryPort;
   /** Snapshot taken once per drain (§7 collaborator-snapshot rule). */
   readonly engine: () => ReceiveEngine;
-  /** Read on every arrival; a drain waits for `whenReady` first, so a cached registry claim applies from the first one. */
-  readonly claims?: ClaimReader & { whenReady?(): Promise<void> };
+  readonly claims?: ClaimReader;
   readonly accepted?: (token: SphereToken) => Promise<void>;
   readonly view: ReceiveView;
   readonly kv: ScopedKV;
@@ -263,7 +262,6 @@ export class Receive {
 
   private async doDrain(): Promise<IncomingTransfer[]> {
     const deps = this.deps;
-    await deps.claims?.whenReady?.();
     // Clock starts at the drain: one finishing inside an interval refreshes once,
     // at the end, exactly as before. Only a slow drain pays for mid-flight ones.
     this.lastRefreshAt = deps.now?.() ?? Date.now();

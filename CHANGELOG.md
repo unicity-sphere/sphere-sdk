@@ -24,23 +24,31 @@ a token. Pending and refused holdings stay out of `assets()`, `tokens()`, prices
 history, and are listed by `unverifiedAssets()` and `unverifiedTokens()`. An arrival is announced in
 `IncomingTransfer.unverifiedTokens`, marked `'pending'` or `'refused'`. A wallet whose plugin claims
 the coin behaves as before. When the registry names another type than a loaded plugin, the plugin's
-claim is kept and the conflict is logged once. An `issuance` that is malformed or names a network's
-own coin (`NETWORKS[network].nativeCoinIds`, UCT on testnet2) is dropped with one warning, so no
-registry edit can freeze UCT.
+claim is kept and the conflict is logged once. `mint()` refuses a claimed coin and `mintCustom()`
+refuses one under a type other than its issuer, both before journaling, since such a token would be
+refused for good. `issuance.tokenType` is read case-insensitively with an optional `0x`; one that is
+still malformed, or that names a network's own coin (`NETWORKS[network].nativeCoinIds`, UCT on
+testnet2), is dropped with one warning, so no registry edit can freeze UCT.
 
-Registry claims are read live. A receive drain waits for the registry's persistent cache, so a
-cached claim applies from the first drain, and a stale cache now still supplies its claims (not its
-definitions). Before a device's first registry load the coin is unclaimed, as before. Each verdict
+Registry claims are read live. The facade's `start()` waits up to 3 s for the registry's persistent
+cache before anything is read, spent or received, and logs and goes on without the claims if the
+read does not settle; a stale cache now still supplies its claims (not its definitions). Before a device's first registry load the coin is unclaimed, as before. Each verdict
 records the issuer of every coin its token carries and stops counting when one of them moves, so a
 claim change re-checks only the tokens of that coin and emits `inventory:updated`; the remembered
 verified set keeps those issuers, so a restart keeps every verdict whose coins did not move. Sets
-written by 0.18.0 carry no issuers and are checked once more after upgrade. `TokenDefinition` gains
+written by 0.18.0 carry no issuers and are checked once more after upgrade, a one-time cost of a
+blob fetch and a `verify` per held token of a plugin-claimed coin; the set is still written with the
+`tokenIds` 0.18.0 reads, so a rolled-back or older client on the same storage keeps working. A
+remembered entry that is malformed is skipped with a warning, and a token whose blob cannot be
+decoded is checked again with backoff rather than refused for good. `TokenDefinition` gains
 `issuance`, and `TokenRegistry` gains `getIssuingTokenType()`, `getIssuanceClaims()`, `cacheRead()`
 and `onDefinitionsChanged()`.
 
-The registry now skips a malformed entry (no `name`, a non-string `symbol`, malformed `icons`) with
-one warning instead of throwing halfway through, which had left the lookup maps partly rebuilt and
-the new claims unapplied; the maps are built aside and swapped in together. The first entry to use
+The registry no longer throws halfway through a file with a malformed entry, which had left the
+lookup maps partly rebuilt and the new claims unapplied: the maps are built aside and swapped in
+together, a malformed display field (a non-string `symbol`, an icon without a string `url`) is
+dropped with one warning and the rest of the entry kept (`null` reads as absent), and an entry with
+no `name` gets no definition while its claim still applies. The first entry to use
 `issuance` is USDC.e on testnet2 (unicitynetwork/unicity-ids#10).
 
 ## [0.18.0] - 2026-10-02
