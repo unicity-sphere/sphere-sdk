@@ -649,11 +649,20 @@ plugin handles its reason tag (a wallet that has not installed the plugin), or t
 reach an answer (for a bridged token, the source chain is unreachable or the lock is short of its
 confirmations). The entry stays unacknowledged on the server and is parked in the wallet's scoped
 store with its position; the mailbox cursor moves past it, so the entries after it are received and
-acknowledged as usual. The first time an entry is parked the SDK emits `transfer:attention` with code
-`receive:unverifiable` and the delivery id as `detail`, so a wallet can say that a token arrived
-which it cannot verify yet. A parked entry is listed again on its own 30 s later, then on a doubling
-schedule capped at one hour (the schedule survives a restart), and accepted or rejected once the
-plugin gives an answer.
+acknowledged as usual. The parked record is written before the cursor passes the entry, and the entry
+is forgotten only once its later claim or rejection has settled. The first time an entry is parked
+the SDK emits `transfer:attention` with code `receive:unverifiable` and, as `detail`, the delivery id,
+a space, then the reason, so a wallet can say that a token arrived which it cannot verify yet;
+`parkedArrivals()` lists what is still parked for a listener that attached later. A parked entry is
+listed again on its own 30 s later, then on a doubling schedule capped at one hour (the schedule
+survives a restart, and at most 20 rechecks run per drain), and accepted or rejected once the plugin
+gives an answer.
+
+### `parkedArrivals(): Promise<readonly ParkedArrival[]>`
+
+The arrivals parked because their mint reason cannot be verified here yet:
+`{ deliveryId, attempts, dueAtMs, since, syncEpoch }`, where `attempts` counts the checks so far and
+`dueAtMs` is when the next one is due.
 
 ```typescript
 const { transfers } = await sphere.payments.receive();

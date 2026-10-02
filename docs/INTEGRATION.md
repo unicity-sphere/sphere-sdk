@@ -1397,6 +1397,7 @@ and `on()` returns its own unsubscribe function.
 | `mint:unresolved` | A journaled mint cannot be replayed safely and is held (`transferId` is the mint id). |
 | `intent:reseed-rejected` | After a backend restore, re-submitting an open intent was refused (`detail` has the reason). |
 | `claim:conflict` | A mailbox claim conflicted on the server and the entry was rejected as stale (`detail` is the delivery id). |
+| `receive:unverifiable` | A token arrived whose mint reason no plugin here can verify yet; it is parked and rechecked, not rejected (`detail` is the delivery id, a space, then the reason). Emitted once per entry; `payments.parkedArrivals()` lists what is still parked. |
 
 The pre-flip names are gone from the public event map. dApps on the Connect wire still receive
 these through the ConnectHost compat adapter: `transfer:confirmed`,

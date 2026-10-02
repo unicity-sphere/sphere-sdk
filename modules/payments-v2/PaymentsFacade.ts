@@ -13,7 +13,7 @@ import type { ITokenEngine } from '../../token-engine/engine';
 import type { SphereToken } from '../../token-engine/types';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
-import type { BurnRequest, BurnResult, CoinlessToken, ConnectionStatus, HistoryPage, MintCustomRequest, MintNftRequest, MintResult, NftView, PaymentsV2, PendingBurn, PendingTransfer, SendRequest, SendWholeTokenRequest } from './api';
+import type { BurnRequest, BurnResult, CoinlessToken, ConnectionStatus, HistoryPage, MintCustomRequest, MintNftRequest, MintResult, NftView, ParkedArrival, PaymentsV2, PendingBurn, PendingTransfer, SendRequest, SendWholeTokenRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { NftCache, readNft, readNfts, type NftReadDeps } from './inventory/nft-read';
@@ -313,9 +313,10 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   async receive(): Promise<{ transfers: IncomingTransfer[] }> {
-    const transfers = await this.track(this.receiveLoop.drainOnce());
-    return { transfers };
+    return { transfers: await this.track(this.receiveLoop.drainOnce()) };
   }
+
+  parkedArrivals = (): Promise<readonly ParkedArrival[]> => this.receiveLoop.parked();
 
   mint(coinId: string, amount: bigint): Promise<MintResult> {
     return this.track(this.mintInner(coinId, amount));
