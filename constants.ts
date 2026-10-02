@@ -357,11 +357,40 @@ export interface NetworkInfo {
  * so it cannot drift. Use as `network: SPHERE_NETWORKS.testnet2`. Custom networks
  * are the same shape: `network: { id, name }`. Only live v2 networks appear here;
  * the legacy `testnet` alias is intentionally not surfaced.
+ *
+ * The `satisfies` clause keeps every `name` a `NETWORKS` key; do not loosen it to `NetworkInfo`.
  */
 export const SPHERE_NETWORKS = {
   mainnet: { id: NETWORKS.mainnet.networkId as number, name: 'mainnet' },
   testnet2: { id: NETWORKS.testnet2.networkId as number, name: 'testnet2' },
-} as const satisfies Record<string, NetworkInfo>;
+} as const satisfies Record<string, { id: number; name: NetworkType }>;
+
+/** The keys of {@link SPHERE_NETWORKS} — the networks a dApp may declare. */
+export type SphereNetworkName = keyof typeof SPHERE_NETWORKS;
+
+/** One ENTRY of {@link SPHERE_NETWORKS} (`{ id, name }`), not a network name: {@link NetworkType} is
+ *  the name. It is what {@link resolveSphereNetwork} returns, and its `name` is a literal key of both
+ *  SPHERE_NETWORKS and NETWORKS. Nameable, so a wallet's own types need no
+ *  `ReturnType<typeof resolveSphereNetwork>`. */
+export type SphereNetworkEntry = (typeof SPHERE_NETWORKS)[SphereNetworkName];
+
+/**
+ * Look a network up by its canonical id.
+ *
+ * Built from SPHERE_NETWORKS, and NETWORKS must NOT be used for this: `testnet` and
+ * `testnet2` both hold networkId 4, so the table cannot be inverted safely. Two entries
+ * collide on that id, and which name an inversion returns depends on how it is written. The
+ * failure is quiet — either answer is a valid NetworkType — and lands wherever the answer is
+ * fed back into a network switcher.
+ *
+ * The result is a COPY: enriching it (say with an icon for display) cannot rewrite the
+ * process-wide table. Its `name` is always present and is a key of both SPHERE_NETWORKS and
+ * NETWORKS, which is what makes it safe to hand to a network switcher without a cast.
+ */
+export function resolveSphereNetwork(id: number): SphereNetworkEntry | undefined {
+  const entry = Object.values(SPHERE_NETWORKS).find((n) => n.id === id);
+  return entry === undefined ? undefined : { ...entry };
+}
 
 // =============================================================================
 // Timeouts & Limits
