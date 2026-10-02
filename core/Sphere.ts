@@ -4490,6 +4490,7 @@ export class Sphere {
         // not own (sphere#487 review).
         nametag: () => this.getNametagForAddress(facadeAddressId),
       },
+      ...(this._plugins ? { plugins: this._plugins } : {}),
     });
     this._paymentsV2Active = { index, facade };
     await facade.start();

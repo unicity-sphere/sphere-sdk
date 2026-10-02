@@ -127,6 +127,38 @@ describe('createSphereTokenEngine', () => {
     ).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
   });
 
+  it('refuses two issuance policies for one token type, or two types issuing one coin, with INVALID_CONFIG naming the plugin', async () => {
+    const { TokenType } = await import('../../../token-engine/sdk');
+    const policy = (typeByte: number, coinIds: string[]) => ({
+      tokenType: new TokenType(new Uint8Array(32).fill(typeByte)),
+      coinIds,
+      verify: vi.fn(),
+    });
+    const engineWith = (plugins: { id: string; tokenIssuancePolicies: ReturnType<typeof policy>[] }[]) =>
+      createSphereTokenEngine({
+        aggregatorUrl: 'http://localhost:3000',
+        privateKey: SigningService.generatePrivateKey(),
+        trustBaseJson: TRUST_BASE_JSON,
+        plugins,
+      });
+
+    await expect(
+      engineWith([
+        { id: 'bridge:a', tokenIssuancePolicies: [policy(1, ['aa'.repeat(32)])] },
+        { id: 'bridge:b', tokenIssuancePolicies: [policy(1, ['bb'.repeat(32)])] },
+      ]),
+    ).rejects.toMatchObject({ code: 'INVALID_CONFIG', message: expect.stringMatching(/bridge:b.*(01){32}/) });
+    await expect(
+      engineWith([
+        { id: 'bridge:a', tokenIssuancePolicies: [policy(1, ['aa'.repeat(32)])] },
+        { id: 'bridge:c', tokenIssuancePolicies: [policy(2, ['AA'.repeat(32)])] },
+      ]),
+    ).rejects.toMatchObject({ code: 'INVALID_CONFIG', message: expect.stringMatching(/bridge:c.*a{64}/) });
+    await expect(
+      engineWith([{ id: 'bridge:a', tokenIssuancePolicies: [policy(1, ['aa'.repeat(32)]), policy(2, ['bb'.repeat(32)])] }]),
+    ).resolves.toBeDefined();
+  });
+
   it('rejects a config without a trust base', async () => {
     await expect(
       createSphereTokenEngine({

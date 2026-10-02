@@ -982,11 +982,40 @@ const result = await sphere.payments.mintNft({
 
 ### Token plugins
 
-A `TokenPlugin` (`{ id, mintJustificationVerifiers }`, passed as `Sphere.init({ plugins })`) adds
-tokens whose genesis carries a mint reason the SDK does not know, such as a bridged asset whose
-reason names a lock on another chain. Each verifier handles one CBOR tag. A verifier returns FAIL
-for a reason that is definitively wrong; it throws when it cannot answer yet, and the engine then
-reports the reason as not verifiable yet (`MINT_REASON_UNVERIFIABLE`) instead of invalid.
+A `TokenPlugin` (`{ id, mintJustificationVerifiers, tokenIssuancePolicies }`, passed as
+`Sphere.init({ plugins })`) adds tokens whose genesis carries a mint reason the SDK does not know,
+such as a bridged asset whose reason names a lock on another chain. Each verifier handles one CBOR
+tag. A verifier returns FAIL for a reason that is definitively wrong; it throws when it cannot answer
+yet, and the engine then reports the reason as not verifiable yet (`MINT_REASON_UNVERIFIABLE`)
+instead of invalid.
+
+A mint reason alone is optional: a token minted without one skips the verifiers. A
+`TokenIssuancePolicy` makes the rule of a token type mandatory. It is the state-transition SDK's
+`ITokenIssuanceVerifier` (`tokenType`, `verify(genesis)`) plus `coinIds`, the coins only that type
+may issue, and an optional `revision` that must change whenever the proofs the policy accepts change,
+a fix to its verification code included. Every genesis of that type, the burned source of a split included, must pass `verify`,
+so a token of the type minted without its reason fails verification and receive refuses it. A
+claimed coin counts only inside a token of its issuing type that verified:
+
+- `assets()` and `tokens()` return only holdings that count, so a caller that predates this sees no
+  counterfeit. The other holdings of a claimed coin come from `unverifiedAssets()` and
+  `unverifiedTokens()`, as separate assets with no price, each marked `unverified`. `'pending'` means
+  the check has not passed yet, for instance while a lock waits for its confirmations. `'refused'`
+  means the token failed verification or is of another type than the one that issues the coin.
+- A received token that carries a claimed coin under another type is announced in the
+  `transfer:incoming` event's `unverifiedTokens`, marked `unverified: 'refused'`, never in `tokens`,
+  and is not written to history for that coin, so history never shows it as a receipt.
+- An unverified token is never spent: coin selection skips it, and `sendWholeToken()` and `burn()`
+  refuse it as not a spendable holding.
+- A token received, left as change of a verified token, or minted with `mintCustom()` under the
+  registered verifiers counts at once. A custom mint accepted only by its per-call verifiers, such as
+  a depositor's own mint before the lock is final, stays pending. Pending tokens and any other held
+  token of a claimed coin, for instance one another device received, are verified in the background,
+  and a check that cannot answer yet is retried with backoff.
+- Verified tokens are remembered per device together with a fingerprint of the registered policies.
+  A changed policy, claim or `revision` discards them, so every held token is checked again.
+- Two policies for one token type, or two types claiming one coin, fail engine construction with
+  `INVALID_CONFIG`.
 
 ### `mintCustom(request: MintCustomRequest): Promise<MintResult>`
 
@@ -1009,7 +1038,9 @@ interface MintCustomRequest {
 - **Per-call verifiers** replace the registered verifier of their own tag for this call only, and
   every other tag keeps its registered verifier. A per-call verifier for a tag no plugin registers is
   refused. The depositor of a bridged asset uses this to accept its own mint before the lock is
-  final.
+  final. The type's issuance policy still applies: a reason it refuses certifies on chain but never
+  passes `verify`, so its journal entry is replayed and never settles. Mint only reasons the type's
+  policy accepts.
 - **Journal-first, like `mint()`.** The bytes are journaled before the chain op, and a failure
   after that returns `{ success: false, error }` and keeps the entry. The convergence pass replays
   the same bytes under the **registered** verifiers (per-call ones are not journaled), so a replay

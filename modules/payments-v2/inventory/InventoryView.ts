@@ -3,7 +3,7 @@
 // the suspectedSpent overlay, the knownSpends set, the in-flight registry and
 // the §6 inventory StreamCursor record. Display mapping lives in presentation.ts.
 
-import type { Asset, Token } from '../../../types';
+import type { Asset, Token, Unverified } from '../../../types';
 import { SerialChain, SingleFlight } from '../async';
 import type { CoinlessToken } from '../api';
 import type { InventoryAsset, InventoryItem, InventoryPage, StoragePort } from '../ports';
@@ -48,7 +48,17 @@ export interface InventoryViewDeps {
    * only knows about the attempt still running in THIS session.
    */
   readonly isPinned?: (tokenId: string) => boolean;
+  readonly trust?: CoinTrust;
 }
+
+export type Standing = 'trusted' | Unverified;
+
+export interface CoinTrust {
+  isClaimed(coinId: string): boolean;
+  standing(tokenId: string, coinId: string): Standing;
+}
+
+const TRUST_ALL: CoinTrust = { isClaimed: () => false, standing: () => 'trusted' };
 
 interface MirrorEntry {
   stateHash: string;
@@ -193,6 +203,14 @@ export class InventoryView {
     if (changed) this.deps.emit('inventory:updated');
   }
 
+  private get trust(): CoinTrust {
+    return this.deps.trust ?? TRUST_ALL;
+  }
+
+  private trusts(tokenId: string, coinId: string): boolean {
+    return this.trust.standing(tokenId, coinId) === 'trusted';
+  }
+
   private pinned(tokenId: string): boolean {
     return this.deps.isPinned?.(tokenId) ?? false;
   }
@@ -222,6 +240,7 @@ export class InventoryView {
   private isSpendable(tokenId: string, entry: MirrorEntry): boolean {
     if (entry.status !== 'active') return false;
     if (this.inFlight.has(tokenId) && !this.pinned(tokenId)) return false;
+    if (!entry.assets.every((asset) => this.trusts(tokenId, asset.coinId))) return false;
     return !this.suspected.has(stateKey(tokenId, entry.stateHash));
   }
 
@@ -252,6 +271,7 @@ export class InventoryView {
         toToken(tokenId, entry, asset, registry, {
           transferring: this.held(tokenId),
           suspectedSpent: this.suspected.has(stateKey(tokenId, entry.stateHash)),
+          standing: this.trust.standing(tokenId, asset.coinId),
         })
       );
     }
@@ -285,9 +305,21 @@ export class InventoryView {
   }
 
   async assets(registry: RegistryReader, price?: PriceReader): Promise<Asset[]> {
-    const raw = aggregateAssets(this.activeEntries(), (tokenId) => this.held(tokenId), registry);
+    const reading = {
+      isTransferring: (tokenId: string) => this.held(tokenId),
+      standing: (tokenId: string, coinId: string) => this.trust.standing(tokenId, coinId),
+    };
+    const raw = aggregateAssets(this.activeEntries(), reading, registry);
     if (!price || raw.length === 0) return raw;
     return withPrices(raw, registry, price);
+  }
+
+  claimHolders(): string[] {
+    const out: string[] = [];
+    for (const [tokenId, entry] of this.activeEntries()) {
+      if (entry.assets.some((asset) => this.trust.isClaimed(asset.coinId))) out.push(tokenId);
+    }
+    return out;
   }
 
   private *activeEntries(): Iterable<[string, MirrorEntry]> {

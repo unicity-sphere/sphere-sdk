@@ -14,7 +14,7 @@
  */
 
 import type { NftContent, NftSignatureStatus } from './nft-payload';
-import type { IMintJustificationVerifier, Token } from './sdk';
+import type { IMintJustificationVerifier, ITokenIssuanceVerifier, Token } from './sdk';
 import type { ValueEnvelope } from './value-envelope';
 
 // ── identity / recipients ─────────────────────────────────────────────────────
@@ -130,12 +130,22 @@ export interface BurnParams {
   readonly reasonBytes: Uint8Array;
 }
 
+/** The issuance rule of one token type, and the coins no other type may carry. */
+export interface TokenIssuancePolicy extends ITokenIssuanceVerifier {
+  /** A token carrying one of these coins counts only when it is of this type and verified. */
+  readonly coinIds: readonly CoinId[];
+  /** Must change whenever the proofs this policy accepts change, a fix to its verification code included, so wallets check held tokens again. */
+  readonly revision?: string;
+}
+
 /** Mint-reason verifiers keyed by CBOR tag, registered at engine construction. */
 export interface TokenPlugin {
   /** Stable identifier for diagnostics, e.g. `'bridge:tron-usdt'`. */
   readonly id: string;
   /** Mint-reason verifiers to register; a duplicate tag across plugins is INVALID_CONFIG. */
   readonly mintJustificationVerifiers?: readonly IMintJustificationVerifier[];
+  /** Issuance policies to register; a duplicate token type or coin across plugins is INVALID_CONFIG. */
+  readonly tokenIssuancePolicies?: readonly TokenIssuancePolicy[];
 }
 
 /** Plan an NFT mint (#785); `mintDataToken` then mints the plan. */

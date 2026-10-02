@@ -20,6 +20,7 @@ import {
   VerifiedSealCache,
 } from '../../../token-engine/sdk';
 import { MintReasonRegistry } from '../../../token-engine/mint-reasons';
+import type { TokenIssuancePolicy } from '../../../token-engine/types';
 import { decodeSpherePaymentData } from '../../../token-engine/SpherePaymentData';
 import { type EngineDeps, SphereTokenEngine } from '../../../token-engine/SphereTokenEngine';
 import { AdversarialResubmitClient } from './support/AdversarialResubmitClient';
@@ -46,6 +47,7 @@ export interface TestEngineOptions {
   proofPollIntervalMs?: number;
   /** Plugin mint-reason verifiers registered on the engine next to the split verifier. */
   mintReasonVerifiers?: readonly IMintJustificationVerifier[];
+  issuancePolicies?: readonly TokenIssuancePolicy[];
 }
 
 /**
@@ -68,6 +70,8 @@ export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngin
       new SplitMintJustificationVerifier(decodeSpherePaymentData),
   );
   for (const verifier of opts.mintReasonVerifiers ?? []) mintJustificationVerifier.registerPlugin(verifier);
+  const tokenIssuanceVerifier = new TokenIssuanceVerifierService(false);
+  for (const policy of opts.issuancePolicies ?? []) tokenIssuanceVerifier.register(policy);
   const privateKey = opts.privateKey ?? SigningService.generatePrivateKey();
   const deps: EngineDeps = {
     client: new StateTransitionClient(opts.wireClient ?? new AdversarialResubmitClient(aggregator)),
@@ -80,7 +84,7 @@ export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngin
       predicateVerifier,
       unicityCertificateVerifier,
       mintJustificationVerifier,
-      new TokenIssuanceVerifierService(false),
+      tokenIssuanceVerifier,
     ),
     signingService: new SigningService(privateKey),
     privateKey,

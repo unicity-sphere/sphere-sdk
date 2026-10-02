@@ -68,6 +68,7 @@ export interface MachineDeps {
   ownNametag?: () => string | undefined;
   emit: (event: string, payload: unknown) => void;
   now: () => number;
+  recordSplit?: (sourceTokenId: string, outputTokenId: string) => Promise<void>;
   /** `committedAmount` = what SETTLED (the certified recipient blobs' value), never the plan. */
   recordHistory?: (info: {
     transferId: string;
@@ -515,6 +516,7 @@ export class TransferMachine {
       const key = keys.get(digest);
       if (key === undefined) throw new SphereError(`no upload key returned for ${digest}`, 'STORAGE_ERROR');
       const { tokenId } = await engine.deliveryKeys(o.changeBlob);
+      await this.deps.recordSplit?.(o.op.sourceTokenId, tokenId);
       added.push({ tokenId, key });
     }
     return added;

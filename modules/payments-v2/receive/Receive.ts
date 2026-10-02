@@ -3,10 +3,12 @@
 
 import { logger } from '../../../core/logger';
 import type { EngineVerifyResult, ITokenEngine, SphereToken } from '../../../token-engine';
+import type { CoinClaims } from '../../../token-engine/claims';
 import { isCoinlessEnvelope } from '../../../token-engine/value-envelope';
 import type { IncomingTransfer, Token } from '../../../types';
 import { SingleFlight } from '../async';
 import type { RegistryReader } from '../inventory/InventoryView';
+import { honoursClaims } from '../inventory/verdicts';
 import type { AttentionEmitter } from '../machine/journal';
 import { isRetryableAckError } from '../ports';
 import type { AckOutcome, AckRequest, DeliveryPort, IncomingDelivery } from '../ports';
@@ -28,6 +30,8 @@ export interface StoredIncoming {
   readonly assets: readonly IncomingAssetAmount[];
   /** Genesis type of an arrival that names no coin (#777) — its only display handle. */
   readonly tokenType?: string;
+  /** Claimed coins this arrival carries without being of their issuing type. */
+  readonly unverifiedCoinIds?: readonly string[];
 }
 
 // Per-key seam over the inventory view (adapted by the facade in P9).
@@ -52,6 +56,8 @@ export interface ReceiveDeps {
   readonly delivery: DeliveryPort;
   /** Snapshot taken once per drain (§7 collaborator-snapshot rule). */
   readonly engine: () => ReceiveEngine;
+  readonly claims?: Pick<CoinClaims, 'issuerOf'>;
+  readonly accepted?: (token: SphereToken) => Promise<void>;
   readonly view: ReceiveView;
   readonly kv: ScopedKV;
   readonly registry: RegistryReader;
@@ -100,7 +106,7 @@ interface PendingAck {
 
 type Screened =
   | { kind: 'ack'; ack: PendingAck }
-  | { kind: 'accept'; record: StoredIncoming }
+  | { kind: 'accept'; record: StoredIncoming; token: SphereToken }
   | { kind: 'defer'; reason: string };
 
 /** An entry parked until its mint reason can be judged; `since` lists it again on its own. */
@@ -328,6 +334,7 @@ export class Receive {
       if (screened.ack.disposition === 'claimed') claimable.n += 1;
       return;
     }
+    await deps.accepted?.(screened.token);
     await deps.view.store(screened.record);
     queueAck(ctx, claimAck(entry));
     claimable.n += 1;
@@ -414,15 +421,24 @@ async function screen(deps: ReceiveDeps, engine: ReceiveEngine, entry: IncomingD
     // #687 gate: a replayed OLDER, already-spent state never displaces the live one.
     return { kind: 'ack', ack: rejectAck(entry, 'invalid') };
   }
+  const unverifiedCoinIds = unverifiedCoinsOf(deps, token);
   return {
     kind: 'accept',
+    token,
     record: {
       tokenId: keys.tokenId,
       stateHash: keys.stateHash,
       assets: toAssetAmounts(token),
       ...(isCoinlessEnvelope(token.valueEnvelope) ? { tokenType: token.tokenType } : {}),
+      ...(unverifiedCoinIds.length > 0 ? { unverifiedCoinIds } : {}),
     },
   };
+}
+
+function unverifiedCoinsOf(deps: ReceiveDeps, token: SphereToken): string[] {
+  const claims = deps.claims;
+  if (claims === undefined || honoursClaims(claims, token)) return [];
+  return (token.value?.assets ?? []).map((asset) => asset.coinId).filter((coinId) => claims.issuerOf(coinId) !== null);
 }
 
 /** A string = the mint reason is not verifiable yet, and why: leave the entry unacked, never reject a token that may be valid. */
@@ -446,27 +462,17 @@ async function announce(
   record: StoredIncoming
 ): Promise<IncomingTransfer> {
   const receivedAt = (deps.now ?? Date.now)();
-  try {
-    await deps.recordReceived({
-      dedupKey: receivedDedupKey(record.tokenId, record.stateHash),
-      tokenId: record.tokenId,
-      stateHash: record.stateHash,
-      assets: record.assets,
-      ...(record.tokenType !== undefined ? { tokenType: record.tokenType } : {}),
-      ...(entry.senderPubkey !== undefined ? { senderPubkey: entry.senderPubkey } : {}),
-      ...(entry.senderNametag !== undefined ? { senderNametag: entry.senderNametag } : {}),
-      ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
-      receivedAt,
-    });
-  } catch (err) {
-    // §5.9: the history hook never fails the money path.
-    logger.debug('PaymentsV2', 'RECEIVED history hook failed (money path unaffected):', err);
-  }
+  await recordArrival(deps, entry, record, receivedAt);
+  const refused = record.assets.filter((asset) => record.unverifiedCoinIds?.includes(asset.coinId));
+  const counted = record.assets.filter((asset) => !refused.includes(asset));
   return {
     id: record.tokenId,
     senderPubkey: entry.senderPubkey ?? '',
     ...(entry.senderNametag !== undefined ? { senderNametag: entry.senderNametag } : {}),
-    tokens: record.assets.map((asset) => toUiToken(record.tokenId, asset, deps.registry, receivedAt)),
+    tokens: counted.map((asset) => toUiToken(record.tokenId, asset, deps.registry, receivedAt)),
+    ...(refused.length > 0
+      ? { unverifiedTokens: refused.map((asset) => ({ ...toUiToken(record.tokenId, asset, deps.registry, receivedAt), unverified: 'refused' as const })) }
+      : {}),
     // #777: named here rather than mapped from assets, which announced an EMPTY list.
     ...(record.tokenType !== undefined
       ? {
@@ -485,6 +491,32 @@ async function announce(
     ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
     receivedAt,
   };
+}
+
+async function recordArrival(
+  deps: ReceiveDeps,
+  entry: IncomingDelivery,
+  record: StoredIncoming,
+  receivedAt: number
+): Promise<void> {
+  const assets = record.assets.filter((asset) => !record.unverifiedCoinIds?.includes(asset.coinId));
+  if (assets.length === 0 && record.unverifiedCoinIds !== undefined) return;
+  try {
+    await deps.recordReceived({
+      dedupKey: receivedDedupKey(record.tokenId, record.stateHash),
+      tokenId: record.tokenId,
+      stateHash: record.stateHash,
+      assets,
+      ...(record.tokenType !== undefined ? { tokenType: record.tokenType } : {}),
+      ...(entry.senderPubkey !== undefined ? { senderPubkey: entry.senderPubkey } : {}),
+      ...(entry.senderNametag !== undefined ? { senderNametag: entry.senderNametag } : {}),
+      ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
+      receivedAt,
+    });
+  } catch (err) {
+    // §5.9: the history hook never fails the money path.
+    logger.debug('PaymentsV2', 'RECEIVED history hook failed (money path unaffected):', err);
+  }
 }
 
 /** Cursor reaches only the last CONSECUTIVE success. progressed=false means nothing settled. */

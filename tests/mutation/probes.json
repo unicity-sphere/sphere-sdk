@@ -1918,6 +1918,77 @@
     ]
   },
   {
+    "name": "factory-issuance-policy-enforced",
+    "note": "#825: the engine context enforces the plugin issuance policies (issuance-policies.test.ts, real factory)",
+    "file": "token-engine/factory.ts",
+    "find": "      mintJustificationVerifier,\n      tokenIssuanceVerifier,\n    ),",
+    "replace": "      mintJustificationVerifier,\n      new TokenIssuanceVerifierService(false),\n    ),",
+    "tests": [
+      "tests/unit/token-engine/issuance-policies.test.ts"
+    ]
+  },
+  {
+    "name": "mint-context-issuance-policy-kept",
+    "note": "#825: a mint with per-call verifiers is still held to the type policy",
+    "file": "token-engine/plugin-ops.ts",
+    "find": "    deps.verificationContext.tokenIssuanceVerifier,\n",
+    "replace": "    new (deps.verificationContext.tokenIssuanceVerifier.constructor as new (reject: boolean) => typeof deps.verificationContext.tokenIssuanceVerifier)(false),\n",
+    "tests": [
+      "tests/unit/token-engine/issuance-policies.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-trust-all",
+    "note": "#825: a claimed coin is trusted only in a verified token",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "    if (!this.isClaimed(coinId) || this.verified.has(tokenId)) return 'trusted';",
+    "replace": "    return 'trusted';",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-issuing-type-ignored",
+    "note": "#825: a look-alike of another type is refused",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "issuers.every((issuer) => issuer === null || issuer === token.tokenType)",
+    "replace": "issuers.every(() => true)",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-fingerprint-ignored",
+    "note": "#825: remembered verdicts reset when the policies change",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "    if (remembered?.fingerprint !== this.deps.claims.fingerprint()) return;",
+    "replace": "    if (remembered === null) return;",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts"
+    ]
+  },
+  {
+    "name": "custom-mint-per-call-trusted",
+    "note": "#825: a custom mint accepted only by its per-call verifier stays pending",
+    "file": "modules/payments-v2/mint-custom.ts",
+    "find": "  if (mintJustificationVerifiers === undefined) await deps.accepted?.(token);",
+    "replace": "  await deps.accepted?.(token);",
+    "tests": [
+      "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
+  },
+  {
+    "name": "inventory-untrusted-spendable",
+    "note": "#825: an untrusted token is never spent",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "    if (!entry.assets.every((asset) => this.trusts(tokenId, asset.coinId))) return false;",
+    "replace": "    if (entry.assets.length < 0) return false;",
+    "tests": [
+      "tests/unit/payments-v2/inventory.test.ts",
+      "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
+  },
+  {
     "name": "receive-parked-saved-after-cursor",
     "note": "A newly parked entry must be written before the cursor passes it, or a crash or failed write in between leaves an unacked entry nothing remembers.",
     "file": "modules/payments-v2/receive/Receive.ts",

@@ -19,7 +19,9 @@ import type { FullIdentity } from '../types';
 import type { PeerInfo } from '../transport';
 import type { StorageProvider } from '../storage';
 import type { PriceProvider } from '../price';
+import { CoinClaims } from '../token-engine/claims';
 import type { ITokenEngine } from '../token-engine/engine';
+import type { TokenPlugin } from '../token-engine/types';
 import type { RegistryReader } from '../modules/payments-v2/inventory/presentation';
 import {
   PaymentsFacade,
@@ -312,6 +314,7 @@ export interface ComposePaymentsV2Spec {
   /** Sphere's per-address engine record — REUSED; the wiring never builds one. */
   engineRef: () => ITokenEngine;
   host: PaymentsV2Host;
+  plugins?: readonly TokenPlugin[];
 }
 
 /**
@@ -351,6 +354,7 @@ export function composePaymentsV2(spec: ComposePaymentsV2Spec): PaymentsFacade {
     engineRef: spec.engineRef,
     kv,
     registry: host.registry,
+    claims: CoinClaims.fromPlugins(spec.plugins),
     ...(host.price !== null ? { price: host.price } : {}),
     emit: host.emit,
     resolveRecipient: (identifier) => resolveRecipientInfo(identifier, network, host.resolvePeer),

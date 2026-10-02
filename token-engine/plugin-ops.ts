@@ -2,7 +2,6 @@ import type { MintReasonRegistry } from './mint-reasons';
 import {
   type PredicateVerifierService,
   type RootTrustBase,
-  TokenIssuanceVerifierService,
   type UnicityCertificateVerifier,
   VerificationContext,
 } from './sdk';
@@ -31,6 +30,6 @@ export function mintContext(
     deps.predicateVerifier,
     deps.unicityCertificateVerifier,
     deps.mintJustificationVerifier.overlaid(verifiers),
-    new TokenIssuanceVerifierService(false),
+    deps.verificationContext.tokenIssuanceVerifier,
   );
 }

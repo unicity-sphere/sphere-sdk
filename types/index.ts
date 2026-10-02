@@ -58,6 +58,8 @@ export type TokenStatus =
   | 'spent'        // Transferred away
   | 'invalid';     // Validation failed
 
+export type Unverified = 'pending' | 'refused';
+
 export interface Token {
   readonly id: string;
   readonly coinId: string;
@@ -84,6 +86,8 @@ export interface Token {
    * send self-heals instead of wedging on a stale source.
    */
   suspectedSpent?: boolean;
+  /** Carries a coin an issuance policy claims without having passed that policy yet (`pending`) or at all (`refused`): shown, never spent. */
+  readonly unverified?: Unverified;
 }
 
 /**
@@ -148,6 +152,8 @@ export interface Asset {
   readonly fiatValueUsd: number | null;
   /** Total fiat value in EUR */
   readonly fiatValueEur: number | null;
+  /** Holds tokens of a claimed coin that have not passed its issuance policy yet (`pending`) or at all (`refused`): never spendable, never priced. */
+  readonly unverified?: Unverified;
 }
 
 // =============================================================================
@@ -205,6 +211,8 @@ export interface IncomingTransfer {
   readonly tokens: Token[];
   /** Arrivals that name no coin (#777). Disjoint from `tokens`, never a zero Token. */
   readonly coinless?: CoinlessToken[];
+  /** Refused arrivals of a claimed coin under another type; never counted, and never in `tokens`. */
+  readonly unverifiedTokens?: Token[];
   readonly memo?: string;
   readonly receivedAt: number;
 }

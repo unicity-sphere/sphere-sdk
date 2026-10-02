@@ -113,3 +113,20 @@ export class CheckpointTrustbaseMismatchError extends SphereError {
     this.name = 'CheckpointTrustbaseMismatchError';
   }
 }
+
+/**
+ * The keep-open engine errors a split leg can raise — mirrors PaymentsModule's `keepOpen` set.
+ * When one of these settles a parallel mint fan-out, the leg's spend MAY already be certified
+ * on-chain, so the intent MUST stay OPEN for checkpoint-based resume; the fan-out must surface a
+ * keep-open outcome rather than an abortable clean failure that would strand a certified sibling
+ * (#684). Only ProofUnconfirmedError / SplitCheckpointLostError are reachable from a mint leg
+ * today; the checkpoint pair is included so the classifier stays faithful to the keep-open family.
+ */
+export function isKeepOpenSplitError(err: unknown): boolean {
+  return (
+    err instanceof ProofUnconfirmedError ||
+    err instanceof CheckpointPersistFailedError ||
+    err instanceof SplitCheckpointLostError ||
+    err instanceof CheckpointTrustbaseMismatchError
+  );
+}

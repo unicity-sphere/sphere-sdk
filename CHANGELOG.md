@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — mandatory issuance policies for plugin token types (#825)
+
+A `TokenPlugin` can register `tokenIssuancePolicies`: the state-transition SDK's per-type issuance
+check plus the coins that type alone may issue. A token of a policed type minted without its reason
+now fails verification, where it used to pass because a missing mint reason skips every verifier.
+A claimed coin counts, prices and spends only inside a verified token of its issuing type; other
+holdings of it are left out of `assets()`, `tokens()` and history, and are read with the new
+`unverifiedAssets()` and `unverifiedTokens()`, marked `unverified: 'pending'` or `'refused'`; a
+refused arrival is announced in `IncomingTransfer.unverifiedTokens`, never in `tokens`. Tokens received, kept as change,
+or custom-minted under the registered verifiers are trusted at once; other held tokens of a claimed
+coin are verified in the background, and a change to the registered policies checks them again.
+
 ## [0.17.6] - 2026-09-22
 
 ### Fixed (wallet safety) — the Node file storage no longer writes an empty store over the wallet file (#811)

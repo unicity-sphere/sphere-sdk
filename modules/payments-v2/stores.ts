@@ -167,4 +167,5 @@ export const STORE_KEYS = {
   // §5.2 InventoryView durable overlays (#625/#679).
   suspectedSpent: 'suspected-spent',
   knownSpends: 'known-spends',
+  verifiedTokens: 'verified-tokens',
 } as const;

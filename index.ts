@@ -196,10 +196,10 @@ export type { HistoryRecord as TransactionHistoryEntry } from './storage';
 // viewer needs to render a payload or check a linked file.
 export type { MintNftRequest, NftView } from './modules/payments-v2/api';
 
-// Token plugins: a consumer registers mint-reason verifiers for token types the
-// SDK does not know (a bridged asset, an attested issuance) via
-// `SphereInitOptions.plugins`; the verifier interface itself is the base SDK's.
-export type { TokenPlugin, BurnParams } from './token-engine';
+// Token plugins: a consumer registers mint-reason verifiers and issuance policies
+// for token types the SDK does not know (a bridged asset, an attested issuance) via
+// `SphereInitOptions.plugins`; the verifier interfaces themselves are the base SDK's.
+export type { TokenPlugin, TokenIssuancePolicy, BurnParams } from './token-engine';
 export type {
   NftAttribute,
   NftContent,

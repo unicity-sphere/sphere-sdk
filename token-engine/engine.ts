@@ -259,7 +259,7 @@ export interface EngineConfig {
    * terminate the pool.
    */
   readonly verification?: VerificationWorkerConfig;
-  /** Token plugins whose mint-reason verifiers join the engine's verification context. */
+  /** Token plugins whose mint-reason verifiers and issuance policies join the engine's verification context. */
   readonly plugins?: readonly TokenPlugin[];
 }
 
