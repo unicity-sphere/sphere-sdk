@@ -144,10 +144,10 @@ export class TokenVerdicts {
 
   private onClaimsChanged(): void {
     if (!this.syncClaims()) return;
-    this.deps.changed();
     const op = this.review(this.deps.holders?.() ?? this.held).then(() => this.deps.changed());
     if (this.deps.track !== undefined) this.deps.track(op);
     else void op.catch(() => undefined);
+    this.deps.changed();
   }
 
   private async drain(): Promise<void> {

@@ -1008,7 +1008,8 @@ claimed coin counts only inside a token of its issuing type that verified:
 - An unverified token is never spent: coin selection skips it, and `sendWholeToken()` and `burn()`
   refuse it as not a spendable holding.
 - A token received, left as change of a verified token, or minted with `mintCustom()` under the
-  registered verifiers counts at once. A custom mint accepted only by its per-call verifiers, such as
+  registered verifiers counts at once, provided a policy for its type is loaded (under a registry
+  claim with no such policy it stays pending, see below). A custom mint accepted only by its per-call verifiers, such as
   a depositor's own mint before the lock is final, stays pending. Pending tokens and any other held
   token of a claimed coin, for instance one another device received, are verified in the background,
   and a check that cannot answer yet is retried with backoff.
