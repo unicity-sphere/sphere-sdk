@@ -1881,18 +1881,18 @@
     "name": "receive-unverifiable-rejected",
     "note": "A token whose mint reason is not verifiable yet may be valid; rejecting it at the mailbox loses it for good.",
     "file": "modules/payments-v2/receive/Receive.ts",
-    "find": "    if (isSphereError(err) && err.code === 'MINT_REASON_UNVERIFIABLE') return null;",
-    "replace": "    if (isSphereError(err) && err.code === 'MINT_REASON_UNVERIFIABLE') return { ok: false, reason: 'unverifiable' };",
+    "find": "    if (isUnverifiable(err)) return null;",
+    "replace": "    if (isUnverifiable(err)) return { ok: false, reason: 'unverifiable' };",
     "tests": [
       "tests/unit/payments-v2/receive.test.ts"
     ]
   },
   {
-    "name": "receive-deferral-cursor-advances",
-    "note": "The listing resumes after the persisted cursor, so a cursor past a deferred entry means it is never listed again.",
+    "name": "receive-deferral-not-parked",
+    "note": "The cursor moves past a deferred entry, so only its parked record brings it back; dropping the record loses the token for good.",
     "file": "modules/payments-v2/receive/Receive.ts",
-    "find": " && pending[i].holdsCursor !== true) {",
-    "replace": ") {",
+    "find": "      this.park(ctx, entry, parked);\n      queueAck(ctx, deferredAck(entry));",
+    "replace": "      queueAck(ctx, deferredAck(entry));",
     "tests": [
       "tests/unit/payments-v2/receive.test.ts"
     ]

@@ -4,6 +4,7 @@ import type { RegistryReader } from '../../../modules/payments-v2/inventory/Inve
 import type { DeliveryPort, IncomingDelivery } from '../../../modules/payments-v2/ports';
 import {
   ACK_BATCH_SIZE,
+  ATTENTION_UNVERIFIABLE,
   RECHECK_BASE_MS,
   RECHECK_MAX_MS,
   REFRESH_INTERVAL_MS,
@@ -317,6 +318,7 @@ interface Harness {
   attentions: { transferId: string; code: string; detail?: string }[];
   historyLog: ReceivedRecord[];
   receive: Receive;
+  deps: ReceiveDeps;
   epoch: string;
   historyFail: boolean;
   /**
@@ -352,6 +354,7 @@ function makeHarness(
     refreshes: [],
     clock: 1_700_000_000_000,
     receive: null as unknown as Receive,
+    deps: null as unknown as ReceiveDeps,
   };
   const deps: ReceiveDeps = {
     delivery,
@@ -380,11 +383,13 @@ function makeHarness(
       return harness.clock;
     },
   };
+  harness.deps = deps;
   harness.receive = new Receive(deps);
   return harness;
 }
 
 const CURSOR_KEY = 'cursor:mailbox';
+const DEFERRED_KEY = 'deferred:mailbox';
 
 describe('payments-v2 Receive drain', () => {
   it('verified-before-balance: a bad-proof token never enters the view and is acked rejected(invalid) with no event and no history', async () => {
@@ -507,7 +512,7 @@ describe('payments-v2 Receive drain', () => {
     expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '3', syncEpoch: 'e1' });
   });
 
-  it('an entry whose mint reason is not verifiable yet stays unacked, the entries after it are received, and the cursor holds before it', async () => {
+  it('an entry whose mint reason is not verifiable yet stays unacked and parked, the entries after it are received, and the cursor moves past it', async () => {
     const h = makeHarness();
     h.delivery.add(meta(T(1), 'S1'));
     h.delivery.add(meta(T(2), 'S1'));
@@ -519,16 +524,68 @@ describe('payments-v2 Receive drain', () => {
     expect(first.map((t) => t.id)).toEqual([T(1), T(3)]);
     expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'unacked', 'claimed']);
     expect(h.delivery.ackLog.some((a) => a.disposition === 'rejected')).toBe(false);
-    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '1', syncEpoch: 'e1' });
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '3', syncEpoch: 'e1' });
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([
+      { deliveryId: `d:${T(2)}:S1`, since: '1', syncEpoch: 'e1', attempts: 1, dueAtMs: h.clock + RECHECK_BASE_MS },
+    ]);
+    expect(h.attentions).toEqual([{ transferId: '', code: ATTENTION_UNVERIFIABLE, detail: `d:${T(2)}:S1` }]);
 
     h.engine.unverifiableOn.clear();
     h.clock += RECHECK_MAX_MS;
     const second = await h.receive.drainOnce();
 
-    expect(h.delivery.sinceLog[1]).toBe('1');
+    expect(h.delivery.sinceLog.slice(1)).toEqual(['3', '1']);
     expect(second.map((t) => t.id)).toEqual([T(2)]);
     expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'claimed', 'claimed']);
-    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '2', syncEpoch: 'e1' });
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '3', syncEpoch: 'e1' });
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
+    expect(h.attentions).toHaveLength(1);
+  });
+
+  it('a parked entry is rechecked by a fresh Receive over the same store, on the schedule it left behind', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    await h.receive.drainOnce();
+    const checks = (): number => h.engine.verifyCalls.filter((k) => k === `${T(1)}:S1`).length;
+    expect(checks()).toBe(1);
+
+    const restarted = new Receive(h.deps);
+    await restarted.drainOnce();
+    expect(checks()).toBe(1);
+
+    h.clock += RECHECK_BASE_MS;
+    h.engine.unverifiableOn.clear();
+    const received = await restarted.drainOnce();
+    expect(received.map((t) => t.id)).toEqual([T(1)]);
+    expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'claimed']);
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
+  });
+
+  it('a parked entry the mailbox no longer lists is forgotten at its recheck', async () => {
+    const h = makeHarness();
+    const parked = h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    await h.receive.drainOnce();
+    expect(h.kv.map.get(DEFERRED_KEY)).toHaveLength(1);
+
+    parked.status = 'claimed';
+    h.clock += RECHECK_BASE_MS;
+    await h.receive.drainOnce();
+
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
+  });
+
+  it('a parked entry from another sync epoch is dropped, since the full re-listing finds it again', async () => {
+    const h = makeHarness({ kvSeed: { 'deferred:mailbox': [{ deliveryId: 'd:old', since: null, syncEpoch: 'e0', attempts: 3, dueAtMs: 0 }] } });
+    h.delivery.add(meta(T(1), 'S1'));
+
+    await h.receive.drainOnce();
+
+    expect(h.delivery.sinceLog).toEqual([undefined]);
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
   });
 
   it('a not-yet-verifiable entry is re-verified on a doubling schedule, not on every drain', async () => {
@@ -553,6 +610,7 @@ describe('payments-v2 Receive drain', () => {
     await h.receive.drainOnce();
     expect(checks()).toBe(3);
     expect(h.delivery.entries[0].status).toBe('unacked');
+    expect(h.attentions).toHaveLength(1);
   });
 
   it('acks batch at 200: the first flush happens only after 200 entries are stored, the remainder flushes at drain end', async () => {

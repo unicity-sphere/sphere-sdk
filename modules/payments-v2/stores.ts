@@ -162,6 +162,7 @@ export const STORE_KEYS = {
   shortfalls: 'shortfalls',
   settlingLinks: 'settling',
   streamCursor: (s: StreamName) => `cursor:${s}`,
+  deferred: (s: StreamName) => `deferred:${s}`,
   epochLatch: 'epoch-latch',
   // §5.2 InventoryView durable overlays (#625/#679).
   suspectedSpent: 'suspected-spent',

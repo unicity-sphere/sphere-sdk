@@ -1,7 +1,6 @@
 // §5.7 of docs/PAYMENTS-V2-DESIGN.md — the single-flighted receive drain.
 // Entry order is money-load-bearing: the view store precedes the claimed ack (#724).
 
-import { isSphereError } from '../../../core/errors';
 import { logger } from '../../../core/logger';
 import type { EngineVerifyResult, ITokenEngine, SphereToken } from '../../../token-engine';
 import { isCoinlessEnvelope } from '../../../token-engine/value-envelope';
@@ -80,22 +79,33 @@ export const POLL_INTERVAL_MS = 30_000;
 export const RECHECK_BASE_MS = POLL_INTERVAL_MS;
 export const RECHECK_MAX_MS = 60 * 60 * 1000;
 export const ATTENTION_CLAIM_CONFLICT = 'claim:conflict';
+/** Raised once per entry whose mint reason this wallet cannot verify yet; the detail is the delivery id. */
+export const ATTENTION_UNVERIFIABLE = 'receive:unverifiable';
 
 export function receivedDedupKey(tokenId: string, stateHash: string): string {
   // Lowercased like History's keys — a case-variant would defeat server dedup.
   return `RECEIVED:${tokenId.toLowerCase()}:${stateHash.toLowerCase()}`;
 }
 
+/** A deferred entry settles like an ack for the cursor's sake, with no call to the server. */
 interface PendingAck {
   readonly deliveryId: string;
-  readonly disposition: 'claimed' | 'rejected';
+  readonly disposition: 'claimed' | 'rejected' | 'deferred';
   readonly reason?: 'invalid' | 'not-owned' | 'other';
   readonly cursor: string;
   readonly transferId?: string;
-  readonly holdsCursor?: boolean;
 }
 
 type Screened = { kind: 'ack'; ack: PendingAck } | { kind: 'accept'; record: StoredIncoming } | { kind: 'defer' };
+
+/** An entry parked until its mint reason can be judged; `since` lists it again on its own. */
+export interface DeferredDelivery {
+  readonly deliveryId: string;
+  readonly since: string | null;
+  readonly syncEpoch: string;
+  readonly attempts: number;
+  readonly dueAtMs: number;
+}
 
 /** The mutable state one listing pass threads through (max-params ≤ 5). */
 interface DrainPass {
@@ -106,8 +116,9 @@ interface DrainPass {
   readonly pageEpoch: () => string;
   /** Entries this drain made claimable — stored, or a held-state claim retry. */
   readonly claimable: { n: number };
-  /** Set once an entry is deferred: later acks settle but the cursor stays before the deferred one. */
-  readonly deferred: { any: boolean };
+  readonly parked: Map<string, DeferredDelivery>;
+  /** The cursor the current listing would resume from to see the entry in hand first. */
+  readonly previousCursor: { value: string | null };
 }
 
 function isClaimConflict(err: unknown): boolean {
@@ -120,7 +131,6 @@ export class Receive {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private unsubscribeWake: (() => void) | null = null;
   private lastRefreshAt = 0;
-  private readonly rechecks = new Map<string, { attempts: number; atMs: number }>();
 
   constructor(private readonly deps: ReceiveDeps) {}
 
@@ -170,9 +180,11 @@ export class Receive {
   /** One listing pass: process each entry, flushing and refreshing as it goes. */
   private async drainPages(ctx: DrainPass, basis: StreamCursor | null): Promise<void> {
     const { deps, pending, pageEpoch, claimable } = ctx;
+    ctx.previousCursor.value = basis === null ? null : String(basis.cursor);
     for await (const entry of deps.delivery.incoming(basis === null ? undefined : String(basis.cursor))) {
       const claimableBefore = claimable.n;
       await this.processEntry(ctx, entry);
+      ctx.previousCursor.value = entry.cursor;
       if (pending.length >= ACK_BATCH_SIZE) {
         // Nothing settled = the head is blocked; continuing re-flushes it once per
         // remaining entry, amplifying one failure into hundreds.
@@ -200,8 +212,11 @@ export class Receive {
     // wake is best-effort), counted where the entry becomes claimable — every
     // downstream proxy had a path that destroyed it.
     const claimable = { n: 0 };
-    const deferred = { any: false };
-    const finish = (): IncomingTransfer[] => {
+    const parkedBefore = await deps.kv.get<DeferredDelivery[]>(STORE_KEYS.deferred('mailbox'));
+    const parked = currentParked(deps, parkedBefore ?? []);
+    const ctx: DrainPass = { deps, engine, pending, stored, pageEpoch, claimable, parked, previousCursor: { value: null } };
+    const finish = async (): Promise<IncomingTransfer[]> => {
+      await saveParked(deps, parked, parkedBefore ?? []);
       if (claimable.n > 0) deps.refreshView?.();
       return stored;
     };
@@ -211,7 +226,7 @@ export class Receive {
       // latch gates the resume decision.
       let basis = record !== null && record.syncEpoch === deps.syncEpoch() ? record : null;
       for (let pass = 0; pass < 2; pass++) {
-        await this.drainPages({ deps, engine, pending, stored, pageEpoch, claimable, deferred }, basis);
+        await this.drainPages(ctx, basis);
         const served = deps.delivery.incomingEpoch();
         if (basis === null || served === null || served === basis.syncEpoch) break;
         // §5.7 restore self-detection: the page reports a different epoch than
@@ -221,6 +236,7 @@ export class Receive {
         await deps.kv.remove(STORE_KEYS.streamCursor('mailbox'));
         basis = null;
       }
+      await this.recheckParked(ctx);
     } catch (err) {
       // Infra failure (engine/blob/view/ack): the failed entry stays UNACKED and
       // re-lists next drain; the fully-processed prefix still flushes below.
@@ -238,12 +254,18 @@ export class Receive {
 
   private async processEntry(ctx: DrainPass, entry: IncomingDelivery): Promise<void> {
     const { deps, engine, stored, claimable } = ctx;
-    const screened = this.recheckDue(entry.deliveryId) ? await screen(deps, engine, entry) : { kind: 'defer' as const };
-    this.scheduleRecheck(entry.deliveryId, screened.kind === 'defer');
-    if (screened.kind === 'defer') {
-      ctx.deferred.any = true;
+    const parked = ctx.parked.get(entry.deliveryId);
+    if (parked !== undefined && this.now() < parked.dueAtMs) {
+      queueAck(ctx, deferredAck(entry));
       return;
     }
+    const screened = await screen(deps, engine, entry);
+    if (screened.kind === 'defer') {
+      this.park(ctx, entry, parked);
+      queueAck(ctx, deferredAck(entry));
+      return;
+    }
+    ctx.parked.delete(entry.deliveryId);
     if (screened.kind === 'ack') {
       queueAck(ctx, screened.ack);
       // A held-state re-list is the retry after a failed ack: nothing to store,
@@ -259,22 +281,62 @@ export class Receive {
     deps.emit('transfer:incoming', transfer);
   }
 
-  private recheckDue(deliveryId: string): boolean {
-    const recheck = this.rechecks.get(deliveryId);
-    return recheck === undefined || (this.deps.now?.() ?? Date.now()) >= recheck.atMs;
+  private now(): number {
+    return this.deps.now?.() ?? Date.now();
   }
 
-  private scheduleRecheck(deliveryId: string, deferred: boolean): void {
-    if (!deferred) {
-      this.rechecks.delete(deliveryId);
-      return;
-    }
-    const previous = this.rechecks.get(deliveryId);
-    if (previous !== undefined && (this.deps.now?.() ?? Date.now()) < previous.atMs) return;
+  private park(ctx: DrainPass, entry: IncomingDelivery, previous: DeferredDelivery | undefined): void {
     const attempts = (previous?.attempts ?? 0) + 1;
     const delay = Math.min(RECHECK_BASE_MS * 2 ** (attempts - 1), RECHECK_MAX_MS);
-    this.rechecks.set(deliveryId, { attempts, atMs: (this.deps.now?.() ?? Date.now()) + delay });
+    ctx.parked.set(entry.deliveryId, {
+      deliveryId: entry.deliveryId,
+      since: ctx.previousCursor.value,
+      syncEpoch: ctx.pageEpoch(),
+      attempts,
+      dueAtMs: this.now() + delay,
+    });
+    if (previous !== undefined) return;
+    logger.warn('PaymentsV2', `receive: ${entry.deliveryId} parked, its mint reason cannot be verified here yet`);
+    ctx.deps.attention(entry.transferId ?? '', ATTENTION_UNVERIFIABLE, entry.deliveryId);
   }
+
+  /** Each parked entry that is due is listed again from just before its position, on its own. */
+  private async recheckParked(ctx: DrainPass): Promise<void> {
+    for (const record of [...ctx.parked.values()]) {
+      if (this.now() < record.dueAtMs) continue;
+      const pass: DrainPass = { ...ctx, pending: [], previousCursor: { value: record.since } };
+      await this.recheckOne(pass, record);
+      await settleOffPath(ctx.deps, pass.pending);
+    }
+  }
+
+  private async recheckOne(ctx: DrainPass, record: DeferredDelivery): Promise<void> {
+    for await (const entry of ctx.deps.delivery.incoming(record.since ?? undefined)) {
+      if (entry.deliveryId === record.deliveryId) {
+        await this.processEntry(ctx, entry);
+        return;
+      }
+      break;
+    }
+    logger.warn('PaymentsV2', `receive: parked ${record.deliveryId} is no longer listed, forgetting it`);
+    ctx.parked.delete(record.deliveryId);
+  }
+}
+
+/** Records from another sync epoch are dropped: their positions no longer mean anything, and the full re-listing finds the entries again. */
+function currentParked(deps: ReceiveDeps, records: readonly DeferredDelivery[]): Map<string, DeferredDelivery> {
+  const current = records.filter((r) => r.syncEpoch === deps.syncEpoch());
+  return new Map(current.map((r) => [r.deliveryId, r]));
+}
+
+async function saveParked(
+  deps: ReceiveDeps,
+  parked: Map<string, DeferredDelivery>,
+  before: readonly DeferredDelivery[]
+): Promise<void> {
+  const after = [...parked.values()];
+  if (JSON.stringify(after) === JSON.stringify(before)) return;
+  await deps.kv.set(STORE_KEYS.deferred('mailbox'), after);
 }
 
 async function screen(deps: ReceiveDeps, engine: ReceiveEngine, entry: IncomingDelivery): Promise<Screened> {
@@ -315,9 +377,14 @@ async function verdictOf(engine: ReceiveEngine, token: SphereToken): Promise<Eng
   try {
     return await engine.verify(token);
   } catch (err) {
-    if (isSphereError(err) && err.code === 'MINT_REASON_UNVERIFIABLE') return null;
+    if (isUnverifiable(err)) return null;
     throw err;
   }
+}
+
+/** Read structurally, as a facade and an engine from separate bundles do not share an error class. */
+function isUnverifiable(err: unknown): boolean {
+  return err !== null && typeof err === 'object' && (err as { code?: unknown }).code === 'MINT_REASON_UNVERIFIABLE';
 }
 
 async function announce(
@@ -379,15 +446,11 @@ async function flushAcks(
   try {
     const settled = await settleAcks(deps, pending);
     let i = 0;
-    while (i < pending.length && settled.has(pending[i].deliveryId) && pending[i].holdsCursor !== true) {
+    while (i < pending.length && settled.has(pending[i].deliveryId)) {
       lastAcked = pending[i].cursor;
       i += 1;
     }
-    // Drop every settled entry, not just the prefix: a later flush must never
-    // re-ack one that already settled.
-    const stuck = pending.filter((p) => !settled.has(p.deliveryId));
-    pending.length = 0;
-    pending.push(...stuck);
+    dropSettled(pending, settled);
   } finally {
     if (lastAcked !== null) {
       const record: StreamCursor = { cursor: lastAcked, syncEpoch: epochOf() };
@@ -397,13 +460,29 @@ async function flushAcks(
   return { progressed: pending.length < before };
 }
 
+/** Drop every settled entry, not just the prefix: a later flush must never re-ack one that already settled. */
+function dropSettled(pending: PendingAck[], settled: ReadonlySet<string>): void {
+  const stuck = pending.filter((p) => !settled.has(p.deliveryId));
+  pending.length = 0;
+  pending.push(...stuck);
+}
+
+/** Acks from a recheck listing settle without touching the cursor, which already lies past them. */
+async function settleOffPath(deps: ReceiveDeps, pending: PendingAck[]): Promise<void> {
+  if (pending.length === 0) return;
+  dropSettled(pending, await settleAcks(deps, pending));
+}
+
 /** Batched when the port offers it, one at a time otherwise; never reorders `pending`. */
 async function settleAcks(deps: ReceiveDeps, pending: readonly PendingAck[]): Promise<Set<string>> {
+  const toSend = pending.filter((p) => p.disposition !== 'deferred');
   const batch = deps.delivery.ackBatch?.bind(deps.delivery);
   if (batch === undefined) return settleOneByOne(deps, pending);
+  const settled = new Set(pending.filter((p) => p.disposition === 'deferred').map((p) => p.deliveryId));
+  if (toSend.length === 0) return settled;
   let outcomes: readonly AckOutcome[];
   try {
-    outcomes = await batch(pending.map(toAckRequest));
+    outcomes = await batch(toSend.map(toAckRequest));
   } catch (err) {
     // A wall a per-entry retry would hit too (429, outage): falling back turns
     // one transient failure into N of them.
@@ -411,9 +490,9 @@ async function settleAcks(deps: ReceiveDeps, pending: readonly PendingAck[]): Pr
     logger.warn('PaymentsV2', 'batched mailbox ack failed — settling one at a time:', err);
     return settleOneByOne(deps, pending);
   }
-  const settled = new Set(outcomes.filter((o) => o.status === 'settled').map((o) => o.deliveryId));
+  for (const o of outcomes) if (o.status === 'settled') settled.add(o.deliveryId);
   const conflicts = outcomes.filter((o) => o.status === 'conflict').map((o) => o.deliveryId);
-  if (conflicts.length > 0) await resolveConflicts(deps, pending, conflicts, settled);
+  if (conflicts.length > 0) await resolveConflicts(deps, toSend, conflicts, settled);
   return settled;
 }
 
@@ -447,6 +526,10 @@ async function rejectStaleClaim(deps: ReceiveDeps, deliveryId: string, transferI
 async function settleOneByOne(deps: ReceiveDeps, pending: readonly PendingAck[]): Promise<Set<string>> {
   const settled = new Set<string>();
   for (const ack of pending) {
+    if (ack.disposition === 'deferred') {
+      settled.add(ack.deliveryId);
+      continue;
+    }
     try {
       await ackOne(deps, ack);
     } catch (err) {
@@ -461,14 +544,14 @@ async function settleOneByOne(deps: ReceiveDeps, pending: readonly PendingAck[])
 function toAckRequest(ack: PendingAck): AckRequest {
   return {
     deliveryId: ack.deliveryId,
-    disposition: ack.disposition,
+    disposition: ack.disposition === 'claimed' ? 'claimed' : 'rejected',
     ...(ack.reason !== undefined ? { reason: ack.reason } : {}),
   };
 }
 
 async function ackOne(deps: ReceiveDeps, ack: PendingAck): Promise<void> {
   try {
-    await deps.delivery.ack(ack.deliveryId, ack.disposition, ack.reason);
+    await deps.delivery.ack(ack.deliveryId, ack.disposition === 'claimed' ? 'claimed' : 'rejected', ack.reason);
   } catch (err) {
     if (ack.disposition !== 'claimed' || !isClaimConflict(err)) throw err;
     await rejectStaleClaim(deps, ack.deliveryId, ack.transferId);
@@ -476,7 +559,11 @@ async function ackOne(deps: ReceiveDeps, ack: PendingAck): Promise<void> {
 }
 
 function queueAck(ctx: DrainPass, ack: PendingAck): void {
-  ctx.pending.push(ctx.deferred.any ? { ...ack, holdsCursor: true } : ack);
+  ctx.pending.push(ack);
+}
+
+function deferredAck(entry: IncomingDelivery): PendingAck {
+  return { deliveryId: entry.deliveryId, disposition: 'deferred', cursor: entry.cursor };
 }
 
 function claimAck(entry: IncomingDelivery): PendingAck {
