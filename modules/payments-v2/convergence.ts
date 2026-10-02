@@ -5,7 +5,7 @@
 
 import type { PendingTransfer } from './api';
 import type { DeliveryPort } from './ports';
-import type { DeliveryJournalEntry, IntentBackstopEntry, ShortfallEntry } from './stores';
+import { isLiveBurn, type DeliveryJournalEntry, type IntentBackstopEntry, type ShortfallEntry } from './stores';
 import type { CoinIntentPayload, IntentPayload } from './machine/types';
 import { retryAfterMsOf, type MachineStores, type ReplayDeps } from './machine/journal';
 import { resumeAll } from './machine/resume';
@@ -100,6 +100,8 @@ export interface ConvergerDeps {
   refreshView(): Promise<void>;
   replayMints(): Promise<number>;
   replayNftMints(): Promise<number>;
+  replayCustomMints(): Promise<number>;
+  replayBurns(): Promise<number>;
   /** §7 ownership: the pass never adopts an op whose machine runs in-process. */
   isActiveOp(id: string): boolean;
   emit(event: string, payload: unknown): void;
@@ -125,7 +127,12 @@ export class Converger {
       retryAfterMs ??= retryAfterMsOf(err);
     }
     // Caught apart: an unreadable coin journal must not starve the NFT one.
-    for (const replay of [() => this.deps.replayMints(), () => this.deps.replayNftMints()]) {
+    for (const replay of [
+      () => this.deps.replayMints(),
+      () => this.deps.replayNftMints(),
+      () => this.deps.replayCustomMints(),
+      () => this.deps.replayBurns(),
+    ]) {
       try {
         progress = (await replay()) > 0 || progress;
       } catch (err) {
@@ -137,14 +144,17 @@ export class Converger {
 
   /** §4 heartbeat predicate — read fresh from the §6 stores, never cached. */
   async pendingWork(): Promise<boolean> {
-    const [backstop, journal, mints, nftMints] = await Promise.all([
+    const [backstop, journal, mints, nftMints, customMints, burns] = await Promise.all([
       this.deps.stores.backstop.list(),
       this.deps.stores.deliveryJournal.list(),
       this.deps.stores.mintJournal.list(),
       this.deps.stores.nftMintJournal.list(),
+      this.deps.stores.customMintJournal.list(),
+      this.deps.stores.burnJournal.list(),
     ]);
-    const mintsOpen = mints.length > 0 || nftMints.length > 0;
-    return backstop.length > 0 || journal.some((e) => e.undeliverable !== true) || mintsOpen;
+    const mintsOpen = mints.length > 0 || nftMints.length > 0 || customMints.length > 0;
+    const burnsOpen = burns.some(isLiveBurn);
+    return backstop.length > 0 || journal.some((e) => e.undeliverable !== true) || mintsOpen || burnsOpen;
   }
 
   private async resumePass(): Promise<boolean> {
@@ -253,6 +263,9 @@ export async function deriveOpenIntentHolds(
     const direct = Array.isArray(payload?.direct) ? payload.direct.filter((id) => typeof id === 'string') : [];
     const split = typeof payload?.split?.tokenId === 'string' ? [payload.split.tokenId] : [];
     holds.set(entry.transferId, [...direct, ...split]);
+  }
+  for (const burn of await stores.burnJournal.list()) {
+    if (isLiveBurn(burn)) holds.set(burn.burnId, [burn.tokenId]);
   }
   return { open: holds, complete };
 }

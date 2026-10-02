@@ -15,6 +15,8 @@
  * existing certification instead of minting a second token.
  */
 
+import { sha256 } from '@noble/hashes/sha2.js';
+
 import { SphereError, type SphereErrorCode } from '../core/errors';
 import {
   awaitProofBounded,
@@ -27,7 +29,7 @@ import { certificationFailure } from './certification-outcome';
 import { randomUUID } from '../core/uuid';
 import {
   CheckpointPersistFailedError,
-  CheckpointTrustbaseMismatchError,
+  isKeepOpenSplitError,
   ProofUnconfirmedError,
   SplitCheckpointLostError,
   TransferConflictError,
@@ -36,22 +38,24 @@ import { deriveDirectAddress } from './identity';
 import { deriveDeliveryKeys } from './blob-keys';
 import { deriveRealization } from './realization';
 import { planNftMint, readTokenNft } from './nft-ops';
+import type { MintReasonRegistry } from './mint-reasons';
+import { mintContext } from './plugin-ops';
 import { burntTokenFromCheckpoint, encodeCheckpoint } from './split-checkpoint';
 import {
+  BurnPredicate,
   CertificationData,
   CertificationStatus,
   EncodedPredicate,
   HexConverter,
   type InclusionProof,
-  InclusionProofVerificationStatus,
   type ITransaction,
-  type MintJustificationVerifierService,
   MintTransaction,
   type NetworkId,
   PaymentAssetCollection,
   type PredicateVerifierService,
   type UnicityCertificateVerifier,
   type RootTrustBase,
+  type IPredicate,
   SignaturePredicate,
   SignaturePredicateUnlockScript,
   type SigningService,
@@ -68,14 +72,13 @@ import {
   TransferTransaction,
   type VerificationContext,
   VerificationStatus,
-  waitInclusionProof,
   type ITokenVerifier,
 } from './sdk';
 import { decodeSpherePaymentData, SpherePaymentData, sphereAssetToSdk } from './SpherePaymentData';
-import { assertMintableData, classifyValueEnvelope, wrapToken } from './value-envelope';
+import { classifyValueEnvelope, wrapToken } from './value-envelope';
 import type { EngineOpOptions, ITokenEngine } from './engine';
 import type {
-  BuildNftMintParams,
+  BuildNftMintParams, BurnParams,
   CoinId,
   EngineIdentity,
   EngineVerifyResult,
@@ -102,7 +105,7 @@ export interface EngineDeps {
   readonly trustBase: RootTrustBase;
   readonly predicateVerifier: PredicateVerifierService;
   readonly unicityCertificateVerifier: UnicityCertificateVerifier;
-  readonly mintJustificationVerifier: MintJustificationVerifierService;
+  readonly mintJustificationVerifier: MintReasonRegistry;
   readonly verificationContext: VerificationContext;
   /**
    * Opt-in parallel verifier (EngineConfig.verification). Absent → tokens verify
@@ -139,23 +142,6 @@ export const DEFAULT_PROOF_POLL_INTERVAL_MS = 300;
  * gateway load on a large multi-output split.
  */
 const MAX_MINT_CONCURRENCY = 8;
-
-/**
- * The keep-open engine errors a split leg can raise — mirrors PaymentsModule's `keepOpen` set.
- * When one of these settles a parallel mint fan-out, the leg's spend MAY already be certified
- * on-chain, so the intent MUST stay OPEN for checkpoint-based resume; the fan-out must surface a
- * keep-open outcome rather than an abortable clean failure that would strand a certified sibling
- * (#684). Only ProofUnconfirmedError / SplitCheckpointLostError are reachable from a mint leg
- * today; the checkpoint pair is included so the classifier stays faithful to the keep-open family.
- */
-function isKeepOpenSplitError(err: unknown): boolean {
-  return (
-    err instanceof ProofUnconfirmedError ||
-    err instanceof CheckpointPersistFailedError ||
-    err instanceof SplitCheckpointLostError ||
-    err instanceof CheckpointTrustbaseMismatchError
-  );
-}
 
 /** Canonical lowercase UUID — the spec's `transferId` wire form (sdk-changes E.1). */
 const TRANSFER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -260,6 +246,11 @@ export class SphereTokenEngine implements ITokenEngine {
     return data ? new Uint8Array(data) : null;
   }
 
+  public readTokenJustification(token: SphereToken): Uint8Array | null {
+    const justification = token.sdkToken.genesis.justification;
+    return justification ? new Uint8Array(justification) : null;
+  }
+
   public readNft(token: SphereToken): Promise<NftReading | null> {
     return readTokenNft(token);
   }
@@ -299,14 +290,16 @@ export class SphereTokenEngine implements ITokenEngine {
     return wrapToken(token);
   }
 
+  public readonly assertMintable = (params: MintDataTokenParams): void => void mintContext(this.deps, params);
+
   public async mintDataToken(params: MintDataTokenParams, options?: EngineOpOptions): Promise<SphereToken> {
-    assertMintableData(params.data);
+    const context = mintContext(this.deps, params);
     const recipient = SignaturePredicate.create(params.recipientPubkey);
     const tokenType = params.tokenType ? new TokenType(params.tokenType) : TokenType.generate();
     // A deterministic salt yields a stable, terms-derived tokenId (TokenId.fromSalt).
     const salt = params.salt ? TokenSalt.fromBytes(params.salt) : TokenSalt.generate();
 
-    const mintTx = await MintTransaction.create(this.deps.networkId, recipient, { data: params.data, tokenType, salt });
+    const mintTx = await MintTransaction.create(this.deps.networkId, recipient, { data: params.data, tokenType, salt, justification: params.justification ?? null });
     const certificationData = await CertificationData.fromMintTransaction(mintTx);
 
     // #692 F13: the caller's deterministic salt already makes the re-call byte-identical;
@@ -319,8 +312,7 @@ export class SphereTokenEngine implements ITokenEngine {
       options,
     );
     const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
-    const token = await Token.mint(certified, this.deps.verificationContext);
-    return wrapToken(token);
+    return wrapToken(await Token.mint(certified, context));
   }
 
   public buildNftMint(params: BuildNftMintParams): Promise<NftMintPlan> {
@@ -329,30 +321,26 @@ export class SphereTokenEngine implements ITokenEngine {
 
   public async transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken> {
     this.assertOwned(params.token);
-    const transferId = this.resolveTransferId(options);
-    const recipient = SignaturePredicate.create(params.recipientPubkey);
+    return this.spend(params.token, SignaturePredicate.create(params.recipientPubkey), params.data ?? null, options, 'Transfer certification failed');
+  }
+
+  public async burn(params: BurnParams, options?: EngineOpOptions): Promise<SphereToken> {
+    this.assertOwned(params.token);
+    return this.spend(params.token, BurnPredicate.create(sha256(params.reasonBytes)), params.reasonBytes, options, 'Burn certification failed');
+  }
+
+  private async spend(token: SphereToken, recipient: IPredicate, data: Uint8Array | null, options: EngineOpOptions | undefined, failLabel: string): Promise<SphereToken> {
     // E.1 deterministic realization: same transferId + inputs ⇒ byte-identical
     // transaction, so an interrupted transfer can be rebuilt and resumed (AC-E1/E2).
     const stateMask = StateMask.fromBytes(
-      deriveRealization(this.privateKeyHex, transferId, this.resolveOpIndex(options), 'stateMask'),
+      deriveRealization(this.privateKeyHex, this.resolveTransferId(options), this.resolveOpIndex(options), 'stateMask'),
     );
-
-    const transferTx = await TransferTransaction.create(params.token.sdkToken, recipient, stateMask, {
-      data: params.data ?? null,
-    });
+    const transferTx = await TransferTransaction.create(token.sdkToken, recipient, stateMask, { data });
     const unlockScript = await SignaturePredicateUnlockScript.create(transferTx, this.deps.signingService);
     const certificationData = await CertificationData.fromTransaction(transferTx, unlockScript);
-
-    const proof = await this.submitAndAwaitProof(
-      certificationData,
-      transferTx,
-      'Transfer certification failed',
-      'TRANSFER_FAILED',
-      options,
-    );
+    const proof = await this.submitAndAwaitProof(certificationData, transferTx, failLabel, 'TRANSFER_FAILED', options);
     const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
-    const transferred = await params.token.sdkToken.transfer(certified, this.deps.verificationContext);
-    return wrapToken(transferred);
+    return wrapToken(await token.sdkToken.transfer(certified, this.deps.verificationContext));
   }
 
   public async split(params: SplitParams, options?: EngineOpOptions): Promise<SplitResult> {

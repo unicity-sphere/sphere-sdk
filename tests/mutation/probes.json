@@ -114,8 +114,8 @@
     "name": "receive-ack-before-store",
     "note": "#724 outcome: the view store precedes the claimed ack (receive.test.ts 'a claimed ack is issued only after the view store succeeds')",
     "file": "modules/payments-v2/receive/Receive.ts",
-    "find": "    await deps.view.store(screened.record);\n    pending.push(claimAck(entry));",
-    "replace": "    pending.push(claimAck(entry));\n    await deps.view.store(screened.record);",
+    "find": "    await deps.view.store(screened.record);\n    queueAck(ctx, claimAck(entry));",
+    "replace": "    queueAck(ctx, claimAck(entry));\n    await deps.view.store(screened.record);",
     "tests": [
       "tests/unit/payments-v2/receive.test.ts"
     ]
@@ -1278,9 +1278,9 @@
   {
     "name": "engine-mintdatatoken-preflight-removed",
     "note": "#778: un-classifiable opaque bytes must be refused BEFORE the chain op. wrapToken runs on mintDataToken's last line, after certification, so without the pre-flight the refusal strands an on-chain token this SDK can never decode.",
-    "file": "token-engine/SphereTokenEngine.ts",
-    "find": "    assertMintableData(params.data);",
-    "replace": "    // mutant: pre-flight dropped",
+    "file": "token-engine/plugin-ops.ts",
+    "find": "  assertMintableData(params.data);",
+    "replace": "  // mutant: pre-flight dropped",
     "tests": [
       "tests/unit/token-engine/SphereTokenEngine.hardening.test.ts"
     ]
@@ -1751,8 +1751,8 @@
     "name": "converger-pendingwork-ignores-nft-journal",
     "note": "#785: a retained NFT mint entry is heartbeat work. Leaving it out of pendingWork() lets the heartbeat go idle, so a certified NFT waits for the next start() to reach inventory.",
     "file": "modules/payments-v2/convergence.ts",
-    "find": "    const mintsOpen = mints.length > 0 || nftMints.length > 0;",
-    "replace": "    const mintsOpen = mints.length > 0;",
+    "find": "    const mintsOpen = mints.length > 0 || nftMints.length > 0 || customMints.length > 0;",
+    "replace": "    const mintsOpen = mints.length > 0 || customMints.length > 0;",
     "tests": [
       "tests/unit/payments-v2/nft.test.ts"
     ]
@@ -1835,6 +1835,177 @@
     "replace": "    void NO_PAYMENTS;",
     "tests": [
       "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "burn-apply-not-external",
+    "note": "A burn's spend has no deposit evidence; without externalDelivery wallet-api tombstones it unevidenced and raises the critical theft alert.",
+    "file": "modules/payments-v2/burn.ts",
+    "find": "added: [], externalDelivery: true });",
+    "replace": "added: [] });",
+    "tests": [
+      "tests/unit/payments-v2/burn.test.ts"
+    ]
+  },
+  {
+    "name": "burn-terminal-conflict-retried",
+    "note": "A burn that lost to another spend can never complete; retrying it keeps the heartbeat busy forever and acknowledge can never clear it.",
+    "file": "modules/payments-v2/burn.ts",
+    "find": "      if (!isTerminal(err)) continue;",
+    "replace": "      if (err !== undefined) continue;",
+    "tests": [
+      "tests/unit/payments-v2/burn.test.ts"
+    ]
+  },
+  {
+    "name": "burn-token-not-reserved",
+    "note": "An unreserved burn source stays selectable, so a send can race the burn for the same token.",
+    "file": "modules/payments-v2/burn-hold.ts",
+    "find": "      this.deps.queue.planWhole(burnId, tokenId);",
+    "replace": "      void this.deps.queue;",
+    "tests": [
+      "tests/unit/payments-v2/burn.test.ts"
+    ]
+  },
+  {
+    "name": "burn-live-entry-not-pinned",
+    "note": "Without the live burn journal entries the restart pin re-derivation offers a token still being burned as spendable.",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    if (isLiveBurn(burn)) holds.set(burn.burnId, [burn.tokenId]);",
+    "replace": "    void burn;",
+    "tests": [
+      "tests/unit/payments-v2/burn.test.ts"
+    ]
+  },
+  {
+    "name": "receive-unverifiable-rejected",
+    "note": "A token whose mint reason is not verifiable yet may be valid; rejecting it at the mailbox loses it for good.",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "    if (isUnverifiable(err)) return err.message;",
+    "replace": "    if (isUnverifiable(err)) return { ok: false, reason: 'unverifiable' };",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts"
+    ]
+  },
+  {
+    "name": "receive-deferral-not-parked",
+    "note": "The cursor moves past a deferred entry, so only its parked record brings it back; dropping the record loses the token for good.",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "      this.park(ctx, entry, parked, screened.reason);\n      queueAck(ctx, deferredAck(entry));",
+    "replace": "      queueAck(ctx, deferredAck(entry));",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts"
+    ]
+  },
+  {
+    "name": "mint-reason-plugin-throw-is-fail",
+    "note": "A plugin throw means the answer is not known yet (RPC outage, lock short of its confirmations); a FAIL there rejects a valid token.",
+    "file": "token-engine/mint-reasons.ts",
+    "find": "    throw new MintReasonUnverifiableError(`Mint-reason tag ${verifier.tag} cannot be verified yet: ${why}`, err);",
+    "replace": "    return new VerificationResult(RULE, VerificationStatus.FAIL, why);",
+    "tests": [
+      "tests/unit/token-engine/mint-reasons.test.ts"
+    ]
+  },
+  {
+    "name": "mint-reason-overlay-drops-registered",
+    "note": "A per-call verifier must overlay the engine registry; replacing it drops every other tag, the split verifier included.",
+    "file": "token-engine/mint-reasons.ts",
+    "find": "    for (const [tag, verifier] of this.byTag) {",
+    "replace": "    for (const [tag, verifier] of [...this.byTag].filter(([t]) => replaced.has(t))) {",
+    "tests": [
+      "tests/unit/token-engine/mint-reasons.test.ts"
+    ]
+  },
+  {
+    "name": "factory-issuance-policy-enforced",
+    "note": "#825: the engine context enforces the plugin issuance policies (issuance-policies.test.ts, real factory)",
+    "file": "token-engine/factory.ts",
+    "find": "      mintJustificationVerifier,\n      tokenIssuanceVerifier,\n    ),",
+    "replace": "      mintJustificationVerifier,\n      new TokenIssuanceVerifierService(false),\n    ),",
+    "tests": [
+      "tests/unit/token-engine/issuance-policies.test.ts"
+    ]
+  },
+  {
+    "name": "mint-context-issuance-policy-kept",
+    "note": "#825: a mint with per-call verifiers is still held to the type policy",
+    "file": "token-engine/plugin-ops.ts",
+    "find": "    deps.verificationContext.tokenIssuanceVerifier,\n",
+    "replace": "    new (deps.verificationContext.tokenIssuanceVerifier.constructor as new (reject: boolean) => typeof deps.verificationContext.tokenIssuanceVerifier)(false),\n",
+    "tests": [
+      "tests/unit/token-engine/issuance-policies.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-trust-all",
+    "note": "#825: a claimed coin is trusted only in a verified token",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "    if (!this.isClaimed(coinId) || this.verified.has(tokenId)) return 'trusted';",
+    "replace": "    return 'trusted';",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-issuing-type-ignored",
+    "note": "#825: a look-alike of another type is refused",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "issuers.every((issuer) => issuer === null || issuer === token.tokenType)",
+    "replace": "issuers.every(() => true)",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts"
+    ]
+  },
+  {
+    "name": "verdicts-fingerprint-ignored",
+    "note": "#825: remembered verdicts reset when the policies change",
+    "file": "modules/payments-v2/inventory/verdicts.ts",
+    "find": "    if (remembered?.fingerprint !== this.deps.claims.fingerprint()) return;",
+    "replace": "    if (remembered === null) return;",
+    "tests": [
+      "tests/unit/payments-v2/verdicts.test.ts"
+    ]
+  },
+  {
+    "name": "custom-mint-per-call-trusted",
+    "note": "#825: a custom mint accepted only by its per-call verifier stays pending",
+    "file": "modules/payments-v2/mint-custom.ts",
+    "find": "  if (mintJustificationVerifiers === undefined) await deps.accepted?.(token);",
+    "replace": "  await deps.accepted?.(token);",
+    "tests": [
+      "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
+  },
+  {
+    "name": "inventory-untrusted-spendable",
+    "note": "#825: an untrusted token is never spent",
+    "file": "modules/payments-v2/inventory/InventoryView.ts",
+    "find": "    if (!entry.assets.every((asset) => this.trusts(tokenId, asset.coinId))) return false;",
+    "replace": "    if (entry.assets.length < 0) return false;",
+    "tests": [
+      "tests/unit/payments-v2/inventory.test.ts",
+      "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
+  },
+  {
+    "name": "receive-parked-saved-after-cursor",
+    "note": "A newly parked entry must be written before the cursor passes it, or a crash or failed write in between leaves an unacked entry nothing remembers.",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "  const deferredSettle = await ctx.parked.save();\n  const toSend",
+    "replace": "  const deferredSettle = true;\n  const toSend",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts"
+    ]
+  },
+  {
+    "name": "receive-parked-forgotten-before-ack-settles",
+    "note": "A parked entry leaves the set only with its settled ack; forgetting it on screening loses the token when the ack then fails, since the cursor is already past it.",
+    "file": "modules/payments-v2/receive/Receive.ts",
+    "find": "    if (settled.has(p.deliveryId)) parked.delete(p.deliveryId);\n    else parked.set({ ...record, dueAtMs: ctx.deps.now?.() ?? Date.now() });",
+    "replace": "    parked.delete(p.deliveryId);",
+    "tests": [
+      "tests/unit/payments-v2/receive.test.ts"
     ]
   }
 ]

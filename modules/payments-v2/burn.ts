@@ -1,0 +1,163 @@
+import { bytesToHex, hexToBytes } from '../../core/crypto';
+import { SphereError } from '../../core/errors';
+import type { ITokenEngine } from '../../token-engine/engine';
+import type { SphereToken } from '../../token-engine/types';
+
+import type { BurnRequest, BurnResult, PendingBurn } from './api';
+import type { RecordSentInput } from './history/History';
+import type { ListStore } from './machine/journal';
+import { messageOf } from './machine/payload';
+import type { StoragePort } from './ports';
+import { classifyError } from './machine/TransferMachine';
+import { isLiveBurn, type BurnFailure, type BurnJournalEntry } from './stores';
+
+export interface BurnDeps {
+  readonly engine: ITokenEngine;
+  readonly storagePort: Pick<StoragePort, 'getBlobs' | 'applyDelta'>;
+  readonly burnJournal: ListStore<BurnJournalEntry>;
+  readonly recordSent: (input: RecordSentInput) => Promise<void>;
+  readonly armHeartbeat: () => void;
+  readonly refreshView: () => void;
+  readonly now: () => number;
+}
+
+export interface BurnReplayDeps extends BurnDeps {
+  readonly isActiveOp: (burnId: string) => boolean;
+}
+
+const HEX32 = /^[0-9a-f]{64}$/;
+
+async function heldToken(deps: BurnDeps, tokenId: string): Promise<SphereToken> {
+  const bytes = (await deps.storagePort.getBlobs([tokenId])).get(tokenId);
+  if (bytes === undefined) {
+    throw new SphereError(`Token ${tokenId} has no blob in storage; it is not held here`, 'STORAGE_ERROR');
+  }
+  return deps.engine.decodeToken({ tokenId, token: bytes });
+}
+
+function assertBurnable(engine: ITokenEngine, token: SphereToken, tokenId: string): void {
+  if (!engine.isOwnedBy(token, engine.getIdentity().chainPubkey)) {
+    throw new SphereError(`Token ${tokenId} is not owned by this wallet`, 'VALIDATION_ERROR');
+  }
+  if (token.valueEnvelope === 'bare_collection') {
+    throw new SphereError(
+      `Token ${tokenId} carries a value envelope this SDK cannot read, so its coins cannot be accounted for; it cannot be burned`,
+      'VALIDATION_ERROR'
+    );
+  }
+}
+
+function assetsOf(token: SphereToken): { coinId: string; amount: string }[] {
+  return (token.value?.assets ?? []).map((a) => ({ coinId: a.coinId, amount: a.amount.toString() }));
+}
+
+export async function runBurnUnderJournal(
+  deps: BurnDeps,
+  input: { burnId: string; request: BurnRequest }
+): Promise<BurnResult> {
+  const { burnId } = input;
+  const { tokenId, reasonBytes } = input.request;
+  if (!HEX32.test(tokenId) || reasonBytes.length === 0) {
+    return { success: false, burnId, tokenId, error: 'burn: tokenId must be 64 hex and reasonBytes non-empty', errorCode: 'VALIDATION_ERROR' };
+  }
+  let token: SphereToken;
+  try {
+    token = await heldToken(deps, tokenId);
+    assertBurnable(deps.engine, token, tokenId);
+  } catch (err) {
+    return refused(burnId, tokenId, err);
+  }
+  const entry: BurnJournalEntry = {
+    burnId,
+    tokenId,
+    reasonHex: bytesToHex(reasonBytes),
+    burnedTokenHex: null,
+    settled: false,
+    assets: assetsOf(token),
+    createdAt: deps.now(),
+  };
+  await deps.burnJournal.upsert(entry);
+  try {
+    const settled = await burnJournaled(deps, entry, token);
+    return { success: true, burnId, tokenId, burnedToken: hexToBytes(settled.burnedTokenHex ?? '') };
+  } catch (err) {
+    const failure = failureOf(err);
+    if (isTerminal(err)) await deps.burnJournal.upsert({ ...entry, failure });
+    else deps.armHeartbeat();
+    return { success: false, burnId, tokenId, error: failure.message, errorCode: failure.code };
+  }
+}
+
+export async function replayBurns(deps: BurnReplayDeps): Promise<number> {
+  let progressed = 0;
+  for (const entry of await deps.burnJournal.list()) {
+    if (!isLiveBurn(entry) || deps.isActiveOp(entry.burnId)) continue;
+    try {
+      const token = entry.burnedTokenHex === null ? await heldToken(deps, entry.tokenId) : null;
+      await burnJournaled(deps, entry, token);
+      progressed += 1;
+    } catch (err) {
+      if (!isTerminal(err)) continue;
+      await deps.burnJournal.upsert({ ...entry, failure: failureOf(err) });
+      progressed += 1;
+    }
+  }
+  return progressed;
+}
+
+export async function pendingBurns(deps: Pick<BurnDeps, 'burnJournal'>): Promise<PendingBurn[]> {
+  return (await deps.burnJournal.list()).map((entry) => ({
+    burnId: entry.burnId,
+    tokenId: entry.tokenId,
+    reasonBytes: hexToBytes(entry.reasonHex),
+    burnedToken: entry.burnedTokenHex === null ? null : hexToBytes(entry.burnedTokenHex),
+    settled: entry.settled,
+    createdAt: entry.createdAt,
+    ...(entry.failure !== undefined ? { failure: entry.failure } : {}),
+  }));
+}
+
+export async function acknowledgeBurn(deps: Pick<BurnDeps, 'burnJournal'>, burnId: string): Promise<void> {
+  const entry = await deps.burnJournal.getByKey(burnId);
+  if (entry === undefined) return;
+  if (isLiveBurn(entry)) {
+    throw new SphereError(`Burn ${burnId} is not settled yet; it cannot be acknowledged`, 'VALIDATION_ERROR');
+  }
+  await deps.burnJournal.removeByKey(burnId);
+}
+
+export function refused(burnId: string, tokenId: string, err: unknown): BurnResult {
+  const failure = failureOf(err);
+  return { success: false, burnId, tokenId, error: failure.message, errorCode: failure.code };
+}
+
+function isTerminal(err: unknown): boolean {
+  return classifyError(err) === 'conflict';
+}
+
+function failureOf(err: unknown): BurnFailure {
+  const code = err !== null && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+  return { code: typeof code === 'string' ? code : 'UNKNOWN', message: messageOf(err) };
+}
+
+async function burnJournaled(deps: BurnDeps, entry: BurnJournalEntry, token: SphereToken | null): Promise<BurnJournalEntry> {
+  let current = entry;
+  if (current.burnedTokenHex === null) {
+    if (token === null) throw new SphereError('burn replay needs the held token to certify', 'VALIDATION_ERROR');
+    const burned = await deps.engine.burn(
+      { token, reasonBytes: hexToBytes(current.reasonHex) },
+      { transferId: current.burnId }
+    );
+    if (burned.blob.tokenId !== current.tokenId) {
+      throw new SphereError(`burned token ${burned.blob.tokenId}, but the journal names ${current.tokenId}`, 'VALIDATION_ERROR');
+    }
+    current = { ...current, burnedTokenHex: bytesToHex(burned.blob.token) };
+    await deps.burnJournal.upsert(current);
+  }
+  await deps.storagePort.applyDelta({ transferId: current.burnId, spent: [current.tokenId], added: [], externalDelivery: true });
+  await deps.recordSent({ transferId: current.burnId, assets: current.assets, tokenId: current.tokenId });
+  current = { ...current, settled: true };
+  await deps.burnJournal.upsert(current);
+  deps.refreshView();
+  return current;
+}

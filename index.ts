@@ -195,6 +195,11 @@ export type { HistoryRecord as TransactionHistoryEntry } from './storage';
 // `payments.mintNft()` / `nft()` / `nfts()` take and return, and the codec a
 // viewer needs to render a payload or check a linked file.
 export type { MintNftRequest, NftView } from './modules/payments-v2/api';
+
+// Token plugins: a consumer registers mint-reason verifiers and issuance policies
+// for token types the SDK does not know (a bridged asset, an attested issuance) via
+// `SphereInitOptions.plugins`; the verifier interfaces themselves are the base SDK's.
+export type { TokenPlugin, TokenIssuancePolicy, BurnParams } from './token-engine';
 export type {
   NftAttribute,
   NftContent,
@@ -218,6 +223,7 @@ export {
   verifyNftLinkContent,
 } from './token-engine/nft-payload';
 export { NFT_MAX_PAYLOAD_BYTES } from './modules/payments-v2/mint-nft';
+export { CUSTOM_MINT_MAX_PAYLOAD_BYTES } from './modules/payments-v2/mint-custom';
 
 export {
   CommunicationsModule,

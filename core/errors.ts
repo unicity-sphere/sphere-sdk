@@ -55,6 +55,7 @@ export type SphereErrorCode =
   | 'SPLIT_CHECKPOINT_LOST'
   // a byte-bound checkpoint proof no longer verifies against the current trust base (validator rotation).
   | 'CHECKPOINT_TRUSTBASE_MISMATCH'
+  | 'MINT_REASON_UNVERIFIABLE'
   | 'STORAGE_ERROR'
   // #665: the on-chain spend committed but the post-commit wallet-api mirror
   // sync (inventory apply / blob upload / save) failed. NOT a lost payment —

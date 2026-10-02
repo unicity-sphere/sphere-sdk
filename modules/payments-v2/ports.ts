@@ -36,6 +36,7 @@ export interface StoragePort {
     transferId: string;
     spent: string[];
     added: { tokenId: string; key: string }[];
+    externalDelivery?: boolean;
   }): Promise<ApplyDeltaResult>;
 }
 

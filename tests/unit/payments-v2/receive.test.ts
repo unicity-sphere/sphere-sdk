@@ -4,6 +4,10 @@ import type { RegistryReader } from '../../../modules/payments-v2/inventory/Inve
 import type { DeliveryPort, IncomingDelivery } from '../../../modules/payments-v2/ports';
 import {
   ACK_BATCH_SIZE,
+  ATTENTION_UNVERIFIABLE,
+  RECHECKS_PER_DRAIN,
+  RECHECK_BASE_MS,
+  RECHECK_MAX_MS,
   REFRESH_INTERVAL_MS,
   Receive,
   receivedDedupKey,
@@ -17,6 +21,7 @@ import type { AckOutcome, AckRequest } from '../../../modules/payments-v2/ports'
 import type { StreamCursor } from '../../../modules/payments-v2/stores';
 import type { EngineVerifyResult, SphereToken, TokenBlob } from '../../../token-engine';
 import type { IncomingTransfer } from '../../../types';
+import { MintReasonUnverifiableError } from '../../../token-engine/errors';
 import { memoryKV, registryStub, type MemoryKV } from './support';
 
 const OWN = `02${'aa'.repeat(32)}`;
@@ -69,6 +74,8 @@ class StubEngine implements ReceiveEngine {
   badProof = new Set<string>();
   spentStates = new Set<string>();
   verifyOutageOn = new Set<string>();
+  unverifiableOn = new Set<string>();
+  verifyCalls: string[] = [];
   isSpentOutage = false;
 
   getIdentity(): { chainPubkey: Uint8Array } {
@@ -96,7 +103,11 @@ class StubEngine implements ReceiveEngine {
   }
 
   async verify(token: SphereToken): Promise<EngineVerifyResult> {
+    this.verifyCalls.push(skey(metaOf(token)));
     if (this.verifyOutageOn.has(skey(metaOf(token)))) throw new Error('trust base unavailable');
+    if (this.unverifiableOn.has(skey(metaOf(token)))) {
+      throw new MintReasonUnverifiableError('lock short of its confirmations (simulated)');
+    }
     return this.badProof.has(skey(metaOf(token))) ? { ok: false, reason: 'bad proof' } : { ok: true };
   }
 
@@ -308,6 +319,7 @@ interface Harness {
   attentions: { transferId: string; code: string; detail?: string }[];
   historyLog: ReceivedRecord[];
   receive: Receive;
+  deps: ReceiveDeps;
   epoch: string;
   historyFail: boolean;
   /**
@@ -343,6 +355,7 @@ function makeHarness(
     refreshes: [],
     clock: 1_700_000_000_000,
     receive: null as unknown as Receive,
+    deps: null as unknown as ReceiveDeps,
   };
   const deps: ReceiveDeps = {
     delivery,
@@ -371,11 +384,13 @@ function makeHarness(
       return harness.clock;
     },
   };
+  harness.deps = deps;
   harness.receive = new Receive(deps);
   return harness;
 }
 
 const CURSOR_KEY = 'cursor:mailbox';
+const DEFERRED_KEY = 'deferred:mailbox';
 
 describe('payments-v2 Receive drain', () => {
   it('verified-before-balance: a bad-proof token never enters the view and is acked rejected(invalid) with no event and no history', async () => {
@@ -496,6 +511,275 @@ describe('payments-v2 Receive drain', () => {
     expect(second.map((t) => t.id)).toEqual([T(2), T(3)]);
     expect(h.delivery.claimed()).toHaveLength(3);
     expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '3', syncEpoch: 'e1' });
+  });
+
+  it('an entry whose mint reason is not verifiable yet stays unacked and parked, the entries after it are received, and the cursor moves past it', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.delivery.add(meta(T(3), 'S1'));
+    h.engine.unverifiableOn.add(`${T(2)}:S1`);
+
+    const first = await h.receive.drainOnce();
+
+    expect(first.map((t) => t.id)).toEqual([T(1), T(3)]);
+    expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'unacked', 'claimed']);
+    expect(h.delivery.ackLog.some((a) => a.disposition === 'rejected')).toBe(false);
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '3', syncEpoch: 'e1' });
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([
+      { deliveryId: `d:${T(2)}:S1`, since: '1', syncEpoch: 'e1', attempts: 1, dueAtMs: h.clock + RECHECK_BASE_MS },
+    ]);
+    expect(h.attentions).toEqual([
+      { transferId: '', code: ATTENTION_UNVERIFIABLE, detail: `d:${T(2)}:S1 lock short of its confirmations (simulated)` },
+    ]);
+
+    h.engine.unverifiableOn.clear();
+    h.clock += RECHECK_MAX_MS;
+    const second = await h.receive.drainOnce();
+
+    expect(h.delivery.sinceLog.slice(1)).toEqual(['3', '1']);
+    expect(second.map((t) => t.id)).toEqual([T(2)]);
+    expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'claimed', 'claimed']);
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '3', syncEpoch: 'e1' });
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
+    expect(h.attentions).toHaveLength(1);
+  });
+
+  it('a parked entry is rechecked by a fresh Receive over the same store, on the schedule it left behind', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    await h.receive.drainOnce();
+    const checks = (): number => h.engine.verifyCalls.filter((k) => k === `${T(1)}:S1`).length;
+    expect(checks()).toBe(1);
+
+    const restarted = new Receive(h.deps);
+    await restarted.drainOnce();
+    expect(checks()).toBe(1);
+
+    h.clock += RECHECK_BASE_MS;
+    h.engine.unverifiableOn.clear();
+    const received = await restarted.drainOnce();
+    expect(received.map((t) => t.id)).toEqual([T(1)]);
+    expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'claimed']);
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
+  });
+
+  it('a parked entry the mailbox no longer lists is forgotten at its recheck', async () => {
+    const h = makeHarness();
+    const parked = h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    await h.receive.drainOnce();
+    expect(h.kv.map.get(DEFERRED_KEY)).toHaveLength(1);
+
+    parked.status = 'claimed';
+    h.clock += RECHECK_BASE_MS;
+    await h.receive.drainOnce();
+
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
+  });
+
+  it('a newly parked entry is written before the cursor passes it, and when that write fails the cursor holds before it', async () => {
+    const h = makeHarness();
+    h.kv.failWriteKeys.add(DEFERRED_KEY);
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.delivery.add(meta(T(3), 'S1'));
+    h.engine.unverifiableOn.add(`${T(2)}:S1`);
+
+    const first = await h.receive.drainOnce();
+
+    expect(first.map((t) => t.id)).toEqual([T(1), T(3)]);
+    expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'unacked', 'claimed']);
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '1', syncEpoch: 'e1' });
+    expect(h.kv.map.get(DEFERRED_KEY)).toBeUndefined();
+
+    h.kv.failWriteKeys.clear();
+    const second = await h.receive.drainOnce();
+
+    expect(second).toEqual([]);
+    const parkedWrite = h.kv.sets.findIndex((w) => w.key === DEFERRED_KEY);
+    const cursorPast = h.kv.sets.findIndex((w) => w.key === CURSOR_KEY && (w.value as StreamCursor).cursor === '2');
+    expect(parkedWrite).toBeGreaterThanOrEqual(0);
+    expect(parkedWrite).toBeLessThan(cursorPast);
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '2', syncEpoch: 'e1' });
+    expect(h.kv.map.get(DEFERRED_KEY)).toMatchObject([{ deliveryId: `d:${T(2)}:S1`, since: '1' }]);
+  });
+
+  it('a rechecked entry is forgotten only once its claim settled; a failed claim keeps it parked and due at once', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    await h.receive.drainOnce();
+
+    h.engine.unverifiableOn.clear();
+    h.clock += RECHECK_BASE_MS;
+    h.delivery.acksUntilFail = h.delivery.ackLog.length;
+    const announced = await h.receive.drainOnce();
+
+    expect(announced.map((t) => t.id)).toEqual([T(1)]);
+    expect(h.delivery.entries[0].status).toBe('unacked');
+    expect(h.kv.map.get(DEFERRED_KEY)).toMatchObject([{ deliveryId: `d:${T(1)}:S1`, dueAtMs: h.clock }]);
+
+    h.delivery.acksUntilFail = Infinity;
+    const again = await h.receive.drainOnce();
+
+    expect(again).toEqual([]);
+    expect(h.delivery.entries[0].status).toBe('claimed');
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
+  });
+
+  it('a batched claim that hits a wall keeps the rechecked entry parked and due at once', async () => {
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    await h.receive.drainOnce();
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '2', syncEpoch: 'e1' });
+
+    h.engine.unverifiableOn.clear();
+    h.clock += RECHECK_BASE_MS;
+    h.delivery.batchFailure = 'retryable';
+    await h.receive.drainOnce();
+
+    expect(h.delivery.entries[0].status).toBe('unacked');
+    expect(h.kv.map.get(DEFERRED_KEY)).toMatchObject([{ deliveryId: `d:${T(1)}:S1`, dueAtMs: h.clock }]);
+  });
+
+  it('a recheck that fails on infrastructure backs that entry off and the others are still rechecked', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.delivery.add(meta(T(3), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    h.engine.unverifiableOn.add(`${T(2)}:S1`);
+    await h.receive.drainOnce();
+
+    h.engine.unverifiableOn.clear();
+    h.engine.verifyOutageOn.add(`${T(1)}:S1`);
+    h.clock += RECHECK_BASE_MS;
+    const received = await h.receive.drainOnce();
+
+    expect(received.map((t) => t.id)).toEqual([T(2)]);
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([
+      { deliveryId: `d:${T(1)}:S1`, since: null, syncEpoch: 'e1', attempts: 2, dueAtMs: h.clock + 2 * RECHECK_BASE_MS },
+    ]);
+  });
+
+  it('rechecks are bounded per drain, the rest wait for the next one', async () => {
+    const h = makeHarness();
+    for (let i = 1; i <= RECHECKS_PER_DRAIN + 5; i++) {
+      h.delivery.add(meta(T(i), 'S1'));
+      h.engine.unverifiableOn.add(`${T(i)}:S1`);
+    }
+    await h.receive.drainOnce();
+    const checks = (): number => h.engine.verifyCalls.length;
+    expect(checks()).toBe(RECHECKS_PER_DRAIN + 5);
+
+    h.clock += RECHECK_BASE_MS;
+    await h.receive.drainOnce();
+    expect(checks()).toBe(2 * RECHECKS_PER_DRAIN + 5);
+
+    await h.receive.drainOnce();
+    expect(checks()).toBe(2 * RECHECKS_PER_DRAIN + 10);
+  });
+
+  it('parking and the cursor move work through ackBatch, which never sees the deferred entry', async () => {
+    const h = makeHarness();
+    h.delivery.enableBatch();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.delivery.add(meta(T(3), 'S1'));
+    h.engine.unverifiableOn.add(`${T(2)}:S1`);
+
+    await h.receive.drainOnce();
+
+    expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'unacked', 'claimed']);
+    expect(h.delivery.batchCalls).toEqual([[`d:${T(1)}:S1`, `d:${T(3)}:S1`]]);
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '3', syncEpoch: 'e1' });
+    expect(h.kv.map.get(DEFERRED_KEY)).toMatchObject([{ deliveryId: `d:${T(2)}:S1` }]);
+  });
+
+  it('a parked entry whose recheck finds it invalid is rejected and forgotten', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    await h.receive.drainOnce();
+
+    h.engine.unverifiableOn.clear();
+    h.engine.badProof.add(`${T(1)}:S1`);
+    h.clock += RECHECK_BASE_MS;
+    const received = await h.receive.drainOnce();
+
+    expect(received).toEqual([]);
+    expect(h.delivery.ackLog).toContainEqual(expect.objectContaining({ deliveryId: `d:${T(1)}:S1`, disposition: 'rejected' }));
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
+  });
+
+  it('a parked entry listed again by the main pass before it is due is passed over without a verify', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.delivery.add(meta(T(2), 'S1'));
+    h.engine.unverifiableOn.add(`${T(2)}:S1`);
+    h.delivery.acksUntilFail = 0;
+    await h.receive.drainOnce();
+    expect(h.kv.map.get(CURSOR_KEY)).toBeUndefined();
+    expect(h.kv.map.get(DEFERRED_KEY)).toMatchObject([{ deliveryId: `d:${T(2)}:S1` }]);
+
+    h.delivery.acksUntilFail = Infinity;
+    await h.receive.drainOnce();
+
+    expect(h.engine.verifyCalls.filter((k) => k === `${T(2)}:S1`)).toHaveLength(1);
+    expect(h.delivery.entries.map((e) => e.status)).toEqual(['claimed', 'unacked']);
+    expect(h.kv.map.get(CURSOR_KEY)).toEqual({ cursor: '2', syncEpoch: 'e1' });
+  });
+
+  it('parked() reads what is parked, so a listener that attaches late still finds the arrivals it cannot verify', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    await h.receive.drainOnce();
+
+    await expect(new Receive(h.deps).parked()).resolves.toMatchObject([{ deliveryId: `d:${T(1)}:S1`, attempts: 1 }]);
+  });
+
+  it('a parked entry from another sync epoch is dropped, since the full re-listing finds it again', async () => {
+    const h = makeHarness({ kvSeed: { 'deferred:mailbox': [{ deliveryId: 'd:old', since: null, syncEpoch: 'e0', attempts: 3, dueAtMs: 0 }] } });
+    h.delivery.add(meta(T(1), 'S1'));
+
+    await h.receive.drainOnce();
+
+    expect(h.delivery.sinceLog).toEqual([undefined]);
+    expect(h.kv.map.get(DEFERRED_KEY)).toEqual([]);
+  });
+
+  it('a not-yet-verifiable entry is re-verified on a doubling schedule, not on every drain', async () => {
+    const h = makeHarness();
+    h.delivery.add(meta(T(1), 'S1'));
+    h.engine.unverifiableOn.add(`${T(1)}:S1`);
+    const checks = (): number => h.engine.verifyCalls.filter((k) => k === `${T(1)}:S1`).length;
+
+    await h.receive.drainOnce();
+    await h.receive.drainOnce();
+    expect(checks()).toBe(1);
+
+    h.clock += RECHECK_BASE_MS;
+    await h.receive.drainOnce();
+    await h.receive.drainOnce();
+    expect(checks()).toBe(2);
+
+    h.clock += RECHECK_BASE_MS;
+    await h.receive.drainOnce();
+    expect(checks()).toBe(2);
+    h.clock += RECHECK_BASE_MS;
+    await h.receive.drainOnce();
+    expect(checks()).toBe(3);
+    expect(h.delivery.entries[0].status).toBe('unacked');
+    expect(h.attentions).toHaveLength(1);
   });
 
   it('acks batch at 200: the first flush happens only after 200 entries are stored, the remainder flushes at drain end', async () => {

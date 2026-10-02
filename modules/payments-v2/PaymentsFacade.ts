@@ -13,13 +13,15 @@ import type { ITokenEngine } from '../../token-engine/engine';
 import type { SphereToken } from '../../token-engine/types';
 import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResult } from '../../types';
 
-import type { CoinlessToken, ConnectionStatus, HistoryPage, MintNftRequest, MintResult, NftView, PaymentsV2, PendingTransfer, SendRequest, SendWholeTokenRequest } from './api';
+import type { BurnRequest, BurnResult, CoinlessToken, ConnectionStatus, HistoryPage, MintCustomRequest, MintNftRequest, MintResult, NftView, ParkedArrival, PaymentsV2, PendingBurn, PendingTransfer, SendRequest, SendWholeTokenRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
 import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { NftCache, readNft, readNfts, type NftReadDeps } from './inventory/nft-read';
-import { readTokenData } from './inventory/token-data';
-import { type CoinReplayDeps, replayCoinMints, runMintUnderJournal } from './mint';
+import { readTokenData, readTokenJustification } from './inventory/token-data';
+import { type CoinReplayDeps, replayCoinMints, runMintUnderJournal, seedHeldStates, tokenInServerInventory } from './mint';
 import { type NftReplayDeps, replayNftMints, runNftMintUnderJournal } from './mint-nft';
+import { type CustomReplayDeps, replayCustomMints, runCustomMintUnderJournal } from './mint-custom';
+import { acknowledgeBurn, type BurnReplayDeps, pendingBurns, replayBurns, runBurnUnderJournal } from './burn';
 import { materializeWholeSpend } from './send-whole';
 import { partialize, stampTransferId } from './send-errors';
 import { requireSameNetworkRecipient } from './recipient';
@@ -28,11 +30,13 @@ import { PrewarmCache, takeSourceBlobs, warmSendSources, type WarmDeps } from '.
 import type { ShortfallEntry } from './stores';
 import type { History } from './history/History';
 import type { InventoryView } from './inventory/InventoryView';
+import type { TokenVerdicts } from './inventory/verdicts';
 import { transferringToken } from './inventory/presentation';
 import type { Receive } from './receive/Receive';
 import type { Requests } from './requests/Requests';
 import type { ReservationLedger } from './select/ledger';
 import type { IntentPins } from './select/pins';
+import type { BurnHold } from './burn-hold';
 import type { SpendQueue, PlannedSpend } from './select/queue';
 import type { MachineStores } from './machine/journal';
 import { buildOps, classifyError, type MachineDeps, type MachinePlan, type TransferMachine } from './machine/TransferMachine';
@@ -59,7 +63,6 @@ export { ATTENTION_RECIPIENT_NETWORK_UNVERIFIED } from './recipient';
 /** Max re-plans after a conflicted attempt (#625/#677 parity with the old send loop). */
 export const MAX_RESELECT = 8;
 
-const INVENTORY_SCAN_PAGE_LIMIT = 50;
 
 /**
  * What this attempt is spending. The policy loop is shared; only planning and the
@@ -104,6 +107,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private readonly wakeRefresh: () => void;
   private readonly prewarmed = new PrewarmCache();
   private readonly view: InventoryView;
+  private readonly verdicts: TokenVerdicts;
   private readonly ledger: ReservationLedger;
   private readonly queue: SpendQueue;
   private readonly machine: TransferMachine;
@@ -132,6 +136,7 @@ export class PaymentsFacade implements PaymentsV2 {
   private readonly activeMoneyOps = new Set<string>();
   /** #737: the ledger holds exactly the sources of the still-open intents. */
   private readonly pins: IntentPins;
+  private readonly burnHold: BurnHold;
   /** Per facade, so per address: an NFT reading is never served to another wallet. */
   private readonly nftCache = new NftCache();
 
@@ -143,6 +148,7 @@ export class PaymentsFacade implements PaymentsV2 {
       track: (op) => this.trackTail(op),
     });
     this.view = parts.view;
+    this.verdicts = parts.verdicts;
     this.wakeRefresh = parts.refreshView;
     this.ledger = parts.ledger;
     this.queue = parts.queue;
@@ -156,6 +162,7 @@ export class PaymentsFacade implements PaymentsV2 {
     this.restoreDeps = parts.restoreDeps;
     this.requests = parts.requests;
     this.pins = parts.pins;
+    this.burnHold = parts.burnHold;
     deps.deliveryPort.bindDeliveryKeys((blob) => this.engine().deliveryKeys(blob));
     this.heartbeat = new ConvergenceHeartbeat({
       now: () => this.nowMs(),
@@ -169,6 +176,8 @@ export class PaymentsFacade implements PaymentsV2 {
       refreshView: () => this.view.delta(),
       replayMints: () => replayCoinMints(this.mintDeps()),
       replayNftMints: () => replayNftMints(this.mintDeps()),
+      replayCustomMints: () => replayCustomMints(this.mintDeps()),
+      replayBurns: () => replayBurns(this.mintDeps()),
       isActiveOp: (id) => this.activeMoneyOps.has(id),
       emit: deps.emit,
       now: () => this.nowMs(),
@@ -203,7 +212,8 @@ export class PaymentsFacade implements PaymentsV2 {
     await this.pins.sync().catch(() => undefined);
     // §7 start posture: never awaited; the heartbeat re-runs this same pass.
     this.trackTail(this.runConvergencePass());
-    this.trackTail(this.seedHeldStates());
+    this.trackTail(seedHeldStates(this.deps.storagePort, this.heldStates));
+    await this.verdicts.start().catch(() => undefined);
     await this.view.fullPull().catch(() => undefined);
     this.receiveLoop.start(this.deps.receivePollMs);
   }
@@ -213,6 +223,7 @@ export class PaymentsFacade implements PaymentsV2 {
     this.started = false;
     this.heartbeat.stop(); // §7 quiescence unchanged: a mid-backoff stop cancels cleanly
     this.receiveLoop.stop();
+    this.verdicts.stop();
     for (const unsubscribe of this.unsubscribers) unsubscribe();
     this.unsubscribers = [];
     await this.deps.session.stop();
@@ -232,29 +243,30 @@ export class PaymentsFacade implements PaymentsV2 {
   // ── reads ──────────────────────────────────────────────────────────────────
 
   async assets(coinId?: string): Promise<Asset[]> {
+    return (await this.heldAssets(coinId)).filter((asset) => asset.unverified === undefined);
+  }
+
+  unverifiedAssets = async (coinId?: string): Promise<Asset[]> => (await this.heldAssets(coinId)).filter((a) => a.unverified !== undefined);
+
+  private async heldAssets(coinId?: string): Promise<Asset[]> {
     const all = await this.view.assets(this.deps.registry, this.deps.price);
     return coinId === undefined ? all : all.filter((asset) => asset.coinId === coinId);
   }
 
   tokens(filter?: { coinId?: string }): Token[] {
-    return this.view.tokens(this.deps.registry, filter);
+    return this.view.tokens(this.deps.registry, filter).filter((token) => token.unverified === undefined);
   }
+
+  unverifiedTokens = (filter?: { coinId?: string }): Token[] => this.view.tokens(this.deps.registry, filter).filter((t) => t.unverified !== undefined);
 
   coinless(): CoinlessToken[] {
     return this.view.coinless(this.deps.registry);
   }
 
-  tokenData(tokenId: string): Promise<Uint8Array | null> {
-    return readTokenData(this.readDeps(), tokenId);
-  }
-
-  nft(tokenId: string): Promise<NftView | null> {
-    return readNft(this.readDeps(), tokenId);
-  }
-
-  nfts(tokenIds: readonly string[]): Promise<ReadonlyMap<string, NftView>> {
-    return readNfts(this.readDeps(), tokenIds);
-  }
+  tokenData = (tokenId: string): Promise<Uint8Array | null> => readTokenData(this.readDeps(), tokenId);
+  tokenJustification = (tokenId: string): Promise<Uint8Array | null> => readTokenJustification(this.readDeps(), tokenId);
+  nft = (tokenId: string): Promise<NftView | null> => readNft(this.readDeps(), tokenId);
+  nfts = (tokenIds: readonly string[]): Promise<ReadonlyMap<string, NftView>> => readNfts(this.readDeps(), tokenIds);
 
   private readDeps(): NftReadDeps {
     return { engine: this.engine(), view: this.view, storagePort: this.deps.storagePort, cache: this.nftCache };
@@ -303,17 +315,25 @@ export class PaymentsFacade implements PaymentsV2 {
   }
 
   async receive(): Promise<{ transfers: IncomingTransfer[] }> {
-    const transfers = await this.track(this.receiveLoop.drainOnce());
-    return { transfers };
+    return { transfers: await this.track(this.receiveLoop.drainOnce()) };
   }
+
+  parkedArrivals = (): Promise<readonly ParkedArrival[]> => this.receiveLoop.parked();
 
   mint(coinId: string, amount: bigint): Promise<MintResult> {
     return this.track(this.mintInner(coinId, amount));
   }
 
   mintNft(request: MintNftRequest): Promise<MintResult> {
-    return this.track(this.ownedMint((mintId) => runNftMintUnderJournal(this.mintDeps(), { mintId, request })));
+    return this.track(this.ownedOp((mintId) => runNftMintUnderJournal(this.mintDeps(), { mintId, request })));
   }
+
+  mintCustom = (request: MintCustomRequest): Promise<MintResult> =>
+    this.track(this.ownedOp((mintId) => runCustomMintUnderJournal(this.mintDeps(), { mintId, request })));
+  burn = (request: BurnRequest): Promise<BurnResult> =>
+    this.track(this.ownedOp((burnId) => this.burnHold.run(burnId, request.tokenId, () => runBurnUnderJournal(this.mintDeps(), { burnId, request }))));
+  pendingBurns = (): Promise<PendingBurn[]> => this.track(pendingBurns(this.machineStores));
+  acknowledgeBurn = (burnId: string): Promise<void> => this.track(acknowledgeBurn(this.machineStores, burnId));
 
   // §4 retry verb: coalesces onto the running pass — NEVER re-issue send() (#631/#676).
   async resumeNow(): Promise<void> {
@@ -346,12 +366,14 @@ export class PaymentsFacade implements PaymentsV2 {
     return (this.deps.now ?? Date.now)();
   }
 
-  /** One snapshot serves the coin and the NFT mint, live and replayed. */
-  private mintDeps(): CoinReplayDeps & NftReplayDeps {
+  /** One snapshot serves the coin, NFT and custom mints and the burn, live and replayed. */
+  private mintDeps(): CoinReplayDeps & NftReplayDeps & CustomReplayDeps & BurnReplayDeps {
     return {
       engine: this.engine(),
       mintJournal: this.machineStores.mintJournal,
       nftMintJournal: this.machineStores.nftMintJournal,
+      customMintJournal: this.machineStores.customMintJournal,
+      burnJournal: this.machineStores.burnJournal, recordSent: (input) => this.historyStore.recordSent(input),
       storagePort: this.deps.storagePort,
       recordMint: (input) => this.historyStore.recordMint(input),
       armHeartbeat: () => this.heartbeat.arm(),
@@ -360,9 +382,10 @@ export class PaymentsFacade implements PaymentsV2 {
       ownPubkeyBytes: this.ownPubkeyBytes,
       nftTokenType: this.deps.nftTokenType,
       isActiveOp: (mintId) => this.activeMoneyOps.has(mintId),
-      tokenInServerInventory: (tokenId) => this.tokenInServerInventory(tokenId),
+      tokenInServerInventory: (tokenId) => tokenInServerInventory(this.deps.storagePort, tokenId),
       emit: this.deps.emit,
       now: () => this.nowMs(),
+      accepted: (token) => this.verdicts.accept(token),
     };
   }
 
@@ -729,30 +752,18 @@ export class PaymentsFacade implements PaymentsV2 {
     if (!/^(?:[0-9a-f]{2})+$/.test(coinId) || amount <= 0n) {
       return { success: false, error: 'coinId must be even-length lowercase hex and amount positive' };
     }
-    return this.ownedMint((mintId) => runMintUnderJournal(this.mintDeps(), { mintId, coinId, amount }));
+    return this.ownedOp((mintId) => runMintUnderJournal(this.mintDeps(), { mintId, coinId, amount }));
   }
 
-  /** A live mint under a fresh id — its replay stays hands-off while this attempt runs. */
-  private async ownedMint(run: (mintId: string) => Promise<MintResult>): Promise<MintResult> {
-    const mintId = this.newId();
-    this.activeMoneyOps.add(mintId);
+  /** A live money op under a fresh id — its replay stays hands-off while this attempt runs (§7). */
+  private async ownedOp<T>(run: (id: string) => Promise<T>): Promise<T> {
+    const id = this.newId();
+    this.activeMoneyOps.add(id);
     try {
-      return await run(mintId);
+      return await run(id);
     } finally {
-      this.activeMoneyOps.delete(mintId);
+      this.activeMoneyOps.delete(id);
     }
-  }
-
-  private async tokenInServerInventory(tokenId: string): Promise<boolean> {
-    let page = await this.deps.storagePort.listInventory();
-    for (let i = 0; i < INVENTORY_SCAN_PAGE_LIMIT; i++) {
-      if (page.items.some((item) => item.tokenId === tokenId && item.status === 'active')) {
-        return true;
-      }
-      if (!page.more) return false;
-      page = await this.deps.storagePort.listInventory(page.cursor);
-    }
-    return false;
   }
 
   // ── wiring internals ───────────────────────────────────────────────────────
@@ -763,17 +774,6 @@ export class PaymentsFacade implements PaymentsV2 {
 
   private newId(): string {
     return (this.deps.newId ?? randomUUID)();
-  }
-
-  private async seedHeldStates(): Promise<void> {
-    let page = await this.deps.storagePort.listInventory();
-    for (let i = 0; i < INVENTORY_SCAN_PAGE_LIMIT; i++) {
-      for (const item of page.items) {
-        if (item.status === 'active') this.heldStates.set(item.tokenId, item.stateHash);
-      }
-      if (!page.more) return;
-      page = await this.deps.storagePort.listInventory(page.cursor);
-    }
   }
 
   private track<T>(op: Promise<T>): Promise<T> {

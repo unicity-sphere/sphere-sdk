@@ -27,8 +27,10 @@ export function createMockTokenEngine(overrides: Partial<ITokenEngine> = {}): IT
     readValue: vi.fn((t: SphereToken) => t.value),
     readMemo: vi.fn((_t: SphereToken) => null),
     readTokenData: vi.fn((_t: SphereToken) => null),
+    readTokenJustification: vi.fn((_t: SphereToken) => null),
     readNft: vi.fn(async (_t: SphereToken) => null),
     mintDataToken: vi.fn(async () => mockSphereToken(null)),
+    assertMintable: vi.fn(),
     buildNftMint: vi.fn(async (): Promise<NftMintPlan> => ({
       data: new Uint8Array(),
       salt: new Uint8Array(32),
@@ -40,6 +42,7 @@ export function createMockTokenEngine(overrides: Partial<ITokenEngine> = {}): IT
     balanceOf: vi.fn((_t: SphereToken, _c: CoinId) => 0n),
     mint: vi.fn(async () => mockSphereToken()),
     transfer: vi.fn(async () => mockSphereToken()),
+    burn: vi.fn(async () => mockSphereToken()),
     split: vi.fn(async () => ({ outputs: [] })),
     verify: vi.fn(async () => ({ ok: true })),
     isSpent: vi.fn(async () => false),

@@ -29,9 +29,10 @@ The key words MUST, MUST NOT, SHOULD and MAY are used as described in RFC 2119.
 - **Nothing on chain authenticates the minter.** The mint signing key is derived from
   the token id and a fixed universal secret, so anyone who knows a token id can
   reproduce it. A verifier registered for a token type receives the whole certified
-  mint transaction, so a type can enforce an issuance policy, but sphere-sdk and
-  wallet-api register none: both build `TokenIssuanceVerifierService(false)`, which
-  accepts a token type that has no verifier, the NFT vessel included. Anyone can
+  mint transaction, so a type can enforce an issuance policy, but wallet-api registers
+  none and sphere-sdk registers only the policies of its token plugins: both build
+  `TokenIssuanceVerifierService(false)`, which accepts a token type that has no
+  verifier, the NFT vessel included. Anyone can
   therefore mint a byte-identical copy of any payload, so attribution has to live
   inside the payload. `NftSigned` carries it, and it is attribution only
   ([Attribution, not authorization](#attribution-not-authorization)).

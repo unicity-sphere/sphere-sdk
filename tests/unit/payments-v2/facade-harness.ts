@@ -6,9 +6,11 @@
 
 import { NETWORKS } from '../../../constants';
 import { getPublicKey, hexToBytes } from '../../../core/crypto';
+import { SphereError } from '../../../core/errors';
 import { resolveRecipientInfo } from '../../../core/payments-v2-wiring';
 import type { PeerInfo } from '../../../transport';
 import type { SphereToken } from '../../../token-engine';
+import type { CoinClaims } from '../../../token-engine/claims';
 import { WalletApiStoragePort } from '../../../impl/wallet-api-v2/storage';
 import { WalletApiDeliveryPort } from '../../../impl/wallet-api-v2/mailbox';
 import type { DeliveryPort, StoragePort } from '../../../modules/payments-v2/ports';
@@ -68,7 +70,7 @@ export interface Hooks {
   putIntent?: () => Promise<void>;
   listOpen?: () => Promise<void>;
   complete?: (transferId: string) => Promise<void>;
-  applyDelta?: () => Promise<void>;
+  applyDelta?: (delta: { transferId: string; spent: string[] }) => Promise<void>;
   deliver?: () => Promise<void>;
   /** Runs before the mailbox listing yields — gates a drain mid-flight. */
   incoming?: () => Promise<void>;
@@ -115,7 +117,7 @@ function hookedStorage(inner: StoragePort, hooks: Hooks): StoragePort {
     },
     uploadBlobs: (blobs) => inner.uploadBlobs(blobs),
     applyDelta: async (delta) => {
-      if (hooks.applyDelta) await hooks.applyDelta();
+      if (hooks.applyDelta) await hooks.applyDelta(delta);
       return inner.applyDelta(delta);
     },
   };
@@ -162,6 +164,7 @@ export interface World {
   /** The fake transport directory the production resolver reads (identifier → binding). */
   peers: Map<string, PeerInfo | null>;
   seed(amount: bigint): Promise<SphereToken>;
+  hold(token: SphereToken): Promise<void>;
   /** #777: a token that names NO coin, indexed through the fake backend. */
   seedCoinless(data?: Uint8Array): Promise<SphereToken>;
   peerDeliver(token: SphereToken, transferId: string): Promise<void>;
@@ -212,6 +215,9 @@ export function makeWorld(
     ownNametag?: () => string | undefined;
     /** Receive's poll backstop; the default parks it far outside any test's clock. */
     receivePollMs?: number;
+    /** The address has no token engine: every engine read throws, as Sphere's engineRef does. */
+    engineUnavailable?: boolean;
+    claims?: CoinClaims;
   } = {}
 ): World {
   const prior = options.restartOf;
@@ -251,6 +257,17 @@ export function makeWorld(
   const peers = prior?.peers ?? new Map<string, PeerInfo | null>([['@peer', peerBinding({ network: NET })]]);
   Object.entries(options.peers ?? {}).forEach(([id, peer]) => peers.set(id, peer));
 
+  const hold = async (token: SphereToken): Promise<void> => {
+    const bytes = token.blob.token;
+    const sha = sha256Hex(bytes);
+    await innerClient.uploadBlob(`fake://put/${sha}`, bytes);
+    await innerClient.apply({
+      transferId: `seed-${token.blob.tokenId}`,
+      spent: [],
+      added: [{ tokenId: token.blob.tokenId, key: sha }],
+    });
+  };
+
   const idPrefix = prior === undefined ? '' : `r${String(++restarts)}-`;
   let ids = 0;
   const facade = new PaymentsFacade({
@@ -267,9 +284,13 @@ export function makeWorld(
       hooks
     ),
     checkpointStore: memoryCheckpoints(),
-    engineRef: () => engine,
+    engineRef: () => {
+      if (options.engineUnavailable === true) throw new SphereError('paymentsV2: token engine unavailable', 'AGGREGATOR_ERROR');
+      return engine;
+    },
     kv,
     registry,
+    ...(options.claims !== undefined ? { claims: options.claims } : {}),
     emit: (event, payload) => {
       events.push({ event, payload });
     },
@@ -309,16 +330,10 @@ export function makeWorld(
         recipientPubkey: hexToBytes(OWN_PUB),
         value: { assets: [{ coinId: COIN, amount }] },
       });
-      const bytes = token.blob.token;
-      const sha = sha256Hex(bytes);
-      await innerClient.uploadBlob(`fake://put/${sha}`, bytes);
-      await innerClient.apply({
-        transferId: `seed-${token.blob.tokenId}`,
-        spent: [],
-        added: [{ tokenId: token.blob.tokenId, key: sha }],
-      });
+      await hold(token);
       return token;
     },
+    hold,
     seedCoinless: async (data?: Uint8Array) => {
       const token = await engine.mintDataToken({
         recipientPubkey: hexToBytes(OWN_PUB),

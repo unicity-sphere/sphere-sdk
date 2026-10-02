@@ -55,6 +55,9 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
                              //   { createWorker, poolSize? }, where createWorker spawns YOUR
                              //   bundled worker entry script. Omit for the sequential
                              //   verifier. See docs/VERIFICATION-WORKERS.md
+  plugins: [bridgePlugin],   // Optional: token plugins. Each registers mint-reason verifiers
+                             //   by CBOR tag into every engine this Sphere builds; a tag claimed
+                             //   twice is INVALID_CONFIG. See "Token plugins" below
   debug: true,               // Optional: debug logging. The flag is process-global — an
                              //   explicit false turns it off, omitting it leaves it as-is
   onProgress: (p) => console.log(p.step, p.message), // Optional: init progress callback
@@ -641,6 +644,26 @@ accepted again. Mailbox entries whose acknowledgement succeeded are remembered i
 seen-set (their mailbox entry ids, not token ids) and skipped on later drains. The token is stored
 BEFORE the mailbox claim is acknowledged, so a crash re-claims instead of losing.
 
+A token whose mint reason **cannot be judged yet** is neither accepted nor rejected: no registered
+plugin handles its reason tag (a wallet that has not installed the plugin), or the plugin could not
+reach an answer (for a bridged token, the source chain is unreachable or the lock is short of its
+confirmations). The entry stays unacknowledged on the server and is parked in the wallet's scoped
+store with its position; the mailbox cursor moves past it, so the entries after it are received and
+acknowledged as usual. The parked record is written before the cursor passes the entry, and the entry
+is forgotten only once its later claim or rejection has settled. The first time an entry is parked
+the SDK emits `transfer:attention` with code `receive:unverifiable` and, as `detail`, the delivery id,
+a space, then the reason, so a wallet can say that a token arrived which it cannot verify yet;
+`parkedArrivals()` lists what is still parked for a listener that attached later. A parked entry is
+listed again on its own 30 s later, then on a doubling schedule capped at one hour (the schedule
+survives a restart, and at most 20 rechecks run per drain), and accepted or rejected once the plugin
+gives an answer.
+
+### `parkedArrivals(): Promise<readonly ParkedArrival[]>`
+
+The arrivals parked because their mint reason cannot be verified here yet:
+`{ deliveryId, attempts, dueAtMs, since, syncEpoch }`, where `attempts` counts the checks so far and
+`dueAtMs` is when the next one is due.
+
 ```typescript
 const { transfers } = await sphere.payments.receive();
 sphere.on('transfer:incoming', (t) => console.log('from', t.senderNametag));
@@ -721,6 +744,13 @@ const bytes = await sphere.payments.tokenData(nft.tokenId);
 
 Note an **empty** payload reads back as a zero-length `Uint8Array`, not `null` — only a genuinely
 absent one is `null`.
+
+### `tokenJustification(tokenId: string): Promise<Uint8Array | null>`
+
+The genesis mint reason (the SDK's `justification`) of a held token, or `null` when it was minted
+without one. Same contract as `tokenData()`: fetches the blob, throws `VALIDATION_ERROR` for a token
+this wallet does not hold. A token plugin reads it to learn what backs a token, e.g. which lock a
+bridged token was minted against.
 
 ### `nft(tokenId: string): Promise<NftView | null>`
 
@@ -949,6 +979,114 @@ const result = await sphere.payments.mintNft({
   wallet-api refuses a blob over its `MAX_BLOB_BYTES` only at upload, after the mint has certified.
   Inline media also travels with every transfer, growing the blob each time; prefer an `NftLink` for
   large files.
+
+### Token plugins
+
+A `TokenPlugin` (`{ id, mintJustificationVerifiers, tokenIssuancePolicies }`, passed as
+`Sphere.init({ plugins })`) adds tokens whose genesis carries a mint reason the SDK does not know,
+such as a bridged asset whose reason names a lock on another chain. Each verifier handles one CBOR
+tag. A verifier returns FAIL for a reason that is definitively wrong; it throws when it cannot answer
+yet, and the engine then reports the reason as not verifiable yet (`MINT_REASON_UNVERIFIABLE`)
+instead of invalid.
+
+A mint reason alone is optional: a token minted without one skips the verifiers. A
+`TokenIssuancePolicy` makes the rule of a token type mandatory. It is the state-transition SDK's
+`ITokenIssuanceVerifier` (`tokenType`, `verify(genesis)`) plus `coinIds`, the coins only that type
+may issue, and an optional `revision` that must change whenever the proofs the policy accepts change,
+a fix to its verification code included. Every genesis of that type, the burned source of a split included, must pass `verify`,
+so a token of the type minted without its reason fails verification and receive refuses it. A
+claimed coin counts only inside a token of its issuing type that verified:
+
+- `assets()` and `tokens()` return only holdings that count, so a caller that predates this sees no
+  counterfeit. The other holdings of a claimed coin come from `unverifiedAssets()` and
+  `unverifiedTokens()`, as separate assets with no price, each marked `unverified`. `'pending'` means
+  the check has not passed yet, for instance while a lock waits for its confirmations. `'refused'`
+  means the token failed verification or is of another type than the one that issues the coin.
+- A received token that carries a claimed coin under another type is announced in the
+  `transfer:incoming` event's `unverifiedTokens`, marked `unverified: 'refused'`, never in `tokens`,
+  and is not written to history for that coin, so history never shows it as a receipt.
+- An unverified token is never spent: coin selection skips it, and `sendWholeToken()` and `burn()`
+  refuse it as not a spendable holding.
+- A token received, left as change of a verified token, or minted with `mintCustom()` under the
+  registered verifiers counts at once. A custom mint accepted only by its per-call verifiers, such as
+  a depositor's own mint before the lock is final, stays pending. Pending tokens and any other held
+  token of a claimed coin, for instance one another device received, are verified in the background,
+  and a check that cannot answer yet is retried with backoff.
+- Verified tokens are remembered per device together with a fingerprint of the registered policies.
+  A changed policy, claim or `revision` discards them, so every held token is checked again.
+- Two policies for one token type, or two types claiming one coin, fail engine construction with
+  `INVALID_CONFIG`.
+
+### `mintCustom(request: MintCustomRequest): Promise<MintResult>`
+
+Mint a plugin's token to this wallet with a caller-fixed token type, salt, payload and mint reason.
+
+```typescript
+interface MintCustomRequest {
+  readonly tokenType: Uint8Array;          // 32 bytes
+  readonly salt: Uint8Array;               // 16 to 64 bytes; the same salt names the same token
+  readonly data: Uint8Array;               // the genesis payload, non-empty
+  readonly justification?: Uint8Array;     // the mint reason: tagged CBOR, omitted rather than empty
+  readonly assets: readonly { coinId: string; amount: bigint }[];  // what `data` declares, for history
+  readonly mintJustificationVerifiers?: readonly IMintJustificationVerifier[];
+}
+```
+
+- **Refused before anything is journaled:** a malformed request, an empty `justification`,
+  `data` plus `justification` over `CUSTOM_MINT_MAX_PAYLOAD_BYTES` (1 MiB), and a reason tag no
+  registered plugin handles. Each returns `{ success: false, error }`.
+- **Per-call verifiers** replace the registered verifier of their own tag for this call only, and
+  every other tag keeps its registered verifier. A per-call verifier for a tag no plugin registers is
+  refused. The depositor of a bridged asset uses this to accept its own mint before the lock is
+  final. The type's issuance policy still applies: a reason it refuses certifies on chain but never
+  passes `verify`, so its journal entry is replayed and never settles. Mint only reasons the type's
+  policy accepts.
+- **Journal-first, like `mint()`.** The bytes are journaled before the chain op, and a failure
+  after that returns `{ success: false, error }` and keeps the entry. The convergence pass replays
+  the same bytes under the **registered** verifiers (per-call ones are not journaled), so a replay
+  that the plugin cannot answer yet stays journaled and converges once it can. Never call
+  `mintCustom()` again with a new salt for a failed result: the same salt recovers the same token.
+
+### `burn(request: BurnRequest): Promise<BurnResult>`
+
+Burn a held token to `BurnPredicate(sha256(reasonBytes))`, with `reasonBytes` as the transfer's
+aux data. A bridge uses the burned blob as its proof of the burn.
+
+```typescript
+interface BurnRequest { readonly tokenId: string; readonly reasonBytes: Uint8Array }
+interface BurnResult {
+  success: boolean;
+  burnId: string;
+  tokenId: string;
+  burnedToken?: Uint8Array;  // on success: persist it, then acknowledgeBurn(burnId)
+  error?: string;
+  errorCode?: string;        // the failing SphereError code
+}
+```
+
+- The token is **reserved** for the life of the burn, like a `sendWholeToken` source: it cannot be
+  selected by a send or burned twice. A token that is not a spendable holding, is not owned by this
+  wallet, or carries a `bare_collection` value is refused before anything is journaled.
+- **Journal-first.** The burn is journaled before the chain op, and the spend is applied to
+  inventory with `externalDelivery: true` (the token left for somewhere no deposit evidences). A
+  failure after journaling keeps the entry, keeps the token reserved (across restarts too), and the
+  convergence pass replays the burn under the same `burnId` until it settles.
+- `errorCode: 'CERTIFICATION_UNCONFIRMED'` means the burn may already be on chain. Never burn again
+  under a new id; the replay finishes it. `errorCode: 'TRANSFER_CONFLICT'` means the token was spent
+  by another transaction first: the entry is terminal, is never retried, and `pendingBurns()` shows
+  it with its `failure`.
+
+### `pendingBurns(): Promise<PendingBurn[]>` / `acknowledgeBurn(burnId: string): Promise<void>`
+
+The burn journal: every burn not yet acknowledged, with `burnedToken` (null until certified),
+`settled`, and `failure` for a terminal one. Both read only the journal, so they work while the
+address has no token engine.
+
+The acknowledge contract: a caller persists the burned blob first (its only copy leaves with the
+entry), then calls `acknowledgeBurn(burnId)`, which removes the entry. A settled or terminal entry
+can be acknowledged; a live one is refused with `VALIDATION_ERROR`; an unknown `burnId` is a no-op.
+After a crash between persisting and acknowledging, `pendingBurns()` still lists the settled entry,
+so a caller recovers by persisting it again (idempotently) and acknowledging.
 
 ### `history(page?: { before?: string; limit?: number }): Promise<HistoryPage>`
 

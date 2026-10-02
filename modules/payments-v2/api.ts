@@ -1,8 +1,12 @@
 // §4 of docs/PAYMENTS-V2-DESIGN.md
 
+import type { IMintJustificationVerifier } from '../../token-engine';
 import type { NftContent } from '../../token-engine/nft-payload';
 import type { NftReading } from '../../token-engine/types';
 import type { Asset, CoinlessToken, IncomingTransfer, Token, TransferResult } from '../../types';
+import type { DeferredDelivery as ParkedArrival } from './receive/Receive';
+
+export type { ParkedArrival };
 
 export interface SendRequest {
   recipient: string;
@@ -24,6 +28,43 @@ export interface MintResult {
   success: boolean;
   tokenId?: string;
   error?: string;
+}
+
+/** Custom-genesis mint (a TokenPlugin's token), always to this wallet; `assets` = what the payload declares. */
+export interface MintCustomRequest {
+  readonly tokenType: Uint8Array;
+  readonly salt: Uint8Array;
+  readonly data: Uint8Array;
+  readonly justification?: Uint8Array;
+  readonly assets: readonly { coinId: string; amount: bigint }[];
+  readonly mintJustificationVerifiers?: readonly IMintJustificationVerifier[];
+}
+
+/** Burn a held token to `BurnPredicate(sha256(reasonBytes))` with the bytes as aux data. */
+export interface BurnRequest {
+  readonly tokenId: string;
+  readonly reasonBytes: Uint8Array;
+}
+
+export interface BurnResult {
+  success: boolean;
+  burnId: string;
+  tokenId: string;
+  /** The burned blob, the proof of the burn: persist it, then `acknowledgeBurn(burnId)`. */
+  burnedToken?: Uint8Array;
+  error?: string;
+  errorCode?: string;
+}
+
+/** A burn not yet acknowledged: in flight (`burnedToken` null), certified, or settled. */
+export interface PendingBurn {
+  readonly burnId: string;
+  readonly tokenId: string;
+  readonly reasonBytes: Uint8Array;
+  readonly burnedToken: Uint8Array | null;
+  readonly settled: boolean;
+  readonly createdAt: number;
+  readonly failure?: { readonly code: string; readonly message: string };
 }
 
 /** #785: `content` uses ERC-721 field names; `sign` (default true) signs as creator with this wallet's chain key. */
@@ -118,9 +159,13 @@ export interface PaymentsV2 {
   prewarmSend(request: SendRequest): Promise<void>;
   discardPrewarm(): void;
   assets(coinId?: string): Promise<Asset[]>;
+  unverifiedAssets(coinId?: string): Promise<Asset[]>;
   tokens(filter?: { coinId?: string }): Token[];
+  unverifiedTokens(filter?: { coinId?: string }): Token[];
   coinless(): CoinlessToken[];
   tokenData(tokenId: string): Promise<Uint8Array | null>;
+  /** The genesis mint reason of one held token; null when it was minted without one. Same contract as tokenData. */
+  tokenJustification(tokenId: string): Promise<Uint8Array | null>;
   /** One held token read as an NFT; null = its payload is not a recognised NFT. `creator` is only CLAIMED unless `signature` is 'valid'. Throws VALIDATION_ERROR when not held, STORAGE_ERROR when its blob is missing (same contract as tokenData). */
   nft(tokenId: string): Promise<NftView | null>;
   /** Batch read for list views. Ids not held, blobs missing or undecodable, and non-NFT payloads are simply absent from the map. Throws only on a transport failure. */
@@ -133,7 +178,13 @@ export interface PaymentsV2 {
   sendCoinless(req: SendWholeTokenRequest): Promise<TransferResult>;
   mint(coinId: string, amount: bigint): Promise<MintResult>;
   mintNft(request: MintNftRequest): Promise<MintResult>;
+  mintCustom(request: MintCustomRequest): Promise<MintResult>;
+  burn(request: BurnRequest): Promise<BurnResult>;
+  pendingBurns(): Promise<PendingBurn[]>;
+  acknowledgeBurn(burnId: string): Promise<void>;
   receive(): Promise<{ transfers: IncomingTransfer[] }>;
+  /** Arrivals parked because no plugin here can verify their mint reason yet; each raised `transfer:attention` once. */
+  parkedArrivals(): Promise<readonly ParkedArrival[]>;
 
   // §7 convergence surface. A retry button calls resumeNow() — NEVER send():
   // a re-issued send double-pays (#631/#676). Coalesces with a running pass.

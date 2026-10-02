@@ -4,6 +4,7 @@
 
 import type { Asset, Token } from '../../../types';
 import type { InventoryAsset } from '../ports';
+import type { Standing } from './InventoryView';
 
 export interface RegistryReader {
   getSymbol(coinId: string): string;
@@ -33,6 +34,7 @@ export interface TokenSnapshot {
 export interface TokenFlags {
   readonly transferring: boolean;
   readonly suspectedSpent: boolean;
+  readonly standing: Standing;
 }
 
 export function toToken(
@@ -56,29 +58,39 @@ export function toToken(
     updatedAt: snapshot.updatedAt,
     lazy: true,
     ...(flags.suspectedSpent ? { suspectedSpent: true } : {}),
+    ...(flags.standing !== 'trusted' ? { unverified: flags.standing } : {}),
   };
 }
 
 interface CoinTotals {
+  coinId: string;
+  standing: Standing;
   total: bigint;
   count: number;
   transferring: bigint;
   transferringCount: number;
 }
 
+export interface AssetReading {
+  readonly isTransferring: (tokenId: string) => boolean;
+  readonly standing: (tokenId: string, coinId: string) => Standing;
+}
+
 export function aggregateAssets(
   entries: Iterable<[string, TokenSnapshot]>,
-  isTransferring: (tokenId: string) => boolean,
+  reading: AssetReading,
   registry: RegistryReader
 ): Asset[] {
   const groups = new Map<string, CoinTotals>();
   for (const [tokenId, entry] of entries) {
-    const moving = isTransferring(tokenId);
+    const moving = reading.isTransferring(tokenId);
     for (const asset of entry.assets) {
-      let group = groups.get(asset.coinId);
+      const standing = reading.standing(tokenId, asset.coinId);
+      const key = standing === 'trusted' ? asset.coinId : `${asset.coinId}:${standing}`;
+      let group = groups.get(key);
       if (!group) {
-        group = { total: 0n, count: 0, transferring: 0n, transferringCount: 0 };
-        groups.set(asset.coinId, group);
+        group = { coinId: asset.coinId, standing, total: 0n, count: 0, transferring: 0n, transferringCount: 0 };
+        groups.set(key, group);
       }
       if (moving) {
         group.transferring += BigInt(asset.amount);
@@ -89,10 +101,11 @@ export function aggregateAssets(
       }
     }
   }
-  return [...groups].map(([coinId, totals]) => toAsset(coinId, totals, registry));
+  return [...groups.values()].map((totals) => toAsset(totals, registry));
 }
 
-function toAsset(coinId: string, totals: CoinTotals, registry: RegistryReader): Asset {
+function toAsset(totals: CoinTotals, registry: RegistryReader): Asset {
+  const coinId = totals.coinId;
   const iconUrl = registry.getIconUrl(coinId);
   return {
     coinId,
@@ -113,6 +126,7 @@ function toAsset(coinId: string, totals: CoinTotals, registry: RegistryReader): 
     change24h: null,
     fiatValueUsd: null,
     fiatValueEur: null,
+    ...(totals.standing !== 'trusted' ? { unverified: totals.standing } : {}),
   };
 }
 
@@ -137,9 +151,9 @@ export async function withPrices(
   price: PriceReader
 ): Promise<Asset[]> {
   try {
-    const ids = [...new Set(raw.map((a) => priceIdOf(registry, a.coinId)))];
+    const ids = [...new Set(raw.filter((a) => !a.unverified).map((a) => priceIdOf(registry, a.coinId)))];
     const quotes = await price.getPrices(ids);
-    return raw.map((a) => priceOne(a, quotes.get(priceIdOf(registry, a.coinId))));
+    return raw.map((a) => (a.unverified ? a : priceOne(a, quotes.get(priceIdOf(registry, a.coinId)))));
   } catch {
     return raw;
   }
@@ -171,5 +185,6 @@ export function transferringToken(
   return toToken(tokenId, snapshot, { coinId, amount: amount.toString() }, registry, {
     transferring: true,
     suspectedSpent: false,
+    standing: 'trusted',
   });
 }

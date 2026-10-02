@@ -14,6 +14,8 @@ import {
   type NftMintJournalEntry,
   type ScopedKV,
   type ShortfallEntry,
+  type CustomMintJournalEntry,
+  type BurnJournalEntry,
 } from '../stores';
 
 export const MAX_DELIVERY_ATTEMPTS = 6;
@@ -267,6 +269,8 @@ export interface MachineStores {
   readonly deliveryJournal: DeliveryJournal;
   readonly mintJournal: ListStore<MintJournalEntry>;
   readonly nftMintJournal: ListStore<NftMintJournalEntry>;
+  readonly customMintJournal: ListStore<CustomMintJournalEntry>;
+  readonly burnJournal: ListStore<BurnJournalEntry>;
   readonly shortfalls: ListStore<ShortfallEntry>;
 }
 
@@ -276,6 +280,8 @@ export function createMachineStores(kv: ScopedKV): MachineStores {
     deliveryJournal: new DeliveryJournal(kv),
     mintJournal: new ListStore<MintJournalEntry>(kv, STORE_KEYS.mintJournal, (e) => e.mintId),
     nftMintJournal: new ListStore<NftMintJournalEntry>(kv, STORE_KEYS.nftMintJournal, (e) => e.mintId),
+    customMintJournal: new ListStore<CustomMintJournalEntry>(kv, STORE_KEYS.customMintJournal, (e) => e.mintId),
+    burnJournal: new ListStore<BurnJournalEntry>(kv, STORE_KEYS.burnJournal, (e) => e.burnId),
     shortfalls: new ListStore<ShortfallEntry>(kv, STORE_KEYS.shortfalls, (e) => e.transferId),
   };
 }

@@ -8,20 +8,22 @@
  */
 
 import type {
-  EngineIdentity,
-  CoinId,
-  SphereValue,
-  SphereToken,
-  TokenBlob,
-  MintParams,
-  MintDataTokenParams,
-  TransferParams,
-  SplitParams,
-  SplitResult,
-  EngineVerifyResult,
   BuildNftMintParams,
+  BurnParams,
+  CoinId,
+  EngineIdentity,
+  EngineVerifyResult,
+  MintDataTokenParams,
+  MintParams,
   NftMintPlan,
   NftReading,
+  SphereToken,
+  SphereValue,
+  SplitParams,
+  SplitResult,
+  TokenBlob,
+  TokenPlugin,
+  TransferParams,
 } from './types';
 
 /**
@@ -125,6 +127,8 @@ export interface ITokenEngine {
   readMemo(token: SphereToken): Uint8Array | null;
   /** Raw genesis data of a token (e.g. a data-token's terms). `null` when absent. Synchronous. */
   readTokenData(token: SphereToken): Uint8Array | null;
+  /** The genesis mint reason (`justification`) of a token; `null` when it was minted without one. Synchronous. */
+  readTokenJustification(token: SphereToken): Uint8Array | null;
   /** Read a token's genesis payload as an NFT. NEVER throws; null = not a recognised NFT. */
   readNft(token: SphereToken): Promise<NftReading | null>;
 
@@ -144,10 +148,15 @@ export interface ITokenEngine {
    * read its bytes via `readTokenData`. (Used e.g. for on-chain invoice tokens.)
    */
   mintDataToken(params: MintDataTokenParams, options?: EngineOpOptions): Promise<SphereToken>;
+  /** Throws VALIDATION_ERROR when `mintDataToken` would refuse `params` before submitting, e.g. a reason tag no registered verifier handles. */
+  assertMintable(params: MintDataTokenParams): void;
   /** Plan an NFT mint: encode (and optionally sign as this engine's identity) the payload and derive its token id. No chain op. */
   buildNftMint(params: BuildNftMintParams): Promise<NftMintPlan>;
   /** Spend a token wholesale to a recipient pubkey; returns the recipient's finished token. */
   transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken>;
+
+  /** Spend the token to `BurnPredicate(sha256(reasonBytes))` with the reason bytes as aux data. */
+  burn(params: BurnParams, options?: EngineOpOptions): Promise<SphereToken>;
   /** Split a token into N value-conserving outputs (burn source + internally mint each output). */
   split(params: SplitParams, options?: EngineOpOptions): Promise<SplitResult>;
 
@@ -250,6 +259,8 @@ export interface EngineConfig {
    * terminate the pool.
    */
   readonly verification?: VerificationWorkerConfig;
+  /** Token plugins whose mint-reason verifiers and issuance policies join the engine's verification context. */
+  readonly plugins?: readonly TokenPlugin[];
 }
 
 /** Factory signature for the real adapter (implemented in Track A). */

@@ -57,6 +57,20 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
       expect(await e.isSpent(recv)).toBe(false);
     });
 
+    it('burn spends the source, leaves a token nobody owns, and carries the reason as its memo', async () => {
+      const e = makeEngine();
+      const me = e.getIdentity().chainPubkey;
+      const token = await e.mint({ recipientPubkey: me, value: { assets: [{ coinId: COIN, amount: 7n }] } });
+      const reason = new Uint8Array([0xd9, 0x98, 0x88, 0x81, 0x01]);
+      const burned = await e.burn({ token, reasonBytes: reason });
+      expect(e.tokenId(burned)).toBe(e.tokenId(token));
+      expect(e.isOwnedBy(burned, me)).toBe(false);
+      expect(e.readMemo(burned)).toEqual(reason);
+      expect(e.balanceOf(burned, COIN)).toBe(7n);
+      await expect(e.isSpent(token)).resolves.toBe(true);
+      await expect(e.burn({ token, reasonBytes: reason })).rejects.toThrow();
+    });
+
     it('split conserves value and spends the source', async () => {
       const e = makeEngine();
       const src = await mintSelf(e, 500n);
@@ -116,6 +130,7 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
       const t = await e.mintDataToken({ recipientPubkey: PK_A, data, tokenType, salt });
       expect(e.readValue(t)).toBeNull();
       expect(e.readTokenData(t)).toEqual(data);
+      expect(e.readTokenJustification(t)).toBeNull();
       expect(e.tokenId(t)).toMatch(/^[0-9a-f]{64}$/);
       // tokenId is derived from (networkId, salt): the same terms-derived salt re-mints
       // to the identical, stable tokenId (the invoice-id use case).

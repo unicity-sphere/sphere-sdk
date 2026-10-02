@@ -84,6 +84,81 @@ describe('createSphereTokenEngine', () => {
     warn.mockRestore();
   });
 
+  it('registers each plugin mint-reason verifier by tag: a tag registered once is claimed, so a second engine over the same plugin list still builds (fresh registry per engine)', async () => {
+    const plugin = (id: string, tags: bigint[]) => ({
+      id,
+      mintJustificationVerifiers: tags.map((tag) => ({ tag, verify: vi.fn() })),
+    });
+    const config = {
+      aggregatorUrl: 'http://localhost:3000',
+      privateKey: SigningService.generatePrivateKey(),
+      trustBaseJson: TRUST_BASE_JSON,
+      plugins: [plugin('bridge:tron-usdt', [1330002n]), plugin('issuer:x', [1330010n, 1330011n])],
+    };
+    const first = await createSphereTokenEngine(config);
+    const second = await createSphereTokenEngine(config);
+    expect(first.getIdentity().chainPubkey).toEqual(second.getIdentity().chainPubkey);
+  });
+
+  it('refuses two plugins claiming the same mint-reason tag with INVALID_CONFIG, naming the plugin', async () => {
+    const verifier = { tag: 1330002n, verify: vi.fn() };
+    await expect(
+      createSphereTokenEngine({
+        aggregatorUrl: 'http://localhost:3000',
+        privateKey: SigningService.generatePrivateKey(),
+        trustBaseJson: TRUST_BASE_JSON,
+        plugins: [
+          { id: 'bridge:a', mintJustificationVerifiers: [verifier] },
+          { id: 'bridge:b', mintJustificationVerifiers: [verifier] },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_CONFIG', message: expect.stringMatching(/bridge:b.*1330002/) });
+  });
+
+  it('refuses a plugin that re-declares the SDK split verifier tag', async () => {
+    const { SplitMintJustification } = await import('../../../token-engine/sdk');
+    await expect(
+      createSphereTokenEngine({
+        aggregatorUrl: 'http://localhost:3000',
+        privateKey: SigningService.generatePrivateKey(),
+        trustBaseJson: TRUST_BASE_JSON,
+        plugins: [{ id: 'rogue', mintJustificationVerifiers: [{ tag: SplitMintJustification.CBOR_TAG, verify: vi.fn() }] }],
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+  });
+
+  it('refuses two issuance policies for one token type, or two types issuing one coin, with INVALID_CONFIG naming the plugin', async () => {
+    const { TokenType } = await import('../../../token-engine/sdk');
+    const policy = (typeByte: number, coinIds: string[]) => ({
+      tokenType: new TokenType(new Uint8Array(32).fill(typeByte)),
+      coinIds,
+      verify: vi.fn(),
+    });
+    const engineWith = (plugins: { id: string; tokenIssuancePolicies: ReturnType<typeof policy>[] }[]) =>
+      createSphereTokenEngine({
+        aggregatorUrl: 'http://localhost:3000',
+        privateKey: SigningService.generatePrivateKey(),
+        trustBaseJson: TRUST_BASE_JSON,
+        plugins,
+      });
+
+    await expect(
+      engineWith([
+        { id: 'bridge:a', tokenIssuancePolicies: [policy(1, ['aa'.repeat(32)])] },
+        { id: 'bridge:b', tokenIssuancePolicies: [policy(1, ['bb'.repeat(32)])] },
+      ]),
+    ).rejects.toMatchObject({ code: 'INVALID_CONFIG', message: expect.stringMatching(/bridge:b.*(01){32}/) });
+    await expect(
+      engineWith([
+        { id: 'bridge:a', tokenIssuancePolicies: [policy(1, ['aa'.repeat(32)])] },
+        { id: 'bridge:c', tokenIssuancePolicies: [policy(2, ['AA'.repeat(32)])] },
+      ]),
+    ).rejects.toMatchObject({ code: 'INVALID_CONFIG', message: expect.stringMatching(/bridge:c.*a{64}/) });
+    await expect(
+      engineWith([{ id: 'bridge:a', tokenIssuancePolicies: [policy(1, ['aa'.repeat(32)]), policy(2, ['bb'.repeat(32)])] }]),
+    ).resolves.toBeDefined();
+  });
+
   it('rejects a config without a trust base', async () => {
     await expect(
       createSphereTokenEngine({

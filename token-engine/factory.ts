@@ -17,7 +17,7 @@ import { SphereError } from '../core/errors';
 import { logger } from '../core/logger';
 import {
   AggregatorClient,
-  MintJustificationVerifierService,
+  HexConverter,
   PredicateVerifierService,
   RootTrustBase,
   Secp256k1SignatureVerifier,
@@ -32,11 +32,47 @@ import {
   WorkerTokenVerifier,
   type IWorker,
 } from './sdk';
+import { CoinClaims } from './claims';
+import { MintReasonRegistry } from './mint-reasons';
 import { decodeSpherePaymentData } from './SpherePaymentData';
 import { type DisposableTokenVerifier, type EngineDeps, SphereTokenEngine } from './SphereTokenEngine';
 import type { EngineConfig, ITokenEngine, VerificationWorker, VerificationWorkerConfig } from './engine';
+import type { TokenPlugin } from './types';
 
 const DEFAULT_VERIFICATION_POOL_SIZE = 4;
+
+interface PluginRegistries {
+  readonly reasons: MintReasonRegistry;
+  readonly policies: TokenIssuanceVerifierService;
+  readonly claims: CoinClaims;
+}
+
+function registerPlugins(registries: PluginRegistries, plugins: EngineConfig['plugins']): void {
+  for (const plugin of plugins ?? []) {
+    for (const verifier of plugin.mintJustificationVerifiers ?? []) {
+      claim(plugin, `mint-reason tag ${verifier.tag}`, () => registries.reasons.registerPlugin(verifier));
+    }
+    for (const policy of plugin.tokenIssuancePolicies ?? []) {
+      const tokenType = HexConverter.encode(policy.tokenType.bytes);
+      claim(plugin, `an issuance policy for token type ${tokenType}`, () => {
+        registries.claims.add(policy);
+        registries.policies.register(policy);
+      });
+    }
+  }
+}
+
+function claim(plugin: TokenPlugin, what: string, register: () => void): void {
+  try {
+    register();
+  } catch (err) {
+    throw new SphereError(
+      `Token plugin '${plugin.id}' registers ${what} twice or over another plugin's: ` +
+        (err instanceof Error ? err.message : String(err)),
+      'INVALID_CONFIG',
+    );
+  }
+}
 
 /** #770(4): what a verification cancelled by `dispose()` rejects with. */
 function disposedError(): SphereError {
@@ -193,9 +229,14 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
   const unicityCertificateVerifier = new UnicityCertificateVerifier(
     new UnicitySealQuorumSignaturesVerificationRule(new Secp256k1SignatureVerifier(), new VerifiedSealCache(256)),
   );
-  const mintJustificationVerifier = new MintJustificationVerifierService();
+  const mintJustificationVerifier = new MintReasonRegistry();
   mintJustificationVerifier.register(
       new SplitMintJustificationVerifier(decodeSpherePaymentData),
+  );
+  const tokenIssuanceVerifier = new TokenIssuanceVerifierService(false);
+  registerPlugins(
+    { reasons: mintJustificationVerifier, policies: tokenIssuanceVerifier, claims: new CoinClaims() },
+    config.plugins,
   );
 
   const deps: EngineDeps = {
@@ -209,7 +250,7 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
       predicateVerifier,
       unicityCertificateVerifier,
       mintJustificationVerifier,
-      new TokenIssuanceVerifierService(false),
+      tokenIssuanceVerifier,
     ),
     signingService: new SigningService(config.privateKey),
     // Also the HKDF ikm for deterministic realization (Part E.1) — the

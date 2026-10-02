@@ -30,11 +30,14 @@ import {
 } from '../../../token-engine/sdk';
 import { nftRecipientCbor, planNftMint, readNftData, type NftOpsDeps } from '../../../token-engine/nft-ops';
 import {
+  assertMintableData,
   type ClassifiedValue,
   classifyValueEnvelope,
 } from '../../../token-engine/value-envelope';
+import { SphereError } from '../../../core/errors';
 import type {
   BuildNftMintParams,
+  BurnParams,
   CoinId,
   EngineIdentity,
   EngineOpOptions,
@@ -71,6 +74,7 @@ interface FakeState {
   readonly genesisOwner: Uint8Array;
   /** The genesis token type, which an NftSigned digest binds; a mint that names none gets one derived from the id. */
   readonly tokenType: Uint8Array;
+  readonly justification: Uint8Array | null;
 }
 
 export interface FakeEngineConfig {
@@ -145,6 +149,10 @@ export class FakeTokenEngine implements ITokenEngine {
     return decodeFakeState(token.blob.token).genesisData;
   }
 
+  public readTokenJustification(token: SphereToken): Uint8Array | null {
+    return decodeFakeState(token.blob.token).justification;
+  }
+
   public async readNft(token: SphereToken): Promise<NftReading | null> {
     try {
       const state = decodeFakeState(token.blob.token);
@@ -171,7 +179,14 @@ export class FakeTokenEngine implements ITokenEngine {
       transferMemo: null,
       genesisOwner: params.recipientPubkey,
       tokenType: derivedTokenType(tokenId),
+      justification: null,
     });
+  }
+
+  /** No reason registry here: any non-empty reason is mintable. */
+  public assertMintable(params: MintDataTokenParams): void {
+    assertMintableData(params.data);
+    if (params.justification?.length === 0) throw new SphereError('The mint reason is not tagged CBOR', 'VALIDATION_ERROR');
   }
 
   public async mintDataToken(params: MintDataTokenParams, _options?: EngineOpOptions): Promise<SphereToken> {
@@ -188,6 +203,7 @@ export class FakeTokenEngine implements ITokenEngine {
       transferMemo: null,
       genesisOwner: params.recipientPubkey,
       tokenType: params.tokenType ?? derivedTokenType(tokenId),
+      justification: params.justification ?? null,
     });
   }
 
@@ -207,6 +223,22 @@ export class FakeTokenEngine implements ITokenEngine {
       genesisData: source.genesisData,
       transferMemo: params.data ?? null,
       genesisOwner: source.genesisOwner,
+      justification: source.justification,
+      tokenType: source.tokenType,
+    });
+  }
+
+  public async burn(params: BurnParams, _options?: EngineOpOptions): Promise<SphereToken> {
+    this.consume(params.token);
+    const source = decodeFakeState(params.token.blob.token);
+    return this.makeToken({
+      tokenId: source.tokenId,
+      stateId: this.nextId(),
+      owner: new Uint8Array(0),
+      genesisData: source.genesisData,
+      transferMemo: params.reasonBytes,
+      genesisOwner: source.genesisOwner,
+      justification: source.justification,
       tokenType: source.tokenType,
     });
   }
@@ -231,6 +263,7 @@ export class FakeTokenEngine implements ITokenEngine {
           transferMemo: null,
           genesisOwner: o.recipientPubkey,
           tokenType: derivedTokenType(tokenId),
+          justification: null,
         }),
       );
     }
@@ -374,7 +407,7 @@ export function readFakeTokenKeys(tokenBytes: Uint8Array): { tokenId: string; ow
   return { tokenId: HexConverter.encode(state.tokenId), owner: HexConverter.encode(state.owner) };
 }
 
-// fake-token state: CBOR array[ tokenId, stateId, owner, genesisData?, transferMemo?, genesisOwner, tokenType ]
+// fake-token state: CBOR array[ tokenId, stateId, owner, genesisData?, transferMemo?, genesisOwner, tokenType, justification? ]
 function encodeFakeState(state: FakeState): Uint8Array {
   return CborSerializer.encodeArray(
     CborSerializer.encodeByteString(state.tokenId),
@@ -384,11 +417,12 @@ function encodeFakeState(state: FakeState): Uint8Array {
     CborSerializer.encodeNullable(state.transferMemo, CborSerializer.encodeByteString),
     CborSerializer.encodeByteString(state.genesisOwner),
     CborSerializer.encodeByteString(state.tokenType),
+    CborSerializer.encodeNullable(state.justification, CborSerializer.encodeByteString),
   );
 }
 
 function decodeFakeState(bytes: Uint8Array): FakeState {
-  const [tokenIdB, stateIdB, ownerB, genesisB, memoB, genesisOwnerB, tokenTypeB] = CborDeserializer.decodeArray(bytes, 7);
+  const [tokenIdB, stateIdB, ownerB, genesisB, memoB, genesisOwnerB, tokenTypeB, justificationB] = CborDeserializer.decodeArray(bytes, 8);
   return {
     tokenId: CborDeserializer.decodeByteString(tokenIdB),
     stateId: CborDeserializer.decodeByteString(stateIdB),
@@ -397,6 +431,7 @@ function decodeFakeState(bytes: Uint8Array): FakeState {
     transferMemo: CborDeserializer.decodeNullable(memoB, CborDeserializer.decodeByteString),
     genesisOwner: CborDeserializer.decodeByteString(genesisOwnerB),
     tokenType: CborDeserializer.decodeByteString(tokenTypeB),
+    justification: CborDeserializer.decodeNullable(justificationB, CborDeserializer.decodeByteString),
   };
 }
 

@@ -10,6 +10,8 @@
  */
 
 // Frozen contract
+export type { IMintJustificationVerifier, ITokenIssuanceVerifier } from './sdk';
+
 export type {
   ITokenEngine,
   EngineConfig,
@@ -30,6 +32,9 @@ export type {
   SphereToken,
   MintParams,
   MintDataTokenParams,
+  BurnParams,
+  TokenPlugin,
+  TokenIssuancePolicy,
   TransferParams,
   SplitOutput,
   SplitParams,
@@ -55,6 +60,7 @@ export { createSphereTokenEngine } from './factory';
 export {
   CheckpointPersistFailedError,
   CheckpointTrustbaseMismatchError,
+  MintReasonUnverifiableError,
   ProofUnconfirmedError,
   SplitCheckpointLostError,
   TransferConflictError,

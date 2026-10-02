@@ -231,6 +231,7 @@ export class WalletApiV2Client {
     transferId: string;
     spent: string[];
     added: { tokenId: string; key: string }[];
+    externalDelivery?: boolean;
   }): Promise<ApplyDeltaWire> {
     return this.http.request('POST', '/v1/inventory/apply', delta) as Promise<ApplyDeltaWire>;
   }
