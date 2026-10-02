@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-02
+
 ### Added — mandatory issuance policies for plugin token types (#825)
 
 A `TokenPlugin` can register `tokenIssuancePolicies`: the state-transition SDK's per-type issuance
@@ -2045,7 +2047,8 @@ consumed exclusively through the `token-engine/` port. Consequences:
 - `PaymentsModule.destroy()` now cleans up storage event subscriptions and debounce timers
 - `IpfsStorageProvider.shutdown()` now disconnects the subscription client
 
-[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.7...HEAD
+[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.7...v0.18.0
 [0.17.7]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.6...v0.17.7
 [0.17.6]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.5...v0.17.6
 [0.17.5]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.4...v0.17.5
