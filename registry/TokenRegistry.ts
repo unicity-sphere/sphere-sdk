@@ -8,6 +8,9 @@
 import { logger } from '../core/logger';
 import { TOKEN_REGISTRY_REFRESH_INTERVAL, STORAGE_KEYS_GLOBAL } from '../constants';
 import type { StorageProvider } from '../storage';
+import { indexDefinitions, type TokenIssuance } from './definitions';
+
+export type { TokenIssuance } from './definitions';
 
 // =============================================================================
 // Types
@@ -40,6 +43,8 @@ export interface TokenDefinition {
   icons?: TokenIcon[];
   /** Hex-encoded coin ID (64 characters) */
   id: string;
+  /** Fungible entries only: the token type that issues this coin. A malformed value is dropped on load. */
+  issuance?: TokenIssuance;
 }
 
 /**
@@ -103,11 +108,16 @@ const FETCH_TIMEOUT_MS = 10_000;
 export class TokenRegistry {
   private static instance: TokenRegistry | null = null;
 
-  private readonly definitionsById: Map<string, TokenDefinition>;
+  private definitionsById = new Map<string, TokenDefinition>();
   /** Non-fungible definitions keyed by TOKEN TYPE — a separate namespace (#147). */
-  private readonly definitionsByType: Map<string, TokenDefinition>;
-  private readonly definitionsBySymbol: Map<string, TokenDefinition>;
-  private readonly definitionsByName: Map<string, TokenDefinition>;
+  private definitionsByType = new Map<string, TokenDefinition>();
+  private definitionsBySymbol = new Map<string, TokenDefinition>();
+  private definitionsByName = new Map<string, TokenDefinition>();
+  /** Coin id → issuing token type. Replaced, never mutated, so a reader can tell a change by identity. */
+  private issuers: ReadonlyMap<string, string> = new Map();
+  private readonly changeListeners = new Set<() => void>();
+  private cacheReadPromise: Promise<void> = Promise.resolve();
+  private readonly warned = new Set<string>();
 
   // Remote refresh state
   private remoteUrl: string | null = null;
@@ -124,12 +134,7 @@ export class TokenRegistry {
   /** Cancels the in-flight fetch (and its abort timer) when the registry is disposed. */
   private inFlight: { abort: () => void } | null = null;
 
-  private constructor() {
-    this.definitionsById = new Map();
-    this.definitionsByType = new Map();
-    this.definitionsBySymbol = new Map();
-    this.definitionsByName = new Map();
-  }
+  private constructor() {}
 
   /**
    * Get singleton instance of TokenRegistry
@@ -204,7 +209,9 @@ export class TokenRegistry {
 
     // Perform initial load (cache → remote fallback) and store the promise
     // so consumers can await readiness via TokenRegistry.waitForReady()
-    this.initialLoadPromise = this.performInitialLoad(autoRefresh);
+    const cacheRead = this.storage ? this.loadFromCache() : null;
+    this.cacheReadPromise = cacheRead?.then(() => undefined) ?? Promise.resolve();
+    this.initialLoadPromise = this.performInitialLoad(autoRefresh, cacheRead);
   }
 
   /**
@@ -225,6 +232,7 @@ export class TokenRegistry {
     this.generation++;
     this.refreshPromise = null;
     this.initialLoadPromise = null;
+    this.changeListeners.clear();
   }
 
   /** Whether dispose() has been called. Reads still work; they are simply frozen. */
@@ -294,13 +302,10 @@ export class TokenRegistry {
    * Perform initial data load: try cache first, fall back to remote fetch.
    * After initial data is available, start periodic auto-refresh if configured.
    */
-  private async performInitialLoad(autoRefresh: boolean): Promise<boolean> {
+  private async performInitialLoad(autoRefresh: boolean, cacheRead: Promise<boolean> | null): Promise<boolean> {
     if (this.disposed) return false;
-    // Step 1: Try loading from cache
-    let loaded = false;
-    if (this.storage) {
-      loaded = await this.loadFromCache();
-    }
+    // Step 1: the cache read applyConfig started (none without storage)
+    let loaded = cacheRead !== null && (await cacheRead);
 
     if (loaded) {
       // Cache hit — start auto-refresh in background (includes immediate remote fetch)
@@ -349,7 +354,8 @@ export class TokenRegistry {
 
   /**
    * Load definitions from StorageProvider cache.
-   * Only applies if cache exists and is fresh (within refreshIntervalMs).
+   * Only applies if cache exists and is fresh (within refreshIntervalMs). A stale cache still
+   * seeds the issuance claims: a coin it names keeps its issuer until a fetch replaces it.
    */
   private async loadFromCache(): Promise<boolean> {
     if (!this.storage) return false;
@@ -367,10 +373,6 @@ export class TokenRegistry {
       const ts = parseInt(cachedTs, 10);
       if (isNaN(ts)) return false;
 
-      // Check freshness
-      const age = Date.now() - ts;
-      if (age > this.refreshIntervalMs) return false;
-
       // Don't overwrite data from a more recent remote fetch
       if (this.lastRefreshAt > ts) return false;
 
@@ -379,6 +381,10 @@ export class TokenRegistry {
       // A switch landed while we were reading — this snapshot is the old network's.
       if (gen !== this.generation) return false;
 
+      if (Date.now() - ts > this.refreshIntervalMs) {
+        this.applyIssuers(indexDefinitions(data as TokenDefinition[], this.warnOnce).issuers);
+        return false;
+      }
       this.applyDefinitions(data as TokenDefinition[]);
       this.lastRefreshAt = ts;
       return true;
@@ -408,30 +414,30 @@ export class TokenRegistry {
   // Remote Refresh
   // ===========================================================================
 
-  /**
-   * Apply an array of token definitions to the internal maps.
-   * Clears existing data before applying.
-   */
-  private applyDefinitions(definitions: TokenDefinition[]): void {
-    this.definitionsById.clear();
-    this.definitionsBySymbol.clear();
-    this.definitionsByName.clear();
-    this.definitionsByType.clear();
+  /** Replaces every lookup map at once with ones built from `served`; a malformed entry is skipped. */
+  private applyDefinitions(served: TokenDefinition[]): void {
+    const index = indexDefinitions(served, this.warnOnce);
+    this.definitionsById = index.byId;
+    this.definitionsByType = index.byType;
+    this.definitionsBySymbol = index.bySymbol;
+    this.definitionsByName = index.byName;
+    this.applyIssuers(index.issuers);
+  }
 
-    // ONE registry file, TWO id namespaces (wallet-api#147): a `fungible` entry's
-    // `id` is a COIN id, a `non-fungible` entry's is a TOKEN TYPE. The flat maps
-    // stay as they were (getDefinition resolves either, and is pinned that way);
-    // `definitionsByType` is the namespace-correct lookup a coinless token needs.
-    for (const def of definitions) {
-      const idLower = def.id.toLowerCase();
-      this.definitionsById.set(idLower, def);
-      if (def.assetKind === 'non-fungible') this.definitionsByType.set(idLower, def);
+  private readonly warnOnce = (key: string, message: string): void => {
+    if (this.warned.has(key)) return;
+    this.warned.add(key);
+    logger.warn('TokenRegistry', message);
+  };
 
-      if (def.symbol) {
-        this.definitionsBySymbol.set(def.symbol.toUpperCase(), def);
+  private applyIssuers(issuers: ReadonlyMap<string, string>): void {
+    this.issuers = issuers;
+    for (const listener of [...this.changeListeners]) {
+      try {
+        listener();
+      } catch (err) {
+        logger.warn('TokenRegistry', 'A definitions listener threw:', err);
       }
-
-      this.definitionsByName.set(def.name.toLowerCase(), def);
     }
   }
 
@@ -701,6 +707,29 @@ export class TokenRegistry {
   getTypeDefinition(tokenType: string): TokenDefinition | undefined {
     if (!tokenType) return undefined;
     return this.definitionsByType.get(tokenType.toLowerCase());
+  }
+
+  /** The token type the registry names as the issuer of a coin (`issuance.tokenType`), or null. */
+  getIssuingTokenType(coinId: string): string | null {
+    return this.issuers.get(coinId.toLowerCase()) ?? null;
+  }
+
+  /** Every issuance claim, coin id → token type. The same map until the claims are next applied. */
+  getIssuanceClaims(): ReadonlyMap<string, string> {
+    return this.issuers;
+  }
+
+  /** Resolves once the persistent cache has been read, whether or not it held anything. Never waits on the network. */
+  cacheRead(): Promise<void> {
+    return this.cacheReadPromise;
+  }
+
+  /** Calls `listener` each time definitions or issuance claims are applied; returns the unsubscribe. */
+  onDefinitionsChanged(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
   }
 
   /**

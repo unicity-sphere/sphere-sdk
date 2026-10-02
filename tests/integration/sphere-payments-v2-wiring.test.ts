@@ -25,7 +25,7 @@ import { getPublicKey, hexToBytes } from '../../core/crypto';
 import { decryptDeliveryBundle, deriveDeliveryEncryptionKey } from '../../core/delivery-envelope';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { TRUSTBASE_TESTNET2 } from '../../assets/trustbase';
-import { STORAGE_KEYS_GLOBAL } from '../../constants';
+import { NETWORKS, STORAGE_KEYS_GLOBAL } from '../../constants';
 import { TokenRegistry } from '../../registry';
 import type { PeerInfo, TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
@@ -200,11 +200,28 @@ interface BuildOptions {
   peers?: Record<string, PeerInfo>;
   nametag?: string;
   plugins?: readonly TokenPlugin[];
+  /** Definitions already in the token registry's persistent cache when the wallet starts. */
+  registryCache?: readonly object[];
+}
+
+/**
+ * The claim check decodes a held token to learn its type, and the real engine cannot read this
+ * world's fake-minted blobs (it would retry them as undecodable), so the facade reads them with the
+ * fake engine that minted them.
+ */
+function readsFakeBlobs(sphere: Sphere, world: World): void {
+  (sphere.payments as unknown as PaymentsFacade).setEngine(world.realization);
 }
 
 async function buildSphere(options: BuildOptions): Promise<Sphere> {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pv2-wiring-'));
   const storage = new FileStorageProvider({ dataDir });
+  if (options.registryCache !== undefined) {
+    const url = NETWORKS[NET].tokenRegistryUrl;
+    await storage.connect();
+    await storage.set(`${STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE}:${url}`, JSON.stringify(options.registryCache));
+    await storage.set(`${STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE_TS}:${url}`, String(Date.now()));
+  }
   const { sphere } = await Sphere.init({
     storage,
     transport: createMockTransport(options.peers),
@@ -615,6 +632,7 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     const world = makeWorld();
     const policy = { tokenType: new TokenType(new Uint8Array(32).fill(0x6f)), coinIds: [COIN], verify: vi.fn() };
     const sphere = await buildSphere({ walletApi: world.walletApi, plugins: [{ id: 'bridge', tokenIssuancePolicies: [policy] }] });
+    readsFakeBlobs(sphere, world);
 
     const seeded = await seedInventory(world, world.transports[0]!, 40n);
     world.transports[0]!.session.fire('inventory');
@@ -625,6 +643,34 @@ describe('Sphere payments wiring — defaults (P11 flip: the vertical is default
     expect(await sphere.payments.assets(COIN)).toEqual([]);
     const unverified = await sphere.payments.unverifiedAssets(COIN);
     expect(unverified.map((a) => [a.totalAmount, a.unverified])).toEqual([['40', 'refused']]);
+  }, 20_000);
+
+  it('a coin the cached token registry names an issuer for is claimed with no plugin loaded (#833)', async () => {
+    const world = makeWorld();
+    const entry = {
+      network: 'unicity:testnet2',
+      assetKind: 'fungible',
+      name: 'claimed-coin',
+      symbol: 'CLM',
+      decimals: 0,
+      description: 'a coin issued only by one token type',
+      id: COIN,
+      issuance: { tokenType: '6f'.repeat(32) },
+    };
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify([entry]), { status: 200 }));
+    cleanups.push(async () => fetch.mockRestore());
+    const sphere = await buildSphere({ walletApi: world.walletApi, registryCache: [entry] });
+    readsFakeBlobs(sphere, world);
+
+    const seeded = await seedInventory(world, world.transports[0]!, 40n);
+    world.transports[0]!.session.fire('inventory');
+    await vi.waitFor(() => {
+      expect(sphere.payments.unverifiedTokens().map((t) => t.id)).toContain(seeded.blob.tokenId);
+    });
+
+    expect(await sphere.payments.assets(COIN)).toEqual([]);
+    const unverified = await sphere.payments.unverifiedAssets(COIN);
+    expect(unverified.map((a) => [a.symbol, a.totalAmount, a.unverified])).toEqual([['CLM', '40', 'refused']]);
   }, 20_000);
 
   // #733: proves composePaymentsV2 wires the resolver that reports the PEER's

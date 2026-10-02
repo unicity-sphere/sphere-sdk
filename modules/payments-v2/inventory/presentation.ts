@@ -13,6 +13,12 @@ export interface RegistryReader {
   getIconUrl(coinId: string): string | null;
   /** Coinless token CLASS metadata, keyed by token type — a separate namespace. */
   getTypeMeta?(tokenType: string): { name: string; iconUrl: string | null } | null;
+  /** Coin id → the token type the registry names as its issuer; the same map until the claims change. */
+  getIssuanceClaims?(): ReadonlyMap<string, string>;
+  /** Resolves once the persistent cache has been read; never waits on the network. */
+  cacheRead?(): Promise<void>;
+  /** Calls `listener` each time definitions or claims are applied; returns the unsubscribe. */
+  onDefinitionsChanged?(listener: () => void): () => void;
 }
 
 export interface PriceQuote {

@@ -86,7 +86,7 @@ export interface Token {
    * send self-heals instead of wedging on a stale source.
    */
   suspectedSpent?: boolean;
-  /** Carries a coin an issuance policy claims without having passed that policy yet (`pending`) or at all (`refused`): shown, never spent. */
+  /** Carries a claimed coin (by an issuance policy or the token registry) not verified here yet (`pending`) or not of its issuing type or failing its policy (`refused`): shown, never spent. */
   readonly unverified?: Unverified;
 }
 
@@ -211,7 +211,7 @@ export interface IncomingTransfer {
   readonly tokens: Token[];
   /** Arrivals that name no coin (#777). Disjoint from `tokens`, never a zero Token. */
   readonly coinless?: CoinlessToken[];
-  /** Refused arrivals of a claimed coin under another type; never counted, and never in `tokens`. */
+  /** Arrivals of a claimed coin that do not count: of another type (`refused`), or of the issuing type with no policy here to verify it (`pending`). Never in `tokens`. */
   readonly unverifiedTokens?: Token[];
   readonly memo?: string;
   readonly receivedAt: number;

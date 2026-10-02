@@ -32,6 +32,8 @@ export interface MintDeps extends FinalizeMintDeps {
   readonly armHeartbeat: () => void;
   readonly ownPubkeyBytes: Uint8Array;
   readonly now: () => number;
+  /** A claimed coin is issued only by its token type, which a self-mint never has. */
+  readonly claims?: { issuerOf(coinId: string): string | null };
 }
 
 /** What replaying a mint journal needs on top of minting. */
@@ -71,6 +73,8 @@ input: { mintId: string; coinId: string; amount: bigint }
 ): Promise<MintResult> {
 const { mintId, coinId, amount } = input;
 const engine = deps.engine;
+  const issuer = deps.claims?.issuerOf(coinId) ?? null;
+  if (issuer !== null) return { success: false, error: `coin ${coinId} is issued only by token type ${issuer}; a self-mint cannot carry it` };
   // tokenId stays '' until mint returns; replay converges via the F13 same-seed re-call.
   const entry: MintJournalEntry = {
     mintId,
