@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-10-07
+
 ### Added — the token registry claims a coin for its issuing token type (#833)
 
 Until now only a loaded plugin could claim a coin, so a wallet without the plugin trusted every
@@ -2091,7 +2093,8 @@ consumed exclusively through the `token-engine/` port. Consequences:
 - `PaymentsModule.destroy()` now cleans up storage event subscriptions and debounce timers
 - `IpfsStorageProvider.shutdown()` now disconnects the subscription client
 
-[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.7...v0.18.0
 [0.17.7]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.6...v0.17.7
 [0.17.6]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.5...v0.17.6
