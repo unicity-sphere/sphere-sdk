@@ -29,4 +29,9 @@ export class CoinClaims {
   public issuerOf(coinId: CoinId): string | null {
     return this.issuers.get(coinId.toLowerCase()) ?? null;
   }
+
+  /** Whether a registered policy of this token type claims this coin, so `verify` judges the coin under it. */
+  public vouches(coinId: CoinId, tokenType: string): boolean {
+    return this.issuerOf(coinId) === tokenType.toLowerCase();
+  }
 }

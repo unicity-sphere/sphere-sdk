@@ -924,6 +924,9 @@ const result = await sphere.payments.mint(coinIdHex, 1_000_000n);
 
 - `coinId` must be even-length lowercase hex; `amount` must be `> 0n`.
   Otherwise it resolves `{ success: false, error }` with nothing journaled.
+- A claimed coin (by a plugin or the token registry) is refused the same way: only its issuing
+  token type may carry it, and a self-mint never has that type, so the token would be refused for
+  good.
 - **A failure after journaling keeps the entry.** A failed chain op resolves
   `{ success: false, error }`, and a failure after the mint certified resolves
   `{ success: false, tokenId, error }`; in both cases the facade replays that journal entry in its
@@ -1008,14 +1011,64 @@ claimed coin counts only inside a token of its issuing type that verified:
 - An unverified token is never spent: coin selection skips it, and `sendWholeToken()` and `burn()`
   refuse it as not a spendable holding.
 - A token received, left as change of a verified token, or minted with `mintCustom()` under the
-  registered verifiers counts at once. A custom mint accepted only by its per-call verifiers, such as
+  registered verifiers counts at once, provided a policy for its type is loaded (under a registry
+  claim with no such policy it stays pending, see below). A custom mint accepted only by its per-call verifiers, such as
   a depositor's own mint before the lock is final, stays pending. Pending tokens and any other held
   token of a claimed coin, for instance one another device received, are verified in the background,
   and a check that cannot answer yet is retried with backoff.
-- Verified tokens are remembered per device together with a fingerprint of the registered policies.
-  A changed policy, claim or `revision` discards them, so every held token is checked again.
+- Verified tokens are remembered per device, each with the issuer of every coin it carries, under
+  a fingerprint of the registered policies. A changed policy or `revision` discards them all. A
+  changed claim, including one from the registry below, discards only the verdicts of tokens
+  carrying that coin, so those tokens alone are checked again.
 - Two policies for one token type, or two types claiming one coin, fail engine construction with
   `INVALID_CONFIG`.
+
+#### Coins the token registry claims
+
+A fungible entry of the network's token registry may name the token type that issues its coin
+(the testnet2 USDC.e entry, unicitynetwork/unicity-ids#10):
+
+```json
+{
+  "assetKind": "fungible",
+  "symbol": "USDC.e",
+  "id": "eae954053183b9d1836d6b5c892867014bcc1571fcc6813f5b56b16a78d0497f",
+  "issuance": { "tokenType": "2ccbf3157add2b9a2dcc10e772abf5cf328e2723f9f290a9d2b6c4a42a132d6c" }
+}
+```
+
+Every wallet then treats the coin as claimed by that type, whether or not it loads the plugin of the
+type, so a token that merely carries the coin id is never shown, priced or spent as that coin:
+
+- A token of another type carrying the coin is `'refused'`, as under a plugin claim.
+- A token of the issuing type stays `'pending'` unless a loaded plugin itself claims the coin for
+  that type. Without such a claim no loaded policy was written for the coin, so `verify` cannot
+  vouch for the token: with no policy for the type at all it passes a token minted with no reason,
+  and a plugin's policy for the type judges only the coins that plugin lists. Such a token is never
+  trusted, spent or priced. When received it is announced in `unverifiedTokens` marked `'pending'`
+  and not written to history. A `mintCustom()` of the type and the change of such a token stay
+  pending too.
+- A wallet whose plugin claims the coin for the same type behaves exactly as under the plugin claim.
+  If a plugin claims the coin for another type, the plugin's claim is kept and the conflict is
+  logged once.
+- `issuance.tokenType` is read case-insensitively and may carry a `0x` prefix. One that is still not
+  64 hex digits, that sits on a non-fungible entry, or that names a network's own coin (UCT on
+  testnet2, per `NETWORKS[network].nativeCoinIds`) is dropped with one warning per registry and
+  value.
+- A claim needs only a fungible entry with a string `id`. A malformed display field (a non-string
+  `symbol`, an icon without a string `url`) is dropped with a warning and the rest of the entry
+  kept; `null` reads as absent. An entry with no `name` gets no definition, but its claim applies.
+
+Registry claims are read live: the registry loads after `Sphere.init` and refreshes hourly. The
+facade's `start()` waits for the registry's persistent cache, up to 3 s (it logs and goes on without
+the claims when the read does not settle), so a claim the cache holds applies before anything is
+read, spent or received. A cache older than the refresh interval still supplies its claims, though not its
+definitions. Until the registry has loaded once on a device the coin is unclaimed, as it was before
+this field existed. A verdict stops counting the moment a coin its token carries changes issuer, and
+a load or refresh that changes a claim checks the affected tokens again and emits
+`inventory:updated`, so a UI moves tokens between `assets()` and `unverifiedAssets()` without a
+reload. Every other verdict stands. A registry claim that agrees or conflicts with a loaded plugin's
+changes nothing.
 
 ### `mintCustom(request: MintCustomRequest): Promise<MintResult>`
 
@@ -1033,8 +1086,9 @@ interface MintCustomRequest {
 ```
 
 - **Refused before anything is journaled:** a malformed request, an empty `justification`,
-  `data` plus `justification` over `CUSTOM_MINT_MAX_PAYLOAD_BYTES` (1 MiB), and a reason tag no
-  registered plugin handles. Each returns `{ success: false, error }`.
+  `data` plus `justification` over `CUSTOM_MINT_MAX_PAYLOAD_BYTES` (1 MiB), a reason tag no
+  registered plugin handles, and an asset whose coin is claimed for another token type than
+  `tokenType`. Each returns `{ success: false, error }`.
 - **Per-call verifiers** replace the registered verifier of their own tag for this call only, and
   every other tag keeps its registered verifier. A per-call verifier for a tag no plugin registers is
   refused. The depositor of a bridged asset uses this to accept its own mint before the lock is
@@ -2084,4 +2138,44 @@ Wait for the initial load (cache, else remote) to settle. Resolves `true` when d
 loaded, `false` on timeout or when there was no data source. `timeoutMs` defaults to `10_000`;
 pass `0` to wait without a timeout. The static `TokenRegistry.waitForReady()` is the same
 contract against the singleton.
+
+### `TokenDefinition`
+
+```typescript
+interface TokenDefinition {
+  network: string;
+  assetKind: 'fungible' | 'non-fungible';
+  name: string;
+  symbol?: string;                     // fungible only
+  decimals?: number;                   // fungible only
+  description: string;
+  icons?: { url: string }[];
+  id: string;                          // a coin id (fungible) or a token type (non-fungible)
+  issuance?: { tokenType: string };    // fungible only: the token type that issues the coin, 64 lowercase hex
+}
+```
+
+A malformed `issuance` is dropped, with a warning, when the definitions are applied, so a
+definition read from the registry never carries one. What a claim does to the wallet is described
+under [Coins the token registry claims](#coins-the-token-registry-claims).
+
+### `registry.getIssuingTokenType(coinId: string): string | null`
+
+The token type the registry names as the issuer of a coin, or `null`. Case-insensitive in `coinId`.
+
+### `registry.getIssuanceClaims(): ReadonlyMap<string, string>`
+
+Every issuance claim, coin id to token type. The same map object is returned until the claims are
+next applied, so a reader can detect a change by identity.
+
+### `registry.cacheRead(): Promise<void>`
+
+Resolves once the persistent cache has been read, whether or not it held anything. It never waits
+on the network.
+
+### `registry.onDefinitionsChanged(listener: () => void): () => void`
+
+Calls `listener` each time definitions or issuance claims are applied: a cache load, a fetch, or a
+network switch of the global registry. Returns the unsubscribe. A listener that throws is logged
+and the others still run. `dispose()` drops every listener.
 

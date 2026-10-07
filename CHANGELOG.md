@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — the token registry claims a coin for its issuing token type (#833)
+
+Until now only a loaded plugin could claim a coin, so a wallet without the plugin trusted every
+token carrying the coin id. Once the registry names such a coin, every client without the plugin
+(sphere-cli, agents, other SDK consumers) would have shown a self-minted token carrying it under the
+registry's name and icon, priced and spendable, since minting is permissionless.
+
+A fungible registry entry may now carry `issuance: { tokenType }`, the only token type that may
+issue its coin, and every wallet treats that coin as claimed whether or not it loads the plugin. A
+token of another type carrying the coin is `refused`. A token of the issuing type is `pending` unless
+a loaded plugin itself claims the coin for that type: with no policy for the type `verify` passes a
+token minted with no reason at all, and a plugin's policy for the type judges only the coins that
+plugin lists. Neither receive, the background check, `mintCustom()` nor a split's change trusts such
+a token. Pending and refused holdings stay out of `assets()`, `tokens()`, prices, spending and
+history, and are listed by `unverifiedAssets()` and `unverifiedTokens()`. An arrival is announced in
+`IncomingTransfer.unverifiedTokens`, marked `'pending'` or `'refused'`. A wallet whose plugin claims
+the coin behaves as before. When the registry names another type than a loaded plugin, the plugin's
+claim is kept and the conflict is logged once. `mint()` refuses a claimed coin and `mintCustom()`
+refuses one under a type other than its issuer, both before journaling, since such a token would be
+refused for good. `issuance.tokenType` is read case-insensitively with an optional `0x`; one that is
+still malformed, or that names a network's own coin (`NETWORKS[network].nativeCoinIds`, UCT on
+testnet2), is dropped with one warning, so no registry edit can freeze UCT.
+
+Registry claims are read live. The facade's `start()` waits up to 3 s for the registry's persistent
+cache before anything is read, spent or received, and logs and goes on without the claims if the
+read does not settle; a stale cache now still supplies its claims (not its definitions). Before a device's first registry load the coin is unclaimed, as before. Each verdict
+records the issuer of every coin its token carries and stops counting when one of them moves, so a
+claim change re-checks only the tokens of that coin and emits `inventory:updated`; the remembered
+verified set keeps those issuers, so a restart keeps every verdict whose coins did not move. Sets
+written by 0.18.0 carry no issuers and are checked once more after upgrade, a one-time cost of a
+blob fetch and a `verify` per held token of a plugin-claimed coin; the set is still written with the
+`tokenIds` 0.18.0 reads, so a rolled-back or older client on the same storage keeps working. A
+remembered entry that is malformed is skipped with a warning, and a token whose blob cannot be
+decoded is checked again with backoff rather than refused for good. `TokenDefinition` gains
+`issuance`, and `TokenRegistry` gains `getIssuingTokenType()`, `getIssuanceClaims()`, `cacheRead()`
+and `onDefinitionsChanged()`.
+
+The registry no longer throws halfway through a file with a malformed entry, which had left the
+lookup maps partly rebuilt and the new claims unapplied: the maps are built aside and swapped in
+together, a malformed display field (a non-string `symbol`, an icon without a string `url`) is
+dropped with one warning and the rest of the entry kept (`null` reads as absent), and an entry with
+no `name` gets no definition while its claim still applies. The first entry to use
+`issuance` is USDC.e on testnet2 (unicitynetwork/unicity-ids#10).
+
 ## [0.18.0] - 2026-10-02
 
 ### Added — mandatory issuance policies for plugin token types (#825)

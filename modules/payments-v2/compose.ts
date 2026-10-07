@@ -13,6 +13,7 @@ import { isWholeIntent } from './machine/payload-view';
 import type { DeliveryPort, StoragePort } from './ports';
 import type { ScopedKV } from './stores';
 import { History, type HistoryClient } from './history/History';
+import { WalletCoinClaims } from './inventory/coin-claims';
 import { InventoryView, type PriceReader, type RegistryReader } from './inventory/InventoryView';
 import { TokenVerdicts } from './inventory/verdicts';
 import { Receive, type ReceivedRecord, type StoredIncoming } from './receive/Receive';
@@ -113,8 +114,10 @@ export interface PaymentsFacadeDeps {
   kv: ScopedKV;
   registry: RegistryReader;
   price?: PriceReader;
-  /** Coins that count only in verified tokens of their issuing type (TokenPlugin issuance policies). */
+  /** Coins that count only in verified tokens of their issuing type (TokenPlugin issuance policies); the registry's `issuance` claims join them. */
   claims?: CoinClaims;
+  /** How long start() waits for the registry's cached claims before going on without them; default 3 s. */
+  claimsReadyTimeoutMs?: number;
   emit: (event: string, payload: unknown) => void;
   resolveRecipient: (identifier: string) => Promise<RecipientInfo | null>;
   signComplete: (transferId: string) => Promise<string>;
@@ -149,6 +152,7 @@ export interface FacadeHooks {
 
 export interface FacadeParts {
   ownPubkeyBytes: Uint8Array;
+  claims: WalletCoinClaims;
   view: InventoryView;
   verdicts: TokenVerdicts;
   ledger: ReservationLedger;
@@ -170,7 +174,8 @@ export interface FacadeParts {
 export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks): FacadeParts {
   const ownPubkeyBytes = hexToBytes(deps.ownPubkey);
   const ledger = new ReservationLedger();
-  const verdicts = buildVerdicts(deps, hooks);
+  const claims = new WalletCoinClaims(deps.claims ?? new CoinClaims(), deps.registry, deps.claimsReadyTimeoutMs);
+  const verdicts = buildVerdicts(deps, hooks, claims, () => view.claimHolders());
   const view = buildView(deps, hooks, ledger, verdicts);
   const queue = new SpendQueue({
     ledger,
@@ -194,6 +199,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
   const pins = buildPins(deps, hooks, { ledger, view, machineStores, machineDeps });
   return {
     ownPubkeyBytes,
+    claims,
     view,
     verdicts,
     refreshView,
@@ -206,7 +212,7 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     machineDeps,
     machine: new TransferMachine(machineDeps),
     heldStates,
-    receiveLoop: buildReceive(deps, hooks, { historyStore, heldStates, verdicts }, refreshView),
+    receiveLoop: buildReceive(deps, hooks, { historyStore, heldStates, verdicts, claims }, refreshView),
     requests: buildRequests(deps, hooks),
     restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view),
   };
@@ -235,13 +241,20 @@ function buildView(
   return view;
 }
 
-function buildVerdicts(deps: PaymentsFacadeDeps, hooks: FacadeHooks): TokenVerdicts {
+function buildVerdicts(
+  deps: PaymentsFacadeDeps,
+  hooks: FacadeHooks,
+  claims: WalletCoinClaims,
+  holders: () => readonly string[]
+): TokenVerdicts {
   return new TokenVerdicts({
     kv: deps.kv,
-    claims: deps.claims ?? new CoinClaims(),
+    claims,
     engine: () => hooks.engine(),
     getBlobs: (tokenIds) => deps.storagePort.getBlobs(tokenIds),
     changed: () => deps.emit('inventory:updated', {}),
+    holders,
+    track: hooks.track,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
 }
@@ -339,14 +352,14 @@ function buildMachineDeps(
 function buildReceive(
   deps: PaymentsFacadeDeps,
   hooks: FacadeHooks,
-  parts: { historyStore: History; heldStates: HeldStateCache; verdicts: TokenVerdicts },
+  parts: { historyStore: History; heldStates: HeldStateCache; verdicts: TokenVerdicts; claims: WalletCoinClaims },
   refreshView: () => void
 ): Receive {
-  const { historyStore, heldStates, verdicts } = parts;
+  const { historyStore, heldStates, verdicts, claims } = parts;
   return new Receive({
     delivery: deps.deliveryPort,
     engine: () => hooks.engine(),
-    claims: deps.claims ?? new CoinClaims(),
+    claims,
     accepted: (token) => verdicts.accept(token),
     view: {
       heldState: (tokenId) => heldStates.get(tokenId) ?? null,
