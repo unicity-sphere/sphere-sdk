@@ -61,6 +61,7 @@ const KEEP_OPEN_CODES = new Set([
 export interface IntentApi {
   put(transferId: string, envelope: string, requiresSeedClose: boolean): Promise<void>;
   listOpen(): Promise<{ transferId: string; payload: string; createdAt: string }[]>;
+  listAborted(): Promise<{ transferId: string }[]>;
   abort(transferId: string): Promise<void>;
   complete(transferId: string, signature?: string): Promise<void>;
 }

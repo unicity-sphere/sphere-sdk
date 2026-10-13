@@ -405,6 +405,9 @@ function makeIntents(w: WorldState): IntentApi {
       const intents = await w.api.listIntents(w.caller, 'open');
       return intents.map((i) => ({ transferId: i.transferId, payload: i.payload, createdAt: i.createdAt }));
     },
+    async listAborted() {
+      return (await w.api.listIntents(w.caller, 'aborted')).map((i) => ({ transferId: i.transferId }));
+    },
     async abort(transferId) {
       w.log.push('abortIntent');
       if (w.overrides.abort) await w.overrides.abort();

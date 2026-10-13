@@ -126,17 +126,14 @@ async function confirmUnconfirmed(
     try {
       await deps.intents.put(id, entry.payloadEnvelope, entry.requiresSeedClose);
     } catch (err) {
-      const dropped =
-        isNeverStorable(err) &&
-        !(await listedNow(deps, id)) &&
-        (await releaseOwed(stores, entry)
-          .then(() => stores.backstop.removeIfUnchanged(id, entry))
-          .catch(() => false));
-      if (dropped) {
+      const verdict = isNeverStorable(err) ? await judgeRefusedHold(deps, id) : 'unknown';
+      const ended = verdict !== 'unknown' && (await endHold(stores, entry, verdict === 'completed').catch(() => false));
+      if (ended) {
         view.locals.delete(id);
         view.onHoldEnded(id);
       }
-      (dropped ? report.conflicted : report.failed).push(id);
+      if (!ended) report.failed.push(id); // completed elsewhere: unaccounted, so a linked request reads paid
+      else if (verdict !== 'completed') report.conflicted.push(id);
       continue;
     }
     await unflag(stores, view.locals, entry);
@@ -147,9 +144,23 @@ async function confirmUnconfirmed(
   return confirmed;
 }
 
-/** #835: a 413/422 says nothing about a held send's earlier ambiguous PUT; a listing taken after it does. */
-async function listedNow(deps: MachineDeps, transferId: string): Promise<boolean> {
-  return (await deps.intents.listOpen().catch(() => [{ transferId }])).some((i) => i.transferId === transferId);
+/** #835: a 413/422 says nothing of a held send's earlier PUT (a mixed fleet may have stored it): an open
+ *  row is kept for the next pass; else the abort probes it — 404 never stored, aborted, or completed. */
+async function judgeRefusedHold(deps: MachineDeps, id: string): Promise<'unknown' | 'refused' | 'completed'> {
+  try {
+    if ((await deps.intents.listOpen()).some((i) => i.transferId === id)) return 'unknown';
+    await deps.intents.abort(id);
+  } catch (err) {
+    return isUnknownIntent(err) ? 'refused' : 'unknown';
+  }
+  const aborted = await deps.intents.listAborted().catch(() => null);
+  if (aborted === null) return 'unknown';
+  return aborted.some((i) => i.transferId === id) ? 'refused' : 'completed';
+}
+
+async function endHold(stores: MachineStores, entry: IntentBackstopEntry, paid: boolean): Promise<boolean> {
+  await (paid ? settleOwed(stores, entry) : releaseOwed(stores, entry));
+  return stores.backstop.removeIfUnchanged(entry.transferId, entry);
 }
 
 /** Best-effort: on a failed write the hold stays in memory and the next pass tries again. */

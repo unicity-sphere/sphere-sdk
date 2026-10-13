@@ -2650,8 +2650,8 @@
     "name": "confirm-422-reported-failed",
     "note": "#835: a held intent refused 413/422 on its re-PUT never ran — reported conflicted so a payment link reverts",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "      (dropped ? report.conflicted : report.failed).push(id);",
-    "replace": "      report.failed.push(id);",
+    "find": "      else if (verdict !== 'completed') report.conflicted.push(id);",
+    "replace": "      else if (verdict === 'completed') report.conflicted.push(id);",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
@@ -3119,8 +3119,8 @@
     "name": "confirm-drop-forgets-owed",
     "note": "#835: a held attempt the ensure step drops on a 413/422 hands what it owed back to the shortfall store before its entry goes (send-intent-unknown.test.ts '(x-refused)...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "        (await releaseOwed(stores, entry)\n          .then(() => stores.backstop.removeIfUnchanged(id, entry))",
-    "replace": "        (await Promise.resolve()\n          .then(() => stores.backstop.removeIfUnchanged(id, entry))",
+    "find": "  await (paid ? settleOwed(stores, entry) : releaseOwed(stores, entry));",
+    "replace": "  await (paid ? settleOwed(stores, entry) : Promise.resolve());",
     "tests": [
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
     ]
@@ -3206,11 +3206,41 @@
     ]
   },
   {
-    "name": "ensure-drop-trusts-snapshot",
-    "note": "#835: a held send's 413/422 re-PUT drops it only when a listing taken after that answer still shows no row; trusting the pass's earlier snapshot, a row a mixed fleet stored meanwhile is dropped, its sources released and a linked request made payable while the intent can still run (machine-resume.test.ts 'a 413/422 on the re-PUT does not drop a held send whose row a listing taken after it shows...')",
+    "name": "refused-hold-trusts-closed-listing",
+    "note": "#835: a held send's 413/422 re-PUT never probes a row that is still open: kept, the next pass resumes it; probed, the abort cancels an intent a mixed fleet stored and the send is reported conflicted (machine-resume.test.ts 'a 413/422 on the re-PUT does not drop a held send whose row a listing taken after it shows...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "        !(await listedNow(deps, id)) &&\n",
-    "replace": "        true &&\n",
+    "find": "    if ((await deps.intents.listOpen()).some((i) => i.transferId === id)) return 'unknown';\n",
+    "replace": "    // mutant: an open row is probed too\n",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "refused-hold-assumes-refused",
+    "note": "#835: a row absent from the open listing may have completed on another device; read as refused, an already-paid request is made payable again (machine-resume.test.ts 'a 413/422 on the re-PUT of a held send another device completed...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  return aborted.some((i) => i.transferId === id) ? 'refused' : 'completed';",
+    "replace": "  return aborted.length >= 0 ? 'refused' : 'completed';",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "refused-hold-probe-failure-refuses",
+    "note": "#835: only a 404 NOT_FOUND from the abort probe proves no row; any other failure keeps the hold (machine-resume.test.ts 'a 413/422 on the re-PUT whose abort probe fails keeps the hold')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    return isUnknownIntent(err) ? 'refused' : 'unknown';",
+    "replace": "    return 'refused';",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "completed-hold-releases",
+    "note": "#835: a hold another device completed paid what it held: its rows are settled, never handed back as owed (machine-resume.test.ts 'a 413/422 on the re-PUT of a held send another device completed...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  await (paid ? settleOwed(stores, entry) : releaseOwed(stores, entry));",
+    "replace": "  await (paid ? releaseOwed(stores, entry) : releaseOwed(stores, entry));",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]

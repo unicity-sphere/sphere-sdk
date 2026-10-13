@@ -462,10 +462,15 @@ Normative behaviors bound into the transitions (not call sites):
   already lists as open just loses its marker and resumes in that pass. Otherwise, when only memory
   held it (its `'unconfirmed'` write failed), the hold is re-persisted first, so a restart finds it
   held; then its stored envelope is re-PUT. A 2xx turns it into an ordinary open intent, which
-  that same pass resumes under the same `transferId` with the same bytes; a 413/422 drops it and
-  reports it conflicted, so a linked request reverts to payable, because nothing ever ran — but
-  only when a listing taken after that answer still shows no row, since the 413/422 says nothing
-  about the earlier ambiguous PUT a mixed fleet may have stored; any other answer keeps it held. A confirmed row (listed, or a 2xx re-PUT) or a dropped hold ends the
+  that same pass resumes under the same `transferId` with the same bytes. A 413/422 says nothing
+  about the earlier ambiguous PUT, which a mixed fleet may have stored and another device may have
+  run, so it ends the hold only after a probe: a row a fresh listing still shows open is kept (the
+  next pass resumes it); otherwise the client aborts the id. `404 NOT_FOUND` means no row was ever
+  stored, and an aborted row will never run: either way the hold is dropped and reported
+  conflicted, so a linked request reverts to payable (its held shortfall rows are owed again). A
+  row the abort leaves out of the aborted listing completed elsewhere: the hold ends as paid (its
+  held rows settled) and stays unaccounted, which a linked request reads as paid. Any other answer,
+  or a failed probe, keeps it held. A confirmed row (listed, or a 2xx re-PUT) or a dropped hold ends the
   in-memory park (`onHoldEnded`). A held entry is never swept, and a linked request stays
   `settling` while it is held. The re-seed skips every entry whose PUT
   was never acked (`intentPut` set), because only an acked intent can have certified anything, while
@@ -807,8 +812,8 @@ optional field, `intentPut?: 'pending' | 'unconfirmed'`:
   crash and S1 semantics are those of an `'open'` entry.
 - **`'unconfirmed'`** marks a parked send (§5.5 E.3): the PUT outcome stayed unknown and `send()`
   reported `SEND_SYNC_PENDING`. Every resume pass re-PUTs `payloadEnvelope` before anything else
-  and never sweeps the entry. The marker is cleared on a 2xx, and the entry is dropped only on a
-  413/422 with no row in a listing taken after it.
+  and never sweeps the entry. The marker is cleared on a 2xx; only a 413/422 can end the hold, and
+  only after the probe above (§5.5 E.3).
 - **Absent:** the PUT was acked, or an older client wrote the entry.
 
 Both marker writes are best-effort, and each failure leaves a known, bounded residual. If the park

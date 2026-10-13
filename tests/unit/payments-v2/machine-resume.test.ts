@@ -597,6 +597,65 @@ describe('resume confirms a parked intent before it resumes or sweeps anything (
     expect(w.deposits.map((d) => d.transferId)).toEqual([plan.transferId]);
   });
 
+  /** A held send whose earlier PUT a task with another cap stored; its re-PUT is now refused 422. */
+  async function refusedHoldWithRow(w: World): Promise<IntentBackstopEntry> {
+    const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+    const entry = await parkSend(w, plan);
+    await w.api.putIntent(w.caller, { transferId: entry.transferId, payload: entry.payloadEnvelope });
+    w.overrides.putIntent = async () => {
+      throw new ValidationFailedError('payload refused');
+    };
+    return entry;
+  }
+
+  it('a 413/422 on the re-PUT of a held send another device completed ends the hold as paid: removed, never conflicted', async () => {
+    const w = makeWorld();
+    const entry = await refusedHoldWithRow(w);
+    await w.api.completeIntent(w.caller, { transferId: entry.transferId });
+    // It held a remainder, and a failed removal left a copy of that row in the shortfall store.
+    const owed = { transferId: 'earlier', remainingAmount: '400', coinId: COIN, recipient: 'aa', committedTokenIds: [], createdAt: 1 };
+    await w.stores().backstop.patch(entry.transferId, (e) => ({ ...e, owes: [owed] }));
+    await w.stores().shortfalls.upsert(owed);
+
+    const report = await resumeAll(w.deps);
+
+    expect(report, 'unaccounted: a linked request reads it paid').toEqual({ resumed: [], conflicted: [], failed: [] });
+    expect(await w.stores().backstop.getByKey(entry.transferId)).toBeUndefined();
+    expect(await w.stores().shortfalls.getByKey('earlier'), 'what it held was paid').toBeUndefined();
+    expect(w.api.inspectIntent(w.caller, entry.transferId)?.status).toBe('completed');
+  });
+
+  it('a 413/422 on the re-PUT of a held send whose row is aborted ends the hold as refused: conflicted, its rows owed again', async () => {
+    const w = makeWorld();
+    const entry = await refusedHoldWithRow(w);
+    await w.api.abortIntent(w.caller, entry.transferId);
+    const owed = { transferId: 'earlier', remainingAmount: '400', coinId: COIN, recipient: 'aa', committedTokenIds: [], createdAt: 1 };
+    await w.stores().backstop.patch(entry.transferId, (e) => ({ ...e, owes: [owed] }));
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [entry.transferId], failed: [] });
+    expect(await w.stores().backstop.getByKey(entry.transferId)).toBeUndefined();
+    expect((await w.stores().shortfalls.getByKey('earlier'))?.remainingAmount).toBe('400');
+  });
+
+  it('a 413/422 on the re-PUT whose abort probe fails keeps the hold', async () => {
+    const w = makeWorld();
+    const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+    await parkSend(w, plan);
+    w.overrides.putIntent = async () => {
+      throw new ValidationFailedError('payload refused');
+    };
+    w.overrides.abort = async () => {
+      throw new FakeApiError(503, 'UNAVAILABLE', 'intent store down');
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [plan.transferId] });
+    expect((await w.stores().backstop.getByKey(plan.transferId))?.intentPut).toBe('unconfirmed');
+  });
+
   it('a parked entry whose row already exists is unflagged without a re-PUT and resumed in the same pass', async () => {
     const w = makeWorld();
     const token = await w.seed(1000n);

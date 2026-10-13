@@ -346,6 +346,7 @@ function buildMachineDeps(
       put: (transferId, envelope, requiresSeedClose) =>
         deps.client.putIntent(transferId, envelope, requiresSeedClose),
       listOpen: () => deps.client.listIntents('open'),
+      listAborted: () => deps.client.listIntents('aborted'),
       abort: (transferId) => deps.client.abortIntent(transferId),
       complete: (transferId, signature) => deps.client.completeIntent(transferId, signature),
     },
