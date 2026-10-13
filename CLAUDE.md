@@ -554,8 +554,9 @@ version:
   it; it is possibly-committed only because another device of the wallet could still run the open
   row, and a linked payment request stays `settling` until the abort is confirmed, then turns
   payable. `PartialSendConflictError.remainingAmount` can be `'0'`: a later attempt that will still
-  be sent owns the rest — never one being cancelled, which keeps the shortfall rows and reports
-  the owed remainder. Accepted residual: until the abort is confirmed, another device of the
+  be sent owns the rest and holds the send's earlier shortfall rows on its backstop entry (handed
+  back, owed again, if it is refused) — never one being cancelled, which keeps the shortfall rows
+  and reports the owed remainder. Accepted residual: until the abort is confirmed, another device of the
   wallet can still resume and complete that attempt, so a remainder re-planned in that window can
   be paid twice (closing it needs server-side exclusivity). Reporting `'0'` would not close the
   race — the other device may already have certified before the abort lands — and would turn it
@@ -1067,7 +1068,7 @@ authoritative for build success.
   Being self-prefixed with the network, it never rides the legacy `isNetworkScopedAddressKey`
   mechanism (which still guards the remaining
   chat/identity keys in the platform storage providers).
-- **The backstop's one optional field, `intentPut?: 'pending' | 'unconfirmed'` (#835).**
+- **The backstop's optional fields (#835): `intentPut?: 'pending' | 'unconfirmed'`, and `owes`.**
   `'pending'` is written with the entry before the first intent PUT and cleared on a 2xx (the
   epoch re-seed never re-PUTs it); `'unconfirmed'` marks a parked send that every resume pass
   re-PUTs first and never sweeps; absent = acked, or written by an older client. A park whose
@@ -1079,7 +1080,11 @@ authoritative for build success.
   `'open'` entry (accepted downgrade window: it may sweep a held send whose PUT never landed —
   an under-payment, never a double pay). Every backstop GC removal is compare-and-delete
   (`ListStore.removeIfUnchanged`), and a tombstone is removed only after the server answers its
-  abort 2xx or 404 `NOT_FOUND`.
+  abort 2xx or 404 `NOT_FOUND`, and is then reported `conflicted` (a linked request is payable
+  again). A second optional field, `owes?: ShortfallEntry[]`, carries the #690 shortfall rows a
+  later attempt of a partial send holds (see the error contract above); an older client ignores it,
+  so on a downgrade a held remainder is recorded nowhere — again an under-payment, never a double
+  pay.
 - **The `pv2:` → `pv2g2:` rename IS the 3.x local migration** (`modules/payments-v2/stores.ts`;
   `sweepSupersededState()` clears the old prefix once per composition, from
   `core/payments-v2-wiring.ts`). Not hygiene — money-critical: the sync-epoch latch lives in that

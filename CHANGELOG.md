@@ -46,6 +46,11 @@ What changed:
   so a link whose send is held or being cancelled is never resolved paid; when that read fails, only
   the reconcile is skipped. A listener that throws (an `emit` that rethrows) is logged and
   can no longer turn a delivered send into a rejection.
+- A later attempt that owns a partial send's remainder (`remainingAmount: '0'`) holds the send's
+  earlier shortfall rows on its intent entry. If it is refused (a 413/422 on its re-PUT, a conflict
+  on resume), the rows come back and the remainder is owed again. A cancel the service confirms
+  with `404 NOT_FOUND` (its row gone, as after a database restore) is reported conflicted, so a
+  linked payment request becomes payable again, never resolved paid.
 - Behaviour changes for integrators:
   - `SEND_SYNC_PENDING` also means "held, not sent yet": the send goes out automatically, possibly
     much later, and cannot be cancelled;
@@ -62,7 +67,9 @@ What changed:
     would not close that race, since the other device may already have certified before the cancel
     lands, and would turn it into a permanent, unsignalled under-payment;
   - the `sync:pending` attention code is no longer emitted.
-- The backstop store gains one optional field, which older clients read as an ordinary open entry.
+- The backstop store gains two optional fields. An older client reads an entry flagged `intentPut`
+  as an ordinary open entry and ignores `owes`, so a downgrade can lose a held remainder: an
+  under-payment, never a double pay.
 
 How it was verified:
 

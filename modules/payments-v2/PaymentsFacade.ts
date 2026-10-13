@@ -39,7 +39,7 @@ import type { ReservationLedger } from './select/ledger';
 import type { IntentPins } from './select/pins';
 import type { BurnHold } from './burn-hold';
 import type { SpendQueue, PlannedSpend } from './select/queue';
-import type { MachineStores } from './machine/journal';
+import { holdShortfalls, type MachineStores } from './machine/journal';
 import { buildOps, classifyError, type MachineDeps, type MachinePlan, type TransferMachine } from './machine/TransferMachine';
 import { buildPayload, messageOf } from './machine/payload';
 import {
@@ -563,11 +563,11 @@ export class PaymentsFacade implements PaymentsV2 {
     return { kind: 'partial', entry: outcome.partial, deliveryPending: outcome.deliveryPending, final: !outcome.closed };
   }
 
-  /** #835: a possibly-committed latest attempt owns the remainder — the send's earlier shortfall rows are
-   *  superseded, its certified legs join the delivered set — unless it is being cancelled: the rows stay. */
+  /** #835: a possibly-committed latest attempt owns the remainder — it holds the send's earlier shortfall
+   *  rows, its certified legs join the delivered set — unless it is being cancelled: the rows stay owed. */
   private async surfaceFailure(err: unknown, run: SendRun, ctx: AttemptCtx): Promise<unknown> {
     if (run.delivered.length === 0 || !isPossiblyCommittedSendOutcome(err) || isCancelUnconfirmed(err)) return partialize(err, run);
-    for (const id of run.settledShortfalls.splice(0)) await this.machineStores.shortfalls.removeByKey(id).catch(() => undefined);
+    await holdShortfalls(this.machineStores, run.settledShortfalls.splice(0), ctx.transferId).catch(() => undefined);
     return partialize(err, run, this.machine.certifiedSourcesOf(ctx.plan));
   }
 

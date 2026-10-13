@@ -279,8 +279,10 @@ export async function derivePendingTransfers(
     seen.add(transferId);
     out.push(journalOnlyRow(transferId, entries));
   }
+  // #835: a row a later attempt holds is listed as that attempt's open row, never as owed.
+  const held = new Set(backstop.flatMap((entry) => (entry.owes ?? []).map((row) => row.transferId)));
   for (const entry of shortfalls) {
-    if (!seen.has(entry.transferId)) out.push(shortfallRow(entry));
+    if (!seen.has(entry.transferId) && !held.has(entry.transferId)) out.push(shortfallRow(entry));
   }
   return out;
 }

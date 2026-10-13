@@ -36,7 +36,7 @@
 > clean failure, which a caller following the contract paid again. The E.3 PUT is now a
 > confirm-or-park gate (§5.5), and "clean" now means fenced on this device (§4, §5.5 E.2). `run()`
 > applies only a fully settled attempt, and the #690 shortfall is durable before ANY apply (§5.5
-> Amendment). The backstop entry gains one optional field (§6). Each resume pass confirms held sends
+> Amendment). The backstop entry gains two optional fields (§6). Each resume pass confirms held sends
 > before its GC, which now verifies tombstones with the server (§7). Appendix A carries the new rules.
 
 ## Progress
@@ -536,10 +536,11 @@ Normative behaviors bound into the transitions (not call sites):
   - **`remainingAmount` `'0'`:** when the latest attempt is possibly-committed after earlier
     partials and will still be sent, `PartialSendConflictError.remainingAmount` is `'0'`. The
     remainder rides that still-open attempt: its error is `cause`, carrying its `transferId`, and
-    `committedTokenIds` also lists its certified sources. The send's earlier shortfall rows are
-    dropped, because the open attempt owns the remainder. Accepted window: when that attempt is
-    itself dropped later (a conflict on resume, or a 413/422 on its ensure re-PUT), the remainder
-    is recorded nowhere — an under-payment, never a double pay.
+    `committedTokenIds` also lists its certified sources. The open attempt owns the remainder, so
+    it holds the send's earlier shortfall rows: they move onto its backstop entry (`owes`) and
+    `pendingTransfers()` lists only its `'open'` row. They go with the entry once it completes. If
+    it is refused instead (a conflict on resume, or a 413/422 on its ensure re-PUT), they return to
+    the shortfall store before its entry is removed, so the remainder is owed again.
   - **A latest attempt being cancelled owns nothing:** its tombstone is written and its abort is
     unconfirmed, so this device never sends it. `remainingAmount` is the owed remainder, `cause`
     is that attempt's `SEND_SYNC_PENDING` (with its `transferId`), and the earlier shortfall rows
@@ -818,6 +819,15 @@ itself is never treated as held: a refused send whose backstop removal failed al
 `'pending'`, and re-PUTing that one would run a send already reported clean. If the clear after a
 2xx fails, the stale `'pending'` only makes a later re-seed skip that entry, so after a backend
 reset the intent's row is not restored.
+
+**Held shortfalls (#835).** The second optional field, `owes?: ShortfallEntry[]`, carries the
+#690 shortfall rows that a possibly-committed later attempt of a partial send now owns
+(`remainingAmount: '0'`, §5.5). The facade moves them onto that attempt's entry instead of
+deleting them: `pendingTransfers()` lists only the attempt's `'open'` row, the rows go with the
+entry once the attempt completes, and both refusal paths (a 413/422 on the ensure re-PUT, a
+conflict on resume) hand them back to the shortfall store before removing the entry. A row left in
+both places by a failed removal is listed once, as the attempt. An older client ignores the field,
+so a downgrade can lose a held remainder: an under-payment, never a double pay.
 
 There is no new disposition, no new `STORE_KEYS` entry and no prefix change, so an older client
 reads either value as an ordinary `'open'` entry and never as an abort. **Downgrade window

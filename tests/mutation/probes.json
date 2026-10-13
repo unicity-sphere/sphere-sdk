@@ -2512,9 +2512,9 @@
   },
   {
     "name": "surface-keeps-stale-shortfall",
-    "note": "#835: a possibly-committed latest attempt owns the remainder, so the run's earlier shortfall rows go; one left behind invites a re-pay of what is still settling (send-intent-unknown.test.ts '(k) a re-plan attempt left open...')",
+    "note": "#835: a possibly-committed latest attempt owns the remainder, so the run's earlier shortfall rows move onto its entry; one left behind as owed invites a re-pay of what is still settling (send-intent-unknown.test.ts '(k) a re-plan attempt left open...')",
     "file": "modules/payments-v2/PaymentsFacade.ts",
-    "find": "    for (const id of run.settledShortfalls.splice(0)) await this.machineStores.shortfalls.removeByKey(id).catch(() => undefined);",
+    "find": "    await holdShortfalls(this.machineStores, run.settledShortfalls.splice(0), ctx.transferId).catch(() => undefined);",
     "replace": "    void run.settledShortfalls;",
     "tests": [
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
@@ -2588,8 +2588,8 @@
     "name": "dropstale-active-after-tombstone",
     "note": "#835: the in-process check runs BEFORE the tombstone branch (HEAD ran it after), so a pass never aborts or drops the tombstone of an attempt still running here (machine-resume.test.ts 'a tombstone of an in-process attempt is untouched...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      try {\n        await intents.abort(id);\n      } catch (err) {\n        if (!isUnknownIntent(err)) continue;\n      }\n      await stores.backstop.removeIfUnchanged(id, entry);\n      continue;\n    }\n",
-    "replace": "    if (view.openIds.has(id)) continue;\n    if (entry.disposition !== 'open') {\n      try {\n        await intents.abort(id);\n      } catch (err) {\n        if (!isUnknownIntent(err)) continue;\n      }\n      await stores.backstop.removeIfUnchanged(id, entry);\n      continue;\n    }\n    if (view.isLocallyActive(id)) continue;\n",
+    "find": "    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      try {\n        await intents.abort(id);\n      } catch (err) {\n        if (!isUnknownIntent(err)) continue;\n      }\n      // A confirmed cancel of an attempt that certified nothing: conflicted, so a link to it is payable again.\n      if (await stores.backstop.removeIfUnchanged(id, entry)) report.conflicted.push(id);\n      continue;\n    }\n",
+    "replace": "    if (view.openIds.has(id)) continue;\n    if (entry.disposition !== 'open') {\n      try {\n        await intents.abort(id);\n      } catch (err) {\n        if (!isUnknownIntent(err)) continue;\n      }\n      // A confirmed cancel of an attempt that certified nothing: conflicted, so a link to it is payable again.\n      if (await stores.backstop.removeIfUnchanged(id, entry)) report.conflicted.push(id);\n      continue;\n    }\n    if (view.isLocallyActive(id)) continue;\n",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
@@ -3103,6 +3103,56 @@
     "replace": "    for (const stream of ALL_STREAMS) await deps.kv.remove(STORE_KEYS.streamCursor(stream));\n    await deps.fullRePull();\n  } finally {\n    deps.onReseedEnd?.();\n  }\n",
     "tests": [
       "tests/unit/payments-v2/restore.test.ts"
+    ]
+  },
+  {
+    "name": "surface-drops-held-shortfall",
+    "note": "#835: the rows a held later attempt owns move onto its entry instead of being deleted; deleted, a hold later refused (413/422) or conflicted leaves the remainder recorded nowhere while the caller was told '0' (send-intent-unknown.test.ts '(x-refused)...' + '(x-conflict)...')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    await holdShortfalls(this.machineStores, run.settledShortfalls.splice(0), ctx.transferId).catch(() => undefined);",
+    "replace": "    for (const id of run.settledShortfalls.splice(0)) await this.machineStores.shortfalls.removeByKey(id).catch(() => undefined);",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "confirm-drop-forgets-owed",
+    "note": "#835: a held attempt the ensure step drops on a 413/422 hands what it owed back to the shortfall store before its entry goes (send-intent-unknown.test.ts '(x-refused)...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "        (await releaseOwed(stores, entry)\n          .then(() => stores.backstop.removeIfUnchanged(id, entry))",
+    "replace": "        (await Promise.resolve()\n          .then(() => stores.backstop.removeIfUnchanged(id, entry))",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-forgets-owed",
+    "note": "#835: a held attempt that conflicts on resume hands what it owed back to the shortfall store before its entry goes (send-intent-unknown.test.ts '(x-conflict)...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      await releaseOwed(stores, await stores.backstop.getByKey(transferId)); // #835: its remainder is owed again\n",
+    "replace": "      // mutant: what it owed is not handed back\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "pending-lists-held-shortfall",
+    "note": "#835: a shortfall row a later attempt holds is listed as that attempt's open row, never also as owed, even when its removal from the shortfall store failed (send-intent-unknown.test.ts '(x-listed-once)...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    if (!seen.has(entry.transferId) && !held.has(entry.transferId)) out.push(shortfallRow(entry));",
+    "replace": "    if (!seen.has(entry.transferId)) out.push(shortfallRow(entry));",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "gc-cancel-unreported",
+    "note": "#835: a tombstone whose abort the server confirms (2xx, or 404 NOT_FOUND after a restore that lost the row) is reported conflicted; unreported, its payment link reads unaccounted with no server row and resolves paid for nothing (send-intent-unknown.test.ts '(y)...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      if (await stores.backstop.removeIfUnchanged(id, entry)) report.conflicted.push(id);",
+    "replace": "      await stores.backstop.removeIfUnchanged(id, entry);",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
     ]
   }
 ]

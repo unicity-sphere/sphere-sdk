@@ -1247,8 +1247,9 @@ the wallet service has not confirmed yet (#835), is an `'open'` row with no cert
 attempt being cancelled (#835: it failed, and the service has not confirmed the cancel) is not
 listed: this device will never send it, although another device of the same wallet could still
 complete it until the cancel is confirmed. After a `PartialSendConflictError` with `remainingAmount: '0'`, the
-attempt still sending the rest is an `'open'` row, and that send has no `'shortfall'` row; with any
-other `remainingAmount`, the `'shortfall'` row carries it.
+attempt still sending the rest is an `'open'` row, and that send has no `'shortfall'` row while that
+attempt can still pay; if it is refused instead, the `'shortfall'` row with the remainder comes
+back. With any other `remainingAmount`, the `'shortfall'` row carries it.
 
 ```typescript
 interface PendingTransfer {

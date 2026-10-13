@@ -803,6 +803,11 @@ export class FakeWalletApi {
     return { status: intent.status, requiresSeedClose: intent.requiresSeedClose, payload: intent.payload };
   }
 
+  /** Test-only: the row is gone, as after a database restore to a snapshot taken before it existed. */
+  forgetIntent(caller: FakeCaller, transferId: string): void {
+    this.intents.get(ownerIdOf(caller))?.delete(transferId);
+  }
+
   /** Test-inspection only — removalClass is not on the list wire (server exposes it via 409 behavior). */
   inspectInventoryRow(
     caller: FakeCaller,

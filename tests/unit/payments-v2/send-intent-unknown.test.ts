@@ -34,7 +34,7 @@ import type {
   SplitResult,
   TransferParams,
 } from '../../../token-engine';
-import { CheckpointPersistFailedError, ProofUnconfirmedError } from '../../../token-engine/errors';
+import { CheckpointPersistFailedError, ProofUnconfirmedError, TransferConflictError } from '../../../token-engine/errors';
 import * as MESSAGES from '../../../modules/payments-v2/send-errors';
 import type { MachineStores } from '../../../modules/payments-v2/machine/journal';
 import { STORE_KEYS, type IntentBackstopEntry, type ShortfallEntry } from '../../../modules/payments-v2/stores';
@@ -2076,6 +2076,159 @@ describe('#835 (v) after a partial, the re-plan attempt fails and its cancel is 
     await world.facade.resumeNow();
     await flushTail();
     expect((await receipts(world)).amount).toBe(1000n);
+  });
+});
+
+// ── (x) after a partial, the re-plan attempt is held ───────────────────────
+
+/** A named source answers a conflict for its next `n` transfers; later ones go through. */
+class ConflictingEngine extends RealizationEngine {
+  readonly conflicts = new Map<string, number>();
+
+  override async transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken> {
+    const id = params.token.blob.tokenId;
+    const left = this.conflicts.get(id) ?? 0;
+    if (left > 0) {
+      this.conflicts.set(id, left - 1);
+      throw new TransferConflictError('source already spent (simulated)');
+    }
+    return super.transfer(params, options);
+  }
+}
+
+describe('#835 (x) after a partial, the re-plan attempt is held: it holds the shortfall until it pays or is refused', () => {
+  /**
+   * 600 of 1000 delivered, the 400 leg conflicted; the re-plan attempt for the 400 (which picks
+   * the same source again: a partial's conflicted source is not demoted) is held, every PUT of it
+   * unanswered. `spent` decides whether that source really is spent, or only lost its first races.
+   */
+  async function heldRemainder(spent: boolean): Promise<{ world: World; held: string }> {
+    const engine = new ConflictingEngine({ chainPubkey: hexToBytes(OWN_PUB) });
+    const world = makeWorld({ engine });
+    await world.seed(600n);
+    const contested = await world.seed(400n);
+    if (spent) await engine.foreignSpend(contested);
+    else engine.conflicts.set(contested.blob.tokenId, 2); // the attempt, then its in-process converge
+    await startSettled(world);
+    world.hooks.putIntent = async () => {
+      if (world.putCalls[world.putCalls.length - 1]?.transferId !== 'tid-1') throw unavailable();
+    };
+
+    const err = rejectionOf(await settle(world.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN })));
+    await flushTail();
+
+    expect(err, describeError(err)).toBeInstanceOf(PartialSendConflictError);
+    const partial = err as PartialSendConflictError;
+    expect(partial.remainingAmount, 'the held attempt owns the remainder').toBe('0');
+    expectMessage(partial.cause, 'INTENT_UNCONFIRMED_MESSAGE');
+    const held = (partial.cause as SphereError).transferId!;
+    expect(shortfallOf(world, 'tid-1'), 'the row moved onto the held attempt').toBeUndefined();
+    expect(backstopOf(world, held)?.owes?.map((row) => [row.transferId, row.remainingAmount])).toEqual([['tid-1', '400']]);
+    const pending = await world.facade.pendingTransfers();
+    expect(pending.map((p) => [p.transferId, p.kind]), 'listed once, as the attempt that may still pay it').toEqual([[held, 'open']]);
+    return { world, held };
+  }
+
+  async function expectOwedAgain(world: World, held: string): Promise<void> {
+    expect(backstopOf(world, held)).toBeUndefined();
+    expect(shortfallOf(world, 'tid-1')?.remainingAmount, 'the remainder is owed again').toBe('400');
+    const pending = await world.facade.pendingTransfers();
+    expect(pending.map((p) => [p.transferId, p.kind, p.amount])).toEqual([['tid-1', 'shortfall', '400']]);
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 600n });
+  }
+
+  it('(x-listed-once) a row whose removal failed after the hold is listed once, as the held attempt', async () => {
+    const engine = new ConflictingEngine({ chainPubkey: hexToBytes(OWN_PUB) });
+    const world = makeWorld({ engine });
+    await world.seed(600n);
+    await engine.foreignSpend(await world.seed(400n));
+    await startSettled(world);
+    world.hooks.putIntent = async () => {
+      if (world.putCalls[world.putCalls.length - 1]?.transferId !== 'tid-1') throw unavailable();
+    };
+    const set = world.kv.set.bind(world.kv);
+    world.kv.set = async <T>(key: string, value: T): Promise<void> => {
+      const rows = key === STORE_KEYS.shortfalls ? (value as unknown as ShortfallEntry[]) : null;
+      if (rows !== null && shortfallOf(world, 'tid-1') !== undefined && !rows.some((row) => row.transferId === 'tid-1')) {
+        throw new Error('injected shortfall removal failure');
+      }
+      return set(key, value);
+    };
+
+    const err = rejectionOf(await settle(world.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN })));
+    await flushTail();
+
+    const held = ((err as PartialSendConflictError).cause as SphereError).transferId!;
+    expect(shortfallOf(world, 'tid-1'), 'the removal failed: the row is in both places').toBeDefined();
+    expect(backstopOf(world, held)?.owes?.map((row) => row.transferId)).toEqual(['tid-1']);
+    const pending = await world.facade.pendingTransfers();
+    expect(pending.map((p) => [p.transferId, p.kind]), 'never also listed as owed').toEqual([[held, 'open']]);
+  });
+
+  it('(x-paid) once the service confirms it, it pays the remainder and the row goes with it', async () => {
+    const { world, held } = await heldRemainder(false);
+    delete world.hooks.putIntent;
+
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(serverIntent(world, held)).toBe('completed');
+    expect((await receipts(world)).amount).toBe(1000n);
+    expect(shortfallOf(world, 'tid-1')).toBeUndefined();
+    expect(await world.facade.pendingTransfers()).toEqual([]);
+  });
+
+  it('(x-refused) a 413/422 on its re-PUT drops it, and the remainder is owed again', async () => {
+    const { world, held } = await heldRemainder(true);
+    world.hooks.putIntent = async () => {
+      throw new WalletApiHttpError(422, 'VALIDATION_FAILED', 'intent payload refused');
+    };
+
+    await world.facade.resumeNow();
+    await flushTail();
+
+    await expectOwedAgain(world, held);
+  });
+
+  it('(x-conflict) its source spent elsewhere, it conflicts on resume, and the remainder is owed again', async () => {
+    const { world, held } = await heldRemainder(true);
+    delete world.hooks.putIntent;
+
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(serverIntent(world, held)).toBe('aborted');
+    await expectOwedAgain(world, held);
+  });
+});
+
+// ── (y) a cancel the server confirms with 404 ──────────────────────────────
+
+describe('#835 (y) a payment being cancelled whose row the server no longer has', () => {
+  it('its abort answered 404 NOT_FOUND confirms the cancel: the request is payable again, never paid', async () => {
+    const engine = new LegFailureEngine({ chainPubkey: hexToBytes(OWN_PUB) });
+    const world = makeWorld({ engine });
+    const token = await world.seed(100n);
+    await startSettled(world);
+    const id = await incomingRequest(world, 100n);
+    engine.failSources.add(token.blob.tokenId);
+    world.hooks.abort = async () => {
+      throw new WalletApiHttpError(500, 'INTERNAL', 'POST /v1/intents/abort: internal server error');
+    };
+    const err = rejectionOf(await settle(world.facade.requests.pay(id))) as SphereError;
+    expectMessage(err, 'CANCEL_UNCONFIRMED_MESSAGE');
+    expect(requestStatus(world, id)).toBe('settling');
+
+    // A restore to a snapshot older than the intent: its row is gone, the request is not.
+    delete world.hooks.abort;
+    world.api.forgetIntent(ownCaller, err.transferId!);
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(backstopOf(world, err.transferId!), 'the tombstone goes once the server answers 404').toBeUndefined();
+    expect(requestStatus(world, id), 'nothing moved: payable again').toBe('pending');
+    expect((await requesterRow(world, id))?.status).toBe('open');
+    expect((await receipts(world)).entries).toBe(0);
   });
 });
 

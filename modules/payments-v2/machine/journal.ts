@@ -325,3 +325,16 @@ export function createMachineStores(kv: ScopedKV): MachineStores {
     shortfalls: new ListStore<ShortfallEntry>(kv, STORE_KEYS.shortfalls, (e) => e.transferId),
   };
 }
+
+/** #835: the rows move onto the holder's entry — gone with it once it completes, owed again if it is refused. */
+export async function holdShortfalls(stores: MachineStores, ids: readonly string[], holder: string): Promise<void> {
+  const rows = (await stores.shortfalls.list()).filter((row) => ids.includes(row.transferId));
+  if (rows.length === 0) return;
+  const held = await stores.backstop.patch(holder, (e) => ({ ...e, owes: [...(e.owes ?? []), ...rows] }));
+  if (held === undefined) return;
+  for (const row of rows) await stores.shortfalls.removeByKey(row.transferId);
+}
+
+export async function releaseOwed(stores: MachineStores, entry: IntentBackstopEntry | undefined): Promise<void> {
+  for (const row of entry?.owes ?? []) await stores.shortfalls.upsert(row);
+}

@@ -13,6 +13,7 @@ import {
   createMachineStores,
   isNeverStorable,
   isUnknownIntent,
+  releaseOwed,
   type MachineStores,
 } from './journal';
 import { TransferMachine, buildOps, classifyError, type IntentApi, type MachineDeps } from './TransferMachine';
@@ -71,7 +72,7 @@ export async function resumeAll(deps: MachineDeps, options: ResumeAllOptions = {
     onHoldEnded: options.onHoldEnded ?? (() => undefined),
   };
   const confirmed = await confirmUnconfirmed(deps, stores, view, report);
-  await dropStaleBackstops(deps.intents, stores, view);
+  await dropStaleBackstops(deps.intents, stores, view, report);
 
   const jobs = await gateAndDecode(deps, stores, [...open, ...confirmed], locals, report);
   const ctx: RunCtx = {
@@ -124,7 +125,11 @@ async function confirmUnconfirmed(
     try {
       await deps.intents.put(id, entry.payloadEnvelope, entry.requiresSeedClose);
     } catch (err) {
-      const dropped = isNeverStorable(err) && (await stores.backstop.removeIfUnchanged(id, entry).catch(() => false));
+      const dropped =
+        isNeverStorable(err) &&
+        (await releaseOwed(stores, entry)
+          .then(() => stores.backstop.removeIfUnchanged(id, entry))
+          .catch(() => false));
       if (dropped) {
         view.locals.delete(id);
         view.onHoldEnded(id);
@@ -177,7 +182,12 @@ async function unflag(
  * answers its abort 2xx or 404 NOT_FOUND. S1: an unflagged 'open' entry that is
  * NOT server-open with no journal legs owed is residue (completed-or-never).
  */
-async function dropStaleBackstops(intents: IntentApi, stores: MachineStores, view: LocalView): Promise<void> {
+async function dropStaleBackstops(
+  intents: IntentApi,
+  stores: MachineStores,
+  view: LocalView,
+  report: ResumeReport
+): Promise<void> {
   for (const entry of view.locals.values()) {
     const id = entry.transferId;
     if (view.openIds.has(id) || view.isLocallyActive(id)) continue;
@@ -187,7 +197,8 @@ async function dropStaleBackstops(intents: IntentApi, stores: MachineStores, vie
       } catch (err) {
         if (!isUnknownIntent(err)) continue;
       }
-      await stores.backstop.removeIfUnchanged(id, entry);
+      // A confirmed cancel of an attempt that certified nothing: conflicted, so a link to it is payable again.
+      if (await stores.backstop.removeIfUnchanged(id, entry)) report.conflicted.push(id);
       continue;
     }
     if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it
@@ -311,6 +322,7 @@ async function classifyResumeFailure(
     // never apply the foreign proof; the caller re-plans under a NEW transferId.
     try {
       await deps.intents.abort(transferId);
+      await releaseOwed(stores, await stores.backstop.getByKey(transferId)); // #835: its remainder is owed again
       await stores.backstop.removeByKey(transferId);
     } catch {
       /* retried at the next resume */
