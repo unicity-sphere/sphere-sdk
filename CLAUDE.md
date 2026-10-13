@@ -191,11 +191,14 @@ const result = await sphere.payments.send({
 // 'confirmed' with deliveryPending: true / deliveryState 'pending-delivery' (certified; the
 // mailbox deposit is retried automatically — NOT a failure). send() never resolves
 // 'completed' or 'failed' (those exist only in the TransferStatus union): failures THROW.
-// Six codes mean the money may already have left — isPossiblyCommittedSendOutcome(err) is true
-// for exactly SEND_SYNC_PENDING, CERTIFICATION_UNCONFIRMED, CHECKPOINT_PERSIST_FAILED,
+// Six codes mean the money may already have left, or will without another call (a send held
+// because wallet-api did not confirm its intent, #835) — isPossiblyCommittedSendOutcome(err) is
+// true for exactly SEND_SYNC_PENDING, CERTIFICATION_UNCONFIRMED, CHECKPOINT_PERSIST_FAILED,
 // SPLIT_CHECKPOINT_LOST, CHECKPOINT_TRUSTBASE_MISMATCH and SEND_PARTIALLY_COMPLETED. Never
-// send() again for those: a retry button calls payments.resumeNow(), and
-// payments.pendingTransfers() lists what is still converging.
+// send() again for those (they carry err.transferId): a retry button calls payments.resumeNow(),
+// and payments.pendingTransfers() lists what is still converging. A PartialSendConflictError
+// whose remainingAmount is '0' owes nothing — a later attempt still owns the rest; never re-plan.
+// false = proven clean: nothing certified, and nothing this device holds can still send it.
 // NOTE: coinId is the 64-hex coin id; get it from a symbol with getCoinIdBySymbol() (step 5).
 // The registry is presentation only.
 
@@ -523,8 +526,9 @@ version:
   ops (transfer/split), per-op progress checkpoints (field-encrypted, signed), mailbox deposit,
   signed complete (`completeSignMessage` — the server's seedGate verifies it). Resume is THE SAME
   machine replaying the SAME transferId — runs inside `facade.start()` (off critical path),
-  never re-issues a spend. A possibly-committed outcome keeps the intent OPEN (never a fresh
-  send); a clean conflict with a demoted source triggers a bounded re-plan — up to
+  never re-issues a spend. A possibly-committed outcome keeps the intent OPEN, or holds a send
+  whose PUT could not be confirmed (never a fresh send); a clean conflict with a demoted source
+  triggers a bounded re-plan — up to
   `MAX_RESELECT` (8) re-selections, none for a whole-token send (#625 marks the source
   `suspectedSpent`, excluded from selection, recoverable by resync).
 - **Receive:** continuous mailbox drain while started + explicit `receive()`. Every incoming
@@ -536,10 +540,15 @@ version:
   vs `pending-delivery` in `deliveryState`, `transfer:attention` when undeliverable/deferred.
 - **Mint:** journal-first (`mint` journal in scoped KV), idempotent same-seed re-call converges
   a replay — crash-safe without a faucet.
-- **Error contract (load-bearing, unchanged):** `CERTIFICATION_UNCONFIRMED`
-  (`ProofUnconfirmedError` with `.cause`), `SEND_SYNC_PENDING`, the checkpoint trio,
-  `SEND_PARTIALLY_COMPLETED`, `isPossiblyCommittedSendOutcome()` — callers keep PENDING_COMMIT
-  handling exactly as before; never re-issue a send after a possibly-committed reject.
+- **Error contract (load-bearing; codes unchanged, two meanings widened by #835):**
+  `CERTIFICATION_UNCONFIRMED` (`ProofUnconfirmedError` with `.cause`), `SEND_SYNC_PENDING`, the
+  checkpoint trio, `SEND_PARTIALLY_COMPLETED`, `isPossiblyCommittedSendOutcome()` — callers keep
+  PENDING_COMMIT handling exactly as before; never re-issue a send after a possibly-committed
+  reject. `SEND_SYNC_PENDING` now also means "held, not sent yet": the intent PUT stayed
+  unconfirmed, or a nothing-certified failure could not be fenced, and the converger sends it
+  later under the same transferId.
+  `PartialSendConflictError.remainingAmount` can be `'0'` (a later attempt owns the rest). The
+  `sync:pending` attention code is no longer emitted.
 - **Lifecycle:** `facade.start()`/`stop()` are Sphere-internal (init/destroy/address switch).
   The public convergence surface is `payments.pendingTransfers()` / `payments.resumeNow()` (a
   retry button calls `resumeNow()`, NEVER `send()`: a re-issued send double-pays), plus
@@ -812,13 +821,38 @@ authoritative for build success.
   signed, field-encrypted progress checkpoint; the mailbox deposit and the signed complete close
   it. A crash at ANY stage resumes the SAME transferId — never a second spend (E.2/E.4, #631,
   #676, #690).
+- **The intent PUT is a confirm-or-park gate (#835):** no engine op runs until a PUT of the
+  stored envelope answers 2xx in this process. A non-2xx is re-PUT with the SAME bytes (never
+  re-encrypted) up to twice, immediately. 413/422, or two pre-write 4xx with nothing ambiguous
+  before them, fail clean (backstop dropped, nothing to abort). Ambiguous answers (0, 408, 499,
+  5xx, non-envelope bodies) **park** the send: backstop `intentPut: 'unconfirmed'`,
+  `SEND_SYNC_PENDING` with its transferId, and every resume pass re-PUTs the stored bytes
+  (ensure) before resuming it. Only a 413/422 on that re-PUT drops it. The epoch re-seed skips
+  never-acked entries. Clean-on-refusal rests on wallet-api's rule that every 4xx from the PUT
+  is raised before any write (ARCHITECTURE §16).
+- **After a leg certifies, nothing is clean (#835):** `run()` applies only a fully settled
+  attempt. A certified leg beside an ordinary failure is `SEND_SYNC_PENDING`, with no apply and
+  no abort. The facade converges in-process ONLY after a certified CONFLICT partial (read from
+  the machine's in-memory certified set, never the backstop), and every failure of that
+  convergence is possibly-committed. The #690 shortfall is durable before ANY apply, because the
+  apply completes an unflagged intent. A nothing-certified failure is clean only when every op
+  conflicted, or when a durable abort tombstone was written AND the server confirmed the abort
+  (2xx/404) with no PUT of the id still able to land (no ambiguous gate answer, no overlapping epoch
+  re-seed); otherwise it is possibly-committed. An unconfirmed abort leaves a row another device of
+  the wallet could run, so the #676 gate reports it `conflicted` only once its abort is confirmed.
 - **Never re-issue `send()` after a possibly-committed outcome** (`isPossiblyCommittedSendOutcome()`
   is true for exactly six codes: `SEND_SYNC_PENDING`, `CERTIFICATION_UNCONFIRMED`,
   `CHECKPOINT_PERSIST_FAILED`, `SPLIT_CHECKPOINT_LOST`, `CHECKPOINT_TRUSTBASE_MISMATCH`,
-  `SEND_PARTIALLY_COMPLETED`): the intent stays OPEN and the convergence pass (`facade.start()`,
-  the heartbeat, or `payments.resumeNow()`) finishes it under the same transferId. A proven clean
-  reject or `TransferConflictError` aborts (with #625 source demotion + a bounded re-plan, up to
-  `MAX_RESELECT` = 8).
+  `SEND_PARTIALLY_COMPLETED`). Every such rejection carries `err.transferId`, except the #738
+  `Cannot spend yet` refusal of a whole-token send, which moved nothing. For the first five
+  codes the intent stays OPEN (or, for a parked send, held locally until its PUT is confirmed),
+  and the convergence pass (`facade.start()`, the heartbeat, or `payments.resumeNow()`)
+  finishes it under the same transferId. `SEND_PARTIALLY_COMPLETED` is different: the delivered
+  partial's intent is completed before the error surfaces. Its `remainingAmount` is either still
+  owed (re-plan only that, under a NEW transferId) or `'0'`, when a later attempt still open
+  under `err.cause.transferId` owns the rest (never re-plan). A proven clean failure is fenced
+  (see the gate bullets above); a nothing-certified `TransferConflictError` then demotes the
+  source (#625) and re-plans, bounded by `MAX_RESELECT` = 8.
 - Each dist bundle (root, `./core`, `./impl/nodejs`, `./impl/browser`) carries its own
   `SphereError` class, and `isSphereError()` is an `instanceof` check. So an error thrown by
   provider code (e.g. the Nostr transport's `TRANSPORT_ERROR` during recipient lookup) is not
@@ -996,6 +1030,15 @@ authoritative for build success.
   Being self-prefixed with the network, it never rides the legacy `isNetworkScopedAddressKey`
   mechanism (which still guards the remaining
   chat/identity keys in the platform storage providers).
+- **The backstop's one optional field, `intentPut?: 'pending' | 'unconfirmed'` (#835).**
+  `'pending'` is written with the entry before the first intent PUT and cleared on a 2xx (the
+  epoch re-seed never re-PUTs it); `'unconfirmed'` marks a parked send that every resume pass
+  re-PUTs first and never sweeps; absent = acked, or written by an older client. No new
+  disposition, `STORE_KEYS` entry or prefix: an older client reads either value as an ordinary
+  `'open'` entry (accepted downgrade window: it may sweep a held send whose PUT never landed —
+  an under-payment, never a double pay). Every backstop GC removal is compare-and-delete
+  (`ListStore.removeIfUnchanged`), and a tombstone is removed only after the server answers its
+  abort 2xx or 404 `NOT_FOUND`.
 - **The `pv2:` → `pv2g2:` rename IS the 3.x local migration** (`modules/payments-v2/stores.ts`;
   `sweepSupersededState()` clears the old prefix once per composition, from
   `core/payments-v2-wiring.ts`). Not hygiene — money-critical: the sync-epoch latch lives in that

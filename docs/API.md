@@ -501,7 +501,12 @@ one code where you used to check for `null`.
 ```
 
 - The intent is durable on the server **before** any chain op; a crash at any stage resumes
-  the SAME `transferId` inside the facade's start — never a second spend.
+  the SAME `transferId` inside the facade's start — never a second spend. No chain op runs until
+  the wallet service has answered 2xx to the intent. When it refuses the intent (for example
+  413 or 422), the send fails clean. When it cannot confirm it after two immediate retries (an
+  outage, a timeout, a 5xx), the send is **held**: `send()` rejects `SEND_SYNC_PENDING` with its
+  `transferId`, and the SDK sends it automatically under that id once the service confirms the
+  intent (#835).
 - Whole-token transfers use `engine.transfer`; partial amounts use `engine.split`: the source
   is burned in one certified operation, then the recipient output and the change are each
   minted in their own certified operation (the mints run in parallel). The burn and its
@@ -564,18 +569,48 @@ certified and delivery is still being retried. That is success, not an error. `s
 resolves with `'completed'` or `'failed'`: a failure throws. (`'failed'` appears only on the
 `transfer:updated` event for a clean failure.)
 
-**Money-safety on rejection.** Some rejections mean the money may already have left the wallet.
-`isPossiblyCommittedSendOutcome(err)` is `true` for exactly these codes: `SEND_SYNC_PENDING`,
-`CERTIFICATION_UNCONFIRMED`, `CHECKPOINT_PERSIST_FAILED`, `SPLIT_CHECKPOINT_LOST`,
-`CHECKPOINT_TRUSTBASE_MISMATCH` and `SEND_PARTIALLY_COMPLETED`. **Never call `send()` again** for
-that payment: a new `send()` gets a new transfer id and pays the recipient a second time. The SDK
-finishes the original under its own transfer id (in-process or at the next start); show it as
-pending ([`pendingTransfers()`](#pendingtransfers-promisependingtransfer)), and wire any "retry"
-button to [`resumeNow()`](#resumenow-promisevoid). A
-[`PartialSendConflictError`](#errors) means part of the amount was delivered and is final; only
-`err.remainingAmount` is still owed, and may be paid only by a new send of exactly that amount.
-When `isPossiblyCommittedSendOutcome(err)` is `false`, the SDK's contract is that nothing left the
-wallet.
+**Money-safety on rejection.** Some rejections mean the money may already have left the wallet,
+or will leave it without another call from you. `isPossiblyCommittedSendOutcome(err)` is `true`
+for exactly these codes: `SEND_SYNC_PENDING`, `CERTIFICATION_UNCONFIRMED`,
+`CHECKPOINT_PERSIST_FAILED`, `SPLIT_CHECKPOINT_LOST`, `CHECKPOINT_TRUSTBASE_MISMATCH` and
+`SEND_PARTIALLY_COMPLETED`. **Never call `send()` again** for that payment: a new `send()` gets a
+new transfer id and pays the recipient a second time. Such a rejection carries the transfer id in
+`err.transferId` (for a `PartialSendConflictError`, the first partial attempt's id). The SDK
+finishes the original under its own transfer id, in-process, on a later convergence pass or at
+the next start. Show it as pending
+([`pendingTransfers()`](#pendingtransfers-promisependingtransfer)), and wire any "retry" button
+to [`resumeNow()`](#resumenow-promisevoid).
+
+`SEND_SYNC_PENDING` covers two cases, and you handle both the same way:
+
+- **Committed, still converging.** The spend committed, in whole or in part, and the rest is
+  still converging: for example a later leg failed after an earlier leg was delivered, or the
+  wallet-api mirror is catching up.
+- **Held, not sent yet (#835).** Nothing is certified yet, but the SDK cannot prove that the
+  payment will never go out, so it **holds** the send and sends it automatically under the same
+  transfer id. Usually the wallet service did not confirm that it recorded the payment, even
+  after two immediate retries (an outage, a timeout, a 5xx); the SDK sends it once the service
+  confirms the intent. If the service instead refuses the intent outright (413 or 422), nothing
+  ever ran and the send is dropped: `pendingTransfers()` stops listing it, and a request paid
+  with it becomes payable again. A send is also held when an attempt failed before anything
+  certified but could not be cancelled with certainty; the SDK runs it again. Either can happen
+  much later: a device that stays offline sends it only after it reconnects. There is no verb to
+  cancel a held send, and one whose failure repeats on every run stays pending, because resume
+  has no attempt budget yet (#744).
+
+A [`PartialSendConflictError`](#errors) means part of the amount was delivered and is final.
+Read `err.remainingAmount` before you do anything else:
+
+- **`'0'`:** a later attempt of the same send is still converging under its own transfer id
+  (`err.cause.transferId`; its row is in `pendingTransfers()`), and that attempt owns the rest.
+  Nothing is owed: do not send any of it again. If that attempt later ends without sending, for
+  example because its source was spent elsewhere, no shortfall is recorded for it. The recipient
+  is then under-paid, never paid twice.
+- **Anything else:** only `err.remainingAmount` is still owed, and it may be paid only by a new
+  send of exactly that amount.
+
+When `isPossiblyCommittedSendOutcome(err)` is `false`, the failure is proven clean: nothing of the
+payment was certified, and nothing this device holds can still send it.
 
 Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (when funds are pinned by transfers
 still converging, the message says how much and points to `pendingTransfers()`),
@@ -599,18 +634,25 @@ try {
   if (result.deliveryPending) show('Sent. Delivery to the recipient is pending and is retried automatically.');
 } catch (err) {
   if (err instanceof PartialSendConflictError) {
-    // Part of the amount was delivered and is final. Only err.remainingAmount is still owed:
-    // if you pay it, do it as a NEW send of exactly that amount, never the original amount.
-    show(`Partly sent: ${err.remainingAmount} base units were not sent.`);
+    if (err.remainingAmount === '0') {
+      // Part was delivered; a later attempt (err.cause.transferId) is still sending the rest.
+      // Nothing is owed: never re-plan or re-send any of it. Show it as pending.
+      show('Partly sent; the rest is on its way.');
+    } else {
+      // Part of the amount was delivered and is final. Only err.remainingAmount is still owed:
+      // if you pay it, do it as a NEW send of exactly that amount, never the original amount.
+      show(`Partly sent: ${err.remainingAmount} base units were not sent.`);
+    }
   } else if (isPossiblyCommittedSendOutcome(err)) {
-    // The money may already have left the wallet. Never call send() again for this payment:
-    // the SDK completes it under the same transferId. Show it as pending.
+    // The money may already have left the wallet, or the send is held and goes out automatically.
+    // Never call send() again for this payment: the SDK completes it under err.transferId.
     show('Sent, waiting for confirmation.');
     const pending = await sphere.payments.pendingTransfers(); // rows for a "pending" list
     // A "retry" button calls sphere.payments.resumeNow(), never send().
   } else {
-    // Nothing left the wallet. Read `code` structurally: errors thrown by the providers
-    // (e.g. the Nostr transport) are a different SphereError class copy, so isSphereError() is false for them.
+    // Proven clean: nothing was certified and nothing on this device can still send it. Read `code`
+    // structurally: errors thrown by the providers (e.g. the Nostr transport) are a different
+    // SphereError class copy, so isSphereError() is false for them.
     const code = (err as { code?: unknown } | null)?.code;
     switch (code) {
       case 'SEND_INSUFFICIENT_BALANCE': show((err as Error).message); break; // names pinned funds when transfers are converging
@@ -897,11 +939,13 @@ A proven conflict is **terminal** — there is no alternative source to re-plan 
 possibly-committed rules exactly as for `send()`: never re-issue after any error for which
 `isPossiblyCommittedSendOutcome(err)` is `true`; `resumeNow()` converges it. One exception: a
 `SEND_SYNC_PENDING` that carries no `err.transferId` (message `Cannot spend yet: …`) is a refusal
-before anything was reserved or sent. The SDK spends nothing until it has confirmed which tokens
-the transfers still converging hold; it runs that check when payments start (also after an
-address switch) and on every convergence pass. Nothing moved and `pendingTransfers()` has no row
-for it, so call `sendWholeToken` (or `sendCoinless`) again later. `resumeNow()` re-runs the check
-but does not send the token.
+before anything was reserved or sent. Tell it apart by the missing `err.transferId`, not by the
+message: every other `SEND_SYNC_PENDING`, including a send held because the wallet service did not
+confirm it recorded the intent (#835), carries one. The SDK spends nothing until it has confirmed
+which tokens the transfers still converging hold; it runs that check when payments start (also
+after an address switch) and on every convergence pass. Nothing moved and `pendingTransfers()` has
+no row for it, so call `sendWholeToken` (or `sendCoinless`) again later. `resumeNow()` re-runs the
+check but does not send the token.
 
 ### `sendCoinless(req: { recipient, tokenId, memo? }): Promise<TransferResult>`
 
@@ -1179,7 +1223,10 @@ const older = await sphere.payments.history({ before: page.cursor!, limit: 50 })
 
 What is still converging, derived on each call from the vertical's journals (open intents,
 deliveries still owed, and the shortfalls of partial sends), never a cached copy. Use it for a
-"pending" list, for example after a possibly-committed `send()` rejection.
+"pending" list, for example after a possibly-committed `send()` rejection. A held send, whose intent
+the wallet service has not confirmed yet (#835), is an `'open'` row with no certified legs. After a
+`PartialSendConflictError` with `remainingAmount: '0'`, the attempt still sending the rest is an
+`'open'` row, and that send has no `'shortfall'` row.
 
 ```typescript
 interface PendingTransfer {
@@ -1200,7 +1247,9 @@ interface PendingTransfer {
 ### `resumeNow(): Promise<void>`
 
 Run a convergence pass now: resume open intents, then drain the delivery and mint journals. It
-joins a pass that is already running. This is the **retry verb**: a "retry" button calls
+joins a pass that is already running. A held send (#835) is first re-offered to the wallet service
+with its stored intent; once the service confirms it, the same pass sends it under the same
+transfer id. This is the **retry verb**: a "retry" button calls
 `resumeNow()`, never `send()`, because a re-issued `send()` pays again. It does nothing before the
 facade has started.
 
@@ -1227,7 +1276,8 @@ interface PaymentsRequestsApi {
     Promise<{ success: boolean; requestId?: string; error?: string }>; // never throws
   list(): PaymentRequestView[];                // requests you RECEIVED
   pay(id: string): Promise<TransferResult>;   // durably 'settling' BEFORE any
-                                              // possibly-committed throw (#441)
+                                              // possibly-committed throw (#441),
+                                              // a held send included (#835)
   decline(id: string): Promise<void>;         // server 403/409 propagate
   dismissProcessed(): void;                   // drop terminal entries from list()
 }
@@ -1256,18 +1306,21 @@ interface PaymentRequestView {
   for `send()`.
 - **Crash safety, exactly.** When the send inside `pay()` fails with a possibly-committed error,
   `pay()` links the request to that transfer in the payments journal and marks it `'settling'`
-  before it rethrows, so the request is not payable, and the link survives a restart. One
-  exception: if writing that link to storage fails, `pay()` rejects with the storage error instead
-  of the send error, so `isPossiblyCommittedSendOutcome` is `false` for it although the payment may
-  have gone out; the link is then held in memory and reaches storage only with a later successful
-  journal write. A second `pay()` of the same id while the first is still running joins it. The
-  link is written after the send returns or throws, not before it starts. If the app or process
-  stops while `pay()` is still waiting on the send, or before a link that failed to write reaches
-  storage, no link exists: on the next start the request is listed as `'pending'` again and
-  `payment_request:incoming` fires again, even if the transfer went through (a transfer the SDK had
-  already recorded is resumed when the wallet starts). Before paying a request again after a
-  restart, check `sphere.payments.pendingTransfers()` and
-  `sphere.payments.history()` for a transfer to that requester.
+  before it rethrows, so the request is not payable, and the link survives a restart. A held send
+  (#835) takes this path too: the request stays `'settling'` while the SDK holds the send, and
+  becomes payable again only once the SDK has proven that nothing was sent (for example when the
+  service refuses the intent outright, with a 413 or 422). One exception: if writing that link to
+  storage fails, `pay()` rejects with the storage error instead of the send error, so
+  `isPossiblyCommittedSendOutcome` is `false` for it although the payment may have gone out; the
+  link is then held in memory and reaches storage only with a later successful journal write. A
+  second `pay()` of the same id while the first is still running joins it. The link is written after
+  the send returns or throws, not before it starts. If the app or process stops while `pay()` is
+  still waiting on the send, or before a link that failed to write reaches storage, no link exists:
+  on the next start the request is listed as `'pending'` again and `payment_request:incoming` fires
+  again, even if the transfer went through (a transfer the SDK had already recorded is resumed when
+  the wallet starts). Before paying a request again after a restart, check
+  `sphere.payments.pendingTransfers()` and `sphere.payments.history()` for a transfer to that
+  requester.
 
 ```typescript
 import { TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
@@ -1526,13 +1579,16 @@ with backoff (up to 10 attempts), and returns a function that closes it.
 class SphereError extends Error {
   readonly code: SphereErrorCode;   // e.g. 'INVALID_CONFIG', 'SEND_INSUFFICIENT_BALANCE', ...
   readonly cause?: unknown;
-  transferId?: string;              // set only on possibly-committed send outcomes
+  transferId?: string;              // set only on possibly-committed send outcomes: the transfer
+                                    // the SDK finishes (absent on the #738 'Cannot spend yet' refusal)
 }
 
 class PartialSendConflictError extends SphereError {   // code 'SEND_PARTIALLY_COMPLETED'
   readonly transferId: string;                 // the first partial attempt's transferId
-  readonly committedTokenIds: readonly string[]; // sources already certified and delivered: never re-send
-  readonly remainingAmount: string;            // base units still owed; pay ONLY this, as a new send
+  readonly committedTokenIds: readonly string[]; // sources already certified: never re-send
+  readonly remainingAmount: string;            // base units still owed; pay ONLY this, as a new send.
+                                               // '0': a later attempt (cause.transferId) still owns
+                                               // the rest, so nothing is owed (#835)
 }
 
 function isSphereError(err: unknown): err is SphereError;
@@ -1543,7 +1599,12 @@ All five are root exports (`SphereErrorCode` is the exported union of codes).
 `isPossiblyCommittedSendOutcome(err)` is `true` for exactly `SEND_SYNC_PENDING`,
 `CERTIFICATION_UNCONFIRMED`, `CHECKPOINT_PERSIST_FAILED`, `SPLIT_CHECKPOINT_LOST`,
 `CHECKPOINT_TRUSTBASE_MISMATCH` and `SEND_PARTIALLY_COMPLETED`: the money may already have left
-the wallet, so never re-send (see [`send()`](#sendreq-sendrequest-promisetransferresult)).
+the wallet, or the send is held and goes out automatically, so never re-send (see
+[`send()`](#sendreq-sendrequest-promisetransferresult)). `false` means the failure is proven clean:
+nothing of the payment was certified, and nothing this device holds can still send it. The six
+codes are unchanged by #835; `SEND_SYNC_PENDING` now also covers a held send that has not gone out
+yet but still may (most often because the wallet service did not confirm it recorded the intent),
+and `PartialSendConflictError.remainingAmount` can be `'0'`.
 `PAYMENTS_NOT_COMPOSED` is the permanent refusal of `sphere.payments` on a `walletApi: 'none'`
 wallet; `NOT_INITIALIZED` is the transient one.
 

@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (money) — a send that may have moved money is never reported as a clean failure (#835)
+
+What was wrong. When `PUT /v1/intents` failed with anything other than a 422, the payments facade
+still converged the attempt in-process. It certified and delivered the legs although the wallet
+service held no intent row, then rejected with the resulting `404 unknown intent`, or with the
+split leg's `GET /progress` 404. Three other cases surfaced their raw error the same way:
+
+- a multi-leg send whose later leg failed with an ordinary error after an earlier leg was
+  delivered;
+- an in-process convergence that failed after delivering (a 5xx on complete, a failed shortfall
+  write, a gateway error while re-certifying a leg);
+- a conflict that masked a delivered leg's unconfirmed re-certification.
+
+Consequence. `isPossiblyCommittedSendOutcome()` returned false, `transfer:updated{status:'failed'}`
+fired, and `requests.pay()` made the request payable again. A caller following the documented
+contract paid the recipient twice.
+
+What changed:
+
+- No chain operation runs before the intent PUT answers 2xx. A failed PUT is re-sent with the same
+  stored bytes. A send the service provably refused fails clean. A send whose PUT stays unconfirmed
+  rejects `SEND_SYNC_PENDING` with its `transferId` and is sent automatically, under the same
+  transferId, once the service confirms the intent.
+- Every failure after a leg certified is possibly-committed with its `transferId`. A shortfall is
+  durable before any inventory apply. A clean report now also requires that nothing on this device
+  can later execute the intent and, when it was cancelled, that the service confirmed the cancel; a
+  failed attempt that cannot meet that is reported `SEND_SYNC_PENDING` with its transferId.
+- Behaviour changes for integrators:
+  - `SEND_SYNC_PENDING` also means "held, not sent yet": the send goes out automatically, possibly
+    much later, and cannot be cancelled;
+  - `PartialSendConflictError.remainingAmount` is `'0'` when a later attempt still owns the
+    remainder;
+  - the `sync:pending` attention code is no longer emitted.
+- The backstop store gains one optional field, which older clients read as an ordinary open entry.
+
+How it was verified:
+
+- the new contract suite `tests/unit/payments-v2/send-intent-unknown.test.ts` (every observable
+  outcome, including retries by a contract-following caller, the epoch restore and
+  `requests.pay()`);
+- machine, resume, restore, heartbeat and facade unit tests;
+- the full mutation run;
+- the live staging money e2e with injected intent-PUT failures.
+
 ## [0.18.1] - 2026-10-07
 
 ### Added — the token registry claims a coin for its issuing token type (#833)

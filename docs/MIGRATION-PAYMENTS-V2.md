@@ -119,6 +119,21 @@ Error contract is UNCHANGED and load-bearing: the typed codes
 `ProofUnconfirmedError.cause` carrying the raw network error all survive
 verbatim. Keep your PENDING_COMMIT handling exactly as it is.
 
+**Two meanings widened since (#835); the codes did not change.**
+`SEND_SYNC_PENDING` now also covers a send that has not gone out yet but
+still may: most often one the wallet service did not confirm it recorded,
+or a failed attempt that could not be cancelled with certainty. The SDK
+holds it and sends it automatically under the same `err.transferId`.
+PENDING_COMMIT handling already treats it correctly: show it as pending
+and never re-send. `PartialSendConflictError.remainingAmount` can now be
+`'0'`: a later attempt, still converging under `err.cause.transferId`,
+owns the rest and nothing is owed, so code that re-plans `remainingAmount`
+must not re-plan at all for `'0'`, and must show the payment as pending,
+not failed. A `false`
+`isPossiblyCommittedSendOutcome()` now means the failure is proven clean:
+nothing certified, and nothing this device holds can still send it. The
+`sync:pending` `transfer:attention` code is no longer emitted.
+
 ### 2a. New in 0.17.x: coinless tokens (NFTs)
 
 Nothing to migrate — purely additive — but worth knowing so a token list is not read as complete:

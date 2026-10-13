@@ -549,17 +549,24 @@ async function sendTokens(recipient: string, amount: string, coinId: string) {
       : 'Sent!');
   } catch (err) {
     if (err instanceof PartialSendConflictError) {
-      // Part of the amount was delivered and is final. Only err.remainingAmount is still owed:
-      // if you pay it, do it as a NEW send of exactly that amount, never the original amount.
-      showToast(`Partly sent: ${err.remainingAmount} base units were not sent.`);
+      if (err.remainingAmount === '0') {
+        // Part was delivered; a later attempt (err.cause.transferId) is still sending the rest.
+        // Nothing is owed: never re-plan or re-send any of it. Show it as pending.
+        showToast('Partly sent; the rest is on its way.');
+      } else {
+        // Part of the amount was delivered and is final. Only err.remainingAmount is still owed:
+        // if you pay it, do it as a NEW send of exactly that amount, never the original amount.
+        showToast(`Partly sent: ${err.remainingAmount} base units were not sent.`);
+      }
     } else if (isPossiblyCommittedSendOutcome(err)) {
-      // The money may already have left the wallet. Never call send() again for this payment:
-      // the SDK completes it under the same transferId. Show it as pending.
+      // The money may already have left the wallet, or the send is held and goes out automatically.
+      // Never call send() again for this payment: the SDK completes it under err.transferId.
       showToast('Sent, waiting for confirmation.');
       // A "retry" button calls sphere.payments.resumeNow(), never send().
     } else {
-      // Nothing left the wallet. Read `code` structurally: errors thrown by the providers
-      // (e.g. the Nostr transport) are a different SphereError class copy, so isSphereError() is false for them.
+      // Proven clean: nothing was certified and nothing on this device can still send it. Read
+      // `code` structurally: errors thrown by the providers (e.g. the Nostr transport) are a
+      // different SphereError class copy, so isSphereError() is false for them.
       const code = (err as { code?: unknown } | null)?.code;
       switch (code) {
         case 'SEND_INSUFFICIENT_BALANCE': showToast((err as Error).message); break; // names pinned funds when transfers are converging
@@ -572,14 +579,20 @@ async function sendTokens(recipient: string, amount: string, coinId: string) {
 }
 ```
 
-Some rejections mean the money may already have left the wallet. `isPossiblyCommittedSendOutcome(err)` is `true`
-for exactly these codes: `SEND_SYNC_PENDING`, `CERTIFICATION_UNCONFIRMED`, `CHECKPOINT_PERSIST_FAILED`,
-`SPLIT_CHECKPOINT_LOST`, `CHECKPOINT_TRUSTBASE_MISMATCH` and `SEND_PARTIALLY_COMPLETED`. Never call `send()` again
-for that payment: a new `send()` gets a new transfer id and pays the recipient a second time. The SDK finishes the
-original under its own transfer id; show it as pending (`sphere.payments.pendingTransfers()`), and wire any
-"retry" button to `sphere.payments.resumeNow()`. A `PartialSendConflictError` means part of the amount was
-delivered and is final; only `err.remainingAmount` is still owed. When `isPossiblyCommittedSendOutcome(err)` is
-`false`, the SDK's contract is that nothing left the wallet.
+Some rejections mean the money may already have left the wallet, or will leave it without another call from you.
+`isPossiblyCommittedSendOutcome(err)` is `true` for exactly these codes: `SEND_SYNC_PENDING`,
+`CERTIFICATION_UNCONFIRMED`, `CHECKPOINT_PERSIST_FAILED`, `SPLIT_CHECKPOINT_LOST`, `CHECKPOINT_TRUSTBASE_MISMATCH`
+and `SEND_PARTIALLY_COMPLETED`. Never call `send()` again for that payment: a new `send()` gets a new transfer id
+and pays the recipient a second time. The SDK finishes the original under its own transfer id (`err.transferId`);
+show it as pending (`sphere.payments.pendingTransfers()`), and wire any "retry" button to
+`sphere.payments.resumeNow()`. `SEND_SYNC_PENDING` also covers a send that has not gone out yet but still may
+(#835), most often one the wallet service did not confirm it recorded: the SDK holds it and sends it automatically
+under the same transfer id. That can be much later, and a held send cannot be cancelled. A
+`PartialSendConflictError` means part of the amount was delivered and is final. If `err.remainingAmount` is `'0'`, a
+later attempt still converging under `err.cause.transferId` owns the rest: nothing is owed, so never re-plan or
+re-send any of it. Otherwise only `err.remainingAmount` is still owed. When `isPossiblyCommittedSendOutcome(err)` is
+`false`, the failure is proven clean: nothing of the payment was certified, and nothing this device holds can still
+send it.
 
 Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag` or `DIRECT://` recipient
 uses your network. Every such send emits `transfer:attention` with `code: 'recipient:network-unverified'` and an
@@ -903,17 +916,20 @@ function WalletApp() {
       setBalance(await totalUsd(sphere));
     } catch (err) {
       if (err instanceof PartialSendConflictError) {
-        // Part was delivered and is final; only err.remainingAmount is still owed.
-        setStatus(`Partly sent: ${err.remainingAmount} base units were not sent.`);
+        // Part was delivered and is final. '0' = a later attempt is still sending the rest:
+        // nothing is owed, so never re-plan. Otherwise only err.remainingAmount is still owed.
+        setStatus(err.remainingAmount === '0'
+          ? 'Partly sent; the rest is on its way. Do not send it again.'
+          : `Partly sent: ${err.remainingAmount} base units were not sent.`);
         setRecipient('');
         setAmount('');
       } else if (isPossiblyCommittedSendOutcome(err)) {
-        // The money may already have left: never re-send. The SDK completes it.
+        // The money may already have left, or the send is held: never re-send. The SDK completes it.
         setStatus('Sent, waiting for confirmation. Do not send it again.');
         setRecipient('');
         setAmount('');
       } else {
-        // Nothing left the wallet.
+        // Proven clean: nothing was certified and nothing on this device can still send it.
         setStatus('Not sent: ' + (err instanceof Error ? err.message : String(err)));
       }
     } finally {

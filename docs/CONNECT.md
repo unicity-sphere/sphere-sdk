@@ -1020,6 +1020,10 @@ The `send` result distinguishes **on-chain finality** from **recipient-side deli
   the send** — the source tokens are terminally spent, and a fresh `intent('send', …)` would
   pay the recipient a second time from different tokens. `transferId` may be absent on this
   path (possibly-certified resolutions carry no id; the still-open intent owns settlement).
+  A send the wallet's payments service has not yet confirmed recording (sphere-sdk #835) takes
+  this path too: nothing is on-chain yet, but the wallet holds the send and executes it
+  automatically under the same transfer once the service confirms it, possibly much later.
+  Re-issuing it pays twice, exactly as above.
 - Treat the money as sent in both cases; use `deliveryPending` only to set expectations
   ("recipient may receive it with a delay") — not to gate retries.
 - `status` is one of `'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed'`.
