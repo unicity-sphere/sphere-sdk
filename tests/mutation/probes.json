@@ -2442,7 +2442,7 @@
     "name": "fence-ignores-failed-tombstone",
     "note": "#835: a clean report needs a durable tombstone; without one the attempt stays open, possibly-committed and never aborted (machine.test.ts 'a clean leg failure whose tombstone cannot be written is held open...'; send-intent-unknown.test.ts (o))",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    if (!tombstoned) return false;",
+    "find": "    if (!tombstoned) return NOT_FENCED_MESSAGE;",
     "replace": "    void tombstoned;",
     "tests": [
       "tests/unit/payments-v2/machine.test.ts",
@@ -2663,7 +2663,7 @@
     "note": "#835: a pass deferred on an unreadable backstop says so — the converger must not reconcile its empty report",
     "file": "modules/payments-v2/machine/resume.ts",
     "find": "    options.onDeferred?.();\n",
-    "replace": "",
+    "replace": "    void options;\n",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts",
       "tests/unit/payments-v2/heartbeat.test.ts",
