@@ -70,6 +70,8 @@ export interface Hooks {
   getBlobs?: (ids: string[]) => Promise<void>;
   putIntent?: () => Promise<void>;
   listOpen?: () => Promise<void>;
+  /** Runs before every POST /v1/intents/<id>/abort reaches the server — throw to fail the abort. */
+  abort?: (transferId: string) => Promise<void>;
   complete?: (transferId: string) => Promise<void>;
   applyDelta?: (delta: { transferId: string; spent: string[] }) => Promise<void>;
   deliver?: () => Promise<void>;
@@ -82,10 +84,19 @@ export interface Counters {
   listOpen: number;
 }
 
-function hookedClient(inner: FakeWalletApiV2Client, hooks: Hooks, counters: Counters): FacadeClient {
+/** One PUT /v1/intents exactly as the facade issued it (#835: a re-PUT must carry the stored bytes). */
+export interface PutCall {
+  transferId: string;
+  envelope: string;
+  requiresSeedClose: boolean | undefined;
+}
+
+function hookedClient(inner: FakeWalletApiV2Client, hooks: Hooks, counters: Counters, putCalls: PutCall[]): FacadeClient {
   return {
     putIntent: async (t, p, r) => {
       counters.putIntent += 1;
+      // Recorded BEFORE the hook: a PUT the hook fails was still issued.
+      putCalls.push({ transferId: t, envelope: p, requiresSeedClose: r });
       if (hooks.putIntent) await hooks.putIntent();
       await inner.putIntent(t, p, r);
     },
@@ -96,7 +107,10 @@ function hookedClient(inner: FakeWalletApiV2Client, hooks: Hooks, counters: Coun
       }
       return inner.listIntents(status);
     },
-    abortIntent: (t) => inner.abortIntent(t),
+    abortIntent: async (t) => {
+      if (hooks.abort) await hooks.abort(t);
+      await inner.abortIntent(t);
+    },
     completeIntent: async (t, s) => {
       if (hooks.complete) await hooks.complete(t);
       await inner.completeIntent(t, s);
@@ -160,6 +174,8 @@ export interface World {
   facade: PaymentsFacade;
   hooks: Hooks;
   counters: Counters;
+  /** Every PUT /v1/intents this facade issued, in order — including the ones a hook failed. */
+  putCalls: PutCall[];
   events: { event: string; payload: unknown }[];
   gates: Gate[];
   /** The fake transport directory the production resolver reads (identifier → binding). */
@@ -254,6 +270,7 @@ export function makeWorld(
   const session = new FakeSession();
   const hooks: Hooks = {};
   const counters: Counters = { putIntent: 0, listOpen: 0 };
+  const putCalls: PutCall[] = [];
   const events: { event: string; payload: unknown }[] = [];
   session.emitStatus = (status) => events.push({ event: 'connection:status', payload: { status } });
   const gates: Gate[] = [];
@@ -277,7 +294,7 @@ export function makeWorld(
   let ids = 0;
   const facade = new PaymentsFacade({
     session,
-    client: hookedClient(innerClient, hooks, counters),
+    client: hookedClient(innerClient, hooks, counters, putCalls),
     storagePort: hookedStorage(new WalletApiStoragePort(innerClient), hooks),
     deliveryPort: hookedDelivery(
       new WalletApiDeliveryPort({
@@ -329,6 +346,7 @@ export function makeWorld(
     facade,
     hooks,
     counters,
+    putCalls,
     events,
     gates,
     peers,

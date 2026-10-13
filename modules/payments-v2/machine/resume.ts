@@ -8,8 +8,14 @@ import type { SphereToken } from '../../../token-engine/types';
 import type { DeliveryJournalEntry, IntentBackstopEntry } from '../stores';
 import { isWholeIntent } from './payload-view';
 import type { CoinIntentPayload, IntentPayload, WholeIntentPayload } from './types';
-import { ATTENTION_CHECKPOINT_STUCK, createMachineStores, type MachineStores } from './journal';
-import { TransferMachine, buildOps, classifyError, type MachineDeps } from './TransferMachine';
+import {
+  ATTENTION_CHECKPOINT_STUCK,
+  createMachineStores,
+  isNeverStorable,
+  isUnknownIntent,
+  type MachineStores,
+} from './journal';
+import { TransferMachine, buildOps, classifyError, type IntentApi, type MachineDeps } from './TransferMachine';
 
 export interface ResumeReport {
   resumed: string[];
@@ -26,6 +32,18 @@ interface ResumeJob {
 export interface ResumeAllOptions {
   /** Ids with an in-process machine attempt — their backstop entries are never GC'd. */
   isLocallyActive?: (transferId: string) => boolean;
+  /** #835: ids the machine parked in memory (their 'unconfirmed' flag write failed). */
+  isParked?: (transferId: string) => boolean;
+  /** #835: the pass deferred on an unreadable backstop — its report proves nothing. */
+  onDeferred?: () => void;
+}
+
+/** One pass's local picture: the backstop snapshot, the server-open ids, the in-process verdicts. */
+interface LocalView {
+  locals: Map<string, IntentBackstopEntry>;
+  openIds: Set<string>;
+  isLocallyActive: (transferId: string) => boolean;
+  isParked: (transferId: string) => boolean;
 }
 
 export async function resumeAll(deps: MachineDeps, options: ResumeAllOptions = {}): Promise<ResumeReport> {
@@ -39,16 +57,19 @@ export async function resumeAll(deps: MachineDeps, options: ResumeAllOptions = {
   } catch {
     // #676: local dispositions unknowable — a server-open intent could be
     // locally aborted, so resuming ANY would risk re-executing one. Defer all.
+    options.onDeferred?.();
     return report;
   }
-  await dropStaleBackstops(
-    stores,
+  const view: LocalView = {
     locals,
-    new Set(open.map((i) => i.transferId)),
-    options.isLocallyActive ?? (() => false)
-  );
+    openIds: new Set(open.map((i) => i.transferId)),
+    isLocallyActive: options.isLocallyActive ?? (() => false),
+    isParked: options.isParked ?? (() => false),
+  };
+  const confirmed = await confirmUnconfirmed(deps, stores, view, report);
+  await dropStaleBackstops(deps.intents, stores, view);
 
-  const jobs = await gateAndDecode(deps, stores, open, locals, report);
+  const jobs = await gateAndDecode(deps, stores, [...open, ...confirmed], locals, report);
   const ctx: RunCtx = {
     deps,
     stores,
@@ -68,30 +89,82 @@ interface RunCtx {
   sources: Map<string, SphereToken>;
 }
 
+function isHeld(entry: IntentBackstopEntry, view: LocalView): boolean {
+  return entry.intentPut === 'unconfirmed' || view.isParked(entry.transferId);
+}
+
 /**
- * Reconciliation GC (never money logic — when in doubt, KEEP the entry).
- * Non-'open' entries not server-open: stale local aborts, dropped as before.
- * S1: an 'open' entry that is NOT server-open (= completed-or-never: tail
- * crash after complete, or crash before the intent PUT was acked) with NO
- * journal legs owed and no in-process attempt is pure residue — without this
- * sweep it is a permanent phantom pendingTransfers() row and the heartbeat
- * re-arms forever. Any journal leg or active op keeps the entry.
+ * #835 ensure step, before anything resumes or is swept: a send reported
+ * SEND_SYNC_PENDING because its PUT never answered 2xx gets its STORED envelope
+ * re-PUT. Confirmed → returned, so this same pass resumes it with the same bytes;
+ * 413/422 → nothing ever ran: dropped, reported conflicted; otherwise kept.
  */
-async function dropStaleBackstops(
+async function confirmUnconfirmed(
+  deps: MachineDeps,
   stores: MachineStores,
-  locals: Map<string, IntentBackstopEntry>,
-  openIds: Set<string>,
-  isLocallyActive: (transferId: string) => boolean
-): Promise<void> {
-  for (const entry of locals.values()) {
-    if (openIds.has(entry.transferId)) continue;
-    if (entry.disposition !== 'open') {
-      await stores.backstop.removeByKey(entry.transferId);
+  view: LocalView,
+  report: ResumeReport
+): Promise<{ transferId: string; payload: string }[]> {
+  const confirmed: { transferId: string; payload: string }[] = [];
+  for (const entry of [...view.locals.values()]) {
+    const id = entry.transferId;
+    if (entry.disposition !== 'open' || !isHeld(entry, view) || view.isLocallyActive(id)) continue;
+    if (view.openIds.has(id)) {
+      await unflag(stores, view.locals, entry); // the row is there: gateAndDecode resumes it this pass
       continue;
     }
-    if (isLocallyActive(entry.transferId)) continue;
-    if ((await stores.deliveryJournal.byTransfer(entry.transferId)).size > 0) continue;
-    await stores.backstop.removeByKey(entry.transferId);
+    try {
+      await deps.intents.put(id, entry.payloadEnvelope, entry.requiresSeedClose);
+    } catch (err) {
+      const dropped = isNeverStorable(err) && (await stores.backstop.removeIfUnchanged(id, entry).catch(() => false));
+      if (dropped) view.locals.delete(id);
+      (dropped ? report.conflicted : report.failed).push(id);
+      continue;
+    }
+    await unflag(stores, view.locals, entry);
+    view.openIds.add(id); // confirmed: S1 must not sweep it this pass
+    confirmed.push({ transferId: id, payload: entry.payloadEnvelope });
+  }
+  return confirmed;
+}
+
+async function unflag(
+  stores: MachineStores,
+  locals: Map<string, IntentBackstopEntry>,
+  entry: IntentBackstopEntry
+): Promise<void> {
+  if (entry.intentPut === undefined) return; // parked in memory only, already unflagged on disk
+  try {
+    const stripped = await stores.backstop.patch(entry.transferId, ({ intentPut: _confirmed, ...rest }) => rest);
+    if (stripped !== undefined) locals.set(entry.transferId, stripped);
+  } catch {
+    /* still flagged: the next pass finds the row listed and unflags it then */
+  }
+}
+
+/**
+ * Reconciliation GC (never money logic — when in doubt, KEEP the entry). Every
+ * removal is compare-and-delete against the snapshot judged (#835), and an
+ * in-process attempt is never touched. A tombstone goes only once the server
+ * answers its abort 2xx or 404 NOT_FOUND. S1: an unflagged 'open' entry that is
+ * NOT server-open with no journal legs owed is residue (completed-or-never).
+ */
+async function dropStaleBackstops(intents: IntentApi, stores: MachineStores, view: LocalView): Promise<void> {
+  for (const entry of view.locals.values()) {
+    const id = entry.transferId;
+    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;
+    if (entry.disposition !== 'open') {
+      try {
+        await intents.abort(id);
+      } catch (err) {
+        if (!isUnknownIntent(err)) continue;
+      }
+      await stores.backstop.removeIfUnchanged(id, entry);
+      continue;
+    }
+    if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it
+    if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;
+    await stores.backstop.removeIfUnchanged(id, entry);
   }
 }
 
@@ -106,14 +179,17 @@ async function gateAndDecode(
   for (const intent of open) {
     const local = locals.get(intent.transferId);
     if (local !== undefined && local.disposition !== 'open') {
-      // #676: a locally-aborted intent is NEVER resumed — converge the server.
+      // #676: a locally-aborted intent is NEVER resumed — converge the server. Conflicted
+      // only once the server confirmed the abort (#835): until then another device of
+      // this wallet could still run the open row, so a payment link stays settling.
+      let aborted = true;
       try {
         await deps.intents.abort(intent.transferId);
-        await stores.backstop.removeByKey(intent.transferId);
       } catch {
-        /* stays locally aborted; converged at the next resume */
+        aborted = false; // stays locally aborted; converged at the next resume
       }
-      report.conflicted.push(intent.transferId);
+      if (aborted) await stores.backstop.removeByKey(intent.transferId).catch(() => undefined);
+      (aborted ? report.conflicted : report.failed).push(intent.transferId);
       continue;
     }
     let payload: IntentPayload;

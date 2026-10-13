@@ -166,6 +166,13 @@ export interface Overrides {
   abort?: () => Promise<void>;
 }
 
+/** One PUT /v1/intents exactly as the machine issued it (#835: a re-PUT must carry the stored bytes). */
+export interface PutCall {
+  transferId: string;
+  envelope: string;
+  requiresSeedClose: boolean;
+}
+
 export interface World {
   api: FakeWalletApi;
   engine: RealizationEngine;
@@ -187,6 +194,8 @@ export interface World {
   signCalls: string[];
   clock: { t: number };
   overrides: Overrides;
+  /** Every intent PUT issued, in order — including the ones an override failed. */
+  putCalls: PutCall[];
   blobByTokenId: Map<string, Uint8Array>;
   seq: { n: number };
   stores(): MachineStores;
@@ -231,6 +240,7 @@ export function makeWorld(): World {
     signCalls: [] as string[],
     clock: { t: 1_000_000 },
     overrides: {} as Overrides,
+    putCalls: [] as PutCall[],
     blobByTokenId: new Map<string, Uint8Array>(),
     seq: { n: 0 },
   };
@@ -285,6 +295,7 @@ interface WorldState {
   delivered: DeliverOptions[];
   completes: { transferId: string; signature?: string }[];
   overrides: Overrides;
+  putCalls: PutCall[];
   blobByTokenId: Map<string, Uint8Array>;
   seq: { n: number };
 }
@@ -385,6 +396,8 @@ function makeIntents(w: WorldState): IntentApi {
   return {
     async put(transferId, envelope, requiresSeedClose) {
       w.log.push('putIntent');
+      // Recorded BEFORE the override: a PUT the override fails was still issued.
+      w.putCalls.push({ transferId, envelope, requiresSeedClose });
       if (w.overrides.putIntent) await w.overrides.putIntent();
       await w.api.putIntent(w.caller, { transferId, payload: envelope, requiresSeedClose });
     },

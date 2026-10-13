@@ -56,6 +56,9 @@ export interface IntentBackstopEntry {
   // #676: a locally-aborted intent is NEVER resumed.
   disposition: 'open' | 'abortPending' | 'aborted';
   createdAt: number;
+  /** #835: 'pending' until a PUT answers 2xx (the reseed skips it); 'unconfirmed' once send()
+   *  parked it (each resume re-PUTs it first, never sweeps it). Absent: acked, or an older client. */
+  intentPut?: 'pending' | 'unconfirmed';
 }
 
 

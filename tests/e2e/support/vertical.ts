@@ -107,6 +107,8 @@ export interface MakeOptions {
   identity?: VIdentity;
   kv?: ScopedKV;
   wrapDelivery?: (inner: DeliveryPort) => DeliveryPort;
+  /** Wraps the FACADE's client only (fault injection, #835); `VWallet.api` stays the real one, for observation. */
+  wrapClient?: (inner: AuthedClient) => AuthedClient;
 }
 
 /** The whole vertical, composed for real: session → authed client → ports → engine → facade. */
@@ -152,7 +154,7 @@ export async function makeVerticalWallet(tag: string, options: MakeOptions = {})
   const events: { event: string; payload: unknown }[] = [];
   const facade = new PaymentsFacade({
     session,
-    client: api,
+    client: options.wrapClient ? options.wrapClient(api) : api,
     storagePort: new WalletApiStoragePort(api),
     deliveryPort: options.wrapDelivery ? options.wrapDelivery(realDelivery) : realDelivery,
     checkpointStore: new WalletApiSplitCheckpointStore({

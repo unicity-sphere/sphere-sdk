@@ -16,17 +16,22 @@
  * and let start() replay journals / resume the SAME transferId, paced under a
  * generous deadline. Money assertions stay exact — exactly-once, conservation.
  *
+ * The #835 block at the end has its own wallets, so `-t '#835'` runs it alone.
+ * It injects faults on PUT /v1/intents only, over the REAL authed client.
+ *
  * Gated on STAGING_AGGREGATOR_KEY. Run:
  *   set -a && source .env && set +a && npx vitest run --config vitest.e2e.config.ts \
  *     tests/e2e/payments-v2-vertical.staging.e2e.test.ts
  */
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { isPossiblyCommittedSendOutcome } from '../../core/errors';
+import { isPossiblyCommittedSendOutcome, SphereError } from '../../core/errors';
+import { WalletApiHttpError } from '../../impl/wallet-api-v2/http';
 import type { DeliveryPort } from '../../modules/payments-v2/ports';
 import { createMachineStores } from '../../modules/payments-v2/machine/journal';
+import { INTENT_UNCONFIRMED_MESSAGE } from '../../modules/payments-v2/send-errors';
 import type { TransferResult } from '../../types';
-import { HARNESS_COIN, randomIdentity } from './support/staging';
+import { BASE_URL, HARNESS_COIN, randomIdentity } from './support/staging';
 import { memoryKV, RUN_STAGING as RUN } from './support/staging';
 import {
   activeRows,
@@ -39,6 +44,7 @@ import {
   mintConverged,
   must,
   openIntentIds,
+  PACE_MS,
   receivedLegs,
   SEND_CONVERGE_MS,
   sendConverged,
@@ -46,6 +52,7 @@ import {
   shutdownVerticalWallets,
   sleep,
   waitFor,
+  type AuthedClient,
   type VWallet,
 } from './support/vertical';
 
@@ -385,4 +392,330 @@ describe.runIf(RUN)('LIVE staging: payments-v2 vertical (facade over real ports 
     expect((await activeRows(d)).map((r) => r.tokenId)).toEqual([genesis]);
     expect(await receivedLegs(d, genesis)).toHaveLength(1);
   }, 3_000_000);
+});
+
+// ── #835: a PUT /v1/intents whose outcome the client cannot see ──────────────
+//
+// Faults ride PUT /v1/intents only, over the REAL authed client
+// (MakeOptions.wrapClient); the session, every other call, the ports, the engine
+// and the gateway stay real. The shapes are what impl/wallet-api-v2/http.ts
+// produces: fetchRaw's status-0 NETWORK wrapper, and the wallet-api 429
+// RATE_LIMITED envelope (wallet-api src/lib/errors.ts).
+
+type PutFault = 'response-lost' | 'network-down' | 'rate-limited';
+
+interface PutCall {
+  readonly transferId: string;
+  readonly envelope: string;
+  readonly requiresSeedClose: boolean | undefined;
+  readonly fault: PutFault | null;
+}
+
+interface PutFaults {
+  readonly calls: PutCall[];
+  /** Every error the wrapper raised, in order. */
+  readonly thrown: WalletApiHttpError[];
+  /** The next PUTs end in these faults, in order; after them PUTs pass through. */
+  queue(...faults: PutFault[]): void;
+  /** Every PUT fails before it leaves the client, until unwrap(). */
+  outage(fault: 'network-down' | 'rate-limited'): void;
+  /** Back to the plain real client. */
+  unwrap(): void;
+  wrap(inner: AuthedClient): AuthedClient;
+}
+
+function putFaults(): PutFaults {
+  const calls: PutCall[] = [];
+  const thrown: WalletApiHttpError[] = [];
+  const queued: PutFault[] = [];
+  let outage: PutFault | null = null;
+  const raise = (err: WalletApiHttpError): WalletApiHttpError => {
+    thrown.push(err);
+    return err;
+  };
+  const network = (transferId: string, when: string): WalletApiHttpError =>
+    new WalletApiHttpError(
+      0,
+      'NETWORK',
+      `wallet-api request failed: PUT ${BASE_URL}/v1/intents/${transferId}: synthetic connection reset ${when} (#835)`
+    );
+  return {
+    calls,
+    thrown,
+    queue: (...faults) => {
+      queued.push(...faults);
+    },
+    outage: (fault) => {
+      outage = fault;
+    },
+    unwrap: () => {
+      outage = null;
+      queued.length = 0;
+    },
+    wrap: (inner) => ({
+      ...inner,
+      putIntent: async (transferId, envelope, requiresSeedClose) => {
+        const fault = outage ?? queued.shift() ?? null;
+        calls.push({ transferId, envelope, requiresSeedClose, fault });
+        if (fault === 'network-down') throw raise(network(transferId, 'before the request left'));
+        if (fault === 'rate-limited') {
+          throw raise(new WalletApiHttpError(429, 'RATE_LIMITED', `PUT /v1/intents/${transferId}: rate limit exceeded`, 1_000));
+        }
+        await inner.putIntent(transferId, envelope, requiresSeedClose);
+        // The server stored (or matched) the row; only its answer is lost.
+        if (fault === 'response-lost') throw raise(network(transferId, 'after the server answered'));
+      },
+    }),
+  };
+}
+
+/** One send is one transferId (never re-issued), and every (re-)PUT of it carries the SAME stored bytes. */
+function expectOneIntent(calls: readonly PutCall[], transferId: string): void {
+  expect([...new Set(calls.map((c) => c.transferId))], 'one send, one transferId').toEqual([transferId]);
+  expect(new Set(calls.map((c) => c.envelope)).size, 'every (re-)PUT carries the same envelope').toBe(1);
+  expect(new Set(calls.map((c) => c.requiresSeedClose)).size).toBe(1);
+}
+
+/** The server never had a row: GET progress answers the typed 404, and neither listing names it. */
+async function expectNoServerRow(w: VWallet, transferId: string): Promise<void> {
+  const answer = await w.api.getProgress(transferId).then(
+    (records) => records,
+    (err: unknown) => err
+  );
+  expect(answer, 'GET /v1/intents/<id>/progress for an intent the server never stored').toBeInstanceOf(WalletApiHttpError);
+  expect((answer as WalletApiHttpError).status).toBe(404);
+  expect((answer as WalletApiHttpError).code).toBe('NOT_FOUND');
+  expect(await openIntentIds(w)).not.toContain(transferId);
+  expect((await w.api.listIntents('aborted')).map((i) => i.transferId)).not.toContain(transferId);
+}
+
+function failedUpdates(w: VWallet, transferId: string, fromEvent: number): TransferResult[] {
+  return w.events
+    .slice(fromEvent)
+    .filter((x) => x.event === 'transfer:updated')
+    .map((x) => x.payload as TransferResult)
+    .filter((r) => r.id === transferId && r.status === 'failed');
+}
+
+async function paid(w: VWallet, amount: bigint): Promise<boolean> {
+  await w.facade.receive().catch(() => undefined);
+  return localTotal(w) === amount && (await serverTotal(w)) === amount;
+}
+
+async function sentRecords(w: VWallet, transferId: string): Promise<unknown[]> {
+  return (await historyEntries(w)).filter((x) => x.type === 'SENT' && x.transferId === transferId);
+}
+
+// Wallets shared ACROSS the three tests (sequential): one 100 token minted by E
+// travels E→F (lost response), back F→E (held, then converged), and E→F is
+// refused (429) — so the block needs no wallet from the suite above.
+let walletE: VWallet | undefined;
+let walletF: VWallet | undefined;
+let tokenE = '';
+const eFaults = putFaults();
+const fFaults = putFaults();
+
+describe.runIf(RUN)('LIVE staging: #835 PUT /v1/intents with an unknown outcome (real client, faulted PUT)', () => {
+  it('a PUT whose response is lost after the server stored it: the immediate re-PUT is absorbed — delivered exactly once, one transferId', async () => {
+    walletE = await makeVerticalWallet('e', { wrapClient: eFaults.wrap });
+    walletF = await makeVerticalWallet('f', { wrapClient: fFaults.wrap });
+    const minted = await mintConverged(walletE, 100n, 'mint E 100', { wrapClient: eFaults.wrap });
+    walletE = minted.wallet;
+    tokenE = minted.tokenId;
+    const e = walletE;
+    const f = walletF;
+    await waitFor(e, () => localTotal(e) === 100n, 60_000, 'E local view shows the 100 mint');
+
+    const first = eFaults.calls.length;
+    eFaults.queue('response-lost');
+    let result: TransferResult | null = null;
+    let transferId: string;
+    try {
+      result = await e.facade.send({ recipient: f.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN });
+      transferId = result.id;
+    } catch (err) {
+      // Degraded staging can keep-open the CERTIFICATION after the gate passed:
+      // the SAME transferId converges (#631), never a second send.
+      if (!isPossiblyCommittedSendOutcome(err)) throw err;
+      transferId = must((err as SphereError).transferId, 'keep-open transferId');
+      logStep(`#835 lost response: keep-open ${transferId} (${(err as Error).message.slice(0, 80)}…)`);
+    }
+    const gate = eFaults.calls.slice(first);
+    expect(gate.map((c) => c.fault), 'the lost answer, then ONE re-PUT that the server answered 2xx').toEqual([
+      'response-lost',
+      null,
+    ]);
+    expectOneIntent(gate, transferId);
+    if (result !== null) {
+      expect(['delivered', 'confirmed']).toContain(result.status);
+      expect(result.tokenTransfers).toEqual([{ sourceTokenId: tokenE, method: 'direct' }]);
+    }
+    let sender = e;
+    if (result === null || result.deliveryPending === true) {
+      sender = await convergeByReplay(e, () => paid(f, 100n), SEND_CONVERGE_MS, '#835 lost response E→F', {
+        wrapClient: eFaults.wrap,
+      });
+      walletE = sender;
+    }
+
+    // Exactly once: F holds the one token at one RECEIVED leg; E is drained under ONE SENT record.
+    await drainUntil(f, () => localTotal(f) === 100n, 90_000, 'F receives the 100');
+    expect((await activeRows(f)).map((r) => r.tokenId)).toEqual([tokenE]);
+    expect(await serverTotal(f)).toBe(100n);
+    await waitFor(sender, async () => (await serverTotal(sender)) === 0n && localTotal(sender) === 0n, 60_000, 'E drained to 0');
+    await waitFor(sender, async () => (await sentRecords(sender, transferId)).length > 0, 30_000, 'E SENT history record');
+    expect(await sentRecords(sender, transferId)).toHaveLength(1);
+    await waitFor(sender, async () => (await openIntentIds(sender)).length === 0, 60_000, 'E open intents empty');
+    await waitFor(sender, async () => (await sender.facade.pendingTransfers()).length === 0, 60_000, 'E nothing pending');
+
+    // No double delivery: a further 10 s drain window changes NOTHING for F.
+    await sleep(10_000);
+    await f.facade.receive().catch(() => undefined);
+    expect(localTotal(f)).toBe(100n);
+    expect(await serverTotal(f)).toBe(100n);
+    expect(await receivedLegs(f, tokenE)).toHaveLength(1);
+  }, 3_000_000);
+
+  it('a PUT that never leaves, 3 times: SEND_SYNC_PENDING with its transferId and no server row; unwrapped, resumeNow PUTs the SAME intent and runs it — delivered exactly once', async () => {
+    const e = must(walletE, 'wallet E');
+    const f = must(walletF, 'wallet F');
+    await waitFor(
+      f,
+      () => f.facade.tokens().some((t) => t.id === tokenE && t.status === 'confirmed'),
+      60_000,
+      'F holds the 100 spendable'
+    );
+
+    const first = fFaults.calls.length;
+    const firstEvent = f.events.length;
+    fFaults.outage('network-down');
+    const outcome = await f.facade
+      .send({ recipient: e.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN })
+      .then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error })
+      );
+    const gate = fFaults.calls.slice(first);
+
+    expect('error' in outcome, 'a send whose PUT outcome stayed unknown never resolves').toBe(true);
+    const held = (outcome as { error: unknown }).error as SphereError;
+    expect(held).toBeInstanceOf(SphereError);
+    expect(held.code).toBe('SEND_SYNC_PENDING');
+    expect(isPossiblyCommittedSendOutcome(held)).toBe(true);
+    expect(held.message).toBe(INTENT_UNCONFIRMED_MESSAGE);
+    expect(held.cause, 'the last answer rides as the cause').toBe(fFaults.thrown[fFaults.thrown.length - 1]);
+    const transferId = must(held.transferId, 'held transferId');
+    expect(gate.map((c) => c.fault), 'the PUT and two immediate re-PUTs, none of which left the client').toEqual([
+      'network-down',
+      'network-down',
+      'network-down',
+    ]);
+    expectOneIntent(gate, transferId);
+
+    // Held, not failed: no 'failed' update, the entry waits for the converger, the source stays pinned.
+    expect(failedUpdates(f, transferId, firstEvent)).toEqual([]);
+    const entry = await createMachineStores(f.kv).backstop.getByKey(transferId);
+    expect(entry?.disposition).toBe('open');
+    expect(entry?.intentPut).toBe('unconfirmed');
+    expect(gate[0]?.envelope, 'the PUT bytes are the stored envelope').toBe(entry?.payloadEnvelope);
+    expect((await f.facade.pendingTransfers()).map((p) => [p.transferId, p.kind])).toEqual([[transferId, 'open']]);
+    expect(f.facade.tokens().find((t) => t.id === tokenE)?.status, 'a held send keeps its source').toBe('transferring');
+    await expectNoServerRow(f, transferId);
+    expect(await serverTotal(f), 'nothing ran: F still holds the 100 on the server').toBe(100n);
+
+    // Unwrapped. The retry verb, never send(): a pass re-PUTs the held entry's SAME
+    // envelope (no row is listed), and a later one runs it from the listing.
+    // resumeNow coalesces onto a pass already in flight, so keep asking, paced.
+    fFaults.unwrap();
+    await f.facade.resumeNow();
+    await f.facade.resumeNow();
+    let lastResume = Date.now();
+    await drainUntil(
+      e,
+      async () => {
+        if (Date.now() - lastResume >= PACE_MS) {
+          lastResume = Date.now();
+          await f.facade.resumeNow();
+        }
+        return localTotal(e) === 100n && (await serverTotal(e)) === 100n;
+      },
+      SEND_CONVERGE_MS,
+      'E paid by the held send, converged in-session'
+    );
+
+    const all = fFaults.calls.slice(first);
+    expectOneIntent(all, transferId);
+    expect(
+      all.filter((c) => c.fault === null).length,
+      'the converger PUT the held intent once the service answered'
+    ).toBeGreaterThanOrEqual(1);
+    expect((await activeRows(e)).map((r) => r.tokenId)).toEqual([tokenE]);
+    expect(await receivedLegs(e, tokenE)).toHaveLength(1);
+    await waitFor(f, async () => (await serverTotal(f)) === 0n && localTotal(f) === 0n, 60_000, 'F drained to 0');
+    await waitFor(f, async () => (await sentRecords(f, transferId)).length > 0, 30_000, 'F SENT history record');
+    expect(await sentRecords(f, transferId)).toHaveLength(1);
+    await waitFor(f, async () => (await openIntentIds(f)).length === 0, 60_000, 'F open intents empty');
+    await waitFor(f, async () => (await f.facade.pendingTransfers()).length === 0, 60_000, 'F nothing pending');
+    expect(failedUpdates(f, transferId, firstEvent)).toEqual([]);
+
+    // No double delivery: a further 10 s drain window changes NOTHING for E.
+    await sleep(10_000);
+    await e.facade.receive().catch(() => undefined);
+    expect(localTotal(e)).toBe(100n);
+    expect(await serverTotal(e)).toBe(100n);
+    expect(await receivedLegs(e, tokenE)).toHaveLength(1);
+  }, 1_500_000);
+
+  it('two pre-write 429 RATE_LIMITED answers: a clean rejection, nothing held, and the server never had a row for that transferId', async () => {
+    const e = must(walletE, 'wallet E');
+    const f = must(walletF, 'wallet F');
+    await waitFor(
+      e,
+      () => e.facade.tokens().some((t) => t.id === tokenE && t.status === 'confirmed'),
+      60_000,
+      'E holds the 100 spendable'
+    );
+
+    const first = eFaults.calls.length;
+    const firstEvent = e.events.length;
+    eFaults.queue('rate-limited', 'rate-limited');
+    const outcome = await e.facade
+      .send({ recipient: f.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN })
+      .then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error })
+      );
+    const gate = eFaults.calls.slice(first);
+
+    expect(gate.map((c) => c.fault), 'two typed refusals, nothing ambiguous before them: no third PUT').toEqual([
+      'rate-limited',
+      'rate-limited',
+    ]);
+    const transferId = must(gate[0], 'the refused PUT').transferId;
+    expectOneIntent(gate, transferId);
+    expect('error' in outcome, 'a refused PUT never resolves the send').toBe(true);
+    const err = (outcome as { error: unknown }).error;
+    expect(err, 'the wire refusal itself is the verdict').toBe(eFaults.thrown[eFaults.thrown.length - 1]);
+    expect(err).toBeInstanceOf(WalletApiHttpError);
+    expect((err as WalletApiHttpError).status).toBe(429);
+    expect((err as WalletApiHttpError).code).toBe('RATE_LIMITED');
+    expect(isPossiblyCommittedSendOutcome(err)).toBe(false);
+    expect(failedUpdates(e, transferId, firstEvent)).toHaveLength(1);
+
+    // Nothing held anywhere: no backstop entry, no pending row, the source spendable again.
+    expect(await createMachineStores(e.kv).backstop.getByKey(transferId)).toBeUndefined();
+    expect(await e.facade.pendingTransfers()).toEqual([]);
+    expect(e.facade.tokens().map((t) => ({ id: t.id, amount: t.amount, status: t.status }))).toEqual([
+      { id: tokenE, amount: '100', status: 'confirmed' },
+    ]);
+    await expectNoServerRow(e, transferId);
+    expect(await serverTotal(e)).toBe(100n);
+
+    // A convergence pass never ensures a refused attempt: no further PUT, still no row.
+    await e.facade.resumeNow();
+    expect(eFaults.calls.slice(first)).toHaveLength(2);
+    await expectNoServerRow(e, transferId);
+    expect(await paid(f, 0n), 'F was never paid').toBe(true);
+    expect(localTotal(e)).toBe(100n);
+  }, 600_000);
 });

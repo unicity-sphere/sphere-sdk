@@ -104,6 +104,8 @@ export interface ConvergerDeps {
   replayBurns(): Promise<number>;
   /** §7 ownership: the pass never adopts an op whose machine runs in-process. */
   isActiveOp(id: string): boolean;
+  /** #835: a send this process parked — held even when its 'unconfirmed' flag write failed. */
+  isParked(id: string): boolean;
   emit(event: string, payload: unknown): void;
   now(): number;
 }
@@ -158,9 +160,17 @@ export class Converger {
   }
 
   private async resumePass(): Promise<boolean> {
+    let deferred = false;
     const report = await resumeAll(this.filteredMachineDeps(), {
       isLocallyActive: (id) => this.deps.isActiveOp(id),
+      isParked: (id) => this.deps.isParked(id),
+      onDeferred: () => {
+        deferred = true;
+      },
     });
+    // #835: an unreadable backstop proves nothing — reconciling its empty report would
+    // resolve a held payment link 'paid' through the unaccounted branch.
+    if (deferred) return false;
     const progress = report.resumed.length > 0 || report.conflicted.length > 0;
     await this.deps.reconcile({
       resumed: report.resumed,

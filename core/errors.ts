@@ -17,6 +17,7 @@
  *   if (err instanceof PartialSendConflictError) {
  *     // Part of the amount already left the wallet and is final. Only err.remainingAmount is still owed:
  *     // if you pay it, do it as a NEW send of exactly that amount, never the original amount.
+ *     // '0' means the rest is still settling under its own transfer (#835): nothing to re-pay.
  *     showToast(`Partly sent: ${err.remainingAmount} base units were not sent`);
  *   } else if (isPossiblyCommittedSendOutcome(err)) {
  *     // The money may already have left the wallet: never call send() again for this payment.
@@ -57,11 +58,11 @@ export type SphereErrorCode =
   | 'CHECKPOINT_TRUSTBASE_MISMATCH'
   | 'MINT_REASON_UNVERIFIABLE'
   | 'STORAGE_ERROR'
-  // #665: the on-chain spend committed but the post-commit wallet-api mirror
-  // sync (inventory apply / blob upload / save) failed. NOT a lost payment —
-  // the intent is kept open and resume converges the mirror (idempotent apply,
-  // #664). Surfaced distinctly so a UI can reassure ("sent — wallet catching
-  // up") instead of showing a hard send failure.
+  // The send is on its way under err.transferId: it committed in whole or in part
+  // with the rest converging (#665), or the wallet service could not confirm it
+  // recorded the intent, so it is held and sent automatically (#835). Never
+  // re-send. The #738 pre-commit refusal carries NO transferId and is the
+  // documented exception.
   | 'SEND_SYNC_PENDING'
   // #677: a multi-leg send lost a source to a concurrent transfer AFTER ≥1
   // earlier leg had already certified on-chain AND been journaled/delivered.
@@ -154,10 +155,11 @@ export class SphereError extends Error {
   readonly cause?: unknown;
   /**
    * #441 deferred-paid linkage: the transferId of the possibly-committed send,
-   * stamped by `sendOnce` before the error leaves so a payment-request consumer
-   * can durably journal request→transfer and resolve 'paid' only when that
-   * transfer actually completes (never optimistically). Present ONLY on
-   * possibly-committed outcomes ({@link isPossiblyCommittedSendOutcome}).
+   * stamped by the machine/facade (`asPossiblyCommitted`/`stampTransferId`) before
+   * the error leaves so a payment-request consumer can durably journal
+   * request→transfer and resolve 'paid' only when that transfer actually completes
+   * (never optimistically). Present ONLY on possibly-committed outcomes
+   * ({@link isPossiblyCommittedSendOutcome}).
    */
   transferId?: string;
 
@@ -178,22 +180,25 @@ export class SphereError extends Error {
  * sources. This is the fallback after the internal remainder re-plan gave up —
  * either insufficient funds OR a transient/transport error during the re-plan
  * (the underlying reason is on `cause`), not necessarily an "out of funds" state.
+ * It is also FINAL, with no in-process re-plan, when a settled partial could not be
+ * closed after its inventory apply: the durable remainder is surfaced as is (#835).
  *
  * Distinct from `TransferConflictError` on purpose: a bare conflict makes the
  * caller re-send the FULL amount, paying the already-delivered leg a second
  * time. Catching THIS type (or `code === 'SEND_PARTIALLY_COMPLETED'`) tells the
- * caller/UI: the delivered legs are final, the conflicted intent stays OPEN
- * (resume converges its certified legs), and only the REMAINDER
+ * caller/UI: the delivered legs are final, and only the REMAINDER
  * ({@link remainingAmount}) may be re-planned — under a NEW transferId, never
- * re-sending the whole amount.
+ * re-sending the whole amount. A `remainingAmount` of `'0'` means nothing may be
+ * re-planned: the rest rides a later attempt that is still converging, named by
+ * `cause.transferId` (#835).
  *
  * NOT a subclass of `TransferConflictError` by design: existing conflict
  * handlers that re-send in full must NOT treat this as an ordinary conflict.
  */
 export class PartialSendConflictError extends SphereError {
   /**
-   * The FIRST partial attempt's transferId — its intent stays open for resume,
-   * and it is the §6 handoff anchor. NOTE: `send()` may re-plan the remainder across
+   * The FIRST partial attempt's transferId — the §6 handoff anchor (its shortfall
+   * row is keyed by it). NOTE: `send()` may re-plan the remainder across
    * SEVERAL internal attempts before giving up, so {@link committedTokenIds} can
    * span MULTIPLE transferIds — they do NOT all map to this single id.
    */
@@ -209,7 +214,8 @@ export class PartialSendConflictError extends SphereError {
    * The still-undelivered portion (base units, decimal string) — `send()` could
    * not COMPLETE it from the remaining live sources (insufficient funds or a
    * transient error; see `cause`). Re-plan ONLY this amount, under a new
-   * transferId; the delivered legs converge via the recipient's §6 claim.
+   * transferId; the delivered legs converge via the recipient's §6 claim. `'0'`
+   * when a later attempt still owns the remainder (#835): never re-plan then.
    */
   readonly remainingAmount: string;
 
@@ -250,11 +256,24 @@ const POSSIBLY_COMMITTED_SEND_CODES: ReadonlySet<SphereErrorCode> = new Set([
  * have) irreversibly left the wallet — a post-commit sync-pending / keep-open
  * certification state, or a `PartialSendConflictError`. Such a send completes (or
  * has already partially completed) via resume/claim and MUST NOT be re-sent, so
- * a persisted "paid" state must stay non-payable. A `false` result is a clean
- * pre-commit failure — nothing left the wallet, safe to re-pay.
+ * a persisted "paid" state must stay non-payable. A `false` result is proven
+ * clean: nothing certified and nothing this device holds can execute it — safe
+ * to re-pay.
  */
 export function isPossiblyCommittedSendOutcome(err: unknown): boolean {
   return isSphereError(err) && POSSIBLY_COMMITTED_SEND_CODES.has(err.code);
+}
+
+/**
+ * Internal (not re-exported from the package entries): the possibly-committed code
+ * an error carries, read STRUCTURALLY — an error from another bundle's
+ * `SphereError` copy fails `instanceof` but must keep its code when wrapped (#835).
+ */
+export function possiblyCommittedCodeOf(err: unknown): SphereErrorCode | undefined {
+  const code = err !== null && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+  return typeof code === 'string' && POSSIBLY_COMMITTED_SEND_CODES.has(code as SphereErrorCode)
+    ? (code as SphereErrorCode)
+    : undefined;
 }
 
 /**

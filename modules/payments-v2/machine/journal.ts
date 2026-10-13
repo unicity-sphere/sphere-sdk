@@ -24,6 +24,7 @@ export const RATE_LIMIT_DEFER_MS = 30_000;
 export const ATTENTION_DELIVERY_DEFERRED = 'delivery:deferred';
 export const ATTENTION_DELIVERY_UNDELIVERABLE = 'delivery:undeliverable';
 export const ATTENTION_CHECKPOINT_STUCK = 'split:checkpoint-stuck';
+// #835: no longer emitted — the condition surfaces as SEND_SYNC_PENDING from send().
 export const ATTENTION_SYNC_PENDING = 'sync:pending';
 
 export type AttentionEmitter = (transferId: string, code: string, detail?: string) => void;
@@ -48,6 +49,32 @@ export function isValidationReject(err: unknown): boolean {
   const e = wireShape(err);
   if (e === null) return false;
   return e.status === 422 || e.statusCode === 422 || e.code === 'VALIDATION' || e.code === 'VALIDATION_FAILED';
+}
+
+/** #835: deterministic on the bytes sent — no PUT of this envelope can ever store a row. */
+export function isNeverStorable(err: unknown): boolean {
+  if (isValidationReject(err)) return true;
+  const e = wireShape(err);
+  return e !== null && (e.status === 413 || e.statusCode === 413);
+}
+
+/**
+ * #835: a 4xx wallet-api raises before any write (ARCHITECTURE §16), so it proves
+ * only that THIS request wrote nothing. 408/499, 5xx, status 0 (network) and
+ * non-envelope bodies are ambiguous: the row may exist, or appear later.
+ */
+export function isPreWriteRefusal(err: unknown): boolean {
+  const e = wireShape(err);
+  if (e === null) return false;
+  const n = typeof e.status === 'number' ? e.status : e.statusCode;
+  return typeof n === 'number' && n >= 400 && n <= 499 && n !== 408 && n !== 499;
+}
+
+/** The server's typed "no such intent" — never an unrouted `HTTP_404`. */
+export function isUnknownIntent(err: unknown): boolean {
+  const e = wireShape(err);
+  if (e === null) return false;
+  return (e.status ?? e.statusCode) === 404 && e.code === 'NOT_FOUND';
 }
 
 /**
@@ -116,6 +143,15 @@ export class ListStore<T> {
     return this.mutate((list) => {
       const next = list.filter((e) => this.keyOf(e) !== key);
       return next.length === list.length ? { result: undefined } : { list: next, result: undefined };
+    });
+  }
+
+  /** Compare-and-delete against the exact snapshot a caller judged (#835); true when removed. */
+  removeIfUnchanged(key: string, expected: T): Promise<boolean> {
+    return this.mutate((list) => {
+      const at = list.findIndex((e) => this.keyOf(e) === key);
+      if (at < 0 || JSON.stringify(list[at]) !== JSON.stringify(expected)) return { result: false };
+      return { list: list.filter((_, i) => i !== at), result: true };
     });
   }
 

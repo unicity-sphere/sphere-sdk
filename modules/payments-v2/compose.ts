@@ -197,6 +197,8 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
 
   const refreshView = coalesced(() => view.delta(), hooks.track);
   const pins = buildPins(deps, hooks, { ledger, view, machineStores, machineDeps });
+  // ONE machine: the restore must reach the instance whose attempts it may overlap (#835).
+  const machine = new TransferMachine(machineDeps);
   return {
     ownPubkeyBytes,
     claims,
@@ -210,11 +212,11 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     historyStore,
     machineStores,
     machineDeps,
-    machine: new TransferMachine(machineDeps),
+    machine,
     heldStates,
     receiveLoop: buildReceive(deps, hooks, { historyStore, heldStates, verdicts, claims }, refreshView),
     requests: buildRequests(deps, hooks),
-    restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view),
+    restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view, machine),
   };
 }
 
@@ -286,9 +288,12 @@ function buildRestoreDeps(
   deps: PaymentsFacadeDeps,
   machineDeps: MachineDeps,
   machineStores: MachineStores,
-  view: InventoryView
+  view: InventoryView,
+  machine: TransferMachine
 ): RestoreDeps {
   return {
+    // #835: a reseed's re-PUT can re-open a row an overlapping attempt aborts, so that attempt never reports clean.
+    onReseedStart: () => machine.noteReseed(),
     stores: machineStores,
     kv: deps.kv,
     reput: (transferId, envelope, requiresSeedClose) =>

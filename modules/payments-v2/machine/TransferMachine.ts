@@ -17,16 +17,24 @@ import {
   TransferConflictError,
 } from '../../../token-engine/errors';
 import type { DeliverOptions, DeliveryPort, StoragePort } from '../ports';
+import {
+  CANCEL_UNCONFIRMED_MESSAGE,
+  INTENT_UNCONFIRMED_MESSAGE,
+  NOT_FENCED_MESSAGE,
+  PARTLY_ON_CHAIN_MESSAGE,
+  asPossiblyCommitted,
+} from '../send-errors';
 import { coinIdOf, splitOf } from './payload-view';
 import type { DeliveryJournalEntry, ScopedKV, ShortfallEntry } from '../stores';
 import type { IntentPayload, OpOutcome, OutcomeClass, PlannedOp } from './types';
 import {
   ATTENTION_DELIVERY_DEFERRED,
-  ATTENTION_SYNC_PENDING,
   RATE_LIMIT_DEFER_MS,
   createMachineStores,
+  isNeverStorable,
+  isPreWriteRefusal,
   isRateLimited,
-  isValidationReject,
+  isUnknownIntent,
   senderNametagOption,
   type AttentionEmitter,
   type MachineStores,
@@ -37,6 +45,10 @@ import {
 // it. Safe to widen only because a rate-limited submit now retries instead of
 // burning a full deadline per op (proof-wait.retryTransient).
 const CERTIFY_WIDTH = 20;
+
+// #835: at most 3 PUTs, issued at once — the heartbeat owns waiting, and an immediate
+// re-PUT serializes behind an in-flight original at the DB (wallet-api #107).
+const PUT_CONFIRM_RETRIES = 2;
 
 const KEEP_OPEN_CODES = new Set([
   'CERTIFICATION_UNCONFIRMED',
@@ -101,6 +113,8 @@ export interface ResumeIntentOutcome {
   deliveryPending: boolean;
   /** Non-null when ≥1 leg delivered but a later leg conflicted (#677/#690). */
   partial: ShortfallEntry | null;
+  /** False when the close failed after the apply (#835): resume closes it later. */
+  closed: boolean;
 }
 
 interface CertifyCtx {
@@ -183,26 +197,51 @@ export function summarize(outcomes: OpOutcome[]): {
 
 export class TransferMachine {
   private readonly stores: MachineStores;
+  /** Bumped by every §5.1 reseed: one that overlaps an attempt may re-PUT it behind its back. */
+  private reseedSeq = 0;
+  /** Attempts whose gate saw ≥1 ambiguous PUT answer before its 2xx (#835). */
+  private readonly uncertainPuts = new WeakSet<MachinePlan>();
+  /** In-process memory of what run() certified — the facade decides from this, never the KV. */
+  private readonly certified = new WeakMap<MachinePlan, readonly string[]>();
+  /** Parked ids, kept in memory too: the 'unconfirmed' flag write may itself fail. */
+  private readonly parked = new Set<string>();
 
   constructor(private readonly deps: MachineDeps) {
     this.stores = createMachineStores(deps.kv);
   }
 
+  noteReseed(): void {
+    this.reseedSeq += 1;
+  }
+
+  /** Source tokenIds whose op run() certified for this plan; [] when none did. */
+  certifiedSourcesOf(plan: MachinePlan): readonly string[] {
+    return this.certified.get(plan) ?? [];
+  }
+
+  wasParked(transferId: string): boolean {
+    return this.parked.has(transferId);
+  }
+
   // ── send path ─────────────────────────────────────────────────────────────
   async run(plan: MachinePlan): Promise<{ committed: OpOutcome[]; deliveryPending: boolean }> {
     const engine = this.deps.engine();
+    const reseedAtStart = this.reseedSeq;
     const envelope = await this.deps.encryptPayload(plan.payload);
     await this.stores.backstop.upsert({
       transferId: plan.transferId,
       payloadEnvelope: envelope,
       requiresSeedClose: plan.payload.split !== undefined,
       disposition: 'open',
+      intentPut: 'pending',
       createdAt: this.deps.now(),
     });
     await this.putIntentGate(plan, envelope);
+    await this.markAcked(plan.transferId);
 
     const outcomes = await this.certifyAll(plan, engine);
-    const { committed, cls, firstError } = summarize(outcomes);
+    const { committed, cls } = summarize(outcomes);
+    if (committed.length > 0) this.certified.set(plan, committed.map((o) => o.op.sourceTokenId));
 
     let deliveryPending = false;
     if (committed.length > 0) {
@@ -213,11 +252,8 @@ export class TransferMachine {
       this.closeTail(engine, plan.transferId, plan.payload, committed);
       return { committed, deliveryPending };
     }
-    if (cls === 'conflict' && committed.length > 0) {
-      await this.applyBestEffort(engine, plan.transferId, committed);
-    }
-    await this.disposeOnFailure(plan.transferId, committed, cls);
-    throw firstError;
+    // #835: an unsettled attempt is never applied here — resume applies it, after its shortfall.
+    throw await this.failureOf(plan, outcomes, reseedAtStart);
   }
 
   // ── resume path: the SAME machine, rehydrated from an open intent ─────────
@@ -232,7 +268,8 @@ export class TransferMachine {
     const outcomes = await this.resumeOps(ctx, engine, r);
     const { committed } = summarize(outcomes);
     const conflicts = this.toConflicts(engine, r, outcomes);
-    if (committed.length === 0 && conflicts.length > 0) throw conflicts[0].error;
+    // #835: a pure conflict only — a keep-open or ordinary outcome beside it wins below.
+    if (committed.length === 0 && conflicts.length > 0 && firstNonConflictError(outcomes) === undefined) throw conflicts[0].error;
 
     let deliveryPending = false;
     if (committed.length > 0) {
@@ -244,25 +281,123 @@ export class TransferMachine {
     const blocking = firstNonConflictError(outcomes);
     if (blocking !== undefined) throw blocking.error;
 
-    await this.applyCommitted(engine, r.transferId, committed);
     if (conflicts.length > 0) {
-      return { deliveryPending, partial: await this.settlePartial(engine, r, committed, conflicts) };
+      const settled = await this.settlePartial(engine, r, committed, conflicts);
+      return { deliveryPending, partial: settled.entry, closed: settled.closed };
     }
+    await this.applyCommitted(engine, r.transferId, committed);
     await this.completeIntent(r.transferId, r.payload);
     await this.finishBookkeeping(engine, r.transferId, r.payload, 'resumed', committed);
-    return { deliveryPending, partial: null };
+    return { deliveryPending, partial: null, closed: true };
   }
 
   // ── shared transitions ─────────────────────────────────────────────────────
 
+  /**
+   * #835 E.3: confirm the intent row before any engine op, re-PUTting the SAME stored
+   * envelope. 413/422 or two pre-write 4xx with nothing ambiguous before them prove no
+   * row exists (refused, clean); anything else that never reached a 2xx parks it.
+   */
   private async putIntentGate(plan: MachinePlan, envelope: string): Promise<void> {
-    try {
-      await this.deps.intents.put(plan.transferId, envelope, plan.payload.split !== undefined);
-    } catch (err) {
-      // #670: only the deterministic pre-submit 422 proves no server row exists.
-      if (isValidationReject(err)) await this.stores.backstop.removeByKey(plan.transferId);
-      throw err;
+    const seal = plan.payload.split !== undefined;
+    let ambiguous = false;
+    let last: unknown;
+    for (let attempt = 0; attempt <= PUT_CONFIRM_RETRIES; attempt++) {
+      try {
+        await this.deps.intents.put(plan.transferId, envelope, seal);
+        if (ambiguous) this.uncertainPuts.add(plan);
+        return;
+      } catch (err) {
+        last = err;
+        // #670, widened to 413: no PUT of these bytes ever stored a row.
+        if (isNeverStorable(err)) return this.refuseIntent(plan.transferId, err);
+        if (!isPreWriteRefusal(err)) ambiguous = true;
+        else if (attempt > 0 && !ambiguous) return this.refuseIntent(plan.transferId, err);
+      }
     }
+    if (!ambiguous) return this.refuseIntent(plan.transferId, last); // unreachable; keeps the gate total
+    return this.parkIntent(plan.transferId, last);
+  }
+
+  /** The wire error is the verdict; a leftover entry is still 'pending', so inert until S1 sweeps it. */
+  private async refuseIntent(transferId: string, err: unknown): Promise<never> {
+    try {
+      await this.stores.backstop.removeByKey(transferId);
+    } catch {
+      /* the reseed skips 'pending', and resume acts only on a row no PUT created */
+    }
+    throw err;
+  }
+
+  private async parkIntent(transferId: string, last: unknown): Promise<never> {
+    this.parked.add(transferId);
+    try {
+      await this.stores.backstop.patch(transferId, (e) => ({ ...e, intentPut: 'unconfirmed' }));
+    } catch {
+      /* wasParked() covers this process; the converger re-PUTs it from memory */
+    }
+    throw asPossiblyCommitted(last, transferId, INTENT_UNCONFIRMED_MESSAGE);
+  }
+
+  private async markAcked(transferId: string): Promise<void> {
+    try {
+      await this.stores.backstop.patch(transferId, ({ intentPut: _acked, ...rest }) => rest);
+    } catch {
+      /* best-effort: a stale 'pending' only makes the reseed skip this entry */
+    }
+  }
+
+  /**
+   * #835: what a failed attempt REPORTS. Clean only when nothing certified and nothing
+   * can run it: every op conflicted, or the server confirmed the abort while no other PUT
+   * of these bytes could still land and re-open the aborted row.
+   */
+  private async failureOf(plan: MachinePlan, outcomes: OpOutcome[], reseedAtStart: number): Promise<unknown> {
+    const { committed, cls, firstError } = summarize(outcomes);
+    if (cls === 'keep-open') return firstError; // E.2/E.3: open; the facade stamps it
+    const ordinary = firstNonConflictError(outcomes);
+    if (committed.length > 0) {
+      // ≥1 leg certified: never abort, never apply here. Pure conflicts beside it
+      // converge in-process; anything else (a journal write too) is possibly-committed.
+      return ordinary === undefined
+        ? firstError
+        : asPossiblyCommitted(ordinary.error, plan.transferId, PARTLY_ON_CHAIN_MESSAGE);
+    }
+    if (outcomes.length === plan.ops.length && outcomes.every((o) => classifyError(o.error) === 'conflict')) {
+      await this.fence(plan.transferId); // any re-run conflicts again: clean whatever the fence did
+      return firstError;
+    }
+    // Checked synchronously before fence() enqueues its tombstone: a reseed that starts
+    // later lists or re-reads the tombstone and skips it.
+    if (this.uncertainPuts.has(plan) || this.reseedSeq !== reseedAtStart) {
+      return asPossiblyCommitted(firstError, plan.transferId, NOT_FENCED_MESSAGE);
+    }
+    const unfenced = await this.fence(plan.transferId);
+    return unfenced === undefined ? firstError : asPossiblyCommitted(firstError, plan.transferId, unfenced);
+  }
+
+  /** E.2 abort, durable first: undefined once fenced, else the message its possibly-committed report carries. */
+  private async fence(transferId: string): Promise<string | undefined> {
+    let tombstoned = false;
+    try {
+      tombstoned =
+        (await this.stores.backstop.patch(transferId, (e) => ({ ...e, disposition: 'abortPending' }))) !== undefined;
+    } catch {
+      /* no tombstone: leave the intent OPEN so the possibly-committed report converges */
+    }
+    if (!tombstoned) return NOT_FENCED_MESSAGE;
+    try {
+      await this.deps.intents.abort(transferId);
+    } catch (err) {
+      // The row is open: the #676 gate aborts it here, but another device of this wallet could run it first.
+      if (!isUnknownIntent(err)) return CANCEL_UNCONFIRMED_MESSAGE;
+    }
+    try {
+      await this.stores.backstop.removeByKey(transferId);
+    } catch {
+      /* a lingering tombstone is dropped once the server confirms the abort */
+    }
+    return undefined;
   }
 
   private async certifyAll(plan: MachinePlan, engine: ITokenEngine): Promise<OpOutcome[]> {
@@ -298,15 +433,19 @@ export class TransferMachine {
 
   /** In-flight snapshot: `tokenTransfers` holds the legs certified SO FAR. */
   private emitProgress(plan: MachinePlan, certified: readonly OpOutcome[]): void {
-    this.deps.emit('transfer:updated', {
-      id: plan.transferId,
-      status: 'submitted',
-      tokens: [],
-      tokenTransfers: certified.map((o) => ({
-        sourceTokenId: o.op.sourceTokenId,
-        method: o.op.kind,
-      })),
-    } satisfies TransferResult);
+    try {
+      this.deps.emit('transfer:updated', {
+        id: plan.transferId,
+        status: 'submitted',
+        tokens: [],
+        tokenTransfers: certified.map((o) => ({
+          sourceTokenId: o.op.sourceTokenId,
+          method: o.op.kind,
+        })),
+      } satisfies TransferResult);
+    } catch {
+      /* #835: a listener's throw must never turn a certified leg into a failed send */
+    }
   }
 
   private async certifyOne(
@@ -425,7 +564,8 @@ export class TransferMachine {
     };
     if (await this.tryBatchDeposit(recipientPubkey, journaled, options)) return pending;
     for (const outcome of journaled) {
-      const stillPending = await this.deliverOne(recipientPubkey, outcome, options);
+      // #835: certified already — a failed defer/recordFailure leaves the entry for the replay.
+      const stillPending = await this.deliverOne(recipientPubkey, outcome, options).catch(() => true);
       pending = pending || stillPending;
     }
     return pending;
@@ -495,15 +635,6 @@ export class TransferMachine {
     }
   }
 
-  private async applyBestEffort(engine: ITokenEngine, transferId: string, committed: OpOutcome[]): Promise<void> {
-    if (committed.some((o) => o.error !== undefined)) return; // unjournaled leg: resume owns it
-    try {
-      await this.applyCommitted(engine, transferId, committed);
-    } catch {
-      this.attention()(transferId, ATTENTION_SYNC_PENDING);
-    }
-  }
-
   private async uploadChangeBlobs(
     engine: ITokenEngine,
     committed: OpOutcome[]
@@ -527,7 +658,7 @@ export class TransferMachine {
     r: RehydratedIntent,
     committed: OpOutcome[],
     conflicts: ResumeConflict[]
-  ): Promise<ShortfallEntry> {
+  ): Promise<{ entry: ShortfallEntry; closed: boolean }> {
     const undelivered = conflicts.reduce((sum, c) => sum + c.amount, 0n);
     const entry: ShortfallEntry = {
       transferId: r.transferId,
@@ -539,12 +670,18 @@ export class TransferMachine {
       committedTokenIds: committed.map((o) => o.op.sourceTokenId),
       createdAt: this.deps.now(),
     };
-    // #690: durable BEFORE complete — after complete the intent is unlistable
-    // and no resume could ever rebuild the remainder the app never saw.
+    // #690 + #835: durable BEFORE the apply — the apply completes an unflagged intent,
+    // after which it is unlistable and no resume could rebuild the unseen remainder.
     await this.stores.shortfalls.upsert(entry);
-    await this.completeIntent(r.transferId, r.payload);
-    await this.finishBookkeeping(engine, r.transferId, r.payload, 'resumed', committed);
-    return entry;
+    await this.applyCommitted(engine, r.transferId, committed);
+    const closed = await this.completeIntent(r.transferId, r.payload).then(
+      () => true,
+      () => false
+    );
+    // An unclosed partial keeps its backstop: the next pass closes it (idempotent).
+    if (closed) await this.finishBookkeeping(engine, r.transferId, r.payload, 'resumed', committed);
+    else await this.recordSettled(engine, r.transferId, r.payload, 'resumed', committed);
+    return { entry, closed };
   }
 
   private closeTail(engine: ITokenEngine, transferId: string, payload: IntentPayload, committed: OpOutcome[]): void {
@@ -570,6 +707,22 @@ export class TransferMachine {
     phase: 'sent' | 'resumed',
     committed: OpOutcome[]
   ): Promise<void> {
+    await this.recordSettled(engine, transferId, payload, phase, committed);
+    try {
+      await this.stores.backstop.removeByKey(transferId);
+    } catch {
+      /* a stale unflagged 'open' entry is residue — S1 sweeps it once the row is closed */
+    }
+  }
+
+  /** SENT history; recorded even when the close failed (the server dedupKey is the transferId). */
+  private async recordSettled(
+    engine: ITokenEngine,
+    transferId: string,
+    payload: IntentPayload,
+    phase: 'sent' | 'resumed',
+    committed: OpOutcome[]
+  ): Promise<void> {
     try {
       // A token-addressed spend has no coin to sum: what settled is the token itself.
       const coinId = coinIdOf(payload);
@@ -588,11 +741,6 @@ export class TransferMachine {
       });
     } catch {
       /* a history failure never fails the money path */
-    }
-    try {
-      await this.stores.backstop.removeByKey(transferId);
-    } catch {
-      /* stale 'open' backstops are inert — resume lists server-open only */
     }
   }
 
@@ -626,23 +774,6 @@ export class TransferMachine {
       total += engine.balanceOf(token, coinId);
     }
     return total.toString();
-  }
-
-  private async disposeOnFailure(transferId: string, committed: OpOutcome[], cls: OutcomeClass): Promise<void> {
-    // Abort ONLY when nothing certified AND the class is clean; the keep-open
-    // family and any partially-certified send leave the intent open (E.2/E.3).
-    if (committed.length > 0 || cls === 'keep-open') return;
-    try {
-      await this.stores.backstop.patch(transferId, (e) => ({ ...e, disposition: 'abortPending' }));
-    } catch {
-      /* server abort below still converges; #676 gate covers the gap */
-    }
-    try {
-      await this.deps.intents.abort(transferId);
-      await this.stores.backstop.removeByKey(transferId);
-    } catch {
-      /* stays abortPending — the #676 resume gate converges, never re-executes */
-    }
   }
 
   private attention(): AttentionEmitter {
