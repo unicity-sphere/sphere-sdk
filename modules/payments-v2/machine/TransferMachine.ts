@@ -36,6 +36,7 @@ import {
   isRateLimited,
   isUnknownIntent,
   senderNametagOption,
+  settleOwed,
   type AttentionEmitter,
   type MachineStores,
 } from './journal';
@@ -708,6 +709,7 @@ export class TransferMachine {
   ): Promise<void> {
     await this.recordSettled(engine, transferId, payload, phase, committed);
     try {
+      await settleOwed(this.stores, await this.stores.backstop.getByKey(transferId));
       await this.stores.backstop.removeByKey(transferId);
     } catch {
       /* a stale unflagged 'open' entry is residue — S1 sweeps it once the row is closed */

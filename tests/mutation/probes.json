@@ -2578,8 +2578,8 @@
     "name": "dropstale-removes-unconditionally",
     "note": "#835: every GC removal is compare-and-delete against the entry the pass judged; a send held after the pass read its snapshot survives that pass (send-intent-unknown.test.ts '(h-stale) a pass judging a snapshot from before the hold never sweeps the held entry')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;\n    await stores.backstop.removeIfUnchanged(id, entry);",
-    "replace": "    if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;\n    await stores.backstop.removeByKey(id);",
+    "find": "    await settleOwed(stores, entry);\n    await stores.backstop.removeIfUnchanged(id, entry);\n  }",
+    "replace": "    await settleOwed(stores, entry);\n    await stores.backstop.removeByKey(id);\n  }",
     "tests": [
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
     ]
@@ -3151,6 +3151,26 @@
     "file": "modules/payments-v2/machine/resume.ts",
     "find": "      if (await stores.backstop.removeIfUnchanged(id, entry)) report.conflicted.push(id);",
     "replace": "      await stores.backstop.removeIfUnchanged(id, entry);",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "complete-keeps-held-copy",
+    "note": "#835: a holder that completed paid what it held, so a copy of a held row that a failed removal left in the shortfall store goes before its entry; kept, the paid remainder is listed as owed again once the entry is gone (send-intent-unknown.test.ts '(x-paid-leftover)...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      await settleOwed(this.stores, await this.stores.backstop.getByKey(transferId));\n",
+    "replace": "      // mutant: a leftover copy of a held row survives the completion\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-keeps-held-copy",
+    "note": "#835: the S1 sweep of a completed holder removes a leftover copy of its held rows before the entry (send-intent-unknown.test.ts '(x-swept-leftover)...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    await settleOwed(stores, entry);\n    await stores.backstop.removeIfUnchanged(id, entry);",
+    "replace": "    await stores.backstop.removeIfUnchanged(id, entry);",
     "tests": [
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
     ]

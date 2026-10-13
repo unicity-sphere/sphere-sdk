@@ -2097,12 +2097,28 @@ class ConflictingEngine extends RealizationEngine {
 }
 
 describe('#835 (x) after a partial, the re-plan attempt is held: it holds the shortfall until it pays or is refused', () => {
+  /** The next `n` shortfall-store writes that would drop tid-1's row fail. */
+  function failRowRemovals(world: World, n: number): void {
+    let left = n;
+    const set = world.kv.set.bind(world.kv);
+    world.kv.set = async <T>(key: string, value: T): Promise<void> => {
+      const rows = key === STORE_KEYS.shortfalls ? (value as unknown as ShortfallEntry[]) : null;
+      const drops = rows !== null && shortfallOf(world, 'tid-1') !== undefined && !rows.some((row) => row.transferId === 'tid-1');
+      if (drops && left > 0) {
+        left -= 1;
+        throw new Error('injected shortfall removal failure');
+      }
+      return set(key, value);
+    };
+  }
+
   /**
    * 600 of 1000 delivered, the 400 leg conflicted; the re-plan attempt for the 400 (which picks
    * the same source again: a partial's conflicted source is not demoted) is held, every PUT of it
-   * unanswered. `spent` decides whether that source really is spent, or only lost its first races.
+   * unanswered. `spent` decides whether that source really is spent, or only lost its first races;
+   * `failedRemovals` fails that many removals of the original row, the first one being the hold's.
    */
-  async function heldRemainder(spent: boolean): Promise<{ world: World; held: string }> {
+  async function heldRemainder(spent: boolean, failedRemovals = 0): Promise<{ world: World; held: string }> {
     const engine = new ConflictingEngine({ chainPubkey: hexToBytes(OWN_PUB) });
     const world = makeWorld({ engine });
     await world.seed(600n);
@@ -2113,6 +2129,7 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     world.hooks.putIntent = async () => {
       if (world.putCalls[world.putCalls.length - 1]?.transferId !== 'tid-1') throw unavailable();
     };
+    failRowRemovals(world, failedRemovals);
 
     const err = rejectionOf(await settle(world.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN })));
     await flushTail();
@@ -2122,8 +2139,10 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     expect(partial.remainingAmount, 'the held attempt owns the remainder').toBe('0');
     expectMessage(partial.cause, 'INTENT_UNCONFIRMED_MESSAGE');
     const held = (partial.cause as SphereError).transferId!;
-    expect(shortfallOf(world, 'tid-1'), 'the row moved onto the held attempt').toBeUndefined();
     expect(backstopOf(world, held)?.owes?.map((row) => [row.transferId, row.remainingAmount])).toEqual([['tid-1', '400']]);
+    expect(shortfallOf(world, 'tid-1') !== undefined, 'the row moved onto the held attempt, unless its removal failed').toBe(
+      failedRemovals > 0
+    );
     const pending = await world.facade.pendingTransfers();
     expect(pending.map((p) => [p.transferId, p.kind]), 'listed once, as the attempt that may still pay it').toEqual([[held, 'open']]);
     return { world, held };
@@ -2137,32 +2156,16 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     expect(await receipts(world)).toEqual({ entries: 1, amount: 600n });
   }
 
+  async function expectPaid(world: World, held: string): Promise<void> {
+    expect(serverIntent(world, held)).toBe('completed');
+    expect((await receipts(world)).amount).toBe(1000n);
+    expect(backstopOf(world, held)).toBeUndefined();
+    expect(shortfallOf(world, 'tid-1'), 'a paid remainder is never listed as owed again').toBeUndefined();
+    expect(await world.facade.pendingTransfers()).toEqual([]);
+  }
+
   it('(x-listed-once) a row whose removal failed after the hold is listed once, as the held attempt', async () => {
-    const engine = new ConflictingEngine({ chainPubkey: hexToBytes(OWN_PUB) });
-    const world = makeWorld({ engine });
-    await world.seed(600n);
-    await engine.foreignSpend(await world.seed(400n));
-    await startSettled(world);
-    world.hooks.putIntent = async () => {
-      if (world.putCalls[world.putCalls.length - 1]?.transferId !== 'tid-1') throw unavailable();
-    };
-    const set = world.kv.set.bind(world.kv);
-    world.kv.set = async <T>(key: string, value: T): Promise<void> => {
-      const rows = key === STORE_KEYS.shortfalls ? (value as unknown as ShortfallEntry[]) : null;
-      if (rows !== null && shortfallOf(world, 'tid-1') !== undefined && !rows.some((row) => row.transferId === 'tid-1')) {
-        throw new Error('injected shortfall removal failure');
-      }
-      return set(key, value);
-    };
-
-    const err = rejectionOf(await settle(world.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN })));
-    await flushTail();
-
-    const held = ((err as PartialSendConflictError).cause as SphereError).transferId!;
-    expect(shortfallOf(world, 'tid-1'), 'the removal failed: the row is in both places').toBeDefined();
-    expect(backstopOf(world, held)?.owes?.map((row) => row.transferId)).toEqual(['tid-1']);
-    const pending = await world.facade.pendingTransfers();
-    expect(pending.map((p) => [p.transferId, p.kind]), 'never also listed as owed').toEqual([[held, 'open']]);
+    await heldRemainder(true, 1);
   });
 
   it('(x-paid) once the service confirms it, it pays the remainder and the row goes with it', async () => {
@@ -2172,10 +2175,33 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     await world.facade.resumeNow();
     await flushTail();
 
+    await expectPaid(world, held);
+  });
+
+  it('(x-paid-leftover) a copy a failed removal left behind goes when the held attempt completes', async () => {
+    const { world, held } = await heldRemainder(false, 1);
+    delete world.hooks.putIntent;
+
+    await world.facade.resumeNow();
+    await flushTail();
+
+    await expectPaid(world, held);
+  });
+
+  it('(x-swept-leftover) when that cleanup fails too, the entry stays, and the sweep removes the copy before the entry', async () => {
+    const { world, held } = await heldRemainder(false, 2);
+    delete world.hooks.putIntent;
+
+    await world.facade.resumeNow();
+    await flushTail();
     expect(serverIntent(world, held)).toBe('completed');
-    expect((await receipts(world)).amount).toBe(1000n);
-    expect(shortfallOf(world, 'tid-1')).toBeUndefined();
-    expect(await world.facade.pendingTransfers()).toEqual([]);
+    expect(backstopOf(world, held), 'kept: the copy is still there').toBeDefined();
+    expect(shortfallOf(world, 'tid-1')).toBeDefined();
+
+    await world.facade.resumeNow();
+    await flushTail();
+
+    await expectPaid(world, held);
   });
 
   it('(x-refused) a 413/422 on its re-PUT drops it, and the remainder is owed again', async () => {

@@ -826,7 +826,9 @@ reset the intent's row is not restored.
 deleting them: `pendingTransfers()` lists only the attempt's `'open'` row, the rows go with the
 entry once the attempt completes, and both refusal paths (a 413/422 on the ensure re-PUT, a
 conflict on resume) hand them back to the shortfall store before removing the entry. A row left in
-both places by a failed removal is listed once, as the attempt. An older client ignores the field,
+both places by a failed removal is listed once, as the attempt, and both completion paths (the
+attempt's own close, and the S1 sweep of a holder completed elsewhere) remove that copy before the
+entry, keeping the entry when they cannot. An older client ignores the field,
 so a downgrade can lose a held remainder: an under-payment, never a double pay.
 
 There is no new disposition, no new `STORE_KEYS` entry and no prefix change, so an older client

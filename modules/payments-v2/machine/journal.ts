@@ -338,3 +338,8 @@ export async function holdShortfalls(stores: MachineStores, ids: readonly string
 export async function releaseOwed(stores: MachineStores, entry: IntentBackstopEntry | undefined): Promise<void> {
   for (const row of entry?.owes ?? []) await stores.shortfalls.upsert(row);
 }
+
+/** A holder that completed paid what it held: a copy a failed removal left behind goes before its entry. */
+export async function settleOwed(stores: MachineStores, entry: IntentBackstopEntry | undefined): Promise<void> {
+  for (const row of entry?.owes ?? []) await stores.shortfalls.removeByKey(row.transferId);
+}

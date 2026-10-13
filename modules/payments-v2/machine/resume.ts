@@ -14,6 +14,7 @@ import {
   isNeverStorable,
   isUnknownIntent,
   releaseOwed,
+  settleOwed,
   type MachineStores,
 } from './journal';
 import { TransferMachine, buildOps, classifyError, type IntentApi, type MachineDeps } from './TransferMachine';
@@ -203,6 +204,7 @@ async function dropStaleBackstops(
     }
     if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it
     if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;
+    await settleOwed(stores, entry);
     await stores.backstop.removeIfUnchanged(id, entry);
   }
 }
