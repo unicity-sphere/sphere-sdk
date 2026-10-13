@@ -19,21 +19,26 @@ export interface RestoreDeps {
   readonly fullRePull: () => Promise<void>;
   readonly attention: AttentionEmitter;
   readonly onReseedStart?: () => void; // #835: before the read, so a send it overlaps never reports clean
+  readonly onReseedEnd?: () => void; // #835: once every re-PUT answered — also when the reseed throws
 }
 
 export async function reseedAndReset(deps: RestoreDeps): Promise<void> {
   deps.onReseedStart?.();
-  for (const listed of await deps.stores.backstop.list()) {
-    const entry = await deps.stores.backstop.getByKey(listed.transferId).catch(() => listed);
-    if (!isReseedable(entry)) continue;
-    try {
-      await deps.reput(entry.transferId, entry.payloadEnvelope, entry.requiresSeedClose);
-      if (entry.requiresSeedClose) {
-        await deps.reseedCheckpoint(entry.transferId, await splitOpIndex(deps, entry.payloadEnvelope));
+  try {
+    for (const listed of await deps.stores.backstop.list()) {
+      const entry = await deps.stores.backstop.getByKey(listed.transferId).catch(() => listed);
+      if (!isReseedable(entry)) continue;
+      try {
+        await deps.reput(entry.transferId, entry.payloadEnvelope, entry.requiresSeedClose);
+        if (entry.requiresSeedClose) {
+          await deps.reseedCheckpoint(entry.transferId, await splitOpIndex(deps, entry.payloadEnvelope));
+        }
+      } catch (err) {
+        deps.attention(entry.transferId, ATTENTION_RESEED_REJECTED, err instanceof Error ? err.message : String(err));
       }
-    } catch (err) {
-      deps.attention(entry.transferId, ATTENTION_RESEED_REJECTED, err instanceof Error ? err.message : String(err));
     }
+  } finally {
+    deps.onReseedEnd?.();
   }
   for (const stream of ALL_STREAMS) await deps.kv.remove(STORE_KEYS.streamCursor(stream));
   await deps.fullRePull();

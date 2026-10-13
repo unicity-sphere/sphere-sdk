@@ -161,4 +161,29 @@ describe('reseedAndReset (§5.1, #835)', () => {
     expect(await h.deps.stores.backstop.list()).toEqual([kept]);
     expect(await h.kv.get(STORE_KEYS.streamCursor('inventory'))).toBeNull();
   });
+
+  it('ends the reseed once, after every re-PUT answered and before the re-pull, which PUTs nothing', async () => {
+    const h = makeHarness();
+    h.deps = { ...h.deps, onReseedEnd: () => h.calls.push('reseedEnd') };
+    await h.deps.stores.backstop.upsert(entry('t-1'));
+    await h.deps.stores.backstop.upsert(entry('t-2'));
+
+    await reseedAndReset(h.deps);
+
+    expect(h.calls.filter((call) => call === 'reseedEnd')).toHaveLength(1);
+    expect(h.calls.indexOf('reput:t-2')).toBeLessThan(h.calls.indexOf('reseedEnd'));
+    expect(h.calls.indexOf('reseedEnd')).toBeLessThan(h.calls.indexOf('rePull'));
+    expect(h.calls[h.calls.length - 1]).toBe('rePull');
+  });
+
+  it('ends the reseed even when it throws: an unreadable backstop still ends it', async () => {
+    const h = makeHarness();
+    h.deps = { ...h.deps, onReseedEnd: () => h.calls.push('reseedEnd') };
+    h.kv.failKeys.add(STORE_KEYS.intentBackstop);
+
+    await expect(reseedAndReset(h.deps)).rejects.toThrow('injected kv read failure');
+
+    expect(h.calls).toContain('reseedStart');
+    expect(h.calls[h.calls.length - 1]).toBe('reseedEnd');
+  });
 });

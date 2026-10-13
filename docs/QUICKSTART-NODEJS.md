@@ -755,20 +755,26 @@ if (page.more) {
 
 ## Error Handling
 
-Some rejections mean the money may already have left the wallet, or will leave it without another call from you.
+Some rejections mean the money may already have left the wallet, will leave it without another call from you, or
+could still leave it from another device of the same wallet until a cancel is confirmed.
 `isPossiblyCommittedSendOutcome(err)` is `true` for exactly these codes: `SEND_SYNC_PENDING`,
 `CERTIFICATION_UNCONFIRMED`, `CHECKPOINT_PERSIST_FAILED`, `SPLIT_CHECKPOINT_LOST`, `CHECKPOINT_TRUSTBASE_MISMATCH`
 and `SEND_PARTIALLY_COMPLETED`. Never call `send()` again for that payment: a new `send()` gets a new transfer id
-and pays the recipient a second time. The SDK finishes the original under its own transfer id (`err.transferId`);
-show it as pending (`sphere.payments.pendingTransfers()`), and wire any "retry" button to
-`sphere.payments.resumeNow()`. `SEND_SYNC_PENDING` also covers a send that has not gone out yet but still may
-(#835), most often one the wallet service did not confirm it recorded: the SDK holds it and sends it automatically
-under the same transfer id. That can be much later, and a held send cannot be cancelled. A
-`PartialSendConflictError` means part of the amount was delivered and is final. If `err.remainingAmount` is `'0'`, a
-later attempt still converging under `err.cause.transferId` owns the rest: nothing is owed, so never re-plan or
-re-send any of it. Otherwise only `err.remainingAmount` is still owed. When `isPossiblyCommittedSendOutcome(err)` is
-`false`, the failure is proven clean: nothing of the payment was certified, and nothing this device holds can still
-send it.
+and pays the recipient a second time. The SDK finishes the original under its own transfer id (`err.transferId`),
+or cancels it (below); show it as pending (`sphere.payments.pendingTransfers()` lists every case except one being
+cancelled), and wire any "retry" button to `sphere.payments.resumeNow()`. `SEND_SYNC_PENDING` also covers a send
+that has not gone out yet but still may (#835), most often one the wallet service did not confirm it recorded: the
+SDK holds it and sends it automatically under the same transfer id. That can be much later, and a held send cannot
+be cancelled. And it covers a failed
+attempt this device is cancelling while the wallet service has not confirmed the cancel (#835): it is never sent
+from here and `pendingTransfers()` does not list it, but until the cancel is confirmed another device of the same
+wallet could still complete it, so it is never sent again either. A `PartialSendConflictError` means part of the
+amount was delivered and is final. If `err.remainingAmount` is `'0'`, a later attempt that will still be sent (under
+`err.cause.transferId`) owns the rest: nothing is owed, so never re-plan or re-send any of it. Otherwise only
+`err.remainingAmount` is still owed, also when the later attempt is being cancelled (until that cancel is confirmed,
+another device of the same wallet could still complete the attempt, so a remainder paid in that window from a wallet
+used on several devices can be paid twice). When `isPossiblyCommittedSendOutcome(err)` is `false`, the failure is
+proven clean: nothing of the payment was certified, and nothing this device holds can still send it.
 
 ```typescript
 // Import the error helpers from the same entry point as Sphere (here: the package root).
@@ -790,9 +796,10 @@ try {
       console.error(`Partly sent: ${err.remainingAmount} base units were not sent.`);
     }
   } else if (isPossiblyCommittedSendOutcome(err)) {
-    // The money may already have left the wallet, or the send is held and goes out automatically.
-    // Never call send() again for this payment: the SDK completes it under err.transferId.
-    console.error('Sent, waiting for confirmation.');
+    // The money may already have left the wallet, the send is held and goes out automatically, or
+    // (SEND_SYNC_PENDING) a failed attempt is being cancelled — err.message says which.
+    // Never call send() again for this payment: the SDK completes (or cancels) it under err.transferId.
+    console.error('Waiting for confirmation. Do not pay again.');
     const pending = await sphere.payments.pendingTransfers(); // what is still converging
     // A "retry" (button or command) calls sphere.payments.resumeNow(), never send().
   } else {

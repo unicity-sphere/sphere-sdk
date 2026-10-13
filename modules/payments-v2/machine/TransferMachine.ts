@@ -197,30 +197,29 @@ export function summarize(outcomes: OpOutcome[]): {
 
 export class TransferMachine {
   private readonly stores: MachineStores;
-  /** Bumped by every §5.1 reseed: one that overlaps an attempt may re-PUT it behind its back. */
+  /** Bumped by every §5.1 reseed, and the ones still running: an overlapping one may re-PUT an attempt behind its back. */
   private reseedSeq = 0;
+  private activeReseeds = 0;
   /** Attempts whose gate saw ≥1 ambiguous PUT answer before its 2xx (#835). */
   private readonly uncertainPuts = new WeakSet<MachinePlan>();
   /** In-process memory of what run() certified — the facade decides from this, never the KV. */
   private readonly certified = new WeakMap<MachinePlan, readonly string[]>();
-  /** Parked ids, kept in memory too: the 'unconfirmed' flag write may itself fail. */
-  private readonly parked = new Set<string>();
+  /** Parked ids, kept in memory too: the 'unconfirmed' flag write may itself fail. The converger drops one once its hold ends. */
+  readonly parked = new Set<string>();
 
   constructor(private readonly deps: MachineDeps) {
     this.stores = createMachineStores(deps.kv);
   }
 
-  noteReseed(): void {
-    this.reseedSeq += 1;
+  /** #835: a reseed that STARTED before an attempt may still list and re-PUT it, so it counts until it ends. */
+  noteReseed(started = true): void {
+    if (started) this.reseedSeq += 1;
+    this.activeReseeds += started ? 1 : -1;
   }
 
   /** Source tokenIds whose op run() certified for this plan; [] when none did. */
   certifiedSourcesOf(plan: MachinePlan): readonly string[] {
     return this.certified.get(plan) ?? [];
-  }
-
-  wasParked(transferId: string): boolean {
-    return this.parked.has(transferId);
   }
 
   // ── send path ─────────────────────────────────────────────────────────────
@@ -309,8 +308,8 @@ export class TransferMachine {
         return;
       } catch (err) {
         last = err;
-        // #670, widened to 413: no PUT of these bytes ever stored a row.
-        if (isNeverStorable(err)) return this.refuseIntent(plan.transferId, err);
+        // #670, widened to 413 — proof only with nothing ambiguous before it: a mixed fleet may have stored that PUT.
+        if (isNeverStorable(err) && !ambiguous) return this.refuseIntent(plan.transferId, err);
         if (!isPreWriteRefusal(err)) ambiguous = true;
         else if (attempt > 0 && !ambiguous) return this.refuseIntent(plan.transferId, err);
       }
@@ -334,7 +333,7 @@ export class TransferMachine {
     try {
       await this.stores.backstop.patch(transferId, (e) => ({ ...e, intentPut: 'unconfirmed' }));
     } catch {
-      /* wasParked() covers this process; the converger re-PUTs it from memory */
+      /* `parked` covers this process; the converger re-PUTs it from memory and re-persists the hold */
     }
     throw asPossiblyCommitted(last, transferId, INTENT_UNCONFIRMED_MESSAGE);
   }
@@ -368,8 +367,8 @@ export class TransferMachine {
       return firstError;
     }
     // Checked synchronously before fence() enqueues its tombstone: a reseed that starts
-    // later lists or re-reads the tombstone and skips it.
-    if (this.uncertainPuts.has(plan) || this.reseedSeq !== reseedAtStart) {
+    // later lists or re-reads the tombstone and skips it; one still running may not.
+    if (this.uncertainPuts.has(plan) || this.reseedSeq !== reseedAtStart || this.activeReseeds > 0) {
       return asPossiblyCommitted(firstError, plan.transferId, NOT_FENCED_MESSAGE);
     }
     const unfenced = await this.fence(plan.transferId);

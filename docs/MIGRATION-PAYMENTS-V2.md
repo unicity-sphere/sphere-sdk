@@ -122,14 +122,22 @@ verbatim. Keep your PENDING_COMMIT handling exactly as it is.
 **Two meanings widened since (#835); the codes did not change.**
 `SEND_SYNC_PENDING` now also covers a send that has not gone out yet but
 still may: most often one the wallet service did not confirm it recorded,
-or a failed attempt that could not be cancelled with certainty. The SDK
-holds it and sends it automatically under the same `err.transferId`.
-PENDING_COMMIT handling already treats it correctly: show it as pending
-and never re-send. `PartialSendConflictError.remainingAmount` can now be
-`'0'`: a later attempt, still converging under `err.cause.transferId`,
-owns the rest and nothing is owed, so code that re-plans `remainingAmount`
-must not re-plan at all for `'0'`, and must show the payment as pending,
-not failed. A `false`
+or a failed attempt that another write of the same intent may still reach.
+The SDK holds it and sends it automatically under the same
+`err.transferId`. It also covers a failed attempt this device is
+cancelling while the wallet service has not confirmed the cancel: this
+device never sends that one and `pendingTransfers()` does not list it, but
+another device of the same wallet could still complete it until the cancel
+is confirmed, and a payment request paid with it stays `settling` until
+then. PENDING_COMMIT handling already treats both correctly: never re-send.
+`PartialSendConflictError.remainingAmount` can now be `'0'`: a later
+attempt that will still be sent, under `err.cause.transferId`, owns the
+rest and nothing is owed, so code that re-plans `remainingAmount` must not
+re-plan at all for `'0'`, and must show the payment as pending, not failed.
+A later attempt being cancelled owns nothing: `remainingAmount` is then
+the owed remainder, as before. Until that cancel is confirmed, another
+device of the same wallet could still complete the attempt, so a remainder
+re-planned in that window can be paid twice on a multi-device wallet. A `false`
 `isPossiblyCommittedSendOutcome()` now means the failure is proven clean:
 nothing certified, and nothing this device holds can still send it. The
 `sync:pending` `transfer:attention` code is no longer emitted.

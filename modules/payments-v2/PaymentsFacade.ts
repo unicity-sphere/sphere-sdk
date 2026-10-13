@@ -15,7 +15,7 @@ import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResul
 
 import type { BurnRequest, BurnResult, CoinlessToken, ConnectionStatus, HistoryPage, MintCustomRequest, MintNftRequest, MintResult, NftView, ParkedArrival, PaymentsV2, PendingBurn, PendingTransfer, SendRequest, SendWholeTokenRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
-import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
+import { ActiveOps, ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { NftCache, readNft, readNfts, type NftReadDeps } from './inventory/nft-read';
 import { readTokenData, readTokenJustification } from './inventory/token-data';
 import { type CoinReplayDeps, replayCoinMints, runMintUnderJournal, seedHeldStates, tokenInServerInventory } from './mint';
@@ -23,7 +23,7 @@ import { type NftReplayDeps, replayNftMints, runNftMintUnderJournal } from './mi
 import { type CustomReplayDeps, replayCustomMints, runCustomMintUnderJournal } from './mint-custom';
 import { acknowledgeBurn, type BurnReplayDeps, pendingBurns, replayBurns, runBurnUnderJournal } from './burn';
 import { materializeWholeSpend } from './send-whole';
-import { asPossiblyCommitted, CONVERGE_FAILED_MESSAGE, partialize, PARTLY_ON_CHAIN_MESSAGE } from './send-errors';
+import { asPossiblyCommitted, CONVERGE_FAILED_MESSAGE, isCancelUnconfirmed, partialize, PARTLY_ON_CHAIN_MESSAGE } from './send-errors';
 import { requireSameNetworkRecipient } from './recipient';
 import { reseedAndReset, type RestoreDeps } from './restore';
 import { PrewarmCache, takeSourceBlobs, warmSendSources, type WarmDeps } from './prewarm-cache';
@@ -135,7 +135,7 @@ export class PaymentsFacade implements PaymentsV2 {
   /** §5.1/§7: restore + convergence passes SERIALIZE here. */
   private readonly passChain = new SerialChain();
   /** §7 ownership: ids with an in-process machine attempt — the pass never adopts one. */
-  private readonly activeMoneyOps = new Set<string>();
+  private readonly activeMoneyOps = new ActiveOps();
   /** #737: the ledger holds exactly the sources of the still-open intents. */
   private readonly pins: IntentPins;
   private readonly burnHold: BurnHold;
@@ -149,6 +149,7 @@ export class PaymentsFacade implements PaymentsV2 {
       isActiveOp: (id) => this.activeMoneyOps.has(id),
       track: (op) => this.trackTail(op),
     });
+    this.deps = parts.deps; // #835: the composed deps, whose emit no listener's throw escapes
     this.view = parts.view;
     this.claims = parts.claims;
     this.verdicts = parts.verdicts;
@@ -181,9 +182,9 @@ export class PaymentsFacade implements PaymentsV2 {
       replayNftMints: () => replayNftMints(this.mintDeps()),
       replayCustomMints: () => replayCustomMints(this.mintDeps()),
       replayBurns: () => replayBurns(this.mintDeps()),
-      isActiveOp: (id) => this.activeMoneyOps.has(id),
-      isParked: (id) => this.machine.wasParked(id),
-      emit: deps.emit,
+      activeOps: this.activeMoneyOps,
+      parked: this.machine.parked,
+      emit: this.deps.emit,
       now: () => this.nowMs(),
     });
   }
@@ -562,10 +563,10 @@ export class PaymentsFacade implements PaymentsV2 {
     return { kind: 'partial', entry: outcome.partial, deliveryPending: outcome.deliveryPending, final: !outcome.closed };
   }
 
-  /** #835: a possibly-committed latest attempt owns the remainder — the send's earlier
-   *  shortfall rows are superseded, and its certified legs join the delivered set. */
+  /** #835: a possibly-committed latest attempt owns the remainder — the send's earlier shortfall rows are
+   *  superseded, its certified legs join the delivered set — unless it is being cancelled: the rows stay. */
   private async surfaceFailure(err: unknown, run: SendRun, ctx: AttemptCtx): Promise<unknown> {
-    if (run.delivered.length === 0 || !isPossiblyCommittedSendOutcome(err)) return partialize(err, run);
+    if (run.delivered.length === 0 || !isPossiblyCommittedSendOutcome(err) || isCancelUnconfirmed(err)) return partialize(err, run);
     for (const id of run.settledShortfalls.splice(0)) await this.machineStores.shortfalls.removeByKey(id).catch(() => undefined);
     return partialize(err, run, this.machine.certifiedSourcesOf(ctx.plan));
   }
@@ -796,4 +797,3 @@ export class PaymentsFacade implements PaymentsV2 {
     this.track(op).catch(() => undefined);
   }
 }
-

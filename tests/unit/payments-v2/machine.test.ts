@@ -668,8 +668,8 @@ describe('TransferMachine intent PUT gate (#835)', () => {
 
     await expect(machine.run(plan)).rejects.toMatchObject({ code: 'SEND_SYNC_PENDING', transferId: plan.transferId });
 
-    expect(machine.wasParked(plan.transferId)).toBe(true);
-    expect(machine.wasParked('another-transfer')).toBe(false);
+    expect(machine.parked.has(plan.transferId)).toBe(true);
+    expect(machine.parked.has('another-transfer')).toBe(false);
     expect((await w.stores().backstop.getByKey(plan.transferId))?.intentPut).toBe('pending');
   });
 
@@ -840,5 +840,143 @@ describe('TransferMachine intent PUT gate (#835)', () => {
     await expect(w.machine().run(plan)).rejects.toThrow('clean reject');
 
     expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
+  });
+});
+
+describe('TransferMachine intent PUT gate — what an answer proves (#835)', () => {
+  const unavailable = (): FakeApiError => new FakeApiError(503, 'UNAVAILABLE', 'intent store down');
+
+  it.each([
+    ['403 HTTP_403', () => new WalletApiHttpError(403, 'HTTP_403', 'PUT /v1/intents failed with status 403')],
+    ['429 HTTP_429', () => new WalletApiHttpError(429, 'HTTP_429', 'PUT /v1/intents failed with status 429')],
+  ])('an untyped 4xx (%s: a page wallet-api did not write) proves nothing, even twice: the attempt is parked', async (_label, make) => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    const thrown: Error[] = [];
+    w.overrides.putIntent = async () => {
+      const err = make();
+      thrown.push(err);
+      throw err;
+    };
+
+    const err = await rejectionOf(w.machine().run(plan));
+
+    expect(err).toMatchObject({ code: 'SEND_SYNC_PENDING', transferId: plan.transferId });
+    expect((err as SphereError).message).toBe(INTENT_UNCONFIRMED_MESSAGE);
+    expect((err as SphereError).cause).toBe(thrown[2]);
+    expect(w.putCalls).toHaveLength(3);
+    expect((await w.stores().backstop.getByKey(plan.transferId))?.intentPut).toBe('unconfirmed');
+    expect(w.engine.transferCalls).toHaveLength(0);
+  });
+
+  it.each([
+    ['413 PAYLOAD_TOO_LARGE', () => new FakeApiError(413, 'PAYLOAD_TOO_LARGE', 'body too large')],
+    ['422 VALIDATION_FAILED', () => new ValidationFailedError('payload refused')],
+  ])('a %s after an ambiguous answer says nothing about the earlier PUT: the attempt is parked, never refused', async (_label, make) => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    const thrown: Error[] = [];
+    w.overrides.putIntent = async () => {
+      // A mixed fleet: the first task may have stored the row, a task with another cap or schema refuses the rest.
+      const err = thrown.length === 0 ? unavailable() : make();
+      thrown.push(err);
+      throw err;
+    };
+
+    const err = await rejectionOf(w.machine().run(plan));
+
+    expect(err).toMatchObject({ code: 'SEND_SYNC_PENDING', transferId: plan.transferId });
+    expect((err as SphereError).message).toBe(INTENT_UNCONFIRMED_MESSAGE);
+    expect((err as SphereError).cause).toBe(thrown[2]);
+    expect(w.putCalls).toHaveLength(3);
+    expect((await w.stores().backstop.getByKey(plan.transferId))?.intentPut).toBe('unconfirmed');
+    expect(w.log).not.toContain('abortIntent');
+    expect(w.engine.transferCalls).toHaveLength(0);
+  });
+});
+
+describe('TransferMachine reseed overlap (#835)', () => {
+  const cleanReject = (w: ReturnType<typeof makeWorld>): void => {
+    w.engine.beforeOp = () => {
+      throw new Error('clean reject');
+    };
+  };
+
+  it('a reseed that started before the attempt and is still running may yet list and re-PUT it: a clean leg failure is held, never fenced', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    const machine = w.machine();
+    machine.noteReseed();
+    cleanReject(w);
+
+    const err = await rejectionOf(machine.run(plan));
+
+    expect(err).toMatchObject({ code: 'SEND_SYNC_PENDING', transferId: plan.transferId });
+    expect((err as SphereError).message).toBe(NOT_FENCED_MESSAGE);
+    expect(w.log).not.toContain('abortIntent');
+    expect((await w.stores().backstop.getByKey(plan.transferId))?.disposition).toBe('open');
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('open');
+  });
+
+  it('a reseed that started and ended before the attempt overlaps nothing: the clean leg failure is fenced, and clean', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    const machine = w.machine();
+    machine.noteReseed();
+    machine.noteReseed(false);
+    cleanReject(w);
+
+    await expect(machine.run(plan)).rejects.toThrow('clean reject');
+
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('aborted');
+    expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
+  });
+
+  it('a reseed that starts and ends while the first PUT is in flight overlaps the attempt: held, never fenced', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    const machine = w.machine();
+    w.overrides.putIntent = async () => {
+      machine.noteReseed();
+      machine.noteReseed(false);
+    };
+    cleanReject(w);
+
+    const err = await rejectionOf(machine.run(plan));
+
+    expect(err).toMatchObject({ code: 'SEND_SYNC_PENDING', transferId: plan.transferId });
+    expect((err as SphereError).message).toBe(NOT_FENCED_MESSAGE);
+    expect(w.log).not.toContain('abortIntent');
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('open');
+  });
+});
+
+describe('TransferMachine — "every op conflicted" counts the ops that never ran (#835)', () => {
+  it('21 legs whose first wave of 20 all conflict, after an ambiguous PUT answer: the unrun 21st keeps it held, never fenced', async () => {
+    const w = makeWorld();
+    const tokens = [];
+    for (let i = 0; i < 21; i++) tokens.push(await w.seed(1n));
+    for (const token of tokens.slice(0, 20)) await w.engine.foreignSpend(token);
+    const plan = await w.plan({ tokens, amount: '21' });
+    let calls = 0;
+    w.overrides.putIntent = async () => {
+      calls += 1;
+      if (calls === 1) throw new FakeApiError(503, 'UNAVAILABLE', 'intent store down');
+    };
+
+    const err = await rejectionOf(w.machine().run(plan));
+
+    expect(w.engine.transferCalls, 'the first wave stopped the send: the 21st leg never ran').toHaveLength(20);
+    expect(err).toMatchObject({ code: 'SEND_SYNC_PENDING', transferId: plan.transferId });
+    expect((err as SphereError).message).toBe(NOT_FENCED_MESSAGE);
+    expect((err as SphereError).cause).toBeInstanceOf(TransferConflictError);
+    expect(w.log).not.toContain('abortIntent');
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('open');
+    expect((await w.stores().backstop.getByKey(plan.transferId))?.disposition).toBe('open');
   });
 });

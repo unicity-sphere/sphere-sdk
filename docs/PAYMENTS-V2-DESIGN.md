@@ -190,7 +190,9 @@ recipient, pre-commit validation, a refused intent PUT) emits
 `''`; empty `tokens`/`tokenTransfers`; `error`) before the rejection surfaces; keep-open / partial /
 conflict-with-committed outcomes NEVER emit `failed` — they are pending/converging, and a `failed`
 label invites a dApp re-send = double-pay. A held-unconfirmed send (§5.5 E.3: the PUT outcome stayed
-unknown) is pending too, never `failed`. The P11 Connect adapter re-emits legacy `transfer:failed`
+unknown) is pending too, never `failed`, and so is an attempt being cancelled (its abort unconfirmed).
+The facade guards `emit` once at composition, so a listener's throw is logged and dropped, never part
+of a send outcome (#835). The P11 Connect adapter re-emits legacy `transfer:failed`
 from `transfer:updated{status:'failed'}`),
 `transfer:attention` `{transferId, code, detail?}` (replaces `split:checkpoint-stuck`,
 `delivery:undeliverable`, `delivery:deferred`), `inventory:updated`, `history:updated`
@@ -432,13 +434,23 @@ Normative behaviors bound into the transitions (not call sites):
   an immediate re-PUT serializes behind an in-flight original at the database. Every answer is
   classified:
   - **2xx:** the row exists; certify.
-  - **413 / 422:** deterministic on these bytes, so no PUT of them ever stored a row (#670, widened
-    to 413). Drop the backstop, never abort; the wire error surfaces clean.
-  - **Any other 4xx except 408/499:** that request wrote nothing (wallet-api ARCHITECTURE §16:
-    every 4xx from the PUT is raised before or without a write), but it says nothing about an
-    earlier request. The send fails clean only on the second such answer with no ambiguous answer
-    before it.
-  - **0, 408, 499, 5xx and non-envelope bodies are ambiguous:** the row may exist, or appear later.
+  - **413 / 422 with no ambiguous answer before it** (even after a typed pre-write 4xx):
+    deterministic on these bytes, so no PUT of them ever stored a row (#670, widened to 413). Drop
+    the backstop, never abort; the wire error surfaces clean. It is matched by HTTP status, in
+    wallet-api's envelope or not (`HTTP_413` / `HTTP_422`): it is a verdict on the bytes
+    themselves, the client only ever re-sends the same bytes, and an intermediary's 413/422 is
+    answered before it forwards the body. After an ambiguous answer in the same gate it proves
+    nothing about that earlier PUT — a mixed fleet with another payload cap or body schema may
+    have stored it — so the gate goes on and parks.
+  - **Any other 4xx except 408/499, in wallet-api's JSON error envelope:** that request wrote
+    nothing (wallet-api ARCHITECTURE §16: every 4xx from the PUT is raised before or without a
+    write), but it says nothing about an earlier request. The send fails clean only on the second
+    such answer with no ambiguous answer before it. The guarantee is wallet-api's, so it holds only
+    for a body wallet-api wrote: the client reads the envelope's typed code, and an untyped 4xx
+    (`HTTP_<status>`, an intermediary's page) is ambiguous.
+  - **0, 408, 499, 5xx, any other untyped 4xx, and a 2xx whose non-empty body is not JSON
+    (`PROTOCOL`), are ambiguous:** the row may exist, or appear later. (The server's own success
+    is a bodyless `204`.)
     When the re-PUTs are spent the attempt is **parked**: the entry is marked
     `intentPut: 'unconfirmed'` (held in memory as well, in case that write fails), and `send()`
     rejects `SEND_SYNC_PENDING` carrying the `transferId`, with the last answer as `cause`. The send
@@ -447,11 +459,14 @@ Normative behaviors bound into the transitions (not call sites):
   A refused gate removes the backstop entry best-effort and surfaces the wire error whatever that
   removal did. A leftover entry is still `'pending'` and so inert: the re-seed skips it, and only an
   S1 sweep removes it. Every resume pass first **ensures** each held entry (§7). One the server
-  already lists as open just loses its marker and resumes in that pass. Otherwise its stored
-  envelope is re-PUT: a 2xx turns it into an ordinary open intent, which that same pass resumes
-  under the same `transferId` with the same bytes; a 413/422 drops it and reports it conflicted, so a linked request reverts
-  to payable, because nothing ever ran; any other answer keeps it held. A held entry is never swept,
-  and a linked request stays `settling` while it is held. The re-seed skips every entry whose PUT
+  already lists as open just loses its marker and resumes in that pass. Otherwise, when only memory
+  held it (its `'unconfirmed'` write failed), the hold is re-persisted first, so a restart finds it
+  held; then its stored envelope is re-PUT. A 2xx turns it into an ordinary open intent, which
+  that same pass resumes under the same `transferId` with the same bytes; a 413/422 drops it and
+  reports it conflicted, so a linked request reverts to payable, because nothing ever ran; any
+  other answer keeps it held. A confirmed row (listed, or a 2xx re-PUT) or a dropped hold ends the
+  in-memory park (`onHoldEnded`). A held entry is never swept, and a linked request stays
+  `settling` while it is held. The re-seed skips every entry whose PUT
   was never acked (`intentPut` set), because only an acked intent can have certified anything, while
   re-PUTing a refused or held one would create a row that no send owns. It re-reads each entry fresh
   before re-PUTing it, so an entry that a gate or a fence changed after the listing is judged as it
@@ -471,15 +486,18 @@ Normative behaviors bound into the transitions (not call sites):
   deterministic: a re-run conflicts again, so the abort is best-effort. The second is that a durable
   `abortPending` tombstone was written, the server answered its abort 2xx or 404 `NOT_FOUND`, and no
   other PUT of that `transferId` from this client can still land: the gate saw no ambiguous answer,
-  and no epoch re-seed started during the attempt. A late PUT would re-open the aborted row,
+  no epoch re-seed started during the attempt, and none is still re-PUTting when it fails (one that
+  started earlier may list the acked entry late and re-PUT it). A late PUT would re-open the aborted row,
   because the server's abort is soft and byte-equal re-openable (Appendix B). Every other
   nothing-certified failure reports possibly-committed (`SEND_SYNC_PENDING`) with its `transferId`:
   - no tombstone could be written, or a PUT may still land: the intent stays open, with no abort,
     and the converger re-runs it under the same `transferId`;
-  - the tombstone is written but the abort failed: the row is still open, and intents are per owner,
-    not per device, so another device of the wallet could run it. This device's #676 gate never
-    resumes it and aborts it on a later pass, and reports it `conflicted` only once that abort is
-    confirmed, so a linked payment request stays `settling` until then.
+  - the tombstone is written but the abort failed (`CANCEL_UNCONFIRMED_MESSAGE`): the row is still
+    open, and intents are per owner, not per device, so another device of the wallet could run it.
+    This device **cancels** it and never sends it: the #676 gate never resumes it, aborts it on a
+    later pass, and reports it `conflicted` only once that abort is confirmed, so a linked payment
+    request stays `settling` until then and turns payable after. `pendingTransfers()` does not list
+    it (an `abortPending` entry is a rollback, not a pending send).
   A tombstone is removed only after the server answers its abort 2xx or 404 `NOT_FOUND`, and never
   while the id is locally active (§7). Until then the #676 gate keeps the intent from ever resuming.
 - **E.4 (the most loss-prone flow — every step is a machine transition, test-pinned):** no mint
@@ -516,10 +534,20 @@ Normative behaviors bound into the transitions (not call sites):
     an in-process convergence is possibly-committed, keeping its own code or else taking
     `SEND_SYNC_PENDING`. There is no soft-abort and no full retry.
   - **`remainingAmount` `'0'`:** when the latest attempt is possibly-committed after earlier
-    partials, `PartialSendConflictError.remainingAmount` is `'0'`. The remainder rides that
-    still-open attempt: its error is `cause`, carrying its `transferId`, and `committedTokenIds`
-    also lists its certified sources. The send's earlier shortfall rows are dropped, because the
-    open attempt owns the remainder.
+    partials and will still be sent, `PartialSendConflictError.remainingAmount` is `'0'`. The
+    remainder rides that still-open attempt: its error is `cause`, carrying its `transferId`, and
+    `committedTokenIds` also lists its certified sources. The send's earlier shortfall rows are
+    dropped, because the open attempt owns the remainder. Accepted window: when that attempt is
+    itself dropped later (a conflict on resume, or a 413/422 on its ensure re-PUT), the remainder
+    is recorded nowhere — an under-payment, never a double pay.
+  - **A latest attempt being cancelled owns nothing:** its tombstone is written and its abort is
+    unconfirmed, so this device never sends it. `remainingAmount` is the owed remainder, `cause`
+    is that attempt's `SEND_SYNC_PENDING` (with its `transferId`), and the earlier shortfall rows
+    stay. Residual: until the server confirms the cancel, another device of the wallet could
+    complete that attempt, and a remainder re-planned in the meantime would then be paid twice.
+    Closing it needs server-side exclusivity between an abort and another device's in-flight
+    resume. Reporting `'0'` instead would not close the race — the other device may already have
+    certified before the abort lands — and would turn it into a permanent, unsignalled under-pay.
   - **Final partial:** a settled partial whose `complete` fails after its apply surfaces as a
     *final* `PartialSendConflictError` with its durable remainder. It is not re-planned in-process,
     since re-planning while a split row is still open could resurrect the consumed shortfall;
@@ -759,7 +787,7 @@ can lose money.** Each row exists because of a documented server non-guarantee.
 | Delivery journal (`(transferId, opIndex)` → blob) | certification→deposit window is client-only | Delivery |
 | Mint journal (pre-submit seed: coinId, amount, mintId) | mint certification→`applyDelta` window is client-only (mint has no intent row) | Mint |
 | NFT mint journal (`nft-mint-journal`: planned payload, salt, token type and tokenId, as hex) | the same window for `mintNft` (#785); the planned BYTES are journaled so a replay re-submits exactly the first attempt | Mint |
-| Partial-shortfall record (`remainingAmount` + delivered set) | the delivered legs' intent completes — resume cannot recover a shortfall the app never saw (#690/#692); written before the attempt's apply (so before the partial surfaces, #835), cleared on re-plan/ack, and dropped when a later attempt of the same send is left open, since that attempt owns the remainder (#835) | TransferMachine |
+| Partial-shortfall record (`remainingAmount` + delivered set) | the delivered legs' intent completes — resume cannot recover a shortfall the app never saw (#690/#692); written before the attempt's apply (so before the partial surfaces, #835), cleared on re-plan/ack, and dropped when a later attempt of the same send is left open and will still be sent, since that attempt owns the remainder — kept when that attempt is being cancelled (#835) | TransferMachine |
 | Seen-set `(tokenId, stateHash)` | mailbox is at-least-once; claimed entries stay listable | delivery impl (S7 port contract) |
 | `suspectedSpent` overlay | server never checks unspentness | InventoryView |
 | Settling journal (request → transferId) | #441 — a possibly-committed pay must survive reload | Requests |
@@ -782,10 +810,14 @@ optional field, `intentPut?: 'pending' | 'unconfirmed'`:
 - **Absent:** the PUT was acked, or an older client wrote the entry.
 
 Both marker writes are best-effort, and each failure leaves a known, bounded residual. If the park
-write fails, the parked id is held in memory for the life of the process. After a restart the entry
-still reads `'pending'`, so an S1 sweep can drop a send whose PUT never landed: an under-payment,
-never a double pay. If the clear after a 2xx fails, the stale `'pending'` only makes a later re-seed
-skip that entry, so after a backend reset the intent's row is not restored.
+write fails, the parked id is held in memory until its row is confirmed or the hold is dropped
+(a 413/422 on its re-PUT), and every resume pass re-persists the `'unconfirmed'` flag before its
+re-PUT, so the hold survives a restart once one pass has run. The residual is a restart before that pass: the entry still reads `'pending'`, so an S1
+sweep can drop a send whose PUT never landed — an under-payment, never a double pay. `'pending'`
+itself is never treated as held: a refused send whose backstop removal failed also reads
+`'pending'`, and re-PUTing that one would run a send already reported clean. If the clear after a
+2xx fails, the stale `'pending'` only makes a later re-seed skip that entry, so after a backend
+reset the intent's row is not restored.
 
 There is no new disposition, no new `STORE_KEYS` entry and no prefix change, so an older client
 reads either value as an ordinary `'open'` entry and never as an abort. **Downgrade window
@@ -853,10 +885,27 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      other read-modify-write of the store), so a park or a fence that lands meanwhile is never
      lost to a stale read.
   4. Gate, decode and resume, unchanged.
+  5. Reconcile payment links, against the backstop read again after the pass: every transferId
+     with a local entry then (held, parked, being cancelled, or an attempt that ended mid-pass) is
+     reported open alongside the pass's own failures, because a link written while the pass ran is
+     in none of its sets and would otherwise reach the unaccounted branch, which resolves it paid.
+     If that read fails, the pass skips only the reconcile: it still reports its progress and
+     refreshes the view.
 
-  The epoch re-seed bumps a counter that the machine reads synchronously right before it
-  enqueues a fence, so an attempt that a re-seed overlapped never reports clean on a tombstone
-  (§5.5 E.2). A re-seed that starts after that check lists or re-reads the tombstone and skips it.
+  Activity is judged once per pass: the pass watches the facade's active-op registry
+  (`ActiveOps`), so an id in process at any moment of the pass — already running when the pass
+  began, or started while it runs (even one whose PUT landed after the server computed the
+  listing, so it is not in it) — is locally active for the whole pass. The listing drops it, and
+  the pass never sweeps, confirms or resumes it, even when its attempt ends before the pass
+  reaches its entry.
+
+  The epoch re-seed bumps a counter, and holds an active count until its last re-PUT has answered
+  (it ends in a `finally` right after the re-PUT loop, also when it throws, and before the
+  stream-cursor reset and the inventory re-pull, which PUT nothing). The machine reads both
+  synchronously right before it enqueues a fence, so an attempt that a re-seed can still reach —
+  one that started during the attempt, or one still re-PUTting that may list the acked entry
+  late — never reports clean on a tombstone (§5.5 E.2).
+  A re-seed that starts after that check lists or re-reads the tombstone and skips it.
 - **Address switch** = stop the vertical, start a new one. **`stop()` awaits quiescence** —
   in-flight machines and the drain complete or park before `start()` for the same address may
   run, because both instances would otherwise write the same per-address durable stores (this is
@@ -1005,12 +1054,19 @@ never recorded spent; locally-aborted intents never resumed, unknown local dispo
 all; unsupported payloads refused; reservation gate + synchronous critical section; per-request
 pay single-flight; settling journal durable-before-throw (not during the send: #806, §5.8);
 post-commit mirror failure ≠ failure;
-pre-submit intent PUT confirm-or-park — a 413/422, or two pre-write 4xx with no ambiguous answer
-before them, drops the backstop and never aborts; an ambiguous answer parks the send as
+pre-submit intent PUT confirm-or-park — a 413/422 (typed or not) with no ambiguous answer before
+it, or two pre-write 4xx (wallet-api's typed envelope only) with no ambiguous answer before them,
+drops the backstop and never aborts; an ambiguous answer (any other untyped 4xx, and a 413/422
+after an ambiguous one, included) parks the send as
 `SEND_SYNC_PENDING` with its transferId, every pass ensures it before resuming it, and the re-seed
-skips never-acked entries (re-seed rejection keeps the backstop) (#670, #835);
+skips never-acked entries (re-seed rejection keeps the backstop) (#670, #835); a hold kept only in
+memory is re-persisted by every pass before its re-PUT, and a confirmed or dropped hold ends it
+(#835); an id in process at any moment of a pass is locally active for all of it, and the pass
+reconciles links against the backstop as it is after the pass (#835);
+no listener's throw reaches a send outcome (#835);
 suspectedSpent demotion durable + re-plan bounded; remainder-only re-plan under new transferId +
-durable shortfall record, `remainingAmount` `'0'` when the latest attempt is still open (#835);
+durable shortfall record, `remainingAmount` `'0'` when the latest attempt is still open and will be
+sent — never for one being cancelled, which keeps the shortfall rows (#835);
 provider pinning; fail-closed composition (with ONE explicit escape:
 `walletApi: 'none'` composes no money at all — #793 — while an OMITTED config still refuses);
 recipient network pinned at

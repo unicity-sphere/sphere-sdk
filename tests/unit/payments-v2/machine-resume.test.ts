@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { ProofUnconfirmedError, TransferConflictError } from '../../../token-engine/errors';
 import { resumeAll } from '../../../modules/payments-v2/machine/resume';
+import { ActiveOps, Converger } from '../../../modules/payments-v2/convergence';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
 import { STORE_KEYS, type IntentBackstopEntry } from '../../../modules/payments-v2/stores';
 import { FakeApiError, ValidationFailedError } from './fakes/FakeWalletApi';
@@ -835,5 +836,123 @@ describe('a local abort record goes only once the server says the row cannot run
     expect(await stores.backstop.removeIfUnchanged('cas-1', entry)).toBe(true);
     expect(await stores.backstop.getByKey('cas-1')).toBeUndefined();
     expect(await stores.backstop.removeIfUnchanged('cas-1', entry)).toBe(false);
+  });
+});
+
+describe('the ensure step keeps a hold durable and seals what it re-PUTs (#835)', () => {
+  it('a held SPLIT send is re-PUT sealed: requiresSeedClose true on the wire and on the row it creates', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ amount: '600', split: { token, splitAmount: '600', remainderAmount: '400' } });
+    const parked = await parkSend(w, plan);
+    expect(parked.requiresSeedClose).toBe(true);
+    w.putCalls.length = 0;
+
+    await resumeAll(w.deps);
+
+    expect(w.putCalls[0]).toEqual({ transferId: plan.transferId, envelope: parked.payloadEnvelope, requiresSeedClose: true });
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.requiresSeedClose).toBe(true);
+  });
+
+  it('a hold kept only in memory (its flag write failed) is re-persisted before the re-PUT, even one that fails', async () => {
+    const w = makeWorld();
+    const entry = openEntry('parked-in-memory', { intentPut: 'pending' });
+    await w.stores().backstop.upsert(entry);
+    w.overrides.putIntent = unavailable;
+
+    const report = await resumeAll(w.deps, { isParked: (id) => id === entry.transferId });
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [entry.transferId] });
+    expect(w.putCalls).toHaveLength(1);
+    expect((await w.stores().backstop.getByKey(entry.transferId))?.intentPut, 'a restart now finds it held').toBe('unconfirmed');
+  });
+
+  it('a re-persisted hold whose re-PUT is refused 422 is still dropped and reported conflicted', async () => {
+    const w = makeWorld();
+    const entry = openEntry('parked-in-memory', { intentPut: 'pending' });
+    await w.stores().backstop.upsert(entry);
+    w.overrides.putIntent = async () => {
+      throw new ValidationFailedError('payload refused');
+    };
+
+    const report = await resumeAll(w.deps, { isParked: (id) => id === entry.transferId });
+
+    expect(report).toEqual({ resumed: [], conflicted: [entry.transferId], failed: [] });
+    expect(await w.stores().backstop.getByKey(entry.transferId)).toBeUndefined();
+  });
+
+  it('onHoldEnded names a held id once its row is confirmed (2xx re-PUT or listing) or it is dropped (422); never one still unconfirmed', async () => {
+    const w = makeWorld();
+    const plans = [];
+    for (let i = 0; i < 4; i++) plans.push(await w.plan({ tokens: [await w.seed(100n)], amount: '100' }));
+    const entries = [];
+    for (const plan of plans) entries.push(await parkSend(w, plan));
+    const [reput, listed, stillDown, refused] = entries;
+    // `listed`'s row landed after all; `stillDown`'s re-PUT keeps failing; `refused`'s is answered 422.
+    await w.api.putIntent(w.caller, { transferId: listed!.transferId, payload: listed!.payloadEnvelope });
+    w.overrides.putIntent = async () => {
+      const last = w.putCalls[w.putCalls.length - 1]?.transferId;
+      if (last === stillDown!.transferId) await unavailable();
+      if (last === refused!.transferId) throw new ValidationFailedError('payload refused');
+    };
+    const ended: string[] = [];
+
+    const report = await resumeAll(w.deps, { onHoldEnded: (id) => ended.push(id) });
+
+    expect(report.conflicted).toEqual([refused!.transferId]);
+    expect([...ended].sort()).toEqual([reput!.transferId, listed!.transferId, refused!.transferId].sort());
+  });
+});
+
+describe('a convergence pass (#835)', () => {
+  it('whose post-pass backstop read fails still reports its progress and refreshes the view; it reconciles nothing', async () => {
+    const w = makeWorld();
+    const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+    await parkSend(w, plan); // the service is back: the pass's ensure re-PUT confirms it and resumes it
+    const stores = createMachineStores(w.kv);
+    // resumeAll reads through its own stores, so only the pass's own post-pass read fails.
+    vi.spyOn(stores.backstop, 'list').mockRejectedValueOnce(new Error('injected kv read failure'));
+    const reconcile = vi.fn(async () => undefined);
+    const refreshView = vi.fn(async () => undefined);
+    const converger = new Converger({
+      machineDeps: w.deps,
+      stores,
+      delivery: w.deps.delivery,
+      reconcile,
+      refreshView,
+      replayMints: async () => 0,
+      replayNftMints: async () => 0,
+      replayCustomMints: async () => 0,
+      replayBurns: async () => 0,
+      activeOps: new ActiveOps(),
+      parked: new Set(),
+      emit: () => undefined,
+      now: () => w.clock.t,
+    });
+
+    const outcome = await converger.convergeOnce();
+
+    expect(w.deposits.map((d) => d.transferId)).toEqual([plan.transferId]);
+    expect(outcome.progress).toBe(true);
+    expect(refreshView).toHaveBeenCalledTimes(1);
+    expect(reconcile, 'an unreadable backstop proves nothing about a link').not.toHaveBeenCalled();
+  });
+});
+
+describe('ActiveOps (#835)', () => {
+  it('a watch records every id in process when it starts and every one started before it stops, and keeps them after they end', () => {
+    const ops = new ActiveOps();
+    ops.add('before');
+    const seen = new Set<string>();
+    const stop = ops.watch(seen);
+    ops.add('during');
+    ops.delete('before');
+    ops.delete('during');
+    stop();
+    ops.add('after');
+
+    expect([...seen].sort()).toEqual(['before', 'during']);
+    expect(ops.has('before')).toBe(false);
+    expect(ops.has('after')).toBe(true);
   });
 });

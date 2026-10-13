@@ -36,6 +36,7 @@ import type {
 } from '../../../token-engine';
 import { CheckpointPersistFailedError, ProofUnconfirmedError } from '../../../token-engine/errors';
 import * as MESSAGES from '../../../modules/payments-v2/send-errors';
+import type { MachineStores } from '../../../modules/payments-v2/machine/journal';
 import { STORE_KEYS, type IntentBackstopEntry, type ShortfallEntry } from '../../../modules/payments-v2/stores';
 import { hexToBytes } from '../../../core/crypto';
 import { RealizationEngine } from './machine-harness';
@@ -49,6 +50,7 @@ import {
   makeWorld,
   ownCaller,
   peerCaller,
+  type Gate,
   type PutCall,
   type World,
 } from './facade-harness';
@@ -84,7 +86,10 @@ const PRE_WRITE_REFUSALS: readonly (readonly [string, () => WalletApiHttpError, 
 ];
 
 // Answers that prove nothing about the row: it may exist, or appear later. A 2xx
-// whose body is not JSON (PROTOCOL) may have stored it too.
+// whose body is not JSON (PROTOCOL) may have stored it too. A 4xx proves "nothing
+// written" only in wallet-api's own envelope: a page it did not write reads HTTP_<status>
+// (an intermediary — a proxy's 403 or 429, or a 499 after it forwarded the request).
+// 408 and 499 stay ambiguous even under a typed body: the status alone says so.
 const AMBIGUOUS_ANSWERS: readonly (readonly [string, () => WalletApiHttpError])[] = [
   ['0 NETWORK', () => new WalletApiHttpError(0, 'NETWORK', 'wallet-api request failed: connection reset')],
   ['500 INTERNAL', () => new WalletApiHttpError(500, 'INTERNAL', 'PUT /v1/intents: internal server error')],
@@ -93,6 +98,11 @@ const AMBIGUOUS_ANSWERS: readonly (readonly [string, () => WalletApiHttpError])[
   ['504 HTTP_504', () => new WalletApiHttpError(504, 'HTTP_504', 'PUT /v1/intents failed with status 504')],
   ['408 HTTP_408', () => new WalletApiHttpError(408, 'HTTP_408', 'PUT /v1/intents failed with status 408')],
   ['200 PROTOCOL', () => new WalletApiHttpError(200, 'PROTOCOL', 'PUT /v1/intents: response is not JSON')],
+  ['429 HTTP_429 (an intermediary page)', () => new WalletApiHttpError(429, 'HTTP_429', 'PUT /v1/intents failed with status 429')],
+  ['403 HTTP_403', () => new WalletApiHttpError(403, 'HTTP_403', 'PUT /v1/intents failed with status 403')],
+  ['499 HTTP_499', () => new WalletApiHttpError(499, 'HTTP_499', 'PUT /v1/intents failed with status 499')],
+  ['408 REQUEST_TIMEOUT (typed)', () => new WalletApiHttpError(408, 'REQUEST_TIMEOUT', 'PUT /v1/intents: request timed out')],
+  ['499 CLIENT_CLOSED_REQUEST (typed)', () => new WalletApiHttpError(499, 'CLIENT_CLOSED_REQUEST', 'PUT /v1/intents: client closed request')],
 ];
 
 const unavailable = (): WalletApiHttpError =>
@@ -1035,6 +1045,40 @@ describe('#835 (h) PUT /v1/intents answers ambiguously on every attempt', () => 
     expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
     expect(serverIntent(world, 'tid-1')).toBe('completed');
   });
+
+  it('(h-kvfail-restart) the next pass re-persists a hold whose flag write failed, so a restart still sends it — once', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await startSettled(world);
+    world.hooks.putIntent = async () => {
+      world.kv.failWriteKeys.add(STORE_KEYS.intentBackstop);
+      throw unavailable();
+    };
+    const outcome = await settle(world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN }));
+    expect((rejectionOf(outcome) as SphereError).code).toBe('SEND_SYNC_PENDING');
+    expect(intentPutOf(backstopOf(world, 'tid-1')), 'the hold never reached the store').toBe('pending');
+
+    // The store heals; the wallet service does not.
+    world.kv.failWriteKeys.delete(STORE_KEYS.intentBackstop);
+    failEveryPut(world, unavailable);
+    await world.facade.resumeNow();
+    await flushTail();
+    expect(intentPutOf(backstopOf(world, 'tid-1')), 'the pass re-persisted the hold before its re-PUT').toBe('unconfirmed');
+    await world.facade.stop();
+
+    // A fresh process: only the store says the send is held.
+    const restarted = makeWorld({ restartOf: world });
+    restarted.innerClient.copyBlobIndexFrom(world.innerClient);
+    await restarted.facade.start();
+    await restarted.facade.resumeNow();
+    await restarted.facade.resumeNow();
+    await flushTail();
+
+    expect(putCallsFor(restarted, 'tid-1').length, 'the restarted facade re-PUT the held intent').toBeGreaterThan(0);
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
+    expect(serverIntent(world, 'tid-1')).toBe('completed');
+    expect(backstopOf(world, 'tid-1')).toBeUndefined();
+  });
 });
 
 // ── (i) an epoch reseed while the PUT is in flight ──────────────────────────
@@ -1556,5 +1600,531 @@ describe('#835 (r) a settled partial whose close fails after the apply', () => {
     expect(sent.map((r) => [r.transferId, r.assets])).toEqual([['tid-1', [{ coinId: COIN, amount: '60' }]]]);
     expect(failedUpdates(world)).toEqual([]);
     expect((await receipts(world)).amount).toBe(60n);
+  });
+});
+
+// ── (s) a convergence pass that overlaps a send or a payment ────────────────
+
+/** A source whose transfer waits on a gate (a resumed intent's proof wait) or fails ordinarily. */
+class GatedEngine extends LegFailureEngine {
+  readonly gates = new Map<string, () => Promise<void>>();
+  readonly unconfirmOnce = new Set<string>();
+
+  override async transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken> {
+    const id = params.token.blob.tokenId;
+    if (this.unconfirmOnce.delete(id)) throw new ProofUnconfirmedError('no inclusion proof before the deadline (simulated)');
+    const gate = this.gates.get(id);
+    if (gate !== undefined) {
+      this.gates.delete(id);
+      await gate();
+    }
+    return super.transfer(params, options);
+  }
+}
+
+/** tid-1 is an earlier send left open (its proof never came); the next pass resumes it. */
+async function worldWithOpenIntent(): Promise<{ world: World; engine: GatedEngine; open: SphereToken; spare: SphereToken }> {
+  const engine = new GatedEngine({ chainPubkey: hexToBytes(OWN_PUB) });
+  const world = makeWorld({ engine });
+  const open = await world.seed(50n);
+  const spare = await world.seed(100n);
+  await startSettled(world);
+  engine.unconfirmOnce.add(open.blob.tokenId);
+  const first = await settle(world.facade.send({ recipient: '@peer', amount: '50', coinId: COIN }));
+  expect((rejectionOf(first) as SphereError).code).toBe('CERTIFICATION_UNCONFIRMED');
+  expect(serverIntent(world, 'tid-1')).toBe('open');
+  return { world, engine, open, spare };
+}
+
+/** Starts a pass that resumes tid-1 and blocks inside its leg until `release()`. */
+async function passBlockedInResume(world: World, engine: GatedEngine, open: SphereToken): Promise<{ pass: Promise<void>; release(): void }> {
+  const gate = makeGate();
+  world.gates.push(gate);
+  engine.gates.set(open.blob.tokenId, () => gate.enter());
+  const pass = world.facade.resumeNow();
+  await vi.waitFor(() => expect(gate.entered).toBe(true));
+  return { pass, release: () => gate.release() };
+}
+
+describe('#835 (s) a payment link written while a convergence pass is in flight', () => {
+  it('(s-park) a pay() that parks while a pass is in flight: the request stays settling, then reads paid once the send converged', async () => {
+    const { world, engine, open } = await worldWithOpenIntent();
+    const id = await incomingRequest(world, 100n);
+    const blocked = await passBlockedInResume(world, engine, open);
+
+    failEveryPut(world, unavailable);
+    const outcome = await settle(world.facade.requests.pay(id));
+    expect((rejectionOf(outcome) as SphereError).code).toBe('SEND_SYNC_PENDING');
+    blocked.release();
+    await blocked.pass;
+    await flushTail();
+
+    expect(requestStatus(world, id), 'a held payment is never resolved paid').toBe('settling');
+    expect((await requesterRow(world, id))?.status, 'no paid respond while nothing moved').toBe('open');
+    expect(serverIntent(world, 'tid-2')).toBeUndefined();
+
+    delete world.hooks.putIntent;
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(requestStatus(world, id)).toBe('paid');
+    expect((await requesterRow(world, id))?.transferId).toBe('tid-2');
+    expect(serverIntent(world, 'tid-2')).toBe('completed');
+  });
+
+  it('(s-cancel) a pay() that ends cancel-unconfirmed while a pass is in flight: settling, then payable once the cancel is confirmed', async () => {
+    const { world, engine, open, spare } = await worldWithOpenIntent();
+    const id = await incomingRequest(world, 100n);
+    const blocked = await passBlockedInResume(world, engine, open);
+
+    engine.failSources.add(spare.blob.tokenId);
+    let abortFails = true;
+    world.hooks.abort = async (transferId) => {
+      if (transferId === 'tid-2' && abortFails) throw new WalletApiHttpError(500, 'INTERNAL', 'POST /v1/intents/abort: internal server error');
+    };
+    const outcome = await settle(world.facade.requests.pay(id));
+    expectMessage(rejectionOf(outcome), 'CANCEL_UNCONFIRMED_MESSAGE');
+    blocked.release();
+    await blocked.pass;
+    await flushTail();
+
+    expect(requestStatus(world, id), 'a payment being cancelled is never resolved paid').toBe('settling');
+    expect((await requesterRow(world, id))?.status).toBe('open');
+
+    abortFails = false;
+    engine.failSources.clear();
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(serverIntent(world, 'tid-2')).toBe('aborted');
+    expect(requestStatus(world, id), 'cancelled with nothing moved: payable again').toBe('pending');
+    expect((await requesterRow(world, id))?.status).toBe('open');
+    expect((await receipts(world)).amount, 'only the earlier send ever reached the peer').toBe(50n);
+  });
+
+  it('(s-listed) a pass that listed while the pay() attempt was active, then ran on after it ended cancel-unconfirmed: settling, never paid', async () => {
+    const engine = new LegFailureEngine({ chainPubkey: hexToBytes(OWN_PUB) });
+    const world = makeWorld({ engine });
+    const tA = await world.seed(100n);
+    await world.seed(50n);
+    await startSettled(world);
+
+    // A held send B, whose every PUT dies before the server stores anything.
+    const inner = world.innerClient;
+    const store = inner.putIntent.bind(inner);
+    let heldId: string | null = null;
+    let rePutGate: Gate | null = null;
+    inner.putIntent = async (transferId, envelope, seal) => {
+      if (heldId !== null && transferId !== heldId) return store(transferId, envelope, seal);
+      heldId ??= transferId;
+      if (rePutGate !== null) await rePutGate.enter(); // the pass's re-PUT of B is slow
+      throw networkDown();
+    };
+    const held = await settle(world.facade.send({ recipient: '@peer', amount: '50', coinId: COIN }));
+    expect((rejectionOf(held) as SphereError).code).toBe('SEND_SYNC_PENDING');
+
+    const id = await incomingRequest(world, 100n);
+    engine.failSources.add(tA.blob.tokenId);
+    const abortGate = makeGate();
+    world.gates.push(abortGate);
+    let aborts = 0;
+    world.hooks.abort = async () => {
+      if ((aborts += 1) === 1) await abortGate.enter();
+      throw new WalletApiHttpError(500, 'INTERNAL', 'POST /v1/intents/abort: internal server error');
+    };
+    rePutGate = makeGate();
+    world.gates.push(rePutGate);
+
+    const paying = settle(world.facade.requests.pay(id));
+    await vi.waitFor(() => expect(abortGate.entered).toBe(true));
+    const pass = world.facade.resumeNow(); // lists while the attempt is still in its fence
+    await vi.waitFor(() => expect(rePutGate!.entered).toBe(true));
+    abortGate.release();
+    const err = rejectionOf(await paying) as SphereError;
+    expectMessage(err, 'CANCEL_UNCONFIRMED_MESSAGE');
+    rePutGate.release();
+    await pass;
+    await flushTail();
+
+    expect(requestStatus(world, id), 'a payment being cancelled is never resolved paid').toBe('settling');
+    expect((await requesterRow(world, id))?.status).toBe('open');
+    expect(backstopOf(world, err.transferId!)?.disposition, 'the pass left the ended attempt to the next one').toBe('abortPending');
+
+    delete world.hooks.abort;
+    engine.failSources.clear();
+    rePutGate = null;
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(serverIntent(world, err.transferId!)).toBe('aborted');
+    expect(requestStatus(world, id), 'cancelled with nothing moved: payable again').toBe('pending');
+    expect((await requesterRow(world, id))?.status).toBe('open');
+    expect((await receipts(world)).entries).toBe(0);
+  });
+
+  it('(s-ended) an attempt held NOT_FENCED that ends after the pass listed it keeps its backstop and its source', async () => {
+    const engine = new LegFailureEngine({ chainPubkey: hexToBytes(OWN_PUB) });
+    const world = makeWorld({ engine });
+    const token = await world.seed(100n);
+    engine.failSources.add(token.blob.tokenId);
+    await startSettled(world);
+    failPutBeforeStoreOnce(world, networkDown); // ambiguous, then 2xx: the attempt cannot be fenced
+
+    const legGate = makeGate();
+    world.gates.push(legGate);
+    const transfer = engine.transfer.bind(engine);
+    let held = false;
+    engine.transfer = async (params, options) => {
+      if (!held) {
+        held = true;
+        await legGate.enter();
+      }
+      return transfer(params, options);
+    };
+    // The pass lists while the attempt is active, and reads the backstop only after it ended.
+    const readGate = makeGate();
+    world.gates.push(readGate);
+    let holdNextRead = false;
+    world.hooks.listOpen = async () => {
+      holdNextRead = true;
+    };
+    const get = world.kv.get.bind(world.kv);
+    world.kv.get = async <T>(key: string): Promise<T | null> => {
+      if (holdNextRead && key === STORE_KEYS.intentBackstop) {
+        holdNextRead = false;
+        await readGate.enter();
+      }
+      return get<T>(key);
+    };
+
+    const sending = settle(world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN }));
+    await vi.waitFor(() => expect(legGate.entered).toBe(true));
+    const pass = world.facade.resumeNow();
+    await vi.waitFor(() => expect(readGate.entered).toBe(true));
+    legGate.release();
+    expectMessage(rejectionOf(await sending), 'NOT_FENCED_MESSAGE');
+    readGate.release();
+    await pass;
+    await flushTail();
+
+    expect(serverIntent(world, 'tid-1')).toBe('open');
+    expect(backstopOf(world, 'tid-1')?.disposition, 'the pass judged the attempt active for its whole run').toBe('open');
+    expect(tokenStatus(world, token.blob.tokenId), 'its source stays pinned to the open intent').toBe('transferring');
+
+    delete world.hooks.listOpen;
+    engine.failSources.delete(token.blob.tokenId);
+    await world.facade.resumeNow();
+    await flushTail();
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
+  });
+});
+
+/** The pass's listing is computed at once; its answer reaches the pass only on `release()`. */
+function delayListing(world: World): Gate {
+  const gate = makeGate();
+  world.gates.push(gate);
+  const inner = world.innerClient;
+  const list = inner.listIntents.bind(inner);
+  let delay = true;
+  inner.listIntents = async (status) => {
+    const listed = await list(status);
+    if (delay && (status ?? 'open') === 'open') {
+      delay = false;
+      await gate.enter();
+    }
+    return listed;
+  };
+  return gate;
+}
+
+describe('#835 (s) an attempt the pass listing cannot show, ending while the pass runs', () => {
+  async function unlistedWorld(): Promise<{ world: World; engine: LegFailureEngine; token: SphereToken; id: string }> {
+    const engine = new LegFailureEngine({ chainPubkey: hexToBytes(OWN_PUB) });
+    const world = makeWorld({ engine });
+    const token = await world.seed(100n);
+    await startSettled(world);
+    const id = await incomingRequest(world, 100n);
+    engine.failSources.add(token.blob.tokenId);
+    return { world, engine, token, id };
+  }
+
+  async function expectOwnedByNoPass(world: World, engine: LegFailureEngine, token: SphereToken, id: string, transferId: string): Promise<void> {
+    expect(serverIntent(world, transferId)).toBe('open');
+    expect(backstopOf(world, transferId)?.disposition, 'the pass never sweeps an attempt in process during it').toBe('open');
+    expect(tokenStatus(world, token.blob.tokenId), 'its source stays pinned to the open intent').toBe('transferring');
+    expect(requestStatus(world, id), 'nothing moved: the link is never resolved paid').toBe('settling');
+    expect((await requesterRow(world, id))?.status).toBe('open');
+
+    engine.failSources.clear();
+    await world.facade.resumeNow();
+    await flushTail();
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
+    expect(requestStatus(world, id)).toBe('paid');
+  }
+
+  it('(s-unlisted) a pay() that starts after the pass listed and ends NOT_FENCED before the listing answers', async () => {
+    const { world, engine, token, id } = await unlistedWorld();
+    const listing = delayListing(world);
+
+    const pass = world.facade.resumeNow();
+    await vi.waitFor(() => expect(listing.entered).toBe(true)); // computed with no row of the pay
+    failPutBeforeStoreOnce(world, networkDown); // ambiguous, then 2xx: the attempt cannot be fenced
+    const err = rejectionOf(await settle(world.facade.requests.pay(id))) as SphereError;
+    expectMessage(err, 'NOT_FENCED_MESSAGE');
+    listing.release();
+    await pass;
+    await flushTail();
+
+    await expectOwnedByNoPass(world, engine, token, id, err.transferId!);
+  });
+
+  it('(s-unlisted-running) a pay() already in its first PUT when the pass begins, ending NOT_FENCED before the listing answers', async () => {
+    const { world, engine, token, id } = await unlistedWorld();
+    const putGate = makeGate();
+    world.gates.push(putGate);
+    const inner = world.innerClient;
+    const store = inner.putIntent.bind(inner);
+    let puts = 0;
+    inner.putIntent = async (transferId, envelope, seal) => {
+      if ((puts += 1) > 1) return store(transferId, envelope, seal);
+      await putGate.enter();
+      throw networkDown(); // ambiguous: the attempt cannot be fenced
+    };
+    const listing = delayListing(world);
+
+    const paying = settle(world.facade.requests.pay(id));
+    await vi.waitFor(() => expect(putGate.entered).toBe(true));
+    const pass = world.facade.resumeNow();
+    await vi.waitFor(() => expect(listing.entered).toBe(true)); // computed before any PUT of the pay landed
+    putGate.release();
+    const err = rejectionOf(await paying) as SphereError;
+    expectMessage(err, 'NOT_FENCED_MESSAGE');
+    listing.release();
+    await pass;
+    await flushTail();
+
+    await expectOwnedByNoPass(world, engine, token, id, err.transferId!);
+  });
+});
+
+// ── (t) a §5.1 reseed already running when the send starts ──────────────────
+
+describe('#835 (t) a reseed that overlaps a send it started before', () => {
+  it('(t) the reseed lists the backstop only after the send acked and re-PUTs it while the only leg fails cleanly: held, never fenced, paid once', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await world.seed(100n); // what a contract-following re-send would spend
+    await startSettled(world);
+    await flushTail();
+    // The reseed's backstop read starts late. The shipped composition issues it before any later
+    // send's upsert, so the guard is defensive and the test forces the ordering on the facade's own stores.
+    const stores = (world.facade as unknown as { machineStores: MachineStores }).machineStores;
+    const listGate = makeGate();
+    world.gates.push(listGate);
+    const list = stores.backstop.list.bind(stores.backstop);
+    let delayNextList = true;
+    stores.backstop.list = async () => {
+      if (delayNextList) {
+        delayNextList = false;
+        await listGate.enter();
+      }
+      return list();
+    };
+    const reputGate = makeGate();
+    world.gates.push(reputGate);
+    world.hooks.putIntent = async () => {
+      if (putCallsFor(world, 'tid-1').length === 2) await reputGate.enter(); // the reseed's re-PUT
+    };
+    const transfer = world.engine.transfer.bind(world.engine);
+    let failOnce = true;
+    world.engine.transfer = async (params, options) => {
+      if (!failOnce) return transfer(params, options);
+      failOnce = false;
+      listGate.release(); // the reseed now lists the acked entry…
+      await vi.waitFor(() => expect(reputGate.entered).toBe(true)); // …and its re-PUT is in flight
+      throw new SphereError('the aggregator refused the transfer (simulated)', 'TRANSFER_FAILED');
+    };
+
+    const reseed = world.facade.handleEpochChange('e2');
+    await vi.waitFor(() => expect(listGate.entered).toBe(true));
+    const request = { recipient: '@peer', amount: '100', coinId: COIN };
+    const outcome = await settle(world.facade.send(request));
+    reputGate.release(); // the re-PUT lands after the send reported
+    await reseed;
+    await flushTail();
+
+    expect(putCallsFor(world, 'tid-1'), 'the reseed re-PUT the acked attempt').toHaveLength(2);
+    const err = rejectionOf(outcome);
+    expect(isPossiblyCommittedSendOutcome(err), describeError(err)).toBe(true);
+    expect((err as SphereError).transferId).toBe('tid-1');
+    expectMessage(err, 'NOT_FENCED_MESSAGE');
+    expect(failedUpdates(world)).toEqual([]);
+
+    await followContract(world, outcome, request);
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
+    expect(serverIntent(world, 'tid-1')).toBe('completed');
+  });
+
+  it("(t') once the reseed has ended, a clean leg failure is fenced and clean again", async () => {
+    const engine = new LegFailureEngine({ chainPubkey: hexToBytes(OWN_PUB) });
+    const world = makeWorld({ engine });
+    const token = await world.seed(100n);
+    engine.failSources.add(token.blob.tokenId);
+    await startSettled(world);
+    await world.facade.handleEpochChange('e2');
+
+    const outcome = await settle(world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN }));
+
+    const err = rejectionOf(outcome);
+    expect(isPossiblyCommittedSendOutcome(err), describeError(err)).toBe(false);
+    expect((err as SphereError).code).toBe('TRANSFER_FAILED');
+    expect(serverIntent(world, 'tid-1')).toBe('aborted');
+    await expectHonestOutcome(world, outcome, 100n);
+  });
+});
+
+// ── (u) a listener's throw never reaches a money-path outcome ───────────────
+
+/** The host's emit rethrows a listener's error (Node's EventEmitter does) for these events. */
+function throwingListener(world: World, events: readonly string[]): void {
+  const push = world.events.push.bind(world.events);
+  world.events.push = (...items) => {
+    if (items.some((item) => events.includes(item.event))) throw new Error('listener blew up');
+    return push(...items);
+  };
+}
+
+describe('#835 (u) a host emit that rethrows a listener error', () => {
+  it('a delivered send() still resolves delivered', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await startSettled(world);
+    throwingListener(world, ['transfer:updated']);
+
+    const result = await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN });
+
+    expect(result.status).toBe('delivered');
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
+  });
+
+  it('requests.pay() over a delivered send still ends paid', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await startSettled(world);
+    const id = await incomingRequest(world, 100n);
+    throwingListener(world, ['transfer:updated', 'payment_request:updated', 'history:updated']);
+
+    const result = await world.facade.requests.pay(id);
+
+    expect(result.status).toBe('delivered');
+    expect(requestStatus(world, id)).toBe('paid');
+    expect((await requesterRow(world, id))?.status).toBe('paid');
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
+  });
+});
+
+// ── (v) a remainder attempt that is being cancelled owns nothing ────────────
+
+describe('#835 (v) after a partial, the re-plan attempt fails and its cancel is unconfirmed', () => {
+  it('the remainder stays owed: remainingAmount is the shortfall, its row is kept, and nothing is sent twice', async () => {
+    const engine = new LegFailureEngine({ chainPubkey: hexToBytes(OWN_PUB) });
+    const world = makeWorld({ engine });
+    const a = await world.seed(600n);
+    const b = await world.seed(400n);
+    const c = await world.seed(400n);
+    await engine.foreignSpend(b);
+    engine.failSources.add(c.blob.tokenId);
+    let abortFails = true;
+    world.hooks.abort = async () => {
+      if (abortFails) throw new WalletApiHttpError(500, 'INTERNAL', 'POST /v1/intents/abort: internal server error');
+    };
+    await startSettled(world);
+
+    const outcome = await settle(world.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN }));
+    await flushTail();
+
+    const err = rejectionOf(outcome);
+    expect(err, describeError(err)).toBeInstanceOf(PartialSendConflictError);
+    const partial = err as PartialSendConflictError;
+    expect(isPossiblyCommittedSendOutcome(partial)).toBe(true);
+    expect(partial.transferId).toBe('tid-1');
+    expect(partial.remainingAmount, 'a cancelled attempt owns no remainder: it is still owed').toBe('400');
+    expect(partial.committedTokenIds).toEqual([a.blob.tokenId]);
+    const planned = plannedIds(world);
+    const cancelling = planned[planned.length - 1];
+    const cause = partial.cause as SphereError;
+    expect(cause.code, describeError(cause)).toBe('SEND_SYNC_PENDING');
+    expect(cause.transferId).toBe(cancelling);
+    expectMessage(cause, 'CANCEL_UNCONFIRMED_MESSAGE');
+    expect(backstopOf(world, cancelling!)?.disposition).toBe('abortPending');
+    expect(shortfallOf(world, 'tid-1')?.remainingAmount, 'the shortfall row is kept').toBe('400');
+    const pending = await world.facade.pendingTransfers();
+    expect(pending.map((p) => [p.transferId, p.kind, p.amount])).toEqual([['tid-1', 'shortfall', '400']]);
+    expect(failedUpdates(world)).toEqual([]);
+
+    // The cancel lands; nothing of the cancelled attempt ever runs, and the shortfall is still owed.
+    abortFails = false;
+    engine.failSources.clear();
+    await world.facade.resumeNow();
+    await flushTail();
+    expect(serverIntent(world, cancelling!)).toBe('aborted');
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 600n });
+    expect(shortfallOf(world, 'tid-1')?.remainingAmount).toBe('400');
+
+    // A caller that re-plans only the shortfall pays the request exactly once.
+    await world.facade.send({ recipient: '@peer', amount: partial.remainingAmount, coinId: COIN });
+    await world.facade.resumeNow();
+    await flushTail();
+    expect((await receipts(world)).amount).toBe(1000n);
+  });
+});
+
+// ── (w) a converged hold is forgotten ───────────────────────────────────────
+
+/** The next backstop write that would drop `transferId` fails once. */
+function failNextBackstopRemoval(world: World, transferId: string): { fired(): boolean } {
+  const kv = world.kv;
+  const set = kv.set.bind(kv);
+  let fired = false;
+  kv.set = async <T>(key: string, value: T): Promise<void> => {
+    if (!fired && key === STORE_KEYS.intentBackstop) {
+      const before = storedList<IntentBackstopEntry>(world, key);
+      const after = value as unknown as IntentBackstopEntry[];
+      if (before.some((e) => e.transferId === transferId) && !after.some((e) => e.transferId === transferId)) {
+        fired = true;
+        throw new Error('injected backstop removal failure');
+      }
+    }
+    return set(key, value);
+  };
+  return { fired: () => fired };
+}
+
+describe('#835 (w) a held send the converger confirmed and completed', () => {
+  it('whose backstop removal failed is swept on a later pass with no further PUT and no further op', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await startSettled(world);
+    failEveryPut(world, unavailable);
+    const outcome = await settle(world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN }));
+    expect((rejectionOf(outcome) as SphereError).code).toBe('SEND_SYNC_PENDING');
+    delete world.hooks.putIntent;
+    const removal = failNextBackstopRemoval(world, 'tid-1');
+    await world.facade.resumeNow();
+    await flushTail();
+    expect(removal.fired()).toBe(true);
+    expect(serverIntent(world, 'tid-1')).toBe('completed');
+    expect(backstopOf(world, 'tid-1'), 'the stale entry outlived its intent').toBeDefined();
+    const puts = putCallsFor(world, 'tid-1').length;
+    const ops = chainOps(world);
+
+    await world.facade.resumeNow();
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(putCallsFor(world, 'tid-1'), 'a confirmed hold is never re-PUT').toHaveLength(puts);
+    expect(chainOps(world), 'nor run again').toBe(ops);
+    expect(backstopOf(world, 'tid-1'), 'swept as S1 residue').toBeUndefined();
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
   });
 });

@@ -27,18 +27,40 @@ contract paid the recipient twice.
 What changed:
 
 - No chain operation runs before the intent PUT answers 2xx. A failed PUT is re-sent with the same
-  stored bytes. A send the service provably refused fails clean. A send whose PUT stays unconfirmed
-  rejects `SEND_SYNC_PENDING` with its `transferId` and is sent automatically, under the same
-  transferId, once the service confirms the intent.
+  stored bytes. A send the service provably refused fails clean: a 413/422, in wallet-api's error
+  envelope or not, whenever no ambiguous answer came before it (it judges the bytes themselves, and
+  the same bytes are all that is ever re-sent); any other 4xx only when it came twice in wallet-api's
+  typed error envelope with nothing ambiguous before it. Any other untyped 4xx (a proxy's page)
+  proves nothing. A send whose PUT stays unconfirmed rejects `SEND_SYNC_PENDING` with its
+  `transferId` and is sent automatically, under the same transferId, once the service confirms the
+  intent; every resume pass re-persists the hold when only memory had it.
 - Every failure after a leg certified is possibly-committed with its `transferId`. A shortfall is
   durable before any inventory apply. A clean report now also requires that nothing on this device
-  can later execute the intent and, when it was cancelled, that the service confirmed the cancel; a
-  failed attempt that cannot meet that is reported `SEND_SYNC_PENDING` with its transferId.
+  can later execute the intent (no ambiguous PUT answer, no epoch re-seed that started during the
+  attempt or is still re-PUTting when it fails) and, when it was cancelled, that the service
+  confirmed the cancel; a failed attempt that cannot meet that is reported `SEND_SYNC_PENDING` with
+  its transferId.
+- A convergence pass treats a send in process at any moment of the pass, including one started
+  after the pass listed the open intents, as running for the whole pass, so the pass never sweeps or
+  resumes it. It reconciles payment links against the local intent store as it is after the pass,
+  so a link whose send is held or being cancelled is never resolved paid; when that read fails, only
+  the reconcile is skipped. A listener that throws (an `emit` that rethrows) is logged and
+  can no longer turn a delivered send into a rejection.
 - Behaviour changes for integrators:
   - `SEND_SYNC_PENDING` also means "held, not sent yet": the send goes out automatically, possibly
     much later, and cannot be cancelled;
-  - `PartialSendConflictError.remainingAmount` is `'0'` when a later attempt still owns the
-    remainder;
+  - `SEND_SYNC_PENDING` also means "being cancelled": an attempt failed with nothing certified and
+    the service has not confirmed its cancel. This device never sends it and `pendingTransfers()`
+    does not list it; a payment request paid with it stays `settling` until the cancel is
+    confirmed, then becomes payable again. Never send it again: until the cancel is confirmed,
+    another device of the wallet could still complete it;
+  - `PartialSendConflictError.remainingAmount` is `'0'` when a later attempt that will still be
+    sent owns the remainder. A later attempt being cancelled owns nothing: this device never sends
+    it, so the owed remainder is reported and its shortfall row stays in `pendingTransfers()`.
+    Until the service confirms that cancel, another device of the same wallet can still complete the
+    attempt, so a remainder re-planned in that window can be paid twice. Reporting `'0'` instead
+    would not close that race, since the other device may already have certified before the cancel
+    lands, and would turn it into a permanent, unsignalled under-payment;
   - the `sync:pending` attention code is no longer emitted.
 - The backstop store gains one optional field, which older clients read as an ordinary open entry.
 

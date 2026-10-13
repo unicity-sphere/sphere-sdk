@@ -543,4 +543,40 @@ describe('PaymentsFacade — #835 held sends and deferred passes', () => {
     expect(reconcile).toHaveBeenCalledTimes(1);
     expect(status()).toBe('paid');
   });
+
+  it('a pass whose backstop read failed reconciles nothing, even when the store reads again before the pass ends', async () => {
+    const w = makeWorld();
+    await w.seed(100n);
+    await w.facade.start();
+    await drain();
+    const wire = await w.api.createRequest(peerCaller, {
+      toPubkey: OWN_PUB,
+      assets: [{ coinId: COIN, amount: '100' }],
+    });
+    await w.facade.requests.drainIncoming();
+    w.hooks.putIntent = async () => {
+      throw intentStoreDown();
+    };
+    await expect(w.facade.requests.pay(wire.id)).rejects.toMatchObject({ code: 'SEND_SYNC_PENDING' });
+    const reconcile = vi.spyOn(w.facade.requests, 'reconcile');
+    // Only the pass's own read fails: the store answers again for everything after it.
+    let failNextRead = false;
+    w.hooks.listOpen = async () => {
+      failNextRead = true;
+    };
+    const get = w.kv.get.bind(w.kv);
+    w.kv.get = async <T>(key: string): Promise<T | null> => {
+      if (failNextRead && key === STORE_KEYS.intentBackstop) {
+        failNextRead = false;
+        throw new Error('injected kv read failure');
+      }
+      return get<T>(key);
+    };
+
+    await tick(HEARTBEAT_SEED_MS);
+
+    expect(w.counters.listOpen).toBeGreaterThan(0);
+    expect(reconcile, 'a deferred pass proves nothing, whatever the store says afterwards').not.toHaveBeenCalled();
+    expect(w.facade.requests.list().find((r) => r.id === wire.id)?.status).toBe('settling');
+  });
 });

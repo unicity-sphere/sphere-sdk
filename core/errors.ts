@@ -21,7 +21,7 @@
  *     showToast(`Partly sent: ${err.remainingAmount} base units were not sent`);
  *   } else if (isPossiblyCommittedSendOutcome(err)) {
  *     // The money may already have left the wallet: never call send() again for this payment.
- *     showToast('Sent, waiting for confirmation');
+ *     showToast('Waiting for confirmation. Do not pay again.');
  *   } else {
  *     switch ((err as { code?: unknown } | null)?.code) {
  *       case 'SEND_INSUFFICIENT_BALANCE': showToast('Not enough funds'); break;
@@ -58,11 +58,10 @@ export type SphereErrorCode =
   | 'CHECKPOINT_TRUSTBASE_MISMATCH'
   | 'MINT_REASON_UNVERIFIABLE'
   | 'STORAGE_ERROR'
-  // The send is on its way under err.transferId: it committed in whole or in part
-  // with the rest converging (#665), or the wallet service could not confirm it
-  // recorded the intent, so it is held and sent automatically (#835). Never
-  // re-send. The #738 pre-commit refusal carries NO transferId and is the
-  // documented exception.
+  // Never re-send. Under err.transferId it committed in part or whole (#665), or is
+  // held and sent automatically (#835), or failed and is being cancelled while
+  // another device could still run it (#835). The #738 pre-commit refusal carries
+  // NO transferId and is the documented exception.
   | 'SEND_SYNC_PENDING'
   // #677: a multi-leg send lost a source to a concurrent transfer AFTER ≥1
   // earlier leg had already certified on-chain AND been journaled/delivered.
@@ -189,7 +188,7 @@ export class SphereError extends Error {
  * caller/UI: the delivered legs are final, and only the REMAINDER
  * ({@link remainingAmount}) may be re-planned — under a NEW transferId, never
  * re-sending the whole amount. A `remainingAmount` of `'0'` means nothing may be
- * re-planned: the rest rides a later attempt that is still converging, named by
+ * re-planned: the rest rides a later attempt that will still be sent, named by
  * `cause.transferId` (#835).
  *
  * NOT a subclass of `TransferConflictError` by design: existing conflict

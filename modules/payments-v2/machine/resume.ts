@@ -34,6 +34,8 @@ export interface ResumeAllOptions {
   isLocallyActive?: (transferId: string) => boolean;
   /** #835: ids the machine parked in memory (their 'unconfirmed' flag write failed). */
   isParked?: (transferId: string) => boolean;
+  /** #835: a held id the ensure step confirmed or dropped — its in-memory park is done. */
+  onHoldEnded?: (transferId: string) => void;
   /** #835: the pass deferred on an unreadable backstop — its report proves nothing. */
   onDeferred?: () => void;
 }
@@ -44,6 +46,7 @@ interface LocalView {
   openIds: Set<string>;
   isLocallyActive: (transferId: string) => boolean;
   isParked: (transferId: string) => boolean;
+  onHoldEnded: (transferId: string) => void;
 }
 
 export async function resumeAll(deps: MachineDeps, options: ResumeAllOptions = {}): Promise<ResumeReport> {
@@ -65,6 +68,7 @@ export async function resumeAll(deps: MachineDeps, options: ResumeAllOptions = {
     openIds: new Set(open.map((i) => i.transferId)),
     isLocallyActive: options.isLocallyActive ?? (() => false),
     isParked: options.isParked ?? (() => false),
+    onHoldEnded: options.onHoldEnded ?? (() => undefined),
   };
   const confirmed = await confirmUnconfirmed(deps, stores, view, report);
   await dropStaleBackstops(deps.intents, stores, view);
@@ -106,26 +110,50 @@ async function confirmUnconfirmed(
   report: ResumeReport
 ): Promise<{ transferId: string; payload: string }[]> {
   const confirmed: { transferId: string; payload: string }[] = [];
-  for (const entry of [...view.locals.values()]) {
-    const id = entry.transferId;
-    if (entry.disposition !== 'open' || !isHeld(entry, view) || view.isLocallyActive(id)) continue;
+  for (const listed of [...view.locals.values()]) {
+    const id = listed.transferId;
+    if (listed.disposition !== 'open' || !isHeld(listed, view) || view.isLocallyActive(id)) continue;
     if (view.openIds.has(id)) {
-      await unflag(stores, view.locals, entry); // the row is there: gateAndDecode resumes it this pass
+      await unflag(stores, view.locals, listed); // the row is there: gateAndDecode resumes it this pass
+      view.onHoldEnded(id);
       continue;
     }
+    // Held in memory only (its flag write failed): every pass re-persists the hold, so a
+    // restart finds it held instead of sweeping a 'pending' entry as residue.
+    const entry = listed.intentPut === 'unconfirmed' ? listed : await persistHold(stores, view.locals, listed);
     try {
       await deps.intents.put(id, entry.payloadEnvelope, entry.requiresSeedClose);
     } catch (err) {
       const dropped = isNeverStorable(err) && (await stores.backstop.removeIfUnchanged(id, entry).catch(() => false));
-      if (dropped) view.locals.delete(id);
+      if (dropped) {
+        view.locals.delete(id);
+        view.onHoldEnded(id);
+      }
       (dropped ? report.conflicted : report.failed).push(id);
       continue;
     }
     await unflag(stores, view.locals, entry);
+    view.onHoldEnded(id);
     view.openIds.add(id); // confirmed: S1 must not sweep it this pass
     confirmed.push({ transferId: id, payload: entry.payloadEnvelope });
   }
   return confirmed;
+}
+
+/** Best-effort: on a failed write the hold stays in memory and the next pass tries again. */
+async function persistHold(
+  stores: MachineStores,
+  locals: Map<string, IntentBackstopEntry>,
+  entry: IntentBackstopEntry
+): Promise<IntentBackstopEntry> {
+  try {
+    const held = await stores.backstop.patch(entry.transferId, (e) => ({ ...e, intentPut: 'unconfirmed' }));
+    if (held === undefined) return entry;
+    locals.set(entry.transferId, held);
+    return held;
+  } catch {
+    return entry;
+  }
 }
 
 async function unflag(

@@ -60,14 +60,18 @@ export function isNeverStorable(err: unknown): boolean {
 
 /**
  * #835: a 4xx wallet-api raises before any write (ARCHITECTURE §16), so it proves
- * only that THIS request wrote nothing. 408/499, 5xx, status 0 (network) and
- * non-envelope bodies are ambiguous: the row may exist, or appear later.
+ * only that THIS request wrote nothing — and only when wallet-api itself answered: its
+ * JSON error envelope carries a typed code, while a body it did not write (an
+ * intermediary's page) reads `HTTP_<status>` and proves nothing. 408/499, 5xx, status 0
+ * (network), an untyped 4xx and a 2xx whose body is not JSON (PROTOCOL) are ambiguous:
+ * the row may exist, or appear later.
  */
 export function isPreWriteRefusal(err: unknown): boolean {
   const e = wireShape(err);
   if (e === null) return false;
   const n = typeof e.status === 'number' ? e.status : e.statusCode;
-  return typeof n === 'number' && n >= 400 && n <= 499 && n !== 408 && n !== 499;
+  const typed = typeof e.code === 'string' && !/^HTTP_\d{3}$/.test(e.code);
+  return typed && typeof n === 'number' && n >= 400 && n <= 499 && n !== 408 && n !== 499;
 }
 
 /** The server's typed "no such intent" — never an unrouted `HTTP_404`. */
