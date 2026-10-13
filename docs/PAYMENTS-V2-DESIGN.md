@@ -817,8 +817,10 @@ re-PUT, so the hold survives a restart once one pass has run. The residual is a 
 sweep can drop a send whose PUT never landed — an under-payment, never a double pay. `'pending'`
 itself is never treated as held: a refused send whose backstop removal failed also reads
 `'pending'`, and re-PUTing that one would run a send already reported clean. If the clear after a
-2xx fails, the stale `'pending'` only makes a later re-seed skip that entry, so after a backend
-reset the intent's row is not restored.
+2xx fails, no op runs: an entry still reading `'pending'` would be skipped by a re-seed and swept by
+S1 after a backend reset, losing the recovery of whatever it certified. The send is parked instead,
+exactly like one whose PUT stayed unconfirmed: `SEND_SYNC_PENDING`, and the next pass finds the row
+listed (or re-PUTs it), clears the flag and resumes it.
 
 **Held shortfalls (#835).** The second optional field, `owes?: ShortfallEntry[]`, carries the
 #690 shortfall rows that a possibly-committed later attempt of a partial send now owns
@@ -826,7 +828,9 @@ reset the intent's row is not restored.
 deleting them: `pendingTransfers()` lists only the attempt's `'open'` row, the rows go with the
 entry once the attempt completes, and both refusal paths (a 413/422 on the ensure re-PUT, a
 conflict on resume) hand them back to the shortfall store before removing the entry. A row left in
-both places by a failed removal is listed once, as the attempt, and both completion paths (the
+both places by a failed removal is listed once, as the attempt; a failed attach still removes the
+rows from the store, so a remainder is never listed as owed while the attempt may pay it (an
+under-payment window if that attempt is later refused, never a double pay); and both completion paths (the
 attempt's own close, and the S1 sweep of a holder completed elsewhere) remove that copy before the
 entry, keeping the entry when they cannot. An older client ignores the field,
 so a downgrade can lose a held remainder: an under-payment, never a double pay.

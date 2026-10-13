@@ -342,8 +342,8 @@ export class TransferMachine {
   private async markAcked(transferId: string): Promise<void> {
     try {
       await this.stores.backstop.patch(transferId, ({ intentPut: _acked, ...rest }) => rest);
-    } catch {
-      /* best-effort: a stale 'pending' only makes the reseed skip this entry */
+    } catch (err) {
+      return this.parkIntent(transferId, err); // no op runs on an entry the reseed and S1 read as never acked
     }
   }
 

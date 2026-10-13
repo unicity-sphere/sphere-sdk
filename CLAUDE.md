@@ -1070,7 +1070,7 @@ authoritative for build success.
   chat/identity keys in the platform storage providers).
 - **The backstop's optional fields (#835): `intentPut?: 'pending' | 'unconfirmed'`, and `owes`.**
   `'pending'` is written with the entry before the first intent PUT and cleared on a 2xx (the
-  epoch re-seed never re-PUTs it); `'unconfirmed'` marks a parked send that every resume pass
+  epoch re-seed never re-PUTs it; if that clear fails, nothing runs and the send is parked); `'unconfirmed'` marks a parked send that every resume pass
   re-PUTs first and never sweeps; absent = acked, or written by an older client. A park whose
   `'unconfirmed'` write failed is held in memory, and the next pass re-persists the flag before
   its re-PUT; a restart before that pass finds `'pending'` and sweeps it (an under-payment window,

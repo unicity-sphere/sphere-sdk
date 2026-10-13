@@ -2097,6 +2097,20 @@ class ConflictingEngine extends RealizationEngine {
 }
 
 describe('#835 (x) after a partial, the re-plan attempt is held: it holds the shortfall until it pays or is refused', () => {
+  /** The next backstop write that attaches held rows fails. */
+  function failHoldWrite(world: World): void {
+    let armed = true;
+    const set = world.kv.set.bind(world.kv);
+    world.kv.set = async <T>(key: string, value: T): Promise<void> => {
+      const attaches = key === STORE_KEYS.intentBackstop && (value as unknown as IntentBackstopEntry[]).some((e) => e.owes !== undefined);
+      if (armed && attaches) {
+        armed = false;
+        throw new Error('injected backstop write failure');
+      }
+      return set(key, value);
+    };
+  }
+
   /** The next `n` shortfall-store writes that would drop tid-1's row fail. */
   function failRowRemovals(world: World, n: number): void {
     let left = n;
@@ -2116,9 +2130,10 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
    * 600 of 1000 delivered, the 400 leg conflicted; the re-plan attempt for the 400 (which picks
    * the same source again: a partial's conflicted source is not demoted) is held, every PUT of it
    * unanswered. `spent` decides whether that source really is spent, or only lost its first races;
-   * `failedRemovals` fails that many removals of the original row, the first one being the hold's.
+   * `failedRemovals` fails that many removals of the original row, the first one being the hold's;
+   * `failHold` fails the write that attaches the rows to the held attempt.
    */
-  async function heldRemainder(spent: boolean, failedRemovals = 0): Promise<{ world: World; held: string }> {
+  async function heldRemainder(spent: boolean, failedRemovals = 0, failHold = false): Promise<{ world: World; held: string }> {
     const engine = new ConflictingEngine({ chainPubkey: hexToBytes(OWN_PUB) });
     const world = makeWorld({ engine });
     await world.seed(600n);
@@ -2130,6 +2145,7 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
       if (world.putCalls[world.putCalls.length - 1]?.transferId !== 'tid-1') throw unavailable();
     };
     failRowRemovals(world, failedRemovals);
+    if (failHold) failHoldWrite(world);
 
     const err = rejectionOf(await settle(world.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN })));
     await flushTail();
@@ -2139,8 +2155,9 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     expect(partial.remainingAmount, 'the held attempt owns the remainder').toBe('0');
     expectMessage(partial.cause, 'INTENT_UNCONFIRMED_MESSAGE');
     const held = (partial.cause as SphereError).transferId!;
-    expect(backstopOf(world, held)?.owes?.map((row) => [row.transferId, row.remainingAmount])).toEqual([['tid-1', '400']]);
-    expect(shortfallOf(world, 'tid-1') !== undefined, 'the row moved onto the held attempt, unless its removal failed').toBe(
+    const owes = backstopOf(world, held)?.owes?.map((row) => [row.transferId, row.remainingAmount]);
+    expect(owes, 'the row is held by the attempt, unless that write failed').toEqual(failHold ? undefined : [['tid-1', '400']]);
+    expect(shortfallOf(world, 'tid-1') !== undefined, 'the row left the store, unless its removal failed').toBe(
       failedRemovals > 0
     );
     const pending = await world.facade.pendingTransfers();
@@ -2166,6 +2183,16 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
 
   it('(x-listed-once) a row whose removal failed after the hold is listed once, as the held attempt', async () => {
     await heldRemainder(true, 1);
+  });
+
+  it('(x-hold-failed) a hold whose write failed still takes the row out of the store: never listed as owed while the attempt may pay', async () => {
+    const { world, held } = await heldRemainder(false, 0, true);
+    delete world.hooks.putIntent;
+
+    await world.facade.resumeNow();
+    await flushTail();
+
+    await expectPaid(world, held);
   });
 
   it('(x-paid) once the service confirms it, it pays the remainder and the row goes with it', async () => {
@@ -2225,6 +2252,45 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
 
     expect(serverIntent(world, held)).toBe('aborted');
     await expectOwedAgain(world, held);
+  });
+});
+
+// ── (z) a 2xx whose ack write fails ─────────────────────────────────────────
+
+describe('#835 (z) the intent PUT answers 2xx but clearing the entry\'s pending flag fails', () => {
+  it('runs nothing on an entry still marked never-acked: held, then resumed by the next pass and paid once', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await startSettled(world);
+    let armed = true;
+    const set = world.kv.set.bind(world.kv);
+    world.kv.set = async <T>(key: string, value: T): Promise<void> => {
+      const before = backstopOf(world, 'tid-1');
+      const after = key === STORE_KEYS.intentBackstop ? (value as unknown as IntentBackstopEntry[]).find((e) => e.transferId === 'tid-1') : undefined;
+      if (armed && before?.intentPut === 'pending' && after !== undefined && after.intentPut === undefined) {
+        armed = false;
+        throw new Error('injected ack write failure');
+      }
+      return set(key, value);
+    };
+
+    const outcome = await settle(world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN }));
+    await flushTail();
+
+    const err = rejectionOf(outcome);
+    expect(isPossiblyCommittedSendOutcome(err), describeError(err)).toBe(true);
+    expect((err as SphereError).transferId).toBe('tid-1');
+    expect(serverIntent(world, 'tid-1'), 'the row is stored').toBe('open');
+    expect(backstopOf(world, 'tid-1')?.intentPut, 'held, as a send whose PUT stayed unconfirmed').toBe('unconfirmed');
+    expect((await receipts(world)).entries, 'no leg ran on an unacked entry').toBe(0);
+    expect(failedUpdates(world)).toEqual([]);
+
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(serverIntent(world, 'tid-1')).toBe('completed');
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
+    expect(backstopOf(world, 'tid-1')).toBeUndefined();
   });
 });
 

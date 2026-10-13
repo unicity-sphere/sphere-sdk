@@ -3174,5 +3174,25 @@
     "tests": [
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
     ]
+  },
+  {
+    "name": "ack-failure-proceeds",
+    "note": "#835: a 2xx whose ack write failed parks the send instead of running its legs; run on an entry still reading 'pending', a backend reset's re-seed skips it and S1 sweeps it, losing the recovery of what certified (send-intent-unknown.test.ts '(z)...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      return this.parkIntent(transferId, err); // no op runs on an entry the reseed and S1 read as never acked\n",
+    "replace": "      void err;\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "hold-failure-keeps-rows",
+    "note": "#835: a hold whose attach write failed still takes the rows out of the shortfall store; kept, they are listed as owed while the attempt may still pay them, and stay listed after it does (send-intent-unknown.test.ts '(x-hold-failed)...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  await stores.backstop.patch(holder, (e) => ({ ...e, owes: [...(e.owes ?? []), ...rows] })).catch(() => undefined);\n  for (const row of rows) await stores.shortfalls.removeByKey(row.transferId);",
+    "replace": "  const held = await stores.backstop.patch(holder, (e) => ({ ...e, owes: [...(e.owes ?? []), ...rows] })).catch(() => undefined);\n  if (held === undefined) return;\n  for (const row of rows) await stores.shortfalls.removeByKey(row.transferId);",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
   }
 ]

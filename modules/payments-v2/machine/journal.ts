@@ -326,12 +326,11 @@ export function createMachineStores(kv: ScopedKV): MachineStores {
   };
 }
 
-/** #835: the rows move onto the holder's entry — gone with it once it completes, owed again if it is refused. */
+/** #835: the rows move onto the holder's entry, and leave the store even if that write fails: never owed twice. */
 export async function holdShortfalls(stores: MachineStores, ids: readonly string[], holder: string): Promise<void> {
   const rows = (await stores.shortfalls.list()).filter((row) => ids.includes(row.transferId));
   if (rows.length === 0) return;
-  const held = await stores.backstop.patch(holder, (e) => ({ ...e, owes: [...(e.owes ?? []), ...rows] }));
-  if (held === undefined) return;
+  await stores.backstop.patch(holder, (e) => ({ ...e, owes: [...(e.owes ?? []), ...rows] })).catch(() => undefined);
   for (const row of rows) await stores.shortfalls.removeByKey(row.transferId);
 }
 
