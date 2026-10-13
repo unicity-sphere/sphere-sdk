@@ -825,7 +825,7 @@ listed (or re-PUTs it), clears the flag and resumes it.
 **Held shortfalls (#835).** The second optional field, `owes?: ShortfallEntry[]`, carries the
 #690 shortfall rows that a possibly-committed later attempt of a partial send now owns
 (`remainingAmount: '0'`, §5.5). The facade moves them onto that attempt's entry instead of
-deleting them: `pendingTransfers()` lists only the attempt's `'open'` row, the rows go with the
+deleting them, while the attempt is still in process, so no pass can adopt it mid-handoff: `pendingTransfers()` lists only the attempt's `'open'` row, the rows go with the
 entry once the attempt completes, and both refusal paths (a 413/422 on the ensure re-PUT, a
 conflict on resume) hand them back to the shortfall store before removing the entry. A row left in
 both places by a failed removal is listed once, as the attempt; a failed attach still removes the

@@ -3194,5 +3194,15 @@
     "tests": [
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
     ]
+  },
+  {
+    "name": "handoff-after-release",
+    "note": "#835: a failed attempt's error is shaped, and its shortfall handoff run, while the attempt is still in process; released first, a pass can adopt and refuse the held attempt mid-handoff, and the remainder is recorded nowhere while the caller is told '0' (send-intent-unknown.test.ts '(x-race)...')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "      const disposition = await this.disposeFailedAttempt(ctx, err); // #835: shaped in process \u2014 no pass adopts it mid-handoff\n",
+    "replace": "      const disposition = await this.disposeFailedAttempt(ctx, err);\n      this.activeMoneyOps.delete(ctx.transferId);\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
   }
 ]

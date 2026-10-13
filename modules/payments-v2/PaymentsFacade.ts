@@ -445,8 +445,8 @@ export class PaymentsFacade implements PaymentsV2 {
       } catch (err) {
         throw partialize(err, run);
       }
-      const disposition = await this.runAttempt(ctx);
-      if (disposition.kind === 'rethrow') throw await this.surfaceFailure(disposition.error, run, ctx);
+      const disposition = await this.runAttempt(ctx, run);
+      if (disposition.kind === 'rethrow') throw disposition.error;
       if (disposition.kind === 'retry-full') {
         // #625's re-plan searches for a DIFFERENT source. A named token has no
         // alternative — re-planning would pick the same one or nothing — so a
@@ -464,14 +464,15 @@ export class PaymentsFacade implements PaymentsV2 {
     }
   }
 
-  private async runAttempt(ctx: AttemptCtx): Promise<AttemptDisposition> {
+  private async runAttempt(ctx: AttemptCtx, run: SendRun): Promise<AttemptDisposition> {
     this.activeMoneyOps.add(ctx.transferId);
     try {
       const { deliveryPending } = await this.machine.run(ctx.plan);
       this.settleSuccess(ctx, ctx.sourceIds);
       return { kind: 'success', deliveryPending };
     } catch (err) {
-      return await this.disposeFailedAttempt(ctx, err);
+      const disposition = await this.disposeFailedAttempt(ctx, err); // #835: shaped in process — no pass adopts it mid-handoff
+      return disposition.kind === 'rethrow' ? { kind: 'rethrow', error: await this.surfaceFailure(disposition.error, run, ctx) } : disposition;
     } finally {
       this.activeMoneyOps.delete(ctx.transferId);
     }
