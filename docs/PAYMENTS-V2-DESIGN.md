@@ -463,8 +463,9 @@ Normative behaviors bound into the transitions (not call sites):
   held it (its `'unconfirmed'` write failed), the hold is re-persisted first, so a restart finds it
   held; then its stored envelope is re-PUT. A 2xx turns it into an ordinary open intent, which
   that same pass resumes under the same `transferId` with the same bytes; a 413/422 drops it and
-  reports it conflicted, so a linked request reverts to payable, because nothing ever ran; any
-  other answer keeps it held. A confirmed row (listed, or a 2xx re-PUT) or a dropped hold ends the
+  reports it conflicted, so a linked request reverts to payable, because nothing ever ran — but
+  only when a listing taken after that answer still shows no row, since the 413/422 says nothing
+  about the earlier ambiguous PUT a mixed fleet may have stored; any other answer keeps it held. A confirmed row (listed, or a 2xx re-PUT) or a dropped hold ends the
   in-memory park (`onHoldEnded`). A held entry is never swept, and a linked request stays
   `settling` while it is held. The re-seed skips every entry whose PUT
   was never acked (`intentPut` set), because only an acked intent can have certified anything, while
@@ -807,7 +808,7 @@ optional field, `intentPut?: 'pending' | 'unconfirmed'`:
 - **`'unconfirmed'`** marks a parked send (§5.5 E.3): the PUT outcome stayed unknown and `send()`
   reported `SEND_SYNC_PENDING`. Every resume pass re-PUTs `payloadEnvelope` before anything else
   and never sweeps the entry. The marker is cleared on a 2xx, and the entry is dropped only on a
-  413/422.
+  413/422 with no row in a listing taken after it.
 - **Absent:** the PUT was acked, or an older client wrote the entry.
 
 Both marker writes are best-effort, and each failure leaves a known, bounded residual. If the park

@@ -847,7 +847,9 @@ authoritative for build success.
   earlier PUT) **park** the send: backstop `intentPut: 'unconfirmed'`, `SEND_SYNC_PENDING` with
   its transferId, and every resume pass re-PUTs the stored bytes (ensure) before resuming it,
   first re-persisting the hold when only memory had it (its flag write failed). Only a 413/422 on
-  that re-PUT drops it; a confirmed or dropped hold ends the in-memory park (`onHoldEnded`). The
+  that re-PUT drops it, and only when a listing taken after that answer still shows no row (a mixed
+  fleet may have stored an earlier PUT); a confirmed or dropped hold ends the in-memory park
+  (`onHoldEnded`). The
   epoch re-seed skips never-acked entries.
   Clean-on-refusal rests on wallet-api's rule that every 4xx from the PUT is raised before any
   write (ARCHITECTURE §16).

@@ -128,6 +128,7 @@ async function confirmUnconfirmed(
     } catch (err) {
       const dropped =
         isNeverStorable(err) &&
+        !(await listedNow(deps, id)) &&
         (await releaseOwed(stores, entry)
           .then(() => stores.backstop.removeIfUnchanged(id, entry))
           .catch(() => false));
@@ -144,6 +145,11 @@ async function confirmUnconfirmed(
     confirmed.push({ transferId: id, payload: entry.payloadEnvelope });
   }
   return confirmed;
+}
+
+/** #835: a 413/422 says nothing about a held send's earlier ambiguous PUT; a listing taken after it does. */
+async function listedNow(deps: MachineDeps, transferId: string): Promise<boolean> {
+  return (await deps.intents.listOpen().catch(() => [{ transferId }])).some((i) => i.transferId === transferId);
 }
 
 /** Best-effort: on a failed write the hold stays in memory and the next pass tries again. */

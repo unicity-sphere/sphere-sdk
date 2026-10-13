@@ -3204,5 +3204,15 @@
     "tests": [
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
     ]
+  },
+  {
+    "name": "ensure-drop-trusts-snapshot",
+    "note": "#835: a held send's 413/422 re-PUT drops it only when a listing taken after that answer still shows no row; trusting the pass's earlier snapshot, a row a mixed fleet stored meanwhile is dropped, its sources released and a linked request made payable while the intent can still run (machine-resume.test.ts 'a 413/422 on the re-PUT does not drop a held send whose row a listing taken after it shows...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "        !(await listedNow(deps, id)) &&\n",
+    "replace": "        true &&\n",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
   }
 ]

@@ -574,6 +574,29 @@ describe('resume confirms a parked intent before it resumes or sweeps anything (
     expect(w.engine.transferCalls).toHaveLength(0);
   });
 
+  it('a 413/422 on the re-PUT does not drop a held send whose row a listing taken after it shows: an earlier PUT was stored meanwhile', async () => {
+    const w = makeWorld();
+    const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+    const entry = await parkSend(w, plan);
+    // The pass lists no row; a task with another cap commits the earlier PUT while this one refuses the re-PUT.
+    w.overrides.putIntent = async () => {
+      await w.api.putIntent(w.caller, { transferId: entry.transferId, payload: entry.payloadEnvelope });
+      throw new ValidationFailedError('payload refused');
+    };
+
+    const first = await resumeAll(w.deps);
+
+    expect(first).toEqual({ resumed: [], conflicted: [], failed: [plan.transferId] });
+    expect((await w.stores().backstop.getByKey(plan.transferId))?.intentPut).toBe('unconfirmed');
+    expect(w.engine.transferCalls).toHaveLength(0);
+
+    delete w.overrides.putIntent;
+    const second = await resumeAll(w.deps);
+
+    expect(second.resumed).toEqual([plan.transferId]);
+    expect(w.deposits.map((d) => d.transferId)).toEqual([plan.transferId]);
+  });
+
   it('a parked entry whose row already exists is unflagged without a re-PUT and resumed in the same pass', async () => {
     const w = makeWorld();
     const token = await w.seed(1000n);
