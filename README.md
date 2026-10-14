@@ -165,11 +165,11 @@ and `SEND_PARTIALLY_COMPLETED`. Never call `send()` again for that payment: a ne
 pays the recipient a second time. The SDK finishes the original under its own transfer id (`err.transferId`), or
 cancels it (below); show it as pending (`sphere.payments.pendingTransfers()` lists every case except one being
 cancelled), and wire any "retry" button to `sphere.payments.resumeNow()`. A `PartialSendConflictError` means part of
-the amount was delivered and is final. If `err.remainingAmount` is `'0'`, a later attempt that will still be sent
-(under `err.cause.transferId`) owns the rest: nothing is owed, so never re-plan or re-send any of it. Otherwise only
-`err.remainingAmount` is still owed — also when that later attempt failed and is being cancelled, since this device
-never sends it (until the cancel is confirmed another device of the same wallet could still complete it, so a remainder
-paid in that window from a wallet used on several devices can be paid twice). When `isPossiblyCommittedSendOutcome(err)` is `false`, the failure is proven clean: nothing of the payment was
+the amount was delivered and is final. If `err.remainingAmount` is `'0'`, a later attempt that may still be sent
+(under `err.cause.transferId`) owns the rest: nothing is owed now, so never re-plan or re-send any of it. That includes a
+later attempt that failed and is being cancelled, which another device of the same wallet could still complete: once the
+cancel is confirmed, the rest shows up in `pendingTransfers()` as a shortfall, and only that is re-planned. Otherwise
+only `err.remainingAmount` is still owed. When `isPossiblyCommittedSendOutcome(err)` is `false`, the failure is proven clean: nothing of the payment was
 certified, and nothing this device holds can still send it.
 
 - `CERTIFICATION_UNCONFIRMED` is a **`ProofUnconfirmedError`** (`mayHaveCertified: true`): the spend may already be on-chain but the proof fetch was inconclusive. `SEND_SYNC_PENDING` (with `err.transferId`) is one of three cases (#835), and none is ever sent again by you:

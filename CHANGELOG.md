@@ -36,7 +36,9 @@ What changed:
   when it came twice in wallet-api's typed error envelope with nothing ambiguous before it. Any
   other untyped 4xx (a proxy's page, a 422 included) proves nothing. A send whose PUT stays unconfirmed rejects `SEND_SYNC_PENDING` with its
   `transferId` and is sent automatically, under the same transferId, once the service confirms the
-  intent; every resume pass re-persists the hold when only memory had it.
+  intent; every resume pass re-persists the hold when only memory had it. A 413/422 on a held send's
+  re-PUT ends the hold only when its row completed on another device (as paid): the PUT that went
+  unconfirmed may still land, so a missing or aborted row keeps it held, its request `settling`.
 - Every failure after a leg certified is possibly-committed with its `transferId`. A shortfall is
   durable before any inventory apply. A clean report now also requires that nothing on this device
   can later execute the intent (no ambiguous PUT answer, no epoch re-seed that started during the
@@ -54,8 +56,9 @@ What changed:
   the reconcile is skipped. A listener that throws (an `emit` that rethrows) is logged and
   can no longer turn a delivered send into a rejection.
 - A later attempt that owns a partial send's remainder (`remainingAmount: '0'`) holds the send's
-  earlier shortfall rows on its intent entry. If it is refused (a 413/422 on its re-PUT, a conflict
-  on resume), the rows come back and the remainder is owed again. A cancel the service confirms
+  earlier shortfall rows on its intent entry, one being cancelled included. Once it is proven not to
+  run (a conflict on resume, or a cancel the service confirms), the rows come back and the remainder
+  is owed again. A cancel the service confirms
   with `404 NOT_FOUND` (its row gone, as after a database restore) is reported conflicted, so a
   linked payment request becomes payable again, never resolved paid. So is a local intent whose row
   was aborted, by a cleanup whose removal failed or by another device: its held rows are owed again,
@@ -68,13 +71,12 @@ What changed:
     does not list it; a payment request paid with it stays `settling` until the cancel is
     confirmed, then becomes payable again. Never send it again: until the cancel is confirmed,
     another device of the wallet could still complete it;
-  - `PartialSendConflictError.remainingAmount` is `'0'` when a later attempt that will still be
-    sent owns the remainder. A later attempt being cancelled owns nothing: this device never sends
-    it, so the owed remainder is reported and its shortfall row stays in `pendingTransfers()`.
-    Until the service confirms that cancel, another device of the same wallet can still complete the
-    attempt, so a remainder re-planned in that window can be paid twice. Reporting `'0'` instead
-    would not close that race, since the other device may already have certified before the cancel
-    lands, and would turn it into a permanent, unsignalled under-payment;
+  - `PartialSendConflictError.remainingAmount` is `'0'` when a possibly-committed later attempt owns
+    the remainder, one being cancelled included: until the service confirms that cancel, another
+    device of the same wallet could still complete it, so nothing is owed yet. Once the cancel is
+    confirmed, the remainder shows up in `pendingTransfers()` as a shortfall to re-plan; if the
+    attempt completed elsewhere, it was paid. Residual (wallet-api#172): a device that certified a
+    leg before the cancel landed may still deliver it;
   - the `sync:pending` attention code is no longer emitted.
 - The backstop store gains two optional fields. An older client reads an entry flagged `intentPut`
   as an ordinary open entry and ignores `owes`, so a downgrade can lose a held remainder: an

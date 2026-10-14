@@ -931,7 +931,7 @@ describe('#835 (h) PUT /v1/intents answers ambiguously on every attempt', () => 
     expect(backstopOf(world, 'tid-1')).toBeUndefined();
   });
 
-  it('(h-422) a held payment whose re-PUT is refused 422 never ran: dropped, the request payable again, the source released', async () => {
+  it('(h-422) a held payment whose re-PUT is refused 422 stays held: its timed-out PUT may still land, and then it pays exactly once', async () => {
     const world = makeWorld();
     const token = await world.seed(100n);
     await startSettled(world);
@@ -949,14 +949,22 @@ describe('#835 (h) PUT /v1/intents answers ambiguously on every attempt', () => 
     await flushTail();
 
     expect(refusals, 'one re-PUT, refused on the bytes').toHaveLength(1);
-    expect(backstopOf(world, 'tid-1')).toBeUndefined();
+    const held = backstopOf(world, 'tid-1');
+    expect(intentPutOf(held), 'no absence proves the earlier PUT dead: still held').toBe('unconfirmed');
     expect(serverIntent(world, 'tid-1')).toBeUndefined();
-    // Only a 'conflicted' report reverts a link; an unaccounted one resolves paid.
-    expect(requestStatus(world, id), 'reported conflicted: nothing ran, so payable again').toBe('pending');
-    expect((await requesterRow(world, id))?.status).toBe('open');
-    expect(tokenStatus(world, token.blob.tokenId)).toBe('confirmed');
+    expect(requestStatus(world, id), 'never payable again while the held send can still pay').toBe('settling');
+    expect(tokenStatus(world, token.blob.tokenId)).toBe('transferring');
     expect(chainOps(world)).toBe(0);
-    expect((await receipts(world)).entries).toBe(0);
+
+    // The PUT that timed out lands after all: the listing confirms the hold, and it pays once.
+    await world.api.putIntent(ownCaller, { transferId: 'tid-1', payload: held!.payloadEnvelope });
+    delete world.hooks.putIntent;
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
+    expect(requestStatus(world, id)).toBe('paid');
+    expect(backstopOf(world, 'tid-1')).toBeUndefined();
   });
 
   it('(h-stale) a pass judging a snapshot from before the hold never sweeps the held entry', async () => {
@@ -2028,10 +2036,10 @@ describe('#835 (u) a host emit that rethrows a listener error', () => {
   });
 });
 
-// ── (v) a remainder attempt that is being cancelled owns nothing ────────────
+// ── (v) a remainder attempt that is being cancelled holds the remainder ─────
 
 describe('#835 (v) after a partial, the re-plan attempt fails and its cancel is unconfirmed', () => {
-  it('the remainder stays owed: remainingAmount is the shortfall, its row is kept, and nothing is sent twice', async () => {
+  it('it holds the remainder until the cancel is confirmed, then it is owed again: nothing is sent twice', async () => {
     const engine = new LegFailureEngine({ chainPubkey: hexToBytes(OWN_PUB) });
     const world = makeWorld({ engine });
     const a = await world.seed(600n);
@@ -2053,7 +2061,7 @@ describe('#835 (v) after a partial, the re-plan attempt fails and its cancel is 
     const partial = err as PartialSendConflictError;
     expect(isPossiblyCommittedSendOutcome(partial)).toBe(true);
     expect(partial.transferId).toBe('tid-1');
-    expect(partial.remainingAmount, 'a cancelled attempt owns no remainder: it is still owed').toBe('400');
+    expect(partial.remainingAmount, 'another device could still complete it: nothing is owed yet').toBe('0');
     expect(partial.committedTokenIds).toEqual([a.blob.tokenId]);
     const planned = plannedIds(world);
     const cancelling = planned[planned.length - 1];
@@ -2062,22 +2070,25 @@ describe('#835 (v) after a partial, the re-plan attempt fails and its cancel is 
     expect(cause.transferId).toBe(cancelling);
     expectMessage(cause, 'CANCEL_UNCONFIRMED_MESSAGE');
     expect(backstopOf(world, cancelling!)?.disposition).toBe('abortPending');
-    expect(shortfallOf(world, 'tid-1')?.remainingAmount, 'the shortfall row is kept').toBe('400');
-    const pending = await world.facade.pendingTransfers();
-    expect(pending.map((p) => [p.transferId, p.kind, p.amount])).toEqual([['tid-1', 'shortfall', '400']]);
+    expect(backstopOf(world, cancelling!)?.owes?.map((row) => row.transferId), 'the attempt being cancelled holds it').toEqual(['tid-1']);
+    expect(shortfallOf(world, 'tid-1'), 'not owed while the cancel is unconfirmed').toBeUndefined();
+    expect(await world.facade.pendingTransfers()).toEqual([]);
     expect(failedUpdates(world)).toEqual([]);
 
-    // The cancel lands; nothing of the cancelled attempt ever runs, and the shortfall is still owed.
+    // The cancel lands: nothing of the cancelled attempt ever runs, and the remainder is owed again.
     abortFails = false;
     engine.failSources.clear();
     await world.facade.resumeNow();
     await flushTail();
     expect(serverIntent(world, cancelling!)).toBe('aborted');
     expect(await receipts(world)).toEqual({ entries: 1, amount: 600n });
+    expect(backstopOf(world, cancelling!)).toBeUndefined();
     expect(shortfallOf(world, 'tid-1')?.remainingAmount).toBe('400');
+    const pending = await world.facade.pendingTransfers();
+    expect(pending.map((p) => [p.transferId, p.kind, p.amount])).toEqual([['tid-1', 'shortfall', '400']]);
 
-    // A caller that re-plans only the shortfall pays the request exactly once.
-    await world.facade.send({ recipient: '@peer', amount: partial.remainingAmount, coinId: COIN });
+    // A caller that re-plans the shortfall once it is owed pays the request exactly once.
+    await world.facade.send({ recipient: '@peer', amount: pending[0]!.amount, coinId: COIN });
     await world.facade.resumeNow();
     await flushTail();
     expect((await receipts(world)).amount).toBe(1000n);
@@ -2178,6 +2189,15 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     expect(await receipts(world)).toEqual({ entries: 1, amount: 600n });
   }
 
+  /** Refused on its re-PUT, the held attempt may still be stored by its earlier PUT: it keeps the remainder. */
+  async function expectStillHolding(world: World, held: string): Promise<void> {
+    expect(backstopOf(world, held)?.owes?.map((row) => row.transferId)).toEqual(['tid-1']);
+    expect(shortfallOf(world, 'tid-1'), 'never owed while the attempt can still pay it').toBeUndefined();
+    const pending = await world.facade.pendingTransfers();
+    expect(pending.map((p) => [p.transferId, p.kind])).toEqual([[held, 'open']]);
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 600n });
+  }
+
   async function expectPaid(world: World, held: string): Promise<void> {
     expect(serverIntent(world, held)).toBe('completed');
     expect((await receipts(world)).amount).toBe(1000n);
@@ -2200,7 +2220,7 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     await expectPaid(world, held);
   });
 
-  it('(x-race) a pass that runs while the handoff is in flight leaves the attempt alone; refused later, the remainder is owed again', async () => {
+  it('(x-race) a pass that runs while the handoff is in flight leaves the attempt alone; refused later, it keeps the remainder', async () => {
     const engine = new ConflictingEngine({ chainPubkey: hexToBytes(OWN_PUB) });
     const world = makeWorld({ engine });
     await world.seed(600n);
@@ -2237,7 +2257,7 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     await world.facade.resumeNow();
     await flushTail();
 
-    await expectOwedAgain(world, held);
+    await expectStillHolding(world, held);
   });
 
   it('(x-paid) once the service confirms it, it pays the remainder and the row goes with it', async () => {
@@ -2276,8 +2296,8 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     await expectPaid(world, held);
   });
 
-  it('(x-refused) a 413/422 on its re-PUT drops it, and the remainder is owed again', async () => {
-    const { world, held } = await heldRemainder(true);
+  it('(x-refused) a 413/422 on its re-PUT keeps it holding the remainder; when its earlier PUT lands, it pays it once', async () => {
+    const { world, held } = await heldRemainder(false);
     world.hooks.putIntent = async () => {
       throw new WalletApiHttpError(422, 'VALIDATION_FAILED', 'intent payload refused');
     };
@@ -2285,7 +2305,14 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     await world.facade.resumeNow();
     await flushTail();
 
-    await expectOwedAgain(world, held);
+    await expectStillHolding(world, held);
+
+    await world.api.putIntent(ownCaller, { transferId: held, payload: backstopOf(world, held)!.payloadEnvelope });
+    delete world.hooks.putIntent;
+    await world.facade.resumeNow();
+    await flushTail();
+
+    await expectPaid(world, held);
   });
 
   it('(x-conflict) its source spent elsewhere, it conflicts on resume, and the remainder is owed again', async () => {

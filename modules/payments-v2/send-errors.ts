@@ -19,13 +19,6 @@ export const MAY_BE_ON_CHAIN_MESSAGE =
 export const CANCEL_UNCONFIRMED_MESSAGE =
   'This payment failed and is being cancelled, but the wallet service has not confirmed the cancellation yet. Do not send it again: until it does, another device of this wallet could still complete it.';
 
-/** #835: failed attempts this device cancels and never sends — known by identity, never by the (user-facing) text. */
-const cancelling = new WeakSet<SphereError>();
-
-export function isCancelUnconfirmed(err: unknown): boolean {
-  return err instanceof SphereError && cancelling.has(err);
-}
-
 /** The parts of a send run these shapers read. */
 export interface PartialRun {
   readonly amount: string;
@@ -35,10 +28,7 @@ export interface PartialRun {
 
 /** #835: this bundle's possibly-committed error with the transferId; a foreign keep-open code survives the wrap. */
 export function asPossiblyCommitted(err: unknown, transferId: string, message = MAY_BE_ON_CHAIN_MESSAGE): SphereError {
-  const surfaced = toPossiblyCommitted(err, transferId, message);
-  // The machine names a cancel-unconfirmed outcome by its message; from here on, by identity.
-  if (message === CANCEL_UNCONFIRMED_MESSAGE) cancelling.add(surfaced);
-  return surfaced;
+  return toPossiblyCommitted(err, transferId, message);
 }
 
 function toPossiblyCommitted(err: unknown, transferId: string, message: string): SphereError {
@@ -56,10 +46,10 @@ function toPossiblyCommitted(err: unknown, transferId: string, message: string):
 
 /** Once anything was delivered, the failure is a SHORTFALL: re-plan the remainder, never the total.
  *  A possibly-committed latest attempt owns the remainder (#835): '0', its certified legs listed —
- *  unless it is being cancelled: this device never sends it, so the remainder stays owed. */
+ *  one being cancelled too, until its cancel is confirmed (another device could still complete it). */
 export function partialize(err: unknown, run: PartialRun, openAttemptCertified: readonly string[] = []): unknown {
   if (run.delivered.length === 0) return err;
-  if (isPossiblyCommittedSendOutcome(err) && !isCancelUnconfirmed(err)) {
+  if (isPossiblyCommittedSendOutcome(err)) {
     return new PartialSendConflictError(
       'Part of your payment was sent and the rest is still settling under its own transfer (see cause.transferId) — do not send any of it again.',
       run.firstPartialId ?? '',

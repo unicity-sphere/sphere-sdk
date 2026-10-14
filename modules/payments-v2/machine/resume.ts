@@ -126,14 +126,12 @@ async function confirmUnconfirmed(
     try {
       await deps.intents.put(id, entry.payloadEnvelope, entry.requiresSeedClose);
     } catch (err) {
-      const verdict = isNeverStorable(err) ? await judgeRefusedHold(deps, id) : 'unknown';
-      const ended = verdict !== 'unknown' && (await endHold(stores, entry, verdict === 'completed').catch(() => false));
+      const paid = isNeverStorable(err) && (await completedElsewhere(deps, id));
+      const ended = paid && (await endHold(stores, entry).catch(() => false));
       if (ended) {
         view.locals.delete(id);
-        view.onHoldEnded(id);
-      }
-      if (!ended) report.failed.push(id); // completed elsewhere: unaccounted, so a linked request reads paid
-      else if (verdict !== 'completed') report.conflicted.push(id);
+        view.onHoldEnded(id); // unaccounted, so a linked request reads paid
+      } else report.failed.push(id);
       continue;
     }
     await unflag(stores, view.locals, entry);
@@ -144,18 +142,23 @@ async function confirmUnconfirmed(
   return confirmed;
 }
 
-/** #835: a 413/422 says nothing of a held send's earlier PUT (a mixed fleet may have stored it): an open
- *  row is kept for the next pass; else the abort probes it — 404 never stored, aborted, or completed. */
-async function judgeRefusedHold(deps: MachineDeps, id: string): Promise<'unknown' | 'refused' | 'completed'> {
+/** #835: a 413/422 says nothing of a held send's earlier PUT, which may still land and create or re-open
+ *  its row: no absence proves it refused, so only a row completed elsewhere ends the hold. */
+async function completedElsewhere(deps: MachineDeps, id: string): Promise<boolean> {
   const open = await deps.intents.listOpen().catch(() => null);
-  if (open === null || open.some((i) => i.transferId === id)) return 'unknown';
-  const outcome = await abortAndConfirm(deps.intents, id);
-  return outcome === 'unknown' || outcome === 'completed' ? outcome : 'refused';
+  if (open === null || open.some((i) => i.transferId === id)) return false;
+  return (await abortAndConfirm(deps.intents, id)) === 'completed';
 }
 
-async function endHold(stores: MachineStores, entry: IntentBackstopEntry, paid: boolean): Promise<boolean> {
-  await (paid ? settleOwed(stores, entry) : releaseOwed(stores, entry));
+async function endHold(stores: MachineStores, entry: IntentBackstopEntry): Promise<boolean> {
+  await settleOwed(stores, entry);
   return stores.backstop.removeIfUnchanged(entry.transferId, entry);
+}
+
+/** A confirmed cancel moved nothing: what it held is owed again, conflicted (a link is payable); a completed row was paid. */
+async function retire(stores: MachineStores, entry: IntentBackstopEntry, refused: boolean, report: ResumeReport): Promise<void> {
+  await (refused ? releaseOwed(stores, entry) : settleOwed(stores, entry));
+  if ((await stores.backstop.removeIfUnchanged(entry.transferId, entry)) && refused) report.conflicted.push(entry.transferId);
 }
 
 /** Best-effort: on a failed write the hold stays in memory and the next pass tries again. */
@@ -207,19 +210,14 @@ async function dropStaleBackstops(
     if (view.openIds.has(id) || view.isLocallyActive(id)) continue;
     if (entry.disposition !== 'open') {
       const outcome = await abortAndConfirm(intents, id);
-      if (outcome === 'unknown') continue;
-      // A confirmed cancel moved nothing (conflicted: a link is payable again); a completed row was paid elsewhere.
-      if ((await stores.backstop.removeIfUnchanged(id, entry)) && outcome !== 'completed') report.conflicted.push(id);
+      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);
       continue;
     }
     if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it
     if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;
     if (aborted === undefined) aborted = await abortedIds(intents);
     if (aborted === null) continue; // completed or aborted: unknown until the listing reads
-    // An aborted row moved nothing: what it held is owed again and a link to it is payable.
-    const refused = aborted.has(id);
-    await (refused ? releaseOwed(stores, entry) : settleOwed(stores, entry));
-    if ((await stores.backstop.removeIfUnchanged(id, entry)) && refused) report.conflicted.push(id);
+    await retire(stores, entry, aborted.has(id), report);
   }
 }
 
@@ -244,8 +242,7 @@ async function gateAndDecode(
       // #676: never resumed. Conflicted only once the cancel is confirmed (#835): until then another device could run it.
       const outcome = await abortAndConfirm(deps.intents, intent.transferId);
       if (outcome === 'unknown') report.failed.push(intent.transferId);
-      else await stores.backstop.removeByKey(intent.transferId).catch(() => undefined);
-      if (outcome === 'aborted' || outcome === 'never-stored') report.conflicted.push(intent.transferId);
+      else await retire(stores, local, outcome !== 'completed', report).catch(() => undefined);
       continue;
     }
     let payload: IntentPayload;

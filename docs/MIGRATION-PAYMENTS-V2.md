@@ -131,13 +131,12 @@ another device of the same wallet could still complete it until the cancel
 is confirmed, and a payment request paid with it stays `settling` until
 then. PENDING_COMMIT handling already treats both correctly: never re-send.
 `PartialSendConflictError.remainingAmount` can now be `'0'`: a later
-attempt that will still be sent, under `err.cause.transferId`, owns the
-rest and nothing is owed, so code that re-plans `remainingAmount` must not
-re-plan at all for `'0'`, and must show the payment as pending, not failed.
-A later attempt being cancelled owns nothing: `remainingAmount` is then
-the owed remainder, as before. Until that cancel is confirmed, another
-device of the same wallet could still complete the attempt, so a remainder
-re-planned in that window can be paid twice on a multi-device wallet. A `false`
+attempt that may still be sent, under `err.cause.transferId`, owns the
+rest and nothing is owed now, so code that re-plans `remainingAmount` must
+not re-plan at all for `'0'`, and must show the payment as pending, not
+failed. That includes a later attempt being cancelled, which another device
+of the same wallet could still complete: once the cancel is confirmed, the
+rest shows up in `pendingTransfers()` as a shortfall to re-plan. A `false`
 `isPossiblyCommittedSendOutcome()` now means the failure is proven clean:
 nothing certified, and nothing this device holds can still send it. The
 `sync:pending` `transfer:attention` code is no longer emitted.

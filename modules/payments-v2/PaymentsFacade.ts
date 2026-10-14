@@ -23,7 +23,7 @@ import { type NftReplayDeps, replayNftMints, runNftMintUnderJournal } from './mi
 import { type CustomReplayDeps, replayCustomMints, runCustomMintUnderJournal } from './mint-custom';
 import { acknowledgeBurn, type BurnReplayDeps, pendingBurns, replayBurns, runBurnUnderJournal } from './burn';
 import { materializeWholeSpend } from './send-whole';
-import { asPossiblyCommitted, CONVERGE_FAILED_MESSAGE, isCancelUnconfirmed, partialize, PARTLY_ON_CHAIN_MESSAGE } from './send-errors';
+import { asPossiblyCommitted, CONVERGE_FAILED_MESSAGE, partialize, PARTLY_ON_CHAIN_MESSAGE } from './send-errors';
 import { requireSameNetworkRecipient } from './recipient';
 import { reseedAndReset, type RestoreDeps } from './restore';
 import { PrewarmCache, takeSourceBlobs, warmSendSources, type WarmDeps } from './prewarm-cache';
@@ -566,7 +566,7 @@ export class PaymentsFacade implements PaymentsV2 {
   /** #835: a possibly-committed latest attempt owns the remainder — it holds the send's earlier shortfall
    *  rows, its certified legs join the delivered set — unless it is being cancelled: the rows stay owed. */
   private async surfaceFailure(err: unknown, run: SendRun, ctx: AttemptCtx): Promise<unknown> {
-    if (run.delivered.length === 0 || !isPossiblyCommittedSendOutcome(err) || isCancelUnconfirmed(err)) return partialize(err, run);
+    if (run.delivered.length === 0 || !isPossiblyCommittedSendOutcome(err)) return partialize(err, run);
     await holdShortfalls(this.machineStores, run.settledShortfalls.splice(0), ctx.transferId).catch(() => undefined);
     return partialize(err, run, this.machine.certifiedSourcesOf(ctx.plan));
   }

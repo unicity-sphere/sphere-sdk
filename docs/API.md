@@ -596,10 +596,10 @@ any of them:
   payment will never go out, so it **holds** the send and sends it automatically under the same
   transfer id. Usually the wallet service did not confirm that it recorded the payment, even
   after two immediate retries (an outage, a timeout, a 5xx, a page a proxy answered); the SDK
-  sends it once the service confirms the intent. If the service instead refuses the intent
-  outright on a later re-send (a 413, or a 422 from wallet-api itself), nothing ever ran and the
-  send is dropped:
-  `pendingTransfers()` stops listing it, and a request paid with it becomes payable again. A send
+  sends it once the service confirms the intent. A refusal on a later re-send (a 413, or a 422
+  from wallet-api itself) does not end it: the re-send that went unconfirmed may still land and
+  store the intent, so the send stays held, and a request paid with it stays `'settling'`. Only a
+  refusal whose intent another device already completed ends it, as paid. A send
   is also held when an attempt failed before anything certified but another write of the same
   intent may still land (an unconfirmed intent answer, an epoch restore that started during the
   attempt or was still re-sending intents when it failed, or a cancel record that could not be
@@ -618,17 +618,15 @@ any of them:
 A [`PartialSendConflictError`](#errors) means part of the amount was delivered and is final.
 Read `err.remainingAmount` before you do anything else:
 
-- **`'0'`:** a later attempt of the same send is still converging under its own transfer id
-  (`err.cause.transferId`; its row is in `pendingTransfers()`), will still be sent, and owns the
-  rest. Nothing is owed: do not send any of it again. If that attempt later ends without sending,
-  for example because its source was spent elsewhere, no shortfall is recorded for it. The
-  recipient is then under-paid, never paid twice.
+- **`'0'`:** a later attempt of the same send may still be sent under its own transfer id
+  (`err.cause.transferId`) and owns the rest. Nothing is owed now: do not send any of it again.
+  That includes a later attempt that failed and is being cancelled (`err.cause` is then its
+  `SEND_SYNC_PENDING`, with the cancel message): this device never sends it, but another device of
+  the same wallet could still complete it until the service confirms the cancel. If that attempt
+  ends without sending (its source was spent elsewhere, or its cancel is confirmed), the remainder
+  comes back as a `'shortfall'` row in `pendingTransfers()`; re-plan only that.
 - **Anything else:** only `err.remainingAmount` is still owed, and it may be paid only by a new
-  send of exactly that amount. This includes a later attempt that failed and is being cancelled
-  (`err.cause` is then its `SEND_SYNC_PENDING`, with the cancel message): this device never sends
-  it, so the remainder stays owed and its `'shortfall'` row stays in `pendingTransfers()`. Until the
-  service confirms that cancel, another device of the same wallet could still complete the attempt,
-  so a remainder paid in the meantime from a wallet used on several devices can be paid twice.
+  send of exactly that amount.
 
 When `isPossiblyCommittedSendOutcome(err)` is `false`, the failure is proven clean: nothing of the
 payment was certified, and nothing this device holds can still send it.
@@ -1250,8 +1248,9 @@ the wallet service has not confirmed yet (#835), is an `'open'` row with no cert
 attempt being cancelled (#835: it failed, and the service has not confirmed the cancel) is not
 listed: this device will never send it, although another device of the same wallet could still
 complete it until the cancel is confirmed. After a `PartialSendConflictError` with `remainingAmount: '0'`, the
-attempt still sending the rest is an `'open'` row, and that send has no `'shortfall'` row while that
-attempt can still pay; if it is refused instead, the `'shortfall'` row with the remainder comes
+attempt still sending the rest is an `'open'` row (none for one being cancelled), and that send has no
+`'shortfall'` row while that attempt can still pay; if it is proven not to run instead (its source
+spent elsewhere, or its cancel confirmed), the `'shortfall'` row with the remainder comes
 back. With any other `remainingAmount`, the `'shortfall'` row carries it.
 
 ```typescript
@@ -1334,8 +1333,9 @@ interface PaymentRequestView {
   `pay()` links the request to that transfer in the payments journal and marks it `'settling'`
   before it rethrows, so the request is not payable, and the link survives a restart. A held send
   (#835) takes this path too: the request stays `'settling'` while the SDK holds the send, and
-  becomes payable again only once the SDK has proven that nothing was sent (for example when the
-  service refuses the intent outright, with a 413, or a 422 from wallet-api itself). One exception: if writing that link to
+  becomes payable again only once the SDK has proven that nothing was sent; a refusal of a held
+  send's re-sent intent (a 413, or a 422 from wallet-api itself) is no such proof, so it stays
+  `'settling'`. One exception: if writing that link to
   storage fails, `pay()` rejects with the storage error instead of the send error, so
   `isPossiblyCommittedSendOutcome` is `false` for it although the payment may have gone out; the
   link is then held in memory and reaches storage only with a later successful journal write. A
@@ -1633,7 +1633,8 @@ codes are unchanged by #835; `SEND_SYNC_PENDING` now also covers a held send tha
 yet but still may (most often because the wallet service did not confirm it recorded the intent),
 and a failed attempt this device is cancelling while the service has not confirmed the cancel
 (never sent from here, not in `pendingTransfers()`). `PartialSendConflictError.remainingAmount`
-can be `'0'`, only when a later attempt that will still be sent owns the rest.
+can be `'0'`, only when a later attempt that may still be sent owns the rest (one being cancelled
+included, until the cancel is confirmed).
 `PAYMENTS_NOT_COMPOSED` is the permanent refusal of `sphere.payments` on a `walletApi: 'none'`
 wallet; `NOT_INITIALIZED` is the transient one.
 

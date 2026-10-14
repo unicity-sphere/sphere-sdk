@@ -1633,11 +1633,11 @@ every case except one being cancelled), and wire any "retry" button to
   payment request paid with it stays `settling` until then, and becomes payable again after.
 
 A `PartialSendConflictError` means part of the amount was delivered and is final. If
-`err.remainingAmount` is `'0'`, a later attempt that will still be sent (under
-`err.cause.transferId`) owns the rest: nothing is owed, so never re-plan or re-send any of it.
-Otherwise only `err.remainingAmount` is still owed, also when the later attempt is being cancelled;
-until that cancel is confirmed, another device of the same wallet could still complete the attempt,
-so a remainder paid in that window from a wallet used on several devices can be paid twice. When `isPossiblyCommittedSendOutcome(err)` is `false`, the failure is proven clean: nothing of the
+`err.remainingAmount` is `'0'`, a later attempt that may still be sent (under
+`err.cause.transferId`) owns the rest: nothing is owed now, so never re-plan or re-send any of it.
+That includes a later attempt being cancelled, which another device of the same wallet could still
+complete: once the cancel is confirmed, the rest shows up in `pendingTransfers()` as a shortfall,
+and only that is re-planned. Otherwise only `err.remainingAmount` is still owed. When `isPossiblyCommittedSendOutcome(err)` is `false`, the failure is proven clean: nothing of the
 payment was certified, and nothing this device holds can still send it.
 
 ```typescript

@@ -197,9 +197,11 @@ const result = await sphere.payments.send({
 // SPLIT_CHECKPOINT_LOST, CHECKPOINT_TRUSTBASE_MISMATCH and SEND_PARTIALLY_COMPLETED. Never
 // send() again for those (they carry err.transferId): a retry button calls payments.resumeNow(),
 // and payments.pendingTransfers() lists what is still converging. A PartialSendConflictError
-// whose remainingAmount is '0' owes nothing — a later attempt that will still be sent owns the
-// rest; never re-plan. A SEND_SYNC_PENDING whose message says the payment is being cancelled is
-// never sent by this device and is not in pendingTransfers(); still never send() it again.
+// whose remainingAmount is '0' owes nothing yet — a later attempt that may still be sent owns the
+// rest (one being cancelled too, until the cancel is confirmed and the rest shows up again as a
+// pendingTransfers() shortfall); never re-plan '0'. A SEND_SYNC_PENDING whose message says the
+// payment is being cancelled is never sent by this device and is not in pendingTransfers(); still
+// never send() it again.
 // false = proven clean: nothing certified, and nothing this device holds can still send it.
 // NOTE: coinId is the 64-hex coin id; get it from a symbol with getCoinIdBySymbol() (step 5).
 // The registry is presentation only.
@@ -553,14 +555,15 @@ version:
   device never sends that one — it only retries the abort — and `pendingTransfers()` does not list
   it; it is possibly-committed only because another device of the wallet could still run the open
   row, and a linked payment request stays `settling` until the abort is confirmed, then turns
-  payable. `PartialSendConflictError.remainingAmount` can be `'0'`: a later attempt that will still
-  be sent owns the rest and holds the send's earlier shortfall rows on its backstop entry (handed
-  back, owed again, if it is refused) — never one being cancelled, which keeps the shortfall rows
-  and reports the owed remainder. Accepted residual: until the abort is confirmed, another device of the
-  wallet can still resume and complete that attempt, so a remainder re-planned in that window can
-  be paid twice (closing it needs server-side exclusivity). Reporting `'0'` would not close the
-  race — the other device may already have certified before the abort lands — and would turn it
-  into a permanent, unsignalled under-pay. The `sync:pending` attention code is no longer emitted.
+  payable. `PartialSendConflictError.remainingAmount` can be `'0'`: a possibly-committed later
+  attempt owns the rest and holds the send's earlier shortfall rows on its backstop entry — one
+  being cancelled included, since another device could still complete it. The rows are handed back,
+  owed again, only once that attempt is proven not to run (a conflict on resume, or a cancel the
+  aborted listing confirms, which also reports it `conflicted`), and settled as paid when it
+  completed elsewhere; nothing is owed while the cancel is unconfirmed. Accepted residual
+  (wallet-api#172, closing it needs server-side exclusivity): another device that certified a leg
+  before the abort landed may still deliver, while the confirmed cancel makes the remainder owed
+  again. The `sync:pending` attention code is no longer emitted.
 - **Lifecycle:** `facade.start()`/`stop()` are Sphere-internal (init/destroy/address switch).
   The public convergence surface is `payments.pendingTransfers()` / `payments.resumeNow()` (a
   retry button calls `resumeNow()`, NEVER `send()`: a re-issued send double-pays), plus
@@ -848,13 +851,18 @@ authoritative for build success.
   have answered without forwarding), and a 413/422 after an ambiguous one — a mixed fleet may have
   stored the earlier PUT) **park** the send: backstop `intentPut: 'unconfirmed'`, `SEND_SYNC_PENDING` with
   its transferId, and every resume pass re-PUTs the stored bytes (ensure) before resuming it,
-  first re-persisting the hold when only memory had it (its flag write failed). Only a 413, or a
-  422 in wallet-api's envelope, on that re-PUT can end it (an untyped `HTTP_422` keeps the hold,
-  unprobed), since it says nothing about the earlier ambiguous PUT a mixed fleet may
-  have stored: a row still open is kept and resumed; otherwise an abort probes the row — `404`
-  (never stored) or aborted drops it as conflicted, completed (on another device) ends it as paid,
-  anything else keeps it. A confirmed or ended hold ends the in-memory park (`onHoldEnded`). The
-  epoch re-seed skips never-acked entries.
+  first re-persisting the hold when only memory had it (its flag write failed). A 413, or a 422 in
+  wallet-api's envelope, on that re-PUT ends it only as paid (an untyped `HTTP_422` keeps the hold,
+  unprobed). It says nothing about the earlier ambiguous PUT, which may still be in flight: a row
+  still open is kept and resumed; otherwise an abort probes the row, and only a row completed on
+  another device (its abort answered `204`, and neither the aborted nor the open listing then shows
+  it) ends the hold, as paid. A `404` or
+  an aborted row proves only that no row exists now — the late PUT can still create it, or re-open
+  it with its byte-equal bytes — so those, like any failed probe, keep it held, reported failed:
+  its source stays pinned, a linked request stays `settling`, and if that PUT lands the listing
+  confirms the hold and it is sent once. Never conflicted from the ensure step (no bound on a hold
+  yet: #845). A confirmed or ended hold ends the in-memory park (`onHoldEnded`). The epoch re-seed
+  skips never-acked entries.
   Clean-on-refusal rests on wallet-api's rule that every 4xx from the PUT is raised before any
   write (ARCHITECTURE §16).
 - **After a leg certifies, nothing is clean (#835):** `run()` applies only a fully settled
@@ -892,10 +900,10 @@ authoritative for build success.
   `SEND_PARTIALLY_COMPLETED` is different: the delivered partial's intent is completed before the
   error surfaces. Its `remainingAmount` is either still owed (re-plan only that, under a NEW
   transferId) or `'0'`, when a later attempt still open under `err.cause.transferId` will be sent
-  and owns the rest (never re-plan). A later attempt being cancelled owns nothing: the owed
-  remainder is reported and its shortfall row kept — with the cross-device residual in the
-  error-contract bullet above (another device can complete it until the abort is confirmed, so a
-  remainder re-planned meanwhile can be paid twice). A proven clean failure is fenced
+  and owns the rest (never re-plan). A later attempt being cancelled owns it too until its cancel
+  is confirmed: then the remainder is owed again and listed by `pendingTransfers()` as a shortfall
+  (re-plan only that), with the wallet-api#172 cross-device residual in the error-contract bullet
+  above. A proven clean failure is fenced
   (see the gate bullets above); a nothing-certified `TransferConflictError` then demotes the
   source (#625) and re-plans, bounded by `MAX_RESELECT` = 8.
 - Each dist bundle (root, `./core`, `./impl/nodejs`, `./impl/browser`) carries its own
@@ -1093,7 +1101,8 @@ authoritative for build success.
   open listing shows was re-opened by a byte-equal re-PUT: the cancel stays unconfirmed). An `'open'` entry whose row is no longer open is judged by the aborted listing: aborted
   (it moved nothing) hands back what it held and is reported `conflicted`, absent from both listings
   settles as paid, and an unreadable listing keeps the entry. A second optional field, `owes?: ShortfallEntry[]`, carries the #690 shortfall rows a
-  later attempt of a partial send holds (see the error contract above); an older client ignores it,
+  later attempt of a partial send holds, a tombstoned one being cancelled included (see the error
+  contract above); an older client ignores it,
   so on a downgrade a held remainder is recorded nowhere — again an under-payment, never a double
   pay.
 - **The `pv2:` → `pv2g2:` rename IS the 3.x local migration** (`modules/payments-v2/stores.ts`;
