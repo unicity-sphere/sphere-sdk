@@ -2895,11 +2895,12 @@
     "name": "refusal-trusts-untyped-4xx",
     "note": "#835 (Codex P2): only wallet-api's own JSON envelope carries the pre-write guarantee; an intermediary's 4xx page (HTTP_<status>) twice must not read as a clean refusal (machine.test.ts 'an untyped 4xx (%s...) proves nothing, even twice...'; send-intent-unknown.test.ts (h) HTTP_403/HTTP_429 rows)",
     "file": "modules/payments-v2/machine/journal.ts",
-    "find": "  const typed = typeof e.code === 'string' && !/^HTTP_\\d{3}$/.test(e.code);",
-    "replace": "  const typed = typeof e.code === 'string';",
+    "find": "  return typeof e.code === 'string' && !/^HTTP_\\d{3}$/.test(e.code);",
+    "replace": "  return typeof e.code === 'string';",
     "tests": [
       "tests/unit/payments-v2/machine.test.ts",
-      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
     ]
   },
   {
@@ -3243,6 +3244,59 @@
     "replace": "  await (paid ? releaseOwed(stores, entry) : releaseOwed(stores, entry));",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "never-storable-trusts-untyped-422",
+    "note": "#835: a 422 proves the bytes unstorable only in wallet-api's envelope; an untyped one may come from a hop that forwarded the request first (machine.test.ts 'an untyped 4xx (422 HTTP_422 ...)'; send-intent-unknown.test.ts (h) 422 HTTP_422 row; machine-resume.test.ts 'an untyped 422 on the re-PUT ...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  return e.status === 413 || e.statusCode === 413 || (isValidationReject(err) && isWrittenByWalletApi(e));",
+    "replace": "  return e.status === 413 || e.statusCode === 413 || isValidationReject(err);",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "never-storable-requires-typed-413",
+    "note": "#835: any 413 judges the bytes, since the hop that receives the body answers it while receiving it (send-intent-unknown.test.ts (g) 413 HTTP_413 rows; machine-resume.test.ts 'an untyped 413 on the re-PUT ...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  return e.status === 413 || e.statusCode === 413 || (isValidationReject(err) && isWrittenByWalletApi(e));",
+    "replace": "  return ((e.status === 413 || e.statusCode === 413) && isWrittenByWalletApi(e)) || (isValidationReject(err) && isWrittenByWalletApi(e));",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "intent-write-any-2xx",
+    "note": "#835: an intent write counts only the route's exact success status; any other 2xx is PROTOCOL (intent-write-ack.test.ts)",
+    "file": "impl/wallet-api-v2/http.ts",
+    "find": "    if (res.ok && opts?.expectStatus !== undefined && res.status !== opts.expectStatus) {",
+    "replace": "    if (res.ok && opts?.expectStatus !== undefined && res.status === 0) {",
+    "tests": [
+      "tests/unit/payments-v2/intent-write-ack.test.ts"
+    ]
+  },
+  {
+    "name": "intent-put-any-2xx",
+    "note": "#835: the intent PUT asks for wallet-api's 204, so a gateway's 200 never reads as a stored row (intent-write-ack.test.ts)",
+    "file": "impl/wallet-api-v2/client.ts",
+    "find": "    await this.http.request('PUT', `/v1/intents/${transferId}`, body, INTENT_WRITE);",
+    "replace": "    await this.http.request('PUT', `/v1/intents/${transferId}`, body);",
+    "tests": [
+      "tests/unit/payments-v2/intent-write-ack.test.ts"
+    ]
+  },
+  {
+    "name": "intent-abort-any-2xx",
+    "note": "#835: the abort asks for wallet-api's 204, so a gateway's 200 never reads as a confirmed cancel (intent-write-ack.test.ts)",
+    "file": "impl/wallet-api-v2/client.ts",
+    "find": "    await this.http.request('POST', `/v1/intents/${transferId}/abort`, undefined, INTENT_WRITE);",
+    "replace": "    await this.http.request('POST', `/v1/intents/${transferId}/abort`);",
+    "tests": [
+      "tests/unit/payments-v2/intent-write-ack.test.ts"
     ]
   }
 ]

@@ -12,6 +12,7 @@ import {
   RATE_LIMIT_DEFER_MS,
 } from '../../../modules/payments-v2/machine/journal';
 import {
+  CANCEL_UNCONFIRMED_MESSAGE,
   INTENT_UNCONFIRMED_MESSAGE,
   NOT_FENCED_MESSAGE,
   PARTLY_ON_CHAIN_MESSAGE,
@@ -841,6 +842,25 @@ describe('TransferMachine intent PUT gate (#835)', () => {
 
     expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
   });
+
+  it('a clean leg failure whose abort is answered by a 2xx other than 204 is not confirmed: being cancelled, row open', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    w.engine.beforeOp = () => {
+      throw new Error('clean reject');
+    };
+    w.overrides.abort = async () => {
+      throw new WalletApiHttpError(200, 'PROTOCOL', `POST /v1/intents/${plan.transferId}/abort: answered 200, not 204`);
+    };
+
+    const err = await rejectionOf(w.machine().run(plan));
+
+    expect(err).toMatchObject({ code: 'SEND_SYNC_PENDING', transferId: plan.transferId });
+    expect((err as SphereError).message).toBe(CANCEL_UNCONFIRMED_MESSAGE);
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('open');
+    expect((await w.stores().backstop.getByKey(plan.transferId))?.disposition).toBe('abortPending');
+  });
 });
 
 describe('TransferMachine intent PUT gate — what an answer proves (#835)', () => {
@@ -849,6 +869,7 @@ describe('TransferMachine intent PUT gate — what an answer proves (#835)', () 
   it.each([
     ['403 HTTP_403', () => new WalletApiHttpError(403, 'HTTP_403', 'PUT /v1/intents failed with status 403')],
     ['429 HTTP_429', () => new WalletApiHttpError(429, 'HTTP_429', 'PUT /v1/intents failed with status 429')],
+    ['422 HTTP_422', () => new WalletApiHttpError(422, 'HTTP_422', 'PUT /v1/intents failed with status 422')],
   ])('an untyped 4xx (%s: a page wallet-api did not write) proves nothing, even twice: the attempt is parked', async (_label, make) => {
     const w = makeWorld();
     const token = await w.seed(1000n);

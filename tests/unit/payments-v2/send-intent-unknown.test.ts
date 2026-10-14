@@ -73,7 +73,8 @@ const PUT_FAILURES: readonly (readonly [string, () => WalletApiHttpError])[] = [
 // Answers wallet-api raises BEFORE any write (ARCHITECTURE §16), with the number
 // of PUTs the gate spends on them: two such answers with nothing ambiguous before
 // prove no PUT of this fresh transferId stored a row; a 413/422 is deterministic
-// on the stored bytes, so one is the verdict (#670). AUTH_SUPERSEDED is the
+// on the stored bytes, so one is the verdict (#670) — a 413 from any hop (the one
+// receiving the body answers it), a 422 only in wallet-api's envelope. AUTH_SUPERSEDED is the
 // session's own 401, raised before the request leaves (impl/wallet-api-v2/session.ts).
 const PRE_WRITE_REFUSALS: readonly (readonly [string, () => WalletApiHttpError, number])[] = [
   ['429 QUOTA_EXCEEDED', () => new WalletApiHttpError(429, 'QUOTA_EXCEEDED', 'open intent cap reached'), 2],
@@ -83,10 +84,12 @@ const PRE_WRITE_REFUSALS: readonly (readonly [string, () => WalletApiHttpError, 
   ['409 CONFLICT', () => new WalletApiHttpError(409, 'CONFLICT', 'PUT /v1/intents: an aborted intent re-opens only with its original payload'), 2],
   ['413 PAYLOAD_TOO_LARGE', () => new WalletApiHttpError(413, 'PAYLOAD_TOO_LARGE', 'PUT /v1/intents: request body is too large'), 1],
   ['422 VALIDATION_FAILED', () => new WalletApiHttpError(422, 'VALIDATION_FAILED', 'PUT /v1/intents: payload envelope refused'), 1],
+  ["413 HTTP_413 (a hop's body limit)", () => new WalletApiHttpError(413, 'HTTP_413', 'PUT /v1/intents failed with status 413'), 1],
 ];
 
 // Answers that prove nothing about the row: it may exist, or appear later. A 2xx
-// whose body is not JSON (PROTOCOL) may have stored it too. A 4xx proves "nothing
+// other than wallet-api's 204, or whose body is not JSON (PROTOCOL), may not have
+// reached it, or may have stored it. A 4xx proves "nothing
 // written" only in wallet-api's own envelope: a page it did not write reads HTTP_<status>
 // (an intermediary — a proxy's 403 or 429, or a 499 after it forwarded the request).
 // 408 and 499 stay ambiguous even under a typed body: the status alone says so.
@@ -98,6 +101,8 @@ const AMBIGUOUS_ANSWERS: readonly (readonly [string, () => WalletApiHttpError])[
   ['504 HTTP_504', () => new WalletApiHttpError(504, 'HTTP_504', 'PUT /v1/intents failed with status 504')],
   ['408 HTTP_408', () => new WalletApiHttpError(408, 'HTTP_408', 'PUT /v1/intents failed with status 408')],
   ['200 PROTOCOL', () => new WalletApiHttpError(200, 'PROTOCOL', 'PUT /v1/intents: response is not JSON')],
+  ['202 PROTOCOL (a 2xx other than 204)', () => new WalletApiHttpError(202, 'PROTOCOL', 'PUT /v1/intents: answered 202, not 204')],
+  ["422 HTTP_422 (not wallet-api's envelope)", () => new WalletApiHttpError(422, 'HTTP_422', 'PUT /v1/intents failed with status 422')],
   ['429 HTTP_429 (an intermediary page)', () => new WalletApiHttpError(429, 'HTTP_429', 'PUT /v1/intents failed with status 429')],
   ['403 HTTP_403', () => new WalletApiHttpError(403, 'HTTP_403', 'PUT /v1/intents failed with status 403')],
   ['499 HTTP_499', () => new WalletApiHttpError(499, 'HTTP_499', 'PUT /v1/intents failed with status 499')],

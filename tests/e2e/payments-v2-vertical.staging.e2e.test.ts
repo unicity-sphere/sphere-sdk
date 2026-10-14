@@ -26,7 +26,8 @@
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { isPossiblyCommittedSendOutcome, SphereError } from '../../core/errors';
-import { WalletApiHttpError } from '../../impl/wallet-api-v2/http';
+import { WalletApiV2Client } from '../../impl/wallet-api-v2/client';
+import { createWalletApiHttp, WalletApiHttpError } from '../../impl/wallet-api-v2/http';
 import type { DeliveryPort } from '../../modules/payments-v2/ports';
 import { createMachineStores } from '../../modules/payments-v2/machine/journal';
 import { INTENT_UNCONFIRMED_MESSAGE } from '../../modules/payments-v2/send-errors';
@@ -400,9 +401,11 @@ describe.runIf(RUN)('LIVE staging: payments-v2 vertical (facade over real ports 
 // (MakeOptions.wrapClient); the session, every other call, the ports, the engine
 // and the gateway stay real. The shapes are what impl/wallet-api-v2/http.ts
 // produces: fetchRaw's status-0 NETWORK wrapper, and the wallet-api 429
-// RATE_LIMITED envelope (wallet-api src/lib/errors.ts).
+// RATE_LIMITED envelope (wallet-api src/lib/errors.ts). 'gateway-200' runs the PUT
+// through the real http layer and client against a hop that answers an empty 200
+// itself and never forwards the request.
 
-type PutFault = 'response-lost' | 'network-down' | 'rate-limited';
+type PutFault = 'response-lost' | 'network-down' | 'rate-limited' | 'gateway-200';
 
 interface PutCall {
   readonly transferId: string;
@@ -418,7 +421,7 @@ interface PutFaults {
   /** The next PUTs end in these faults, in order; after them PUTs pass through. */
   queue(...faults: PutFault[]): void;
   /** Every PUT fails before it leaves the client, until unwrap(). */
-  outage(fault: 'network-down' | 'rate-limited'): void;
+  outage(fault: 'network-down' | 'rate-limited' | 'gateway-200'): void;
   /** Back to the plain real client. */
   unwrap(): void;
   wrap(inner: AuthedClient): AuthedClient;
@@ -433,6 +436,13 @@ function putFaults(): PutFaults {
     thrown.push(err);
     return err;
   };
+  const hop = new WalletApiV2Client(
+    createWalletApiHttp({
+      baseUrl: BASE_URL,
+      fetchFn: async () => ({ status: 200, ok: true, text: async () => '', arrayBuffer: async () => new ArrayBuffer(0) }),
+      getToken: () => null,
+    })
+  );
   const network = (transferId: string, when: string): WalletApiHttpError =>
     new WalletApiHttpError(
       0,
@@ -458,6 +468,14 @@ function putFaults(): PutFaults {
         const fault = outage ?? queued.shift() ?? null;
         calls.push({ transferId, envelope, requiresSeedClose, fault });
         if (fault === 'network-down') throw raise(network(transferId, 'before the request left'));
+        if (fault === 'gateway-200') {
+          const answer = await hop.putIntent(transferId, envelope, requiresSeedClose).then(
+            () => new Error('the real client read a 200 from a hop as a stored intent'),
+            (err: unknown) => err
+          );
+          if (!(answer instanceof WalletApiHttpError)) throw answer;
+          throw raise(answer);
+        }
         if (fault === 'rate-limited') {
           throw raise(new WalletApiHttpError(429, 'RATE_LIMITED', `PUT /v1/intents/${transferId}: rate limit exceeded`, 1_000));
         }
@@ -718,4 +736,62 @@ describe.runIf(RUN)('LIVE staging: #835 PUT /v1/intents with an unknown outcome 
     expect(await paid(f, 0n), 'F was never paid').toBe(true);
     expect(localTotal(e)).toBe(100n);
   }, 600_000);
+
+  it('a PUT answered 200 by a hop that never forwarded it, 3 times: held, no server row; unwrapped, it converges — delivered exactly once', async () => {
+    const e = must(walletE, 'wallet E');
+    const f = must(walletF, 'wallet F');
+
+    const first = eFaults.calls.length;
+    const firstEvent = e.events.length;
+    const legsBefore = (await receivedLegs(f, tokenE)).length; // F received this token once already, E→F above
+    eFaults.outage('gateway-200');
+    const outcome = await e.facade
+      .send({ recipient: f.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN })
+      .then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error })
+      );
+    const gate = eFaults.calls.slice(first);
+
+    expect('error' in outcome, 'a 2xx other than 204 never confirms the intent').toBe(true);
+    const held = (outcome as { error: unknown }).error as SphereError;
+    expect(held.code).toBe('SEND_SYNC_PENDING');
+    expect(held.message).toBe(INTENT_UNCONFIRMED_MESSAGE);
+    expect(held.cause).toBe(eFaults.thrown[eFaults.thrown.length - 1]);
+    expect(held.cause).toMatchObject({ status: 200, code: 'PROTOCOL' });
+    const transferId = must(held.transferId, 'held transferId');
+    expect(gate.map((c) => c.fault)).toEqual(['gateway-200', 'gateway-200', 'gateway-200']);
+    expectOneIntent(gate, transferId);
+    expect(failedUpdates(e, transferId, firstEvent)).toEqual([]);
+    expect((await createMachineStores(e.kv).backstop.getByKey(transferId))?.intentPut).toBe('unconfirmed');
+    await expectNoServerRow(e, transferId);
+    expect(await serverTotal(e), 'nothing ran: E still holds the 100 on the server').toBe(100n);
+
+    eFaults.unwrap();
+    await e.facade.resumeNow();
+    await e.facade.resumeNow();
+    let lastResume = Date.now();
+    await drainUntil(
+      f,
+      async () => {
+        if (Date.now() - lastResume >= PACE_MS) {
+          lastResume = Date.now();
+          await e.facade.resumeNow();
+        }
+        return localTotal(f) === 100n && (await serverTotal(f)) === 100n;
+      },
+      SEND_CONVERGE_MS,
+      'F paid by the held send, converged in-session'
+    );
+
+    expectOneIntent(eFaults.calls.slice(first), transferId);
+    expect(await receivedLegs(f, tokenE)).toHaveLength(legsBefore + 1);
+    await waitFor(e, async () => (await serverTotal(e)) === 0n && localTotal(e) === 0n, 60_000, 'E drained to 0');
+    await waitFor(e, async () => (await openIntentIds(e)).length === 0, 60_000, 'E open intents empty');
+    expect(failedUpdates(e, transferId, firstEvent)).toEqual([]);
+    await sleep(10_000);
+    await f.facade.receive().catch(() => undefined);
+    expect(localTotal(f)).toBe(100n);
+    expect(await receivedLegs(f, tokenE)).toHaveLength(legsBefore + 1);
+  }, 1_500_000);
 });

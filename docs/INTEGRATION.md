@@ -923,7 +923,7 @@ Node.js environments are not subject to CORS — no proxy needed.
 When you call `send()`, the transfer runs as a durable server-side intent:
 
 1. **Intent first** — the transfer intent is recorded on the wallet-api server BEFORE any
-   chain op (crash-safe by construction): nothing is spent until the server has answered 2xx.
+   chain op (crash-safe by construction): nothing is spent until the server has answered `204`.
    A refused intent fails the send clean; one the server cannot confirm after two immediate
    retries is held, and `send()` rejects `SEND_SYNC_PENDING` with its `transferId` while the SDK
    sends it later, automatically, under that id (#835).

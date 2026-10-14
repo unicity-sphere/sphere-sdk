@@ -427,19 +427,21 @@ Normative behaviors bound into the transitions (not call sites):
   **Amended 2026-10-13 (#835) — the pre-submit PUT is a confirm-or-park gate.** The 422-only rule
   rethrew every other PUT failure unchanged, and the facade then converged the attempt with no
   server row (see the header note). Now **no engine op runs for an attempt until a PUT of its
-  stored envelope has answered 2xx in this process.** The backstop entry is written with
-  `intentPut: 'pending'` (§6) before the first PUT, and the 2xx clears it. A PUT that does not
-  answer 2xx is re-sent with the SAME stored envelope, never a re-encryption, and the same
+  stored envelope has answered `204` in this process.** The backstop entry is written with
+  `intentPut: 'pending'` (§6) before the first PUT, and the `204` clears it. A PUT that does not
+  answer `204` is re-sent with the SAME stored envelope, never a re-encryption, and the same
   `requiresSeedClose`. It is re-sent at most twice and immediately: the heartbeat owns waiting, and
   an immediate re-PUT serializes behind an in-flight original at the database. Every answer is
   classified:
-  - **2xx:** the row exists; certify.
+  - **`204`** (wallet-api's only success answer, bodyless)**:** the row exists; certify.
   - **413 / 422 with no ambiguous answer before it** (even after a typed pre-write 4xx):
     deterministic on these bytes, so no PUT of them ever stored a row (#670, widened to 413). Drop
-    the backstop, never abort; the wire error surfaces clean. It is matched by HTTP status, in
-    wallet-api's envelope or not (`HTTP_413` / `HTTP_422`): it is a verdict on the bytes
-    themselves, the client only ever re-sends the same bytes, and an intermediary's 413/422 is
-    answered before it forwards the body. After an ambiguous answer in the same gate it proves
+    the backstop, never abort; the wire error surfaces clean. It is a verdict on the bytes
+    themselves, and the client only ever re-sends the same bytes. A 413 counts from any hop, in
+    wallet-api's envelope or not (`HTTP_413`): the hop that receives the body answers it while
+    receiving it. A 422 counts only in wallet-api's envelope: an untyped `HTTP_422` may come from a
+    hop that forwarded the request first (one that rewrites upstream answers), so it is ambiguous.
+    After an ambiguous answer in the same gate it proves
     nothing about that earlier PUT — a mixed fleet with another payload cap or body schema may
     have stored it — so the gate goes on and parks.
   - **Any other 4xx except 408/499, in wallet-api's JSON error envelope:** that request wrote
@@ -448,9 +450,10 @@ Normative behaviors bound into the transitions (not call sites):
     such answer with no ambiguous answer before it. The guarantee is wallet-api's, so it holds only
     for a body wallet-api wrote: the client reads the envelope's typed code, and an untyped 4xx
     (`HTTP_<status>`, an intermediary's page) is ambiguous.
-  - **0, 408, 499, 5xx, any other untyped 4xx, and a 2xx whose non-empty body is not JSON
-    (`PROTOCOL`), are ambiguous:** the row may exist, or appear later. (The server's own success
-    is a bodyless `204`.)
+  - **0, 408, 499, 5xx, any other untyped 4xx (`HTTP_422` included), and any 2xx other than
+    `204` (`PROTOCOL`), are ambiguous:** the row may exist, or appear later. A 2xx other than the
+    route's bodyless `204` may come from a gateway's fixed response or a misroute that never
+    forwarded the request (`expectStatus`, `impl/wallet-api-v2/http.ts`).
     When the re-PUTs are spent the attempt is **parked**: the entry is marked
     `intentPut: 'unconfirmed'` (held in memory as well, in case that write fails), and `send()`
     rejects `SEND_SYNC_PENDING` carrying the `transferId`, with the last answer as `cause`. The send
@@ -461,8 +464,9 @@ Normative behaviors bound into the transitions (not call sites):
   S1 sweep removes it. Every resume pass first **ensures** each held entry (§7). One the server
   already lists as open just loses its marker and resumes in that pass. Otherwise, when only memory
   held it (its `'unconfirmed'` write failed), the hold is re-persisted first, so a restart finds it
-  held; then its stored envelope is re-PUT. A 2xx turns it into an ordinary open intent, which
-  that same pass resumes under the same `transferId` with the same bytes. A 413/422 says nothing
+  held; then its stored envelope is re-PUT. A `204` turns it into an ordinary open intent, which
+  that same pass resumes under the same `transferId` with the same bytes. An untyped `HTTP_422`
+  proves nothing and keeps the hold, unprobed. A 413, or a 422 in wallet-api's envelope, says nothing
   about the earlier ambiguous PUT, which a mixed fleet may have stored and another device may have
   run, so it ends the hold only after a probe: a row a fresh listing still shows open is kept (the
   next pass resumes it); otherwise the client aborts the id. `404 NOT_FOUND` means no row was ever
@@ -470,7 +474,7 @@ Normative behaviors bound into the transitions (not call sites):
   conflicted, so a linked request reverts to payable (its held shortfall rows are owed again). A
   row the abort leaves out of the aborted listing completed elsewhere: the hold ends as paid (its
   held rows settled) and stays unaccounted, which a linked request reads as paid. Any other answer,
-  or a failed probe, keeps it held. A confirmed row (listed, or a 2xx re-PUT) or a dropped hold ends the
+  or a failed probe, keeps it held. A confirmed row (listed, or a `204` re-PUT) or a dropped hold ends the
   in-memory park (`onHoldEnded`). A held entry is never swept, and a linked request stays
   `settling` while it is held. The re-seed skips every entry whose PUT
   was never acked (`intentPut` set), because only an acked intent can have certified anything, while
@@ -490,7 +494,8 @@ Normative behaviors bound into the transitions (not call sites):
   attempt is clean and the machine never aborts. A nothing-certified failure after the PUT was acked
   is reported clean in only two cases. The first is that every planned op conflicted, which is
   deterministic: a re-run conflicts again, so the abort is best-effort. The second is that a durable
-  `abortPending` tombstone was written, the server answered its abort 2xx or 404 `NOT_FOUND`, and no
+  `abortPending` tombstone was written, the server answered its abort `204` or 404 `NOT_FOUND` (any
+  other 2xx confirms nothing: something other than the route may have answered), and no
   other PUT of that `transferId` from this client can still land: the gate saw no ambiguous answer,
   no epoch re-seed started during the attempt, and none is still re-PUTting when it fails (one that
   started earlier may list the acked entry late and re-PUT it). A late PUT would re-open the aborted row,
@@ -504,7 +509,7 @@ Normative behaviors bound into the transitions (not call sites):
     later pass, and reports it `conflicted` only once that abort is confirmed, so a linked payment
     request stays `settling` until then and turns payable after. `pendingTransfers()` does not list
     it (an `abortPending` entry is a rollback, not a pending send).
-  A tombstone is removed only after the server answers its abort 2xx or 404 `NOT_FOUND`, and never
+  A tombstone is removed only after the server answers its abort `204` or 404 `NOT_FOUND`, and never
   while the id is locally active (§7). Until then the #676 gate keeps the intent from ever resuming.
 - **E.4 (the most loss-prone flow — every step is a machine transition, test-pinned):** no mint
   submit before its checkpoint is durably server-acked **and read back** — a `put()` rejection
@@ -807,13 +812,13 @@ carries over (a testnet journal must never act on another network).
 **The backstop's PUT-ack marker (amended 2026-10-13, #835).** `IntentBackstopEntry` gains one
 optional field, `intentPut?: 'pending' | 'unconfirmed'`:
 - **`'pending'`** is written in the same upsert that creates the entry, before the first PUT, and
-  cleared when a PUT answers 2xx. Nothing of the attempt is certified while it is set, and the
+  cleared when a PUT answers `204`. Nothing of the attempt is certified while it is set, and the
   §5.1 re-seed never re-PUTs it. Everything else reads it as an ordinary `'open'` entry, so the
   crash and S1 semantics are those of an `'open'` entry.
 - **`'unconfirmed'`** marks a parked send (§5.5 E.3): the PUT outcome stayed unknown and `send()`
   reported `SEND_SYNC_PENDING`. Every resume pass re-PUTs `payloadEnvelope` before anything else
-  and never sweeps the entry. The marker is cleared on a 2xx; only a 413/422 can end the hold, and
-  only after the probe above (§5.5 E.3).
+  and never sweeps the entry. The marker is cleared on a `204`; only a 413, or a 422 in wallet-api's
+  envelope, can end the hold, and only after the probe above (§5.5 E.3).
 - **Absent:** the PUT was acked, or an older client wrote the entry.
 
 Both marker writes are best-effort, and each failure leaves a known, bounded residual. If the park
@@ -823,7 +828,7 @@ re-PUT, so the hold survives a restart once one pass has run. The residual is a 
 sweep can drop a send whose PUT never landed — an under-payment, never a double pay. `'pending'`
 itself is never treated as held: a refused send whose backstop removal failed also reads
 `'pending'`, and re-PUTing that one would run a send already reported clean. If the clear after a
-2xx fails, no op runs: an entry still reading `'pending'` would be skipped by a re-seed and swept by
+`204` fails, no op runs: an entry still reading `'pending'` would be skipped by a re-seed and swept by
 S1 after a backend reset, losing the recovery of whatever it certified. The send is parked instead,
 exactly like one whose PUT stayed unconfirmed: `SEND_SYNC_PENDING`, and the next pass finds the row
 listed (or re-PUTs it), clears the flag and resumes it.
@@ -902,7 +907,7 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
   3. The S1 GC. It checks local activity first, so an entry whose machine is running in-process
      is never touched. That closes the race in which the GC dropped the `abortPending` tombstone
      an active attempt had just written. It removes a tombstone only after the server answers its
-     abort 2xx or 404 `NOT_FOUND`, and it skips held entries. Every removal is compare-and-delete
+     abort `204` or 404 `NOT_FOUND`, and it skips held entries. Every removal is compare-and-delete
      against the exact snapshot it judged (`ListStore.removeIfUnchanged`, serialized with every
      other read-modify-write of the store), so a park or a fence that lands meanwhile is never
      lost to a stale read.
@@ -1060,13 +1065,13 @@ each other; P5+ are sequential.
 ## Appendix A — invariant register (must hold in v2; each carries a test)
 
 Send: intent-before-engine, absolute — no engine op before a PUT of the stored envelope answered
-2xx in this process (#835); journal-before-deliver; delivery failure never fails a certified
+`204` in this process (#835); journal-before-deliver; delivery failure never fails a certified
 send; bounded replay + 429 deferral outside the poison budget; certified-spend terminal;
 settled-only accounting with keep-open > conflict > other; keep-open family never aborted;
 clean-means-fenced — a clean report needs nothing certified and nothing this device holds able to
 execute the intent (the PUT was refused, every op conflicted, or the server confirmed the abort
 of a durably tombstoned intent with no PUT of that id still able to land), else possibly-committed, and any failure after
-a certified leg is possibly-committed (#835); tombstones removed only on a server abort 2xx/404 and
+a certified leg is possibly-committed (#835); tombstones removed only on a server abort `204`/404 and
 never while locally active, every GC removal compare-and-delete (#835); shortfall-before-apply —
 `run()` applies only a fully settled attempt, any other attempt is applied only by resume after its
 shortfall row is durable (#835); conflict-never-masks — a conflict is thrown only when nothing
@@ -1076,10 +1081,11 @@ never recorded spent; locally-aborted intents never resumed, unknown local dispo
 all; unsupported payloads refused; reservation gate + synchronous critical section; per-request
 pay single-flight; settling journal durable-before-throw (not during the send: #806, §5.8);
 post-commit mirror failure ≠ failure;
-pre-submit intent PUT confirm-or-park — a 413/422 (typed or not) with no ambiguous answer before
-it, or two pre-write 4xx (wallet-api's typed envelope only) with no ambiguous answer before them,
-drops the backstop and never aborts; an ambiguous answer (any other untyped 4xx, and a 413/422
-after an ambiguous one, included) parks the send as
+pre-submit intent PUT confirm-or-park — a 413 (from any hop) or a 422 (wallet-api's typed envelope
+only) with no ambiguous answer before it, or two pre-write 4xx (wallet-api's typed envelope only)
+with no ambiguous answer before them, drops the backstop and never aborts; an ambiguous answer (any
+other untyped 4xx, `HTTP_422` included, any 2xx other than `204`, and a 413/422 after an ambiguous
+one, included) parks the send as
 `SEND_SYNC_PENDING` with its transferId, every pass ensures it before resuming it, and the re-seed
 skips never-acked entries (re-seed rejection keeps the backstop) (#670, #835); a hold kept only in
 memory is re-persisted by every pass before its re-PUT, and a confirmed or dropped hold ends it

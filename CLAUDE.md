@@ -834,20 +834,23 @@ authoritative for build success.
   it. A crash at ANY stage resumes the SAME transferId — never a second spend (E.2/E.4, #631,
   #676, #690).
 - **The intent PUT is a confirm-or-park gate (#835):** no engine op runs until a PUT of the
-  stored envelope answers 2xx in this process. A non-2xx is re-PUT with the SAME bytes (never
-  re-encrypted) up to twice, immediately. A 413/422 with nothing ambiguous before it (even after a
-  typed pre-write 4xx), or two pre-write 4xx with nothing ambiguous before them, fail clean
-  (backstop dropped, nothing to abort). A 413/422 is matched by HTTP status, typed or
-  `HTTP_413`/`HTTP_422`: it is a verdict on the bytes themselves and the client only ever re-sends
-  the same bytes, and an intermediary's 413/422 is answered before it forwards the body. Every
-  other 4xx is pre-write only in wallet-api's JSON error envelope (a typed code); an
-  `HTTP_<status>` code means a body wallet-api did not write (an intermediary's page) and proves
-  nothing. Ambiguous answers (0, 408, 499, 5xx, any other untyped 4xx, a 2xx whose body is not
-  JSON (`PROTOCOL`), and a 413/422 after an ambiguous one — a mixed fleet may have stored the
-  earlier PUT) **park** the send: backstop `intentPut: 'unconfirmed'`, `SEND_SYNC_PENDING` with
+  stored envelope answers wallet-api's bodyless `204` in this process. Any other answer is re-PUT
+  with the SAME bytes (never re-encrypted) up to twice, immediately. A 413/422 with nothing
+  ambiguous before it (even after a typed pre-write 4xx), or two pre-write 4xx with nothing
+  ambiguous before them, fail clean (backstop dropped, nothing to abort). A 413/422 is a verdict on
+  the bytes themselves, and the client only ever re-sends the same bytes. A 413 counts from any
+  hop, typed or `HTTP_413`: the hop that receives the body answers it while receiving it. A 422
+  counts only in wallet-api's envelope: an untyped `HTTP_422` may come from a hop that forwarded
+  the request first. Every other 4xx is pre-write only in wallet-api's JSON error envelope (a typed
+  code); an `HTTP_<status>` code means a body wallet-api did not write (an intermediary's page) and
+  proves nothing. Ambiguous answers (0, 408, 499, 5xx, any other untyped 4xx including
+  `HTTP_422`, any 2xx other than `204` (`PROTOCOL`: a gateway's fixed response or a misroute may
+  have answered without forwarding), and a 413/422 after an ambiguous one — a mixed fleet may have
+  stored the earlier PUT) **park** the send: backstop `intentPut: 'unconfirmed'`, `SEND_SYNC_PENDING` with
   its transferId, and every resume pass re-PUTs the stored bytes (ensure) before resuming it,
-  first re-persisting the hold when only memory had it (its flag write failed). Only a 413/422 on
-  that re-PUT can end it, since it says nothing about the earlier ambiguous PUT a mixed fleet may
+  first re-persisting the hold when only memory had it (its flag write failed). Only a 413, or a
+  422 in wallet-api's envelope, on that re-PUT can end it (an untyped `HTTP_422` keeps the hold,
+  unprobed), since it says nothing about the earlier ambiguous PUT a mixed fleet may
   have stored: a row still open is kept and resumed; otherwise an abort probes the row — `404`
   (never stored) or aborted drops it as conflicted, completed (on another device) ends it as paid,
   anything else keeps it. A confirmed or ended hold ends the in-memory park (`onHoldEnded`). The
@@ -861,8 +864,8 @@ authoritative for build success.
   convergence is possibly-committed. The #690 shortfall is durable before ANY apply, because the
   apply completes an unflagged intent. A nothing-certified failure is clean only when every op
   conflicted, or when a durable abort tombstone was written AND the server confirmed the abort
-  (2xx/404) with no PUT of the id still able to land (no ambiguous gate answer, and no epoch
-  re-seed that started during the attempt or is still re-PUTting when it fails — one that started
+  (`204`, or a typed 404 `NOT_FOUND`; any other 2xx confirms nothing) with no PUT of the id still
+  able to land (no ambiguous gate answer, and no epoch re-seed that started during the attempt or is still re-PUTting when it fails — one that started
   earlier may list the acked entry late and re-PUT it; a re-seed counts as active until its last
   re-PUT answered, before its cursor reset and re-pull); otherwise it is possibly-committed. An
   unconfirmed abort leaves a row another device of the wallet could run, so the #676 gate reports
@@ -1072,7 +1075,7 @@ authoritative for build success.
   mechanism (which still guards the remaining
   chat/identity keys in the platform storage providers).
 - **The backstop's optional fields (#835): `intentPut?: 'pending' | 'unconfirmed'`, and `owes`.**
-  `'pending'` is written with the entry before the first intent PUT and cleared on a 2xx (the
+  `'pending'` is written with the entry before the first intent PUT and cleared on its `204` (the
   epoch re-seed never re-PUTs it; if that clear fails, nothing runs and the send is parked); `'unconfirmed'` marks a parked send that every resume pass
   re-PUTs first and never sweeps; absent = acked, or written by an older client. A park whose
   `'unconfirmed'` write failed is held in memory, and the next pass re-persists the flag before
@@ -1083,7 +1086,7 @@ authoritative for build success.
   `'open'` entry (accepted downgrade window: it may sweep a held send whose PUT never landed —
   an under-payment, never a double pay). Every backstop GC removal is compare-and-delete
   (`ListStore.removeIfUnchanged`), and a tombstone is removed only after the server answers its
-  abort 2xx or 404 `NOT_FOUND`, and is then reported `conflicted` (a linked request is payable
+  abort `204` or 404 `NOT_FOUND`, and is then reported `conflicted` (a linked request is payable
   again). A second optional field, `owes?: ShortfallEntry[]`, carries the #690 shortfall rows a
   later attempt of a partial send holds (see the error contract above); an older client ignores it,
   so on a downgrade a held remainder is recorded nowhere — again an under-payment, never a double

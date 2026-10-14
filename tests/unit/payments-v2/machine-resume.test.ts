@@ -5,6 +5,7 @@ import { resumeAll } from '../../../modules/payments-v2/machine/resume';
 import { ActiveOps, Converger } from '../../../modules/payments-v2/convergence';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
 import { STORE_KEYS, type IntentBackstopEntry } from '../../../modules/payments-v2/stores';
+import { WalletApiHttpError } from '../../../impl/wallet-api-v2/http';
 import { FakeApiError, ValidationFailedError } from './fakes/FakeWalletApi';
 import { COIN, makeWorld, opKey, type World } from './machine-harness';
 
@@ -571,6 +572,38 @@ describe('resume confirms a parked intent before it resumes or sweeps anything (
     expect(report).toEqual({ resumed: [], conflicted: [plan.transferId], failed: [] });
     expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
     expect(w.api.inspectIntent(w.caller, plan.transferId)).toBeUndefined();
+    expect(w.engine.transferCalls).toHaveLength(0);
+  });
+
+  it("an untyped 422 on the re-PUT (a page wallet-api did not write) proves nothing: the hold is kept and never probed", async () => {
+    const w = makeWorld();
+    const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+    await parkSend(w, plan);
+    w.overrides.putIntent = async () => {
+      throw new WalletApiHttpError(422, 'HTTP_422', 'PUT /v1/intents failed with status 422');
+    };
+    w.log.length = 0;
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [plan.transferId] });
+    expect((await w.stores().backstop.getByKey(plan.transferId))?.intentPut).toBe('unconfirmed');
+    expect(w.log).not.toContain('abortIntent');
+    expect(w.engine.transferCalls).toHaveLength(0);
+  });
+
+  it("an untyped 413 on the re-PUT (a hop's body limit) judges the bytes: the hold is probed and dropped", async () => {
+    const w = makeWorld();
+    const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+    await parkSend(w, plan);
+    w.overrides.putIntent = async () => {
+      throw new WalletApiHttpError(413, 'HTTP_413', 'PUT /v1/intents failed with status 413');
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [plan.transferId], failed: [] });
+    expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
     expect(w.engine.transferCalls).toHaveLength(0);
   });
 

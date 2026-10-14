@@ -26,12 +26,15 @@ contract paid the recipient twice.
 
 What changed:
 
-- No chain operation runs before the intent PUT answers 2xx. A failed PUT is re-sent with the same
-  stored bytes. A send the service provably refused fails clean: a 413/422, in wallet-api's error
-  envelope or not, whenever no ambiguous answer came before it (it judges the bytes themselves, and
-  the same bytes are all that is ever re-sent); any other 4xx only when it came twice in wallet-api's
-  typed error envelope with nothing ambiguous before it. Any other untyped 4xx (a proxy's page)
-  proves nothing. A send whose PUT stays unconfirmed rejects `SEND_SYNC_PENDING` with its
+- No chain operation runs before the intent PUT answers wallet-api's bodyless `204`; any other
+  2xx (a gateway's fixed response or a misroute may answer without forwarding) proves nothing, and
+  the same holds for confirming a cancel. A failed PUT is re-sent with the same stored bytes. A send
+  the service provably refused fails clean whenever no ambiguous answer came before it: a 413 from
+  any hop (whoever receives the body answers it while receiving it), a 422 only in wallet-api's
+  error envelope (an untyped one may come from a hop that forwarded the request first) — either
+  judges the bytes themselves, and the same bytes are all that is ever re-sent; any other 4xx only
+  when it came twice in wallet-api's typed error envelope with nothing ambiguous before it. Any
+  other untyped 4xx (a proxy's page, a 422 included) proves nothing. A send whose PUT stays unconfirmed rejects `SEND_SYNC_PENDING` with its
   `transferId` and is sent automatically, under the same transferId, once the service confirms the
   intent; every resume pass re-persists the hold when only memory had it.
 - Every failure after a leg certified is possibly-committed with its `transferId`. A shortfall is

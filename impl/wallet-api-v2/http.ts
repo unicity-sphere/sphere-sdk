@@ -52,6 +52,8 @@ export interface WalletApiHttpConfig {
 export interface RequestOptions {
   /** Default true; auth endpoints opt out so a stale bearer is never attached. */
   auth?: boolean;
+  /** The one success status the route answers; any other 2xx throws `PROTOCOL` (#835). */
+  expectStatus?: number;
 }
 
 export interface WalletApiHttp {
@@ -163,6 +165,9 @@ export function createWalletApiHttp(config: WalletApiHttpConfig): WalletApiHttp 
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     });
     const what = `${method} ${path}`;
+    if (res.ok && opts?.expectStatus !== undefined && res.status !== opts.expectStatus) {
+      throw new WalletApiHttpError(res.status, 'PROTOCOL', `${what}: answered ${res.status}, not ${opts.expectStatus}`);
+    }
     if (res.status === 204) return null;
     if (!res.ok) throw await toHttpError(res, what);
     return parseJsonBody(await readBodyText(res), what, res.status);

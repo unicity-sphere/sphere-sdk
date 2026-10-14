@@ -51,11 +51,18 @@ export function isValidationReject(err: unknown): boolean {
   return e.status === 422 || e.statusCode === 422 || e.code === 'VALIDATION' || e.code === 'VALIDATION_FAILED';
 }
 
-/** #835: deterministic on the bytes sent — no PUT of this envelope can ever store a row. */
+function isWrittenByWalletApi(e: WireErrorShape): boolean {
+  return typeof e.code === 'string' && !/^HTTP_\d{3}$/.test(e.code);
+}
+
+/**
+ * #835: no PUT of these bytes can store a row. Any hop's 413 counts (it answers while receiving the
+ * body); a 422 only in wallet-api's envelope (a hop that forwarded the request may have written it).
+ */
 export function isNeverStorable(err: unknown): boolean {
-  if (isValidationReject(err)) return true;
   const e = wireShape(err);
-  return e !== null && (e.status === 413 || e.statusCode === 413);
+  if (e === null) return false;
+  return e.status === 413 || e.statusCode === 413 || (isValidationReject(err) && isWrittenByWalletApi(e));
 }
 
 /**
@@ -63,15 +70,13 @@ export function isNeverStorable(err: unknown): boolean {
  * only that THIS request wrote nothing — and only when wallet-api itself answered: its
  * JSON error envelope carries a typed code, while a body it did not write (an
  * intermediary's page) reads `HTTP_<status>` and proves nothing. 408/499, 5xx, status 0
- * (network), an untyped 4xx and a 2xx whose body is not JSON (PROTOCOL) are ambiguous:
- * the row may exist, or appear later.
+ * (network), an untyped 4xx and a 2xx other than 204 (PROTOCOL) are ambiguous.
  */
 export function isPreWriteRefusal(err: unknown): boolean {
   const e = wireShape(err);
   if (e === null) return false;
   const n = typeof e.status === 'number' ? e.status : e.statusCode;
-  const typed = typeof e.code === 'string' && !/^HTTP_\d{3}$/.test(e.code);
-  return typed && typeof n === 'number' && n >= 400 && n <= 499 && n !== 408 && n !== 499;
+  return isWrittenByWalletApi(e) && typeof n === 'number' && n >= 400 && n <= 499 && n !== 408 && n !== 499;
 }
 
 /** The server's typed "no such intent" — never an unrouted `HTTP_404`. */

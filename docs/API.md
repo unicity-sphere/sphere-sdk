@@ -502,13 +502,15 @@ one code where you used to check for `null`.
 
 - The intent is durable on the server **before** any chain op; a crash at any stage resumes
   the SAME `transferId` inside the facade's start — never a second spend. No chain op runs until
-  the wallet service has answered 2xx to the intent. When it refuses the intent (a 413 or 422,
-  from wallet-api or a proxy, unless one of the unclear answers below came first; or another 4xx
-  twice in wallet-api's own error envelope), the send fails clean.
+  the wallet service has answered the intent with its `204`. When it refuses the intent (a 413,
+  from wallet-api or a proxy; a 422 in wallet-api's own error envelope; either only when none of
+  the unclear answers below came first; or another 4xx twice in wallet-api's own error envelope),
+  the send fails clean.
   When it cannot confirm it after two immediate retries (an outage, a timeout, a 5xx, another 4xx
-  page that wallet-api did not write, or a 413/422 after such an answer), the send is **held**: `send()`
-  rejects `SEND_SYNC_PENDING` with its `transferId`, and the SDK sends it automatically under that
-  id once the service confirms the intent (#835).
+  page that wallet-api did not write, a 422 page included, a success other than `204`, which a
+  gateway may have answered without forwarding the request, or a 413/422 after such an answer),
+  the send is **held**: `send()` rejects `SEND_SYNC_PENDING` with its `transferId`, and the SDK
+  sends it automatically under that id once the service confirms the intent (#835).
 - Whole-token transfers use `engine.transfer`; partial amounts use `engine.split`: the source
   is burned in one certified operation, then the recipient output and the change are each
   minted in their own certified operation (the mints run in parallel). The burn and its
@@ -595,7 +597,8 @@ any of them:
   transfer id. Usually the wallet service did not confirm that it recorded the payment, even
   after two immediate retries (an outage, a timeout, a 5xx, a page a proxy answered); the SDK
   sends it once the service confirms the intent. If the service instead refuses the intent
-  outright on a later re-send (413 or 422), nothing ever ran and the send is dropped:
+  outright on a later re-send (a 413, or a 422 from wallet-api itself), nothing ever ran and the
+  send is dropped:
   `pendingTransfers()` stops listing it, and a request paid with it becomes payable again. A send
   is also held when an attempt failed before anything certified but another write of the same
   intent may still land (an unconfirmed intent answer, an epoch restore that started during the
@@ -1332,7 +1335,7 @@ interface PaymentRequestView {
   before it rethrows, so the request is not payable, and the link survives a restart. A held send
   (#835) takes this path too: the request stays `'settling'` while the SDK holds the send, and
   becomes payable again only once the SDK has proven that nothing was sent (for example when the
-  service refuses the intent outright, with a 413 or 422). One exception: if writing that link to
+  service refuses the intent outright, with a 413, or a 422 from wallet-api itself). One exception: if writing that link to
   storage fails, `pay()` rejects with the storage error instead of the send error, so
   `isPossiblyCommittedSendOutcome` is `false` for it although the payment may have gone out; the
   link is then held in memory and reaches storage only with a later successful journal write. A
