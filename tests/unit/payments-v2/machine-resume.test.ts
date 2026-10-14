@@ -928,6 +928,24 @@ describe('the sweep of an entry whose row is no longer open tells completed from
     expect(await w.stores().shortfalls.getByKey('earlier')).toBeUndefined();
   });
 
+  it('an acked entry whose row a byte-equal re-PUT re-opens after the pass listed it is kept, never settled as paid', async () => {
+    const w = makeWorld();
+    const payload = openEntry('reopened').payloadEnvelope;
+    await w.api.putIntent(w.caller, { transferId: 'reopened', payload });
+    await w.api.abortIntent(w.caller, 'reopened');
+    await w.stores().backstop.upsert(openEntry('reopened', { owes: [owed] }));
+    w.overrides.listAborted = async () => {
+      await w.api.putIntent(w.caller, { transferId: 'reopened', payload }); // a delayed PUT lands after the pass's listing
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [] });
+    expect((await w.stores().backstop.getByKey('reopened'))?.owes).toEqual([owed]);
+    expect(await w.stores().shortfalls.getByKey('earlier')).toBeUndefined();
+    expect(w.api.inspectIntent(w.caller, 'reopened')?.status).toBe('open');
+  });
+
   it('an unreadable aborted listing keeps the entry and what it held for a later pass', async () => {
     const w = makeWorld();
     await w.api.putIntent(w.caller, { transferId: 'elsewhere', payload: openEntry('elsewhere').payloadEnvelope });
@@ -1246,6 +1264,64 @@ describe('a convergence pass (#835)', () => {
     expect(outcome.progress).toBe(true);
     expect(refreshView).toHaveBeenCalledTimes(1);
     expect(reconcile, 'an unreadable backstop proves nothing about a link').not.toHaveBeenCalled();
+  });
+
+  it("hands the heartbeat the longest Retry-After a held send's re-PUT was answered with", async () => {
+    const w = makeWorld();
+    const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+    await parkSend(w, plan);
+    w.overrides.putIntent = async () => {
+      throw new WalletApiHttpError(429, 'RATE_LIMITED', 'PUT /v1/intents: rate limit exceeded', 60_000);
+    };
+    const converger = new Converger({
+      machineDeps: w.deps,
+      stores: createMachineStores(w.kv),
+      delivery: w.deps.delivery,
+      reconcile: async () => undefined,
+      refreshView: async () => undefined,
+      replayMints: async () => 0,
+      replayNftMints: async () => 0,
+      replayCustomMints: async () => 0,
+      replayBurns: async () => 0,
+      activeOps: new ActiveOps(),
+      parked: new Set(),
+      emit: () => undefined,
+      now: () => w.clock.t,
+    });
+
+    const report = await resumeAll(w.deps);
+    const outcome = await converger.convergeOnce();
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [plan.transferId], retryAfterMs: 60_000 });
+    expect(outcome.retryAfterMs, 'never retried before the server asked').toBe(60_000);
+  });
+
+  it('waits out the longest Retry-After of the pass and the journal replays, whichever answered first', async () => {
+    const w = makeWorld();
+    const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+    await parkSend(w, plan);
+    w.overrides.putIntent = async () => {
+      throw new WalletApiHttpError(429, 'RATE_LIMITED', 'PUT /v1/intents: rate limit exceeded', 60_000);
+    };
+    const converger = new Converger({
+      machineDeps: w.deps,
+      stores: createMachineStores(w.kv),
+      delivery: w.deps.delivery,
+      reconcile: async () => undefined,
+      refreshView: async () => undefined,
+      replayMints: async () => {
+        throw new WalletApiHttpError(429, 'RATE_LIMITED', 'mint replay: rate limit exceeded', 300_000);
+      },
+      replayNftMints: async () => 0,
+      replayCustomMints: async () => 0,
+      replayBurns: async () => 0,
+      activeOps: new ActiveOps(),
+      parked: new Set(),
+      emit: () => undefined,
+      now: () => w.clock.t,
+    });
+
+    expect((await converger.convergeOnce()).retryAfterMs).toBe(300_000);
   });
 });
 

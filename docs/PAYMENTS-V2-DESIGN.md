@@ -931,10 +931,18 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      other read-modify-write of the store), so a park or a fence that lands meanwhile is never
      lost to a stale read. An `'open'` entry whose row is no longer open completed or was aborted
      (its cleanup failed, or another device's resume conflicted and aborted it). The GC reads the
-     aborted listing to tell the two apart, once per pass and only when an entry needs it: an
-     aborted row moved nothing, so its held rows are owed again and it is reported `conflicted`;
-     only a row in neither listing settles them as paid. While that listing cannot be read the
-     entry stays.
+     aborted listing, then the open listing again, to tell the two apart. It reads them once per
+     pass, and only when an entry needs them:
+     - an aborted row moved nothing, so its held rows are owed again and it is reported
+       `conflicted`;
+     - a row open again was re-opened by a byte-equal re-PUT after the pass listed it, and is left
+       to a later pass;
+     - only a row in neither listing settles them as paid.
+
+     While either listing cannot be read, the entry stays. A failed intent's `Retry-After` rides
+     the pass report (`ResumeReport.retryAfterMs`, the longest seen), and `convergeOnce` keeps the
+     longest across the pass and the journal replays, so the heartbeat never retries a
+     rate-limited held send, resume or replay before the server asked.
   4. Gate, decode and resume, unchanged.
   5. Reconcile payment links, against the backstop read again after the pass: every transferId
      with a local entry then (held, parked, being cancelled, or an attempt that ended mid-pass) is

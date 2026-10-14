@@ -998,7 +998,10 @@ describe('#835 (h) PUT /v1/intents answers ambiguously on every attempt', () => 
 
     let staleNext = false;
     let served = false;
+    let armed = true; // only the pass's own judging read is stale; later reads see the store as it is
     restarted.hooks.listOpen = async () => {
+      if (!armed) return;
+      armed = false;
       staleNext = true;
     };
     const get = restarted.kv.get.bind(restarted.kv);

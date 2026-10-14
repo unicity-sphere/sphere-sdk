@@ -1100,7 +1100,8 @@ authoritative for build success.
   the open listing was completed elsewhere, so the tombstone goes as paid, never conflicted (one the
   open listing shows was re-opened by a byte-equal re-PUT: the cancel stays unconfirmed). An `'open'` entry whose row is no longer open is judged by the aborted listing: aborted
   (it moved nothing) hands back what it held and is reported `conflicted`, absent from both listings
-  settles as paid, and an unreadable listing keeps the entry. A second optional field, `owes?: ShortfallEntry[]`, carries the #690 shortfall rows a
+  (the open one read again after it) settles as paid, open again (a byte-equal re-PUT re-opened it)
+  is left to a later pass, and an unreadable listing keeps the entry. A second optional field, `owes?: ShortfallEntry[]`, carries the #690 shortfall rows a
   later attempt of a partial send holds, a tombstoned one being cancelled included (see the error
   contract above); an older client ignores it,
   so on a downgrade a held remainder is recorded nowhere — again an under-payment, never a double

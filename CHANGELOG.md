@@ -47,7 +47,9 @@ What changed:
   because an abort of a row another device already completed is a no-op `204` too. A failed attempt
   that cannot meet that is reported `SEND_SYNC_PENDING` with its transferId, and one completed
   elsewhere (in neither the aborted nor the open listing) is later resolved paid, never made
-  payable again. A partial send applied but not closed now also arms the convergence heartbeat, so
+  payable again. The convergence heartbeat honors a `Retry-After` that any single intent's answer
+  carried during a pass (a held send's re-PUT included), not only one that failed the whole pass. A
+  partial send applied but not closed now also arms the convergence heartbeat, so
   an idle wallet closes it without a `resumeNow()`.
 - A convergence pass treats a send in process at any moment of the pass, including one started
   after the pass listed the open intents, as running for the whole pass, so the pass never sweeps or

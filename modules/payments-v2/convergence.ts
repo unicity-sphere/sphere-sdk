@@ -149,16 +149,21 @@ export class Converger {
   async convergeOnce(): Promise<ConvergeOutcome> {
     let progress = false;
     let retryAfterMs: number | null = null;
+    const wait = (ms: number | null): void => {
+      if (ms !== null) retryAfterMs = Math.max(retryAfterMs ?? 0, ms); // the longest any phase was asked
+    };
     try {
-      progress = await this.resumePass();
+      const pass = await this.resumePass();
+      progress = pass.progress;
+      wait(pass.retryAfterMs);
     } catch (err) {
-      retryAfterMs = retryAfterMsOf(err);
+      wait(retryAfterMsOf(err));
     }
     try {
       const stats = await this.deps.stores.deliveryJournal.replay(this.replayDeps());
       progress = progress || stats.delivered > 0;
     } catch (err) {
-      retryAfterMs ??= retryAfterMsOf(err);
+      wait(retryAfterMsOf(err));
     }
     // Caught apart: an unreadable coin journal must not starve the NFT one.
     for (const replay of [
@@ -170,7 +175,7 @@ export class Converger {
       try {
         progress = (await replay()) > 0 || progress;
       } catch (err) {
-        retryAfterMs ??= retryAfterMsOf(err);
+        wait(retryAfterMsOf(err));
       }
     }
     return { progress, retryAfterMs };
@@ -191,7 +196,7 @@ export class Converger {
     return backstop.length > 0 || journal.some((e) => e.undeliverable !== true) || mintsOpen || burnsOpen;
   }
 
-  private async resumePass(): Promise<boolean> {
+  private async resumePass(): Promise<ConvergeOutcome> {
     let deferred = false;
     // #835: activity is judged ONCE per pass — an id in process at ANY moment of the pass is
     // the process's own for all of it, even when its attempt ends before the pass reaches
@@ -208,7 +213,7 @@ export class Converger {
     }).finally(stopWatching);
     // #835: an unreadable backstop proves nothing — reconciling its empty report would
     // resolve a held payment link 'paid' through the unaccounted branch.
-    if (deferred) return false;
+    if (deferred) return { progress: false, retryAfterMs: null };
     const progress = report.resumed.length > 0 || report.conflicted.length > 0;
     // #835: a link written while the pass ran is in none of its sets. Anything with a local
     // entry NOW (held, parked, being cancelled, or an attempt that ended mid-pass) can still
@@ -226,7 +231,7 @@ export class Converger {
       });
     }
     if (progress) await this.deps.refreshView().catch(() => undefined);
-    return progress;
+    return { progress, retryAfterMs: report.retryAfterMs ?? null };
   }
 
   private filteredMachineDeps(inPass: ReadonlySet<string>): MachineDeps {

@@ -14,6 +14,7 @@ import {
   createMachineStores,
   isNeverStorable,
   releaseOwed,
+  retryAfterMsOf,
   settleOwed,
   type MachineStores,
 } from './journal';
@@ -23,6 +24,14 @@ export interface ResumeReport {
   resumed: string[];
   conflicted: string[];
   failed: string[];
+  /** The longest Retry-After a failed intent's answer carried: the heartbeat waits it out. */
+  retryAfterMs?: number;
+}
+
+function noteFailed(report: ResumeReport, transferId: string, err: unknown): void {
+  report.failed.push(transferId);
+  const wait = retryAfterMsOf(err);
+  if (wait !== null) report.retryAfterMs = Math.max(report.retryAfterMs ?? 0, wait);
 }
 
 interface ResumeJob {
@@ -131,7 +140,7 @@ async function confirmUnconfirmed(
       if (ended) {
         view.locals.delete(id);
         view.onHoldEnded(id); // unaccounted, so a linked request reads paid
-      } else report.failed.push(id);
+      } else noteFailed(report, id, err);
       continue;
     }
     await unflag(stores, view.locals, entry);
@@ -204,7 +213,7 @@ async function dropStaleBackstops(
   view: LocalView,
   report: ResumeReport
 ): Promise<void> {
-  let aborted: Set<string> | null | undefined;
+  let listed: { aborted: Set<string>; open: Set<string> } | null | undefined;
   for (const entry of view.locals.values()) {
     const id = entry.transferId;
     if (view.openIds.has(id) || view.isLocallyActive(id)) continue;
@@ -215,17 +224,18 @@ async function dropStaleBackstops(
     }
     if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it
     if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;
-    if (aborted === undefined) aborted = await abortedIds(intents);
-    if (aborted === null) continue; // completed or aborted: unknown until the listing reads
-    await retire(stores, entry, aborted.has(id), report);
+    if (listed === undefined) listed = await freshListings(intents);
+    // Unknown until both listings read; open again (a byte-equal re-PUT re-opened it): a later pass judges it.
+    if (listed === null || listed.open.has(id)) continue;
+    await retire(stores, entry, listed.aborted.has(id), report);
   }
 }
 
-function abortedIds(intents: IntentApi): Promise<Set<string> | null> {
-  return intents.listAborted().then(
-    (rows) => new Set(rows.map((row) => row.transferId)),
-    () => null
-  );
+async function freshListings(intents: IntentApi): Promise<{ aborted: Set<string>; open: Set<string> } | null> {
+  const ids = (rows: { transferId: string }[]): Set<string> => new Set(rows.map((row) => row.transferId));
+  const aborted = await intents.listAborted().then(ids, () => null);
+  const open = aborted === null ? null : await intents.listOpen().then(ids, () => null);
+  return aborted === null || open === null ? null : { aborted, open };
 }
 
 async function gateAndDecode(
@@ -348,7 +358,7 @@ async function classifyResumeFailure(
   if (code === 'SPLIT_CHECKPOINT_LOST' || code === 'CHECKPOINT_TRUSTBASE_MISMATCH') {
     deps.emit('transfer:attention', { transferId, code: ATTENTION_CHECKPOINT_STUCK, detail: String(code) });
   }
-  report.failed.push(transferId);
+  noteFailed(report, transferId, err);
 }
 
 /**

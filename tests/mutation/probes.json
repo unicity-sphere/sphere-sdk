@@ -2534,7 +2534,7 @@
     "name": "converger-reconciles-deferred",
     "note": "#835: a pass that could not read the backstop proves nothing and reconciles nothing — even when the store reads again before the pass ends, so the reconcile's own fresh read does not shadow this guard (heartbeat.test.ts 'a pass that cannot read the backstop reconciles nothing...' + 'a pass whose backstop read failed reconciles nothing, even when the store reads again...'; send-intent-unknown.test.ts (q))",
     "file": "modules/payments-v2/convergence.ts",
-    "find": "    if (deferred) return false;",
+    "find": "    if (deferred) return { progress: false, retryAfterMs: null };",
     "replace": "    void deferred;",
     "tests": [
       "tests/unit/payments-v2/heartbeat.test.ts",
@@ -2650,7 +2650,7 @@
     "name": "confirm-422-reported-failed",
     "note": "#835: a held send refused 413/422 on its re-PUT stays held and is reported failed, so a link to it stays settling (machine-resume.test.ts 'a 422 on the re-PUT of a held send with no row keeps the hold...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "      } else report.failed.push(id);",
+    "find": "      } else noteFailed(report, id, err);",
     "replace": "      }",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts",
@@ -3288,7 +3288,7 @@
     "name": "sweep-aborted-reads-completed",
     "note": "#835: an entry whose row is aborted moved nothing; settled as completed, what it held is erased and a link reads paid (machine-resume.test.ts 'the sweep of an entry whose row is no longer open tells completed from aborted')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    await retire(stores, entry, aborted.has(id), report);",
+    "find": "    await retire(stores, entry, listed.aborted.has(id), report);",
     "replace": "    await retire(stores, entry, false, report);",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
@@ -3298,8 +3298,8 @@
     "name": "sweep-unreadable-listing-settles",
     "note": "#835: without the aborted listing the sweep cannot tell completed from aborted, so it keeps the entry (machine-resume.test.ts 'an unreadable aborted listing keeps the entry...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    if (aborted === null) continue; // completed or aborted: unknown until the listing reads",
-    "replace": "    if (aborted === null) aborted = new Set<string>();",
+    "find": "    if (listed === null || listed.open.has(id)) continue;",
+    "replace": "    if (listed === null) listed = { aborted: new Set<string>(), open: new Set<string>() };",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
@@ -3373,6 +3373,46 @@
     "replace": "      logger.warn('PaymentsV2', `a '${event}' listener threw; the event is dropped, the operation unaffected:`, err);\n",
     "tests": [
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-reopened-read-completed",
+    "note": "#835: the sweep re-reads the open listing; a row a byte-equal re-PUT re-opened after the pass listed it is open again, never settled as completed (machine-resume.test.ts 'an acked entry whose row a byte-equal re-PUT re-opens after the pass listed it...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    if (listed === null || listed.open.has(id)) continue;",
+    "replace": "    if (listed === null) continue;",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "retry-after-dropped",
+    "note": "#835: a failed intent's Retry-After rides the pass report; dropped, the heartbeat retries a rate-limited held send on its own short schedule (machine-resume.test.ts 'hands the heartbeat the longest Retry-After...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (wait !== null) report.retryAfterMs = Math.max(report.retryAfterMs ?? 0, wait);",
+    "replace": "  void wait;",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "converger-ignores-pass-retry-after",
+    "note": "#835: the pass report's Retry-After reaches the heartbeat through convergeOnce (machine-resume.test.ts 'hands the heartbeat the longest Retry-After...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    return { progress, retryAfterMs: report.retryAfterMs ?? null };",
+    "replace": "    return { progress, retryAfterMs: null };",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "retry-after-first-wins",
+    "note": "#835: convergeOnce waits out the LONGEST Retry-After of the resume pass and the journal replays; keeping the first, a 60 s resume backoff hides a 300 s replay one (machine-resume.test.ts 'waits out the longest Retry-After of the pass and the journal replays...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "      if (ms !== null) retryAfterMs = Math.max(retryAfterMs ?? 0, ms); // the longest any phase was asked",
+    "replace": "      if (ms !== null) retryAfterMs ??= ms;",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
     ]
   }
 ]
