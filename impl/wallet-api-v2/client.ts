@@ -2,7 +2,7 @@
 
 import { sha256 } from '@noble/hashes/sha2.js';
 
-import { WalletApiHttpError, type WalletApiHttp } from './http';
+import { WalletApiHttpError, type RequestOptions, type WalletApiHttp } from './http';
 
 export interface AuthChallengeWire {
   nonce: string;
@@ -176,6 +176,12 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(bin);
 }
 
+/**
+ * #835: wallet-api answers an intent PUT and abort only with a bodyless 204. Any other 2xx came from
+ * something else (a gateway's fixed response, a misroute), so it proves no row was stored or aborted.
+ */
+const INTENT_WRITE: RequestOptions = { expectStatus: 204 };
+
 export class WalletApiV2Client {
   constructor(private readonly http: WalletApiHttp) {}
 
@@ -269,7 +275,7 @@ export class WalletApiV2Client {
     const body = requiresSeedClose
       ? { payload: payloadEnvelope, requiresSeedClose: true }
       : { payload: payloadEnvelope };
-    await this.http.request('PUT', `/v1/intents/${transferId}`, body);
+    await this.http.request('PUT', `/v1/intents/${transferId}`, body, INTENT_WRITE);
   }
 
   async listIntents(status: 'open' | 'aborted' = 'open'): Promise<IntentWire[]> {
@@ -280,7 +286,7 @@ export class WalletApiV2Client {
   }
 
   async abortIntent(transferId: string): Promise<void> {
-    await this.http.request('POST', `/v1/intents/${transferId}/abort`);
+    await this.http.request('POST', `/v1/intents/${transferId}/abort`, undefined, INTENT_WRITE);
   }
 
   async completeIntent(transferId: string, signature?: string): Promise<void> {

@@ -4,6 +4,7 @@
 import { coalesced } from './async';
 import { hexToBytes } from '../../core/crypto';
 import { decryptField, encryptField } from '../../core/field-encryption';
+import { logger } from '../../core/logger';
 import { CoinClaims } from '../../token-engine/claims';
 import type { ITokenEngine, SplitCheckpointStore } from '../../token-engine/engine';
 import type { TransferResult } from '../../types';
@@ -151,6 +152,8 @@ export interface FacadeHooks {
 }
 
 export interface FacadeParts {
+  /** The deps every part and the facade use: the caller's, with the emit guarded (#835). */
+  deps: PaymentsFacadeDeps;
   ownPubkeyBytes: Uint8Array;
   claims: WalletCoinClaims;
   view: InventoryView;
@@ -171,7 +174,8 @@ export interface FacadeParts {
   restoreDeps: RestoreDeps;
 }
 
-export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks): FacadeParts {
+export function composeFacadeParts(raw: PaymentsFacadeDeps, hooks: FacadeHooks): FacadeParts {
+  const deps: PaymentsFacadeDeps = { ...raw, emit: guardedEmit(raw.emit) };
   const ownPubkeyBytes = hexToBytes(deps.ownPubkey);
   const ledger = new ReservationLedger();
   const claims = new WalletCoinClaims(deps.claims ?? new CoinClaims(), deps.registry, deps.claimsReadyTimeoutMs);
@@ -197,7 +201,10 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
 
   const refreshView = coalesced(() => view.delta(), hooks.track);
   const pins = buildPins(deps, hooks, { ledger, view, machineStores, machineDeps });
+  // ONE machine: the restore must reach the instance whose attempts it may overlap (#835).
+  const machine = new TransferMachine(machineDeps);
   return {
+    deps,
     ownPubkeyBytes,
     claims,
     view,
@@ -210,11 +217,30 @@ export function composeFacadeParts(deps: PaymentsFacadeDeps, hooks: FacadeHooks)
     historyStore,
     machineStores,
     machineDeps,
-    machine: new TransferMachine(machineDeps),
+    machine,
     heldStates,
     receiveLoop: buildReceive(deps, hooks, { historyStore, heldStates, verdicts, claims }, refreshView),
     requests: buildRequests(deps, hooks),
-    restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view),
+    restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view, machine),
+  };
+}
+
+/**
+ * #835: an event is a notification, never part of a money outcome. A host emit that
+ * rethrows a listener's error (Node's EventEmitter does) would otherwise turn a delivered
+ * send() into a raw rejection — read as clean, so the caller pays again.
+ */
+function guardedEmit(emit: PaymentsFacadeDeps['emit']): PaymentsFacadeDeps['emit'] {
+  return (event, payload) => {
+    try {
+      emit(event, payload);
+    } catch (err) {
+      try {
+        logger.warn('PaymentsV2', `a '${event}' listener threw; the event is dropped, the operation unaffected:`, err);
+      } catch {
+        // A log sink that throws must not reach the money outcome either.
+      }
+    }
   };
 }
 
@@ -286,9 +312,13 @@ function buildRestoreDeps(
   deps: PaymentsFacadeDeps,
   machineDeps: MachineDeps,
   machineStores: MachineStores,
-  view: InventoryView
+  view: InventoryView,
+  machine: TransferMachine
 ): RestoreDeps {
   return {
+    // #835: a reseed's re-PUT can re-open a row an overlapping attempt aborts, so that attempt never reports clean.
+    onReseedStart: () => machine.noteReseed(),
+    onReseedEnd: () => machine.noteReseed(false),
     stores: machineStores,
     kv: deps.kv,
     reput: (transferId, envelope, requiresSeedClose) =>
@@ -320,6 +350,7 @@ function buildMachineDeps(
       put: (transferId, envelope, requiresSeedClose) =>
         deps.client.putIntent(transferId, envelope, requiresSeedClose),
       listOpen: () => deps.client.listIntents('open'),
+      listAborted: () => deps.client.listIntents('aborted'),
       abort: (transferId) => deps.client.abortIntent(transferId),
       complete: (transferId, signature) => deps.client.completeIntent(transferId, signature),
     },

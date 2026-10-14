@@ -24,6 +24,7 @@ export const RATE_LIMIT_DEFER_MS = 30_000;
 export const ATTENTION_DELIVERY_DEFERRED = 'delivery:deferred';
 export const ATTENTION_DELIVERY_UNDELIVERABLE = 'delivery:undeliverable';
 export const ATTENTION_CHECKPOINT_STUCK = 'split:checkpoint-stuck';
+// #835: no longer emitted — the condition surfaces as SEND_SYNC_PENDING from send().
 export const ATTENTION_SYNC_PENDING = 'sync:pending';
 
 export type AttentionEmitter = (transferId: string, code: string, detail?: string) => void;
@@ -48,6 +49,74 @@ export function isValidationReject(err: unknown): boolean {
   const e = wireShape(err);
   if (e === null) return false;
   return e.status === 422 || e.statusCode === 422 || e.code === 'VALIDATION' || e.code === 'VALIDATION_FAILED';
+}
+
+function isWrittenByWalletApi(e: WireErrorShape): boolean {
+  return typeof e.code === 'string' && !/^HTTP_\d{3}$/.test(e.code);
+}
+
+/**
+ * #835: no PUT of these bytes can store a row. Any hop's 413 counts (it answers while receiving the
+ * body); a 422 only in wallet-api's envelope (a hop that forwarded the request may have written it).
+ */
+export function isNeverStorable(err: unknown): boolean {
+  const e = wireShape(err);
+  if (e === null) return false;
+  return e.status === 413 || e.statusCode === 413 || (isValidationReject(err) && isWrittenByWalletApi(e));
+}
+
+/**
+ * #835: a 4xx wallet-api raises before any write (ARCHITECTURE §16), so it proves
+ * only that THIS request wrote nothing — and only when wallet-api itself answered: its
+ * JSON error envelope carries a typed code, while a body it did not write (an
+ * intermediary's page) reads `HTTP_<status>` and proves nothing. 408/499, 5xx, status 0
+ * (network), an untyped 4xx and a 2xx other than 204 (PROTOCOL) are ambiguous.
+ */
+export function isPreWriteRefusal(err: unknown): boolean {
+  const e = wireShape(err);
+  if (e === null) return false;
+  const n = typeof e.status === 'number' ? e.status : e.statusCode;
+  return isWrittenByWalletApi(e) && typeof n === 'number' && n >= 400 && n <= 499 && n !== 408 && n !== 499;
+}
+
+/** The server's typed "no such intent" — never an unrouted `HTTP_404`. */
+export function isUnknownIntent(err: unknown): boolean {
+  const e = wireShape(err);
+  if (e === null) return false;
+  return (e.status ?? e.statusCode) === 404 && e.code === 'NOT_FOUND';
+}
+
+export type AbortOutcome = 'aborted' | 'never-stored' | 'completed' | 'unknown';
+
+interface IntentListing {
+  abort(id: string): Promise<void>;
+  listAborted(): Promise<{ transferId: string }[]>;
+  listOpen(): Promise<{ transferId: string }[]>;
+}
+
+/** #835: a 204 abort of a completed row is a no-op; completed = in neither listing (a re-PUT may re-open it). */
+export async function abortAndConfirm(
+  intents: IntentListing,
+  transferId: string,
+  onError: (err: unknown) => void = () => undefined
+): Promise<AbortOutcome> {
+  try {
+    await intents.abort(transferId);
+  } catch (err) {
+    if (isUnknownIntent(err)) return 'never-stored';
+    onError(err);
+    return 'unknown';
+  }
+  const listed = (rows: { transferId: string }[]): boolean => rows.some((row) => row.transferId === transferId);
+  const unread = (err: unknown): null => {
+    onError(err);
+    return null;
+  };
+  const aborted = await intents.listAborted().catch(unread);
+  if (aborted === null) return 'unknown';
+  if (listed(aborted)) return 'aborted';
+  const open = await intents.listOpen().catch(unread);
+  return open === null || listed(open) ? 'unknown' : 'completed';
 }
 
 /**
@@ -116,6 +185,15 @@ export class ListStore<T> {
     return this.mutate((list) => {
       const next = list.filter((e) => this.keyOf(e) !== key);
       return next.length === list.length ? { result: undefined } : { list: next, result: undefined };
+    });
+  }
+
+  /** Compare-and-delete against the exact snapshot a caller judged (#835); true when removed. */
+  removeIfUnchanged(key: string, expected: T): Promise<boolean> {
+    return this.mutate((list) => {
+      const at = list.findIndex((e) => this.keyOf(e) === key);
+      if (at < 0 || JSON.stringify(list[at]) !== JSON.stringify(expected)) return { result: false };
+      return { list: list.filter((_, i) => i !== at), result: true };
     });
   }
 
@@ -284,4 +362,20 @@ export function createMachineStores(kv: ScopedKV): MachineStores {
     burnJournal: new ListStore<BurnJournalEntry>(kv, STORE_KEYS.burnJournal, (e) => e.burnId),
     shortfalls: new ListStore<ShortfallEntry>(kv, STORE_KEYS.shortfalls, (e) => e.transferId),
   };
+}
+
+/** #835: the rows move onto the holder's entry, and leave the store even if reading or attaching them fails: never owed twice. */
+export async function holdShortfalls(stores: MachineStores, ids: readonly string[], holder: string): Promise<void> {
+  const rows = await stores.shortfalls.list().then((all) => all.filter((row) => ids.includes(row.transferId)), () => []);
+  if (rows.length > 0) await stores.backstop.patch(holder, (e) => ({ ...e, owes: [...(e.owes ?? []), ...rows] })).catch(() => undefined);
+  for (const id of ids) await stores.shortfalls.removeByKey(id);
+}
+
+export async function releaseOwed(stores: MachineStores, entry: IntentBackstopEntry | undefined): Promise<void> {
+  for (const row of entry?.owes ?? []) await stores.shortfalls.upsert(row);
+}
+
+/** A holder that completed paid what it held: a copy a failed removal left behind goes before its entry. */
+export async function settleOwed(stores: MachineStores, entry: IntentBackstopEntry | undefined): Promise<void> {
+  for (const row of entry?.owes ?? []) await stores.shortfalls.removeByKey(row.transferId);
 }

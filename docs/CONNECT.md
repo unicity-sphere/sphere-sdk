@@ -1020,7 +1020,14 @@ The `send` result distinguishes **on-chain finality** from **recipient-side deli
   the send** — the source tokens are terminally spent, and a fresh `intent('send', …)` would
   pay the recipient a second time from different tokens. `transferId` may be absent on this
   path (possibly-certified resolutions carry no id; the still-open intent owns settlement).
-- Treat the money as sent in both cases; use `deliveryPending` only to set expectations
+  A send the wallet's payments service has not yet confirmed recording (sphere-sdk #835) takes
+  this path too: nothing is on-chain yet, but the wallet holds the send and executes it
+  automatically under the same transfer once the service confirms it, possibly much later.
+  Re-issuing it pays twice, exactly as above. A failed attempt the wallet is cancelling, whose
+  cancel the service has not confirmed yet (sphere-sdk #835), is reported the same way: it never
+  goes out from this device, but until the cancel is confirmed another device of the same wallet
+  could still complete it, so it is never re-issued either.
+- Never re-issue in any of these cases; use `deliveryPending` only to set expectations
   ("recipient may receive it with a delay") — not to gate retries.
 - `status` is one of `'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed'`.
 - The SDK's `TransferResult` also carries `deliveryState` (`'landed' | 'pending-delivery'`), but the wallet does **not** forward it over Connect — `deliveryPending` is the only delivery signal a dApp receives.

@@ -18,6 +18,7 @@ import { createMachineStores } from '../../../modules/payments-v2/machine/journa
 import { FakeApiError } from './fakes/FakeWalletApi';
 import {
   COIN,
+  OWN_PUB,
   PEER_PUB,
   cleanupWorlds,
   eventsOf,
@@ -263,6 +264,38 @@ describe('PaymentsFacade — §7 convergence heartbeat', () => {
     expect(rows).toEqual([expect.objectContaining({ kind: 'shortfall', amount: '400' })]);
   });
 
+  it('a partial send applied but not closed arms the heartbeat: its intent closes in-session, no resumeNow', async () => {
+    const w = makeWorld();
+    await w.seed(600n);
+    const small = await w.seed(400n);
+    await w.engine.foreignSpend(small);
+    await w.facade.start();
+    await drain();
+
+    let completeFailures = 1;
+    w.hooks.complete = async () => {
+      if (completeFailures > 0) {
+        completeFailures -= 1;
+        throw new FakeApiError(503, 'UNAVAILABLE', 'complete failed');
+      }
+    };
+    let caught: unknown;
+    try {
+      await w.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PartialSendConflictError);
+    const tid = (caught as PartialSendConflictError).transferId;
+    const openRow = (rows: { transferId: string; kind: string }[]): boolean =>
+      rows.some((r) => r.transferId === tid && r.kind === 'open');
+    expect(openRow(await w.facade.pendingTransfers()), 'its close failed: still listed open').toBe(true);
+
+    await tick(HEARTBEAT_SEED_MS); // only the heartbeat can close it
+    expect(openRow(await w.facade.pendingTransfers())).toBe(false);
+    expect(w.api.inspectIntent(ownCaller, tid)?.status).toBe('completed');
+  });
+
   it('connection:status recovery resets the backoff: the pending tick fires at the seed, and an idle heartbeat stays idle', async () => {
     const w = makeWorld();
     await seedStuckIntent(w);
@@ -462,5 +495,120 @@ describe("resume GC — stale 'open' backstop entries (S1: not server-open, noth
     gate.release();
     const result = await sending;
     expect(result.status).toBe('delivered');
+  });
+});
+
+describe('PaymentsFacade — #835 held sends and deferred passes', () => {
+  const intentStoreDown = (): FakeApiError => new FakeApiError(503, 'SERVICE_UNAVAILABLE', 'intent store down');
+
+  it("a held send ('unconfirmed') is heartbeat work: re-PUT on every backoff tick while the service fails, never swept", async () => {
+    const w = makeWorld();
+    const token = await w.seed(100n);
+    await w.facade.start();
+    await drain();
+    expect(w.counters.listOpen).toBe(1);
+
+    w.hooks.putIntent = async () => {
+      throw intentStoreDown();
+    };
+    await expect(w.facade.send({ recipient: '@peer', amount: '100', coinId: COIN })).rejects.toMatchObject({
+      code: 'SEND_SYNC_PENDING',
+      transferId: 'tid-1',
+    });
+    expect(w.counters.putIntent).toBe(3); // the PUT and two immediate re-PUTs, then held
+    const held = (): Promise<IntentBackstopEntry | undefined> => createMachineStores(w.kv).backstop.getByKey('tid-1');
+    const stored = await held();
+    expect(stored).toMatchObject({ disposition: 'open', intentPut: 'unconfirmed' });
+
+    let puts = 3;
+    for (const gap of [HEARTBEAT_SEED_MS, 2 * HEARTBEAT_SEED_MS, 4 * HEARTBEAT_SEED_MS]) {
+      await tick(gap - 1);
+      expect(w.counters.putIntent).toBe(puts); // never earlier than the backoff
+      await tick(1);
+      puts += 1;
+      expect(w.counters.putIntent).toBe(puts); // each pass re-PUTs the held bytes first...
+      expect(await held()).toEqual(stored); // ...and never sweeps the entry
+    }
+    expect(w.engine.transferCalls).toHaveLength(0);
+    expect(await w.facade.pendingTransfers()).toEqual([expect.objectContaining({ transferId: 'tid-1', kind: 'open' })]);
+
+    delete w.hooks.putIntent; // the service answers again
+    await tick(8 * HEARTBEAT_SEED_MS); // the re-PUT confirms the row, and the SAME pass runs it
+    expect(w.counters.putIntent).toBe(puts + 1);
+    expect(w.api.inspectIntent(ownCaller, 'tid-1')?.status).toBe('completed');
+    expect(await held()).toBeUndefined();
+    expect((await w.api.listMailbox(peerCaller, 0)).entries.map((e) => e.tokenId)).toEqual([token.blob.tokenId]);
+    expect(w.engine.transferCalls.map((c) => c.key)).toEqual(['tid-1:0']); // run once, under the held id
+    expect(await w.facade.pendingTransfers()).toEqual([]);
+  });
+
+  it('a pass that cannot read the backstop reconciles nothing: a held payment link stays settling', async () => {
+    const w = makeWorld();
+    await w.seed(100n);
+    await w.facade.start();
+    await drain();
+    const wire = await w.api.createRequest(peerCaller, {
+      toPubkey: OWN_PUB,
+      assets: [{ coinId: COIN, amount: '100' }],
+    });
+    await w.facade.requests.drainIncoming();
+    w.hooks.putIntent = async () => {
+      throw intentStoreDown();
+    };
+    await expect(w.facade.requests.pay(wire.id)).rejects.toMatchObject({ code: 'SEND_SYNC_PENDING' });
+    const status = (): string | undefined => w.facade.requests.list().find((r) => r.id === wire.id)?.status;
+    expect(status()).toBe('settling');
+    const reconcile = vi.spyOn(w.facade.requests, 'reconcile');
+
+    w.kv.failKeys.add(STORE_KEYS.intentBackstop);
+    const passes = w.counters.listOpen;
+    await tick(HEARTBEAT_SEED_MS);
+    expect(w.counters.listOpen).toBe(passes + 1); // the pass ran...
+    expect(reconcile).not.toHaveBeenCalled(); // ...deferred, and its empty report proved nothing
+    expect(status()).toBe('settling');
+    const row = (await w.api.listRequests(peerCaller, { role: 'outgoing' })).requests.find((r) => r.id === wire.id);
+    expect(row?.status, 'no paid respond for an unpaid request').toBe('open');
+
+    w.kv.failKeys.delete(STORE_KEYS.intentBackstop);
+    delete w.hooks.putIntent;
+    await tick(2 * HEARTBEAT_SEED_MS); // a readable pass confirms the held intent, runs it, and reconciles
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(status()).toBe('paid');
+  });
+
+  it('a pass whose backstop read failed reconciles nothing, even when the store reads again before the pass ends', async () => {
+    const w = makeWorld();
+    await w.seed(100n);
+    await w.facade.start();
+    await drain();
+    const wire = await w.api.createRequest(peerCaller, {
+      toPubkey: OWN_PUB,
+      assets: [{ coinId: COIN, amount: '100' }],
+    });
+    await w.facade.requests.drainIncoming();
+    w.hooks.putIntent = async () => {
+      throw intentStoreDown();
+    };
+    await expect(w.facade.requests.pay(wire.id)).rejects.toMatchObject({ code: 'SEND_SYNC_PENDING' });
+    const reconcile = vi.spyOn(w.facade.requests, 'reconcile');
+    // Only the pass's own read fails: the store answers again for everything after it.
+    let failNextRead = false;
+    w.hooks.listOpen = async () => {
+      failNextRead = true;
+    };
+    const get = w.kv.get.bind(w.kv);
+    w.kv.get = async <T>(key: string): Promise<T | null> => {
+      if (failNextRead && key === STORE_KEYS.intentBackstop) {
+        failNextRead = false;
+        throw new Error('injected kv read failure');
+      }
+      return get<T>(key);
+    };
+
+    await tick(HEARTBEAT_SEED_MS);
+
+    expect(w.counters.listOpen).toBeGreaterThan(0);
+    expect(reconcile, 'a deferred pass proves nothing, whatever the store says afterwards').not.toHaveBeenCalled();
+    expect(w.facade.requests.list().find((r) => r.id === wire.id)?.status).toBe('settling');
   });
 });

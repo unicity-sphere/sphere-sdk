@@ -9,7 +9,7 @@ import { isLiveBurn, type DeliveryJournalEntry, type IntentBackstopEntry, type S
 import type { CoinIntentPayload, IntentPayload } from './machine/types';
 import { retryAfterMsOf, type MachineStores, type ReplayDeps } from './machine/journal';
 import { resumeAll } from './machine/resume';
-import type { MachineDeps } from './machine/TransferMachine';
+import type { IntentApi, MachineDeps } from './machine/TransferMachine';
 
 // Backoff: seed 5 s, ×2 per unproductive pass, cap 120 s; reset on progress
 // and on connection recovery; a surfaced Retry-After floors the next pass.
@@ -92,6 +92,38 @@ export class ConvergenceHeartbeat {
   }
 }
 
+/**
+ * §7 ownership: the ids with an in-process money op. #835: a running pass watches it, so
+ * every id in process at any moment of that pass — already running when it began, or
+ * started while it runs — stays the process's own until the pass ends.
+ */
+export class ActiveOps {
+  private readonly ids = new Set<string>();
+  private readonly passes = new Set<Set<string>>();
+
+  add(id: string): void {
+    this.ids.add(id);
+    for (const seen of this.passes) seen.add(id);
+  }
+
+  delete(id: string): void {
+    this.ids.delete(id);
+  }
+
+  has(id: string): boolean {
+    return this.ids.has(id);
+  }
+
+  /** Records into `seen` every id in process now and every one started until the stop is called. */
+  watch(seen: Set<string>): () => void {
+    for (const id of this.ids) seen.add(id);
+    this.passes.add(seen);
+    return () => {
+      this.passes.delete(seen);
+    };
+  }
+}
+
 export interface ConvergerDeps {
   machineDeps: MachineDeps;
   stores: MachineStores;
@@ -103,7 +135,9 @@ export interface ConvergerDeps {
   replayCustomMints(): Promise<number>;
   replayBurns(): Promise<number>;
   /** §7 ownership: the pass never adopts an op whose machine runs in-process. */
-  isActiveOp(id: string): boolean;
+  readonly activeOps: ActiveOps;
+  /** #835: the sends this process parked — held even when their 'unconfirmed' flag write failed. */
+  readonly parked: Set<string>;
   emit(event: string, payload: unknown): void;
   now(): number;
 }
@@ -115,16 +149,21 @@ export class Converger {
   async convergeOnce(): Promise<ConvergeOutcome> {
     let progress = false;
     let retryAfterMs: number | null = null;
+    const wait = (ms: number | null): void => {
+      if (ms !== null) retryAfterMs = Math.max(retryAfterMs ?? 0, ms); // the longest any phase was asked
+    };
     try {
-      progress = await this.resumePass();
+      const pass = await this.resumePass();
+      progress = pass.progress;
+      wait(pass.retryAfterMs);
     } catch (err) {
-      retryAfterMs = retryAfterMsOf(err);
+      wait(retryAfterMsOf(err));
     }
     try {
       const stats = await this.deps.stores.deliveryJournal.replay(this.replayDeps());
       progress = progress || stats.delivered > 0;
     } catch (err) {
-      retryAfterMs ??= retryAfterMsOf(err);
+      wait(retryAfterMsOf(err));
     }
     // Caught apart: an unreadable coin journal must not starve the NFT one.
     for (const replay of [
@@ -136,7 +175,7 @@ export class Converger {
       try {
         progress = (await replay()) > 0 || progress;
       } catch (err) {
-        retryAfterMs ??= retryAfterMsOf(err);
+        wait(retryAfterMsOf(err));
       }
     }
     return { progress, retryAfterMs };
@@ -157,30 +196,49 @@ export class Converger {
     return backstop.length > 0 || journal.some((e) => e.undeliverable !== true) || mintsOpen || burnsOpen;
   }
 
-  private async resumePass(): Promise<boolean> {
-    const report = await resumeAll(this.filteredMachineDeps(), {
-      isLocallyActive: (id) => this.deps.isActiveOp(id),
-    });
+  private async resumePass(): Promise<ConvergeOutcome> {
+    let deferred = false;
+    // #835: activity is judged ONCE per pass — an id in process at ANY moment of the pass is
+    // the process's own for all of it, even when its attempt ends before the pass reaches
+    // its entry, or started after the listing was computed (so is not in it).
+    const inPass = new Set<string>();
+    const stopWatching = this.deps.activeOps.watch(inPass);
+    const report = await resumeAll(this.filteredMachineDeps(inPass), {
+      isLocallyActive: (id) => inPass.has(id),
+      isParked: (id) => this.deps.parked.has(id),
+      onHoldEnded: (id) => this.deps.parked.delete(id),
+      onDeferred: () => {
+        deferred = true;
+      },
+    }).finally(stopWatching);
+    // #835: an unreadable backstop proves nothing — reconciling its empty report would
+    // resolve a held payment link 'paid' through the unaccounted branch.
+    if (deferred) return { progress: false, retryAfterMs: null };
     const progress = report.resumed.length > 0 || report.conflicted.length > 0;
-    await this.deps.reconcile({
-      resumed: report.resumed,
-      conflicted: report.conflicted,
-      open: report.failed,
-    });
+    // #835: a link written while the pass ran is in none of its sets. Anything with a local
+    // entry NOW (held, parked, being cancelled, or an attempt that ended mid-pass) can still
+    // run or abort, so it is open — never "unaccounted", which resolves the link paid. An
+    // unreadable backstop skips only the reconcile, never the pass's progress.
+    const local = await this.deps.stores.backstop.list().then(
+      (entries) => entries.map((entry) => entry.transferId),
+      () => null
+    );
+    if (local !== null) {
+      await this.deps.reconcile({
+        resumed: report.resumed,
+        conflicted: report.conflicted,
+        open: [...report.failed, ...local],
+      });
+    }
     if (progress) await this.deps.refreshView().catch(() => undefined);
-    return progress;
+    return { progress, retryAfterMs: report.retryAfterMs ?? null };
   }
 
-  private filteredMachineDeps(): MachineDeps {
+  private filteredMachineDeps(inPass: ReadonlySet<string>): MachineDeps {
     const intents = this.deps.machineDeps.intents;
-    return {
-      ...this.deps.machineDeps,
-      intents: {
-        ...intents,
-        listOpen: async () =>
-          (await intents.listOpen()).filter((intent) => !this.deps.isActiveOp(intent.transferId)),
-      },
-    };
+    const listOpen: IntentApi['listOpen'] = async () =>
+      (await intents.listOpen()).filter((intent) => !inPass.has(intent.transferId));
+    return { ...this.deps.machineDeps, intents: { ...intents, listOpen } };
   }
 
   private replayDeps(): ReplayDeps {
@@ -226,8 +284,10 @@ export async function derivePendingTransfers(
     seen.add(transferId);
     out.push(journalOnlyRow(transferId, entries));
   }
+  // #835: a row a later attempt holds is listed as that attempt's open row, never as owed.
+  const held = new Set(backstop.flatMap((entry) => (entry.owes ?? []).map((row) => row.transferId)));
   for (const entry of shortfalls) {
-    if (!seen.has(entry.transferId)) out.push(shortfallRow(entry));
+    if (!seen.has(entry.transferId) && !held.has(entry.transferId)) out.push(shortfallRow(entry));
   }
   return out;
 }

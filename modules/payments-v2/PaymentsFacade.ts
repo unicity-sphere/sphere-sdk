@@ -15,7 +15,7 @@ import type { Asset, IncomingTransfer, Token, TokenTransferDetail, TransferResul
 
 import type { BurnRequest, BurnResult, CoinlessToken, ConnectionStatus, HistoryPage, MintCustomRequest, MintNftRequest, MintResult, NftView, ParkedArrival, PaymentsV2, PendingBurn, PendingTransfer, SendRequest, SendWholeTokenRequest } from './api';
 import { SerialChain, SingleFlight } from './async';
-import { ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
+import { ActiveOps, ConvergenceHeartbeat, Converger, derivePendingTransfers } from './convergence';
 import { NftCache, readNft, readNfts, type NftReadDeps } from './inventory/nft-read';
 import { readTokenData, readTokenJustification } from './inventory/token-data';
 import { type CoinReplayDeps, replayCoinMints, runMintUnderJournal, seedHeldStates, tokenInServerInventory } from './mint';
@@ -23,7 +23,7 @@ import { type NftReplayDeps, replayNftMints, runNftMintUnderJournal } from './mi
 import { type CustomReplayDeps, replayCustomMints, runCustomMintUnderJournal } from './mint-custom';
 import { acknowledgeBurn, type BurnReplayDeps, pendingBurns, replayBurns, runBurnUnderJournal } from './burn';
 import { materializeWholeSpend } from './send-whole';
-import { partialize, stampTransferId } from './send-errors';
+import { asPossiblyCommitted, CONVERGE_FAILED_MESSAGE, partialize, PARTLY_ON_CHAIN_MESSAGE } from './send-errors';
 import { requireSameNetworkRecipient } from './recipient';
 import { reseedAndReset, type RestoreDeps } from './restore';
 import { PrewarmCache, takeSourceBlobs, warmSendSources, type WarmDeps } from './prewarm-cache';
@@ -39,7 +39,7 @@ import type { ReservationLedger } from './select/ledger';
 import type { IntentPins } from './select/pins';
 import type { BurnHold } from './burn-hold';
 import type { SpendQueue, PlannedSpend } from './select/queue';
-import type { MachineStores } from './machine/journal';
+import { holdShortfalls, type MachineStores } from './machine/journal';
 import { buildOps, classifyError, type MachineDeps, type MachinePlan, type TransferMachine } from './machine/TransferMachine';
 import { buildPayload, messageOf } from './machine/payload';
 import {
@@ -90,7 +90,7 @@ type AttemptDisposition =
   | { kind: 'rethrow'; error: unknown }
   | { kind: 'retry-full'; error: unknown }
   | { kind: 'success'; deliveryPending: boolean }
-  | { kind: 'partial'; entry: ShortfallEntry; deliveryPending: boolean };
+  | { kind: 'partial'; entry: ShortfallEntry; deliveryPending: boolean; final: boolean };
 
 /** Accumulated state of one send() across its internal attempts. */
 interface SendRun {
@@ -135,7 +135,7 @@ export class PaymentsFacade implements PaymentsV2 {
   /** §5.1/§7: restore + convergence passes SERIALIZE here. */
   private readonly passChain = new SerialChain();
   /** §7 ownership: ids with an in-process machine attempt — the pass never adopts one. */
-  private readonly activeMoneyOps = new Set<string>();
+  private readonly activeMoneyOps = new ActiveOps();
   /** #737: the ledger holds exactly the sources of the still-open intents. */
   private readonly pins: IntentPins;
   private readonly burnHold: BurnHold;
@@ -149,6 +149,7 @@ export class PaymentsFacade implements PaymentsV2 {
       isActiveOp: (id) => this.activeMoneyOps.has(id),
       track: (op) => this.trackTail(op),
     });
+    this.deps = parts.deps; // #835: the composed deps, whose emit no listener's throw escapes
     this.view = parts.view;
     this.claims = parts.claims;
     this.verdicts = parts.verdicts;
@@ -181,8 +182,9 @@ export class PaymentsFacade implements PaymentsV2 {
       replayNftMints: () => replayNftMints(this.mintDeps()),
       replayCustomMints: () => replayCustomMints(this.mintDeps()),
       replayBurns: () => replayBurns(this.mintDeps()),
-      isActiveOp: (id) => this.activeMoneyOps.has(id),
-      emit: deps.emit,
+      activeOps: this.activeMoneyOps,
+      parked: this.machine.parked,
+      emit: this.deps.emit,
       now: () => this.nowMs(),
     });
   }
@@ -398,8 +400,8 @@ export class PaymentsFacade implements PaymentsV2 {
 
   // ── send policy (§5.5 + old-loop parity; the machine stays policy-free) ────
 
-  /** The ONE place a send() outcome is shaped: success emits in finishSend, a
-   *  CLEAN rejection emits `transfer:updated{status:'failed'}` here (§4). */
+  /** The ONE place a send() outcome is emitted: success in finishSend, a CLEAN rejection as
+   *  `transfer:updated{status:'failed'}` here (§4) — anything that may have certified is never clean (#835). */
   private async runJob(job: SendJob, amount: string): Promise<TransferResult> {
     const run: SendRun = {
       amount,
@@ -443,8 +445,8 @@ export class PaymentsFacade implements PaymentsV2 {
       } catch (err) {
         throw partialize(err, run);
       }
-      const disposition = await this.runAttempt(ctx);
-      if (disposition.kind === 'rethrow') throw partialize(disposition.error, run);
+      const disposition = await this.runAttempt(ctx, run);
+      if (disposition.kind === 'rethrow') throw disposition.error;
       if (disposition.kind === 'retry-full') {
         // #625's re-plan searches for a DIFFERENT source. A named token has no
         // alternative — re-planning would pick the same one or nothing — so a
@@ -462,31 +464,31 @@ export class PaymentsFacade implements PaymentsV2 {
     }
   }
 
-  private async runAttempt(ctx: AttemptCtx): Promise<AttemptDisposition> {
+  private async runAttempt(ctx: AttemptCtx, run: SendRun): Promise<AttemptDisposition> {
     this.activeMoneyOps.add(ctx.transferId);
     try {
       const { deliveryPending } = await this.machine.run(ctx.plan);
       this.settleSuccess(ctx, ctx.sourceIds);
       return { kind: 'success', deliveryPending };
     } catch (err) {
-      return await this.disposeFailedAttempt(ctx, err);
+      const disposition = await this.disposeFailedAttempt(ctx, err); // #835: shaped in process — no pass adopts it mid-handoff
+      return disposition.kind === 'rethrow' ? { kind: 'rethrow', error: await this.surfaceFailure(disposition.error, run, ctx) } : disposition;
     } finally {
       this.activeMoneyOps.delete(ctx.transferId);
     }
   }
 
-  /** Partial (#677/#690): shortfall already durable (machine wrote it BEFORE
-   *  complete); accumulate settled, re-plan ONLY the remainder, NEW transferId. */
+  /** Partial (#677/#690): shortfall already durable (the machine wrote it BEFORE
+   *  the apply, #835); accumulate settled, re-plan ONLY the remainder, NEW transferId. */
   private async consumePartial(
     ctx: AttemptCtx,
-    disposition: { entry: ShortfallEntry; deliveryPending: boolean },
+    disposition: { entry: ShortfallEntry; deliveryPending: boolean; final: boolean },
     run: SendRun,
     attempt: number
   ): Promise<TransferResult | null> {
-    if (disposition.deliveryPending) {
-      run.pendingAny = true;
-      this.heartbeat.arm(); // deposits owed — heartbeat work even if the remainder later throws
-    }
+    if (disposition.deliveryPending) run.pendingAny = true;
+    // Deposits owed, or applied but not closed: heartbeat work even if the remainder later throws.
+    if (disposition.deliveryPending || disposition.final) this.heartbeat.arm();
     const partial = disposition.entry;
     run.delivered.push(...partial.committedTokenIds);
     run.firstPartialId ??= partial.transferId;
@@ -495,6 +497,16 @@ export class PaymentsFacade implements PaymentsV2 {
     this.settlePartial(ctx, partial);
     if (BigInt(partial.remainingAmount) <= 0n) {
       return this.finishSend(ctx.transferId, run);
+    }
+    // #835: applied but not closed — re-planning while that row is still open could
+    // resurrect the consumed shortfall, so the durable remainder is surfaced as is.
+    if (disposition.final) {
+      throw new PartialSendConflictError(
+        'Part of your payment was sent; the rest could not be sent because a source was spent elsewhere. The delivered portion is final — re-plan only the shortfall, never the full amount.',
+        run.firstPartialId,
+        run.delivered,
+        partial.remainingAmount
+      );
     }
     if (attempt >= MAX_RESELECT) {
       throw new PartialSendConflictError(
@@ -508,17 +520,14 @@ export class PaymentsFacade implements PaymentsV2 {
     return null;
   }
 
-  /** Failure disposition: possibly-committed → rethrow UNWRAPPED; backstop
-   *  'open' → converge via resumeIntent; clean demoted conflict → full re-plan. */
+  /** Failure disposition (#835): possibly-committed or keep-open → kept open; run() certified a leg
+   *  in THIS process (never read from the backstop) → converge; clean demoted conflict → full re-plan. */
   private async disposeFailedAttempt(ctx: AttemptCtx, err: unknown): Promise<AttemptDisposition> {
-    if (isPossiblyCommittedSendOutcome(err)) {
-      this.settleKeepOpen(ctx);
-      stampTransferId(err, ctx.transferId);
-      return { kind: 'rethrow', error: err };
-    }
-    const backstop = await this.machineStores.backstop.getByKey(ctx.transferId);
-    if (backstop !== undefined && backstop.disposition === 'open') {
-      return this.convergePartial(ctx);
+    // classifyError reads the code structurally: another bundle's keep-open error fails `instanceof`.
+    if (isPossiblyCommittedSendOutcome(err) || classifyError(err) === 'keep-open') return this.keepOpen(ctx, err);
+    if (this.machine.certifiedSourcesOf(ctx.plan).length > 0) {
+      // run() never throws an ordinary error past a certified leg; the 2nd arm keeps this total.
+      return classifyError(err) === 'conflict' ? this.convergePartial(ctx) : this.keepOpen(ctx, err, PARTLY_ON_CHAIN_MESSAGE);
     }
     this.settleFailure(ctx.transferId, ctx.coinId, ctx.sourceIds);
     if (classifyError(err) !== 'conflict') return { kind: 'rethrow', error: err };
@@ -526,7 +535,15 @@ export class PaymentsFacade implements PaymentsV2 {
     return demoted > 0 ? { kind: 'retry-full', error: err } : { kind: 'rethrow', error: err };
   }
 
-  /** #677/#690: ≥1 leg committed — the SAME machine, resumed in-process, converges it. */
+  /** Open intent, surfaced as this bundle's possibly-committed error carrying its transferId. */
+  private keepOpen(ctx: AttemptCtx, err: unknown, message?: string): AttemptDisposition {
+    const surfaced = asPossiblyCommitted(err, ctx.transferId, message);
+    this.settleKeepOpen(ctx);
+    return { kind: 'rethrow', error: surfaced };
+  }
+
+  /** #677/#690: run() certified ≥1 leg here and the rest conflicted — the SAME machine,
+   *  resumed in-process, converges it. A leg is on chain, so no failure is clean (#835). */
   private async convergePartial(ctx: AttemptCtx): Promise<AttemptDisposition> {
     let outcome;
     try {
@@ -537,30 +554,21 @@ export class PaymentsFacade implements PaymentsV2 {
         journaled: await this.machineStores.deliveryJournal.byTransfer(ctx.transferId),
       });
     } catch (err) {
-      return this.disposeConvergeFailure(ctx, err);
+      return this.keepOpen(ctx, err, CONVERGE_FAILED_MESSAGE);
     }
     if (outcome.partial === null) {
       this.settleSuccess(ctx, ctx.sourceIds);
       return { kind: 'success', deliveryPending: outcome.deliveryPending };
     }
-    return { kind: 'partial', entry: outcome.partial, deliveryPending: outcome.deliveryPending };
+    return { kind: 'partial', entry: outcome.partial, deliveryPending: outcome.deliveryPending, final: !outcome.closed };
   }
 
-  private async disposeConvergeFailure(ctx: AttemptCtx, err: unknown): Promise<AttemptDisposition> {
-    if (isPossiblyCommittedSendOutcome(err)) {
-      this.settleKeepOpen(ctx);
-      stampTransferId(err, ctx.transferId);
-      return { kind: 'rethrow', error: err };
-    }
-    if (classifyError(err) === 'conflict') {
-      // Nothing was delivered after all (E.2 pure lost race): soft-abort and
-      // fall back to the clean-conflict path.
-      await this.softAbort(ctx.transferId);
-      this.settleFailure(ctx.transferId, ctx.coinId, ctx.sourceIds);
-      const demoted = await this.demoteSpentSources(ctx);
-      return demoted > 0 ? { kind: 'retry-full', error: err } : { kind: 'rethrow', error: err };
-    }
-    return { kind: 'rethrow', error: err };
+  /** #835: a possibly-committed latest attempt owns the remainder — it holds the send's earlier shortfall
+   *  rows, its certified legs join the delivered set — unless it is being cancelled: the rows stay owed. */
+  private async surfaceFailure(err: unknown, run: SendRun, ctx: AttemptCtx): Promise<unknown> {
+    if (run.delivered.length === 0 || !isPossiblyCommittedSendOutcome(err)) return partialize(err, run);
+    await holdShortfalls(this.machineStores, run.settledShortfalls.splice(0), ctx.transferId).catch(() => undefined);
+    return partialize(err, run, this.machine.certifiedSourcesOf(ctx.plan));
   }
 
   private async planAndMaterialize(recipientPubkey: string, job: SendJob, run: SendRun): Promise<AttemptCtx> {
@@ -651,7 +659,12 @@ export class PaymentsFacade implements PaymentsV2 {
 
   /** isSpent sweep over the attempt's sources; demote proven-spent states (durable). */
   private async demoteSpentSources(ctx: AttemptCtx): Promise<number> {
-    const engine = this.engine();
+    let engine: ITokenEngine;
+    try {
+      engine = this.engine();
+    } catch {
+      return 0; // no engine to probe with: never demote on a guess, and never mask the attempt's error
+    }
     let demoted = 0;
     for (const [tokenId, token] of ctx.plan.sources) {
       const state = ctx.plan.payload.spentStates?.[tokenId];
@@ -743,16 +756,6 @@ export class PaymentsFacade implements PaymentsV2 {
     return result;
   }
 
-  /** Nothing delivered → UNWRAPPED; after ≥1 delivered leg every failure surfaces as PartialSendConflictError over the settled set. */
-  private async softAbort(transferId: string): Promise<void> {
-    try {
-      await this.deps.client.abortIntent(transferId);
-      await this.machineStores.backstop.removeByKey(transferId);
-    } catch {
-      // Stays locally recorded; the #676 resume gate converges it later.
-    }
-  }
-
   // ── mint (§5.9: journal-first, replayed at start, never blind re-mint) ─────
 
   private async mintInner(coinId: string, amount: bigint): Promise<MintResult> {
@@ -794,4 +797,3 @@ export class PaymentsFacade implements PaymentsV2 {
     this.track(op).catch(() => undefined);
   }
 }
-

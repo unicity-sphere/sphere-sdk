@@ -285,6 +285,7 @@ describe('PaymentsFacade — NFT mint journal replay (#785)', () => {
     const counter = { applies: 0 };
     countApplies(world, counter);
     await world.facade.start();
+    await world.facade.resumeNow(); // start()'s pass is over: only the restarted process replays the mint
 
     det.failNext = true;
     const first = await world.facade.mintNft({ content: METADATA });

@@ -7,18 +7,20 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { hexToBytes } from '../../../core/crypto';
 import { decryptDeliveryBundle, deriveDeliveryEncryptionKey } from '../../../core/delivery-envelope';
-import { PartialSendConflictError, SphereError } from '../../../core/errors';
+import { isPossiblyCommittedSendOutcome, PartialSendConflictError, SphereError } from '../../../core/errors';
 import { ProofUnconfirmedError } from '../../../token-engine/errors';
 import type { TransferResult } from '../../../types';
 import type { EngineOpOptions, MintParams, SphereToken } from '../../../token-engine';
 import { STORE_KEYS, type MintJournalEntry } from '../../../modules/payments-v2/stores';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
+import { MAY_BE_ON_CHAIN_MESSAGE } from '../../../modules/payments-v2/send-errors';
 import {
   ATTENTION_MINT_UNRESOLVED,
   ATTENTION_RECIPIENT_NETWORK_UNVERIFIED,
   type DeterministicMintCapable,
 } from '../../../modules/payments-v2/PaymentsFacade';
 import { RealizationEngine } from './machine-harness';
+import { FakeApiError } from './fakes/FakeWalletApi';
 import {
   COIN,
   OWN_PUB,
@@ -31,6 +33,7 @@ import {
   ownCaller,
   peerBinding,
   peerCaller,
+  type World,
 } from './facade-harness';
 
 /**
@@ -918,5 +921,239 @@ describe('PaymentsFacade — sendWholeToken: moving a coinless token (#777)', ()
 
     // The coinless token is not a candidate: selection saw only the coin token.
     expect(result.tokenTransfers).toEqual([{ sourceTokenId: coin.blob.tokenId, method: 'split' }]);
+  });
+});
+
+describe('PaymentsFacade — #835 failure shaping and attempt settlement', () => {
+  /** What another dist bundle's SphereError copy looks like here: the right code, the wrong class. */
+  function foreignKeepOpen(): Error {
+    return Object.assign(new Error('proof fetch inconclusive (another bundle)'), {
+      name: 'SphereError',
+      code: 'CERTIFICATION_UNCONFIRMED',
+      mayHaveCertified: true,
+    });
+  }
+
+  async function payableRequest(world: World, amount: string): Promise<string> {
+    const wire = await world.api.createRequest(peerCaller, { toPubkey: OWN_PUB, assets: [{ coinId: COIN, amount }] });
+    await world.facade.requests.drainIncoming();
+    return wire.id;
+  }
+
+  /** A send that queues for change instead of answering is a leaked expected change — report it, never hang on it. */
+  async function promptly(op: Promise<unknown>): Promise<unknown> {
+    return Promise.race([
+      op.then(() => 'resolved', (err: unknown) => err),
+      flushTail(100).then(() => 'still queued'),
+    ]);
+  }
+
+  function transferring(world: World): string[] {
+    return world.facade.tokens().filter((t) => t.status === 'transferring').map((t) => t.id);
+  }
+
+  it("a keep-open error from another bundle surfaces as THIS bundle's error: code kept, transferId set, cause the original", async () => {
+    const world = makeWorld();
+    const token = await world.seed(100n);
+    await world.facade.start();
+    const foreign = foreignKeepOpen();
+    world.engine.afterOp = (_key, kind) => (kind === 'direct' ? foreign : null);
+
+    const caught = await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN }).then(
+      () => undefined,
+      (err: unknown) => err
+    );
+
+    expect(caught).toBeInstanceOf(SphereError); // the facade's copy, so isPossiblyCommittedSendOutcome sees it
+    expect(isPossiblyCommittedSendOutcome(caught)).toBe(true);
+    expect((caught as SphereError).code).toBe('CERTIFICATION_UNCONFIRMED');
+    expect((caught as SphereError).message, 'its own wording, not a generic one').toBe(foreign.message);
+    expect((caught as SphereError).transferId).toBe('tid-1');
+    expect((caught as SphereError).cause).toBe(foreign);
+    expect(eventsOf(world, 'transfer:updated')).toEqual([]);
+    expect(world.api.inspectIntent(ownCaller, 'tid-1')?.status).toBe('open');
+    expect(transferring(world), 'the open intent keeps its source').toEqual([token.blob.tokenId]);
+  });
+
+  it('a code-less keep-open error (mayHaveCertified only) is SEND_SYNC_PENDING that says it MAY be on chain', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await world.facade.start();
+    const uncoded = Object.assign(new Error('submit outcome unknown'), { mayHaveCertified: true });
+    world.engine.afterOp = (_key, kind) => (kind === 'direct' ? uncoded : null);
+
+    const caught = await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN }).then(
+      () => undefined,
+      (err: unknown) => err
+    );
+
+    expect(caught).toBeInstanceOf(SphereError);
+    expect((caught as SphereError).code).toBe('SEND_SYNC_PENDING');
+    expect((caught as SphereError).message).toBe(MAY_BE_ON_CHAIN_MESSAGE);
+    expect((caught as SphereError).transferId).toBe('tid-1');
+    expect((caught as SphereError).cause).toBe(uncoded);
+    expect(world.api.inspectIntent(ownCaller, 'tid-1')?.status).toBe('open');
+  });
+
+  it('requests.pay() over that foreign keep-open error leaves the request settling, then paid once it converges', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await world.facade.start();
+    const id = await payableRequest(world, '100');
+    world.engine.afterOp = (_key, kind) => (kind === 'direct' ? foreignKeepOpen() : null);
+
+    await expect(world.facade.requests.pay(id)).rejects.toMatchObject({ code: 'CERTIFICATION_UNCONFIRMED', transferId: 'tid-1' });
+    const status = (): string | undefined => world.facade.requests.list().find((r) => r.id === id)?.status;
+    expect(status(), 'a possibly-certified payment is never payable again').toBe('settling');
+
+    world.engine.afterOp = null;
+    await world.facade.resumeNow();
+    await flushTail();
+    expect(status()).toBe('paid');
+    expect((await world.api.listMailbox(peerCaller, 0)).entries).toHaveLength(1);
+  });
+
+  it('an epoch reseed overlapping an acked attempt makes its clean leg failure possibly-committed — never fenced, run once later', async () => {
+    const world = makeWorld();
+    const token = await world.seed(100n);
+    await world.facade.start();
+    const aborts: string[] = [];
+    world.hooks.abort = async (transferId) => {
+      aborts.push(transferId);
+    };
+    let reseedPut!: () => void;
+    const reseeding = new Promise<void>((resolve) => (reseedPut = resolve));
+    world.hooks.putIntent = async () => {
+      if (world.counters.putIntent === 2) reseedPut(); // the reseed re-PUTting the acked attempt
+    };
+    let legFails = true;
+    world.engine.beforeOp = () => {
+      if (!legFails) return;
+      legFails = false;
+      void world.facade.handleEpochChange('e2');
+      throw new SphereError('the aggregator refused the transfer (simulated)', 'TRANSFER_FAILED');
+    };
+    const engineTransfer = world.engine.transfer.bind(world.engine);
+    world.engine.transfer = async (params, options) => {
+      const first = legFails;
+      try {
+        return await engineTransfer(params, options);
+      } catch (err) {
+        if (first) await reseeding; // the leg fails only once the reseed has re-PUT the row
+        throw err;
+      }
+    };
+
+    const caught = await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN }).then(
+      () => undefined,
+      (err: unknown) => err
+    );
+
+    expect((caught as SphereError).code, String(caught)).toBe('SEND_SYNC_PENDING');
+    expect((caught as SphereError).transferId).toBe('tid-1');
+    expect(((caught as SphereError).cause as SphereError).code).toBe('TRANSFER_FAILED');
+    expect(aborts, 'a row the reseed may re-open is never aborted').toEqual([]);
+    expect(world.api.inspectIntent(ownCaller, 'tid-1')?.status).toBe('open');
+    expect(eventsOf(world, 'transfer:updated').filter((u) => (u as TransferResult).status === 'failed')).toEqual([]);
+
+    await world.facade.resumeNow();
+    await flushTail();
+    expect(world.api.inspectIntent(ownCaller, 'tid-1')?.status).toBe('completed');
+    expect((await world.api.listMailbox(peerCaller, 0)).entries.map((e) => e.tokenId)).toEqual([token.blob.tokenId]);
+  });
+
+  it('a refused send settles as a failure: nothing reserved, no expected change left to queue on', async () => {
+    const world = makeWorld();
+    const token = await world.seed(200n);
+    await world.facade.start();
+    const refusal = new FakeApiError(403, 'TLS_REQUIRED', 'PUT /v1/intents: TLS required');
+    world.hooks.putIntent = async () => {
+      throw refusal;
+    };
+
+    // 120 of a 200 token: a split, so the attempt declared 80 of expected change.
+    await expect(world.facade.send({ recipient: '@peer', amount: '120', coinId: COIN })).rejects.toBe(refusal);
+    expect(transferring(world)).toEqual([]);
+
+    delete world.hooks.putIntent;
+    const over = await promptly(world.facade.send({ recipient: '@peer', amount: '250', coinId: COIN }));
+    expect((over as SphereError).code, `a send over the balance answered ${String(over)}`).toBe('SEND_INSUFFICIENT_BALANCE');
+    const retry = await world.facade.send({ recipient: '@peer', amount: '120', coinId: COIN });
+    expect(retry.status, 'the released source is spendable again').toBe('delivered');
+    expect(retry.tokens.map((t) => t.id)).toEqual([token.blob.tokenId]);
+  });
+
+  it('a held send settles open: its source stays pinned and no expected change is left to queue on', async () => {
+    const world = makeWorld();
+    const token = await world.seed(200n);
+    await world.facade.start();
+    world.hooks.putIntent = async () => {
+      throw new FakeApiError(503, 'SERVICE_UNAVAILABLE', 'intent store down');
+    };
+
+    await expect(world.facade.send({ recipient: '@peer', amount: '120', coinId: COIN })).rejects.toMatchObject({
+      code: 'SEND_SYNC_PENDING',
+      transferId: 'tid-1',
+    });
+    expect(transferring(world)).toEqual([token.blob.tokenId]);
+
+    const next = await promptly(world.facade.send({ recipient: '@peer', amount: '50', coinId: COIN }));
+    expect((next as SphereError).code, `a second send answered ${String(next)}`).toBe('SEND_INSUFFICIENT_BALANCE');
+    expect((next as SphereError).message).toContain('pinned by 1 transfer(s) still converging');
+    expect(world.engine.transferCalls).toHaveLength(0);
+    expect(world.engine.splitCalls).toHaveLength(0);
+  });
+
+  it('a partial converged in-process releases every source of the attempt once its remainder lands', async () => {
+    const world = makeWorld();
+    await world.seed(600n);
+    const b = await world.seed(400n);
+    await world.seed(250n);
+    await world.seed(150n);
+    await world.engine.foreignSpend(b);
+    await world.facade.start();
+
+    const result = await world.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN });
+    await flushTail();
+
+    expect(result.status).toBe('delivered');
+    expect(transferring(world)).toEqual([]);
+    expect(world.facade.tokens().map((t) => [t.id, t.suspectedSpent])).toEqual([[b.blob.tokenId, true]]);
+    expect(await world.facade.pendingTransfers()).toEqual([]);
+  });
+
+  it('a final partial (the close failed after the apply) settles once: nothing left reserved, the shortfall kept', async () => {
+    const world = makeWorld();
+    await world.seed(60n);
+    const b = await world.seed(40n);
+    await world.engine.foreignSpend(b);
+    await world.facade.start();
+    let completeFails = true;
+    world.hooks.complete = async () => {
+      if (!completeFails) return;
+      completeFails = false;
+      throw new FakeApiError(503, 'HTTP_503', 'complete failed with status 503');
+    };
+
+    await expect(world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN })).rejects.toMatchObject({
+      code: 'SEND_PARTIALLY_COMPLETED',
+      remainingAmount: '40',
+    });
+    await flushTail();
+
+    expect(transferring(world)).toEqual([]);
+    expect(world.facade.tokens().map((t) => [t.id, t.suspectedSpent])).toEqual([[b.blob.tokenId, true]]);
+    expect((await createMachineStores(world.kv).shortfalls.getByKey('tid-1'))?.remainingAmount).toBe('40');
+    expect(await world.facade.pendingTransfers()).toEqual([
+      expect.objectContaining({ transferId: 'tid-1', kind: 'open' }),
+    ]);
+
+    await world.facade.resumeNow(); // the unclosed intent is closed by the next pass, never re-run
+    await flushTail();
+    expect(world.api.inspectIntent(ownCaller, 'tid-1')?.status).toBe('completed');
+    expect(await world.facade.pendingTransfers()).toEqual([
+      expect.objectContaining({ transferId: 'tid-1', kind: 'shortfall', amount: '40' }),
+    ]);
+    expect((await world.api.listMailbox(peerCaller, 0)).entries).toHaveLength(1);
   });
 });

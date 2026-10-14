@@ -8,13 +8,34 @@ import type { SphereToken } from '../../../token-engine/types';
 import type { DeliveryJournalEntry, IntentBackstopEntry } from '../stores';
 import { isWholeIntent } from './payload-view';
 import type { CoinIntentPayload, IntentPayload, WholeIntentPayload } from './types';
-import { ATTENTION_CHECKPOINT_STUCK, createMachineStores, type MachineStores } from './journal';
-import { TransferMachine, buildOps, classifyError, type MachineDeps } from './TransferMachine';
+import {
+  ATTENTION_CHECKPOINT_STUCK,
+  abortAndConfirm,
+  createMachineStores,
+  isNeverStorable,
+  releaseOwed,
+  retryAfterMsOf,
+  settleOwed,
+  type MachineStores,
+} from './journal';
+import { TransferMachine, buildOps, classifyError, type IntentApi, type MachineDeps } from './TransferMachine';
 
 export interface ResumeReport {
   resumed: string[];
   conflicted: string[];
   failed: string[];
+  /** The longest Retry-After a failed intent's answer carried: the heartbeat waits it out. */
+  retryAfterMs?: number;
+}
+
+function noteWait(report: ResumeReport, err: unknown): void {
+  const wait = retryAfterMsOf(err);
+  if (wait !== null) report.retryAfterMs = Math.max(report.retryAfterMs ?? 0, wait);
+}
+
+function noteFailed(report: ResumeReport, transferId: string, err: unknown): void {
+  report.failed.push(transferId);
+  noteWait(report, err);
 }
 
 interface ResumeJob {
@@ -26,6 +47,21 @@ interface ResumeJob {
 export interface ResumeAllOptions {
   /** Ids with an in-process machine attempt — their backstop entries are never GC'd. */
   isLocallyActive?: (transferId: string) => boolean;
+  /** #835: ids the machine parked in memory (their 'unconfirmed' flag write failed). */
+  isParked?: (transferId: string) => boolean;
+  /** #835: a held id the ensure step confirmed or dropped — its in-memory park is done. */
+  onHoldEnded?: (transferId: string) => void;
+  /** #835: the pass deferred on an unreadable backstop — its report proves nothing. */
+  onDeferred?: () => void;
+}
+
+/** One pass's local picture: the backstop snapshot, the server-open ids, the in-process verdicts. */
+interface LocalView {
+  locals: Map<string, IntentBackstopEntry>;
+  openIds: Set<string>;
+  isLocallyActive: (transferId: string) => boolean;
+  isParked: (transferId: string) => boolean;
+  onHoldEnded: (transferId: string) => void;
 }
 
 export async function resumeAll(deps: MachineDeps, options: ResumeAllOptions = {}): Promise<ResumeReport> {
@@ -39,16 +75,20 @@ export async function resumeAll(deps: MachineDeps, options: ResumeAllOptions = {
   } catch {
     // #676: local dispositions unknowable — a server-open intent could be
     // locally aborted, so resuming ANY would risk re-executing one. Defer all.
+    options.onDeferred?.();
     return report;
   }
-  await dropStaleBackstops(
-    stores,
+  const view: LocalView = {
     locals,
-    new Set(open.map((i) => i.transferId)),
-    options.isLocallyActive ?? (() => false)
-  );
+    openIds: new Set(open.map((i) => i.transferId)),
+    isLocallyActive: options.isLocallyActive ?? (() => false),
+    isParked: options.isParked ?? (() => false),
+    onHoldEnded: options.onHoldEnded ?? (() => undefined),
+  };
+  const confirmed = await confirmUnconfirmed(deps, stores, view, report);
+  await dropStaleBackstops(deps.intents, stores, view, report);
 
-  const jobs = await gateAndDecode(deps, stores, open, locals, report);
+  const jobs = await gateAndDecode(deps, stores, [...open, ...confirmed], locals, report);
   const ctx: RunCtx = {
     deps,
     stores,
@@ -68,31 +108,149 @@ interface RunCtx {
   sources: Map<string, SphereToken>;
 }
 
+function isHeld(entry: IntentBackstopEntry, view: LocalView): boolean {
+  return entry.intentPut === 'unconfirmed' || view.isParked(entry.transferId);
+}
+
 /**
- * Reconciliation GC (never money logic — when in doubt, KEEP the entry).
- * Non-'open' entries not server-open: stale local aborts, dropped as before.
- * S1: an 'open' entry that is NOT server-open (= completed-or-never: tail
- * crash after complete, or crash before the intent PUT was acked) with NO
- * journal legs owed and no in-process attempt is pure residue — without this
- * sweep it is a permanent phantom pendingTransfers() row and the heartbeat
- * re-arms forever. Any journal leg or active op keeps the entry.
+ * #835 ensure step, before anything resumes or is swept: a send reported
+ * SEND_SYNC_PENDING because its PUT never answered 2xx gets its STORED envelope
+ * re-PUT. Confirmed → returned, so this same pass resumes it with the same bytes;
+ * 413/422 → nothing ever ran: dropped, reported conflicted; otherwise kept.
  */
-async function dropStaleBackstops(
+async function confirmUnconfirmed(
+  deps: MachineDeps,
   stores: MachineStores,
-  locals: Map<string, IntentBackstopEntry>,
-  openIds: Set<string>,
-  isLocallyActive: (transferId: string) => boolean
-): Promise<void> {
-  for (const entry of locals.values()) {
-    if (openIds.has(entry.transferId)) continue;
-    if (entry.disposition !== 'open') {
-      await stores.backstop.removeByKey(entry.transferId);
+  view: LocalView,
+  report: ResumeReport
+): Promise<{ transferId: string; payload: string }[]> {
+  const confirmed: { transferId: string; payload: string }[] = [];
+  for (const listed of [...view.locals.values()]) {
+    const id = listed.transferId;
+    if (listed.disposition !== 'open' || !isHeld(listed, view) || view.isLocallyActive(id)) continue;
+    if (view.openIds.has(id)) {
+      await unflag(stores, view.locals, listed); // the row is there: gateAndDecode resumes it this pass
+      view.onHoldEnded(id);
       continue;
     }
-    if (isLocallyActive(entry.transferId)) continue;
-    if ((await stores.deliveryJournal.byTransfer(entry.transferId)).size > 0) continue;
-    await stores.backstop.removeByKey(entry.transferId);
+    // Held in memory only (its flag write failed): every pass re-persists the hold, so a
+    // restart finds it held instead of sweeping a 'pending' entry as residue.
+    const entry = listed.intentPut === 'unconfirmed' ? listed : await persistHold(stores, view.locals, listed);
+    try {
+      await deps.intents.put(id, entry.payloadEnvelope, entry.requiresSeedClose);
+    } catch (err) {
+      const paid = isNeverStorable(err) && (await completedElsewhere(deps, id, report));
+      const ended = paid && (await endHold(stores, entry).catch(() => false));
+      if (ended) {
+        view.locals.delete(id);
+        view.onHoldEnded(id); // unaccounted, so a linked request reads paid
+      } else noteFailed(report, id, err);
+      continue;
+    }
+    await unflag(stores, view.locals, entry);
+    view.onHoldEnded(id);
+    view.openIds.add(id); // confirmed: S1 must not sweep it this pass
+    confirmed.push({ transferId: id, payload: entry.payloadEnvelope });
   }
+  return confirmed;
+}
+
+/** #835: a 413/422 says nothing of a held send's earlier PUT, which may still land and create or re-open
+ *  its row: no absence proves it refused, so only a row completed elsewhere ends the hold. */
+async function completedElsewhere(deps: MachineDeps, id: string, report: ResumeReport): Promise<boolean> {
+  const noted = (err: unknown): null => {
+    noteWait(report, err);
+    return null;
+  };
+  const open = await deps.intents.listOpen().catch(noted);
+  if (open === null || open.some((i) => i.transferId === id)) return false;
+  return (await abortAndConfirm(deps.intents, id, (err) => noteWait(report, err))) === 'completed';
+}
+
+async function endHold(stores: MachineStores, entry: IntentBackstopEntry): Promise<boolean> {
+  await settleOwed(stores, entry);
+  return stores.backstop.removeIfUnchanged(entry.transferId, entry);
+}
+
+/** A confirmed cancel moved nothing: what it held is owed again, conflicted (a link is payable); a completed row was paid. */
+async function retire(stores: MachineStores, entry: IntentBackstopEntry, refused: boolean, report: ResumeReport): Promise<void> {
+  await (refused ? releaseOwed(stores, entry) : settleOwed(stores, entry));
+  if ((await stores.backstop.removeIfUnchanged(entry.transferId, entry)) && refused) report.conflicted.push(entry.transferId);
+}
+
+/** Best-effort: on a failed write the hold stays in memory and the next pass tries again. */
+async function persistHold(
+  stores: MachineStores,
+  locals: Map<string, IntentBackstopEntry>,
+  entry: IntentBackstopEntry
+): Promise<IntentBackstopEntry> {
+  try {
+    const held = await stores.backstop.patch(entry.transferId, (e) => ({ ...e, intentPut: 'unconfirmed' }));
+    if (held === undefined) return entry;
+    locals.set(entry.transferId, held);
+    return held;
+  } catch {
+    return entry;
+  }
+}
+
+async function unflag(
+  stores: MachineStores,
+  locals: Map<string, IntentBackstopEntry>,
+  entry: IntentBackstopEntry
+): Promise<void> {
+  if (entry.intentPut === undefined) return; // parked in memory only, already unflagged on disk
+  try {
+    const stripped = await stores.backstop.patch(entry.transferId, ({ intentPut: _confirmed, ...rest }) => rest);
+    if (stripped !== undefined) locals.set(entry.transferId, stripped);
+  } catch {
+    /* still flagged: the next pass finds the row listed and unflags it then */
+  }
+}
+
+/**
+ * Reconciliation GC (never money logic — when in doubt, KEEP the entry). Every
+ * removal is compare-and-delete against the snapshot judged (#835), and an
+ * in-process attempt is never touched. A tombstone goes only once the server
+ * answers its abort 2xx or 404 NOT_FOUND. S1: an unflagged 'open' entry that is
+ * NOT server-open with no journal legs owed is residue (completed-or-never).
+ */
+async function dropStaleBackstops(
+  intents: IntentApi,
+  stores: MachineStores,
+  view: LocalView,
+  report: ResumeReport
+): Promise<void> {
+  for (const entry of view.locals.values()) {
+    const id = entry.transferId;
+    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;
+    if (entry.disposition !== 'open') {
+      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));
+      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);
+      continue;
+    }
+    if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it
+    if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;
+    // Read for each entry: a byte-equal re-PUT may re-open a row while an earlier one is retired.
+    const listed = await freshListings(intents, report);
+    // Unknown until both listings read; open again (a byte-equal re-PUT re-opened it): a later pass judges it.
+    if (listed === null || listed.open.has(id)) continue;
+    await retire(stores, entry, listed.aborted.has(id), report);
+  }
+}
+
+async function freshListings(
+  intents: IntentApi,
+  report: ResumeReport
+): Promise<{ aborted: Set<string>; open: Set<string> } | null> {
+  const ids = (rows: { transferId: string }[]): Set<string> => new Set(rows.map((row) => row.transferId));
+  const noted = (err: unknown): null => {
+    noteWait(report, err);
+    return null;
+  };
+  const aborted = await intents.listAborted().then(ids, noted);
+  const open = aborted === null ? null : await intents.listOpen().then(ids, noted);
+  return aborted === null || open === null ? null : { aborted, open };
 }
 
 async function gateAndDecode(
@@ -106,14 +264,10 @@ async function gateAndDecode(
   for (const intent of open) {
     const local = locals.get(intent.transferId);
     if (local !== undefined && local.disposition !== 'open') {
-      // #676: a locally-aborted intent is NEVER resumed — converge the server.
-      try {
-        await deps.intents.abort(intent.transferId);
-        await stores.backstop.removeByKey(intent.transferId);
-      } catch {
-        /* stays locally aborted; converged at the next resume */
-      }
-      report.conflicted.push(intent.transferId);
+      // #676: never resumed. Conflicted only once the cancel is confirmed (#835): until then another device could run it.
+      const outcome = await abortAndConfirm(deps.intents, intent.transferId, (err) => noteWait(report, err));
+      if (outcome === 'unknown') report.failed.push(intent.transferId);
+      else await retire(stores, local, outcome !== 'completed', report).catch(() => undefined);
       continue;
     }
     let payload: IntentPayload;
@@ -207,6 +361,7 @@ async function classifyResumeFailure(
     // never apply the foreign proof; the caller re-plans under a NEW transferId.
     try {
       await deps.intents.abort(transferId);
+      await releaseOwed(stores, await stores.backstop.getByKey(transferId)); // #835: its remainder is owed again
       await stores.backstop.removeByKey(transferId);
     } catch {
       /* retried at the next resume */
@@ -218,7 +373,7 @@ async function classifyResumeFailure(
   if (code === 'SPLIT_CHECKPOINT_LOST' || code === 'CHECKPOINT_TRUSTBASE_MISMATCH') {
     deps.emit('transfer:attention', { transferId, code: ATTENTION_CHECKPOINT_STUCK, detail: String(code) });
   }
-  report.failed.push(transferId);
+  noteFailed(report, transferId, err);
 }
 
 /**

@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (money) — a send that may have moved money is never reported as a clean failure (#835)
+
+What was wrong. When `PUT /v1/intents` failed with anything other than a 422, the payments facade
+still converged the attempt in-process. It certified and delivered the legs although the wallet
+service held no intent row, then rejected with the resulting `404 unknown intent`, or with the
+split leg's `GET /progress` 404. Three other cases surfaced their raw error the same way:
+
+- a multi-leg send whose later leg failed with an ordinary error after an earlier leg was
+  delivered;
+- an in-process convergence that failed after delivering (a 5xx on complete, a failed shortfall
+  write, a gateway error while re-certifying a leg);
+- a conflict that masked a delivered leg's unconfirmed re-certification.
+
+Consequence. `isPossiblyCommittedSendOutcome()` returned false, `transfer:updated{status:'failed'}`
+fired, and `requests.pay()` made the request payable again. A caller following the documented
+contract paid the recipient twice.
+
+What changed:
+
+- No chain operation runs before the intent PUT answers wallet-api's bodyless `204`; any other
+  2xx (a gateway's fixed response or a misroute may answer without forwarding) proves nothing, and
+  the same holds for confirming a cancel. A failed PUT is re-sent with the same stored bytes. A send
+  the service provably refused fails clean whenever no ambiguous answer came before it: a 413 from
+  any hop (whoever receives the body answers it while receiving it), a 422 only in wallet-api's
+  error envelope (an untyped one may come from a hop that forwarded the request first) — either
+  judges the bytes themselves, and the same bytes are all that is ever re-sent; any other 4xx only
+  when it came twice in wallet-api's typed error envelope with nothing ambiguous before it. Any
+  other untyped 4xx (a proxy's page, a 422 included) proves nothing. A send whose PUT stays unconfirmed rejects `SEND_SYNC_PENDING` with its
+  `transferId` and is sent automatically, under the same transferId, once the service confirms the
+  intent; every resume pass re-persists the hold when only memory had it. A 413/422 on a held send's
+  re-PUT ends the hold only when its row completed on another device (as paid): the PUT that went
+  unconfirmed may still land, so a missing or aborted row keeps it held, its request `settling`.
+- Every failure after a leg certified is possibly-committed with its `transferId`. A shortfall is
+  durable before any inventory apply. A clean report now also requires that nothing on this device
+  can later execute the intent (no ambiguous PUT answer, no epoch re-seed that started during the
+  attempt or is still re-PUTting when it fails) and, when it was cancelled, that the service
+  confirmed the cancel: an abort's `204` counts only once the aborted listing shows the row,
+  because an abort of a row another device already completed is a no-op `204` too. A failed attempt
+  that cannot meet that is reported `SEND_SYNC_PENDING` with its transferId, and one completed
+  elsewhere (in neither the aborted nor the open listing) is later resolved paid, never made
+  payable again. The convergence heartbeat honors a `Retry-After` that any single intent's answer
+  carried during a pass (a held send's re-PUT included), not only one that failed the whole pass. A
+  partial send applied but not closed now also arms the convergence heartbeat, so
+  an idle wallet closes it without a `resumeNow()`.
+- A convergence pass treats a send in process at any moment of the pass, including one started
+  after the pass listed the open intents, as running for the whole pass, so the pass never sweeps or
+  resumes it. It reconciles payment links against the local intent store as it is after the pass,
+  so a link whose send is held or being cancelled is never resolved paid; when that read fails, only
+  the reconcile is skipped. A listener that throws (an `emit` that rethrows) is logged and
+  can no longer turn a delivered send into a rejection.
+- A later attempt that owns a partial send's remainder (`remainingAmount: '0'`) holds the send's
+  earlier shortfall rows on its intent entry, one being cancelled included. Once it is proven not to
+  run (a conflict on resume, or a cancel the service confirms), the rows come back and the remainder
+  is owed again. A cancel the service confirms
+  with `404 NOT_FOUND` (its row gone, as after a database restore) is reported conflicted, so a
+  linked payment request becomes payable again, never resolved paid. So is a local intent whose row
+  was aborted, by a cleanup whose removal failed or by another device: its held rows are owed again,
+  where it used to be swept as completed and its remainder erased.
+- Behaviour changes for integrators:
+  - `SEND_SYNC_PENDING` also means "held, not sent yet": the send goes out automatically, possibly
+    much later, and cannot be cancelled;
+  - `SEND_SYNC_PENDING` also means "being cancelled": an attempt failed with nothing certified and
+    the service has not confirmed its cancel. This device never sends it and `pendingTransfers()`
+    does not list it; a payment request paid with it stays `settling` until the cancel is
+    confirmed, then becomes payable again. Never send it again: until the cancel is confirmed,
+    another device of the wallet could still complete it;
+  - `PartialSendConflictError.remainingAmount` is `'0'` when a possibly-committed later attempt owns
+    the remainder, one being cancelled included: until the service confirms that cancel, another
+    device of the same wallet could still complete it, so nothing is owed yet. Once the cancel is
+    confirmed, the remainder shows up in `pendingTransfers()` as a shortfall to re-plan; if the
+    attempt completed elsewhere, it was paid. Residual (wallet-api#172): a device that certified a
+    leg before the cancel landed may still deliver it;
+  - the `sync:pending` attention code is no longer emitted.
+- The backstop store gains two optional fields. An older client reads an entry flagged `intentPut`
+  as an ordinary open entry and ignores `owes`, so a downgrade can lose a held remainder: an
+  under-payment, never a double pay.
+
+How it was verified:
+
+- the new contract suite `tests/unit/payments-v2/send-intent-unknown.test.ts` (every observable
+  outcome, including retries by a contract-following caller, the epoch restore and
+  `requests.pay()`);
+- machine, resume, restore, heartbeat and facade unit tests;
+- the full mutation run;
+- the live staging money e2e with injected intent-PUT failures.
+
 ## [0.18.1] - 2026-10-07
 
 ### Added — the token registry claims a coin for its issuing token type (#833)

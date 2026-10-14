@@ -30,16 +30,6 @@
     ]
   },
   {
-    "name": "machine-conflict-apply-drop",
-    "note": "certified-source-terminal: the conflict path still applies the certified sibling (machine.test.ts 'a source certified during a failed send is terminal')",
-    "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    if (cls === 'conflict' && committed.length > 0) {\n      await this.applyBestEffort(engine, plan.transferId, committed);\n    }",
-    "replace": "    if (cls === 'conflict' && committed.length > 0) {\n      void committed;\n    }",
-    "tests": [
-      "tests/unit/payments-v2/machine.test.ts"
-    ]
-  },
-  {
     "name": "machine-429-defer-removal",
     "note": "S3: recipient 429 defers outside the poison budget (machine.test.ts 'recipient 429 defers the journaled blob')",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
@@ -2360,6 +2350,1099 @@
     "replace": "      timer = setTimeout(() => resolve(true), 2 ** 31 - 1);",
     "tests": [
       "tests/unit/payments-v2/claimed-coins.test.ts"
+    ]
+  },
+  {
+    "name": "machine-run-applies-unsettled-attempt",
+    "note": "#835: run() never applies an attempt that did not settle; resume applies it after its shortfall row is durable. Replaces machine-conflict-apply-drop, whose find went with applyBestEffort (machine.test.ts 'audit#4: a conflicted leg is never in applyDelta.spent[]...' + 'a source certified during a failed send is terminal...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    throw await this.failureOf(plan, outcomes, reseedAtStart);",
+    "replace": "    if (cls === 'conflict' && committed.length > 0) await this.applyCommitted(engine, plan.transferId, committed);\n    throw await this.failureOf(plan, outcomes, reseedAtStart);",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "gate-trusts-first-refusal",
+    "note": "#835: one pre-write refusal proves nothing (a lost 2xx can precede it); only a second one with nothing ambiguous before it shows no row exists (machine.test.ts 'two pre-write refusals (%s)...' + 'one refusal is no proof...'; send-intent-unknown.test.ts (b) 429 cases, (g) PUT counts)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "        else if (attempt > 0 && !ambiguous) return this.refuseIntent(plan.transferId, err);",
+    "replace": "        else if (!ambiguous) return this.refuseIntent(plan.transferId, err);",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "gate-ambiguous-as-refusal",
+    "note": "#835: an ambiguous PUT answer (network, 5xx, 408, an unparsable 2xx) may have stored the row, so the attempt is parked possibly-committed, never refused clean (machine.test.ts 'awaits the intent PUT before any engine op...' + 'an ambiguous answer then refusals parks the attempt...'; send-intent-unknown.test.ts (h))",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "        if (!isPreWriteRefusal(err)) ambiguous = true;",
+    "replace": "        if (!isPreWriteRefusal(err)) void 0;",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "gate-reput-reencrypts",
+    "note": "#835: every re-PUT carries the STORED envelope byte for byte; only identical bytes are idempotent against a row an earlier PUT may have stored (machine.test.ts 'every re-PUT carries the STORED envelope...'; send-intent-unknown.test.ts (h) identical putCalls)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "        await this.deps.intents.put(plan.transferId, envelope, seal);",
+    "replace": "        await this.deps.intents.put(plan.transferId, attempt > 0 ? await this.deps.encryptPayload(plan.payload) : envelope, seal);",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "park-forgets-in-memory",
+    "note": "#835: a park is remembered in memory BEFORE its 'unconfirmed' flag write, which may fail; the converger re-PUTs it from memory (machine.test.ts 'a park whose flag write fails is still possibly-committed and remembered in memory'; send-intent-unknown.test.ts (h-kvfail))",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    this.parked.add(transferId);",
+    "replace": "    void transferId;",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "run-ignores-uncertain-put",
+    "note": "#835: after an ambiguous PUT answer an earlier PUT may still land and re-open an aborted row, so a clean leg failure cannot be fenced: held possibly-committed (machine.test.ts 'after an ambiguous PUT answer a clean leg failure cannot be fenced either...'; send-intent-unknown.test.ts (n))",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    if (this.uncertainPuts.has(plan) || this.reseedSeq !== reseedAtStart || this.activeReseeds > 0) {",
+    "replace": "    if (this.reseedSeq !== reseedAtStart || this.activeReseeds > 0) {",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "run-ignores-reseed-overlap",
+    "note": "#835: a reseed that started AND ended during the attempt may have re-PUT its row behind its back, so a clean leg failure cannot be fenced; the active count alone misses one that already ended (machine.test.ts 'a reseed that starts and ends while the first PUT is in flight overlaps the attempt...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    if (this.uncertainPuts.has(plan) || this.reseedSeq !== reseedAtStart || this.activeReseeds > 0) {",
+    "replace": "    if (this.uncertainPuts.has(plan) || this.activeReseeds > 0) {",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "run-raw-after-commit",
+    "note": "#835: once a leg certified, an ordinary failure beside it (its journal write too) is possibly-committed, never the raw error (machine.test.ts 'a leg certified beside an ordinary leg failure...' + 'a certified leg whose journal write fails...'). Machine-only: the facade's defensive keep-open arm re-wraps the raw error, so no facade suite sees this mutant",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "        : asPossiblyCommitted(ordinary.error, plan.transferId, PARTLY_ON_CHAIN_MESSAGE);",
+    "replace": "        : firstError;",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "fence-ignores-failed-tombstone",
+    "note": "#835: a clean report needs a durable tombstone; without one the attempt stays open, possibly-committed and never aborted (machine.test.ts 'a clean leg failure whose tombstone cannot be written is held open...'; send-intent-unknown.test.ts (o))",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    if (!tombstoned) return NOT_FENCED_MESSAGE;",
+    "replace": "    void tombstoned;",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-masks-keepopen",
+    "note": "#835: resume throws a conflict ('nothing ran') only when no other outcome sits beside it; a keep-open or ordinary re-certification of a delivered leg wins (machine-resume.test.ts 'a delivered leg whose re-certification is unconfirmed beside a conflict...'; send-intent-unknown.test.ts (j-pay), whose background pass must not abort the intent)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": " && firstNonConflictError(outcomes) === undefined) throw conflicts[0].error;",
+    "replace": ") throw conflicts[0].error;",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "resume-apply-before-shortfall",
+    "note": "#690 + #835: the shortfall row is durable BEFORE the apply; applied first, a failed shortfall write loses the unseen remainder of an intent the apply already settled (machine-resume.test.ts 'the shortfall is durable before ANY apply...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    await this.stores.shortfalls.upsert(entry);\n    await this.applyCommitted(engine, r.transferId, committed);",
+    "replace": "    await this.applyCommitted(engine, r.transferId, committed);\n    await this.stores.shortfalls.upsert(entry);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "resume-partial-close-strict",
+    "note": "#835: a close that fails after a settled partial's apply reports closed: false, never a throw, so the facade surfaces the durable remainder as final instead of re-planning it (machine-resume.test.ts 'a close that fails after the partial apply reports closed: false...'; send-intent-unknown.test.ts (r))",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    const closed = await this.completeIntent(r.transferId, r.payload).then(\n      () => true,\n      () => false\n    );",
+    "replace": "    const closed = await this.completeIntent(r.transferId, r.payload).then(() => true);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "facade-converges-from-backstop",
+    "note": "#835: the facade converges a failed attempt only when run() certified a leg IN THIS PROCESS; a leftover 'open' backstop entry (a refusal whose cleanup write failed) proves nothing ran (send-intent-unknown.test.ts (g) '%s whose backstop cleanup write fails...' + (p))",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    if (this.machine.certifiedSourcesOf(ctx.plan).length > 0) {",
+    "replace": "    if ((await this.machineStores.backstop.getByKey(ctx.transferId))?.disposition === 'open') {",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "facade-converge-failure-raw",
+    "note": "#835: a leg is on chain, so a failed in-process convergence stays open and possibly-committed, never a raw (clean-looking) error (send-intent-unknown.test.ts (e) 'a conflicted leg after a delivered one, then the shortfall write fails...' + (j))",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "      return this.keepOpen(ctx, err, CONVERGE_FAILED_MESSAGE);",
+    "replace": "      return { kind: 'rethrow', error: err };",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "facade-foreign-keepopen-raw",
+    "note": "#835: another bundle's keep-open error fails instanceof, so it is recognised by its code and surfaced as this bundle's possibly-committed error with the transferId (facade.test.ts 'a keep-open error from another bundle surfaces as THIS bundle's error...' + its requests.pay() twin)",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    if (isPossiblyCommittedSendOutcome(err) || classifyError(err) === 'keep-open') return this.keepOpen(ctx, err);",
+    "replace": "    if (isPossiblyCommittedSendOutcome(err)) return this.keepOpen(ctx, err);",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "surface-keeps-stale-shortfall",
+    "note": "#835: a possibly-committed latest attempt owns the remainder, so the run's earlier shortfall rows move onto its entry; one left behind as owed invites a re-pay of what is still settling (send-intent-unknown.test.ts '(k) a re-plan attempt left open...')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    await holdShortfalls(this.machineStores, run.settledShortfalls.splice(0), ctx.transferId).catch(() => undefined);",
+    "replace": "    void run.settledShortfalls;",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "partialize-folds-open-attempt",
+    "note": "#835: after a partial, a possibly-committed latest attempt leaves remainingAmount '0': the rest is settling under its own transfer, and a caller that re-plans a non-zero remainder pays it twice (send-intent-unknown.test.ts '(k) a re-plan attempt left open...')",
+    "file": "modules/payments-v2/send-errors.ts",
+    "find": "      '0',",
+    "replace": "      run.amount,",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "converger-reconciles-deferred",
+    "note": "#835: a pass that could not read the backstop proves nothing and reconciles nothing — even when the store reads again before the pass ends, so the reconcile's own fresh read does not shadow this guard (heartbeat.test.ts 'a pass that cannot read the backstop reconciles nothing...' + 'a pass whose backstop read failed reconciles nothing, even when the store reads again...'; send-intent-unknown.test.ts (q))",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    if (deferred) return { progress: false, retryAfterMs: null };",
+    "replace": "    void deferred;",
+    "tests": [
+      "tests/unit/payments-v2/heartbeat.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "confirm-skips-reput",
+    "note": "#835: the ensure step re-PUTs a held entry's STORED envelope before anything resumes; skipped, the held send is never recorded and never runs (machine-resume.test.ts 'a parked entry with no row is re-PUT with its stored bytes...'; send-intent-unknown.test.ts (h))",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      await deps.intents.put(id, entry.payloadEnvelope, entry.requiresSeedClose);",
+    "replace": "      void deps;",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "dropstale-sweeps-unconfirmed",
+    "note": "#835: a held entry (flagged 'unconfirmed', or parked in memory) was reported possibly-committed, so the GC never sweeps it as S1 residue (machine-resume.test.ts 'an ambiguous re-PUT keeps the entry flagged across passes...'; heartbeat.test.ts 'a held send...never swept')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it",
+    "replace": "    // mutant: a held entry is swept like residue",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "dropstale-trusts-listing-for-tombstones",
+    "note": "#835: an unlisted tombstone goes only after its abort answers 204 the aborted listing confirms, or 404 NOT_FOUND; a listing that omits the row is no proof the row cannot run (machine-resume.test.ts 'an unlisted tombstone whose abort answers %s is kept'; send-intent-unknown.test.ts (p))",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);",
+    "replace": "      await retire(stores, entry, outcome !== 'completed', report);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "dropstale-removes-unconditionally",
+    "note": "#835: every GC removal is compare-and-delete against the entry the pass judged; a send held after the pass read its snapshot survives that pass (send-intent-unknown.test.ts '(h-stale) a pass judging a snapshot from before the hold never sweeps the held entry')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if ((await stores.backstop.removeIfUnchanged(entry.transferId, entry)) && refused) report.conflicted.push(entry.transferId);",
+    "replace": "  await stores.backstop.removeByKey(entry.transferId);\n  if (refused) report.conflicted.push(entry.transferId);",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "dropstale-active-after-tombstone",
+    "note": "#835: the in-process check runs BEFORE the tombstone branch (HEAD ran it after), so a pass never aborts or drops the tombstone of an attempt still running here (machine-resume.test.ts 'a tombstone of an in-process attempt is untouched...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);\n      continue;\n    }\n",
+    "replace": "    if (view.openIds.has(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);\n      continue;\n    }\n    if (view.isLocallyActive(id)) continue;\n",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "restore-reseeds-pending",
+    "note": "#835: a reseed never re-PUTs an entry whose PUT was not acked ('pending' or 'unconfirmed'): it would create the row of an attempt that may be about to report clean (restore.test.ts 'never re-PUTs an entry whose PUT was not acked...'; send-intent-unknown.test.ts (i))",
+    "file": "modules/payments-v2/restore.ts",
+    "find": " && entry.intentPut === undefined;",
+    "replace": ";",
+    "tests": [
+      "tests/unit/payments-v2/restore.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "restore-trusts-snapshot",
+    "note": "#835: each listed entry is re-read and judged as it is NOW, so one a send tombstoned or removed after the list is never re-PUT (restore.test.ts 'judges each entry as it is now...')",
+    "file": "modules/payments-v2/restore.ts",
+    "find": "      const entry = await deps.stores.backstop.getByKey(listed.transferId).catch(() => listed);",
+    "replace": "      const entry = listed;",
+    "tests": [
+      "tests/unit/payments-v2/restore.test.ts"
+    ]
+  },
+  {
+    "name": "compose-drops-reseed-hook",
+    "note": "#835: the reseed must reach the ONE machine whose attempts it can overlap. onReseedStart is optional on RestoreDeps, so dropping it compiles and silently disarms run-ignores-reseed-overlap's guard in the real composition (facade.test.ts 'an epoch reseed overlapping an acked attempt...')",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "    onReseedStart: () => machine.noteReseed(),\n",
+    "replace": "    // mutant: the restore never tells the machine a reseed started\n",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "converger-drops-isparked",
+    "note": "#835: a send parked only in memory (its flag write failed) reaches the pass through this option alone; isParked is optional on resumeAll, so dropping it compiles (send-intent-unknown.test.ts '(h-kvfail) the hold cannot be written...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "      isParked: (id) => this.deps.parked.has(id),\n",
+    "replace": "      // mutant: the pass never learns which sends were parked in memory\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "confirm-forgets-in-memory-park",
+    "note": "#835: a park whose 'unconfirmed' flag write failed is still held (the machine's parked set) — confirmed and never swept",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  return entry.intentPut === 'unconfirmed' || view.isParked(entry.transferId);",
+    "replace": "  return entry.intentPut === 'unconfirmed';",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "confirm-422-reported-failed",
+    "note": "#835: a held send refused 413/422 on its re-PUT stays held and is reported failed, so a link to it stays settling (machine-resume.test.ts 'a 422 on the re-PUT of a held send with no row keeps the hold...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      } else noteFailed(report, id, err);",
+    "replace": "      }",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "resume-deferral-silent",
+    "note": "#835: a pass deferred on an unreadable backstop says so — the converger must not reconcile its empty report",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    options.onDeferred?.();\n",
+    "replace": "    void options;\n",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/heartbeat.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "restore-announces-late",
+    "note": "#835: the reseed bumps the machine's overlap counter BEFORE it lists, so an attempt it overlaps never reports clean",
+    "file": "modules/payments-v2/restore.ts",
+    "find": "  deps.onReseedStart?.();\n  try {\n    for (const listed of await deps.stores.backstop.list()) {",
+    "replace": "  const all = await deps.stores.backstop.list();\n  deps.onReseedStart?.();\n  try {\n    for (const listed of all) {",
+    "tests": [
+      "tests/unit/payments-v2/restore.test.ts"
+    ]
+  },
+  {
+    "name": "deliver-bookkeeping-throws",
+    "note": "#835: a certified leg's delivery bookkeeping failure leaves the journal entry for the replay, never fails the send",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "await this.deliverOne(recipientPubkey, outcome, options).catch(() => true);",
+    "replace": "await this.deliverOne(recipientPubkey, outcome, options);",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "progress-listener-throws",
+    "note": "#835: a transfer:updated listener's throw never turns a certified leg into a failed send",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    } catch {\n      /* #835: a listener's throw must never turn a certified leg into a failed send */\n    }",
+    "replace": "    } finally {\n      /* mutant */\n    }",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "refuse-masks-wire-error",
+    "note": "#835: a refused PUT rethrows the WIRE error even when the backstop removal fails",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    try {\n      await this.stores.backstop.removeByKey(transferId);\n    } catch {\n      /* the reseed skips 'pending', and resume acts only on a row no PUT created */\n    }\n    throw err;",
+    "replace": "    await this.stores.backstop.removeByKey(transferId);\n    throw err;",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "fence-abort-404-kept",
+    "note": "#835: an abort answered 404 NOT_FOUND proves no row can run \u2014 clean, entry dropped",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "    if (isUnknownIntent(err)) return 'never-stored';",
+    "replace": "    if (isUnknownIntent(err)) return 'unknown';",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "fence-trusts-failed-abort",
+    "note": "#835: a failed abort leaves the row open (another device could run it) \u2014 possibly-committed, never clean",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "    onError(err);\n    return 'unknown';",
+    "replace": "    onError(err);\n    return 'aborted';",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "gate-reports-conflicted-on-failed-abort",
+    "note": "#835: the #676 gate reports conflicted only once the server confirmed the abort; a failed abort keeps a link settling",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      if (outcome === 'unknown') report.failed.push(intent.transferId);\n      else await retire(stores, local, outcome !== 'completed', report).catch(() => undefined);",
+    "replace": "      await retire(stores, local, outcome !== 'completed', report).catch(() => undefined);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "confirm-defers-to-next-pass",
+    "note": "#835: a held intent whose re-PUT confirmed is resumed in the SAME pass",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    confirmed.push({ transferId: id, payload: entry.payloadEnvelope });",
+    "replace": "    report.failed.push(id);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/heartbeat.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "wrap-drops-foreign-wording",
+    "note": "#835: another bundle's possibly-committed error keeps its own wording when wrapped",
+    "file": "modules/payments-v2/send-errors.ts",
+    "find": "  const text = foreign !== undefined && err instanceof Error ? err.message : message;",
+    "replace": "  const text = message;",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "wrap-default-overstates",
+    "note": "#835: a code-less keep-open error says the payment MAY be on chain, not that part of it is",
+    "file": "modules/payments-v2/send-errors.ts",
+    "find": "export function asPossiblyCommitted(err: unknown, transferId: string, message = MAY_BE_ON_CHAIN_MESSAGE): SphereError {",
+    "replace": "export function asPossiblyCommitted(err: unknown, transferId: string, message = PARTLY_ON_CHAIN_MESSAGE): SphereError {",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "surface-omits-open-certified",
+    "note": "#835: a possibly-committed latest attempt's certified legs join committedTokenIds",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    return partialize(err, run, this.machine.certifiedSourcesOf(ctx.plan));\n",
+    "replace": "    return partialize(err, run);\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "final-partial-replans",
+    "note": "#835: a settled partial whose close failed surfaces its durable remainder — no in-process re-plan",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    if (disposition.final) {\n",
+    "replace": "    if (disposition.final && attempt < 0) {\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/facade.test.ts"
+    ]
+  },
+  {
+    "name": "keepopen-skips-settle",
+    "note": "#835: every possibly-committed exit settles keep-open (pins + heartbeat) exactly once",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    this.settleKeepOpen(ctx);\n    return { kind: 'rethrow', error: surfaced };\n",
+    "replace": "    return { kind: 'rethrow', error: surfaced };\n",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "facade-isparked-unwired",
+    "note": "#835: the converger reads the machine's own parked set, so an in-memory park reaches every pass (send-intent-unknown.test.ts '(h-kvfail) the hold cannot be written...')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "      parked: this.machine.parked,\n",
+    "replace": "      parked: new Set<string>(),\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "compose-second-machine",
+    "note": "#835: the reseed reaches the SAME machine instance the sends run on",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "    restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view, machine),\n",
+    "replace": "    restoreDeps: buildRestoreDeps(deps, machineDeps, machineStores, view, new TransferMachine(machineDeps)),\n",
+    "tests": [
+      "tests/unit/payments-v2/facade.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "run-captures-reseed-late",
+    "note": "#835: the overlap baseline is taken BEFORE the gate; taken after the ack, a reseed that ran during the PUT goes unseen and the attempt reports clean although that reseed may re-PUT its row (machine.test.ts 'a reseed that starts and ends while the first PUT is in flight overlaps the attempt...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    const reseedAtStart = this.reseedSeq;\n    const envelope = await this.deps.encryptPayload(plan.payload);\n    await this.stores.backstop.upsert({\n      transferId: plan.transferId,\n      payloadEnvelope: envelope,\n      requiresSeedClose: plan.payload.split !== undefined,\n      disposition: 'open',\n      intentPut: 'pending',\n      createdAt: this.deps.now(),\n    });\n    await this.putIntentGate(plan, envelope);\n    await this.markAcked(plan.transferId);\n",
+    "replace": "    const envelope = await this.deps.encryptPayload(plan.payload);\n    await this.stores.backstop.upsert({\n      transferId: plan.transferId,\n      payloadEnvelope: envelope,\n      requiresSeedClose: plan.payload.split !== undefined,\n      disposition: 'open',\n      intentPut: 'pending',\n      createdAt: this.deps.now(),\n    });\n    await this.putIntentGate(plan, envelope);\n    await this.markAcked(plan.transferId);\n    const reseedAtStart = this.reseedSeq;\n",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "run-ignores-active-reseed",
+    "note": "#835 (Codex P1): a reseed that started before the attempt may list it after its ack and re-PUT it while the attempt fences, re-opening an aborted row; while one runs, a clean leg failure is held (machine.test.ts 'a reseed that started before the attempt and is still running...'; send-intent-unknown.test.ts '(t) the reseed lists the backstop only after the send acked...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    if (this.uncertainPuts.has(plan) || this.reseedSeq !== reseedAtStart || this.activeReseeds > 0) {",
+    "replace": "    if (this.uncertainPuts.has(plan) || this.reseedSeq !== reseedAtStart) {",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "restore-skips-end-hook",
+    "note": "#835: a reseed must say it ended, or every later clean leg failure is held as if one were still running (restore.test.ts 'ends the reseed once...' + 'ends the reseed even when it throws...'; send-intent-unknown.test.ts \"(t') once the reseed has ended...\")",
+    "file": "modules/payments-v2/restore.ts",
+    "find": "    deps.onReseedEnd?.();",
+    "replace": "    void deps;",
+    "tests": [
+      "tests/unit/payments-v2/restore.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "compose-drops-reseed-end-hook",
+    "note": "#835: the restore's end reaches the ONE machine; onReseedEnd is optional on RestoreDeps, so dropping it compiles and holds every later clean failure possibly-committed (send-intent-unknown.test.ts \"(t') once the reseed has ended...\")",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "    onReseedEnd: () => machine.noteReseed(false),\n",
+    "replace": "    // mutant: the restore never tells the machine a reseed ended\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "confirm-skips-hold-repair",
+    "note": "#835 (Codex P1): a hold kept only in memory (its flag write failed) is re-persisted by every pass before its re-PUT; otherwise a restart finds a 'pending' entry, sweeps it as residue, and the reported SEND_SYNC_PENDING send is never sent (machine-resume.test.ts 'a hold kept only in memory...'; send-intent-unknown.test.ts '(h-kvfail-restart)...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    const entry = listed.intentPut === 'unconfirmed' ? listed : await persistHold(stores, view.locals, listed);",
+    "replace": "    const entry = listed;",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "confirm-compares-pre-repair-snapshot",
+    "note": "#835: once the hold is re-persisted, ending it compares against the REPAIRED entry; judged against the pre-repair snapshot it never matches and a hold whose row completed elsewhere is never ended (machine-resume.test.ts 'a re-persisted hold whose re-PUT is refused 422 and whose row completed elsewhere ends as paid...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    const entry = listed.intentPut === 'unconfirmed' ? listed : await persistHold(stores, view.locals, listed);",
+    "replace": "    const entry = listed;\n    if (listed.intentPut !== 'unconfirmed') await persistHold(stores, view.locals, listed);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "refusal-trusts-untyped-4xx",
+    "note": "#835 (Codex P2): only wallet-api's own JSON envelope carries the pre-write guarantee; an intermediary's 4xx page (HTTP_<status>) twice must not read as a clean refusal (machine.test.ts 'an untyped 4xx (%s...) proves nothing, even twice...'; send-intent-unknown.test.ts (h) HTTP_403/HTTP_429 rows)",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  return typeof e.code === 'string' && !/^HTTP_\\d{3}$/.test(e.code);",
+    "replace": "  return typeof e.code === 'string';",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "refusal-trusts-499",
+    "note": "#835: a 499 may follow a forwarded request, so it is ambiguous even under a typed body (send-intent-unknown.test.ts (h) '499 CLIENT_CLOSED_REQUEST (typed)')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "n >= 400 && n <= 499 && n !== 408 && n !== 499;",
+    "replace": "n >= 400 && n <= 499 && n !== 408;",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "refusal-trusts-408",
+    "note": "#835: a 408 may follow a request the server already read, so it is ambiguous even under a typed body (send-intent-unknown.test.ts (h) '408 REQUEST_TIMEOUT (typed)')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "n >= 400 && n <= 499 && n !== 408 && n !== 499;",
+    "replace": "n >= 400 && n <= 499 && n !== 499;",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "gate-trusts-422-after-ambiguous",
+    "note": "#835: a 413/422 proves nothing about an EARLIER ambiguous PUT — a mixed fleet with another cap or schema may have stored it — so after one the gate parks instead of refusing clean (machine.test.ts 'a %s after an ambiguous answer says nothing about the earlier PUT...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "        if (isNeverStorable(err) && !ambiguous) return this.refuseIntent(plan.transferId, err);",
+    "replace": "        if (isNeverStorable(err)) return this.refuseIntent(plan.transferId, err);",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "converger-reconciles-stale-report",
+    "note": "#835: a payment link written while a pass ran is in none of its sets; reconciled as unaccounted it resolves paid while its send is held or being cancelled — every transferId with a local backstop entry NOW is open (send-intent-unknown.test.ts '(s-park)...' + '(s-cancel)...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "        open: [...report.failed, ...local],",
+    "replace": "        open: [...report.failed],",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "converger-rejudges-activity",
+    "note": "#835: a pass judges activity once — an id in process at any moment of the pass stays so for all of it; re-judged later, an attempt that ended mid-pass has its open entry swept, its source released and its link resolved paid (send-intent-unknown.test.ts '(s-ended)...' + '(s-unlisted)...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "      isLocallyActive: (id) => inPass.has(id),",
+    "replace": "      isLocallyActive: (id) => this.deps.activeOps.has(id),",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "partialize-zero-for-cancelling",
+    "note": "#835: a remainder attempt being cancelled owns the remainder ('0') until its cancel is confirmed: another device could still complete it, so advertising it owed invites a double payment (send-intent-unknown.test.ts '(v)...')",
+    "file": "modules/payments-v2/send-errors.ts",
+    "find": "  if (isPossiblyCommittedSendOutcome(err)) {",
+    "replace": "  if (isPossiblyCommittedSendOutcome(err) && (err as Error).message !== CANCEL_UNCONFIRMED_MESSAGE) {",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "surface-drops-cancelling-shortfall",
+    "note": "#835: the earlier shortfall rows move onto an attempt being cancelled too, and come back only once its cancel is confirmed (send-intent-unknown.test.ts '(v)...')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    if (run.delivered.length === 0 || !isPossiblyCommittedSendOutcome(err)) return partialize(err, run);",
+    "replace": "    if (run.delivered.length === 0 || !isPossiblyCommittedSendOutcome(err) || String((err as Error).message).includes('being cancelled')) return partialize(err, run);",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "emit-unguarded",
+    "note": "#835: no listener's throw reaches a money outcome — a host emit that rethrows (Node's EventEmitter) would turn a delivered send() into a raw, clean-looking rejection (send-intent-unknown.test.ts '(u)...')",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "  const deps: PaymentsFacadeDeps = { ...raw, emit: guardedEmit(raw.emit) };",
+    "replace": "  const deps: PaymentsFacadeDeps = raw;",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "facade-uses-raw-deps",
+    "note": "#835: the facade itself emits through the composed (guarded) deps — finishSend's success emit included (send-intent-unknown.test.ts '(u) a delivered send() still resolves delivered')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    this.deps = parts.deps; // #835: the composed deps, whose emit no listener's throw escapes\n",
+    "replace": "    void parts.deps;\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "confirm-reput-drops-seal",
+    "note": "#835 I9: the converger's confirm re-PUT carries the STORED requiresSeedClose; a split's row created without it refuses every progress append, so the burn's checkpoint never persists (machine-resume.test.ts 'a held SPLIT send is re-PUT sealed...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      await deps.intents.put(id, entry.payloadEnvelope, entry.requiresSeedClose);",
+    "replace": "      await deps.intents.put(id, entry.payloadEnvelope, false);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "all-ops-conflict-counts-unrun",
+    "note": "#835 I2(b): 'every op conflicted' counts the ops that never ran — a first wave of 20 conflicts leaves a 21st a later run can certify (machine.test.ts '21 legs whose first wave of 20 all conflict...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    if (outcomes.length === plan.ops.length && outcomes.every((o) => classifyError(o.error) === 'conflict')) {",
+    "replace": "    if (outcomes.every((o) => classifyError(o.error) === 'conflict')) {",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "converger-never-clears-park",
+    "note": "#835: a confirmed hold leaves the in-memory park; kept, a completed intent whose backstop removal failed is re-PUT and run again every pass instead of swept (send-intent-unknown.test.ts '(w)...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "      onHoldEnded: (id) => this.deps.parked.delete(id),\n",
+    "replace": "      // mutant: a confirmed hold stays parked in memory\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "confirm-reput-keeps-park",
+    "note": "#835: the ensure step reports a hold confirmed by a 2xx re-PUT (machine-resume.test.ts 'onHoldEnded names a held id...'; send-intent-unknown.test.ts '(w)...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    view.onHoldEnded(id);\n    view.openIds.add(id);",
+    "replace": "    view.openIds.add(id);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "confirm-listed-keeps-park",
+    "note": "#835: the ensure step reports a hold whose row the listing already shows (machine-resume.test.ts 'onHoldEnded names a held id...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      await unflag(stores, view.locals, listed); // the row is there: gateAndDecode resumes it this pass\n      view.onHoldEnded(id);\n",
+    "replace": "      await unflag(stores, view.locals, listed); // the row is there: gateAndDecode resumes it this pass\n",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "active-ops-misses-new-start",
+    "note": "#835: a pass records every money op that starts while it runs; missed, an attempt the listing could not show (its PUT landed after the list was computed) that ends mid-pass is swept, its source released and its link resolved paid (send-intent-unknown.test.ts '(s-unlisted) a pay() that starts after the pass listed...'; machine-resume.test.ts 'ActiveOps...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    for (const seen of this.passes) seen.add(id);",
+    "replace": "    void this.passes;",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "active-ops-misses-running",
+    "note": "#835: a pass's watch starts with every op already in process; missed, an unlisted attempt that was running when the pass began and ends mid-pass is swept (send-intent-unknown.test.ts '(s-unlisted-running)...'; machine-resume.test.ts 'ActiveOps...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    for (const id of this.ids) seen.add(id);",
+    "replace": "    // mutant: the ops already in process are not recorded",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "converger-post-read-drops-progress",
+    "note": "#835: an unreadable post-pass backstop skips only the reconcile; returning early drops the pass's progress and its view refresh, so the heartbeat backs off after a pass that resumed something (machine-resume.test.ts 'whose post-pass backstop read fails still reports its progress...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    if (local !== null) {",
+    "replace": "    if (local === null) return false;\n    {",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "confirm-drop-keeps-park",
+    "note": "#835: a hold the ensure step drops on a 413/422 leaves the in-memory park too (machine-resume.test.ts 'onHoldEnded names a held id...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "        view.locals.delete(id);\n        view.onHoldEnded(id); // unaccounted, so a linked request reads paid\n",
+    "replace": "        view.locals.delete(id);\n",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "restore-ends-after-repull",
+    "note": "#835: a reseed's PUT window ends with its last re-PUT; ended only after the inventory re-pull, every clean leg failure during the re-pull is held open as if a re-PUT could still land (restore.test.ts 'ends the reseed once, after every re-PUT answered and before the re-pull...')",
+    "file": "modules/payments-v2/restore.ts",
+    "find": "  } finally {\n    deps.onReseedEnd?.();\n  }\n  for (const stream of ALL_STREAMS) await deps.kv.remove(STORE_KEYS.streamCursor(stream));\n  await deps.fullRePull();\n",
+    "replace": "    for (const stream of ALL_STREAMS) await deps.kv.remove(STORE_KEYS.streamCursor(stream));\n    await deps.fullRePull();\n  } finally {\n    deps.onReseedEnd?.();\n  }\n",
+    "tests": [
+      "tests/unit/payments-v2/restore.test.ts"
+    ]
+  },
+  {
+    "name": "surface-drops-held-shortfall",
+    "note": "#835: the rows a held later attempt owns move onto its entry instead of being deleted; deleted, a hold later refused (413/422) or conflicted leaves the remainder recorded nowhere while the caller was told '0' (send-intent-unknown.test.ts '(x-refused)...' + '(x-conflict)...')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    await holdShortfalls(this.machineStores, run.settledShortfalls.splice(0), ctx.transferId).catch(() => undefined);",
+    "replace": "    for (const id of run.settledShortfalls.splice(0)) await this.machineStores.shortfalls.removeByKey(id).catch(() => undefined);",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-forgets-owed",
+    "note": "#835: a held attempt that conflicts on resume hands what it owed back to the shortfall store before its entry goes (send-intent-unknown.test.ts '(x-conflict)...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      await releaseOwed(stores, await stores.backstop.getByKey(transferId)); // #835: its remainder is owed again\n",
+    "replace": "      // mutant: what it owed is not handed back\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "pending-lists-held-shortfall",
+    "note": "#835: a shortfall row a later attempt holds is listed as that attempt's open row, never also as owed, even when its removal from the shortfall store failed (send-intent-unknown.test.ts '(x-listed-once)...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    if (!seen.has(entry.transferId) && !held.has(entry.transferId)) out.push(shortfallRow(entry));",
+    "replace": "    if (!seen.has(entry.transferId)) out.push(shortfallRow(entry));",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "gc-cancel-unreported",
+    "note": "#835: a tombstone whose cancel the aborted listing confirms (or a typed 404) is reported conflicted and hands back what it held; read as completed, a link stays paid for nothing (machine-resume.test.ts 'a confirmed cancel hands back what the tombstone held...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);",
+    "replace": "      if (outcome !== 'unknown') await retire(stores, entry, false, report);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "complete-keeps-held-copy",
+    "note": "#835: a holder that completed paid what it held, so a copy of a held row that a failed removal left in the shortfall store goes before its entry; kept, the paid remainder is listed as owed again once the entry is gone (send-intent-unknown.test.ts '(x-paid-leftover)...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      await settleOwed(this.stores, await this.stores.backstop.getByKey(transferId));\n",
+    "replace": "      // mutant: a leftover copy of a held row survives the completion\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-keeps-held-copy",
+    "note": "#835: the S1 sweep of a completed holder removes a leftover copy of its held rows before the entry (send-intent-unknown.test.ts '(x-swept-leftover)...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  await (refused ? releaseOwed(stores, entry) : settleOwed(stores, entry));",
+    "replace": "  await (refused ? releaseOwed(stores, entry) : undefined);",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "ack-failure-proceeds",
+    "note": "#835: a 2xx whose ack write failed parks the send instead of running its legs; run on an entry still reading 'pending', a backend reset's re-seed skips it and S1 sweeps it, losing the recovery of what certified (send-intent-unknown.test.ts '(z)...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      return this.parkIntent(transferId, err); // no op runs on an entry the reseed and S1 read as never acked\n",
+    "replace": "      void err;\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "hold-failure-keeps-rows",
+    "note": "#835: a hold whose attach write failed still takes the rows out of the shortfall store; kept, they are listed as owed while the attempt may still pay them, and stay listed after it does (send-intent-unknown.test.ts '(x-hold-failed)...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  if (rows.length > 0) await stores.backstop.patch(holder, (e) => ({ ...e, owes: [...(e.owes ?? []), ...rows] })).catch(() => undefined);\n  for (const id of ids) await stores.shortfalls.removeByKey(id);",
+    "replace": "  const held = rows.length > 0 ? await stores.backstop.patch(holder, (e) => ({ ...e, owes: [...(e.owes ?? []), ...rows] })).catch(() => undefined) : undefined;\n  if (held === undefined) return;\n  for (const id of ids) await stores.shortfalls.removeByKey(id);",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "handoff-after-release",
+    "note": "#835: a failed attempt's error is shaped, and its shortfall handoff run, while the attempt is still in process; released first, a pass can adopt the held attempt mid-handoff and conflict it, and the remainder is recorded nowhere while the caller is told '0' (send-intent-unknown.test.ts '(x-race)...')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "      const disposition = await this.disposeFailedAttempt(ctx, err); // #835: shaped in process \u2014 no pass adopts it mid-handoff\n",
+    "replace": "      const disposition = await this.disposeFailedAttempt(ctx, err);\n      this.activeMoneyOps.delete(ctx.transferId);\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "refused-hold-trusts-closed-listing",
+    "note": "#835: a held send's 413/422 re-PUT never probes a row that is still open: kept, the next pass resumes it; probed, the abort cancels an intent a mixed fleet stored and the send is reported conflicted (machine-resume.test.ts 'a 413/422 on the re-PUT does not drop a held send whose row a listing taken after it shows...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (open === null || open.some((i) => i.transferId === id)) return false;",
+    "replace": "  if (open === null) return false;",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "refused-hold-assumes-refused",
+    "note": "#835: a row absent from the open listing may have completed on another device; read as refused, an already-paid request is made payable again (machine-resume.test.ts 'a 413/422 on the re-PUT of a held send another device completed...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  if (listed(aborted)) return 'aborted';",
+    "replace": "  if (aborted.length >= 0) return 'aborted';",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "refused-hold-probe-failure-refuses",
+    "note": "#835: a 413/422 on a held send's re-PUT ends the hold only when its row completed elsewhere; a 404 or an aborted row proves only present absence while the earlier ambiguous PUT may still land (machine-resume.test.ts 'a 422 on the re-PUT of a held send with no row keeps the hold...'; send-intent-unknown.test.ts '(h-422)')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  return (await abortAndConfirm(deps.intents, id, (err) => noteWait(report, err))) === 'completed';",
+    "replace": "  return (await abortAndConfirm(deps.intents, id, (err) => noteWait(report, err))) !== 'unknown';",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "completed-hold-releases",
+    "note": "#835: a hold another device completed paid what it held: its rows are settled, never handed back as owed (machine-resume.test.ts 'a 413/422 on the re-PUT of a held send another device completed...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  await settleOwed(stores, entry);\n  return stores.backstop.removeIfUnchanged(entry.transferId, entry);",
+    "replace": "  await releaseOwed(stores, entry);\n  return stores.backstop.removeIfUnchanged(entry.transferId, entry);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "never-storable-trusts-untyped-422",
+    "note": "#835: a 422 proves the bytes unstorable only in wallet-api's envelope; an untyped one may come from a hop that forwarded the request first (machine.test.ts 'an untyped 4xx (422 HTTP_422 ...)'; send-intent-unknown.test.ts (h) 422 HTTP_422 row; machine-resume.test.ts 'an untyped 422 on the re-PUT ...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  return e.status === 413 || e.statusCode === 413 || (isValidationReject(err) && isWrittenByWalletApi(e));",
+    "replace": "  return e.status === 413 || e.statusCode === 413 || isValidationReject(err);",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "never-storable-requires-typed-413",
+    "note": "#835: any 413 judges the bytes, since the hop that receives the body answers it while receiving it (send-intent-unknown.test.ts (g) 413 HTTP_413 rows; machine-resume.test.ts 'an untyped 413 on the re-PUT ...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  return e.status === 413 || e.statusCode === 413 || (isValidationReject(err) && isWrittenByWalletApi(e));",
+    "replace": "  return ((e.status === 413 || e.statusCode === 413) && isWrittenByWalletApi(e)) || (isValidationReject(err) && isWrittenByWalletApi(e));",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "intent-write-any-2xx",
+    "note": "#835: an intent write counts only the route's exact success status; any other 2xx is PROTOCOL (intent-write-ack.test.ts)",
+    "file": "impl/wallet-api-v2/http.ts",
+    "find": "    if (res.ok && opts?.expectStatus !== undefined && res.status !== opts.expectStatus) {",
+    "replace": "    if (res.ok && opts?.expectStatus !== undefined && res.status === 0) {",
+    "tests": [
+      "tests/unit/payments-v2/intent-write-ack.test.ts"
+    ]
+  },
+  {
+    "name": "intent-put-any-2xx",
+    "note": "#835: the intent PUT asks for wallet-api's 204, so a gateway's 200 never reads as a stored row (intent-write-ack.test.ts)",
+    "file": "impl/wallet-api-v2/client.ts",
+    "find": "    await this.http.request('PUT', `/v1/intents/${transferId}`, body, INTENT_WRITE);",
+    "replace": "    await this.http.request('PUT', `/v1/intents/${transferId}`, body);",
+    "tests": [
+      "tests/unit/payments-v2/intent-write-ack.test.ts"
+    ]
+  },
+  {
+    "name": "intent-abort-any-2xx",
+    "note": "#835: the abort asks for wallet-api's 204, so a gateway's 200 never reads as a confirmed cancel (intent-write-ack.test.ts)",
+    "file": "impl/wallet-api-v2/client.ts",
+    "find": "    await this.http.request('POST', `/v1/intents/${transferId}/abort`, undefined, INTENT_WRITE);",
+    "replace": "    await this.http.request('POST', `/v1/intents/${transferId}/abort`);",
+    "tests": [
+      "tests/unit/payments-v2/intent-write-ack.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-aborted-reads-completed",
+    "note": "#835: an entry whose row is aborted moved nothing; settled as completed, what it held is erased and a link reads paid (machine-resume.test.ts 'the sweep of an entry whose row is no longer open tells completed from aborted')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    await retire(stores, entry, listed.aborted.has(id), report);",
+    "replace": "    await retire(stores, entry, false, report);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-unreadable-listing-settles",
+    "note": "#835: without the aborted listing the sweep cannot tell completed from aborted, so it keeps the entry (machine-resume.test.ts 'an unreadable aborted listing keeps the entry...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    if (listed === null || listed.open.has(id)) continue;",
+    "replace": "    if (listed === null) listed = { aborted: new Set<string>(), open: new Set<string>() };",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-aborted-not-conflicted",
+    "note": "#835: a swept entry whose row is aborted is reported conflicted, so a link to it is payable again (machine-resume.test.ts 'an acked entry whose row another device aborted is conflicted...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if ((await stores.backstop.removeIfUnchanged(entry.transferId, entry)) && refused) report.conflicted.push(entry.transferId);",
+    "replace": "  await stores.backstop.removeIfUnchanged(entry.transferId, entry);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-aborted-rows-dropped",
+    "note": "#835: what an aborted holder held is owed again, never left only on the entry the sweep removes (machine-resume.test.ts 'an acked entry whose row another device aborted...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  await (refused ? releaseOwed(stores, entry) : settleOwed(stores, entry));",
+    "replace": "  await (refused ? undefined : settleOwed(stores, entry));",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "abort-unread-listing-confirms",
+    "note": "#835: a 204 abort is confirmed only by the aborted listing; while it cannot be read the cancel stays unconfirmed (machine.test.ts 'a clean leg failure whose aborted listing cannot be read...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  if (aborted === null) return 'unknown';",
+    "replace": "  if (aborted === null) return 'aborted';",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "fence-completed-elsewhere-clean",
+    "note": "#835: a 204 abort of a row another device completed is a no-op; reported clean, the caller re-pays a payment that was made (machine.test.ts 'a clean leg failure whose row another device completed...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    if (outcome === 'unknown' || outcome === 'completed') return CANCEL_UNCONFIRMED_MESSAGE;",
+    "replace": "    if (outcome === 'unknown') return CANCEL_UNCONFIRMED_MESSAGE;",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "abort-reopened-read-completed",
+    "note": "#835: a row in neither listing completed; one a byte-equal re-PUT re-opened between the abort and the listing is in the open one and must stay unconfirmed, never settle a link as paid (machine-resume.test.ts 'a tombstone whose row a byte-equal re-PUT re-opens...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  return open === null || listed(open) ? 'unknown' : 'completed';",
+    "replace": "  return open === null ? 'unknown' : 'completed';",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "unclosed-partial-heartbeat-idle",
+    "note": "#835: a partial applied but not closed leaves its intent for a later pass; with no deposit owed, only this arms the heartbeat, so an idle wallet never closes it (heartbeat.test.ts 'a partial send applied but not closed arms the heartbeat...')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    if (disposition.deliveryPending || disposition.final) this.heartbeat.arm();",
+    "replace": "    if (disposition.deliveryPending) this.heartbeat.arm();",
+    "tests": [
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "emit-guard-log-escapes",
+    "note": "#835: the emit guard's own warning must not escape either; a log sink that throws while recording a listener's throw would otherwise turn a delivered send() into a raw rejection (send-intent-unknown.test.ts '(u) ... when the log sink that records the listener throw throws too')",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "      try {\n        logger.warn('PaymentsV2', `a '${event}' listener threw; the event is dropped, the operation unaffected:`, err);\n      } catch {\n        // A log sink that throws must not reach the money outcome either.\n      }\n",
+    "replace": "      logger.warn('PaymentsV2', `a '${event}' listener threw; the event is dropped, the operation unaffected:`, err);\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-reopened-read-completed",
+    "note": "#835: the sweep re-reads the open listing; a row a byte-equal re-PUT re-opened after the pass listed it is open again, never settled as completed (machine-resume.test.ts 'an acked entry whose row a byte-equal re-PUT re-opens after the pass listed it...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    if (listed === null || listed.open.has(id)) continue;",
+    "replace": "    if (listed === null) continue;",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "retry-after-dropped",
+    "note": "#835: a failed intent's Retry-After rides the pass report; dropped, the heartbeat retries a rate-limited held send on its own short schedule (machine-resume.test.ts 'hands the heartbeat the longest Retry-After...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (wait !== null) report.retryAfterMs = Math.max(report.retryAfterMs ?? 0, wait);",
+    "replace": "  void wait;",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "converger-ignores-pass-retry-after",
+    "note": "#835: the pass report's Retry-After reaches the heartbeat through convergeOnce (machine-resume.test.ts 'hands the heartbeat the longest Retry-After...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    return { progress, retryAfterMs: report.retryAfterMs ?? null };",
+    "replace": "    return { progress, retryAfterMs: null };",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "retry-after-first-wins",
+    "note": "#835: convergeOnce waits out the LONGEST Retry-After of the resume pass and the journal replays; keeping the first, a 60 s resume backoff hides a 300 s replay one (machine-resume.test.ts 'waits out the longest Retry-After of the pass and the journal replays...')",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "      if (ms !== null) retryAfterMs = Math.max(retryAfterMs ?? 0, ms); // the longest any phase was asked",
+    "replace": "      if (ms !== null) retryAfterMs ??= ms;",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "hold-read-failure-keeps-rows",
+    "note": "#835: a handoff whose read of the shortfall store fails still removes the rows by id; kept, they are listed as owed while the held attempt may still pay them (send-intent-unknown.test.ts '(x-read-failed)...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  for (const id of ids) await stores.shortfalls.removeByKey(id);",
+    "replace": "  for (const row of rows) await stores.shortfalls.removeByKey(row.transferId);",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "abort-confirm-drops-retry-after",
+    "note": "#835: an abort answered with a Retry-After reaches the pass report through onError; dropped, the heartbeat retries the cancel before the server allows (machine-resume.test.ts 'a tombstone listed open whose abort answers 429 with Retry-After...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "    onError(err);\n    return 'unknown';",
+    "replace": "    return 'unknown';",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-shares-one-snapshot",
+    "note": "#835: each stale entry is judged by listings read for it; one snapshot shared across the sweep judges a row re-opened while an earlier entry is retired as aborted, hands back what it holds and deletes its only record (machine-resume.test.ts 'each entry is judged by listings read for it...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  for (const entry of view.locals.values()) {\n    const id = entry.transferId;\n    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);\n      continue;\n    }\n    if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it\n    if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;\n    // Read for each entry: a byte-equal re-PUT may re-open a row while an earlier one is retired.\n    const listed = await freshListings(intents, report);\n",
+    "replace": "  let shared: Awaited<ReturnType<typeof freshListings>> | undefined;\n  for (const entry of view.locals.values()) {\n    const id = entry.transferId;\n    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);\n      continue;\n    }\n    if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it\n    if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;\n    // Read for each entry: a byte-equal re-PUT may re-open a row while an earlier one is retired.\n    const listed = (shared ??= await freshListings(intents, report));\n",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
     ]
   }
 ]
