@@ -3364,5 +3364,15 @@
     "tests": [
       "tests/unit/payments-v2/heartbeat.test.ts"
     ]
+  },
+  {
+    "name": "emit-guard-log-escapes",
+    "note": "#835: the emit guard's own warning must not escape either; a log sink that throws while recording a listener's throw would otherwise turn a delivered send() into a raw rejection (send-intent-unknown.test.ts '(u) ... when the log sink that records the listener throw throws too')",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "      try {\n        logger.warn('PaymentsV2', `a '${event}' listener threw; the event is dropped, the operation unaffected:`, err);\n      } catch {\n        // A log sink that throws must not reach the money outcome either.\n      }\n",
+    "replace": "      logger.warn('PaymentsV2', `a '${event}' listener threw; the event is dropped, the operation unaffected:`, err);\n",
+    "tests": [
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
   }
 ]

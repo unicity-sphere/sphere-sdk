@@ -235,7 +235,11 @@ function guardedEmit(emit: PaymentsFacadeDeps['emit']): PaymentsFacadeDeps['emit
     try {
       emit(event, payload);
     } catch (err) {
-      logger.warn('PaymentsV2', `a '${event}' listener threw; the event is dropped, the operation unaffected:`, err);
+      try {
+        logger.warn('PaymentsV2', `a '${event}' listener threw; the event is dropped, the operation unaffected:`, err);
+      } catch {
+        // A log sink that throws must not reach the money outcome either.
+      }
     }
   };
 }

@@ -39,6 +39,7 @@ import * as MESSAGES from '../../../modules/payments-v2/send-errors';
 import type { MachineStores } from '../../../modules/payments-v2/machine/journal';
 import { STORE_KEYS, type IntentBackstopEntry, type ShortfallEntry } from '../../../modules/payments-v2/stores';
 import { hexToBytes } from '../../../core/crypto';
+import { logger } from '../../../core/logger';
 import { RealizationEngine } from './machine-harness';
 import {
   COIN,
@@ -2018,6 +2019,26 @@ describe('#835 (u) a host emit that rethrows a listener error', () => {
 
     expect(result.status).toBe('delivered');
     expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
+  });
+
+  it('a delivered send() still resolves delivered when the log sink that records the listener throw throws too', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await startSettled(world);
+    throwingListener(world, ['transfer:updated']);
+    logger.configure({
+      handler: () => {
+        throw new Error('log sink blew up');
+      },
+    });
+    try {
+      const result = await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN });
+
+      expect(result.status).toBe('delivered');
+      expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
+    } finally {
+      logger.configure({ handler: null });
+    }
   });
 
   it('requests.pay() over a delivered send still ends paid', async () => {
