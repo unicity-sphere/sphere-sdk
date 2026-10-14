@@ -769,6 +769,53 @@ describe('resume confirms a parked intent before it resumes or sweeps anything (
   });
 });
 
+describe('a cancel counts only once the aborted listing shows its row: an abort of a completed row is a no-op 204 (#835)', () => {
+  it('a tombstone whose row another device completed is removed as paid, never conflicted', async () => {
+    const w = makeWorld();
+    await w.api.putIntent(w.caller, { transferId: 'paid-elsewhere', payload: openEntry('paid-elsewhere').payloadEnvelope });
+    await w.api.completeIntent(w.caller, { transferId: 'paid-elsewhere' });
+    await w.stores().backstop.upsert(openEntry('paid-elsewhere', { disposition: 'abortPending' }));
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [] });
+    expect(await w.stores().backstop.getByKey('paid-elsewhere')).toBeUndefined();
+    expect(w.api.inspectIntent(w.caller, 'paid-elsewhere')?.status).toBe('completed');
+  });
+
+  it('a tombstone whose aborted listing cannot be read is kept, and reported once the listing reads', async () => {
+    const w = makeWorld();
+    await w.api.putIntent(w.caller, { transferId: 'cancelled', payload: openEntry('cancelled').payloadEnvelope });
+    await w.api.abortIntent(w.caller, 'cancelled');
+    await w.stores().backstop.upsert(openEntry('cancelled', { disposition: 'abortPending' }));
+    w.overrides.listAborted = async () => {
+      throw new FakeApiError(503, 'UNAVAILABLE', 'intent store down');
+    };
+
+    expect(await resumeAll(w.deps)).toEqual({ resumed: [], conflicted: [], failed: [] });
+    expect((await w.stores().backstop.getByKey('cancelled'))?.disposition).toBe('abortPending');
+
+    delete w.overrides.listAborted;
+    expect(await resumeAll(w.deps)).toEqual({ resumed: [], conflicted: ['cancelled'], failed: [] });
+    expect(await w.stores().backstop.getByKey('cancelled')).toBeUndefined();
+  });
+
+  it('a locally aborted intent listed open that another device completes before the abort lands is not conflicted', async () => {
+    const w = makeWorld();
+    await w.api.putIntent(w.caller, { transferId: 'raced', payload: openEntry('raced').payloadEnvelope });
+    await w.stores().backstop.upsert(openEntry('raced', { disposition: 'abortPending' }));
+    w.overrides.abort = async () => {
+      await w.api.completeIntent(w.caller, { transferId: 'raced' }); // lands between the listing and the abort
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [] });
+    expect(await w.stores().backstop.getByKey('raced')).toBeUndefined();
+    expect(w.api.inspectIntent(w.caller, 'raced')?.status).toBe('completed');
+  });
+});
+
 describe('the sweep of an entry whose row is no longer open tells completed from aborted (#835)', () => {
   const owed = { transferId: 'earlier', remainingAmount: '400', coinId: COIN, recipient: 'aa', committedTokenIds: [], createdAt: 1 };
 

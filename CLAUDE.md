@@ -864,7 +864,8 @@ authoritative for build success.
   convergence is possibly-committed. The #690 shortfall is durable before ANY apply, because the
   apply completes an unflagged intent. A nothing-certified failure is clean only when every op
   conflicted, or when a durable abort tombstone was written AND the server confirmed the abort
-  (`204`, or a typed 404 `NOT_FOUND`; any other 2xx confirms nothing) with no PUT of the id still
+  (a `204` the aborted listing then confirms, since an abort of a row another device completed is
+  a no-op `204` too; or a typed 404 `NOT_FOUND`; any other 2xx confirms nothing) with no PUT of the id still
   able to land (no ambiguous gate answer, and no epoch re-seed that started during the attempt or is still re-PUTting when it fails — one that started
   earlier may list the acked entry late and re-PUT it; a re-seed counts as active until its last
   re-PUT answered, before its cursor reset and re-pull); otherwise it is possibly-committed. An
@@ -1086,8 +1087,9 @@ authoritative for build success.
   `'open'` entry (accepted downgrade window: it may sweep a held send whose PUT never landed —
   an under-payment, never a double pay). Every backstop GC removal is compare-and-delete
   (`ListStore.removeIfUnchanged`), and a tombstone is removed only after the server answers its
-  abort `204` or 404 `NOT_FOUND`, and is then reported `conflicted` (a linked request is payable
-  again). An `'open'` entry whose row is no longer open is judged by the aborted listing: aborted
+  abort `204` and the aborted listing shows the row, or 404 `NOT_FOUND`, and is then reported
+  `conflicted` (a linked request is payable again); a `204` for a row the listing does not show
+  was completed elsewhere, so the tombstone goes as paid, never conflicted. An `'open'` entry whose row is no longer open is judged by the aborted listing: aborted
   (it moved nothing) hands back what it held and is reported `conflicted`, absent from both listings
   settles as paid, and an unreadable listing keeps the entry. A second optional field, `owes?: ShortfallEntry[]`, carries the #690 shortfall rows a
   later attempt of a partial send holds (see the error contract above); an older client ignores it,

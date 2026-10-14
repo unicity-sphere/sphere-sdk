@@ -10,9 +10,9 @@ import { isWholeIntent } from './payload-view';
 import type { CoinIntentPayload, IntentPayload, WholeIntentPayload } from './types';
 import {
   ATTENTION_CHECKPOINT_STUCK,
+  abortAndConfirm,
   createMachineStores,
   isNeverStorable,
-  isUnknownIntent,
   releaseOwed,
   settleOwed,
   type MachineStores,
@@ -147,15 +147,10 @@ async function confirmUnconfirmed(
 /** #835: a 413/422 says nothing of a held send's earlier PUT (a mixed fleet may have stored it): an open
  *  row is kept for the next pass; else the abort probes it — 404 never stored, aborted, or completed. */
 async function judgeRefusedHold(deps: MachineDeps, id: string): Promise<'unknown' | 'refused' | 'completed'> {
-  try {
-    if ((await deps.intents.listOpen()).some((i) => i.transferId === id)) return 'unknown';
-    await deps.intents.abort(id);
-  } catch (err) {
-    return isUnknownIntent(err) ? 'refused' : 'unknown';
-  }
-  const aborted = await deps.intents.listAborted().catch(() => null);
-  if (aborted === null) return 'unknown';
-  return aborted.some((i) => i.transferId === id) ? 'refused' : 'completed';
+  const open = await deps.intents.listOpen().catch(() => null);
+  if (open === null || open.some((i) => i.transferId === id)) return 'unknown';
+  const outcome = await abortAndConfirm(deps.intents, id);
+  return outcome === 'unknown' || outcome === 'completed' ? outcome : 'refused';
 }
 
 async function endHold(stores: MachineStores, entry: IntentBackstopEntry, paid: boolean): Promise<boolean> {
@@ -211,13 +206,10 @@ async function dropStaleBackstops(
     const id = entry.transferId;
     if (view.openIds.has(id) || view.isLocallyActive(id)) continue;
     if (entry.disposition !== 'open') {
-      try {
-        await intents.abort(id);
-      } catch (err) {
-        if (!isUnknownIntent(err)) continue;
-      }
-      // A confirmed cancel of an attempt that certified nothing: conflicted, so a link to it is payable again.
-      if (await stores.backstop.removeIfUnchanged(id, entry)) report.conflicted.push(id);
+      const outcome = await abortAndConfirm(intents, id);
+      if (outcome === 'unknown') continue;
+      // A confirmed cancel moved nothing (conflicted: a link is payable again); a completed row was paid elsewhere.
+      if ((await stores.backstop.removeIfUnchanged(id, entry)) && outcome !== 'completed') report.conflicted.push(id);
       continue;
     }
     if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it
@@ -249,17 +241,11 @@ async function gateAndDecode(
   for (const intent of open) {
     const local = locals.get(intent.transferId);
     if (local !== undefined && local.disposition !== 'open') {
-      // #676: a locally-aborted intent is NEVER resumed — converge the server. Conflicted
-      // only once the server confirmed the abort (#835): until then another device of
-      // this wallet could still run the open row, so a payment link stays settling.
-      let aborted = true;
-      try {
-        await deps.intents.abort(intent.transferId);
-      } catch {
-        aborted = false; // stays locally aborted; converged at the next resume
-      }
-      if (aborted) await stores.backstop.removeByKey(intent.transferId).catch(() => undefined);
-      (aborted ? report.conflicted : report.failed).push(intent.transferId);
+      // #676: never resumed. Conflicted only once the cancel is confirmed (#835): until then another device could run it.
+      const outcome = await abortAndConfirm(deps.intents, intent.transferId);
+      if (outcome === 'unknown') report.failed.push(intent.transferId);
+      else await stores.backstop.removeByKey(intent.transferId).catch(() => undefined);
+      if (outcome === 'aborted' || outcome === 'never-stored') report.conflicted.push(intent.transferId);
       continue;
     }
     let payload: IntentPayload;

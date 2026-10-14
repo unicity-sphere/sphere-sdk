@@ -843,6 +843,43 @@ describe('TransferMachine intent PUT gate (#835)', () => {
     expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
   });
 
+  it('a clean leg failure whose row another device completed before the abort is not clean: the 204 is a no-op', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    w.engine.beforeOp = () => {
+      throw new Error('clean reject');
+    };
+    w.overrides.abort = async () => {
+      await w.api.completeIntent(w.caller, { transferId: plan.transferId }); // completion wins over the abort
+    };
+
+    const err = await rejectionOf(w.machine().run(plan));
+
+    expect(err).toMatchObject({ code: 'SEND_SYNC_PENDING', transferId: plan.transferId });
+    expect((err as SphereError).message).toBe(CANCEL_UNCONFIRMED_MESSAGE);
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('completed');
+    expect((await w.stores().backstop.getByKey(plan.transferId))?.disposition).toBe('abortPending');
+  });
+
+  it('a clean leg failure whose aborted listing cannot be read after the abort is not clean', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    w.engine.beforeOp = () => {
+      throw new Error('clean reject');
+    };
+    w.overrides.listAborted = async () => {
+      throw new FakeApiError(503, 'UNAVAILABLE', 'intent store down');
+    };
+
+    const err = await rejectionOf(w.machine().run(plan));
+
+    expect(err).toMatchObject({ code: 'SEND_SYNC_PENDING', transferId: plan.transferId });
+    expect((err as SphereError).message).toBe(CANCEL_UNCONFIRMED_MESSAGE);
+    expect((await w.stores().backstop.getByKey(plan.transferId))?.disposition).toBe('abortPending');
+  });
+
   it('a clean leg failure whose abort is answered by a 2xx other than 204 is not confirmed: being cancelled, row open', async () => {
     const w = makeWorld();
     const token = await w.seed(1000n);

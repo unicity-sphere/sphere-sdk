@@ -494,8 +494,10 @@ Normative behaviors bound into the transitions (not call sites):
   attempt is clean and the machine never aborts. A nothing-certified failure after the PUT was acked
   is reported clean in only two cases. The first is that every planned op conflicted, which is
   deterministic: a re-run conflicts again, so the abort is best-effort. The second is that a durable
-  `abortPending` tombstone was written, the server answered its abort `204` or 404 `NOT_FOUND` (any
-  other 2xx confirms nothing: something other than the route may have answered), and no
+  `abortPending` tombstone was written, the server answered its abort `204` and its aborted listing
+  then shows the row, or answered 404 `NOT_FOUND` (any other 2xx confirms nothing: something other
+  than the route may have answered; and an abort of a row another device completed is a no-op
+  `204`, since completion wins), and no
   other PUT of that `transferId` from this client can still land: the gate saw no ambiguous answer,
   no epoch re-seed started during the attempt, and none is still re-PUTting when it fails (one that
   started earlier may list the acked entry late and re-PUT it). A late PUT would re-open the aborted row,
@@ -509,8 +511,9 @@ Normative behaviors bound into the transitions (not call sites):
     later pass, and reports it `conflicted` only once that abort is confirmed, so a linked payment
     request stays `settling` until then and turns payable after. `pendingTransfers()` does not list
     it (an `abortPending` entry is a rollback, not a pending send).
-  A tombstone is removed only after the server answers its abort `204` or 404 `NOT_FOUND`, and never
-  while the id is locally active (§7). Until then the #676 gate keeps the intent from ever resuming.
+  A tombstone is removed only after the server confirms its abort (a `204` the aborted listing
+  confirms, or 404 `NOT_FOUND`); one whose row the listing does not show was completed on another
+  device and goes as paid, never conflicted. It is never removed while the id is locally active (§7). Until then the #676 gate keeps the intent from ever resuming.
 - **E.4 (the most loss-prone flow — every step is a machine transition, test-pinned):** no mint
   submit before its checkpoint is durably server-acked **and read back** — a `put()` rejection
   raises `CheckpointPersistFailedError` with **zero** mint submits (keep-open; burn certified,
@@ -909,7 +912,8 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
   3. The S1 GC. It checks local activity first, so an entry whose machine is running in-process
      is never touched. That closes the race in which the GC dropped the `abortPending` tombstone
      an active attempt had just written. It removes a tombstone only after the server answers its
-     abort `204` or 404 `NOT_FOUND`, and it skips held entries. Every removal is compare-and-delete
+     abort `204` and the aborted listing shows the row (conflicted), or the listing does not
+     (completed elsewhere: paid), or 404 `NOT_FOUND` (conflicted), and it skips held entries. Every removal is compare-and-delete
      against the exact snapshot it judged (`ListStore.removeIfUnchanged`, serialized with every
      other read-modify-write of the store), so a park or a fence that lands meanwhile is never
      lost to a stale read. An `'open'` entry whose row is no longer open completed or was aborted
@@ -1078,7 +1082,7 @@ settled-only accounting with keep-open > conflict > other; keep-open family neve
 clean-means-fenced — a clean report needs nothing certified and nothing this device holds able to
 execute the intent (the PUT was refused, every op conflicted, or the server confirmed the abort
 of a durably tombstoned intent with no PUT of that id still able to land), else possibly-committed, and any failure after
-a certified leg is possibly-committed (#835); tombstones removed only on a server abort `204`/404 and
+a certified leg is possibly-committed (#835); tombstones removed only on a server abort `204` the aborted listing confirms, or a 404, and
 never while locally active, every GC removal compare-and-delete (#835); shortfall-before-apply —
 `run()` applies only a fully settled attempt, any other attempt is applied only by resume after its
 shortfall row is durable (#835); conflict-never-masks — a conflict is thrown only when nothing

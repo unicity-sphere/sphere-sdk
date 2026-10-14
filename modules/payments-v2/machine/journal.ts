@@ -86,6 +86,23 @@ export function isUnknownIntent(err: unknown): boolean {
   return (e.status ?? e.statusCode) === 404 && e.code === 'NOT_FOUND';
 }
 
+export type AbortOutcome = 'aborted' | 'never-stored' | 'completed' | 'unknown';
+
+/** #835: an abort is a no-op 204 on a row another device completed, so only the aborted listing proves a cancel. */
+export async function abortAndConfirm(
+  intents: { abort(id: string): Promise<void>; listAborted(): Promise<{ transferId: string }[]> },
+  transferId: string
+): Promise<AbortOutcome> {
+  try {
+    await intents.abort(transferId);
+  } catch (err) {
+    return isUnknownIntent(err) ? 'never-stored' : 'unknown';
+  }
+  const aborted = await intents.listAborted().catch(() => null);
+  if (aborted === null) return 'unknown';
+  return aborted.some((row) => row.transferId === transferId) ? 'aborted' : 'completed';
+}
+
 /**
  * Duck-typed `WalletApiHttpError.retryAfter` (milliseconds) — modules never
  * import from impl/, so the heartbeat honors the header structurally.

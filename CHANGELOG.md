@@ -41,8 +41,10 @@ What changed:
   durable before any inventory apply. A clean report now also requires that nothing on this device
   can later execute the intent (no ambiguous PUT answer, no epoch re-seed that started during the
   attempt or is still re-PUTting when it fails) and, when it was cancelled, that the service
-  confirmed the cancel; a failed attempt that cannot meet that is reported `SEND_SYNC_PENDING` with
-  its transferId.
+  confirmed the cancel: an abort's `204` counts only once the aborted listing shows the row,
+  because an abort of a row another device already completed is a no-op `204` too. A failed attempt
+  that cannot meet that is reported `SEND_SYNC_PENDING` with its transferId, and one completed
+  elsewhere is later resolved paid, never made payable again.
 - A convergence pass treats a send in process at any moment of the pass, including one started
   after the pass listed the open intents, as running for the whole pass, so the pass never sweeps or
   resumes it. It reconciles payment links against the local intent store as it is after the pass,

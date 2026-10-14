@@ -30,11 +30,11 @@ import type { IntentPayload, OpOutcome, OutcomeClass, PlannedOp } from './types'
 import {
   ATTENTION_DELIVERY_DEFERRED,
   RATE_LIMIT_DEFER_MS,
+  abortAndConfirm,
   createMachineStores,
   isNeverStorable,
   isPreWriteRefusal,
   isRateLimited,
-  isUnknownIntent,
   senderNametagOption,
   settleOwed,
   type AttentionEmitter,
@@ -387,12 +387,8 @@ export class TransferMachine {
       /* no tombstone: leave the intent OPEN so the possibly-committed report converges */
     }
     if (!tombstoned) return NOT_FENCED_MESSAGE;
-    try {
-      await this.deps.intents.abort(transferId);
-    } catch (err) {
-      // The row is open: the #676 gate aborts it here, but another device of this wallet could run it first.
-      if (!isUnknownIntent(err)) return CANCEL_UNCONFIRMED_MESSAGE;
-    }
+    const outcome = await abortAndConfirm(this.deps.intents, transferId); // until then another device could run it
+    if (outcome === 'unknown' || outcome === 'completed') return CANCEL_UNCONFIRMED_MESSAGE;
     try {
       await this.stores.backstop.removeByKey(transferId);
     } catch {

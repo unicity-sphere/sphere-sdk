@@ -2565,10 +2565,10 @@
   },
   {
     "name": "dropstale-trusts-listing-for-tombstones",
-    "note": "#835: an unlisted tombstone goes only after its abort answers 2xx or 404 NOT_FOUND; a listing that omits the row is no proof the row cannot run (machine-resume.test.ts 'an unlisted tombstone whose abort answers %s is kept'; send-intent-unknown.test.ts (p))",
+    "note": "#835: an unlisted tombstone goes only after its abort answers 204 the aborted listing confirms, or 404 NOT_FOUND; a listing that omits the row is no proof the row cannot run (machine-resume.test.ts 'an unlisted tombstone whose abort answers %s is kept'; send-intent-unknown.test.ts (p))",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "      try {\n        await intents.abort(id);\n      } catch (err) {\n        if (!isUnknownIntent(err)) continue;\n      }\n",
-    "replace": "      // mutant: the tombstone goes without the server's word\n",
+    "find": "      const outcome = await abortAndConfirm(intents, id);\n      if (outcome === 'unknown') continue;\n",
+    "replace": "      const outcome = (await abortAndConfirm(intents, id).catch(() => 'unknown')) && 'aborted';\n",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
@@ -2588,8 +2588,8 @@
     "name": "dropstale-active-after-tombstone",
     "note": "#835: the in-process check runs BEFORE the tombstone branch (HEAD ran it after), so a pass never aborts or drops the tombstone of an attempt still running here (machine-resume.test.ts 'a tombstone of an in-process attempt is untouched...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      try {\n        await intents.abort(id);\n      } catch (err) {\n        if (!isUnknownIntent(err)) continue;\n      }\n      // A confirmed cancel of an attempt that certified nothing: conflicted, so a link to it is payable again.\n      if (await stores.backstop.removeIfUnchanged(id, entry)) report.conflicted.push(id);\n      continue;\n    }\n",
-    "replace": "    if (view.openIds.has(id)) continue;\n    if (entry.disposition !== 'open') {\n      try {\n        await intents.abort(id);\n      } catch (err) {\n        if (!isUnknownIntent(err)) continue;\n      }\n      // A confirmed cancel of an attempt that certified nothing: conflicted, so a link to it is payable again.\n      if (await stores.backstop.removeIfUnchanged(id, entry)) report.conflicted.push(id);\n      continue;\n    }\n    if (view.isLocallyActive(id)) continue;\n",
+    "find": "    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id);\n      if (outcome === 'unknown') continue;\n      // A confirmed cancel moved nothing (conflicted: a link is payable again); a completed row was paid elsewhere.\n      if ((await stores.backstop.removeIfUnchanged(id, entry)) && outcome !== 'completed') report.conflicted.push(id);\n      continue;\n    }\n",
+    "replace": "    if (view.openIds.has(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id);\n      if (outcome === 'unknown') continue;\n      // A confirmed cancel moved nothing (conflicted: a link is payable again); a completed row was paid elsewhere.\n      if ((await stores.backstop.removeIfUnchanged(id, entry)) && outcome !== 'completed') report.conflicted.push(id);\n      continue;\n    }\n    if (view.isLocallyActive(id)) continue;\n",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
@@ -2712,20 +2712,21 @@
   },
   {
     "name": "fence-abort-404-kept",
-    "note": "#835: an abort answered 404 NOT_FOUND proves no row can run — clean, entry dropped",
-    "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "      if (!isUnknownIntent(err)) return CANCEL_UNCONFIRMED_MESSAGE;",
-    "replace": "      return CANCEL_UNCONFIRMED_MESSAGE;",
+    "note": "#835: an abort answered 404 NOT_FOUND proves no row can run \u2014 clean, entry dropped",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "    return isUnknownIntent(err) ? 'never-stored' : 'unknown';",
+    "replace": "    return 'unknown';",
     "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
       "tests/unit/payments-v2/machine.test.ts"
     ]
   },
   {
     "name": "fence-trusts-failed-abort",
-    "note": "#835: a failed abort leaves the row open (another device could run it) — possibly-committed, never clean",
-    "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "      if (!isUnknownIntent(err)) return CANCEL_UNCONFIRMED_MESSAGE;",
-    "replace": "      if (!isUnknownIntent(err)) return undefined;",
+    "note": "#835: a failed abort leaves the row open (another device could run it) \u2014 possibly-committed, never clean",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "    return isUnknownIntent(err) ? 'never-stored' : 'unknown';",
+    "replace": "    return isUnknownIntent(err) ? 'never-stored' : 'aborted';",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
@@ -2735,7 +2736,7 @@
     "name": "gate-reports-conflicted-on-failed-abort",
     "note": "#835: the #676 gate reports conflicted only once the server confirmed the abort; a failed abort keeps a link settling",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "      (aborted ? report.conflicted : report.failed).push(intent.transferId);",
+    "find": "      if (outcome === 'aborted' || outcome === 'never-stored') report.conflicted.push(intent.transferId);",
     "replace": "      report.conflicted.push(intent.transferId);",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts",
@@ -3150,7 +3151,7 @@
     "name": "gc-cancel-unreported",
     "note": "#835: a tombstone whose abort the server confirms (2xx, or 404 NOT_FOUND after a restore that lost the row) is reported conflicted; unreported, its payment link reads unaccounted with no server row and resolves paid for nothing (send-intent-unknown.test.ts '(y)...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "      if (await stores.backstop.removeIfUnchanged(id, entry)) report.conflicted.push(id);",
+    "find": "      if ((await stores.backstop.removeIfUnchanged(id, entry)) && outcome !== 'completed') report.conflicted.push(id);",
     "replace": "      await stores.backstop.removeIfUnchanged(id, entry);",
     "tests": [
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
@@ -3211,8 +3212,8 @@
     "name": "refused-hold-trusts-closed-listing",
     "note": "#835: a held send's 413/422 re-PUT never probes a row that is still open: kept, the next pass resumes it; probed, the abort cancels an intent a mixed fleet stored and the send is reported conflicted (machine-resume.test.ts 'a 413/422 on the re-PUT does not drop a held send whose row a listing taken after it shows...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    if ((await deps.intents.listOpen()).some((i) => i.transferId === id)) return 'unknown';\n",
-    "replace": "    // mutant: an open row is probed too\n",
+    "find": "  if (open === null || open.some((i) => i.transferId === id)) return 'unknown';",
+    "replace": "  if (open === null) return 'unknown';",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
@@ -3220,19 +3221,20 @@
   {
     "name": "refused-hold-assumes-refused",
     "note": "#835: a row absent from the open listing may have completed on another device; read as refused, an already-paid request is made payable again (machine-resume.test.ts 'a 413/422 on the re-PUT of a held send another device completed...')",
-    "file": "modules/payments-v2/machine/resume.ts",
-    "find": "  return aborted.some((i) => i.transferId === id) ? 'refused' : 'completed';",
-    "replace": "  return aborted.length >= 0 ? 'refused' : 'completed';",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  return aborted.some((row) => row.transferId === transferId) ? 'aborted' : 'completed';",
+    "replace": "  return aborted.length >= 0 ? 'aborted' : 'completed';",
     "tests": [
-      "tests/unit/payments-v2/machine-resume.test.ts"
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/machine.test.ts"
     ]
   },
   {
     "name": "refused-hold-probe-failure-refuses",
     "note": "#835: only a 404 NOT_FOUND from the abort probe proves no row; any other failure keeps the hold (machine-resume.test.ts 'a 413/422 on the re-PUT whose abort probe fails keeps the hold')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    return isUnknownIntent(err) ? 'refused' : 'unknown';",
-    "replace": "    return 'refused';",
+    "find": "  return outcome === 'unknown' || outcome === 'completed' ? outcome : 'refused';",
+    "replace": "  return outcome === 'completed' ? outcome : 'refused';",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
@@ -3338,6 +3340,27 @@
     "replace": "    await (refused ? undefined : settleOwed(stores, entry));",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "abort-unread-listing-confirms",
+    "note": "#835: a 204 abort is confirmed only by the aborted listing; while it cannot be read the cancel stays unconfirmed (machine.test.ts 'a clean leg failure whose aborted listing cannot be read...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  if (aborted === null) return 'unknown';",
+    "replace": "  if (aborted === null) return 'aborted';",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "fence-completed-elsewhere-clean",
+    "note": "#835: a 204 abort of a row another device completed is a no-op; reported clean, the caller re-pays a payment that was made (machine.test.ts 'a clean leg failure whose row another device completed...')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    if (outcome === 'unknown' || outcome === 'completed') return CANCEL_UNCONFIRMED_MESSAGE;",
+    "replace": "    if (outcome === 'unknown') return CANCEL_UNCONFIRMED_MESSAGE;",
+    "tests": [
+      "tests/unit/payments-v2/machine.test.ts"
     ]
   }
 ]
