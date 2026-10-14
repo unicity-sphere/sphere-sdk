@@ -221,7 +221,6 @@ async function dropStaleBackstops(
   view: LocalView,
   report: ResumeReport
 ): Promise<void> {
-  let listed: { aborted: Set<string>; open: Set<string> } | null | undefined;
   for (const entry of view.locals.values()) {
     const id = entry.transferId;
     if (view.openIds.has(id) || view.isLocallyActive(id)) continue;
@@ -232,7 +231,8 @@ async function dropStaleBackstops(
     }
     if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it
     if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;
-    if (listed === undefined) listed = await freshListings(intents, report);
+    // Read for each entry: a byte-equal re-PUT may re-open a row while an earlier one is retired.
+    const listed = await freshListings(intents, report);
     // Unknown until both listings read; open again (a byte-equal re-PUT re-opened it): a later pass judges it.
     if (listed === null || listed.open.has(id)) continue;
     await retire(stores, entry, listed.aborted.has(id), report);

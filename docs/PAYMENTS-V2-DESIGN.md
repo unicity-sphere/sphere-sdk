@@ -931,8 +931,8 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      other read-modify-write of the store), so a park or a fence that lands meanwhile is never
      lost to a stale read. An `'open'` entry whose row is no longer open completed or was aborted
      (its cleanup failed, or another device's resume conflicted and aborted it). The GC reads the
-     aborted listing, then the open listing again, to tell the two apart. It reads them once per
-     pass, and only when an entry needs them:
+     aborted listing, then the open listing again, to tell the two apart. It reads them for each
+     entry it judges, since a row can be re-opened while an earlier entry is retired:
      - an aborted row moved nothing, so its held rows are owed again and it is reported
        `conflicted`;
      - a row open again was re-opened by a byte-equal re-PUT after the pass listed it, and is left

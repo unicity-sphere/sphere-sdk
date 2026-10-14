@@ -965,6 +965,36 @@ describe('the sweep of an entry whose row is no longer open tells completed from
     expect(w.api.inspectIntent(w.caller, 'reopened')?.status).toBe('open');
   });
 
+  it('each entry is judged by listings read for it: a row re-opened while an earlier entry is retired is kept', async () => {
+    const w = makeWorld();
+    const second = { ...owed, transferId: 'earlier-2' };
+    for (const id of ['first', 'second']) {
+      await w.api.putIntent(w.caller, { transferId: id, payload: openEntry(id).payloadEnvelope });
+      await w.api.abortIntent(w.caller, id);
+    }
+    await w.stores().backstop.upsert(openEntry('first', { owes: [owed] }));
+    await w.stores().backstop.upsert(openEntry('second', { owes: [second] }));
+    // A delayed byte-equal PUT re-opens 'second' while the sweep retires 'first'.
+    const set = w.kv.set.bind(w.kv);
+    let reopened = false;
+    w.kv.set = async <T>(key: string, value: T): Promise<void> => {
+      await set(key, value);
+      const entries = key === STORE_KEYS.intentBackstop ? (value as unknown as IntentBackstopEntry[]) : null;
+      if (!reopened && entries !== null && !entries.some((e) => e.transferId === 'first')) {
+        reopened = true;
+        await w.api.putIntent(w.caller, { transferId: 'second', payload: openEntry('second').payloadEnvelope });
+      }
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(reopened).toBe(true);
+    expect(report.conflicted).toEqual(['first']);
+    expect((await w.stores().backstop.getByKey('second'))?.owes, 'its row is open again: it may still pay').toEqual([second]);
+    expect(await w.stores().shortfalls.getByKey('earlier-2'), 'never owed while it may still pay').toBeUndefined();
+    expect((await w.stores().shortfalls.getByKey('earlier'))?.remainingAmount).toBe('400');
+  });
+
   it('an unreadable aborted listing keeps the entry and what it held for a later pass', async () => {
     const w = makeWorld();
     await w.api.putIntent(w.caller, { transferId: 'elsewhere', payload: openEntry('elsewhere').payloadEnvelope });

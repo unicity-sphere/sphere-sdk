@@ -563,7 +563,9 @@ version:
   completed elsewhere; nothing is owed while the cancel is unconfirmed. Accepted residual
   (wallet-api#172, closing it needs server-side exclusivity): another device that certified a leg
   before the abort landed may still deliver, while the confirmed cancel makes the remainder owed
-  again. The `sync:pending` attention code is no longer emitted.
+  again. A delayed byte-equal PUT that re-opens an aborted row after the client last read the
+  listings for it is the same gap: an abort is not exclusive with a later write of the same row.
+  The `sync:pending` attention code is no longer emitted.
 - **Lifecycle:** `facade.start()`/`stop()` are Sphere-internal (init/destroy/address switch).
   The public convergence surface is `payments.pendingTransfers()` / `payments.resumeNow()` (a
   retry button calls `resumeNow()`, NEVER `send()`: a re-issued send double-pays), plus
@@ -1100,7 +1102,7 @@ authoritative for build success.
   the open listing was completed elsewhere, so the tombstone goes as paid, never conflicted (one the
   open listing shows was re-opened by a byte-equal re-PUT: the cancel stays unconfirmed). An `'open'` entry whose row is no longer open is judged by the aborted listing: aborted
   (it moved nothing) hands back what it held and is reported `conflicted`, absent from both listings
-  (the open one read again after it) settles as paid, open again (a byte-equal re-PUT re-opened it)
+  (both read for that entry, the open one after the aborted one) settles as paid, open again (a byte-equal re-PUT re-opened it)
   is left to a later pass, and an unreadable listing keeps the entry. A second optional field, `owes?: ShortfallEntry[]`, carries the #690 shortfall rows a
   later attempt of a partial send holds, a tombstoned one being cancelled included (see the error
   contract above); an older client ignores it,

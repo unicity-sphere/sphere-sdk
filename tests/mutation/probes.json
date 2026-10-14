@@ -3434,5 +3434,15 @@
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
+  },
+  {
+    "name": "sweep-shares-one-snapshot",
+    "note": "#835: each stale entry is judged by listings read for it; one snapshot shared across the sweep judges a row re-opened while an earlier entry is retired as aborted, hands back what it holds and deletes its only record (machine-resume.test.ts 'each entry is judged by listings read for it...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  for (const entry of view.locals.values()) {\n    const id = entry.transferId;\n    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);\n      continue;\n    }\n    if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it\n    if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;\n    // Read for each entry: a byte-equal re-PUT may re-open a row while an earlier one is retired.\n    const listed = await freshListings(intents, report);\n",
+    "replace": "  let shared: Awaited<ReturnType<typeof freshListings>> | undefined;\n  for (const entry of view.locals.values()) {\n    const id = entry.transferId;\n    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);\n      continue;\n    }\n    if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it\n    if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;\n    // Read for each entry: a byte-equal re-PUT may re-open a row while an earlier one is retired.\n    const listed = (shared ??= await freshListings(intents, report));\n",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
   }
 ]
