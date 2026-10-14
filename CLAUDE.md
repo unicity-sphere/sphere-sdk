@@ -1088,8 +1088,9 @@ authoritative for build success.
   an under-payment, never a double pay). Every backstop GC removal is compare-and-delete
   (`ListStore.removeIfUnchanged`), and a tombstone is removed only after the server answers its
   abort `204` and the aborted listing shows the row, or 404 `NOT_FOUND`, and is then reported
-  `conflicted` (a linked request is payable again); a `204` for a row the listing does not show
-  was completed elsewhere, so the tombstone goes as paid, never conflicted. An `'open'` entry whose row is no longer open is judged by the aborted listing: aborted
+  `conflicted` (a linked request is payable again); a `204` for a row in neither the aborted nor
+  the open listing was completed elsewhere, so the tombstone goes as paid, never conflicted (one the
+  open listing shows was re-opened by a byte-equal re-PUT: the cancel stays unconfirmed). An `'open'` entry whose row is no longer open is judged by the aborted listing: aborted
   (it moved nothing) hands back what it held and is reported `conflicted`, absent from both listings
   settles as paid, and an unreadable listing keeps the entry. A second optional field, `owes?: ShortfallEntry[]`, carries the #690 shortfall rows a
   later attempt of a partial send holds (see the error contract above); an older client ignores it,

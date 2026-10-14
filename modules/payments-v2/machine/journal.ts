@@ -88,19 +88,25 @@ export function isUnknownIntent(err: unknown): boolean {
 
 export type AbortOutcome = 'aborted' | 'never-stored' | 'completed' | 'unknown';
 
-/** #835: an abort is a no-op 204 on a row another device completed, so only the aborted listing proves a cancel. */
-export async function abortAndConfirm(
-  intents: { abort(id: string): Promise<void>; listAborted(): Promise<{ transferId: string }[]> },
-  transferId: string
-): Promise<AbortOutcome> {
+interface IntentListing {
+  abort(id: string): Promise<void>;
+  listAborted(): Promise<{ transferId: string }[]>;
+  listOpen(): Promise<{ transferId: string }[]>;
+}
+
+/** #835: a 204 abort of a completed row is a no-op; completed = in neither listing (a re-PUT may re-open it). */
+export async function abortAndConfirm(intents: IntentListing, transferId: string): Promise<AbortOutcome> {
   try {
     await intents.abort(transferId);
   } catch (err) {
     return isUnknownIntent(err) ? 'never-stored' : 'unknown';
   }
+  const listed = (rows: { transferId: string }[]): boolean => rows.some((row) => row.transferId === transferId);
   const aborted = await intents.listAborted().catch(() => null);
   if (aborted === null) return 'unknown';
-  return aborted.some((row) => row.transferId === transferId) ? 'aborted' : 'completed';
+  if (listed(aborted)) return 'aborted';
+  const open = await intents.listOpen().catch(() => null);
+  return open === null || listed(open) ? 'unknown' : 'completed';
 }
 
 /**

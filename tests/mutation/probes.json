@@ -3222,8 +3222,8 @@
     "name": "refused-hold-assumes-refused",
     "note": "#835: a row absent from the open listing may have completed on another device; read as refused, an already-paid request is made payable again (machine-resume.test.ts 'a 413/422 on the re-PUT of a held send another device completed...')",
     "file": "modules/payments-v2/machine/journal.ts",
-    "find": "  return aborted.some((row) => row.transferId === transferId) ? 'aborted' : 'completed';",
-    "replace": "  return aborted.length >= 0 ? 'aborted' : 'completed';",
+    "find": "  if (listed(aborted)) return 'aborted';",
+    "replace": "  if (aborted.length >= 0) return 'aborted';",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts",
       "tests/unit/payments-v2/machine.test.ts"
@@ -3361,6 +3361,26 @@
     "replace": "    if (outcome === 'unknown') return CANCEL_UNCONFIRMED_MESSAGE;",
     "tests": [
       "tests/unit/payments-v2/machine.test.ts"
+    ]
+  },
+  {
+    "name": "abort-reopened-read-completed",
+    "note": "#835: a row in neither listing completed; one a byte-equal re-PUT re-opened between the abort and the listing is in the open one and must stay unconfirmed, never settle a link as paid (machine-resume.test.ts 'a tombstone whose row a byte-equal re-PUT re-opens...')",
+    "file": "modules/payments-v2/machine/journal.ts",
+    "find": "  return open === null || listed(open) ? 'unknown' : 'completed';",
+    "replace": "  return open === null ? 'unknown' : 'completed';",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "unclosed-partial-heartbeat-idle",
+    "note": "#835: a partial applied but not closed leaves its intent for a later pass; with no deposit owed, only this arms the heartbeat, so an idle wallet never closes it (heartbeat.test.ts 'a partial send applied but not closed arms the heartbeat...')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "    if (disposition.deliveryPending || disposition.final) this.heartbeat.arm();",
+    "replace": "    if (disposition.deliveryPending) this.heartbeat.arm();",
+    "tests": [
+      "tests/unit/payments-v2/heartbeat.test.ts"
     ]
   }
 ]

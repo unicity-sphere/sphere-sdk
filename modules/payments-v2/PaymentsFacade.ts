@@ -486,10 +486,9 @@ export class PaymentsFacade implements PaymentsV2 {
     run: SendRun,
     attempt: number
   ): Promise<TransferResult | null> {
-    if (disposition.deliveryPending) {
-      run.pendingAny = true;
-      this.heartbeat.arm(); // deposits owed — heartbeat work even if the remainder later throws
-    }
+    if (disposition.deliveryPending) run.pendingAny = true;
+    // Deposits owed, or applied but not closed: heartbeat work even if the remainder later throws.
+    if (disposition.deliveryPending || disposition.final) this.heartbeat.arm();
     const partial = disposition.entry;
     run.delivered.push(...partial.committedTokenIds);
     run.firstPartialId ??= partial.transferId;

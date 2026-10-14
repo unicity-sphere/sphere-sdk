@@ -800,6 +800,23 @@ describe('a cancel counts only once the aborted listing shows its row: an abort 
     expect(await w.stores().backstop.getByKey('cancelled')).toBeUndefined();
   });
 
+  it('a tombstone whose row a byte-equal re-PUT re-opens before the listing is read stays unconfirmed, never read as completed', async () => {
+    const w = makeWorld();
+    const payload = openEntry('reopened').payloadEnvelope;
+    await w.api.putIntent(w.caller, { transferId: 'reopened', payload });
+    await w.api.abortIntent(w.caller, 'reopened');
+    await w.stores().backstop.upsert(openEntry('reopened', { disposition: 'abortPending' }));
+    w.overrides.listAborted = async () => {
+      await w.api.putIntent(w.caller, { transferId: 'reopened', payload }); // another device's re-PUT lands first
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [] });
+    expect((await w.stores().backstop.getByKey('reopened'))?.disposition).toBe('abortPending');
+    expect(w.api.inspectIntent(w.caller, 'reopened')?.status).toBe('open');
+  });
+
   it('a locally aborted intent listed open that another device completes before the abort lands is not conflicted', async () => {
     const w = makeWorld();
     await w.api.putIntent(w.caller, { transferId: 'raced', payload: openEntry('raced').payloadEnvelope });

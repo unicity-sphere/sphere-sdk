@@ -264,6 +264,38 @@ describe('PaymentsFacade — §7 convergence heartbeat', () => {
     expect(rows).toEqual([expect.objectContaining({ kind: 'shortfall', amount: '400' })]);
   });
 
+  it('a partial send applied but not closed arms the heartbeat: its intent closes in-session, no resumeNow', async () => {
+    const w = makeWorld();
+    await w.seed(600n);
+    const small = await w.seed(400n);
+    await w.engine.foreignSpend(small);
+    await w.facade.start();
+    await drain();
+
+    let completeFailures = 1;
+    w.hooks.complete = async () => {
+      if (completeFailures > 0) {
+        completeFailures -= 1;
+        throw new FakeApiError(503, 'UNAVAILABLE', 'complete failed');
+      }
+    };
+    let caught: unknown;
+    try {
+      await w.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PartialSendConflictError);
+    const tid = (caught as PartialSendConflictError).transferId;
+    const openRow = (rows: { transferId: string; kind: string }[]): boolean =>
+      rows.some((r) => r.transferId === tid && r.kind === 'open');
+    expect(openRow(await w.facade.pendingTransfers()), 'its close failed: still listed open').toBe(true);
+
+    await tick(HEARTBEAT_SEED_MS); // only the heartbeat can close it
+    expect(openRow(await w.facade.pendingTransfers())).toBe(false);
+    expect(w.api.inspectIntent(ownCaller, tid)?.status).toBe('completed');
+  });
+
   it('connection:status recovery resets the backoff: the pending tick fires at the seed, and an idle heartbeat stays idle', async () => {
     const w = makeWorld();
     await seedStuckIntent(w);

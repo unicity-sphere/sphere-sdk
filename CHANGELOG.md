@@ -44,7 +44,9 @@ What changed:
   confirmed the cancel: an abort's `204` counts only once the aborted listing shows the row,
   because an abort of a row another device already completed is a no-op `204` too. A failed attempt
   that cannot meet that is reported `SEND_SYNC_PENDING` with its transferId, and one completed
-  elsewhere is later resolved paid, never made payable again.
+  elsewhere (in neither the aborted nor the open listing) is later resolved paid, never made
+  payable again. A partial send applied but not closed now also arms the convergence heartbeat, so
+  an idle wallet closes it without a `resumeNow()`.
 - A convergence pass treats a send in process at any moment of the pass, including one started
   after the pass listed the open intents, as running for the whole pass, so the pass never sweeps or
   resumes it. It reconciles payment links against the local intent store as it is after the pass,

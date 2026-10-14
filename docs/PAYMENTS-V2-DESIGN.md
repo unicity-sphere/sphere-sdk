@@ -472,7 +472,8 @@ Normative behaviors bound into the transitions (not call sites):
   next pass resumes it); otherwise the client aborts the id. `404 NOT_FOUND` means no row was ever
   stored, and an aborted row will never run: either way the hold is dropped and reported
   conflicted, so a linked request reverts to payable (its held shortfall rows are owed again). A
-  row the abort leaves out of the aborted listing completed elsewhere: the hold ends as paid (its
+  row the abort leaves out of both the aborted and the open listing completed elsewhere (one the open
+  listing shows was re-opened by a byte-equal re-PUT, and stays held): the hold ends as paid (its
   held rows settled) and stays unaccounted, which a linked request reads as paid. Any other answer,
   or a failed probe, keeps it held. A confirmed row (listed, or a `204` re-PUT) or a dropped hold ends the
   in-memory park (`onHoldEnded`). A held entry is never swept, and a linked request stays
@@ -512,8 +513,9 @@ Normative behaviors bound into the transitions (not call sites):
     request stays `settling` until then and turns payable after. `pendingTransfers()` does not list
     it (an `abortPending` entry is a rollback, not a pending send).
   A tombstone is removed only after the server confirms its abort (a `204` the aborted listing
-  confirms, or 404 `NOT_FOUND`); one whose row the listing does not show was completed on another
-  device and goes as paid, never conflicted. It is never removed while the id is locally active (§7). Until then the #676 gate keeps the intent from ever resuming.
+  confirms, or 404 `NOT_FOUND`); one whose row neither the aborted nor the open listing shows was
+  completed on another device and goes as paid, never conflicted, while one the open listing shows
+  was re-opened by a byte-equal re-PUT and stays. It is never removed while the id is locally active (§7). Until then the #676 gate keeps the intent from ever resuming.
 - **E.4 (the most loss-prone flow — every step is a machine transition, test-pinned):** no mint
   submit before its checkpoint is durably server-acked **and read back** — a `put()` rejection
   raises `CheckpointPersistFailedError` with **zero** mint submits (keep-open; burn certified,
@@ -912,8 +914,9 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
   3. The S1 GC. It checks local activity first, so an entry whose machine is running in-process
      is never touched. That closes the race in which the GC dropped the `abortPending` tombstone
      an active attempt had just written. It removes a tombstone only after the server answers its
-     abort `204` and the aborted listing shows the row (conflicted), or the listing does not
-     (completed elsewhere: paid), or 404 `NOT_FOUND` (conflicted), and it skips held entries. Every removal is compare-and-delete
+     abort `204` and the aborted listing shows the row (conflicted), or neither it nor the open
+     listing does (completed elsewhere: paid), or 404 `NOT_FOUND` (conflicted), and it skips held
+     entries. Every removal is compare-and-delete
      against the exact snapshot it judged (`ListStore.removeIfUnchanged`, serialized with every
      other read-modify-write of the store), so a park or a fence that lands meanwhile is never
      lost to a stale read. An `'open'` entry whose row is no longer open completed or was aborted
