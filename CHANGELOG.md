@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-14
+
 ### Fixed (money) — a send that may have moved money is never reported as a clean failure (#835)
 
 What was wrong. When `PUT /v1/intents` failed with anything other than a 422, the payments facade
@@ -2179,7 +2181,8 @@ consumed exclusively through the `token-engine/` port. Consequences:
 - `PaymentsModule.destroy()` now cleans up storage event subscriptions and debounce timers
 - `IpfsStorageProvider.shutdown()` now disconnects the subscription client
 
-[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.7...v0.18.0
 [0.17.7]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.6...v0.17.7
