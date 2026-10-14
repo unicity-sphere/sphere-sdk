@@ -1158,6 +1158,22 @@ describe('the ensure step keeps a hold durable and seals what it re-PUTs (#835)'
     expect((await w.stores().backstop.getByKey(entry.transferId))?.intentPut, 'a restart now finds it held').toBe('unconfirmed');
   });
 
+  it('a re-persisted hold whose re-PUT is refused 422 and whose row completed elsewhere ends as paid: removed against the repaired entry', async () => {
+    const w = makeWorld();
+    const entry = openEntry('parked-in-memory', { intentPut: 'pending' });
+    await w.stores().backstop.upsert(entry);
+    await w.api.putIntent(w.caller, { transferId: entry.transferId, payload: entry.payloadEnvelope });
+    await w.api.completeIntent(w.caller, { transferId: entry.transferId });
+    w.overrides.putIntent = async () => {
+      throw new ValidationFailedError('payload refused');
+    };
+
+    const report = await resumeAll(w.deps, { isParked: (id) => id === entry.transferId });
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [] });
+    expect(await w.stores().backstop.getByKey(entry.transferId)).toBeUndefined();
+  });
+
   it('a re-persisted hold whose re-PUT is refused 422 stays held, durably', async () => {
     const w = makeWorld();
     const entry = openEntry('parked-in-memory', { intentPut: 'pending' });

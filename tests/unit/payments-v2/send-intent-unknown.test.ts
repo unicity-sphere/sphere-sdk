@@ -2220,7 +2220,7 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     await expectPaid(world, held);
   });
 
-  it('(x-race) a pass that runs while the handoff is in flight leaves the attempt alone; refused later, it keeps the remainder', async () => {
+  it('(x-race) a pass that runs while the handoff is in flight leaves the attempt alone; conflicted later, the remainder is owed again', async () => {
     const engine = new ConflictingEngine({ chainPubkey: hexToBytes(OWN_PUB) });
     const world = makeWorld({ engine });
     await world.seed(600n);
@@ -2243,10 +2243,8 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
 
     const sending = settle(world.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN }));
     await vi.waitFor(() => expect(handoff.entered).toBe(true));
-    world.hooks.putIntent = async () => {
-      throw new WalletApiHttpError(422, 'VALIDATION_FAILED', 'intent payload refused');
-    };
-    await world.facade.resumeNow(); // the attempt is still in process: this pass never re-PUTs or drops it
+    delete world.hooks.putIntent; // its PUT would land and the attempt conflict, if a pass adopted it now
+    await world.facade.resumeNow(); // the attempt is still in process: this pass never re-PUTs or resumes it
     handoff.release();
     const partial = rejectionOf(await sending) as PartialSendConflictError;
     await flushTail();
@@ -2257,7 +2255,8 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     await world.facade.resumeNow();
     await flushTail();
 
-    await expectStillHolding(world, held);
+    expect(serverIntent(world, held)).toBe('aborted');
+    await expectOwedAgain(world, held);
   });
 
   it('(x-paid) once the service confirms it, it pays the remainder and the row goes with it', async () => {
