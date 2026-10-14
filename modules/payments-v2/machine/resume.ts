@@ -206,6 +206,7 @@ async function dropStaleBackstops(
   view: LocalView,
   report: ResumeReport
 ): Promise<void> {
+  let aborted: Set<string> | null | undefined;
   for (const entry of view.locals.values()) {
     const id = entry.transferId;
     if (view.openIds.has(id) || view.isLocallyActive(id)) continue;
@@ -221,9 +222,20 @@ async function dropStaleBackstops(
     }
     if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it
     if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;
-    await settleOwed(stores, entry);
-    await stores.backstop.removeIfUnchanged(id, entry);
+    if (aborted === undefined) aborted = await abortedIds(intents);
+    if (aborted === null) continue; // completed or aborted: unknown until the listing reads
+    // An aborted row moved nothing: what it held is owed again and a link to it is payable.
+    const refused = aborted.has(id);
+    await (refused ? releaseOwed(stores, entry) : settleOwed(stores, entry));
+    if ((await stores.backstop.removeIfUnchanged(id, entry)) && refused) report.conflicted.push(id);
   }
+}
+
+function abortedIds(intents: IntentApi): Promise<Set<string> | null> {
+  return intents.listAborted().then(
+    (rows) => new Set(rows.map((row) => row.transferId)),
+    () => null
+  );
 }
 
 async function gateAndDecode(

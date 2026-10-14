@@ -843,7 +843,9 @@ both places by a failed removal is listed once, as the attempt; a failed attach 
 rows from the store, so a remainder is never listed as owed while the attempt may pay it (an
 under-payment window if that attempt is later refused, never a double pay); and both completion paths (the
 attempt's own close, and the S1 sweep of a holder completed elsewhere) remove that copy before the
-entry, keeping the entry when they cannot. An older client ignores the field,
+entry, keeping the entry when they cannot. The sweep settles only a holder whose row is in neither
+listing: one whose row is aborted (a conflict cleanup whose removal failed, or another device's
+abort) hands its rows back instead. An older client ignores the field,
 so a downgrade can lose a held remainder: an under-payment, never a double pay.
 
 There is no new disposition, no new `STORE_KEYS` entry and no prefix change, so an older client
@@ -910,7 +912,12 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      abort `204` or 404 `NOT_FOUND`, and it skips held entries. Every removal is compare-and-delete
      against the exact snapshot it judged (`ListStore.removeIfUnchanged`, serialized with every
      other read-modify-write of the store), so a park or a fence that lands meanwhile is never
-     lost to a stale read.
+     lost to a stale read. An `'open'` entry whose row is no longer open completed or was aborted
+     (its cleanup failed, or another device's resume conflicted and aborted it). The GC reads the
+     aborted listing to tell the two apart, once per pass and only when an entry needs it: an
+     aborted row moved nothing, so its held rows are owed again and it is reported `conflicted`;
+     only a row in neither listing settles them as paid. While that listing cannot be read the
+     entry stays.
   4. Gate, decode and resume, unchanged.
   5. Reconcile payment links, against the backstop read again after the pass: every transferId
      with a local entry then (held, parked, being cancelled, or an attempt that ended mid-pass) is

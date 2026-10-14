@@ -164,6 +164,7 @@ export interface Overrides {
   deliver?: () => Promise<void>;
   complete?: (transferId: string) => Promise<void>;
   abort?: () => Promise<void>;
+  listAborted?: () => Promise<void>;
 }
 
 /** One PUT /v1/intents exactly as the machine issued it (#835: a re-PUT must carry the stored bytes). */
@@ -406,6 +407,7 @@ function makeIntents(w: WorldState): IntentApi {
       return intents.map((i) => ({ transferId: i.transferId, payload: i.payload, createdAt: i.createdAt }));
     },
     async listAborted() {
+      if (w.overrides.listAborted) await w.overrides.listAborted();
       return (await w.api.listIntents(w.caller, 'aborted')).map((i) => ({ transferId: i.transferId }));
     },
     async abort(transferId) {

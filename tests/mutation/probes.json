@@ -2578,8 +2578,8 @@
     "name": "dropstale-removes-unconditionally",
     "note": "#835: every GC removal is compare-and-delete against the entry the pass judged; a send held after the pass read its snapshot survives that pass (send-intent-unknown.test.ts '(h-stale) a pass judging a snapshot from before the hold never sweeps the held entry')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    await settleOwed(stores, entry);\n    await stores.backstop.removeIfUnchanged(id, entry);\n  }",
-    "replace": "    await settleOwed(stores, entry);\n    await stores.backstop.removeByKey(id);\n  }",
+    "find": "    if ((await stores.backstop.removeIfUnchanged(id, entry)) && refused) report.conflicted.push(id);",
+    "replace": "    await stores.backstop.removeByKey(id);\n    if (refused) report.conflicted.push(id);",
     "tests": [
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
     ]
@@ -3170,10 +3170,11 @@
     "name": "sweep-keeps-held-copy",
     "note": "#835: the S1 sweep of a completed holder removes a leftover copy of its held rows before the entry (send-intent-unknown.test.ts '(x-swept-leftover)...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    await settleOwed(stores, entry);\n    await stores.backstop.removeIfUnchanged(id, entry);",
-    "replace": "    await stores.backstop.removeIfUnchanged(id, entry);",
+    "find": "    await (refused ? releaseOwed(stores, entry) : settleOwed(stores, entry));",
+    "replace": "    await (refused ? releaseOwed(stores, entry) : undefined);",
     "tests": [
-      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
     ]
   },
   {
@@ -3297,6 +3298,46 @@
     "replace": "    await this.http.request('POST', `/v1/intents/${transferId}/abort`);",
     "tests": [
       "tests/unit/payments-v2/intent-write-ack.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-aborted-reads-completed",
+    "note": "#835: an entry whose row is aborted moved nothing; settled as completed, what it held is erased and a link reads paid (machine-resume.test.ts 'the sweep of an entry whose row is no longer open tells completed from aborted')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    const refused = aborted.has(id);",
+    "replace": "    const refused = false;",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-unreadable-listing-settles",
+    "note": "#835: without the aborted listing the sweep cannot tell completed from aborted, so it keeps the entry (machine-resume.test.ts 'an unreadable aborted listing keeps the entry...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    if (aborted === null) continue; // completed or aborted: unknown until the listing reads",
+    "replace": "    if (aborted === null) aborted = new Set<string>();",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-aborted-not-conflicted",
+    "note": "#835: a swept entry whose row is aborted is reported conflicted, so a link to it is payable again (machine-resume.test.ts 'an acked entry whose row another device aborted is conflicted...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    if ((await stores.backstop.removeIfUnchanged(id, entry)) && refused) report.conflicted.push(id);",
+    "replace": "    await stores.backstop.removeIfUnchanged(id, entry);",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "sweep-aborted-rows-dropped",
+    "note": "#835: what an aborted holder held is owed again, never left only on the entry the sweep removes (machine-resume.test.ts 'an acked entry whose row another device aborted...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    await (refused ? releaseOwed(stores, entry) : settleOwed(stores, entry));",
+    "replace": "    await (refused ? undefined : settleOwed(stores, entry));",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts"
     ]
   }
 ]

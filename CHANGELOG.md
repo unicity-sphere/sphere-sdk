@@ -53,7 +53,9 @@ What changed:
   earlier shortfall rows on its intent entry. If it is refused (a 413/422 on its re-PUT, a conflict
   on resume), the rows come back and the remainder is owed again. A cancel the service confirms
   with `404 NOT_FOUND` (its row gone, as after a database restore) is reported conflicted, so a
-  linked payment request becomes payable again, never resolved paid.
+  linked payment request becomes payable again, never resolved paid. So is a local intent whose row
+  was aborted, by a cleanup whose removal failed or by another device: its held rows are owed again,
+  where it used to be swept as completed and its remainder erased.
 - Behaviour changes for integrators:
   - `SEND_SYNC_PENDING` also means "held, not sent yet": the send goes out automatically, possibly
     much later, and cannot be cancelled;

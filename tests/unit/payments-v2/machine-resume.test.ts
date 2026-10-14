@@ -769,6 +769,82 @@ describe('resume confirms a parked intent before it resumes or sweeps anything (
   });
 });
 
+describe('the sweep of an entry whose row is no longer open tells completed from aborted (#835)', () => {
+  const owed = { transferId: 'earlier', remainingAmount: '400', coinId: COIN, recipient: 'aa', committedTokenIds: [], createdAt: 1 };
+
+  it('a holder whose conflict cleanup could not remove its entry: the next pass hands its rows back, never settles them', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000', transferId: 'holder' });
+    const transfer = w.engine.transfer.bind(w.engine);
+    w.engine.transfer = async () => {
+      throw new ProofUnconfirmedError('gateway blip');
+    };
+    await expect(w.machine().run(plan)).rejects.toMatchObject({ code: 'CERTIFICATION_UNCONFIRMED' });
+    w.engine.transfer = transfer;
+    await w.engine.foreignSpend(token);
+    await w.stores().backstop.patch('holder', (e) => ({ ...e, owes: [owed] }));
+    w.kv.failWriteKeys.add(STORE_KEYS.intentBackstop); // the cleanup's entry removal fails
+
+    const first = await resumeAll(w.deps);
+
+    expect(first.conflicted).toEqual(['holder']);
+    expect(w.api.inspectIntent(w.caller, 'holder')?.status).toBe('aborted');
+    expect((await w.stores().backstop.getByKey('holder'))?.disposition, 'the removal failed').toBe('open');
+    expect((await w.stores().shortfalls.getByKey('earlier'))?.remainingAmount).toBe('400');
+
+    w.kv.failWriteKeys.delete(STORE_KEYS.intentBackstop);
+    const second = await resumeAll(w.deps);
+
+    expect(second).toEqual({ resumed: [], conflicted: ['holder'], failed: [] });
+    expect(await w.stores().backstop.getByKey('holder')).toBeUndefined();
+    expect((await w.stores().shortfalls.getByKey('earlier'))?.remainingAmount, 'still owed: nothing was paid').toBe('400');
+  });
+
+  it('an acked entry whose row another device aborted is conflicted, and the rows it held are owed again', async () => {
+    const w = makeWorld();
+    await w.api.putIntent(w.caller, { transferId: 'elsewhere', payload: openEntry('elsewhere').payloadEnvelope });
+    await w.api.abortIntent(w.caller, 'elsewhere');
+    await w.stores().backstop.upsert(openEntry('elsewhere', { owes: [owed] }));
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: ['elsewhere'], failed: [] });
+    expect(await w.stores().backstop.getByKey('elsewhere')).toBeUndefined();
+    expect((await w.stores().shortfalls.getByKey('earlier'))?.remainingAmount).toBe('400');
+  });
+
+  it('an acked entry whose row completed settles what it held: removed, never conflicted', async () => {
+    const w = makeWorld();
+    await w.api.putIntent(w.caller, { transferId: 'done', payload: openEntry('done').payloadEnvelope });
+    await w.api.completeIntent(w.caller, { transferId: 'done' });
+    await w.stores().backstop.upsert(openEntry('done', { owes: [owed] }));
+    await w.stores().shortfalls.upsert(owed); // a copy a failed removal left behind
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [] });
+    expect(await w.stores().backstop.getByKey('done')).toBeUndefined();
+    expect(await w.stores().shortfalls.getByKey('earlier')).toBeUndefined();
+  });
+
+  it('an unreadable aborted listing keeps the entry and what it held for a later pass', async () => {
+    const w = makeWorld();
+    await w.api.putIntent(w.caller, { transferId: 'elsewhere', payload: openEntry('elsewhere').payloadEnvelope });
+    await w.api.abortIntent(w.caller, 'elsewhere');
+    await w.stores().backstop.upsert(openEntry('elsewhere', { owes: [owed] }));
+    w.overrides.listAborted = async () => {
+      throw new FakeApiError(503, 'UNAVAILABLE', 'intent store down');
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [] });
+    expect((await w.stores().backstop.getByKey('elsewhere'))?.owes).toEqual([owed]);
+    expect(await w.stores().shortfalls.getByKey('earlier')).toBeUndefined();
+  });
+});
+
 describe('resume never lets a conflict mask another outcome, and never applies before the shortfall (#835)', () => {
   it('a delivered leg whose re-certification is unconfirmed beside a conflict is not aborted and not reported conflicted', async () => {
     const w = makeWorld();
