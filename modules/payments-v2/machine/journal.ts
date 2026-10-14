@@ -95,17 +95,27 @@ interface IntentListing {
 }
 
 /** #835: a 204 abort of a completed row is a no-op; completed = in neither listing (a re-PUT may re-open it). */
-export async function abortAndConfirm(intents: IntentListing, transferId: string): Promise<AbortOutcome> {
+export async function abortAndConfirm(
+  intents: IntentListing,
+  transferId: string,
+  onError: (err: unknown) => void = () => undefined
+): Promise<AbortOutcome> {
   try {
     await intents.abort(transferId);
   } catch (err) {
-    return isUnknownIntent(err) ? 'never-stored' : 'unknown';
+    if (isUnknownIntent(err)) return 'never-stored';
+    onError(err);
+    return 'unknown';
   }
   const listed = (rows: { transferId: string }[]): boolean => rows.some((row) => row.transferId === transferId);
-  const aborted = await intents.listAborted().catch(() => null);
+  const unread = (err: unknown): null => {
+    onError(err);
+    return null;
+  };
+  const aborted = await intents.listAborted().catch(unread);
   if (aborted === null) return 'unknown';
   if (listed(aborted)) return 'aborted';
-  const open = await intents.listOpen().catch(() => null);
+  const open = await intents.listOpen().catch(unread);
   return open === null || listed(open) ? 'unknown' : 'completed';
 }
 
@@ -354,12 +364,11 @@ export function createMachineStores(kv: ScopedKV): MachineStores {
   };
 }
 
-/** #835: the rows move onto the holder's entry, and leave the store even if that write fails: never owed twice. */
+/** #835: the rows move onto the holder's entry, and leave the store even if reading or attaching them fails: never owed twice. */
 export async function holdShortfalls(stores: MachineStores, ids: readonly string[], holder: string): Promise<void> {
-  const rows = (await stores.shortfalls.list()).filter((row) => ids.includes(row.transferId));
-  if (rows.length === 0) return;
-  await stores.backstop.patch(holder, (e) => ({ ...e, owes: [...(e.owes ?? []), ...rows] })).catch(() => undefined);
-  for (const row of rows) await stores.shortfalls.removeByKey(row.transferId);
+  const rows = await stores.shortfalls.list().then((all) => all.filter((row) => ids.includes(row.transferId)), () => []);
+  if (rows.length > 0) await stores.backstop.patch(holder, (e) => ({ ...e, owes: [...(e.owes ?? []), ...rows] })).catch(() => undefined);
+  for (const id of ids) await stores.shortfalls.removeByKey(id);
 }
 
 export async function releaseOwed(stores: MachineStores, entry: IntentBackstopEntry | undefined): Promise<void> {

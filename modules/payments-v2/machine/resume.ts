@@ -28,10 +28,14 @@ export interface ResumeReport {
   retryAfterMs?: number;
 }
 
-function noteFailed(report: ResumeReport, transferId: string, err: unknown): void {
-  report.failed.push(transferId);
+function noteWait(report: ResumeReport, err: unknown): void {
   const wait = retryAfterMsOf(err);
   if (wait !== null) report.retryAfterMs = Math.max(report.retryAfterMs ?? 0, wait);
+}
+
+function noteFailed(report: ResumeReport, transferId: string, err: unknown): void {
+  report.failed.push(transferId);
+  noteWait(report, err);
 }
 
 interface ResumeJob {
@@ -135,7 +139,7 @@ async function confirmUnconfirmed(
     try {
       await deps.intents.put(id, entry.payloadEnvelope, entry.requiresSeedClose);
     } catch (err) {
-      const paid = isNeverStorable(err) && (await completedElsewhere(deps, id));
+      const paid = isNeverStorable(err) && (await completedElsewhere(deps, id, report));
       const ended = paid && (await endHold(stores, entry).catch(() => false));
       if (ended) {
         view.locals.delete(id);
@@ -153,10 +157,14 @@ async function confirmUnconfirmed(
 
 /** #835: a 413/422 says nothing of a held send's earlier PUT, which may still land and create or re-open
  *  its row: no absence proves it refused, so only a row completed elsewhere ends the hold. */
-async function completedElsewhere(deps: MachineDeps, id: string): Promise<boolean> {
-  const open = await deps.intents.listOpen().catch(() => null);
+async function completedElsewhere(deps: MachineDeps, id: string, report: ResumeReport): Promise<boolean> {
+  const noted = (err: unknown): null => {
+    noteWait(report, err);
+    return null;
+  };
+  const open = await deps.intents.listOpen().catch(noted);
   if (open === null || open.some((i) => i.transferId === id)) return false;
-  return (await abortAndConfirm(deps.intents, id)) === 'completed';
+  return (await abortAndConfirm(deps.intents, id, (err) => noteWait(report, err))) === 'completed';
 }
 
 async function endHold(stores: MachineStores, entry: IntentBackstopEntry): Promise<boolean> {
@@ -218,23 +226,30 @@ async function dropStaleBackstops(
     const id = entry.transferId;
     if (view.openIds.has(id) || view.isLocallyActive(id)) continue;
     if (entry.disposition !== 'open') {
-      const outcome = await abortAndConfirm(intents, id);
+      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));
       if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);
       continue;
     }
     if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it
     if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;
-    if (listed === undefined) listed = await freshListings(intents);
+    if (listed === undefined) listed = await freshListings(intents, report);
     // Unknown until both listings read; open again (a byte-equal re-PUT re-opened it): a later pass judges it.
     if (listed === null || listed.open.has(id)) continue;
     await retire(stores, entry, listed.aborted.has(id), report);
   }
 }
 
-async function freshListings(intents: IntentApi): Promise<{ aborted: Set<string>; open: Set<string> } | null> {
+async function freshListings(
+  intents: IntentApi,
+  report: ResumeReport
+): Promise<{ aborted: Set<string>; open: Set<string> } | null> {
   const ids = (rows: { transferId: string }[]): Set<string> => new Set(rows.map((row) => row.transferId));
-  const aborted = await intents.listAborted().then(ids, () => null);
-  const open = aborted === null ? null : await intents.listOpen().then(ids, () => null);
+  const noted = (err: unknown): null => {
+    noteWait(report, err);
+    return null;
+  };
+  const aborted = await intents.listAborted().then(ids, noted);
+  const open = aborted === null ? null : await intents.listOpen().then(ids, noted);
   return aborted === null || open === null ? null : { aborted, open };
 }
 
@@ -250,7 +265,7 @@ async function gateAndDecode(
     const local = locals.get(intent.transferId);
     if (local !== undefined && local.disposition !== 'open') {
       // #676: never resumed. Conflicted only once the cancel is confirmed (#835): until then another device could run it.
-      const outcome = await abortAndConfirm(deps.intents, intent.transferId);
+      const outcome = await abortAndConfirm(deps.intents, intent.transferId, (err) => noteWait(report, err));
       if (outcome === 'unknown') report.failed.push(intent.transferId);
       else await retire(stores, local, outcome !== 'completed', report).catch(() => undefined);
       continue;

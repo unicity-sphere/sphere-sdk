@@ -2283,6 +2283,46 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     await expectOwedAgain(world, held);
   });
 
+  it('(x-read-failed) a handoff whose read of the shortfall store fails still takes the row out: never listed as owed while the attempt may pay it', async () => {
+    const engine = new ConflictingEngine({ chainPubkey: hexToBytes(OWN_PUB) });
+    const world = makeWorld({ engine });
+    await world.seed(600n);
+    const contested = await world.seed(400n);
+    engine.conflicts.set(contested.blob.tokenId, 2); // the attempt, then its in-process converge
+    await startSettled(world);
+    let failedPuts = 0;
+    world.hooks.putIntent = async () => {
+      if (world.putCalls[world.putCalls.length - 1]?.transferId === 'tid-1') return;
+      failedPuts += 1;
+      throw unavailable();
+    };
+    let armed = true;
+    const get = world.kv.get.bind(world.kv);
+    world.kv.get = async <T>(key: string): Promise<T | null> => {
+      if (armed && key === STORE_KEYS.shortfalls && failedPuts === 3) {
+        armed = false;
+        throw new Error('injected shortfall read failure');
+      }
+      return get<T>(key);
+    };
+
+    const partial = rejectionOf(await settle(world.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN }))) as PartialSendConflictError;
+    await flushTail();
+
+    expect(armed, 'the handoff read failed').toBe(false);
+    expect(partial.remainingAmount, 'the held attempt owns the remainder').toBe('0');
+    const held = (partial.cause as SphereError).transferId!;
+    expect(shortfallOf(world, 'tid-1'), 'never listed as owed while the attempt may pay it').toBeUndefined();
+    const pending = await world.facade.pendingTransfers();
+    expect(pending.map((p) => [p.transferId, p.kind])).toEqual([[held, 'open']]);
+
+    delete world.hooks.putIntent;
+    await world.facade.resumeNow();
+    await flushTail();
+
+    await expectPaid(world, held);
+  });
+
   it('(x-paid) once the service confirms it, it pays the remainder and the row goes with it', async () => {
     const { world, held } = await heldRemainder(false);
     delete world.hooks.putIntent;

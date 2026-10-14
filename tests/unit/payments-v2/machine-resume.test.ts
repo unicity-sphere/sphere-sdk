@@ -819,6 +819,25 @@ describe('a cancel counts only once the aborted listing shows its row: an abort 
     expect(await w.stores().shortfalls.getByKey('earlier')).toBeUndefined();
   });
 
+  it("a tombstone listed open whose abort answers 429 with Retry-After is kept, and the pass hands that wait to the heartbeat", async () => {
+    const w = makeWorld();
+    await w.api.putIntent(w.caller, { transferId: 'cancelled', payload: openEntry('cancelled').payloadEnvelope });
+    await w.stores().backstop.upsert(openEntry('cancelled', { disposition: 'abortPending' }));
+    w.overrides.abort = async () => {
+      throw new WalletApiHttpError(429, 'RATE_LIMITED', 'POST /v1/intents/cancelled/abort: rate limit exceeded', 120_000);
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(report, 'the #676 gate keeps a cancel it could not confirm open').toEqual({
+      resumed: [],
+      conflicted: [],
+      failed: ['cancelled'],
+      retryAfterMs: 120_000,
+    });
+    expect((await w.stores().backstop.getByKey('cancelled'))?.disposition).toBe('abortPending');
+  });
+
   it('a tombstone whose aborted listing cannot be read is kept, and reported once the listing reads', async () => {
     const w = makeWorld();
     await w.api.putIntent(w.caller, { transferId: 'cancelled', payload: openEntry('cancelled').payloadEnvelope });
