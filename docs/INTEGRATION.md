@@ -1684,8 +1684,8 @@ try {
 Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (not enough spendable funds; when
 some funds are pinned by transfers still converging, its message says how much and points to
 `pendingTransfers()`; it is also the refusal while spending is paused, because the SDK has not yet
-confirmed which tokens converging transfers hold, for `send()`, `sendWholeToken()`,
-`sendCoinless()` and `burn()` alike, and the message says so), `INVALID_RECIPIENT` (no published chain pubkey, or a recipient on another
+confirmed which tokens converging transfers hold, for `send()`, `sendWholeToken()` and
+`sendCoinless()` alike, and the message says so; `burn()` resolves it as `errorCode` instead of rejecting), `INVALID_RECIPIENT` (no published chain pubkey, or a recipient on another
 network), `TRANSPORT_ERROR` (the recipient lookup could not reach the Nostr relays) and
 `VALIDATION_ERROR` (for example a malformed amount).
 `INSUFFICIENT_BALANCE` exists in the `SphereErrorCode` union but is never thrown.

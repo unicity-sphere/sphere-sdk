@@ -586,7 +586,7 @@ the next start — or, in one case below, cancels it. Show it as pending
 ([`pendingTransfers()`](#pendingtransfers-promisependingtransfer)), and wire any "retry" button
 to [`resumeNow()`](#resumenow-promisevoid).
 
-`SEND_SYNC_PENDING` with a `transferId` is one of three cases. Never send the payment again in
+`SEND_SYNC_PENDING` is one of three cases. Never send the payment again in
 any of them:
 
 - **Committed, still converging.** The spend committed, in whole or in part, and the rest is
@@ -633,8 +633,8 @@ payment was certified, and nothing this device holds can still send it.
 
 Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (when funds are pinned by transfers
 still converging, the message says how much and points to `pendingTransfers()`; it is also the
-refusal while spending is paused, for `send()`, `sendWholeToken()`, `sendCoinless()` and `burn()`
-alike, and the message says so),
+refusal while spending is paused, for `send()`, `sendWholeToken()` and `sendCoinless()` alike, and
+the message says so; [`burn()`](#burnrequest-burnrequest-promiseburnresult) resolves it as `errorCode` instead of rejecting),
 `INVALID_RECIPIENT` (no published chain pubkey, or a proven different network), `TRANSPORT_ERROR`
 (the recipient lookup could not reach the relay), `VALIDATION_ERROR` (for example a malformed or
 non-positive amount) and `TRANSFER_CONFLICT` (below).

@@ -601,8 +601,9 @@ the rest shows up in `pendingTransfers()` as a shortfall, and only that is re-pl
 `err.remainingAmount` is still owed. When `isPossiblyCommittedSendOutcome(err)` is `false`, the failure is
 proven clean: nothing of the payment was certified, and nothing this device holds can still send it.
 `SEND_INSUFFICIENT_BALANCE` is one of those clean failures, and it is also the refusal while spending is paused
-(the SDK has not yet confirmed which tokens converging transfers hold), for `send()`, `sendWholeToken()`,
-`sendCoinless()` and `burn()` alike; show `err.message`, which says so.
+(the SDK has not yet confirmed which tokens converging transfers hold): `send()`, `sendWholeToken()` and
+`sendCoinless()` reject with it (show `err.message`, which says so), and `burn()` resolves
+`{ success: false, errorCode: 'SEND_INSUFFICIENT_BALANCE' }` instead of rejecting.
 
 Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag` or `DIRECT://` recipient
 uses your network. Every such send emits `transfer:attention` with `code: 'recipient:network-unverified'` and an
