@@ -5,9 +5,10 @@
 import { SphereError } from '../../../core/errors';
 import { logger } from '../../../core/logger';
 import type { SphereToken } from '../../../token-engine/types';
+import type { StoragePort } from '../ports';
 import type { DeliveryJournalEntry, IntentBackstopEntry } from '../stores';
 import { isWholeIntent } from './payload-view';
-import type { CoinIntentPayload, IntentPayload, WholeIntentPayload } from './types';
+import type { CoinIntentPayload, IntentPayload, PlannedOp, WholeIntentPayload } from './types';
 import {
   ATTENTION_CHECKPOINT_STUCK,
   abortAndConfirm,
@@ -41,6 +42,7 @@ function noteFailed(report: ResumeReport, transferId: string, err: unknown): voi
 interface ResumeJob {
   transferId: string;
   payload: IntentPayload;
+  ops: PlannedOp[];
   journaled: Map<number, DeliveryJournalEntry>;
 }
 
@@ -53,6 +55,16 @@ export interface ResumeAllOptions {
   onHoldEnded?: (transferId: string) => void;
   /** #835: the pass deferred on an unreadable backstop — its report proves nothing. */
   onDeferred?: () => void;
+  /** #840: ids whose refusal was already logged — one warning per intent, not one per pass. */
+  warned?: Set<string>;
+}
+
+/** #840: what a pass judged, and the payloads it refused to plan (kept apart: never budgeted or settled). */
+interface PassState {
+  report: ResumeReport;
+  gated: string[];
+  refused: string[];
+  warned: Set<string>;
 }
 
 /** One pass's local picture: the backstop snapshot, the server-open ids, the in-process verdicts. */
@@ -85,20 +97,45 @@ export async function resumeAll(deps: MachineDeps, options: ResumeAllOptions = {
     isParked: options.isParked ?? (() => false),
     onHoldEnded: options.onHoldEnded ?? (() => undefined),
   };
-  const confirmed = await confirmUnconfirmed(deps, stores, view, report);
-  await dropStaleBackstops(deps.intents, stores, view, report);
+  const pass: PassState = {
+    report,
+    gated: open.map((i) => i.transferId),
+    refused: [],
+    warned: options.warned ?? new Set(),
+  };
+  try {
+    await runPass(deps, stores, view, open, pass);
+  } catch (err) {
+    // #840: verdicts already made durable (a retired tombstone) stand; every id not judged yet stays open.
+    noteWait(report, err);
+    const judged = new Set([...report.resumed, ...report.conflicted, ...report.failed, ...pass.refused]);
+    report.failed.push(...pass.gated.filter((id) => !judged.has(id)));
+  }
+  report.failed.push(...pass.refused);
+  return report;
+}
 
-  const jobs = await gateAndDecode(deps, stores, [...open, ...confirmed], locals, report);
+async function runPass(
+  deps: MachineDeps,
+  stores: MachineStores,
+  view: LocalView,
+  open: { transferId: string; payload: string }[],
+  pass: PassState
+): Promise<void> {
+  const confirmed = await confirmUnconfirmed(deps, stores, view, pass.report);
+  pass.gated.push(...confirmed.map((c) => c.transferId));
+  await dropStaleBackstops(deps.intents, stores, view, pass.report);
+
+  const jobs = await gateAndDecode(deps, stores, [...open, ...confirmed], view.locals, pass);
   const ctx: RunCtx = {
     deps,
     stores,
     machine: new TransferMachine(deps),
-    sources: await fetchSources(deps, jobs),
+    sources: await fetchSources(deps, jobs, pass.report),
   };
   for (const job of jobs) {
-    await runOne(ctx, job, report);
+    await runOne(ctx, job, pass.report);
   }
-  return report;
 }
 
 interface RunCtx {
@@ -258,8 +295,9 @@ async function gateAndDecode(
   stores: MachineStores,
   open: { transferId: string; payload: string }[],
   locals: Map<string, IntentBackstopEntry>,
-  report: ResumeReport
+  pass: PassState
 ): Promise<ResumeJob[]> {
+  const { report } = pass;
   const jobs: ResumeJob[] = [];
   for (const intent of open) {
     const local = locals.get(intent.transferId);
@@ -271,52 +309,90 @@ async function gateAndDecode(
       continue;
     }
     let payload: IntentPayload;
+    let ops: PlannedOp[];
     try {
       payload = validatePayload(await deps.decryptPayload(intent.payload));
-    } catch {
-      report.failed.push(intent.transferId);
+      ops = buildOps(payload); // #840: planned per intent, so one that cannot plan fails alone
+    } catch (err) {
+      refuse(pass, intent.transferId, err);
       continue;
     }
     jobs.push({
       transferId: intent.transferId,
       payload,
+      ops,
       journaled: await stores.deliveryJournal.byTransfer(intent.transferId),
     });
   }
   return jobs;
 }
 
-/** One batched blob read across every intent (§7 start() posture). */
-async function fetchSources(deps: MachineDeps, jobs: ResumeJob[]): Promise<Map<string, SphereToken>> {
-  const needed = new Set<string>();
-  for (const job of jobs) {
-    for (const op of buildOps(job.payload)) {
-      if (op.kind === 'direct' && job.journaled.has(op.opIndex)) continue;
-      needed.add(op.sourceTokenId);
-    }
-  }
+/** #840: a payload this client cannot plan is reported failed and left open — never run, aborted or completed. */
+function refuse(pass: PassState, transferId: string, err: unknown): void {
+  pass.refused.push(transferId);
+  if (pass.warned.has(transferId)) return;
+  pass.warned.add(transferId);
+  logger.warn('PaymentsV2', `resume: intent ${transferId} is not resumable — ${String(err)}`);
+}
+
+/** The sources a job still has to read: every op but a journaled direct leg. */
+function neededBy(job: ResumeJob): string[] {
+  return job.ops.filter((op) => op.kind !== 'direct' || !job.journaled.has(op.opIndex)).map((op) => op.sourceTokenId);
+}
+
+/** One batched blob read across every intent (§7 start() posture). Jobs whose source is missing fail closed below. */
+async function fetchSources(
+  deps: MachineDeps,
+  jobs: ResumeJob[],
+  report: ResumeReport
+): Promise<Map<string, SphereToken>> {
   const decoded = new Map<string, SphereToken>();
+  const needed = new Set(jobs.flatMap(neededBy));
   if (needed.size === 0) return decoded;
-  let blobs: Map<string, Uint8Array>;
+  const blobs = await readBlobs(deps.storage, [...needed], jobs, report);
   try {
-    blobs = await deps.storage.getBlobs([...needed]);
-  } catch {
-    return decoded; // jobs that needed a source fail closed below
-  }
-  const engine = deps.engine();
-  for (const [tokenId, bytes] of blobs) {
-    try {
-      decoded.set(tokenId, await engine.decodeToken({ tokenId, token: bytes }));
-    } catch (err) {
-      logger.warn('PaymentsV2', `resume: source ${tokenId} did not decode — ${String(err)}`);
+    const engine = deps.engine();
+    for (const [tokenId, bytes] of blobs) {
+      try {
+        decoded.set(tokenId, await engine.decodeToken({ tokenId, token: bytes }));
+      } catch (err) {
+        logger.warn('PaymentsV2', `resume: source ${tokenId} did not decode — ${String(err)}`);
+      }
     }
+  } catch (err) {
+    noteWait(report, err); // no engine: nothing decodes
   }
   return decoded;
 }
 
+/** #840: the server refuses a whole batch over one id (malformed, not owned, one download failed): read per job. */
+async function readBlobs(
+  storage: StoragePort,
+  ids: string[],
+  jobs: ResumeJob[],
+  report: ResumeReport
+): Promise<Map<string, Uint8Array>> {
+  try {
+    return await storage.getBlobs(ids);
+  } catch (err) {
+    noteWait(report, err);
+  }
+  const blobs = new Map<string, Uint8Array>();
+  const own = jobs.map(neededBy).filter((needed) => needed.length > 0);
+  if (own.length < 2) return blobs; // the batch was one job's own read
+  for (const needed of own) {
+    try {
+      for (const [id, bytes] of await storage.getBlobs(needed)) blobs.set(id, bytes);
+    } catch (err) {
+      noteWait(report, err);
+    }
+  }
+  return blobs;
+}
+
 async function runOne(ctx: RunCtx, job: ResumeJob, report: ResumeReport): Promise<void> {
   const mine = new Map<string, SphereToken>();
-  for (const op of buildOps(job.payload)) {
+  for (const op of job.ops) {
     if (op.kind === 'direct' && job.journaled.has(op.opIndex)) continue;
     const token = ctx.sources.get(op.sourceTokenId);
     if (token === undefined) {
@@ -389,11 +465,22 @@ function validateCoinPayload(c: Partial<CoinIntentPayload>): CoinIntentPayload {
   const s = c.split;
   if (
     s !== undefined &&
-    (typeof s.tokenId !== 'string' || typeof s.splitAmount !== 'string' || typeof s.remainderAmount !== 'string')
+    (typeof s.tokenId !== 'string' || !isAssetValue(s.splitAmount) || !isAssetValue(s.remainderAmount))
   ) {
     throw new SphereError('intent payload split spec is malformed', 'VALIDATION_ERROR');
   }
+  // #840: the engine refuses a non-hex coin at the split leg, after the direct legs spent.
+  if (s !== undefined && !/^(?:[0-9a-f]{2})+$/.test(c.coinId)) {
+    throw new SphereError('intent payload coinId is not canonical hex', 'VALIDATION_ERROR');
+  }
   return { ...(c as CoinIntentPayload), kind: 'coin' };
+}
+
+const ASSET_VALUE_BOUND = 1n << 256n;
+
+/** #840: a value the engine accepts, [1, 2^256), in the one form every writer emits (bigint toString). */
+function isAssetValue(s: unknown): boolean {
+  return typeof s === 'string' && /^[1-9]\d*$/.test(s) && BigInt(s) < ASSET_VALUE_BOUND;
 }
 
 function validateWholePayload(p: Partial<WholeIntentPayload>): WholeIntentPayload {

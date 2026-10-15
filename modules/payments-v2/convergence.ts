@@ -145,6 +145,8 @@ export interface ConvergerDeps {
 
 export class Converger {
   private readonly reposting = new Set<string>();
+  /** #840: intents whose refusal to resume was logged — once per facade. */
+  private readonly warned = new Set<string>();
 
   constructor(private readonly deps: ConvergerDeps) {}
 
@@ -237,6 +239,7 @@ export class Converger {
       isLocallyActive: (id) => inPass.has(id),
       isParked: (id) => this.deps.parked.has(id),
       onHoldEnded: (id) => this.deps.parked.delete(id),
+      warned: this.warned,
       onDeferred: () => {
         deferred = true;
       },
