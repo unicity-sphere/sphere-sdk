@@ -27,3 +27,12 @@ export function certificationFailure(
     submitError ?? err,
   );
 }
+
+/** #839: past a matching proof the op IS certified under its id, so realizing it never fails clean. */
+export async function realizeCertified<T>(failLabel: string, realize: () => Promise<T>): Promise<T> {
+  try {
+    return await realize();
+  } catch (err) {
+    throw new ProofUnconfirmedError(`${failLabel}: certified on chain but not realized; resume under the same id`, err);
+  }
+}

@@ -25,7 +25,7 @@ import {
   retryTransient,
   TransientSubmitAnswer,
 } from './proof-wait';
-import { certificationFailure } from './certification-outcome';
+import { certificationFailure, realizeCertified } from './certification-outcome';
 import { randomUUID } from '../core/uuid';
 import {
   CheckpointPersistFailedError,
@@ -333,8 +333,10 @@ export class SphereTokenEngine implements ITokenEngine {
     const unlockScript = await SignaturePredicateUnlockScript.create(transferTx, this.deps.signingService);
     const certificationData = await CertificationData.fromTransaction(transferTx, unlockScript);
     const proof = await this.submitAndAwaitProof(certificationData, transferTx, failLabel, 'TRANSFER_FAILED', options);
-    const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
-    return wrapToken(await token.sdkToken.transfer(certified, this.deps.verificationContext));
+    return realizeCertified(failLabel, async () => {
+      const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);
+      return wrapToken(await token.sdkToken.transfer(certified, this.deps.verificationContext));
+    });
   }
 
   public async split(params: SplitParams, options?: EngineOpOptions): Promise<SplitResult> {
@@ -468,10 +470,10 @@ export class SphereTokenEngine implements ITokenEngine {
     }
     await this.assertNoLegStranded(ctx);
     const { burntToken, burnProof } = await this.burnSource(ctx);
-    const envelope = await encodeCheckpoint(ctx.split.burn.transaction, burnProof, burntToken);
     // The durable-ack gate: `put` resolving IS the ack, and NO mint has been submitted yet.
     let authoritative: Uint8Array;
     try {
+      const envelope = await encodeCheckpoint(ctx.split.burn.transaction, burnProof, burntToken);
       authoritative = await store.put(ctx.transferId, opIndex, envelope);
     } catch (err) {
       throw new CheckpointPersistFailedError(
@@ -490,8 +492,10 @@ export class SphereTokenEngine implements ITokenEngine {
     const burnUnlock = await SignaturePredicateUnlockScript.create(burnTx, this.deps.signingService);
     const burnCert = await CertificationData.fromTransaction(burnTx, burnUnlock);
     const burnProof = await this.submitAndAwaitProof(burnCert, burnTx, 'Split burn failed', 'TRANSFER_FAILED', ctx.options);
-    const burnCertified = await burnTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, burnProof);
-    const burntToken = await ctx.params.token.sdkToken.transfer(burnCertified, this.deps.verificationContext);
+    const burntToken = await realizeCertified('Split burn failed', async () => {
+      const burnCertified = await burnTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, burnProof);
+      return ctx.params.token.sdkToken.transfer(burnCertified, this.deps.verificationContext);
+    });
     return { burntToken, burnProof };
   }
 

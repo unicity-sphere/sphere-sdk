@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (money) — a failure after the inclusion proof matched is never a clean failure (#839)
+
+What was wrong. Once a transfer, burn or split burn had a proof that match-verified, the steps that
+realize it (building the certified transaction, applying it to the token, wrapping the result, and
+for a split encoding the burn checkpoint) could still throw a raw error. The payments machine read
+that as an ordinary failure with nothing certified, aborted the intent and, once the abort was
+confirmed, reported the send clean.
+
+Consequence. The spend was on chain, but no recipient blob and no checkpoint existed, and the
+aborted intent never resumed, so the value was stranded. The send reported
+`transfer:updated{status:'failed'}`, its source went back to selection, and a linked payment request
+became payable again. Next to a leg that conflicted, the attempt was reported as a clean
+`TRANSFER_CONFLICT`, and the full amount was re-planned under a new transferId on top of the
+certified leg. Across devices, another device could resume the still-open row before this device's
+abort was confirmed and deliver the leg while this one re-sent: a double pay. Reaching this needs
+the token's own verification to disagree with the proof wait's, and it is not known to have happened.
+
+What changed:
+
+- `engine.transfer()`, `engine.burn()` and `engine.split()` now reject a failure after a matching
+  proof with `ProofUnconfirmedError` (`CERTIFICATION_UNCONFIRMED`, the original error as `cause`),
+  and a split checkpoint that cannot be encoded with `CheckpointPersistFailedError`
+  (`CHECKPOINT_PERSIST_FAILED`), the same error a checkpoint that could not be stored already gets.
+  Both are keep-open: the intent stays open with its sources reserved, `send()` rejects
+  possibly-committed with its `transferId`, and the convergence pass realizes the same spend under
+  the same transferId. `burn()` reports `errorCode: 'CERTIFICATION_UNCONFIRMED'` for it.
+- The engine contract is written down in `token-engine/engine.ts`: `transfer`/`burn`/`split`
+  reject with an untyped error only when the call submitted nothing, or for a proven-clean submit
+  reject. `mint` and `mintDataToken` are unchanged and may still reject untyped after
+  certification, so their callers journal first and replay under the same id.
+- No type, signature or error code changed. Both codes were already in
+  `isPossiblyCommittedSendOutcome()`'s set.
+
+How it was verified:
+
+- `tests/unit/token-engine/post-proof-keep-open.test.ts`: the real engine with each realization
+  step failing once after the proof (transfer, burn, split with and without a checkpoint store,
+  checkpoint encode); each asserts the source is spent and that the same transferId realizes it;
+- `tests/unit/payments-v2/machine-post-proof.test.ts`: `TransferMachine` over the real engine for a
+  direct leg, a direct leg beside a conflicting one, and a split; none is aborted, and resume
+  delivers, applies the change and closes;
+- `tests/aggregator`: the same injection against a real aggregator-go;
+- mutation probes over each wrapped step.
+
 ### Changed (breaking) — DIRECT:// is no longer a payment recipient; unused DIRECT helpers removed (#847)
 
 What was wrong. A `DIRECT://` string is the wallet's Sphere Quests account id, yet `send()` and

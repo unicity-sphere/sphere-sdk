@@ -21,14 +21,16 @@
 
 import { readFileSync } from 'node:fs';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { createSphereTokenEngine, type ITokenEngine } from '../../token-engine';
+import { ProofUnconfirmedError } from '../../token-engine/errors';
 import {
   HexConverter,
   InclusionProofVerificationStatus,
   RootTrustBase,
   SigningService,
+  Token,
   VerificationStatus,
 } from '../../token-engine/sdk';
 import { startAggregatorStack, type AggregatorStack } from './support/aggregatorStack';
@@ -140,6 +142,40 @@ describe('engine ↔ real aggregator-go v3', () => {
     expect(Buffer.from(resumed.blob.token).equals(Buffer.from(first.blob.token))).toBe(true);
     expect(await recipient.verify(resumed)).toEqual({ ok: true });
   }, 180_000);
+
+  describe('#839: a failure after the service certified the spend', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    // The proof the service issued match-verified, so the spend IS on chain: the
+    // error must be keep-open, and the same transferId must realize the SAME spend.
+    it('is keep-open, and a same-transferId re-call realizes the spend the service certified', async () => {
+      const engine = await newEngine();
+      const recipient = await newEngine();
+      const src = await engine.mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: COIN, amount: 9n }] },
+      });
+      const transferId = uuid();
+      const to = recipient.getIdentity().chainPubkey;
+      const cause = new Error('realization failed after the proof (#839)');
+      vi.spyOn(Token.prototype, 'transfer').mockRejectedValueOnce(cause);
+
+      const err = await engine.transfer({ token: src, recipientPubkey: to }, { transferId }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+
+      expect(err).toBeInstanceOf(ProofUnconfirmedError);
+      expect((err as ProofUnconfirmedError).cause).toBe(cause);
+      expect(await engine.isSpent(src)).toBe(true);
+      vi.restoreAllMocks();
+      const resumed = await engine.transfer({ token: src, recipientPubkey: to }, { transferId });
+      expect(recipient.balanceOf(resumed, COIN)).toBe(9n);
+      expect(await recipient.verify(resumed)).toEqual({ ok: true });
+    }, 180_000);
+  });
 
   // The guard against every `{ ok: true }` above being vacuous. A verify() that
   // never consulted the trust base would pass all four; only a NO it can be made
