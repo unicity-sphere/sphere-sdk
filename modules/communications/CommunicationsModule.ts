@@ -173,8 +173,8 @@ export class CommunicationsModule {
 
   /**
    * Load messages from storage.
-   * Uses per-address key (STORAGE_KEYS_ADDRESS.MESSAGES) which is automatically
-   * scoped by LocalStorageProvider to sphere_DIRECT_xxx_yyy_messages.
+   * Uses per-address key (STORAGE_KEYS_ADDRESS.MESSAGES), which the storage
+   * provider scopes to the active chain pubkey (`{prefix}{chainPubkey}_messages`).
    * Falls back to legacy global 'direct_messages' key for migration.
    */
   async load(): Promise<void> {

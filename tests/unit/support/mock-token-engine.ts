@@ -15,14 +15,11 @@ export function mockSphereToken(value: SphereValue | null = { assets: [] }): Sph
   };
 }
 
-const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
-
 /** A vi-spy ITokenEngine. Pass overrides to fix return values per test. */
 export function createMockTokenEngine(overrides: Partial<ITokenEngine> = {}): ITokenEngine {
   const identity: EngineIdentity = { chainPubkey: new Uint8Array(33).fill(0x02) };
   const base: ITokenEngine = {
     getIdentity: vi.fn((): EngineIdentity => ({ chainPubkey: new Uint8Array(identity.chainPubkey) })),
-    deriveIdentityAddress: vi.fn((pubkey?: Uint8Array) => Promise.resolve(`DIRECT://${hex(pubkey ?? identity.chainPubkey)}`)),
     tokenId: vi.fn((t: SphereToken) => t.blob.tokenId),
     readValue: vi.fn((t: SphereToken) => t.value),
     readMemo: vi.fn((_t: SphereToken) => null),

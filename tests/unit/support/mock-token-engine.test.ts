@@ -6,7 +6,7 @@ describe('createMockTokenEngine', () => {
   it('implements every ITokenEngine method as a spy', () => {
     const e: ITokenEngine = createMockTokenEngine();
     const methods: (keyof ITokenEngine)[] = [
-      'getIdentity', 'deriveIdentityAddress', 'readValue', 'balanceOf',
+      'getIdentity', 'readValue', 'balanceOf',
       'mint', 'transfer', 'split', 'verify', 'isSpent', 'encodeToken', 'decodeToken',
       'buildNftMint', 'readNft',
     ];
@@ -15,15 +15,6 @@ describe('createMockTokenEngine', () => {
 
   it('getIdentity returns a 33-byte chain pubkey', () => {
     expect(createMockTokenEngine().getIdentity().chainPubkey).toHaveLength(33);
-  });
-
-  it('deriveIdentityAddress returns a DIRECT:// string and is pubkey-pure', async () => {
-    const e = createMockTokenEngine();
-    const a = new Uint8Array(33).fill(0xa1);
-    const b = new Uint8Array(33).fill(0xb2);
-    expect(await e.deriveIdentityAddress(a)).toMatch(/^DIRECT:\/\//);
-    expect(await e.deriveIdentityAddress(a)).toBe(await e.deriveIdentityAddress(a));
-    expect(await e.deriveIdentityAddress(a)).not.toBe(await e.deriveIdentityAddress(b));
   });
 
   it('default async ops resolve to sensible shapes', async () => {

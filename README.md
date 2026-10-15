@@ -120,11 +120,12 @@ stored before the rest of the setup runs, so if that call then throws (for examp
 Gate your backup prompt on your own "backup confirmed" flag and read the phrase with
 `sphere.getMnemonic()` until the user confirms.
 
-Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag` or `DIRECT://`
+Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag`
 recipient uses your network. Every such send emits `transfer:attention` with
 `code: 'recipient:network-unverified'` and an empty `transferId`, and then proceeds on your network.
 Treat it as information, not an error; on mainnet, make sure the recipient runs mainnet. A bare 66-hex
-chain pubkey recipient is taken as being on your network.
+chain pubkey recipient is taken as being on your network. A `DIRECT://` recipient is refused with
+`INVALID_RECIPIENT` before any lookup (#847): pay the recipient's `@nametag` or chain pubkey instead.
 
 ### What just happened (the provider model)
 
@@ -454,18 +455,20 @@ deprecated; it returns `Map<addressId, Map<nametagIndex, nametag>>`, keyed by th
 
 ### Identity Properties
 
-**Important:** The DIRECT address is the primary address for the Unicity network.
+`directAddress` (`DIRECT://…`) is the wallet's **Sphere Quests account id** and nothing else. It is not a
+payment address: `payments.send()` and `payments.requests.create()` refuse it (#847). Pay a `@nametag` or a
+chain pubkey; money always locks to the recipient's chain pubkey.
 
 ```typescript
 interface Identity {
   chainPubkey: string;         // 33-byte compressed secp256k1 public key
-  directAddress?: string;      // DIRECT address (DIRECT://...) - PRIMARY ADDRESS
+  directAddress?: string;      // DIRECT://... — the Sphere Quests account id (not a payment address)
   ipnsName?: string;           // legacy derived id ('12D3KooW…'); nothing in the SDK uses it
   nametag?: string;            // Registered nametag (@username)
 }
 
-// Access identity - use directAddress as primary
-console.log(sphere.identity?.directAddress);    // DIRECT://0000be36... (PRIMARY)
+// Access identity
+console.log(sphere.identity?.directAddress);    // DIRECT://0000be36... (Quests account id)
 console.log(sphere.identity?.nametag);          // alice (human-readable)
 console.log(sphere.identity?.chainPubkey);      // 02abc123... (33-byte compressed)
 ```
@@ -968,7 +971,7 @@ mnemonic → master key → BIP32 derivation → identity
                         │              shared keys                  │
                         │  privateKey:   "abc..."  (hex secp256k1)  │
                         │  chainPubkey:  "02def..." (33-byte comp.) │
-                        │  directAddress: "DIRECT://..." (L3)       │
+                        │  directAddress: "DIRECT://..." (Quests)   │
                         └─────────────────────┬─────────────────────┘
                                               ↓
               ┌──────────────────┬──────────────────┐
@@ -1390,7 +1393,7 @@ function getRelayStatuses() {
 
 Nametags provide human-readable addresses (e.g., `@alice`) for receiving payments. Valid formats: lowercase alphanumeric with `_` or `-` (3–20 chars), or E.164 phone numbers (e.g., `+14155552671`). Input is normalized to lowercase automatically.
 
-**How registration works:** registering a nametag publishes a **Nostr identity binding** (name ↔ chain pubkey). Uniqueness follows UNIP-01: every nametag binding the SDK publishes carries the `["L", "unicity:nametag"]` marker, a UNIP-01 relay keeps the first author it receives for a marked name, and resolution uses the marked binding. A name claimed by more than one author resolves to `null`; `created_at` never decides between authors (see [docs/NAMETAG-BINDINGS.md](docs/NAMETAG-BINDINGS.md)). A name is available iff no binding resolves for it (`sphere.isNametagAvailable(name)`). Runtime name resolution is binding-only; payments always go to the recipient's key-based `DIRECT://` address (there are no PROXY addresses).
+**How registration works:** registering a nametag publishes a **Nostr identity binding** (name ↔ chain pubkey). Uniqueness follows UNIP-01: every nametag binding the SDK publishes carries the `["L", "unicity:nametag"]` marker, a UNIP-01 relay keeps the first author it receives for a marked name, and resolution uses the marked binding. A name claimed by more than one author resolves to `null`; `created_at` never decides between authors (see [docs/NAMETAG-BINDINGS.md](docs/NAMETAG-BINDINGS.md)). A name is available iff no binding resolves for it (`sphere.isNametagAvailable(name)`). Runtime name resolution is binding-only; payments always lock to the recipient's chain pubkey, a `DIRECT://` recipient is refused (#847), and there are no PROXY addresses.
 
 Registration is **Nostr-binding-only**. The self-issued `UnicityIdToken` on-chain claim was removed with the 2.0.0 state-transition-sdk bump (upstream deleted the unicity-id primitive) — nothing is minted at registration, and nothing on chain is consulted to resolve a name.
 

@@ -33,8 +33,9 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { Sphere, type WalletApiTransportConfig } from '../../core/Sphere';
 import { isPossiblyCommittedSendOutcome } from '../../core/errors';
+import { DIRECT_RECIPIENT_REFUSED_MESSAGE } from '../../modules/payments-v2/recipient';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
-import type { TransportProvider } from '../../transport';
+import type { PeerInfo, TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { IncomingTransfer, ProviderStatus, TransferResult } from '../../types';
 import type { PaymentsV2 } from '../../modules/payments-v2/api';
@@ -300,4 +301,64 @@ describe.runIf(RUN)('LIVE staging: Sphere payments wiring (default transport pat
     sphere = null;
     logStep('done: mint → self-send → drain → balance 100, clean destroy');
   }, 2_700_000);
+
+  // #847: the wallet's OWN Quests id, sent to over the REAL composition. The mock
+  // relay answers every lookup with this wallet's binding, so before the refusal
+  // the DIRECT:// send resolved and reached planning. Now it never resolves, never
+  // PUTs an intent, and the server's open listing stays empty.
+  it('#847: send() to the wallet\'s own DIRECT:// address is refused before any lookup or intent PUT', async () => {
+    const ownDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sphere-pv2-e2e-direct-'));
+    trustBaseJson ??= await trustbase();
+    const requests: string[] = [];
+    const openListings: unknown[][] = [];
+    const recordingFetch = async (url: string, init?: RequestInit): Promise<Response> => {
+      const method = init?.method ?? 'GET';
+      requests.push(`${method} ${url}`);
+      const response = await fetch(url, init);
+      if (method === 'GET' && url.includes('/v1/intents?status=open') && response.ok) {
+        openListings.push(((await response.clone().json()) as { intents: unknown[] }).intents);
+      }
+      return response;
+    };
+    let own: PeerInfo | null = null;
+    const resolve = vi.fn(async (_identifier: string): Promise<PeerInfo | null> => own);
+    const transport = { ...createMockTransport(), resolve } as TransportProvider;
+    const { sphere: wallet } = await Sphere.init({
+      storage: new FileStorageProvider({ dataDir: ownDir }),
+      transport,
+      oracle: createStagingOracle(trustBaseJson),
+      walletApi: { baseUrl: BASE_URL, network: NETWORK, deviceId: `${deviceId}-direct`, webSocketFactory: nodeWsFactory, fetchFn: recordingFetch },
+      autoGenerate: true,
+      network: NETWORK,
+    });
+    try {
+      const identity = wallet.identity!;
+      const directAddress = identity.directAddress!;
+      expect(directAddress).toMatch(/^DIRECT:\/\//);
+      own = { chainPubkey: identity.chainPubkey, directAddress, transportPubkey: identity.chainPubkey.slice(2), timestamp: 0 };
+      const pendingBefore = await wallet.payments.pendingTransfers();
+      resolve.mockClear();
+      const sentBefore = requests.length;
+
+      const err = await wallet.payments.send({ recipient: directAddress, amount: '1', coinId: HARNESS_COIN }).then(
+        () => undefined,
+        (e: unknown) => e as { code?: string; message?: string; transferId?: string }
+      );
+
+      expect(err?.code).toBe('INVALID_RECIPIENT');
+      expect(err?.message).toBe(DIRECT_RECIPIENT_REFUSED_MESSAGE);
+      expect(err?.transferId).toBeUndefined();
+      expect(isPossiblyCommittedSendOutcome(err)).toBe(false);
+      expect(resolve).not.toHaveBeenCalled();
+      expect(requests.slice(sentBefore).filter((r) => r.startsWith('PUT ') && r.includes('/v1/intents/'))).toEqual([]);
+      expect(await wallet.payments.pendingTransfers()).toEqual(pendingBefore);
+      openListings.length = 0;
+      await wallet.payments.resumeNow();
+      expect(openListings.length).toBeGreaterThan(0);
+      expect(openListings.at(-1)).toEqual([]);
+    } finally {
+      await wallet.destroy().catch(() => undefined);
+      fs.rmSync(ownDir, { recursive: true, force: true });
+    }
+  }, 300_000);
 });

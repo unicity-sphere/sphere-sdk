@@ -1,11 +1,13 @@
 /**
- * token-engine/identity.ts — legacy `DIRECT://` identity address (Path A, A6).
+ * token-engine/identity.ts — the legacy `DIRECT://` derivation (Path A, A6).
  *
- * Reproduces the wallet's stable L3 identity address EXACTLY as the v1
- * `UnmaskedPredicateReference` → `DirectAddress` path did, but VENDORED (no v1 SDK
- * import) so the v1 dependency can be removed at the final cut-over. Quest XP is
- * keyed on this address, so it MUST stay byte-identical — the multi-vector
- * golden test (identity.test.ts) locks it.
+ * Its one job is the wallet's Sphere Quests account id (#847): it is not a payment
+ * address, and the money path refuses it as a recipient. Reproduces the v1
+ * `UnmaskedPredicateReference` → `DirectAddress` path EXACTLY, VENDORED (no v1 SDK
+ * import). Quests accounts are keyed on its output, so it MUST stay byte-identical —
+ * the multi-vector golden test (identity.test.ts) locks it. The wallet passes
+ * `getPublicKey(SHA256(privateKey))`, NOT `chainPubkey` (core/Sphere.ts
+ * `deriveL3PredicateAddress`), so nobody can compute a wallet's id from its pubkey.
  *
  * The recipe (recovered from v1 `UnmaskedPredicateReference.create` + `DirectAddress.create`):
  *   ref     = SHA-256( CBOR[ bstr([UNMASKED]), bstr(tokenType.toCBOR()),
@@ -20,12 +22,7 @@
 
 import { CborSerializer, DataHasher, HashAlgorithm, HexConverter } from './sdk';
 
-/**
- * Unicity L3 token type used for identity-address derivation (immutable).
- * Also pinned as the fixed token type of self-issued Unicity ID tokens
- * (token-engine/unicity-id.ts) — the same constant the v1 nametag mint used,
- * keeping the mint deterministic per (name, wallet key).
- */
+/** Unicity L3 token type used for identity-address derivation (immutable; the v1 constant). */
 export const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
 /** v1 `SigningService.algorithm` for secp256k1. */
 const SIGNING_ALGORITHM = 'secp256k1';
@@ -52,8 +49,9 @@ function sha256(data: Uint8Array): Promise<Uint8Array> {
 }
 
 /**
- * Derive the legacy `DIRECT://` identity address for a compressed (33-byte)
- * secp256k1 public key. Deterministic; byte-identical to the v1 path (Path A).
+ * Derive the legacy `DIRECT://` string for a compressed (33-byte) secp256k1 public
+ * key. Deterministic; byte-identical to the v1 path (Path A). See the header for
+ * which key the wallet passes.
  */
 export async function deriveDirectAddress(publicKey: Uint8Array): Promise<string> {
   const tokenTypeCbor = CborSerializer.encodeByteString(hexToBytes(UNICITY_TOKEN_TYPE_HEX)); // v1 TokenType.toCBOR()

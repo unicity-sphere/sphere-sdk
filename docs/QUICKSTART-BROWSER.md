@@ -422,7 +422,7 @@ The snippets below assume an initialised `sphere` (see [Framework Setup](#framew
 ```typescript
 const identity = sphere.identity;
 
-console.log('L3 Address:', identity?.directAddress);  // DIRECT://...
+console.log('Quests id:', identity?.directAddress);  // DIRECT://... (not a payment address)
 console.log('Public Key:', identity?.chainPubkey);    // 02abc...
 console.log('Nametag:', identity?.nametag);           // 'username' (stored without the leading @)
 ```
@@ -605,7 +605,7 @@ proven clean: nothing of the payment was certified, and nothing this device hold
 `sendCoinless()` reject with it (show `err.message`, which says so), and `burn()` resolves
 `{ success: false, errorCode: 'SEND_INSUFFICIENT_BALANCE' }` instead of rejecting.
 
-Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag` or `DIRECT://` recipient
+Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag` recipient
 uses your network. Every such send emits `transfer:attention` with `code: 'recipient:network-unverified'` and an
 empty `transferId`, and then proceeds on your network. Treat it as information, not an error; on mainnet, make
 sure the recipient runs mainnet. A bare 66-hex chain pubkey recipient is taken as being on your network.

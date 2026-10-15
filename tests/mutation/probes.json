@@ -3466,5 +3466,115 @@
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
+  },
+  {
+    "name": "direct-recipient-gate-refusal-removed",
+    "note": "#847: requireSameNetworkRecipient refuses a DIRECT:// recipient before resolution; without it send/sendWholeToken/sendCoinless pay whatever chain pubkey the relay's binding names (direct-recipient.test.ts)",
+    "file": "modules/payments-v2/recipient.ts",
+    "find": "  if (isDirectAddressRecipient(identifier)) throw new SphereError(DIRECT_RECIPIENT_REFUSED_MESSAGE, 'INVALID_RECIPIENT');\n  const recipient = await deps.resolveRecipient(identifier);",
+    "replace": "  const recipient = await deps.resolveRecipient(identifier);",
+    "tests": [
+      "tests/unit/payments-v2/direct-recipient.test.ts"
+    ]
+  },
+  {
+    "name": "direct-recipient-gate-refusal-after-resolve",
+    "note": "#847: the refusal comes BEFORE deps.resolveRecipient, so no relay lookup runs for a DIRECT:// recipient (direct-recipient.test.ts 'resolveRecipient never called')",
+    "file": "modules/payments-v2/recipient.ts",
+    "find": "  if (isDirectAddressRecipient(identifier)) throw new SphereError(DIRECT_RECIPIENT_REFUSED_MESSAGE, 'INVALID_RECIPIENT');\n  const recipient = await deps.resolveRecipient(identifier);",
+    "replace": "  const recipient = await deps.resolveRecipient(identifier);\n  if (isDirectAddressRecipient(identifier)) throw new SphereError(DIRECT_RECIPIENT_REFUSED_MESSAGE, 'INVALID_RECIPIENT');",
+    "tests": [
+      "tests/unit/payments-v2/direct-recipient.test.ts"
+    ]
+  },
+  {
+    "name": "direct-recipient-matcher-misses-at-prefix",
+    "note": "#847: the matcher also catches a leading @ (`@DIRECT://`, which an example app produces); killed by the '@ prefix' spelling",
+    "file": "modules/payments-v2/recipient.ts",
+    "find": "const DIRECT_RECIPIENT_RE = /^\\s*@?\\s*direct:/i;",
+    "replace": "const DIRECT_RECIPIENT_RE = /^\\s*direct:/i;",
+    "tests": [
+      "tests/unit/payments-v2/direct-recipient.test.ts"
+    ]
+  },
+  {
+    "name": "direct-recipient-matcher-case-sensitive",
+    "note": "#847: the matcher ignores case; killed by the lower-case `direct://` spelling",
+    "file": "modules/payments-v2/recipient.ts",
+    "find": "const DIRECT_RECIPIENT_RE = /^\\s*@?\\s*direct:/i;",
+    "replace": "const DIRECT_RECIPIENT_RE = /^\\s*@?\\s*DIRECT:/;",
+    "tests": [
+      "tests/unit/payments-v2/direct-recipient.test.ts"
+    ]
+  },
+  {
+    "name": "direct-recipient-requests-refusal-removed",
+    "note": "#847: Requests.create refuses a DIRECT:// `to` before resolvePubkey and before any server call, keeping its never-throws contract (direct-recipient.test.ts requests.create)",
+    "file": "modules/payments-v2/requests/Requests.ts",
+    "find": "      if (isDirectAddressRecipient(to)) return { success: false, error: DIRECT_RECIPIENT_REFUSED_MESSAGE };\n",
+    "replace": "      if (to === '') return { success: false, error: DIRECT_RECIPIENT_REFUSED_MESSAGE };\n",
+    "tests": [
+      "tests/unit/payments-v2/direct-recipient.test.ts"
+    ]
+  },
+  {
+    "name": "direct-recipient-prewarm-reads-blobs",
+    "note": "#847: prewarmSend for a DIRECT:// recipient reads nothing, since that send is refused (direct-recipient.test.ts prewarmSend)",
+    "file": "modules/payments-v2/prewarm-cache.ts",
+    "find": "  if (isDirectAddressRecipient(request.recipient)) return;\n",
+    "replace": "  if (request.recipient === '') return;\n",
+    "tests": [
+      "tests/unit/payments-v2/direct-recipient.test.ts"
+    ]
+  },
+  {
+    "name": "direct-recipient-connect-host-refusal-removed",
+    "note": "#847: ConnectHost refuses a DIRECT:// payment `to` before onIntent and before any auto-approve handler (connect/direct-recipient.test.ts)",
+    "file": "connect/host/ConnectHost.ts",
+    "find": "    const refusal = directRecipientRefusal(msg.action, msg.params);\n",
+    "replace": "    const refusal: string | null = null;\n",
+    "tests": [
+      "tests/unit/connect/direct-recipient.test.ts"
+    ]
+  },
+  {
+    "name": "direct-recipient-connect-send-not-refused",
+    "note": "#847: the `send` intent is a payment intent; dropping it from the set lets a DIRECT:// `to` reach the wallet prompt",
+    "file": "connect/host/direct-recipient.ts",
+    "find": "  INTENT_ACTIONS.SEND,\n",
+    "replace": "  INTENT_ACTIONS.RECEIVE,\n",
+    "tests": [
+      "tests/unit/connect/direct-recipient.test.ts"
+    ]
+  },
+  {
+    "name": "direct-recipient-connect-payment-request-not-refused",
+    "note": "#847: the `payment_request` intent is a payment intent; dropping it from the set lets a DIRECT:// `to` reach the wallet prompt",
+    "file": "connect/host/direct-recipient.ts",
+    "find": "  INTENT_ACTIONS.PAYMENT_REQUEST,\n",
+    "replace": "  INTENT_ACTIONS.RECEIVE,\n",
+    "tests": [
+      "tests/unit/connect/direct-recipient.test.ts"
+    ]
+  },
+  {
+    "name": "direct-recipient-connect-send-nft-not-refused",
+    "note": "#847: the `send_nft` intent is a payment intent; dropping it from the set lets a DIRECT:// `to` reach the wallet prompt",
+    "file": "connect/host/direct-recipient.ts",
+    "find": "  INTENT_ACTIONS.SEND_NFT,\n",
+    "replace": "  INTENT_ACTIONS.RECEIVE,\n",
+    "tests": [
+      "tests/unit/connect/direct-recipient.test.ts"
+    ]
+  },
+  {
+    "name": "transport-identity-binding-drops-direct-address",
+    "note": "#847 Quests surface: the base identity binding must keep writing content.direct_address through the real nostr-js-sdk builder; without it resolve(<chain pubkey>) returns no Quests id and sign-in fails (identity-binding-quests.test.ts)",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "    const success = await this.nostrClient!.publishIdentityBinding({\n      publicKey: chainPubkey,\n      directAddress,\n    });",
+    "replace": "    const success = await this.nostrClient!.publishIdentityBinding({\n      publicKey: chainPubkey,\n    });",
+    "tests": [
+      "tests/unit/transport/identity-binding-quests.test.ts"
+    ]
   }
 ]

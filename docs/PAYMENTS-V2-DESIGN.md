@@ -705,7 +705,8 @@ parse has already dropped every content field outside its whitelist. Re-querying
 re-deriving ownership ourselves (candidate filtering by identifier, marker preference, ambiguity→null,
 multi-relay settle — all private), and a second resolver that can disagree with the SDK's is worse
 than a missing field on a money guard. So for those two routes §5.6 can only ever land on row 3
-today; `bindingInfoToPeerInfo` therefore carries **no** network at all rather than a value that
+today (since #847 a `DIRECT://` *recipient* is refused before resolution, so for money only the
+`@nametag` route is left); `bindingInfoToPeerInfo` therefore carries **no** network at all rather than a value that
 merely looks read. The limitation is pinned by
 `tests/unit/payments-v2/recipient-network.transport.test.ts` (relay → transport → resolver →
 gate, per route), which goes red the day upstream carries the field.

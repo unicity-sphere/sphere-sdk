@@ -843,9 +843,9 @@ export class NostrTransportProvider implements TransportProvider {
    * than a missing field on a MONEY guard. Nothing can declare a network today
    * regardless: the publish builders whitelist the same fields.
    *
-   * CONSEQUENCE, stated plainly: for `@nametag` and `DIRECT://` recipients the
-   * §5.6 cross-network guard can only SIGNAL (`recipient:network-unverified`),
-   * never refuse. Upstream #734 must add `network` to the binding builders AND
+   * CONSEQUENCE, stated plainly: for `@nametag` recipients the §5.6
+   * cross-network guard can only SIGNAL (`recipient:network-unverified`), never
+   * refuse (a `DIRECT://` recipient is refused before resolution, #847). Upstream #734 must add `network` to the binding builders AND
    * to `BindingInfo`; the tripwire in
    * tests/unit/payments-v2/recipient-network.transport.test.ts fails the day it
    * lands, so this wiring cannot be forgotten. Do not "fix" this by inventing a

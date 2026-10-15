@@ -1,5 +1,6 @@
 import type { InventoryView } from './inventory/InventoryView';
 import type { StoragePort } from './ports';
+import { isDirectAddressRecipient } from './recipient';
 import type { SpendQueue } from './select/queue';
 
 /** Source blobs fetched ahead of a send, scoped to the state each token sat at (F6). */
@@ -52,11 +53,12 @@ export interface WarmDeps {
   readonly cache: PrewarmCache;
 }
 
-/** Reserves nothing and throws nothing: the send re-fetches whatever is missing. */
+/** Reserves nothing and throws nothing: the send re-fetches whatever is missing. A send the gate will refuse (#847) warms nothing. */
 export async function warmSendSources(
   deps: WarmDeps,
-  request: { coinId: string; amount: string }
+  request: { coinId: string; amount: string; recipient?: string }
 ): Promise<void> {
+  if (isDirectAddressRecipient(request.recipient)) return;
   const ids = deps.queue.previewSelection(request);
   if (ids.length === 0) return;
   const generation = deps.cache.begin();

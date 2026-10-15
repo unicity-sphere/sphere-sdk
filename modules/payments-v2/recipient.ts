@@ -8,6 +8,16 @@ import type { RecipientInfo } from './compose';
 
 export const ATTENTION_RECIPIENT_NETWORK_UNVERIFIED = 'recipient:network-unverified';
 
+// #847: the Quests account id is no payment address (any case; `@DIRECT://` too).
+const DIRECT_RECIPIENT_RE = /^\s*@?\s*direct:/i;
+
+export const DIRECT_RECIPIENT_REFUSED_MESSAGE =
+  "DIRECT:// addresses are no longer accepted as payment recipients; use the recipient's @nametag or chain pubkey";
+
+export function isDirectAddressRecipient(identifier: unknown): boolean {
+  return typeof identifier === 'string' && DIRECT_RECIPIENT_RE.test(identifier);
+}
+
 export interface RecipientGateDeps {
   resolveRecipient: (identifier: string) => Promise<RecipientInfo | null>;
   network: string;
@@ -18,6 +28,7 @@ export async function requireSameNetworkRecipient(
   deps: RecipientGateDeps,
   identifier: string
 ): Promise<RecipientInfo> {
+  if (isDirectAddressRecipient(identifier)) throw new SphereError(DIRECT_RECIPIENT_REFUSED_MESSAGE, 'INVALID_RECIPIENT');
   const recipient = await deps.resolveRecipient(identifier);
   if (recipient === null || recipient.chainPubkey === '') {
     throw new SphereError(`Recipient ${identifier} has no published chain pubkey`, 'INVALID_RECIPIENT');

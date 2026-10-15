@@ -45,8 +45,8 @@ export type {
   NftReading,
 } from './types';
 
-// Identity (A6): legacy DIRECT:// address derivation (Path A — XP-invariant).
-// Reused by core/Sphere (B6) and the engine's deriveIdentityAddress.
+// Identity (A6): the DIRECT:// Sphere Quests account-id derivation, byte-stable.
+// core/Sphere feeds it getPublicKey(SHA256(privateKey)), never the chain pubkey.
 export { deriveDirectAddress } from './identity';
 
 // The concrete adapter factory (A4) — the public way to obtain an ITokenEngine.

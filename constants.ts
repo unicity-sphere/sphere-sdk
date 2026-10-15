@@ -106,16 +106,16 @@ const NETWORK_SCOPED_ADDRESS_KEYS: readonly string[] = [
   STORAGE_KEYS_ADDRESS.AUTO_RETURN_LEDGER,
 ];
 
-/** Composite per-address key prefixes (modules store `{addressId}_{prefix}{id}`) — per-network. */
+/** Composite per-address key prefixes (pre-flip modules stored `{addressId}_{prefix}{id}`) — per-network. */
 const NETWORK_SCOPED_ADDRESS_PREFIXES: readonly string[] = [
   STORAGE_KEYS_ADDRESS.SWAP_RECORD_PREFIX, // 'swap:'
-  'inv_ledger:', // AccountingModule INV_LEDGER_PREFIX
+  'inv_ledger:', // the removed accounting module's invoice-ledger prefix (a network-scoping witness)
 ];
 
 /**
  * True if a storage key is a per-NETWORK token/payment key (so the storage provider adds the
- * network segment). Handles the bare form ('auto_return_ledger'), the module-built addressId
- * form ('DIRECT_a_b_auto_return_ledger'), and composites ('{addressId}_swap:{id}'). Chat/identity
+ * network segment). Handles the bare form ('auto_return_ledger'), the addressId form the pre-flip
+ * modules built ('DIRECT_a_b_auto_return_ledger'), and composites ('{addressId}_swap:{id}'). Chat/identity
  * keys return false — they remain per-address, network-agnostic.
  */
 export function isNetworkScopedAddressKey(key: string): boolean {
@@ -129,19 +129,9 @@ export function isNetworkScopedAddressKey(key: string): boolean {
 }
 
 /**
- * Build a per-address storage key using address identifier
- * @param addressId - Short identifier for the address (e.g., first 8 chars of pubkey hash, or direct address hash)
- * @param key - The key from STORAGE_KEYS_ADDRESS
- * @returns Key in format: "{addressId}_{key}" e.g., "a1b2c3d4_tokens"
- */
-export function getAddressStorageKey(addressId: string, key: string): string {
-  return `${addressId}_${key}`;
-}
-
-/**
  * Create a readable address identifier from directAddress or chainPubkey
  * Format: DIRECT_first6_last6 (sanitized for filesystem/storage)
- * @param directAddress - The L3 direct address (DIRECT:xxx) or chainPubkey
+ * @param directAddress - The wallet's DIRECT:// address (its Quests account id) or chainPubkey
  * @returns Sanitized identifier like "DIRECT_abc123_xyz789"
  */
 export function getAddressId(directAddress: string): string {
