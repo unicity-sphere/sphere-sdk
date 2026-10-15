@@ -78,10 +78,12 @@ function is the aggregator, which hard-rejects `CertificationDataVersion = 1`. C
 request deadline on any transaction (`expiresAt` is left for the service to assign), and v3's two
 new certification statuses are not clean rejects — `REQUEST_EXPIRED` and `SERVICE_NOT_READY` each
 report only that *this* submit was not admitted, never that no earlier attempt certified.
-`TRANSACTION_HASH_MISMATCH` remains the only conflict signal, and `CERTIFICATION_UNCONFIRMED` /
-[`isPossiblyCommittedSendOutcome()`](#send-error-handling) keep exactly the meaning they had.
-`CERTIFICATION_UNCONFIRMED` also covers a spend that is certified but not yet realized: its proof
-matched, and a later step failed (#839). The reasoning behind the deadline policy is in the CHANGELOG entry for 0.15.0.
+`TRANSACTION_HASH_MISMATCH` remains the only conflict signal, and the 3.x bump did not change
+[`isPossiblyCommittedSendOutcome()`](#send-error-handling) or `CERTIFICATION_UNCONFIRMED`. Since
+#839, `CERTIFICATION_UNCONFIRMED` also covers a spend that is certified but not yet realized: its
+proof matched and a later step failed, so the spend is on chain and `cause` is that step's error.
+Handle it as before (keep it pending, never re-send). The reasoning behind the deadline policy is
+in the CHANGELOG entry for 0.15.0.
 
 ### `sphere.paymentsV2` is removed
 

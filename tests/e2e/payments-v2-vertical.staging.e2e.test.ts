@@ -992,8 +992,10 @@ describe.runIf(RUN)('LIVE staging: #842 SENT history beside the apply (real clie
 
 // ── #839: a failure after the gateway certified the spend ────────────────────
 // The real engine's proof wait match-verifies the gateway's proof; only then does
-// Token.transfer run. Failing it once, for G's token only (other wallets in this
-// process keep running), leaves a spend that IS on chain and was never realized.
+// Token.transfer run. Failing it for G's token only (other wallets in this process
+// keep running) leaves a spend that IS on chain and was never realized. The fault
+// stays armed until the keep-open checks are done, so the heartbeat the keep-open
+// arms (5 s) cannot realize the spend while they run; resumeNow() comes after.
 
 /** Records every abort the facade sends, then passes it through to the real client. */
 function abortRecorder(): { calls: string[]; wrap: (inner: AuthedClient) => AuthedClient } {
@@ -1016,18 +1018,18 @@ async function heldSource(w: VWallet, tokenId: string): Promise<SphereToken> {
   return w.engine.decodeToken({ tokenId, token: bytes });
 }
 
-/** Token.transfer rejects once, and only on a token whose genesis id is `tokenId`. */
-function failRealizationOnce(tokenId: string): { fired: () => boolean } {
+/** Token.transfer rejects on a token whose genesis id is `tokenId`, until `disarm()`. */
+function failRealization(tokenId: string): { fired: () => boolean; disarm: () => void } {
   const original = Token.prototype.transfer;
-  let armed = true;
-  vi.spyOn(Token.prototype, 'transfer').mockImplementation(function (this: Token, ...args) {
-    if (armed && HexConverter.encode(this.id.bytes) === tokenId) {
-      armed = false;
+  let fired = 0;
+  const spy = vi.spyOn(Token.prototype, 'transfer').mockImplementation(function (this: Token, ...args) {
+    if (HexConverter.encode(this.id.bytes) === tokenId) {
+      fired++;
       return Promise.reject(new Error('synthetic realization failure after the proof (#839)'));
     }
     return original.apply(this, args);
   });
-  return { fired: () => !armed };
+  return { fired: () => fired > 0, disarm: () => spy.mockRestore() };
 }
 
 describe.runIf(RUN)('LIVE staging: #839 realization fails after the proof (real gateway, in-process fault)', () => {
@@ -1045,14 +1047,13 @@ describe.runIf(RUN)('LIVE staging: #839 realization fails after the proof (real 
     await waitFor(g, () => localTotal(g) === 100n, 60_000, 'G local view shows the 100 mint');
 
     const firstEvent = g.events.length;
-    const fault = failRealizationOnce(tokenG);
+    const fault = failRealization(tokenG);
     const outcome = await g.facade
       .send({ recipient: h.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN })
       .then(
         (result) => ({ result }),
         (error: unknown) => ({ error })
       );
-    vi.restoreAllMocks();
 
     expect(fault.fired(), 'the realization ran, so the gateway certified the spend first').toBe(true);
     expect('error' in outcome, 'an unrealized certified spend never resolves the send').toBe(true);
@@ -1061,6 +1062,7 @@ describe.runIf(RUN)('LIVE staging: #839 realization fails after the proof (real 
     expect(err.code).toBe('CERTIFICATION_UNCONFIRMED');
     expect(isPossiblyCommittedSendOutcome(err)).toBe(true);
     const transferId = must(err.transferId, 'keep-open transferId');
+    expect(g.facade.tokens().find((t) => t.id === tokenG)?.status, 'the source stays reserved').toBe('transferring');
     expect(await g.engine.isSpent(await heldSource(g, tokenG)), 'the spend is on chain').toBe(true);
 
     // Never cancelled: no abort left this client, the row is open on the server, nothing failed.
@@ -1068,7 +1070,8 @@ describe.runIf(RUN)('LIVE staging: #839 realization fails after the proof (real 
     expect(await openIntentIds(g)).toContain(transferId);
     expect((await g.api.listIntents('aborted')).map((i) => i.transferId)).not.toContain(transferId);
     expect(failedUpdates(g, transferId, firstEvent)).toEqual([]);
-    expect(g.facade.tokens().find((t) => t.id === tokenG)?.status, 'the source stays reserved').toBe('transferring');
+    expect(g.facade.tokens().find((t) => t.id === tokenG)?.status, 'still reserved after the checks').toBe('transferring');
+    fault.disarm();
 
     // The retry verb, never send(): the same transferId re-proves the certified spend and realizes it.
     await g.facade.resumeNow();
