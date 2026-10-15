@@ -2684,8 +2684,8 @@
     "name": "dropstale-trusts-listing-for-tombstones",
     "note": "#835: an unlisted tombstone goes only after its abort answers 204 the aborted listing confirms, or 404 NOT_FOUND; a listing that omits the row is no proof the row cannot run (machine-resume.test.ts 'an unlisted tombstone whose abort answers %s is kept'; send-intent-unknown.test.ts (p))",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);",
-    "replace": "      await retire(stores, entry, outcome !== 'completed', report);",
+    "find": "      if (outcome !== 'unknown') await retire(stores, entry, outcome, report);",
+    "replace": "      await retire(stores, entry, outcome as 'aborted', report);",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
@@ -2695,8 +2695,8 @@
     "name": "dropstale-removes-unconditionally",
     "note": "#835: every GC removal is compare-and-delete against the entry the pass judged; a send held after the pass read its snapshot survives that pass (send-intent-unknown.test.ts '(h-stale) a pass judging a snapshot from before the hold never sweeps the held entry')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "  if ((await stores.backstop.removeIfUnchanged(entry.transferId, entry)) && refused) report.conflicted.push(entry.transferId);",
-    "replace": "  await stores.backstop.removeByKey(entry.transferId);\n  if (refused) report.conflicted.push(entry.transferId);",
+    "find": "  } else if ((await stores.backstop.removeIfUnchanged(entry.transferId, entry)) && refused) {\n    report.conflicted.push(entry.transferId);\n  }",
+    "replace": "  } else {\n    await stores.backstop.removeByKey(entry.transferId);\n    if (refused) report.conflicted.push(entry.transferId);\n  }",
     "tests": [
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
     ]
@@ -2705,8 +2705,8 @@
     "name": "dropstale-active-after-tombstone",
     "note": "#835: the in-process check runs BEFORE the tombstone branch (HEAD ran it after), so a pass never aborts or drops the tombstone of an attempt still running here (machine-resume.test.ts 'a tombstone of an in-process attempt is untouched...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);\n      continue;\n    }\n",
-    "replace": "    if (view.openIds.has(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);\n      continue;\n    }\n    if (view.isLocallyActive(id)) continue;\n",
+    "find": "    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome, report);\n      continue;\n    }\n",
+    "replace": "    if (view.openIds.has(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome, report);\n      continue;\n    }\n    if (view.isLocallyActive(id)) continue;\n",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
@@ -2853,8 +2853,8 @@
     "name": "gate-reports-conflicted-on-failed-abort",
     "note": "#835: the #676 gate reports conflicted only once the server confirmed the abort; a failed abort keeps a link settling",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "      if (outcome === 'unknown') report.failed.push(intent.transferId);\n      else await retire(stores, local, outcome !== 'completed', report).catch(() => undefined);",
-    "replace": "      await retire(stores, local, outcome !== 'completed', report).catch(() => undefined);",
+    "find": "      if (outcome === 'unknown') report.failed.push(intent.transferId);\n      else await retire(stores, local, outcome, report).catch(() => undefined);",
+    "replace": "      await retire(stores, local, outcome as 'aborted', report).catch(() => undefined);",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
@@ -3248,8 +3248,8 @@
     "name": "gc-cancel-unreported",
     "note": "#835: a tombstone whose cancel the aborted listing confirms (or a typed 404) is reported conflicted and hands back what it held; read as completed, a link stays paid for nothing (machine-resume.test.ts 'a confirmed cancel hands back what the tombstone held...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);",
-    "replace": "      if (outcome !== 'unknown') await retire(stores, entry, false, report);",
+    "find": "      if (outcome !== 'unknown') await retire(stores, entry, outcome, report);",
+    "replace": "      if (outcome !== 'unknown') await retire(stores, entry, 'completed', report);",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
@@ -3405,8 +3405,8 @@
     "name": "sweep-aborted-reads-completed",
     "note": "#835: an entry whose row is aborted moved nothing; settled as completed, what it held is erased and a link reads paid (machine-resume.test.ts 'the sweep of an entry whose row is no longer open tells completed from aborted')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    await retire(stores, entry, listed.aborted.has(id), report);",
-    "replace": "    await retire(stores, entry, false, report);",
+    "find": "    await retire(stores, entry, listed.aborted.has(id) ? 'aborted' : 'completed', report);",
+    "replace": "    await retire(stores, entry, 'completed', report);",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
@@ -3425,8 +3425,8 @@
     "name": "sweep-aborted-not-conflicted",
     "note": "#835: a swept entry whose row is aborted is reported conflicted, so a link to it is payable again (machine-resume.test.ts 'an acked entry whose row another device aborted is conflicted...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "  if ((await stores.backstop.removeIfUnchanged(entry.transferId, entry)) && refused) report.conflicted.push(entry.transferId);",
-    "replace": "  await stores.backstop.removeIfUnchanged(entry.transferId, entry);",
+    "find": "  } else if ((await stores.backstop.removeIfUnchanged(entry.transferId, entry)) && refused) {\n    report.conflicted.push(entry.transferId);\n  }",
+    "replace": "  } else {\n    await stores.backstop.removeIfUnchanged(entry.transferId, entry);\n  }",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
@@ -3556,8 +3556,8 @@
     "name": "sweep-shares-one-snapshot",
     "note": "#835: each stale entry is judged by listings read for it; one snapshot shared across the sweep judges a row re-opened while an earlier entry is retired as aborted, hands back what it holds and deletes its only record (machine-resume.test.ts 'each entry is judged by listings read for it...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "  for (const entry of view.locals.values()) {\n    const id = entry.transferId;\n    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);\n      continue;\n    }\n    if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it\n    if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;\n    // Read for each entry: a byte-equal re-PUT may re-open a row while an earlier one is retired.\n    const listed = await freshListings(intents, report);\n",
-    "replace": "  let shared: Awaited<ReturnType<typeof freshListings>> | undefined;\n  for (const entry of view.locals.values()) {\n    const id = entry.transferId;\n    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);\n      continue;\n    }\n    if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it\n    if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;\n    // Read for each entry: a byte-equal re-PUT may re-open a row while an earlier one is retired.\n    const listed = (shared ??= await freshListings(intents, report));\n",
+    "find": "  for (const entry of view.locals.values()) {\n    const id = entry.transferId;\n    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome, report);\n      continue;\n    }\n    if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it\n    if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;\n    // Read for each entry: a byte-equal re-PUT may re-open a row while an earlier one is retired.\n    const listed = await freshListings(intents, report);\n",
+    "replace": "  let shared: Awaited<ReturnType<typeof freshListings>> | undefined;\n  for (const entry of view.locals.values()) {\n    const id = entry.transferId;\n    if (view.openIds.has(id) || view.isLocallyActive(id)) continue;\n    if (entry.disposition !== 'open') {\n      const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));\n      if (outcome !== 'unknown') await retire(stores, entry, outcome, report);\n      continue;\n    }\n    if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it\n    if ((await stores.deliveryJournal.byTransfer(id)).size > 0) continue;\n    // Read for each entry: a byte-equal re-PUT may re-open a row while an earlier one is retired.\n    const listed = (shared ??= await freshListings(intents, report));\n",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
@@ -4229,10 +4229,81 @@
   },
   {
     "name": "resume-pass-not-total",
-    "note": "#840: a throw after a verdict was made durable (a never-stored tombstone retired as conflicted) must still return the partial report. Rethrown, reconcile never runs, and the next pass finds the link unaccounted and resolves it paid with nothing moved.",
+    "note": "#840: a pass that throws part-way still returns what it decided and reports every unjudged id failed. Rethrown, the converger skips the reconcile and the view refresh for the whole pass, and the Retry-After the throw carried never reaches the heartbeat.",
     "file": "modules/payments-v2/machine/resume.ts",
     "find": "    noteWait(report, err);\n    const judged = ",
     "replace": "    throw err;\n    const judged = ",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-never-stored-removed-before-reconcile",
+    "note": "#840: a cancel answered 404 NOT_FOUND appears in no listing, so its tombstone is the conflicted verdict's only durable copy. Removed inside the pass, a crash, a stop, a failed post-pass backstop read or a failed reconcile loses it, and the next pass resolves the linked request paid with nothing moved.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (outcome === 'never-stored') {\n",
+    "replace": "  if (outcome === 'never-stored' && false) {\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "converger-never-stored-never-retired",
+    "note": "#840: the converger removes a never-stored cancel's tombstone once the reconcile consumed its verdict. Without it the tombstone stays forever: an abort request on every pass and a heartbeat that never idles.",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "        await this.deps.stores.backstop.removeIfUnchanged(entry.transferId, entry).catch(() => false);\n",
+    "replace": "        void entry;\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "converger-retires-before-reconcile",
+    "note": "#840: a never-stored cancel's tombstone goes only after the reconcile resolved. Removed first, a reconcile that throws loses the verdict and the next pass resolves the linked request paid.",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    if (local !== null) {\n      await this.deps.reconcile({\n        resumed: report.resumed,\n        conflicted: report.conflicted,\n        open: [...report.failed, ...local],\n      });\n",
+    "replace": "    if (local !== null) {\n      for (const entry of report.retireAfterReconcile ?? []) {\n        await this.deps.stores.backstop.removeIfUnchanged(entry.transferId, entry).catch(() => false);\n      }\n      await this.deps.reconcile({\n        resumed: report.resumed,\n        conflicted: report.conflicted,\n        open: [...report.failed, ...local],\n      });\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-pass-partial-drops-unjudged",
+    "note": "#840: after a part-way throw every id the pass had not judged is reported failed. Dropped, a server-open intent with no local entry is in none of the reconcile's sets and is counted unaccounted, which resolves a linked request paid.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    report.failed.push(...pass.gated.filter((id) => !judged.has(id)));\n",
+    "replace": "    void judged;\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "converger-refusal-warned-per-pass",
+    "note": "#840: the converger owns the warn-once set and hands it to every pass. Dropped, resumeAll starts a fresh set each pass and a refused intent is logged on every start, resumeNow and heartbeat.",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "      warned: this.warned,\n",
+    "replace": "      warned: undefined,\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-fetch-fallback-wait-dropped",
+    "note": "#840: a per-intent re-read after a refused batch can carry a Retry-After the batch did not; dropped, the heartbeat retries sooner than the server asked.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      for (const [id, bytes] of await storage.getBlobs(needed)) blobs.set(id, bytes);\n    } catch (err) {\n      noteWait(report, err);\n",
+    "replace": "      for (const [id, bytes] of await storage.getBlobs(needed)) blobs.set(id, bytes);\n    } catch (_err) {\n      /* wait dropped */\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-never-stored-keeps-owes",
+    "note": "#840: the tombstone kept for a never-stored cancel drops the rows it handed back. Kept, those rows stay hidden from pendingTransfers while it lingers, and every later pass hands them back again, re-owing a remainder the user already paid.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (entry.owes === undefined) return entry;\n  return stores.backstop.patch(",
+    "replace": "  return entry;\n  return stores.backstop.patch(",
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
     ]

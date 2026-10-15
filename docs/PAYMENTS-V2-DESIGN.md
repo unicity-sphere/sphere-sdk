@@ -606,9 +606,12 @@ Normative behaviors bound into the transitions (not call sites):
   unowned (403) id, and one failed download rejects the read. On such a refusal resume reads
   each intent's sources again on its own, so only the intent that named the bad id fails closed;
   the refusal's `Retry-After` reaches the heartbeat. A pass that throws after the backstop read
-  still returns what it already decided: a tombstone it retired stays `conflicted`, and every
-  intent it had not judged yet is reported `failed`, so the reconcile treats it as open and never
-  as unaccounted (which would resolve a link paid).
+  still returns what it already decided, and every intent it had not judged yet is reported
+  `failed`, so the reconcile treats it as open and never as unaccounted (which would resolve a
+  link paid). A cancel answered `404 NOT_FOUND` is in no listing, so its tombstone is the only
+  durable copy of its `conflicted` verdict: the converger removes it only after the reconcile
+  resolves, and until then every pass reports it `conflicted` again. The kept tombstone no longer
+  holds the shortfall rows it handed back, so they are listed and never handed back twice.
 - **Fan-out:** certify at width 20 (`CERTIFY_WIDTH`, widened from 8 by #746), fail-fast
   **between** batches (in-flight siblings always settle); the burn certifies + checkpoints before
   any mint; mint legs parallel (width 8).

@@ -1148,14 +1148,17 @@ describe('a local abort record goes only once the server says the row cannot run
     expect(await w.stores().backstop.getByKey(entry.transferId)).toBeUndefined();
   });
 
-  it('an unlisted tombstone whose abort answers 404 NOT_FOUND (no row) is dropped', async () => {
+  it('an unlisted tombstone whose abort answers 404 NOT_FOUND (no row) is conflicted, and dropped only after the reconcile', async () => {
     const w = makeWorld();
     const entry = await tombstone(w, 'no-row');
 
-    await resumeAll(w.deps);
+    const report = await resumeAll(w.deps);
 
     expect(w.log).toContain('abortIntent');
-    expect(await w.stores().backstop.getByKey(entry.transferId)).toBeUndefined();
+    expect(report.conflicted).toEqual([entry.transferId]);
+    // #840: no listing will ever show a row the server never stored — the entry is the verdict's only copy.
+    expect(report.retireAfterReconcile).toEqual([entry]);
+    expect(await w.stores().backstop.getByKey(entry.transferId)).toEqual(entry);
   });
 
   it.each([

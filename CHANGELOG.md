@@ -18,13 +18,17 @@ spent, and the split then failed or ran under `BigInt`'s reading of a grammar it
 have meant. The batched source read had the same coupling one layer down: wallet-api refuses the
 whole `blob-urls` batch over one malformed or unowned token id, and one failed blob download
 rejects the read, so every send in the pass that needed a source failed closed, and the refusal's
-`Retry-After` was dropped. A pass that threw also dropped everything it had already decided.
+`Retry-After` was dropped. A pass that threw also dropped everything it had already decided. A
+cancel the server answered `404 NOT_FOUND` (it never stored the row) had its tombstone removed
+inside the pass, while its `conflicted` verdict existed only in that pass's report.
 
 Consequence. Any client of the wallet that wrote such an intent stopped every device from resuming
 and reconciling, on every pass: possibly-committed sends never converged, their sources stayed
-reserved, and payment requests linked to them stayed `settling`. A cancel the pass had already
-confirmed with `404 NOT_FOUND` lost its `conflicted` verdict, so the next pass could resolve its
-linked request paid with nothing moved.
+reserved, and payment requests linked to them stayed `settling`. No listing ever shows a row the
+server never stored, so when the payment-request reconcile did not run after that removal (the
+pass threw, the process stopped, the post-pass backstop read failed, or the reconcile itself
+failed), the verdict was gone: the next pass found the link unaccounted and resolved the request
+paid with nothing moved.
 
 What changed:
 
@@ -39,14 +43,20 @@ What changed:
   heartbeat.
 - A pass that throws after reading the backstop keeps its verdicts and reports every intent it
   had not judged as `failed`, so the payment-request reconcile still runs and treats them as open.
+- A cancel answered `404 NOT_FOUND` keeps its tombstone until the reconcile has applied its
+  `conflicted` verdict; the converger removes it only after the reconcile resolves. A pass that
+  does not get that far leaves the tombstone, and the next pass aborts it again, gets the same
+  `404` and reports it `conflicted` again. The kept tombstone drops the shortfall rows it handed
+  back, so `pendingTransfers()` lists them and a remainder already paid is never owed again.
 - A device still on 0.19.0 or older keeps stopping on such an intent; the fix reaches each device
   only when it upgrades.
 
 How it was verified: `tests/unit/payments-v2/resume-unplannable.test.ts` (every refused form,
 the domain boundaries, server-faithful `blob-urls` refusals, the reconcile and the partial-report
-cases), `tests/unit/payments-v2/resume-isolation.test.ts` (a planning failure that validation
-does not name), new mutation probes, and a live staging case with a crafted foreign intent beside
-a keep-open send.
+cases, and a never-stored cancel across a skipped reconcile, a failed post-pass backstop read and
+a failed reconcile), `tests/unit/payments-v2/resume-isolation.test.ts` (a planning failure that
+validation does not name), new mutation probes, and a live staging case with a crafted foreign
+intent beside a keep-open send.
 
 ### Fixed (money) — a failure after the inclusion proof matched is never a clean failure (#839)
 

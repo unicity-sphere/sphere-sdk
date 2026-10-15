@@ -262,6 +262,10 @@ export class Converger {
         conflicted: report.conflicted,
         open: [...report.failed, ...local],
       });
+      // #840: only now is a never-stored cancel's verdict applied; until then its tombstone is the only copy.
+      for (const entry of report.retireAfterReconcile ?? []) {
+        await this.deps.stores.backstop.removeIfUnchanged(entry.transferId, entry).catch(() => false);
+      }
     }
     if (progress) await this.deps.refreshView().catch(() => undefined);
     return { progress, retryAfterMs: report.retryAfterMs ?? null };
