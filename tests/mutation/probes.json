@@ -4058,6 +4058,16 @@
     ]
   },
   {
+    "name": "engine-transfer-wrap-outside-realize",
+    "note": "#839: wrapping the realized transfer/burn token (its toCBOR) runs after the proof matched, so it must stay inside realizeCertified. Hoisted out, a wrap throw escapes transfer()/burn() as a raw error the machine fences and aborts with the spend on chain.",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "      return wrapToken(await token.sdkToken.transfer(certified, this.deps.verificationContext));\n    });",
+    "replace": "      return token.sdkToken.transfer(certified, this.deps.verificationContext);\n    }).then(wrapToken);",
+    "tests": [
+      "tests/unit/token-engine/post-proof-keep-open.test.ts"
+    ]
+  },
+  {
     "name": "engine-burn-certify-outside-realize",
     "note": "#839: a split burn's toCertifiedTransaction runs after its proof matched; hoisted out of realizeCertified, its throw escapes split() raw, the machine aborts the intent, and the whole source value is stranded with the burn on chain (E.4).",
     "file": "token-engine/SphereTokenEngine.ts",
