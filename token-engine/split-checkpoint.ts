@@ -121,6 +121,15 @@ function isTrustbaseFailure(err: unknown): boolean {
   return status === InclusionProofVerificationStatus.INVALID_TRUSTBASE;
 }
 
+/** #839: the burn is certified by now, so a re-encode failure surfaces typed (keep-open), never raw. */
+async function reEncoded(what: string, encode: () => Uint8Array | Promise<Uint8Array>): Promise<Uint8Array> {
+  try {
+    return await encode();
+  } catch (err) {
+    throw new SplitCheckpointLostError(`split checkpoint could not re-encode the ${what}`, err);
+  }
+}
+
 /**
  * Rebuild the burnt token from a stored checkpoint (resume, or adopt-after-put). NEVER refetches
  * the burn proof — it applies the STORED proof to the re-derived burn tx, so the mint
@@ -129,6 +138,7 @@ function isTrustbaseFailure(err: unknown): boolean {
  * - stored proof fails ONLY the current trust base         → CheckpointTrustbaseMismatchError
  * - stored proof otherwise invalid / corrupt               → SplitCheckpointLostError
  * - rebuilt burnt token re-encodes to a different hash      → SplitCheckpointLostError (wire migration)
+ * - burn tx or burnt token cannot be re-encoded at all      → SplitCheckpointLostError (#839)
  */
 export async function burntTokenFromCheckpoint(
   deps: CheckpointDeps,
@@ -137,7 +147,7 @@ export async function burntTokenFromCheckpoint(
   sourceToken: Token,
 ): Promise<Token> {
   const decoded = decodeCheckpoint(storedBytes);
-  if (!bytesEqual(decoded.burnTxBytes, reDerivedBurnTx.toCBOR())) {
+  if (!bytesEqual(decoded.burnTxBytes, await reEncoded('re-derived burn tx', () => reDerivedBurnTx.toCBOR()))) {
     throw new SplitCheckpointLostError(
       `split checkpoint burn tx does not match the re-derived burn (stored under ${decoded.sdkVersion}) — derivation drift`,
     );
@@ -171,7 +181,7 @@ export async function burntTokenFromCheckpoint(
   } catch (err) {
     throw new SplitCheckpointLostError('split checkpoint could not rebuild the burnt token', err);
   }
-  if (!bytesEqual(await sha256(burntToken.toCBOR()), decoded.burntTokenHash)) {
+  if (!bytesEqual(await reEncoded('burnt token', async () => sha256(burntToken.toCBOR())), decoded.burntTokenHash)) {
     throw new SplitCheckpointLostError('split checkpoint burnt-token hash mismatch (wire re-encoding drift)');
   }
   return burntToken;

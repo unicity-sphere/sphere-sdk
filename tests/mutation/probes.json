@@ -3681,5 +3681,35 @@
     "tests": [
       "tests/unit/token-engine/post-proof-keep-open.test.ts"
     ]
+  },
+  {
+    "name": "checkpoint-burn-tx-reencode-unguarded",
+    "note": "#839: after the checkpoint put acks the burn is certified and stored; re-encoding the re-derived burn tx there must fail typed (SplitCheckpointLostError, keep-open). Unguarded, the raw error escapes split() as 'other', the machine fences and aborts the intent, and the source value is stranded with the burn on chain.",
+    "file": "token-engine/split-checkpoint.ts",
+    "find": "await reEncoded('re-derived burn tx', () => reDerivedBurnTx.toCBOR())",
+    "replace": "reDerivedBurnTx.toCBOR()",
+    "tests": [
+      "tests/unit/token-engine/post-proof-keep-open.test.ts"
+    ]
+  },
+  {
+    "name": "checkpoint-burnt-token-reencode-unguarded",
+    "note": "#839: hashing the rebuilt burnt token's CBOR runs after the burn certified and its checkpoint was stored; a raw throw there escapes split() as an abortable failure with the spend on chain.",
+    "file": "token-engine/split-checkpoint.ts",
+    "find": "await reEncoded('burnt token', async () => sha256(burntToken.toCBOR()))",
+    "replace": "await sha256(burntToken.toCBOR())",
+    "tests": [
+      "tests/unit/token-engine/post-proof-keep-open.test.ts"
+    ]
+  },
+  {
+    "name": "checkpoint-reencode-rethrows-raw",
+    "note": "#839: reEncoded is what turns a post-burn re-encode failure into the typed keep-open SplitCheckpointLostError; rethrowing the raw error makes both re-encodes abortable again.",
+    "file": "token-engine/split-checkpoint.ts",
+    "find": "    throw new SplitCheckpointLostError(`split checkpoint could not re-encode the ${what}`, err);",
+    "replace": "    throw err;",
+    "tests": [
+      "tests/unit/token-engine/post-proof-keep-open.test.ts"
+    ]
   }
 ]

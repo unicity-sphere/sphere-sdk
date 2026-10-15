@@ -34,9 +34,16 @@ What changed:
   (`CHECKPOINT_PERSIST_FAILED`), the same error a checkpoint that could not be stored already gets.
   Both are keep-open: the intent stays open with its sources reserved, `send()` rejects
   possibly-committed with its `transferId`, and the convergence pass realizes the same spend under
-  the same transferId. For `payments.burn()` the only visible change is the reported `errorCode`:
-  `'CERTIFICATION_UNCONFIRMED'` where it was `'UNKNOWN'`.
-- The engine contract is written down in `token-engine/engine.ts`: `transfer`/`burn`/`split`
+  the same transferId. For `payments.burn()` the visible change is the reported `errorCode`
+  (`'CERTIFICATION_UNCONFIRMED'` where it was `'UNKNOWN'`) and `error`, which now reads
+  `Burn certification failed: certified on chain but not realized; resume under the same id` where
+  it was the raw error's message.
+- After a split checkpoint is stored, rebuilding the burnt token re-encodes the burn transaction and
+  the burnt token. A failure there is now `SplitCheckpointLostError` (`SPLIT_CHECKPOINT_LOST`,
+  keep-open, the original error as `cause`), like the other steps of that rebuild, where it was a
+  raw error the machine aborted.
+- The engine contract is written down in the `ITokenEngine` doc (`token-engine/engine.ts`, shipped
+  in the `./token-engine` type declarations): `transfer`/`burn`/`split`
   reject with an untyped error only when the call submitted nothing, or for a proven-clean submit
   reject. `mint` and `mintDataToken` are unchanged and may still reject untyped after
   certification, so their callers journal first and replay under the same id.
@@ -47,16 +54,18 @@ How it was verified:
 
 - `tests/unit/token-engine/post-proof-keep-open.test.ts`: the real engine with each realization
   step failing once after the proof (transfer, burn, split with and without a checkpoint store,
-  checkpoint encode); each asserts the typed error and that the source is spent, then re-calls under
-  the same transferId and checks the realized token or split outputs;
+  checkpoint encode, re-encoding the burn transaction or the burnt token after the checkpoint is
+  stored); each asserts the typed error and that the source is spent, then re-calls under the same
+  transferId and checks the realized token or split outputs;
 - `tests/unit/payments-v2/machine-post-proof.test.ts`: `TransferMachine` over the real engine for a
   direct leg, a direct leg beside a conflicting one, and a split; none is aborted or reported clean.
   For the direct leg and the split, resume then delivers and closes (the split also applies the
   change);
-- `tests/aggregator`: the same injection against a real aggregator-go;
+- `tests/aggregator`: a direct `engine.transfer()` whose `Token.transfer` fails once after a real
+  aggregator-go certified it; the burn and split paths run only against `TestAggregatorClient`;
 - mutation probes that unwrap each `realizeCertified` call, hoist the transfer's or the split burn's
-  `toCertifiedTransaction` out of it, move the checkpoint encode out of the persist gate, or rethrow
-  the raw error.
+  `toCertifiedTransaction` out of it, move the checkpoint encode out of the persist gate, unguard
+  either re-encode in the checkpoint rebuild, or rethrow the raw error from either wrapper.
 
 ### Changed (breaking) — DIRECT:// is no longer a payment recipient; unused DIRECT helpers removed (#847)
 

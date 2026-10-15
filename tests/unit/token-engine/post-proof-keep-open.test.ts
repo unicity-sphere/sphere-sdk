@@ -10,7 +10,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { CheckpointPersistFailedError, ProofUnconfirmedError } from '../../../token-engine/errors';
+import { CheckpointPersistFailedError, ProofUnconfirmedError, SplitCheckpointLostError } from '../../../token-engine/errors';
 import type { SplitCheckpointStore } from '../../../token-engine/engine';
 import { Token, TransferTransaction } from '../../../token-engine/sdk';
 import type { SphereToken } from '../../../token-engine/types';
@@ -30,10 +30,18 @@ const COIN = 'aa'.repeat(32);
 /** First-write-wins, durable on resolve: the SplitCheckpointStore contract, in memory. */
 class MemStore implements SplitCheckpointStore {
   puts = 0;
+  /** Runs once the slot is written: a fault armed here hits only what follows the durable ack. */
+  afterPut: () => void = () => {};
   private readonly slots = new Map<string, Uint8Array>();
   async put(transferId: string, opIndex: number, bytes: Uint8Array): Promise<Uint8Array> {
     this.puts++;
-    const key = `${transferId}:${opIndex}`;
+    try {
+      return this.write(`${transferId}:${opIndex}`, bytes);
+    } finally {
+      this.afterPut();
+    }
+  }
+  private write(key: string, bytes: Uint8Array): Uint8Array {
     const have = this.slots.get(key);
     if (have !== undefined) return have;
     this.slots.set(key, bytes);
@@ -217,6 +225,41 @@ describe('#839 a failure after a matching proof is keep-open', () => {
     expect(err).toBeInstanceOf(ProofUnconfirmedError);
     expect((err as ProofUnconfirmedError).cause).toBe(cause);
     expect(store.puts).toBe(0);
+    expect(wire.submits.length - submitsBefore, 'the burn alone was submitted: no mint leg').toBe(1);
+    expect(await engine.isSpent(source)).toBe(true);
+    vi.restoreAllMocks();
+    const { outputs } = await engine.split(
+      { token: source, outputs: splitOutputs(engine, recipient) },
+      { transferId, checkpointStore: store },
+    );
+    expect(outputs.map((o) => engine.balanceOf(o, COIN))).toEqual([4n, 6n]);
+    expect(await Promise.all(outputs.map((o) => engine.verify(o)))).toEqual([{ ok: true }, { ok: true }]);
+  }, 60_000);
+
+  it.each([
+    ['the burnt token', () => vi.spyOn(Token.prototype, 'toCBOR')],
+    ['the re-derived burn tx', () => vi.spyOn(TransferTransaction.prototype, 'toCBOR')],
+  ])('(h) split with a store: re-encoding %s after the checkpoint is stored is SplitCheckpointLostError; the same transferId completes', async (_what, spy) => {
+    const { engine, wire, source } = await rig();
+    const store = new MemStore();
+    const recipient = freshPubkey();
+    const transferId = crypto.randomUUID();
+    const submitsBefore = wire.submits.length;
+    const cause = new Error('re-encode failed');
+    store.afterPut = () => {
+      spy().mockImplementationOnce(() => {
+        throw cause;
+      });
+      store.afterPut = () => {};
+    };
+
+    const err = await rejection(
+      engine.split({ token: source, outputs: splitOutputs(engine, recipient) }, { transferId, checkpointStore: store }),
+    );
+
+    expect(err).toBeInstanceOf(SplitCheckpointLostError);
+    expect((err as SplitCheckpointLostError).cause).toBe(cause);
+    expect(store.puts).toBe(1);
     expect(wire.submits.length - submitsBefore, 'the burn alone was submitted: no mint leg').toBe(1);
     expect(await engine.isSpent(source)).toBe(true);
     vi.restoreAllMocks();

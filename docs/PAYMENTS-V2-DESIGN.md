@@ -529,7 +529,8 @@ Normative behaviors bound into the transitions (not call sites):
   match-verifies `OK`, the leaf is ours under this `transferId`, so no later failure is a clean
   reject: building the certified transaction, applying it to the token, wrapping the result, or
   encoding the E.4 checkpoint. The engine raises `ProofUnconfirmedError` (the failure as `cause`),
-  or `CheckpointPersistFailedError` for the checkpoint encode, and the machine keeps the intent
+  or `CheckpointPersistFailedError` for the checkpoint encode (`SplitCheckpointLostError` for a
+  re-encode while rebuilding the burnt token from the stored checkpoint), and the machine keeps the intent
   open; resume rebuilds the byte-identical transaction, re-proves it `OK` and realizes it. Before,
   such an error reached the machine as `other` and was fenced: once the abort was confirmed it was
   reported clean, with the spend on chain. So `transfer`/`burn`/`split` reject untyped only when the call submitted nothing,
