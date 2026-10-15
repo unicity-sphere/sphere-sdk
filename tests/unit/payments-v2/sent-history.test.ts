@@ -468,6 +468,7 @@ function convergerOf(w: World, activeOps = new ActiveOps()): Converger {
     stores: w.stores(),
     delivery: w.deps.delivery,
     reconcile: async () => undefined,
+    linkedTransferIds: async () => new Set<string>(),
     refreshView: async () => undefined,
     replayMints: async () => 0,
     replayNftMints: async () => 0,

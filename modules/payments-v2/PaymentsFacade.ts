@@ -169,15 +169,13 @@ export class PaymentsFacade implements PaymentsV2 {
     this.pins = parts.pins;
     this.burnHold = parts.burnHold;
     deps.deliveryPort.bindDeliveryKeys((blob) => this.engine().deliveryKeys(blob));
-    this.heartbeat = new ConvergenceHeartbeat({
-      now: () => this.nowMs(),
-      onTick: () => this.trackTail(this.runConvergencePass()),
-    });
+    this.heartbeat = new ConvergenceHeartbeat({ now: () => this.nowMs(), onTick: () => this.trackTail(this.runConvergencePass()) });
     this.converger = new Converger({
       machineDeps: this.machineDeps,
       stores: this.machineStores,
       delivery: deps.deliveryPort,
       reconcile: (report) => this.requests.reconcile(report),
+      linkedTransferIds: () => this.requests.linkedTransferIds(),
       refreshView: () => this.view.delta(),
       replayMints: () => replayCoinMints(this.mintDeps()),
       replayNftMints: () => replayNftMints(this.mintDeps()),

@@ -605,12 +605,16 @@ Normative behaviors bound into the transitions (not call sites):
   stays one request, but wallet-api refuses a whole `blob-urls` batch over one malformed (400) or
   unowned (403) id, and one failed download rejects the read. On such a refusal resume reads
   each intent's sources again on its own, so only the intent that named the bad id fails closed;
-  the refusal's `Retry-After` reaches the heartbeat. A pass that throws after the backstop read
+  the refusal's `Retry-After` reaches the heartbeat, and a refusal that carries one is not re-read
+  per intent. A pass that throws after the backstop read
   still returns what it already decided, and every intent it had not judged yet is reported
   `failed`, so the reconcile treats it as open and never as unaccounted (which would resolve a
   link paid). A cancel answered `404 NOT_FOUND` is in no listing, so its tombstone is the only
-  durable copy of its `conflicted` verdict: the converger removes it only after the reconcile
-  resolves, and until then every pass reports it `conflicted` again. The kept tombstone no longer
+  durable copy of its `conflicted` verdict. A reconcile can resolve without applying it (a
+  settling journal that failed open to empty, a cleared link whose write failed), so the converger
+  removes the tombstone only after the reconcile resolves and no settling link names it, in memory
+  or on disk; until then every pass reports it `conflicted` again. The settling journal drops a
+  link from memory only after its removal is on disk, so the next pass re-applies the verdict. The kept tombstone no longer
   holds the shortfall rows it handed back, so they are listed and never handed back twice.
 - **Fan-out:** certify at width 20 (`CERTIFY_WIDTH`, widened from 8 by #746), fail-fast
   **between** batches (in-flight siblings always settle); the burn certifies + checkpoints before
@@ -981,8 +985,10 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      is never touched. That closes the race in which the GC dropped the `abortPending` tombstone
      an active attempt had just written. It removes a tombstone only after the server answers its
      abort `204` and the aborted listing shows the row (conflicted), or neither it nor the open
-     listing does (completed elsewhere: paid), or 404 `NOT_FOUND` (conflicted), handing back or
-     settling any shortfall rows the tombstone holds to match, and it skips held entries. Every removal is compare-and-delete
+     listing does (completed elsewhere: paid), handing back or settling any shortfall rows the
+     tombstone holds to match, and it skips held entries. A 404 `NOT_FOUND` (the server never
+     stored the row) is reported conflicted and its rows handed back, but the tombstone is kept,
+     without them, for step 5: no listing will ever show that row. Every removal is compare-and-delete
      against the exact snapshot it judged (`ListStore.removeIfUnchanged`, serialized with every
      other read-modify-write of the store), so a park or a fence that lands meanwhile is never
      lost to a stale read. An `'open'` entry whose row is no longer open completed or was aborted
@@ -1005,7 +1011,9 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      reported open alongside the pass's own failures, because a link written while the pass ran is
      in none of its sets and would otherwise reach the unaccounted branch, which resolves it paid.
      If that read fails, the pass skips only the reconcile: it still reports its progress and
-     refreshes the view.
+     refreshes the view. After the reconcile resolves, the converger compare-and-deletes each
+     tombstone step 3 kept for a 404, but only once no settling link names its transferId, in
+     memory or in a fresh read of the journal (#840).
 
   Activity is judged once per pass: the pass watches the facade's active-op registry
   (`ActiveOps`), so an id in process at any moment of the pass — already running when the pass

@@ -169,8 +169,27 @@ export class Requests implements PaymentsRequestsApi {
     });
   }
 
+  /** #840: memory drops the link only once the disk has: a failed write leaves it for the next reconcile. */
   private clearLink(requestId: string): Promise<void> {
-    return this.mutateJournal((m) => m.delete(requestId));
+    return this.journalChain.enqueue(async () => {
+      await this.ensureJournalLoaded();
+      if (!this.journal!.has(requestId)) return;
+      const next = new Map(this.journal!);
+      next.delete(requestId);
+      await this.deps.kv.set(STORE_KEYS.settlingLinks, Object.fromEntries(next));
+      this.journal = next;
+    });
+  }
+
+  /** #840: every transferId a link names, in memory or on disk (read fresh: the load may have failed open). */
+  async linkedTransferIds(): Promise<ReadonlySet<string>> {
+    await this.ensureJournalLoaded();
+    const raw = await this.deps.kv.get<Record<string, Partial<SettlingLink>>>(STORE_KEYS.settlingLinks);
+    const ids = new Set([...this.journal!.values()].map((link) => link.transferId));
+    for (const link of raw !== null && typeof raw === 'object' ? Object.values(raw) : []) {
+      if (typeof link?.transferId === 'string') ids.add(link.transferId);
+    }
+    return ids;
   }
 
   // ── incoming stream (gap-free ?since= upsert-by-id) ──────────────────────

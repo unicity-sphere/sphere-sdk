@@ -4221,17 +4221,17 @@
     "name": "resume-fetch-sources-wait-dropped",
     "note": "#840: a 429/503 on the batched source read carries Retry-After; dropped, the heartbeat retries sooner than the server asked.",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    return await storage.getBlobs(ids);\n  } catch (err) {\n    noteWait(report, err);\n  }\n",
-    "replace": "    return await storage.getBlobs(ids);\n  } catch (_err) {\n    /* wait dropped */\n  }\n",
+    "find": "    return await storage.getBlobs(ids);\n  } catch (err) {\n    noteWait(report, err);\n    if (retryAfterMsOf",
+    "replace": "    return await storage.getBlobs(ids);\n  } catch (err) {\n    void report;\n    if (retryAfterMsOf",
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
     ]
   },
   {
     "name": "resume-pass-not-total",
-    "note": "#840: a pass that throws part-way still returns what it decided and reports every unjudged id failed. Rethrown, the converger skips the reconcile and the view refresh for the whole pass, and the Retry-After the throw carried never reaches the heartbeat.",
+    "note": "#840: a pass that throws part-way still returns what it decided and reports every unjudged id failed. Rethrown, the converger skips the reconcile and the view refresh for the whole pass, so no verdict the pass already made reaches a linked request.",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    noteWait(report, err);\n    const judged = ",
+    "find": "    noteWait(report, err); // defensive: every remote call in the pass catches its own wait today\n    const judged = ",
     "replace": "    throw err;\n    const judged = ",
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
@@ -4250,10 +4250,10 @@
   },
   {
     "name": "converger-never-stored-never-retired",
-    "note": "#840: the converger removes a never-stored cancel's tombstone once the reconcile consumed its verdict. Without it the tombstone stays forever: an abort request on every pass and a heartbeat that never idles.",
+    "note": "#840: the converger removes a never-stored cancel's tombstone once the reconcile ran and no settling link names it. Without it the tombstone stays forever: an abort request on every pass and a heartbeat that never idles.",
     "file": "modules/payments-v2/convergence.ts",
-    "find": "        await this.deps.stores.backstop.removeIfUnchanged(entry.transferId, entry).catch(() => false);\n",
-    "replace": "        void entry;\n",
+    "find": "      await this.deps.stores.backstop.removeIfUnchanged(entry.transferId, entry).catch(() => false);\n",
+    "replace": "      void entry;\n",
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
     ]
@@ -4262,8 +4262,69 @@
     "name": "converger-retires-before-reconcile",
     "note": "#840: a never-stored cancel's tombstone goes only after the reconcile resolved. Removed first, a reconcile that throws loses the verdict and the next pass resolves the linked request paid.",
     "file": "modules/payments-v2/convergence.ts",
-    "find": "    if (local !== null) {\n      await this.deps.reconcile({\n        resumed: report.resumed,\n        conflicted: report.conflicted,\n        open: [...report.failed, ...local],\n      });\n",
-    "replace": "    if (local !== null) {\n      for (const entry of report.retireAfterReconcile ?? []) {\n        await this.deps.stores.backstop.removeIfUnchanged(entry.transferId, entry).catch(() => false);\n      }\n      await this.deps.reconcile({\n        resumed: report.resumed,\n        conflicted: report.conflicted,\n        open: [...report.failed, ...local],\n      });\n",
+    "find": "    if (local !== null) {\n      await this.deps.reconcile({\n",
+    "replace": "    if (local !== null) {\n      await this.retireJudged(report.retireAfterReconcile ?? []);\n      await this.deps.reconcile({\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "converger-retires-while-linked",
+    "note": "#840: a reconcile can resolve without applying the conflicted verdict (a settling journal that failed open, a cleared link whose write failed). Retired while a link still names it, the tombstone is gone and after a restart the link is unaccounted and resolved paid though nothing moved.",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "      if (linked.has(entry.transferId)) continue;\n",
+    "replace": "      if (linked === undefined) continue;\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "converger-retires-on-unreadable-links",
+    "note": "#840: an unreadable settling journal proves nothing about a link to a never-stored cancel; read as empty, its tombstone would be retired with the link possibly still on disk.",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    const linked = await this.deps.linkedTransferIds().catch(() => null);\n",
+    "replace": "    const linked = await this.deps.linkedTransferIds().catch(() => new Set<string>());\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "requests-clearlink-drops-memory-first",
+    "note": "#840: the in-memory journal drops a link only after the disk write succeeded. Dropped first, a failed write leaves the link on disk only, the next reconcile has nothing to apply, and the never-stored tombstone stays until a restart.",
+    "file": "modules/payments-v2/requests/Requests.ts",
+    "find": "      await this.deps.kv.set(STORE_KEYS.settlingLinks, Object.fromEntries(next));\n      this.journal = next;\n",
+    "replace": "      this.journal = next;\n      await this.deps.kv.set(STORE_KEYS.settlingLinks, Object.fromEntries(next));\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "requests-linked-ignores-disk",
+    "note": "#840: a settling journal that failed open to empty still has its links on disk; read from memory only, the converger retires a never-stored tombstone whose link a restart resolves paid.",
+    "file": "modules/payments-v2/requests/Requests.ts",
+    "find": "      if (typeof link?.transferId === 'string') ids.add(link.transferId);\n",
+    "replace": "      void link;\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts",
+      "tests/unit/payments-v2/requests.test.ts"
+    ]
+  },
+  {
+    "name": "requests-linked-ignores-memory",
+    "note": "#840: a link whose write failed lives only in memory and still holds its request; read from disk only, the converger retires a never-stored tombstone and the next pass finds that link unaccounted and resolves it paid.",
+    "file": "modules/payments-v2/requests/Requests.ts",
+    "find": "    const ids = new Set([...this.journal!.values()].map((link) => link.transferId));\n",
+    "replace": "    const ids = new Set<string>();\n",
+    "tests": [
+      "tests/unit/payments-v2/requests.test.ts"
+    ]
+  },
+  {
+    "name": "resume-fetch-fallback-ignores-backoff",
+    "note": "#840: a refused batch that carried a Retry-After is not re-read per intent; re-read, every pass multiplies the load by the number of open intents against a server that just asked to wait.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    if (retryAfterMsOf(err) !== null) return new Map(); // asked to back off: a read per job only adds load\n",
+    "replace": "    void err;\n",
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
     ]

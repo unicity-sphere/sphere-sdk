@@ -1299,6 +1299,7 @@ describe('a convergence pass (#835)', () => {
       stores,
       delivery: w.deps.delivery,
       reconcile,
+      linkedTransferIds: async () => new Set<string>(),
       refreshView,
       replayMints: async () => 0,
       replayNftMints: async () => 0,
@@ -1330,6 +1331,7 @@ describe('a convergence pass (#835)', () => {
       stores: createMachineStores(w.kv),
       delivery: w.deps.delivery,
       reconcile: async () => undefined,
+      linkedTransferIds: async () => new Set<string>(),
       refreshView: async () => undefined,
       replayMints: async () => 0,
       replayNftMints: async () => 0,
@@ -1360,6 +1362,7 @@ describe('a convergence pass (#835)', () => {
       stores: createMachineStores(w.kv),
       delivery: w.deps.delivery,
       reconcile: async () => undefined,
+      linkedTransferIds: async () => new Set<string>(),
       refreshView: async () => undefined,
       replayMints: async () => {
         throw new WalletApiHttpError(429, 'RATE_LIMITED', 'mint replay: rate limit exceeded', 300_000);
