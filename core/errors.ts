@@ -52,7 +52,8 @@ export type SphereErrorCode =
   // Split burn checkpoint (sdk-changes E.4, sphere-sdk#501) — all keep-open (token-engine/errors.ts):
   // burn certified but the checkpoint could not be persisted (no mint submitted);
   | 'CHECKPOINT_PERSIST_FAILED'
-  // a certified mint leaf has no reproducing stored bytes, or a stored checkpoint fails byte-binding;
+  // a certified mint leaf has no reproducing stored bytes, a stored checkpoint fails byte-binding,
+  // or a re-encode while rebuilding from it throws (#839; recoverable, no mint submitted);
   | 'SPLIT_CHECKPOINT_LOST'
   // a byte-bound checkpoint proof no longer verifies against the current trust base (validator rotation).
   | 'CHECKPOINT_TRUSTBASE_MISMATCH'

@@ -41,7 +41,8 @@ What changed:
 - After a split checkpoint is stored, rebuilding the burnt token re-encodes the burn transaction and
   the burnt token. A failure there is now `SplitCheckpointLostError` (`SPLIT_CHECKPOINT_LOST`,
   keep-open, the original error as `cause`), like the other steps of that rebuild, where it was a
-  raw error the machine aborted.
+  raw error the machine aborted. That code therefore also covers a transient re-encode failure:
+  the checkpoint is intact, no mint was submitted, and resume completes the split.
 - The engine contract is written down in the `ITokenEngine` doc (`token-engine/engine.ts`, shipped
   in the `./token-engine` type declarations): `transfer`/`burn`/`split`
   reject with an untyped error only when the call submitted nothing, or for a proven-clean submit
@@ -53,7 +54,8 @@ What changed:
 How it was verified:
 
 - `tests/unit/token-engine/post-proof-keep-open.test.ts`: the real engine with each realization
-  step failing once after the proof (transfer, burn, split with and without a checkpoint store,
+  step failing once after the proof (transfer, including the wrap of the realized token, burn,
+  split with and without a checkpoint store,
   checkpoint encode, re-encoding the burn transaction or the burnt token after the checkpoint is
   stored); each asserts the typed error and that the source is spent, then re-calls under the same
   transferId and checks the realized token or split outputs;
@@ -64,7 +66,8 @@ How it was verified:
 - `tests/aggregator`: a direct `engine.transfer()` whose `Token.transfer` fails once after a real
   aggregator-go certified it; the burn and split paths run only against `TestAggregatorClient`;
 - mutation probes that unwrap each `realizeCertified` call, hoist the transfer's or the split burn's
-  `toCertifiedTransaction` out of it, move the checkpoint encode out of the persist gate, unguard
+  `toCertifiedTransaction` or the transfer's `wrapToken` out of it, move the checkpoint encode out
+  of the persist gate, unguard
   either re-encode in the checkpoint rebuild, or rethrow the raw error from either wrapper.
 
 ### Changed (breaking) — DIRECT:// is no longer a payment recipient; unused DIRECT helpers removed (#847)

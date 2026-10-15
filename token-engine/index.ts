@@ -54,9 +54,9 @@ export { createSphereTokenEngine } from './factory';
 
 // Typed error surface of the recoverable engine (Part E.2/E.4). TransferConflictError = the source
 // was consumed by a DIFFERENT transaction (lost race — abort + re-plan). The rest are KEEP-OPEN
-// (never abort): ProofUnconfirmedError (#631 indeterminate certification), and the split burn
-// checkpoint family (sphere-sdk#501/E.4) that the wallet-api adapter + PaymentsModule must catch
-// and dispose — CheckpointPersistFailedError, SplitCheckpointLostError, CheckpointTrustbaseMismatchError.
+// (never abort): ProofUnconfirmedError (#631 indeterminate certification, or #839 certified but not
+// realized) and the split checkpoint family (sphere-sdk#501/E.4) the wallet-api adapter must catch —
+// CheckpointPersistFailedError, SplitCheckpointLostError, CheckpointTrustbaseMismatchError.
 export {
   CheckpointPersistFailedError,
   CheckpointTrustbaseMismatchError,
