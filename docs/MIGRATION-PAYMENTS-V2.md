@@ -117,7 +117,9 @@ Error contract is UNCHANGED and load-bearing: the typed codes
 (`CERTIFICATION_UNCONFIRMED`, `SEND_SYNC_PENDING`, the checkpoint trio,
 `SEND_PARTIALLY_COMPLETED`, …), `isPossiblyCommittedSendOutcome()`, and
 `ProofUnconfirmedError.cause` carrying the raw network error all survive
-verbatim. Keep your PENDING_COMMIT handling exactly as it is.
+verbatim. Keep your PENDING_COMMIT handling exactly as it is. One addition
+(#839): when the proof matched and only realizing the spend failed, the spend
+is on chain and `cause` is that realization error, not a network error.
 
 **Two meanings widened since (#835); the codes did not change.**
 `SEND_SYNC_PENDING` now also covers a send that has not gone out yet but
