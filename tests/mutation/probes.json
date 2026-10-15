@@ -1520,9 +1520,9 @@
   {
     "name": "wholesend-history-drops-real-assets",
     "note": "#777: a WHOLE send of a valued token must record the coins it actually carried. Falling back to [] logs a real coin movement as carrying nothing \u2014 the money moved, the ledger says otherwise.",
-    "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "        coinId === undefined ? await this.settledAssets(engine, committed) : undefined;",
-    "replace": "        coinId === undefined ? [] : undefined;",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "      coinId === undefined ? await settledAssets(engine, committed) : undefined;",
+    "replace": "      coinId === undefined ? [] : undefined;",
     "tests": [
       "tests/unit/payments-v2/facade.test.ts"
     ]
