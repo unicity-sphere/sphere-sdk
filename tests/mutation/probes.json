@@ -3880,5 +3880,67 @@
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
     ]
+  },
+  {
+    "name": "converger-kept-tombstone-progress",
+    "note": "#840: a kept 404 tombstone is reported conflicted on every pass. Counted as progress each time, the heartbeat resets to its 5 s seed for good while a settling link names it or the journal cannot be read.",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    const fresh = report.conflicted.some((id) => !(retiring.has(id) && this.reported.has(id)));\n",
+    "replace": "    const fresh = report.conflicted.length > 0;\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "converger-kept-tombstone-progress-blanket",
+    "note": "#840: only a kept tombstone the previous pass already reported is no progress. Excluded on its id alone, a new verdict on that id (its row turns up aborted, so it is removed and reported conflicted) would not reset the backoff.",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    const fresh = report.conflicted.some((id) => !(retiring.has(id) && this.reported.has(id)));\n",
+    "replace": "    const fresh = report.conflicted.some((id) => !this.reported.has(id));\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "converger-retires-without-reconcile",
+    "note": "#840: the tombstone goes only after a reconcile ran. Retired when the post-pass backstop read failed and the reconcile was skipped, the verdict is lost and the next pass resolves the linked request paid.",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "      await this.retireJudged(report.retireAfterReconcile ?? []);\n    }\n",
+    "replace": "    }\n    await this.retireJudged(report.retireAfterReconcile ?? []);\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-never-stored-unreported",
+    "note": "#840: a 404 NOT_FOUND cancel is reported conflicted on every pass that keeps its tombstone. Not reported, the link stays settling and the converger keeps the tombstone forever while the link names it.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    report.conflicted.push(entry.transferId);\n    (report.retireAfterReconcile ??= [])",
+    "replace": "    (report.retireAfterReconcile ??= [])",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-never-stored-not-retired",
+    "note": "#840: a never-stored cancel's tombstone is handed to the converger to retire after the reconcile. Not handed over, it is aborted again on every pass for good.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    (report.retireAfterReconcile ??= []).push((await stripOwed(stores, entry)) ?? entry);\n",
+    "replace": "    await stripOwed(stores, entry);\n",
+    "tests": [
+      "tests/unit/payments-v2/machine-resume.test.ts",
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "requests-linked-ids-unreadable-as-empty",
+    "note": "#840: an unreadable settling journal on disk must reject linkedTransferIds. Read as no links, the converger retires a never-stored cancel's tombstone with its link possibly still on disk, and after a restart the request is resolved paid.",
+    "file": "modules/payments-v2/requests/Requests.ts",
+    "find": "    const raw = await this.deps.kv.get<Record<string, Partial<SettlingLink>>>(STORE_KEYS.settlingLinks);\n",
+    "replace": "    const raw = await this.deps.kv.get<Record<string, Partial<SettlingLink>>>(STORE_KEYS.settlingLinks).catch(() => null);\n",
+    "tests": [
+      "tests/unit/payments-v2/requests.test.ts"
+    ]
   }
 ]

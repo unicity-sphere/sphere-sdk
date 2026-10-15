@@ -8,7 +8,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { logger } from '../../../core/logger';
 import { WalletApiHttpError } from '../../../impl/wallet-api-v2/http';
-import { ActiveOps, Converger, derivePendingTransfers, type ConvergerDeps } from '../../../modules/payments-v2/convergence';
+import {
+  ActiveOps,
+  Converger,
+  ConvergenceHeartbeat,
+  HEARTBEAT_CAP_MS,
+  HEARTBEAT_SEED_MS,
+  derivePendingTransfers,
+  type ConvergerDeps,
+} from '../../../modules/payments-v2/convergence';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
 import { resumeAll } from '../../../modules/payments-v2/machine/resume';
 import { Requests, type RequestWire } from '../../../modules/payments-v2/requests/Requests';
@@ -504,5 +512,77 @@ describe('a never-stored cancel keeps its tombstone while a settling link still 
 
     await run.convergeOnce();
     expect(await w.stores().backstop.getByKey('never-stored')).toBeDefined();
+  });
+});
+
+describe('a kept never-stored tombstone is no progress once reported: the heartbeat backs off (#840)', () => {
+  /** Drives each pass's outcome through a real heartbeat and returns the delays it scheduled. */
+  async function delaysOver(run: Converger, passes: number): Promise<number[]> {
+    const delays: number[] = [];
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((_fn: () => void, ms?: number) => {
+      delays.push(ms ?? 0);
+      return 0;
+    }) as typeof setTimeout);
+    const heartbeat = new ConvergenceHeartbeat({ now: () => 0, onTick: () => undefined });
+    heartbeat.start();
+    for (let i = 0; i < passes; i++) heartbeat.settle(await run.convergeOnce(), await run.pendingWork());
+    return delays;
+  }
+
+  it('an unreadable settling journal keeps the tombstone, and only the first pass of a session counts as progress', async () => {
+    const w = makeWorld();
+    await neverStoredTombstone(w);
+    w.kv.failKeys.add(STORE_KEYS.settlingLinks);
+    const progress: boolean[] = [];
+    const first = session(w, []);
+    const convergeOnce = first.convergeOnce.bind(first);
+    first.convergeOnce = async () => {
+      const outcome = await convergeOnce();
+      progress.push(outcome.progress);
+      return outcome;
+    };
+
+    const delays = await delaysOver(first, 7);
+
+    expect(progress).toEqual([true, false, false, false, false, false, false]);
+    expect(delays).toEqual([HEARTBEAT_SEED_MS, 10_000, 20_000, 40_000, 80_000, HEARTBEAT_CAP_MS, HEARTBEAT_CAP_MS]);
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeDefined();
+    expect((await session(w, []).convergeOnce()).progress, 'a restart reports the kept verdict once').toBe(true);
+  });
+
+  it('a link still names it: re-reporting the kept verdict does not reset the backoff', async () => {
+    const w = makeWorld();
+    await neverStoredTombstone(w);
+    const { run, reconcile } = converger(w, w.deps, createMachineStores(w.kv), {
+      linkedTransferIds: async () => new Set(['never-stored']),
+    });
+
+    expect(await delaysOver(run, 3)).toEqual([HEARTBEAT_SEED_MS, 10_000, 20_000]);
+    expect(reconcile.mock.calls.map((call) => (call[0] as Reconciled).conflicted)).toEqual([
+      ['never-stored'],
+      ['never-stored'],
+      ['never-stored'],
+    ]);
+  });
+
+  it('another cancel judged beside a kept one, or a new verdict on a kept one, is still progress', async () => {
+    const w = makeWorld();
+    await neverStoredTombstone(w);
+    const { run } = converger(w, w.deps, createMachineStores(w.kv), {
+      linkedTransferIds: async () => new Set(['never-stored', 'second']),
+    });
+    expect((await run.convergeOnce()).progress).toBe(true);
+    expect((await run.convergeOnce()).progress).toBe(false);
+
+    const second = await w.stores().backstop.getByKey('never-stored');
+    await w.stores().backstop.upsert({ ...second!, transferId: 'second' });
+    expect((await run.convergeOnce()).progress).toBe(true);
+    expect((await run.convergeOnce()).progress).toBe(false);
+
+    // The row turns up aborted after all: a new verdict on a kept id, which the converger did not retire.
+    await w.api.putIntent(w.caller, { transferId: 'never-stored', payload: second!.payloadEnvelope });
+    await w.api.abortIntent(w.caller, 'never-stored');
+    expect(await run.convergeOnce()).toMatchObject({ progress: true });
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeUndefined();
   });
 });

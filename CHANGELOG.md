@@ -50,7 +50,8 @@ What changed:
   without applying the verdict (a settling journal that failed open to empty, or a cleared link
   whose write failed), so resolving alone is not enough. A pass that does not get that far leaves
   the tombstone, and the next pass aborts it again, gets the same `404` and reports it
-  `conflicted` again. The settling journal now drops a link from memory only after its removal
+  `conflicted` again. Only the first of those reports counts as progress, so the heartbeat
+  backs off to its cap instead of retrying such a tombstone every 5 s. The settling journal now drops a link from memory only after its removal
   is on disk, so a failed write is retried by the next reconcile instead of waiting for a
   restart. The kept tombstone drops the shortfall rows it handed
   back, so `pendingTransfers()` lists them and a remainder already paid is never owed again.
@@ -61,11 +62,13 @@ How it was verified: `tests/unit/payments-v2/resume-unplannable.test.ts` (every 
 the domain boundaries, server-faithful `blob-urls` refusals, the reconcile and the partial-report
 cases, and a never-stored cancel across a skipped reconcile, a failed post-pass backstop read and
 a failed reconcile, and a real settling journal whose read failed open or whose cleared link
-failed to write, each followed by a restart that must not resolve the request paid),
+failed to write, each followed by a restart that must not resolve the request paid, and the
+heartbeat backing off while such a tombstone is kept),
 `tests/unit/payments-v2/requests.test.ts` (`linkedTransferIds`),
 `tests/unit/payments-v2/resume-isolation.test.ts` (a planning failure that
-validation does not name), new mutation probes, and a live staging case with a crafted foreign
-intent beside a keep-open send.
+validation does not name), and new mutation probes. The live staging case with a crafted foreign
+intent beside a keep-open send is `tests/e2e/payments-v2-vertical.staging.e2e.test.ts`
+(`-t '#840'`).
 
 ### Changed (breaking) — DIRECT:// is no longer a payment recipient; unused DIRECT helpers removed (#847)
 

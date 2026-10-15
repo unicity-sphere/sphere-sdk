@@ -602,7 +602,9 @@ Normative behaviors bound into the transitions (not call sites):
   durable copy of its `conflicted` verdict. A reconcile can resolve without applying it (a
   settling journal that failed open to empty, a cleared link whose write failed), so the converger
   removes the tombstone only after the reconcile resolves and no settling link names it, in memory
-  or on disk; until then every pass reports it `conflicted` again. The settling journal drops a
+  or on disk; until then every pass reports it `conflicted` again. Only the first of those
+  reports counts as heartbeat progress, so a tombstone kept for good (an unreadable settling
+  journal) is retried at the backoff cap, not every 5 s; each session reports it once. The settling journal drops a
   link from memory only after its removal is on disk, so the next pass re-applies the verdict. The kept tombstone no longer
   holds the shortfall rows it handed back, so they are listed and never handed back twice.
 - **Fan-out:** certify at width 20 (`CERTIFY_WIDTH`, widened from 8 by #746), fail-fast
@@ -938,7 +940,8 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
   per-intent-serial. Pinned by a startup request-count test.
 - **In-session convergence heartbeat:** between `start()` and `stop()`, while open intents exist
   or the delivery/mint journals are non-empty, the facade re-runs the SAME single-flighted resume
-  pass on an exponential backoff — seed 5 s, ×2, cap 120 s; reset on progress (any leg converging)
+  pass on an exponential backoff — seed 5 s, ×2, cap 120 s; reset on progress (any leg converging,
+  but not a kept 404 tombstone that the previous pass already reported `conflicted`, #840)
   and on `connection:status` recovery; a surfaced wallet-api `Retry-After` floors the next pass;
   the pass never adopts an intent whose machine is still running in-process (facade ownership).
   State is an in-memory timer handle + backoff value only — the pending set is re-read from the
@@ -974,7 +977,11 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      the pass report (`ResumeReport.retryAfterMs`, the longest seen), and `convergeOnce` keeps the
      longest across the pass and the journal replays, so the heartbeat never retries a
      rate-limited held send, resume or replay before the server asked.
-  4. Gate, decode and resume, unchanged.
+  4. Gate, decode and resume. Since #840 each intent is planned on its own: a payload this client
+     cannot plan is refused (reported `failed`, left open, kept out of any attempt budget), a
+     refused batched source read is re-read per intent unless it carried a `Retry-After`, and
+     steps 2-4 run inside one boundary that reports every id not judged yet `failed`. The
+     §5.5 #840 bullet has the details.
   5. Reconcile payment links, against the backstop read again after the pass: every transferId
      with a local entry then (held, parked, being cancelled, or an attempt that ended mid-pass) is
      reported open alongside the pass's own failures, because a link written while the pass ran is

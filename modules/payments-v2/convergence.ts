@@ -8,7 +8,7 @@ import type { DeliveryPort } from './ports';
 import { isLiveBurn, type DeliveryJournalEntry, type IntentBackstopEntry, type ShortfallEntry } from './stores';
 import type { CoinIntentPayload, IntentPayload } from './machine/types';
 import { retryAfterMsOf, type MachineStores, type ReplayDeps } from './machine/journal';
-import { resumeAll } from './machine/resume';
+import { resumeAll, type ResumeReport } from './machine/resume';
 import type { IntentApi, MachineDeps } from './machine/TransferMachine';
 
 // Backoff: seed 5 s, ×2 per unproductive pass, cap 120 s; reset on progress
@@ -147,6 +147,8 @@ export interface ConvergerDeps {
 export class Converger {
   /** #840: intents whose refusal to resume was logged — once per facade. */
   private readonly warned = new Set<string>();
+  /** #840: the never-stored cancels the last pass reported: reporting a kept one again converges nothing. */
+  private reported = new Set<string>();
 
   constructor(private readonly deps: ConvergerDeps) {}
 
@@ -220,7 +222,7 @@ export class Converger {
     // #835: an unreadable backstop proves nothing — reconciling its empty report would
     // resolve a held payment link 'paid' through the unaccounted branch.
     if (deferred) return { progress: false, retryAfterMs: null };
-    const progress = report.resumed.length > 0 || report.conflicted.length > 0;
+    const progress = this.progressOf(report);
     // #835: a link written while the pass ran is in none of its sets. Anything with a local
     // entry NOW (held, parked, being cancelled, or an attempt that ended mid-pass) can still
     // run or abort, so it is open — never "unaccounted", which resolves the link paid. An
@@ -239,6 +241,14 @@ export class Converger {
     }
     if (progress) await this.deps.refreshView().catch(() => undefined);
     return { progress, retryAfterMs: report.retryAfterMs ?? null };
+  }
+
+  /** #840: a kept tombstone is judged again on every pass; only its first verdict resets the backoff. */
+  private progressOf(report: ResumeReport): boolean {
+    const retiring = new Set((report.retireAfterReconcile ?? []).map((entry) => entry.transferId));
+    const fresh = report.conflicted.some((id) => !(retiring.has(id) && this.reported.has(id)));
+    this.reported = retiring;
+    return report.resumed.length > 0 || fresh;
   }
 
   /** #840: a never-stored cancel's tombstone is its verdict's only durable copy, and a reconcile can
