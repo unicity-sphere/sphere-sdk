@@ -129,6 +129,8 @@ export interface ConvergerDeps {
   stores: MachineStores;
   delivery: DeliveryPort;
   reconcile(report: { resumed: string[]; conflicted: string[]; open: string[] }): Promise<void>;
+  /** #840: every transferId a settling link names, in memory or on disk; rejects when the disk is unreadable. */
+  linkedTransferIds(): Promise<ReadonlySet<string>>;
   refreshView(): Promise<void>;
   replayMints(): Promise<number>;
   replayNftMints(): Promise<number>;
@@ -233,13 +235,22 @@ export class Converger {
         conflicted: report.conflicted,
         open: [...report.failed, ...local],
       });
-      // #840: only now is a never-stored cancel's verdict applied; until then its tombstone is the only copy.
-      for (const entry of report.retireAfterReconcile ?? []) {
-        await this.deps.stores.backstop.removeIfUnchanged(entry.transferId, entry).catch(() => false);
-      }
+      await this.retireJudged(report.retireAfterReconcile ?? []);
     }
     if (progress) await this.deps.refreshView().catch(() => undefined);
     return { progress, retryAfterMs: report.retryAfterMs ?? null };
+  }
+
+  /** #840: a never-stored cancel's tombstone is its verdict's only durable copy, and a reconcile can
+   *  resolve without applying it: the tombstone goes only once no settling link names it. */
+  private async retireJudged(entries: readonly IntentBackstopEntry[]): Promise<void> {
+    if (entries.length === 0) return;
+    const linked = await this.deps.linkedTransferIds().catch(() => null);
+    if (linked === null) return;
+    for (const entry of entries) {
+      if (linked.has(entry.transferId)) continue;
+      await this.deps.stores.backstop.removeIfUnchanged(entry.transferId, entry).catch(() => false);
+    }
   }
 
   private filteredMachineDeps(inPass: ReadonlySet<string>): MachineDeps {

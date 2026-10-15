@@ -28,7 +28,7 @@ export interface ResumeReport {
   failed: string[];
   /** The longest Retry-After a failed intent's answer carried: the heartbeat waits it out. */
   retryAfterMs?: number;
-  /** #840: never-stored cancels, removed only once the reconcile consumed their `conflicted` verdict. */
+  /** #840: never-stored cancels, removed only once the reconcile ran and no settling link names them. */
   retireAfterReconcile?: IntentBackstopEntry[];
 }
 
@@ -110,7 +110,7 @@ export async function resumeAll(deps: MachineDeps, options: ResumeAllOptions = {
     await runPass(deps, stores, view, open, pass);
   } catch (err) {
     // #840: what the pass already decided is still reported; every id not judged yet stays open.
-    noteWait(report, err);
+    noteWait(report, err); // defensive: every remote call in the pass catches its own wait today
     const judged = new Set([...report.resumed, ...report.conflicted, ...report.failed, ...pass.refused]);
     report.failed.push(...pass.gated.filter((id) => !judged.has(id)));
   }
@@ -398,6 +398,7 @@ async function readBlobs(
     return await storage.getBlobs(ids);
   } catch (err) {
     noteWait(report, err);
+    if (retryAfterMsOf(err) !== null) return new Map(); // asked to back off: a read per job only adds load
   }
   const blobs = new Map<string, Uint8Array>();
   const own = jobs.map(neededBy).filter((needed) => needed.length > 0);

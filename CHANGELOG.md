@@ -40,13 +40,19 @@ What changed:
   It is logged once per facade.
 - When the batched source read is refused, each intent's sources are read again on their own, so
   only the intent that named the bad id fails closed. The refusal's `Retry-After` reaches the
-  heartbeat.
+  heartbeat, and a refusal that carries one is not re-read per intent, so a server that asked to
+  back off gets no extra requests.
 - A pass that throws after reading the backstop keeps its verdicts and reports every intent it
   had not judged as `failed`, so the payment-request reconcile still runs and treats them as open.
 - A cancel answered `404 NOT_FOUND` keeps its tombstone until the reconcile has applied its
-  `conflicted` verdict; the converger removes it only after the reconcile resolves. A pass that
-  does not get that far leaves the tombstone, and the next pass aborts it again, gets the same
-  `404` and reports it `conflicted` again. The kept tombstone drops the shortfall rows it handed
+  `conflicted` verdict: the converger removes it only after the reconcile resolves and no settling
+  link names its transferId, in memory or in a fresh read of the journal. A reconcile can resolve
+  without applying the verdict (a settling journal that failed open to empty, or a cleared link
+  whose write failed), so resolving alone is not enough. A pass that does not get that far leaves
+  the tombstone, and the next pass aborts it again, gets the same `404` and reports it
+  `conflicted` again. The settling journal now drops a link from memory only after its removal
+  is on disk, so a failed write is retried by the next reconcile instead of waiting for a
+  restart. The kept tombstone drops the shortfall rows it handed
   back, so `pendingTransfers()` lists them and a remainder already paid is never owed again.
 - A device still on 0.19.0 or older keeps stopping on such an intent; the fix reaches each device
   only when it upgrades.
@@ -54,7 +60,10 @@ What changed:
 How it was verified: `tests/unit/payments-v2/resume-unplannable.test.ts` (every refused form,
 the domain boundaries, server-faithful `blob-urls` refusals, the reconcile and the partial-report
 cases, and a never-stored cancel across a skipped reconcile, a failed post-pass backstop read and
-a failed reconcile), `tests/unit/payments-v2/resume-isolation.test.ts` (a planning failure that
+a failed reconcile, and a real settling journal whose read failed open or whose cleared link
+failed to write, each followed by a restart that must not resolve the request paid),
+`tests/unit/payments-v2/requests.test.ts` (`linkedTransferIds`),
+`tests/unit/payments-v2/resume-isolation.test.ts` (a planning failure that
 validation does not name), new mutation probes, and a live staging case with a crafted foreign
 intent beside a keep-open send.
 

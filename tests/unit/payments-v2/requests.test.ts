@@ -549,3 +549,29 @@ describe('payments-v2 Requests — reconcile (all five arms)', () => {
     expect(settlingRecord(h.kv)[id]).toMatchObject({ transferId: 'tx-x' });
   });
 });
+
+describe('payments-v2 Requests — linkedTransferIds (#840)', () => {
+  it('names a link whose write failed: it lives only in memory, and it still holds the request', async () => {
+    const h = makeHarness();
+    const id = await seedRequest(h.api);
+    await h.requests.drainIncoming();
+    h.sendImpl.mockRejectedValueOnce(possiblyCommitted('tx-memory'));
+    h.kv.failWriteKeys.add(SETTLING_KEY);
+    await expect(h.requests.pay(id)).rejects.toThrow(/injected kv write failure/);
+    h.kv.failWriteKeys.delete(SETTLING_KEY);
+
+    expect(settlingRecord(h.kv)[id]).toBeUndefined();
+    expect([...(await h.requests.linkedTransferIds())]).toEqual(['tx-memory']);
+  });
+
+  it('names a link on disk that a load which failed open never saw, and rejects on an unreadable disk', async () => {
+    const link: SettlingLink = { requestId: 'r1', transferId: 'tx-disk', committed: false, createdAt: 1 };
+    const kv = memoryKV({ seed: { [SETTLING_KEY]: { r1: link } }, failKeys: [SETTLING_KEY] });
+    const h = makeHarness({ kv });
+    await h.requests.reconcile({ resumed: [], conflicted: ['tx-disk'], open: [] }); // fails open: applies nothing
+
+    await expect(h.requests.linkedTransferIds()).rejects.toThrow(/injected kv read failure/);
+    kv.failKeys.delete(SETTLING_KEY);
+    expect([...(await h.requests.linkedTransferIds())]).toEqual(['tx-disk']);
+  });
+});

@@ -177,6 +177,7 @@ export class PaymentsFacade implements PaymentsV2 {
       stores: this.machineStores,
       delivery: deps.deliveryPort,
       reconcile: (report) => this.requests.reconcile(report),
+      linkedTransferIds: () => this.requests.linkedTransferIds(),
       refreshView: () => this.view.delta(),
       replayMints: () => replayCoinMints(this.mintDeps()),
       replayNftMints: () => replayNftMints(this.mintDeps()),

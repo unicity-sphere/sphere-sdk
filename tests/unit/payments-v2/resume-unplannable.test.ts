@@ -11,11 +11,13 @@ import { WalletApiHttpError } from '../../../impl/wallet-api-v2/http';
 import { ActiveOps, Converger, derivePendingTransfers, type ConvergerDeps } from '../../../modules/payments-v2/convergence';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
 import { resumeAll } from '../../../modules/payments-v2/machine/resume';
+import { Requests, type RequestWire } from '../../../modules/payments-v2/requests/Requests';
 import type { MachineDeps } from '../../../modules/payments-v2/machine/TransferMachine';
 import { STORE_KEYS } from '../../../modules/payments-v2/stores';
 import { ProofUnconfirmedError } from '../../../token-engine/errors';
 import { FakeApiError } from './fakes/FakeWalletApi';
 import { COIN, makeWorld, type World } from './machine-harness';
+import { stubRequestMemoCodec } from './support';
 
 const BAD_ID = '00000000-0000-4000-8000-000000000840'; // sorts before every harness id
 const TWO_256 = (1n << 256n).toString();
@@ -71,7 +73,8 @@ type Reconciled = { resumed: string[]; conflicted: string[]; open: string[] };
 function converger(
   w: World,
   machineDeps: MachineDeps = w.deps,
-  stores = createMachineStores(w.kv)
+  stores = createMachineStores(w.kv),
+  over: Partial<ConvergerDeps> = {}
 ): { run: Converger; reconcile: ReturnType<typeof vi.fn> } {
   const reconcile = vi.fn(async (_report: Reconciled) => undefined);
   const deps: ConvergerDeps = {
@@ -79,6 +82,7 @@ function converger(
     stores,
     delivery: w.deps.delivery,
     reconcile,
+    linkedTransferIds: async () => new Set<string>(),
     refreshView: async () => undefined,
     replayMints: async () => 0,
     replayNftMints: async () => 0,
@@ -88,6 +92,7 @@ function converger(
     parked: new Set(),
     emit: () => undefined,
     now: () => w.clock.t,
+    ...over,
   };
   return { run: new Converger(deps), reconcile };
 }
@@ -251,6 +256,22 @@ describe('a source read the server refuses fails only the intent that named it (
     expect(await resumeAll(w.deps)).toEqual({ resumed: [], conflicted: [], failed: [good], retryAfterMs: 30_000 });
   });
 
+  it('a refused batch that asked to back off is not re-read per intent', async () => {
+    const w = makeWorld();
+    const first = await keepOpenSend(w);
+    const second = await keepOpenSend(w);
+    let calls = 0;
+    w.deps.storage.getBlobs = async () => {
+      calls++;
+      throw new WalletApiHttpError(429, 'RATE_LIMITED', 'POST /v1/tokens/blob-urls: slow down', 30_000);
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(calls, 'one request per intent would multiply the load the server asked to shed').toBe(1);
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [first, second].sort(), retryAfterMs: 30_000 });
+  });
+
   it("a per-intent re-read's Retry-After reaches the report when the refused batch carried none", async () => {
     const w = makeWorld();
     const first = await keepOpenSend(w);
@@ -387,5 +408,101 @@ describe("a cancel the server never stored keeps its tombstone until the reconci
     expect(reconcile).toHaveBeenCalledTimes(2);
     expect((reconcile.mock.calls[1][0] as Reconciled).conflicted).toEqual(['never-stored']);
     expect(await w.stores().backstop.getByKey('never-stored')).toBeUndefined();
+  });
+});
+
+/** One app session: a fresh Requests over the world's KV, wired into a converger as the facade wires it. */
+function session(w: World, responded: unknown[]): Converger {
+  const requests = new Requests({
+    client: {
+      createPaymentRequest: async () => {
+        throw new Error('unused');
+      },
+      listPaymentRequests: async () => {
+        throw new Error('unused');
+      },
+      respondPaymentRequest: async (id, response) => {
+        responded.push({ id, response });
+        return {} as RequestWire;
+      },
+    },
+    kv: w.kv,
+    ownPubkey: w.senderHex,
+    send: async () => {
+      throw new Error('unused');
+    },
+    resolvePubkey: async () => null,
+    listAbortedTransferIds: async () => [],
+    emit: () => undefined,
+    memo: stubRequestMemoCodec,
+  });
+  return converger(w, w.deps, createMachineStores(w.kv), {
+    reconcile: (report) => requests.reconcile(report),
+    linkedTransferIds: () => requests.linkedTransferIds(),
+  }).run;
+}
+
+describe('a never-stored cancel keeps its tombstone while a settling link still names it (#840)', () => {
+  // A reconcile can resolve without applying the verdict; after a restart the link would be
+  // unaccounted, absent from every aborted listing, and resolved paid though nothing moved.
+  async function linkedTombstone(w: World): Promise<void> {
+    await neverStoredTombstone(w);
+    const link = { requestId: 'r1', transferId: 'never-stored', committed: false, createdAt: 1 };
+    await w.kv.set(STORE_KEYS.settlingLinks, { r1: link });
+  }
+
+  it('a settling journal that failed open to empty: the tombstone stays, and the next session reverts the link', async () => {
+    const w = makeWorld();
+    await linkedTombstone(w);
+    const responded: unknown[] = [];
+    const get = w.kv.get.bind(w.kv);
+    let transient = true;
+    w.kv.get = async <T>(key: string): Promise<T | null> => {
+      if (transient && key === STORE_KEYS.settlingLinks) {
+        transient = false;
+        throw new Error('injected transient read failure');
+      }
+      return get<T>(key);
+    };
+
+    await session(w, responded).convergeOnce();
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeDefined();
+
+    await session(w, responded).convergeOnce(); // restart
+    expect(w.kv.map.get(STORE_KEYS.settlingLinks)).toEqual({});
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeUndefined();
+    await session(w, responded).convergeOnce();
+    expect(responded, 'nothing moved: the request must never be responded paid').toEqual([]);
+  });
+
+  it('a failed write of the cleared link: the link stays in memory, and the next pass clears it before the tombstone goes', async () => {
+    const w = makeWorld();
+    await linkedTombstone(w);
+    const responded: unknown[] = [];
+    const run = session(w, responded);
+    w.kv.failWriteKeys.add(STORE_KEYS.settlingLinks);
+
+    await run.convergeOnce();
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeDefined();
+
+    w.kv.failWriteKeys.delete(STORE_KEYS.settlingLinks);
+    await run.convergeOnce();
+    expect(w.kv.map.get(STORE_KEYS.settlingLinks)).toEqual({});
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeUndefined();
+    await session(w, responded).convergeOnce(); // restart
+    expect(responded, 'nothing moved: the request must never be responded paid').toEqual([]);
+  });
+
+  it('an unreadable settling journal after the reconcile: the tombstone stays', async () => {
+    const w = makeWorld();
+    await neverStoredTombstone(w);
+    const { run } = converger(w, w.deps, createMachineStores(w.kv), {
+      linkedTransferIds: async () => {
+        throw new Error('injected settling journal read failure');
+      },
+    });
+
+    await run.convergeOnce();
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeDefined();
   });
 });
