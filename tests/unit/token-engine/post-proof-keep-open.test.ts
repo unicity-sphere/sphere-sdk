@@ -102,6 +102,31 @@ describe('#839 a failure after a matching proof is keep-open', () => {
     expect(engine.isOwnedBy(out, recipient)).toBe(true);
   }, 30_000);
 
+  it("(a') transfer: wrapping the realized token failing after the proof is ProofUnconfirmedError with the cause; the same transferId realizes it", async () => {
+    const { engine, source } = await rig();
+    const recipient = freshPubkey();
+    const transferId = crypto.randomUUID();
+    const cause = new Error('re-encode failed');
+    const realTransfer = Token.prototype.transfer;
+    vi.spyOn(Token.prototype, 'transfer').mockImplementationOnce(async function (this: Token, ...args: Parameters<Token['transfer']>) {
+      const realized = await realTransfer.apply(this, args);
+      vi.spyOn(realized, 'toCBOR').mockImplementationOnce(() => {
+        throw cause;
+      });
+      return realized;
+    });
+
+    const err = await rejection(engine.transfer({ token: source, recipientPubkey: recipient }, { transferId }));
+
+    expect(err).toBeInstanceOf(ProofUnconfirmedError);
+    expect((err as ProofUnconfirmedError).cause).toBe(cause);
+    expect(await engine.isSpent(source)).toBe(true);
+    vi.restoreAllMocks();
+    const out = await engine.transfer({ token: source, recipientPubkey: recipient }, { transferId });
+    expect(await engine.verify(out)).toEqual({ ok: true });
+    expect(engine.isOwnedBy(out, recipient)).toBe(true);
+  }, 30_000);
+
   it('(b) transfer: toCertifiedTransaction failing after the proof is ProofUnconfirmedError; the same transferId realizes it', async () => {
     const { engine, source } = await rig();
     const recipient = freshPubkey();
