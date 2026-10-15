@@ -125,6 +125,12 @@ export interface ITokenEngine {
   readNft(token: SphereToken): Promise<NftReading | null>;
 
   // ── lifecycle (sender-driven: build → submit → wait → certify → realize) ──
+
+  // #839: transfer/burn/split reject untyped only when the call submitted nothing, or for a proven-clean
+  // submit reject. Once a proof matches, every failure is keep-open: ProofUnconfirmedError, or
+  // CheckpointPersistFailedError for a split checkpoint not encoded or not stored. mint/mintDataToken
+  // may reject untyped AFTER certification, so their callers journal first and replay the same id.
+
   /**
    * Mint (issue) a new token to a recipient pubkey. NOT a wallet end-user flow —
    * this is the issuer/developer capability: an app issuing its own tokens

@@ -4003,5 +4003,48 @@
     "tests": [
       "tests/unit/payments-v2/history.test.ts"
     ]
+  },
+  {
+    "name": "engine-transfer-realize-unwrapped",
+    "note": "#839: past a matching proof the transfer/burn IS certified, so a failure building the certified transaction, applying it or wrapping the token must be keep-open. Unwrapped, a raw error reaches the machine as 'other': run() fences and aborts the intent and reports a clean failure with the spend on chain (beside a conflicting leg, a clean conflict that re-plans the full amount).",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "    return realizeCertified(failLabel, async () => {",
+    "replace": "    return ((_label: string, realize: () => Promise<SphereToken>) => realize())(failLabel, async () => {",
+    "tests": [
+      "tests/unit/token-engine/post-proof-keep-open.test.ts",
+      "tests/unit/payments-v2/machine-post-proof.test.ts"
+    ]
+  },
+  {
+    "name": "engine-burn-realize-unwrapped",
+    "note": "#839: a split burn whose proof matched is on chain; a raw error from toCertifiedTransaction or Token.transfer must not escape split() as an abortable failure, or the machine aborts the intent and strands the whole source value.",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "    const burntToken = await realizeCertified('Split burn failed', async () => {",
+    "replace": "    const burntToken = await ((_label: string, realize: () => Promise<Token>) => realize())('Split burn failed', async () => {",
+    "tests": [
+      "tests/unit/token-engine/post-proof-keep-open.test.ts",
+      "tests/unit/payments-v2/machine-post-proof.test.ts"
+    ]
+  },
+  {
+    "name": "engine-checkpoint-encode-outside-gate",
+    "note": "#839: encoding the E.4 checkpoint runs after the burn certified; an encode failure is the CheckpointPersistFailedError state (burn certified, no checkpoint acked, zero mints submitted), never a raw error.",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "    try {\n      const envelope = await encodeCheckpoint(ctx.split.burn.transaction, burnProof, burntToken);\n      authoritative = await store.put(ctx.transferId, opIndex, envelope);",
+    "replace": "    const envelope = await encodeCheckpoint(ctx.split.burn.transaction, burnProof, burntToken);\n    try {\n      authoritative = await store.put(ctx.transferId, opIndex, envelope);",
+    "tests": [
+      "tests/unit/token-engine/post-proof-keep-open.test.ts"
+    ]
+  },
+  {
+    "name": "realize-certified-rethrows-raw",
+    "note": "#839: realizeCertified is the one place a post-proof failure becomes keep-open (ProofUnconfirmedError with the cause); rethrowing the raw error makes every wrapped step abortable again.",
+    "file": "token-engine/certification-outcome.ts",
+    "find": "    throw new ProofUnconfirmedError(`${failLabel}: certified on chain but not realized; resume under the same id`, err);",
+    "replace": "    throw err;",
+    "tests": [
+      "tests/unit/token-engine/post-proof-keep-open.test.ts",
+      "tests/unit/payments-v2/machine-post-proof.test.ts"
+    ]
   }
 ]
