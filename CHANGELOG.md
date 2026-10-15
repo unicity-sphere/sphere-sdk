@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — a named spend or burn refused while spending is paused is a clean failure (#838)
+
+What was wrong. Until the SDK has confirmed which tokens the transfers still converging hold (before
+payments start, after an address switch, and for as long as an open transfer's record cannot be
+read), every spend is refused. `send()` refused with `SEND_INSUFFICIENT_BALANCE`, but
+`sendWholeToken()` and `sendCoinless()` refused with `SEND_SYNC_PENDING` and no `transferId`
+(message `Cannot spend yet: …`), and `burn()` returned `errorCode: 'SEND_SYNC_PENDING'`.
+
+Consequence. Nothing had been reserved, recorded or sent, yet `isPossiblyCommittedSendOutcome()`
+returned true for the refusal, so `transfer:updated{status:'failed'}` was not emitted. A wallet that
+follows the possibly-committed contract showed a token that never moved as still going out, and
+told the user not to send it again. Since #835, `SEND_SYNC_PENDING` also means "held, sent
+automatically", which made the refusal more misleading.
+
+What changed:
+
+- `sendWholeToken()` and `sendCoinless()` refuse with `SEND_INSUFFICIENT_BALANCE`, the same code
+  and message `send()` gives in that state. The `Cannot spend yet: ` prefix is gone.
+  `isPossiblyCommittedSendOutcome()` is false for it, the error carries no `transferId`, and
+  `transfer:updated{status:'failed'}` now fires for it (and `transfer:failed` through the Connect
+  compatibility adapter), as it already did for `send()`.
+- `burn()` refused in that state returns `errorCode: 'SEND_INSUFFICIENT_BALANCE'`, with nothing
+  journaled.
+- Every `SEND_SYNC_PENDING` the SDK raises now carries `err.transferId`.
+
+How it was verified: facade tests in `tests/unit/payments-v2/pinned-balance.test.ts` (a restart over
+an open transfer whose record does not decode, where both whole-token verbs refuse cleanly and
+leave no PUT, backstop entry, pending row or reservation behind; the same code and message as
+`send()`; a refusal before start, then the same send succeeding once started), a burn test in
+`burn.test.ts`, and mutation probes on both refusal paths.
+
 ## [0.19.1] - 2026-10-16
 
 ### Fixed — `@nametag` and `DIRECT://` resolution never chooses between competing claims (nostr-js-sdk 0.6.1)

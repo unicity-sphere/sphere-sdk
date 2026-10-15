@@ -5,11 +5,14 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { isPossiblyCommittedSendOutcome } from '../../../core/errors';
 import { ProofUnconfirmedError } from '../../../token-engine/errors';
+import type { TransferResult } from '../../../types';
 import { IntentPins, type IntentPinsDeps } from '../../../modules/payments-v2/select/pins';
 import { SpendQueue } from '../../../modules/payments-v2/select/queue';
 import { ReservationLedger } from '../../../modules/payments-v2/select/ledger';
-import { COIN, cleanupWorlds, flushTail, makeWorld, ownCaller, type World } from './facade-harness';
+import { STORE_KEYS, type IntentBackstopEntry } from '../../../modules/payments-v2/stores';
+import { COIN, cleanupWorlds, eventsOf, flushTail, makeWorld, ownCaller, type World } from './facade-harness';
 
 afterEach(cleanupWorlds);
 
@@ -165,6 +168,18 @@ describe('#738 review: the held-set gate fails CLOSED', () => {
       spendableToken: () => true,
     });
     expect(() => queue.planWhole('r1', 'nft-1')).toThrow(/spending is paused|cannot spend yet/i);
+    // #838: nothing was reserved or sent, so the refusal is CLEAN — the coin path's code.
+    const err = (() => {
+      try {
+        queue.planWhole('r1', 'nft-1');
+      } catch (e) {
+        return e;
+      }
+      return undefined;
+    })();
+    expect(err).toMatchObject({ code: 'SEND_INSUFFICIENT_BALANCE' });
+    expect(isPossiblyCommittedSendOutcome(err)).toBe(false);
+    expect(ledger.holderOf('nft-1')).toBeUndefined();
   });
 
   it('#777: once the ledger is proven, the same named token plans and reserves', () => {
@@ -249,5 +264,92 @@ describe('#738: the gate signals transitions, not passes', () => {
     await pins.sync();
     await pins.sync();
     expect(emits).toBe(1);
+  });
+});
+
+/** The restarted world of the #738 restart test: its only open intent's envelope does not decode. */
+async function restartOverUnreadableIntent(): Promise<{ world: World; nft: string; valued: string }> {
+  const world = makeWorld();
+  await world.seed(100n);
+  const valued = (await world.seed(60n)).blob.tokenId;
+  const nft = (await world.seedCoinless()).blob.tokenId;
+  await world.facade.start();
+  await parkKeepOpen(world, '100');
+  await world.facade.stop();
+  const intentsKey = [...world.kv.map.keys()].find((k) => k.endsWith('intents'));
+  for (const row of world.kv.map.get(intentsKey!) as { payloadEnvelope: string }[]) row.payloadEnvelope = 'not-decryptable';
+  const restarted = makeWorld({ restartOf: world });
+  await restarted.facade.start();
+  await flushTail();
+  return { world: restarted, nft, valued };
+}
+
+function failedIds(world: World): string[] {
+  return (eventsOf(world, 'transfer:updated') as TransferResult[]).filter((r) => r.status === 'failed').map((r) => r.id);
+}
+
+function holderOf(world: World, tokenId: string): string | undefined {
+  return (world.facade as unknown as { ledger: ReservationLedger }).ledger.holderOf(tokenId);
+}
+
+/** Runs one refused call; returns its error and the id of the ONE failed event it emitted. */
+async function refusal(world: World, call: () => Promise<unknown>): Promise<{ err: unknown; id: string }> {
+  const before = failedIds(world).length;
+  const err = await call().then(
+    () => undefined,
+    (e: unknown) => e
+  );
+  const added = failedIds(world).slice(before);
+  expect(added).toHaveLength(1);
+  return { err, id: added[0] };
+}
+
+function expectClean(err: unknown): void {
+  expect(err).toMatchObject({ code: 'SEND_INSUFFICIENT_BALANCE', message: expect.stringMatching(/spending is paused/i) });
+  expect(isPossiblyCommittedSendOutcome(err)).toBe(false);
+  expect((err as { transferId?: string }).transferId).toBeUndefined();
+}
+
+describe('#838: the unproven-ledger refusal of a named spend is CLEAN', () => {
+  it('after a restart over an undecodable intent, both whole verbs refuse cleanly and leave nothing behind', async () => {
+    const { world, nft, valued } = await restartOverUnreadableIntent();
+    const pendingBefore = (await world.facade.pendingTransfers()).map((p) => p.transferId);
+    expect(pendingBefore).toHaveLength(1);
+
+    const calls: [string, () => Promise<unknown>][] = [
+      [nft, () => world.facade.sendCoinless({ recipient: '@peer', tokenId: nft })],
+      [valued, () => world.facade.sendWholeToken({ recipient: '@peer', tokenId: valued })],
+    ];
+    for (const [tokenId, call] of calls) {
+      const { err, id } = await refusal(world, call);
+      expectClean(err);
+      expect(world.putCalls.map((c) => c.transferId)).not.toContain(id);
+      expect((await world.facade.pendingTransfers()).map((p) => p.transferId)).toEqual(pendingBefore);
+      const backstop = (world.kv.map.get(STORE_KEYS.intentBackstop) as IntentBackstopEntry[] | undefined) ?? [];
+      expect(backstop.map((e) => e.transferId)).not.toContain(id);
+      expect(holderOf(world, tokenId)).toBeUndefined();
+    }
+  });
+
+  it('send() and sendWholeToken() refuse the same state with an identical code and message', async () => {
+    const { world, valued } = await restartOverUnreadableIntent();
+    const coin = await world.facade.send({ recipient: '@peer', amount: '10', coinId: COIN }).catch((e: unknown) => e);
+    const whole = await world.facade.sendWholeToken({ recipient: '@peer', tokenId: valued }).catch((e: unknown) => e);
+    expect(coin).toMatchObject({ code: 'SEND_INSUFFICIENT_BALANCE' });
+    const shape = (e: unknown) => ({ code: (e as { code: string }).code, message: (e as Error).message });
+    expect(shape(whole)).toEqual(shape(coin));
+  });
+
+  it('a never-started facade refuses cleanly, then the SAME send succeeds once started: nothing leaked', async () => {
+    const world = makeWorld();
+    const nft = (await world.seedCoinless()).blob.tokenId;
+
+    const { err } = await refusal(world, () => world.facade.sendCoinless({ recipient: '@peer', tokenId: nft }));
+    expectClean(err);
+    expect(holderOf(world, nft)).toBeUndefined();
+
+    await world.facade.start();
+    const ok = await world.facade.sendCoinless({ recipient: '@peer', tokenId: nft });
+    expect(ok.status).toBe('delivered');
   });
 });

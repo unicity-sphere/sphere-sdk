@@ -50,13 +50,18 @@ interface FreeView {
   readonly unproven: string | null;
 }
 
+/** #738/#838: held-set unproven, so nothing was reserved or sent — one CLEAN refusal for a coin spend, a named spend and a burn. */
+function unprovenRefusal(reason: string): SphereError {
+  return new SphereError(reason, 'SEND_INSUFFICIENT_BALANCE');
+}
+
 /**
  * #737: the CODE is load-bearing (dApps key on it) but "insufficient balance" sent
  * a user auditing a treasury that was never short — every token was pinned by an
  * intent still converging. When something is pinned, the message says so.
  */
 function insufficientBalance(view: FreeView, amount: bigint): SphereError {
-  if (view.unproven !== null) return new SphereError(view.unproven, 'SEND_INSUFFICIENT_BALANCE');
+  if (view.unproven !== null) return unprovenRefusal(view.unproven);
   const message =
     view.pinnedTotal > 0n
       ? `Insufficient spendable balance: need ${amount.toString()}, ${view.freeTotal.toString()} free, ` +
@@ -107,7 +112,7 @@ export class SpendQueue {
     // open intent already holds.
     const unproven = this.deps.ledger.unprovenReason();
     if (unproven !== null) {
-      throw new SphereError(`Cannot spend yet: ${unproven}`, 'SEND_SYNC_PENDING');
+      throw unprovenRefusal(unproven);
     }
     if (this.deps.spendableToken?.(tokenId) !== true) {
       throw new SphereError(`Token ${tokenId} is not a spendable holding`, 'VALIDATION_ERROR');

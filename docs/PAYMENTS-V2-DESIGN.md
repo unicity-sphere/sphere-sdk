@@ -378,6 +378,10 @@ open intents and their sources come from the backstop, decrypted on read like
 when there is one: free total, pinned total, and how many transfers hold it, plus "do not
 re-send". "Insufficient balance" alone reads as *you are broke* and sent #737 auditing a treasury
 that was never short.
+While the held-set is unproven (#738) the gate refuses a coin spend, a named spend
+(`sendWholeToken` / `sendCoinless`) and a burn with the same clean `SEND_INSUFFICIENT_BALANCE` and
+the same message (#838): nothing was reserved or sent, so the refusal must never read as
+possibly-committed.
 
 ### 5.5 `TransferMachine` — one machine for send AND resume
 
