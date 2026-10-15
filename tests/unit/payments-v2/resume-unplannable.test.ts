@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { logger } from '../../../core/logger';
 import { WalletApiHttpError } from '../../../impl/wallet-api-v2/http';
-import { ActiveOps, Converger, type ConvergerDeps } from '../../../modules/payments-v2/convergence';
+import { ActiveOps, Converger, derivePendingTransfers, type ConvergerDeps } from '../../../modules/payments-v2/convergence';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
 import { resumeAll } from '../../../modules/payments-v2/machine/resume';
 import type { MachineDeps } from '../../../modules/payments-v2/machine/TransferMachine';
@@ -68,11 +68,15 @@ function serverFaithfulBlobs(w: World, failDownloadOf?: string): void {
 
 type Reconciled = { resumed: string[]; conflicted: string[]; open: string[] };
 
-function converger(w: World, machineDeps: MachineDeps = w.deps): { run: Converger; reconcile: ReturnType<typeof vi.fn> } {
+function converger(
+  w: World,
+  machineDeps: MachineDeps = w.deps,
+  stores = createMachineStores(w.kv)
+): { run: Converger; reconcile: ReturnType<typeof vi.fn> } {
   const reconcile = vi.fn(async (_report: Reconciled) => undefined);
   const deps: ConvergerDeps = {
     machineDeps,
-    stores: createMachineStores(w.kv),
+    stores,
     delivery: w.deps.delivery,
     reconcile,
     refreshView: async () => undefined,
@@ -246,18 +250,36 @@ describe('a source read the server refuses fails only the intent that named it (
 
     expect(await resumeAll(w.deps)).toEqual({ resumed: [], conflicted: [], failed: [good], retryAfterMs: 30_000 });
   });
+
+  it("a per-intent re-read's Retry-After reaches the report when the refused batch carried none", async () => {
+    const w = makeWorld();
+    const first = await keepOpenSend(w);
+    const second = await keepOpenSend(w);
+    let calls = 0;
+    w.deps.storage.getBlobs = async () => {
+      calls++;
+      if (calls === 1) throw new FakeApiError(403, 'FORBIDDEN', 'not in inventory');
+      throw new WalletApiHttpError(503, 'UNAVAILABLE', 'POST /v1/tokens/blob-urls: unavailable', 30_000);
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(calls).toBe(3);
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [first, second].sort(), retryAfterMs: 30_000 });
+  });
 });
 
+async function neverStoredTombstone(w: World): Promise<void> {
+  await w.stores().backstop.upsert({
+    transferId: 'never-stored',
+    payloadEnvelope: `enc:${JSON.stringify({ v: 2, kind: 'coin', recipient: w.recipientHex, coinId: COIN, amount: '1', direct: [] })}`,
+    requiresSeedClose: false,
+    disposition: 'abortPending',
+    createdAt: 1,
+  });
+}
+
 describe('a pass that throws part-way keeps the verdicts it already made durable (#840)', () => {
-  async function neverStoredTombstone(w: World): Promise<void> {
-    await w.stores().backstop.upsert({
-      transferId: 'never-stored',
-      payloadEnvelope: `enc:${JSON.stringify({ v: 2, kind: 'coin', recipient: w.recipientHex, coinId: COIN, amount: '1', direct: [] })}`,
-      requiresSeedClose: false,
-      disposition: 'abortPending',
-      createdAt: 1,
-    });
-  }
 
   it('with no token engine: the retired tombstone is still reported conflicted', async () => {
     const w = makeWorld();
@@ -294,5 +316,76 @@ describe('a pass that throws part-way keeps the verdicts it already made durable
     expect(passed.conflicted).toEqual(['never-stored']);
     expect(passed.open).toEqual(expect.arrayContaining([good, BAD_ID]));
     expect(w.api.inspectIntent(w.caller, BAD_ID)?.status).toBe('open');
+  });
+});
+
+describe("a cancel the server never stored keeps its tombstone until the reconcile consumed the verdict (#840)", () => {
+  // The tombstone is the verdict's only durable copy: the aborted listing never shows a row the
+  // server never stored, so without it a later pass finds the link unaccounted and resolves it paid.
+  it('the pass that judged it never reached the reconcile: the tombstone stays, and the next pass reports it conflicted', async () => {
+    const w = makeWorld();
+    await neverStoredTombstone(w);
+
+    expect(await resumeAll(w.deps)).toMatchObject({ conflicted: ['never-stored'] });
+
+    expect((await w.stores().backstop.getByKey('never-stored'))?.disposition).toBe('abortPending');
+    const { run, reconcile } = converger(w);
+    await run.convergeOnce();
+    expect((reconcile.mock.calls[0][0] as Reconciled).conflicted).toEqual(['never-stored']);
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeUndefined();
+  });
+
+  it("the post-pass backstop read fails: the reconcile is skipped, the tombstone stays, the next pass reports it conflicted", async () => {
+    const w = makeWorld();
+    await neverStoredTombstone(w);
+    const stores = createMachineStores(w.kv);
+    const list = stores.backstop.list.bind(stores.backstop);
+    let unreadable = true;
+    stores.backstop.list = async () => {
+      if (!unreadable) return list();
+      unreadable = false;
+      throw new Error('injected backstop read failure');
+    };
+    const { run, reconcile } = converger(w, w.deps, stores);
+
+    await run.convergeOnce();
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeDefined();
+
+    await run.convergeOnce();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect((reconcile.mock.calls[0][0] as Reconciled).conflicted).toEqual(['never-stored']);
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeUndefined();
+  });
+
+  it('the kept tombstone stops holding what it handed back: the shortfall is listed, and a paid one never comes back', async () => {
+    const w = makeWorld();
+    const owed = { transferId: 'earlier', remainingAmount: '400', coinId: COIN, recipient: w.recipientHex, committedTokenIds: [], createdAt: 1 };
+    await neverStoredTombstone(w);
+    await w.stores().backstop.patch('never-stored', (e) => ({ ...e, owes: [owed] }));
+    const decrypt = (envelope: string): Promise<unknown> => w.deps.decryptPayload(envelope);
+
+    await resumeAll(w.deps);
+    expect((await w.stores().backstop.getByKey('never-stored'))?.owes).toBeUndefined();
+    expect((await derivePendingTransfers(w.stores(), decrypt)).map((row) => row.transferId)).toEqual(['earlier']);
+
+    await w.stores().shortfalls.removeByKey('earlier'); // the user paid the remainder under a new send
+    expect(await resumeAll(w.deps)).toMatchObject({ conflicted: ['never-stored'] });
+    expect(await w.stores().shortfalls.list()).toEqual([]);
+  });
+
+  it('the reconcile throws: the tombstone stays, and the next pass reports it conflicted again', async () => {
+    const w = makeWorld();
+    await neverStoredTombstone(w);
+    const { run, reconcile } = converger(w);
+    reconcile.mockRejectedValueOnce(new Error('settling journal unreadable'));
+
+    await run.convergeOnce();
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeDefined();
+
+    await run.convergeOnce();
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect((reconcile.mock.calls[1][0] as Reconciled).conflicted).toEqual(['never-stored']);
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeUndefined();
   });
 });

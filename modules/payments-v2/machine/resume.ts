@@ -17,6 +17,7 @@ import {
   releaseOwed,
   retryAfterMsOf,
   settleOwed,
+  type AbortOutcome,
   type MachineStores,
 } from './journal';
 import { TransferMachine, buildOps, classifyError, type IntentApi, type MachineDeps } from './TransferMachine';
@@ -27,6 +28,8 @@ export interface ResumeReport {
   failed: string[];
   /** The longest Retry-After a failed intent's answer carried: the heartbeat waits it out. */
   retryAfterMs?: number;
+  /** #840: never-stored cancels, removed only once the reconcile consumed their `conflicted` verdict. */
+  retireAfterReconcile?: IntentBackstopEntry[];
 }
 
 function noteWait(report: ResumeReport, err: unknown): void {
@@ -106,7 +109,7 @@ export async function resumeAll(deps: MachineDeps, options: ResumeAllOptions = {
   try {
     await runPass(deps, stores, view, open, pass);
   } catch (err) {
-    // #840: verdicts already made durable (a retired tombstone) stand; every id not judged yet stays open.
+    // #840: what the pass already decided is still reported; every id not judged yet stays open.
     noteWait(report, err);
     const judged = new Set([...report.resumed, ...report.conflicted, ...report.failed, ...pass.refused]);
     report.failed.push(...pass.gated.filter((id) => !judged.has(id)));
@@ -210,9 +213,28 @@ async function endHold(stores: MachineStores, entry: IntentBackstopEntry): Promi
 }
 
 /** A confirmed cancel moved nothing: what it held is owed again, conflicted (a link is payable); a completed row was paid. */
-async function retire(stores: MachineStores, entry: IntentBackstopEntry, refused: boolean, report: ResumeReport): Promise<void> {
+async function retire(
+  stores: MachineStores,
+  entry: IntentBackstopEntry,
+  outcome: Exclude<AbortOutcome, 'unknown'>,
+  report: ResumeReport
+): Promise<void> {
+  const refused = outcome !== 'completed';
   await (refused ? releaseOwed(stores, entry) : settleOwed(stores, entry));
-  if ((await stores.backstop.removeIfUnchanged(entry.transferId, entry)) && refused) report.conflicted.push(entry.transferId);
+  if (outcome === 'never-stored') {
+    // #840: no listing ever shows it, so the entry is the verdict's only durable copy. It no longer
+    // holds what it handed back: a later pass must not owe again a remainder already paid.
+    report.conflicted.push(entry.transferId);
+    (report.retireAfterReconcile ??= []).push((await stripOwed(stores, entry)) ?? entry);
+  } else if ((await stores.backstop.removeIfUnchanged(entry.transferId, entry)) && refused) {
+    report.conflicted.push(entry.transferId);
+  }
+}
+
+/** On a failed write the rows stay held, so hidden, and the next pass hands them back again. */
+async function stripOwed(stores: MachineStores, entry: IntentBackstopEntry): Promise<IntentBackstopEntry | undefined> {
+  if (entry.owes === undefined) return entry;
+  return stores.backstop.patch(entry.transferId, ({ owes: _handedBack, ...rest }) => rest).catch(() => undefined);
 }
 
 /** Best-effort: on a failed write the hold stays in memory and the next pass tries again. */
@@ -263,7 +285,7 @@ async function dropStaleBackstops(
     if (view.openIds.has(id) || view.isLocallyActive(id)) continue;
     if (entry.disposition !== 'open') {
       const outcome = await abortAndConfirm(intents, id, (err) => noteWait(report, err));
-      if (outcome !== 'unknown') await retire(stores, entry, outcome !== 'completed', report);
+      if (outcome !== 'unknown') await retire(stores, entry, outcome, report);
       continue;
     }
     if (isHeld(entry, view)) continue; // reported possibly-committed: the ensure step owns it
@@ -272,7 +294,7 @@ async function dropStaleBackstops(
     const listed = await freshListings(intents, report);
     // Unknown until both listings read; open again (a byte-equal re-PUT re-opened it): a later pass judges it.
     if (listed === null || listed.open.has(id)) continue;
-    await retire(stores, entry, listed.aborted.has(id), report);
+    await retire(stores, entry, listed.aborted.has(id) ? 'aborted' : 'completed', report);
   }
 }
 
@@ -305,7 +327,7 @@ async function gateAndDecode(
       // #676: never resumed. Conflicted only once the cancel is confirmed (#835): until then another device could run it.
       const outcome = await abortAndConfirm(deps.intents, intent.transferId, (err) => noteWait(report, err));
       if (outcome === 'unknown') report.failed.push(intent.transferId);
-      else await retire(stores, local, outcome !== 'completed', report).catch(() => undefined);
+      else await retire(stores, local, outcome, report).catch(() => undefined);
       continue;
     }
     let payload: IntentPayload;
