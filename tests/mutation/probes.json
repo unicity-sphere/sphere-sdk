@@ -3661,5 +3661,25 @@
       "tests/unit/token-engine/post-proof-keep-open.test.ts",
       "tests/unit/payments-v2/machine-post-proof.test.ts"
     ]
+  },
+  {
+    "name": "engine-transfer-certify-outside-realize",
+    "note": "#839: building the certified transfer/burn transaction runs after the proof matched, so it must stay inside realizeCertified. Hoisted out, a toCertifiedTransaction throw escapes transfer()/burn() as a raw error the machine fences and aborts with the spend on chain.",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "    return realizeCertified(failLabel, async () => {\n      const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);\n",
+    "replace": "    const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, proof);\n    return realizeCertified(failLabel, async () => {\n",
+    "tests": [
+      "tests/unit/token-engine/post-proof-keep-open.test.ts"
+    ]
+  },
+  {
+    "name": "engine-burn-certify-outside-realize",
+    "note": "#839: a split burn's toCertifiedTransaction runs after its proof matched; hoisted out of realizeCertified, its throw escapes split() raw, the machine aborts the intent, and the whole source value is stranded with the burn on chain (E.4).",
+    "file": "token-engine/SphereTokenEngine.ts",
+    "find": "    const burntToken = await realizeCertified('Split burn failed', async () => {\n      const burnCertified = await burnTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, burnProof);\n",
+    "replace": "    const burnCertified = await burnTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, this.deps.unicityCertificateVerifier, burnProof);\n    const burntToken = await realizeCertified('Split burn failed', async () => {\n",
+    "tests": [
+      "tests/unit/token-engine/post-proof-keep-open.test.ts"
+    ]
   }
 ]
