@@ -28,6 +28,14 @@ export class TransferConflictError extends SphereError {
   }
 }
 
+/** A token's mint reason cannot be judged yet: no verifier for its tag here, or the plugin could not reach an answer. */
+export class MintReasonUnverifiableError extends SphereError {
+  constructor(message: string, cause?: unknown) {
+    super(message, 'MINT_REASON_UNVERIFIABLE', cause);
+    this.name = 'MintReasonUnverifiableError';
+  }
+}
+
 /**
  * The op's certification is INDETERMINATE: the submit was accepted (`SUCCESS`)
  * or failed ambiguously (a thrown submit POST that may have been processed
@@ -43,14 +51,6 @@ export class TransferConflictError extends SphereError {
  * certified proof + recipient blob, or records the spend if a foreign tx won the
  * race — never a second on-chain spend (sdk-changes E.2/E.3, #631).
  */
-/** A token's mint reason cannot be judged yet: no verifier for its tag here, or the plugin could not reach an answer. */
-export class MintReasonUnverifiableError extends SphereError {
-  constructor(message: string, cause?: unknown) {
-    super(message, 'MINT_REASON_UNVERIFIABLE', cause);
-    this.name = 'MintReasonUnverifiableError';
-  }
-}
-
 export class ProofUnconfirmedError extends SphereError {
   readonly mayHaveCertified = true as const;
 
@@ -84,7 +84,8 @@ export class CheckpointPersistFailedError extends SphereError {
  * leaf is already certified on-chain but no stored bytes reproduce its certified transactionHash
  * (server data loss / withholding, or a pre-E.4 legacy intent), or a stored checkpoint fails its
  * byte-binding checks (the re-derived burn tx ≠ the stored bytes — cross-version derivation drift
- * — or a corrupt stored proof, or a burnt-token re-encode mismatch).
+ * — or a corrupt stored proof, or a burnt-token re-encode mismatch), or a re-encode during that
+ * rebuild throws (#839: recoverable, the checkpoint is intact and no mint was submitted).
  *
  * Distinct from {@link TransferConflictError}: a split-mint stateId is HKDF-derived from
  * `(seed, transferId)`, so only a seed-holder under THIS `transferId` can have certified it — this

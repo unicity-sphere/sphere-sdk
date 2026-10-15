@@ -20,8 +20,9 @@
  * It injects faults on PUT /v1/intents only, over the REAL authed client. The
  * #842 block after it (`-t '#842'`, its own wallets too) injects them on
  * POST /v1/intents/:id/complete and POST /v1/inventory/apply.
- * The #839 block at the end has its own wallets too (`-t '#839'`). It fails the
- * token's realization once AFTER the real gateway certified the spend, in process.
+ * The #839 block at the end has its own wallets too (`-t '#839'`). AFTER the real
+ * gateway certified the spend it fails every realization of that token, in process,
+ * until it is disarmed just before resumeNow().
  *
  * Gated on STAGING_AGGREGATOR_KEY. Run:
  *   set -a && source .env && set +a && npx vitest run --config vitest.e2e.config.ts \
