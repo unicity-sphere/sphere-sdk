@@ -14,7 +14,7 @@ export interface SettledAttempt {
   committed: OpOutcome[];
 }
 
-/** SENT history; recorded even when the close failed (the server dedupKey is the transferId). */
+/** SENT history, whatever the apply or the close answered (the server dedupKey is the transferId). Never throws. */
 export async function recordSettled(
   engine: ITokenEngine,
   recordHistory: MachineDeps['recordHistory'],
@@ -36,7 +36,7 @@ export async function recordSettled(
       ...(committedAssets !== undefined ? { committedAssets } : {}),
     });
   } catch {
-    /* a history failure never fails the money path */
+    /* #842: load-bearing — a rejection would override the apply's outcome, or go unhandled in run() */
   }
 }
 

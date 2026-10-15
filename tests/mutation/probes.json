@@ -1582,7 +1582,7 @@
   },
   {
     "name": "nft-parse-accepts-signed-as-image",
-    "note": "#785 nesting: NftSigned appears only at the top level. checkMediaRef already refuses a wrapper object, so the live regression is a media-slot decoder that UNWRAPS one — recognising an image whose signature nobody verifies.",
+    "note": "#785 nesting: NftSigned appears only at the top level. checkMediaRef already refuses a wrapper object, so the live regression is a media-slot decoder that UNWRAPS one \u2014 recognising an image whose signature nobody verifies.",
     "file": "token-engine/nft-payload.ts",
     "find": "new Map<bigint, BodyDecoder<NftMediaRef>>([",
     "replace": "new Map<bigint, BodyDecoder<NftMediaRef>>([\n  [NFT_SIGNED_TAG, (body) => decodeSigned(body).content as NftMediaRef],",
@@ -1612,7 +1612,7 @@
   },
   {
     "name": "nft-digest-omits-network",
-    "note": "#785 review: the NftSigned digest names the mint's network id α, as the yellowpaper genesis commitment does. The token id already commits to α, so this is the explicit statement rather than a separate replay defence; the preimage is a cross-SDK byte vector (docs/NFT-METADATA.md).",
+    "note": "#785 review: the NftSigned digest names the mint's network id \u03b1, as the yellowpaper genesis commitment does. The token id already commits to \u03b1, so this is the explicit statement rather than a separate replay defence; the preimage is a cross-SDK byte vector (docs/NFT-METADATA.md).",
     "file": "token-engine/nft-payload.ts",
     "find": "    CborSerializer.encodeUnsignedInteger(NFT_FORMAT_VERSION),\n    CborSerializer.encodeUnsignedInteger(NetworkId.fromId(context.networkId).id),",
     "replace": "    CborSerializer.encodeUnsignedInteger(NFT_FORMAT_VERSION),",
@@ -1632,7 +1632,7 @@
   },
   {
     "name": "nft-collection-id-length-rule-dropped",
-    "note": "#785 review: collection_id is 1–64 bytes. Without the bound an empty identifier becomes a second spelling of absent beside null, and identifiers grow without limit; encoder and parser still agree with each other, so only the rule's own cases notice.",
+    "note": "#785 review: collection_id is 1\u201364 bytes. Without the bound an empty identifier becomes a second spelling of absent beside null, and identifiers grow without limit; encoder and parser still agree with each other, so only the rule's own cases notice.",
     "file": "token-engine/nft-payload.ts",
     "find": "const COLLECTION_ID_PATTERN = /^(?:[0-9a-f]{2}){1,64}$/i;",
     "replace": "const COLLECTION_ID_PATTERN = /^(?:[0-9a-f]{2})*$/i;",
@@ -1692,7 +1692,7 @@
   },
   {
     "name": "nft-mint-chain-op-before-journal",
-    "note": "#785 §5.9: the NFT mint plan (payload, salt, type) is journaled BEFORE the chain op. Without it a crash after certification leaves a token on-chain with no client record and nothing to replay.",
+    "note": "#785 \u00a75.9: the NFT mint plan (payload, salt, type) is journaled BEFORE the chain op. Without it a crash after certification leaves a token on-chain with no client record and nothing to replay.",
     "file": "modules/payments-v2/mint-nft.ts",
     "find": "  await deps.nftMintJournal.upsert(entry);",
     "replace": "  // mutant: the plan is never journaled",
@@ -1702,7 +1702,7 @@
   },
   {
     "name": "nft-replay-fresh-salt",
-    "note": "#785 §5.9: replay re-submits the JOURNALED bytes. A fresh salt is a new token id: a second token is certified and the first, certified-but-unfinalised one is never recovered.",
+    "note": "#785 \u00a75.9: replay re-submits the JOURNALED bytes. A fresh salt is a new token id: a second token is certified and the first, certified-but-unfinalised one is never recovered.",
     "file": "modules/payments-v2/mint-nft.ts",
     "find": "        await mintJournaled(deps, entry);",
     "replace": "        await mintJournaled(deps, { ...entry, saltHex: bytesToHex(crypto.getRandomValues(new Uint8Array(32))) });",
@@ -1712,7 +1712,7 @@
   },
   {
     "name": "nft-mint-finalises-unplanned-token",
-    "note": "#785 §5.9: a minted token id other than the plan's is never finalised, so the journal entry and its planned id stay authoritative.",
+    "note": "#785 \u00a75.9: a minted token id other than the plan's is never finalised, so the journal entry and its planned id stay authoritative.",
     "file": "modules/payments-v2/mint-nft.ts",
     "find": "  if (token.blob.tokenId !== entry.tokenId) {",
     "replace": "  if (false as boolean) {",
@@ -1722,7 +1722,7 @@
   },
   {
     "name": "nfts-cache-never-consulted",
-    "note": "#785 §5.2: nfts() serves repeat reads from the per-facade cache. Never consulting it refetches every blob of a list view on every render.",
+    "note": "#785 \u00a75.2: nfts() serves repeat reads from the per-facade cache. Never consulting it refetches every blob of a list view on every render.",
     "file": "modules/payments-v2/inventory/nft-read.ts",
     "find": "    const cached = deps.cache.get(tokenId);",
     "replace": "    const cached = undefined as NftView | null | undefined;",
@@ -1732,7 +1732,7 @@
   },
   {
     "name": "nft-read-caches-decode-failure",
-    "note": "#785 §5.2: a blob that fails to decode is NOT cached. The cache is never invalidated, so remembering a transient failure as 'not an NFT' hides that NFT for the life of the facade.",
+    "note": "#785 \u00a75.2: a blob that fails to decode is NOT cached. The cache is never invalidated, so remembering a transient failure as 'not an NFT' hides that NFT for the life of the facade.",
     "file": "modules/payments-v2/inventory/nft-read.ts",
     "find": "    throw err;",
     "replace": "    view = null;",
@@ -1802,7 +1802,7 @@
   },
   {
     "name": "msgonly-optout-strict",
-    "note": "#793: only the exact literal 'none' opts out — any other string is a near-miss and is refused by name (wallet-api-composition.test.ts 'refuses any OTHER string')",
+    "note": "#793: only the exact literal 'none' opts out \u2014 any other string is a near-miss and is refused by name (wallet-api-composition.test.ts 'refuses any OTHER string')",
     "file": "core/payments-v2-wiring.ts",
     "find": "  if (walletApi === NO_PAYMENTS) return NO_PAYMENTS;",
     "replace": "  if (typeof walletApi === 'string') return NO_PAYMENTS;",
@@ -1842,7 +1842,7 @@
   },
   {
     "name": "msgonly-no-engine",
-    "note": "#793: a messaging-only wallet builds no token engine — the facade is its only consumer",
+    "note": "#793: a messaging-only wallet builds no token engine \u2014 the facade is its only consumer",
     "file": "core/Sphere.ts",
     "find": "    if (this._paymentsV2Composition === NO_PAYMENTS) return undefined;",
     "replace": "    void NO_PAYMENTS;",
@@ -2486,8 +2486,8 @@
     "name": "resume-apply-before-shortfall",
     "note": "#690 + #835: the shortfall row is durable BEFORE the apply; applied first, a failed shortfall write loses the unseen remainder of an intent the apply already settled (machine-resume.test.ts 'the shortfall is durable before ANY apply...')",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    await this.stores.shortfalls.upsert(entry);\n    await this.applyCommitted(engine, r.transferId, committed);",
-    "replace": "    await this.applyCommitted(engine, r.transferId, committed);\n    await this.stores.shortfalls.upsert(entry);",
+    "find": "    await this.stores.shortfalls.upsert(entry);\n    const close = (): Promise<boolean> => this.completeIntent(r.transferId, r.payload).then(() => true, () => false);\n    const closed = await this.applyRecorded(engine, r, committed, close);\n",
+    "replace": "    const close = (): Promise<boolean> => this.completeIntent(r.transferId, r.payload).then(() => true, () => false);\n    const closed = await this.applyRecorded(engine, r, committed, close);\n    await this.stores.shortfalls.upsert(entry);\n",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
@@ -2496,11 +2496,64 @@
     "name": "resume-partial-close-strict",
     "note": "#835: a close that fails after a settled partial's apply reports closed: false, never a throw, so the facade surfaces the durable remainder as final instead of re-planning it (machine-resume.test.ts 'a close that fails after the partial apply reports closed: false...'; send-intent-unknown.test.ts (r))",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    const closed = await this.completeIntent(r.transferId, r.payload).then(\n      () => true,\n      () => false\n    );",
-    "replace": "    const closed = await this.completeIntent(r.transferId, r.payload).then(() => true);",
+    "find": "    const close = (): Promise<boolean> => this.completeIntent(r.transferId, r.payload).then(() => true, () => false);\n",
+    "replace": "    const close = (): Promise<boolean> => this.completeIntent(r.transferId, r.payload).then(() => true);\n",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "run-history-after-apply",
+    "note": "#842: SENT history starts BESIDE run()'s apply. Posted only once the apply answers, an apply the server committed whose answer never arrives (lost, or the process died) records nothing, and the restart sweep removes the last trace of a payment that left (sent-history.test.ts T3, C1)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      void recordSettled(engine, this.deps.recordHistory, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      await this.applyCommitted(engine, plan.transferId, committed);\n",
+    "replace": "      await this.applyCommitted(engine, plan.transferId, committed);\n      void recordSettled(engine, this.deps.recordHistory, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "run-history-dropped",
+    "note": "#842: run() itself posts the SENT history; left to the close tail, a complete that fails after a good apply loses the row for good, since the apply completed the intent and no pass lists it again (sent-history.test.ts T1, T3, C1; send-intent-unknown.test.ts (sent-complete), (sent-whole))",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      void recordSettled(engine, this.deps.recordHistory, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n",
+    "replace": "      // mutant: no SENT history beside the apply\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "resume-history-dropped",
+    "note": "#842: a resumed intent posts its SENT history whatever its apply or close answered; skipped, a lost apply answer or a failed close leaves a row the next pass sweeps with nothing recorded (sent-history.test.ts T2, T4, T5; send-intent-unknown.test.ts (sent-resume))",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    const recorded = recordSettled(engine, this.deps.recordHistory, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });\n",
+    "replace": "    const recorded = Promise.resolve();\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "resume-close-waits-on-history",
+    "note": "#842: the resume path awaits its SENT POST only AFTER the close; awaited first, a hung history endpoint (the client sets no request timeout) holds back both the apply and the close (sent-history.test.ts T7)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    const recorded = recordSettled(engine, this.deps.recordHistory, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });\n    try {\n      await this.applyCommitted(engine, r.transferId, committed);\n",
+    "replace": "    const recorded = recordSettled(engine, this.deps.recordHistory, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });\n    await recorded;\n    try {\n      await this.applyCommitted(engine, r.transferId, committed);\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "settled-history-escapes-money-path",
+    "note": "#842: recordSettled never throws. A history failure that escapes rejects resume's applyRecorded finally (a resumed intent reads failed) and is an unhandled rejection beside run()'s apply (sent-history.test.ts T6a, T6b)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  } catch {\n    /* #842: load-bearing \u2014 a rejection would override the apply's outcome, or go unhandled in run() */\n  }",
+    "replace": "  } finally {\n    /* mutant: a history failure escapes into the money path */\n  }",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
     ]
   },
   {
@@ -2555,7 +2608,7 @@
   },
   {
     "name": "converger-reconciles-deferred",
-    "note": "#835: a pass that could not read the backstop proves nothing and reconciles nothing — even when the store reads again before the pass ends, so the reconcile's own fresh read does not shadow this guard (heartbeat.test.ts 'a pass that cannot read the backstop reconciles nothing...' + 'a pass whose backstop read failed reconciles nothing, even when the store reads again...'; send-intent-unknown.test.ts (q))",
+    "note": "#835: a pass that could not read the backstop proves nothing and reconciles nothing \u2014 even when the store reads again before the pass ends, so the reconcile's own fresh read does not shadow this guard (heartbeat.test.ts 'a pass that cannot read the backstop reconciles nothing...' + 'a pass whose backstop read failed reconciles nothing, even when the store reads again...'; send-intent-unknown.test.ts (q))",
     "file": "modules/payments-v2/convergence.ts",
     "find": "    if (deferred) return { progress: false, retryAfterMs: null };",
     "replace": "    void deferred;",
@@ -2660,7 +2713,7 @@
   },
   {
     "name": "confirm-forgets-in-memory-park",
-    "note": "#835: a park whose 'unconfirmed' flag write failed is still held (the machine's parked set) — confirmed and never swept",
+    "note": "#835: a park whose 'unconfirmed' flag write failed is still held (the machine's parked set) \u2014 confirmed and never swept",
     "file": "modules/payments-v2/machine/resume.ts",
     "find": "  return entry.intentPut === 'unconfirmed' || view.isParked(entry.transferId);",
     "replace": "  return entry.intentPut === 'unconfirmed';",
@@ -2682,7 +2735,7 @@
   },
   {
     "name": "resume-deferral-silent",
-    "note": "#835: a pass deferred on an unreadable backstop says so — the converger must not reconcile its empty report",
+    "note": "#835: a pass deferred on an unreadable backstop says so \u2014 the converger must not reconcile its empty report",
     "file": "modules/payments-v2/machine/resume.ts",
     "find": "    options.onDeferred?.();\n",
     "replace": "    void options;\n",
@@ -2810,7 +2863,7 @@
   },
   {
     "name": "final-partial-replans",
-    "note": "#835: a settled partial whose close failed surfaces its durable remainder — no in-process re-plan",
+    "note": "#835: a settled partial whose close failed surfaces its durable remainder \u2014 no in-process re-plan",
     "file": "modules/payments-v2/PaymentsFacade.ts",
     "find": "    if (disposition.final) {\n",
     "replace": "    if (disposition.final && attempt < 0) {\n",
@@ -2949,7 +3002,7 @@
   },
   {
     "name": "gate-trusts-422-after-ambiguous",
-    "note": "#835: a 413/422 proves nothing about an EARLIER ambiguous PUT — a mixed fleet with another cap or schema may have stored it — so after one the gate parks instead of refusing clean (machine.test.ts 'a %s after an ambiguous answer says nothing about the earlier PUT...')",
+    "note": "#835: a 413/422 proves nothing about an EARLIER ambiguous PUT \u2014 a mixed fleet with another cap or schema may have stored it \u2014 so after one the gate parks instead of refusing clean (machine.test.ts 'a %s after an ambiguous answer says nothing about the earlier PUT...')",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
     "find": "        if (isNeverStorable(err) && !ambiguous) return this.refuseIntent(plan.transferId, err);",
     "replace": "        if (isNeverStorable(err)) return this.refuseIntent(plan.transferId, err);",
@@ -2959,7 +3012,7 @@
   },
   {
     "name": "converger-reconciles-stale-report",
-    "note": "#835: a payment link written while a pass ran is in none of its sets; reconciled as unaccounted it resolves paid while its send is held or being cancelled — every transferId with a local backstop entry NOW is open (send-intent-unknown.test.ts '(s-park)...' + '(s-cancel)...')",
+    "note": "#835: a payment link written while a pass ran is in none of its sets; reconciled as unaccounted it resolves paid while its send is held or being cancelled \u2014 every transferId with a local backstop entry NOW is open (send-intent-unknown.test.ts '(s-park)...' + '(s-cancel)...')",
     "file": "modules/payments-v2/convergence.ts",
     "find": "        open: [...report.failed, ...local],",
     "replace": "        open: [...report.failed],",
@@ -2969,7 +3022,7 @@
   },
   {
     "name": "converger-rejudges-activity",
-    "note": "#835: a pass judges activity once — an id in process at any moment of the pass stays so for all of it; re-judged later, an attempt that ended mid-pass has its open entry swept, its source released and its link resolved paid (send-intent-unknown.test.ts '(s-ended)...' + '(s-unlisted)...')",
+    "note": "#835: a pass judges activity once \u2014 an id in process at any moment of the pass stays so for all of it; re-judged later, an attempt that ended mid-pass has its open entry swept, its source released and its link resolved paid (send-intent-unknown.test.ts '(s-ended)...' + '(s-unlisted)...')",
     "file": "modules/payments-v2/convergence.ts",
     "find": "      isLocallyActive: (id) => inPass.has(id),",
     "replace": "      isLocallyActive: (id) => this.deps.activeOps.has(id),",
@@ -2999,7 +3052,7 @@
   },
   {
     "name": "emit-unguarded",
-    "note": "#835: no listener's throw reaches a money outcome — a host emit that rethrows (Node's EventEmitter) would turn a delivered send() into a raw, clean-looking rejection (send-intent-unknown.test.ts '(u)...')",
+    "note": "#835: no listener's throw reaches a money outcome \u2014 a host emit that rethrows (Node's EventEmitter) would turn a delivered send() into a raw, clean-looking rejection (send-intent-unknown.test.ts '(u)...')",
     "file": "modules/payments-v2/compose.ts",
     "find": "  const deps: PaymentsFacadeDeps = { ...raw, emit: guardedEmit(raw.emit) };",
     "replace": "  const deps: PaymentsFacadeDeps = raw;",
@@ -3009,7 +3062,7 @@
   },
   {
     "name": "facade-uses-raw-deps",
-    "note": "#835: the facade itself emits through the composed (guarded) deps — finishSend's success emit included (send-intent-unknown.test.ts '(u) a delivered send() still resolves delivered')",
+    "note": "#835: the facade itself emits through the composed (guarded) deps \u2014 finishSend's success emit included (send-intent-unknown.test.ts '(u) a delivered send() still resolves delivered')",
     "file": "modules/payments-v2/PaymentsFacade.ts",
     "find": "    this.deps = parts.deps; // #835: the composed deps, whose emit no listener's throw escapes\n",
     "replace": "    void parts.deps;\n",
@@ -3029,7 +3082,7 @@
   },
   {
     "name": "all-ops-conflict-counts-unrun",
-    "note": "#835 I2(b): 'every op conflicted' counts the ops that never ran — a first wave of 20 conflicts leaves a 21st a later run can certify (machine.test.ts '21 legs whose first wave of 20 all conflict...')",
+    "note": "#835 I2(b): 'every op conflicted' counts the ops that never ran \u2014 a first wave of 20 conflicts leaves a 21st a later run can certify (machine.test.ts '21 legs whose first wave of 20 all conflict...')",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
     "find": "    if (outcomes.length === plan.ops.length && outcomes.every((o) => classifyError(o.error) === 'conflict')) {",
     "replace": "    if (outcomes.every((o) => classifyError(o.error) === 'conflict')) {",

@@ -2508,3 +2508,104 @@ describe('#835 (w) a held send the converger confirmed and completed', () => {
     expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
   });
 });
+
+// ── #842: SENT history beside the apply ─────────────────────────────────────
+
+/** The SENT rows the server's history holds for this wallet. */
+async function sentRows(world: World): Promise<{ transferId?: string; tokenId?: string; assets: unknown }[]> {
+  return (await world.api.listHistory(ownCaller, {})).records
+    .filter((r) => r.type === 'SENT')
+    .map((r) => ({ transferId: r.transferId, ...(r.tokenId !== undefined ? { tokenId: r.tokenId } : {}), assets: r.assets }));
+}
+
+/** POST /v1/inventory/apply commits on the server, then its answer is lost once. */
+function loseApplyAnswerOnce(world: World): void {
+  const inner = world.innerClient;
+  const apply = inner.apply.bind(inner);
+  let lose = true;
+  inner.apply = async (delta) => {
+    const result = await apply(delta);
+    if (!lose) return result;
+    lose = false;
+    throw new WalletApiHttpError(504, 'HTTP_504', 'POST /v1/inventory/apply failed with status 504');
+  };
+}
+
+const completeDown = (): WalletApiHttpError => new WalletApiHttpError(503, 'HTTP_503', 'complete failed with status 503');
+
+describe('#842 SENT history is posted beside the apply, never gated on the close (facade)', () => {
+  it('(sent-complete) send() resolves, complete answers 503 once: after resumeNow, one SENT row and nothing pending', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await startSettled(world);
+    failCompleteOnce(world, completeDown);
+
+    await world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN });
+    await flushTail();
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(serverIntent(world, 'tid-1'), 'the apply completed the row').toBe('completed');
+    expect(await world.facade.pendingTransfers()).toEqual([]);
+    expect(backstopOf(world, 'tid-1')).toBeUndefined();
+    expect(await sentRows(world)).toEqual([{ transferId: 'tid-1', assets: [{ coinId: COIN, amount: '100' }] }]);
+  });
+
+  it('(sent-lost-apply) the apply commits and its answer is lost: possibly-committed, then one SENT row', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await startSettled(world);
+    loseApplyAnswerOnce(world);
+
+    const err = rejectionOf(await settle(world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN })));
+    expect((err as SphereError).code).toBe('SEND_SYNC_PENDING');
+    expect(isPossiblyCommittedSendOutcome(err)).toBe(true);
+    expect(failedUpdates(world)).toEqual([]);
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(await world.facade.pendingTransfers()).toEqual([]);
+    expect(await sentRows(world)).toEqual([{ transferId: 'tid-1', assets: [{ coinId: COIN, amount: '100' }] }]);
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
+  });
+
+  it('(sent-resume) the apply fails on the send, the resume close answers 503: one SENT row once the backstop goes', async () => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await startSettled(world);
+    let applyFails = true;
+    world.hooks.applyDelta = async () => {
+      if (!applyFails) return;
+      applyFails = false;
+      throw new WalletApiHttpError(503, 'HTTP_503', 'POST /v1/inventory/apply failed with status 503');
+    };
+
+    const err = rejectionOf(await settle(world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN })));
+    expect((err as SphereError).code).toBe('SEND_SYNC_PENDING');
+    failCompleteOnce(world, completeDown);
+    await world.facade.resumeNow();
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(serverIntent(world, 'tid-1')).toBe('completed');
+    expect(backstopOf(world, 'tid-1')).toBeUndefined();
+    expect(await sentRows(world)).toEqual([{ transferId: 'tid-1', assets: [{ coinId: COIN, amount: '100' }] }]);
+  });
+
+  it('(sent-whole) a whole-token send whose complete answers 503 records the coins the token really carried', async () => {
+    const world = makeWorld();
+    const coin = await world.seed(100n);
+    await startSettled(world);
+    failCompleteOnce(world, completeDown);
+
+    await world.facade.sendWholeToken({ recipient: '@peer', tokenId: coin.blob.tokenId });
+    await flushTail();
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(await world.facade.pendingTransfers()).toEqual([]);
+    expect(await sentRows(world)).toEqual([
+      { transferId: 'tid-1', tokenId: coin.blob.tokenId, assets: [{ coinId: COIN, amount: '100' }] },
+    ]);
+  });
+});

@@ -609,6 +609,14 @@ Normative behaviors bound into the transitions (not call sites):
   path the evidenced apply already completed the intent server-side (whole-token applies complete
   unflagged intents unconditionally; a split's change blob in `added` is seed evidence) — the
   explicit call converges the rare unevidenced edge via resume, so fire-and-forget is safe.
+  **Amended 2026-10-15 (#842):** the SENT POST is no longer part of that tail. It starts BESIDE
+  the apply, once every leg certified: fire-and-forget on `send()`, and on resume awaited only
+  after the close attempt, so a hung history endpoint holds neither the apply nor `complete`.
+  Neither the apply's answer nor the close gates it. The apply completes an unflagged intent, and
+  after that no pass lists the row again: the next pass sweeps its backstop as residue and records
+  nothing. A SENT POST that waited on `complete`, or on the apply's answer, was lost for good when
+  `complete` failed, or when the apply committed but its answer never arrived (a lost response, or
+  a process that stopped first).
 
 **The E.2 outcome table, with v3's statuses (classification unchanged — #760).** Two statuses
 joined `CertificationStatus` (submit answers) and two joined
@@ -775,8 +783,12 @@ SENT by `transferId` (resume re-POST is a server no-op), RECEIVED by `(type, tok
 what SETTLED — the machine computes it from the certified recipient blobs (summarize()'s committed
 set), never the planned amount**, so a partial records the delivered portion and the remainder's
 re-plan records its own under the new transferId; a failed POST never fails
-the money path; server wire shape pinned (`ts` ISO+offset; genesis-stable lowercase `tokenId`),
-client-facing entries keep the consumed `timestamp` name via the read-through mapping. History
+the money path. **SENT is posted beside the apply (#842)**, once every leg certified, whatever the
+apply or the close answers (§5.5 "Resolution point"): the apply completes an unflagged intent,
+which then leaves the open listing for good. The POST itself stays best-effort and is not retried,
+so a missing SENT row does not prove that nothing was sent; server wire shape pinned (`ts`
+ISO+offset; genesis-stable lowercase `tokenId`), client-facing entries keep the consumed
+`timestamp` name via the read-through mapping. History
 `memo`/`counterparty_nametag` are **self-scoped encrypted** (`sphere-fieldenc-v1`), owned here.
 Mint: engine self-mint routed through the **same idempotent submit-then-probe primitive as
 transfer/split** — the #692 F13 fix lands in `token-engine` (P8); the fake aggregator models

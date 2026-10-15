@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (money) — SENT history is posted beside the apply, never gated on the close (#842)
+
+What was wrong. A non-partial send posted its SENT history record only after
+`POST /v1/intents/:id/complete` succeeded, on `send()`'s close tail and on the resume path. The
+inventory apply that runs before `complete` already completes an unflagged intent on the server,
+so after it no convergence pass lists the row again: the next pass removes its local entry and
+records nothing. A `complete` that failed after a good apply lost the SENT row for good, and so
+did an apply that committed on the server but whose answer never arrived (a lost response, or an
+app that stopped while waiting).
+
+Consequence. `history()` and `pendingTransfers()` were both empty for a payment that had left the
+wallet. A caller following the documented re-pay check (look in both before paying a request again
+after a restart) could pay twice.
+
+What changed:
+
+- Once every leg is certified, the SENT POST starts beside the inventory apply. Neither the apply's
+  answer nor the close waits for it or gates it: `send()` does not wait for it, and the resume path
+  waits for it only after the close attempt, so a history endpoint that never answers holds back
+  neither the apply nor `complete`. The recorded amount is still what settled, never the plan.
+- A failed resume close still reports the intent failed and carries its `Retry-After`. A history
+  failure still never fails a send or a resume.
+- Behaviour changes for integrators:
+  - a SENT row can now be in `history()` while the same transfer is still listed in
+    `pendingTransfers()` (a send that rejected `SEND_SYNC_PENDING` after its legs certified). Do not
+    read a SENT row as "settled";
+  - `history:updated` for a send can now fire before `send()` resolves and before
+    `inventory:updated`;
+  - an intent whose apply keeps failing re-posts its SENT record on every convergence pass. The
+    server deduplicates the record by `transferId`, but each post emits `history:updated` with a
+    freshly generated entry `id` that `history()` never serves;
+  - a SENT row is still best-effort and a failed POST is not retried, so a missing row does not
+    prove that nothing was sent.
+
+How it was verified: machine-level tests in `tests/unit/payments-v2/sent-history.test.ts` (a
+failed close, a lost apply answer and an apply whose answer never arrives, on `send()` and on
+resume, a settled partial, a hung and a throwing history POST, and no record for a clean failure),
+facade-level cases in `tests/unit/payments-v2/send-intent-unknown.test.ts` against the real history
+store, including a whole-token send, and mutation probes for each ordering.
+
 ### Changed (breaking) — DIRECT:// is no longer a payment recipient; unused DIRECT helpers removed (#847)
 
 What was wrong. A `DIRECT://` string is the wallet's Sphere Quests account id, yet `send()` and

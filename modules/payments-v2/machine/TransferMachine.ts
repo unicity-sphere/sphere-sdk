@@ -201,8 +201,10 @@ export class TransferMachine {
       deliveryPending = await this.deliverSet(plan.transferId, plan.recipientPubkey, plan.memo, committed);
     }
     if (cls === null) {
+      // #842: every leg certified, so SENT goes out beside the apply — an applied row is never listed again.
+      void recordSettled(engine, this.deps.recordHistory, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });
       await this.applyCommitted(engine, plan.transferId, committed);
-      this.closeTail(engine, plan.transferId, plan.payload, committed);
+      this.closeTail(plan.transferId, plan.payload);
       return { committed, deliveryPending };
     }
     // #835: an unsettled attempt is never applied here — resume applies it, after its shortfall.
@@ -238,9 +240,8 @@ export class TransferMachine {
       const settled = await this.settlePartial(engine, r, committed, conflicts);
       return { deliveryPending, partial: settled.entry, closed: settled.closed };
     }
-    await this.applyCommitted(engine, r.transferId, committed);
-    await this.completeIntent(r.transferId, r.payload);
-    await this.finishBookkeeping(engine, r.transferId, r.payload, 'resumed', committed);
+    await this.applyRecorded(engine, r, committed, () => this.completeIntent(r.transferId, r.payload));
+    await this.finishBookkeeping(r.transferId);
     return { deliveryPending, partial: null, closed: true };
   }
 
@@ -622,25 +623,32 @@ export class TransferMachine {
     // #690 + #835: durable BEFORE the apply — the apply completes an unflagged intent,
     // after which it is unlistable and no resume could rebuild the unseen remainder.
     await this.stores.shortfalls.upsert(entry);
-    await this.applyCommitted(engine, r.transferId, committed);
-    const closed = await this.completeIntent(r.transferId, r.payload).then(
-      () => true,
-      () => false
-    );
+    const close = (): Promise<boolean> => this.completeIntent(r.transferId, r.payload).then(() => true, () => false);
+    const closed = await this.applyRecorded(engine, r, committed, close);
     // An unclosed partial keeps its backstop: the next pass closes it (idempotent).
-    if (closed) await this.finishBookkeeping(engine, r.transferId, r.payload, 'resumed', committed);
-    else await recordSettled(engine, this.deps.recordHistory, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });
+    if (closed) await this.finishBookkeeping(r.transferId);
     return { entry, closed };
   }
 
-  private closeTail(engine: ITokenEngine, transferId: string, payload: IntentPayload, committed: OpOutcome[]): void {
+  /** #842: SENT starts beside the apply and is awaited only after the close, whatever either answered. */
+  private async applyRecorded<T>(engine: ITokenEngine, r: RehydratedIntent, committed: OpOutcome[], close: () => Promise<T>): Promise<T> {
+    const recorded = recordSettled(engine, this.deps.recordHistory, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });
+    try {
+      await this.applyCommitted(engine, r.transferId, committed);
+      return await close();
+    } finally {
+      await recorded;
+    }
+  }
+
+  private closeTail(transferId: string, payload: IntentPayload): void {
     void (async () => {
       try {
         await this.completeIntent(transferId, payload);
       } catch {
         return; // idempotent backstop — resume converges the unevidenced edge
       }
-      await this.finishBookkeeping(engine, transferId, payload, 'sent', committed);
+      await this.finishBookkeeping(transferId);
     })();
   }
 
@@ -649,14 +657,7 @@ export class TransferMachine {
     await this.deps.intents.complete(transferId, signature);
   }
 
-  private async finishBookkeeping(
-    engine: ITokenEngine,
-    transferId: string,
-    payload: IntentPayload,
-    phase: 'sent' | 'resumed',
-    committed: OpOutcome[]
-  ): Promise<void> {
-    await recordSettled(engine, this.deps.recordHistory, { transferId, payload, phase, committed });
+  private async finishBookkeeping(transferId: string): Promise<void> {
     try {
       await settleOwed(this.stores, await this.stores.backstop.getByKey(transferId));
       await this.stores.backstop.removeByKey(transferId);

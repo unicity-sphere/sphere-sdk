@@ -16,8 +16,10 @@
  * and let start() replay journals / resume the SAME transferId, paced under a
  * generous deadline. Money assertions stay exact — exactly-once, conservation.
  *
- * The #835 block at the end has its own wallets, so `-t '#835'` runs it alone.
- * It injects faults on PUT /v1/intents only, over the REAL authed client.
+ * The #835 block near the end has its own wallets, so `-t '#835'` runs it alone.
+ * It injects faults on PUT /v1/intents only, over the REAL authed client. The
+ * #842 block after it (`-t '#842'`, its own wallets too) injects them on
+ * POST /v1/intents/:id/complete and POST /v1/inventory/apply.
  *
  * Gated on STAGING_AGGREGATOR_KEY. Run:
  *   set -a && source .env && set +a && npx vitest run --config vitest.e2e.config.ts \
@@ -26,9 +28,9 @@
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { isPossiblyCommittedSendOutcome, SphereError } from '../../core/errors';
-import { WalletApiV2Client } from '../../impl/wallet-api-v2/client';
+import { WalletApiV2Client, type HistoryRecordWire } from '../../impl/wallet-api-v2/client';
 import { createWalletApiHttp, WalletApiHttpError } from '../../impl/wallet-api-v2/http';
-import type { DeliveryPort } from '../../modules/payments-v2/ports';
+import type { DeliveryPort, StoragePort } from '../../modules/payments-v2/ports';
 import { createMachineStores } from '../../modules/payments-v2/machine/journal';
 import { INTENT_UNCONFIRMED_MESSAGE } from '../../modules/payments-v2/send-errors';
 import type { TransferResult } from '../../types';
@@ -794,4 +796,188 @@ describe.runIf(RUN)('LIVE staging: #835 PUT /v1/intents with an unknown outcome 
     expect(localTotal(f)).toBe(100n);
     expect(await receivedLegs(f, tokenE)).toHaveLength(legsBefore + 1);
   }, 1_500_000);
+});
+
+// ── #842: SENT history is posted beside the apply, never gated on the close ───
+//
+// Faults ride POST /v1/intents/:id/complete (over the facade's REAL authed client,
+// MakeOptions.wrapClient) and POST /v1/inventory/apply (over the facade's REAL
+// storage port, MakeOptions.wrapStorage). The apply completes an unflagged intent on
+// the server, so once it commits no pass lists the row again: the SENT row must
+// already be on its way, whatever the close or the apply's answer did.
+
+interface CloseFaults {
+  /** Which faults fired, in order. */
+  readonly fired: ('complete-503' | 'apply-answer-lost')[];
+  /** Every SENT record the facade POSTed, in order (a re-POST included). */
+  readonly sent: HistoryRecordWire[];
+  /** The next complete answers 503 before it reaches the server. */
+  failCompleteOnce(): void;
+  /** The next apply commits on the server, then its answer is lost. */
+  loseApplyAnswerOnce(): void;
+  wrapClient(inner: AuthedClient): AuthedClient;
+  wrapStorage(inner: StoragePort): StoragePort;
+}
+
+function closeFaults(): CloseFaults {
+  const fired: CloseFaults['fired'] = [];
+  const sent: HistoryRecordWire[] = [];
+  let completeArmed = false;
+  let applyArmed = false;
+  return {
+    fired,
+    sent,
+    failCompleteOnce: () => {
+      completeArmed = true;
+    },
+    loseApplyAnswerOnce: () => {
+      applyArmed = true;
+    },
+    wrapClient: (inner) => ({
+      ...inner,
+      completeIntent: async (transferId, signature) => {
+        if (completeArmed) {
+          completeArmed = false;
+          fired.push('complete-503');
+          throw new WalletApiHttpError(503, 'HTTP_503', `POST /v1/intents/${transferId}/complete failed with status 503 (synthetic, #842)`);
+        }
+        await inner.completeIntent(transferId, signature);
+      },
+      postHistory: async (records) => {
+        sent.push(...records.filter((r) => r.type === 'SENT'));
+        return inner.postHistory(records);
+      },
+    }),
+    // WalletApiStoragePort is a class: forward each member, a spread would drop its prototype methods.
+    wrapStorage: (inner) => ({
+      listInventory: (since) => inner.listInventory(since),
+      getBlobs: (ids) => inner.getBlobs(ids),
+      uploadBlobs: (blobs) => inner.uploadBlobs(blobs),
+      applyDelta: async (delta) => {
+        const result = await inner.applyDelta(delta);
+        if (!applyArmed) return result;
+        applyArmed = false;
+        fired.push('apply-answer-lost');
+        throw new WalletApiHttpError(0, 'NETWORK', `wallet-api request failed: POST ${BASE_URL}/v1/inventory/apply: synthetic connection reset after the server answered (#842)`);
+      },
+    }),
+  };
+}
+
+/** Run convergence passes, paced, until nothing of `transferId` is left open or pending on `w`. */
+async function settledByPasses(w: VWallet, transferId: string, label: string): Promise<void> {
+  let lastResume = 0;
+  await waitFor(
+    w,
+    async () => {
+      if (Date.now() - lastResume >= PACE_MS) {
+        lastResume = Date.now();
+        await w.facade.resumeNow();
+      }
+      const local = await createMachineStores(w.kv).backstop.getByKey(transferId);
+      return local === undefined && !(await openIntentIds(w)).includes(transferId) && (await w.facade.pendingTransfers()).length === 0;
+    },
+    SEND_CONVERGE_MS,
+    label
+  );
+}
+
+let walletG: VWallet | undefined;
+let walletH: VWallet | undefined;
+let tokenG = '';
+const gFaults = closeFaults();
+const hFaults = closeFaults();
+const gWrap = { wrapClient: gFaults.wrapClient, wrapStorage: gFaults.wrapStorage };
+const hWrap = { wrapClient: hFaults.wrapClient, wrapStorage: hFaults.wrapStorage };
+
+describe.runIf(RUN)('LIVE staging: #842 SENT history beside the apply (real client, faulted complete / apply)', () => {
+  it('complete answers 503 once after a good apply: after resumeNow, exactly one SENT row in the real history', async () => {
+    walletG = await makeVerticalWallet('g', gWrap);
+    walletH = await makeVerticalWallet('h', hWrap);
+    const minted = await mintConverged(walletG, 100n, 'mint G 100', gWrap);
+    walletG = minted.wallet;
+    tokenG = minted.tokenId;
+    const g0 = walletG;
+    const h = walletH;
+    await waitFor(g0, () => localTotal(g0) === 100n, 60_000, 'G local view shows the 100 mint');
+
+    gFaults.failCompleteOnce();
+    const firstEvent = g0.events.length;
+    const outcome = await g0.facade
+      .send({ recipient: h.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN })
+      .then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error })
+      );
+    let g = g0;
+    let transferId: string;
+    if ('result' in outcome) {
+      transferId = outcome.result.id;
+    } else {
+      // Degraded staging can keep the certification open: the SAME transferId converges, wrapped alike.
+      if (!isPossiblyCommittedSendOutcome(outcome.error)) throw outcome.error;
+      transferId = must((outcome.error as SphereError).transferId, 'keep-open transferId');
+    }
+    if ('error' in outcome || outcome.result.deliveryPending === true) {
+      g = await convergeByReplay(g0, () => paid(h, 100n), SEND_CONVERGE_MS, '#842 complete 503 G→H', gWrap);
+      walletG = g;
+    }
+    await waitFor(g, () => gFaults.fired.includes('complete-503'), 120_000, 'the complete fault fired');
+    await settledByPasses(g, transferId, '#842 complete 503: G settles');
+
+    await drainUntil(h, () => localTotal(h) === 100n, 90_000, 'H receives the 100');
+    expect(await receivedLegs(h, tokenG)).toHaveLength(1);
+    expect(await serverTotal(g)).toBe(0n);
+    const rows = await sentRecords(g, transferId);
+    expect(rows, 'exactly one SENT row, although the close failed').toHaveLength(1);
+    expect(rows[0]).toMatchObject({ transferId, coinId: HARNESS_COIN, amount: '100' });
+    expect(failedUpdates(g0, transferId, firstEvent)).toEqual([]);
+    expect(failedUpdates(g, transferId, g === g0 ? firstEvent : 0)).toEqual([]);
+  }, 3_000_000);
+
+  it("the apply's answer is lost after the server commits: possibly-committed, then exactly one SENT row; the real server dedups a re-POST", async () => {
+    const g = must(walletG, 'wallet G');
+    const h0 = must(walletH, 'wallet H');
+    await waitFor(
+      h0,
+      () => h0.facade.tokens().some((t) => t.id === tokenG && t.status === 'confirmed'),
+      60_000,
+      'H holds the 100 spendable'
+    );
+
+    hFaults.loseApplyAnswerOnce();
+    const firstEvent = h0.events.length;
+    const outcome = await h0.facade
+      .send({ recipient: g.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN })
+      .then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error })
+      );
+    expect('error' in outcome, 'a send whose apply answer was lost never resolves').toBe(true);
+    const err = (outcome as { error: unknown }).error;
+    expect(isPossiblyCommittedSendOutcome(err)).toBe(true);
+    const transferId = must((err as SphereError).transferId, 'possibly-committed transferId');
+    logStep(`#842 lost apply answer: ${(err as SphereError).code} ${transferId}`);
+    let h = h0;
+    if (!hFaults.fired.includes('apply-answer-lost')) {
+      // Degraded staging kept the certification open first: the resume applies under the SAME transferId.
+      h = await convergeByReplay(h0, () => hFaults.fired.includes('apply-answer-lost'), SEND_CONVERGE_MS, '#842 lost apply H→G', hWrap);
+      walletH = h;
+    }
+    await settledByPasses(h, transferId, '#842 lost apply: H settles');
+
+    await drainUntil(g, () => localTotal(g) === 100n, 90_000, 'G receives the 100 back');
+    expect(await receivedLegs(g, tokenG)).toHaveLength(1);
+    expect(await serverTotal(h)).toBe(0n);
+    const rows = await sentRecords(h, transferId);
+    expect(rows, 'exactly one SENT row, although the apply answer was lost').toHaveLength(1);
+    expect(rows[0]).toMatchObject({ transferId, coinId: HARNESS_COIN, amount: '100' });
+    expect(failedUpdates(h0, transferId, firstEvent)).toEqual([]);
+    expect(failedUpdates(h, transferId, h === h0 ? firstEvent : 0)).toEqual([]);
+
+    // The facade's own SENT record, POSTed again: the server keeps the one row.
+    const record = must(hFaults.sent.find((r) => r.dedupKey === transferId), 'the SENT record H posted');
+    expect(await h.api.postHistory([record])).toEqual({ inserted: 0, deduped: 1 });
+    expect(await sentRecords(h, transferId)).toHaveLength(1);
+  }, 3_000_000);
 });
