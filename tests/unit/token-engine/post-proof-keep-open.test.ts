@@ -94,31 +94,40 @@ describe('#839 a failure after a matching proof is keep-open', () => {
     expect(engine.isOwnedBy(out, recipient)).toBe(true);
   }, 30_000);
 
-  it('(b) transfer: toCertifiedTransaction failing after the proof is ProofUnconfirmedError', async () => {
+  it('(b) transfer: toCertifiedTransaction failing after the proof is ProofUnconfirmedError; the same transferId realizes it', async () => {
     const { engine, source } = await rig();
+    const recipient = freshPubkey();
+    const transferId = crypto.randomUUID();
     const cause = new Error('certify drift');
     vi.spyOn(TransferTransaction.prototype, 'toCertifiedTransaction').mockRejectedValueOnce(cause);
 
-    const err = await rejection(
-      engine.transfer({ token: source, recipientPubkey: freshPubkey() }, { transferId: crypto.randomUUID() }),
-    );
+    const err = await rejection(engine.transfer({ token: source, recipientPubkey: recipient }, { transferId }));
 
     expect(err).toBeInstanceOf(ProofUnconfirmedError);
     expect((err as ProofUnconfirmedError).cause).toBe(cause);
     expect(await engine.isSpent(source)).toBe(true);
+    vi.restoreAllMocks();
+    const out = await engine.transfer({ token: source, recipientPubkey: recipient }, { transferId });
+    expect(await engine.verify(out)).toEqual({ ok: true });
+    expect(engine.isOwnedBy(out, recipient)).toBe(true);
   }, 30_000);
 
-  it('(c) burn: toCertifiedTransaction failing after the proof is ProofUnconfirmedError', async () => {
-    const { engine, source } = await rig();
+  it('(c) burn: toCertifiedTransaction failing after the proof is ProofUnconfirmedError; the same transferId realizes it', async () => {
+    const { engine, wire, source } = await rig();
+    const reasonBytes = new Uint8Array([1]);
+    const transferId = crypto.randomUUID();
     vi.spyOn(TransferTransaction.prototype, 'toCertifiedTransaction').mockRejectedValueOnce(new Error('certify drift'));
 
-    const err = await rejection(
-      engine.burn({ token: source, reasonBytes: new Uint8Array([1]) }, { transferId: crypto.randomUUID() }),
-    );
+    const err = await rejection(engine.burn({ token: source, reasonBytes }, { transferId }));
 
     expect(err).toBeInstanceOf(ProofUnconfirmedError);
     expect((err as Error).message).not.toMatch(/intent/);
     expect(await engine.isSpent(source)).toBe(true);
+    vi.restoreAllMocks();
+    const submitted = wire.submits.length;
+    const burned = await engine.burn({ token: source, reasonBytes }, { transferId });
+    expect(await engine.verify(burned)).toEqual({ ok: true });
+    expect(wire.submits.length - submitted, 'the re-call re-submits the identical burn once').toBe(1);
   }, 30_000);
 
   it('(d) split with a store: the burn failing after its proof is keep-open, stores nothing, submits no mint; the same transferId completes', async () => {
@@ -147,18 +156,23 @@ describe('#839 a failure after a matching proof is keep-open', () => {
     expect(engine.isOwnedBy(outputs[0], recipient)).toBe(true);
   }, 60_000);
 
-  it('(e) split without a store: the burn failing after its proof is keep-open', async () => {
+  it('(e) split without a store: the burn failing after its proof is keep-open; the same transferId completes', async () => {
     const { engine, wire, source } = await rig();
+    const recipient = freshPubkey();
+    const transferId = crypto.randomUUID();
     const submitsBefore = wire.submits.length;
     vi.spyOn(Token.prototype, 'transfer').mockRejectedValueOnce(new Error('burn verify drift'));
 
-    const err = await rejection(
-      engine.split({ token: source, outputs: splitOutputs(engine, freshPubkey()) }, { transferId: crypto.randomUUID() }),
-    );
+    const err = await rejection(engine.split({ token: source, outputs: splitOutputs(engine, recipient) }, { transferId }));
 
     expect(err).toBeInstanceOf(ProofUnconfirmedError);
     expect(wire.submits.length - submitsBefore).toBe(1);
     expect(await engine.isSpent(source)).toBe(true);
+    vi.restoreAllMocks();
+    const { outputs } = await engine.split({ token: source, outputs: splitOutputs(engine, recipient) }, { transferId });
+    expect(outputs.map((o) => engine.balanceOf(o, COIN))).toEqual([4n, 6n]);
+    expect(await Promise.all(outputs.map((o) => engine.verify(o)))).toEqual([{ ok: true }, { ok: true }]);
+    expect(engine.isOwnedBy(outputs[0], recipient)).toBe(true);
   }, 60_000);
 
   it('(f) split: a checkpoint encode failure is CheckpointPersistFailedError, nothing stored; the same transferId completes', async () => {
@@ -179,6 +193,33 @@ describe('#839 a failure after a matching proof is keep-open', () => {
     expect(store.puts).toBe(0);
     expect(wire.submits.length - submitsBefore).toBe(1);
     expect(await engine.isSpent(source)).toBe(true);
+    const { outputs } = await engine.split(
+      { token: source, outputs: splitOutputs(engine, recipient) },
+      { transferId, checkpointStore: store },
+    );
+    expect(outputs.map((o) => engine.balanceOf(o, COIN))).toEqual([4n, 6n]);
+    expect(await Promise.all(outputs.map((o) => engine.verify(o)))).toEqual([{ ok: true }, { ok: true }]);
+  }, 60_000);
+
+  it('(g) split with a store: the burn\'s toCertifiedTransaction failing after its proof is keep-open, stores nothing, submits no mint; the same transferId completes', async () => {
+    const { engine, wire, source } = await rig();
+    const store = new MemStore();
+    const recipient = freshPubkey();
+    const transferId = crypto.randomUUID();
+    const submitsBefore = wire.submits.length;
+    const cause = new Error('burn certify drift');
+    vi.spyOn(TransferTransaction.prototype, 'toCertifiedTransaction').mockRejectedValueOnce(cause);
+
+    const err = await rejection(
+      engine.split({ token: source, outputs: splitOutputs(engine, recipient) }, { transferId, checkpointStore: store }),
+    );
+
+    expect(err).toBeInstanceOf(ProofUnconfirmedError);
+    expect((err as ProofUnconfirmedError).cause).toBe(cause);
+    expect(store.puts).toBe(0);
+    expect(wire.submits.length - submitsBefore, 'the burn alone was submitted: no mint leg').toBe(1);
+    expect(await engine.isSpent(source)).toBe(true);
+    vi.restoreAllMocks();
     const { outputs } = await engine.split(
       { token: source, outputs: splitOutputs(engine, recipient) },
       { transferId, checkpointStore: store },

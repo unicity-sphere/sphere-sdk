@@ -11,11 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 What was wrong. Once a transfer, burn or split burn had a proof that match-verified, the steps that
 realize it (building the certified transaction, applying it to the token, wrapping the result, and
-for a split encoding the burn checkpoint) could still throw a raw error. The payments machine read
-that as an ordinary failure with nothing certified, aborted the intent and, once the abort was
-confirmed, reported the send clean.
+for a split encoding the burn checkpoint) could still throw a raw error. For a send (a direct
+transfer leg or a split), the payments machine read that as an ordinary failure with nothing
+certified, aborted the intent and, once the abort was confirmed, reported the send clean.
+`payments.burn()` does not run through that machine: its journal already kept every non-conflict
+failure live and replayed it under the same burnId, so a burn was never aborted or stranded.
 
-Consequence. The spend was on chain, but no recipient blob and no checkpoint existed, and the
+Consequence, for sends. The spend was on chain, but no recipient blob and no checkpoint existed, and the
 aborted intent never resumed, so the value was stranded. The send reported
 `transfer:updated{status:'failed'}`, its source went back to selection, and a linked payment request
 became payable again. Next to a leg that conflicted, the attempt was reported as a clean
@@ -32,24 +34,29 @@ What changed:
   (`CHECKPOINT_PERSIST_FAILED`), the same error a checkpoint that could not be stored already gets.
   Both are keep-open: the intent stays open with its sources reserved, `send()` rejects
   possibly-committed with its `transferId`, and the convergence pass realizes the same spend under
-  the same transferId. `burn()` reports `errorCode: 'CERTIFICATION_UNCONFIRMED'` for it.
+  the same transferId. For `payments.burn()` the only visible change is the reported `errorCode`:
+  `'CERTIFICATION_UNCONFIRMED'` where it was `'UNKNOWN'`.
 - The engine contract is written down in `token-engine/engine.ts`: `transfer`/`burn`/`split`
   reject with an untyped error only when the call submitted nothing, or for a proven-clean submit
   reject. `mint` and `mintDataToken` are unchanged and may still reject untyped after
   certification, so their callers journal first and replay under the same id.
-- No type, signature or error code changed. Both codes were already in
+- No type, signature or error code was added. Both codes were already in
   `isPossiblyCommittedSendOutcome()`'s set.
 
 How it was verified:
 
 - `tests/unit/token-engine/post-proof-keep-open.test.ts`: the real engine with each realization
   step failing once after the proof (transfer, burn, split with and without a checkpoint store,
-  checkpoint encode); each asserts the source is spent and that the same transferId realizes it;
+  checkpoint encode); each asserts the typed error and that the source is spent, then re-calls under
+  the same transferId and checks the realized token or split outputs;
 - `tests/unit/payments-v2/machine-post-proof.test.ts`: `TransferMachine` over the real engine for a
-  direct leg, a direct leg beside a conflicting one, and a split; none is aborted, and resume
-  delivers, applies the change and closes;
+  direct leg, a direct leg beside a conflicting one, and a split; none is aborted or reported clean.
+  For the direct leg and the split, resume then delivers and closes (the split also applies the
+  change);
 - `tests/aggregator`: the same injection against a real aggregator-go;
-- mutation probes over each wrapped step.
+- mutation probes that unwrap each `realizeCertified` call, hoist the transfer's or the split burn's
+  `toCertifiedTransaction` out of it, move the checkpoint encode out of the persist gate, or rethrow
+  the raw error.
 
 ### Fixed (money) — SENT history is posted beside the apply, never gated on the close (#842)
 

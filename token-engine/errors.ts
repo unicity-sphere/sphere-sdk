@@ -34,7 +34,8 @@ export class TransferConflictError extends SphereError {
  * server-side), and the inclusion-proof fetch/verify returned NO verdict — a
  * transient network/timeout error, NOT a matching proof and NOT
  * `TRANSACTION_HASH_MISMATCH`. The source's spend MAY already be on-chain under
- * THIS `transferId`.
+ * THIS `transferId`. Also raised when the proof DID match but realizing it failed
+ * (#839): then the spend IS on-chain, and `cause` is the realization error.
  *
  * Unlike {@link TransferConflictError} (a foreign tx won — abort + re-plan under
  * a NEW id), the caller MUST keep the intent OPEN: resume re-derives the
@@ -61,9 +62,9 @@ export class ProofUnconfirmedError extends SphereError {
 
 /**
  * A split's burn certified but its checkpoint (sdk-changes E.4, sphere-sdk#501) could NOT be
- * durably persisted — the `SplitCheckpointStore.put` rejected (network / 5xx / timeout / quota) —
- * so NO mint leg was submitted. The burn is on-chain (funds in-flight, not lost); the outputs are
- * fully recoverable on resume.
+ * durably persisted — it could not be encoded (#839), or the `SplitCheckpointStore.put` rejected
+ * (network / 5xx / timeout / quota) — so NO mint leg was submitted. The burn is on-chain (funds
+ * in-flight, not lost); the outputs are fully recoverable on resume.
  *
  * Keep-open family (like {@link ProofUnconfirmedError}): the caller MUST keep the intent OPEN and
  * resume under the SAME `transferId` — the next attempt re-derives the byte-identical burn,
