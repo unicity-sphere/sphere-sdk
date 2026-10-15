@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (money) — one malformed or foreign open intent no longer stops every resume (#840)
+
+What was wrong. Resume checked a durable intent's split amounts by type only and planned every
+intent's legs in one step outside any per-intent failure boundary. A split amount `BigInt` cannot
+parse (`'abc'`, `'1e3'`) made the whole convergence pass throw. A string `BigInt` does parse but no
+client writes (`''`, `'0'`, `'-5'`, `'0x258'`, `'0600'`, a value of 2^256 or more), or a split
+under a coin id that is not lowercase hex, passed the check: the direct legs beside the split were
+spent, and the split then failed or ran under `BigInt`'s reading of a grammar its writer may not
+have meant. The batched source read had the same coupling one layer down: wallet-api refuses the
+whole `blob-urls` batch over one malformed or unowned token id, and one failed blob download
+rejects the read, so every send in the pass that needed a source failed closed, and the refusal's
+`Retry-After` was dropped. A pass that threw also dropped everything it had already decided.
+
+Consequence. Any client of the wallet that wrote such an intent stopped every device from resuming
+and reconciling, on every pass: possibly-committed sends never converged, their sources stayed
+reserved, and payment requests linked to them stayed `settling`. A cancel the pass had already
+confirmed with `404 NOT_FOUND` lost its `conflicted` verdict, so the next pass could resolve its
+linked request paid with nothing moved.
+
+What changed:
+
+- Split amounts must be canonical positive decimal strings below 2^256, and a split's coin id
+  must be lowercase even-length hex. `amount` stays type-checked only, since the send path writes
+  it verbatim and accepts leading zeros.
+- Each intent is planned inside its own failure boundary. One that cannot be planned is reported
+  `failed` and left open: never executed, aborted or completed, and its sources are not touched.
+  It is logged once per facade.
+- When the batched source read is refused, each intent's sources are read again on their own, so
+  only the intent that named the bad id fails closed. The refusal's `Retry-After` reaches the
+  heartbeat.
+- A pass that throws after reading the backstop keeps its verdicts and reports every intent it
+  had not judged as `failed`, so the payment-request reconcile still runs and treats them as open.
+- A device still on 0.19.0 or older keeps stopping on such an intent; the fix reaches each device
+  only when it upgrades.
+
+How it was verified: `tests/unit/payments-v2/resume-unplannable.test.ts` (every refused form,
+the domain boundaries, server-faithful `blob-urls` refusals, the reconcile and the partial-report
+cases), `tests/unit/payments-v2/resume-isolation.test.ts` (a planning failure that validation
+does not name), new mutation probes, and a live staging case with a crafted foreign intent beside
+a keep-open send.
+
 ### Changed (breaking) — DIRECT:// is no longer a payment recipient; unused DIRECT helpers removed (#847)
 
 What was wrong. A `DIRECT://` string is the wallet's Sphere Quests account id, yet `send()` and

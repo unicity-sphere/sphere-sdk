@@ -581,6 +581,23 @@ Normative behaviors bound into the transitions (not call sites):
     *final* `PartialSendConflictError` with its durable remainder. It is not re-planned in-process,
     since re-planning while a split row is still open could resurrect the consumed shortfall;
     resume closes it, idempotently.
+- **Resume plans and reads each intent on its own (#840).** One open intent never stops a pass
+  resuming the others. A payload this client cannot plan is refused before any of its legs runs:
+  an unknown `kind`, a split amount (`splitAmount`, `remainderAmount`) that is not a canonical
+  positive decimal below 2^256 (no sign, no leading zero, a JSON string), or a split `coinId`
+  that is not lowercase even-length hex. `amount` stays type-checked only: the send path accepts
+  leading zeros and writes it verbatim, and resume never parses it. A refused intent is reported
+  `failed` and left open, so a linked request stays `settling`. It is never executed, aborted or
+  completed, its sources are not touched, and it is kept apart from leg failures so that no
+  attempt budget can ever count, settle or write it off: this device ran none of its legs and
+  cannot know what its writer certified. It is logged once per facade. The batched source read
+  stays one request, but wallet-api refuses a whole `blob-urls` batch over one malformed (400) or
+  unowned (403) id, and one failed download rejects the read. On such a refusal resume reads
+  each intent's sources again on its own, so only the intent that named the bad id fails closed;
+  the refusal's `Retry-After` reaches the heartbeat. A pass that throws after the backstop read
+  still returns what it already decided: a tombstone it retired stays `conflicted`, and every
+  intent it had not judged yet is reported `failed`, so the reconcile treats it as open and never
+  as unaccounted (which would resolve a link paid).
 - **Fan-out:** certify at width 20 (`CERTIFY_WIDTH`, widened from 8 by #746), fail-fast
   **between** batches (in-flight siblings always settle); the burn certifies + checkpoints before
   any mint; mint legs parallel (width 8).

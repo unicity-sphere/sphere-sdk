@@ -3618,5 +3618,135 @@
     "tests": [
       "tests/unit/transport/identity-binding-quests.test.ts"
     ]
+  },
+  {
+    "name": "resume-split-amount-typeof-only",
+    "note": "#840: a split amount is a canonical positive decimal below 2^256. Checked by type alone, '0', '-5', '0x258' or ' 600' pass, the direct leg beside the split is spent, and the split then fails (or runs under BigInt's reading of a foreign grammar): a partial pay on a plan that can never complete.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "(typeof s.tokenId !== 'string' || !isAssetValue(s.splitAmount) || !isAssetValue(s.remainderAmount))",
+    "replace": "(typeof s.tokenId !== 'string' || typeof s.splitAmount !== 'string' || !isAssetValue(s.remainderAmount))",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-remainder-amount-typeof-only",
+    "note": "#840: the remainder amount gets the same domain check as the split amount; a '0' or '-5' remainder otherwise reaches the engine after the direct leg is spent.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "(typeof s.tokenId !== 'string' || !isAssetValue(s.splitAmount) || !isAssetValue(s.remainderAmount))",
+    "replace": "(typeof s.tokenId !== 'string' || !isAssetValue(s.splitAmount) || typeof s.remainderAmount !== 'string')",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-asset-value-noncanonical",
+    "note": "#840: only the form every writer emits (bigint toString, no leading zero) is accepted. '0', '0600' and '0400' are otherwise executed: a zero split fails after the direct leg, a leading-zero one runs a realization its writer may not have meant.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "/^[1-9]\\d*$/.test(s)",
+    "replace": "/^\\d+$/.test(s)",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-asset-value-any-literal",
+    "note": "#840: a split amount that is not a decimal literal (hex, sign, whitespace, empty) is refused before any leg runs, never read under BigInt's grammar.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "/^[1-9]\\d*$/.test(s)",
+    "replace": "/^[\\s\\S]*$/.test(s)",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-asset-value-unbounded",
+    "note": "#840: the engine's asset domain ends below 2^256. A split of exactly 2^256 passes an inclusive bound and spends the direct leg before the engine refuses it.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "BigInt(s) < ASSET_VALUE_BOUND",
+    "replace": "BigInt(s) <= ASSET_VALUE_BOUND",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-asset-value-typeof-dropped",
+    "note": "#840: a JSON-number split amount passes the regex (test() stringifies it) and, above 2^53, has already lost precision in JSON.parse: it would run as a different realization, surface as a hash mismatch, and abort as a conflict. Killed by the number cases.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  return typeof s === 'string' && /^[1-9]",
+    "replace": "  return /^[1-9]",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-split-coinid-typeof-only",
+    "note": "#840: with a split present the coin id must be canonical hex. The engine refuses any other at the split leg, AFTER resumeOps spent the direct legs: a partial pay on a plan that can never complete.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (s !== undefined && !/^(?:[0-9a-f]{2})+$/.test(c.coinId)) {",
+    "replace": "  if (s !== undefined && typeof c.coinId !== 'string') {",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-plans-outside-intent-try",
+    "note": "#840: ops are planned inside each intent's own try, so an intent buildOps cannot plan fails alone. Validation shadows this for every JSON input, so only the vi.mock test (a buildOps that throws) kills it.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      ops = buildOps(payload); // #840: planned per intent, so one that cannot plan fails alone\n    } catch (err) {\n      refuse(pass, intent.transferId, err);\n      continue;\n    }\n",
+    "replace": "    } catch (err) {\n      refuse(pass, intent.transferId, err);\n      continue;\n    }\n    ops = buildOps(payload);\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-isolation.test.ts"
+    ]
+  },
+  {
+    "name": "resume-refusals-unreported",
+    "note": "#840: a refused payload is kept apart from leg failures but still reported failed, so the converger reconciles it as open and a linked request stays settling, never unaccounted.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  report.failed.push(...pass.refused);\n",
+    "replace": "  void pass.refused;\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-refusal-warns-every-pass",
+    "note": "#840: a refused intent is logged once per facade, not on every pass (start, resumeNow and the heartbeat) forever.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (pass.warned.has(transferId)) return;\n",
+    "replace": "  if (pass.warned.has(transferId) && false) return;\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-fetch-sources-no-fallback",
+    "note": "#840: wallet-api refuses a whole blob-urls batch over one malformed (400) or unowned (403) id, and getBlobs rejects on one failed download. Without the per-intent re-read, one foreign intent fails every keep-open send in the pass closed, on every pass.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (own.length < 2) return blobs; // the batch was one job's own read\n",
+    "replace": "  return blobs; // the batch was one job's own read\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-fetch-sources-wait-dropped",
+    "note": "#840: a 429/503 on the batched source read carries Retry-After; dropped, the heartbeat retries sooner than the server asked.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    return await storage.getBlobs(ids);\n  } catch (err) {\n    noteWait(report, err);\n  }\n",
+    "replace": "    return await storage.getBlobs(ids);\n  } catch (_err) {\n    /* wait dropped */\n  }\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-pass-not-total",
+    "note": "#840: a throw after a verdict was made durable (a never-stored tombstone retired as conflicted) must still return the partial report. Rethrown, reconcile never runs, and the next pass finds the link unaccounted and resolves it paid with nothing moved.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    noteWait(report, err);\n    const judged = ",
+    "replace": "    throw err;\n    const judged = ",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
   }
 ]
