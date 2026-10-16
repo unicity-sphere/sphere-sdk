@@ -8,6 +8,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { ActiveOps, Converger } from '../../../modules/payments-v2/convergence';
+import { WalletApiHttpError } from '../../../impl/wallet-api-v2/http';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
 import { resumeAll } from '../../../modules/payments-v2/machine/resume';
 import { Requests, type RequestWire } from '../../../modules/payments-v2/requests/Requests';
@@ -22,6 +23,11 @@ const OWED = { transferId: 'earlier', remainingAmount: '400', coinId: COIN, reci
 
 const fail500 = async (): Promise<void> => {
   throw new FakeApiError(500, 'INTERNAL', 'injected abort outage');
+};
+
+/** The server never stored the row (as after a database restore): a typed 404 confirms the cancel. */
+const neverStored = async (): Promise<void> => {
+  throw new FakeApiError(404, 'NOT_FOUND', 'intent not found');
 };
 
 /** A keep-open send whose only source another device then spends: its next resume is a pure conflict. */
@@ -191,6 +197,52 @@ describe('a pure conflict on resume is reported conflicted only once its abort i
   });
 });
 
+describe('a pure conflict on resume whose abort is not answered 204 (#846)', () => {
+  it('the abort answers 429 with Retry-After: failed, kept as a cancel, and the pass hands that wait to the heartbeat', async () => {
+    const w = makeWorld();
+    const id = await lostRace(w);
+    w.overrides.abort = async () => {
+      throw new WalletApiHttpError(429, 'RATE_LIMITED', `POST /v1/intents/${id}/abort: rate limit exceeded`, 120_000);
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [id], retryAfterMs: 120_000 });
+    expect((await w.stores().backstop.getByKey(id))?.disposition).toBe('abortPending');
+    expect(w.api.inspectIntent(w.caller, id)?.status).toBe('open');
+  });
+
+  it('the abort answers 404 NOT_FOUND: conflicted, its rows owed again, and the tombstone is kept for the reconcile', async () => {
+    const w = makeWorld();
+    const id = await lostRace(w, true);
+    w.overrides.abort = neverStored;
+
+    const report = await resumeAll(w.deps);
+
+    expect(report.conflicted).toEqual([id]);
+    expect(report.failed).toEqual([]);
+    expect(report.retireAfterReconcile?.map((entry) => entry.transferId)).toEqual([id]);
+    const kept = await w.stores().backstop.getByKey(id);
+    expect(kept?.disposition, 'no listing will ever show the row: the tombstone is the verdict').toBe('abortPending');
+    expect(kept?.owes, 'it no longer holds what it handed back').toBeUndefined();
+    expect((await w.stores().shortfalls.getByKey('earlier'))?.remainingAmount).toBe('400');
+  });
+
+  it('the abort answers 404 NOT_FOUND in a full pass: the link is payable again, then the tombstone goes', async () => {
+    const w = makeWorld();
+    const id = await lostRace(w);
+    await link(w, id);
+    w.overrides.abort = neverStored;
+    const responded: unknown[] = [];
+
+    await session(w, responded).convergeOnce();
+
+    expect(w.kv.map.get(STORE_KEYS.settlingLinks), 'payable once the cancel is confirmed').toEqual({});
+    expect(responded, 'nothing moved: never responded paid').toEqual([]);
+    expect(await w.stores().backstop.getByKey(id), 'retired once no link names it').toBeUndefined();
+  });
+});
+
 describe('a pure conflict on resume of an intent with no local entry (#846)', () => {
   it('another device wrote it: conflicted only once its abort is confirmed', async () => {
     const w = makeWorld();
@@ -213,5 +265,14 @@ describe('a pure conflict on resume of an intent with no local entry (#846)', ()
 
     expect(await resumeAll(w.deps)).toEqual({ resumed: [], conflicted: [], failed: [] });
     expect(w.api.inspectIntent(w.caller, id)?.status).toBe('completed');
+  });
+
+  it('its abort answers 404 NOT_FOUND: conflicted, and nothing local is created for it', async () => {
+    const w = makeWorld();
+    const id = await foreignLostRace(w);
+    w.overrides.abort = neverStored;
+
+    expect(await resumeAll(w.deps)).toEqual({ resumed: [], conflicted: [id], failed: [] });
+    expect(await w.stores().backstop.list()).toEqual([]);
   });
 });

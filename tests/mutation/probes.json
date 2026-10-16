@@ -4594,5 +4594,35 @@
       "tests/unit/payments-v2/resume-conflict-cancel.test.ts",
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
+  },
+  {
+    "name": "resume-conflict-drops-retry-after",
+    "note": "#846: a 429/503 Retry-After on the resume-conflict abort or its listing reaches the pass report, so the heartbeat waits it out instead of retrying every beat (resume-conflict-cancel.test.ts 'the abort answers 429 with Retry-After...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  const outcome = await abortAndConfirm(deps.intents, transferId, (err) => noteWait(report, err));",
+    "replace": "  const outcome = await abortAndConfirm(deps.intents, transferId, () => undefined);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-never-stored-failed",
+    "note": "#846: a typed 404 NOT_FOUND confirms the cancel of a pure conflict on resume: conflicted, its rows owed again, its tombstone kept for the reconcile (resume-conflict-cancel.test.ts 'the abort answers 404 NOT_FOUND...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (outcome === 'unknown') report.failed.push(transferId); // the tombstone paths confirm it later",
+    "replace": "  if (outcome === 'unknown' || outcome === 'never-stored') report.failed.push(transferId);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-foreign-never-stored-unreported",
+    "note": "#846: with no local entry a typed 404 NOT_FOUND still confirms the cancel, so it is reported conflicted, never left unaccounted (resume-conflict-cancel.test.ts 'its abort answers 404 NOT_FOUND...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  } else if (outcome !== 'completed') report.conflicted.push(transferId); // no local entry: another device's intent",
+    "replace": "  } else if (outcome === 'aborted') report.conflicted.push(transferId);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
   }
 ]
