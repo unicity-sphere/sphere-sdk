@@ -20,7 +20,7 @@ import {
 import { coinIdOf, splitOf } from './payload-view';
 import type { DeliveryJournalEntry, ScopedKV, ShortfallEntry } from '../stores';
 import type { IntentPayload, OpOutcome, OutcomeClass, PlannedOp } from './types';
-import { buildOps, classifyError, conflictAmount } from './outcomes';
+import { buildOps, classifyError, conflictAmount, isSettledOutcome } from './outcomes';
 import { keepAndPost, settledRecord, type OutboxDeps } from './settled-history';
 import {
   ATTENTION_DELIVERY_DEFERRED,
@@ -120,6 +120,25 @@ export interface ResumeIntentOutcome {
   closed: boolean;
 }
 
+/** #844: what the in-process converge of a partial resolves to — always a partial. */
+export interface ConvergedRun extends ResumeIntentOutcome {
+  partial: ShortfallEntry;
+}
+
+/** #844: what run() settled for a plan, in process only (never the KV); the converge reuses it. */
+interface RunRecord {
+  readonly outcomes: OpOutcome[];
+  deliveryPending: boolean;
+}
+
+/** One pass over ops in CERTIFY_WIDTH waves; `certified` accumulates the legs reported so far. */
+interface Waves {
+  readonly ops: readonly PlannedOp[];
+  readonly sources: Map<string, SphereToken>;
+  readonly certified: OpOutcome[];
+  readonly haltOn: (o: OpOutcome) => boolean;
+}
+
 interface CertifyCtx {
   transferId: string;
   recipientPubkey: string;
@@ -160,6 +179,15 @@ export function summarize(outcomes: OpOutcome[]): {
   return { committed, cls, firstError };
 }
 
+/** #844: no record of this plan's run() here — nothing to converge from, so the intent stays open. */
+function unconverged(transferId: string): SphereError {
+  const err = new SphereError(PARTLY_ON_CHAIN_MESSAGE, 'SEND_SYNC_PENDING');
+  err.transferId = transferId;
+  return err;
+}
+
+const byOpIndex = (a: OpOutcome, b: OpOutcome): number => a.op.opIndex - b.op.opIndex;
+
 export class TransferMachine {
   private readonly stores: MachineStores;
   /** Bumped by every §5.1 reseed, and the ones still running: an overlapping one may re-PUT an attempt behind its back. */
@@ -167,8 +195,8 @@ export class TransferMachine {
   private activeReseeds = 0;
   /** Attempts whose gate saw ≥1 ambiguous PUT answer before its 2xx (#835). */
   private readonly uncertainPuts = new WeakSet<MachinePlan>();
-  /** In-process memory of what run() certified — the facade decides from this, never the KV. */
-  private readonly certified = new WeakMap<MachinePlan, readonly string[]>();
+  /** In-process memory of what run() settled — the facade decides from this, never the KV. */
+  private readonly runs = new WeakMap<MachinePlan, RunRecord>();
   /** Parked ids, kept in memory too: the 'unconfirmed' flag write may itself fail. The converger drops one once its hold ends. */
   readonly parked = new Set<string>();
 
@@ -182,9 +210,9 @@ export class TransferMachine {
     this.activeReseeds += started ? 1 : -1;
   }
 
-  /** Source tokenIds whose op run() certified for this plan; [] when none did. */
+  /** Source tokenIds whose op certified for this plan in this process (run() or its converge); [] when none did. */
   certifiedSourcesOf(plan: MachinePlan): readonly string[] {
-    return this.certified.get(plan) ?? [];
+    return (this.runs.get(plan)?.outcomes ?? []).filter((o) => o.certified).map((o) => o.op.sourceTokenId);
   }
 
   // ── send path ─────────────────────────────────────────────────────────────
@@ -205,11 +233,12 @@ export class TransferMachine {
 
     const outcomes = await this.certifyAll(plan, engine);
     const { committed, cls } = summarize(outcomes);
-    if (committed.length > 0) this.certified.set(plan, committed.map((o) => o.op.sourceTokenId));
+    const record: RunRecord = { outcomes: [...outcomes], deliveryPending: true }; // pending until the deposit pass returns
+    if (committed.length > 0) this.runs.set(plan, record);
 
     let deliveryPending = false;
     if (committed.length > 0) {
-      deliveryPending = await this.deliverSet(plan.transferId, plan.recipientPubkey, plan.memo, committed);
+      deliveryPending = record.deliveryPending = await this.deliverSet(plan.transferId, plan.recipientPubkey, plan.memo, committed);
     }
     if (cls === null) {
       // #842: every leg certified, so SENT is kept and leaves before the apply — an applied row is never listed again.
@@ -223,8 +252,23 @@ export class TransferMachine {
     throw await this.failureOf(plan, outcomes, reseedAtStart);
   }
 
+  /** #844: settle a conflicted run() of this process from what it settled; only ops it never settled certify. */
+  async convergeRun(plan: MachinePlan): Promise<ConvergedRun> {
+    const record = this.runs.get(plan);
+    if (record === undefined) throw unconverged(plan.transferId);
+    const r: RehydratedIntent = { transferId: plan.transferId, payload: plan.payload, sources: plan.sources, journaled: new Map() };
+    const outcome = await this.settleIntent(r, record);
+    // Unreachable: a reused conflict always leaves a partial. Kept total, as possibly-committed.
+    if (outcome.partial === null) throw unconverged(plan.transferId);
+    return { ...outcome, partial: outcome.partial };
+  }
+
   // ── resume path: the SAME machine, rehydrated from an open intent ─────────
-  async resumeIntent(r: RehydratedIntent): Promise<ResumeIntentOutcome> {
+  resumeIntent(r: RehydratedIntent): Promise<ResumeIntentOutcome> {
+    return this.settleIntent(r, undefined);
+  }
+
+  private async settleIntent(r: RehydratedIntent, prior: RunRecord | undefined): Promise<ResumeIntentOutcome> {
     const engine = this.deps.engine();
     const ctx: CertifyCtx = {
       transferId: r.transferId,
@@ -232,16 +276,14 @@ export class TransferMachine {
       payload: r.payload,
       ...(r.payload.memo !== undefined ? { memo: r.payload.memo } : {}),
     };
-    const outcomes = await this.resumeOps(ctx, engine, r);
+    const { outcomes, reused } =
+      prior === undefined ? { outcomes: await this.resumeOps(ctx, engine, r), reused: [] } : await this.convergeOps(ctx, engine, r, prior);
     const { committed } = summarize(outcomes);
     const conflicts = this.toConflicts(engine, r, outcomes);
     // #835: a pure conflict only — a keep-open or ordinary outcome beside it wins below.
     if (committed.length === 0 && conflicts.length > 0 && firstNonConflictError(outcomes) === undefined) throw conflicts[0].error;
 
-    let deliveryPending = false;
-    if (committed.length > 0) {
-      deliveryPending = await this.deliverSet(r.transferId, r.payload.recipient, r.payload.memo, committed);
-    }
+    const deliveryPending = await this.deliverSettled(r, committed, reused, prior?.deliveryPending === true);
     // An intent closes only when every op settled cleanly (#744) — judged per
     // outcome, since a conflict outranks and would hide an ordinary failure whose
     // amount is in neither committed[] nor conflicts[] (#745 review).
@@ -369,35 +411,40 @@ export class TransferMachine {
       payload: plan.payload,
       ...(plan.memo !== undefined ? { memo: plan.memo } : {}),
     };
+    const haltOn = (o: OpOutcome): boolean => o.error !== undefined && !o.certified;
+    return this.certifyWaves(ctx, engine, { ops: plan.ops, sources: plan.sources, certified: [], haltOn });
+  }
+
+  /** §5.5 fan-out: CERTIFY_WIDTH waves, fail-fast BETWEEN waves — in-flight siblings always settle. */
+  private async certifyWaves(ctx: CertifyCtx, engine: ITokenEngine, w: Waves): Promise<OpOutcome[]> {
     const outcomes: OpOutcome[] = [];
-    const certified: OpOutcome[] = [];
-    for (let at = 0; at < plan.ops.length; at += CERTIFY_WIDTH) {
-      const batch = plan.ops.slice(at, at + CERTIFY_WIDTH);
+    for (let at = 0; at < w.ops.length; at += CERTIFY_WIDTH) {
+      const batch = w.ops.slice(at, at + CERTIFY_WIDTH);
       const settled = await Promise.all(
         batch.map((op) =>
-          this.certifyOne(ctx, engine, op, plan.sources.get(op.sourceTokenId)).then((o) => {
+          this.certifyOne(ctx, engine, op, w.sources.get(op.sourceTokenId)).then((o) => {
             // Report each leg as it lands, not each wave: a <=CERTIFY_WIDTH send is
             // one wave, so per-wave reporting would jump 0% -> 100%. Rides the
             // existing transfer:updated / tokenTransfers surface — nothing new.
             if (o.certified) {
-              certified.push(o);
-              this.emitProgress(plan, certified);
+              w.certified.push(o);
+              this.emitProgress(ctx.transferId, w.certified);
             }
             return o;
           })
         )
       );
       outcomes.push(...settled);
-      if (settled.some((o) => o.error !== undefined && !o.certified)) break;
+      if (settled.some(w.haltOn)) break;
     }
     return outcomes;
   }
 
   /** In-flight snapshot: `tokenTransfers` holds the legs certified SO FAR. */
-  private emitProgress(plan: MachinePlan, certified: readonly OpOutcome[]): void {
+  private emitProgress(transferId: string, certified: readonly OpOutcome[]): void {
     try {
       this.deps.emit('transfer:updated', {
-        id: plan.transferId,
+        id: transferId,
         status: 'submitted',
         tokens: [],
         tokenTransfers: certified.map((o) => ({
@@ -497,6 +544,49 @@ export class TransferMachine {
       if (last.error !== undefined && classifyError(last.error) !== 'conflict') break;
     }
     return outcomes;
+  }
+
+  /** #844: run()'s settled outcomes stand; the ops it never settled certify in run()'s waves. */
+  private async convergeOps(ctx: CertifyCtx, engine: ITokenEngine, r: RehydratedIntent, prior: RunRecord): Promise<{ outcomes: OpOutcome[]; reused: readonly OpOutcome[] }> {
+    const reused = prior.outcomes.filter(isSettledOutcome);
+    const settledAt = new Set(reused.map((o) => o.op.opIndex));
+    const fresh = await this.certifyWaves(ctx, engine, {
+      ops: buildOps(r.payload).filter((op) => !settledAt.has(op.opIndex)),
+      sources: r.sources,
+      certified: reused.filter((o) => o.certified),
+      // A conflict never stops the next wave: every op must be judged before a partial settles.
+      haltOn: (o) => o.error !== undefined && classifyError(o.error) !== 'conflict',
+    });
+    this.remember(prior, fresh);
+    return { outcomes: [...reused, ...fresh].sort(byOpIndex), reused };
+  }
+
+  /** #844: a leg the converge certified joins the record, so certifiedSourcesOf names it too. */
+  private remember(record: RunRecord, fresh: readonly OpOutcome[]): void {
+    for (const o of fresh.filter((f) => f.certified)) {
+      const at = record.outcomes.findIndex((p) => p.op.opIndex === o.op.opIndex);
+      if (at < 0) record.outcomes.push(o);
+      else record.outcomes[at] = o;
+    }
+  }
+
+  /** #844 D1: deposit only legs this pass certified; run()'s owed deposits stay journaled for the replay. */
+  private async deliverSettled(r: RehydratedIntent, committed: OpOutcome[], reused: readonly OpOutcome[], priorPending: boolean): Promise<boolean> {
+    const fresh = committed.filter((o) => !reused.includes(o));
+    let pending = false;
+    if (fresh.length > 0) pending = await this.deliverSet(r.transferId, r.payload.recipient, r.payload.memo, fresh);
+    // The journal replay is not ActiveOps-gated: it may have landed run()'s owed deposit meanwhile.
+    if (priorPending && !pending) pending = await this.stillOwed(r.transferId, reused);
+    return pending;
+  }
+
+  private async stillOwed(transferId: string, reused: readonly OpOutcome[]): Promise<boolean> {
+    try {
+      const journal = await this.stores.deliveryJournal.byTransfer(transferId);
+      return reused.some((o) => o.certified && journal.has(o.op.opIndex));
+    } catch {
+      return true; // unreadable: keep run()'s answer
+    }
   }
 
   /** Conflicted ops with the amount each leaves undelivered (#690 shortfall math). */

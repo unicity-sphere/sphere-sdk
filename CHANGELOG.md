@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — a send's in-process converge reuses what its attempt settled (#844)
+
+What was wrong. When a send attempt certified some legs and another leg lost its source to a
+conflict, the facade converged the attempt in-process by resuming it as if from the server. Only a
+direct leg whose deposit was still journaled was taken from the journal; every other op went to
+the gateway, one op at a time, so these were resubmitted and their inclusion proofs awaited again:
+each direct leg the attempt had just certified and delivered, the split (which always re-runs), and
+each leg the attempt had just proved conflicted. Then every certified leg was deposited again, the
+journaled ones included, so a deposit the attempt had been told to defer (429) was retried at once,
+and a failed one counted twice toward its poison budget.
+
+Consequence. Gateway round trips on the send's critical path for legs that were already settled. A
+gateway blip during one of those resubmissions turned a send that had finished in memory into a
+possibly-committed rejection (`CERTIFICATION_UNCONFIRMED` or `SEND_SYNC_PENDING`) that converged
+in the background, so a request stayed `settling` and the pending UI showed for a payment that was
+already settled. The money outcome was correct.
+
+What changed:
+
+- The machine keeps, in memory and per attempt, what `run()` settled: each certified and journaled
+  leg (its recipient blob, and for the split its change blob), each leg proved conflicted (a
+  `TRANSACTION_HASH_MISMATCH` is permanent), and whether its deposits are still owed. Nothing new
+  is persisted; a restart resumes from the server intent exactly as before.
+- The in-process converge (`TransferMachine.convergeRun`) reuses those outcomes and submits only the
+  ops the attempt never reached (those in a later `CERTIFY_WIDTH` wave), in the same waves and with
+  the same `transfer:updated` progress events as the attempt. A conflict in one of those waves does
+  not stop the next wave, so every op is judged before the partial settles and the shortfall is the
+  sum of every conflicted leg.
+- The converge deposits only the legs it certified itself. A leg whose deposit the attempt could not
+  make stays journaled, its attempt count and deferral intact, and is retried by the journal replay
+  and the convergence pass. Behaviour change for integrators: in that case the send now resolves
+  `'confirmed'` with `deliveryPending: true` where the in-process retry could have returned
+  `'delivered'`; both are documented success states. Before reporting the deposit still owed, the
+  converge reads the journal once more, because the replay may land it meanwhile.
+- A converge always ends partial or failed, so the facade no longer has a converge success branch:
+  a facade success comes only from the attempt itself. Every converge failure is still
+  possibly-committed.
+
+How it was verified: machine-level tests in `tests/unit/payments-v2/machine-converge.test.ts` (no
+chain op or deposit for a settled leg, a certified split reused, only the unreached wave
+certified, in one wave and with progress, a fresh leg unconfirmed, a 500 and a 429 deposit left to
+the replay, a split in an unreached wave, a reused plus a fresh conflict, a deposit the replay
+landed meanwhile, an unreadable journal, a batch-deposit port, and two defensive cases the facade
+cannot reach), facade-level tests in `tests/unit/payments-v2/facade-converge.test.ts` (one submit
+and one deposit per leg, a gateway that blips on every resubmission, more than one wave, both
+conflicted sources demoted), the existing #835 cases re-pointed to the background pass, mutation
+probes for each reuse rule, and a case run against the live staging wallet-api (`-t '#844'` in
+`tests/e2e/payments-v2-vertical.staging.e2e.test.ts`) where a second instance of the wallet spends
+a source out from under the first instance's selection.
+
 ### Fixed (money) — a send that lost its race on resume is reported cancelled only once the cancel is confirmed (#846)
 
 What was wrong. When a resumed send found every leg's source already spent by someone else and

@@ -565,10 +565,26 @@ Normative behaviors bound into the transitions (not call sites):
     finishes it.
   - **In-process convergence:** the facade converges in-process only after a certified *conflict*
     partial. It decides that from what `run()` certified in this process, never from the backstop.
-    A conflict never masks a keep-open or ordinary outcome of the same resume pass: `resumeIntent`
-    throws a conflict only when nothing certified and every errored outcome is a conflict. Every failure of
+    A conflict never masks a keep-open or ordinary outcome of the same pass: `settleIntent`
+    (reached through `resumeIntent` or `convergeRun`) throws a conflict only when nothing certified
+    and every errored outcome is a conflict. Every failure of
     an in-process convergence is possibly-committed, keeping its own code or else taking
     `SEND_SYNC_PENDING`. There is no soft-abort and no full retry.
+    **Amended (#844):** the in-process convergence (`TransferMachine.convergeRun`) reuses what
+    `run()` settled in this process, kept in memory per plan (the run record, never the KV): each
+    leg it certified and journaled (its recipient blob, and for the split its change blob) and each
+    leg it proved conflicted (a `TRANSACTION_HASH_MISMATCH` is permanent). Only the ops `run()`
+    never reached, those in a later `CERTIFY_WIDTH` wave, are submitted, in the same waves and with
+    the same progress events as `run()`; a conflict in such a wave does not stop the next one, so
+    every op is judged before the partial settles. A certified leg whose journal write failed is
+    re-certified, never reused. The converge deposits only the legs it certified itself. A leg
+    whose deposit `run()` could not make (failed, or deferred by a 429) stays journaled with its
+    `attempts` and `deferredUntil` intact and is retried by the journal replay and `resumeAll`, never
+    in process; the converge then reports `deliveryPending`, after one re-read of the journal (the
+    replay is not gated by the pass's active set and may land it meanwhile; an unreadable journal
+    keeps it pending). A converge always ends in a partial or a failure, so the facade's success
+    disposition comes only from `run()`. A restart, or a later pass, resumes from the server intent
+    as before: direct legs from the journal, the split through its checkpoint.
   - **`remainingAmount` `'0'`:** when the latest attempt is possibly-committed after earlier
     partials, `PartialSendConflictError.remainingAmount` is `'0'`. The remainder rides that
     attempt: its error is `cause`, carrying its `transferId`, and `committedTokenIds` also lists
@@ -659,7 +675,8 @@ Normative behaviors bound into the transitions (not call sites):
   **Amended 2026-10-13 (#835):** `run()` applies only a fully settled attempt, one with no errored
   leg at all. The best-effort apply after a conflict partial is gone, and with it the
   `sync:pending` attention code it raised; the condition now surfaces as `SEND_SYNC_PENDING` from
-  `send()`. An attempt with a conflicted or failed leg is applied only by `resumeIntent`, and only
+  `send()`. An attempt with a conflicted or failed leg is applied only by `settleIntent` (through
+  `resumeIntent` on resume, or `convergeRun` in process, #844), and only
   after its #690 shortfall row is durable. The apply itself completes an unflagged intent, so the
   shortfall must be durable before ANY apply, not just before `complete`: the apply-then-shortfall
   order had the same lost-shortfall window, one call earlier.
@@ -1209,7 +1226,8 @@ a certified leg is possibly-committed (#835); tombstones removed only on a serve
 never while locally active, every GC removal compare-and-delete (#835); shortfall-before-apply —
 `run()` applies only a fully settled attempt, any other attempt is applied only by resume after its
 shortfall row is durable (#835); conflict-never-masks — a conflict is thrown only when nothing
-certified and every errored outcome is a conflict (#835);
+certified and every errored outcome is a conflict (#835); converge-reuses-run — the in-process
+convergence re-submits and re-deposits nothing `run()` settled in this process (#844);
 same-transferId resume, foreign proof never applied; re-deliver never re-certify; conflicted leg
 never recorded spent; locally-aborted intents never resumed, unknown local disposition defers
 all; unsupported payloads refused; reservation gate + synchronous critical section; per-request
