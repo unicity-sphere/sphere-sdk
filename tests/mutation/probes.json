@@ -3791,6 +3791,16 @@
     ]
   },
   {
+    "name": "facade-links-not-wired",
+    "note": "#840: the converger keeps a never-stored cancel's tombstone only while the facade hands it its own Requests' settling links. An empty set retires the tombstone after a reconcile that applied nothing (a journal that failed open), and after a restart the link is unaccounted and responded paid with nothing moved (never-stored-cancel.facade.test.ts).",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "      linkedTransferIds: () => this.requests.linkedTransferIds(),\n",
+    "replace": "      linkedTransferIds: async () => new Set<string>(),\n",
+    "tests": [
+      "tests/unit/payments-v2/never-stored-cancel.facade.test.ts"
+    ]
+  },
+  {
     "name": "converger-retires-on-unreadable-links",
     "note": "#840: an unreadable settling journal proves nothing about a link to a never-stored cancel; read as empty, its tombstone would be retired with the link possibly still on disk.",
     "file": "modules/payments-v2/convergence.ts",
@@ -3865,8 +3875,18 @@
     "name": "resume-fetch-fallback-wait-dropped",
     "note": "#840: a per-intent re-read after a refused batch can carry a Retry-After the batch did not; dropped, the heartbeat retries sooner than the server asked.",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "      for (const [id, bytes] of await storage.getBlobs(needed)) blobs.set(id, bytes);\n    } catch (err) {\n      noteWait(report, err);\n",
-    "replace": "      for (const [id, bytes] of await storage.getBlobs(needed)) blobs.set(id, bytes);\n    } catch (_err) {\n      /* wait dropped */\n",
+    "find": "    } catch (err) {\n      noteWait(report, err);\n      if (retryAfterMsOf(err) !== null) break;",
+    "replace": "    } catch (err) {\n      void report;\n      if (retryAfterMsOf(err) !== null) break;",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-fetch-fallback-reads-past-backoff",
+    "note": "#840: a per-intent re-read answered with a Retry-After ends the re-reads for that pass; without the stop, every remaining open intent sends one more request to a server that just asked to wait (resume-unplannable.test.ts 'a per-intent re-read's Retry-After reaches the report...').",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      if (retryAfterMsOf(err) !== null) break; // asked to back off: the jobs left fail closed\n",
+    "replace": "      // mutant: a back-off answer does not stop the per-intent re-reads\n",
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
     ]
@@ -3887,6 +3907,16 @@
     "file": "modules/payments-v2/convergence.ts",
     "find": "    const fresh = report.conflicted.some((id) => !(retiring.has(id) && this.reported.has(id)));\n",
     "replace": "    const fresh = report.conflicted.length > 0;\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "converger-kept-tombstone-forgotten-when-unjudged",
+    "note": "#840: a kept 404 tombstone stays reported until it is gone. Forgotten after a pass whose abort failed, the next 404 counts as fresh progress, and an abort that fails intermittently keeps the heartbeat near its 5 s seed (resume-unplannable.test.ts 'an abort that fails between the kept verdicts...').",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    for (const id of retiring) this.reported.add(id);\n",
+    "replace": "    this.reported = retiring;\n",
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
     ]
