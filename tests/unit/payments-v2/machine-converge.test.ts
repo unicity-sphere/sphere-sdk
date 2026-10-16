@@ -306,6 +306,23 @@ describe('#844 convergeRun reuses what run() settled', () => {
     expect(outcome.closed).toBe(true);
   });
 
+  it('M9c run() landed every deposit: the converge trusts that and reads no journal, so an unreadable one changes nothing', async () => {
+    const w = makeWorld();
+    const a = await w.seed(600n);
+    const b = await w.seed(400n);
+    await w.engine.foreignSpend(b);
+    const plan = await w.plan({ tokens: [a, b], amount: '1000' });
+    const machine = w.machine();
+    await expect(machine.run(plan)).rejects.toBeInstanceOf(TransferConflictError);
+    w.kv.failKeys.add(STORE_KEYS.deliveryJournal);
+
+    const outcome = await machine.convergeRun(plan);
+    w.kv.failKeys.delete(STORE_KEYS.deliveryJournal);
+
+    expect(outcome).toMatchObject({ deliveryPending: false, closed: true });
+    expect(w.deposits.map((d) => d.tokenId)).toHaveLength(1);
+  });
+
   it('a partial over a port with deliverBatch: run() batches its legs, the converge batches only the legs it certified', async () => {
     const w = makeWorld();
     const tokens = await seedMany(w, ones(22));

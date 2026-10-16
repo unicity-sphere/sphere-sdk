@@ -4703,7 +4703,7 @@
   },
   {
     "name": "run-record-misses-delivery",
-    "note": "#844: the run record carries run()'s deposit outcome; left at its conservative 'pending', every converged partial reads pending-delivery (machine-converge.test.ts M1, facade-converge.test.ts F1)",
+    "note": "#844: the run record carries run()'s deposit outcome; left at its conservative 'pending', a converge whose journal read fails reports a landed deposit as still owed (machine-converge.test.ts M9c)",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
     "find": "      deliveryPending = record.deliveryPending = await this.deliverSet(",
     "replace": "      deliveryPending = await this.deliverSet(",
