@@ -44,8 +44,8 @@ export interface TransportAddressResolver {
   /**
    * Resolve any Unicity address to a transport pubkey.
    *
-   * Accepts: @nametag, DIRECT://..., compressed hex (66 chars),
-   * x-only hex (64 chars).
+   * Accepts: @nametag, compressed hex (66 chars), x-only hex (64 chars),
+   * and DIRECT://... (deprecated, refused in #847 phase 2).
    *
    * Results are cached to avoid redundant network round-trips.
    */

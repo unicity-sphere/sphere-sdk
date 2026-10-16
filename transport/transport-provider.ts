@@ -34,7 +34,8 @@ export interface TransportProvider extends BaseProvider {
 
   /**
    * Resolve any identifier to full peer information.
-   * Accepts @nametag, bare nametag, DIRECT://, chain pubkey, or transport pubkey.
+   * Accepts @nametag, bare nametag, chain pubkey, transport pubkey, or DIRECT:// (deprecated,
+   * refused in #847 phase 2; never a payment recipient).
    * @param identifier - Any supported identifier format
    * @returns PeerInfo or null if not found
    */

@@ -3349,12 +3349,13 @@ export class Sphere {
 
   /**
    * Resolve any identifier to full peer information.
-   * Accepts @nametag, bare nametag, DIRECT://, chain pubkey, or transport pubkey.
+   * Accepts @nametag, bare nametag, chain pubkey, transport pubkey, or DIRECT:// (deprecated,
+   * refused in #847 phase 2; never a payment recipient).
    *
    * @example
    * ```ts
    * const peer = await sphere.resolve('@alice');
-   * const peer = await sphere.resolve('DIRECT://...');
+   * const peer = await sphere.resolve('DIRECT://...'); // deprecated (#847 phase 2)
    * const peer = await sphere.resolve('02ab12...'); // 33-byte compressed chain pubkey
    * const peer = await sphere.resolve('ab12cd...'); // 64-char hex transport pubkey
    * ```
@@ -3372,7 +3373,7 @@ export class Sphere {
    * Useful before a batch of DM operations (e.g., sending hello_ack to
    * multiple tenants, or broadcasting to a list of agents).
    *
-   * @param address - Any valid Unicity address (@nametag, DIRECT://, hex pubkey)
+   * @param address - @nametag or hex pubkey; DIRECT:// is deprecated (#847 phase 2)
    * @throws SphereError if the address cannot be resolved
    */
   async preResolveDM(address: string): Promise<void> {

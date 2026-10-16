@@ -48,7 +48,9 @@ fed `getPublicKey(SHA256(privateKey))`), `sphere.identity.directAddress`,
 working and are deprecated; a later phase of #847 refuses them.
 
 **Migration.** Pay a `@nametag` or the recipient's 66-hex chain pubkey. A UI that offered a
-`DIRECT://` recipient field stops offering it; a dApp that sent `to: 'DIRECT://…'` gets -32602.
+`DIRECT://` recipient field stops offering it; a dApp that sent `to: 'DIRECT://…'` gets -32602. On
+`payment_request` such a dApp needs the payer's `@nametag` for now: the Sphere wallet prefixes a
+66-hex `to` with `@`, which turns it into a Unicity ID lookup that fails.
 
 Verified by `tests/unit/payments-v2/direct-recipient.test.ts`, `tests/unit/connect/direct-recipient.test.ts`,
 `tests/unit/transport/identity-binding-quests.test.ts` (the real nostr-js-sdk builders still write

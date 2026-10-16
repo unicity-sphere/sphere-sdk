@@ -1004,8 +1004,11 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 > pubkey. A `DIRECT://` address (any case, with or without a leading `@`) is not a payment recipient:
 > the host refuses the intent with `INVALID_PARAMS` (-32602) and the message "DIRECT:// addresses are
 > no longer accepted as payment recipients; use the recipient's @nametag or chain pubkey", and the
-> wallet never sees it (#847). `identity.directAddress` stays in the handshake: it is the wallet's
-> Sphere Quests account id, for sign-in. A `dm` to `DIRECT://` still reaches the wallet.
+> wallet never sees it (#847). For `payment_request` the Sphere wallet currently prefixes `to` with
+> `@`, so a 66-hex chain pubkey there is looked up as a Unicity ID and the request fails: until the
+> wallet passes it through unprefixed, as it already does for `send`, a `payment_request` needs the
+> payer's `@nametag`. `identity.directAddress` stays in the handshake: it is the wallet's Sphere
+> Quests account id, for sign-in. A `dm` to `DIRECT://` still reaches the wallet.
 
 > **Amount units:** `amount` is always in **base units** (the smallest indivisible unit), as a
 > string — the same convention as the SDK's `payments.mint(coinId, amount: bigint)`
@@ -1358,9 +1361,9 @@ try {
 | 4200 | `ERROR_CODES.INTENT_CANCELLED` | Intent cancelled — the user declined and **nothing happened**. Safe to re-offer. |
 | 4201 | `ERROR_CODES.INTENT_OUTCOME_UNKNOWN` | The intent reached the wallet and its outcome is unknown: the answer was lost (a host deadline, a lock, a logout), or the wallet cannot tell whether the operation will still complete (a mint journaled before it failed carries `data.tokenId`). **The money or token may or may not have moved. Do NOT retry**; reconcile out of band first. |
 
-> **Where each row comes from.** Nine codes are emitted by the SDK host itself — 4001, 4002, 4004,
-> 4006, 4007, 4008, 4009, -32603 and 4201 (the only `ERROR_CODES.*` members referenced under
-> `connect/`). Those are properties of this repo and hold for any wallet built on it. Everything
+> **Where each row comes from.** Ten codes are emitted by the SDK host itself — 4001, 4002, 4004,
+> 4006, 4007, 4008, 4009, -32602 (only the #847 `DIRECT://` `to` refusal), -32603 and 4201 (the
+> only `ERROR_CODES.*` members referenced under `connect/`). Those are properties of this repo and hold for any wallet built on it. Everything
 > else in the table is the *wallet's* to send: 4003 and 4200 come from the wallet's own rejection,
 > relayed by the host, and the rows written "the Sphere wallet currently …" describe the Sphere
 > wallet as it stands today — `sphere`, `src/components/connect/intentValidation.ts`,

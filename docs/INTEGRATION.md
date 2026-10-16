@@ -1682,8 +1682,7 @@ confirmed which tokens converging transfers hold, for `send()`, `sendWholeToken(
 `sendCoinless()` alike, and the message says so; `burn()` resolves it as `errorCode` instead of
 rejecting), `INVALID_RECIPIENT` (no published chain pubkey, a recipient on another network, or a
 `DIRECT://` recipient, #847), `TRANSPORT_ERROR` (the recipient lookup could not reach the Nostr
-relays) and
-`VALIDATION_ERROR` (for example a malformed amount).
+relays) and `VALIDATION_ERROR` (for example a malformed amount).
 `INSUFFICIENT_BALANCE` exists in the `SphereErrorCode` union but is never thrown.
 
 ### Verification Is Built In
