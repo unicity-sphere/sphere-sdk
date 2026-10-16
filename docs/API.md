@@ -622,7 +622,7 @@ any of them:
   event marks the confirmed cancel.
 
 A possibly-committed send that resumes to find its source spent elsewhere before any leg certified
-(a lost race) ends the same way (#846). When this device holds the send, the SDK records the
+(a lost race) ends the same way (#846). For a send made on this device, the SDK records the
 cancel before it aborts and from then on only retries the cancel. A send that lost its race can
 never be certified, so a pass that runs it again before that record is written only conflicts
 again.
