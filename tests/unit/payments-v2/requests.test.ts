@@ -575,3 +575,102 @@ describe('payments-v2 Requests — linkedTransferIds (#840)', () => {
     expect([...(await h.requests.linkedTransferIds())]).toEqual(['tx-disk']);
   });
 });
+
+/** Holds the next settling-journal write until the returned release runs. */
+function gateNextSettlingWrite(kv: MemoryKV): () => void {
+  const set = kv.set.bind(kv);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let armed = true;
+  kv.set = async <T>(key: string, value: T): Promise<void> => {
+    if (armed && key === SETTLING_KEY) {
+      armed = false;
+      await gate;
+    }
+    return set(key, value);
+  };
+  return release;
+}
+
+const settled = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe('payments-v2 Requests — a link write still queued is never missed (#840)', () => {
+  it('linkedTransferIds refuses to answer while a link write is queued behind a stalled one', async () => {
+    const h = makeHarness();
+    const first = await seedRequest(h.api);
+    const second = await seedRequest(h.api);
+    await h.requests.drainIncoming();
+    const release = gateNextSettlingWrite(h.kv);
+    h.sendImpl.mockRejectedValueOnce(possiblyCommitted('tx-first'));
+    h.sendImpl.mockRejectedValueOnce(possiblyCommitted('tx-queued'));
+    const paying = [h.requests.pay(first), h.requests.pay(second)].map((p) => p.catch(() => undefined));
+    await settled();
+
+    await expect(h.requests.linkedTransferIds()).rejects.toThrow(/settling journal write in flight/);
+
+    release();
+    await Promise.all(paying);
+    expect([...(await h.requests.linkedTransferIds())].sort()).toEqual(['tx-first', 'tx-queued']);
+  });
+});
+
+describe('payments-v2 Requests — a request the server resolved is never payable again (#840)', () => {
+  /** pay() leaves a link to tx-a; another device then pays the request on the server. */
+  async function paidElsewhere(h: Harness): Promise<string> {
+    const id = await seedRequest(h.api);
+    await h.requests.drainIncoming();
+    h.sendImpl.mockRejectedValueOnce(possiblyCommitted('tx-a'));
+    await expect(h.requests.pay(id)).rejects.toThrow();
+    await h.api.respondRequest(payerCaller, id, { action: 'paid', transferId: 'tx-b' });
+    return id;
+  }
+
+  async function expectNotPayable(h: Harness, id: string): Promise<void> {
+    expect(h.requests.list()[0]!.status).toBe('paid');
+    await expect(h.requests.pay(id)).rejects.toThrow(/not payable/);
+    expect(h.sendImpl).toHaveBeenCalledTimes(1);
+  }
+
+  it('the stale-link clear failed: a reconcile that then finds the link conflicted keeps it paid', async () => {
+    const h = makeHarness();
+    const id = await paidElsewhere(h);
+    h.kv.failWriteKeys.add(SETTLING_KEY);
+    await h.requests.drainIncoming();
+    await settled();
+    h.kv.failWriteKeys.delete(SETTLING_KEY);
+    expect(h.requests.list()[0]!.status).toBe('paid');
+
+    await h.requests.reconcile({ resumed: [], conflicted: ['tx-a'], open: [] });
+    await expectNotPayable(h, id);
+  });
+
+  it('a reconcile racing the stale-link clear write keeps it paid', async () => {
+    const h = makeHarness();
+    const id = await paidElsewhere(h);
+    const release = gateNextSettlingWrite(h.kv);
+    await h.requests.drainIncoming();
+
+    const reconciling = h.requests.reconcile({ resumed: [], conflicted: ['tx-a'], open: [] });
+    await settled();
+    release();
+    await reconciling;
+    expect(settlingRecord(h.kv)[id]).toBeUndefined();
+    await expectNotPayable(h, id);
+  });
+
+  it('a clean send failure after another device paid the request does not re-open it', async () => {
+    const h = makeHarness();
+    const id = await seedRequest(h.api);
+    await h.requests.drainIncoming();
+    h.sendImpl.mockImplementationOnce(async () => {
+      await h.api.respondRequest(payerCaller, id, { action: 'paid', transferId: 'tx-b' });
+      await h.requests.drainIncoming();
+      throw new SphereError('insufficient balance', 'INSUFFICIENT_BALANCE');
+    });
+    await expect(h.requests.pay(id)).rejects.toThrow(/insufficient balance/);
+
+    await expectNotPayable(h, id);
+  });
+});

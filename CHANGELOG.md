@@ -62,6 +62,14 @@ What changed:
   is on disk, so a failed write is retried by the next reconcile instead of waiting for a
   restart. The kept tombstone drops the shortfall rows it handed
   back, so `pendingTransfers()` lists them and a remainder already paid is never owed again.
+- The journal check refuses to answer while a settling-journal write is queued or running, so a
+  link to the tombstone that `pay()` queued behind a stalled write keeps the tombstone for that
+  pass. Without it the tombstone could go first, and the next pass resolved that link paid.
+- A payment request the server already resolved (paid on another device, declined or expired)
+  stays so when a `conflicted` or aborted verdict finds its link. Before, the link could still be
+  in memory (its removal not yet written, or failed), and the request went back to `pending`, so
+  `pay()` could pay it a second time. A clean `send()` failure no longer re-opens a request the
+  server resolved while the send ran.
 - A device still on 0.19.0 or older keeps stopping on such an intent; the fix reaches each device
   only when it upgrades.
 
@@ -71,9 +79,12 @@ cases, and a never-stored cancel across a skipped reconcile, a failed post-pass 
 a failed reconcile, and a real settling journal whose read failed open or whose cleared link
 failed to write, each followed by a restart that must not resolve the request paid, and the
 heartbeat backing off while such a tombstone is kept, its abort failing on every other pass
-included), `tests/unit/payments-v2/never-stored-cancel.facade.test.ts` (the same never-stored
+included, a link to it queued behind a stalled journal write, and a failed strip of the rows
+it handed back), `tests/unit/payments-v2/never-stored-cancel.facade.test.ts` (the same never-stored
 cancel through the composed facade, whose own settling links keep the tombstone),
-`tests/unit/payments-v2/requests.test.ts` (`linkedTransferIds`),
+`tests/unit/payments-v2/requests.test.ts` (`linkedTransferIds`, a link write queued behind a
+stalled one, and a server-resolved request that a reconcile or a clean send failure must leave
+unpayable),
 `tests/unit/payments-v2/resume-isolation.test.ts` (a planning failure that
 validation does not name), and new mutation probes. The live staging case with a crafted foreign
 intent beside a keep-open send is `tests/e2e/payments-v2-vertical.staging.e2e.test.ts`
