@@ -897,7 +897,7 @@ describe('a cancel counts only once the aborted listing shows its row: an abort 
 describe('the sweep of an entry whose row is no longer open tells completed from aborted (#835)', () => {
   const owed = { transferId: 'earlier', remainingAmount: '400', coinId: COIN, recipient: 'aa', committedTokenIds: [], createdAt: 1 };
 
-  it('a holder whose conflict cleanup could not remove its entry: the next pass hands its rows back, never settles them', async () => {
+  it('a holder whose conflict cleanup could not remove its entry stays a tombstone: the next pass hands its rows back, never settles them', async () => {
     const w = makeWorld();
     const token = await w.seed(1000n);
     const plan = await w.plan({ tokens: [token], amount: '1000', transferId: 'holder' });
@@ -909,15 +909,18 @@ describe('the sweep of an entry whose row is no longer open tells completed from
     w.engine.transfer = transfer;
     await w.engine.foreignSpend(token);
     await w.stores().backstop.patch('holder', (e) => ({ ...e, owes: [owed] }));
-    w.kv.failWriteKeys.add(STORE_KEYS.intentBackstop); // the cleanup's entry removal fails
+    w.overrides.abort = async () => {
+      w.kv.failWriteKeys.add(STORE_KEYS.intentBackstop); // #846: the tombstone is written; the entry removal fails
+    };
 
     const first = await resumeAll(w.deps);
 
-    expect(first.conflicted).toEqual(['holder']);
+    expect(first, 'reported once its cleanup lands').toEqual({ resumed: [], conflicted: [], failed: ['holder'] });
     expect(w.api.inspectIntent(w.caller, 'holder')?.status).toBe('aborted');
-    expect((await w.stores().backstop.getByKey('holder'))?.disposition, 'the removal failed').toBe('open');
+    expect((await w.stores().backstop.getByKey('holder'))?.disposition, 'the removal failed').toBe('abortPending');
     expect((await w.stores().shortfalls.getByKey('earlier'))?.remainingAmount).toBe('400');
 
+    delete w.overrides.abort;
     w.kv.failWriteKeys.delete(STORE_KEYS.intentBackstop);
     const second = await resumeAll(w.deps);
 

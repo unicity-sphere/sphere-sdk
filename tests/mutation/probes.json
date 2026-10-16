@@ -3226,12 +3226,13 @@
   },
   {
     "name": "resume-conflict-forgets-owed",
-    "note": "#835: a held attempt that conflicts on resume hands what it owed back to the shortfall store before its entry goes (send-intent-unknown.test.ts '(x-conflict)...')",
+    "note": "#835/#846: a held attempt that conflicts on resume keeps what it owed on its tombstone, so the confirmed cancel hands it back to the shortfall store before its entry goes (send-intent-unknown.test.ts '(x-conflict)...', resume-conflict-cancel.test.ts 'the abort is confirmed but the entry removal fails...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "      await releaseOwed(stores, await stores.backstop.getByKey(transferId)); // #835: its remainder is owed again\n",
-    "replace": "      // mutant: what it owed is not handed back\n",
+    "find": "    entry = await stores.backstop.patch(transferId, (e) => ({ ...e, disposition: 'abortPending' }));",
+    "replace": "    entry = await stores.backstop.patch(transferId, (e) => ({ ...e, owes: undefined, disposition: 'abortPending' }));",
     "tests": [
-      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
     ]
   },
   {
@@ -4530,6 +4531,68 @@
     "replace": "=> rest);",
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-plain-abort",
+    "note": "#846: a pure conflict on resume counts its cancel only once the aborted listing shows the row; an abort of a row another device completed is a no-op 204, so a bare 2xx would report a paid send conflicted and make its request payable again (resume-conflict-cancel.test.ts '...completed on another device...', '...completed before the abort landed...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  const outcome = await abortAndConfirm(deps.intents, transferId, (err) => noteWait(report, err));",
+    "replace": "  const outcome = await deps.intents.abort(transferId).then(() => 'aborted' as const, () => 'unknown' as const);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-no-tombstone",
+    "note": "#846: the tombstone is written before the abort; without it a failed removal leaves an 'open' entry that an epoch re-seed re-PUTs, re-opening the aborted row, and a failed write still aborts (resume-conflict-cancel.test.ts '...the entry removal fails...', 'the tombstone cannot be written...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    entry = await stores.backstop.patch(transferId, (e) => ({ ...e, disposition: 'abortPending' }));",
+    "replace": "    entry = await stores.backstop.getByKey(transferId);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-aborts-untombstoned",
+    "note": "#846: a tombstone write that fails stops the cancel there: no abort runs, and the next pass re-judges the intent (resume-conflict-cancel.test.ts 'the tombstone cannot be written...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    noteFailed(report, transferId, err); // no tombstone, so no abort: the next pass re-judges it\n    return;\n",
+    "replace": "    noteFailed(report, transferId, err); // no tombstone, so no abort: the next pass re-judges it\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-unknown-conflicted",
+    "note": "#846: an unconfirmed abort leaves a row another device could run, so a pure conflict on resume whose abort fails is reported failed and its link stays settling (resume-conflict-cancel.test.ts 'the abort fails...', 'another device wrote it...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (outcome === 'unknown') report.failed.push(transferId); // the tombstone paths confirm it later",
+    "replace": "  if (outcome === 'unknown') report.conflicted.push(transferId);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-foreign-completed-conflicted",
+    "note": "#846: with no local entry (another device's intent) a row completed before the abort landed is paid, never conflicted (resume-conflict-cancel.test.ts 'its row was completed before the abort landed...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  } else if (outcome !== 'completed') report.conflicted.push(transferId); // no local entry: another device's intent",
+    "replace": "  } else report.conflicted.push(transferId);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-retire-failure-unreported",
+    "note": "#846: a confirmed cancel whose cleanup throws is reported failed, so the pass does not read it as settled (resume-conflict-cancel.test.ts '...the entry removal fails...', machine-resume.test.ts 'a holder whose conflict cleanup could not remove its entry...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": ".catch((err: unknown) => noteFailed(report, transferId, err));",
+    "replace": ".catch(() => undefined);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
     ]
   }
 ]

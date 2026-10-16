@@ -458,16 +458,9 @@ async function classifyResumeFailure(
   report: ResumeReport
 ): Promise<void> {
   if (classifyError(err) === 'conflict') {
-    // E.2 pure lost race — nothing was delivered under this intent: soft-abort,
+    // E.2 pure lost race — nothing was delivered under this intent: cancel it,
     // never apply the foreign proof; the caller re-plans under a NEW transferId.
-    try {
-      await deps.intents.abort(transferId);
-      await releaseOwed(stores, await stores.backstop.getByKey(transferId)); // #835: its remainder is owed again
-      await stores.backstop.removeByKey(transferId);
-    } catch {
-      /* retried at the next resume */
-    }
-    report.conflicted.push(transferId);
+    await cancelAndRetire(deps, stores, transferId, report);
     return;
   }
   const code = err !== null && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
@@ -475,6 +468,27 @@ async function classifyResumeFailure(
     deps.emit('transfer:attention', { transferId, code: ATTENTION_CHECKPOINT_STUCK, detail: String(code) });
   }
   noteFailed(report, transferId, err);
+}
+
+/** #846: conflicted only once the abort is confirmed, tombstone first (a re-seed never re-PUTs it); completed = paid. */
+async function cancelAndRetire(
+  deps: MachineDeps,
+  stores: MachineStores,
+  transferId: string,
+  report: ResumeReport
+): Promise<void> {
+  let entry: IntentBackstopEntry | undefined;
+  try {
+    entry = await stores.backstop.patch(transferId, (e) => ({ ...e, disposition: 'abortPending' }));
+  } catch (err) {
+    noteFailed(report, transferId, err); // no tombstone, so no abort: the next pass re-judges it
+    return;
+  }
+  const outcome = await abortAndConfirm(deps.intents, transferId, (err) => noteWait(report, err));
+  if (outcome === 'unknown') report.failed.push(transferId); // the tombstone paths confirm it later
+  else if (entry !== undefined) {
+    await retire(stores, entry, outcome, report).catch((err: unknown) => noteFailed(report, transferId, err));
+  } else if (outcome !== 'completed') report.conflicted.push(transferId); // no local entry: another device's intent
 }
 
 /**

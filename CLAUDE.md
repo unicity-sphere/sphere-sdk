@@ -559,8 +559,8 @@ version:
   payable. `PartialSendConflictError.remainingAmount` can be `'0'`: a possibly-committed later
   attempt owns the rest and holds the send's earlier shortfall rows on its backstop entry — one
   being cancelled included, since another device could still complete it. The rows are handed back,
-  owed again, only once that attempt is proven not to run (a conflict on resume, or a cancel the
-  aborted listing confirms, which also reports it `conflicted`), and settled as paid when it
+  owed again, only once that attempt is proven not to run (a cancel the aborted listing confirms,
+  a conflict on resume included, which also reports it `conflicted`), and settled as paid when it
   completed elsewhere; nothing is owed while the cancel is unconfirmed. Accepted residual
   (wallet-api#172, closing it needs server-side exclusivity): another device that certified a leg
   before the abort landed may still deliver, while the confirmed cancel makes the remainder owed
@@ -891,7 +891,11 @@ authoritative for build success.
   earlier may list the acked entry late and re-PUT it; a re-seed counts as active until its last
   re-PUT answered, before its cursor reset and re-pull); otherwise it is possibly-committed. An
   unconfirmed abort leaves a row another device of the wallet could run, so the #676 gate reports
-  it `conflicted` only once its abort is confirmed.
+  it `conflicted` only once its abort is confirmed. A pure conflict on resume (#846) is cancelled
+  the same way: tombstone first (a failed write aborts nothing and reports `failed`), then
+  `abortAndConfirm` — confirmed → its held rows owed again, `conflicted`; a row completed elsewhere
+  → paid; unconfirmed → `failed`, the kept tombstone confirmed by a later pass. With no local
+  entry (another device's intent) it is the same abort and the same verdicts.
 - **A convergence pass judges activity once (#835):** the pass watches `ActiveOps`
   (`convergence.ts`), so an id in process at ANY moment of the pass — already running when it
   began, or started during it (even one whose PUT landed after the server computed the listing,
