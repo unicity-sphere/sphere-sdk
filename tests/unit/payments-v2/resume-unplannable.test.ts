@@ -155,6 +155,22 @@ describe('one open intent resume cannot plan never wedges the pass (#840)', () =
     });
   }
 
+  for (const coinId of [COIN.toUpperCase(), COIN.slice(1), '']) {
+    it(`a direct-only send under coin id ${JSON.stringify(coinId)} is refused: a conflicted leg would cost 0 and complete it`, async () => {
+      const w = makeWorld();
+      const kept = await w.seed(600n);
+      const lost = await w.seed(400n);
+      await w.engine.foreignSpend(lost);
+      await stageIntent(w, BAD_ID, { coinId, direct: [kept.blob.tokenId, lost.blob.tokenId] });
+
+      const report = await resumeAll(w.deps);
+
+      expect(report).toEqual({ resumed: [], conflicted: [], failed: [BAD_ID] });
+      expectUntouched(w);
+      expect(w.log).not.toContain('completeIntent');
+    });
+  }
+
   it('the smallest asset value on either side of a split still resumes: 1 is in the domain', async () => {
     for (const split of [{ splitAmount: '1', remainderAmount: '999' }, { splitAmount: '999', remainderAmount: '1' }]) {
       const w = makeWorld();
