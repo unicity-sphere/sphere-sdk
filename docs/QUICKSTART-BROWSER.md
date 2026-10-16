@@ -729,10 +729,11 @@ before a link that failed to write reaches storage, no link exists: on the next 
 `'pending'` again and `payment_request:incoming` fires again, even if the transfer went through (a transfer the SDK
 had already recorded is resumed when the wallet starts). Before paying a request again after a restart, check
 `sphere.payments.pendingTransfers()` and `sphere.payments.history()` for a transfer to that requester. A SENT history
-row is best-effort. The SDK posts it once the transfer's legs have settled and records only what was delivered: for a
-partial send, the delivered part, with the remainder recorded under its own transferId when it is paid. A POST that
-fails is re-posted only by a later convergence pass while the transfer is still open, never after it settled, so a
-missing row does not prove that nothing was sent.
+row is best-effort. The SDK posts it once the transfer's legs have settled, and it records what certified on chain,
+whether or not the mailbox deposit has landed yet: a send that resolves `'confirmed'` with `deliveryPending: true` is
+posted too. For a partial send it records the certified part, with the remainder recorded under its own transferId when
+it is paid. A POST that fails is re-posted only by a later convergence pass while the transfer is still open, never
+after it settled, so a missing row does not prove that nothing was sent.
 
 ### Transaction History
 

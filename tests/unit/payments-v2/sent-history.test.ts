@@ -368,6 +368,21 @@ describe('#842 SENT history is posted beside the apply, never gated on the close
     expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
   });
 
+  it('T11 run(): a deposit still owed does not hold the row back — SENT records the certified amount', async () => {
+    const w = makeWorld();
+    const plan = await w.plan({ tokens: await seedAll(w, [600n, 400n]), amount: '1000' });
+    const recorded = captureHistory(w);
+    w.overrides.deliver = async () => {
+      throw new FakeApiError(503, 'UNAVAILABLE', 'mailbox down');
+    };
+
+    await expect(w.machine().run(plan)).resolves.toMatchObject({ deliveryPending: true });
+    await w.flushTail();
+
+    expect(w.deposits, 'nothing reached the mailbox').toEqual([]);
+    expect(recorded).toEqual([{ transferId: plan.transferId, phase: 'sent', committedAmount: '1000' }]);
+  });
+
   it('N1 a clean failure (nothing certified) records no SENT history', async () => {
     const w = makeWorld();
     const token = await w.seed(1000n);

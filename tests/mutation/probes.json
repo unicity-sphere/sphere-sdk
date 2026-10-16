@@ -2536,6 +2536,16 @@
     ]
   },
   {
+    "name": "run-history-gated-on-delivery",
+    "note": "#842: run() posts SENT for every certified leg whether or not its mailbox deposit landed. Gated on the deposit, a send that resolves 'confirmed' with deliveryPending: true gets no row, and the apply then completes the intent, so no later pass ever posts one (sent-history.test.ts T11)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      void postSettled(this.deps.recordHistory, sent);",
+    "replace": "      if (!deliveryPending) void postSettled(this.deps.recordHistory, sent);",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
     "name": "run-history-before-settled",
     "note": "#842: run() posts SENT only once the attempt fully settled. Posted as soon as a leg certified, a keep-open leg beside it fixes the certified part as the payment's amount for good, since the server keeps the first post under the transferId dedupKey (sent-history.test.ts N2)",
     "file": "modules/payments-v2/machine/TransferMachine.ts",

@@ -49,13 +49,15 @@ What changed:
     freshly generated entry `id` that `history()` never serves;
   - a SENT row is still best-effort. A POST that fails is re-posted only by a later pass while the
     transfer is still open, never after it settled, so a missing row does not prove that nothing
-    was sent. A partial send's row records only the delivered part; the remainder is recorded
-    under its own transferId when it is paid.
+    was sent. The row records what certified on chain, whether or not the mailbox deposit has
+    landed yet (a send resolving `'confirmed'` with `deliveryPending: true` is posted too); a
+    partial send's row records only the certified part, and the remainder is recorded under its
+    own transferId when it is paid.
 
 How it was verified: machine-level tests in `tests/unit/payments-v2/sent-history.test.ts` (a
 failed close, a lost apply answer, and a process that dies the moment the apply is issued, over
-one leg and two, on `send()` and on resume; a settled partial; a hung, a rejecting and a
-synchronously throwing history hook; a failed resumed apply reported at once while its POST
+one leg and two, on `send()` and on resume; a settled partial; a deposit still owed; a hung, a
+rejecting and a synchronously throwing history hook; a failed resumed apply reported at once while its POST
 hangs; nothing posted while a leg is unsettled; an undecodable blob; no record for a clean
 failure), facade-level cases in `tests/unit/payments-v2/send-intent-unknown.test.ts` against the
 real history store, including a whole-token send and a held send whose resume is the only writer

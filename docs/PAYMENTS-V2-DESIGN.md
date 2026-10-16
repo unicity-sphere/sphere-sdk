@@ -786,7 +786,7 @@ History: server read-through (`GET /v1/history` keyset pages) + client POSTs wit
 SENT by `transferId` (resume re-POST is a server no-op), RECEIVED by `(type, tokenId, stateHash)`,
 **MINT by `('MINT', tokenId)`** (a resumed mint must not double-POST); **a SENT record's amount is
 what SETTLED — the machine computes it from the certified recipient blobs (summarize()'s committed
-set), never the planned amount**, so a partial records the delivered portion and the remainder's
+set), never the planned amount**, so a partial records the certified portion and the remainder's
 re-plan records its own under the new transferId; a failed POST never fails
 the money path. **SENT is issued before the apply (#842)**, once the legs settled, whatever the
 apply or the close answers (§5.5 "Resolution point"): the apply completes an unflagged intent,
