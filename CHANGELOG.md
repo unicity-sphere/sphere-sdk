@@ -18,7 +18,9 @@ spent, and the split then failed or ran under `BigInt`'s reading of a grammar it
 have meant. A coin id that is not lowercase hex also passed on a send with no split. A direct leg
 that conflicted on resume was then costed by an exact match on that id, so it read as 0: the send
 completed as fully paid, nothing was owed for that leg, and a linked payment request resolved
-paid. The batched source read had the same coupling one layer down: wallet-api refuses the
+paid. A coin intent naming no leg at all (no direct leg and no split) passed too: it ran zero
+legs and was completed and reported resumed, so a linked request resolved paid with nothing moved.
+The batched source read had the same coupling one layer down: wallet-api refuses the
 whole `blob-urls` batch over one malformed or unowned token id, and one failed blob download
 rejects the read, so every send in the pass that needed a source failed closed, and the refusal's
 `Retry-After` was dropped. A pass that threw also dropped everything it had already decided. A
@@ -36,7 +38,8 @@ paid with nothing moved.
 What changed:
 
 - Split amounts must be canonical positive decimal strings below 2^256, and a coin intent's coin
-  id must be lowercase even-length hex, with or without a split. `amount` stays type-checked only, since the send path writes
+  id must be lowercase even-length hex, with or without a split. A coin intent must name at least
+  one leg (a direct leg or a split); no writer emits one with none. `amount` stays type-checked only, since the send path writes
   it verbatim and accepts leading zeros.
 - Each intent is planned inside its own failure boundary. One that cannot be planned is reported
   `failed` and left open: never executed, aborted or completed, and its sources are not touched.

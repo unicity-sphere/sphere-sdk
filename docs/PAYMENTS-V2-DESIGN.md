@@ -586,7 +586,9 @@ Normative behaviors bound into the transitions (not call sites):
   an unknown `kind`, a split amount (`splitAmount`, `remainderAmount`) that is not a canonical
   positive decimal below 2^256 (no sign, no leading zero, a JSON string), or a coin intent's
   `coinId` that is not lowercase even-length hex, with or without a split (a conflicted direct leg
-  is costed by an exact match on it, so another form would read 0 and complete the send paid). `amount` stays type-checked only: the send path accepts
+  is costed by an exact match on it, so another form would read 0 and complete the send paid), or a
+  coin intent that names no leg (no direct leg and no split: it would run nothing and complete
+  paid; the selector never plans one). `amount` stays type-checked only: the send path accepts
   leading zeros and writes it verbatim, and resume never parses it. A refused intent is reported
   `failed` and left open, so a linked request stays `settling`. It is never executed, aborted or
   completed, its sources are not touched, and it is kept apart from leg failures so that no

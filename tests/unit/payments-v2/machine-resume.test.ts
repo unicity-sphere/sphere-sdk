@@ -748,16 +748,22 @@ describe('resume confirms a parked intent before it resumes or sweeps anything (
 
   it('a pending entry the machine parked in memory (its flag write failed) is confirmed like a flagged one', async () => {
     const w = makeWorld();
-    const entry = openEntry('parked-in-memory', { intentPut: 'pending' });
-    await w.stores().backstop.upsert(entry);
-    const isParked = (id: string): boolean => id === entry.transferId;
+    const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+    const flagged = await parkSend(w, plan);
+    // The 'unconfirmed' write is the one that failed: the entry still reads 'pending'.
+    const entry = await w.stores().backstop.patch(plan.transferId, (e) => ({ ...e, intentPut: 'pending' }));
+    expect(entry?.intentPut).toBe('pending');
+    w.putCalls.length = 0;
+    const isParked = (id: string): boolean => id === plan.transferId;
 
     const report = await resumeAll(w.deps, { isParked });
 
-    expect(w.putCalls).toEqual([{ transferId: entry.transferId, envelope: entry.payloadEnvelope, requiresSeedClose: false }]);
-    // Confirmed, then run in the same pass: this synthetic intent has no legs, so it simply closes.
-    expect(report).toEqual({ resumed: [entry.transferId], conflicted: [], failed: [] });
-    expect(w.api.inspectIntent(w.caller, entry.transferId)?.status).toBe('completed');
+    expect(w.putCalls).toEqual([
+      { transferId: plan.transferId, envelope: flagged.payloadEnvelope, requiresSeedClose: flagged.requiresSeedClose },
+    ]);
+    // Confirmed, then run in the same pass under the same transferId.
+    expect(report).toEqual({ resumed: [plan.transferId], conflicted: [], failed: [] });
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('completed');
   });
 
   it('a deferred pass (unreadable backstop) says so through onDeferred and confirms nothing', async () => {
