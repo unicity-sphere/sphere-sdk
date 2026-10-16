@@ -614,7 +614,9 @@ Normative behaviors bound into the transitions (not call sites):
   apply: fire-and-forget on `send()` when every leg certified first time, and on resume (so also in
   `send()`'s in-process converge of a conflicted leg) awaited only after the close attempt, so a
   hung history endpoint holds neither the apply nor `complete` — though, with no client request
-  timeout, it still holds that pass after them. Neither the apply's answer nor the close gates it. The apply completes an unflagged intent, and
+  timeout, it still holds that pass after them. A resumed apply that fails rethrows at once,
+  without waiting on the POST, so the intent is reported failed and the pass moves on. Neither
+  the apply's answer nor the close gates the POST. The apply completes an unflagged intent, and
   after that no pass lists the row again: the next pass sweeps its backstop as residue and records
   nothing. A SENT POST that waited on `complete`, or on the apply's answer, was lost for good when
   `complete` failed, or when the apply committed but its answer never arrived (a lost response, or
@@ -767,7 +769,8 @@ unless the server lists its intent as aborted (paid-never-re-payable once a dura
 `pay()` can list an already-paid request as `pending` (payable) again after a restart; and
 if the link write fails on the possibly-committed path, `pay()` rejects with the storage error
 instead of the send error and the link lives only in memory. Until #806 is fixed, check
-`pendingTransfers()` / `history()` before paying a request again. **The settlement invariant (one
+`pendingTransfers()` / `history()` before paying a request again — though a missing SENT row
+proves nothing (§5.9: the POST is best-effort). **The settlement invariant (one
 code path):** a settling link is removed ONLY by a CONFIRMED paid respond (2xx, or the 409
 already-resolved absorb) or by a proven clean pre-commit failure — never by a network error, a
 5xx, or a reload; a clean-success send whose respond fails keeps the link (status `settling`) and

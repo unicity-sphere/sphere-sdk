@@ -631,12 +631,12 @@ export class TransferMachine {
     return { entry, closed };
   }
 
-  /** #842: SENT leaves before the apply and is awaited only after the close, whatever either answered. */
+  /** #842: SENT leaves before the apply; awaited only after a close, so a failed apply reports at once. */
   private async applyRecorded<T>(engine: ITokenEngine, r: RehydratedIntent, committed: OpOutcome[], close: () => Promise<T>): Promise<T> {
     const sent = await settledRecord(engine, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });
     const recorded = postSettled(this.deps.recordHistory, sent);
+    await this.applyCommitted(engine, r.transferId, committed);
     try {
-      await this.applyCommitted(engine, r.transferId, committed);
       return await close();
     } finally {
       await recorded;

@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { isPossiblyCommittedSendOutcome } from '../../../core/errors';
-import { TransferConflictError } from '../../../token-engine/errors';
+import { ProofUnconfirmedError, TransferConflictError } from '../../../token-engine/errors';
 import { resumeAll } from '../../../modules/payments-v2/machine/resume';
 import { FakeApiError } from './fakes/FakeWalletApi';
 import { makeWorld, type World } from './machine-harness';
@@ -267,6 +267,22 @@ describe('#842 SENT history is posted beside the apply, never gated on the close
     expect(order, 'SENT went out beside the apply, never after the close').toEqual(['recordHistory', 'completeIntent']);
   });
 
+  it('T10 resume: an apply that fails is reported failed at once, even while the history POST never answers', async () => {
+    const w = makeWorld();
+    const transferId = await openAfterFailedApply(w);
+    w.deps.recordHistory = () => new Promise<never>(() => undefined);
+    failApplyOnce(w);
+
+    const report = await Promise.race([
+      resumeAll(w.deps),
+      new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 200)),
+    ]);
+
+    expect(report, 'the pass is not held by the POST').not.toBe('hung');
+    expect(report).toMatchObject({ resumed: [], failed: [transferId] });
+    expect(w.completes, 'nothing closes after a failed apply').toEqual([]);
+  });
+
   it('T8 run(): a history POST that never answers holds neither the apply, the close nor send()', async () => {
     const w = makeWorld();
     const token = await w.seed(1000n);
@@ -364,5 +380,28 @@ describe('#842 SENT history is posted beside the apply, never gated on the close
     await resumeAll(w.deps);
 
     expect(recorded).toEqual([]);
+  });
+
+  // The server keeps the FIRST post under a dedupKey, so a SENT row posted before the
+  // attempt settled would fix the certified part as the payment's amount for good.
+  it('N2 a keep-open leg beside a certified one: run() posts nothing, and resume posts the settled 1000', async () => {
+    const w = makeWorld();
+    const plan = await w.plan({ tokens: await seedAll(w, [600n, 400n]), amount: '1000' });
+    const recorded = captureHistory(w);
+    let unconfirmed = true;
+    w.engine.beforeOp = (key) => {
+      if (key !== `${plan.transferId}:1` || !unconfirmed) return;
+      unconfirmed = false;
+      throw new ProofUnconfirmedError('proof not seen yet');
+    };
+
+    await expect(w.machine().run(plan)).rejects.toSatisfy(isPossiblyCommittedSendOutcome);
+    await w.flushTail();
+    expect(recorded, 'nothing is posted while a leg is unsettled').toEqual([]);
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toMatchObject({ resumed: [plan.transferId], failed: [] });
+    expect(recorded).toEqual([{ transferId: plan.transferId, phase: 'resumed', committedAmount: '1000' }]);
   });
 });

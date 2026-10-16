@@ -31,7 +31,10 @@ What changed:
   that converges a conflicted leg in-process, the POST is awaited after the close attempt: a
   history endpoint that never answers holds back neither the apply nor `complete`, but it still
   holds that pass (and that `send()`) after them, as any request that never answers does, since
-  the client sets no request timeout. The recorded amount is still what settled, never the plan.
+  the client sets no request timeout. A resumed apply that fails is reported at once, without
+  waiting for the POST, so one intent's hung history request never holds back the report of a
+  failed apply or the wallet's other open intents. The recorded amount is still what settled,
+  never the plan.
 - A failed resume close still reports the intent failed and carries its `Retry-After`. A history
   failure, a history hook that throws, or a recipient blob the history read cannot decode still
   never fails a send or a resume.
@@ -52,11 +55,15 @@ What changed:
 How it was verified: machine-level tests in `tests/unit/payments-v2/sent-history.test.ts` (a
 failed close, a lost apply answer, and a process that dies the moment the apply is issued, over
 one leg and two, on `send()` and on resume; a settled partial; a hung, a rejecting and a
-synchronously throwing history hook; an undecodable blob; no record for a clean failure),
-facade-level cases in `tests/unit/payments-v2/send-intent-unknown.test.ts` against the real history
-store, including a whole-token send and a held send whose resume is the only writer of its row,
-a staging case that re-POSTs a SENT record under a fresh entry id and expects the server to
-deduplicate it, and mutation probes for each ordering on both paths.
+synchronously throwing history hook; a failed resumed apply reported at once while its POST
+hangs; nothing posted while a leg is unsettled; an undecodable blob; no record for a clean
+failure), facade-level cases in `tests/unit/payments-v2/send-intent-unknown.test.ts` against the
+real history store, including a whole-token send and a held send whose resume is the only writer
+of its row, mutation probes for each ordering on both paths, and two cases run against the live
+staging wallet-api (`-t '#842'` in `tests/e2e/payments-v2-vertical.staging.e2e.test.ts`): a
+`complete` that answers 503 once after a good apply, and an apply whose answer is lost after the
+server committed it, each leaving exactly one SENT row in the real `history()`, and a re-POST of
+that record under a fresh entry id that the server deduplicates.
 
 ### Changed (breaking) — DIRECT:// is no longer a payment recipient; unused DIRECT helpers removed (#847)
 
