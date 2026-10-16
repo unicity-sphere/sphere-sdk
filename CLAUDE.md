@@ -157,7 +157,7 @@ if (created && generatedMnemonic) {
 
 // 4. Identity is ready
 const identity = sphere.identity!;
-console.log('L3 address:', identity.directAddress);  // DIRECT://... (primary)
+console.log('Quests id:', identity.directAddress);   // DIRECT://... (not a payment address, #847)
 console.log('Unicity ID:', identity.nametag);        // alice
 
 // 5. Balances and tokens (server-read-through; Asset keeps its legacy shape —
@@ -178,9 +178,10 @@ const views = await sphere.payments.nfts(nfts.map((t) => t.tokenId)); // Map<tok
 const filtered = sphere.payments.tokens({ coinId: '...' });
 
 // 6. Send tokens (L3). Recipient must have a PUBLISHED chain pubkey
-//    (@nametag / DIRECT:// resolve via Nostr binding); fails loudly otherwise.
+//    (@nametag resolves via Nostr binding); fails loudly otherwise. A DIRECT://
+//    recipient is refused with INVALID_RECIPIENT before any lookup (#847).
 const result = await sphere.payments.send({
-  recipient: '@bob',           // @nametag, DIRECT://..., or chain pubkey (02...)
+  recipient: '@bob',           // @nametag or chain pubkey (02...); never DIRECT://
   amount: '1000000',           // in smallest unit (string)
   coinId: coinIdHex,           // coin ID — 64-hex ONLY on the money path (see the note below)
   memo: 'Payment for coffee',  // optional (recipient-encrypted envelope)
@@ -416,7 +417,6 @@ sphere-sdk/
 │   ├── Sphere.ts           # Main wallet class - entry point
 │   ├── payments-v2-wiring.ts # Composition: walletApi config → facade (resolvePaymentsV2Composition)
 │   ├── wallet-api-protocol.ts # Cross-repo contract strings (auth challenge, intent signing)
-│   ├── address.ts          # DIRECT:// address parsing/validation
 │   ├── crypto.ts           # BIP39/BIP32, secp256k1, hashing, message signing
 │   ├── encryption.ts       # Wallet/seed encryption, CryptoJS AES-256-CBC: encryptSimple (OpenSSL
 │   │                       #   passphrase mode, MD5 EVP_BytesToKey, 1 iteration) stores the seed
@@ -440,7 +440,7 @@ sphere-sdk/
 │   ├── certification-outcome.ts # conflict vs possibly-committed classification
 │   ├── split-checkpoint.ts # Durable burn checkpoint (CHECKPOINT_VERSION 2)
 │   ├── blob-keys.ts        # deriveDeliveryKeys() over raw Token.toCBOR() bytes
-│   ├── identity.ts         # deriveDirectAddress() — vendored v1-identical DIRECT:// derivation
+│   ├── identity.ts         # deriveDirectAddress() — vendored v1-identical DIRECT:// (Quests id) derivation
 │   ├── network.ts          # SphereNetwork ↔ SDK NetworkId mapping
 │   └── sdk.ts              # ⚠️ THE ONLY file allowed to import @unicitylabs/state-transition-sdk
 │
@@ -582,7 +582,7 @@ sphere-domain type that moved is `TokenBlob` (two never-read fields dropped — 
   `no-restricted-imports` rule blocks any other import of
   `@unicitylabs/state-transition-sdk` — everything else codes against the
   `ITokenEngine` port and sphere-domain types from `token-engine/`.
-- `ITokenEngine` operations: `getIdentity`, `deriveIdentityAddress`, `tokenId`,
+- `ITokenEngine` operations: `getIdentity`, `tokenId`,
   `readValue`, `balanceOf`, `readMemo`, `readTokenData`, `mint`, `mintDataToken`,
   `transfer`, `split`, `verify`, `isSpent`, `isOwnedBy`, `encodeToken`,
   `decodeToken`, `deliveryKeys`, `buildNftMint`, `readNft` (#785), and the optional
@@ -646,22 +646,30 @@ mnemonic → master key → BIP32 derivation → identity
                                               ↓
                         ┌─────────────────────┴─────────────────────┐
                         │  chainPubkey:   33-byte compressed pubkey │
-                        │  directAddress: DIRECT://... (L3)         │
+                        │  directAddress: DIRECT://... (Quests id)  │
                         │  transportPubkey: derived for Nostr       │
                         └─────────────────────────────────────────────┘
 ```
 
 The `DIRECT://` address is derived by `token-engine/identity.ts`
 (`deriveDirectAddress`) — a vendored, byte-identical reproduction of the v1
-derivation. It MUST stay stable: external systems (Quest XP) key user identity
-on it.
+derivation, fed `getPublicKey(SHA256(privateKey))` (never `chainPubkey`, so nobody
+can compute it from the pubkey). Its ONE job is the wallet's Sphere Quests account
+id (#847), and it MUST stay byte-stable: Quests keys accounts on it and reads it
+back from the identity binding's `direct_address` via `resolve(<chain pubkey>)`.
+It is NOT a payment address: `send()` / `sendWholeToken()` / `sendCoinless()` reject
+a `DIRECT://` recipient (any case, leading `@`) with `INVALID_RECIPIENT` before any
+lookup, `requests.create()` resolves `{ success: false }`, and ConnectHost refuses
+it on `send` / `payment_request` / `send_nft` with `INVALID_PARAMS`
+(`isDirectAddressRecipient`, `DIRECT_RECIPIENT_REFUSED_MESSAGE`). Money always
+locks to the recipient's chain pubkey.
 
 ### Key Types
 
 ```typescript
 interface Identity {
   chainPubkey: string;      // 33-byte compressed secp256k1 (for L3)
-  directAddress?: string;   // L3 DIRECT address
+  directAddress?: string;   // DIRECT://... — the Sphere Quests account id, not a payment address
   ipnsName?: string;        // legacy derived id; retained for backup-format stability
   nametag?: string;         // Unicity ID (@username)
 }
@@ -671,7 +679,7 @@ interface FullIdentity extends Identity {
 }
 
 interface SendRequest {     // sphere.payments.send()
-  recipient: string;        // @nametag, DIRECT://..., chain pubkey
+  recipient: string;        // @nametag or chain pubkey (DIRECT:// is refused, #847)
   amount: string;           // Amount in smallest unit
   coinId: string;           // Coin ID — even-length lowercase hex
   memo?: string;            // Optional message (recipient-encrypted envelope)
@@ -1043,12 +1051,14 @@ authoritative for build success.
 
 ### Peer Resolution
 - `sphere.resolve(identifier)` — unified lookup via transport.
-- Accepts: `@nametag`, `DIRECT://...`, chain pubkey (`02`/`03`),
-  transport pubkey (64-hex). Returns `PeerInfo` or `null`.
+- Accepts: `@nametag`, chain pubkey (`02`/`03`), transport pubkey (64-hex), and — deprecated,
+  kept until #847 phase 2 (as are DMs to it) — `DIRECT://...`. Returns `PeerInfo` or `null`;
+  `resolve(<chain pubkey>)` returns the peer's published `directAddress` (the Quests read-back).
 - Identity binding event published on init/load — wallet discoverable without a Unicity ID.
 - The payments vertical rides the same resolution for `send()`/`requests.create()` recipients.
-  A bare 66-hex chain pubkey is taken as being on the session network. A `@nametag` / `DIRECT://`
-  binding declares no network (#734), so every such send emits `transfer:attention`
+  A `DIRECT://` recipient is refused before resolution (#847). A bare 66-hex chain pubkey is
+  taken as being on the session network. A `@nametag` binding declares no network (#734), so
+  every such send emits `transfer:attention`
   `recipient:network-unverified` (with `transferId: ''`) and proceeds on the session network; a
   resolved peer that DOES declare another network is refused with `INVALID_RECIPIENT`.
 

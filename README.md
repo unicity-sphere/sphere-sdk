@@ -482,7 +482,7 @@ Event handlers receive the payload directly: `sphere.on('identity:changed', (e) 
 // Listen for address switches
 const off = sphere.on('identity:changed', (event) => {
   console.log('Switched to address index:', event.addressIndex);
-  console.log('L3 address:', event.directAddress);
+  console.log('Quests id:', event.directAddress);
   console.log('Chain pubkey:', event.chainPubkey);
   console.log('Nametag:', event.nametag);
 });
