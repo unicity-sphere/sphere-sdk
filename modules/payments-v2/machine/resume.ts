@@ -493,6 +493,9 @@ function validateCoinPayload(c: Partial<CoinIntentPayload>): CoinIntentPayload {
   ) {
     throw new SphereError('intent payload split spec is malformed', 'VALIDATION_ERROR');
   }
+  if (s === undefined && c.direct?.length === 0) {
+    throw new SphereError('coin intent payload names no leg', 'VALIDATION_ERROR'); // #840: zero ops would complete it paid
+  }
   // #840: a split leg refuses any other form after the direct legs spent, and a conflicted
   // direct leg is costed by exact coin id, so it would read 0 and the intent complete paid.
   if (!/^(?:[0-9a-f]{2})+$/.test(c.coinId)) {

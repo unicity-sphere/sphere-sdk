@@ -4188,6 +4188,16 @@
     ]
   },
   {
+    "name": "resume-coin-zero-legs-accepted",
+    "note": "#840: a coin intent with no direct leg and no split builds zero ops, and resume completes it as paid with nothing moved. No writer emits one (the selector returns null for a non-positive target), so it is refused and left open (resume-unplannable.test.ts 'a coin intent that names no leg is refused').",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (s === undefined && c.direct?.length === 0) {",
+    "replace": "  if (s === undefined && c.direct?.length === -1) {",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
     "name": "resume-plans-outside-intent-try",
     "note": "#840: ops are planned inside each intent's own try, so an intent buildOps cannot plan fails alone. Validation shadows this for every JSON input, so only the vi.mock test (a buildOps that throws) kills it.",
     "file": "modules/payments-v2/machine/resume.ts",

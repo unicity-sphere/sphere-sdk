@@ -46,9 +46,9 @@ async function keepOpenSend(w: World, amount = 1000n): Promise<string> {
 }
 
 /** An intent another client of this wallet wrote, server-open, with no local entry here. */
-async function stageIntent(w: World, id: string, payload: Record<string, unknown>): Promise<void> {
+async function stageIntent(w: World, id: string, payload: Record<string, unknown>, requiresSeedClose = true): Promise<void> {
   const body = { v: 2, kind: 'coin', recipient: w.recipientHex, coinId: COIN, amount: '1000', ...payload };
-  await w.api.putIntent(w.caller, { transferId: id, payload: `enc:${JSON.stringify(body)}`, requiresSeedClose: true });
+  await w.api.putIntent(w.caller, { transferId: id, payload: `enc:${JSON.stringify(body)}`, requiresSeedClose });
 }
 
 /** One direct leg, then a split of a second token: a late refusal would spend the direct leg first. */
@@ -163,6 +163,19 @@ describe('one open intent resume cannot plan never wedges the pass (#840)', () =
       const lost = await w.seed(400n);
       await w.engine.foreignSpend(lost);
       await stageIntent(w, BAD_ID, { coinId, direct: [kept.blob.tokenId, lost.blob.tokenId] });
+
+      const report = await resumeAll(w.deps);
+
+      expect(report).toEqual({ resumed: [], conflicted: [], failed: [BAD_ID] });
+      expectUntouched(w);
+      expect(w.log).not.toContain('completeIntent');
+    });
+  }
+
+  for (const requiresSeedClose of [false, true]) {
+    it(`a coin intent that names no leg is refused (requiresSeedClose ${requiresSeedClose}): zero ops would complete it paid`, async () => {
+      const w = makeWorld();
+      await stageIntent(w, BAD_ID, { direct: [] }, requiresSeedClose);
 
       const report = await resumeAll(w.deps);
 
