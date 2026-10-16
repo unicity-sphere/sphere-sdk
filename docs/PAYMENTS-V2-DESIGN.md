@@ -698,7 +698,7 @@ fires end to end. `@nametag` and `DIRECT://` resolve through nostr-js-sdk's
 `queryBindingByNametag`/`queryBindingByAddress`, which hardcode `parseBindingInfo` inside a
 **private** resolver: sphere never sees the signed event that UNIP-01 resolution selected, and the
 parse has already dropped every content field outside its whitelist. Re-querying raw would mean
-re-deriving ownership ourselves (marker preference, cross-author first-seen-wins, ambiguity→null,
+re-deriving ownership ourselves (candidate filtering by identifier, marker preference, ambiguity→null,
 multi-relay settle — all private), and a second resolver that can disagree with the SDK's is worse
 than a missing field on a money guard. So for those two routes §5.6 can only ever land on row 3
 today; `bindingInfoToPeerInfo` therefore carries **no** network at all rather than a value that

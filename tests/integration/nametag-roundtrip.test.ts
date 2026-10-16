@@ -4,7 +4,7 @@
  *
  * Key behavior (matching nostr-js-sdk):
  * - publishIdentityBinding delegates to nostrClient.publishNametagBinding
- * - resolveNametag delegates to nostrClient.queryPubkeyByNametag (first-seen-wins)
+ * - resolveNametag delegates to nostrClient.queryPubkeyByNametag (single claimant, or null)
  *
  * Uses NostrClient module-level mock since NostrTransportProvider
  * delegates WebSocket management to NostrClient.
@@ -116,18 +116,13 @@ const mockPublishNametagBinding = vi.fn().mockImplementation(
     const { hashNametag: ht } = await import('@unicitylabs/nostr-js-sdk');
     const hashedNametag = ht(nametagId);
 
-    // Check for existing binding by different pubkey (first-seen-wins)
-    const existing = relayEventStore.find((e) => {
-      const tTag = e.tags.find((t) => t[0] === 't');
-      return tTag && tTag[1] === hashedNametag;
+    // Reject if any other author claims the nametag (as nostr-js-sdk does)
+    const claimedByOther = relayEventStore.some((e) => {
+      const dTag = e.tags.find((t) => t[0] === 'd');
+      return dTag && dTag[1] === hashedNametag && e.pubkey !== mockNostrPubkey;
     });
-
-    if (existing) {
-      // Check if it's a different author — reject
-      const nostrPubkey = mockNostrPubkey;
-      if (existing.pubkey !== nostrPubkey) {
-        return false;
-      }
+    if (claimedByOther) {
+      return false;
     }
 
     // Store event (simulating what nostr-js-sdk does)
@@ -152,21 +147,22 @@ const mockPublishNametagBinding = vi.fn().mockImplementation(
   }
 );
 
-// queryPubkeyByNametag: first-seen-wins lookup
+// queryPubkeyByNametag: the single claimant, or null (as nostr-js-sdk)
 const mockQueryPubkeyByNametag = vi.fn().mockImplementation(async (nametagId: string) => {
   const { hashNametag: ht } = await import('@unicitylabs/nostr-js-sdk');
   const hashedNametag = ht(nametagId);
 
-  const matching = relayEventStore.filter((e) => {
-    const tTag = e.tags.find((t) => t[0] === 't');
-    return tTag && tTag[1] === hashedNametag;
-  });
+  const claimants = new Set(
+    relayEventStore
+      .filter((e) => {
+        const dTag = e.tags.find((t) => t[0] === 'd');
+        return dTag && dTag[1] === hashedNametag;
+      })
+      .map((e) => e.pubkey),
+  );
 
-  if (matching.length === 0) return null;
-
-  // First-seen-wins: earliest created_at
-  matching.sort((a, b) => a.created_at - b.created_at);
-  return matching[0].pubkey;
+  // More than one author is ambiguous: created_at never picks a winner.
+  return claimants.size === 1 ? [...claimants][0] : null;
 });
 
 let mockNostrPubkey = '';

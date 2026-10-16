@@ -1027,9 +1027,10 @@ authoritative for build success.
 - Human-readable aliases (e.g., `@alice`) for receiving payments.
 - **Registration = publishing the Nostr identity binding** (name ↔ chainPubkey). The binding
   carries the UNIP-01 marker `["L", "unicity:nametag"]` (nostr-js-sdk 0.6.0): a UNIP-01 relay
-  enforces single ownership by receive order, and resolution prefers the marked binding
-  (ambiguous → `null`); `created_at` first-seen-wins is only the legacy fallback for unmarked
-  bindings and is forgeable. See `docs/NAMETAG-BINDINGS.md`. Runtime name resolution is
+  enforces single ownership by receive order. Resolution (nostr-js-sdk 0.6.1) counts only
+  bindings for the queried identifier (nametag: `d` tag = name hash), prefers the marked binding
+  for nametags, and returns `null` when more than one author claims the identifier; `created_at`
+  never picks between authors. See `docs/NAMETAG-BINDINGS.md`. Runtime name resolution is
   Nostr-binding-only; receive is always `SignaturePredicate(chainPubkey)`;
   there is **no PROXY addressing anywhere**.
 - The self-issued `UnicityIdToken` mint was REMOVED with the 2.0.0 SDK bump

@@ -1844,7 +1844,7 @@ interface SphereEventMap {
 
 ## Unicity ID (Nametag) Registration
 
-Nametags (Unicity IDs, `@alice`) are **Nostr identity bindings** (name ↔ chainPubkey) — there is no PROXY address scheme and receive is always locked to the recipient's chain pubkey (`SignaturePredicate`). Registration publishes the binding; ownership follows UNIP-01 (marked bindings, single owner by relay receive order, ambiguous → null; `created_at` first-seen-wins only for legacy unmarked bindings), see [NAMETAG-BINDINGS.md](./NAMETAG-BINDINGS.md#anti-hijacking).
+Nametags (Unicity IDs, `@alice`) are **Nostr identity bindings** (name ↔ chainPubkey) — there is no PROXY address scheme and receive is always locked to the recipient's chain pubkey (`SignaturePredicate`). Registration publishes the binding; ownership follows UNIP-01 (marked bindings, single owner by relay receive order; a name claimed by more than one author resolves to null, and `created_at` never decides between authors), see [NAMETAG-BINDINGS.md](./NAMETAG-BINDINGS.md#anti-hijacking).
 
 ### Sphere Methods
 

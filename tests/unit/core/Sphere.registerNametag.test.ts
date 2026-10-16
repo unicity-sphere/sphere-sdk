@@ -1,7 +1,7 @@
 /**
  * registerNametag is Nostr-binding only (D5): registering a nametag publishes the
  * identity binding (name ↔ chainPubkey); there is NO on-chain nametag token mint.
- * Receive is always SignaturePredicate(chainPubkey). The publish first-seen-wins
+ * Receive is always SignaturePredicate(chainPubkey). The publish "already claimed"
  * failure path is the uniqueness guard.
  *
  * (Replaces the obsolete Sphere.mint-before-publish suite, whose mint-then-publish
