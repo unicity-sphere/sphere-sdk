@@ -30,6 +30,7 @@ import { stubRequestMemoCodec } from './support';
 
 const BAD_ID = '00000000-0000-4000-8000-000000000840'; // sorts before every harness id
 const TWO_256 = (1n << 256n).toString();
+const OTHER_COIN = 'bb'.repeat(32); // canonical, but no seeded token carries it
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -171,6 +172,31 @@ describe('one open intent resume cannot plan never wedges the pass (#840)', () =
       expect(w.log).not.toContain('completeIntent');
     });
   }
+
+  it('a direct-only send under a canonical coin id its sources do not carry is refused: a conflicted leg would cost 0', async () => {
+    const w = makeWorld();
+    const kept = await w.seed(600n);
+    const lost = await w.seed(400n);
+    await w.engine.foreignSpend(lost);
+    await stageIntent(w, BAD_ID, { coinId: OTHER_COIN, direct: [kept.blob.tokenId, lost.blob.tokenId] });
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [BAD_ID] });
+    expectUntouched(w);
+    expect(w.log).not.toContain('completeIntent');
+    expect(await w.stores().shortfalls.list()).toEqual([]);
+  });
+
+  it('a split under a canonical coin id its sources do not carry is refused before the direct leg beside it is spent', async () => {
+    const w = makeWorld();
+    await stageSplit(w, BAD_ID, { splitAmount: '600', remainderAmount: '400' }, OTHER_COIN);
+
+    const report = await resumeAll(w.deps);
+
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [BAD_ID] });
+    expectUntouched(w);
+  });
 
   for (const requiresSeedClose of [false, true]) {
     it(`a coin intent that names no leg is refused (requiresSeedClose ${requiresSeedClose}): zero ops would complete it paid`, async () => {

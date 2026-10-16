@@ -588,7 +588,10 @@ Normative behaviors bound into the transitions (not call sites):
   `coinId` that is not lowercase even-length hex, with or without a split (a conflicted direct leg
   is costed by an exact match on it, so another form would read 0 and complete the send paid), or a
   coin intent that names no leg (no direct leg and no split: it would run nothing and complete
-  paid; the selector never plans one). `amount` stays type-checked only: the send path accepts
+  paid; the selector never plans one). Each source a coin intent still has to spend must carry its
+  coin by its blob, read before any leg runs: a conflicted leg is costed by its balance of that coin,
+  so a source without it would read 0 too, and a split of it fails after the direct legs spent.
+  `amount` stays type-checked only: the send path accepts
   leading zeros and writes it verbatim, and resume never parses it. A refused intent is reported
   `failed` and left open, so a linked request stays `settling`. It is never executed, aborted or
   completed, its sources are not touched, and it is kept apart from leg failures so that no

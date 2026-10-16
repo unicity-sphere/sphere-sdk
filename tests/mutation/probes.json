@@ -1524,8 +1524,8 @@
     "name": "resume-skips-blob-value-authority",
     "note": "#777: the blob is the authority on resume too. Without this a durable intent labelled 'token' whose named source carries coins moves them while history records assets: [] \u2014 value moved, nothing accounted.",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "    if (isWholeIntent(job.payload) && token.valueEnvelope === 'bare_collection') {",
-    "replace": "    if (false as boolean) {",
+    "find": "  if (isWholeIntent(payload)) return token.valueEnvelope === 'bare_collection' ? 'carrying coin value' : null;",
+    "replace": "  if (isWholeIntent(payload)) return null;",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
@@ -3705,6 +3705,16 @@
     "file": "modules/payments-v2/machine/resume.ts",
     "find": "  if (s === undefined && c.direct?.length === 0) {",
     "replace": "  if (s === undefined && c.direct?.length === -1) {",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-coin-source-without-coin-accepted",
+    "note": "#840: every source a coin intent still has to spend must carry its coin by its blob. A canonical coin id the sources do not hold costs a conflicted direct leg 0, so the intent completes as paid with the leg owed nowhere, and a split of such a source fails only after the direct legs beside it spent (resume-unplannable.test.ts '...a canonical coin id its sources do not carry...').",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  return ctx.deps.engine().balanceOf(token, payload.coinId) > 0n ? null : 'without the intent coin';",
+    "replace": "  return null;",
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
     ]
