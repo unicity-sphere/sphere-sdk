@@ -4097,6 +4097,27 @@
     ]
   },
   {
+    "name": "resume-conflict-retire-completed-as-aborted",
+    "note": "#846: with a local entry, a row another device completed before the abort landed (a no-op 204) is paid: its holds settle and it is never reported conflicted, so a linked request never turns payable again (resume-conflict-cancel.test.ts 'the row was completed on another device before the abort landed...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    await retire(stores, entry, outcome, report).catch(",
+    "replace": "    await retire(stores, entry, outcome === 'completed' ? 'aborted' : outcome, report).catch(",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-retire-completed-refused",
+    "note": "#846: retire treats a completed row as paid, never refused: refusing it releases what it held (owed again) and reports it conflicted, a double pay (resume-conflict-cancel.test.ts, machine-resume.test.ts tombstone cases)",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  const refused = outcome !== 'completed';",
+    "replace": "  const refused = true;",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
     "name": "resume-conflict-retire-failure-unreported",
     "note": "#846: a confirmed cancel whose cleanup throws is reported failed, so the pass does not read it as settled (resume-conflict-cancel.test.ts '...the entry removal fails...', machine-resume.test.ts 'a holder whose conflict cleanup could not remove its entry...')",
     "file": "modules/payments-v2/machine/resume.ts",
