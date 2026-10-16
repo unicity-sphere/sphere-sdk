@@ -34,8 +34,9 @@ What changed:
   `isValidDirectAddress`, `normalizeAddress`, `addressesMatch` and the `AddressType` /
   `ParsedAddress` types (the whole `core/address.ts`, including its unexported `DIRECT_PREFIX`);
   `getAddressStorageKey`; and `ITokenEngine.deriveIdentityAddress`, which hashed the raw chain pubkey
-  and so returned a different string from `sphere.identity.directAddress`. A custom engine that still
-  implements it is unaffected; a caller of it no longer compiles.
+  and so returned a different string from `sphere.identity.directAddress`. A class that implements
+  `ITokenEngine` and keeps the method still compiles; an object literal typed `ITokenEngine` must
+  drop the property (TS2353, excess property), and a caller of it no longer compiles.
 
 Kept, byte-stable, for Quests sign-in: the derivation (`deriveDirectAddress` on `./token-engine`,
 fed `getPublicKey(SHA256(privateKey))`), `sphere.identity.directAddress`,

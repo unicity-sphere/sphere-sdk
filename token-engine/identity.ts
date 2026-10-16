@@ -1,8 +1,9 @@
 /**
  * token-engine/identity.ts — the legacy `DIRECT://` derivation (Path A, A6).
  *
- * Its one job is the wallet's Sphere Quests account id (#847): it is not a payment
- * address, and the money path refuses it as a recipient. Reproduces the v1
+ * Its output is the wallet's Sphere Quests account id (#847) and the input to addressId
+ * (getAddressId: the key of the per-address nametag map and tracked addresses). It is
+ * not a payment address; the money path refuses it as a recipient. Reproduces the v1
  * `UnmaskedPredicateReference` → `DirectAddress` path EXACTLY, VENDORED (no v1 SDK
  * import). Quests accounts are keyed on its output, so it MUST stay byte-identical —
  * the multi-vector golden test (identity.test.ts) locks it. The wallet passes

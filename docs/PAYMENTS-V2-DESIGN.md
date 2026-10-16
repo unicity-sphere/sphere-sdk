@@ -1030,10 +1030,11 @@ verify per entry, batched acks.
   - **Shapes:** exact single token (1 direct); exact combination (k direct, 2–5); greedy
     m direct + 1 split; split-only (0 direct + 1 split); greedy exact-sum (all-direct, no split);
     whole-balance send.
-  - **Recipients:** third party (@nametag, DIRECT://, raw pubkey); **self-send** (spend and claim
-    commute server-side; same tokenId in `spent`+`added` is a 422 — the self-output rides the
-    mailbox); **roundtrip A→B→A** (re-acquired genesis at a new state — the `(tokenId, stateHash)`
-    dedup must accept it, RECEIVED history per state, server handoff tombstones + reactivation).
+  - **Recipients:** third party (@nametag, raw pubkey; a DIRECT:// recipient is refused, #847);
+    **self-send** (spend and claim commute server-side; same tokenId in `spent`+`added` is a 422
+    — the self-output rides the mailbox); **roundtrip A→B→A** (re-acquired genesis at a new
+    state — the `(tokenId, stateHash)` dedup must accept it, RECEIVED history per state, server
+    handoff tombstones + reactivation).
   - **Cross-products that have bitten before:** split where change and recipient outputs land in
     the same wallet (self-split); m direct + split in one transfer resumed mid-way (non-prefix
     certified subset); concurrent sends of the same coin (one queues for change); send while the

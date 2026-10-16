@@ -45,7 +45,7 @@ export type {
   NftReading,
 } from './types';
 
-// Identity (A6): the DIRECT:// Sphere Quests account-id derivation, byte-stable.
+// Identity (A6): the DIRECT:// derivation (Sphere Quests id, addressId input), byte-stable.
 // core/Sphere feeds it getPublicKey(SHA256(privateKey)), never the chain pubkey.
 export { deriveDirectAddress } from './identity';
 
