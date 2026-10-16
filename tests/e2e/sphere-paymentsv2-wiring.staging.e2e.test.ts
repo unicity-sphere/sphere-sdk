@@ -152,8 +152,8 @@ afterAll(async () => {
   if (dataDir !== '') fs.rmSync(dataDir, { recursive: true, force: true });
 }, 240_000);
 
-async function diagnose(label: string): Promise<string> {
-  const pv2 = sphere?.payments;
+async function diagnose(label: string, wallet: Sphere | null = sphere): Promise<string> {
+  const pv2 = wallet?.payments;
   if (!pv2) return `${label}: no active vertical`;
   const history = await pv2.history({ limit: 50 }).catch(() => ({ entries: [] }));
   return JSON.stringify(
@@ -192,14 +192,14 @@ async function mintConvergedOnce(amount: bigint, wallet: Sphere = sphere!): Prom
     const tokens = wallet.payments.tokens({ coinId: HARNESS_COIN });
     if (tokens.length > 0) {
       if (tokens.length !== 1 || totalOf(wallet.payments) !== amount) {
-        throw new Error(`mint replay must converge to exactly ONE token\n${await diagnose('mint-replay')}`);
+        throw new Error(`mint replay must converge to exactly ONE token\n${await diagnose('mint-replay', wallet)}`);
       }
       logStep(`mint converged via replay on cycle ${cycle}: ${tokens[0]!.id}`);
       return tokens[0]!.id;
     }
     if (cycle % 5 === 0) logStep(`mint replay still throttled after ${cycle} cycles`);
   }
-  throw new Error(`mint never admitted by the gateway submit throttle\n${await diagnose('mint')}`);
+  throw new Error(`mint never admitted by the gateway submit throttle\n${await diagnose('mint', wallet)}`);
 }
 
 /**
