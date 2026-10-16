@@ -176,8 +176,8 @@ const MINT_VALIDATION_ERROR = 'coinId must be even-length lowercase hex and amou
  * by replaying the SAME mintId — resumeNow() drives the in-session pass — and
  * a fresh mint() re-call would race that replay into a SECOND token.
  */
-async function mintConvergedOnce(amount: bigint): Promise<string> {
-  const result = await sphere!.payments.mint(HARNESS_COIN, amount);
+async function mintConvergedOnce(amount: bigint, wallet: Sphere = sphere!): Promise<string> {
+  const result = await wallet.payments.mint(HARNESS_COIN, amount);
   if (result.success) {
     logStep(`mint admitted directly: ${result.tokenId ?? ''}`);
     return result.tokenId!;
@@ -188,10 +188,10 @@ async function mintConvergedOnce(amount: bigint): Promise<string> {
   logStep(`mint keep-open (${(result.error ?? 'unknown').slice(0, 70)}…) — converging via same-mintId replay`);
   for (let cycle = 1; cycle <= MAX_MINT_ATTEMPTS && !aborted; cycle++) {
     await sleep(THROTTLE_WAIT_MS);
-    await sphere!.payments.resumeNow().catch(() => undefined);
-    const tokens = sphere!.payments.tokens({ coinId: HARNESS_COIN });
+    await wallet.payments.resumeNow().catch(() => undefined);
+    const tokens = wallet.payments.tokens({ coinId: HARNESS_COIN });
     if (tokens.length > 0) {
-      if (tokens.length !== 1 || totalOf(sphere!.payments) !== amount) {
+      if (tokens.length !== 1 || totalOf(wallet.payments) !== amount) {
         throw new Error(`mint replay must converge to exactly ONE token\n${await diagnose('mint-replay')}`);
       }
       logStep(`mint converged via replay on cycle ${cycle}: ${tokens[0]!.id}`);
@@ -303,9 +303,9 @@ describe.runIf(RUN)('LIVE staging: Sphere payments wiring (default transport pat
   }, 2_700_000);
 
   // #847: the wallet's OWN Quests id, sent to over the REAL composition. The mock
-  // relay answers every lookup with this wallet's binding, so before the refusal
-  // the DIRECT:// send resolved and reached planning. Now it never resolves, never
-  // PUTs an intent, and the server's open listing stays empty.
+  // relay answers every lookup with this wallet's binding and the wallet is funded,
+  // so before the refusal the DIRECT:// send resolved, planned and PUT an intent.
+  // Now it never resolves, never PUTs an intent, and the open listing stays empty.
   it('#847: send() to the wallet\'s own DIRECT:// address is refused before any lookup or intent PUT', async () => {
     const ownDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sphere-pv2-e2e-direct-'));
     trustBaseJson ??= await trustbase();
@@ -336,6 +336,9 @@ describe.runIf(RUN)('LIVE staging: Sphere payments wiring (default transport pat
       const directAddress = identity.directAddress!;
       expect(directAddress).toMatch(/^DIRECT:\/\//);
       own = { chainPubkey: identity.chainPubkey, directAddress, transportPubkey: identity.chainPubkey.slice(2), timestamp: 0 };
+      await mintConvergedOnce(1n, wallet);
+      for (let i = 0; totalOf(wallet.payments) !== 1n && i < 30; i++) await sleep(2_000);
+      expect(totalOf(wallet.payments)).toBe(1n); // spendable: on base this send reached the intent PUT
       const pendingBefore = await wallet.payments.pendingTransfers();
       resolve.mockClear();
       const sentBefore = requests.length;
@@ -352,13 +355,16 @@ describe.runIf(RUN)('LIVE staging: Sphere payments wiring (default transport pat
       expect(resolve).not.toHaveBeenCalled();
       expect(requests.slice(sentBefore).filter((r) => r.startsWith('PUT ') && r.includes('/v1/intents/'))).toEqual([]);
       expect(await wallet.payments.pendingTransfers()).toEqual(pendingBefore);
-      openListings.length = 0;
+      // resumeNow() joins a pass already in flight (start()'s, or a heartbeat's) whose
+      // listing may predate the reset; settle that one, then run passes until one lists.
       await wallet.payments.resumeNow();
+      openListings.length = 0;
+      for (let pass = 0; pass < 3 && openListings.length === 0; pass++) await wallet.payments.resumeNow();
       expect(openListings.length).toBeGreaterThan(0);
       expect(openListings.at(-1)).toEqual([]);
     } finally {
       await wallet.destroy().catch(() => undefined);
       fs.rmSync(ownDir, { recursive: true, force: true });
     }
-  }, 300_000);
+  }, 2_700_000);
 });
