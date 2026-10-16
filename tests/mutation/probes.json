@@ -4793,5 +4793,35 @@
       "tests/unit/payments-v2/machine-converge.test.ts",
       "tests/unit/payments-v2/facade-converge.test.ts"
     ]
+  },
+  {
+    "name": "converge-wave-never-halts",
+    "note": "#844: a non-conflict failure in a fresh wave of the converge stops it between waves; going on would certify later legs on chain for an intent that stays open (machine-converge.test.ts M10)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      haltOn: (o) => o.error !== undefined && classifyError(o.error) !== 'conflict',",
+    "replace": "      haltOn: () => false,",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-fresh-owed-overwritten",
+    "note": "#844: the stale-pending re-read judges only run()'s reused legs, so it must never clear a pending answer a fresh leg's failed deposit gave (machine-converge.test.ts M9d)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    if (priorPending && !pending) pending = await this.stillOwed(r.transferId, reused);",
+    "replace": "    if (priorPending) pending = await this.stillOwed(r.transferId, reused);",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-partial-skips-demote",
+    "note": "#844: after a converged partial the facade demotes every conflicted source, reused or fresh, from the proven conflict alone; the facade's isSpent sweep cannot stand in for it (facade-converge.test.ts F6b)",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "      if (state !== undefined) this.trackTail(this.view.demote(tokenId, state.protocol));",
+    "replace": "      if (state !== undefined) void state;",
+    "tests": [
+      "tests/unit/payments-v2/facade-converge.test.ts"
+    ]
   }
 ]

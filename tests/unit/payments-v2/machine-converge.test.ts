@@ -285,6 +285,48 @@ describe('#844 convergeRun reuses what run() settled', () => {
     expect(w.deposits.map((d) => d.tokenId)).toHaveLength(1);
   });
 
+  it("M9d run()'s owed deposit landed by the replay, a fresh leg's deposit failed: the converge still reports pending", async () => {
+    const w = makeWorld();
+    const tokens = await seedMany(w, ones(22));
+    await w.engine.foreignSpend(tokens[3]);
+    const plan = await w.plan({ tokens, amount: '22' });
+    const down = async (): Promise<void> => {
+      throw new FakeApiError(500, 'INTERNAL', 'mailbox down');
+    };
+    w.overrides.deliver = down;
+    const machine = w.machine();
+    await expect(machine.run(plan)).rejects.toBeInstanceOf(TransferConflictError);
+    delete w.overrides.deliver;
+    const replayed = await w.stores().deliveryJournal.replay({ delivery: w.deps.delivery, now: () => w.clock.t, attention: () => undefined });
+    expect(replayed).toMatchObject({ delivered: 19 });
+    w.overrides.deliver = down;
+
+    const outcome = await machine.convergeRun(plan);
+
+    expect(outcome.deliveryPending, "op 20's and op 21's blobs are still owed").toBe(true);
+    const owed = [...(await w.stores().deliveryJournal.byTransfer(plan.transferId)).keys()].sort((x, y) => x - y);
+    expect(owed).toEqual([20, 21]);
+  });
+
+  it('M10 a non-conflict failure in a wave run() never reached stops the converge before the next wave', async () => {
+    const w = makeWorld();
+    const tokens = await seedMany(w, ones(41));
+    await w.engine.foreignSpend(tokens[3]);
+    const plan = await w.plan({ tokens, amount: '41' });
+    const machine = w.machine();
+    await expect(machine.run(plan)).rejects.toBeInstanceOf(TransferConflictError);
+    w.engine.afterOp = (key) => (key === `${plan.transferId}:20` ? new ProofUnconfirmedError('no proof (simulated)') : null);
+
+    const err = await rejectionOf(machine.convergeRun(plan));
+
+    expect(err).toBeInstanceOf(ProofUnconfirmedError);
+    const keys = w.engine.transferCalls.map((c) => c.key);
+    expect(keys, "the converge's first wave ran").toContain(`${plan.transferId}:39`);
+    expect(keys, 'the next wave never reached the engine').not.toContain(`${plan.transferId}:40`);
+    expect(w.applied).toEqual([]);
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('open');
+  });
+
   it('M9b the journal cannot be read after a deposit run() owed: the converge keeps reporting it pending', async () => {
     const w = makeWorld();
     const a = await w.seed(600n);

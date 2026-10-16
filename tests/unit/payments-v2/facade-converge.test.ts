@@ -66,6 +66,15 @@ async function seedMany(world: World, amounts: bigint[]): Promise<SphereToken[]>
   return tokens;
 }
 
+/** A spent-status probe that is down for the listed sources: the facade's own isSpent sweep demotes none of them. */
+class ProbeDownEngine extends RealizationEngine {
+  readonly probeDown = new Set<string>();
+  override async isSpent(token: SphereToken, o?: EngineOpOptions): Promise<boolean> {
+    if (this.probeDown.has(token.blob.tokenId)) throw new Error('spent-status probe unavailable (simulated)');
+    return super.isSpent(token, o);
+  }
+}
+
 /** 1..22 plus a 300 decoy: a send of 253 plans all 22 direct (exact), so op 20 and op 21 sit in the second wave. */
 async function twentyTwoLegs(world: World): Promise<SphereToken[]> {
   const tokens = await seedMany(world, Array.from({ length: 22 }, (_, i) => BigInt(i + 1)));
@@ -182,7 +191,7 @@ describe('#844 the in-process converge reuses what run() settled', () => {
     ]);
   });
 
-  it('F6 a reused conflict beside a fresh-wave conflict: the remainder is their sum and both sources are demoted', async () => {
+  it('F6 a reused conflict beside a fresh-wave conflict: the remainder is their sum and both sources end demoted', async () => {
     const world = makeWorld();
     const tokens = await twentyTwoLegs(world);
     await world.engine.foreignSpend(tokens[0]);
@@ -204,5 +213,29 @@ describe('#844 the in-process converge reuses what run() settled', () => {
     const { entries } = await world.api.listMailbox(peerCaller, 0);
     expect(entries, '20 direct legs of tid-1, then one leg of the remainder (1 + 21)').toHaveLength(21);
     expect(await world.facade.pendingTransfers()).toEqual([]);
+  });
+
+  it('F6b the converge demotes both conflicted sources itself: no other demotion can, with the spent-status probe down', async () => {
+    const engine = new ProbeDownEngine({ chainPubkey: hexToBytes(OWN_PUB) });
+    const world = makeWorld({ engine });
+    const tokens = await twentyTwoLegs(world);
+    await engine.foreignSpend(tokens[0]);
+    await engine.foreignSpend(tokens[20]);
+    engine.probeDown.add(tokens[0].blob.tokenId);
+    engine.probeDown.add(tokens[20].blob.tokenId);
+    await world.facade.start();
+
+    // How the remainder ends is not this test's subject: only the converge can have demoted.
+    await world.facade.send({ recipient: '@peer', amount: '253', coinId: COIN }).catch(() => undefined);
+    await flushTail();
+
+    const suspected = world.facade
+      .tokens()
+      .filter((t) => t.suspectedSpent === true)
+      .map((t) => t.id)
+      .sort();
+    expect(suspected, 'demoted by the partial settle of the converge, from its proven conflicts').toEqual(
+      [tokens[0].blob.tokenId, tokens[20].blob.tokenId].sort()
+    );
   });
 });

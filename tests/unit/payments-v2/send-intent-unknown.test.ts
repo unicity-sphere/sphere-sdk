@@ -425,7 +425,7 @@ class LegFailureEngine extends RealizationEngine {
 class UnconfirmedLegEngine extends LegFailureEngine {
   /** Every attempt of these sources is unconfirmed. */
   readonly unconfirmedSources = new Set<string>();
-  /** Only the SECOND attempt is — the in-process re-certification of a leg run() already delivered. */
+  /** Only the SECOND attempt is: the first re-certification, which a background resume pass makes (#844). */
   readonly unconfirmedOnSecondCall = new Set<string>();
   /** Every attempt after the first is: no re-certification of these legs ever confirms. */
   readonly unconfirmedAfterFirstCall = new Set<string>();
