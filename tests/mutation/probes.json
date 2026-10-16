@@ -3982,5 +3982,36 @@
     "tests": [
       "tests/unit/payments-v2/requests.test.ts"
     ]
+  },
+  {
+    "name": "requests-linked-ignores-queued-link-writes",
+    "note": "#840: a link pay() queued behind a stalled settling-journal write is in neither memory nor disk yet. Answered anyway, the converger retires the never-stored tombstone that link names, and once the write lands the next pass finds the link unaccounted and responds the request paid with nothing moved.",
+    "file": "modules/payments-v2/requests/Requests.ts",
+    "find": "    if (this.linkWrites > 0) throw new SphereError('settling journal write in flight', 'STORAGE_ERROR');\n",
+    "replace": "    void this.linkWrites;\n",
+    "tests": [
+      "tests/unit/payments-v2/requests.test.ts",
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "requests-revert-reopens-terminal",
+    "note": "#840: a conflicted or aborted verdict can still find the link of a request the server already resolved (its removal not yet written, or failed). Reverting it to pending makes a request another device paid payable again, and pay() sends the amount a second time.",
+    "file": "modules/payments-v2/requests/Requests.ts",
+    "find": "    if (status !== undefined && !TERMINAL.has(status)) this.setStatus(requestId, 'pending');\n",
+    "replace": "    if (status !== undefined) this.setStatus(requestId, 'pending');\n",
+    "tests": [
+      "tests/unit/payments-v2/requests.test.ts"
+    ]
+  },
+  {
+    "name": "resume-never-stored-strip-failure-unguarded",
+    "note": "#840: stripping the handed-back rows off a kept never-stored tombstone can fail. Without the fallback to the unstripped entry, undefined reaches the converger, whose progress step throws before the reconcile, so the conflicted verdict never reaches the linked request while the backstop write keeps failing.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    (report.retireAfterReconcile ??= []).push((await stripOwed(stores, entry)) ?? entry);\n",
+    "replace": "    (report.retireAfterReconcile ??= []).push((await stripOwed(stores, entry))!);\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
   }
 ]

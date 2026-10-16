@@ -603,10 +603,14 @@ Normative behaviors bound into the transitions (not call sites):
   durable copy of its `conflicted` verdict. A reconcile can resolve without applying it (a
   settling journal that failed open to empty, a cleared link whose write failed), so the converger
   removes the tombstone only after the reconcile resolves and no settling link names it, in memory
-  or on disk; until then every pass reports it `conflicted` again. Only the first of those
+  or on disk, and never while a settling-journal write is still queued or running (that write may
+  be a link to it); until then every pass reports it `conflicted` again. Only the first of those
   reports counts as heartbeat progress, so a tombstone kept for good (an unreadable settling
-  journal) is retried at the backoff cap, not every 5 s; each session reports it once. The settling journal drops a
-  link from memory only after its removal is on disk, so the next pass re-applies the verdict. The kept tombstone no longer
+  journal) is retried at the backoff cap, not every 5 s; each session counts it as progress once. The settling journal drops a
+  link from memory only after its removal is on disk, so the next pass re-applies the verdict.
+  A request the server already resolved (paid, declined, expired) is never made payable again by
+  a `conflicted` or aborted verdict, which can still find its link while that link's removal is
+  unwritten: another payer may have paid it. The kept tombstone no longer
   holds the shortfall rows it handed back, so they are listed and never handed back twice.
 - **Fan-out:** certify at width 20 (`CERTIFY_WIDTH`, widened from 8 by #746), fail-fast
   **between** batches (in-flight siblings always settle); the burn certifies + checkpoints before
@@ -991,8 +995,9 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      in none of its sets and would otherwise reach the unaccounted branch, which resolves it paid.
      If that read fails, the pass skips only the reconcile: it still reports its progress and
      refreshes the view. After the reconcile resolves, the converger compare-and-deletes each
-     tombstone step 3 kept for a 404, but only once no settling link names its transferId, in
-     memory or in a fresh read of the journal (#840).
+     tombstone kept for a 404 (by the step-3 GC or the step-4 #676 gate), but only once no
+     settling link names its transferId, in memory or in a fresh read of the journal, and no
+     settling-journal write is queued or running (#840).
 
   Activity is judged once per pass: the pass watches the facade's active-op registry
   (`ActiveOps`), so an id in process at any moment of the pass — already running when the pass

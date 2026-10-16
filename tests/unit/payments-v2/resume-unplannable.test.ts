@@ -6,6 +6,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { SphereError } from '../../../core/errors';
 import { logger } from '../../../core/logger';
 import { WalletApiHttpError } from '../../../impl/wallet-api-v2/http';
 import {
@@ -419,6 +420,31 @@ describe("a cancel the server never stored keeps its tombstone until the reconci
     expect(await w.stores().shortfalls.list()).toEqual([]);
   });
 
+  it('stripping what it handed back fails: the verdict still reaches the reconcile, and a later pass lists the row and retires it', async () => {
+    const w = makeWorld();
+    const owed = { transferId: 'earlier', remainingAmount: '400', coinId: COIN, recipient: w.recipientHex, committedTokenIds: [], createdAt: 1 };
+    await neverStoredTombstone(w);
+    await w.stores().backstop.patch('never-stored', (e) => ({ ...e, owes: [owed] }));
+    const decrypt = (envelope: string): Promise<unknown> => w.deps.decryptPayload(envelope);
+    let linked = new Set(['never-stored']);
+    const { run, reconcile } = converger(w, w.deps, createMachineStores(w.kv), {
+      linkedTransferIds: async () => linked,
+    });
+    w.kv.failWriteKeys.add(STORE_KEYS.intentBackstop);
+
+    await run.convergeOnce();
+    expect((reconcile.mock.calls[0][0] as Reconciled).conflicted).toEqual(['never-stored']);
+    expect((await w.stores().backstop.getByKey('never-stored'))?.owes).toEqual([owed]);
+    expect(await derivePendingTransfers(w.stores(), decrypt), 'still held, so never listed').toEqual([]);
+
+    w.kv.failWriteKeys.delete(STORE_KEYS.intentBackstop);
+    linked = new Set();
+    await run.convergeOnce();
+    expect((reconcile.mock.calls[1][0] as Reconciled).conflicted).toEqual(['never-stored']);
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeUndefined();
+    expect((await derivePendingTransfers(w.stores(), decrypt)).map((row) => row.transferId)).toEqual(['earlier']);
+  });
+
   it('the reconcile throws: the tombstone stays, and the next pass reports it conflicted again', async () => {
     const w = makeWorld();
     await neverStoredTombstone(w);
@@ -434,6 +460,13 @@ describe("a cancel the server never stored keeps its tombstone until the reconci
     expect(await w.stores().backstop.getByKey('never-stored')).toBeUndefined();
   });
 });
+
+/** A held send: possibly committed, and it names its transferId. */
+function pending(transferId: string): SphereError {
+  const err = new SphereError('held', 'SEND_SYNC_PENDING');
+  err.transferId = transferId;
+  return err;
+}
 
 /** One app session: a fresh Requests over the world's KV, wired into a converger as the facade wires it. */
 function session(w: World, responded: unknown[]): Converger {
@@ -515,6 +548,55 @@ describe('a never-stored cancel keeps its tombstone while a settling link still 
     expect(await w.stores().backstop.getByKey('never-stored')).toBeUndefined();
     await session(w, responded).convergeOnce(); // restart
     expect(responded, 'nothing moved: the request must never be responded paid').toEqual([]);
+  });
+
+  it('a link to it still queued behind a stalled journal write: the tombstone stays, and nothing is responded paid', async () => {
+    const w = makeWorld();
+    await neverStoredTombstone(w);
+    await stageSplit(w, BAD_ID, { splitAmount: 'abc', remainderAmount: '400' }); // r0's link: open every pass
+    const wire = (id: string): RequestWire => ({
+      id, seq: 1, fromPubkey: w.recipientHex, toPubkey: w.senderHex, assets: [{ coinId: COIN, amount: '1' }],
+      status: 'open', transferId: null, createdAt: '2026-01-01T00:00:00.000Z',
+    });
+    const responded: unknown[] = [];
+    const requests = new Requests({
+      client: {
+        createPaymentRequest: async () => {
+          throw new Error('unused');
+        },
+        listPaymentRequests: async () => ({ requests: [wire('r0'), wire('r1')], more: false, cursor: 1, syncEpoch: 1 }),
+        respondPaymentRequest: async (id, response) => {
+          responded.push({ id, response });
+          return wire(id);
+        },
+      },
+      kv: w.kv, ownPubkey: w.senderHex, resolvePubkey: async () => null, listAbortedTransferIds: async () => [],
+      emit: () => undefined, memo: stubRequestMemoCodec,
+      send: vi.fn().mockRejectedValueOnce(pending(BAD_ID)).mockRejectedValueOnce(pending('never-stored')),
+    });
+    await requests.drainIncoming();
+    const set = w.kv.set.bind(w.kv);
+    let release!: () => void;
+    const stalled = new Promise<void>((resolve) => (release = resolve));
+    w.kv.set = async <T>(key: string, value: T): Promise<void> => {
+      if (key === STORE_KEYS.settlingLinks) await stalled;
+      return set(key, value);
+    };
+    const paying = [requests.pay('r0'), requests.pay('r1')].map((p) => p.catch(() => undefined));
+    const run = converger(w, w.deps, createMachineStores(w.kv), {
+      reconcile: (report) => requests.reconcile(report),
+      linkedTransferIds: () => requests.linkedTransferIds(),
+    }).run;
+
+    await run.convergeOnce();
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeDefined();
+
+    release();
+    await Promise.all(paying);
+    await run.convergeOnce();
+    await run.convergeOnce();
+    expect(responded, 'nothing moved: the request must never be responded paid').toEqual([]);
+    expect(requests.list().find((view) => view.id === 'r1')?.status).toBe('pending');
   });
 
   it('an unreadable settling journal after the reconcile: the tombstone stays', async () => {
