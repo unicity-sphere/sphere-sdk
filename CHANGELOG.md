@@ -37,7 +37,8 @@ What changed:
   sum of every conflicted leg.
 - The converge deposits only the legs it certified itself. A leg whose deposit the attempt could not
   make stays journaled, its attempt count and deferral intact, and is retried by the journal replay
-  and the convergence pass. Behaviour change for integrators: in that case the send now resolves
+  that every convergence pass runs (and by the resume of open intents, while the converge leaves the
+  intent open). Behaviour change for integrators: in that case the send now resolves
   `'confirmed'` with `deliveryPending: true` where the in-process retry could have returned
   `'delivered'`; both are documented success states. Before reporting the deposit still owed, the
   converge reads the journal once more, because the replay may land it meanwhile.
@@ -49,13 +50,15 @@ How it was verified: machine-level tests in `tests/unit/payments-v2/machine-conv
 chain op or deposit for a settled leg, a certified split reused, only the unreached wave
 certified, in one wave and with progress, a fresh leg unconfirmed, a 500 and a 429 deposit left to
 the replay, a split in an unreached wave, a reused plus a fresh conflict, a deposit the replay
-landed meanwhile, an unreadable journal, a batch-deposit port, and two defensive cases the facade
-cannot reach), facade-level tests in `tests/unit/payments-v2/facade-converge.test.ts` (one submit
-and one deposit per leg, a gateway that blips on every resubmission, more than one wave, both
-conflicted sources demoted), the existing #835 cases re-pointed to the background pass, mutation
-probes for each reuse rule, and a case run against the live staging wallet-api (`-t '#844'` in
-`tests/e2e/payments-v2-vertical.staging.e2e.test.ts`) where a second instance of the wallet spends
-a source out from under the first instance's selection.
+landed meanwhile while a fresh leg's deposit failed, an unreadable journal, a non-conflict failure
+that stops the next wave, a batch-deposit port, and two defensive cases the facade cannot reach),
+facade-level tests in `tests/unit/payments-v2/facade-converge.test.ts` (one submit and one deposit
+per leg, a gateway that blips on every resubmission, more than one wave, both conflicted sources
+demoted by the converge itself, with the facade's own spent-status probe down), the existing #835
+cases re-pointed to the background pass, and mutation probes for each reuse rule. A case for the
+live staging wallet-api (`-t '#844'` in `tests/e2e/payments-v2-vertical.staging.e2e.test.ts`), in
+which a second instance of the wallet spends a source out from under the first instance's
+selection, is added for the release's staging run.
 
 ### Fixed (money) — a send that lost its race on resume is reported cancelled only once the cancel is confirmed (#846)
 

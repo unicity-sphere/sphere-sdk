@@ -579,11 +579,12 @@ Normative behaviors bound into the transitions (not call sites):
     every op is judged before the partial settles. A certified leg whose journal write failed is
     re-certified, never reused. The converge deposits only the legs it certified itself. A leg
     whose deposit `run()` could not make (failed, or deferred by a 429) stays journaled with its
-    `attempts` and `deferredUntil` intact and is retried by the journal replay and `resumeAll`, never
-    in process; the converge then reports `deliveryPending`, after one re-read of the journal (the
-    replay is not gated by the pass's active set and may land it meanwhile; an unreadable journal
-    keeps it pending). A converge always ends in a partial or a failure, so the facade's success
-    disposition comes only from `run()`. A restart, or a later pass, resumes from the server intent
+    `attempts` and `deferredUntil` intact, never retried in process. The journal replay of every
+    convergence pass retries it; `resumeAll` does too, but only while the intent stays open (the
+    converge failed, or its close did), since it lists only open intents. The converge reports
+    `deliveryPending`, after one re-read of the journal (the replay is not gated by the pass's
+    active set and may land it meanwhile; an unreadable journal keeps it pending). A converge always
+    ends in a partial or a failure, so the facade's success disposition comes only from `run()`. A restart, or a later pass, resumes from the server intent
     as before: direct legs from the journal, the split through its checkpoint.
   - **`remainingAmount` `'0'`:** when the latest attempt is possibly-committed after earlier
     partials, `PartialSendConflictError.remainingAmount` is `'0'`. The remainder rides that
