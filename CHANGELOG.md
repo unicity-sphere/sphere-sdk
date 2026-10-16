@@ -18,7 +18,8 @@ spent, and the split then failed or ran under `BigInt`'s reading of a grammar it
 have meant. A coin id that is not lowercase hex also passed on a send with no split. A direct leg
 that conflicted on resume was then costed by an exact match on that id, so it read as 0: the send
 completed as fully paid, nothing was owed for that leg, and a linked payment request resolved
-paid. A coin intent naming no leg at all (no direct leg and no split) passed too: it ran zero
+paid. A well-formed coin id that the intent's sources do not carry was costed 0 the same way, and
+a split of such a source failed only after the direct legs beside it were spent. A coin intent naming no leg at all (no direct leg and no split) passed too: it ran zero
 legs and was completed and reported resumed, so a linked request resolved paid with nothing moved.
 The batched source read had the same coupling one layer down: wallet-api refuses the
 whole `blob-urls` batch over one malformed or unowned token id, and one failed blob download
@@ -41,6 +42,9 @@ What changed:
   id must be lowercase even-length hex, with or without a split. A coin intent must name at least
   one leg (a direct leg or a split); no writer emits one with none. `amount` stays type-checked only, since the send path writes
   it verbatim and accepts leading zeros.
+- Every source a coin intent still has to spend must carry its coin, read from the source's blob
+  before any leg runs (the check a whole intent's source already had). An intent with one that
+  does not is reported `failed` and left open, with none of its legs run.
 - Each intent is planned inside its own failure boundary. One that cannot be planned is reported
   `failed` and left open: never executed, aborted or completed, and its sources are not touched.
   It is logged once per facade.

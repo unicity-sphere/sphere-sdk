@@ -423,14 +423,9 @@ async function runOne(ctx: RunCtx, job: ResumeJob, report: ResumeReport): Promis
       report.failed.push(job.transferId); // fail closed: intent stays open, untouched
       return;
     }
-    // The blob is the authority on what a source carries — the same rule the send
-    // path applies at materialize. A durable intent labelled whole whose named
-    // source actually holds coins would move them while history records assets: [].
-    if (isWholeIntent(job.payload) && token.valueEnvelope === 'bare_collection') {
-      logger.warn(
-        'PaymentsV2',
-        `resume: token intent ${job.transferId} names a source carrying coin value — refusing`
-      );
+    const refusal = refusedSource(ctx, job.payload, token);
+    if (refusal !== null) {
+      logger.warn('PaymentsV2', `resume: intent ${job.transferId} names a source ${refusal} — refusing`);
       report.failed.push(job.transferId);
       return;
     }
@@ -447,6 +442,12 @@ async function runOne(ctx: RunCtx, job: ResumeJob, report: ResumeReport): Promis
   } catch (err) {
     await classifyResumeFailure(ctx.deps, ctx.stores, job.transferId, err, report);
   }
+}
+
+/** The blob is the authority on what a source carries (#777); #840: a conflicted leg without the coin costs 0, so paid. */
+function refusedSource(ctx: RunCtx, payload: IntentPayload, token: SphereToken): string | null {
+  if (isWholeIntent(payload)) return token.valueEnvelope === 'bare_collection' ? 'carrying coin value' : null;
+  return ctx.deps.engine().balanceOf(token, payload.coinId) > 0n ? null : 'without the intent coin';
 }
 
 async function classifyResumeFailure(
