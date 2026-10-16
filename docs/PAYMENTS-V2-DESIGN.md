@@ -938,16 +938,16 @@ listed (or re-PUTs it), clears the flag and resumes it.
 #690 shortfall rows that a possibly-committed later attempt of a partial send now owns
 (`remainingAmount: '0'`, §5.5). The facade moves them onto that attempt's entry instead of
 deleting them, while the attempt is still in process, so no pass can adopt it mid-handoff: `pendingTransfers()` lists only the attempt's `'open'` row, the rows go with the
-entry once the attempt completes, and the paths that prove it will not run (a conflict on resume,
-a cancel the aborted listing confirms) hand them back to the shortfall store before removing the
+entry once the attempt completes, and the paths that prove it will not run (a conflict on resume
+whose cancel is confirmed, any other cancel the aborted listing confirms) hand them back to the shortfall store before removing the
 entry; a 413/422 on the ensure re-PUT proves nothing of the kind, so the hold keeps them. A row left in
 both places by a failed removal is listed once, as the attempt; a failed attach still removes the
 rows from the store, so a remainder is never listed as owed while the attempt may pay it (an
 under-payment window if that attempt is later refused, never a double pay); and both completion paths (the
 attempt's own close, and the S1 sweep of a holder completed elsewhere) remove that copy before the
 entry, keeping the entry when they cannot. The sweep settles only a holder whose row is in neither
-listing: one whose row is aborted (a conflict cleanup whose removal failed, or another device's
-abort) hands its rows back instead. An older client ignores the field,
+listing: one whose row is aborted (another device's abort, or a pre-#846 client's conflict cleanup
+whose removal failed) hands its rows back instead. An older client ignores the field,
 so a downgrade can lose a held remainder: an under-payment, never a double pay.
 
 There is no new disposition, no new `STORE_KEYS` entry and no prefix change, so an older client
@@ -1021,7 +1021,8 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      against the exact snapshot it judged (`ListStore.removeIfUnchanged`, serialized with every
      other read-modify-write of the store), so a park or a fence that lands meanwhile is never
      lost to a stale read. An `'open'` entry whose row is no longer open completed or was aborted
-     (its cleanup failed, or another device's resume conflicted and aborted it). The GC reads the
+     (another device's resume conflicted and aborted it, or a pre-#846 client's conflict cleanup
+     could not remove it; this client's step-4 conflict writes a tombstone before it aborts). The GC reads the
      aborted listing, then the open listing again, to tell the two apart. It reads them for each
      entry it judges, since a row can be re-opened while an earlier entry is retired:
      - an aborted row moved nothing, so its held rows are owed again and it is reported
@@ -1046,7 +1047,8 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      in none of its sets and would otherwise reach the unaccounted branch, which resolves it paid.
      If that read fails, the pass skips only the reconcile: it still reports its progress and
      refreshes the view. After the reconcile resolves, the converger compare-and-deletes each
-     tombstone kept for a 404 (by the step-3 GC or the step-4 #676 gate), but only once no
+     tombstone kept for a 404 (by the step-3 GC, the step-4 #676 gate, or a step-4 resume conflict
+     whose abort answered 404), but only once no
      settling link names its transferId, in memory or in a fresh read of the journal, and no
      settling-link write (a new or updated link) is queued or running (#840).
 

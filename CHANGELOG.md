@@ -31,21 +31,23 @@ What changed:
   the intent is reported `failed`, and the next pass judges it again.
 - The abort counts only once it is confirmed (`abortAndConfirm`: a `204` the aborted listing then
   shows, or a typed `404 NOT_FOUND`). Then the held rows are owed again, the entry is removed and
-  the send is reported `conflicted`. A `204` for a row in neither listing settles the entry as paid,
+  the send is reported `conflicted`; after a `404` no listing will ever show the row, so the
+  tombstone, without its rows, is kept until the pass's reconcile has applied the verdict. A `204` for a row in neither listing settles the entry as paid,
   so a linked request resolves paid. An unconfirmed abort, or a confirmed one whose cleanup throws,
   is reported `failed`: the request stays `'settling'`, and a later pass confirms the kept
-  tombstone like any other.
+  tombstone like any other. A `Retry-After` on that abort or its listing reaches the heartbeat.
 - An intent with no local entry (another device of the wallet wrote it) gets the same confirmed
   abort: `conflicted` once confirmed, nothing when the row completed elsewhere, `failed` otherwise.
 
 How it was verified: `tests/unit/payments-v2/resume-conflict-cancel.test.ts` (a failed abort that
 leaves the link settling until a later pass confirms it, a row completed on another device that
 resolves the request paid and settles its held rows, a tombstone write that fails and aborts
-nothing, a removal that fails after a confirmed abort and is never re-PUT by an epoch re-seed, and
-the same verdicts for an intent with no local entry), the updated cleanup-failure case in
-`tests/unit/payments-v2/machine-resume.test.ts`, and new mutation probes. The live staging case, a
-pure conflict on resume while the abort answers 500, is in
-`tests/e2e/payments-v2-vertical.staging.e2e.test.ts` (`-t '#846'`).
+nothing, a removal that fails after a confirmed abort and is never re-PUT by an epoch re-seed, an
+abort answered `429` with `Retry-After`, an abort answered `404 NOT_FOUND`, and the same verdicts
+for an intent with no local entry), the updated cleanup-failure case in
+`tests/unit/payments-v2/machine-resume.test.ts`, and new mutation probes. A live staging case, a
+pure conflict on resume while the abort answers 500, passes against the staging wallet-api
+(`tests/e2e/payments-v2-vertical.staging.e2e.test.ts`, `-t '#846'`).
 
 ### Fixed (money) — one malformed or foreign open intent no longer stops every resume (#840)
 

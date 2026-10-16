@@ -622,7 +622,10 @@ any of them:
   event marks the confirmed cancel.
 
 A possibly-committed send that resumes to find its source spent elsewhere before any leg certified
-(a lost race) ends the same way (#846). The SDK records the cancel first and never sends it again.
+(a lost race) ends the same way (#846). When this device holds the send, the SDK records the
+cancel before it aborts and from then on only retries the cancel. A send that lost its race can
+never be certified, so a pass that runs it again before that record is written only conflicts
+again.
 It counts the send as not sent (a linked request payable again, a held remainder owed again) only
 once the wallet service confirms the cancel; until then a linked request stays `'settling'`. If the
 cancel finds the intent already completed on another device, the send counts as paid.
