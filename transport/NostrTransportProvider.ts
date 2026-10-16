@@ -834,11 +834,11 @@ export class NostrTransportProvider implements TransportProvider {
    * `network` IS DELIBERATELY ABSENT HERE — a live limitation, not an oversight
    * (#734). `queryBindingByNametag`/`queryBindingByAddress` are the whole public
    * resolution API for `@nametag` and `DIRECT://`, and both hardcode
-   * `parseBindingInfo` inside the SDK's PRIVATE `queryWithFirstSeenWins`: the
-   * caller never sees the signed event that resolution selected, and the parse
+   * `parseBindingInfo` inside the SDK's PRIVATE resolver (`queryBindingClaimants`):
+   * the caller never sees the signed event that resolution selected, and the parse
    * has already dropped every content field outside its whitelist. Re-querying
-   * raw would mean re-deriving UNIP-01 ownership ourselves (marker preference,
-   * cross-author first-seen-wins, ambiguity→null, multi-relay settle — all
+   * raw would mean re-deriving UNIP-01 ownership ourselves (candidate filtering by
+   * identifier, marker preference, ambiguity→null, multi-relay settle — all
    * private), and a second resolver that can disagree with the SDK's is worse
    * than a missing field on a MONEY guard. Nothing can declare a network today
    * regardless: the publish builders whitelist the same fields.

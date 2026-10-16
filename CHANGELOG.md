@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — `@nametag` and `DIRECT://` resolution never chooses between competing claims (nostr-js-sdk 0.6.1)
+
+What was wrong. Resolution in nostr-js-sdk 0.6.0 counted every binding event the relay returned for
+the queried hash, including bindings for a different identifier, and among unmarked bindings fell
+back to the earliest `created_at`, which the publisher chooses. Either could resolve a nametag or
+address to a key other than its owner's.
+
+What changed. nostr-js-sdk is bumped to 0.6.1. A nametag lookup counts only bindings whose `d` tag
+is the name hash; an address lookup counts only events that carry the address tag and ignores the
+UNIP-01 marker. An identifier claimed by more than one author resolves to `null`, so a send to it
+fails with `INVALID_RECIPIENT` as for an unknown one; a single legacy (unmarked) binding still
+resolves. `registerNametag()` refuses a name that another author claims, including a contested one.
+
+Known gap. `isNametagAvailable()` returns `true` for a contested name, because it resolves to
+`null`; `registerNametag()` then refuses it.
+
 ## [0.19.0] - 2026-10-14
 
 ### Fixed (money) — a send that may have moved money is never reported as a clean failure (#835)

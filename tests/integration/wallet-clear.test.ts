@@ -342,7 +342,7 @@ describe('Sphere.clear() integration', () => {
 
       await Sphere.clear({ storage });
 
-      // A NEW wallet (different mnemonic) cannot take the name — first-seen-wins.
+      // A NEW wallet (different mnemonic) cannot take the name — it is already claimed.
       const storage2 = new FileStorageProvider({ dataDir: DATA_DIR });
       const { sphere: sphere2 } = await Sphere.init({
         storage: storage2,

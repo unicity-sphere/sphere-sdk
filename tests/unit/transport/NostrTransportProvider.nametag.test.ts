@@ -143,10 +143,14 @@ const mockQueryBindingByNametag = vi.fn().mockImplementation(async (nametagId: s
   const hashedNametag = ht(nametagId);
   const key = `nametag:${hashedNametag}`;
   const events = storedQueryEvents.get(key) || [];
-  if (events.length === 0) return null;
-  // First-seen-wins: pick event with earliest created_at
-  const sorted = [...events].sort((a: any, b: any) => a.created_at - b.created_at);
-  const event = sorted[0] as any;
+  // As nostr-js-sdk: each author's latest event; more than one author is ambiguous (null).
+  const latestByAuthor = new Map<string, any>();
+  for (const e of events as any[]) {
+    const prev = latestByAuthor.get(e.pubkey);
+    if (!prev || e.created_at > prev.created_at) latestByAuthor.set(e.pubkey, e);
+  }
+  if (latestByAuthor.size !== 1) return null;
+  const event = [...latestByAuthor.values()][0];
   const content = JSON.parse(event.content);
   return {
     transportPubkey: event.pubkey,

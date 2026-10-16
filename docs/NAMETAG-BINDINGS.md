@@ -157,7 +157,7 @@ These are different d-tags, so they create **separate** replaceable events. A wa
 
 ## Anti-Hijacking
 
-Ownership follows **UNIP-01**, which nostr-js-sdk implements from 0.6.0 (this SDK locks 0.6.0).
+Ownership follows **UNIP-01**, which nostr-js-sdk implements from 0.6.0 (this SDK locks 0.6.1).
 Every nametag binding carries the `["L", "unicity:nametag"]` marker. A relay that implements
 UNIP-01 enforces single ownership of a marked name: the first author it accepts for that name owns
 it (relay receive order, not the event's `created_at`), and it rejects a marked binding for that
@@ -165,8 +165,9 @@ name from any other author.
 
 ### Conflict Detection (publish-time)
 
-`publishNametagBinding()` first resolves the name with `queryPubkeyByNametag()` (the rule below).
-If a different pubkey owns it, it throws `"already claimed"`. It then publishes the binding; a relay
+`publishNametagBinding()` first collects the authors claiming the name (the candidates of the rule
+below). If any author other than the publisher claims it, it throws `"already claimed"` — including
+a name contested by several authors, which resolves to `null` but is not available. It then publishes the binding; a relay
 rejection that names an ownership conflict ("owned by another key" / "already claimed", the UNIP-01
 single-owner rejection) also throws `"already claimed"`, and any other publish error makes it
 return `false`. Re-publishing by the same pubkey (an update) is allowed.
@@ -182,23 +183,23 @@ returns `null` for the name instead of picking a winner (below).
 ### Resolution Strategy (query-time)
 
 The query methods (`queryPubkeyByNametag`, `queryBindingByNametag`, `queryBindingByAddress`) collect
-the matching binding events, skip any whose signature does not verify (so a relay cannot inject a
-forged binding), group the rest by author, and keep each author's most recent event (by
-`created_at`). Then:
+the matching binding events and keep only those that bind the queried identifier: for a nametag,
+bindings whose `d` tag is the nametag hash (the tag a UNIP-01 relay vets ownership of); for an
+address, events that carry the address's `t` tag. They skip any event whose signature does not
+verify (so a relay cannot inject a forged binding), group the rest by author, and keep each
+author's most recent event (by `created_at`). Then (nostr-js-sdk 0.6.1):
 
-1. **Marked bindings win.** If any author's most recent binding carries the UNIP-01 marker, only
-   those authors count and `created_at` is ignored. Exactly one such author: that author's most
-   recent binding is the answer. More than one (for example, relays in different states): the query
-   resolves to `null` rather than guessing.
-2. **Legacy fallback: first-seen-wins by `created_at`.** Only when no author's most recent binding
-   is marked (bindings published before UNIP-01, such as by nostr-js-sdk 0.5.x): the author whose
-   earliest event has the lowest `created_at` wins, and ties go to the lexicographically lowest
-   pubkey. `created_at` is chosen by the publisher, so this rule does **not** prevent hijacking: a
-   backdated event wins it. nostr-js-sdk keeps it only so names that were never re-published with
-   the marker still resolve ("Self-asserted timestamps are not authoritative"). A marked binding
-   for the same name overrides it.
-3. **Latest-wins for the same author** — in both cases the winning author's most recent event is
-   returned, so the most complete data comes back.
+1. **Marked bindings first (nametags only).** If any author's most recent binding carries the
+   UNIP-01 marker, only those authors count. Address lookups ignore the marker: it vouches for the
+   binding's nametag, not for the addresses the binding advertises.
+2. **One author resolves; more than one is `null`.** Exactly one remaining author: that author's
+   most recent binding is the answer. More than one (a competing claim, or relays in different
+   states): the query resolves to `null` rather than guessing. `created_at` is chosen by the
+   publisher, so it never decides between authors. A name with a single legacy (unmarked) binding
+   still resolves. (nostr-js-sdk 0.6.0 and earlier fell back to the earliest `created_at` among
+   unmarked bindings.)
+3. **Latest-wins for the same author** — the winning author's most recent event is returned, so the
+   most complete data comes back.
 
 Rule 3 is what makes Path C (register nametag after creation) work. Address-based lookups find both
 the old bare binding and the newer nametag binding. Without latest-wins-for-same-author, the stale
