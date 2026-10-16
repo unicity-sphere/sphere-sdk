@@ -293,7 +293,7 @@ describe('a source read the server refuses fails only the intent that named it (
 
     const report = await resumeAll(w.deps);
 
-    expect(calls).toBe(3);
+    expect(calls, 'a re-read answered with a Retry-After ends the per-intent reads for this pass').toBe(2);
     expect(report).toEqual({ resumed: [], conflicted: [], failed: [first, second].sort(), retryAfterMs: 30_000 });
   });
 });
@@ -563,6 +563,24 @@ describe('a kept never-stored tombstone is no progress once reported: the heartb
       ['never-stored'],
       ['never-stored'],
     ]);
+  });
+
+  it('an abort that fails between the kept verdicts does not make the next one fresh progress', async () => {
+    const w = makeWorld();
+    await neverStoredTombstone(w);
+    let pass = 0;
+    w.overrides.abort = async () => {
+      if (pass % 2 === 1) throw new FakeApiError(502, 'UPSTREAM', 'bad gateway');
+    };
+    const { run } = converger(w, w.deps, createMachineStores(w.kv), {
+      linkedTransferIds: async () => new Set(['never-stored']),
+    });
+
+    const progress: boolean[] = [];
+    for (; pass < 6; pass++) progress.push((await run.convergeOnce()).progress);
+
+    expect(progress).toEqual([true, false, false, false, false, false]);
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeDefined();
   });
 
   it('another cancel judged beside a kept one, or a new verdict on a kept one, is still progress', async () => {

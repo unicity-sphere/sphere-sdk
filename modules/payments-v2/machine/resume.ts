@@ -408,6 +408,7 @@ async function readBlobs(
       for (const [id, bytes] of await storage.getBlobs(needed)) blobs.set(id, bytes);
     } catch (err) {
       noteWait(report, err);
+      if (retryAfterMsOf(err) !== null) break; // asked to back off: the jobs left fail closed
     }
   }
   return blobs;

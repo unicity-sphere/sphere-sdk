@@ -605,8 +605,8 @@ Normative behaviors bound into the transitions (not call sites):
   stays one request, but wallet-api refuses a whole `blob-urls` batch over one malformed (400) or
   unowned (403) id, and one failed download rejects the read. On such a refusal resume reads
   each intent's sources again on its own, so only the intent that named the bad id fails closed;
-  the refusal's `Retry-After` reaches the heartbeat, and a refusal that carries one is not re-read
-  per intent. A pass that throws after the backstop read
+  the refusal's `Retry-After` reaches the heartbeat, a refusal that carries one is not re-read
+  per intent, and the per-intent re-reads stop at the first answer that carries one. A pass that throws after the backstop read
   still returns what it already decided, and every intent it had not judged yet is reported
   `failed`, so the reconcile treats it as open and never as unaccounted (which would resolve a
   link paid). A cancel answered `404 NOT_FOUND` is in no listing, so its tombstone is the only
@@ -972,7 +972,8 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
 - **In-session convergence heartbeat:** between `start()` and `stop()`, while open intents exist
   or the delivery/mint journals are non-empty, the facade re-runs the SAME single-flighted resume
   pass on an exponential backoff — seed 5 s, ×2, cap 120 s; reset on progress (any leg converging,
-  but not a kept 404 tombstone that the previous pass already reported `conflicted`, #840)
+  but not a kept 404 tombstone already reported `conflicted` while that tombstone is still kept,
+  even across a pass whose abort failed, #840)
   and on `connection:status` recovery; a surfaced wallet-api `Retry-After` floors the next pass;
   the pass never adopts an intent whose machine is still running in-process (facade ownership).
   State is an in-memory timer handle + backoff value only — the pending set is re-read from the
@@ -1010,7 +1011,8 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      rate-limited held send, resume or replay before the server asked.
   4. Gate, decode and resume. Since #840 each intent is planned on its own: a payload this client
      cannot plan is refused (reported `failed`, left open, kept out of any attempt budget), a
-     refused batched source read is re-read per intent unless it carried a `Retry-After`, and
+     refused batched source read is re-read per intent unless it carried a `Retry-After` (the
+     re-reads stop at the first answer that carries one), and
      steps 2-4 run inside one boundary that reports every id not judged yet `failed`. The
      §5.5 #840 bullet has the details.
   5. Reconcile payment links, against the backstop read again after the pass: every transferId

@@ -149,7 +149,7 @@ export class Converger {
   private readonly reposting = new Set<string>();
   /** #840: intents whose refusal to resume was logged — once per facade. */
   private readonly warned = new Set<string>();
-  /** #840: the never-stored cancels the last pass reported: reporting a kept one again converges nothing. */
+  /** #840: never-stored cancels already reported whose tombstone is still kept: re-reporting one converges nothing. */
   private reported = new Set<string>();
 
   constructor(private readonly deps: ConvergerDeps) {}
@@ -251,7 +251,6 @@ export class Converger {
     // #835: an unreadable backstop proves nothing — reconciling its empty report would
     // resolve a held payment link 'paid' through the unaccounted branch.
     if (deferred) return { progress: false, retryAfterMs: null };
-    const progress = this.progressOf(report);
     // #835: a link written while the pass ran is in none of its sets. Anything with a local
     // entry NOW (held, parked, being cancelled, or an attempt that ended mid-pass) can still
     // run or abort, so it is open — never "unaccounted", which resolves the link paid. An
@@ -260,6 +259,7 @@ export class Converger {
       (entries) => entries.map((entry) => entry.transferId),
       () => null
     );
+    const progress = this.progressOf(report, local);
     if (local !== null) {
       await this.deps.reconcile({
         resumed: report.resumed,
@@ -272,11 +272,12 @@ export class Converger {
     return { progress, retryAfterMs: report.retryAfterMs ?? null };
   }
 
-  /** #840: a kept tombstone is judged again on every pass; only its first verdict resets the backoff. */
-  private progressOf(report: ResumeReport): boolean {
+  /** #840: only a kept tombstone's first verdict resets the backoff, even across a pass whose abort failed. */
+  private progressOf(report: ResumeReport, local: readonly string[] | null): boolean {
     const retiring = new Set((report.retireAfterReconcile ?? []).map((entry) => entry.transferId));
     const fresh = report.conflicted.some((id) => !(retiring.has(id) && this.reported.has(id)));
-    this.reported = retiring;
+    if (local !== null) this.reported = new Set([...this.reported].filter((id) => local.includes(id)));
+    for (const id of retiring) this.reported.add(id);
     return report.resumed.length > 0 || fresh;
   }
 
