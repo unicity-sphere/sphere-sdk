@@ -13,9 +13,11 @@
 //   - `@nametag` / `DIRECT://`: resolution goes through nostr-js-sdk's
 //     `queryBindingBy*`, whose `parseBindingInfo` whitelists the content fields
 //     and never hands back the selected event — the declaration is dropped
-//     before sphere can see it, so the gate can only SIGNAL. That limitation is
-//     PINNED below (with upstream's real parser doing the dropping), not
-//     assumed; the pins go red the day #734 lands, which is when
+//     before sphere can see it. For `@nametag` the gate can therefore only
+//     SIGNAL. A `DIRECT://` recipient never reaches it: the money gate refuses
+//     it before resolution (#847), and only the resolve-route pin stays. That
+//     limitation is PINNED below (with upstream's real parser doing the
+//     dropping), not assumed; the pins go red the day #734 lands, which is when
 //     `bindingInfoToPeerInfo` must start carrying the field.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';

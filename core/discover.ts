@@ -28,7 +28,7 @@ export interface DiscoverAddressProgress {
 export interface DiscoveredAddress {
   /** HD derivation index */
   index: number;
-  /** L3 DIRECT address */
+  /** Sphere Quests account id (DIRECT://...); never a payment recipient */
   directAddress: string;
   /** 33-byte compressed chain pubkey */
   chainPubkey: string;

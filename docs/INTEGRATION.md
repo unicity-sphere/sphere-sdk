@@ -1667,7 +1667,7 @@ try {
     const code = (err as { code?: unknown } | null)?.code;
     switch (code) {
       case 'SEND_INSUFFICIENT_BALANCE': show((err as Error).message); break; // names pinned funds, or says spending is paused
-      case 'INVALID_RECIPIENT': show('Recipient not found'); break;
+      case 'INVALID_RECIPIENT': show((err as Error).message); break; // not found, another network, or DIRECT://
       case 'TRANSPORT_ERROR': show('Could not look up the recipient. Check the connection.'); break;
       default: show(err instanceof Error ? err.message : String(err));
     }
@@ -1679,8 +1679,10 @@ Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (not enough spenda
 some funds are pinned by transfers still converging, its message says how much and points to
 `pendingTransfers()`; it is also the refusal while spending is paused, because the SDK has not yet
 confirmed which tokens converging transfers hold, for `send()`, `sendWholeToken()` and
-`sendCoinless()` alike, and the message says so; `burn()` resolves it as `errorCode` instead of rejecting), `INVALID_RECIPIENT` (no published chain pubkey, or a recipient on another
-network), `TRANSPORT_ERROR` (the recipient lookup could not reach the Nostr relays) and
+`sendCoinless()` alike, and the message says so; `burn()` resolves it as `errorCode` instead of
+rejecting), `INVALID_RECIPIENT` (no published chain pubkey, a recipient on another network, or a
+`DIRECT://` recipient, #847), `TRANSPORT_ERROR` (the recipient lookup could not reach the Nostr
+relays) and
 `VALIDATION_ERROR` (for example a malformed amount).
 `INSUFFICIENT_BALANCE` exists in the `SphereErrorCode` union but is never thrown.
 

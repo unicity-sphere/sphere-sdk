@@ -25,7 +25,7 @@
  *   } else {
  *     switch ((err as { code?: unknown } | null)?.code) {
  *       case 'SEND_INSUFFICIENT_BALANCE': showToast((err as Error).message); break; // pinned funds, or spending paused
- *       case 'INVALID_RECIPIENT': showToast('Recipient not found'); break;
+ *       case 'INVALID_RECIPIENT': showToast((err as Error).message); break; // not found, another network, or DIRECT://
  *       case 'TRANSPORT_ERROR': showToast('Network connection issue'); break;
  *       default: showToast(err instanceof Error ? err.message : String(err));
  *     }

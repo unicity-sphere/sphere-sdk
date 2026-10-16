@@ -571,7 +571,7 @@ async function sendTokens(recipient: string, amount: string, coinId: string) {
       const code = (err as { code?: unknown } | null)?.code;
       switch (code) {
         case 'SEND_INSUFFICIENT_BALANCE': showToast((err as Error).message); break; // names pinned funds, or says spending is paused
-        case 'INVALID_RECIPIENT': showToast('Recipient not found'); break;
+        case 'INVALID_RECIPIENT': showToast((err as Error).message); break; // not found, another network, or DIRECT://
         case 'TRANSPORT_ERROR': showToast('Could not look up the recipient. Check the connection.'); break;
         default: showToast(err instanceof Error ? err.message : String(err));
       }

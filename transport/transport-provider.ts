@@ -54,7 +54,7 @@ export interface TransportProvider extends BaseProvider {
   /**
    * Resolve a DIRECT:// address to full peer info.
    * Performs reverse lookup: address → binding event → PeerInfo.
-   * @param address - L3 address (DIRECT://...)
+   * @param address - Quests account id (DIRECT://...); deprecated lookup, kept until #847 phase 2
    * @returns PeerInfo or null if no binding found for this address
    */
   resolveAddressInfo?(address: string): Promise<PeerInfo | null>;
@@ -312,7 +312,7 @@ export interface PeerInfo {
   transportPubkey: string;
   /** 33-byte compressed secp256k1 public key (for L3 chain) */
   chainPubkey: string;
-  /** L3 DIRECT address (DIRECT://...) */
+  /** Sphere Quests account id (DIRECT://...) from the binding; never a payment recipient */
   directAddress: string;
   /**
    * Network the peer's identity binding DECLARES ('testnet2', …) — absent when

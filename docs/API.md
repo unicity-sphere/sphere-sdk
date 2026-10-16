@@ -641,7 +641,8 @@ Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (when funds are pi
 still converging, the message says how much and points to `pendingTransfers()`; it is also the
 refusal while spending is paused, for `send()`, `sendWholeToken()` and `sendCoinless()` alike, and
 the message says so; [`burn()`](#burnrequest-burnrequest-promiseburnresult) resolves it as `errorCode` instead of rejecting),
-`INVALID_RECIPIENT` (no published chain pubkey, or a proven different network), `TRANSPORT_ERROR`
+`INVALID_RECIPIENT` (no published chain pubkey, a proven different network, or a `DIRECT://`
+recipient, #847), `TRANSPORT_ERROR`
 (the recipient lookup could not reach the relay), `VALIDATION_ERROR` (for example a malformed or
 non-positive amount) and `TRANSFER_CONFLICT` (below).
 `INSUFFICIENT_BALANCE` is never thrown by `send()`.

@@ -817,7 +817,7 @@ try {
         console.error((err as Error).message); // names pinned funds, or says spending is paused
         break;
       case 'INVALID_RECIPIENT':
-        console.error('Recipient not found');
+        console.error((err as Error).message); // not found, another network, or DIRECT://
         break;
       case 'TRANSPORT_ERROR':
         console.error('Could not look up the recipient. Check the connection.');

@@ -453,8 +453,8 @@ export interface SphereInitResult {
 /**
  * Derive the wallet's legacy L3 identity address (DIRECT://...) from a private key.
  *
- * Delegates to the shared, golden-locked `deriveDirectAddress` helper (token-engine,
- * A6) so the engine and the wallet derive byte-identical addresses from ONE recipe.
+ * Delegates to the golden-locked `deriveDirectAddress` helper exported by token-engine.
+ * The engine itself derives no DIRECT:// address; this is the SDK's only caller.
  *
  * XP-CRITICAL (Path A / D10): Quest XP and Unicity IDs are keyed on this address, so it
  * MUST stay byte-identical across the v1→v2 migration. The legacy v1 derivation ran the

@@ -214,7 +214,7 @@ try {
     const code = (err as { code?: unknown } | null)?.code;
     switch (code) {
       case 'SEND_INSUFFICIENT_BALANCE': show((err as Error).message); break; // names pinned funds, or says spending is paused
-      case 'INVALID_RECIPIENT': show('Recipient not found'); break;
+      case 'INVALID_RECIPIENT': show((err as Error).message); break; // not found, another network, or DIRECT://
       case 'TRANSPORT_ERROR': show('Could not look up the recipient. Check the connection.'); break;
       default: show(err instanceof Error ? err.message : String(err));
     }
@@ -455,8 +455,9 @@ deprecated; it returns `Map<addressId, Map<nametagIndex, nametag>>`, keyed by th
 
 ### Identity Properties
 
-`directAddress` (`DIRECT://…`) is the wallet's **Sphere Quests account id** and nothing else. It is not a
-payment address: `payments.send()` and `payments.requests.create()` refuse it (#847). Pay a `@nametag` or a
+`directAddress` (`DIRECT://…`) is the wallet's **Sphere Quests account id**. It is also the input to `addressId`
+(`DIRECT_<first6>_<last6>`), the durable key of per-address local state such as the nametag map, so changing
+it would orphan that state. It is not a payment address: `payments.send()` and `payments.requests.create()` refuse it (#847). Pay a `@nametag` or a
 chain pubkey; money always locks to the recipient's chain pubkey.
 
 ```typescript

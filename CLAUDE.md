@@ -654,9 +654,11 @@ mnemonic → master key → BIP32 derivation → identity
 The `DIRECT://` address is derived by `token-engine/identity.ts`
 (`deriveDirectAddress`) — a vendored, byte-identical reproduction of the v1
 derivation, fed `getPublicKey(SHA256(privateKey))` (never `chainPubkey`, so nobody
-can compute it from the pubkey). Its ONE job is the wallet's Sphere Quests account
-id (#847), and it MUST stay byte-stable: Quests keys accounts on it and reads it
-back from the identity binding's `direct_address` via `resolve(<chain pubkey>)`.
+can compute it from the pubkey). It is the wallet's Sphere Quests account id
+(#847) and the input to `addressId` (`getAddressId`, the durable key of the
+per-address nametag map and tracked addresses), and it MUST stay byte-stable:
+Quests keys accounts on it and reads it back from the identity binding's
+`direct_address` via `resolve(<chain pubkey>)`, and a changed value re-keys local state.
 It is NOT a payment address: `send()` / `sendWholeToken()` / `sendCoinless()` reject
 a `DIRECT://` recipient (any case, leading `@`) with `INVALID_RECIPIENT` before any
 lookup, `requests.create()` resolves `{ success: false }`, and ConnectHost refuses
