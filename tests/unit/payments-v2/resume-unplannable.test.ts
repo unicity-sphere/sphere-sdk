@@ -484,6 +484,22 @@ describe("a cancel the server never stored keeps its tombstone until the reconci
     expect((await derivePendingTransfers(w.stores(), decrypt)).map((row) => row.transferId)).toEqual(['earlier']);
   });
 
+  it('stripping what it handed back fails: every other open intent in that pass still resumes', async () => {
+    const w = makeWorld();
+    const good = await keepOpenSend(w);
+    const owed = { transferId: 'earlier', remainingAmount: '400', coinId: COIN, recipient: w.recipientHex, committedTokenIds: [], createdAt: 1 };
+    await neverStoredTombstone(w);
+    await w.stores().backstop.patch('never-stored', (e) => ({ ...e, owes: [owed] }));
+    w.kv.failWriteKeys.add(STORE_KEYS.intentBackstop);
+
+    const report = await resumeAll(w.deps);
+
+    expect(report.resumed).toEqual([good]);
+    expect(report.failed).toEqual([]);
+    expect(report.conflicted).toEqual(['never-stored']);
+    expect(report.retireAfterReconcile?.map((e) => e.transferId)).toEqual(['never-stored']);
+  });
+
   it('the reconcile throws: the tombstone stays, and the next pass reports it conflicted again', async () => {
     const w = makeWorld();
     await neverStoredTombstone(w);

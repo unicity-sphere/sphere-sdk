@@ -4521,5 +4521,15 @@
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
     ]
+  },
+  {
+    "name": "resume-never-stored-strip-failure-escapes",
+    "note": "#840: a failed strip of the handed-back rows off a kept never-stored tombstone stays inside that tombstone. Escaping, it throws out of the GC sweep into the pass-level catch: every server-open intent not judged yet is reported failed without being resumed, and the tombstone is never handed over for retirement (resume-unplannable.test.ts 'stripping what it handed back fails: every other open intent in that pass still resumes').",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "=> rest).catch(() => undefined);",
+    "replace": "=> rest);",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
   }
 ]

@@ -619,8 +619,9 @@ Normative behaviors bound into the transitions (not call sites):
   durable copy of its `conflicted` verdict. A reconcile can resolve without applying it (a
   settling journal that failed open to empty, a cleared link whose write failed), so the converger
   removes the tombstone only after the reconcile resolves and no settling link names it, in memory
-  or on disk, and never while a settling-journal write is still queued or running (that write may
-  be a link to it); until then every pass reports it `conflicted` again. Only the first of those
+  or on disk, and never while a settling-link write (a new or updated link) is still queued or
+  running (that write may be a link to it; a removal in flight needs no wait, since memory keeps
+  the link until the removal is on disk); until then every pass reports it `conflicted` again. Only the first of those
   reports counts as heartbeat progress, so a tombstone kept for good (an unreadable settling
   journal) is retried at the backoff cap, not every 5 s; each session counts it as progress once. The settling journal drops a
   link from memory only after its removal is on disk, so the next pass re-applies the verdict.
@@ -1033,7 +1034,7 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      refreshes the view. After the reconcile resolves, the converger compare-and-deletes each
      tombstone kept for a 404 (by the step-3 GC or the step-4 #676 gate), but only once no
      settling link names its transferId, in memory or in a fresh read of the journal, and no
-     settling-journal write is queued or running (#840).
+     settling-link write (a new or updated link) is queued or running (#840).
 
   Activity is judged once per pass: the pass watches the facade's active-op registry
   (`ActiveOps`), so an id in process at any moment of the pass — already running when the pass

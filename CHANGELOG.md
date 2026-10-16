@@ -69,7 +69,8 @@ What changed:
   is on disk, so a failed write is retried by the next reconcile instead of waiting for a
   restart. The kept tombstone drops the shortfall rows it handed
   back, so `pendingTransfers()` lists them and a remainder already paid is never owed again.
-- The journal check refuses to answer while a settling-journal write is queued or running, so a
+- The journal check refuses to answer while a settling-link write (a new or updated link) is queued
+  or running, so a
   link to the tombstone that `pay()` queued behind a stalled write keeps the tombstone for that
   pass. Without it the tombstone could go first, and the next pass resolved that link paid.
 - A payment request the server already resolved (paid on another device, declined or expired)
