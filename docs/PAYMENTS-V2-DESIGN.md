@@ -564,8 +564,9 @@ Normative behaviors bound into the transitions (not call sites):
     its certified sources. The attempt owns the remainder, so it holds the send's earlier shortfall
     rows: they move onto its backstop entry (`owes`) and `pendingTransfers()` lists only its
     `'open'` row. They go with the entry once it completes. If it is proven not to run instead (a
-    conflict on resume), they return to the shortfall store before its entry is removed, so the
-    remainder is owed again; a 413/422 on its ensure re-PUT does not prove that, so it keeps them.
+    conflict on resume whose cancel is confirmed), they return to the shortfall store before its
+    entry is removed, so the remainder is owed again; a 413/422 on its ensure re-PUT does not prove
+    that, so it keeps them.
   - **A latest attempt being cancelled holds the remainder too:** its tombstone is written and its
     abort is unconfirmed, so this device never sends it, but another device of the wallet could
     still complete it. So `remainingAmount` is `'0'`, `cause` is that attempt's `SEND_SYNC_PENDING`
@@ -577,6 +578,19 @@ Normative behaviors bound into the transitions (not call sites):
     certified a leg before the abort landed may still deliver, while the confirmed cancel makes the
     remainder owed again. Closing it needs server-side exclusivity between an abort and another
     device's in-flight resume.
+  - **A pure conflict on resume is a cancel (#846).** Every errored leg conflicted and nothing
+    certified, so the intent is cancelled the same way the send-time fence cancels one. The
+    `abortPending` tombstone is written first; if that write fails, nothing is aborted, the intent
+    is reported `failed`, and the next pass judges it again. The abort then counts only once it is
+    confirmed (a `204` the aborted listing shows, or 404 `NOT_FOUND`): the rows the entry holds are
+    owed again, the entry is removed, and the intent is reported `conflicted`. A 404 keeps the
+    tombstone until the reconcile has consumed the verdict (the #840 bullet below). A `204` for a
+    row that neither listing shows means another device completed it, so the entry settles as paid
+    and is not reported conflicted. An unconfirmed abort is reported `failed`, and so is a confirmed
+    one whose cleanup throws; the kept tombstone is judged again by a later pass, like any other.
+    Since the tombstone exists before the abort, an entry whose removal failed is never re-PUT by an
+    epoch re-seed, which would re-open the aborted row. An intent with no local entry (another
+    device wrote it) gets the same abort and the same verdicts, with nothing to hand back or remove.
   - **Final partial:** a settled partial whose `complete` fails after its apply surfaces as a
     *final* `PartialSendConflictError` with its durable remainder. It is not re-planned in-process,
     since re-planning while a split row is still open could resurrect the consumed shortfall;
