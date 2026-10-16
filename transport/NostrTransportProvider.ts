@@ -816,8 +816,9 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   /**
-   * Resolve a DIRECT:// address to full peer info.
-   * Performs reverse lookup via nostr-js-sdk (UNIP-01 marker-preferring resolution).
+   * Resolve a 66-hex chain pubkey (the Quests read-back, kept) or a DIRECT://
+   * string (deprecated, #847 phase 2) to full peer info, via nostr-js-sdk
+   * (UNIP-01 marker-preferring resolution).
    */
   async resolveAddressInfo(address: string): Promise<PeerInfo | null> {
     await this.ensureConnectedForResolve();

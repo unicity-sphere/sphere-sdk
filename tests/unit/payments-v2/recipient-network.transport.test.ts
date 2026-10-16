@@ -275,7 +275,8 @@ describe('§5.6 recipient gate — relay → transport → resolveRecipientInfo 
   });
 
   // The limitation, enforced where it costs money: the binding on the relay
-  // DOES declare a foreign network, and these two routes still send.
+  // DOES declare a foreign network, and the @nametag route still sends. The
+  // DIRECT:// route is refused before resolution (#847), pinned next.
   it('LIMITATION (#734) @nametag recipient: the declaration is unreadable, so the send PROCEEDS and is signalled', async () => {
     publishBinding({ network: 'mars', nametag: 'alice' });
     const world = makeWorld({ resolvePeer });

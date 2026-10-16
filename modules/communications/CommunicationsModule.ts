@@ -777,8 +777,8 @@ export class CommunicationsModule {
   }
 
   /**
-   * Get the shared transport address resolver (for consumers that need the
-   * same resolution + caching, e.g. the payments vertical's recipient lookup).
+   * Get the DM transport address resolver (its resolution + caching). The
+   * payments vertical does not use it: it resolves through `transport.resolve`.
    */
   getTransportResolver(): TransportAddressResolver | null {
     return this.transportResolver;

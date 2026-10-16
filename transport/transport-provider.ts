@@ -52,9 +52,11 @@ export interface TransportProvider extends BaseProvider {
   resolveNametagInfo?(nametag: string): Promise<PeerInfo | null>;
 
   /**
-   * Resolve a DIRECT:// address to full peer info.
-   * Performs reverse lookup: address → binding event → PeerInfo.
-   * @param address - Quests account id (DIRECT://...); deprecated lookup, kept until #847 phase 2
+   * Resolve a 66-hex chain pubkey or a DIRECT:// string to full peer info.
+   * Reverse lookup: address → binding event → PeerInfo. The chain-pubkey input
+   * is how Quests reads `directAddress` back: keep it. Only the DIRECT:// input
+   * is deprecated (removed in #847 phase 2).
+   * @param address - 66-hex chain pubkey, or a Quests account id (DIRECT://...)
    * @returns PeerInfo or null if no binding found for this address
    */
   resolveAddressInfo?(address: string): Promise<PeerInfo | null>;

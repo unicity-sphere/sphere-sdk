@@ -239,7 +239,7 @@ function App() {
 
   return (
     <div>
-      <p>Address: {sphere?.identity?.directAddress}</p>
+      <p>Receive at (chain pubkey): {sphere?.identity?.chainPubkey}</p>
       <p>Nametag: {sphere?.identity?.nametag || 'Not registered'}</p>
     </div>
   );
@@ -294,7 +294,7 @@ onUnmounted(() => {
     <code>{{ mnemonic }}</code>
   </div>
   <div v-else>
-    <p>Address: {{ sphere?.identity?.directAddress }}</p>
+    <p>Receive at (chain pubkey): {{ sphere?.identity?.chainPubkey }}</p>
   </div>
 </template>
 ```
@@ -337,7 +337,7 @@ export default function WalletPage() {
   if (error) return <div>Wallet failed to start: {error}</div>;
   if (!sphere) return <div>Loading...</div>;
 
-  return <div>Address: {sphere.identity?.directAddress}</div>;
+  return <div>Receive at (chain pubkey): {sphere.identity?.chainPubkey}</div>;
 }
 ```
 
@@ -957,7 +957,7 @@ function WalletApp() {
       {sphere && (
         <>
           <div style={{ marginBottom: 20 }}>
-            <strong>Address:</strong> {sphere.identity?.directAddress}
+            <strong>Receive at (chain pubkey):</strong> {sphere.identity?.chainPubkey}
             <br />
             <strong>Nametag:</strong> {sphere.identity?.nametag || 'Not registered'}
             <br />
@@ -967,7 +967,7 @@ function WalletApp() {
           <div>
             <h3>Send UCT</h3>
             <input
-              placeholder="@recipient or address"
+              placeholder="@nametag or chain pubkey"
               value={recipient}
               onChange={(e) => setRecipient(e.target.value)}
             />

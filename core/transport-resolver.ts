@@ -1,11 +1,10 @@
 /**
  * Shared transport address resolver.
  *
- * Resolves any valid Unicity address (@nametag, DIRECT://, hex pubkey)
- * to a transport-level pubkey for messaging and token delivery.
- *
- * Used by CommunicationsModule (DMs) and the payments vertical's recipient
- * resolution to ensure a single resolution path — no code duplication.
+ * Resolves a DM recipient (@nametag, DIRECT://, hex pubkey) to a
+ * transport-level pubkey. Used by CommunicationsModule only; the payments
+ * vertical resolves through `transport.resolve` and refuses DIRECT:// (#847).
+ * DIRECT:// is accepted here until #847 phase 2.
  *
  * Includes an in-memory cache (TTL-based) to avoid redundant network lookups.
  */

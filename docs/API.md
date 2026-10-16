@@ -1680,7 +1680,7 @@ it: read `code` structurally (`(err as { code?: unknown }).code`). Import
 ### Identity and FullIdentity
 
 **Single Identity Model**: the same secp256k1 key pair powers all wallet operations. The same `privateKey`/`chainPubkey` is used for:
-- L3 token ownership and transfers (via `chainPubkey` and `directAddress`)
+- L3 token ownership and transfers (locked to `chainPubkey`; `directAddress` is the Quests account id, never a recipient)
 - Nostr P2P messaging (derived transport key)
 
 `sphere.identity` is an `Identity` (public fields only). `FullIdentity` adds the private key; it
