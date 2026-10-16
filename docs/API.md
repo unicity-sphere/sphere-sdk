@@ -1365,9 +1365,11 @@ interface PaymentRequestView {
   again, even if the transfer went through (a transfer the SDK had already recorded is resumed when
   the wallet starts). Before paying a request again after a restart, check
   `sphere.payments.pendingTransfers()` and `sphere.payments.history()` for a transfer to that
-  requester. A SENT history row is best-effort: the SDK posts it once every leg of the transfer is
-  certified and does not retry a POST that fails. A missing row therefore does not prove that
-  nothing was sent.
+  requester. A SENT history row is best-effort. The SDK posts it once the transfer's legs have
+  settled and records only what was delivered: for a partial send, the delivered part, with the
+  remainder recorded under its own transferId when it is paid. A POST that fails is re-posted only
+  by a later convergence pass while the transfer is still open, never after it settled, so a missing
+  row does not prove that nothing was sent.
 
 ```typescript
 import { TokenRegistry, getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';

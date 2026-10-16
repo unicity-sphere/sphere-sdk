@@ -609,10 +609,12 @@ Normative behaviors bound into the transitions (not call sites):
   path the evidenced apply already completed the intent server-side (whole-token applies complete
   unflagged intents unconditionally; a split's change blob in `added` is seed evidence) — the
   explicit call converges the rare unevidenced edge via resume, so fire-and-forget is safe.
-  **Amended 2026-10-15 (#842):** the SENT POST is no longer part of that tail. It starts BESIDE
-  the apply, once every leg certified: fire-and-forget on `send()`, and on resume awaited only
-  after the close attempt, so a hung history endpoint holds neither the apply nor `complete`.
-  Neither the apply's answer nor the close gates it. The apply completes an unflagged intent, and
+  **Amended 2026-10-15 (#842):** the SENT POST is no longer part of that tail. Once the legs
+  settled, the record is built locally from the certified blobs and the POST is ISSUED before the
+  apply: fire-and-forget on `send()` when every leg certified first time, and on resume (so also in
+  `send()`'s in-process converge of a conflicted leg) awaited only after the close attempt, so a
+  hung history endpoint holds neither the apply nor `complete` — though, with no client request
+  timeout, it still holds that pass after them. Neither the apply's answer nor the close gates it. The apply completes an unflagged intent, and
   after that no pass lists the row again: the next pass sweeps its backstop as residue and records
   nothing. A SENT POST that waited on `complete`, or on the apply's answer, was lost for good when
   `complete` failed, or when the apply committed but its answer never arrived (a lost response, or
@@ -783,10 +785,11 @@ SENT by `transferId` (resume re-POST is a server no-op), RECEIVED by `(type, tok
 what SETTLED — the machine computes it from the certified recipient blobs (summarize()'s committed
 set), never the planned amount**, so a partial records the delivered portion and the remainder's
 re-plan records its own under the new transferId; a failed POST never fails
-the money path. **SENT is posted beside the apply (#842)**, once every leg certified, whatever the
+the money path. **SENT is issued before the apply (#842)**, once the legs settled, whatever the
 apply or the close answers (§5.5 "Resolution point"): the apply completes an unflagged intent,
-which then leaves the open listing for good. The POST itself stays best-effort and is not retried,
-so a missing SENT row does not prove that nothing was sent; server wire shape pinned (`ts`
+which then leaves the open listing for good. The POST itself stays best-effort: a failed one is
+re-posted only by a later pass while the intent is still open, never after it settled, so a
+missing SENT row does not prove that nothing was sent; server wire shape pinned (`ts`
 ISO+offset; genesis-stable lowercase `tokenId`), client-facing entries keep the consumed
 `timestamp` name via the read-through mapping. History
 `memo`/`counterparty_nametag` are **self-scoped encrypted** (`sphere-fieldenc-v1`), owned here.

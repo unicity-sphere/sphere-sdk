@@ -21,7 +21,7 @@ import { coinIdOf, splitOf } from './payload-view';
 import type { DeliveryJournalEntry, ScopedKV, ShortfallEntry } from '../stores';
 import type { IntentPayload, OpOutcome, OutcomeClass, PlannedOp } from './types';
 import { buildOps, classifyError, conflictAmount } from './outcomes';
-import { recordSettled } from './settled-history';
+import { postSettled, settledRecord } from './settled-history';
 import {
   ATTENTION_DELIVERY_DEFERRED,
   RATE_LIMIT_DEFER_MS,
@@ -201,8 +201,9 @@ export class TransferMachine {
       deliveryPending = await this.deliverSet(plan.transferId, plan.recipientPubkey, plan.memo, committed);
     }
     if (cls === null) {
-      // #842: every leg certified, so SENT goes out beside the apply — an applied row is never listed again.
-      void recordSettled(engine, this.deps.recordHistory, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });
+      // #842: every leg certified, so SENT leaves before the apply — an applied row is never listed again.
+      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });
+      void postSettled(this.deps.recordHistory, sent);
       await this.applyCommitted(engine, plan.transferId, committed);
       this.closeTail(plan.transferId, plan.payload);
       return { committed, deliveryPending };
@@ -630,9 +631,10 @@ export class TransferMachine {
     return { entry, closed };
   }
 
-  /** #842: SENT starts beside the apply and is awaited only after the close, whatever either answered. */
+  /** #842: SENT leaves before the apply and is awaited only after the close, whatever either answered. */
   private async applyRecorded<T>(engine: ITokenEngine, r: RehydratedIntent, committed: OpOutcome[], close: () => Promise<T>): Promise<T> {
-    const recorded = recordSettled(engine, this.deps.recordHistory, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });
+    const sent = await settledRecord(engine, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });
+    const recorded = postSettled(this.deps.recordHistory, sent);
     try {
       await this.applyCommitted(engine, r.transferId, committed);
       return await close();

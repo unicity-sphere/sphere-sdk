@@ -14,12 +14,13 @@ export interface SettledAttempt {
   committed: OpOutcome[];
 }
 
-/** SENT history, whatever the apply or the close answered (the server dedupKey is the transferId). Never throws. */
-export async function recordSettled(
+export type SettledRecord = Parameters<NonNullable<MachineDeps['recordHistory']>>[0];
+
+/** #842: read locally, so it is awaited before the apply and the POST leaves first. Never throws. */
+export async function settledRecord(
   engine: ITokenEngine,
-  recordHistory: MachineDeps['recordHistory'],
   { transferId, payload, phase, committed }: SettledAttempt
-): Promise<void> {
+): Promise<SettledRecord | undefined> {
   try {
     // A token-addressed spend has no coin to sum: what settled is the token itself.
     const coinId = coinIdOf(payload);
@@ -28,15 +29,19 @@ export async function recordSettled(
     // A whole-token spend records what the moved token ACTUALLY carried, never `assets: []`.
     const committedAssets =
       coinId === undefined ? await settledAssets(engine, committed) : undefined;
-    await recordHistory?.({
-      transferId,
-      payload,
-      phase,
-      committedAmount,
-      ...(committedAssets !== undefined ? { committedAssets } : {}),
-    });
+    return { transferId, payload, phase, committedAmount, ...(committedAssets !== undefined ? { committedAssets } : {}) };
   } catch {
-    /* #842: load-bearing — a rejection would override the apply's outcome, or go unhandled in run() */
+    return undefined; // a history failure never fails the money path
+  }
+}
+
+/** Issues the POST at once (dedupKey = transferId). Never rejects: that would override the apply's outcome. */
+export function postSettled(recordHistory: MachineDeps['recordHistory'], record: SettledRecord | undefined): Promise<void> {
+  if (record === undefined || recordHistory === undefined) return Promise.resolve();
+  try {
+    return recordHistory(record).catch(() => undefined);
+  } catch {
+    return Promise.resolve();
   }
 }
 

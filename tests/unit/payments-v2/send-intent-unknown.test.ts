@@ -2592,6 +2592,32 @@ describe('#842 SENT history is posted beside the apply, never gated on the close
     expect(await sentRows(world)).toEqual([{ transferId: 'tid-1', assets: [{ coinId: COIN, amount: '100' }] }]);
   });
 
+  it.each([
+    { fault: 'the resume close answers 503', inject: (world: World) => failCompleteOnce(world, completeDown) },
+    { fault: 'the resumed apply commits and its answer is lost', inject: loseApplyAnswerOnce },
+  ])('(sent-held) a held send whose legs only resume certifies, and $fault: resume alone writes the one SENT row', async ({ inject }) => {
+    const world = makeWorld();
+    await world.seed(100n);
+    await startSettled(world);
+    failEveryPut(world, unavailable);
+    const err = rejectionOf(await settle(world.facade.send({ recipient: '@peer', amount: '100', coinId: COIN })));
+    expect((err as SphereError).code).toBe('SEND_SYNC_PENDING');
+    expect(chainOps(world), 'held: nothing ran, so run() recorded nothing').toBe(0);
+    expect(await sentRows(world)).toEqual([]);
+    delete world.hooks.putIntent;
+    inject(world);
+
+    await world.facade.resumeNow();
+    await world.facade.resumeNow();
+    await flushTail();
+
+    expect(serverIntent(world, 'tid-1')).toBe('completed');
+    expect(backstopOf(world, 'tid-1')).toBeUndefined();
+    expect(await world.facade.pendingTransfers()).toEqual([]);
+    expect(await sentRows(world)).toEqual([{ transferId: 'tid-1', assets: [{ coinId: COIN, amount: '100' }] }]);
+    expect(await receipts(world)).toEqual({ entries: 1, amount: 100n });
+  });
+
   it('(sent-whole) a whole-token send whose complete answers 503 records the coins the token really carried', async () => {
     const world = makeWorld();
     const coin = await world.seed(100n);

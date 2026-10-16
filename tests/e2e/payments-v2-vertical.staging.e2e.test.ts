@@ -25,6 +25,8 @@
  *   set -a && source .env && set +a && npx vitest run --config vitest.e2e.config.ts \
  *     tests/e2e/payments-v2-vertical.staging.e2e.test.ts
  */
+import { randomUUID } from 'node:crypto';
+
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { isPossiblyCommittedSendOutcome, SphereError } from '../../core/errors';
@@ -975,9 +977,10 @@ describe.runIf(RUN)('LIVE staging: #842 SENT history beside the apply (real clie
     expect(failedUpdates(h0, transferId, firstEvent)).toEqual([]);
     expect(failedUpdates(h, transferId, h === h0 ? firstEvent : 0)).toEqual([]);
 
-    // The facade's own SENT record, POSTed again: the server keeps the one row.
+    // The facade's SENT record, POSTed again as every re-post is built: a FRESH entry id, the same
+    // dedupKey. The server must dedup on the dedupKey, or each pass adds a row for one payment.
     const record = must(hFaults.sent.find((r) => r.dedupKey === transferId), 'the SENT record H posted');
-    expect(await h.api.postHistory([record])).toEqual({ inserted: 0, deduped: 1 });
+    expect(await h.api.postHistory([{ ...record, id: randomUUID() }])).toEqual({ inserted: 0, deduped: 1 });
     expect(await sentRecords(h, transferId)).toHaveLength(1);
   }, 3_000_000);
 });

@@ -19,7 +19,10 @@ interface Recorded {
 }
 
 function captureHistory(w: World): Recorded[] {
-  const recorded: Recorded[] = [];
+  return captureHistoryInto(w, []);
+}
+
+function captureHistoryInto(w: World, recorded: Recorded[]): Recorded[] {
   w.deps.recordHistory = async ({ transferId, phase, committedAmount }) => {
     w.log.push('recordHistory');
     recorded.push({ transferId, phase, committedAmount });
@@ -39,17 +42,28 @@ function loseApplyAnswerOnce(w: World): void {
   };
 }
 
-/** The server applies the delta, then the process dies before the answer arrives: it never returns. */
-function applyThenDie(w: World): { revive(): void } {
+/**
+ * The process dies the moment the apply is ISSUED: the server commits it, and nothing the
+ * client starts afterwards ever leaves. `recordHistory` counts only calls made before that.
+ */
+function dieOnApply(w: World): { recorded: Recorded[]; revive(): void } {
   const storage = w.deps.storage;
   const apply = storage.applyDelta.bind(storage);
+  const recorded: Recorded[] = [];
+  let dead = false;
+  w.deps.recordHistory = async ({ transferId, phase, committedAmount }) => {
+    if (!dead) recorded.push({ transferId, phase, committedAmount });
+  };
   storage.applyDelta = async (delta) => {
+    dead = true;
     await apply(delta);
     return new Promise<never>(() => undefined);
   };
   return {
+    recorded,
     revive: () => {
       storage.applyDelta = apply;
+      captureHistoryInto(w, recorded);
     },
   };
 }
@@ -72,10 +86,21 @@ function failCompleteOnce(w: World): void {
   };
 }
 
+/** One leg, and two: a second leg puts more local work between the record and the apply. */
+const LEGS = [
+  { legs: 'one leg', amounts: [1000n] },
+  { legs: 'two legs', amounts: [600n, 400n] },
+];
+
+async function seedAll(w: World, amounts: bigint[]): Promise<Awaited<ReturnType<World['seed']>>[]> {
+  const tokens: Awaited<ReturnType<World['seed']>>[] = [];
+  for (const amount of amounts) tokens.push(await w.seed(amount));
+  return tokens;
+}
+
 /** A send whose apply failed before the server acted: certified, delivered, still open. */
-async function openAfterFailedApply(w: World): Promise<string> {
-  const token = await w.seed(1000n);
-  const plan = await w.plan({ tokens: [token], amount: '1000' });
+async function openAfterFailedApply(w: World, amounts: bigint[] = [1000n]): Promise<string> {
+  const plan = await w.plan({ tokens: await seedAll(w, amounts), amount: '1000' });
   failApplyOnce(w);
   await expect(w.machine().run(plan)).rejects.toMatchObject({ code: 'SEND_SYNC_PENDING' });
   await w.flushTail();
@@ -139,25 +164,41 @@ describe('#842 SENT history is posted beside the apply, never gated on the close
     expect(recorded).toHaveLength(1);
   });
 
-  it('C1 run(): the apply commits and the process dies before its answer — SENT is already recorded, and survives the restart sweep', async () => {
+  it.each(LEGS)('C1 run() over $legs: the process dies once the apply is issued — SENT was already issued, and survives the restart sweep', async ({ amounts }) => {
     const w = makeWorld();
-    const token = await w.seed(1000n);
-    const plan = await w.plan({ tokens: [token], amount: '1000' });
-    const recorded = captureHistory(w);
-    const death = applyThenDie(w);
+    const plan = await w.plan({ tokens: await seedAll(w, amounts), amount: '1000' });
+    const death = dieOnApply(w);
 
     void w.machine().run(plan);
     await w.flushTail();
 
     expect(w.api.inspectIntent(w.caller, plan.transferId)?.status, 'the apply committed').toBe('completed');
-    expect(recorded).toEqual([{ transferId: plan.transferId, phase: 'sent', committedAmount: '1000' }]);
+    expect(death.recorded, 'issued before the apply').toEqual([{ transferId: plan.transferId, phase: 'sent', committedAmount: '1000' }]);
 
     // Restart: a fresh pass over the same server and durable stores.
     death.revive();
     const report = await resumeAll(w.deps);
     expect(report).toMatchObject({ resumed: [], conflicted: [], failed: [] });
     expect(await w.stores().backstop.getByKey(plan.transferId), 'the restart sweep removed the backstop').toBeUndefined();
-    expect(recorded, 'exactly one SENT row, from before the crash').toHaveLength(1);
+    expect(death.recorded, 'exactly one SENT row, from before the crash').toHaveLength(1);
+  });
+
+  it.each(LEGS)('C2 resume over $legs: the process dies once the apply is issued — SENT was already issued, and survives the restart sweep', async ({ amounts }) => {
+    const w = makeWorld();
+    const transferId = await openAfterFailedApply(w, amounts);
+    const death = dieOnApply(w);
+
+    void resumeAll(w.deps);
+    await w.flushTail();
+
+    expect(w.api.inspectIntent(w.caller, transferId)?.status, 'the apply committed').toBe('completed');
+    expect(death.recorded, 'issued before the apply').toEqual([{ transferId, phase: 'resumed', committedAmount: '1000' }]);
+
+    death.revive();
+    const report = await resumeAll(w.deps);
+    expect(report).toMatchObject({ resumed: [], conflicted: [], failed: [] });
+    expect(await w.stores().backstop.getByKey(transferId)).toBeUndefined();
+    expect(death.recorded).toHaveLength(1);
   });
 
   it('T2 resume: a close that fails after the apply records SENT history and still reports failed', async () => {
@@ -226,6 +267,25 @@ describe('#842 SENT history is posted beside the apply, never gated on the close
     expect(order, 'SENT went out beside the apply, never after the close').toEqual(['recordHistory', 'completeIntent']);
   });
 
+  it('T8 run(): a history POST that never answers holds neither the apply, the close nor send()', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    w.deps.recordHistory = () => {
+      w.log.push('recordHistory');
+      return new Promise<never>(() => undefined);
+    };
+
+    await expect(w.machine().run(plan)).resolves.toMatchObject({ deliveryPending: false });
+    await w.flushTail();
+
+    expect(w.completes.map((c) => c.transferId), 'the close was issued').toEqual([plan.transferId]);
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('completed');
+    expect(await w.stores().backstop.getByKey(plan.transferId), 'the close tail finished').toBeUndefined();
+    const order = w.log.filter((step) => ['recordHistory', 'applyDelta', 'completeIntent'].includes(step));
+    expect(order).toEqual(['recordHistory', 'applyDelta', 'completeIntent']);
+  });
+
   it('T6a run(): a history POST that throws neither fails the send nor escapes as an unhandled rejection', async () => {
     const w = makeWorld();
     const token = await w.seed(1000n);
@@ -258,6 +318,38 @@ describe('#842 SENT history is posted beside the apply, never gated on the close
     expect(unhandled).toEqual([]);
     expect(w.api.inspectIntent(w.caller, transferId)?.status).toBe('completed');
     expect(await w.stores().backstop.getByKey(transferId)).toBeUndefined();
+  });
+
+  it('T6c run(): a history hook that throws synchronously fails nothing either', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    w.deps.recordHistory = () => {
+      throw new Error('history hook threw');
+    };
+
+    await expect(w.machine().run(plan)).resolves.toMatchObject({ deliveryPending: false });
+    await w.flushTail();
+
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('completed');
+    expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
+  });
+
+  it('T9 a recipient blob the history read cannot decode records nothing and still applies and closes', async () => {
+    const w = makeWorld();
+    const token = await w.seed(1000n);
+    const plan = await w.plan({ tokens: [token], amount: '1000' });
+    const recorded = captureHistory(w);
+    w.engine.decodeToken = async () => {
+      throw new Error('undecodable');
+    };
+
+    await expect(w.machine().run(plan)).resolves.toMatchObject({ deliveryPending: false });
+    await w.flushTail();
+
+    expect(recorded).toEqual([]);
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('completed');
+    expect(await w.stores().backstop.getByKey(plan.transferId)).toBeUndefined();
   });
 
   it('N1 a clean failure (nothing certified) records no SENT history', async () => {

@@ -23,12 +23,18 @@ after a restart) could pay twice.
 
 What changed:
 
-- Once every leg is certified, the SENT POST starts beside the inventory apply. Neither the apply's
-  answer nor the close waits for it or gates it: `send()` does not wait for it, and the resume path
-  waits for it only after the close attempt, so a history endpoint that never answers holds back
-  neither the apply nor `complete`. The recorded amount is still what settled, never the plan.
+- Once the legs have settled (every leg certified, or for a partial the certified legs beside the
+  conflicted ones), the SENT record is built locally from the certified blobs and its POST is
+  issued BEFORE the inventory apply, so it is already on its way when the apply commits. Neither
+  the apply's answer nor the close waits for the POST or gates it. A send whose legs all certify
+  on the first attempt does not wait for it either. On the resume path, and so also in a `send()`
+  that converges a conflicted leg in-process, the POST is awaited after the close attempt: a
+  history endpoint that never answers holds back neither the apply nor `complete`, but it still
+  holds that pass (and that `send()`) after them, as any request that never answers does, since
+  the client sets no request timeout. The recorded amount is still what settled, never the plan.
 - A failed resume close still reports the intent failed and carries its `Retry-After`. A history
-  failure still never fails a send or a resume.
+  failure, a history hook that throws, or a recipient blob the history read cannot decode still
+  never fails a send or a resume.
 - Behaviour changes for integrators:
   - a SENT row can now be in `history()` while the same transfer is still listed in
     `pendingTransfers()` (a send that rejected `SEND_SYNC_PENDING` after its legs certified). Do not
@@ -38,14 +44,19 @@ What changed:
   - an intent whose apply keeps failing re-posts its SENT record on every convergence pass. The
     server deduplicates the record by `transferId`, but each post emits `history:updated` with a
     freshly generated entry `id` that `history()` never serves;
-  - a SENT row is still best-effort and a failed POST is not retried, so a missing row does not
-    prove that nothing was sent.
+  - a SENT row is still best-effort. A POST that fails is re-posted only by a later pass while the
+    transfer is still open, never after it settled, so a missing row does not prove that nothing
+    was sent. A partial send's row records only the delivered part; the remainder is recorded
+    under its own transferId when it is paid.
 
 How it was verified: machine-level tests in `tests/unit/payments-v2/sent-history.test.ts` (a
-failed close, a lost apply answer and an apply whose answer never arrives, on `send()` and on
-resume, a settled partial, a hung and a throwing history POST, and no record for a clean failure),
+failed close, a lost apply answer, and a process that dies the moment the apply is issued, over
+one leg and two, on `send()` and on resume; a settled partial; a hung, a rejecting and a
+synchronously throwing history hook; an undecodable blob; no record for a clean failure),
 facade-level cases in `tests/unit/payments-v2/send-intent-unknown.test.ts` against the real history
-store, including a whole-token send, and mutation probes for each ordering.
+store, including a whole-token send and a held send whose resume is the only writer of its row,
+a staging case that re-POSTs a SENT record under a fresh entry id and expects the server to
+deduplicate it, and mutation probes for each ordering on both paths.
 
 ### Changed (breaking) — DIRECT:// is no longer a payment recipient; unused DIRECT helpers removed (#847)
 

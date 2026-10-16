@@ -2505,10 +2505,10 @@
   },
   {
     "name": "run-history-after-apply",
-    "note": "#842: SENT history starts BESIDE run()'s apply. Posted only once the apply answers, an apply the server committed whose answer never arrives (lost, or the process died) records nothing, and the restart sweep removes the last trace of a payment that left (sent-history.test.ts T3, C1)",
+    "note": "#842: run() issues the SENT POST BEFORE its apply. Issued only after the apply, an apply the server committed whose answer never arrives (lost, or the process died once it was issued) records nothing, and the restart sweep removes the last trace of a payment that left (sent-history.test.ts T3, C1, T8)",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "      void recordSettled(engine, this.deps.recordHistory, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      await this.applyCommitted(engine, plan.transferId, committed);\n",
-    "replace": "      await this.applyCommitted(engine, plan.transferId, committed);\n      void recordSettled(engine, this.deps.recordHistory, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n",
+    "find": "      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      void postSettled(this.deps.recordHistory, sent);\n      await this.applyCommitted(engine, plan.transferId, committed);\n",
+    "replace": "      await this.applyCommitted(engine, plan.transferId, committed);\n      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      void postSettled(this.deps.recordHistory, sent);\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
@@ -2518,19 +2518,40 @@
     "name": "run-history-dropped",
     "note": "#842: run() itself posts the SENT history; left to the close tail, a complete that fails after a good apply loses the row for good, since the apply completed the intent and no pass lists it again (sent-history.test.ts T1, T3, C1; send-intent-unknown.test.ts (sent-complete), (sent-whole))",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "      void recordSettled(engine, this.deps.recordHistory, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n",
-    "replace": "      // mutant: no SENT history beside the apply\n",
+    "find": "      void postSettled(this.deps.recordHistory, sent);\n",
+    "replace": "      void sent; // mutant: no SENT history beside the apply\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
     ]
   },
   {
-    "name": "resume-history-dropped",
-    "note": "#842: a resumed intent posts its SENT history whatever its apply or close answered; skipped, a lost apply answer or a failed close leaves a row the next pass sweeps with nothing recorded (sent-history.test.ts T2, T4, T5; send-intent-unknown.test.ts (sent-resume))",
+    "name": "run-awaits-history",
+    "note": "#842: run() never waits on its SENT POST. Awaited, a history endpoint that never answers (the client sets no request timeout) holds back the apply and the close, and send() never resolves although every leg is certified and delivered (sent-history.test.ts T8)",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    const recorded = recordSettled(engine, this.deps.recordHistory, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });\n",
-    "replace": "    const recorded = Promise.resolve();\n",
+    "find": "      void postSettled(",
+    "replace": "      await postSettled(",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "resume-history-dropped",
+    "note": "#842: a resumed intent posts its SENT history whatever its apply or close answered; skipped, a lost apply answer or a failed close leaves a row the next pass sweeps with nothing recorded (sent-history.test.ts T2, T4, T5, C2; send-intent-unknown.test.ts (sent-held), where resume is the row's only writer)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    const recorded = postSettled(this.deps.recordHistory, sent);\n",
+    "replace": "    void sent;\n    const recorded = Promise.resolve();\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "resume-history-after-apply",
+    "note": "#842: resume issues the SENT POST BEFORE its apply. Issued only once the apply answered, a lost apply answer, or a process that dies once the apply is issued, records nothing, and the next pass sweeps the completed row (sent-history.test.ts T4, T5, C2; send-intent-unknown.test.ts (sent-held))",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    const recorded = postSettled(this.deps.recordHistory, sent);\n    try {\n      await this.applyCommitted(engine, r.transferId, committed);\n",
+    "replace": "    let recorded = Promise.resolve();\n    try {\n      await this.applyCommitted(engine, r.transferId, committed);\n      recorded = postSettled(this.deps.recordHistory, sent);\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
@@ -2540,18 +2561,38 @@
     "name": "resume-close-waits-on-history",
     "note": "#842: the resume path awaits its SENT POST only AFTER the close; awaited first, a hung history endpoint (the client sets no request timeout) holds back both the apply and the close (sent-history.test.ts T7)",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    const recorded = recordSettled(engine, this.deps.recordHistory, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });\n    try {\n      await this.applyCommitted(engine, r.transferId, committed);\n",
-    "replace": "    const recorded = recordSettled(engine, this.deps.recordHistory, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });\n    await recorded;\n    try {\n      await this.applyCommitted(engine, r.transferId, committed);\n",
+    "find": "    const recorded = postSettled(this.deps.recordHistory, sent);\n    try {\n      await this.applyCommitted(engine, r.transferId, committed);\n",
+    "replace": "    const recorded = postSettled(this.deps.recordHistory, sent);\n    await recorded;\n    try {\n      await this.applyCommitted(engine, r.transferId, committed);\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
   },
   {
     "name": "settled-history-escapes-money-path",
-    "note": "#842: recordSettled never throws. A history failure that escapes rejects resume's applyRecorded finally (a resumed intent reads failed) and is an unhandled rejection beside run()'s apply (sent-history.test.ts T6a, T6b)",
+    "note": "#842: the SENT POST never rejects. A history failure that escapes rejects resume's applyRecorded finally (a resumed intent reads failed) and is an unhandled rejection beside run()'s apply (sent-history.test.ts T6a, T6b)",
     "file": "modules/payments-v2/machine/settled-history.ts",
-    "find": "  } catch {\n    /* #842: load-bearing \u2014 a rejection would override the apply's outcome, or go unhandled in run() */\n  }",
-    "replace": "  } finally {\n    /* mutant: a history failure escapes into the money path */\n  }",
+    "find": "    return recordHistory(record).catch(() => undefined);",
+    "replace": "    return recordHistory(record);",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "settled-history-sync-throw-escapes",
+    "note": "#842: a history hook that throws synchronously never reaches the money path; escaped, it rejects run() after every leg certified and was delivered, before the apply (sent-history.test.ts T6c)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  } catch {\n    return Promise.resolve();\n  }",
+    "replace": "  } finally {\n    /* mutant: a synchronous throw escapes */\n  }",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "settled-record-escapes-money-path",
+    "note": "#842: the SENT record is built before the apply, so a blob the history read cannot decode must yield no record, never a throw; escaped, run() rejects before the apply after every leg certified and was delivered (sent-history.test.ts T9)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    return undefined; // a history failure never fails the money path",
+    "replace": "    throw new Error('mutant: the history read escapes');",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
