@@ -493,8 +493,9 @@ function validateCoinPayload(c: Partial<CoinIntentPayload>): CoinIntentPayload {
   ) {
     throw new SphereError('intent payload split spec is malformed', 'VALIDATION_ERROR');
   }
-  // #840: the engine refuses a non-hex coin at the split leg, after the direct legs spent.
-  if (s !== undefined && !/^(?:[0-9a-f]{2})+$/.test(c.coinId)) {
+  // #840: a split leg refuses any other form after the direct legs spent, and a conflicted
+  // direct leg is costed by exact coin id, so it would read 0 and the intent complete paid.
+  if (!/^(?:[0-9a-f]{2})+$/.test(c.coinId)) {
     throw new SphereError('intent payload coinId is not canonical hex', 'VALIDATION_ERROR');
   }
   return { ...(c as CoinIntentPayload), kind: 'coin' };

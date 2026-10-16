@@ -4169,10 +4169,20 @@
   },
   {
     "name": "resume-split-coinid-typeof-only",
-    "note": "#840: with a split present the coin id must be canonical hex. The engine refuses any other at the split leg, AFTER resumeOps spent the direct legs: a partial pay on a plan that can never complete.",
+    "note": "#840: a coin intent's coin id must be canonical hex. The engine refuses any other at the split leg, AFTER resumeOps spent the direct legs: a partial pay on a plan that can never complete.",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "  if (s !== undefined && !/^(?:[0-9a-f]{2})+$/.test(c.coinId)) {",
-    "replace": "  if (s !== undefined && typeof c.coinId !== 'string') {",
+    "find": "  if (!/^(?:[0-9a-f]{2})+$/.test(c.coinId)) {",
+    "replace": "  if (typeof c.coinId !== 'string') {",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-coinid-hex-split-only",
+    "note": "#840: the hex check holds for a direct-only coin intent too. A conflicted direct leg is costed by balanceOf under the exact payload coin id, so a non-canonical one reads 0n and the intent completes as paid with nothing owed.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (!/^(?:[0-9a-f]{2})+$/.test(c.coinId)) {",
+    "replace": "  if (s !== undefined && !/^(?:[0-9a-f]{2})+$/.test(c.coinId)) {",
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
     ]

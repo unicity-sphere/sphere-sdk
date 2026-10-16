@@ -15,7 +15,10 @@ parse (`'abc'`, `'1e3'`) made the whole convergence pass throw. A string `BigInt
 client writes (`''`, `'0'`, `'-5'`, `'0x258'`, `'0600'`, a value of 2^256 or more), or a split
 under a coin id that is not lowercase hex, passed the check: the direct legs beside the split were
 spent, and the split then failed or ran under `BigInt`'s reading of a grammar its writer may not
-have meant. The batched source read had the same coupling one layer down: wallet-api refuses the
+have meant. A coin id that is not lowercase hex also passed on a send with no split. A direct leg
+that conflicted on resume was then costed by an exact match on that id, so it read as 0: the send
+completed as fully paid, nothing was owed for that leg, and a linked payment request resolved
+paid. The batched source read had the same coupling one layer down: wallet-api refuses the
 whole `blob-urls` batch over one malformed or unowned token id, and one failed blob download
 rejects the read, so every send in the pass that needed a source failed closed, and the refusal's
 `Retry-After` was dropped. A pass that threw also dropped everything it had already decided. A
@@ -32,8 +35,8 @@ paid with nothing moved.
 
 What changed:
 
-- Split amounts must be canonical positive decimal strings below 2^256, and a split's coin id
-  must be lowercase even-length hex. `amount` stays type-checked only, since the send path writes
+- Split amounts must be canonical positive decimal strings below 2^256, and a coin intent's coin
+  id must be lowercase even-length hex, with or without a split. `amount` stays type-checked only, since the send path writes
   it verbatim and accepts leading zeros.
 - Each intent is planned inside its own failure boundary. One that cannot be planned is reported
   `failed` and left open: never executed, aborted or completed, and its sources are not touched.
@@ -42,7 +45,9 @@ What changed:
   only the intent that named the bad id fails closed. The refusal's `Retry-After` reaches the
   heartbeat. A refusal that carries one is not re-read per intent, and the per-intent re-reads stop
   at the first answer that carries one, so a server that asked to back off gets no further
-  requests that pass; the intents left unread fail closed until the next pass.
+  blob-url reads that pass; the intents left unread fail closed until the next pass. The rest of
+  the pass still runs, so intents that need no source read, the reconcile and the journal replays
+  still send their requests.
 - A pass that throws after reading the backstop keeps its verdicts and reports every intent it
   had not judged as `failed`, so the payment-request reconcile still runs and treats them as open.
 - A cancel answered `404 NOT_FOUND` keeps its tombstone until the reconcile has applied its
