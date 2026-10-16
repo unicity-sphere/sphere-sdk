@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-10-16
+
 ### Fixed — `@nametag` and `DIRECT://` resolution never chooses between competing claims (nostr-js-sdk 0.6.1)
 
 What was wrong. Resolution in nostr-js-sdk 0.6.0 counted every binding event the relay returned for
@@ -2197,7 +2199,8 @@ consumed exclusively through the `token-engine/` port. Consequences:
 - `PaymentsModule.destroy()` now cleans up storage event subscriptions and debounce timers
 - `IpfsStorageProvider.shutdown()` now disconnects the subscription client
 
-[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.19.1...HEAD
+[0.19.1]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/unicity-sphere/sphere-sdk/compare/v0.17.7...v0.18.0
