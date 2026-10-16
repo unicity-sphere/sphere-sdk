@@ -3589,6 +3589,26 @@
     ]
   },
   {
+    "name": "sync-binding-heal-skips-missing-direct-address",
+    "note": "#847 Quests surface: a relay binding with no content.direct_address must be re-published with the Quests id; without the check it is skipped forever and resolve(<chain pubkey>) never yields the Quests id (nametag-overwrite-guard.test.ts)",
+    "file": "core/Sphere.ts",
+    "find": "            const needsUpdate =\n              !existing.directAddress ||\n",
+    "replace": "            const needsUpdate =\n",
+    "tests": [
+      "tests/integration/nametag-overwrite-guard.test.ts"
+    ]
+  },
+  {
+    "name": "sync-binding-heal-publishes-empty-quests-id",
+    "note": "#847 Quests surface: the incomplete-binding re-publish must carry the wallet's DIRECT:// Quests id, never '' (nametag-overwrite-guard.test.ts)",
+    "file": "core/Sphere.ts",
+    "find": "                this._identity!.directAddress || '',\n                this._identity?.nametag || existing.nametag || undefined,",
+    "replace": "                '',\n                this._identity?.nametag || existing.nametag || undefined,",
+    "tests": [
+      "tests/integration/nametag-overwrite-guard.test.ts"
+    ]
+  },
+  {
     "name": "transport-nametag-binding-drops-direct-address",
     "note": "#847 Quests surface: the nametag binding must keep writing content.direct_address through the real nostr-js-sdk builder (identity-binding-quests.test.ts)",
     "file": "transport/NostrTransportProvider.ts",

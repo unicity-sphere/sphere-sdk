@@ -243,6 +243,47 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
     await sphere2.destroy();
   });
 
+  // #847: content.direct_address is the Sphere Quests account id, and this
+  // re-publish is the only path that writes it into a binding that lacks it.
+  it('re-publishes a binding that carries no direct address, with the Quests id', async () => {
+    const transport = createMockTransport();
+    const oracle = createMockOracle();
+
+    const { sphere: sphere1 } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      network: TEST_NETWORK,
+      walletApi: makePv2World().walletApi,
+      autoGenerate: true,
+      nametag: 'quest_user',
+    });
+    const directAddr = sphere1.identity!.directAddress!;
+    const chainPubkey = sphere1.identity!.chainPubkey;
+    expect(directAddr).toMatch(/^DIRECT:\/\//);
+    await sphere1.destroy();
+
+    // A binding written by an older client: same key and nametag, no direct address.
+    const full = relayBindings.get(directAddr)!;
+    relayBindings.delete(directAddr);
+    relayBindings.set('', { ...full, directAddress: '' });
+    transport.publishIdentityBinding.mockClear();
+
+    const sphere2 = await Sphere.load({
+      storage,
+      transport,
+      oracle,
+      network: TEST_NETWORK,
+      walletApi: makePv2World().walletApi,
+    });
+
+    expect(transport.publishIdentityBinding).toHaveBeenCalledTimes(1);
+    expect(transport.publishIdentityBinding).toHaveBeenCalledWith(chainPubkey, directAddr, 'quest_user');
+    expect(relayBindings.get(directAddr)!.directAddress).toBe(directAddr);
+
+    await sphere2.destroy();
+  });
+
   it('should recover nametag from relay when local state lost it', async () => {
     const transport = createMockTransport();
     const oracle = createMockOracle();
