@@ -149,11 +149,13 @@ describe('one open intent resume cannot plan never wedges the pass (#840)', () =
     it(`a split under coin id ${JSON.stringify(coinId)} is refused before the direct leg beside it is spent`, async () => {
       const w = makeWorld();
       await stageSplit(w, BAD_ID, { splitAmount: '600', remainderAmount: '400' }, coinId);
+      const reads = vi.spyOn(w.deps.storage, 'getBlobs');
 
       const report = await resumeAll(w.deps);
 
       expect(report).toEqual({ resumed: [], conflicted: [], failed: [BAD_ID] });
       expectUntouched(w);
+      expect(reads, 'refused from the payload alone: its sources are never read').not.toHaveBeenCalled();
     });
   }
 
@@ -164,12 +166,14 @@ describe('one open intent resume cannot plan never wedges the pass (#840)', () =
       const lost = await w.seed(400n);
       await w.engine.foreignSpend(lost);
       await stageIntent(w, BAD_ID, { coinId, direct: [kept.blob.tokenId, lost.blob.tokenId] });
+      const reads = vi.spyOn(w.deps.storage, 'getBlobs');
 
       const report = await resumeAll(w.deps);
 
       expect(report).toEqual({ resumed: [], conflicted: [], failed: [BAD_ID] });
       expectUntouched(w);
       expect(w.log).not.toContain('completeIntent');
+      expect(reads, 'refused from the payload alone: its sources are never read').not.toHaveBeenCalled();
     });
   }
 
