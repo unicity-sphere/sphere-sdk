@@ -5,15 +5,35 @@
 //
 // Every other SDK test mocks the nostr client, so a nostr-js-sdk bump that stopped
 // writing `content.direct_address` would stay green and break Quests sign-in. Here
-// the REAL upstream builders run behind NostrTransportProvider's parameter mapping:
-// only the relay I/O (connect, publishEvent, subscribe) is faked.
+// the REAL upstream builders and the REAL lookup (address filter, candidate check,
+// signature verify, single-owner pick) run behind NostrTransportProvider: only the
+// relay I/O is faked, and the fake relay replays what was published to a matching
+// subscription, then EOSE.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { getPublicKey } from '../../../core/crypto';
 import type { WebSocketFactory } from '../../../transport/websocket';
 
-const relay = vi.hoisted(() => ({ published: [] as { tags: string[][]; content: string }[] }));
+interface StoredEvent {
+  kind: number;
+  pubkey: string;
+  tags: string[][];
+  content: string;
+}
+const relay = vi.hoisted(() => ({ published: [] as StoredEvent[] }));
+
+/** A relay's filter match over the fields the binding queries use. */
+function matches(filter: unknown, event: StoredEvent): boolean {
+  const json = JSON.parse(JSON.stringify(filter)) as Record<string, unknown>;
+  return Object.entries(json).every(([key, wanted]) => {
+    if (!Array.isArray(wanted)) return true;
+    if (key === 'kinds') return wanted.includes(event.kind);
+    if (key === 'authors') return wanted.includes(event.pubkey);
+    if (!key.startsWith('#')) return true;
+    return event.tags.some(([name, value]) => name === key.slice(1) && wanted.includes(value));
+  });
+}
 
 vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@unicitylabs/nostr-js-sdk')>();
@@ -23,25 +43,22 @@ vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
     override disconnect = (): void => undefined;
     override isConnected = (): boolean => true;
     override getConnectedRelays = (): Set<string> => new Set(['wss://fake.relay']);
-    override queryPubkeyByNametag = async (): Promise<string | null> => null;
     override publishEvent = async (event: SdkEvent): Promise<string> => {
       relay.published.push(event);
       return 'fake-event-id';
     };
-    override subscribe = ((...args: unknown[]): string => {
-      const listener = args.find((a) => typeof a === 'object' && a !== null && 'onEndOfStoredEvents' in a) as
-        | { onEndOfStoredEvents?: (id: string) => void }
-        | undefined;
-      setTimeout(() => listener?.onEndOfStoredEvents?.('fake-sub'), 0);
+    // Stored events matching the filter, then EOSE: what a relay answers a REQ with.
+    override subscribe = ((filter: unknown, listener: {
+      onEvent?: (event: SdkEvent) => void;
+      onEndOfStoredEvents?: (id: string) => void;
+    }): string => {
+      setTimeout(() => {
+        for (const event of relay.published.filter((e) => matches(filter, e))) listener.onEvent?.(event as SdkEvent);
+        listener.onEndOfStoredEvents?.('fake-sub');
+      }, 0);
       return 'fake-sub';
     }) as never;
     override unsubscribe = (): void => undefined;
-    // The reverse lookup over what was published: the `t` tag the builder wrote.
-    override queryBindingByAddress = async (address: string) => {
-      const tag = actual.hashAddressForTag(address);
-      const event = relay.published.find((e) => e.tags.some(([k, v]) => k === 't' && v === tag));
-      return event ? actual.parseBindingInfo(event as SdkEvent) : null;
-    };
   }
   return { ...actual, NostrClient: RelaylessNostrClient };
 });
