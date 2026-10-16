@@ -3576,5 +3576,26 @@
     "tests": [
       "tests/unit/transport/identity-binding-quests.test.ts"
     ]
+  },
+  {
+    "name": "register-nametag-drops-quests-id",
+    "note": "#847 Quests surface: registerNametag must publish the wallet's DIRECT:// Quests id in the nametag binding; '' would leave resolve(<chain pubkey>) with no Quests id once that newer binding wins (Sphere.registerNametag.test.ts, sphere-payments-v2-wiring.test.ts)",
+    "file": "core/Sphere.ts",
+    "find": "        this._identity!.directAddress || '',\n        cleanNametag,",
+    "replace": "        '',\n        cleanNametag,",
+    "tests": [
+      "tests/unit/core/Sphere.registerNametag.test.ts",
+      "tests/integration/sphere-payments-v2-wiring.test.ts"
+    ]
+  },
+  {
+    "name": "transport-nametag-binding-drops-direct-address",
+    "note": "#847 Quests surface: the nametag binding must keep writing content.direct_address through the real nostr-js-sdk builder (identity-binding-quests.test.ts)",
+    "file": "transport/NostrTransportProvider.ts",
+    "find": "          {\n            publicKey: chainPubkey,\n            directAddress,\n          },",
+    "replace": "          {\n            publicKey: chainPubkey,\n          },",
+    "tests": [
+      "tests/unit/transport/identity-binding-quests.test.ts"
+    ]
   }
 ]
