@@ -609,6 +609,17 @@ Normative behaviors bound into the transitions (not call sites):
   path the evidenced apply already completed the intent server-side (whole-token applies complete
   unflagged intents unconditionally; a split's change blob in `added` is seed evidence) — the
   explicit call converges the rare unevidenced edge via resume, so fire-and-forget is safe.
+  **Amended 2026-10-15 (#842):** the SENT POST is no longer part of that tail. Once the legs
+  settled, the record is built locally from the certified blobs, kept in the SENT outbox (§6), and
+  the POST is ISSUED before the apply. No path awaits it, on `send()` or on resume (so also in
+  `send()`'s in-process converge of a conflicted leg): the outbox re-posts what does not land, so a
+  hung history endpoint holds no apply, `complete` or pass, and a resumed apply or close that fails
+  is reported at once with its `Retry-After`. Neither
+  the apply's answer nor the close gates the POST. The apply completes an unflagged intent, and
+  after that no pass lists the row again: the next pass sweeps its backstop as residue and records
+  nothing. A SENT POST that waited on `complete`, or on the apply's answer, was lost for good when
+  `complete` failed, or when the apply committed but its answer never arrived (a lost response, or
+  a process that stopped first).
 
 **The E.2 outcome table, with v3's statuses (classification unchanged — #760).** Two statuses
 joined `CertificationStatus` (submit answers) and two joined
@@ -757,7 +768,8 @@ unless the server lists its intent as aborted (paid-never-re-payable once a dura
 `pay()` can list an already-paid request as `pending` (payable) again after a restart; and
 if the link write fails on the possibly-committed path, `pay()` rejects with the storage error
 instead of the send error and the link lives only in memory. Until #806 is fixed, check
-`pendingTransfers()` / `history()` before paying a request again. **The settlement invariant (one
+`pendingTransfers()` / `history()` before paying a request again — though a missing SENT row
+proves nothing (§5.9: the POST is best-effort). **The settlement invariant (one
 code path):** a settling link is removed ONLY by a CONFIRMED paid respond (2xx, or the 409
 already-resolved absorb) or by a proven clean pre-commit failure — never by a network error, a
 5xx, or a reload; a clean-success send whose respond fails keeps the link (status `settling`) and
@@ -773,10 +785,17 @@ History: server read-through (`GET /v1/history` keyset pages) + client POSTs wit
 SENT by `transferId` (resume re-POST is a server no-op), RECEIVED by `(type, tokenId, stateHash)`,
 **MINT by `('MINT', tokenId)`** (a resumed mint must not double-POST); **a SENT record's amount is
 what SETTLED — the machine computes it from the certified recipient blobs (summarize()'s committed
-set), never the planned amount**, so a partial records the delivered portion and the remainder's
+set), never the planned amount**, so a partial records the certified portion and the remainder's
 re-plan records its own under the new transferId; a failed POST never fails
-the money path; server wire shape pinned (`ts` ISO+offset; genesis-stable lowercase `tokenId`),
-client-facing entries keep the consumed `timestamp` name via the read-through mapping. History
+the money path. **SENT is issued before the apply (#842)**, once the legs settled, whatever the
+apply or the close answers (§5.5 "Resolution point"): the apply completes an unflagged intent,
+which then leaves the open listing for good. So the record goes into the SENT outbox
+(`STORE_KEYS.sentOutbox`) before the apply and leaves it only once its POST is recorded or
+permanently refused; every convergence pass re-posts what it holds, beside the pass. A row can
+still be missing (an unwritable outbox, a device that never runs again), so a missing SENT row
+does not prove that nothing was sent; server wire shape pinned (`ts`
+ISO+offset; genesis-stable lowercase `tokenId`), client-facing entries keep the consumed
+`timestamp` name via the read-through mapping. History
 `memo`/`counterparty_nametag` are **self-scoped encrypted** (`sphere-fieldenc-v1`), owned here.
 Mint: engine self-mint routed through the **same idempotent submit-then-probe primitive as
 transfer/split** — the #692 F13 fix lands in `token-engine` (P8); the fake aggregator models
@@ -821,6 +840,7 @@ can lose money.** Each row exists because of a documented server non-guarantee.
 | Seen-set `(tokenId, stateHash)` | mailbox is at-least-once; claimed entries stay listable | delivery impl (S7 port contract) |
 | `suspectedSpent` overlay | server never checks unspentness | InventoryView |
 | Settling journal (request → transferId) | #441 — a possibly-committed pay must survive reload | Requests |
+| SENT outbox (`sent-outbox`: a settled send's SENT record, payload encrypted, #842) | the apply completes the intent, which then leaves every listing, so nothing else can re-post a SENT POST that failed or that the process never finished | TransferMachine (the convergence pass removes what it re-posted) |
 | Stream cursors + syncEpoch (atomic `(cursor, epoch)` record per stream + one global epoch latch) | wakes are lossy; epoch guards restores | Session/owners |
 
 All keyed per-network **and** per-address: the scope prefix is `pv2g2:{network}:{chainPubkey}:`,

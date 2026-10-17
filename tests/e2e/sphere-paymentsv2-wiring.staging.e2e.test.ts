@@ -261,6 +261,8 @@ describe.runIf(RUN)('LIVE staging: Sphere payments wiring (default transport pat
     //    the self-output rides our own mailbox back at a NEW state.
     const own = sphere!.identity!.chainPubkey;
     const settled = async (): Promise<boolean> => {
+      // The pre-send row reads 100 too, held as 'transferring' until the post-send refresh tombstones it.
+      if (sphere!.payments.tokens({ coinId: HARNESS_COIN }).some((t) => t.status !== 'confirmed')) return false;
       if (totalOf(sphere!.payments) !== 100n) return false;
       const { entries } = await sphere!.payments.history({ limit: 100 });
       return entries.some((e) => e.type === 'RECEIVED' && e.tokenId === genesis.toLowerCase());

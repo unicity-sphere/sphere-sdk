@@ -409,7 +409,7 @@ function validateWholePayload(p: Partial<WholeIntentPayload>): WholeIntentPayloa
   return { ...(p as WholeIntentPayload), kind: 'whole', direct: [p.direct[0]] };
 }
 
-function validatePayload(raw: unknown): IntentPayload {
+export function validatePayload(raw: unknown): IntentPayload {
   const p = raw !== null && typeof raw === 'object' ? (raw as Partial<IntentPayload>) : null;
   if (p === null || p.v !== 2 || !Array.isArray(p.direct) || p.direct.some((t) => typeof t !== 'string')) {
     throw new SphereError(

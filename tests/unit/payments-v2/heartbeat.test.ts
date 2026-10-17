@@ -264,6 +264,52 @@ describe('PaymentsFacade — §7 convergence heartbeat', () => {
     expect(rows).toEqual([expect.objectContaining({ kind: 'shortfall', amount: '400' })]);
   });
 
+  it('#842 a send whose SENT POST fails while the wallet is idle arms the heartbeat: the kept row is posted in-session, at the send time', async () => {
+    const w = makeWorld();
+    await w.seed(1000n);
+    await w.facade.start();
+    await drain();
+    let failures = 1;
+    w.hooks.postHistory = async () => {
+      if (failures > 0) {
+        failures -= 1;
+        throw new FakeApiError(503, 'UNAVAILABLE', 'history down');
+      }
+    };
+    const sentAt = Date.now();
+    await w.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN });
+    await drain();
+    const sentRows = async (): Promise<{ timestamp: number }[]> =>
+      (await w.facade.history()).entries.filter((entry) => entry.type === 'SENT');
+    expect(await sentRows(), 'the POST failed').toEqual([]);
+
+    await tick(HEARTBEAT_SEED_MS); // no resumeNow, no deposit owed: only the armed heartbeat re-posts it
+    const rows = await sentRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.timestamp, 'the send time, not the re-post time').toBe(sentAt);
+  });
+
+  it('#842 a SENT POST answered after stop() deletes nothing, and stop() never waits on it', async () => {
+    const w = makeWorld();
+    await w.seed(1000n);
+    await w.facade.start();
+    await drain();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    w.hooks.postHistory = () => gate;
+    await w.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN });
+    await drain();
+
+    await w.facade.stop(); // returns although the history POST still hangs
+    release();
+    await drain();
+
+    const kept = await createMachineStores(w.kv).sentOutbox.list();
+    expect(kept, 'left for the next facade on this address to re-post').toHaveLength(1);
+  });
+
   it('a partial send applied but not closed arms the heartbeat: its intent closes in-session, no resumeNow', async () => {
     const w = makeWorld();
     await w.seed(600n);

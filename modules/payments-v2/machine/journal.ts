@@ -13,6 +13,7 @@ import {
   type MintJournalEntry,
   type NftMintJournalEntry,
   type ScopedKV,
+  type SentOutboxEntry,
   type ShortfallEntry,
   type CustomMintJournalEntry,
   type BurnJournalEntry,
@@ -350,6 +351,7 @@ export interface MachineStores {
   readonly customMintJournal: ListStore<CustomMintJournalEntry>;
   readonly burnJournal: ListStore<BurnJournalEntry>;
   readonly shortfalls: ListStore<ShortfallEntry>;
+  readonly sentOutbox: ListStore<SentOutboxEntry>;
 }
 
 export function createMachineStores(kv: ScopedKV): MachineStores {
@@ -361,6 +363,7 @@ export function createMachineStores(kv: ScopedKV): MachineStores {
     customMintJournal: new ListStore<CustomMintJournalEntry>(kv, STORE_KEYS.customMintJournal, (e) => e.mintId),
     burnJournal: new ListStore<BurnJournalEntry>(kv, STORE_KEYS.burnJournal, (e) => e.burnId),
     shortfalls: new ListStore<ShortfallEntry>(kv, STORE_KEYS.shortfalls, (e) => e.transferId),
+    sentOutbox: new ListStore<SentOutboxEntry>(kv, STORE_KEYS.sentOutbox, (e) => e.transferId),
   };
 }
 

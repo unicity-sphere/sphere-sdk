@@ -8,7 +8,8 @@ import type { DeliveryPort } from './ports';
 import { isLiveBurn, type DeliveryJournalEntry, type IntentBackstopEntry, type ShortfallEntry } from './stores';
 import type { CoinIntentPayload, IntentPayload } from './machine/types';
 import { retryAfterMsOf, type MachineStores, type ReplayDeps } from './machine/journal';
-import { resumeAll } from './machine/resume';
+import { resumeAll, validatePayload } from './machine/resume';
+import { repostKept } from './machine/settled-history';
 import type { IntentApi, MachineDeps } from './machine/TransferMachine';
 
 // Backoff: seed 5 s, ×2 per unproductive pass, cap 120 s; reset on progress
@@ -143,6 +144,8 @@ export interface ConvergerDeps {
 }
 
 export class Converger {
+  private readonly reposting = new Set<string>();
+
   constructor(private readonly deps: ConvergerDeps) {}
 
   /** Resume open intents, then drain the delivery + mint journals (all idempotent). */
@@ -178,22 +181,49 @@ export class Converger {
         wait(retryAfterMsOf(err));
       }
     }
+    this.repostSentOutbox();
     return { progress, retryAfterMs };
+  }
+
+  /** #842: off the pass, so a history POST that never answers holds no convergence. */
+  private repostSentOutbox(): void {
+    const { machineDeps, stores, activeOps } = this.deps;
+    const inFlight = machineDeps.sentInFlight ?? this.reposting;
+    const recordHistory = machineDeps.recordHistory;
+    if (recordHistory === undefined) return;
+    const deps = {
+      recordHistory,
+      whileLive: machineDeps.whileLive,
+      outbox: stores.sentOutbox,
+      readPayload: async (envelope: string) => validatePayload(await machineDeps.decryptPayload(envelope)),
+    };
+    void stores.sentOutbox.list().then((entries) => {
+      for (const entry of entries) {
+        const { transferId } = entry;
+        // An attempt in process posts its own record; one POST per record at a time, whoever issued it.
+        if (activeOps.has(transferId) || inFlight.has(transferId)) continue;
+        inFlight.add(transferId);
+        void repostKept(deps, entry).finally(() => inFlight.delete(transferId));
+      }
+    }, () => undefined);
   }
 
   /** §4 heartbeat predicate — read fresh from the §6 stores, never cached. */
   async pendingWork(): Promise<boolean> {
-    const [backstop, journal, mints, nftMints, customMints, burns] = await Promise.all([
+    const [backstop, journal, mints, nftMints, customMints, burns, sentOutbox] = await Promise.all([
       this.deps.stores.backstop.list(),
       this.deps.stores.deliveryJournal.list(),
       this.deps.stores.mintJournal.list(),
       this.deps.stores.nftMintJournal.list(),
       this.deps.stores.customMintJournal.list(),
       this.deps.stores.burnJournal.list(),
+      this.deps.stores.sentOutbox.list(),
     ]);
     const mintsOpen = mints.length > 0 || nftMints.length > 0 || customMints.length > 0;
     const burnsOpen = burns.some(isLiveBurn);
-    return backstop.length > 0 || journal.some((e) => e.undeliverable !== true) || mintsOpen || burnsOpen;
+    // #842: an unacknowledged SENT record is work too — only a pass re-posts it.
+    const historyOwed = sentOutbox.length > 0;
+    return backstop.length > 0 || journal.some((e) => e.undeliverable !== true) || mintsOpen || burnsOpen || historyOwed;
   }
 
   private async resumePass(): Promise<ConvergeOutcome> {

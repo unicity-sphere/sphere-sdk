@@ -30,7 +30,7 @@ import { WalletApiStoragePort } from '../../../impl/wallet-api-v2/storage';
 import { WalletApiDeliveryPort } from '../../../impl/wallet-api-v2/mailbox';
 import { WalletApiSplitCheckpointStore } from '../../../impl/wallet-api-v2/checkpoints';
 import { PaymentsFacade } from '../../../modules/payments-v2/PaymentsFacade';
-import type { DeliveryPort, InventoryItem } from '../../../modules/payments-v2/ports';
+import type { DeliveryPort, InventoryItem, StoragePort } from '../../../modules/payments-v2/ports';
 import type { ScopedKV } from '../../../modules/payments-v2/stores';
 import { createMachineStores } from '../../../modules/payments-v2/machine/journal';
 import { createSphereTokenEngine } from '../../../token-engine/factory';
@@ -109,6 +109,8 @@ export interface MakeOptions {
   wrapDelivery?: (inner: DeliveryPort) => DeliveryPort;
   /** Wraps the FACADE's client only (fault injection, #835); `VWallet.api` stays the real one, for observation. */
   wrapClient?: (inner: AuthedClient) => AuthedClient;
+  /** Wraps the FACADE's storage port only (fault injection on POST /v1/inventory/apply, #842). */
+  wrapStorage?: (inner: StoragePort) => StoragePort;
 }
 
 /** The whole vertical, composed for real: session → authed client → ports → engine → facade. */
@@ -155,7 +157,7 @@ export async function makeVerticalWallet(tag: string, options: MakeOptions = {})
   const facade = new PaymentsFacade({
     session,
     client: options.wrapClient ? options.wrapClient(api) : api,
-    storagePort: new WalletApiStoragePort(api),
+    storagePort: options.wrapStorage ? options.wrapStorage(new WalletApiStoragePort(api)) : new WalletApiStoragePort(api),
     deliveryPort: options.wrapDelivery ? options.wrapDelivery(realDelivery) : realDelivery,
     checkpointStore: new WalletApiSplitCheckpointStore({
       client: api,

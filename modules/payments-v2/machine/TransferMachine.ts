@@ -21,7 +21,7 @@ import { coinIdOf, splitOf } from './payload-view';
 import type { DeliveryJournalEntry, ScopedKV, ShortfallEntry } from '../stores';
 import type { IntentPayload, OpOutcome, OutcomeClass, PlannedOp } from './types';
 import { buildOps, classifyError, conflictAmount } from './outcomes';
-import { recordSettled } from './settled-history';
+import { keepAndPost, settledRecord, type OutboxDeps } from './settled-history';
 import {
   ATTENTION_DELIVERY_DEFERRED,
   RATE_LIMIT_DEFER_MS,
@@ -73,7 +73,10 @@ export interface MachineDeps {
   emit: (event: string, payload: unknown) => void;
   now: () => number;
   recordSplit?: (sourceTokenId: string, outputTokenId: string) => Promise<void>;
-  /** `committedAmount` = what SETTLED (the certified recipient blobs' value), never the plan. */
+  /**
+   * `committedAmount` = what SETTLED (the certified recipient blobs' value), never the plan.
+   * Resolves `false` only when a retry may still record it (#842: the SENT outbox keeps it).
+   */
   recordHistory?: (info: {
     transferId: string;
     payload: IntentPayload;
@@ -81,7 +84,15 @@ export interface MachineDeps {
     committedAmount: string;
     /** A WHOLE-token spend moves the token, not an amount: its real assets, [] when coinless. */
     committedAssets?: readonly { coinId: string; amount: string }[];
-  }) => Promise<void>;
+    /** #842: when the record was kept — the row's time, re-posts included. */
+    timestamp?: number;
+  }) => Promise<boolean | void>;
+  /** #842: a SENT record was kept for a re-post — wake the convergence heartbeat. */
+  armHeartbeat?: () => void;
+  /** #842: runs a detached store write only while the owner runs, and tracks it so stop() waits. */
+  whileLive?: (write: () => Promise<unknown>) => void;
+  /** #842: transferIds whose SENT POST is under way, shared with the outbox re-post: one at a time. */
+  sentInFlight?: Set<string>;
 }
 
 export interface MachinePlan {
@@ -201,8 +212,11 @@ export class TransferMachine {
       deliveryPending = await this.deliverSet(plan.transferId, plan.recipientPubkey, plan.memo, committed);
     }
     if (cls === null) {
+      // #842: every leg certified, so SENT is kept and leaves before the apply — an applied row is never listed again.
+      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });
+      await keepAndPost(this.outbox(), sent);
       await this.applyCommitted(engine, plan.transferId, committed);
-      this.closeTail(engine, plan.transferId, plan.payload, committed);
+      this.closeTail(plan.transferId, plan.payload);
       return { committed, deliveryPending };
     }
     // #835: an unsettled attempt is never applied here — resume applies it, after its shortfall.
@@ -238,9 +252,8 @@ export class TransferMachine {
       const settled = await this.settlePartial(engine, r, committed, conflicts);
       return { deliveryPending, partial: settled.entry, closed: settled.closed };
     }
-    await this.applyCommitted(engine, r.transferId, committed);
-    await this.completeIntent(r.transferId, r.payload);
-    await this.finishBookkeeping(engine, r.transferId, r.payload, 'resumed', committed);
+    await this.applyRecorded(engine, r, committed, () => this.completeIntent(r.transferId, r.payload));
+    await this.finishBookkeeping(r.transferId);
     return { deliveryPending, partial: null, closed: true };
   }
 
@@ -622,25 +635,34 @@ export class TransferMachine {
     // #690 + #835: durable BEFORE the apply — the apply completes an unflagged intent,
     // after which it is unlistable and no resume could rebuild the unseen remainder.
     await this.stores.shortfalls.upsert(entry);
-    await this.applyCommitted(engine, r.transferId, committed);
-    const closed = await this.completeIntent(r.transferId, r.payload).then(
-      () => true,
-      () => false
-    );
+    const close = (): Promise<boolean> => this.completeIntent(r.transferId, r.payload).then(() => true, () => false);
+    const closed = await this.applyRecorded(engine, r, committed, close);
     // An unclosed partial keeps its backstop: the next pass closes it (idempotent).
-    if (closed) await this.finishBookkeeping(engine, r.transferId, r.payload, 'resumed', committed);
-    else await recordSettled(engine, this.deps.recordHistory, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });
+    if (closed) await this.finishBookkeeping(r.transferId);
     return { entry, closed };
   }
 
-  private closeTail(engine: ITokenEngine, transferId: string, payload: IntentPayload, committed: OpOutcome[]): void {
+  /** #842: SENT is kept and leaves before the apply, never awaited: the outbox re-posts what does not land. */
+  private async applyRecorded<T>(engine: ITokenEngine, r: RehydratedIntent, committed: OpOutcome[], close: () => Promise<T>): Promise<T> {
+    const sent = await settledRecord(engine, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });
+    await keepAndPost(this.outbox(), sent);
+    await this.applyCommitted(engine, r.transferId, committed);
+    return close();
+  }
+
+  private outbox(): OutboxDeps {
+    const { recordHistory, encryptPayload, now, armHeartbeat, whileLive, sentInFlight } = this.deps;
+    return { recordHistory, encryptPayload, now, armHeartbeat, whileLive, inFlight: sentInFlight, outbox: this.stores.sentOutbox };
+  }
+
+  private closeTail(transferId: string, payload: IntentPayload): void {
     void (async () => {
       try {
         await this.completeIntent(transferId, payload);
       } catch {
         return; // idempotent backstop — resume converges the unevidenced edge
       }
-      await this.finishBookkeeping(engine, transferId, payload, 'sent', committed);
+      await this.finishBookkeeping(transferId);
     })();
   }
 
@@ -649,14 +671,7 @@ export class TransferMachine {
     await this.deps.intents.complete(transferId, signature);
   }
 
-  private async finishBookkeeping(
-    engine: ITokenEngine,
-    transferId: string,
-    payload: IntentPayload,
-    phase: 'sent' | 'resumed',
-    committed: OpOutcome[]
-  ): Promise<void> {
-    await recordSettled(engine, this.deps.recordHistory, { transferId, payload, phase, committed });
+  private async finishBookkeeping(transferId: string): Promise<void> {
     try {
       await settleOwed(this.stores, await this.stores.backstop.getByKey(transferId));
       await this.stores.backstop.removeByKey(transferId);

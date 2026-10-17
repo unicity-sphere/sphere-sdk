@@ -63,6 +63,16 @@ export interface IntentBackstopEntry {
   owes?: ShortfallEntry[];
 }
 
+/** #842: a settled send's SENT record, kept from before its apply until the POST is answered for good. */
+export interface SentOutboxEntry {
+  transferId: string;
+  payloadEnvelope: string;
+  phase: 'sent' | 'resumed';
+  committedAmount: string;
+  committedAssets?: { coinId: string; amount: string }[];
+  createdAt: number;
+}
+
 
 // #621 delivery journal.
 export interface DeliveryJournalEntry {
@@ -165,6 +175,7 @@ export const STORE_KEYS = {
   customMintJournal: 'custom-mint-journal',
   burnJournal: 'burn-journal',
   shortfalls: 'shortfalls',
+  sentOutbox: 'sent-outbox',
   settlingLinks: 'settling',
   streamCursor: (s: StreamName) => `cursor:${s}`,
   deferred: (s: StreamName) => `deferred:${s}`,

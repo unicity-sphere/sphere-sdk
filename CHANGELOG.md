@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (money) — SENT history is posted beside the apply, never gated on the close (#842)
+
+What was wrong. A non-partial send posted its SENT history record only after
+`POST /v1/intents/:id/complete` succeeded, on `send()`'s close tail and on the resume path. The
+inventory apply that runs before `complete` already completes an unflagged intent on the server,
+so after it no convergence pass lists the row again: the next pass removes its local entry and
+records nothing. A `complete` that failed after a good apply lost the SENT row for good, and so
+did an apply that committed on the server but whose answer never arrived (a lost response, or an
+app that stopped while waiting).
+
+Consequence. `history()` and `pendingTransfers()` were both empty for a payment that had left the
+wallet. A caller following the documented re-pay check (look in both before paying a request again
+after a restart) could pay twice.
+
+What changed:
+
+- Once the legs have settled (every leg certified, or for a partial the certified legs beside the
+  conflicted ones), the SENT record is built locally from the certified blobs, kept in a local SENT
+  outbox, and its POST is issued BEFORE the inventory apply, so it is already on its way when the
+  apply commits. Neither
+  the apply's answer nor the close waits for the POST or gates it, on `send()` or on the resume
+  path (so also in a `send()` that converges a conflicted leg in-process): the outbox below
+  re-posts a record that does not land, so a history endpoint that never answers holds back no
+  apply, `complete`, `send()` or convergence pass, and a resumed apply or close that fails is
+  reported at once, with its `Retry-After`. The recorded amount is still what settled, never the
+  plan.
+- The SENT outbox (`STORE_KEYS.sentOutbox`, `sent-outbox` in the per-address scoped KV) is new
+  durable client state. A record leaves it once its POST is recorded, or refused for good (a 422 in
+  wallet-api's typed envelope, or a 413 from any hop); a 401, 403 or 404 keeps it, since a later
+  session or route may accept it, and so does a transient failure or a POST the process never
+  finished. Every convergence pass re-posts what it keeps. The re-post runs beside the pass, and a
+  record has one POST under way at a time, whether the send, a resume or a re-post issued it, so a
+  history endpoint that never answers holds no convergence and a resumed send is posted once. A
+  record kept by a send wakes an idle heartbeat, and every attempt, a later resume's included,
+  carries the time the record was FIRST kept, so a send recovered hours later still lands in history
+  at its own time. A stopped facade makes no outbox write: a POST answered after `stop()` leaves its
+  record for the next facade on that address to re-post, and `stop()` never waits on the history
+  endpoint. A kept record is not a pending transfer: `pendingTransfers()`, source reservations and
+  payment-request links ignore it. An older client ignores the key, so after a downgrade a kept
+  record is not re-posted.
+- A failed resume close still reports the intent failed and carries its `Retry-After`. A history
+  failure, a history hook that throws, or a recipient blob the history read cannot decode still
+  never fails a send or a resume.
+- Behaviour changes for integrators:
+  - a SENT row can now be in `history()` while the same transfer is still listed in
+    `pendingTransfers()` (a send that rejected `SEND_SYNC_PENDING` after its legs certified). Do not
+    read a SENT row as "settled";
+  - `history:updated` for a send can now fire before `send()` resolves and before
+    `inventory:updated`;
+  - an intent whose apply keeps failing re-posts its SENT record on every convergence pass. The
+    server deduplicates the record by `transferId`, but each post emits `history:updated` with a
+    freshly generated entry `id` that `history()` never serves;
+  - a SENT row is still best-effort, but a failed POST no longer loses it: the outbox re-posts it
+    until the server records it. A row can still be missing (the outbox could not be written, or
+    the sending device never runs again), so a missing row does not prove that nothing was sent. The row records what certified on chain, whether or not the mailbox deposit has
+    landed yet (a send resolving `'confirmed'` with `deliveryPending: true` is posted too); a
+    partial send's row records only the certified part, and the remainder is recorded under its
+    own transferId when it is paid.
+
+How it was verified: machine-level tests in `tests/unit/payments-v2/sent-history.test.ts` (a
+failed close, a lost apply answer, and a process that dies the moment the apply is issued, over
+one leg and two, on `send()` and on resume; a settled partial; a deposit still owed; a hung, a
+rejecting and a synchronously throwing history hook; a failed resumed apply reported at once while its POST
+hangs; nothing posted while a leg is unsettled; an undecodable blob; no record for a clean
+failure; a resumed close that fails while the POST never answers; and the SENT outbox: a process
+that dies at the apply taking the in-flight POST with it,
+on `send()` and on resume, a failed POST beside a successful apply and close, a re-post that
+throws, one that never answers, an unreadable payload, a transfer still in process, the
+heartbeat predicate, a pass that leaves alone a record its own attempt kept, the kept time on a
+re-post and on a later resume, the heartbeat a kept record arms, a stopped owner's late answer,
+and an unwritable outbox; and, in `heartbeat.test.ts`, an idle wallet whose send's POST failed
+posting the row in-session at the send time, and a POST answered after `stop()`), facade-level cases in `tests/unit/payments-v2/send-intent-unknown.test.ts` against the
+real history store, including a whole-token send and a held send whose resume is the only writer
+of its row, mutation probes for each ordering on both paths, and two cases run against the live
+staging wallet-api (`-t '#842'` in `tests/e2e/payments-v2-vertical.staging.e2e.test.ts`): a
+`complete` that answers 503 once after a good apply, and an apply whose answer is lost after the
+server committed it, each leaving exactly one SENT row in the real `history()`, and a re-POST of
+that record under a fresh entry id that the server deduplicates.
+
 ### Changed (breaking) — DIRECT:// is no longer a payment recipient; unused DIRECT helpers removed (#847)
 
 What was wrong. A `DIRECT://` string is the wallet's Sphere Quests account id, yet `send()` and
