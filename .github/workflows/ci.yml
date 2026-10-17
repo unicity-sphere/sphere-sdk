@@ -104,9 +104,10 @@ jobs:
           path: mutation-shard-${{ matrix.shard }}.txt
           overwrite: true
 
-  # One result for the whole manifest, read from every shard's own record rather than the matrix
-  # result, which a successful rerun of one failed shard can turn green while another still failed.
-  # A missing record fails too.
+  # One result for the whole manifest. The matrix result alone can turn green after a successful
+  # rerun of one failed shard while another still failed; a shard's record alone can be a stale
+  # success from an earlier attempt whose rerun died before replacing it. Both must say success, and
+  # a missing record fails.
   test-mutation:
     runs-on: ubuntu-latest
     needs: mutation-shard
@@ -119,6 +120,8 @@ jobs:
 
       - name: Every shard killed every probe
         run: |
+          echo "matrix: ${{ needs.mutation-shard.result }}"
+          test "${{ needs.mutation-shard.result }}" = success || failed=1
           for shard in 1 2 3 4 5 6 7 8; do
             result=$(cat "mutation-shard-$shard.txt" 2>/dev/null || echo 'no result')
             echo "shard $shard/8: $result"
