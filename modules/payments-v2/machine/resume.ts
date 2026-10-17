@@ -5,7 +5,7 @@
 import { SphereError } from '../../../core/errors';
 import { logger } from '../../../core/logger';
 import type { SphereToken } from '../../../token-engine/types';
-import type { StoragePort } from '../ports';
+import { BLOB_DOWNLOAD_FAILED, type StoragePort } from '../ports';
 import type { DeliveryJournalEntry, IntentBackstopEntry } from '../stores';
 import { isWholeIntent } from './payload-view';
 import type { CoinIntentPayload, IntentPayload, PlannedOp, WholeIntentPayload } from './types';
@@ -387,6 +387,14 @@ async function fetchSources(
   return decoded;
 }
 
+/** #840: an outage (network, 408/425/429, a wallet-api 5xx) is no one id's: a read per job only multiplies it. */
+function isOneIdRefusal(err: unknown): boolean {
+  const { status, statusCode, code } = (err ?? {}) as { status?: unknown; statusCode?: unknown; code?: unknown };
+  if (code === BLOB_DOWNLOAD_FAILED) return true;
+  const n = typeof status === 'number' ? status : statusCode;
+  return typeof n === 'number' && n >= 400 && n <= 499 && ![408, 425, 429].includes(n);
+}
+
 /** #840: the server refuses a whole batch over one id (malformed, not owned, one download failed): read per job. */
 async function readBlobs(
   storage: StoragePort,
@@ -399,6 +407,7 @@ async function readBlobs(
   } catch (err) {
     noteWait(report, err);
     if (retryAfterMsOf(err) !== null) return new Map(); // asked to back off: a read per job only adds load
+    if (!isOneIdRefusal(err)) return new Map(); // an outage: every job fails closed until the next pass
   }
   const blobs = new Map<string, Uint8Array>();
   const own = jobs.map(neededBy).filter((needed) => needed.length > 0);
@@ -409,6 +418,7 @@ async function readBlobs(
     } catch (err) {
       noteWait(report, err);
       if (retryAfterMsOf(err) !== null) break; // asked to back off: the jobs left fail closed
+      if (!isOneIdRefusal(err)) break; // an outage began: the jobs left fail closed
     }
   }
   return blobs;

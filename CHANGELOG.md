@@ -143,11 +143,14 @@ What changed:
 - Each intent is planned inside its own failure boundary. One that cannot be planned is reported
   `failed` and left open: never executed, aborted or completed, and its sources are not touched.
   It is logged once per facade.
-- When the batched source read is refused, each intent's sources are read again on their own, so
-  only the intent that named the bad id fails closed. The refusal's `Retry-After` reaches the
-  heartbeat. A refusal that carries one is not re-read per intent, and the per-intent re-reads stop
-  at the first answer that carries one, so a server that asked to back off gets no further
-  blob-url reads that pass; the intents left unread fail closed until the next pass. The rest of
+- When the batched source read is refused over one id (a 4xx other than 408/425/429, or one blob's
+  download failed), each intent's sources are read again on their own, so only the intent that
+  named the bad id fails closed. The refusal's `Retry-After` reaches the heartbeat. A refusal that
+  carries one is not re-read per intent, and the per-intent re-reads stop at the first answer that
+  carries one, so a server that asked to back off gets no further blob-url reads that pass. An
+  outage (a network error, a 408/425/429 or a wallet-api 5xx) is not re-read per intent either, and
+  the re-reads stop at the first such answer, so a pass sends no more than one extra request into
+  it; the intents left unread fail closed until the next pass. The rest of
   the pass still runs, so intents that need no source read, the reconcile and the journal replays
   still send their requests.
 - A pass that throws after reading the backstop keeps its verdicts and reports every intent it
@@ -167,7 +170,10 @@ What changed:
 - The journal check refuses to answer while a settling-link write (a new or updated link) is queued
   or running, so a
   link to the tombstone that `pay()` queued behind a stalled write keeps the tombstone for that
-  pass. Without it the tombstone could go first, and the next pass resolved that link paid.
+  pass. It also refuses while any `pay()` is in flight: one whose send already failed may not have
+  queued its link yet. Without either, the tombstone could go first, and the next pass resolved
+  that link paid. A `pay()` links only its own send's transferId, so one that starts after the
+  answer cannot name the tombstone.
 - A payment request the server already resolved (paid on another device, declined or expired)
   stays so when a `conflicted` or aborted verdict finds its link. Before, the link could still be
   in memory (its removal not yet written, or failed), and the request went back to `pending`, so
@@ -182,8 +188,9 @@ cases, and a never-stored cancel across a skipped reconcile, a failed post-pass 
 a failed reconcile, and a real settling journal whose read failed open or whose cleared link
 failed to write, each followed by a restart that must not resolve the request paid, and the
 heartbeat backing off while such a tombstone is kept, its abort failing on every other pass
-included, a link to it queued behind a stalled journal write, and a failed strip of the rows
-it handed back), `tests/unit/payments-v2/never-stored-cancel.facade.test.ts` (the same never-stored
+included, a link to it queued behind a stalled journal write or not yet queued by a `pay()` still
+in flight, and a failed strip of the rows it handed back; a batched source read the network, a
+wallet-api 5xx, a hop's 502 or a 408 failed, read once and not per intent), `tests/unit/payments-v2/never-stored-cancel.facade.test.ts` (the same never-stored
 cancel through the composed facade, whose own settling links keep the tombstone),
 `tests/unit/payments-v2/requests.test.ts` (`linkedTransferIds`, a link write queued behind a
 stalled one, and a server-resolved request that a reconcile or a clean send failure must leave

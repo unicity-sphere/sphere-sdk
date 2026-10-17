@@ -4362,7 +4362,7 @@
   },
   {
     "name": "resume-fetch-fallback-ignores-backoff",
-    "note": "#840: a refused batch that carried a Retry-After is not re-read per intent; re-read, every pass multiplies the load by the number of open intents against a server that just asked to wait.",
+    "note": "#840: a refused batch that carried a Retry-After is not re-read per intent, even when it is a refusal one id can cause; re-read, every pass multiplies the load by the number of open intents against a server that just asked to wait.",
     "file": "modules/payments-v2/machine/resume.ts",
     "find": "    if (retryAfterMsOf(err) !== null) return new Map(); // asked to back off: a read per job only adds load\n",
     "replace": "    void err;\n",
@@ -4402,10 +4402,50 @@
   },
   {
     "name": "resume-fetch-fallback-reads-past-backoff",
-    "note": "#840: a per-intent re-read answered with a Retry-After ends the re-reads for that pass; without the stop, every remaining open intent sends one more request to a server that just asked to wait (resume-unplannable.test.ts 'a per-intent re-read's Retry-After reaches the report...').",
+    "note": "#840: a per-intent re-read answered with a Retry-After ends the re-reads for that pass, even when it is a refusal one id can cause; without the stop, every remaining open intent sends one more request to a server that just asked to wait (resume-unplannable.test.ts 'a per-intent re-read's Retry-After (a one-id refusal) reaches the report...').",
     "file": "modules/payments-v2/machine/resume.ts",
     "find": "      if (retryAfterMsOf(err) !== null) break; // asked to back off: the jobs left fail closed\n",
     "replace": "      // mutant: a back-off answer does not stop the per-intent re-reads\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-fetch-fans-out-outage",
+    "note": "#840: a batch the network or the server failed (no Retry-After) is an outage, not one id. Re-read per intent, every pass sends 1 + N requests to a server that is down, each up to a request timeout.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    if (!isOneIdRefusal(err)) return new Map(); // an outage: every job fails closed until the next pass\n",
+    "replace": "    void isOneIdRefusal;\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-fetch-fallback-reads-past-outage",
+    "note": "#840: a per-intent re-read the network or the server failed ends the re-reads for that pass; without the stop, every remaining open intent sends one more request into the outage.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "      if (!isOneIdRefusal(err)) break; // an outage began: the jobs left fail closed\n",
+    "replace": "      // mutant: an outage does not stop the per-intent re-reads\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-fetch-download-not-isolated",
+    "note": "#840: getBlobs rejects the whole batch when one blob's download failed, whatever the object store's status. Read as an outage, one unreadable source fails every keep-open send in the pass closed, on every pass.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (code === BLOB_DOWNLOAD_FAILED) return true;\n",
+    "replace": "  void code;\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-fetch-retryable-4xx-isolated",
+    "note": "#840: a 408/425/429 says ask again later, not that one id is refused. Read as a one-id refusal, a batch that timed out is re-read once per open intent.",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "![408, 425, 429].includes(n)",
+    "replace": "true",
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
     ]
@@ -4500,6 +4540,16 @@
     "replace": "    void this.linkWrites;\n",
     "tests": [
       "tests/unit/payments-v2/requests.test.ts",
+      "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "requests-linked-ignores-pay-in-flight",
+    "note": "#840: a pay() whose send already failed may not have queued its link yet. Answered anyway, the converger retires the never-stored tombstone that link will name, and the next pass finds the link unaccounted and responds the request paid with nothing moved.",
+    "file": "modules/payments-v2/requests/Requests.ts",
+    "find": "    if (this.payInFlight.size > 0) throw new SphereError('payment request pay in flight', 'STORAGE_ERROR');\n",
+    "replace": "    void this.payInFlight;\n",
+    "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
     ]
   },

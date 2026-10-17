@@ -187,11 +187,13 @@ export class Requests implements PaymentsRequestsApi {
   }
 
   /** #840: every transferId a link names, in memory or on disk (read fresh: the load may have failed open).
-   *  Rejects while a link write is queued or running: it may be the link a caller looks for. */
+   *  Rejects while a pay() or a link write is in flight: either may link the id a caller looks for. A
+   *  pay() links only its own send's transferId, so one that starts after this answer never names it. */
   async linkedTransferIds(): Promise<ReadonlySet<string>> {
     await this.ensureJournalLoaded();
     const raw = await this.deps.kv.get<Record<string, Partial<SettlingLink>>>(STORE_KEYS.settlingLinks);
     if (this.linkWrites > 0) throw new SphereError('settling journal write in flight', 'STORAGE_ERROR');
+    if (this.payInFlight.size > 0) throw new SphereError('payment request pay in flight', 'STORAGE_ERROR');
     const ids = new Set([...this.journal!.values()].map((link) => link.transferId));
     for (const link of raw !== null && typeof raw === 'object' ? Object.values(raw) : []) {
       if (typeof link?.transferId === 'string') ids.add(link.transferId);

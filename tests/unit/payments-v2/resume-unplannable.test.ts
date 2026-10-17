@@ -324,14 +324,17 @@ describe('a source read the server refuses fails only the intent that named it (
     expect(await resumeAll(w.deps)).toEqual({ resumed: [], conflicted: [], failed: [good], retryAfterMs: 30_000 });
   });
 
-  it('a refused batch that asked to back off is not re-read per intent', async () => {
+  it.each([
+    ['a 429', () => new WalletApiHttpError(429, 'RATE_LIMITED', 'POST /v1/tokens/blob-urls: slow down', 30_000)],
+    ['a one-id refusal', () => new WalletApiHttpError(403, 'FORBIDDEN', 'POST /v1/tokens/blob-urls: not owned', 30_000)],
+  ])('a refused batch that asked to back off (%s) is not re-read per intent', async (_label, failure) => {
     const w = makeWorld();
     const first = await keepOpenSend(w);
     const second = await keepOpenSend(w);
     let calls = 0;
     w.deps.storage.getBlobs = async () => {
       calls++;
-      throw new WalletApiHttpError(429, 'RATE_LIMITED', 'POST /v1/tokens/blob-urls: slow down', 30_000);
+      throw failure();
     };
 
     const report = await resumeAll(w.deps);
@@ -340,7 +343,10 @@ describe('a source read the server refuses fails only the intent that named it (
     expect(report).toEqual({ resumed: [], conflicted: [], failed: [first, second].sort(), retryAfterMs: 30_000 });
   });
 
-  it("a per-intent re-read's Retry-After reaches the report when the refused batch carried none", async () => {
+  it.each([
+    ['a 503', () => new WalletApiHttpError(503, 'UNAVAILABLE', 'POST /v1/tokens/blob-urls: unavailable', 30_000)],
+    ['a one-id refusal', () => new WalletApiHttpError(403, 'FORBIDDEN', 'POST /v1/tokens/blob-urls: not owned', 30_000)],
+  ])("a per-intent re-read's Retry-After (%s) reaches the report when the refused batch carried none", async (_label, failure) => {
     const w = makeWorld();
     const first = await keepOpenSend(w);
     const second = await keepOpenSend(w);
@@ -348,13 +354,51 @@ describe('a source read the server refuses fails only the intent that named it (
     w.deps.storage.getBlobs = async () => {
       calls++;
       if (calls === 1) throw new FakeApiError(403, 'FORBIDDEN', 'not in inventory');
-      throw new WalletApiHttpError(503, 'UNAVAILABLE', 'POST /v1/tokens/blob-urls: unavailable', 30_000);
+      throw failure();
     };
 
     const report = await resumeAll(w.deps);
 
     expect(calls, 'a re-read answered with a Retry-After ends the per-intent reads for this pass').toBe(2);
     expect(report).toEqual({ resumed: [], conflicted: [], failed: [first, second].sort(), retryAfterMs: 30_000 });
+  });
+
+  it.each([
+    ['the network', () => new WalletApiHttpError(0, 'NETWORK', 'POST /v1/tokens/blob-urls: fetch failed')],
+    ['a wallet-api 503 with no Retry-After', () => new WalletApiHttpError(503, 'UNAVAILABLE', 'POST /v1/tokens/blob-urls: down')],
+    ["a hop's 502", () => new FakeApiError(502, 'HTTP_502', 'bad gateway')],
+    ['a 408', () => new FakeApiError(408, 'HTTP_408', 'request timeout')],
+  ])('a batch %s failed is not re-read per intent: an outage, not one id', async (_label, failure) => {
+    const w = makeWorld();
+    const first = await keepOpenSend(w);
+    const second = await keepOpenSend(w);
+    let calls = 0;
+    w.deps.storage.getBlobs = async () => {
+      calls++;
+      throw failure();
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(calls, 'one request per intent would multiply an outage by the number of open intents').toBe(1);
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [first, second].sort() });
+  });
+
+  it('a per-intent re-read the network failed ends the per-intent reads for this pass', async () => {
+    const w = makeWorld();
+    const first = await keepOpenSend(w);
+    const second = await keepOpenSend(w);
+    let calls = 0;
+    w.deps.storage.getBlobs = async () => {
+      calls++;
+      if (calls === 1) throw new FakeApiError(403, 'FORBIDDEN', 'not in inventory');
+      throw new WalletApiHttpError(0, 'NETWORK', 'POST /v1/tokens/blob-urls: fetch failed');
+    };
+
+    const report = await resumeAll(w.deps);
+
+    expect(calls, 'an outage that began mid-fallback ends the re-reads: the jobs left fail closed').toBe(2);
+    expect(report).toEqual({ resumed: [], conflicted: [], failed: [first, second].sort() });
   });
 });
 
@@ -656,6 +700,50 @@ describe('a never-stored cancel keeps its tombstone while a settling link still 
     await run.convergeOnce();
     expect(responded, 'nothing moved: the request must never be responded paid').toEqual([]);
     expect(requests.list().find((view) => view.id === 'r1')?.status).toBe('pending');
+  });
+
+  it('a pay() still in flight while the links are read: the tombstone stays, and its link is reverted, never paid', async () => {
+    const w = makeWorld();
+    await neverStoredTombstone(w);
+    const wire: RequestWire = {
+      id: 'r1', seq: 1, fromPubkey: w.recipientHex, toPubkey: w.senderHex, assets: [{ coinId: COIN, amount: '1' }],
+      status: 'open', transferId: null, createdAt: '2026-01-01T00:00:00.000Z',
+    };
+    const responded: unknown[] = [];
+    let failSend!: (err: unknown) => void;
+    const requests = new Requests({
+      client: {
+        createPaymentRequest: async () => {
+          throw new Error('unused');
+        },
+        listPaymentRequests: async () => ({ requests: [wire], more: false, cursor: 1, syncEpoch: 1 }),
+        respondPaymentRequest: async (id, response) => {
+          responded.push({ id, response });
+          return wire;
+        },
+      },
+      kv: w.kv, ownPubkey: w.senderHex, resolvePubkey: async () => null, listAbortedTransferIds: async () => [],
+      emit: () => undefined, memo: stubRequestMemoCodec,
+      // Its send failed but its link is not written yet: the window between the throw and the write.
+      send: () => new Promise((_resolve, reject) => (failSend = reject)),
+    });
+    await requests.drainIncoming();
+    const paying = requests.pay('r1').catch(() => undefined);
+    const run = converger(w, w.deps, createMachineStores(w.kv), {
+      reconcile: (report) => requests.reconcile(report),
+      linkedTransferIds: () => requests.linkedTransferIds(),
+    }).run;
+
+    await run.convergeOnce();
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeDefined();
+
+    failSend(pending('never-stored'));
+    await paying;
+    await run.convergeOnce();
+    await run.convergeOnce();
+    expect(responded, 'nothing moved: the request must never be responded paid').toEqual([]);
+    expect(requests.list().find((view) => view.id === 'r1')?.status).toBe('pending');
+    expect(await w.stores().backstop.getByKey('never-stored')).toBeUndefined();
   });
 
   it('an unreadable settling journal after the reconcile: the tombstone stays', async () => {

@@ -27,6 +27,8 @@ export interface ApplyDeltaResult {
   syncEpoch: string;
 }
 
+export const BLOB_DOWNLOAD_FAILED = 'BLOB_DOWNLOAD';
+
 export interface StoragePort {
   listInventory(since?: number): Promise<InventoryPage>;
   getBlobs(tokenIds: string[]): Promise<Map<string, Uint8Array>>;
