@@ -456,6 +456,7 @@ function dieOnApplyLosingPost(w: World): { recorded: Recorded[]; revive(): void 
     recorded,
     revive: () => {
       storage.applyDelta = apply;
+      w.deps.sentInFlight = new Set(); // a new process: nothing of the dead one is in flight
       captureHistoryInto(w, recorded);
     },
   };
@@ -718,6 +719,51 @@ describe('#842 the SENT outbox keeps a record until its POST is answered for goo
 
     live = true;
     await passLater(w);
+    expect(await outbox(w)).toEqual([]);
+  });
+
+  it('O15 a record re-kept by a resume is POSTed once in that pass, although it keeps its first time', async () => {
+    const w = makeWorld();
+    let calls = 0;
+    w.deps.recordHistory = async () => {
+      calls += 1;
+      return false;
+    };
+    const transferId = await openAfterFailedApply(w); // kept, its POST and its apply failed
+    let answer: () => void = () => undefined;
+    w.deps.recordHistory = () => {
+      calls += 1;
+      return new Promise<void>((resolve) => {
+        answer = resolve;
+      });
+    };
+
+    await passLater(w); // the resume keeps it again (first time kept) and POSTs; the re-post must not
+
+    expect(w.api.inspectIntent(w.caller, transferId)?.status).toBe('completed');
+    expect(calls, "run()'s POST and the resume's, never a third").toBe(2);
+    answer();
+    await w.flushTail();
+    expect(await outbox(w)).toEqual([]);
+  });
+
+  it('O16 a resume issues no second POST while one for the same record is under way', async () => {
+    const w = makeWorld();
+    const transferId = await openAfterFailedApply(w);
+    let calls = 0;
+    w.deps.recordHistory = async () => {
+      calls += 1;
+    };
+    w.deps.sentInFlight!.add(transferId); // a re-post of this record is under way
+
+    await resumeAll(w.deps);
+    await w.flushTail();
+    expect(calls).toBe(0);
+    expect(await outbox(w), 'still kept for a later pass').toHaveLength(1);
+
+    w.deps.sentInFlight!.delete(transferId);
+    await passLater(w);
+    expect(calls).toBe(1);
     expect(await outbox(w)).toEqual([]);
   });
 

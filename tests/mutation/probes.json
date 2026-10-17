@@ -3785,10 +3785,10 @@
   },
   {
     "name": "converger-reposts-in-flight-again",
-    "note": "#842: one re-post per record at a time; a POST that never answers is not stacked by every pass (O6)",
+    "note": "#842: one POST per record at a time; a POST that never answers is not stacked by every pass, nor beside a resume's own (sent-history.test.ts O6, O10, O15)",
     "file": "modules/payments-v2/convergence.ts",
-    "find": "        if (entry.createdAt >= startedAt || activeOps.has(transferId) || this.reposting.has(transferId)) continue;",
-    "replace": "        if (entry.createdAt >= startedAt || activeOps.has(transferId)) continue;",
+    "find": "        if (activeOps.has(transferId) || inFlight.has(transferId)) continue;",
+    "replace": "        if (activeOps.has(transferId)) continue;",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
@@ -3797,8 +3797,8 @@
     "name": "converger-reposts-active-transfer",
     "note": "#842: a transfer still in process posts its own record; the pass leaves it alone (O7)",
     "file": "modules/payments-v2/convergence.ts",
-    "find": "        if (entry.createdAt >= startedAt || activeOps.has(transferId) || this.reposting.has(transferId)) continue;",
-    "replace": "        if (entry.createdAt >= startedAt || this.reposting.has(transferId)) continue;",
+    "find": "        if (activeOps.has(transferId) || inFlight.has(transferId)) continue;",
+    "replace": "        if (inFlight.has(transferId)) continue;",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
@@ -3807,7 +3807,7 @@
     "name": "converger-never-reposts",
     "note": "#842: every pass re-posts the outbox; without it a kept record is never posted (O1/O3)",
     "file": "modules/payments-v2/convergence.ts",
-    "find": "    this.repostSentOutbox(startedAt);\n    return { progress, retryAfterMs };",
+    "find": "    this.repostSentOutbox();\n    return { progress, retryAfterMs };",
     "replace": "    return { progress, retryAfterMs };",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
@@ -3844,11 +3844,11 @@
     ]
   },
   {
-    "name": "converger-reposts-in-pass-record",
-    "note": "#842: a pass leaves alone a record kept during it — its attempt's own POST is in flight; re-posted, every resumed send would POST twice (sent-history.test.ts O10)",
-    "file": "modules/payments-v2/convergence.ts",
-    "find": "        if (entry.createdAt >= startedAt || activeOps.has(transferId) || this.reposting.has(transferId)) continue;",
-    "replace": "        if (activeOps.has(transferId) || this.reposting.has(transferId)) continue;",
+    "name": "keep-post-not-registered",
+    "note": "#842: the machine registers its own SENT POST, so the pass's re-post leaves that record alone; unregistered, a resumed record POSTs twice in one pass (sent-history.test.ts O10, O15)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  deps.inFlight?.add(record.transferId);\n",
+    "replace": "  void deps.inFlight;\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
@@ -3952,6 +3952,26 @@
     "replace": "whileLive: (write) => this.trackTail(write()),",
     "tests": [
       "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "keep-posts-while-reposting",
+    "note": "#842: a resume issues no POST while one for the same record is under way (sent-history.test.ts O16)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  if (deps.inFlight?.has(record.transferId)) return; // a POST of this record is already under way\n",
+    "replace": "  void 0;\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "keep-in-flight-never-cleared",
+    "note": "#842: an answered POST leaves the in-flight set; kept there, the record is never re-posted (sent-history.test.ts O3, O11)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    deps.inFlight?.delete(record.transferId);\n",
+    "replace": "    void 0;\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
     ]
   }
 ]

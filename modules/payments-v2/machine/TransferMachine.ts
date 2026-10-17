@@ -91,6 +91,8 @@ export interface MachineDeps {
   armHeartbeat?: () => void;
   /** #842: runs a detached store write only while the owner runs, and tracks it so stop() waits. */
   whileLive?: (write: () => Promise<unknown>) => void;
+  /** #842: transferIds whose SENT POST is under way, shared with the outbox re-post: one at a time. */
+  sentInFlight?: Set<string>;
 }
 
 export interface MachinePlan {
@@ -649,8 +651,8 @@ export class TransferMachine {
   }
 
   private outbox(): OutboxDeps {
-    const { recordHistory, encryptPayload, now, armHeartbeat, whileLive } = this.deps;
-    return { recordHistory, encryptPayload, now, armHeartbeat, whileLive, outbox: this.stores.sentOutbox };
+    const { recordHistory, encryptPayload, now, armHeartbeat, whileLive, sentInFlight } = this.deps;
+    return { recordHistory, encryptPayload, now, armHeartbeat, whileLive, inFlight: sentInFlight, outbox: this.stores.sentOutbox };
   }
 
   private closeTail(transferId: string, payload: IntentPayload): void {

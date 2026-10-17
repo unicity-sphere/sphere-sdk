@@ -36,9 +36,9 @@ What changed:
 - The SENT outbox (`STORE_KEYS.sentOutbox`, `sent-outbox` in the per-address scoped KV) is new
   durable client state. A record leaves it once its POST is recorded, or refused with a permanent
   4xx; a transient failure, or a POST the process never finished, keeps it, and every convergence
-  pass re-posts it. The re-post runs beside the pass, one POST per record at a time, and leaves
-  alone a record kept during that pass (its attempt's own POST is in flight), so a history
-  endpoint that never answers holds no convergence and a resumed send is posted once. A record
+  pass re-posts it. The re-post runs beside the pass, and a record has one POST under way at a
+  time, whether the send, a resume or a re-post issued it, so a history endpoint that never answers
+  holds no convergence and a resumed send is posted once. A record
   kept by a send wakes an idle heartbeat, and every attempt, a later resume's included, carries the
   time the record was FIRST kept, so a send recovered hours later still lands in history at its own
   time. A stopped facade makes no outbox write: a POST answered after `stop()` leaves its record

@@ -371,6 +371,7 @@ function buildMachineDeps(
     now: deps.now ?? Date.now,
     armHeartbeat: () => hooks.armHeartbeat(),
     whileLive: (write) => hooks.whileLive(write),
+    sentInFlight: new Set<string>(),
     recordHistory: async ({ transferId, payload, committedAmount, committedAssets, timestamp }) =>
       historyStore.recordSent({
         transferId,

@@ -53,6 +53,7 @@ export interface OutboxDeps {
   now: MachineDeps['now'];
   armHeartbeat: MachineDeps['armHeartbeat'];
   whileLive: MachineDeps['whileLive'];
+  inFlight: MachineDeps['sentInFlight'];
   outbox: MachineStores['sentOutbox'];
 }
 
@@ -67,7 +68,10 @@ export async function keepAndPost(deps: OutboxDeps, settled: SettledRecord | und
   } catch {
     /* the in-flight POST is then the record's only copy */
   }
+  if (deps.inFlight?.has(record.transferId)) return; // a POST of this record is already under way
+  deps.inFlight?.add(record.transferId);
   void postSettled(deps.recordHistory, record).then((done) => {
+    deps.inFlight?.delete(record.transferId);
     if (done) whileLive(deps.whileLive, () => deps.outbox.removeByKey(record.transferId));
     else deps.armHeartbeat?.(); // kept: an idle wallet must still run the pass that re-posts it
   });
