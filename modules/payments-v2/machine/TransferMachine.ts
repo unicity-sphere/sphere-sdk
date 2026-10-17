@@ -21,7 +21,7 @@ import { coinIdOf, splitOf } from './payload-view';
 import type { DeliveryJournalEntry, ScopedKV, ShortfallEntry } from '../stores';
 import type { IntentPayload, OpOutcome, OutcomeClass, PlannedOp } from './types';
 import { buildOps, classifyError, conflictAmount } from './outcomes';
-import { postSettled, settledRecord } from './settled-history';
+import { keepAndPost, settledRecord, type OutboxDeps } from './settled-history';
 import {
   ATTENTION_DELIVERY_DEFERRED,
   RATE_LIMIT_DEFER_MS,
@@ -73,7 +73,10 @@ export interface MachineDeps {
   emit: (event: string, payload: unknown) => void;
   now: () => number;
   recordSplit?: (sourceTokenId: string, outputTokenId: string) => Promise<void>;
-  /** `committedAmount` = what SETTLED (the certified recipient blobs' value), never the plan. */
+  /**
+   * `committedAmount` = what SETTLED (the certified recipient blobs' value), never the plan.
+   * Resolves `false` only when a retry may still record it (#842: the SENT outbox keeps it).
+   */
   recordHistory?: (info: {
     transferId: string;
     payload: IntentPayload;
@@ -81,7 +84,7 @@ export interface MachineDeps {
     committedAmount: string;
     /** A WHOLE-token spend moves the token, not an amount: its real assets, [] when coinless. */
     committedAssets?: readonly { coinId: string; amount: string }[];
-  }) => Promise<void>;
+  }) => Promise<boolean | void>;
 }
 
 export interface MachinePlan {
@@ -201,9 +204,9 @@ export class TransferMachine {
       deliveryPending = await this.deliverSet(plan.transferId, plan.recipientPubkey, plan.memo, committed);
     }
     if (cls === null) {
-      // #842: every leg certified, so SENT leaves before the apply — an applied row is never listed again.
+      // #842: every leg certified, so SENT is kept and leaves before the apply — an applied row is never listed again.
       const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });
-      void postSettled(this.deps.recordHistory, sent);
+      await keepAndPost(this.outbox(), sent);
       await this.applyCommitted(engine, plan.transferId, committed);
       this.closeTail(plan.transferId, plan.payload);
       return { committed, deliveryPending };
@@ -631,16 +634,21 @@ export class TransferMachine {
     return { entry, closed };
   }
 
-  /** #842: SENT leaves before the apply; awaited only after a close, so a failed apply reports at once. */
+  /** #842: SENT is kept and leaves before the apply; awaited only after a close, so a failed apply reports at once. */
   private async applyRecorded<T>(engine: ITokenEngine, r: RehydratedIntent, committed: OpOutcome[], close: () => Promise<T>): Promise<T> {
     const sent = await settledRecord(engine, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });
-    const recorded = postSettled(this.deps.recordHistory, sent);
+    const { posted } = await keepAndPost(this.outbox(), sent);
     await this.applyCommitted(engine, r.transferId, committed);
     try {
       return await close();
     } finally {
-      await recorded;
+      await posted;
     }
+  }
+
+  private outbox(): OutboxDeps {
+    const { recordHistory, encryptPayload, now } = this.deps;
+    return { recordHistory, encryptPayload, now, outbox: this.stores.sentOutbox };
   }
 
   private closeTail(transferId: string, payload: IntentPayload): void {

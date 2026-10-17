@@ -381,7 +381,7 @@ export class PaymentsFacade implements PaymentsV2 {
       mintJournal: this.machineStores.mintJournal,
       nftMintJournal: this.machineStores.nftMintJournal,
       customMintJournal: this.machineStores.customMintJournal,
-      burnJournal: this.machineStores.burnJournal, recordSent: (input) => this.historyStore.recordSent(input),
+      burnJournal: this.machineStores.burnJournal, recordSent: async (input) => void (await this.historyStore.recordSent(input)),
       storagePort: this.deps.storagePort,
       recordMint: (input) => this.historyStore.recordMint(input),
       armHeartbeat: () => this.heartbeat.arm(),

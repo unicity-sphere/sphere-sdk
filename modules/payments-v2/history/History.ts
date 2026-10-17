@@ -126,8 +126,8 @@ export class History {
 
   // ── client POSTs (best-effort — NEVER throw into the money path) ────────────
 
-  async recordSent(input: RecordSentInput): Promise<void> {
-    await this.post(() => ({
+  async recordSent(input: RecordSentInput): Promise<boolean> {
+    return this.post(() => ({
       dedupKey: input.transferId,
       id: (this.deps.newId ?? randomUUID)(),
       type: 'SENT' as const,
@@ -167,25 +167,34 @@ export class History {
 
   // ── internals ────────────────────────────────────────────────────────────────
 
-  private async post(build: () => HistoryWireRecord): Promise<void> {
-    const record = build();
+  /** `false` only for a transient failure: a retry may still record it. */
+  private async post(build: () => HistoryWireRecord): Promise<boolean> {
+    let record: HistoryWireRecord;
+    try {
+      record = build();
+    } catch (err) {
+      this.deps.log?.('history record cannot be built — no retry can fix it', err);
+      return true;
+    }
     try {
       await this.deps.client.postHistory([record]);
     } catch (err) {
       // §5.9 keeps this off the money path, but a 4xx is PERMANENT: no retry can
       // fix a shape the server refuses, and logging it as retry-safe is what let a
       // coinless receipt vanish silently (#780). Name the two apart.
+      const permanent = isPermanentReject(err);
       this.deps.log?.(
-        isPermanentReject(err)
+        permanent
           ? 'history POST REJECTED — the record shape is refused; no retry can fix it'
           : 'history POST failed (dedupKey makes retry safe)',
         err
       );
-      return;
+      return permanent;
     }
     // The recorded entry is in hand — emit it through the SAME read-through
     // mapping page() serves (decrypted memo/nametag, `timestamp` name).
     this.deps.emit('history:updated', this.toEntry(record));
+    return true;
   }
 
   private ts(timestamp?: number): string {

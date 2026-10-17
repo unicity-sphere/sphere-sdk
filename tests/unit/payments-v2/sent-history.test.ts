@@ -8,7 +8,9 @@ import { describe, expect, it } from 'vitest';
 
 import { isPossiblyCommittedSendOutcome } from '../../../core/errors';
 import { ProofUnconfirmedError, TransferConflictError } from '../../../token-engine/errors';
+import { ActiveOps, Converger, derivePendingTransfers } from '../../../modules/payments-v2/convergence';
 import { resumeAll } from '../../../modules/payments-v2/machine/resume';
+import { STORE_KEYS } from '../../../modules/payments-v2/stores';
 import { FakeApiError } from './fakes/FakeWalletApi';
 import { makeWorld, type World } from './machine-harness';
 
@@ -418,5 +420,211 @@ describe('#842 SENT history is posted beside the apply, never gated on the close
 
     expect(report).toMatchObject({ resumed: [plan.transferId], failed: [] });
     expect(recorded).toEqual([{ transferId: plan.transferId, phase: 'resumed', committedAmount: '1000' }]);
+  });
+});
+
+/** The process dies the moment the apply is issued, and the SENT POST already in flight dies with it. */
+function dieOnApplyLosingPost(w: World): { recorded: Recorded[]; revive(): void } {
+  const storage = w.deps.storage;
+  const apply = storage.applyDelta.bind(storage);
+  const recorded: Recorded[] = [];
+  w.deps.recordHistory = () => new Promise<never>(() => undefined); // issued, never answered
+  storage.applyDelta = async (delta) => {
+    await apply(delta);
+    return new Promise<never>(() => undefined);
+  };
+  return {
+    recorded,
+    revive: () => {
+      storage.applyDelta = apply;
+      captureHistoryInto(w, recorded);
+    },
+  };
+}
+
+function convergerOf(w: World, activeOps = new ActiveOps()): Converger {
+  return new Converger({
+    machineDeps: w.deps,
+    stores: w.stores(),
+    delivery: w.deps.delivery,
+    reconcile: async () => undefined,
+    refreshView: async () => undefined,
+    replayMints: async () => 0,
+    replayNftMints: async () => 0,
+    replayCustomMints: async () => 0,
+    replayBurns: async () => 0,
+    activeOps,
+    parked: new Set(),
+    emit: () => undefined,
+    now: () => w.clock.t,
+  });
+}
+
+async function outbox(w: World): Promise<Recorded[]> {
+  return (await w.stores().sentOutbox.list()).map(({ transferId, phase, committedAmount }) => ({ transferId, phase, committedAmount }));
+}
+
+/** A settled send whose SENT POST was answered "try again": its record is in the outbox. */
+async function sentWithRecordKept(w: World): Promise<string> {
+  const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+  w.deps.recordHistory = async () => false;
+  await w.machine().run(plan);
+  await w.flushTail();
+  expect(await outbox(w)).toEqual([{ transferId: plan.transferId, phase: 'sent', committedAmount: '1000' }]);
+  return plan.transferId;
+}
+
+describe('#842 the SENT outbox keeps a record until its POST is answered for good', () => {
+  it.each(LEGS)('O1 run() over $legs: the process dies once the apply is issued, taking the in-flight POST with it — the restart re-posts the kept record once', async ({ amounts }) => {
+    const w = makeWorld();
+    const plan = await w.plan({ tokens: await seedAll(w, amounts), amount: '1000' });
+    const death = dieOnApplyLosingPost(w);
+
+    void w.machine().run(plan);
+    await w.flushTail();
+
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status, 'the apply committed').toBe('completed');
+    expect(await outbox(w), 'kept before the apply').toEqual([{ transferId: plan.transferId, phase: 'sent', committedAmount: '1000' }]);
+
+    death.revive();
+    await convergerOf(w).convergeOnce();
+    await w.flushTail();
+
+    expect(death.recorded, 'exactly one SENT row, re-posted from the outbox').toEqual([
+      { transferId: plan.transferId, phase: 'sent', committedAmount: '1000' },
+    ]);
+    expect(await outbox(w)).toEqual([]);
+    expect(await w.stores().backstop.getByKey(plan.transferId), 'the restart swept the backstop').toBeUndefined();
+  });
+
+  it.each(LEGS)('O2 resume over $legs: the process dies once the apply is issued, taking the in-flight POST with it — the restart re-posts the kept record once', async ({ amounts }) => {
+    const w = makeWorld();
+    const transferId = await openAfterFailedApply(w, amounts);
+    const death = dieOnApplyLosingPost(w);
+
+    void resumeAll(w.deps);
+    await w.flushTail();
+
+    expect(w.api.inspectIntent(w.caller, transferId)?.status, 'the apply committed').toBe('completed');
+    expect(await outbox(w)).toEqual([{ transferId, phase: 'resumed', committedAmount: '1000' }]);
+
+    death.revive();
+    await convergerOf(w).convergeOnce();
+    await w.flushTail();
+
+    expect(death.recorded).toEqual([{ transferId, phase: 'resumed', committedAmount: '1000' }]);
+    expect(await outbox(w)).toEqual([]);
+  });
+
+  it('O3 run(): the POST fails while the apply and close succeed — nothing is left pending, and the next pass posts the kept record once', async () => {
+    const w = makeWorld();
+    const transferId = await sentWithRecordKept(w);
+
+    expect(w.api.inspectIntent(w.caller, transferId)?.status).toBe('completed');
+    expect(await w.stores().backstop.getByKey(transferId), 'the send itself settled').toBeUndefined();
+    expect(await derivePendingTransfers(w.stores(), w.deps.decryptPayload), 'a kept record is not a pending transfer').toEqual([]);
+
+    const recorded = captureHistory(w);
+    await convergerOf(w).convergeOnce();
+    await w.flushTail();
+
+    expect(recorded).toEqual([{ transferId, phase: 'sent', committedAmount: '1000' }]);
+    expect(await outbox(w)).toEqual([]);
+  });
+
+  it('O4 an acknowledged POST leaves nothing in the outbox', async () => {
+    const w = makeWorld();
+    const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+    const recorded = captureHistory(w);
+
+    await w.machine().run(plan);
+    await w.flushTail();
+
+    expect(recorded).toHaveLength(1);
+    expect(await outbox(w)).toEqual([]);
+  });
+
+  it('O5 a re-post that throws keeps the record for the next pass; one whose payload cannot be read is dropped unposted', async () => {
+    const w = makeWorld();
+    await sentWithRecordKept(w);
+    let calls = 0;
+    w.deps.recordHistory = async () => {
+      calls += 1;
+      throw new Error('history down');
+    };
+
+    await convergerOf(w).convergeOnce();
+    await w.flushTail();
+    expect(calls).toBe(1);
+    expect(await outbox(w), 'a retry may still record it').toHaveLength(1);
+
+    const [kept] = await w.stores().sentOutbox.list();
+    await w.stores().sentOutbox.upsert({ ...kept!, payloadEnvelope: 'not-an-envelope' });
+    await convergerOf(w).convergeOnce();
+    await w.flushTail();
+    expect(calls, 'nothing is posted for a payload no retry can read').toBe(1);
+    expect(await outbox(w)).toEqual([]);
+  });
+
+  it('O6 a re-post that never answers holds no pass, and the next pass starts no second POST for it', async () => {
+    const w = makeWorld();
+    await sentWithRecordKept(w);
+    let calls = 0;
+    w.deps.recordHistory = () => {
+      calls += 1;
+      return new Promise<never>(() => undefined);
+    };
+    const converger = convergerOf(w);
+
+    await converger.convergeOnce();
+    await w.flushTail();
+    await converger.convergeOnce();
+    await w.flushTail();
+
+    expect(calls).toBe(1);
+    expect(await outbox(w)).toHaveLength(1);
+  });
+
+  it('O7 a pass never re-posts the record of a transfer still in process: its attempt posts its own', async () => {
+    const w = makeWorld();
+    const transferId = await sentWithRecordKept(w);
+    const recorded = captureHistory(w);
+    const active = new ActiveOps();
+    active.add(transferId);
+
+    await convergerOf(w, active).convergeOnce();
+    await w.flushTail();
+    expect(recorded).toEqual([]);
+
+    active.delete(transferId);
+    await convergerOf(w, active).convergeOnce();
+    await w.flushTail();
+    expect(recorded).toHaveLength(1);
+    expect(await outbox(w)).toEqual([]);
+  });
+
+  it('O8 the heartbeat counts a kept record as work until it is posted', async () => {
+    const w = makeWorld();
+    await sentWithRecordKept(w);
+    const converger = convergerOf(w);
+    expect(await converger.pendingWork()).toBe(true);
+
+    captureHistory(w);
+    await converger.convergeOnce();
+    await w.flushTail();
+    expect(await converger.pendingWork()).toBe(false);
+  });
+
+  it('O9 an outbox that cannot be written fails nothing: the send settles and its POST still leaves', async () => {
+    const w = makeWorld();
+    w.kv.failWriteKeys.add(STORE_KEYS.sentOutbox);
+    const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+    const recorded = captureHistory(w);
+
+    await expect(w.machine().run(plan)).resolves.toMatchObject({ deliveryPending: false });
+    await w.flushTail();
+
+    expect(recorded).toEqual([{ transferId: plan.transferId, phase: 'sent', committedAmount: '1000' }]);
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('completed');
   });
 });

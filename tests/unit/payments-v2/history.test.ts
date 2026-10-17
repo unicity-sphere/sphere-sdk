@@ -250,8 +250,9 @@ describe('History §5.9 — client POSTs and dedup keys', () => {
     const h = makeHarness();
     h.setFailPosts(true);
     await expect(
-      h.history.recordSent({ transferId: 'b2222222-2222-4222-8222-222222222222', assets: [{ coinId: COIN, amount: '1' }] })
-    ).resolves.toBeUndefined();
+      h.history.recordSent({ transferId: 'b2222222-2222-4222-8222-222222222222', assets: [{ coinId: COIN, amount: '1' }] }),
+      '#842: false = a retry may still record it'
+    ).resolves.toBe(false);
     await expect(
       h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [{ coinId: COIN, amount: '1' }] })
     ).resolves.toBeUndefined();
@@ -431,5 +432,37 @@ describe('History — a permanent reject is distinguishable from a transient fai
       h.history.recordReceived({ tokenId: TOKEN, stateHash: STATE_A, assets: [] })
     ).resolves.toBeUndefined();
     expect(h.emit).not.toHaveBeenCalled();
+  });
+});
+
+describe('#842 recordSent answers whether a retry may still record it (the SENT outbox keeps it until then)', () => {
+  const sent = { transferId: 'd4444444-4444-4444-8444-444444444444', assets: [{ coinId: COIN, amount: '1' }] };
+
+  it('a recorded POST is final: true', async () => {
+    const h = makeHarness();
+    await expect(h.history.recordSent(sent)).resolves.toBe(true);
+    expect(await h.serverRecords()).toHaveLength(1);
+  });
+
+  it('a refused shape is final too: true, since no retry can fix it', async () => {
+    const h = makeHarness();
+    h.setPostError(Object.assign(new Error('unprocessable'), { status: 422 }));
+    await expect(h.history.recordSent(sent)).resolves.toBe(true);
+  });
+
+  it('a transient failure (503, 408, 429, or no status) is not: false', async () => {
+    const transient: (Error & { status?: number })[] = [503, 408, 429].map((status) => Object.assign(new Error('try later'), { status }));
+    for (const err of [...transient, new Error('reset')]) {
+      const h = makeHarness();
+      h.setPostError(err);
+      await expect(h.history.recordSent(sent), String((err as { status?: number }).status)).resolves.toBe(false);
+    }
+  });
+
+  it('a record that cannot be built is final: true, logged, and nothing is posted', async () => {
+    const h = makeHarness();
+    await expect(h.history.recordSent({ ...sent, timestamp: Number.NaN })).resolves.toBe(true);
+    expect(h.log).toHaveBeenCalledWith(expect.stringMatching(/cannot be built/), expect.any(RangeError));
+    expect(await h.serverRecords()).toHaveLength(0);
   });
 });

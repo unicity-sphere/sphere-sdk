@@ -365,8 +365,8 @@ function buildMachineDeps(
     ...(deps.ownNametag !== undefined ? { ownNametag: deps.ownNametag } : {}),
     emit: deps.emit,
     now: deps.now ?? Date.now,
-    recordHistory: async ({ transferId, payload, committedAmount, committedAssets }) => {
-      await historyStore.recordSent({
+    recordHistory: async ({ transferId, payload, committedAmount, committedAssets }) =>
+      historyStore.recordSent({
         transferId,
         // §5.9: the SETTLED amount, never payload.amount — the plan. A token
         // spend moved no coin: `assets: []` + tokenId (wallet-api#151 / §10).
@@ -375,8 +375,7 @@ function buildMachineDeps(
           : { assets: [{ coinId: payload.coinId, amount: committedAmount }] }),
         recipientPubkey: payload.recipient,
         ...(payload.memo !== undefined ? { memo: payload.memo } : {}),
-      });
-    },
+      }),
   };
 }
 
