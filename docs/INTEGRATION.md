@@ -1048,8 +1048,10 @@ requester. A SENT history row is best-effort. The SDK posts it once the transfer
 settled, and it records what certified on chain, whether or not the mailbox deposit has landed yet:
 a send that resolves `'confirmed'` with `deliveryPending: true` is posted too. For a partial send it
 records the certified part, with the remainder recorded under its own transferId when it is paid. A
-POST that fails is re-posted only by a later convergence pass while the transfer is still open,
-never after it settled, so a missing row does not prove that nothing was sent.
+POST that fails, or that a stopped app never finished, is kept in a local outbox and re-posted by
+later convergence passes until the server records it. A row can still be missing (the outbox could
+not be written, or the sending device never runs again), so a missing row does not prove that
+nothing was sent.
 
 ---
 

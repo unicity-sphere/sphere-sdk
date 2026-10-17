@@ -1091,7 +1091,7 @@ authoritative for build success.
 - Everything the client persists for money lives in the per-(network, address) scoped KV:
   `pv2g2:{network}:{chainPubkey}:*` inside the plain `StorageProvider` — refresh token, sync
   cursors, receive seen-set, intent backstop, split-checkpoint cache, delivery journal (#621), mint journal,
-  NFT mint journal (#785), #690 shortfalls, request settling journal, the epoch latch and the §5.2 `suspectedSpent` /
+  NFT mint journal (#785), #690 shortfalls, the #842 SENT outbox, request settling journal, the epoch latch and the §5.2 `suspectedSpent` /
   `knownSpends` overlays — the complete list is `STORE_KEYS` in `modules/payments-v2/stores.ts`
   plus the session's refresh token under `refreshTokenKey(deviceId)` (`auth:refresh:<deviceId>`,
   `impl/wallet-api-v2/session.ts`) plus the delivery port's receive seen-set under

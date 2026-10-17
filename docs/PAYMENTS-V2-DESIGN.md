@@ -790,9 +790,11 @@ set), never the planned amount**, so a partial records the certified portion and
 re-plan records its own under the new transferId; a failed POST never fails
 the money path. **SENT is issued before the apply (#842)**, once the legs settled, whatever the
 apply or the close answers (§5.5 "Resolution point"): the apply completes an unflagged intent,
-which then leaves the open listing for good. The POST itself stays best-effort: a failed one is
-re-posted only by a later pass while the intent is still open, never after it settled, so a
-missing SENT row does not prove that nothing was sent; server wire shape pinned (`ts`
+which then leaves the open listing for good. So the record goes into the SENT outbox
+(`STORE_KEYS.sentOutbox`) before the apply and leaves it only once its POST is recorded or
+permanently refused; every convergence pass re-posts what it holds, beside the pass. A row can
+still be missing (an unwritable outbox, a device that never runs again), so a missing SENT row
+does not prove that nothing was sent; server wire shape pinned (`ts`
 ISO+offset; genesis-stable lowercase `tokenId`), client-facing entries keep the consumed
 `timestamp` name via the read-through mapping. History
 `memo`/`counterparty_nametag` are **self-scoped encrypted** (`sphere-fieldenc-v1`), owned here.
@@ -839,6 +841,7 @@ can lose money.** Each row exists because of a documented server non-guarantee.
 | Seen-set `(tokenId, stateHash)` | mailbox is at-least-once; claimed entries stay listable | delivery impl (S7 port contract) |
 | `suspectedSpent` overlay | server never checks unspentness | InventoryView |
 | Settling journal (request → transferId) | #441 — a possibly-committed pay must survive reload | Requests |
+| SENT outbox (`sent-outbox`: a settled send's SENT record, payload encrypted, #842) | the apply completes the intent, which then leaves every listing, so nothing else can re-post a SENT POST that failed or that the process never finished | TransferMachine (the convergence pass removes what it re-posted) |
 | Stream cursors + syncEpoch (atomic `(cursor, epoch)` record per stream + one global epoch latch) | wakes are lossy; epoch guards restores | Session/owners |
 
 All keyed per-network **and** per-address: the scope prefix is `pv2g2:{network}:{chainPubkey}:`,
