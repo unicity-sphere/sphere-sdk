@@ -77,6 +77,8 @@ export interface Hooks {
   deliver?: () => Promise<void>;
   /** Runs before the mailbox listing yields — gates a drain mid-flight. */
   incoming?: () => Promise<void>;
+  /** Runs before every history POST reaches the server — throw to fail it. */
+  postHistory?: () => Promise<void>;
 }
 
 export interface Counters {
@@ -116,7 +118,10 @@ function hookedClient(inner: FakeWalletApiV2Client, hooks: Hooks, counters: Coun
       await inner.completeIntent(t, s);
     },
     listHistory: (o) => inner.listHistory(o),
-    postHistory: (r) => inner.postHistory(r),
+    postHistory: async (r) => {
+      if (hooks.postHistory) await hooks.postHistory();
+      return inner.postHistory(r);
+    },
     createPaymentRequest: (i) => inner.createPaymentRequest(i),
     listPaymentRequests: (p) => inner.listPaymentRequests(p),
     respondPaymentRequest: (id, r) => inner.respondPaymentRequest(id, r),

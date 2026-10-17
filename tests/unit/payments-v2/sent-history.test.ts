@@ -641,6 +641,41 @@ describe('#842 the SENT outbox keeps a record until its POST is answered for goo
     expect(await outbox(w)).toEqual([]);
   });
 
+  it('O11 every attempt carries the time the record was kept, a later re-post included', async () => {
+    const w = makeWorld();
+    const keptAt = w.clock.t;
+    const stamps: (number | undefined)[] = [];
+    w.deps.recordHistory = async ({ timestamp }) => {
+      stamps.push(timestamp);
+      return stamps.length > 1 ? undefined : false; // the first POST fails, the re-post lands
+    };
+
+    await w.machine().run(await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' }));
+    await w.flushTail();
+    await passLater(w);
+
+    expect(stamps).toEqual([keptAt, keptAt]);
+    expect(await outbox(w)).toEqual([]);
+  });
+
+  it("O12 a kept record arms the heartbeat; an acknowledged POST and a pass's own failed re-post do not", async () => {
+    const w = makeWorld();
+    let arms = 0;
+    w.deps.armHeartbeat = () => {
+      arms += 1;
+    };
+    captureHistory(w);
+    await w.machine().run(await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' }));
+    await w.flushTail();
+    expect(arms, 'acknowledged: nothing kept').toBe(0);
+
+    await sentWithRecordKept(w);
+    expect(arms, 'kept: an idle wallet must run a pass').toBe(1);
+
+    await passLater(w); // the re-post fails again: the running heartbeat's own backoff decides
+    expect(arms).toBe(1);
+  });
+
   it('O8 the heartbeat counts a kept record as work until it is posted', async () => {
     const w = makeWorld();
     await sentWithRecordKept(w);

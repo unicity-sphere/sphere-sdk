@@ -84,7 +84,11 @@ export interface MachineDeps {
     committedAmount: string;
     /** A WHOLE-token spend moves the token, not an amount: its real assets, [] when coinless. */
     committedAssets?: readonly { coinId: string; amount: string }[];
+    /** #842: when the record was kept — the row's time, re-posts included. */
+    timestamp?: number;
   }) => Promise<boolean | void>;
+  /** #842: a SENT record was kept for a re-post — wake the convergence heartbeat. */
+  armHeartbeat?: () => void;
 }
 
 export interface MachinePlan {
@@ -643,8 +647,8 @@ export class TransferMachine {
   }
 
   private outbox(): OutboxDeps {
-    const { recordHistory, encryptPayload, now } = this.deps;
-    return { recordHistory, encryptPayload, now, outbox: this.stores.sentOutbox };
+    const { recordHistory, encryptPayload, now, armHeartbeat } = this.deps;
+    return { recordHistory, encryptPayload, now, armHeartbeat, outbox: this.stores.sentOutbox };
   }
 
   private closeTail(transferId: string, payload: IntentPayload): void {

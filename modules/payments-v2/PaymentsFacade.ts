@@ -148,6 +148,7 @@ export class PaymentsFacade implements PaymentsV2 {
       send: (request) => this.send(request),
       isActiveOp: (id) => this.activeMoneyOps.has(id),
       track: (op) => this.trackTail(op),
+      armHeartbeat: () => this.heartbeat.arm(),
     });
     this.deps = parts.deps; // #835: the composed deps, whose emit no listener's throw escapes
     this.view = parts.view;

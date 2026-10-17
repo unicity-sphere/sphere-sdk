@@ -3852,5 +3852,66 @@
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
+  },
+  {
+    "name": "sent-kept-no-arm",
+    "note": "#842: a record kept after a failed POST wakes the heartbeat; without it an idle wallet re-posts it only on resumeNow() or a restart (sent-history.test.ts O12, heartbeat.test.ts '#842 a send whose SENT POST fails')",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    else deps.armHeartbeat?.(); // kept: an idle wallet must still run the pass that re-posts it",
+    "replace": "    else void deps.armHeartbeat;",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts",
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "facade-arm-hook-dropped",
+    "note": "#842: the facade hands the machine its heartbeat (heartbeat.test.ts '#842 a send whose SENT POST fails')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "      armHeartbeat: () => this.heartbeat.arm(),\n    });",
+    "replace": "      armHeartbeat: () => undefined,\n    });",
+    "tests": [
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "compose-arm-hook-dropped",
+    "note": "#842: composition wires the facade's heartbeat into the machine (heartbeat.test.ts '#842 a send whose SENT POST fails')",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "    armHeartbeat: () => hooks.armHeartbeat(),",
+    "replace": "    armHeartbeat: () => undefined,",
+    "tests": [
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "sent-time-not-kept",
+    "note": "#842: the record is stamped when kept, so every attempt carries one time (sent-history.test.ts O11)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  const record = { ...settled, timestamp: deps.now() }; // the row's time on every attempt, re-posts included",
+    "replace": "  const record = { ...settled, timestamp: undefined as unknown as number };",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "repost-time-of-repost",
+    "note": "#842: a re-post carries the time the record was kept; without it a recovered send lands at the re-post time, out of order (sent-history.test.ts O11)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    const { transferId, phase, committedAmount, committedAssets, createdAt: timestamp } = entry;",
+    "replace": "    const { transferId, phase, committedAmount, committedAssets } = entry;\n    const timestamp = undefined;",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "compose-drops-sent-time",
+    "note": "#842: composition forwards the kept time to recordSent; dropped, the server row takes the POST time (heartbeat.test.ts '#842 a send whose SENT POST fails')",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "        ...(timestamp !== undefined ? { timestamp } : {}),\n",
+    "replace": "",
+    "tests": [
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
   }
 ]

@@ -51,19 +51,22 @@ export interface OutboxDeps {
   recordHistory: MachineDeps['recordHistory'];
   encryptPayload: MachineDeps['encryptPayload'];
   now: MachineDeps['now'];
+  armHeartbeat: MachineDeps['armHeartbeat'];
   outbox: MachineStores['sentOutbox'];
 }
 
 /** #842: kept in the outbox BEFORE the apply (an applied row is never listed again); the POST is never awaited. */
-export async function keepAndPost(deps: OutboxDeps, record: SettledRecord | undefined): Promise<void> {
-  if (record === undefined || deps.recordHistory === undefined) return;
+export async function keepAndPost(deps: OutboxDeps, settled: SettledRecord | undefined): Promise<void> {
+  if (settled === undefined || deps.recordHistory === undefined) return;
+  const record = { ...settled, timestamp: deps.now() }; // the row's time on every attempt, re-posts included
   try {
-    await deps.outbox.upsert(toOutbox(record, await deps.encryptPayload(record.payload), deps.now()));
+    await deps.outbox.upsert(toOutbox(record, await deps.encryptPayload(record.payload)));
   } catch {
     /* the in-flight POST is then the record's only copy */
   }
   void postSettled(deps.recordHistory, record).then(async (done) => {
     if (done) await deps.outbox.removeByKey(record.transferId).catch(() => undefined);
+    else deps.armHeartbeat?.(); // kept: an idle wallet must still run the pass that re-posts it
   });
 }
 
@@ -77,9 +80,9 @@ export interface RepostDeps {
 export async function repostKept(deps: RepostDeps, entry: SentOutboxEntry): Promise<void> {
   let record: SettledRecord | undefined;
   try {
-    const { transferId, phase, committedAmount, committedAssets } = entry;
+    const { transferId, phase, committedAmount, committedAssets, createdAt: timestamp } = entry;
     const payload = await deps.readPayload(entry.payloadEnvelope);
-    record = { transferId, payload, phase, committedAmount, ...(committedAssets !== undefined ? { committedAssets } : {}) };
+    record = { transferId, payload, phase, committedAmount, timestamp, ...(committedAssets !== undefined ? { committedAssets } : {}) };
   } catch {
     record = undefined; // an unreadable payload never becomes readable
   }
@@ -88,15 +91,15 @@ export async function repostKept(deps: RepostDeps, entry: SentOutboxEntry): Prom
   }
 }
 
-function toOutbox(record: SettledRecord, payloadEnvelope: string, createdAt: number): SentOutboxEntry {
-  const { transferId, phase, committedAmount, committedAssets } = record;
+function toOutbox(record: SettledRecord & { timestamp: number }, payloadEnvelope: string): SentOutboxEntry {
+  const { transferId, phase, committedAmount, committedAssets, timestamp } = record;
   return {
     transferId,
     payloadEnvelope,
     phase,
     committedAmount,
     ...(committedAssets !== undefined ? { committedAssets: committedAssets.map((asset) => ({ ...asset })) } : {}),
-    createdAt,
+    createdAt: timestamp,
   };
 }
 
