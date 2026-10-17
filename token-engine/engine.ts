@@ -92,6 +92,13 @@ export interface EngineOpOptions {
  * The token engine port. The wallet's secp256k1 identity, the target network,
  * the aggregator client and the trust base are all bound at construction
  * (see EngineConfig); operations below take only sphere-domain arguments.
+ *
+ * Error contract (#839): `transfer`/`burn`/`split` reject untyped only when the call submitted
+ * nothing, or for a proven-clean submit reject. Once a proof matches, every failure is a typed
+ * keep-open error (`isKeepOpenSplitError`'s set), e.g. `ProofUnconfirmedError` for an unrealized
+ * spend, `CheckpointPersistFailedError` for a split checkpoint not encoded or not stored,
+ * `SplitCheckpointLostError` for a stored checkpoint that cannot be rebuilt. `mint`/`mintDataToken`
+ * may reject untyped AFTER certification, so their callers journal first and replay the same id.
  */
 export interface ITokenEngine {
   // ── identity / recipients ───────────────────────────────────────────────
@@ -125,6 +132,7 @@ export interface ITokenEngine {
   readNft(token: SphereToken): Promise<NftReading | null>;
 
   // ── lifecycle (sender-driven: build → submit → wait → certify → realize) ──
+
   /**
    * Mint (issue) a new token to a recipient pubkey. NOT a wallet end-user flow —
    * this is the issuer/developer capability: an app issuing its own tokens
