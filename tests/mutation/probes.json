@@ -329,7 +329,8 @@
     "replace": "      2_000_000_000,\n      options?.signal,",
     "tests": [
       "tests/unit/token-engine/proof-deadline.test.ts"
-    ]
+    ],
+    "testName": "a fetch that NEVER settles still ends at the deadline"
   },
   {
     "name": "proof-timeout-config-ignored",

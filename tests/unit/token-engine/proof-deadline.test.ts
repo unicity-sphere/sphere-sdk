@@ -121,7 +121,7 @@ describe('#739 the inclusion-proof wait always terminates', () => {
 
     expect(err).toBeInstanceOf(ProofUnconfirmedError);
     expect(Date.now() - started).toBeLessThan(3_000);
-  }, 30_000);
+  });
 
   it('a non-positive deadline is refused at construction, not honoured as "no cap" or as zero', () => {
     // engine.ts once documented 0 as "no engine-side cap". Read literally that is

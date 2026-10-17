@@ -32,6 +32,9 @@ function loadManifest() {
     if (!Array.isArray(p.tests) || p.tests.length === 0 || p.tests.some((/** @type {unknown} */ t) => typeof t !== 'string')) {
       die(`probe ${p.name}: "tests" must be a non-empty string array`);
     }
+    if (p.testName !== undefined && (typeof p.testName !== 'string' || p.testName === '')) {
+      die(`probe ${p.name}: "testName" must be a non-empty string when present`);
+    }
     if (p.find === p.replace) die(`probe ${p.name}: find and replace are identical`);
     if (seen.has(p.name)) die(`duplicate probe name: ${p.name}`);
     seen.add(p.name);
@@ -75,7 +78,10 @@ function runProbe(probe) {
   writeFileSync(abs, original.slice(0, first) + probe.replace + original.slice(first + probe.find.length));
   let vitest;
   try {
-    vitest = spawnSync('npx', ['vitest', 'run', ...probe.tests], {
+    // `testName` runs only the test that kills the probe: a mutation that hangs a test otherwise
+    // waits out the timeout of every other test in its file.
+    const only = probe.testName === undefined ? [] : ['-t', probe.testName];
+    vitest = spawnSync('npx', ['vitest', 'run', ...probe.tests, ...only], {
       cwd: root,
       encoding: 'utf8',
       env: { ...process.env, CI: 'true', NO_COLOR: '1', FORCE_COLOR: '0' },
