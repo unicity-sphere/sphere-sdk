@@ -110,11 +110,29 @@ function runProbe(probe) {
   };
 }
 
+/**
+ * `MUTATION_SHARD=i/n` (CI) keeps every n-th probe from the i-th, so n parallel jobs, each in its
+ * own checkout, cover the manifest exactly once. Unset, every selected probe runs.
+ */
+function shardOf(probes) {
+  const spec = process.env.MUTATION_SHARD;
+  if (spec === undefined || spec === '') return probes;
+  const match = /^(\d+)\/(\d+)$/.exec(spec);
+  const [i, n] = match === null ? [0, 0] : [Number(match[1]), Number(match[2])];
+  if (i < 1 || i > n) die(`MUTATION_SHARD must be i/n with 1 <= i <= n, got "${spec}"`);
+  return probes.filter((_, k) => k % n === i - 1);
+}
+
 function main() {
   const filters = process.argv.slice(2);
   const probes = loadManifest();
-  const selected = filters.length === 0 ? probes : probes.filter((p) => filters.includes(p.name));
-  if (selected.length === 0) die(`no probes match ${filters.join(', ')} (names: ${probes.map((p) => p.name).join(', ')})`);
+  const matching = filters.length === 0 ? probes : probes.filter((p) => filters.includes(p.name));
+  if (matching.length === 0) die(`no probes match ${filters.join(', ')} (names: ${probes.map((p) => p.name).join(', ')})`);
+  const selected = shardOf(matching);
+  if (selected.length === 0) {
+    console.log(`no probe falls in shard ${String(process.env.MUTATION_SHARD)}`);
+    return;
+  }
 
   for (const probe of selected) assertPristine(probe.file);
 
