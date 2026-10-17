@@ -94,14 +94,13 @@ function wireAssets(
 }
 
 /**
- * A 4xx other than 408/429 is the server refusing this record's SHAPE — permanent,
- * so no retry can fix it. Duck-typed on `status` so the module keeps no dependency
- * on a transport implementation.
+ * #842: final only when no retry can change it — a 413 (the body itself, from any hop) or a 422 in
+ * wallet-api's own envelope. A 401/403/404, or an untyped `HTTP_422` a hop wrote, may pass later.
  */
 function isPermanentReject(err: unknown): boolean {
-  const status = (err as { status?: unknown } | null)?.status;
-  if (typeof status !== 'number') return false;
-  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+  const { status, code } = (err ?? {}) as { status?: unknown; code?: unknown };
+  if (status === 413) return true;
+  return status === 422 && typeof code === 'string' && !code.startsWith('HTTP_');
 }
 
 const WIRE_TOKEN_ID = /^(?:[0-9a-f]{2}){1,64}$/;
@@ -126,8 +125,8 @@ export class History {
 
   // ── client POSTs (best-effort — NEVER throw into the money path) ────────────
 
-  async recordSent(input: RecordSentInput): Promise<void> {
-    await this.post(() => ({
+  async recordSent(input: RecordSentInput): Promise<boolean> {
+    return this.post(() => ({
       dedupKey: input.transferId,
       id: (this.deps.newId ?? randomUUID)(),
       type: 'SENT' as const,
@@ -167,25 +166,34 @@ export class History {
 
   // ── internals ────────────────────────────────────────────────────────────────
 
-  private async post(build: () => HistoryWireRecord): Promise<void> {
-    const record = build();
+  /** `false` only for a transient failure: a retry may still record it. */
+  private async post(build: () => HistoryWireRecord): Promise<boolean> {
+    let record: HistoryWireRecord;
+    try {
+      record = build();
+    } catch (err) {
+      this.deps.log?.('history record cannot be built — no retry can fix it', err);
+      return true;
+    }
     try {
       await this.deps.client.postHistory([record]);
     } catch (err) {
       // §5.9 keeps this off the money path, but a 4xx is PERMANENT: no retry can
       // fix a shape the server refuses, and logging it as retry-safe is what let a
       // coinless receipt vanish silently (#780). Name the two apart.
+      const permanent = isPermanentReject(err);
       this.deps.log?.(
-        isPermanentReject(err)
+        permanent
           ? 'history POST REJECTED — the record shape is refused; no retry can fix it'
           : 'history POST failed (dedupKey makes retry safe)',
         err
       );
-      return;
+      return permanent;
     }
     // The recorded entry is in hand — emit it through the SAME read-through
     // mapping page() serves (decrypted memo/nametag, `timestamp` name).
     this.deps.emit('history:updated', this.toEntry(record));
+    return true;
   }
 
   private ts(timestamp?: number): string {

@@ -254,6 +254,7 @@ export function makeWorld(): World {
     intents: makeIntents(world),
     checkpointStore: memoryCheckpoints(),
     kv,
+    sentInFlight: new Set<string>(), // #842: shared by the machine and the outbox re-post, as composed
     encryptPayload: async (p) => `enc:${JSON.stringify(p)}`,
     decryptPayload: async (envelope) => {
       if (!envelope.startsWith('enc:')) throw new Error('undecryptable envelope');

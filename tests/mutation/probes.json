@@ -1369,9 +1369,9 @@
   },
   {
     "name": "history-permanent-reject-logged-as-retry-safe",
-    "note": "#780: a 4xx is a permanent shape refusal that no retry can fix. Logging it as retry-safe is exactly what let a coinless receipt vanish silently.",
+    "note": "#780: wallet-api's typed 422 is a permanent shape refusal that no retry can fix. Logging it as retry-safe is exactly what let a coinless receipt vanish silently.",
     "file": "modules/payments-v2/history/History.ts",
-    "find": "  return status >= 400 && status < 500 && status !== 408 && status !== 429;",
+    "find": "  return status === 422 && typeof code === 'string' && !code.startsWith('HTTP_');",
     "replace": "  return false;",
     "tests": [
       "tests/unit/payments-v2/history.test.ts"
@@ -1381,8 +1381,8 @@
     "name": "history-treats-429-as-permanent",
     "note": "#780: 408/429 are transient. Calling them permanent would tell an operator a retryable failure is unfixable.",
     "file": "modules/payments-v2/history/History.ts",
-    "find": "  return status >= 400 && status < 500 && status !== 408 && status !== 429;",
-    "replace": "  return status >= 400 && status < 500;",
+    "find": "  if (status === 413) return true;\n",
+    "replace": "  if (status === 413 || status === 429 || status === 408) return true;\n",
     "tests": [
       "tests/unit/payments-v2/history.test.ts"
     ]
@@ -2486,8 +2486,8 @@
     "name": "resume-apply-before-shortfall",
     "note": "#690 + #835: the shortfall row is durable BEFORE the apply; applied first, a failed shortfall write loses the unseen remainder of an intent the apply already settled (machine-resume.test.ts 'the shortfall is durable before ANY apply...')",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    await this.stores.shortfalls.upsert(entry);\n    await this.applyCommitted(engine, r.transferId, committed);",
-    "replace": "    await this.applyCommitted(engine, r.transferId, committed);\n    await this.stores.shortfalls.upsert(entry);",
+    "find": "    await this.stores.shortfalls.upsert(entry);\n    const close = (): Promise<boolean> => this.completeIntent(r.transferId, r.payload).then(() => true, () => false);\n    const closed = await this.applyRecorded(engine, r, committed, close);\n",
+    "replace": "    const close = (): Promise<boolean> => this.completeIntent(r.transferId, r.payload).then(() => true, () => false);\n    const closed = await this.applyRecorded(engine, r, committed, close);\n    await this.stores.shortfalls.upsert(entry);\n",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts"
     ]
@@ -2496,11 +2496,105 @@
     "name": "resume-partial-close-strict",
     "note": "#835: a close that fails after a settled partial's apply reports closed: false, never a throw, so the facade surfaces the durable remainder as final instead of re-planning it (machine-resume.test.ts 'a close that fails after the partial apply reports closed: false...'; send-intent-unknown.test.ts (r))",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    const closed = await this.completeIntent(r.transferId, r.payload).then(\n      () => true,\n      () => false\n    );",
-    "replace": "    const closed = await this.completeIntent(r.transferId, r.payload).then(() => true);",
+    "find": "    const close = (): Promise<boolean> => this.completeIntent(r.transferId, r.payload).then(() => true, () => false);\n",
+    "replace": "    const close = (): Promise<boolean> => this.completeIntent(r.transferId, r.payload).then(() => true);\n",
     "tests": [
       "tests/unit/payments-v2/machine-resume.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "run-history-after-apply",
+    "note": "#842: run() issues the SENT POST BEFORE its apply. Issued only after the apply, an apply the server committed whose answer never arrives (lost, or the process died once it was issued) records nothing, and the restart sweep removes the last trace of a payment that left (sent-history.test.ts T3, C1, T8)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      await keepAndPost(this.outbox(), sent);\n      await this.applyCommitted(engine, plan.transferId, committed);\n",
+    "replace": "      await this.applyCommitted(engine, plan.transferId, committed);\n      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      await keepAndPost(this.outbox(), sent);\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "run-history-dropped",
+    "note": "#842: run() itself posts the SENT history; left to the close tail, a complete that fails after a good apply loses the row for good, since the apply completed the intent and no pass lists it again (sent-history.test.ts T1, T3, C1; send-intent-unknown.test.ts (sent-complete), (sent-whole))",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      await keepAndPost(this.outbox(), sent);\n",
+    "replace": "      void sent; // mutant: no SENT history beside the apply\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "sent-post-awaited",
+    "note": "#842: no path waits on the SENT POST — the outbox keeps the record. Awaited, a history endpoint that never answers (the client sets no request timeout) holds back the apply, the close, send(), and a resumed close failure's report with every later intent of the pass (sent-history.test.ts T7, T8, T10, T12)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  void postSettled(deps.recordHistory, record).then(",
+    "replace": "  await postSettled(deps.recordHistory, record).then(",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "run-history-gated-on-delivery",
+    "note": "#842: run() posts SENT for every certified leg whether or not its mailbox deposit landed. Gated on the deposit, a send that resolves 'confirmed' with deliveryPending: true gets no row, and the apply then completes the intent, so no later pass ever posts one (sent-history.test.ts T11)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      await keepAndPost(this.outbox(), sent);\n",
+    "replace": "      if (!deliveryPending) await keepAndPost(this.outbox(), sent);\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "run-history-before-settled",
+    "note": "#842: run() posts SENT only once the attempt fully settled. Posted as soon as a leg certified, a keep-open leg beside it fixes the certified part as the payment's amount for good, since the server keeps the first post under the transferId dedupKey (sent-history.test.ts N2)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    if (cls === null) {\n      // #842: every leg certified, so SENT is kept and leaves before the apply — an applied row is never listed again.\n      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      await keepAndPost(this.outbox(), sent);\n",
+    "replace": "    if (committed.length > 0) {\n      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      await keepAndPost(this.outbox(), sent);\n    }\n    if (cls === null) {\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "resume-history-dropped",
+    "note": "#842: a resumed intent posts its SENT history whatever its apply or close answered; skipped, a lost apply answer or a failed close leaves a row the next pass sweeps with nothing recorded (sent-history.test.ts T2, T4, T5, C2; send-intent-unknown.test.ts (sent-held), where resume is the row's only writer)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    await keepAndPost(this.outbox(), sent);\n    await this.applyCommitted(engine, r.transferId, committed);\n",
+    "replace": "    void sent;\n    await this.applyCommitted(engine, r.transferId, committed);\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "resume-history-after-apply",
+    "note": "#842: resume issues the SENT POST BEFORE its apply. Issued only once the apply answered, a lost apply answer, or a process that dies once the apply is issued, records nothing, and the next pass sweeps the completed row (sent-history.test.ts T4, T5, C2; send-intent-unknown.test.ts (sent-held))",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    await keepAndPost(this.outbox(), sent);\n    await this.applyCommitted(engine, r.transferId, committed);\n",
+    "replace": "    await this.applyCommitted(engine, r.transferId, committed);\n    await keepAndPost(this.outbox(), sent);\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "settled-history-escapes-money-path",
+    "note": "#842: the SENT POST never rejects. A history failure that escapes rejects resume's applyRecorded finally (a resumed intent reads failed) and is an unhandled rejection beside run()'s apply (sent-history.test.ts T6a, T6b)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    return (await recordHistory(record)) !== false;\n  } catch {\n    return false;\n  }",
+    "replace": "    return (await recordHistory(record)) !== false;\n  } finally {\n    /* mutant: a history failure escapes */\n  }",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "settled-record-escapes-money-path",
+    "note": "#842: the SENT record is built before the apply, so a blob the history read cannot decode must yield no record, never a throw; escaped, run() rejects before the apply after every leg certified and was delivered (sent-history.test.ts T9)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    return undefined; // a history failure never fails the money path",
+    "replace": "    throw new Error('mutant: the history read escapes');",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
     ]
   },
   {
@@ -3617,6 +3711,297 @@
     "replace": "          {\n            publicKey: chainPubkey,\n          },",
     "tests": [
       "tests/unit/transport/identity-binding-quests.test.ts"
+    ]
+  },
+  {
+    "name": "sent-outbox-not-kept",
+    "note": "#842: the SENT record is kept in the outbox before the apply; without it a POST lost with the process is never re-posted (sent-history.test.ts O1/O2)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    await deps.outbox.upsert(toOutbox(record, await deps.encryptPayload(record.payload)));\n",
+    "replace": "    void toOutbox;\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "sent-outbox-cleared-unacknowledged",
+    "note": "#842: only a POST answered for good clears the record; a 'try again' keeps it for the next pass (O3)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    if (done) whileLive(deps.whileLive, () => deps.outbox.removeByKey(record.transferId));",
+    "replace": "    if (done || !done) whileLive(deps.whileLive, () => deps.outbox.removeByKey(record.transferId));",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "sent-outbox-never-cleared",
+    "note": "#842: an acknowledged POST clears its record, or every pass would re-post it (O4)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    if (done) whileLive(deps.whileLive, () => deps.outbox.removeByKey(record.transferId));",
+    "replace": "    if (done) void whileLive;",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "repost-drops-on-transient-failure",
+    "note": "#842: a re-post that fails transiently keeps the record for the next pass (O5)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  if (record === undefined || (await postSettled(deps.recordHistory, record))) {",
+    "replace": "  if (record === undefined || (await postSettled(deps.recordHistory, record)) || true) {",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "repost-keeps-unreadable",
+    "note": "#842: a record whose payload cannot be read is dropped unposted; kept, it would be retried every pass forever (O5)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    record = undefined; // an unreadable payload never becomes readable",
+    "replace": "    return;",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "posted-throw-reads-as-recorded",
+    "note": "#842: a history hook that throws has not recorded anything: a retry may still record it (O5)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    return (await recordHistory(record)) !== false;\n  } catch {\n    return false;\n  }",
+    "replace": "    return (await recordHistory(record)) !== false;\n  } catch {\n    return true;\n  }",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "posted-false-reads-as-recorded",
+    "note": "#842: `false` from the history hook means a retry may still record it, so the record stays kept (O3)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    return (await recordHistory(record)) !== false;",
+    "replace": "    await recordHistory(record);\n    return true;",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "converger-reposts-in-flight-again",
+    "note": "#842: one POST per record at a time; a POST that never answers is not stacked by every pass, nor beside a resume's own (sent-history.test.ts O6, O10, O15)",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "        if (activeOps.has(transferId) || inFlight.has(transferId)) continue;",
+    "replace": "        if (activeOps.has(transferId)) continue;",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "converger-reposts-active-transfer",
+    "note": "#842: a transfer still in process posts its own record; the pass leaves it alone (O7)",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "        if (activeOps.has(transferId) || inFlight.has(transferId)) continue;",
+    "replace": "        if (inFlight.has(transferId)) continue;",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "converger-never-reposts",
+    "note": "#842: every pass re-posts the outbox; without it a kept record is never posted (O1/O3)",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    this.repostSentOutbox();\n    return { progress, retryAfterMs };",
+    "replace": "    return { progress, retryAfterMs };",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "pending-work-ignores-sent-outbox",
+    "note": "#842: a kept record is heartbeat work, or an idle wallet never re-posts it (O8)",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "    const historyOwed = sentOutbox.length > 0;",
+    "replace": "    const historyOwed = false;",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "history-transient-reads-final",
+    "note": "#842: recordSent answers false for a transient failure, so the outbox keeps the record",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "      return permanent;",
+    "replace": "      return true;",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "history-build-failure-escapes",
+    "note": "#842: a record that cannot be built is final: thrown, it would be retried every pass forever",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "    try {\n      record = build();\n    } catch (err) {\n      this.deps.log?.('history record cannot be built — no retry can fix it', err);\n      return true;\n    }",
+    "replace": "    record = build();",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "keep-post-not-registered",
+    "note": "#842: the machine registers its own SENT POST, so the pass's re-post leaves that record alone; unregistered, a resumed record POSTs twice in one pass (sent-history.test.ts O10, O15)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  deps.inFlight?.add(record.transferId);\n",
+    "replace": "  void deps.inFlight;\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "sent-kept-no-arm",
+    "note": "#842: a record kept after a failed POST wakes the heartbeat; without it an idle wallet re-posts it only on resumeNow() or a restart (sent-history.test.ts O12, heartbeat.test.ts '#842 a send whose SENT POST fails')",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    else deps.armHeartbeat?.(); // kept: an idle wallet must still run the pass that re-posts it",
+    "replace": "    else void deps.armHeartbeat;",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts",
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "facade-arm-hook-dropped",
+    "note": "#842: the facade hands the machine its heartbeat (heartbeat.test.ts '#842 a send whose SENT POST fails')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "      armHeartbeat: () => this.heartbeat.arm(), whileLive:",
+    "replace": "      armHeartbeat: () => undefined, whileLive:",
+    "tests": [
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "compose-arm-hook-dropped",
+    "note": "#842: composition wires the facade's heartbeat into the machine (heartbeat.test.ts '#842 a send whose SENT POST fails')",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "    armHeartbeat: () => hooks.armHeartbeat(),",
+    "replace": "    armHeartbeat: () => undefined,",
+    "tests": [
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "sent-time-not-kept",
+    "note": "#842: the record is stamped when kept, so every attempt carries one time (sent-history.test.ts O11)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  const record = { ...settled, timestamp: kept?.createdAt ?? deps.now() };",
+    "replace": "  const record = { ...settled, timestamp: undefined as unknown as number };",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "repost-time-of-repost",
+    "note": "#842: a re-post carries the time the record was kept; without it a recovered send lands at the re-post time, out of order (sent-history.test.ts O11)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    const { transferId, phase, committedAmount, committedAssets, createdAt: timestamp } = entry;",
+    "replace": "    const { transferId, phase, committedAmount, committedAssets } = entry;\n    const timestamp = undefined;",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "compose-drops-sent-time",
+    "note": "#842: composition forwards the kept time to recordSent; dropped, the server row takes the POST time (heartbeat.test.ts '#842 a send whose SENT POST fails')",
+    "file": "modules/payments-v2/compose.ts",
+    "find": "        ...(timestamp !== undefined ? { timestamp } : {}),\n",
+    "replace": "        ...{},\n",
+    "tests": [
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "sent-time-rekept-fresh",
+    "note": "#842: a record kept again by a later resume keeps its FIRST time; re-stamped, a send recovered hours later lands at recovery time (sent-history.test.ts O13)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  const record = { ...settled, timestamp: kept?.createdAt ?? deps.now() };",
+    "replace": "  const record = { ...settled, timestamp: deps.now() };",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "keep-removal-unfenced",
+    "note": "#842: the removal after an answered POST runs only while the owner runs; unfenced, a stopped facade's late read-modify-write can overwrite a record the next facade on the same address just kept (sent-history.test.ts O14)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    if (done) whileLive(deps.whileLive, () => deps.outbox.removeByKey(record.transferId));",
+    "replace": "    if (done) void deps.outbox.removeByKey(record.transferId);",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "repost-removal-unfenced",
+    "note": "#842: a re-post's removal is fenced the same way (sent-history.test.ts O14)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    whileLive(deps.whileLive, () => deps.outbox.removeIfUnchanged(entry.transferId, entry));",
+    "replace": "    void deps.outbox.removeIfUnchanged(entry.transferId, entry);",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "facade-writes-after-stop",
+    "note": "#842: a stopped facade runs no detached outbox write (heartbeat.test.ts '#842 a SENT POST answered after stop()')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "whileLive: (write) => this.started && this.trackTail(write()),",
+    "replace": "whileLive: (write) => this.trackTail(write()),",
+    "tests": [
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "keep-posts-while-reposting",
+    "note": "#842: a resume issues no POST while one for the same record is under way (sent-history.test.ts O16)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  if (deps.inFlight?.has(record.transferId)) return; // a POST of this record is already under way\n",
+    "replace": "  void 0;\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "keep-in-flight-never-cleared",
+    "note": "#842: an answered POST leaves the in-flight set; kept there, the record is never re-posted (sent-history.test.ts O3, O11)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    deps.inFlight?.delete(record.transferId);\n",
+    "replace": "    void 0;\n",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "history-recoverable-4xx-final",
+    "note": "#842: a 401/403/404 the history POST gets may pass on a later session or route; read as final, the SENT outbox drops the record and the row is lost (history.test.ts '#842 ... a 4xx a later session or route may answer is kept')",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "  return status === 422 && typeof code === 'string' && !code.startsWith('HTTP_');",
+    "replace": "  return typeof status === 'number' && status >= 400 && status < 500 && status !== 408 && status !== 429;",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "history-untyped-422-final",
+    "note": "#842: only wallet-api's own typed 422 refuses the shape; an untyped HTTP_422 came from a hop (history.test.ts, the HTTP_422 case)",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "  return status === 422 && typeof code === 'string' && !code.startsWith('HTTP_');",
+    "replace": "  return status === 422;",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "history-413-retried",
+    "note": "#842: a 413 is a verdict on the body itself, from any hop: retried, the outbox re-posts it forever (history.test.ts, the 413 case)",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "  if (status === 413) return true;\n",
+    "replace": "  void 0;\n",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts"
     ]
   }
 ]

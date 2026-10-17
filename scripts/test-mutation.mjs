@@ -84,6 +84,9 @@ function runProbe(probe) {
     vitest = spawnSync('npx', ['vitest', 'run', ...probe.tests, ...only], {
       cwd: root,
       encoding: 'utf8',
+      // A failing assertion can print a whole Sphere, and the GitHub Actions reporter repeats it as
+      // annotations; the 1 MiB default then aborts the run with ENOBUFS instead of judging the probe.
+      maxBuffer: 256 * 1024 * 1024,
       env: { ...process.env, CI: 'true', NO_COLOR: '1', FORCE_COLOR: '0' },
     });
   } finally {

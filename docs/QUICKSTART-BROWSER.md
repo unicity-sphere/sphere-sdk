@@ -728,7 +728,14 @@ returns or throws, not before it starts. If the app or process stops while `pay(
 before a link that failed to write reaches storage, no link exists: on the next start the request is listed as
 `'pending'` again and `payment_request:incoming` fires again, even if the transfer went through (a transfer the SDK
 had already recorded is resumed when the wallet starts). Before paying a request again after a restart, check
-`sphere.payments.pendingTransfers()` and `sphere.payments.history()` for a transfer to that requester.
+`sphere.payments.pendingTransfers()` and `sphere.payments.history()` for a transfer to that requester. A SENT history
+row is best-effort. The SDK posts it once the transfer's legs have settled, and it records what certified on chain,
+whether or not the mailbox deposit has landed yet: a send that resolves `'confirmed'` with `deliveryPending: true` is
+posted too. For a partial send it records the certified part, with the remainder recorded under its own transferId when
+it is paid. A POST that fails, or that a stopped app never finished, is kept in a local outbox and
+re-posted by later convergence passes until the server records it. A row can still be missing (the
+outbox could not be written, or the sending device never runs again), so a missing row does not
+prove that nothing was sent.
 
 ### Transaction History
 
