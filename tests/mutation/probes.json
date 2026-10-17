@@ -2507,8 +2507,8 @@
     "name": "run-history-after-apply",
     "note": "#842: run() issues the SENT POST BEFORE its apply. Issued only after the apply, an apply the server committed whose answer never arrives (lost, or the process died once it was issued) records nothing, and the restart sweep removes the last trace of a payment that left (sent-history.test.ts T3, C1, T8)",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      void postSettled(this.deps.recordHistory, sent);\n      await this.applyCommitted(engine, plan.transferId, committed);\n",
-    "replace": "      await this.applyCommitted(engine, plan.transferId, committed);\n      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      void postSettled(this.deps.recordHistory, sent);\n",
+    "find": "      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      await keepAndPost(this.outbox(), sent);\n      await this.applyCommitted(engine, plan.transferId, committed);\n",
+    "replace": "      await this.applyCommitted(engine, plan.transferId, committed);\n      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      await keepAndPost(this.outbox(), sent);\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
@@ -2518,7 +2518,7 @@
     "name": "run-history-dropped",
     "note": "#842: run() itself posts the SENT history; left to the close tail, a complete that fails after a good apply loses the row for good, since the apply completed the intent and no pass lists it again (sent-history.test.ts T1, T3, C1; send-intent-unknown.test.ts (sent-complete), (sent-whole))",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "      void postSettled(this.deps.recordHistory, sent);\n",
+    "find": "      await keepAndPost(this.outbox(), sent);\n",
     "replace": "      void sent; // mutant: no SENT history beside the apply\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts",
@@ -2526,11 +2526,11 @@
     ]
   },
   {
-    "name": "run-awaits-history",
-    "note": "#842: run() never waits on its SENT POST. Awaited, a history endpoint that never answers (the client sets no request timeout) holds back the apply and the close, and send() never resolves although every leg is certified and delivered (sent-history.test.ts T8)",
-    "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "      void postSettled(",
-    "replace": "      await postSettled(",
+    "name": "sent-post-awaited",
+    "note": "#842: no path waits on the SENT POST — the outbox keeps the record. Awaited, a history endpoint that never answers (the client sets no request timeout) holds back the apply, the close, send(), and a resumed close failure's report with every later intent of the pass (sent-history.test.ts T7, T8, T10, T12)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  void postSettled(deps.recordHistory, record).then(",
+    "replace": "  await postSettled(deps.recordHistory, record).then(",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
@@ -2539,8 +2539,8 @@
     "name": "run-history-gated-on-delivery",
     "note": "#842: run() posts SENT for every certified leg whether or not its mailbox deposit landed. Gated on the deposit, a send that resolves 'confirmed' with deliveryPending: true gets no row, and the apply then completes the intent, so no later pass ever posts one (sent-history.test.ts T11)",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "      void postSettled(this.deps.recordHistory, sent);",
-    "replace": "      if (!deliveryPending) void postSettled(this.deps.recordHistory, sent);",
+    "find": "      await keepAndPost(this.outbox(), sent);\n",
+    "replace": "      if (!deliveryPending) await keepAndPost(this.outbox(), sent);\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
@@ -2549,8 +2549,8 @@
     "name": "run-history-before-settled",
     "note": "#842: run() posts SENT only once the attempt fully settled. Posted as soon as a leg certified, a keep-open leg beside it fixes the certified part as the payment's amount for good, since the server keeps the first post under the transferId dedupKey (sent-history.test.ts N2)",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    if (cls === null) {\n      // #842: every leg certified, so SENT leaves before the apply \u2014 an applied row is never listed again.\n      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      void postSettled(this.deps.recordHistory, sent);\n",
-    "replace": "    if (committed.length > 0) {\n      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      void postSettled(this.deps.recordHistory, sent);\n    }\n    if (cls === null) {\n",
+    "find": "    if (cls === null) {\n      // #842: every leg certified, so SENT is kept and leaves before the apply — an applied row is never listed again.\n      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      await keepAndPost(this.outbox(), sent);\n",
+    "replace": "    if (committed.length > 0) {\n      const sent = await settledRecord(engine, { transferId: plan.transferId, payload: plan.payload, phase: 'sent', committed });\n      await keepAndPost(this.outbox(), sent);\n    }\n    if (cls === null) {\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
@@ -2559,8 +2559,8 @@
     "name": "resume-history-dropped",
     "note": "#842: a resumed intent posts its SENT history whatever its apply or close answered; skipped, a lost apply answer or a failed close leaves a row the next pass sweeps with nothing recorded (sent-history.test.ts T2, T4, T5, C2; send-intent-unknown.test.ts (sent-held), where resume is the row's only writer)",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    const recorded = postSettled(this.deps.recordHistory, sent);\n",
-    "replace": "    void sent;\n    const recorded = Promise.resolve();\n",
+    "find": "    await keepAndPost(this.outbox(), sent);\n    await this.applyCommitted(engine, r.transferId, committed);\n",
+    "replace": "    void sent;\n    await this.applyCommitted(engine, r.transferId, committed);\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
@@ -2570,49 +2570,19 @@
     "name": "resume-history-after-apply",
     "note": "#842: resume issues the SENT POST BEFORE its apply. Issued only once the apply answered, a lost apply answer, or a process that dies once the apply is issued, records nothing, and the next pass sweeps the completed row (sent-history.test.ts T4, T5, C2; send-intent-unknown.test.ts (sent-held))",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    const recorded = postSettled(this.deps.recordHistory, sent);\n    await this.applyCommitted(engine, r.transferId, committed);\n",
-    "replace": "    await this.applyCommitted(engine, r.transferId, committed);\n    const recorded = postSettled(this.deps.recordHistory, sent);\n",
+    "find": "    await keepAndPost(this.outbox(), sent);\n    await this.applyCommitted(engine, r.transferId, committed);\n",
+    "replace": "    await this.applyCommitted(engine, r.transferId, committed);\n    await keepAndPost(this.outbox(), sent);\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts",
       "tests/unit/payments-v2/send-intent-unknown.test.ts"
     ]
   },
   {
-    "name": "resume-close-waits-on-history",
-    "note": "#842: the resume path awaits its SENT POST only AFTER the close; awaited first, a hung history endpoint (the client sets no request timeout) holds back both the apply and the close (sent-history.test.ts T7)",
-    "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    const recorded = postSettled(this.deps.recordHistory, sent);\n    await this.applyCommitted(engine, r.transferId, committed);\n",
-    "replace": "    const recorded = postSettled(this.deps.recordHistory, sent);\n    await recorded;\n    await this.applyCommitted(engine, r.transferId, committed);\n",
-    "tests": [
-      "tests/unit/payments-v2/sent-history.test.ts"
-    ]
-  },
-  {
-    "name": "resume-failed-apply-waits-on-history",
-    "note": "#842: a resumed apply that fails rethrows at once; held until the SENT POST settles, a history endpoint that never answers (the client sets no request timeout) keeps that intent unreported and holds the single-flight pass and every later open intent (sent-history.test.ts T10)",
-    "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    await this.applyCommitted(engine, r.transferId, committed);\n    try {\n      return await close();\n",
-    "replace": "    try {\n      await this.applyCommitted(engine, r.transferId, committed);\n      return await close();\n",
-    "tests": [
-      "tests/unit/payments-v2/sent-history.test.ts"
-    ]
-  },
-  {
     "name": "settled-history-escapes-money-path",
     "note": "#842: the SENT POST never rejects. A history failure that escapes rejects resume's applyRecorded finally (a resumed intent reads failed) and is an unhandled rejection beside run()'s apply (sent-history.test.ts T6a, T6b)",
     "file": "modules/payments-v2/machine/settled-history.ts",
-    "find": "    return recordHistory(record).catch(() => undefined);",
-    "replace": "    return recordHistory(record);",
-    "tests": [
-      "tests/unit/payments-v2/sent-history.test.ts"
-    ]
-  },
-  {
-    "name": "settled-history-sync-throw-escapes",
-    "note": "#842: a history hook that throws synchronously never reaches the money path; escaped, it rejects run() after every leg certified and was delivered, before the apply (sent-history.test.ts T6c)",
-    "file": "modules/payments-v2/machine/settled-history.ts",
-    "find": "  } catch {\n    return Promise.resolve();\n  }",
-    "replace": "  } finally {\n    /* mutant: a synchronous throw escapes */\n  }",
+    "find": "    return (await recordHistory(record)) !== false;\n  } catch {\n    return false;\n  }",
+    "replace": "    return (await recordHistory(record)) !== false;\n  } finally {\n    /* mutant: a history failure escapes */\n  }",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
@@ -3774,26 +3744,6 @@
     ]
   },
   {
-    "name": "run-keeps-sent-after-apply",
-    "note": "#842: run() keeps the record BEFORE the apply; after it, a process that dies at the apply keeps nothing (O1)",
-    "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "      await keepAndPost(this.outbox(), sent);\n      await this.applyCommitted(engine, plan.transferId, committed);",
-    "replace": "      await this.applyCommitted(engine, plan.transferId, committed);\n      await keepAndPost(this.outbox(), sent);",
-    "tests": [
-      "tests/unit/payments-v2/sent-history.test.ts"
-    ]
-  },
-  {
-    "name": "resume-keeps-sent-after-apply",
-    "note": "#842: a resumed apply keeps the record BEFORE the apply too (O2)",
-    "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "    const { posted } = await keepAndPost(this.outbox(), sent);\n    await this.applyCommitted(engine, r.transferId, committed);",
-    "replace": "    await this.applyCommitted(engine, r.transferId, committed);\n    const { posted } = await keepAndPost(this.outbox(), sent);",
-    "tests": [
-      "tests/unit/payments-v2/sent-history.test.ts"
-    ]
-  },
-  {
     "name": "repost-drops-on-transient-failure",
     "note": "#842: a re-post that fails transiently keeps the record for the next pass (O5)",
     "file": "modules/payments-v2/machine/settled-history.ts",
@@ -3837,8 +3787,8 @@
     "name": "converger-reposts-in-flight-again",
     "note": "#842: one re-post per record at a time; a POST that never answers is not stacked by every pass (O6)",
     "file": "modules/payments-v2/convergence.ts",
-    "find": "        if (activeOps.has(transferId) || this.reposting.has(transferId)) continue;",
-    "replace": "        if (activeOps.has(transferId)) continue;",
+    "find": "        if (entry.createdAt >= startedAt || activeOps.has(transferId) || this.reposting.has(transferId)) continue;",
+    "replace": "        if (entry.createdAt >= startedAt || activeOps.has(transferId)) continue;",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
@@ -3847,8 +3797,8 @@
     "name": "converger-reposts-active-transfer",
     "note": "#842: a transfer still in process posts its own record; the pass leaves it alone (O7)",
     "file": "modules/payments-v2/convergence.ts",
-    "find": "        if (activeOps.has(transferId) || this.reposting.has(transferId)) continue;",
-    "replace": "        if (this.reposting.has(transferId)) continue;",
+    "find": "        if (entry.createdAt >= startedAt || activeOps.has(transferId) || this.reposting.has(transferId)) continue;",
+    "replace": "        if (entry.createdAt >= startedAt || this.reposting.has(transferId)) continue;",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
@@ -3857,7 +3807,7 @@
     "name": "converger-never-reposts",
     "note": "#842: every pass re-posts the outbox; without it a kept record is never posted (O1/O3)",
     "file": "modules/payments-v2/convergence.ts",
-    "find": "    this.repostSentOutbox();\n    return { progress, retryAfterMs };",
+    "find": "    this.repostSentOutbox(startedAt);\n    return { progress, retryAfterMs };",
     "replace": "    return { progress, retryAfterMs };",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
@@ -3891,6 +3841,16 @@
     "replace": "    record = build();",
     "tests": [
       "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "converger-reposts-in-pass-record",
+    "note": "#842: a pass leaves alone a record kept during it — its attempt's own POST is in flight; re-posted, every resumed send would POST twice (sent-history.test.ts O10)",
+    "file": "modules/payments-v2/convergence.ts",
+    "find": "        if (entry.createdAt >= startedAt || activeOps.has(transferId) || this.reposting.has(transferId)) continue;",
+    "replace": "        if (activeOps.has(transferId) || this.reposting.has(transferId)) continue;",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
     ]
   }
 ]

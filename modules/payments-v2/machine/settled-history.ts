@@ -54,18 +54,17 @@ export interface OutboxDeps {
   outbox: MachineStores['sentOutbox'];
 }
 
-/** #842: kept in the outbox BEFORE the apply (an applied row is never listed again), then posted. */
-export async function keepAndPost(deps: OutboxDeps, record: SettledRecord | undefined): Promise<{ posted: Promise<void> }> {
-  if (record === undefined || deps.recordHistory === undefined) return { posted: Promise.resolve() };
+/** #842: kept in the outbox BEFORE the apply (an applied row is never listed again); the POST is never awaited. */
+export async function keepAndPost(deps: OutboxDeps, record: SettledRecord | undefined): Promise<void> {
+  if (record === undefined || deps.recordHistory === undefined) return;
   try {
     await deps.outbox.upsert(toOutbox(record, await deps.encryptPayload(record.payload), deps.now()));
   } catch {
     /* the in-flight POST is then the record's only copy */
   }
-  const posted = postSettled(deps.recordHistory, record).then(async (done) => {
+  void postSettled(deps.recordHistory, record).then(async (done) => {
     if (done) await deps.outbox.removeByKey(record.transferId).catch(() => undefined);
   });
-  return { posted };
 }
 
 export interface RepostDeps {

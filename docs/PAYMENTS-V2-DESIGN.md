@@ -610,12 +610,11 @@ Normative behaviors bound into the transitions (not call sites):
   unflagged intents unconditionally; a split's change blob in `added` is seed evidence) — the
   explicit call converges the rare unevidenced edge via resume, so fire-and-forget is safe.
   **Amended 2026-10-15 (#842):** the SENT POST is no longer part of that tail. Once the legs
-  settled, the record is built locally from the certified blobs and the POST is ISSUED before the
-  apply: fire-and-forget on `send()` when every leg certified first time, and on resume (so also in
-  `send()`'s in-process converge of a conflicted leg) awaited only after the close attempt, so a
-  hung history endpoint holds neither the apply nor `complete` — though, with no client request
-  timeout, it still holds that pass after them. A resumed apply that fails rethrows at once,
-  without waiting on the POST, so the intent is reported failed and the pass moves on. Neither
+  settled, the record is built locally from the certified blobs, kept in the SENT outbox (§6), and
+  the POST is ISSUED before the apply. No path awaits it, on `send()` or on resume (so also in
+  `send()`'s in-process converge of a conflicted leg): the outbox re-posts what does not land, so a
+  hung history endpoint holds no apply, `complete` or pass, and a resumed apply or close that fails
+  is reported at once with its `Retry-After`. Neither
   the apply's answer nor the close gates the POST. The apply completes an unflagged intent, and
   after that no pass lists the row again: the next pass sweeps its backstop as residue and records
   nothing. A SENT POST that waited on `complete`, or on the apply's answer, was lost for good when

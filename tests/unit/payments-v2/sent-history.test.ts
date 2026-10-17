@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 
 import { isPossiblyCommittedSendOutcome } from '../../../core/errors';
 import { ProofUnconfirmedError, TransferConflictError } from '../../../token-engine/errors';
+import { WalletApiHttpError } from '../../../impl/wallet-api-v2/http';
 import { ActiveOps, Converger, derivePendingTransfers } from '../../../modules/payments-v2/convergence';
 import { resumeAll } from '../../../modules/payments-v2/machine/resume';
 import { STORE_KEYS } from '../../../modules/payments-v2/stores';
@@ -285,6 +286,24 @@ describe('#842 SENT history is posted beside the apply, never gated on the close
     expect(w.completes, 'nothing closes after a failed apply').toEqual([]);
   });
 
+  it('T12 resume: a close that fails while the history POST never answers is reported with its Retry-After, and the pass goes on', async () => {
+    const w = makeWorld();
+    const stuck = await openAfterFailedApply(w);
+    const next = await openAfterFailedApply(w);
+    w.deps.recordHistory = () => new Promise<never>(() => undefined);
+    w.overrides.complete = async (transferId) => {
+      if (transferId === stuck) throw new WalletApiHttpError(429, 'RATE_LIMITED', 'complete: rate limit exceeded', 60_000);
+    };
+
+    const report = await Promise.race([
+      resumeAll(w.deps),
+      new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 200)),
+    ]);
+
+    expect(report, 'the close failure is not held by the POST').not.toBe('hung');
+    expect(report).toMatchObject({ resumed: [next], failed: [stuck], retryAfterMs: 60_000 });
+  });
+
   it('T8 run(): a history POST that never answers holds neither the apply, the close nor send()', async () => {
     const w = makeWorld();
     const token = await w.seed(1000n);
@@ -460,6 +479,13 @@ function convergerOf(w: World, activeOps = new ActiveOps()): Converger {
   });
 }
 
+/** A convergence pass that starts after everything so far: a restart, or the next heartbeat. */
+async function passLater(w: World, converger = convergerOf(w)): Promise<void> {
+  w.clock.t += 1_000;
+  await converger.convergeOnce();
+  await w.flushTail();
+}
+
 async function outbox(w: World): Promise<Recorded[]> {
   return (await w.stores().sentOutbox.list()).map(({ transferId, phase, committedAmount }) => ({ transferId, phase, committedAmount }));
 }
@@ -487,8 +513,7 @@ describe('#842 the SENT outbox keeps a record until its POST is answered for goo
     expect(await outbox(w), 'kept before the apply').toEqual([{ transferId: plan.transferId, phase: 'sent', committedAmount: '1000' }]);
 
     death.revive();
-    await convergerOf(w).convergeOnce();
-    await w.flushTail();
+    await passLater(w);
 
     expect(death.recorded, 'exactly one SENT row, re-posted from the outbox').toEqual([
       { transferId: plan.transferId, phase: 'sent', committedAmount: '1000' },
@@ -509,8 +534,7 @@ describe('#842 the SENT outbox keeps a record until its POST is answered for goo
     expect(await outbox(w)).toEqual([{ transferId, phase: 'resumed', committedAmount: '1000' }]);
 
     death.revive();
-    await convergerOf(w).convergeOnce();
-    await w.flushTail();
+    await passLater(w);
 
     expect(death.recorded).toEqual([{ transferId, phase: 'resumed', committedAmount: '1000' }]);
     expect(await outbox(w)).toEqual([]);
@@ -525,8 +549,7 @@ describe('#842 the SENT outbox keeps a record until its POST is answered for goo
     expect(await derivePendingTransfers(w.stores(), w.deps.decryptPayload), 'a kept record is not a pending transfer').toEqual([]);
 
     const recorded = captureHistory(w);
-    await convergerOf(w).convergeOnce();
-    await w.flushTail();
+    await passLater(w);
 
     expect(recorded).toEqual([{ transferId, phase: 'sent', committedAmount: '1000' }]);
     expect(await outbox(w)).toEqual([]);
@@ -553,15 +576,13 @@ describe('#842 the SENT outbox keeps a record until its POST is answered for goo
       throw new Error('history down');
     };
 
-    await convergerOf(w).convergeOnce();
-    await w.flushTail();
+    await passLater(w);
     expect(calls).toBe(1);
     expect(await outbox(w), 'a retry may still record it').toHaveLength(1);
 
     const [kept] = await w.stores().sentOutbox.list();
     await w.stores().sentOutbox.upsert({ ...kept!, payloadEnvelope: 'not-an-envelope' });
-    await convergerOf(w).convergeOnce();
-    await w.flushTail();
+    await passLater(w);
     expect(calls, 'nothing is posted for a payload no retry can read').toBe(1);
     expect(await outbox(w)).toEqual([]);
   });
@@ -576,10 +597,8 @@ describe('#842 the SENT outbox keeps a record until its POST is answered for goo
     };
     const converger = convergerOf(w);
 
-    await converger.convergeOnce();
-    await w.flushTail();
-    await converger.convergeOnce();
-    await w.flushTail();
+    await passLater(w, converger);
+    await passLater(w, converger);
 
     expect(calls).toBe(1);
     expect(await outbox(w)).toHaveLength(1);
@@ -592,14 +611,33 @@ describe('#842 the SENT outbox keeps a record until its POST is answered for goo
     const active = new ActiveOps();
     active.add(transferId);
 
-    await convergerOf(w, active).convergeOnce();
-    await w.flushTail();
+    await passLater(w, convergerOf(w, active));
     expect(recorded).toEqual([]);
 
     active.delete(transferId);
-    await convergerOf(w, active).convergeOnce();
-    await w.flushTail();
+    await passLater(w, convergerOf(w, active));
     expect(recorded).toHaveLength(1);
+    expect(await outbox(w)).toEqual([]);
+  });
+
+  it('O10 a pass that resumes an intent posts its record once: the re-post skips a record kept during the pass', async () => {
+    const w = makeWorld();
+    const transferId = await openAfterFailedApply(w);
+    let calls = 0;
+    let answer: () => void = () => undefined;
+    w.deps.recordHistory = () => {
+      calls += 1;
+      return new Promise<void>((resolve) => {
+        answer = resolve;
+      });
+    };
+
+    await passLater(w); // resumes, applies and closes; its own POST is still in flight
+
+    expect(w.api.inspectIntent(w.caller, transferId)?.status).toBe('completed');
+    expect(calls, "only the attempt's POST").toBe(1);
+    answer();
+    await w.flushTail();
     expect(await outbox(w)).toEqual([]);
   });
 
@@ -610,8 +648,7 @@ describe('#842 the SENT outbox keeps a record until its POST is answered for goo
     expect(await converger.pendingWork()).toBe(true);
 
     captureHistory(w);
-    await converger.convergeOnce();
-    await w.flushTail();
+    await passLater(w, converger);
     expect(await converger.pendingWork()).toBe(false);
   });
 

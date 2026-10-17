@@ -634,16 +634,12 @@ export class TransferMachine {
     return { entry, closed };
   }
 
-  /** #842: SENT is kept and leaves before the apply; awaited only after a close, so a failed apply reports at once. */
+  /** #842: SENT is kept and leaves before the apply, never awaited: the outbox re-posts what does not land. */
   private async applyRecorded<T>(engine: ITokenEngine, r: RehydratedIntent, committed: OpOutcome[], close: () => Promise<T>): Promise<T> {
     const sent = await settledRecord(engine, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });
-    const { posted } = await keepAndPost(this.outbox(), sent);
+    await keepAndPost(this.outbox(), sent);
     await this.applyCommitted(engine, r.transferId, committed);
-    try {
-      return await close();
-    } finally {
-      await posted;
-    }
+    return close();
   }
 
   private outbox(): OutboxDeps {

@@ -150,6 +150,7 @@ export class Converger {
 
   /** Resume open intents, then drain the delivery + mint journals (all idempotent). */
   async convergeOnce(): Promise<ConvergeOutcome> {
+    const startedAt = this.deps.now();
     let progress = false;
     let retryAfterMs: number | null = null;
     const wait = (ms: number | null): void => {
@@ -181,12 +182,12 @@ export class Converger {
         wait(retryAfterMsOf(err));
       }
     }
-    this.repostSentOutbox();
+    this.repostSentOutbox(startedAt);
     return { progress, retryAfterMs };
   }
 
   /** #842: off the pass, so a history POST that never answers holds no convergence. */
-  private repostSentOutbox(): void {
+  private repostSentOutbox(startedAt: number): void {
     const { machineDeps, stores, activeOps } = this.deps;
     const recordHistory = machineDeps.recordHistory;
     if (recordHistory === undefined) return;
@@ -198,8 +199,8 @@ export class Converger {
     void stores.sentOutbox.list().then((entries) => {
       for (const entry of entries) {
         const { transferId } = entry;
-        // An in-process attempt posts its own record; one re-post per entry at a time.
-        if (activeOps.has(transferId) || this.reposting.has(transferId)) continue;
+        // An attempt posts its own record (one in process, or kept during this pass); one re-post at a time.
+        if (entry.createdAt >= startedAt || activeOps.has(transferId) || this.reposting.has(transferId)) continue;
         this.reposting.add(transferId);
         void repostKept(deps, entry).finally(() => this.reposting.delete(transferId));
       }

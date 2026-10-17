@@ -27,20 +27,18 @@ What changed:
   conflicted ones), the SENT record is built locally from the certified blobs, kept in a local SENT
   outbox, and its POST is issued BEFORE the inventory apply, so it is already on its way when the
   apply commits. Neither
-  the apply's answer nor the close waits for the POST or gates it. A send whose legs all certify
-  on the first attempt does not wait for it either. On the resume path, and so also in a `send()`
-  that converges a conflicted leg in-process, the POST is awaited after the close attempt: a
-  history endpoint that never answers holds back neither the apply nor `complete`, but it still
-  holds that pass (and that `send()`) after them, as any request that never answers does, since
-  the client sets no request timeout. A resumed apply that fails is reported at once, without
-  waiting for the POST, so one intent's hung history request never holds back the report of a
-  failed apply or the wallet's other open intents. The recorded amount is still what settled,
-  never the plan.
+  the apply's answer nor the close waits for the POST or gates it, on `send()` or on the resume
+  path (so also in a `send()` that converges a conflicted leg in-process): the outbox below
+  re-posts a record that does not land, so a history endpoint that never answers holds back no
+  apply, `complete`, `send()` or convergence pass, and a resumed apply or close that fails is
+  reported at once, with its `Retry-After`. The recorded amount is still what settled, never the
+  plan.
 - The SENT outbox (`STORE_KEYS.sentOutbox`, `sent-outbox` in the per-address scoped KV) is new
   durable client state. A record leaves it once its POST is recorded, or refused with a permanent
   4xx; a transient failure, or a POST the process never finished, keeps it, and every convergence
-  pass re-posts it. The re-post runs beside the pass, one POST per record at a time, so a history
-  endpoint that never answers holds no convergence. A kept record is not a pending transfer:
+  pass re-posts it. The re-post runs beside the pass, one POST per record at a time, and leaves
+  alone a record kept during that pass (its attempt's own POST is in flight), so a history
+  endpoint that never answers holds no convergence and a resumed send is posted once. A kept record is not a pending transfer:
   `pendingTransfers()`, source reservations and payment-request links ignore it. An older client
   ignores the key, so after a downgrade a kept record is not re-posted.
 - A failed resume close still reports the intent failed and carries its `Retry-After`. A history
@@ -67,10 +65,12 @@ failed close, a lost apply answer, and a process that dies the moment the apply 
 one leg and two, on `send()` and on resume; a settled partial; a deposit still owed; a hung, a
 rejecting and a synchronously throwing history hook; a failed resumed apply reported at once while its POST
 hangs; nothing posted while a leg is unsettled; an undecodable blob; no record for a clean
-failure; and the SENT outbox: a process that dies at the apply taking the in-flight POST with it,
+failure; a resumed close that fails while the POST never answers; and the SENT outbox: a process
+that dies at the apply taking the in-flight POST with it,
 on `send()` and on resume, a failed POST beside a successful apply and close, a re-post that
 throws, one that never answers, an unreadable payload, a transfer still in process, the
-heartbeat predicate and an unwritable outbox), facade-level cases in `tests/unit/payments-v2/send-intent-unknown.test.ts` against the
+heartbeat predicate, a pass that leaves alone a record its own attempt kept, and an unwritable
+outbox), facade-level cases in `tests/unit/payments-v2/send-intent-unknown.test.ts` against the
 real history store, including a whole-token send and a held send whose resume is the only writer
 of its row, mutation probes for each ordering on both paths, and two cases run against the live
 staging wallet-api (`-t '#842'` in `tests/e2e/payments-v2-vertical.staging.e2e.test.ts`): a
