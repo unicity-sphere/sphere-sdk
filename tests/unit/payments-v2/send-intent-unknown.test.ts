@@ -425,11 +425,16 @@ class LegFailureEngine extends RealizationEngine {
 class UnconfirmedLegEngine extends LegFailureEngine {
   /** Every attempt of these sources is unconfirmed. */
   readonly unconfirmedSources = new Set<string>();
-  /** Only the SECOND attempt is — the in-process re-certification of a leg run() already delivered. */
+  /** Only the SECOND attempt is: the first re-certification, which a background resume pass makes (#844). */
   readonly unconfirmedOnSecondCall = new Set<string>();
   /** Every attempt after the first is: no re-certification of these legs ever confirms. */
   readonly unconfirmedAfterFirstCall = new Set<string>();
   private readonly calls = new Map<string, number>();
+
+  /** How many times this source's leg reached the engine, unconfirmed attempts included. */
+  submits(tokenId: string): number {
+    return this.calls.get(tokenId) ?? 0;
+  }
 
   override async transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken> {
     const tokenId = params.token.blob.tokenId;
@@ -1134,20 +1139,24 @@ describe('#835 (i) an epoch reseed while the first PUT is still in flight', () =
 // ── (j)–(l) once a leg certified, no failure is clean ───────────────────────
 
 describe('#835 (j)–(l) after a certified leg, every failure is possibly-committed', () => {
-  it('(j) a conflict beside a delivered leg whose in-process re-certification is unconfirmed: no re-plan of the full amount', async () => {
+  it('(j) a conflict beside a delivered leg, its in-process converge failing before the apply, then a background re-certification unconfirmed: no re-plan of the full amount', async () => {
     const engine = new UnconfirmedLegEngine({ chainPubkey: hexToBytes(OWN_PUB) });
     const world = makeWorld({ engine });
     const a = await world.seed(600n);
     const b = await world.seed(400n);
     await world.seed(1100n); // what a full re-plan of 1000 would spend
     await engine.foreignSpend(b);
+    // #844: the in-process converge reuses run()'s legs, so a's second call is the background pass's.
     engine.unconfirmedOnSecondCall.add(a.blob.tokenId);
     await world.facade.start();
+    world.kv.failWriteKeys.add(STORE_KEYS.shortfalls); // the in-process converge fails before its apply
 
     const outcome = await settle(world.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN }));
     await flushTail();
+    world.kv.failWriteKeys.delete(STORE_KEYS.shortfalls);
 
     expect(plannedIds(world), 'a certified leg rules out re-planning the full amount').toEqual(['tid-1']);
+    expect(engine.submits(a.blob.tokenId), 'the in-process converge reuses the leg run() certified (#844)').toBe(1);
     const { entries } = await world.api.listMailbox(peerCaller, 0);
     expect(entries.map((e) => e.tokenId), 'the unconflicted leg was delivered by run()').toEqual([a.blob.tokenId]);
     const err = rejectionOf(outcome);
@@ -1155,12 +1164,16 @@ describe('#835 (j)–(l) after a certified leg, every failure is possibly-commit
     expect((err as SphereError).transferId).toBe('tid-1');
     expect(failedUpdates(world)).toEqual([]);
 
+    await world.facade.resumeNow(); // a's re-certification unconfirmed beside b's conflict
+    await flushTail();
+    expect(serverIntent(world, 'tid-1'), 'a delivered leg is never aborted as a lost race').toBe('open');
+
     await world.facade.resumeNow();
     await flushTail();
     await expectPaidAtMostOnce(world, 1000n);
   });
 
-  it('(j-pay) the same through requests.pay(), the re-certification never confirming: no pass reads the conflict as "nothing ran"', async () => {
+  it('(j-pay) the same through requests.pay(), the background re-certification never confirming: no pass reads the conflict as "nothing ran"', async () => {
     const engine = new UnconfirmedLegEngine({ chainPubkey: hexToBytes(OWN_PUB) });
     const world = makeWorld({ engine });
     const a = await world.seed(600n);
@@ -1170,17 +1183,20 @@ describe('#835 (j)–(l) after a certified leg, every failure is possibly-commit
     engine.unconfirmedAfterFirstCall.add(a.blob.tokenId);
     await world.facade.start();
     const id = await incomingRequest(world, 1000n);
+    world.kv.failWriteKeys.add(STORE_KEYS.shortfalls); // #844: the in-process converge fails before its apply
 
     const outcome = await settle(world.facade.requests.pay(id));
     await flushTail();
+    world.kv.failWriteKeys.delete(STORE_KEYS.shortfalls);
 
     expect(plannedIds(world)).toEqual(['tid-1']);
+    expect(engine.submits(a.blob.tokenId), 'the in-process converge reuses the leg run() certified (#844)').toBe(1);
     const err = rejectionOf(outcome);
     expect(isPossiblyCommittedSendOutcome(err), describeError(err)).toBe(true);
     expect((err as SphereError).transferId).toBe('tid-1');
     expect(requestStatus(world, id)).toBe('settling');
 
-    // The background resume sees the same pair: a conflict beside a keep-open leg.
+    // The background resume sees the pair: a conflict beside a keep-open leg.
     await world.facade.resumeNow();
     await flushTail();
 
@@ -2179,7 +2195,7 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     await world.seed(600n);
     const contested = await world.seed(400n);
     if (spent) await engine.foreignSpend(contested);
-    else engine.conflicts.set(contested.blob.tokenId, 2); // the attempt, then its in-process converge
+    else engine.conflicts.set(contested.blob.tokenId, 1); // the attempt: its in-process converge reuses that conflict (#844)
     await startSettled(world);
     world.hooks.putIntent = async () => {
       if (world.putCalls[world.putCalls.length - 1]?.transferId !== 'tid-1') throw unavailable();
@@ -2288,7 +2304,7 @@ describe('#835 (x) after a partial, the re-plan attempt is held: it holds the sh
     const world = makeWorld({ engine });
     await world.seed(600n);
     const contested = await world.seed(400n);
-    engine.conflicts.set(contested.blob.tokenId, 2); // the attempt, then its in-process converge
+    engine.conflicts.set(contested.blob.tokenId, 1); // the attempt: its in-process converge reuses that conflict (#844)
     await startSettled(world);
     let failedPuts = 0;
     world.hooks.putIntent = async () => {

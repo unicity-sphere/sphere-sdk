@@ -881,8 +881,12 @@ authoritative for build success.
 - **After a leg certifies, nothing is clean (#835):** `run()` applies only a fully settled
   attempt. A certified leg beside an ordinary failure is `SEND_SYNC_PENDING`, with no apply and
   no abort. The facade converges in-process ONLY after a certified CONFLICT partial (read from
-  the machine's in-memory certified set, never the backstop), and every failure of that
-  convergence is possibly-committed. The #690 shortfall is durable before ANY apply, because the
+  the machine's in-memory run record, never the backstop), and every failure of that
+  convergence is possibly-committed. That converge (`TransferMachine.convergeRun`, #844) reuses
+  what `run()` settled in this process (its certified legs and its proven conflicts), certifies
+  only the ops `run()` never reached (in `CERTIFY_WIDTH` waves), and deposits only those: a deposit
+  `run()` could not make stays journaled for the replay and the send reports `deliveryPending`. It
+  always ends partial or failed, so a facade success comes only from `run()`. The #690 shortfall is durable before ANY apply, because the
   apply completes an unflagged intent. A nothing-certified failure is clean only when every op
   conflicted, or when a durable abort tombstone was written AND the server confirmed the abort
   (a `204` the aborted listing then confirms, since an abort of a row another device completed is

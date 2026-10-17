@@ -26,9 +26,12 @@
  * The #840 block after that has its own wallets too (`-t '#840'`). It PUTs
  * crafted intents for its wallet through the REAL client and loses one proof
  * answer in process; every service call stays real.
- * The #846 block at the end has its own wallets (`-t '#846'`). It keeps one
+ * The #846 block after that has its own wallets (`-t '#846'`). It keeps one
  * send's submit from leaving in process, spends its source elsewhere with the
  * REAL engine, and fails POST /v1/intents/<id>/abort over the REAL client.
+ * The #844 block at the end (`-t '#844'`, its own wallets) spies on the engine in
+ * process and holds one instance's inventory view while a second instance spends a
+ * source under it.
  *
  * Gated on STAGING_AGGREGATOR_KEY. Run:
  *   set -a && source .env && set +a && npx vitest run --config vitest.e2e.config.ts \
@@ -48,6 +51,7 @@ import type { DeliveryPort, StoragePort } from '../../modules/payments-v2/ports'
 import { createMachineStores } from '../../modules/payments-v2/machine/journal';
 import { INTENT_UNCONFIRMED_MESSAGE } from '../../modules/payments-v2/send-errors';
 import type { ITokenEngine } from '../../token-engine/engine';
+import type { EngineOpOptions, SplitParams, TransferParams } from '../../token-engine';
 import { ProofUnconfirmedError } from '../../token-engine/errors';
 import { HexConverter, Token } from '../../token-engine/sdk';
 import type { SphereToken } from '../../token-engine/types';
@@ -1363,4 +1367,158 @@ describe.runIf(RUN)('LIVE staging: #846 a pure conflict on resume while the abor
     expect(localTotal(h), 'nothing moved to the payee').toBe(0n);
     expect(await serverTotal(h)).toBe(0n);
   }, 2_400_000);
+});
+
+// ── #844: a send's in-process converge reuses what its attempt settled ────────
+//
+// A second instance of the same wallet (its own device and kv) spends a source while the first
+// instance's view is held at its last page (MakeOptions.wrapStorage), so the first instance
+// selects that source anyway: its attempt certifies the other leg and the stale one conflicts on
+// the real gateway, and the facade converges the partial in-process. An in-process spy on the
+// first instance's engine (MakeOptions.wrapEngine) counts submits: each leg of each attempt
+// reaches the engine once.
+
+interface SubmitSpy {
+  /** One entry per engine transfer or split the facade issued, in order. */
+  readonly calls: { readonly key: string; readonly transferId: string; readonly sourceTokenId: string }[];
+  wrap(inner: ITokenEngine): ITokenEngine;
+}
+
+function submitSpy(): SubmitSpy {
+  const calls: SubmitSpy['calls'] = [];
+  const note = (sourceTokenId: string, options?: EngineOpOptions): void => {
+    const transferId = options?.transferId ?? '';
+    calls.push({ key: `${transferId}:${String(options?.opIndex ?? 0)}`, transferId, sourceTokenId });
+  };
+  return {
+    calls,
+    wrap: (inner) =>
+      new Proxy(inner, {
+        get(target, prop) {
+          if (prop === 'transfer') {
+            return (params: TransferParams, options?: EngineOpOptions) => {
+              note(params.token.blob.tokenId, options);
+              return target.transfer(params, options);
+            };
+          }
+          if (prop === 'split') {
+            return (params: SplitParams, options?: EngineOpOptions) => {
+              note(params.token.blob.tokenId, options);
+              return target.split(params, options);
+            };
+          }
+          const value: unknown = Reflect.get(target, prop, target);
+          return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+        },
+      }),
+  };
+}
+
+interface InventoryHold {
+  /** While true, every delta read answers the last page's epoch with no items and the same cursor. */
+  held: boolean;
+  wrap(inner: StoragePort): StoragePort;
+}
+
+function inventoryHold(): InventoryHold {
+  let epoch: string | null = null;
+  const hold: InventoryHold = {
+    held: false,
+    // WalletApiStoragePort is a class: forward each member, a spread would drop its prototype methods.
+    wrap: (inner) => ({
+      listInventory: async (since) => {
+        if (hold.held && since !== undefined && epoch !== null) return { cursor: since, syncEpoch: epoch, more: false, items: [] };
+        const page = await inner.listInventory(since);
+        epoch = page.syncEpoch;
+        return page;
+      },
+      getBlobs: (ids) => inner.getBlobs(ids),
+      uploadBlobs: (blobs) => inner.uploadBlobs(blobs),
+      applyDelta: (delta) => inner.applyDelta(delta),
+    }),
+  };
+  return hold;
+}
+
+const kSpy = submitSpy();
+const kHold = inventoryHold();
+const kWrap = { wrapEngine: kSpy.wrap, wrapStorage: kHold.wrap };
+
+describe.runIf(RUN)('LIVE staging: #844 the in-process converge reuses what the attempt settled (second instance, real gateway conflict)', () => {
+  it('a source spent by a second instance under the first one\'s selection: delivered, every leg of every attempt submitted once', async () => {
+    const kIdentity = randomIdentity();
+    let k1 = await makeVerticalWallet('k1', { identity: kIdentity, ...kWrap });
+    const r = await makeVerticalWallet('r');
+    const sink = await makeVerticalWallet('s');
+    const tokens: string[] = [];
+    for (const amount of [600n, 400n, 700n]) {
+      const minted = await mintConverged(k1, amount, `mint K ${String(amount)}`, kWrap);
+      k1 = minted.wallet;
+      tokens.push(minted.tokenId);
+    }
+    const [a, b, c] = tokens;
+    const first = k1;
+    await waitFor(first, () => localTotal(first) === 1700n, 90_000, 'K1 local view shows 600 + 400 + 700');
+
+    // The second instance: same identity, its own device and kv. It spends b (its single exact match for 400).
+    const k2 = await makeVerticalWallet('k2', { identity: kIdentity });
+    await waitFor(k2, () => localTotal(k2) === 1700n, 90_000, 'K2 local view shows the same three tokens');
+    kHold.held = true;
+    const spent = await sendConverged(
+      k2,
+      { recipient: sink.identity.chainPubkey, amount: '400', coinId: HARNESS_COIN },
+      () => paid(sink, 400n),
+      '#844 K2 spends b'
+    );
+    await drainUntil(sink, () => localTotal(sink) === 400n, 90_000, 'the sink receives b');
+    expect((await activeRows(sink)).map((row) => row.tokenId), 'the second instance spent b').toEqual([b]);
+    await waitFor(spent.wallet, async () => (await openIntentIds(spent.wallet)).length === 0, 120_000, 'K2 open intents empty');
+    await spent.wallet.facade.stop();
+    // A pass of K1 that listed K2's intent pinned b; one pass now, with K2's intent closed, unpins it.
+    await first.facade.resumeNow();
+    expect(
+      first.facade.tokens({ coinId: HARNESS_COIN }).map((t) => t.id).sort(),
+      'K1 still holds the stale view'
+    ).toEqual([a, b, c].sort());
+
+    kSpy.calls.length = 0;
+    const firstEvent = first.events.length;
+    const outcome = await first.facade
+      .send({ recipient: r.identity.chainPubkey, amount: '1000', coinId: HARNESS_COIN })
+      .then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error })
+      );
+    kHold.held = false;
+    if ('error' in outcome) throw outcome.error; // a converged partial resolves; a rejection is the #844 failure mode
+    const { result } = outcome;
+    logStep(`#844 K1 send: ${result.status} ${result.id} after ${String(kSpy.calls.length)} engine submits`);
+    expect(['delivered', 'confirmed']).toContain(result.status);
+
+    const partial = must(kSpy.calls.find((x) => x.sourceTokenId === b), 'the attempt that selected the stale b').transferId;
+    const partialLegs = kSpy.calls.filter((x) => x.transferId === partial);
+    expect(partialLegs.map((x) => x.sourceTokenId).sort(), 'the partial attempt selected a and b').toEqual([a, b].sort());
+    expect(new Set(partialLegs.map((x) => x.key)).size, 'its converge resubmitted neither leg').toBe(partialLegs.length);
+    const keys = kSpy.calls.map((x) => x.key);
+    expect(new Set(keys).size, `every leg of every attempt submitted once: ${keys.join(', ')}`).toBe(keys.length);
+    expect(failedUpdates(first, partial, firstEvent)).toEqual([]);
+    expect(failedUpdates(first, result.id, firstEvent)).toEqual([]);
+
+    let sender = first;
+    if (result.deliveryPending === true) {
+      sender = await convergeByReplay(first, () => paid(r, 1000n), SEND_CONVERGE_MS, '#844 K1 deliveries', kWrap);
+    }
+    await drainUntil(r, () => localTotal(r) === 1000n, 120_000, 'R receives 600 + 400');
+    expect(await serverTotal(r)).toBe(1000n);
+    await waitFor(sender, async () => (await serverTotal(sender)) === 300n, 90_000, 'K holds the 300 change of c');
+    await waitFor(sender, async () => (await openIntentIds(sender)).length === 0, 120_000, 'K1 open intents empty');
+    await waitFor(sender, async () => (await sender.facade.pendingTransfers()).length === 0, 60_000, 'K1 nothing pending');
+    expect(await receivedLegs(r, a), 'a delivered once').toHaveLength(1);
+
+    // Paid exactly once: a further 10 s drain window changes nothing for R.
+    await sleep(10_000);
+    await r.facade.receive().catch(() => undefined);
+    expect(localTotal(r)).toBe(1000n);
+    expect(await serverTotal(r)).toBe(1000n);
+  }, 3_000_000);
 });

@@ -111,7 +111,7 @@ export interface MakeOptions {
   wrapClient?: (inner: AuthedClient) => AuthedClient;
   /** Wraps the FACADE's storage port only (fault injection on POST /v1/inventory/apply, #842). */
   wrapStorage?: (inner: StoragePort) => StoragePort;
-  /** Wraps the FACADE's engine only (fault injection, #840); `VWallet.engine` stays the real one. */
+  /** Wraps the FACADE's engine only (fault injection #840, a submit spy #844); `VWallet.engine` stays the real one. */
   wrapEngine?: (inner: ITokenEngine) => ITokenEngine;
 }
 

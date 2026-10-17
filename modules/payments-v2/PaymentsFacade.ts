@@ -541,25 +541,15 @@ export class PaymentsFacade implements PaymentsV2 {
     return { kind: 'rethrow', error: surfaced };
   }
 
-  /** #677/#690: run() certified ≥1 leg here and the rest conflicted — the SAME machine,
-   *  resumed in-process, converges it. A leg is on chain, so no failure is clean (#835). */
+  /** #677/#690: run() certified ≥1 leg here and the rest conflicted — the SAME machine converges it from what
+   *  run() settled (#844), so it always ends partial. A leg is on chain, so no failure is clean (#835). */
   private async convergePartial(ctx: AttemptCtx): Promise<AttemptDisposition> {
-    let outcome;
     try {
-      outcome = await this.machine.resumeIntent({
-        transferId: ctx.transferId,
-        payload: ctx.plan.payload,
-        sources: ctx.plan.sources,
-        journaled: await this.machineStores.deliveryJournal.byTransfer(ctx.transferId),
-      });
+      const outcome = await this.machine.convergeRun(ctx.plan);
+      return { kind: 'partial', entry: outcome.partial, deliveryPending: outcome.deliveryPending, final: !outcome.closed };
     } catch (err) {
       return this.keepOpen(ctx, err, CONVERGE_FAILED_MESSAGE);
     }
-    if (outcome.partial === null) {
-      this.settleSuccess(ctx, ctx.sourceIds);
-      return { kind: 'success', deliveryPending: outcome.deliveryPending };
-    }
-    return { kind: 'partial', entry: outcome.partial, deliveryPending: outcome.deliveryPending, final: !outcome.closed };
   }
 
   /** #835: a possibly-committed latest attempt owns the remainder — it holds the send's earlier shortfall
