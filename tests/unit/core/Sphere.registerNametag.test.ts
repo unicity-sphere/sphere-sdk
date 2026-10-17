@@ -120,10 +120,12 @@ describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)
 
     await sphere.registerNametag('alice');
 
-    // Published the binding with the nametag…
+    // Published the binding with the nametag and the Quests id (#847: Quests reads
+    // `direct_address` back from this binding, so '' here would break its sign-in)…
+    expect(sphere.identity!.directAddress).toMatch(/^DIRECT:\/\//);
     expect(transport.publishIdentityBinding).toHaveBeenCalledWith(
       sphere.identity!.chainPubkey,
-      expect.any(String),
+      sphere.identity!.directAddress,
       'alice',
     );
     // …updated local state…

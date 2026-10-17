@@ -55,6 +55,7 @@ import {
 import type { PermissionScope } from '../permissions';
 import type { SphereInstance, ConnectDirectMessage } from './SphereInstance';
 import { attachCompatEvent, sumFiatUsd } from './payments-compat';
+import { directRecipientRefusal } from './direct-recipient';
 import {
   assertWalletTransition,
   gate,
@@ -1028,6 +1029,13 @@ export class ConnectHost {
     // 5. Permission check
     if (!hasIntentPermission(this.grantedPermissions, msg.action)) {
       this.sendIntentError(msg.id, ERROR_CODES.PERMISSION_DENIED, `Permission denied for intent: ${msg.action}`);
+      return;
+    }
+
+    // 5b. #847: a DIRECT:// payment recipient can only fail — refuse it before any prompt or auto-approve.
+    const refusal = directRecipientRefusal(msg.action, msg.params);
+    if (refusal !== null) {
+      this.sendIntentError(msg.id, ERROR_CODES.INVALID_PARAMS, refusal);
       return;
     }
 

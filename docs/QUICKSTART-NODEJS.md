@@ -379,15 +379,16 @@ if (result.deliveryPending) {
   console.log('Note: certified on-chain, delivery deferred (normal behavior)');
 }
 
-// Send to direct address
+// Send to a chain pubkey. A DIRECT:// address is NOT a recipient: send() refuses it
+// with INVALID_RECIPIENT (it is the wallet's Sphere Quests account id).
 const result2 = await sphere.payments.send({
-  recipient: 'DIRECT://0000be36...',
+  recipient: '02abc123...',
   amount: '500000',
   coinId,
 });
 ```
 
-Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag` or `DIRECT://` recipient
+Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag` recipient
 uses your network. Every such send emits `transfer:attention` with `code: 'recipient:network-unverified'` and an
 empty `transferId`, and then proceeds on your network. Treat it as information, not an error; on mainnet, make
 sure the recipient runs mainnet. A bare 66-hex chain pubkey recipient is taken as being on your network.
@@ -816,7 +817,7 @@ try {
         console.error((err as Error).message); // names pinned funds, or says spending is paused
         break;
       case 'INVALID_RECIPIENT':
-        console.error('Recipient not found');
+        console.error((err as Error).message); // not found, another network, or DIRECT://
         break;
       case 'TRANSPORT_ERROR':
         console.error('Could not look up the recipient. Check the connection.');

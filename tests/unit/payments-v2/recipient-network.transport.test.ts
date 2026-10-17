@@ -13,15 +13,18 @@
 //   - `@nametag` / `DIRECT://`: resolution goes through nostr-js-sdk's
 //     `queryBindingBy*`, whose `parseBindingInfo` whitelists the content fields
 //     and never hands back the selected event — the declaration is dropped
-//     before sphere can see it, so the gate can only SIGNAL. That limitation is
-//     PINNED below (with upstream's real parser doing the dropping), not
-//     assumed; the pins go red the day #734 lands, which is when
+//     before sphere can see it. For `@nametag` the gate can therefore only
+//     SIGNAL. A `DIRECT://` recipient never reaches it: the money gate refuses
+//     it before resolution (#847), and only the resolve-route pin stays. That
+//     limitation is PINNED below (with upstream's real parser doing the
+//     dropping), not assumed; the pins go red the day #734 lands, which is when
 //     `bindingInfoToPeerInfo` must start carrying the field.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { NOSTR_EVENT_KINDS } from '../../../constants';
 import { ATTENTION_RECIPIENT_NETWORK_UNVERIFIED } from '../../../modules/payments-v2/PaymentsFacade';
+import { DIRECT_RECIPIENT_REFUSED_MESSAGE } from '../../../modules/payments-v2/recipient';
 import type { PeerInfo } from '../../../transport';
 import type { WebSocketFactory } from '../../../transport/websocket';
 import { COIN, NET, PEER_PUB, cleanupWorlds, eventsOf, makeWorld } from './facade-harness';
@@ -272,7 +275,8 @@ describe('§5.6 recipient gate — relay → transport → resolveRecipientInfo 
   });
 
   // The limitation, enforced where it costs money: the binding on the relay
-  // DOES declare a foreign network, and these two routes still send.
+  // DOES declare a foreign network, and the @nametag route still sends. The
+  // DIRECT:// route is refused before resolution (#847), pinned next.
   it('LIMITATION (#734) @nametag recipient: the declaration is unreadable, so the send PROCEEDS and is signalled', async () => {
     publishBinding({ network: 'mars', nametag: 'alice' });
     const world = makeWorld({ resolvePeer });
@@ -291,21 +295,21 @@ describe('§5.6 recipient gate — relay → transport → resolveRecipientInfo 
     ]);
   });
 
-  it('LIMITATION (#734) DIRECT:// recipient: the declaration is unreadable, so the send PROCEEDS and is signalled', async () => {
+  // #847: the DIRECT:// route used to send here too, to whatever chain pubkey the
+  // relay's binding named. It is now refused before the relay is asked at all.
+  it('#847 DIRECT:// recipient: refused before resolution, though the relay holds a binding for it', async () => {
     publishBinding({ network: 'mars' });
+    const resolveSpy = vi.spyOn(transport, 'resolve');
     const world = makeWorld({ resolvePeer });
     await world.seed(100n);
     await world.facade.start();
 
-    const result = await world.facade.send({ recipient: PEER_DIRECT, amount: '100', coinId: COIN });
+    await expect(
+      world.facade.send({ recipient: PEER_DIRECT, amount: '100', coinId: COIN })
+    ).rejects.toMatchObject({ code: 'INVALID_RECIPIENT', message: DIRECT_RECIPIENT_REFUSED_MESSAGE });
 
-    expect(result.status).toBe('delivered');
-    expect(eventsOf(world, 'transfer:attention')).toEqual([
-      {
-        transferId: '',
-        code: ATTENTION_RECIPIENT_NETWORK_UNVERIFIED,
-        detail: expect.stringContaining(`recipient ${PEER_DIRECT}`) as unknown,
-      },
-    ]);
+    expect(resolveSpy).not.toHaveBeenCalled();
+    expect(world.counters.putIntent).toBe(0);
+    expect(eventsOf(world, 'transfer:attention')).toEqual([]);
   });
 });

@@ -705,7 +705,8 @@ parse has already dropped every content field outside its whitelist. Re-querying
 re-deriving ownership ourselves (candidate filtering by identifier, marker preference, ambiguity→null,
 multi-relay settle — all private), and a second resolver that can disagree with the SDK's is worse
 than a missing field on a money guard. So for those two routes §5.6 can only ever land on row 3
-today; `bindingInfoToPeerInfo` therefore carries **no** network at all rather than a value that
+today (since #847 a `DIRECT://` *recipient* is refused before resolution, so for money only the
+`@nametag` route is left); `bindingInfoToPeerInfo` therefore carries **no** network at all rather than a value that
 merely looks read. The limitation is pinned by
 `tests/unit/payments-v2/recipient-network.transport.test.ts` (relay → transport → resolver →
 gate, per route), which goes red the day upstream carries the field.
@@ -1029,10 +1030,11 @@ verify per entry, batched acks.
   - **Shapes:** exact single token (1 direct); exact combination (k direct, 2–5); greedy
     m direct + 1 split; split-only (0 direct + 1 split); greedy exact-sum (all-direct, no split);
     whole-balance send.
-  - **Recipients:** third party (@nametag, DIRECT://, raw pubkey); **self-send** (spend and claim
-    commute server-side; same tokenId in `spent`+`added` is a 422 — the self-output rides the
-    mailbox); **roundtrip A→B→A** (re-acquired genesis at a new state — the `(tokenId, stateHash)`
-    dedup must accept it, RECEIVED history per state, server handoff tombstones + reactivation).
+  - **Recipients:** third party (@nametag, raw pubkey; a DIRECT:// recipient is refused, #847);
+    **self-send** (spend and claim commute server-side; same tokenId in `spent`+`added` is a 422
+    — the self-output rides the mailbox); **roundtrip A→B→A** (re-acquired genesis at a new
+    state — the `(tokenId, stateHash)` dedup must accept it, RECEIVED history per state, server
+    handoff tombstones + reactivation).
   - **Cross-products that have bitten before:** split where change and recipient outputs land in
     the same wallet (self-split); m direct + split in one transfer resumed mid-way (non-prefix
     certified subset); concurrent sends of the same coin (one queues for change); send while the

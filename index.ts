@@ -73,7 +73,6 @@ export type {
 
 export {
   getAddressId,
-  getAddressStorageKey,
   STORAGE_KEYS_ADDRESS,
   STORAGE_KEYS_GLOBAL,
 } from './constants';
@@ -224,6 +223,8 @@ export {
 } from './token-engine/nft-payload';
 export { NFT_MAX_PAYLOAD_BYTES } from './modules/payments-v2/mint-nft';
 export { CUSTOM_MINT_MAX_PAYLOAD_BYTES } from './modules/payments-v2/mint-custom';
+// #847: the money gates' DIRECT:// refusal, so a UI can say it before it calls send().
+export { DIRECT_RECIPIENT_REFUSED_MESSAGE, isDirectAddressRecipient } from './modules/payments-v2/recipient';
 
 export {
   CommunicationsModule,
@@ -401,10 +402,6 @@ export {
   CoinGeckoPriceProvider,
   createPriceProvider,
 } from './price';
-
-// Address parsing
-export { parseAddress, isValidAddress, isValidDirectAddress, normalizeAddress, addressesMatch } from './core/address';
-export type { AddressType, ParsedAddress } from './core/address';
 
 // =============================================================================
 // Exports added for @unicity-sphere/cli consumption (phase 2 extraction).

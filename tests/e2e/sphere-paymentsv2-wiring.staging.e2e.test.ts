@@ -33,8 +33,9 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { Sphere, type WalletApiTransportConfig } from '../../core/Sphere';
 import { isPossiblyCommittedSendOutcome } from '../../core/errors';
+import { DIRECT_RECIPIENT_REFUSED_MESSAGE } from '../../modules/payments-v2/recipient';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
-import type { TransportProvider } from '../../transport';
+import type { PeerInfo, TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { IncomingTransfer, ProviderStatus, TransferResult } from '../../types';
 import type { PaymentsV2 } from '../../modules/payments-v2/api';
@@ -151,8 +152,8 @@ afterAll(async () => {
   if (dataDir !== '') fs.rmSync(dataDir, { recursive: true, force: true });
 }, 240_000);
 
-async function diagnose(label: string): Promise<string> {
-  const pv2 = sphere?.payments;
+async function diagnose(label: string, wallet: Sphere | null = sphere): Promise<string> {
+  const pv2 = wallet?.payments;
   if (!pv2) return `${label}: no active vertical`;
   const history = await pv2.history({ limit: 50 }).catch(() => ({ entries: [] }));
   return JSON.stringify(
@@ -175,8 +176,8 @@ const MINT_VALIDATION_ERROR = 'coinId must be even-length lowercase hex and amou
  * by replaying the SAME mintId — resumeNow() drives the in-session pass — and
  * a fresh mint() re-call would race that replay into a SECOND token.
  */
-async function mintConvergedOnce(amount: bigint): Promise<string> {
-  const result = await sphere!.payments.mint(HARNESS_COIN, amount);
+async function mintConvergedOnce(amount: bigint, wallet: Sphere = sphere!): Promise<string> {
+  const result = await wallet.payments.mint(HARNESS_COIN, amount);
   if (result.success) {
     logStep(`mint admitted directly: ${result.tokenId ?? ''}`);
     return result.tokenId!;
@@ -187,18 +188,18 @@ async function mintConvergedOnce(amount: bigint): Promise<string> {
   logStep(`mint keep-open (${(result.error ?? 'unknown').slice(0, 70)}…) — converging via same-mintId replay`);
   for (let cycle = 1; cycle <= MAX_MINT_ATTEMPTS && !aborted; cycle++) {
     await sleep(THROTTLE_WAIT_MS);
-    await sphere!.payments.resumeNow().catch(() => undefined);
-    const tokens = sphere!.payments.tokens({ coinId: HARNESS_COIN });
+    await wallet.payments.resumeNow().catch(() => undefined);
+    const tokens = wallet.payments.tokens({ coinId: HARNESS_COIN });
     if (tokens.length > 0) {
-      if (tokens.length !== 1 || totalOf(sphere!.payments) !== amount) {
-        throw new Error(`mint replay must converge to exactly ONE token\n${await diagnose('mint-replay')}`);
+      if (tokens.length !== 1 || totalOf(wallet.payments) !== amount) {
+        throw new Error(`mint replay must converge to exactly ONE token\n${await diagnose('mint-replay', wallet)}`);
       }
       logStep(`mint converged via replay on cycle ${cycle}: ${tokens[0]!.id}`);
       return tokens[0]!.id;
     }
     if (cycle % 5 === 0) logStep(`mint replay still throttled after ${cycle} cycles`);
   }
-  throw new Error(`mint never admitted by the gateway submit throttle\n${await diagnose('mint')}`);
+  throw new Error(`mint never admitted by the gateway submit throttle\n${await diagnose('mint', wallet)}`);
 }
 
 /**
@@ -299,5 +300,71 @@ describe.runIf(RUN)('LIVE staging: Sphere payments wiring (default transport pat
     expect(() => sphere!.payments).toThrow();
     sphere = null;
     logStep('done: mint → self-send → drain → balance 100, clean destroy');
+  }, 2_700_000);
+
+  // #847: the wallet's OWN Quests id, sent to over the REAL composition. The mock
+  // relay answers every lookup with this wallet's binding and the wallet is funded,
+  // so before the refusal the DIRECT:// send resolved, planned and PUT an intent.
+  // Now it never resolves, never PUTs an intent, and the open listing stays empty.
+  it('#847: send() to the wallet\'s own DIRECT:// address is refused before any lookup or intent PUT', async () => {
+    const ownDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sphere-pv2-e2e-direct-'));
+    trustBaseJson ??= await trustbase();
+    const requests: string[] = [];
+    const openListings: unknown[][] = [];
+    const recordingFetch = async (url: string, init?: RequestInit): Promise<Response> => {
+      const method = init?.method ?? 'GET';
+      requests.push(`${method} ${url}`);
+      const response = await fetch(url, init);
+      if (method === 'GET' && url.includes('/v1/intents?status=open') && response.ok) {
+        openListings.push(((await response.clone().json()) as { intents: unknown[] }).intents);
+      }
+      return response;
+    };
+    let own: PeerInfo | null = null;
+    const resolve = vi.fn(async (_identifier: string): Promise<PeerInfo | null> => own);
+    const transport = { ...createMockTransport(), resolve } as TransportProvider;
+    const { sphere: wallet } = await Sphere.init({
+      storage: new FileStorageProvider({ dataDir: ownDir }),
+      transport,
+      oracle: createStagingOracle(trustBaseJson),
+      walletApi: { baseUrl: BASE_URL, network: NETWORK, deviceId: `${deviceId}-direct`, webSocketFactory: nodeWsFactory, fetchFn: recordingFetch },
+      autoGenerate: true,
+      network: NETWORK,
+    });
+    try {
+      const identity = wallet.identity!;
+      const directAddress = identity.directAddress!;
+      expect(directAddress).toMatch(/^DIRECT:\/\//);
+      own = { chainPubkey: identity.chainPubkey, directAddress, transportPubkey: identity.chainPubkey.slice(2), timestamp: 0 };
+      await mintConvergedOnce(1n, wallet);
+      for (let i = 0; totalOf(wallet.payments) !== 1n && i < 30; i++) await sleep(2_000);
+      expect(totalOf(wallet.payments)).toBe(1n); // spendable: on base this send reached the intent PUT
+      const pendingBefore = await wallet.payments.pendingTransfers();
+      resolve.mockClear();
+      const sentBefore = requests.length;
+
+      const err = await wallet.payments.send({ recipient: directAddress, amount: '1', coinId: HARNESS_COIN }).then(
+        () => undefined,
+        (e: unknown) => e as { code?: string; message?: string; transferId?: string }
+      );
+
+      expect(err?.code).toBe('INVALID_RECIPIENT');
+      expect(err?.message).toBe(DIRECT_RECIPIENT_REFUSED_MESSAGE);
+      expect(err?.transferId).toBeUndefined();
+      expect(isPossiblyCommittedSendOutcome(err)).toBe(false);
+      expect(resolve).not.toHaveBeenCalled();
+      expect(requests.slice(sentBefore).filter((r) => r.startsWith('PUT ') && r.includes('/v1/intents/'))).toEqual([]);
+      expect(await wallet.payments.pendingTransfers()).toEqual(pendingBefore);
+      // resumeNow() joins a pass already in flight (start()'s, or a heartbeat's) whose
+      // listing may predate the reset; settle that one, then run passes until one lists.
+      await wallet.payments.resumeNow();
+      openListings.length = 0;
+      for (let pass = 0; pass < 3 && openListings.length === 0; pass++) await wallet.payments.resumeNow();
+      expect(openListings.length).toBeGreaterThan(0);
+      expect(openListings.at(-1)).toEqual([]);
+    } finally {
+      await wallet.destroy().catch(() => undefined);
+      fs.rmSync(ownDir, { recursive: true, force: true });
+    }
   }, 2_700_000);
 });

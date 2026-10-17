@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
 import { supportsDeterministicMint } from '../../../modules/payments-v2/compose';
-import { deriveDirectAddress } from '../../../token-engine/identity';
 import { runEngineContract } from './engine-contract';
 import { createTestEngine, freshPubkey } from './test-engine';
 
@@ -55,13 +54,6 @@ describe('SphereTokenEngine (real adapter, A1–A3) — via in-memory aggregator
     expect(e.readValue(back)).toEqual({ assets: [{ coinId: COIN, amount: 5n }] });
     expect((await e.verify(back)).ok).toBe(true);
   }, 15000);
-
-  it('deriveIdentityAddress matches the standalone DIRECT:// helper', async () => {
-    const e = createTestEngine();
-    const pubkey = e.getIdentity().chainPubkey;
-    expect(await e.deriveIdentityAddress()).toBe(await deriveDirectAddress(pubkey));
-    expect(await e.deriveIdentityAddress(pubkey)).toMatch(/^DIRECT:\/\//);
-  });
 
   it('splits a token into value-conserving outputs (sum preserved, each verifies)', async () => {
     const e = createTestEngine();

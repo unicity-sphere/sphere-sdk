@@ -1155,9 +1155,10 @@ describe("Sphere payments wiring — the explicit messaging-only composition (wa
 
     await sphere.registerNametag('kbbot');
 
+    expect(sphere.identity!.directAddress).toMatch(/^DIRECT:\/\//);
     expect(transport.publishIdentityBinding).toHaveBeenCalledWith(
       sphere.identity!.chainPubkey,
-      expect.any(String),
+      sphere.identity!.directAddress,
       'kbbot'
     );
     expect(sphere.identity!.nametag).toBe('kbbot');

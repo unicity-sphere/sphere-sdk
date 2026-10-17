@@ -453,8 +453,8 @@ export interface SphereInitResult {
 /**
  * Derive the wallet's legacy L3 identity address (DIRECT://...) from a private key.
  *
- * Delegates to the shared, golden-locked `deriveDirectAddress` helper (token-engine,
- * A6) so the engine and the wallet derive byte-identical addresses from ONE recipe.
+ * Delegates to the golden-locked `deriveDirectAddress` helper exported by token-engine.
+ * The engine itself derives no DIRECT:// address; this is the SDK's only caller.
  *
  * XP-CRITICAL (Path A / D10): Quest XP and Unicity IDs are keyed on this address, so it
  * MUST stay byte-identical across the v1→v2 migration. The legacy v1 derivation ran the
@@ -3349,12 +3349,13 @@ export class Sphere {
 
   /**
    * Resolve any identifier to full peer information.
-   * Accepts @nametag, bare nametag, DIRECT://, chain pubkey, or transport pubkey.
+   * Accepts @nametag, bare nametag, chain pubkey, transport pubkey, or DIRECT:// (deprecated,
+   * refused in #847 phase 2; never a payment recipient).
    *
    * @example
    * ```ts
    * const peer = await sphere.resolve('@alice');
-   * const peer = await sphere.resolve('DIRECT://...');
+   * const peer = await sphere.resolve('DIRECT://...'); // deprecated (#847 phase 2)
    * const peer = await sphere.resolve('02ab12...'); // 33-byte compressed chain pubkey
    * const peer = await sphere.resolve('ab12cd...'); // 64-char hex transport pubkey
    * ```
@@ -3372,7 +3373,7 @@ export class Sphere {
    * Useful before a batch of DM operations (e.g., sending hello_ack to
    * multiple tenants, or broadcasting to a list of agents).
    *
-   * @param address - Any valid Unicity address (@nametag, DIRECT://, hex pubkey)
+   * @param address - @nametag or hex pubkey; DIRECT:// is deprecated (#847 phase 2)
    * @throws SphereError if the address cannot be resolved
    */
   async preResolveDM(address: string): Promise<void> {

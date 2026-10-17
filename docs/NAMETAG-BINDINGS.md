@@ -144,6 +144,11 @@ Published by `syncIdentityWithTransport()` when no nametag is set.
 }
 ```
 
+`direct_address` is the wallet's **Sphere Quests account id**. The wallet derives it from a hash of
+its private key, so nobody can compute it from `public_key`; the Quests backend reads it back from
+this binding with `resolve(<chain pubkey>)`, and both binding forms keep writing it. It is not a
+payment address: the SDK refuses a `DIRECT://` payment or payment-request recipient (#847).
+
 ## d-tag Strategy
 
 The `d` tag determines which event gets replaced (NIP-78: same kind + pubkey + d-tag = replacement).
@@ -244,7 +249,8 @@ if (me) {
 ### Resolving
 
 ```typescript
-// Unified resolution (accepts @nametag, DIRECT:// address, chain pubkey, transport pubkey)
+// Unified resolution: @nametag, chain pubkey, transport pubkey. A DIRECT:// address is still
+// accepted here but deprecated (#847 phase 2 refuses it); it is never a payment recipient.
 const peer = await sphere.resolve('@alice');
 // PeerInfo | null: { nametag?, transportPubkey, chainPubkey, directAddress, timestamp }
 

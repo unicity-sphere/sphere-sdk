@@ -816,8 +816,9 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   /**
-   * Resolve a DIRECT:// address to full peer info.
-   * Performs reverse lookup via nostr-js-sdk (UNIP-01 marker-preferring resolution).
+   * Resolve a 66-hex chain pubkey (the Quests read-back, kept) or a DIRECT://
+   * string (deprecated, #847 phase 2) to full peer info, via nostr-js-sdk
+   * (UNIP-01 marker-preferring resolution).
    */
   async resolveAddressInfo(address: string): Promise<PeerInfo | null> {
     await this.ensureConnectedForResolve();
@@ -843,9 +844,9 @@ export class NostrTransportProvider implements TransportProvider {
    * than a missing field on a MONEY guard. Nothing can declare a network today
    * regardless: the publish builders whitelist the same fields.
    *
-   * CONSEQUENCE, stated plainly: for `@nametag` and `DIRECT://` recipients the
-   * §5.6 cross-network guard can only SIGNAL (`recipient:network-unverified`),
-   * never refuse. Upstream #734 must add `network` to the binding builders AND
+   * CONSEQUENCE, stated plainly: for `@nametag` recipients the §5.6
+   * cross-network guard can only SIGNAL (`recipient:network-unverified`), never
+   * refuse (a `DIRECT://` recipient is refused before resolution, #847). Upstream #734 must add `network` to the binding builders AND
    * to `BindingInfo`; the tripwire in
    * tests/unit/payments-v2/recipient-network.transport.test.ts fails the day it
    * lands, so this wiring cannot be forgotten. Do not "fix" this by inventing a

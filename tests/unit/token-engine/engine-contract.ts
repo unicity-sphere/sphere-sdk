@@ -35,12 +35,6 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
       expect(id.chainPubkey.length).toBe(33);
     });
 
-    it('deriveIdentityAddress is a pure function of the pubkey', async () => {
-      const e = makeEngine();
-      expect(await e.deriveIdentityAddress(PK_A)).toBe(await e.deriveIdentityAddress(PK_A));
-      expect(await e.deriveIdentityAddress(PK_A)).not.toBe(await e.deriveIdentityAddress(PK_B));
-    });
-
     it('mint yields a token whose value and balance reflect the mint', async () => {
       const e = makeEngine();
       const t = await mintTo(e, PK_A, 500n);

@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (breaking) — DIRECT:// is no longer a payment recipient; unused DIRECT helpers removed (#847)
+
+What was wrong. A `DIRECT://` string is the wallet's Sphere Quests account id, yet `send()` and
+`requests.create()` still accepted one as a recipient. It was resolved through a relay-supplied
+identity binding, so the binding the relay returned decided who was paid. The docs presented it as
+"the primary address", while money always locks to the recipient's chain pubkey.
+
+What changed:
+
+- `payments.send()`, `sendWholeToken()` and `sendCoinless()` reject a `DIRECT://` recipient with
+  `INVALID_RECIPIENT` and the message "DIRECT:// addresses are no longer accepted as payment
+  recipients; use the recipient's @nametag or chain pubkey". Matching ignores case, leading
+  whitespace and a leading `@` (`@DIRECT://…`). The refusal comes before any lookup, reservation,
+  blob read or intent PUT; it carries no `transferId`, `isPossiblyCommittedSendOutcome()` is
+  `false`, and `transfer:updated{status:'failed'}` fires as for an unresolvable recipient.
+  `prewarmSend()` for such a recipient reads nothing.
+- `payments.requests.create()` resolves `{ success: false, error }` with the same message, without
+  a lookup or a server call.
+- ConnectHost refuses a `DIRECT://` `to` on the `send`, `payment_request` and `send_nft` intents with
+  `INVALID_PARAMS` (-32602) and the same message, before `onIntent` and before any auto-approve
+  handler. The `dm` intent is unchanged.
+- New exports (package root and `./payments-v2`): `isDirectAddressRecipient(identifier)` and
+  `DIRECT_RECIPIENT_REFUSED_MESSAGE`, so a UI can refuse the input before it calls the SDK.
+- Removed, with no caller in the SDK or its consumers: `parseAddress`, `isValidAddress`,
+  `isValidDirectAddress`, `normalizeAddress`, `addressesMatch` and the `AddressType` /
+  `ParsedAddress` types (the whole `core/address.ts`, including its unexported `DIRECT_PREFIX`);
+  `getAddressStorageKey`; and `ITokenEngine.deriveIdentityAddress`, which hashed the raw chain pubkey
+  and so returned a different string from `sphere.identity.directAddress`. A class that implements
+  `ITokenEngine` and keeps the method still compiles; an object literal typed `ITokenEngine` must
+  drop the property (TS2353, excess property), and a caller of it no longer compiles.
+
+Kept, byte-stable, for Quests sign-in: the derivation (`deriveDirectAddress` on `./token-engine`,
+fed `getPublicKey(SHA256(privateKey))`), `sphere.identity.directAddress`,
+`TrackedAddress.directAddress`, the `identity:changed` payload, Connect
+`PublicIdentity.directAddress`, the identity binding's `direct_address` field,
+`sphere.resolve(<66-hex chain pubkey>)` returning `PeerInfo.directAddress`, `signMessage` /
+`verifySignedMessage` / `recoverPubkeyFromSignature` and the Connect `sign_message` intent, and
+`addressId` / `getAddressId`. `sphere.resolve('DIRECT://…')` and DMs to a `DIRECT://` peer keep
+working and are deprecated; a later phase of #847 refuses them.
+
+**Migration.** Pay a `@nametag` or the recipient's 66-hex chain pubkey. A UI that offered a
+`DIRECT://` recipient field stops offering it; a dApp that sent `to: 'DIRECT://…'` gets -32602. On
+`payment_request` such a dApp needs the payer's `@nametag` for now: the Sphere wallet prefixes a
+66-hex `to` with `@`, which turns it into a Unicity ID lookup that fails.
+
+Verified by `tests/unit/payments-v2/direct-recipient.test.ts`, `tests/unit/connect/direct-recipient.test.ts`,
+`tests/unit/transport/identity-binding-quests.test.ts` (the real nostr-js-sdk builders still write
+`direct_address` and `public_key`, and `resolve(<chain pubkey>)` reads it back), mutation probes
+`direct-recipient-*`, and a staging case in `sphere-paymentsv2-wiring.staging.e2e.test.ts`.
+
 ### Fixed — a named spend or burn refused while spending is paused is a clean failure (#838)
 
 What was wrong. Until the SDK has confirmed which tokens the transfers still converging hold (before

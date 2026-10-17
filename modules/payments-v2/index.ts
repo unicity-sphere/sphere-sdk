@@ -56,6 +56,7 @@ export {
   supportsDeterministicMint,
 } from './PaymentsFacade';
 export { HEARTBEAT_SEED_MS, HEARTBEAT_CAP_MS } from './convergence';
+export { DIRECT_RECIPIENT_REFUSED_MESSAGE, isDirectAddressRecipient } from './recipient';
 export type {
   PaymentsFacadeDeps,
   FacadeSession,

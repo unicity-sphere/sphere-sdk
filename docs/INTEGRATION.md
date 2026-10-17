@@ -330,7 +330,7 @@ if (created && generatedMnemonic) {
   console.log('Save this mnemonic:', generatedMnemonic);
 }
 
-console.log('Address:', sphere.identity?.directAddress);  // DIRECT://... (L3)
+console.log('Quests id:', sphere.identity?.directAddress);  // DIRECT://... (not a payment address)
 ```
 
 `Sphere.init` loads the wallet that is already in the storage, if there is one, and then ignores
@@ -540,7 +540,7 @@ const identity = sphere.identity; // Identity | null (never includes the private
 if (!identity) throw new Error('wallet not ready');
 
 console.log('Chain Pubkey:', identity.chainPubkey);   // 33-byte compressed secp256k1
-console.log('Direct Address:', identity.directAddress); // DIRECT://... (L3)
+console.log('Quests id:', identity.directAddress);     // DIRECT://... (not a payment address)
 console.log('Nametag:', identity.nametag);            // e.g., 'alice'
 ```
 
@@ -605,7 +605,7 @@ interface AddressInfo {
 }
 ```
 
-`deriveAddress(index)` returns key material, not an address. For the `DIRECT://` address use
+`deriveAddress(index)` returns key material, not an address. For the `DIRECT://` Quests account id use
 `sphere.identity?.directAddress` (active address) or
 `sphere.getTrackedAddress(index)?.directAddress` (after `switchToAddress(index)`, which tracks the
 index).
@@ -770,13 +770,6 @@ const toNametag = await sphere.payments.send({
   memo: 'Payment for coffee',
 });
 
-// Send to DIRECT address
-const toAddress = await sphere.payments.send({
-  recipient: 'DIRECT://0000be36...',
-  amount: '500000',
-  coinId,
-});
-
 // Send to chain pubkey (33-byte compressed secp256k1)
 const toPubkey = await sphere.payments.send({
   recipient: '02abc123...',
@@ -802,18 +795,19 @@ never produced.
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `recipient` | Yes | `@nametag`, `DIRECT://...`, or chain pubkey |
+| `recipient` | Yes | `@nametag` or chain pubkey. A `DIRECT://...` address is refused with `INVALID_RECIPIENT` (#847) |
 | `amount` | Yes | Amount in smallest unit (string) |
 | `coinId` | Yes | The 64-character hex coin id. Look it up with `getCoinIdBySymbol()` (after `await TokenRegistry.waitForReady()`; it returns `undefined` for an unknown symbol), or take `coinId` from `sphere.payments.assets()` for a coin the wallet holds. |
 | `memo` | No | Optional message (recipient-encrypted envelope) |
 
 The recipient must have a **published chain pubkey** (Nostr identity binding) — otherwise
-`send()` throws `INVALID_RECIPIENT`. The token engine must be available (oracle with a v2
+`send()` throws `INVALID_RECIPIENT`. A `DIRECT://` recipient throws `INVALID_RECIPIENT` before any
+lookup: it is the wallet's Sphere Quests account id, not a payment address. The token engine must be available (oracle with a v2
 trust base + gateway URL) — otherwise `Sphere.init` already fails with `INVALID_CONFIG` when it
 starts the payments vertical.
 
-Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag` or
-`DIRECT://` recipient uses your network. Every such send emits `transfer:attention` with
+Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag`
+recipient uses your network. Every such send emits `transfer:attention` with
 `code: 'recipient:network-unverified'` and an empty `transferId`, and then proceeds on your
 network. Treat it as information, not an error; on mainnet, make sure the recipient runs mainnet.
 A bare 66-hex chain pubkey recipient is taken as being on your network.
@@ -1394,7 +1388,7 @@ and `on()` returns its own unsubscribe function.
 
 | Code | Meaning |
 |------|---------|
-| `recipient:network-unverified` | Informational, emitted with an empty `transferId` on every send to a `@nametag` or `DIRECT://` recipient: bindings do not carry a network yet, so the recipient's network cannot be checked (see [Send Tokens](#send-tokens)). |
+| `recipient:network-unverified` | Informational, emitted with an empty `transferId` on every send to a `@nametag` recipient: bindings do not carry a network yet, so the recipient's network cannot be checked (see [Send Tokens](#send-tokens)). |
 | `delivery:deferred` | The token is certified, but the mailbox deposit was rate-limited; it is deferred and retried. |
 | `delivery:undeliverable` | The mailbox deposit failed on every attempt of its retry budget. |
 | `split:checkpoint-stuck` | Resuming a split failed on its burn checkpoint (`detail` names `SPLIT_CHECKPOINT_LOST` or `CHECKPOINT_TRUSTBASE_MISMATCH`). |
@@ -1673,7 +1667,7 @@ try {
     const code = (err as { code?: unknown } | null)?.code;
     switch (code) {
       case 'SEND_INSUFFICIENT_BALANCE': show((err as Error).message); break; // names pinned funds, or says spending is paused
-      case 'INVALID_RECIPIENT': show('Recipient not found'); break;
+      case 'INVALID_RECIPIENT': show((err as Error).message); break; // not found, another network, or DIRECT://
       case 'TRANSPORT_ERROR': show('Could not look up the recipient. Check the connection.'); break;
       default: show(err instanceof Error ? err.message : String(err));
     }
@@ -1685,9 +1679,10 @@ Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (not enough spenda
 some funds are pinned by transfers still converging, its message says how much and points to
 `pendingTransfers()`; it is also the refusal while spending is paused, because the SDK has not yet
 confirmed which tokens converging transfers hold, for `send()`, `sendWholeToken()` and
-`sendCoinless()` alike, and the message says so; `burn()` resolves it as `errorCode` instead of rejecting), `INVALID_RECIPIENT` (no published chain pubkey, or a recipient on another
-network), `TRANSPORT_ERROR` (the recipient lookup could not reach the Nostr relays) and
-`VALIDATION_ERROR` (for example a malformed amount).
+`sendCoinless()` alike, and the message says so; `burn()` resolves it as `errorCode` instead of
+rejecting), `INVALID_RECIPIENT` (no published chain pubkey, a recipient on another network, or a
+`DIRECT://` recipient, #847), `TRANSPORT_ERROR` (the recipient lookup could not reach the Nostr
+relays) and `VALIDATION_ERROR` (for example a malformed amount).
 `INSUFFICIENT_BALANCE` exists in the `SphereErrorCode` union but is never thrown.
 
 ### Verification Is Built In
@@ -1703,7 +1698,7 @@ sphere.on('transfer:updated', (transfer) => {
 });
 
 sphere.on('transfer:attention', ({ transferId, code }) => {
-  // Informational, on every @nametag / DIRECT:// send (empty transferId): not a problem.
+  // Informational, on every @nametag send (empty transferId): not a problem.
   if (code === 'recipient:network-unverified') return;
   console.warn('Transfer needs attention:', transferId, code);
 });

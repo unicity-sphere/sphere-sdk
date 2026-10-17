@@ -173,8 +173,8 @@ export class CommunicationsModule {
 
   /**
    * Load messages from storage.
-   * Uses per-address key (STORAGE_KEYS_ADDRESS.MESSAGES) which is automatically
-   * scoped by LocalStorageProvider to sphere_DIRECT_xxx_yyy_messages.
+   * Uses per-address key (STORAGE_KEYS_ADDRESS.MESSAGES), which the storage
+   * provider scopes to the active chain pubkey (`{prefix}{chainPubkey}_messages`).
    * Falls back to legacy global 'direct_messages' key for migration.
    */
   async load(): Promise<void> {
@@ -759,7 +759,7 @@ export class CommunicationsModule {
    * Call before a batch of DM operations to avoid resolution latency
    * on the first sendDM() call. Subsequent calls use the cache.
    *
-   * @param address - Any valid Unicity address (@nametag, DIRECT://, hex pubkey)
+   * @param address - @nametag or hex pubkey; DIRECT:// is deprecated (#847 phase 2)
    * @returns The resolved transport pubkey (caller should NOT use this — it's transport-specific)
    */
   async preResolve(address: string): Promise<string> {
@@ -777,8 +777,8 @@ export class CommunicationsModule {
   }
 
   /**
-   * Get the shared transport address resolver (for consumers that need the
-   * same resolution + caching, e.g. the payments vertical's recipient lookup).
+   * Get the DM transport address resolver (its resolution + caching). The
+   * payments vertical does not use it: it resolves through `transport.resolve`.
    */
   getTransportResolver(): TransportAddressResolver | null {
     return this.transportResolver;

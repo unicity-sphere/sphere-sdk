@@ -30,7 +30,7 @@ export interface BaseProvider extends ProviderMetadata {
 export interface Identity {
   /** 33-byte compressed secp256k1 public key (for L3 chain) */
   readonly chainPubkey: string;
-  /** L3 DIRECT address (DIRECT://...) */
+  /** Sphere Quests account id (DIRECT://...); never a payment recipient (#847) */
   readonly directAddress?: string;
   readonly ipnsName?: string;
   readonly nametag?: string;
@@ -273,7 +273,7 @@ export interface TrackedAddressEntry {
 export interface TrackedAddress extends TrackedAddressEntry {
   /** Short address identifier (e.g., "DIRECT_abc123_xyz789") */
   readonly addressId: string;
-  /** L3 DIRECT address (DIRECT://...) */
+  /** Sphere Quests account id (DIRECT://...), input to addressId; never a payment recipient */
   readonly directAddress: string;
   /** 33-byte compressed secp256k1 public key */
   readonly chainPubkey: string;

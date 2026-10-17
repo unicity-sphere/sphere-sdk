@@ -34,7 +34,6 @@ import {
   SplitCheckpointLostError,
   TransferConflictError,
 } from './errors';
-import { deriveDirectAddress } from './identity';
 import { deriveDeliveryKeys } from './blob-keys';
 import { deriveRealization } from './realization';
 import { planNftMint, readTokenNft } from './nft-ops';
@@ -200,11 +199,6 @@ export class SphereTokenEngine implements ITokenEngine {
 
   public getIdentity(): EngineIdentity {
     return { chainPubkey: new Uint8Array(this.deps.signingService.publicKey) };
-  }
-
-  /** Legacy DIRECT:// address (Path A). Async: the derivation hashes via the SDK. */
-  public deriveIdentityAddress(pubkey?: Uint8Array): Promise<string> {
-    return deriveDirectAddress(pubkey ?? this.deps.signingService.publicKey);
   }
 
   // ── value (read) ─────────────────────────────────────────────────────────────

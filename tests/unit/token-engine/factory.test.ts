@@ -30,7 +30,6 @@ describe('createSphereTokenEngine', () => {
     });
 
     expect(engine.getIdentity().chainPubkey).toEqual(new SigningService(privateKey).publicKey);
-    expect(await engine.deriveIdentityAddress()).toMatch(/^DIRECT:\/\//);
   });
 
   it('takes the network id from the trust base — non-standard ids work (e.g. testnet2 = 4)', async () => {

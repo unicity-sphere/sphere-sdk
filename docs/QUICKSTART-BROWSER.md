@@ -239,7 +239,7 @@ function App() {
 
   return (
     <div>
-      <p>Address: {sphere?.identity?.directAddress}</p>
+      <p>Receive at (chain pubkey): {sphere?.identity?.chainPubkey}</p>
       <p>Nametag: {sphere?.identity?.nametag || 'Not registered'}</p>
     </div>
   );
@@ -294,7 +294,7 @@ onUnmounted(() => {
     <code>{{ mnemonic }}</code>
   </div>
   <div v-else>
-    <p>Address: {{ sphere?.identity?.directAddress }}</p>
+    <p>Receive at (chain pubkey): {{ sphere?.identity?.chainPubkey }}</p>
   </div>
 </template>
 ```
@@ -337,7 +337,7 @@ export default function WalletPage() {
   if (error) return <div>Wallet failed to start: {error}</div>;
   if (!sphere) return <div>Loading...</div>;
 
-  return <div>Address: {sphere.identity?.directAddress}</div>;
+  return <div>Receive at (chain pubkey): {sphere.identity?.chainPubkey}</div>;
 }
 ```
 
@@ -422,7 +422,7 @@ The snippets below assume an initialised `sphere` (see [Framework Setup](#framew
 ```typescript
 const identity = sphere.identity;
 
-console.log('L3 Address:', identity?.directAddress);  // DIRECT://...
+console.log('Quests id:', identity?.directAddress);  // DIRECT://... (not a payment address)
 console.log('Public Key:', identity?.chainPubkey);    // 02abc...
 console.log('Nametag:', identity?.nametag);           // 'username' (stored without the leading @)
 ```
@@ -571,7 +571,7 @@ async function sendTokens(recipient: string, amount: string, coinId: string) {
       const code = (err as { code?: unknown } | null)?.code;
       switch (code) {
         case 'SEND_INSUFFICIENT_BALANCE': showToast((err as Error).message); break; // names pinned funds, or says spending is paused
-        case 'INVALID_RECIPIENT': showToast('Recipient not found'); break;
+        case 'INVALID_RECIPIENT': showToast((err as Error).message); break; // not found, another network, or DIRECT://
         case 'TRANSPORT_ERROR': showToast('Could not look up the recipient. Check the connection.'); break;
         default: showToast(err instanceof Error ? err.message : String(err));
       }
@@ -605,7 +605,7 @@ proven clean: nothing of the payment was certified, and nothing this device hold
 `sendCoinless()` reject with it (show `err.message`, which says so), and `burn()` resolves
 `{ success: false, errorCode: 'SEND_INSUFFICIENT_BALANCE' }` instead of rejecting.
 
-Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag` or `DIRECT://` recipient
+Nametag bindings do not carry a network yet, so the SDK cannot prove that a `@nametag` recipient
 uses your network. Every such send emits `transfer:attention` with `code: 'recipient:network-unverified'` and an
 empty `transferId`, and then proceeds on your network. Treat it as information, not an error; on mainnet, make
 sure the recipient runs mainnet. A bare 66-hex chain pubkey recipient is taken as being on your network.
@@ -957,7 +957,7 @@ function WalletApp() {
       {sphere && (
         <>
           <div style={{ marginBottom: 20 }}>
-            <strong>Address:</strong> {sphere.identity?.directAddress}
+            <strong>Receive at (chain pubkey):</strong> {sphere.identity?.chainPubkey}
             <br />
             <strong>Nametag:</strong> {sphere.identity?.nametag || 'Not registered'}
             <br />
@@ -967,7 +967,7 @@ function WalletApp() {
           <div>
             <h3>Send UCT</h3>
             <input
-              placeholder="@recipient or address"
+              placeholder="@nametag or chain pubkey"
               value={recipient}
               onChange={(e) => setRecipient(e.target.value)}
             />

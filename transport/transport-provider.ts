@@ -34,7 +34,8 @@ export interface TransportProvider extends BaseProvider {
 
   /**
    * Resolve any identifier to full peer information.
-   * Accepts @nametag, bare nametag, DIRECT://, chain pubkey, or transport pubkey.
+   * Accepts @nametag, bare nametag, chain pubkey, transport pubkey, or DIRECT:// (deprecated,
+   * refused in #847 phase 2; never a payment recipient).
    * @param identifier - Any supported identifier format
    * @returns PeerInfo or null if not found
    */
@@ -52,9 +53,11 @@ export interface TransportProvider extends BaseProvider {
   resolveNametagInfo?(nametag: string): Promise<PeerInfo | null>;
 
   /**
-   * Resolve a DIRECT:// address to full peer info.
-   * Performs reverse lookup: address → binding event → PeerInfo.
-   * @param address - L3 address (DIRECT://...)
+   * Resolve a 66-hex chain pubkey or a DIRECT:// string to full peer info.
+   * Reverse lookup: address → binding event → PeerInfo. The chain-pubkey input
+   * is how Quests reads `directAddress` back: keep it. Only the DIRECT:// input
+   * is deprecated (removed in #847 phase 2).
+   * @param address - 66-hex chain pubkey, or a Quests account id (DIRECT://...)
    * @returns PeerInfo or null if no binding found for this address
    */
   resolveAddressInfo?(address: string): Promise<PeerInfo | null>;
@@ -312,7 +315,7 @@ export interface PeerInfo {
   transportPubkey: string;
   /** 33-byte compressed secp256k1 public key (for L3 chain) */
   chainPubkey: string;
-  /** L3 DIRECT address (DIRECT://...) */
+  /** Sphere Quests account id (DIRECT://...) from the binding; never a payment recipient */
   directAddress: string;
   /**
    * Network the peer's identity binding DECLARES ('testnet2', …) — absent when

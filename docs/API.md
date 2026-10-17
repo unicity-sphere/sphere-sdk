@@ -288,9 +288,10 @@ Subscribe to events. Returns unsubscribe function. Type-safe — see `SphereEven
 Derive the key material at a specific HD index. The result is
 [`AddressInfo`](#addressinfo) = `{ privateKey, publicKey, path, index }`: it has **no address
 field**, and it holds the private key, so never log or serialise the whole object. For the
-`DIRECT://` address use `sphere.identity?.directAddress` (active address) or
-`sphere.getTrackedAddress(index)?.directAddress` (after `switchToAddress(index)`). The DIRECT
-address cannot be computed from `publicKey`: it derives from a hash of the private key.
+`DIRECT://` address (the wallet's Sphere Quests account id, not a payment address) use
+`sphere.identity?.directAddress` (active address) or `sphere.getTrackedAddress(index)?.directAddress`
+(after `switchToAddress(index)`). The DIRECT address cannot be computed from `publicKey`: it derives
+from a hash of the private key.
 
 ```typescript
 // Derive the first receiving address's keys
@@ -388,7 +389,7 @@ Resolve any identifier to full peer information. Delegates to the transport prov
 // By nametag
 const byNametag = await sphere.resolve('@alice');
 
-// By DIRECT address
+// By DIRECT address — deprecated: still answered until #847 phase 2, never a payment recipient
 const byDirect = await sphere.resolve('DIRECT://000059756bc9c2e4c...');
 
 // By chain pubkey (33-byte compressed, 02/03 prefix)
@@ -405,7 +406,7 @@ interface PeerInfo {
   nametag?: string;        // @name if registered
   transportPubkey: string; // 32-byte transport key
   chainPubkey: string;     // 33-byte compressed secp256k1
-  directAddress: string;   // DIRECT://... L3 address
+  directAddress: string;   // DIRECT://... the Quests account id the binding publishes ('' if none)
   network?: string;        // network the binding declares; always absent on the @nametag and
                            //   DIRECT:// routes today (bindings do not carry one yet)
   timestamp: number;       // Binding event timestamp
@@ -525,12 +526,17 @@ one code where you used to check for `null`.
   messaging-only (`walletApi: 'none'`). A missing gateway API key does not stop the engine from
   being built: the SDK logs a warning and sends gateway requests without a key. The recipient
   must have a published chain pubkey (otherwise `INVALID_RECIPIENT`).
+- **`DIRECT://` is not a recipient (#847).** `send()`, `sendWholeToken()` and `sendCoinless()`
+  reject a `DIRECT://` recipient (any case, leading `@` or whitespace included) with
+  `INVALID_RECIPIENT` and `DIRECT_RECIPIENT_REFUSED_MESSAGE`, before any lookup, reservation or
+  intent write. The rejection is clean: no `transferId`, and `isPossiblyCommittedSendOutcome` is
+  `false`. `isDirectAddressRecipient()` (package root) lets a UI refuse the input first.
 
 ### `send(req: SendRequest): Promise<TransferResult>`
 
 ```typescript
 interface SendRequest {
-  recipient: string;    // @nametag, hex chain pubkey, or DIRECT:// address
+  recipient: string;    // @nametag or hex chain pubkey (a DIRECT:// address is refused)
   amount: string;       // Amount in smallest units (decimal string)
   coinId: string;       // The 64-hex coin id
   memo?: string;        // Optional message (recipient-encrypted envelope)
@@ -635,7 +641,8 @@ Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (when funds are pi
 still converging, the message says how much and points to `pendingTransfers()`; it is also the
 refusal while spending is paused, for `send()`, `sendWholeToken()` and `sendCoinless()` alike, and
 the message says so; [`burn()`](#burnrequest-burnrequest-promiseburnresult) resolves it as `errorCode` instead of rejecting),
-`INVALID_RECIPIENT` (no published chain pubkey, or a proven different network), `TRANSPORT_ERROR`
+`INVALID_RECIPIENT` (no published chain pubkey, a proven different network, or a `DIRECT://`
+recipient, #847), `TRANSPORT_ERROR`
 (the recipient lookup could not reach the relay), `VALIDATION_ERROR` (for example a malformed or
 non-positive amount) and `TRANSFER_CONFLICT` (below).
 `INSUFFICIENT_BALANCE` is never thrown by `send()`.
@@ -678,7 +685,7 @@ try {
     const code = (err as { code?: unknown } | null)?.code;
     switch (code) {
       case 'SEND_INSUFFICIENT_BALANCE': show((err as Error).message); break; // names pinned funds, or says spending is paused
-      case 'INVALID_RECIPIENT': show('Recipient not found'); break;
+      case 'INVALID_RECIPIENT': show((err as Error).message); break; // not found, another network, or DIRECT://
       case 'TRANSPORT_ERROR': show('Could not look up the recipient. Check the connection.'); break;
       default: show(err instanceof Error ? err.message : String(err));
     }
@@ -687,7 +694,7 @@ try {
 ```
 
 **Recipient network.** Nametag bindings do not carry a network yet, so the SDK cannot prove that a
-`@nametag` or `DIRECT://` recipient uses your network. Every such send emits `transfer:attention`
+`@nametag` recipient uses your network. Every such send emits `transfer:attention`
 with `code: 'recipient:network-unverified'` and an empty `transferId`, and then proceeds on your
 network. Treat it as information, not an error; on mainnet, make sure the recipient runs mainnet. A
 bare 66-hex chain pubkey recipient is taken as being on your network.
@@ -1298,7 +1305,8 @@ has started.
 `prewarmSend` previews the coin selection for a send you are about to make and fetches those source
 tokens' blobs ahead of time, so the send itself starts faster. It reserves nothing and does not
 throw for a fetch failure or an amount it cannot cover; the send re-fetches whatever is missing or
-has changed state since. `discardPrewarm` drops the warmed blobs.
+has changed state since. For a `DIRECT://` recipient it reads nothing, since that send is refused.
+`discardPrewarm` drops the warmed blobs.
 
 ### Payment Requests (`sphere.payments.requests`)
 
@@ -1331,7 +1339,9 @@ interface PaymentRequestView {
 ```
 
 - `create()` never throws: it resolves `{ success, requestId?, error? }`, so check `success`. Its
-  `coinId` is the hex id (see [`send()`](#sendreq-sendrequest-promisetransferresult)).
+  `coinId` is the hex id (see [`send()`](#sendreq-sendrequest-promisetransferresult)). A `DIRECT://`
+  `to` resolves `{ success: false, error: DIRECT_RECIPIENT_REFUSED_MESSAGE }` without a lookup or a
+  server call (#847).
 - `list()`, `payment_request:incoming` and `payment_request:updated` cover requests you
   **received**. The SDK does not track requests you created: detect that one was paid through
   `transfer:incoming` or `payments.history()`.
@@ -1670,7 +1680,7 @@ it: read `code` structurally (`(err as { code?: unknown }).code`). Import
 ### Identity and FullIdentity
 
 **Single Identity Model**: the same secp256k1 key pair powers all wallet operations. The same `privateKey`/`chainPubkey` is used for:
-- L3 token ownership and transfers (via `chainPubkey` and `directAddress`)
+- L3 token ownership and transfers (locked to `chainPubkey`; `directAddress` is the Quests account id, never a recipient)
 - Nostr P2P messaging (derived transport key)
 
 `sphere.identity` is an `Identity` (public fields only). `FullIdentity` adds the private key; it
@@ -1680,7 +1690,7 @@ is what the SDK's modules receive internally, and a `Sphere` never returns one.
 interface Identity {
   /** 33-byte compressed secp256k1 public key (for L3 chain) */
   readonly chainPubkey: string;
-  /** L3 DIRECT address (DIRECT://...) */
+  /** DIRECT://... — the Sphere Quests account id; not a payment address (#847) */
   readonly directAddress?: string;
   /** Legacy derived id: '12D3KooW' + first 40 hex chars of sha256(chainPubkey bytes); nothing in the SDK uses it */
   readonly ipnsName?: string;
@@ -1745,7 +1755,7 @@ Full tracked address with derived fields (available in memory via `getActiveAddr
 ```typescript
 interface TrackedAddress extends TrackedAddressEntry {
   readonly addressId: string;      // Short ID (e.g., "DIRECT_abc123_xyz789")
-  readonly directAddress: string;  // L3 DIRECT address (DIRECT://...)
+  readonly directAddress: string;  // DIRECT://... — this address's Quests account id
   readonly chainPubkey: string;    // 33-byte compressed secp256k1
   readonly nametag?: string;       // Primary nametag (without @ prefix)
 }

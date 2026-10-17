@@ -98,14 +98,6 @@ export interface ITokenEngine {
   /** This engine's wallet identity (chain pubkey). Synchronous. */
   getIdentity(): EngineIdentity;
 
-  /**
-   * Legacy `DIRECT://` address for the given pubkey (defaults to this engine's
-   * identity). This is the ONLY "address" in v2 and is kept stable across the
-   * migration (Path A) so Quest XP / Unicity IDs keyed on it survive. Async —
-   * the derivation hashes via the SDK.
-   */
-  deriveIdentityAddress(pubkey?: Uint8Array): Promise<string>;
-
   // ── value (read) ─────────────────────────────────────────────────────────
   /**
    * Genesis-stable token id — 64-char lowercase hex of the v2 TokenId (same

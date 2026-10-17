@@ -18,6 +18,7 @@ import type {
   SendRequest,
 } from '../api';
 import { SerialChain, SingleFlight } from '../async';
+import { DIRECT_RECIPIENT_REFUSED_MESSAGE, isDirectAddressRecipient } from '../recipient';
 import { STORE_KEYS, type ScopedKV, type SettlingLink, type StreamCursor } from '../stores';
 
 export type RequestWireStatus = 'open' | 'paid' | 'declined' | 'expired';
@@ -290,6 +291,7 @@ export class Requests implements PaymentsRequestsApi {
     terms: { coinId: string; amount: string; memo?: string }
   ): Promise<{ success: boolean; requestId?: string; error?: string }> {
     try {
+      if (isDirectAddressRecipient(to)) return { success: false, error: DIRECT_RECIPIENT_REFUSED_MESSAGE };
       const toPubkey = CHAIN_PUBKEY_RE.test(to) ? to.toLowerCase() : await this.deps.resolvePubkey(to);
       if (toPubkey === null || toPubkey === undefined) {
         return { success: false, error: `Recipient ${to} has no published chain pubkey` };
