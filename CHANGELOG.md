@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (money) — a send that lost its race on resume is reported cancelled only once the cancel is confirmed (#846)
+
+What was wrong. When a resumed send found every leg's source already spent by someone else and
+nothing certified (a pure lost race), the resume aborted the intent with a plain `abort`, handed
+any held shortfall rows back, removed the backstop entry, and reported the send `conflicted`,
+even when the abort had failed: the cleanup sat in a `try` with an empty `catch`. It also never
+read the aborted listing, so an abort of a row another device had already completed (a no-op
+`204`, because completion wins) still read as a cancel. And no tombstone was written before the
+abort, so an abort that succeeded followed by a removal that failed left an ordinary `'open'`
+entry behind.
+
+Consequence. A `conflicted` verdict makes a linked payment request payable again and owes a held
+remainder again. With a failed abort, that happened while the intent was still open on the server,
+where another device of the wallet could still send it. With a row completed elsewhere, the request
+became payable for a payment that had been made, so paying it again paid twice. The leftover
+`'open'` entry was re-PUT by the next epoch re-seed, and a byte-equal PUT re-opens the aborted row.
+
+What changed:
+
+- The pure-conflict branch of resume now cancels the way the send-time fence and the tombstone
+  paths do. It writes the `abortPending` tombstone first. If that write fails, nothing is aborted,
+  the intent is reported `failed`, and the next pass judges it again.
+- The abort counts only once it is confirmed (`abortAndConfirm`: a `204` the aborted listing then
+  shows, or a typed `404 NOT_FOUND`). Then the held rows are owed again, the entry is removed and
+  the send is reported `conflicted`; after a `404` no listing will ever show the row, so the
+  tombstone, without its rows, is kept until the pass's reconcile has applied the verdict. A `204` for a row in neither listing settles the entry as paid,
+  so a linked request resolves paid. An unconfirmed abort, or a confirmed one whose cleanup throws,
+  is reported `failed`: the request stays `'settling'`, and a later pass confirms the kept
+  tombstone like any other. A `Retry-After` on that abort or its listing reaches the heartbeat.
+- An intent with no local entry (another device of the wallet wrote it) gets the same confirmed
+  abort: `conflicted` once confirmed, nothing when the row completed elsewhere, `failed` otherwise.
+
+How it was verified: `tests/unit/payments-v2/resume-conflict-cancel.test.ts` (a failed abort that
+leaves the link settling until a later pass confirms it, a row completed on another device that
+resolves the request paid and settles its held rows, a tombstone write that fails and aborts
+nothing, a removal that fails after a confirmed abort and is never re-PUT by an epoch re-seed, an
+abort answered `429` with `Retry-After`, an abort answered `404 NOT_FOUND`, and the same verdicts
+for an intent with no local entry), the updated cleanup-failure case in
+`tests/unit/payments-v2/machine-resume.test.ts`, and new mutation probes. A live staging case, a
+pure conflict on resume while the abort answers 500, passes against the staging wallet-api
+(`tests/e2e/payments-v2-vertical.staging.e2e.test.ts`, `-t '#846'`).
+
 ### Fixed (money) — one malformed or foreign open intent no longer stops every resume (#840)
 
 What was wrong. Resume checked a durable intent's split amounts by type only and planned every

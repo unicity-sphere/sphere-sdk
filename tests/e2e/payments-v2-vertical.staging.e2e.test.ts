@@ -18,9 +18,12 @@
  *
  * The #835 block has its own wallets, so `-t '#835'` runs it alone.
  * It injects faults on PUT /v1/intents only, over the REAL authed client.
- * The #840 block at the end has its own wallets too (`-t '#840'`). It PUTs
+ * The #840 block has its own wallets too (`-t '#840'`). It PUTs
  * crafted intents for its wallet through the REAL client and loses one proof
  * answer in process; every service call stays real.
+ * The #846 block at the end has its own wallets (`-t '#846'`). It keeps one
+ * send's submit from leaving in process, spends its source elsewhere with the
+ * REAL engine, and fails POST /v1/intents/<id>/abort over the REAL client.
  *
  * Gated on STAGING_AGGREGATOR_KEY. Run:
  *   set -a && source .env && set +a && npx vitest run --config vitest.e2e.config.ts \
@@ -33,6 +36,8 @@ import { isPossiblyCommittedSendOutcome, SphereError } from '../../core/errors';
 import { deriveFieldEncryptionKey, encryptField } from '../../core/field-encryption';
 import { WalletApiV2Client } from '../../impl/wallet-api-v2/client';
 import { createWalletApiHttp, WalletApiHttpError } from '../../impl/wallet-api-v2/http';
+import { WalletApiStoragePort } from '../../impl/wallet-api-v2/storage';
+import { hexToBytes } from '../../core/crypto';
 import type { DeliveryPort } from '../../modules/payments-v2/ports';
 import { createMachineStores } from '../../modules/payments-v2/machine/journal';
 import { INTENT_UNCONFIRMED_MESSAGE } from '../../modules/payments-v2/send-errors';
@@ -911,5 +916,140 @@ describe.runIf(RUN)('LIVE staging: #840 a crafted open intent beside a genuine k
     expect(await openIntentIds(wallet)).toEqual(expect.arrayContaining(crafted));
 
     for (const id of crafted) await wallet.api.abortIntent(id); // cleanup: nothing ever ran under them
+  }, 2_400_000);
+});
+
+// ── #846: a pure conflict on resume is cancelled only once the abort is confirmed ──
+// A payment request H→I is paid with a send whose submit never leaves the client (in
+// process, before the engine call), so nothing is certified and the send is kept open.
+// I's REAL engine then spends the source to a third key, and every abort I's facade
+// sends answers 500. The next resume conflicts on its only leg: the request must stay
+// 'settling' while the abort fails, and turn payable only once an abort is confirmed.
+
+interface SubmitHold {
+  held: boolean;
+}
+
+/** The facade's engine: while held, every transfer fails before it is submitted (nothing certifies). */
+function holdsSubmits(hold: SubmitHold): (inner: ITokenEngine) => ITokenEngine {
+  return (inner) => {
+    const transfer: ITokenEngine['transfer'] = async (params, options) => {
+      if (hold.held) throw new ProofUnconfirmedError('e2e #846: the submit never left the client');
+      return inner.transfer(params, options);
+    };
+    return new Proxy(inner, {
+      get: (target, prop) => {
+        if (prop === 'transfer') return transfer;
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+  };
+}
+
+/** The facade's client: while down, every abort answers the wallet-api 500 envelope. */
+function failsAborts(down: { on: boolean }): (inner: AuthedClient) => AuthedClient {
+  return (inner) => ({
+    ...inner,
+    abortIntent: async (transferId) => {
+      if (down.on) throw new WalletApiHttpError(500, 'INTERNAL', `POST /v1/intents/${transferId}/abort: injected outage (#846)`);
+      await inner.abortIntent(transferId);
+    },
+  });
+}
+
+/** Another holder of the key spends the token on chain; wallet-api still lists it in inventory. */
+async function spendElsewhere(w: VWallet, tokenId: string): Promise<void> {
+  const bytes = must((await new WalletApiStoragePort(w.api).getBlobs([tokenId])).get(tokenId), 'source blob');
+  const token = await w.engine.decodeToken({ tokenId, token: bytes });
+  const options = { transferId: randomUUID(), opIndex: 0 };
+  const recipientPubkey = hexToBytes(randomIdentity().chainPubkey);
+  const deadline = Date.now() + SEND_CONVERGE_MS;
+  for (;;) {
+    try {
+      await w.engine.transfer({ token, recipientPubkey }, options); // the same seed: a retry resumes the one spend
+      return;
+    } catch (err) {
+      if (Date.now() > deadline) throw err;
+      logStep(`#846: foreign spend not confirmed yet (${String(err).slice(0, 80)}) — retrying the same op`);
+      await sleep(PACE_MS);
+    }
+  }
+}
+
+function requestStatus(w: VWallet, requestId: string): string | undefined {
+  return w.facade.requests.list().find((view) => view.id === requestId)?.status;
+}
+
+describe.runIf(RUN)('LIVE staging: #846 a pure conflict on resume while the abort fails', () => {
+  it('the request stays settling until a later pass confirms the abort; nothing reaches the payee', async () => {
+    const hold: SubmitHold = { held: true };
+    const abortsDown = { on: false };
+    const faults = { wrapEngine: holdsSubmits(hold), wrapClient: failsAborts(abortsDown) };
+    const h = await makeVerticalWallet('h846');
+    const minted = await mintConverged(await makeVerticalWallet('i846', faults), 100n, 'mint I 100', faults);
+    const payer = minted.wallet;
+    await waitFor(
+      payer,
+      () => payer.facade.tokens().some((t) => t.id === minted.tokenId && t.status === 'confirmed'),
+      60_000,
+      'I holds the 100 spendable'
+    );
+
+    const created = await h.facade.requests.create(payer.identity.chainPubkey, { coinId: HARNESS_COIN, amount: '100' });
+    expect(created.success, created.error).toBe(true);
+    const requestId = must(created.requestId, 'request id');
+    await waitFor(payer, () => requestStatus(payer, requestId) === 'pending', 120_000, 'I sees the request from H');
+
+    const paid = await payer.facade.requests.pay(requestId).then(
+      (result) => ({ result }),
+      (error: unknown) => ({ error })
+    );
+    expect('error' in paid, 'a submit that never left never resolves the send').toBe(true);
+    const keptOpen = (paid as { error: unknown }).error;
+    expect(isPossiblyCommittedSendOutcome(keptOpen)).toBe(true);
+    const transferId = must((keptOpen as SphereError).transferId, 'keep-open transferId');
+    expect(requestStatus(payer, requestId)).toBe('settling');
+    logStep(`#846: keep-open ${transferId} for request ${requestId}`);
+
+    await spendElsewhere(payer, minted.tokenId);
+    abortsDown.on = true;
+    hold.held = false; // the next resume submits, and loses to the spend above
+
+    const stores = createMachineStores(payer.kv);
+    await waitFor(
+      payer,
+      async () => {
+        await payer.facade.resumeNow();
+        return (await stores.backstop.getByKey(transferId))?.disposition === 'abortPending';
+      },
+      SEND_CONVERGE_MS,
+      'the resume conflicted and wrote its tombstone'
+    );
+    for (let pass = 0; pass < 3; pass++) {
+      await payer.facade.resumeNow();
+      expect(requestStatus(payer, requestId), 'never payable while the abort fails').toBe('settling');
+      expect(await openIntentIds(payer), 'another device could still run it').toContain(transferId);
+      await sleep(PACE_MS);
+    }
+    expect(await payer.facade.pendingTransfers(), 'being cancelled: never sent from here').toEqual([]);
+
+    abortsDown.on = false;
+    await waitFor(
+      payer,
+      async () => {
+        await payer.facade.resumeNow();
+        return requestStatus(payer, requestId) === 'pending';
+      },
+      120_000,
+      'the confirmed cancel makes the request payable again'
+    );
+    expect((await payer.api.listIntents('aborted')).map((i) => i.transferId)).toContain(transferId);
+    expect(await stores.backstop.getByKey(transferId)).toBeUndefined();
+
+    await sleep(10_000);
+    await h.facade.receive().catch(() => undefined);
+    expect(localTotal(h), 'nothing moved to the payee').toBe(0n);
+    expect(await serverTotal(h)).toBe(0n);
   }, 2_400_000);
 });
