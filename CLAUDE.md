@@ -11,7 +11,8 @@ This repo is part of the wallet-api program (process: `../wallet-api/docs/develo
   from `main`; wallet-api#119 records this in the process doc). Every PR links a GitHub issue
   (`Closes #N`, docs-only changes exempt); squash-merge after green CI (`.github/workflows/ci.yml`:
   verify:version + typecheck + typecheck:tests + lint + build + test:run on Node 22 and 24,
-  plus a separate `test:mutation` job).
+  plus `test:mutation`, sharded across 8 parallel jobs by `MUTATION_SHARD=i/n` and summed up in one
+  `test-mutation` check).
 - **The normative spec for the program's SDK work is `../wallet-api/docs/sdk-changes.md`** — Part E
   (recoverable engine), then S1–S7 (thin wallet, ports, wallet-api providers). It was adversarially
   verified; build it, don't redesign it. Spec-first: contract changes land in the spec in the same
