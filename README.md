@@ -172,12 +172,12 @@ cancel is confirmed, the rest shows up in `pendingTransfers()` as a shortfall, a
 only `err.remainingAmount` is still owed. When `isPossiblyCommittedSendOutcome(err)` is `false`, the failure is proven clean: nothing of the payment was
 certified, and nothing this device holds can still send it.
 
-- `CERTIFICATION_UNCONFIRMED` is a **`ProofUnconfirmedError`** (`mayHaveCertified: true`): the spend may already be on-chain but the proof fetch was inconclusive. `SEND_SYNC_PENDING` (with `err.transferId`) is one of three cases (#835), and none is ever sent again by you:
+- `CERTIFICATION_UNCONFIRMED` is a **`ProofUnconfirmedError`** (`mayHaveCertified: true`): the spend may already be on-chain but the proof fetch was inconclusive. `SEND_SYNC_PENDING` is one of three cases (#835), and none is ever sent again by you:
   - **Committed, converging.** The spend committed in whole or in part and the rest is converging (for example the wallet-api mirror is still catching up, or a later leg failed after an earlier one was delivered).
   - **Held, not sent yet.** Nothing is certified, but the payment may still go out, so the SDK holds it and sends it automatically under the same `transferId`. Most often the wallet service did not confirm that it recorded the intent (the SDK sends it once the service does); also when a failed attempt could not be fenced off, because another PUT of the same intent may still land (the SDK runs it again). This can be much later, and a held send cannot be cancelled. `pendingTransfers()` lists it.
   - **Being cancelled.** An attempt failed before anything certified and this device is cancelling it, but the wallet service has not confirmed the cancel yet. This device never sends it, and `pendingTransfers()` does not list it. It is not a clean failure only because another device of the same wallet could still complete it until the cancel is confirmed. A payment request paid with it stays `settling` until then, and becomes payable again once the cancel is confirmed. The error's message says it is being cancelled.
 - **Recovery is automatic.** The open intent is replayed under the same `transferId` (recovers the proof + delivery, or records the spend if a rival tx won; **never a second spend**). A send that lost a source to a conflict after another leg certified converges in-process; every other possibly-committed outcome converges in the background: on the next heartbeat pass (about 5 s later, backing off while it keeps failing), and every remaining open or held intent is resumed when the vertical starts (`Sphere.init` / `Sphere.load` / an address switch). `sphere.payments.resumeNow()` runs that convergence now; it is the only retry verb.
-- Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (when funds are pinned by transfers still converging, its message says how much and points to `pendingTransfers()`), `INVALID_RECIPIENT`, `TRANSPORT_ERROR` (the recipient lookup could not reach the relay) and `VALIDATION_ERROR` (a bad amount). `INSUFFICIENT_BALANCE` is never thrown.
+- Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (when funds are pinned by transfers still converging, its message says how much and points to `pendingTransfers()`; it is also the refusal while spending is paused, before the SDK has confirmed which tokens converging transfers hold, for `send()`, `sendWholeToken()` and `sendCoinless()` alike, and the message says so; `burn()` resolves it as `errorCode` instead of rejecting), `INVALID_RECIPIENT`, `TRANSPORT_ERROR` (the recipient lookup could not reach the relay) and `VALIDATION_ERROR` (a bad amount). `INSUFFICIENT_BALANCE` is never thrown.
 - Import the error helpers from the same entry point as `Sphere`, and read `code` structurally for the clean failures: errors thrown by provider code (the `./impl/*` bundles, for example the Nostr transport during the recipient lookup) are a different `SphereError` class copy, so `isSphereError()` is `false` for them.
 
 ```ts
@@ -212,7 +212,7 @@ try {
     // SphereError class copy, so isSphereError() is false for them.
     const code = (err as { code?: unknown } | null)?.code;
     switch (code) {
-      case 'SEND_INSUFFICIENT_BALANCE': show((err as Error).message); break; // names pinned funds when transfers are converging
+      case 'SEND_INSUFFICIENT_BALANCE': show((err as Error).message); break; // names pinned funds, or says spending is paused
       case 'INVALID_RECIPIENT': show('Recipient not found'); break;
       case 'TRANSPORT_ERROR': show('Could not look up the recipient. Check the connection.'); break;
       default: show(err instanceof Error ? err.message : String(err));

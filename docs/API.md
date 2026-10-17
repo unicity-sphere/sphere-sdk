@@ -586,7 +586,7 @@ the next start — or, in one case below, cancels it. Show it as pending
 ([`pendingTransfers()`](#pendingtransfers-promisependingtransfer)), and wire any "retry" button
 to [`resumeNow()`](#resumenow-promisevoid).
 
-`SEND_SYNC_PENDING` with a `transferId` is one of three cases. Never send the payment again in
+`SEND_SYNC_PENDING` is one of three cases. Never send the payment again in
 any of them:
 
 - **Committed, still converging.** The spend committed, in whole or in part, and the rest is
@@ -632,7 +632,9 @@ When `isPossiblyCommittedSendOutcome(err)` is `false`, the failure is proven cle
 payment was certified, and nothing this device holds can still send it.
 
 Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (when funds are pinned by transfers
-still converging, the message says how much and points to `pendingTransfers()`),
+still converging, the message says how much and points to `pendingTransfers()`; it is also the
+refusal while spending is paused, for `send()`, `sendWholeToken()` and `sendCoinless()` alike, and
+the message says so; [`burn()`](#burnrequest-burnrequest-promiseburnresult) resolves it as `errorCode` instead of rejecting),
 `INVALID_RECIPIENT` (no published chain pubkey, or a proven different network), `TRANSPORT_ERROR`
 (the recipient lookup could not reach the relay), `VALIDATION_ERROR` (for example a malformed or
 non-positive amount) and `TRANSFER_CONFLICT` (below).
@@ -675,7 +677,7 @@ try {
     // SphereError class copy, so isSphereError() is false for them.
     const code = (err as { code?: unknown } | null)?.code;
     switch (code) {
-      case 'SEND_INSUFFICIENT_BALANCE': show((err as Error).message); break; // names pinned funds when transfers are converging
+      case 'SEND_INSUFFICIENT_BALANCE': show((err as Error).message); break; // names pinned funds, or says spending is paused
       case 'INVALID_RECIPIENT': show('Recipient not found'); break;
       case 'TRANSPORT_ERROR': show('Could not look up the recipient. Check the connection.'); break;
       default: show(err instanceof Error ? err.message : String(err));
@@ -953,19 +955,23 @@ coinless one logs `assets: []`.
 **Refused:** a token whose value envelope this SDK cannot decode (`bare_collection`, the bridged
 dialect). Its coins are real but unaccountable here, so the move would happen while history could
 only say `assets: []`. Also refused, before any chain op: a tokenId that is unknown, tombstoned,
-already in flight, or #625-demoted.
+already in flight, or #625-demoted, and any token while spending is paused (below).
 
 A proven conflict is **terminal** — there is no alternative source to re-plan onto. Treat the
 possibly-committed rules exactly as for `send()`: never re-issue after any error for which
-`isPossiblyCommittedSendOutcome(err)` is `true`; `resumeNow()` converges it. One exception: a
-`SEND_SYNC_PENDING` that carries no `err.transferId` (message `Cannot spend yet: …`) is a refusal
-before anything was reserved or sent. Tell it apart by the missing `err.transferId`, not by the
-message: every other `SEND_SYNC_PENDING`, including a send held because the wallet service did not
-confirm it recorded the intent (#835), carries one. The SDK spends nothing until it has confirmed
-which tokens the transfers still converging hold; it runs that check when payments start (also
-after an address switch) and on every convergence pass. Nothing moved and `pendingTransfers()` has
-no row for it, so call `sendWholeToken` (or `sendCoinless`) again later. `resumeNow()` re-runs the
-check but does not send the token.
+`isPossiblyCommittedSendOutcome(err)` is `true`; `resumeNow()` converges it. Every such error
+carries `err.transferId`.
+
+**Spending paused (#838).** The SDK spends nothing until it has confirmed which tokens the
+transfers still converging hold. It runs that check when payments start (also after an address
+switch) and on every convergence pass, and it keeps failing while an open transfer's record cannot
+be read. Until the check succeeds, `sendWholeToken` (and `sendCoinless`) is refused with
+`SEND_INSUFFICIENT_BALANCE`, the same code and message `send()` gives in that state, before
+anything is reserved or sent. It is a clean failure: `isPossiblyCommittedSendOutcome(err)` is
+`false`, there is no `err.transferId`, `transfer:updated` reports it `'failed'`, and
+`pendingTransfers()` has no row for it. Call again later; `resumeNow()` re-runs the check but does
+not send the token. Up to 0.19.0 this refusal was `SEND_SYNC_PENDING` with the message
+`Cannot spend yet: …`.
 
 ### `sendCoinless(req: { recipient, tokenId, memo? }): Promise<TransferResult>`
 
@@ -1185,6 +1191,9 @@ interface BurnResult {
 - The token is **reserved** for the life of the burn, like a `sendWholeToken` source: it cannot be
   selected by a send or burned twice. A token that is not a spendable holding, is not owned by this
   wallet, or carries a `bare_collection` value is refused before anything is journaled.
+- While spending is paused (see [`sendWholeToken`](#sendwholetokenreq--recipient-tokenid-memo--promisetransferresult)),
+  a burn is refused before anything is journaled with `errorCode: 'SEND_INSUFFICIENT_BALANCE'`
+  (0.19.0 returned `'SEND_SYNC_PENDING'`). Nothing moved: burn again later.
 - **Journal-first.** The burn is journaled before the chain op, and the spend is applied to
   inventory with `externalDelivery: true` (the token left for somewhere no deposit evidences). A
   failure after journaling keeps the entry, keeps the token reserved (across restarts too), and the
@@ -1605,8 +1614,8 @@ with backoff (up to 10 attempts), and returns a function that closes it.
 class SphereError extends Error {
   readonly code: SphereErrorCode;   // e.g. 'INVALID_CONFIG', 'SEND_INSUFFICIENT_BALANCE', ...
   readonly cause?: unknown;
-  transferId?: string;              // set only on possibly-committed send outcomes: the transfer
-                                    // the SDK finishes (absent on the #738 'Cannot spend yet' refusal)
+  transferId?: string;              // set on every possibly-committed send outcome: the transfer
+                                    // the SDK finishes (or cancels)
 }
 
 class PartialSendConflictError extends SphereError {   // code 'SEND_PARTIALLY_COMPLETED'

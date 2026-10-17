@@ -24,7 +24,7 @@
  *     showToast('Waiting for confirmation. Do not pay again.');
  *   } else {
  *     switch ((err as { code?: unknown } | null)?.code) {
- *       case 'SEND_INSUFFICIENT_BALANCE': showToast('Not enough funds'); break;
+ *       case 'SEND_INSUFFICIENT_BALANCE': showToast((err as Error).message); break; // pinned funds, or spending paused
  *       case 'INVALID_RECIPIENT': showToast('Recipient not found'); break;
  *       case 'TRANSPORT_ERROR': showToast('Network connection issue'); break;
  *       default: showToast(err instanceof Error ? err.message : String(err));
@@ -60,8 +60,7 @@ export type SphereErrorCode =
   | 'STORAGE_ERROR'
   // Never re-send. Under err.transferId it committed in part or whole (#665), or is
   // held and sent automatically (#835), or failed and is being cancelled while
-  // another device could still run it (#835). The #738 pre-commit refusal carries
-  // NO transferId and is the documented exception.
+  // another device could still run it (#835). It always carries err.transferId (#838).
   | 'SEND_SYNC_PENDING'
   // #677: a multi-leg send lost a source to a concurrent transfer AFTER ≥1
   // earlier leg had already certified on-chain AND been journaled/delivered.

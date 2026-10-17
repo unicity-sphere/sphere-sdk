@@ -775,6 +775,10 @@ attempt being cancelled, which another device of the same wallet could still com
 the rest shows up in `pendingTransfers()` as a shortfall, and only that is re-planned. Otherwise only
 `err.remainingAmount` is still owed. When `isPossiblyCommittedSendOutcome(err)` is `false`, the failure is
 proven clean: nothing of the payment was certified, and nothing this device holds can still send it.
+`SEND_INSUFFICIENT_BALANCE` is one of those clean failures, and it is also the refusal while spending is paused
+(the SDK has not yet confirmed which tokens converging transfers hold): `send()`, `sendWholeToken()` and
+`sendCoinless()` reject with it (show `err.message`, which says so), and `burn()` resolves
+`{ success: false, errorCode: 'SEND_INSUFFICIENT_BALANCE' }` instead of rejecting.
 
 ```typescript
 // Import the error helpers from the same entry point as Sphere (here: the package root).
@@ -809,7 +813,7 @@ try {
     const code = (err as { code?: unknown } | null)?.code;
     switch (code) {
       case 'SEND_INSUFFICIENT_BALANCE':
-        console.error((err as Error).message); // names pinned funds when transfers are converging
+        console.error((err as Error).message); // names pinned funds, or says spending is paused
         break;
       case 'INVALID_RECIPIENT':
         console.error('Recipient not found');

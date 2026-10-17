@@ -1620,7 +1620,7 @@ confirmed. `isPossiblyCommittedSendOutcome(err)` is `true` for exactly these cod
 second time. The SDK finishes (or, in the last case below, cancels) the original under its own
 transfer id (`err.transferId`); show it as pending (`sphere.payments.pendingTransfers()` lists
 every case except one being cancelled), and wire any "retry" button to
-`sphere.payments.resumeNow()`. `SEND_SYNC_PENDING` with a transfer id is one of three cases (#835):
+`sphere.payments.resumeNow()`. `SEND_SYNC_PENDING` is one of three cases (#835):
 
 - **committed, converging:** the spend committed in whole or in part and the rest is converging;
 - **held, not sent yet:** nothing is certified, but the payment may still go out, most often
@@ -1672,7 +1672,7 @@ try {
     // SphereError class copy, so isSphereError() is false for them.
     const code = (err as { code?: unknown } | null)?.code;
     switch (code) {
-      case 'SEND_INSUFFICIENT_BALANCE': show((err as Error).message); break; // names pinned funds when transfers are converging
+      case 'SEND_INSUFFICIENT_BALANCE': show((err as Error).message); break; // names pinned funds, or says spending is paused
       case 'INVALID_RECIPIENT': show('Recipient not found'); break;
       case 'TRANSPORT_ERROR': show('Could not look up the recipient. Check the connection.'); break;
       default: show(err instanceof Error ? err.message : String(err));
@@ -1683,7 +1683,9 @@ try {
 
 Clean failures you can branch on: `SEND_INSUFFICIENT_BALANCE` (not enough spendable funds; when
 some funds are pinned by transfers still converging, its message says how much and points to
-`pendingTransfers()`), `INVALID_RECIPIENT` (no published chain pubkey, or a recipient on another
+`pendingTransfers()`; it is also the refusal while spending is paused, because the SDK has not yet
+confirmed which tokens converging transfers hold, for `send()`, `sendWholeToken()` and
+`sendCoinless()` alike, and the message says so; `burn()` resolves it as `errorCode` instead of rejecting), `INVALID_RECIPIENT` (no published chain pubkey, or a recipient on another
 network), `TRANSPORT_ERROR` (the recipient lookup could not reach the Nostr relays) and
 `VALIDATION_ERROR` (for example a malformed amount).
 `INSUFFICIENT_BALANCE` exists in the `SphereErrorCode` union but is never thrown.

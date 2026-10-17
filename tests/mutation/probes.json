@@ -1421,10 +1421,32 @@
     "name": "plantoken-skips-738-gate",
     "note": "#777/#738: while the held-set is unproven nothing is spendable. Skipping the gate for a NAMED source lets a restart double-spend a token an open intent already holds.",
     "file": "modules/payments-v2/select/queue.ts",
-    "find": "    if (unproven !== null) {\n      throw new SphereError(`Cannot spend yet: ${unproven}`, 'SEND_SYNC_PENDING');",
-    "replace": "    if (false as boolean) {\n      throw new SphereError(`Cannot spend yet: ${String(unproven)}`, 'SEND_SYNC_PENDING');",
+    "find": "    if (unproven !== null) {\n      throw unprovenRefusal(unproven);",
+    "replace": "    if (false as boolean) {\n      throw unprovenRefusal(String(unproven));",
     "tests": [
       "tests/unit/payments-v2/pinned-balance.test.ts"
+    ]
+  },
+  {
+    "name": "unproven-refusal-reads-possibly-committed",
+    "note": "#838: the unproven-ledger refusal precedes every reserve, PUT and chain op. Giving it a possibly-committed code suppresses transfer:updated{failed} and tells a wallet an unsent token is still going out.",
+    "file": "modules/payments-v2/select/queue.ts",
+    "find": "  return new SphereError(reason, 'SEND_INSUFFICIENT_BALANCE');",
+    "replace": "  return new SphereError(reason, 'SEND_SYNC_PENDING');",
+    "tests": [
+      "tests/unit/payments-v2/pinned-balance.test.ts",
+      "tests/unit/payments-v2/burn.test.ts"
+    ]
+  },
+  {
+    "name": "planwhole-unproven-refusal-diverges",
+    "note": "#838: a named spend and a burn refuse the unproven ledger exactly as a coin spend does. Restoring the old SEND_SYNC_PENDING throw in planWhole alone makes the verbs disagree and the refusal read as possibly-committed.",
+    "file": "modules/payments-v2/select/queue.ts",
+    "find": "      throw unprovenRefusal(unproven);",
+    "replace": "      throw new SphereError(`Cannot spend yet: ${unproven}`, 'SEND_SYNC_PENDING');",
+    "tests": [
+      "tests/unit/payments-v2/pinned-balance.test.ts",
+      "tests/unit/payments-v2/burn.test.ts"
     ]
   },
   {

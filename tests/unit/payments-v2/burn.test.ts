@@ -99,6 +99,24 @@ describe('PaymentsFacade — burn (plugin tokens)', () => {
     expect(await journal(world)).toEqual([]);
   });
 
+  it('#838: refused while the held-set is unproven with the CLEAN code, journals nothing, and burns once started', async () => {
+    const det = new DetBurnEngine();
+    const world = makeWorld({ engine: det });
+    const source = await world.seed(100n);
+    const tokenId = source.blob.tokenId;
+
+    const refusedBurn = await world.facade.burn({ tokenId, reasonBytes: REASON });
+
+    expect(refusedBurn).toMatchObject({ success: false, errorCode: 'SEND_INSUFFICIENT_BALANCE', error: expect.stringMatching(/spending is paused/i) });
+    expect(det.calls).toEqual([]);
+    expect(await journal(world)).toEqual([]);
+    expect(await world.facade.pendingBurns()).toEqual([]);
+
+    await world.facade.start();
+    await expect(world.facade.burn({ tokenId, reasonBytes: REASON })).resolves.toMatchObject({ success: true, tokenId });
+    expect(det.calls).toHaveLength(1);
+  });
+
   it('reserves the token while the burn certifies: a send of it, or a second burn, is refused', async () => {
     const det = new DetBurnEngine();
     const world = makeWorld({ engine: det });

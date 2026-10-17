@@ -894,8 +894,9 @@ authoritative for build success.
 - **Never re-issue `send()` after a possibly-committed outcome** (`isPossiblyCommittedSendOutcome()`
   is true for exactly six codes: `SEND_SYNC_PENDING`, `CERTIFICATION_UNCONFIRMED`,
   `CHECKPOINT_PERSIST_FAILED`, `SPLIT_CHECKPOINT_LOST`, `CHECKPOINT_TRUSTBASE_MISMATCH`,
-  `SEND_PARTIALLY_COMPLETED`). Every such rejection carries `err.transferId`, except the #738
-  `Cannot spend yet` refusal of a whole-token send, which moved nothing. For the first five
+  `SEND_PARTIALLY_COMPLETED`). Every such rejection carries `err.transferId`. The #738
+  unproven-ledger refusal (spending paused) moved nothing and is the clean
+  `SEND_INSUFFICIENT_BALANCE` for coin, whole-token and burn alike (#838). For the first five
   codes the intent stays OPEN (or, for a parked send, held locally until its PUT is confirmed),
   and the convergence pass (`facade.start()`, the heartbeat, or `payments.resumeNow()`)
   finishes it under the same transferId — or, for one being cancelled, only retries its abort.
