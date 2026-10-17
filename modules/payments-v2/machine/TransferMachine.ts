@@ -9,13 +9,6 @@ import { SphereError } from '../../../core/errors';
 import type { TransferResult } from '../../../types';
 import type { ITokenEngine, SplitCheckpointStore } from '../../../token-engine/engine';
 import type { SphereToken } from '../../../token-engine/types';
-import {
-  CheckpointPersistFailedError,
-  CheckpointTrustbaseMismatchError,
-  ProofUnconfirmedError,
-  SplitCheckpointLostError,
-  TransferConflictError,
-} from '../../../token-engine/errors';
 import type { DeliverOptions, DeliveryPort, StoragePort } from '../ports';
 import {
   CANCEL_UNCONFIRMED_MESSAGE,
@@ -27,6 +20,8 @@ import {
 import { coinIdOf, splitOf } from './payload-view';
 import type { DeliveryJournalEntry, ScopedKV, ShortfallEntry } from '../stores';
 import type { IntentPayload, OpOutcome, OutcomeClass, PlannedOp } from './types';
+import { buildOps, classifyError, conflictAmount } from './outcomes';
+import { recordSettled } from './settled-history';
 import {
   ATTENTION_DELIVERY_DEFERRED,
   RATE_LIMIT_DEFER_MS,
@@ -41,6 +36,8 @@ import {
   type MachineStores,
 } from './journal';
 
+export { buildOps, classifyError } from './outcomes';
+
 // #746: measured live, a 4-op wave cost the same as an 8-op wave — at 8 we were
 // latency-bound, so each wave paid a proof round-trip and the barrier multiplied
 // it. Safe to widen only because a rate-limited submit now retries instead of
@@ -50,13 +47,6 @@ const CERTIFY_WIDTH = 20;
 // #835: at most 3 PUTs, issued at once — the heartbeat owns waiting, and an immediate
 // re-PUT serializes behind an in-flight original at the DB (wallet-api #107).
 const PUT_CONFIRM_RETRIES = 2;
-
-const KEEP_OPEN_CODES = new Set([
-  'CERTIFICATION_UNCONFIRMED',
-  'CHECKPOINT_PERSIST_FAILED',
-  'SPLIT_CHECKPOINT_LOST',
-  'CHECKPOINT_TRUSTBASE_MISMATCH',
-]);
 
 export interface IntentApi {
   put(transferId: string, envelope: string, requiresSeedClose: boolean): Promise<void>;
@@ -130,44 +120,6 @@ interface ResumeConflict {
   op: PlannedOp;
   error: unknown;
   amount: bigint;
-}
-
-/** opIndex is plan-derived: the op's position in direct[], split at direct.length (E.1). */
-export function buildOps(payload: IntentPayload): PlannedOp[] {
-  const ops: PlannedOp[] = payload.direct.map((sourceTokenId, opIndex) => ({
-    kind: 'direct',
-    opIndex,
-    sourceTokenId,
-    deliveredAmount: 0n,
-  }));
-  if (payload.split !== undefined) {
-    ops.push({
-      kind: 'split',
-      opIndex: payload.direct.length,
-      sourceTokenId: payload.split.tokenId,
-      deliveredAmount: BigInt(payload.split.splitAmount),
-    });
-  }
-  return ops;
-}
-
-export function classifyError(e: unknown): OutcomeClass {
-  if (
-    e instanceof ProofUnconfirmedError ||
-    e instanceof SplitCheckpointLostError ||
-    e instanceof CheckpointPersistFailedError ||
-    e instanceof CheckpointTrustbaseMismatchError
-  ) {
-    return 'keep-open';
-  }
-  if (e instanceof TransferConflictError) return 'conflict';
-  const coded = e !== null && typeof e === 'object' ? (e as { code?: unknown; mayHaveCertified?: unknown }) : null;
-  if (coded !== null) {
-    if (coded.mayHaveCertified === true) return 'keep-open';
-    if (typeof coded.code === 'string' && KEEP_OPEN_CODES.has(coded.code)) return 'keep-open';
-    if (coded.code === 'TRANSFER_CONFLICT') return 'conflict';
-  }
-  return 'other';
 }
 
 /** Precedence keep-open > conflict > other; committed = certified regardless of error (#441). */
@@ -677,7 +629,7 @@ export class TransferMachine {
     );
     // An unclosed partial keeps its backstop: the next pass closes it (idempotent).
     if (closed) await this.finishBookkeeping(engine, r.transferId, r.payload, 'resumed', committed);
-    else await this.recordSettled(engine, r.transferId, r.payload, 'resumed', committed);
+    else await recordSettled(engine, this.deps.recordHistory, { transferId: r.transferId, payload: r.payload, phase: 'resumed', committed });
     return { entry, closed };
   }
 
@@ -704,7 +656,7 @@ export class TransferMachine {
     phase: 'sent' | 'resumed',
     committed: OpOutcome[]
   ): Promise<void> {
-    await this.recordSettled(engine, transferId, payload, phase, committed);
+    await recordSettled(engine, this.deps.recordHistory, { transferId, payload, phase, committed });
     try {
       await settleOwed(this.stores, await this.stores.backstop.getByKey(transferId));
       await this.stores.backstop.removeByKey(transferId);
@@ -713,83 +665,9 @@ export class TransferMachine {
     }
   }
 
-  /** SENT history; recorded even when the close failed (the server dedupKey is the transferId). */
-  private async recordSettled(
-    engine: ITokenEngine,
-    transferId: string,
-    payload: IntentPayload,
-    phase: 'sent' | 'resumed',
-    committed: OpOutcome[]
-  ): Promise<void> {
-    try {
-      // A token-addressed spend has no coin to sum: what settled is the token itself.
-      const coinId = coinIdOf(payload);
-      const committedAmount =
-        coinId === undefined ? '0' : await this.settledAmount(engine, coinId, committed);
-      // A whole-token spend has no coin to sum — record what the moved token ACTUALLY
-      // carried, so a valued one is not logged as `assets: []`.
-      const committedAssets =
-        coinId === undefined ? await this.settledAssets(engine, committed) : undefined;
-      await this.deps.recordHistory?.({
-        transferId,
-        payload,
-        phase,
-        committedAmount,
-        ...(committedAssets !== undefined ? { committedAssets } : {}),
-      });
-    } catch {
-      /* a history failure never fails the money path */
-    }
-  }
-
-  /**
-   * §5.9: SENT history records what SETTLED, never the plan — the value of the
-   * certified recipient blobs (summarize()'s committed set is the only source;
-   * a journal-rehydrated resume leg has no source token, but every committed
-   * leg carries its recipient blob, so the outcome-derived rule is uniform).
-   */
-  /** Every asset across the certified recipient blobs — the whole-spend twin of settledAmount. */
-  private async settledAssets(
-    engine: ITokenEngine,
-    committed: OpOutcome[]
-  ): Promise<{ coinId: string; amount: string }[]> {
-    const total = new Map<string, bigint>();
-    for (const outcome of committed) {
-      if (outcome.recipientBlob === undefined) continue;
-      const token = await engine.decodeToken({ tokenId: '', token: outcome.recipientBlob });
-      for (const asset of engine.readValue(token)?.assets ?? []) {
-        total.set(asset.coinId, (total.get(asset.coinId) ?? 0n) + asset.amount);
-      }
-    }
-    return [...total].map(([coinId, amount]) => ({ coinId, amount: amount.toString() }));
-  }
-
-  private async settledAmount(engine: ITokenEngine, coinId: string, committed: OpOutcome[]): Promise<string> {
-    let total = 0n;
-    for (const outcome of committed) {
-      if (outcome.recipientBlob === undefined) continue;
-      const token = await engine.decodeToken({ tokenId: '', token: outcome.recipientBlob });
-      total += engine.balanceOf(token, coinId);
-    }
-    return total.toString();
-  }
-
   private attention(): AttentionEmitter {
     return (transferId, code, detail) => {
       this.deps.emit('transfer:attention', detail === undefined ? { transferId, code } : { transferId, code, detail });
     };
   }
-}
-
-function conflictAmount(
-  engine: ITokenEngine,
-  payload: IntentPayload,
-  op: PlannedOp,
-  source: SphereToken | undefined
-): bigint {
-  const split = splitOf(payload);
-  if (op.kind === 'split') return BigInt(split!.splitAmount);
-  const coinId = coinIdOf(payload);
-  if (coinId === undefined) return 0n; // token-addressed: the unit is the token
-  return source !== undefined ? engine.balanceOf(source, coinId) : 0n;
 }
