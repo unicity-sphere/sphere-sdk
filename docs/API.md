@@ -621,6 +621,15 @@ any of them:
   with it stays `'settling'` until the cancel is confirmed, then becomes payable again; no other
   event marks the confirmed cancel.
 
+A possibly-committed send that resumes to find its source spent elsewhere before any leg certified
+(a lost race) ends the same way (#846). For a send made on this device, the SDK records the
+cancel before it aborts and from then on only retries the cancel. A send that lost its race can
+never be certified, so a pass that runs it again before that record is written only conflicts
+again.
+It counts the send as not sent (a linked request payable again, a held remainder owed again) only
+once the wallet service confirms the cancel; until then a linked request stays `'settling'`. If the
+cancel finds the intent already completed on another device, the send counts as paid.
+
 A [`PartialSendConflictError`](#errors) means part of the amount was delivered and is final.
 Read `err.remainingAmount` before you do anything else:
 
@@ -629,7 +638,7 @@ Read `err.remainingAmount` before you do anything else:
   That includes a later attempt that failed and is being cancelled (`err.cause` is then its
   `SEND_SYNC_PENDING`, with the cancel message): this device never sends it, but another device of
   the same wallet could still complete it until the service confirms the cancel. If that attempt
-  ends without sending (its source was spent elsewhere, or its cancel is confirmed), the remainder
+  ends without sending (its cancel is confirmed, also after its source was spent elsewhere), the remainder
   comes back as a `'shortfall'` row in `pendingTransfers()`; re-plan only that.
 - **Anything else:** only `err.remainingAmount` is still owed, and it may be paid only by a new
   send of exactly that amount.
@@ -1265,8 +1274,8 @@ attempt being cancelled (#835: it failed, and the service has not confirmed the 
 listed: this device will never send it, although another device of the same wallet could still
 complete it until the cancel is confirmed. After a `PartialSendConflictError` with `remainingAmount: '0'`, the
 attempt still sending the rest is an `'open'` row (none for one being cancelled), and that send has no
-`'shortfall'` row while that attempt can still pay; if it is proven not to run instead (its source
-spent elsewhere, or its cancel confirmed), the `'shortfall'` row with the remainder comes
+`'shortfall'` row while that attempt can still pay; if it is proven not to run instead (its cancel
+is confirmed, also after its source was spent elsewhere), the `'shortfall'` row with the remainder comes
 back. With any other `remainingAmount`, the `'shortfall'` row carries it.
 
 ```typescript

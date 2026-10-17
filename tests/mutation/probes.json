@@ -426,8 +426,8 @@
     "name": "send-reports-no-progress",
     "note": "A multi-token send must report each leg as it certifies; without it the UI can only show a spinner (per-leg, not per-wave \u2014 a <=CERTIFY_WIDTH send is one wave).",
     "file": "modules/payments-v2/machine/TransferMachine.ts",
-    "find": "            if (o.certified) {\n              certified.push(o);\n              this.emitProgress(plan, certified);\n            }",
-    "replace": "            if (o.certified) {\n              certified.push(o);\n            }",
+    "find": "            if (o.certified) {\n              w.certified.push(o);\n              this.emitProgress(ctx.transferId, w.certified);\n            }",
+    "replace": "            if (o.certified) {\n              w.certified.push(o);\n            }",
     "tests": [
       "tests/unit/payments-v2/facade.test.ts"
     ]
@@ -3226,12 +3226,13 @@
   },
   {
     "name": "resume-conflict-forgets-owed",
-    "note": "#835: a held attempt that conflicts on resume hands what it owed back to the shortfall store before its entry goes (send-intent-unknown.test.ts '(x-conflict)...')",
+    "note": "#835/#846: a held attempt that conflicts on resume keeps what it owed on its tombstone, so the confirmed cancel hands it back to the shortfall store before its entry goes (send-intent-unknown.test.ts '(x-conflict)...', resume-conflict-cancel.test.ts 'the abort is confirmed but the entry removal fails...')",
     "file": "modules/payments-v2/machine/resume.ts",
-    "find": "      await releaseOwed(stores, await stores.backstop.getByKey(transferId)); // #835: its remainder is owed again\n",
-    "replace": "      // mutant: what it owed is not handed back\n",
+    "find": "    entry = await stores.backstop.patch(transferId, (e) => ({ ...e, disposition: 'abortPending' }));",
+    "replace": "    entry = await stores.backstop.patch(transferId, (e) => ({ ...e, owes: undefined, disposition: 'abortPending' }));",
     "tests": [
-      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+      "tests/unit/payments-v2/send-intent-unknown.test.ts",
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
     ]
   },
   {
@@ -4530,6 +4531,297 @@
     "replace": "=> rest);",
     "tests": [
       "tests/unit/payments-v2/resume-unplannable.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-plain-abort",
+    "note": "#846: a pure conflict on resume counts its cancel only once the aborted listing shows the row; an abort of a row another device completed is a no-op 204, so a bare 2xx would report a paid send conflicted and make its request payable again (resume-conflict-cancel.test.ts '...completed on another device...', '...completed before the abort landed...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  const outcome = await abortAndConfirm(deps.intents, transferId, (err) => noteWait(report, err));",
+    "replace": "  const outcome = await deps.intents.abort(transferId).then(() => 'aborted' as const, () => 'unknown' as const);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-no-tombstone",
+    "note": "#846: the tombstone is written before the abort; without it a failed removal leaves an 'open' entry that an epoch re-seed re-PUTs, re-opening the aborted row, and a failed write still aborts (resume-conflict-cancel.test.ts '...the entry removal fails...', 'the tombstone cannot be written...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    entry = await stores.backstop.patch(transferId, (e) => ({ ...e, disposition: 'abortPending' }));",
+    "replace": "    entry = await stores.backstop.getByKey(transferId);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-aborts-untombstoned",
+    "note": "#846: a tombstone write that fails stops the cancel there: no abort runs, and the next pass re-judges the intent (resume-conflict-cancel.test.ts 'the tombstone cannot be written...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    noteFailed(report, transferId, err); // no tombstone, so no abort: the next pass re-judges it\n    return;\n",
+    "replace": "    noteFailed(report, transferId, err); // no tombstone, so no abort: the next pass re-judges it\n",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-unknown-conflicted",
+    "note": "#846: an unconfirmed abort leaves a row another device could run, so a pure conflict on resume whose abort fails is reported failed and its link stays settling (resume-conflict-cancel.test.ts 'the abort fails...', 'another device wrote it...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (outcome === 'unknown') report.failed.push(transferId); // the tombstone paths confirm it later",
+    "replace": "  if (outcome === 'unknown') report.conflicted.push(transferId);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-foreign-completed-conflicted",
+    "note": "#846: with no local entry (another device's intent) a row completed before the abort landed is paid, never conflicted (resume-conflict-cancel.test.ts 'its row was completed before the abort landed...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  } else if (outcome !== 'completed') report.conflicted.push(transferId); // no local entry: another device's intent",
+    "replace": "  } else report.conflicted.push(transferId);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-retire-completed-as-aborted",
+    "note": "#846: with a local entry, a row another device completed before the abort landed (a no-op 204) is paid: its holds settle and it is never reported conflicted, so a linked request never turns payable again (resume-conflict-cancel.test.ts 'the row was completed on another device before the abort landed...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "    await retire(stores, entry, outcome, report).catch(",
+    "replace": "    await retire(stores, entry, outcome === 'completed' ? 'aborted' : outcome, report).catch(",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-retire-completed-refused",
+    "note": "#846: retire treats a completed row as paid, never refused: refusing it releases what it held (owed again) and reports it conflicted, a double pay (resume-conflict-cancel.test.ts, machine-resume.test.ts tombstone cases)",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  const refused = outcome !== 'completed';",
+    "replace": "  const refused = true;",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-retire-failure-unreported",
+    "note": "#846: a confirmed cancel whose cleanup throws is reported failed, so the pass does not read it as settled (resume-conflict-cancel.test.ts '...the entry removal fails...', machine-resume.test.ts 'a holder whose conflict cleanup could not remove its entry...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": ".catch((err: unknown) => noteFailed(report, transferId, err));",
+    "replace": ".catch(() => undefined);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts",
+      "tests/unit/payments-v2/machine-resume.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-drops-retry-after",
+    "note": "#846: a 429/503 Retry-After on the resume-conflict abort or its listing reaches the pass report, so the heartbeat waits it out instead of retrying every beat (resume-conflict-cancel.test.ts 'the abort answers 429 with Retry-After...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  const outcome = await abortAndConfirm(deps.intents, transferId, (err) => noteWait(report, err));",
+    "replace": "  const outcome = await abortAndConfirm(deps.intents, transferId, () => undefined);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-never-stored-failed",
+    "note": "#846: a typed 404 NOT_FOUND confirms the cancel of a pure conflict on resume: conflicted, its rows owed again, its tombstone kept for the reconcile (resume-conflict-cancel.test.ts 'the abort answers 404 NOT_FOUND...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  if (outcome === 'unknown') report.failed.push(transferId); // the tombstone paths confirm it later",
+    "replace": "  if (outcome === 'unknown' || outcome === 'never-stored') report.failed.push(transferId);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "resume-conflict-foreign-never-stored-unreported",
+    "note": "#846: with no local entry a typed 404 NOT_FOUND still confirms the cancel, so it is reported conflicted, never left unaccounted (resume-conflict-cancel.test.ts 'its abort answers 404 NOT_FOUND...')",
+    "file": "modules/payments-v2/machine/resume.ts",
+    "find": "  } else if (outcome !== 'completed') report.conflicted.push(transferId); // no local entry: another device's intent",
+    "replace": "  } else if (outcome === 'aborted') report.conflicted.push(transferId);",
+    "tests": [
+      "tests/unit/payments-v2/resume-conflict-cancel.test.ts"
+    ]
+  },
+  {
+    "name": "converge-recertifies-settled",
+    "note": "#844: the in-process converge reuses what run() settled; re-certifying it resubmits legs already on chain and lets a gateway blip fail a settled partial (machine-converge.test.ts M1/M2, facade-converge.test.ts F1-F4)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    const reused = prior.outcomes.filter(isSettledOutcome);",
+    "replace": "    const reused: OpOutcome[] = [];",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts",
+      "tests/unit/payments-v2/facade-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-reuses-unjournaled-leg",
+    "note": "#844: a certified leg whose journal write failed is never reused: it re-certifies and is journaled before any deposit (machine-converge.test.ts M6)",
+    "file": "modules/payments-v2/machine/outcomes.ts",
+    "find": "  return o.certified ? o.error === undefined : classifyError(o.error) === 'conflict';",
+    "replace": "  return o.certified || classifyError(o.error) === 'conflict';",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-recertifies-conflict",
+    "note": "#844 (B): a proven TRANSACTION_HASH_MISMATCH is permanent, so the converge reuses it rather than resubmitting the conflicted leg (machine-converge.test.ts M1/M8, facade-converge.test.ts F1/F6, send-intent-unknown.test.ts (x))",
+    "file": "modules/payments-v2/machine/outcomes.ts",
+    "find": "  return o.certified ? o.error === undefined : classifyError(o.error) === 'conflict';",
+    "replace": "  return o.certified ? o.error === undefined : false;",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts",
+      "tests/unit/payments-v2/facade-converge.test.ts",
+      "tests/unit/payments-v2/send-intent-unknown.test.ts"
+    ]
+  },
+  {
+    "name": "converge-redelivers-settled",
+    "note": "#844 D1: the converge deposits only legs it certified; re-depositing run()'s legs ignores a 429 deferral and counts the poison budget twice (machine-converge.test.ts M1/M4/M4b, heartbeat.test.ts 'a partial send whose delivered leg still owes its deposit')",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    const fresh = committed.filter((o) => !reused.includes(o));",
+    "replace": "    const fresh = committed;",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts",
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "converge-drops-run-delivery-pending",
+    "note": "#844 D1: a deposit run() still owes stays journaled, so the converge must report deliveryPending, or the send reads 'landed' and the heartbeat is never armed (machine-converge.test.ts M4, heartbeat.test.ts)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    const deliveryPending = await this.deliverSettled(r, committed, reused, prior?.deliveryPending === true);",
+    "replace": "    const deliveryPending = await this.deliverSettled(r, committed, reused, false);",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts",
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "run-record-misses-delivery",
+    "note": "#844: the run record carries run()'s deposit outcome; left at its conservative 'pending', a converge whose journal read fails reports a landed deposit as still owed (machine-converge.test.ts M9c)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      deliveryPending = record.deliveryPending = await this.deliverSet(",
+    "replace": "      deliveryPending = await this.deliverSet(",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts",
+      "tests/unit/payments-v2/facade-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-without-run-record",
+    "note": "#844: the converge runs only from a record of this process's run(); without one it must not certify anything (machine-converge.test.ts M5)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    const record = this.runs.get(plan);\n    if (record === undefined) throw unconverged(plan.transferId);",
+    "replace": "    const record = this.runs.get(plan) ?? { outcomes: [], deliveryPending: false };",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts"
+    ]
+  },
+  {
+    "name": "facade-converge-ignores-run",
+    "note": "#844: the facade converges from the machine's run record, never by rebuilding the attempt from the KV, which re-certifies and re-deposits settled legs (facade-converge.test.ts F1-F3)",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "      const outcome = await this.machine.convergeRun(ctx.plan);",
+    "replace": "      const outcome = await this.machine.resumeIntent({ transferId: ctx.transferId, payload: ctx.plan.payload, sources: ctx.plan.sources, journaled: await this.machineStores.deliveryJournal.byTransfer(ctx.transferId) });",
+    "tests": [
+      "tests/unit/payments-v2/facade-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-skips-fresh-record",
+    "note": "#844: a leg the converge certified joins the run record, so a failing converge still names it as certified (machine-converge.test.ts M3)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    this.remember(prior, fresh);",
+    "replace": "    this.remember(prior, []);",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-trusts-stale-pending",
+    "note": "#844: the journal replay is not ActiveOps-gated and may land run()'s owed deposit mid-converge; the converge re-reads the journal before reporting it pending (machine-converge.test.ts M9)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    if (priorPending && !pending) pending = await this.stillOwed(r.transferId, reused);",
+    "replace": "    if (priorPending && !pending) pending = true;",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-unreadable-journal-clears-pending",
+    "note": "#844: an unreadable journal keeps run()'s 'pending' answer; reading it as settled reports a deposit landed that may still be owed (machine-converge.test.ts M9b)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      return true; // unreadable: keep run()'s answer",
+    "replace": "      return false;",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-progress-drops-run-legs",
+    "note": "#844: progress from the converge's fresh legs lists every leg certified so far, run()'s included, so the UI never steps back (machine-converge.test.ts M2b, facade-converge.test.ts F5)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      certified: reused.filter((o) => o.certified),",
+    "replace": "      certified: [],",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts",
+      "tests/unit/payments-v2/facade-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-wave-halts-on-conflict",
+    "note": "#844: a conflict in a converge wave never stops the next wave; the unreached legs would be neither delivered nor counted in the shortfall (machine-converge.test.ts M8)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      haltOn: (o) => o.error !== undefined && classifyError(o.error) !== 'conflict',",
+    "replace": "      haltOn: (o) => o.error !== undefined && !o.certified,",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts"
+    ]
+  },
+  {
+    "name": "certify-waves-width-one",
+    "note": "#844: the legs run() never reached certify in run()'s CERTIFY_WIDTH waves, not one at a time on the send's critical path (machine-converge.test.ts M2b, facade-converge.test.ts F5)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    for (let at = 0; at < w.ops.length; at += CERTIFY_WIDTH) {\n      const batch = w.ops.slice(at, at + CERTIFY_WIDTH);",
+    "replace": "    for (let at = 0; at < w.ops.length; at += 1) {\n      const batch = w.ops.slice(at, at + 1);",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts",
+      "tests/unit/payments-v2/facade-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-wave-never-halts",
+    "note": "#844: a non-conflict failure in a fresh wave of the converge stops it between waves; going on would certify later legs on chain for an intent that stays open (machine-converge.test.ts M10)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "      haltOn: (o) => o.error !== undefined && classifyError(o.error) !== 'conflict',",
+    "replace": "      haltOn: () => false,",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-fresh-owed-overwritten",
+    "note": "#844: the stale-pending re-read judges only run()'s reused legs, so it must never clear a pending answer a fresh leg's failed deposit gave (machine-converge.test.ts M9d)",
+    "file": "modules/payments-v2/machine/TransferMachine.ts",
+    "find": "    if (priorPending && !pending) pending = await this.stillOwed(r.transferId, reused);",
+    "replace": "    if (priorPending) pending = await this.stillOwed(r.transferId, reused);",
+    "tests": [
+      "tests/unit/payments-v2/machine-converge.test.ts"
+    ]
+  },
+  {
+    "name": "converge-partial-skips-demote",
+    "note": "#844: after a converged partial the facade demotes every conflicted source, reused or fresh, from the proven conflict alone; the facade's isSpent sweep cannot stand in for it (facade-converge.test.ts F6b)",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "      if (state !== undefined) this.trackTail(this.view.demote(tokenId, state.protocol));",
+    "replace": "      if (state !== undefined) void state;",
+    "tests": [
+      "tests/unit/payments-v2/facade-converge.test.ts"
     ]
   }
 ]
