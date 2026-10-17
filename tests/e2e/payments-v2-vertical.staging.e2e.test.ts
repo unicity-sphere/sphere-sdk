@@ -20,6 +20,9 @@
  * It injects faults on PUT /v1/intents only, over the REAL authed client. The
  * #842 block after it (`-t '#842'`, its own wallets too) injects them on
  * POST /v1/intents/:id/complete and POST /v1/inventory/apply.
+ * The #839 block at the end has its own wallets too (`-t '#839'`). AFTER the real
+ * gateway certified the spend it fails every realization of that token, in process,
+ * until it is disarmed just before resumeNow().
  *
  * Gated on STAGING_AGGREGATOR_KEY. Run:
  *   set -a && source .env && set +a && npx vitest run --config vitest.e2e.config.ts \
@@ -27,14 +30,17 @@
  */
 import { randomUUID } from 'node:crypto';
 
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { isPossiblyCommittedSendOutcome, SphereError } from '../../core/errors';
 import { WalletApiV2Client, type HistoryRecordWire } from '../../impl/wallet-api-v2/client';
 import { createWalletApiHttp, WalletApiHttpError } from '../../impl/wallet-api-v2/http';
+import { WalletApiStoragePort } from '../../impl/wallet-api-v2/storage';
 import type { DeliveryPort, StoragePort } from '../../modules/payments-v2/ports';
 import { createMachineStores } from '../../modules/payments-v2/machine/journal';
 import { INTENT_UNCONFIRMED_MESSAGE } from '../../modules/payments-v2/send-errors';
+import { HexConverter, Token } from '../../token-engine/sdk';
+import type { SphereToken } from '../../token-engine/types';
 import type { TransferResult } from '../../types';
 import { BASE_URL, HARNESS_COIN, randomIdentity } from './support/staging';
 import { memoryKV, RUN_STAGING as RUN } from './support/staging';
@@ -983,4 +989,122 @@ describe.runIf(RUN)('LIVE staging: #842 SENT history beside the apply (real clie
     expect(await h.api.postHistory([{ ...record, id: randomUUID() }])).toEqual({ inserted: 0, deduped: 1 });
     expect(await sentRecords(h, transferId)).toHaveLength(1);
   }, 3_000_000);
+});
+
+// ── #839: a failure after the gateway certified the spend ────────────────────
+// The real engine's proof wait match-verifies the gateway's proof; only then does
+// Token.transfer run. Failing it for G's token only (other wallets in this process
+// keep running) leaves a spend that IS on chain and was never realized. The fault
+// stays armed until the keep-open checks are done, so the heartbeat the keep-open
+// arms (5 s) cannot realize the spend while they run; resumeNow() comes after.
+
+/** Records every abort the facade sends, then passes it through to the real client. */
+function abortRecorder(): { calls: string[]; wrap: (inner: AuthedClient) => AuthedClient } {
+  const calls: string[] = [];
+  return {
+    calls,
+    wrap: (inner) => ({
+      ...inner,
+      abortIntent: async (transferId) => {
+        calls.push(transferId);
+        await inner.abortIntent(transferId);
+      },
+    }),
+  };
+}
+
+/** The source as the server still holds it (its row is reserved, not yet applied). */
+async function heldSource(w: VWallet, tokenId: string): Promise<SphereToken> {
+  const bytes = must((await new WalletApiStoragePort(w.api).getBlobs([tokenId])).get(tokenId), 'source blob');
+  return w.engine.decodeToken({ tokenId, token: bytes });
+}
+
+/** Token.transfer rejects on a token whose genesis id is `tokenId`, until `disarm()`. */
+function failRealization(tokenId: string): { fired: () => boolean; disarm: () => void } {
+  const original = Token.prototype.transfer;
+  let fired = 0;
+  const spy = vi.spyOn(Token.prototype, 'transfer').mockImplementation(function (this: Token, ...args) {
+    if (HexConverter.encode(this.id.bytes) === tokenId) {
+      fired++;
+      return Promise.reject(new Error('synthetic realization failure after the proof (#839)'));
+    }
+    return original.apply(this, args);
+  });
+  return { fired: () => fired > 0, disarm: () => spy.mockRestore() };
+}
+
+describe.runIf(RUN)('LIVE staging: #839 realization fails after the proof (real gateway, in-process fault)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('possibly-committed, no abort reaches wallet-api, the row stays open; resumeNow delivers exactly once', async () => {
+    const aborts = abortRecorder();
+    let g = await makeVerticalWallet('g839', { wrapClient: aborts.wrap });
+    const h = await makeVerticalWallet('h839');
+    const minted = await mintConverged(g, 100n, 'mint G 100', { wrapClient: aborts.wrap });
+    g = minted.wallet;
+    const tokenG = minted.tokenId;
+    await waitFor(g, () => localTotal(g) === 100n, 60_000, 'G local view shows the 100 mint');
+
+    const firstEvent = g.events.length;
+    const fault = failRealization(tokenG);
+    const outcome = await g.facade
+      .send({ recipient: h.identity.chainPubkey, amount: '100', coinId: HARNESS_COIN })
+      .then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error })
+      );
+
+    expect(fault.fired(), 'the realization ran, so the gateway certified the spend first').toBe(true);
+    expect('error' in outcome, 'an unrealized certified spend never resolves the send').toBe(true);
+    const err = (outcome as { error: unknown }).error as SphereError;
+    expect(err).toBeInstanceOf(SphereError);
+    expect(err.code).toBe('CERTIFICATION_UNCONFIRMED');
+    expect(isPossiblyCommittedSendOutcome(err)).toBe(true);
+    const transferId = must(err.transferId, 'keep-open transferId');
+    expect(g.facade.tokens().find((t) => t.id === tokenG)?.status, 'the source stays reserved').toBe('transferring');
+    expect(await g.engine.isSpent(await heldSource(g, tokenG)), 'the spend is on chain').toBe(true);
+
+    // Never cancelled: no abort left this client, the row is open on the server, nothing failed.
+    expect(aborts.calls, 'no abort reached wallet-api').toEqual([]);
+    expect(await openIntentIds(g)).toContain(transferId);
+    expect((await g.api.listIntents('aborted')).map((i) => i.transferId)).not.toContain(transferId);
+    expect(failedUpdates(g, transferId, firstEvent)).toEqual([]);
+    expect(g.facade.tokens().find((t) => t.id === tokenG)?.status, 'still reserved after the checks').toBe('transferring');
+    fault.disarm();
+
+    // The retry verb, never send(): the same transferId re-proves the certified spend and realizes it.
+    await g.facade.resumeNow();
+    let lastResume = Date.now();
+    await drainUntil(
+      h,
+      async () => {
+        if (Date.now() - lastResume >= PACE_MS) {
+          lastResume = Date.now();
+          await g.facade.resumeNow();
+        }
+        return localTotal(h) === 100n && (await serverTotal(h)) === 100n;
+      },
+      SEND_CONVERGE_MS,
+      'H paid by the resumed certified spend'
+    );
+
+    expect(aborts.calls).toEqual([]);
+    expect((await activeRows(h)).map((r) => r.tokenId)).toEqual([tokenG]);
+    expect(await receivedLegs(h, tokenG)).toHaveLength(1);
+    await waitFor(g, async () => (await serverTotal(g)) === 0n && localTotal(g) === 0n, 60_000, 'G drained to 0');
+    await waitFor(g, async () => (await sentRecords(g, transferId)).length > 0, 30_000, 'G SENT history record');
+    expect(await sentRecords(g, transferId)).toHaveLength(1);
+    await waitFor(g, async () => (await openIntentIds(g)).length === 0, 60_000, 'G open intents empty');
+    await waitFor(g, async () => (await g.facade.pendingTransfers()).length === 0, 60_000, 'G nothing pending');
+    expect(failedUpdates(g, transferId, firstEvent)).toEqual([]);
+
+    // No double delivery: a further 10 s drain window changes NOTHING for H.
+    await sleep(10_000);
+    await h.facade.receive().catch(() => undefined);
+    expect(localTotal(h)).toBe(100n);
+    expect(await serverTotal(h)).toBe(100n);
+    expect(await receivedLegs(h, tokenG)).toHaveLength(1);
+  }, 1_500_000);
 });
