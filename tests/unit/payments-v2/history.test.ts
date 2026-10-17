@@ -400,7 +400,7 @@ describe('History — every type accepts an empty asset list (#780)', () => {
 });
 
 describe('History — a permanent reject is distinguishable from a transient failure (#780)', () => {
-  const reject422 = Object.assign(new Error('unprocessable'), { status: 422 });
+  const reject422 = Object.assign(new Error('unprocessable'), { status: 422, code: 'VALIDATION_FAILED' });
 
   it('names a 422 as refused rather than retry-safe: no retry can fix a shape the server rejects', async () => {
     const h = makeHarness();
@@ -444,10 +444,23 @@ describe('#842 recordSent answers whether a retry may still record it (the SENT 
     expect(await h.serverRecords()).toHaveLength(1);
   });
 
-  it('a refused shape is final too: true, since no retry can fix it', async () => {
-    const h = makeHarness();
-    h.setPostError(Object.assign(new Error('unprocessable'), { status: 422 }));
-    await expect(h.history.recordSent(sent)).resolves.toBe(true);
+  it("a refused shape is final too: true for wallet-api's typed 422 and for a 413 from any hop", async () => {
+    for (const err of [
+      Object.assign(new Error('unprocessable'), { status: 422, code: 'VALIDATION_FAILED' }),
+      Object.assign(new Error('too large'), { status: 413, code: 'HTTP_413' }),
+    ]) {
+      const h = makeHarness();
+      h.setPostError(err);
+      await expect(h.history.recordSent(sent), err.message).resolves.toBe(true);
+    }
+  });
+
+  it('a 4xx a later session or route may answer is kept: 401, 403, 404, and an untyped HTTP_422', async () => {
+    for (const [status, code] of [[401, 'UNAUTHORIZED'], [403, 'FORBIDDEN'], [404, 'NOT_FOUND'], [422, 'HTTP_422']] as const) {
+      const h = makeHarness();
+      h.setPostError(Object.assign(new Error(code), { status, code }));
+      await expect(h.history.recordSent(sent), code).resolves.toBe(false);
+    }
   });
 
   it('a transient failure (503, 408, 429, or no status) is not: false', async () => {

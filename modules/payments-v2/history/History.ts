@@ -94,14 +94,13 @@ function wireAssets(
 }
 
 /**
- * A 4xx other than 408/429 is the server refusing this record's SHAPE — permanent,
- * so no retry can fix it. Duck-typed on `status` so the module keeps no dependency
- * on a transport implementation.
+ * #842: final only when no retry can change it — a 413 (the body itself, from any hop) or a 422 in
+ * wallet-api's own envelope. A 401/403/404, or an untyped `HTTP_422` a hop wrote, may pass later.
  */
 function isPermanentReject(err: unknown): boolean {
-  const status = (err as { status?: unknown } | null)?.status;
-  if (typeof status !== 'number') return false;
-  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+  const { status, code } = (err ?? {}) as { status?: unknown; code?: unknown };
+  if (status === 413) return true;
+  return status === 422 && typeof code === 'string' && !code.startsWith('HTTP_');
 }
 
 const WIRE_TOKEN_ID = /^(?:[0-9a-f]{2}){1,64}$/;

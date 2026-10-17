@@ -34,18 +34,19 @@ What changed:
   reported at once, with its `Retry-After`. The recorded amount is still what settled, never the
   plan.
 - The SENT outbox (`STORE_KEYS.sentOutbox`, `sent-outbox` in the per-address scoped KV) is new
-  durable client state. A record leaves it once its POST is recorded, or refused with a permanent
-  4xx; a transient failure, or a POST the process never finished, keeps it, and every convergence
-  pass re-posts it. The re-post runs beside the pass, and a record has one POST under way at a
-  time, whether the send, a resume or a re-post issued it, so a history endpoint that never answers
-  holds no convergence and a resumed send is posted once. A record
-  kept by a send wakes an idle heartbeat, and every attempt, a later resume's included, carries the
-  time the record was FIRST kept, so a send recovered hours later still lands in history at its own
-  time. A stopped facade makes no outbox write: a POST answered after `stop()` leaves its record
-  for the next facade on that address to re-post, and `stop()` never waits on the history
-  endpoint. A kept record is not a pending transfer:
-  `pendingTransfers()`, source reservations and payment-request links ignore it. An older client
-  ignores the key, so after a downgrade a kept record is not re-posted.
+  durable client state. A record leaves it once its POST is recorded, or refused for good (a 422 in
+  wallet-api's typed envelope, or a 413 from any hop); a 401, 403 or 404 keeps it, since a later
+  session or route may accept it, and so does a transient failure or a POST the process never
+  finished. Every convergence pass re-posts what it keeps. The re-post runs beside the pass, and a
+  record has one POST under way at a time, whether the send, a resume or a re-post issued it, so a
+  history endpoint that never answers holds no convergence and a resumed send is posted once. A
+  record kept by a send wakes an idle heartbeat, and every attempt, a later resume's included,
+  carries the time the record was FIRST kept, so a send recovered hours later still lands in history
+  at its own time. A stopped facade makes no outbox write: a POST answered after `stop()` leaves its
+  record for the next facade on that address to re-post, and `stop()` never waits on the history
+  endpoint. A kept record is not a pending transfer: `pendingTransfers()`, source reservations and
+  payment-request links ignore it. An older client ignores the key, so after a downgrade a kept
+  record is not re-posted.
 - A failed resume close still reports the intent failed and carries its `Retry-After`. A history
   failure, a history hook that throws, or a recipient blob the history read cannot decode still
   never fails a send or a resume.

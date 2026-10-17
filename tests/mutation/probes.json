@@ -1369,9 +1369,9 @@
   },
   {
     "name": "history-permanent-reject-logged-as-retry-safe",
-    "note": "#780: a 4xx is a permanent shape refusal that no retry can fix. Logging it as retry-safe is exactly what let a coinless receipt vanish silently.",
+    "note": "#780: wallet-api's typed 422 is a permanent shape refusal that no retry can fix. Logging it as retry-safe is exactly what let a coinless receipt vanish silently.",
     "file": "modules/payments-v2/history/History.ts",
-    "find": "  return status >= 400 && status < 500 && status !== 408 && status !== 429;",
+    "find": "  return status === 422 && typeof code === 'string' && !code.startsWith('HTTP_');",
     "replace": "  return false;",
     "tests": [
       "tests/unit/payments-v2/history.test.ts"
@@ -1381,8 +1381,8 @@
     "name": "history-treats-429-as-permanent",
     "note": "#780: 408/429 are transient. Calling them permanent would tell an operator a retryable failure is unfixable.",
     "file": "modules/payments-v2/history/History.ts",
-    "find": "  return status >= 400 && status < 500 && status !== 408 && status !== 429;",
-    "replace": "  return status >= 400 && status < 500;",
+    "find": "  if (status === 413) return true;\n",
+    "replace": "  if (status === 413 || status === 429 || status === 408) return true;\n",
     "tests": [
       "tests/unit/payments-v2/history.test.ts"
     ]
@@ -3972,6 +3972,36 @@
     "replace": "    void 0;\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "history-recoverable-4xx-final",
+    "note": "#842: a 401/403/404 the history POST gets may pass on a later session or route; read as final, the SENT outbox drops the record and the row is lost (history.test.ts '#842 ... a 4xx a later session or route may answer is kept')",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "  return status === 422 && typeof code === 'string' && !code.startsWith('HTTP_');",
+    "replace": "  return typeof status === 'number' && status >= 400 && status < 500 && status !== 408 && status !== 429;",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "history-untyped-422-final",
+    "note": "#842: only wallet-api's own typed 422 refuses the shape; an untyped HTTP_422 came from a hop (history.test.ts, the HTTP_422 case)",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "  return status === 422 && typeof code === 'string' && !code.startsWith('HTTP_');",
+    "replace": "  return status === 422;",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts"
+    ]
+  },
+  {
+    "name": "history-413-retried",
+    "note": "#842: a 413 is a verdict on the body itself, from any hop: retried, the outbox re-posts it forever (history.test.ts, the 413 case)",
+    "file": "modules/payments-v2/history/History.ts",
+    "find": "  if (status === 413) return true;\n",
+    "replace": "  void 0;\n",
+    "tests": [
+      "tests/unit/payments-v2/history.test.ts"
     ]
   }
 ]
