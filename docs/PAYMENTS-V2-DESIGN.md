@@ -581,6 +581,43 @@ Normative behaviors bound into the transitions (not call sites):
     *final* `PartialSendConflictError` with its durable remainder. It is not re-planned in-process,
     since re-planning while a split row is still open could resurrect the consumed shortfall;
     resume closes it, idempotently.
+- **Resume plans and reads each intent on its own (#840).** One open intent never stops a pass
+  resuming the others. A payload this client cannot plan is refused before any of its legs runs:
+  an unknown `kind`, a split amount (`splitAmount`, `remainderAmount`) that is not a canonical
+  positive decimal below 2^256 (no sign, no leading zero, a JSON string), or a coin intent's
+  `coinId` that is not lowercase even-length hex, with or without a split (a conflicted direct leg
+  is costed by an exact match on it, so another form would read 0 and complete the send paid), or a
+  coin intent that names no leg (no direct leg and no split: it would run nothing and complete
+  paid; the selector never plans one). Each source a coin intent still has to spend must carry its
+  coin by its blob, read before any leg runs: a conflicted leg is costed by its balance of that coin,
+  so a source without it would read 0 too, and a split of it fails after the direct legs spent.
+  `amount` stays type-checked only: the send path accepts
+  leading zeros and writes it verbatim, and resume never parses it. A refused intent is reported
+  `failed` and left open, so a linked request stays `settling`. It is never executed, aborted or
+  completed, its sources are not touched, and it is kept apart from leg failures so that no
+  attempt budget can ever count, settle or write it off: this device ran none of its legs and
+  cannot know what its writer certified. It is logged once per facade. The batched source read
+  stays one request, but wallet-api refuses a whole `blob-urls` batch over one malformed (400) or
+  unowned (403) id, and one failed download rejects the read. On such a refusal resume reads
+  each intent's sources again on its own, so only the intent that named the bad id fails closed;
+  the refusal's `Retry-After` reaches the heartbeat, a refusal that carries one is not re-read
+  per intent, and the per-intent re-reads stop at the first answer that carries one. A pass that throws after the backstop read
+  still returns what it already decided, and every intent it had not judged yet is reported
+  `failed`, so the reconcile treats it as open and never as unaccounted (which would resolve a
+  link paid). A cancel answered `404 NOT_FOUND` is in no listing, so its tombstone is the only
+  durable copy of its `conflicted` verdict. A reconcile can resolve without applying it (a
+  settling journal that failed open to empty, a cleared link whose write failed), so the converger
+  removes the tombstone only after the reconcile resolves and no settling link names it, in memory
+  or on disk, and never while a settling-link write (a new or updated link) is still queued or
+  running (that write may be a link to it; a removal in flight needs no wait, since memory keeps
+  the link until the removal is on disk); until then every pass reports it `conflicted` again. Only the first of those
+  reports counts as heartbeat progress, so a tombstone kept for good (an unreadable settling
+  journal) is retried at the backoff cap, not every 5 s; each session counts it as progress once. The settling journal drops a
+  link from memory only after its removal is on disk, so the next pass re-applies the verdict.
+  A request the server already resolved (paid, declined, expired) is never made payable again by
+  a `conflicted` or aborted verdict, which can still find its link while that link's removal is
+  unwritten: another payer may have paid it. The kept tombstone no longer
+  holds the shortfall rows it handed back, so they are listed and never handed back twice.
 - **Fan-out:** certify at width 20 (`CERTIFY_WIDTH`, widened from 8 by #746), fail-fast
   **between** batches (in-flight siblings always settle); the burn certifies + checkpoints before
   any mint; mint legs parallel (width 8).
@@ -914,7 +951,9 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
   per-intent-serial. Pinned by a startup request-count test.
 - **In-session convergence heartbeat:** between `start()` and `stop()`, while open intents exist
   or the delivery/mint journals are non-empty, the facade re-runs the SAME single-flighted resume
-  pass on an exponential backoff — seed 5 s, ×2, cap 120 s; reset on progress (any leg converging)
+  pass on an exponential backoff — seed 5 s, ×2, cap 120 s; reset on progress (any leg converging,
+  but not a kept 404 tombstone already reported `conflicted` while that tombstone is still kept,
+  even across a pass whose abort failed, #840)
   and on `connection:status` recovery; a surfaced wallet-api `Retry-After` floors the next pass;
   the pass never adopts an intent whose machine is still running in-process (facade ownership).
   State is an in-memory timer handle + backoff value only — the pending set is re-read from the
@@ -930,8 +969,10 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      is never touched. That closes the race in which the GC dropped the `abortPending` tombstone
      an active attempt had just written. It removes a tombstone only after the server answers its
      abort `204` and the aborted listing shows the row (conflicted), or neither it nor the open
-     listing does (completed elsewhere: paid), or 404 `NOT_FOUND` (conflicted), handing back or
-     settling any shortfall rows the tombstone holds to match, and it skips held entries. Every removal is compare-and-delete
+     listing does (completed elsewhere: paid), handing back or settling any shortfall rows the
+     tombstone holds to match, and it skips held entries. A 404 `NOT_FOUND` (the server never
+     stored the row) is reported conflicted and its rows handed back, but the tombstone is kept,
+     without them, for step 5: no listing will ever show that row. Every removal is compare-and-delete
      against the exact snapshot it judged (`ListStore.removeIfUnchanged`, serialized with every
      other read-modify-write of the store), so a park or a fence that lands meanwhile is never
      lost to a stale read. An `'open'` entry whose row is no longer open completed or was aborted
@@ -948,13 +989,21 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      the pass report (`ResumeReport.retryAfterMs`, the longest seen), and `convergeOnce` keeps the
      longest across the pass and the journal replays, so the heartbeat never retries a
      rate-limited held send, resume or replay before the server asked.
-  4. Gate, decode and resume, unchanged.
+  4. Gate, decode and resume. Since #840 each intent is planned on its own: a payload this client
+     cannot plan is refused (reported `failed`, left open, kept out of any attempt budget), a
+     refused batched source read is re-read per intent unless it carried a `Retry-After` (the
+     re-reads stop at the first answer that carries one), and
+     steps 2-4 run inside one boundary that reports every id not judged yet `failed`. The
+     §5.5 #840 bullet has the details.
   5. Reconcile payment links, against the backstop read again after the pass: every transferId
      with a local entry then (held, parked, being cancelled, or an attempt that ended mid-pass) is
      reported open alongside the pass's own failures, because a link written while the pass ran is
      in none of its sets and would otherwise reach the unaccounted branch, which resolves it paid.
      If that read fails, the pass skips only the reconcile: it still reports its progress and
-     refreshes the view.
+     refreshes the view. After the reconcile resolves, the converger compare-and-deletes each
+     tombstone kept for a 404 (by the step-3 GC or the step-4 #676 gate), but only once no
+     settling link names its transferId, in memory or in a fresh read of the journal, and no
+     settling-link write (a new or updated link) is queued or running (#840).
 
   Activity is judged once per pass: the pass watches the facade's active-op registry
   (`ActiveOps`), so an id in process at any moment of the pass — already running when the pass

@@ -16,21 +16,28 @@
  * and let start() replay journals / resume the SAME transferId, paced under a
  * generous deadline. Money assertions stay exact — exactly-once, conservation.
  *
- * The #835 block at the end has its own wallets, so `-t '#835'` runs it alone.
+ * The #835 block has its own wallets, so `-t '#835'` runs it alone.
  * It injects faults on PUT /v1/intents only, over the REAL authed client.
+ * The #840 block at the end has its own wallets too (`-t '#840'`). It PUTs
+ * crafted intents for its wallet through the REAL client and loses one proof
+ * answer in process; every service call stays real.
  *
  * Gated on STAGING_AGGREGATOR_KEY. Run:
  *   set -a && source .env && set +a && npx vitest run --config vitest.e2e.config.ts \
  *     tests/e2e/payments-v2-vertical.staging.e2e.test.ts
  */
+import { randomUUID } from 'node:crypto';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { isPossiblyCommittedSendOutcome, SphereError } from '../../core/errors';
+import { deriveFieldEncryptionKey, encryptField } from '../../core/field-encryption';
 import { WalletApiV2Client } from '../../impl/wallet-api-v2/client';
 import { createWalletApiHttp, WalletApiHttpError } from '../../impl/wallet-api-v2/http';
 import type { DeliveryPort } from '../../modules/payments-v2/ports';
 import { createMachineStores } from '../../modules/payments-v2/machine/journal';
 import { INTENT_UNCONFIRMED_MESSAGE } from '../../modules/payments-v2/send-errors';
+import type { ITokenEngine } from '../../token-engine/engine';
+import { ProofUnconfirmedError } from '../../token-engine/errors';
 import type { TransferResult } from '../../types';
 import { BASE_URL, HARNESS_COIN, randomIdentity } from './support/staging';
 import { memoryKV, RUN_STAGING as RUN } from './support/staging';
@@ -794,4 +801,115 @@ describe.runIf(RUN)('LIVE staging: #835 PUT /v1/intents with an unknown outcome 
     expect(localTotal(f)).toBe(100n);
     expect(await receivedLegs(f, tokenE)).toHaveLength(legsBefore + 1);
   }, 1_500_000);
+});
+
+// ── #840: a crafted foreign intent never stops a genuine one resuming ────────
+// Two intents PUT for G's own wallet, sealed with G's field key, as a buggy or
+// foreign client of the same wallet would write them: X names a split amount
+// BigInt cannot parse, Y names a well-formed token id G does not own (the real
+// wallet-api answers the whole blob-urls batch 403 for it). Beside them, a
+// genuine keep-open send: its only leg certifies, but the proof answer is lost
+// in process, so its resume must read its source again.
+
+/** The facade's engine, with the FIRST transfer's proof answer lost after the leg certified. */
+function losesFirstProofAnswer(inner: ITokenEngine): ITokenEngine {
+  let tripped = false;
+  const transfer: ITokenEngine['transfer'] = async (params, options) => {
+    const first = !tripped;
+    tripped = true;
+    const out = await inner.transfer(params, options);
+    if (first) throw new ProofUnconfirmedError('e2e #840: the proof answer was lost after the leg certified');
+    return out;
+  };
+  return new Proxy(inner, {
+    get: (target, prop) => {
+      if (prop === 'transfer') return transfer;
+      const value: unknown = Reflect.get(target, prop, target);
+      return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+}
+
+async function craftIntent(w: VWallet, payload: Record<string, unknown>): Promise<string> {
+  const transferId = randomUUID();
+  const sealed = encryptField(deriveFieldEncryptionKey(w.identity.privateKey), JSON.stringify({ v: 2, kind: 'coin', ...payload }));
+  await w.api.putIntent(transferId, sealed, false);
+  return transferId;
+}
+
+describe.runIf(RUN)('LIVE staging: #840 a crafted open intent beside a genuine keep-open send', () => {
+  it('the genuine send resumes and is delivered exactly once; the crafted intents stay open and untouched', async () => {
+    const lossy = { wrapEngine: losesFirstProofAnswer };
+    const g = await makeVerticalWallet('g840', lossy);
+    const h = await makeVerticalWallet('h840');
+    const minted = await mintConverged(g, 100n, 'mint G 100', lossy);
+    const wallet = minted.wallet;
+    const recipient = h.identity.chainPubkey;
+    const unparseable = await craftIntent(wallet, {
+      recipient,
+      coinId: HARNESS_COIN,
+      amount: '1',
+      direct: [],
+      split: { tokenId: minted.tokenId, splitAmount: 'abc', remainderAmount: '1' },
+    });
+    const unowned = await craftIntent(wallet, { recipient, coinId: HARNESS_COIN, amount: '1', direct: ['ab'.repeat(32)] });
+    const crafted = [unparseable, unowned];
+    expect(await openIntentIds(wallet)).toEqual(expect.arrayContaining(crafted));
+    await waitFor(
+      wallet,
+      () => wallet.facade.tokens().some((t) => t.id === minted.tokenId && t.status === 'confirmed'),
+      60_000,
+      'G holds the 100 spendable'
+    );
+
+    const outcome = await wallet.facade.send({ recipient, amount: '100', coinId: HARNESS_COIN }).then(
+      (result) => ({ result }),
+      (error: unknown) => ({ error })
+    );
+    expect('error' in outcome, 'a lost proof answer never resolves the send').toBe(true);
+    const keptOpen = (outcome as { error: unknown }).error;
+    expect(isPossiblyCommittedSendOutcome(keptOpen)).toBe(true);
+    const transferId = must((keptOpen as SphereError).transferId, 'keep-open transferId');
+    logStep(`#840: keep-open ${transferId} beside crafted ${crafted.join(', ')}`);
+
+    // The retry verb, never send(); resumeNow coalesces onto a pass in flight, so keep asking, paced.
+    await wallet.facade.resumeNow();
+    let lastResume = Date.now();
+    await drainUntil(
+      h,
+      async () => {
+        if (Date.now() - lastResume >= PACE_MS) {
+          lastResume = Date.now();
+          await wallet.facade.resumeNow();
+        }
+        return localTotal(h) === 100n && (await serverTotal(h)) === 100n;
+      },
+      SEND_CONVERGE_MS,
+      'H paid by the genuine send, resumed beside the crafted intents'
+    );
+
+    expect(await receivedLegs(h, minted.tokenId)).toHaveLength(1);
+    await waitFor(wallet, async () => (await serverTotal(wallet)) === 0n, 60_000, 'G drained to 0');
+    await waitFor(
+      wallet,
+      async () => !(await openIntentIds(wallet)).includes(transferId),
+      60_000,
+      'the genuine intent closed'
+    );
+    // Untouched: still open, never aborted, nothing pending locally for them.
+    expect(await openIntentIds(wallet)).toEqual(expect.arrayContaining(crafted));
+    const abortedIds = (await wallet.api.listIntents('aborted')).map((i) => i.transferId);
+    expect(abortedIds.filter((id) => crafted.includes(id))).toEqual([]);
+    await waitFor(wallet, async () => (await wallet.facade.pendingTransfers()).length === 0, 60_000, 'G nothing pending');
+
+    // Another pass changes nothing: H keeps exactly one leg, the crafted intents stay open.
+    await wallet.facade.resumeNow();
+    await sleep(10_000);
+    await h.facade.receive().catch(() => undefined);
+    expect(localTotal(h)).toBe(100n);
+    expect(await receivedLegs(h, minted.tokenId)).toHaveLength(1);
+    expect(await openIntentIds(wallet)).toEqual(expect.arrayContaining(crafted));
+
+    for (const id of crafted) await wallet.api.abortIntent(id); // cleanup: nothing ever ran under them
+  }, 2_400_000);
 });

@@ -109,6 +109,8 @@ export interface MakeOptions {
   wrapDelivery?: (inner: DeliveryPort) => DeliveryPort;
   /** Wraps the FACADE's client only (fault injection, #835); `VWallet.api` stays the real one, for observation. */
   wrapClient?: (inner: AuthedClient) => AuthedClient;
+  /** Wraps the FACADE's engine only (fault injection, #840); `VWallet.engine` stays the real one. */
+  wrapEngine?: (inner: ITokenEngine) => ITokenEngine;
 }
 
 /** The whole vertical, composed for real: session → authed client → ports → engine → facade. */
@@ -151,6 +153,7 @@ export async function makeVerticalWallet(tag: string, options: MakeOptions = {})
     privateKey: hexToBytes(identity.privateKey),
     trustBaseJson: await trustbase(),
   });
+  const facadeEngine = options.wrapEngine ? options.wrapEngine(engine) : engine;
   const events: { event: string; payload: unknown }[] = [];
   const facade = new PaymentsFacade({
     session,
@@ -163,7 +166,7 @@ export async function makeVerticalWallet(tag: string, options: MakeOptions = {})
       fieldKey,
       signProgress: (message) => signMessage(identity.privateKey, message),
     }),
-    engineRef: () => engine,
+    engineRef: () => facadeEngine,
     kv,
     registry,
     emit: (event, payload) => {
