@@ -289,6 +289,27 @@ describe('PaymentsFacade — §7 convergence heartbeat', () => {
     expect(rows[0]!.timestamp, 'the send time, not the re-post time').toBe(sentAt);
   });
 
+  it('#842 a SENT POST answered after stop() deletes nothing, and stop() never waits on it', async () => {
+    const w = makeWorld();
+    await w.seed(1000n);
+    await w.facade.start();
+    await drain();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    w.hooks.postHistory = () => gate;
+    await w.facade.send({ recipient: '@peer', amount: '1000', coinId: COIN });
+    await drain();
+
+    await w.facade.stop(); // returns although the history POST still hangs
+    release();
+    await drain();
+
+    const kept = await createMachineStores(w.kv).sentOutbox.list();
+    expect(kept, 'left for the next facade on this address to re-post').toHaveLength(1);
+  });
+
   it('a partial send applied but not closed arms the heartbeat: its intent closes in-session, no resumeNow', async () => {
     const w = makeWorld();
     await w.seed(600n);

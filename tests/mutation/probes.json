@@ -3717,7 +3717,7 @@
     "name": "sent-outbox-not-kept",
     "note": "#842: the SENT record is kept in the outbox before the apply; without it a POST lost with the process is never re-posted (sent-history.test.ts O1/O2)",
     "file": "modules/payments-v2/machine/settled-history.ts",
-    "find": "    await deps.outbox.upsert(toOutbox(record, await deps.encryptPayload(record.payload), deps.now()));\n",
+    "find": "    await deps.outbox.upsert(toOutbox(record, await deps.encryptPayload(record.payload)));\n",
     "replace": "    void toOutbox;\n",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
@@ -3727,8 +3727,8 @@
     "name": "sent-outbox-cleared-unacknowledged",
     "note": "#842: only a POST answered for good clears the record; a 'try again' keeps it for the next pass (O3)",
     "file": "modules/payments-v2/machine/settled-history.ts",
-    "find": "    if (done) await deps.outbox.removeByKey(record.transferId).catch(() => undefined);",
-    "replace": "    void done;\n    await deps.outbox.removeByKey(record.transferId).catch(() => undefined);",
+    "find": "    if (done) whileLive(deps.whileLive, () => deps.outbox.removeByKey(record.transferId));",
+    "replace": "    if (done || !done) whileLive(deps.whileLive, () => deps.outbox.removeByKey(record.transferId));",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
@@ -3737,8 +3737,8 @@
     "name": "sent-outbox-never-cleared",
     "note": "#842: an acknowledged POST clears its record, or every pass would re-post it (O4)",
     "file": "modules/payments-v2/machine/settled-history.ts",
-    "find": "    if (done) await deps.outbox.removeByKey(record.transferId).catch(() => undefined);",
-    "replace": "    void done;",
+    "find": "    if (done) whileLive(deps.whileLive, () => deps.outbox.removeByKey(record.transferId));",
+    "replace": "    if (done) void whileLive;",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
     ]
@@ -3868,8 +3868,8 @@
     "name": "facade-arm-hook-dropped",
     "note": "#842: the facade hands the machine its heartbeat (heartbeat.test.ts '#842 a send whose SENT POST fails')",
     "file": "modules/payments-v2/PaymentsFacade.ts",
-    "find": "      armHeartbeat: () => this.heartbeat.arm(),\n    });",
-    "replace": "      armHeartbeat: () => undefined,\n    });",
+    "find": "      armHeartbeat: () => this.heartbeat.arm(), whileLive:",
+    "replace": "      armHeartbeat: () => undefined, whileLive:",
     "tests": [
       "tests/unit/payments-v2/heartbeat.test.ts"
     ]
@@ -3888,7 +3888,7 @@
     "name": "sent-time-not-kept",
     "note": "#842: the record is stamped when kept, so every attempt carries one time (sent-history.test.ts O11)",
     "file": "modules/payments-v2/machine/settled-history.ts",
-    "find": "  const record = { ...settled, timestamp: deps.now() }; // the row's time on every attempt, re-posts included",
+    "find": "  const record = { ...settled, timestamp: kept?.createdAt ?? deps.now() };",
     "replace": "  const record = { ...settled, timestamp: undefined as unknown as number };",
     "tests": [
       "tests/unit/payments-v2/sent-history.test.ts"
@@ -3909,7 +3909,47 @@
     "note": "#842: composition forwards the kept time to recordSent; dropped, the server row takes the POST time (heartbeat.test.ts '#842 a send whose SENT POST fails')",
     "file": "modules/payments-v2/compose.ts",
     "find": "        ...(timestamp !== undefined ? { timestamp } : {}),\n",
-    "replace": "",
+    "replace": "        ...{},\n",
+    "tests": [
+      "tests/unit/payments-v2/heartbeat.test.ts"
+    ]
+  },
+  {
+    "name": "sent-time-rekept-fresh",
+    "note": "#842: a record kept again by a later resume keeps its FIRST time; re-stamped, a send recovered hours later lands at recovery time (sent-history.test.ts O13)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "  const record = { ...settled, timestamp: kept?.createdAt ?? deps.now() };",
+    "replace": "  const record = { ...settled, timestamp: deps.now() };",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "keep-removal-unfenced",
+    "note": "#842: the removal after an answered POST runs only while the owner runs; unfenced, a stopped facade's late read-modify-write can overwrite a record the next facade on the same address just kept (sent-history.test.ts O14)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    if (done) whileLive(deps.whileLive, () => deps.outbox.removeByKey(record.transferId));",
+    "replace": "    if (done) void deps.outbox.removeByKey(record.transferId);",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "repost-removal-unfenced",
+    "note": "#842: a re-post's removal is fenced the same way (sent-history.test.ts O14)",
+    "file": "modules/payments-v2/machine/settled-history.ts",
+    "find": "    whileLive(deps.whileLive, () => deps.outbox.removeIfUnchanged(entry.transferId, entry));",
+    "replace": "    void deps.outbox.removeIfUnchanged(entry.transferId, entry);",
+    "tests": [
+      "tests/unit/payments-v2/sent-history.test.ts"
+    ]
+  },
+  {
+    "name": "facade-writes-after-stop",
+    "note": "#842: a stopped facade runs no detached outbox write (heartbeat.test.ts '#842 a SENT POST answered after stop()')",
+    "file": "modules/payments-v2/PaymentsFacade.ts",
+    "find": "whileLive: (write) => this.started && this.trackTail(write()),",
+    "replace": "whileLive: (write) => this.trackTail(write()),",
     "tests": [
       "tests/unit/payments-v2/heartbeat.test.ts"
     ]

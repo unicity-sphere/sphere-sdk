@@ -151,6 +151,8 @@ export interface FacadeHooks {
   track(op: Promise<unknown>): void;
   /** #842: work appeared outside a pass (a kept SENT record) — wake the convergence heartbeat. */
   armHeartbeat(): void;
+  /** #842: a detached store write — run only while started, and tracked so stop() waits for it. */
+  whileLive(write: () => Promise<unknown>): void;
 }
 
 export interface FacadeParts {
@@ -368,6 +370,7 @@ function buildMachineDeps(
     emit: deps.emit,
     now: deps.now ?? Date.now,
     armHeartbeat: () => hooks.armHeartbeat(),
+    whileLive: (write) => hooks.whileLive(write),
     recordHistory: async ({ transferId, payload, committedAmount, committedAssets, timestamp }) =>
       historyStore.recordSent({
         transferId,

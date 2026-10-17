@@ -39,8 +39,11 @@ What changed:
   pass re-posts it. The re-post runs beside the pass, one POST per record at a time, and leaves
   alone a record kept during that pass (its attempt's own POST is in flight), so a history
   endpoint that never answers holds no convergence and a resumed send is posted once. A record
-  kept by a send wakes an idle heartbeat, and every attempt carries the time the record was kept,
-  so a send recovered hours later still lands in history at its own time. A kept record is not a pending transfer:
+  kept by a send wakes an idle heartbeat, and every attempt, a later resume's included, carries the
+  time the record was FIRST kept, so a send recovered hours later still lands in history at its own
+  time. A stopped facade makes no outbox write: a POST answered after `stop()` leaves its record
+  for the next facade on that address to re-post, and `stop()` never waits on the history
+  endpoint. A kept record is not a pending transfer:
   `pendingTransfers()`, source reservations and payment-request links ignore it. An older client
   ignores the key, so after a downgrade a kept record is not re-posted.
 - A failed resume close still reports the intent failed and carries its `Retry-After`. A history
@@ -72,8 +75,9 @@ that dies at the apply taking the in-flight POST with it,
 on `send()` and on resume, a failed POST beside a successful apply and close, a re-post that
 throws, one that never answers, an unreadable payload, a transfer still in process, the
 heartbeat predicate, a pass that leaves alone a record its own attempt kept, the kept time on a
-re-post, the heartbeat a kept record arms, and an unwritable outbox; and, in `heartbeat.test.ts`,
-an idle wallet whose send's POST failed posting the row in-session at the send time), facade-level cases in `tests/unit/payments-v2/send-intent-unknown.test.ts` against the
+re-post and on a later resume, the heartbeat a kept record arms, a stopped owner's late answer,
+and an unwritable outbox; and, in `heartbeat.test.ts`, an idle wallet whose send's POST failed
+posting the row in-session at the send time, and a POST answered after `stop()`), facade-level cases in `tests/unit/payments-v2/send-intent-unknown.test.ts` against the
 real history store, including a whole-token send and a held send whose resume is the only writer
 of its row, mutation probes for each ordering on both paths, and two cases run against the live
 staging wallet-api (`-t '#842'` in `tests/e2e/payments-v2-vertical.staging.e2e.test.ts`): a

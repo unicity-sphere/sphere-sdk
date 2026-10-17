@@ -193,6 +193,7 @@ export class Converger {
     if (recordHistory === undefined) return;
     const deps = {
       recordHistory,
+      whileLive: machineDeps.whileLive,
       outbox: stores.sentOutbox,
       readPayload: async (envelope: string) => validatePayload(await machineDeps.decryptPayload(envelope)),
     };

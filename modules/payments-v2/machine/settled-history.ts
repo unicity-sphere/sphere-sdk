@@ -52,26 +52,37 @@ export interface OutboxDeps {
   encryptPayload: MachineDeps['encryptPayload'];
   now: MachineDeps['now'];
   armHeartbeat: MachineDeps['armHeartbeat'];
+  whileLive: MachineDeps['whileLive'];
   outbox: MachineStores['sentOutbox'];
 }
 
 /** #842: kept in the outbox BEFORE the apply (an applied row is never listed again); the POST is never awaited. */
 export async function keepAndPost(deps: OutboxDeps, settled: SettledRecord | undefined): Promise<void> {
   if (settled === undefined || deps.recordHistory === undefined) return;
-  const record = { ...settled, timestamp: deps.now() }; // the row's time on every attempt, re-posts included
+  const kept = await deps.outbox.getByKey(settled.transferId).catch(() => undefined);
+  // The row's time on every attempt: the FIRST keep's, so a later resume or re-post moves nothing.
+  const record = { ...settled, timestamp: kept?.createdAt ?? deps.now() };
   try {
     await deps.outbox.upsert(toOutbox(record, await deps.encryptPayload(record.payload)));
   } catch {
     /* the in-flight POST is then the record's only copy */
   }
-  void postSettled(deps.recordHistory, record).then(async (done) => {
-    if (done) await deps.outbox.removeByKey(record.transferId).catch(() => undefined);
+  void postSettled(deps.recordHistory, record).then((done) => {
+    if (done) whileLive(deps.whileLive, () => deps.outbox.removeByKey(record.transferId));
     else deps.armHeartbeat?.(); // kept: an idle wallet must still run the pass that re-posts it
   });
 }
 
+/** A detached outbox write runs only while its owner does; a stopped one leaves the entry to the next. */
+function whileLive(fence: MachineDeps['whileLive'], write: () => Promise<unknown>): void {
+  const guarded = (): Promise<unknown> => write().catch(() => undefined);
+  if (fence === undefined) void guarded();
+  else fence(guarded);
+}
+
 export interface RepostDeps {
   recordHistory: NonNullable<MachineDeps['recordHistory']>;
+  whileLive: MachineDeps['whileLive'];
   outbox: MachineStores['sentOutbox'];
   readPayload(envelope: string): Promise<IntentPayload>;
 }
@@ -87,7 +98,7 @@ export async function repostKept(deps: RepostDeps, entry: SentOutboxEntry): Prom
     record = undefined; // an unreadable payload never becomes readable
   }
   if (record === undefined || (await postSettled(deps.recordHistory, record))) {
-    await deps.outbox.removeIfUnchanged(entry.transferId, entry).catch(() => undefined);
+    whileLive(deps.whileLive, () => deps.outbox.removeIfUnchanged(entry.transferId, entry));
   }
 }
 

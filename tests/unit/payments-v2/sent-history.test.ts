@@ -676,6 +676,51 @@ describe('#842 the SENT outbox keeps a record until its POST is answered for goo
     expect(arms).toBe(1);
   });
 
+  it('O13 a record kept again by a later resume keeps its first time', async () => {
+    const w = makeWorld();
+    const firstAt = w.clock.t;
+    const stamps: (number | undefined)[] = [];
+    w.deps.recordHistory = async ({ timestamp }) => {
+      stamps.push(timestamp);
+      return false;
+    };
+    const transferId = await openAfterFailedApply(w); // run() kept it, its POST and its apply failed
+
+    w.clock.t += 3_600_000;
+    await resumeAll(w.deps); // the resume keeps it again, and its POST fails again
+
+    expect(stamps).toEqual([firstAt, firstAt]);
+    expect((await w.stores().sentOutbox.getByKey(transferId))?.createdAt).toBe(firstAt);
+  });
+
+  it('O14 a stopped owner writes nothing: an answer after stop() leaves the record for the next instance', async () => {
+    const w = makeWorld();
+    let live = true;
+    w.deps.whileLive = (write) => {
+      if (live) void write();
+    };
+    let answer: () => void = () => undefined;
+    w.deps.recordHistory = () =>
+      new Promise<void>((resolve) => {
+        answer = resolve;
+      });
+    await w.machine().run(await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' }));
+    await w.flushTail();
+
+    live = false; // the facade stopped while the POST was in flight
+    answer();
+    await w.flushTail();
+    expect(await outbox(w), 'the late answer removed nothing').toHaveLength(1);
+
+    w.deps.recordHistory = async () => undefined;
+    await passLater(w); // a stopped converger's re-post removes nothing either
+    expect(await outbox(w)).toHaveLength(1);
+
+    live = true;
+    await passLater(w);
+    expect(await outbox(w)).toEqual([]);
+  });
+
   it('O8 the heartbeat counts a kept record as work until it is posted', async () => {
     const w = makeWorld();
     await sentWithRecordKept(w);

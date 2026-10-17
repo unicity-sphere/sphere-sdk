@@ -89,6 +89,8 @@ export interface MachineDeps {
   }) => Promise<boolean | void>;
   /** #842: a SENT record was kept for a re-post — wake the convergence heartbeat. */
   armHeartbeat?: () => void;
+  /** #842: runs a detached store write only while the owner runs, and tracks it so stop() waits. */
+  whileLive?: (write: () => Promise<unknown>) => void;
 }
 
 export interface MachinePlan {
@@ -647,8 +649,8 @@ export class TransferMachine {
   }
 
   private outbox(): OutboxDeps {
-    const { recordHistory, encryptPayload, now, armHeartbeat } = this.deps;
-    return { recordHistory, encryptPayload, now, armHeartbeat, outbox: this.stores.sentOutbox };
+    const { recordHistory, encryptPayload, now, armHeartbeat, whileLive } = this.deps;
+    return { recordHistory, encryptPayload, now, armHeartbeat, whileLive, outbox: this.stores.sentOutbox };
   }
 
   private closeTail(transferId: string, payload: IntentPayload): void {
