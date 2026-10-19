@@ -8,7 +8,7 @@ import type { DeliveryPort } from './ports';
 import { isLiveBurn, type DeliveryJournalEntry, type IntentBackstopEntry, type ShortfallEntry } from './stores';
 import type { CoinIntentPayload, IntentPayload } from './machine/types';
 import { retryAfterMsOf, type MachineStores, type ReplayDeps } from './machine/journal';
-import { resumeAll, validatePayload } from './machine/resume';
+import { resumeAll, validatePayload, type ResumeReport } from './machine/resume';
 import { repostKept } from './machine/settled-history';
 import type { IntentApi, MachineDeps } from './machine/TransferMachine';
 
@@ -130,6 +130,8 @@ export interface ConvergerDeps {
   stores: MachineStores;
   delivery: DeliveryPort;
   reconcile(report: { resumed: string[]; conflicted: string[]; open: string[] }): Promise<void>;
+  /** #840: every transferId a settling link names, in memory or on disk; rejects when the disk is unreadable. */
+  linkedTransferIds(): Promise<ReadonlySet<string>>;
   refreshView(): Promise<void>;
   replayMints(): Promise<number>;
   replayNftMints(): Promise<number>;
@@ -145,6 +147,10 @@ export interface ConvergerDeps {
 
 export class Converger {
   private readonly reposting = new Set<string>();
+  /** #840: intents whose refusal to resume was logged — once per facade. */
+  private readonly warned = new Set<string>();
+  /** #840: never-stored cancels already reported whose tombstone is still kept: re-reporting one converges nothing. */
+  private reported = new Set<string>();
 
   constructor(private readonly deps: ConvergerDeps) {}
 
@@ -237,6 +243,7 @@ export class Converger {
       isLocallyActive: (id) => inPass.has(id),
       isParked: (id) => this.deps.parked.has(id),
       onHoldEnded: (id) => this.deps.parked.delete(id),
+      warned: this.warned,
       onDeferred: () => {
         deferred = true;
       },
@@ -244,7 +251,6 @@ export class Converger {
     // #835: an unreadable backstop proves nothing — reconciling its empty report would
     // resolve a held payment link 'paid' through the unaccounted branch.
     if (deferred) return { progress: false, retryAfterMs: null };
-    const progress = report.resumed.length > 0 || report.conflicted.length > 0;
     // #835: a link written while the pass ran is in none of its sets. Anything with a local
     // entry NOW (held, parked, being cancelled, or an attempt that ended mid-pass) can still
     // run or abort, so it is open — never "unaccounted", which resolves the link paid. An
@@ -253,15 +259,38 @@ export class Converger {
       (entries) => entries.map((entry) => entry.transferId),
       () => null
     );
+    const progress = this.progressOf(report, local);
     if (local !== null) {
       await this.deps.reconcile({
         resumed: report.resumed,
         conflicted: report.conflicted,
         open: [...report.failed, ...local],
       });
+      await this.retireJudged(report.retireAfterReconcile ?? []);
     }
     if (progress) await this.deps.refreshView().catch(() => undefined);
     return { progress, retryAfterMs: report.retryAfterMs ?? null };
+  }
+
+  /** #840: only a kept tombstone's first verdict resets the backoff, even across a pass whose abort failed. */
+  private progressOf(report: ResumeReport, local: readonly string[] | null): boolean {
+    const retiring = new Set((report.retireAfterReconcile ?? []).map((entry) => entry.transferId));
+    const fresh = report.conflicted.some((id) => !(retiring.has(id) && this.reported.has(id)));
+    if (local !== null) this.reported = new Set([...this.reported].filter((id) => local.includes(id)));
+    for (const id of retiring) this.reported.add(id);
+    return report.resumed.length > 0 || fresh;
+  }
+
+  /** #840: a never-stored cancel's tombstone is its verdict's only durable copy, and a reconcile can
+   *  resolve without applying it: the tombstone goes only once no settling link names it. */
+  private async retireJudged(entries: readonly IntentBackstopEntry[]): Promise<void> {
+    if (entries.length === 0) return;
+    const linked = await this.deps.linkedTransferIds().catch(() => null);
+    if (linked === null) return;
+    for (const entry of entries) {
+      if (linked.has(entry.transferId)) continue;
+      await this.deps.stores.backstop.removeIfUnchanged(entry.transferId, entry).catch(() => false);
+    }
   }
 
   private filteredMachineDeps(inPass: ReadonlySet<string>): MachineDeps {

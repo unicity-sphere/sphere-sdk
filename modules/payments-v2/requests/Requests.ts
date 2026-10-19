@@ -117,6 +117,7 @@ export class Requests implements PaymentsRequestsApi {
   private journal: Map<string, SettlingLink> | null = null;
   private journalLoad: Promise<void> | null = null;
   private readonly journalChain = new SerialChain();
+  private linkWrites = 0; // queued or running: one may be the link linkedTransferIds is asked about
 
   private readonly payInFlight = new Map<string, Promise<TransferResult>>();
   private readonly reconcileFlight = new SingleFlight<void>();
@@ -144,11 +145,15 @@ export class Requests implements PaymentsRequestsApi {
   }
 
   private mutateJournal(fn: (m: Map<string, SettlingLink>) => boolean): Promise<void> {
-    return this.journalChain.enqueue(async () => {
+    this.linkWrites += 1;
+    const write = this.journalChain.enqueue(async () => {
       await this.ensureJournalLoaded();
       if (fn(this.journal!)) {
         await this.deps.kv.set(STORE_KEYS.settlingLinks, Object.fromEntries(this.journal!));
       }
+    });
+    return write.finally(() => {
+      this.linkWrites -= 1;
     });
   }
 
@@ -169,8 +174,31 @@ export class Requests implements PaymentsRequestsApi {
     });
   }
 
+  /** #840: memory drops the link only once the disk has: a failed write leaves it for the next reconcile. */
   private clearLink(requestId: string): Promise<void> {
-    return this.mutateJournal((m) => m.delete(requestId));
+    return this.journalChain.enqueue(async () => {
+      await this.ensureJournalLoaded();
+      if (!this.journal!.has(requestId)) return;
+      const next = new Map(this.journal!);
+      next.delete(requestId);
+      await this.deps.kv.set(STORE_KEYS.settlingLinks, Object.fromEntries(next));
+      this.journal = next;
+    });
+  }
+
+  /** #840: every transferId a link names, in memory or on disk (read fresh: the load may have failed open).
+   *  Rejects while a pay() or a link write is in flight: either may link the id a caller looks for. A
+   *  pay() links only its own send's transferId, so one that starts after this answer never names it. */
+  async linkedTransferIds(): Promise<ReadonlySet<string>> {
+    await this.ensureJournalLoaded();
+    const raw = await this.deps.kv.get<Record<string, Partial<SettlingLink>>>(STORE_KEYS.settlingLinks);
+    if (this.linkWrites > 0) throw new SphereError('settling journal write in flight', 'STORAGE_ERROR');
+    if (this.payInFlight.size > 0) throw new SphereError('payment request pay in flight', 'STORAGE_ERROR');
+    const ids = new Set([...this.journal!.values()].map((link) => link.transferId));
+    for (const link of raw !== null && typeof raw === 'object' ? Object.values(raw) : []) {
+      if (typeof link?.transferId === 'string') ids.add(link.transferId);
+    }
+    return ids;
   }
 
   // ── incoming stream (gap-free ?since= upsert-by-id) ──────────────────────
@@ -481,9 +509,11 @@ export class Requests implements PaymentsRequestsApi {
     return this.settle(requestId, link.transferId, { committed: link.committed, respond: true });
   }
 
-  /** Removal cause (b): a PROVEN clean outcome (pre-commit failure / server-aborted). */
+  /** Removal cause (b): a PROVEN clean outcome (pre-commit failure / server-aborted). A request
+   *  already paid, declined or expired stays so: only the link held it, and another payer may have paid it. */
   private async revertPayable(requestId: string): Promise<void> {
     await this.clearLink(requestId);
-    this.setStatus(requestId, 'pending');
+    const status = this.mirror.get(requestId)?.status;
+    if (status !== undefined && !TERMINAL.has(status)) this.setStatus(requestId, 'pending');
   }
 }

@@ -748,16 +748,22 @@ describe('resume confirms a parked intent before it resumes or sweeps anything (
 
   it('a pending entry the machine parked in memory (its flag write failed) is confirmed like a flagged one', async () => {
     const w = makeWorld();
-    const entry = openEntry('parked-in-memory', { intentPut: 'pending' });
-    await w.stores().backstop.upsert(entry);
-    const isParked = (id: string): boolean => id === entry.transferId;
+    const plan = await w.plan({ tokens: [await w.seed(1000n)], amount: '1000' });
+    const flagged = await parkSend(w, plan);
+    // The 'unconfirmed' write is the one that failed: the entry still reads 'pending'.
+    const entry = await w.stores().backstop.patch(plan.transferId, (e) => ({ ...e, intentPut: 'pending' }));
+    expect(entry?.intentPut).toBe('pending');
+    w.putCalls.length = 0;
+    const isParked = (id: string): boolean => id === plan.transferId;
 
     const report = await resumeAll(w.deps, { isParked });
 
-    expect(w.putCalls).toEqual([{ transferId: entry.transferId, envelope: entry.payloadEnvelope, requiresSeedClose: false }]);
-    // Confirmed, then run in the same pass: this synthetic intent has no legs, so it simply closes.
-    expect(report).toEqual({ resumed: [entry.transferId], conflicted: [], failed: [] });
-    expect(w.api.inspectIntent(w.caller, entry.transferId)?.status).toBe('completed');
+    expect(w.putCalls).toEqual([
+      { transferId: plan.transferId, envelope: flagged.payloadEnvelope, requiresSeedClose: flagged.requiresSeedClose },
+    ]);
+    // Confirmed, then run in the same pass under the same transferId.
+    expect(report).toEqual({ resumed: [plan.transferId], conflicted: [], failed: [] });
+    expect(w.api.inspectIntent(w.caller, plan.transferId)?.status).toBe('completed');
   });
 
   it('a deferred pass (unreadable backstop) says so through onDeferred and confirms nothing', async () => {
@@ -891,7 +897,7 @@ describe('a cancel counts only once the aborted listing shows its row: an abort 
 describe('the sweep of an entry whose row is no longer open tells completed from aborted (#835)', () => {
   const owed = { transferId: 'earlier', remainingAmount: '400', coinId: COIN, recipient: 'aa', committedTokenIds: [], createdAt: 1 };
 
-  it('a holder whose conflict cleanup could not remove its entry: the next pass hands its rows back, never settles them', async () => {
+  it('a holder whose conflict cleanup could not remove its entry stays a tombstone: the next pass hands its rows back, never settles them', async () => {
     const w = makeWorld();
     const token = await w.seed(1000n);
     const plan = await w.plan({ tokens: [token], amount: '1000', transferId: 'holder' });
@@ -903,15 +909,18 @@ describe('the sweep of an entry whose row is no longer open tells completed from
     w.engine.transfer = transfer;
     await w.engine.foreignSpend(token);
     await w.stores().backstop.patch('holder', (e) => ({ ...e, owes: [owed] }));
-    w.kv.failWriteKeys.add(STORE_KEYS.intentBackstop); // the cleanup's entry removal fails
+    w.overrides.abort = async () => {
+      w.kv.failWriteKeys.add(STORE_KEYS.intentBackstop); // #846: the tombstone is written; the entry removal fails
+    };
 
     const first = await resumeAll(w.deps);
 
-    expect(first.conflicted).toEqual(['holder']);
+    expect(first, 'reported once its cleanup lands').toEqual({ resumed: [], conflicted: [], failed: ['holder'] });
     expect(w.api.inspectIntent(w.caller, 'holder')?.status).toBe('aborted');
-    expect((await w.stores().backstop.getByKey('holder'))?.disposition, 'the removal failed').toBe('open');
+    expect((await w.stores().backstop.getByKey('holder'))?.disposition, 'the removal failed').toBe('abortPending');
     expect((await w.stores().shortfalls.getByKey('earlier'))?.remainingAmount).toBe('400');
 
+    delete w.overrides.abort;
     w.kv.failWriteKeys.delete(STORE_KEYS.intentBackstop);
     const second = await resumeAll(w.deps);
 
@@ -1148,14 +1157,17 @@ describe('a local abort record goes only once the server says the row cannot run
     expect(await w.stores().backstop.getByKey(entry.transferId)).toBeUndefined();
   });
 
-  it('an unlisted tombstone whose abort answers 404 NOT_FOUND (no row) is dropped', async () => {
+  it('an unlisted tombstone whose abort answers 404 NOT_FOUND (no row) is conflicted, and dropped only after the reconcile', async () => {
     const w = makeWorld();
     const entry = await tombstone(w, 'no-row');
 
-    await resumeAll(w.deps);
+    const report = await resumeAll(w.deps);
 
     expect(w.log).toContain('abortIntent');
-    expect(await w.stores().backstop.getByKey(entry.transferId)).toBeUndefined();
+    expect(report.conflicted).toEqual([entry.transferId]);
+    // #840: no listing will ever show a row the server never stored — the entry is the verdict's only copy.
+    expect(report.retireAfterReconcile).toEqual([entry]);
+    expect(await w.stores().backstop.getByKey(entry.transferId)).toEqual(entry);
   });
 
   it.each([
@@ -1296,6 +1308,7 @@ describe('a convergence pass (#835)', () => {
       stores,
       delivery: w.deps.delivery,
       reconcile,
+      linkedTransferIds: async () => new Set<string>(),
       refreshView,
       replayMints: async () => 0,
       replayNftMints: async () => 0,
@@ -1327,6 +1340,7 @@ describe('a convergence pass (#835)', () => {
       stores: createMachineStores(w.kv),
       delivery: w.deps.delivery,
       reconcile: async () => undefined,
+      linkedTransferIds: async () => new Set<string>(),
       refreshView: async () => undefined,
       replayMints: async () => 0,
       replayNftMints: async () => 0,
@@ -1357,6 +1371,7 @@ describe('a convergence pass (#835)', () => {
       stores: createMachineStores(w.kv),
       delivery: w.deps.delivery,
       reconcile: async () => undefined,
+      linkedTransferIds: async () => new Set<string>(),
       refreshView: async () => undefined,
       replayMints: async () => {
         throw new WalletApiHttpError(429, 'RATE_LIMITED', 'mint replay: rate limit exceeded', 300_000);

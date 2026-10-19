@@ -11,7 +11,7 @@ import {
   TransferConflictError,
 } from '../../../token-engine/errors';
 import { coinIdOf, splitOf } from './payload-view';
-import type { IntentPayload, OutcomeClass, PlannedOp } from './types';
+import type { IntentPayload, OpOutcome, OutcomeClass, PlannedOp } from './types';
 
 const KEEP_OPEN_CODES = new Set([
   'CERTIFICATION_UNCONFIRMED',
@@ -56,6 +56,11 @@ export function classifyError(e: unknown): OutcomeClass {
     if (coded.code === 'TRANSFER_CONFLICT') return 'conflict';
   }
   return 'other';
+}
+
+/** #844: certified and journaled, or a proven foreign spend — re-running either changes nothing. */
+export function isSettledOutcome(o: OpOutcome): boolean {
+  return o.certified ? o.error === undefined : classifyError(o.error) === 'conflict';
 }
 
 export function conflictAmount(

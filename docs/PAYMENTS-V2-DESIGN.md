@@ -565,18 +565,36 @@ Normative behaviors bound into the transitions (not call sites):
     finishes it.
   - **In-process convergence:** the facade converges in-process only after a certified *conflict*
     partial. It decides that from what `run()` certified in this process, never from the backstop.
-    A conflict never masks a keep-open or ordinary outcome of the same resume pass: `resumeIntent`
-    throws a conflict only when nothing certified and every errored outcome is a conflict. Every failure of
+    A conflict never masks a keep-open or ordinary outcome of the same pass: `settleIntent`
+    (reached through `resumeIntent` or `convergeRun`) throws a conflict only when nothing certified
+    and every errored outcome is a conflict. Every failure of
     an in-process convergence is possibly-committed, keeping its own code or else taking
     `SEND_SYNC_PENDING`. There is no soft-abort and no full retry.
+    **Amended (#844):** the in-process convergence (`TransferMachine.convergeRun`) reuses what
+    `run()` settled in this process, kept in memory per plan (the run record, never the KV): each
+    leg it certified and journaled (its recipient blob, and for the split its change blob) and each
+    leg it proved conflicted (a `TRANSACTION_HASH_MISMATCH` is permanent). Only the ops `run()`
+    never reached, those in a later `CERTIFY_WIDTH` wave, are submitted, in the same waves and with
+    the same progress events as `run()`; a conflict in such a wave does not stop the next one, so
+    every op is judged before the partial settles. A certified leg whose journal write failed is
+    re-certified, never reused. The converge deposits only the legs it certified itself. A leg
+    whose deposit `run()` could not make (failed, or deferred by a 429) stays journaled with its
+    `attempts` and `deferredUntil` intact, never retried in process. The journal replay of every
+    convergence pass retries it; `resumeAll` does too, but only while the intent stays open (the
+    converge failed, or its close did), since it lists only open intents. The converge reports
+    `deliveryPending`, after one re-read of the journal (the replay is not gated by the pass's
+    active set and may land it meanwhile; an unreadable journal keeps it pending). A converge always
+    ends in a partial or a failure, so the facade's success disposition comes only from `run()`. A restart, or a later pass, resumes from the server intent
+    as before: direct legs from the journal, the split through its checkpoint.
   - **`remainingAmount` `'0'`:** when the latest attempt is possibly-committed after earlier
     partials, `PartialSendConflictError.remainingAmount` is `'0'`. The remainder rides that
     attempt: its error is `cause`, carrying its `transferId`, and `committedTokenIds` also lists
     its certified sources. The attempt owns the remainder, so it holds the send's earlier shortfall
     rows: they move onto its backstop entry (`owes`) and `pendingTransfers()` lists only its
     `'open'` row. They go with the entry once it completes. If it is proven not to run instead (a
-    conflict on resume), they return to the shortfall store before its entry is removed, so the
-    remainder is owed again; a 413/422 on its ensure re-PUT does not prove that, so it keeps them.
+    conflict on resume whose cancel is confirmed), they return to the shortfall store before its
+    entry is removed, so the remainder is owed again; a 413/422 on its ensure re-PUT does not prove
+    that, so it keeps them.
   - **A latest attempt being cancelled holds the remainder too:** its tombstone is written and its
     abort is unconfirmed, so this device never sends it, but another device of the wallet could
     still complete it. So `remainingAmount` is `'0'`, `cause` is that attempt's `SEND_SYNC_PENDING`
@@ -588,10 +606,60 @@ Normative behaviors bound into the transitions (not call sites):
     certified a leg before the abort landed may still deliver, while the confirmed cancel makes the
     remainder owed again. Closing it needs server-side exclusivity between an abort and another
     device's in-flight resume.
+  - **A pure conflict on resume is a cancel (#846).** Every errored leg conflicted and nothing
+    certified, so the intent is cancelled the same way the send-time fence cancels one. The
+    `abortPending` tombstone is written first; if that write fails, nothing is aborted, the intent
+    is reported `failed`, and the next pass judges it again. The abort then counts only once it is
+    confirmed (a `204` the aborted listing shows, or 404 `NOT_FOUND`): the rows the entry holds are
+    owed again, the entry is removed, and the intent is reported `conflicted`. A 404 keeps the
+    tombstone until the reconcile has consumed the verdict (the #840 bullet below). A `204` for a
+    row that neither listing shows means another device completed it, so the entry settles as paid
+    and is not reported conflicted. An unconfirmed abort is reported `failed`, and so is a confirmed
+    one whose cleanup throws; the kept tombstone is judged again by a later pass, like any other.
+    Since the tombstone exists before the abort, an entry whose removal failed is never re-PUT by an
+    epoch re-seed, which would re-open the aborted row. An intent with no local entry (another
+    device wrote it) gets the same abort and the same verdicts, with nothing to hand back or remove.
   - **Final partial:** a settled partial whose `complete` fails after its apply surfaces as a
     *final* `PartialSendConflictError` with its durable remainder. It is not re-planned in-process,
     since re-planning while a split row is still open could resurrect the consumed shortfall;
     resume closes it, idempotently.
+- **Resume plans and reads each intent on its own (#840).** One open intent never stops a pass
+  resuming the others. A payload this client cannot plan is refused before any of its legs runs:
+  an unknown `kind`, a split amount (`splitAmount`, `remainderAmount`) that is not a canonical
+  positive decimal below 2^256 (no sign, no leading zero, a JSON string), or a coin intent's
+  `coinId` that is not lowercase even-length hex, with or without a split (a conflicted direct leg
+  is costed by an exact match on it, so another form would read 0 and complete the send paid), or a
+  coin intent that names no leg (no direct leg and no split: it would run nothing and complete
+  paid; the selector never plans one). Each source a coin intent still has to spend must carry its
+  coin by its blob, read before any leg runs: a conflicted leg is costed by its balance of that coin,
+  so a source without it would read 0 too, and a split of it fails after the direct legs spent.
+  `amount` stays type-checked only: the send path accepts
+  leading zeros and writes it verbatim, and resume never parses it. A refused intent is reported
+  `failed` and left open, so a linked request stays `settling`. It is never executed, aborted or
+  completed, its sources are not touched, and it is kept apart from leg failures so that no
+  attempt budget can ever count, settle or write it off: this device ran none of its legs and
+  cannot know what its writer certified. It is logged once per facade. The batched source read
+  stays one request, but wallet-api refuses a whole `blob-urls` batch over one malformed (400) or
+  unowned (403) id, and one failed download rejects the read. On such a refusal resume reads
+  each intent's sources again on its own, so only the intent that named the bad id fails closed;
+  the refusal's `Retry-After` reaches the heartbeat, a refusal that carries one is not re-read
+  per intent, and the per-intent re-reads stop at the first answer that carries one. A pass that throws after the backstop read
+  still returns what it already decided, and every intent it had not judged yet is reported
+  `failed`, so the reconcile treats it as open and never as unaccounted (which would resolve a
+  link paid). A cancel answered `404 NOT_FOUND` is in no listing, so its tombstone is the only
+  durable copy of its `conflicted` verdict. A reconcile can resolve without applying it (a
+  settling journal that failed open to empty, a cleared link whose write failed), so the converger
+  removes the tombstone only after the reconcile resolves and no settling link names it, in memory
+  or on disk, and never while a settling-link write (a new or updated link) is still queued or
+  running (that write may be a link to it; a removal in flight needs no wait, since memory keeps
+  the link until the removal is on disk); until then every pass reports it `conflicted` again. Only the first of those
+  reports counts as heartbeat progress, so a tombstone kept for good (an unreadable settling
+  journal) is retried at the backoff cap, not every 5 s; each session counts it as progress once. The settling journal drops a
+  link from memory only after its removal is on disk, so the next pass re-applies the verdict.
+  A request the server already resolved (paid, declined, expired) is never made payable again by
+  a `conflicted` or aborted verdict, which can still find its link while that link's removal is
+  unwritten: another payer may have paid it. The kept tombstone no longer
+  holds the shortfall rows it handed back, so they are listed and never handed back twice.
 - **Fan-out:** certify at width 20 (`CERTIFY_WIDTH`, widened from 8 by #746), fail-fast
   **between** batches (in-flight siblings always settle); the burn certifies + checkpoints before
   any mint; mint legs parallel (width 8).
@@ -608,7 +676,8 @@ Normative behaviors bound into the transitions (not call sites):
   **Amended 2026-10-13 (#835):** `run()` applies only a fully settled attempt, one with no errored
   leg at all. The best-effort apply after a conflict partial is gone, and with it the
   `sync:pending` attention code it raised; the condition now surfaces as `SEND_SYNC_PENDING` from
-  `send()`. An attempt with a conflicted or failed leg is applied only by `resumeIntent`, and only
+  `send()`. An attempt with a conflicted or failed leg is applied only by `settleIntent` (through
+  `resumeIntent` on resume, or `convergeRun` in process, #844), and only
   after its #690 shortfall row is durable. The apply itself completes an unflagged intent, so the
   shortfall must be durable before ANY apply, not just before `complete`: the apply-then-shortfall
   order had the same lost-shortfall window, one call earlier.
@@ -887,16 +956,16 @@ listed (or re-PUTs it), clears the flag and resumes it.
 #690 shortfall rows that a possibly-committed later attempt of a partial send now owns
 (`remainingAmount: '0'`, §5.5). The facade moves them onto that attempt's entry instead of
 deleting them, while the attempt is still in process, so no pass can adopt it mid-handoff: `pendingTransfers()` lists only the attempt's `'open'` row, the rows go with the
-entry once the attempt completes, and the paths that prove it will not run (a conflict on resume,
-a cancel the aborted listing confirms) hand them back to the shortfall store before removing the
+entry once the attempt completes, and the paths that prove it will not run (a conflict on resume
+whose cancel is confirmed, any other cancel the aborted listing confirms) hand them back to the shortfall store before removing the
 entry; a 413/422 on the ensure re-PUT proves nothing of the kind, so the hold keeps them. A row left in
 both places by a failed removal is listed once, as the attempt; a failed attach still removes the
 rows from the store, so a remainder is never listed as owed while the attempt may pay it (an
 under-payment window if that attempt is later refused, never a double pay); and both completion paths (the
 attempt's own close, and the S1 sweep of a holder completed elsewhere) remove that copy before the
 entry, keeping the entry when they cannot. The sweep settles only a holder whose row is in neither
-listing: one whose row is aborted (a conflict cleanup whose removal failed, or another device's
-abort) hands its rows back instead. An older client ignores the field,
+listing: one whose row is aborted (another device's abort, or a pre-#846 client's conflict cleanup
+whose removal failed) hands its rows back instead. An older client ignores the field,
 so a downgrade can lose a held remainder: an under-payment, never a double pay.
 
 There is no new disposition, no new `STORE_KEYS` entry and no prefix change, so an older client
@@ -945,7 +1014,9 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
   per-intent-serial. Pinned by a startup request-count test.
 - **In-session convergence heartbeat:** between `start()` and `stop()`, while open intents exist
   or the delivery/mint journals are non-empty, the facade re-runs the SAME single-flighted resume
-  pass on an exponential backoff — seed 5 s, ×2, cap 120 s; reset on progress (any leg converging)
+  pass on an exponential backoff — seed 5 s, ×2, cap 120 s; reset on progress (any leg converging,
+  but not a kept 404 tombstone already reported `conflicted` while that tombstone is still kept,
+  even across a pass whose abort failed, #840)
   and on `connection:status` recovery; a surfaced wallet-api `Retry-After` floors the next pass;
   the pass never adopts an intent whose machine is still running in-process (facade ownership).
   State is an in-memory timer handle + backoff value only — the pending set is re-read from the
@@ -961,12 +1032,15 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      is never touched. That closes the race in which the GC dropped the `abortPending` tombstone
      an active attempt had just written. It removes a tombstone only after the server answers its
      abort `204` and the aborted listing shows the row (conflicted), or neither it nor the open
-     listing does (completed elsewhere: paid), or 404 `NOT_FOUND` (conflicted), handing back or
-     settling any shortfall rows the tombstone holds to match, and it skips held entries. Every removal is compare-and-delete
+     listing does (completed elsewhere: paid), handing back or settling any shortfall rows the
+     tombstone holds to match, and it skips held entries. A 404 `NOT_FOUND` (the server never
+     stored the row) is reported conflicted and its rows handed back, but the tombstone is kept,
+     without them, for step 5: no listing will ever show that row. Every removal is compare-and-delete
      against the exact snapshot it judged (`ListStore.removeIfUnchanged`, serialized with every
      other read-modify-write of the store), so a park or a fence that lands meanwhile is never
      lost to a stale read. An `'open'` entry whose row is no longer open completed or was aborted
-     (its cleanup failed, or another device's resume conflicted and aborted it). The GC reads the
+     (another device's resume conflicted and aborted it, or a pre-#846 client's conflict cleanup
+     could not remove it; this client's step-4 conflict writes a tombstone before it aborts). The GC reads the
      aborted listing, then the open listing again, to tell the two apart. It reads them for each
      entry it judges, since a row can be re-opened while an earlier entry is retired:
      - an aborted row moved nothing, so its held rows are owed again and it is reported
@@ -979,13 +1053,22 @@ null, `noteEpoch` takes its `previous === null` early return, and no restore fir
      the pass report (`ResumeReport.retryAfterMs`, the longest seen), and `convergeOnce` keeps the
      longest across the pass and the journal replays, so the heartbeat never retries a
      rate-limited held send, resume or replay before the server asked.
-  4. Gate, decode and resume, unchanged.
+  4. Gate, decode and resume. Since #840 each intent is planned on its own: a payload this client
+     cannot plan is refused (reported `failed`, left open, kept out of any attempt budget), a
+     refused batched source read is re-read per intent unless it carried a `Retry-After` (the
+     re-reads stop at the first answer that carries one), and
+     steps 2-4 run inside one boundary that reports every id not judged yet `failed`. The
+     §5.5 #840 bullet has the details.
   5. Reconcile payment links, against the backstop read again after the pass: every transferId
      with a local entry then (held, parked, being cancelled, or an attempt that ended mid-pass) is
      reported open alongside the pass's own failures, because a link written while the pass ran is
      in none of its sets and would otherwise reach the unaccounted branch, which resolves it paid.
      If that read fails, the pass skips only the reconcile: it still reports its progress and
-     refreshes the view.
+     refreshes the view. After the reconcile resolves, the converger compare-and-deletes each
+     tombstone kept for a 404 (by the step-3 GC, the step-4 #676 gate, or a step-4 resume conflict
+     whose abort answered 404), but only once no
+     settling link names its transferId, in memory or in a fresh read of the journal, and no
+     settling-link write (a new or updated link) is queued or running (#840).
 
   Activity is judged once per pass: the pass watches the facade's active-op registry
   (`ActiveOps`), so an id in process at any moment of the pass — already running when the pass
@@ -1144,7 +1227,8 @@ a certified leg is possibly-committed (#835); tombstones removed only on a serve
 never while locally active, every GC removal compare-and-delete (#835); shortfall-before-apply —
 `run()` applies only a fully settled attempt, any other attempt is applied only by resume after its
 shortfall row is durable (#835); conflict-never-masks — a conflict is thrown only when nothing
-certified and every errored outcome is a conflict (#835);
+certified and every errored outcome is a conflict (#835); converge-reuses-run — the in-process
+convergence re-submits and re-deposits nothing `run()` settled in this process (#844);
 same-transferId resume, foreign proof never applied; re-deliver never re-certify; conflicted leg
 never recorded spent; locally-aborted intents never resumed, unknown local disposition defers
 all; unsupported payloads refused; reservation gate + synchronous critical section; per-request

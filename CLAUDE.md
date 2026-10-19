@@ -559,8 +559,8 @@ version:
   payable. `PartialSendConflictError.remainingAmount` can be `'0'`: a possibly-committed later
   attempt owns the rest and holds the send's earlier shortfall rows on its backstop entry — one
   being cancelled included, since another device could still complete it. The rows are handed back,
-  owed again, only once that attempt is proven not to run (a conflict on resume, or a cancel the
-  aborted listing confirms, which also reports it `conflicted`), and settled as paid when it
+  owed again, only once that attempt is proven not to run (a cancel the aborted listing confirms,
+  a conflict on resume included, which also reports it `conflicted`), and settled as paid when it
   completed elsewhere; nothing is owed while the cancel is unconfirmed. Accepted residual
   (wallet-api#172, closing it needs server-side exclusivity): another device that certified a leg
   before the abort landed may still deliver, while the confirmed cancel makes the remainder owed
@@ -881,8 +881,12 @@ authoritative for build success.
 - **After a leg certifies, nothing is clean (#835):** `run()` applies only a fully settled
   attempt. A certified leg beside an ordinary failure is `SEND_SYNC_PENDING`, with no apply and
   no abort. The facade converges in-process ONLY after a certified CONFLICT partial (read from
-  the machine's in-memory certified set, never the backstop), and every failure of that
-  convergence is possibly-committed. The #690 shortfall is durable before ANY apply, because the
+  the machine's in-memory run record, never the backstop), and every failure of that
+  convergence is possibly-committed. That converge (`TransferMachine.convergeRun`, #844) reuses
+  what `run()` settled in this process (its certified legs and its proven conflicts), certifies
+  only the ops `run()` never reached (in `CERTIFY_WIDTH` waves), and deposits only those: a deposit
+  `run()` could not make stays journaled for the replay and the send reports `deliveryPending`. It
+  always ends partial or failed, so a facade success comes only from `run()`. The #690 shortfall is durable before ANY apply, because the
   apply completes an unflagged intent. A nothing-certified failure is clean only when every op
   conflicted, or when a durable abort tombstone was written AND the server confirmed the abort
   (a `204` the aborted listing then confirms, since an abort of a row another device completed is
@@ -891,7 +895,11 @@ authoritative for build success.
   earlier may list the acked entry late and re-PUT it; a re-seed counts as active until its last
   re-PUT answered, before its cursor reset and re-pull); otherwise it is possibly-committed. An
   unconfirmed abort leaves a row another device of the wallet could run, so the #676 gate reports
-  it `conflicted` only once its abort is confirmed.
+  it `conflicted` only once its abort is confirmed. A pure conflict on resume (#846) is cancelled
+  the same way: tombstone first (a failed write aborts nothing and reports `failed`), then
+  `abortAndConfirm` — confirmed → its held rows owed again, `conflicted`; a row completed elsewhere
+  → paid; unconfirmed → `failed`, the kept tombstone confirmed by a later pass. With no local
+  entry (another device's intent) it is the same abort and the same verdicts.
 - **A convergence pass judges activity once (#835):** the pass watches `ActiveOps`
   (`convergence.ts`), so an id in process at ANY moment of the pass — already running when it
   began, or started during it (even one whose PUT landed after the server computed the listing,

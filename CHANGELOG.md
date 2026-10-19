@@ -7,6 +7,199 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — a send's in-process converge reuses what its attempt settled (#844)
+
+What was wrong. When a send attempt certified some legs and another leg lost its source to a
+conflict, the facade converged the attempt in-process by resuming it as if from the server. Only a
+direct leg whose deposit was still journaled was taken from the journal; every other op went to
+the gateway, one op at a time, so these were resubmitted and their inclusion proofs awaited again:
+each direct leg the attempt had just certified and delivered, the split (which always re-runs), and
+each leg the attempt had just proved conflicted. Then every certified leg was deposited again, the
+journaled ones included, so a deposit the attempt had been told to defer (429) was retried at once,
+and a failed one counted twice toward its poison budget.
+
+Consequence. Gateway round trips on the send's critical path for legs that were already settled. A
+gateway blip during one of those resubmissions turned a send that had finished in memory into a
+possibly-committed rejection (`CERTIFICATION_UNCONFIRMED` or `SEND_SYNC_PENDING`) that converged
+in the background, so a request stayed `settling` and the pending UI showed for a payment that was
+already settled. The money outcome was correct.
+
+What changed:
+
+- The machine keeps, in memory and per attempt, what `run()` settled: each certified and journaled
+  leg (its recipient blob, and for the split its change blob), each leg proved conflicted (a
+  `TRANSACTION_HASH_MISMATCH` is permanent), and whether its deposits are still owed. Nothing new
+  is persisted; a restart resumes from the server intent exactly as before.
+- The in-process converge (`TransferMachine.convergeRun`) reuses those outcomes and submits only the
+  ops the attempt never reached (those in a later `CERTIFY_WIDTH` wave), in the same waves and with
+  the same `transfer:updated` progress events as the attempt. A conflict in one of those waves does
+  not stop the next wave, so every op is judged before the partial settles and the shortfall is the
+  sum of every conflicted leg.
+- The converge deposits only the legs it certified itself. A leg whose deposit the attempt could not
+  make stays journaled, its attempt count and deferral intact, and is retried by the journal replay
+  that every convergence pass runs (and by the resume of open intents, while the converge leaves the
+  intent open). Behaviour change for integrators: in that case the send now resolves
+  `'confirmed'` with `deliveryPending: true` where the in-process retry could have returned
+  `'delivered'`; both are documented success states. Before reporting the deposit still owed, the
+  converge reads the journal once more, because the replay may land it meanwhile.
+- A converge always ends partial or failed, so the facade no longer has a converge success branch:
+  a facade success comes only from the attempt itself. Every converge failure is still
+  possibly-committed.
+
+How it was verified: machine-level tests in `tests/unit/payments-v2/machine-converge.test.ts` (no
+chain op or deposit for a settled leg, a certified split reused, only the unreached wave
+certified, in one wave and with progress, a fresh leg unconfirmed, a 500 and a 429 deposit left to
+the replay, a split in an unreached wave, a reused plus a fresh conflict, a deposit the replay
+landed meanwhile while a fresh leg's deposit failed, an unreadable journal, a non-conflict failure
+that stops the next wave, a batch-deposit port, and two defensive cases the facade cannot reach),
+facade-level tests in `tests/unit/payments-v2/facade-converge.test.ts` (one submit and one deposit
+per leg, a gateway that blips on every resubmission, more than one wave, both conflicted sources
+demoted by the converge itself, with the facade's own spent-status probe down), the existing #835
+cases re-pointed to the background pass, and mutation probes for each reuse rule. A case for the
+live staging wallet-api (`-t '#844'` in `tests/e2e/payments-v2-vertical.staging.e2e.test.ts`), in
+which a second instance of the wallet spends a source out from under the first instance's
+selection, is added for the release's staging run.
+
+### Fixed (money) — a send that lost its race on resume is reported cancelled only once the cancel is confirmed (#846)
+
+What was wrong. When a resumed send found every leg's source already spent by someone else and
+nothing certified (a pure lost race), the resume aborted the intent with a plain `abort`, handed
+any held shortfall rows back, removed the backstop entry, and reported the send `conflicted`,
+even when the abort had failed: the cleanup sat in a `try` with an empty `catch`. It also never
+read the aborted listing, so an abort of a row another device had already completed (a no-op
+`204`, because completion wins) still read as a cancel. And no tombstone was written before the
+abort, so an abort that succeeded followed by a removal that failed left an ordinary `'open'`
+entry behind.
+
+Consequence. A `conflicted` verdict makes a linked payment request payable again and owes a held
+remainder again. With a failed abort, that happened while the intent was still open on the server,
+where another device of the wallet could still send it. With a row completed elsewhere, the request
+became payable for a payment that had been made, so paying it again paid twice. The leftover
+`'open'` entry was re-PUT by the next epoch re-seed, and a byte-equal PUT re-opens the aborted row.
+
+What changed:
+
+- The pure-conflict branch of resume now cancels the way the send-time fence and the tombstone
+  paths do. It writes the `abortPending` tombstone first. If that write fails, nothing is aborted,
+  the intent is reported `failed`, and the next pass judges it again.
+- The abort counts only once it is confirmed (`abortAndConfirm`: a `204` the aborted listing then
+  shows, or a typed `404 NOT_FOUND`). Then the held rows are owed again, the entry is removed and
+  the send is reported `conflicted`; after a `404` no listing will ever show the row, so the
+  tombstone, without its rows, is kept until the pass's reconcile has applied the verdict. A `204` for a row in neither listing settles the entry as paid,
+  so a linked request resolves paid. An unconfirmed abort, or a confirmed one whose cleanup throws,
+  is reported `failed`: the request stays `'settling'`, and a later pass confirms the kept
+  tombstone like any other. A `Retry-After` on that abort or its listing reaches the heartbeat.
+- An intent with no local entry (another device of the wallet wrote it) gets the same confirmed
+  abort: `conflicted` once confirmed, nothing when the row completed elsewhere, `failed` otherwise.
+
+How it was verified: `tests/unit/payments-v2/resume-conflict-cancel.test.ts` (a failed abort that
+leaves the link settling until a later pass confirms it, a row completed on another device that
+resolves the request paid and settles its held rows, a tombstone write that fails and aborts
+nothing, a removal that fails after a confirmed abort and is never re-PUT by an epoch re-seed, an
+abort answered `429` with `Retry-After`, an abort answered `404 NOT_FOUND`, and the same verdicts
+for an intent with no local entry), the updated cleanup-failure case in
+`tests/unit/payments-v2/machine-resume.test.ts`, and new mutation probes. A live staging case, a
+pure conflict on resume while the abort answers 500, passes against the staging wallet-api
+(`tests/e2e/payments-v2-vertical.staging.e2e.test.ts`, `-t '#846'`).
+
+### Fixed (money) — one malformed or foreign open intent no longer stops every resume (#840)
+
+What was wrong. Resume checked a durable intent's split amounts by type only and planned every
+intent's legs in one step outside any per-intent failure boundary. A split amount `BigInt` cannot
+parse (`'abc'`, `'1e3'`) made the whole convergence pass throw. A string `BigInt` does parse but no
+client writes (`''`, `'0'`, `'-5'`, `'0x258'`, `'0600'`, a value of 2^256 or more), or a split
+under a coin id that is not lowercase hex, passed the check: the direct legs beside the split were
+spent, and the split then failed or ran under `BigInt`'s reading of a grammar its writer may not
+have meant. A coin id that is not lowercase hex also passed on a send with no split. A direct leg
+that conflicted on resume was then costed by an exact match on that id, so it read as 0: the send
+completed as fully paid, nothing was owed for that leg, and a linked payment request resolved
+paid. A well-formed coin id that the intent's sources do not carry was costed 0 the same way, and
+a split of such a source failed only after the direct legs beside it were spent. A coin intent naming no leg at all (no direct leg and no split) passed too: it ran zero
+legs and was completed and reported resumed, so a linked request resolved paid with nothing moved.
+The batched source read had the same coupling one layer down: wallet-api refuses the
+whole `blob-urls` batch over one malformed or unowned token id, and one failed blob download
+rejects the read, so every send in the pass that needed a source failed closed, and the refusal's
+`Retry-After` was dropped. A pass that threw also dropped everything it had already decided. A
+cancel the server answered `404 NOT_FOUND` (it never stored the row) had its tombstone removed
+inside the pass, while its `conflicted` verdict existed only in that pass's report.
+
+Consequence. Any client of the wallet that wrote such an intent stopped every device from resuming
+and reconciling, on every pass: possibly-committed sends never converged, their sources stayed
+reserved, and payment requests linked to them stayed `settling`. No listing ever shows a row the
+server never stored, so when the payment-request reconcile did not run after that removal (the
+pass threw, the process stopped, the post-pass backstop read failed, or the reconcile itself
+failed), the verdict was gone: the next pass found the link unaccounted and resolved the request
+paid with nothing moved.
+
+What changed:
+
+- Split amounts must be canonical positive decimal strings below 2^256, and a coin intent's coin
+  id must be lowercase even-length hex, with or without a split. A coin intent must name at least
+  one leg (a direct leg or a split); no writer emits one with none. `amount` stays type-checked only, since the send path writes
+  it verbatim and accepts leading zeros.
+- Every source a coin intent still has to spend must carry its coin, read from the source's blob
+  before any leg runs (the check a whole intent's source already had). An intent with one that
+  does not is reported `failed` and left open, with none of its legs run.
+- Each intent is planned inside its own failure boundary. One that cannot be planned is reported
+  `failed` and left open: never executed, aborted or completed, and its sources are not touched.
+  It is logged once per facade.
+- When the batched source read is refused over one id (a 4xx other than 408/425/429, or one blob's
+  download failed), each intent's sources are read again on their own, so only the intent that
+  named the bad id fails closed. The refusal's `Retry-After` reaches the heartbeat. A refusal that
+  carries one is not re-read per intent, and the per-intent re-reads stop at the first answer that
+  carries one, so a server that asked to back off gets no further blob-url reads that pass. An
+  outage (a network error, a 408/425/429 or a wallet-api 5xx) is not re-read per intent either, and
+  the re-reads stop at the first such answer, so a pass sends no more than one extra request into
+  it; the intents left unread fail closed until the next pass. The rest of
+  the pass still runs, so intents that need no source read, the reconcile and the journal replays
+  still send their requests.
+- A pass that throws after reading the backstop keeps its verdicts and reports every intent it
+  had not judged as `failed`, so the payment-request reconcile still runs and treats them as open.
+- A cancel answered `404 NOT_FOUND` keeps its tombstone until the reconcile has applied its
+  `conflicted` verdict: the converger removes it only after the reconcile resolves and no settling
+  link names its transferId, in memory or in a fresh read of the journal. A reconcile can resolve
+  without applying the verdict (a settling journal that failed open to empty, or a cleared link
+  whose write failed), so resolving alone is not enough. A pass that does not get that far leaves
+  the tombstone, and the next pass aborts it again, gets the same `404` and reports it
+  `conflicted` again. Only the first of those reports counts as progress, also when a pass between
+  them could not abort it (a network error or a 5xx), so the heartbeat backs off to its cap
+  instead of retrying such a tombstone every 5 s. The settling journal now drops a link from memory only after its removal
+  is on disk, so a failed write is retried by the next reconcile instead of waiting for a
+  restart. The kept tombstone drops the shortfall rows it handed
+  back, so `pendingTransfers()` lists them and a remainder already paid is never owed again.
+- The journal check refuses to answer while a settling-link write (a new or updated link) is queued
+  or running, so a
+  link to the tombstone that `pay()` queued behind a stalled write keeps the tombstone for that
+  pass. It also refuses while any `pay()` is in flight: one whose send already failed may not have
+  queued its link yet. Without either, the tombstone could go first, and the next pass resolved
+  that link paid. A `pay()` links only its own send's transferId, so one that starts after the
+  answer cannot name the tombstone.
+- A payment request the server already resolved (paid on another device, declined or expired)
+  stays so when a `conflicted` or aborted verdict finds its link. Before, the link could still be
+  in memory (its removal not yet written, or failed), and the request went back to `pending`, so
+  `pay()` could pay it a second time. A clean `send()` failure no longer re-opens a request the
+  server resolved while the send ran.
+- A device still on 0.19.0 or older keeps stopping on such an intent; the fix reaches each device
+  only when it upgrades.
+
+How it was verified: `tests/unit/payments-v2/resume-unplannable.test.ts` (every refused form,
+the domain boundaries, server-faithful `blob-urls` refusals, the reconcile and the partial-report
+cases, and a never-stored cancel across a skipped reconcile, a failed post-pass backstop read and
+a failed reconcile, and a real settling journal whose read failed open or whose cleared link
+failed to write, each followed by a restart that must not resolve the request paid, and the
+heartbeat backing off while such a tombstone is kept, its abort failing on every other pass
+included, a link to it queued behind a stalled journal write or not yet queued by a `pay()` still
+in flight, and a failed strip of the rows it handed back; a batched source read the network, a
+wallet-api 5xx, a hop's 502 or a 408 failed, read once and not per intent), `tests/unit/payments-v2/never-stored-cancel.facade.test.ts` (the same never-stored
+cancel through the composed facade, whose own settling links keep the tombstone),
+`tests/unit/payments-v2/requests.test.ts` (`linkedTransferIds`, a link write queued behind a
+stalled one, and a server-resolved request that a reconcile or a clean send failure must leave
+unpayable),
+`tests/unit/payments-v2/resume-isolation.test.ts` (a planning failure that
+validation does not name), and new mutation probes. The live staging case with a crafted foreign
+intent beside a keep-open send is `tests/e2e/payments-v2-vertical.staging.e2e.test.ts`
+(`-t '#840'`).
+
 ### Fixed (money) — a failure after the inclusion proof matched is never a clean failure (#839)
 
 What was wrong. Once a transfer, burn or split burn had a proof that match-verified, the steps that

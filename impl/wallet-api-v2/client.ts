@@ -2,6 +2,8 @@
 
 import { sha256 } from '@noble/hashes/sha2.js';
 
+import { BLOB_DOWNLOAD_FAILED } from '../../modules/payments-v2/ports';
+
 import { WalletApiHttpError, type RequestOptions, type WalletApiHttp } from './http';
 
 export interface AuthChallengeWire {
@@ -245,7 +247,7 @@ export class WalletApiV2Client {
   async fetchBlob(getUrl: string): Promise<Uint8Array> {
     const res = await this.http.fetchRaw(getUrl, { method: 'GET' });
     if (!res.ok) {
-      throw new WalletApiHttpError(res.status, 'BLOB_DOWNLOAD', `blob download failed with status ${res.status}`);
+      throw new WalletApiHttpError(res.status, BLOB_DOWNLOAD_FAILED, `blob download failed with status ${res.status}`);
     }
     return new Uint8Array(await res.arrayBuffer());
   }

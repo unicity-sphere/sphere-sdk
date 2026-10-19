@@ -240,7 +240,7 @@ describe('PaymentsFacade — §7 convergence heartbeat', () => {
     await w.facade.start();
     await drain();
 
-    let deliverFailures = 2; // the send leg + the in-send resume re-delivery
+    let deliverFailures = 1; // the send leg: the in-send converge never re-delivers a leg run() settled (#844)
     w.hooks.deliver = async () => {
       if (deliverFailures > 0) {
         deliverFailures -= 1;
