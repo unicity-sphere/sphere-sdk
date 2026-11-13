@@ -1361,7 +1361,7 @@ try {
 | -32601 | `ERROR_CODES.METHOD_NOT_FOUND` | Comes from the **wallet**, never from the SDK host (there an unmapped name is 4002). The Sphere wallet currently answers every intent outside its supported set, `send_nft` included, with it. |
 | -32602 | `ERROR_CODES.INVALID_PARAMS` | Mostly the wallet's: the Sphere wallet currently validates intent params up front and rejects a malformed one with it, before showing any UI. That includes a `send` or `payment_request` whose `to` is neither an `@`-prefixed nametag nor a pubkey (see **Recipients** under the intents table). The SDK host sends it for one case itself: a `send`, `payment_request` or `send_nft` intent whose `to` is a `DIRECT://` address (#847), before `onIntent` and before any auto-approve handler. |
 | -32603 | `ERROR_CODES.INTERNAL_ERROR` | The host caught an error it cannot attribute: a router throw (a `SphereError`'s code rides in `data.reason`, e.g. `'PAYMENTS_NOT_COMPOSED'` from a messaging-only wallet), a query that outlived the host deadline, or an intent handler that threw. A wallet that destroys its Sphere without calling `setLocked()` / `setUnavailable()` first also produces it. |
-| 4200 | `ERROR_CODES.INTENT_CANCELLED` | Intent cancelled — the user declined and **nothing happened**. Safe to re-offer. |
+| 4200 | `ERROR_CODES.INTENT_CANCELLED` | Intent cancelled — **nothing happened**. Safe to re-offer. Usually the user declined. The Sphere wallet currently also sends it, with "The wallet is busy with another request. Try again in a moment.", for an intent that would open a prompt while its network-switch prompt is up; an auto-approved intent opens none and is not refused. |
 | 4201 | `ERROR_CODES.INTENT_OUTCOME_UNKNOWN` | The intent reached the wallet and its outcome is unknown: the answer was lost (a host deadline, a lock, a logout), or the wallet cannot tell whether the operation will still complete (a mint journaled before it failed carries `data.tokenId`). **The money or token may or may not have moved. Do NOT retry**; reconcile out of band first. |
 
 > **Where each row comes from.** Ten codes are emitted by the SDK host itself — 4001, 4002, 4004,
@@ -1370,7 +1370,7 @@ try {
 > else in the table is the *wallet's* to send: 4003 and 4200 come from the wallet's own rejection,
 > relayed by the host, and the rows written "the Sphere wallet currently …" describe the Sphere
 > wallet as it stands today — `sphere`, `src/components/connect/intentValidation.ts`,
-> `ConnectIntentHandler.tsx` and `ConnectProvider.tsx`, read at commit `762d350d` — not protocol
+> `ConnectIntentHandler.tsx` and `ConnectProvider.tsx`, read at commit `3c4778d5` — not protocol
 > guarantees. Every one of these codes is defined on the wire, so another wallet may legitimately
 > use a "reserved" code and the Sphere wallet may start emitting one. Discriminate on `.code`, and
 > handle the codes you depend on defensively rather than treating this column as fixed.
